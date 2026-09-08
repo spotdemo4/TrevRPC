@@ -285,6 +285,7 @@ struct ChannelCore::Generation final {
   bool subject_armed = false;
   bool subject_arm_needed = false;
   bool close_submitted = false;
+  std::uint64_t close_request_generation = 0;
   // The C runtime and provider both report -EALREADY, but only the former
   // guarantees that a terminal subject event is still in flight.
   bool close_observation_pending = false;
@@ -310,7 +311,8 @@ struct ChannelCore::SharedState final
       : runtime(std::move(runtime_value)), config(std::move(config_value)),
         endpoint_starter(std::move(endpoint_starter_value)), backoff(std::move(backoff_value)) {}
 
-  [[nodiscard]] Result<void> start(std::thread& worker) {
+  [[nodiscard]] Result<void> start(std::thread& worker,
+                                   std::shared_ptr<ThreadCompletionToken> completion) {
     const int injected_error = injected_channel_start_error.exchange(0, std::memory_order_acq_rel);
     if (injected_error != 0) {
       {
@@ -324,7 +326,10 @@ struct ChannelCore::SharedState final
       return Error::runtime(injected_error, "injected RPC channel coordinator start failure");
     }
     try {
-      worker = std::thread([state = shared_from_this()] { state->worker_loop(); });
+      worker = std::thread([state = shared_from_this(), completion = std::move(completion)] {
+        state->worker_loop();
+        completion->complete();
+      });
     } catch (...) {
       {
         std::lock_guard lock(mutex);
@@ -373,12 +378,14 @@ struct ChannelCore::SharedState final
     return std::chrono::steady_clock::now() + cleanup_delay(attempt);
   }
 
-  void record_close_failure_locked(int error) noexcept {
-    if (!close_requested || error == 0 || close_failure_generation >= close_request_generation) {
+  void record_close_failure_locked(int error, std::uint64_t request_generation) noexcept {
+    if (!close_requested || error == 0 || request_generation == 0 ||
+        request_generation != close_request_generation ||
+        close_failure_generation >= request_generation) {
       return;
     }
     close_failure_error = error;
-    close_failure_generation = close_request_generation;
+    close_failure_generation = request_generation;
   }
 
   void enqueue_lifecycle_locked(ChannelCoreEvent event) noexcept {
@@ -524,7 +531,7 @@ struct ChannelCore::SharedState final
         if (close_requested &&
             (generation->close_submitted || generation->close_observation_pending) &&
             !generation->retry_scheduled) {
-          record_close_failure_locked(retry_error);
+          record_close_failure_locked(retry_error, generation->close_request_generation);
         }
         const bool was_ready = generation->ready;
         if (was_ready && active_generation == generation) {
@@ -539,7 +546,7 @@ struct ChannelCore::SharedState final
           if (close_requested &&
               (generation->close_submitted || generation->close_observation_pending) &&
               !generation->retry_scheduled && event.status != 0) {
-            record_close_failure_locked(event.status);
+            record_close_failure_locked(event.status, generation->close_request_generation);
           }
           generation->terminal = true;
           const bool was_ready = generation->ready;
@@ -683,7 +690,8 @@ struct ChannelCore::SharedState final
     }
   }
 
-  void submit_endpoint_close(const std::shared_ptr<Generation>& generation) noexcept {
+  void submit_endpoint_close(const std::shared_ptr<Generation>& generation,
+                             std::uint64_t request_generation) noexcept {
     auto operation = runtime->reserve_operation();
     if (!operation) {
       {
@@ -692,7 +700,7 @@ struct ChannelCore::SharedState final
         generation->close_observation_pending = false;
         generation->close_error = operation.error().code();
         generation->close_retry_at = cleanup_retry_deadline(generation->close_attempt++);
-        record_close_failure_locked(generation->close_error);
+        record_close_failure_locked(generation->close_error, request_generation);
       }
       condition.notify_all();
       return;
@@ -713,7 +721,7 @@ struct ChannelCore::SharedState final
         // a bounded opportunity to settle before reporting a failure.
         if (error != -EALREADY ||
             generation->close_retry_at == std::chrono::steady_clock::time_point::max()) {
-          record_close_failure_locked(error);
+          record_close_failure_locked(error, request_generation);
         }
       }
       condition.notify_all();
@@ -729,17 +737,18 @@ struct ChannelCore::SharedState final
     try {
       auto weak = weak_from_this();
       consumed =
-          runtime->subscribe_operation(operation.value(), [weak](Result<RpcEvent> result) noexcept {
-            if (auto state = weak.lock()) {
-              std::lock_guard lock(state->mutex);
-              if (!result) {
-                state->record_close_failure_locked(result.error().code());
-              } else if (result.value().status != 0) {
-                state->record_close_failure_locked(result.value().status);
-              }
-              state->condition.notify_all();
-            }
-          });
+          runtime->subscribe_operation(
+              operation.value(), [weak, request_generation](Result<RpcEvent> result) noexcept {
+                if (auto state = weak.lock()) {
+                  std::lock_guard lock(state->mutex);
+                  if (!result) {
+                    state->record_close_failure_locked(result.error().code(), request_generation);
+                  } else if (result.value().status != 0) {
+                    state->record_close_failure_locked(result.value().status, request_generation);
+                  }
+                  state->condition.notify_all();
+                }
+              });
     } catch (...) {
       consumed = Error::runtime(-ENOMEM, "failed to allocate RPC close callback");
     }
@@ -750,14 +759,15 @@ struct ChannelCore::SharedState final
     }
   }
 
-  void settle_unregistered_endpoint(const std::shared_ptr<Generation>& generation) noexcept {
+  void settle_unregistered_endpoint(const std::shared_ptr<Generation>& generation,
+                                    std::uint64_t request_generation) noexcept {
     auto settled = runtime->settle_unregistered_endpoint(generation->endpoint);
     if (!settled) {
       {
         std::lock_guard lock(mutex);
         generation->cleanup_error = settled.error().code();
         generation->cleanup_retry_at = cleanup_retry_deadline(generation->cleanup_attempt++);
-        record_close_failure_locked(generation->cleanup_error);
+        record_close_failure_locked(generation->cleanup_error, request_generation);
       }
       condition.notify_all();
       return;
@@ -775,7 +785,8 @@ struct ChannelCore::SharedState final
     schedule_start_failure(registration_error);
   }
 
-  void release_endpoint(const std::shared_ptr<Generation>& generation) noexcept {
+  void release_endpoint(const std::shared_ptr<Generation>& generation,
+                        std::uint64_t request_generation) noexcept {
     runtime->unregister_endpoint(generation->endpoint);
     const int error = trevrpc_rpc_endpoint_release(runtime->native_handle(), generation->endpoint);
     {
@@ -789,7 +800,7 @@ struct ChannelCore::SharedState final
       } else {
         generation->release_error = error;
         generation->release_retry_at = cleanup_retry_deadline(generation->release_attempt++);
-        record_close_failure_locked(error);
+        record_close_failure_locked(error, request_generation);
       }
     }
     condition.notify_all();
@@ -822,6 +833,7 @@ struct ChannelCore::SharedState final
     for (;;) {
       enum class Action { None, Start, Arm, Close, Cleanup, Release, Dispatch, Shutdown };
       Action action = Action::None;
+      std::uint64_t action_request_generation = 0;
       std::shared_ptr<Generation> generation;
       std::optional<ChannelCoreEvent> lifecycle_event;
       {
@@ -840,6 +852,7 @@ struct ChannelCore::SharedState final
                                              });
                    found != generations.end()) {
           generation = *found;
+          action_request_generation = close_requested ? close_request_generation : 0;
           action = Action::Cleanup;
         } else if (auto found = std::find_if(generations.begin(), generations.end(),
                                              [&](const auto& candidate) {
@@ -852,6 +865,7 @@ struct ChannelCore::SharedState final
                    found != generations.end()) {
           generation = *found;
           generation->releasing = true;
+          action_request_generation = close_requested ? close_request_generation : 0;
           action = Action::Release;
         } else if (auto found = std::find_if(generations.begin(), generations.end(),
                                              [&](const auto& candidate) {
@@ -864,6 +878,8 @@ struct ChannelCore::SharedState final
                    found != generations.end()) {
           generation = *found;
           generation->close_submitted = true;
+          generation->close_request_generation = close_request_generation;
+          action_request_generation = close_request_generation;
           action = Action::Close;
         } else if (auto found = std::find_if(generations.begin(), generations.end(),
                                              [](const auto& candidate) {
@@ -879,6 +895,7 @@ struct ChannelCore::SharedState final
           action = Action::Start;
         } else if (close_requested && generations.empty() &&
                    (shutdown_retry_error == 0 || now >= shutdown_retry_at)) {
+          action_request_generation = close_request_generation;
           action = Action::Shutdown;
         } else {
           auto deadline = retry_pending ? retry_at : std::chrono::steady_clock::time_point::max();
@@ -914,13 +931,13 @@ struct ChannelCore::SharedState final
         arm_subject(generation);
         break;
       case Action::Close:
-        submit_endpoint_close(generation);
+        submit_endpoint_close(generation, action_request_generation);
         break;
       case Action::Cleanup:
-        settle_unregistered_endpoint(generation);
+        settle_unregistered_endpoint(generation, action_request_generation);
         break;
       case Action::Release:
-        release_endpoint(generation);
+        release_endpoint(generation, action_request_generation);
         break;
       case Action::Dispatch:
         dispatch_lifecycle(*lifecycle_event);
@@ -937,7 +954,7 @@ struct ChannelCore::SharedState final
             std::lock_guard lock(mutex);
             shutdown_retry_error = result.error().code();
             shutdown_retry_at = cleanup_retry_deadline(shutdown_attempt++);
-            record_close_failure_locked(shutdown_retry_error);
+            record_close_failure_locked(shutdown_retry_error, action_request_generation);
           }
           condition.notify_all();
           continue;
@@ -1075,10 +1092,11 @@ Result<std::shared_ptr<ChannelCore>> ChannelCore::create(std::shared_ptr<RpcEven
     state = std::make_shared<SharedState>(std::move(runtime), std::move(config),
                                           std::move(endpoint_starter), std::move(backoff));
     core = std::shared_ptr<ChannelCore>(new ChannelCore(state));
+    core->worker_completion_ = std::make_shared<ThreadCompletionToken>();
   } catch (...) {
     return Error::runtime(-ENOMEM, "failed to allocate RPC channel state");
   }
-  auto started = state->start(core->worker_);
+  auto started = state->start(core->worker_, core->worker_completion_);
   if (!started) {
     return started.error();
   }
@@ -1109,6 +1127,10 @@ Result<std::shared_ptr<ChannelCore>> ChannelCore::connect(ChannelCoreConfig conf
   }
   if (error != 0) {
     return Error::runtime(error);
+  }
+  if (config.max_frame_size != 0) {
+    runtime_config.max_receive_owned_bytes = static_cast<std::uint64_t>(config.max_frame_size);
+    runtime_config.max_message_size = static_cast<std::uint64_t>(config.max_frame_size);
   }
   auto cleanup_reserved = RpcEventRuntime::reserve_unadopted_cleanup();
   if (!cleanup_reserved) {
@@ -1182,7 +1204,7 @@ ChannelCore::~ChannelCore() {
   // so never make destruction wait on user-owned stream lifetime. The reaper
   // owns the join handle and provides bounded, deterministic test/application
   // shutdown through drain_lifecycle_reaper_until().
-  reap_thread(std::move(worker_));
+  reap_thread(std::move(worker_), std::move(worker_completion_));
 }
 
 ChannelCorePhase ChannelCore::phase() const noexcept {

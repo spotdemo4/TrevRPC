@@ -871,6 +871,25 @@ void test_client_status_fin_waits_for_paused_send() {
   assert(channel->request_close());
 }
 
+void test_client_receive_returns_terminal_before_cleanup_retry() {
+  auto test = make_runtime();
+  auto channel = make_client_channel(test);
+  auto stream = open_client_stream(test, channel);
+  trevrpc_cpp_rpc_fake_set_call_release_result(test.fake, test.runtime->native_handle(), -EIO, false);
+  assert(trevrpc_cpp_rpc_fake_push_response_status(test.fake, TREVRPC_RPC_STATUS_OK) == 0);
+  assert(trevrpc_cpp_rpc_fake_push_stream_readable(test.fake) == 0);
+  assert(trevrpc_cpp_rpc_fake_push_stream_receive_fin(test.fake) == 0);
+
+  auto terminal = stream->receive();
+  assert(terminal);
+  assert(terminal.value().terminal);
+  assert(!terminal.value().message);
+  assert(terminal.value().status.is_ok());
+
+  stream->close();
+  assert(channel->close());
+}
+
 void test_client_drains_queued_receives_after_terminal_event() {
   auto test = make_runtime();
   auto channel = make_client_channel(test);
@@ -2481,6 +2500,7 @@ int main(int argc, char** argv) {
   test_client_close_after_runtime_stop_releases_without_terminal_wait();
   test_client_concurrent_close_waits_for_one_cleanup();
   test_client_status_fin_waits_for_paused_send();
+  test_client_receive_returns_terminal_before_cleanup_retry();
   test_client_drains_queued_receives_after_terminal_event();
   test_client_close_retry_exhaustion_releases_reservations();
   test_stream_preregistration_and_terminal_order();

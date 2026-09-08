@@ -17,6 +17,8 @@
 
 namespace trevrpc::detail {
 
+class ThreadCompletionToken;
+
 enum class ChannelCorePhase {
   Connecting,
   Ready,
@@ -186,6 +188,7 @@ private:
   [[nodiscard]] std::size_t test_live_generations() const noexcept;
 
   std::thread worker_;
+  std::shared_ptr<ThreadCompletionToken> worker_completion_;
   std::shared_ptr<SharedState> state_;
 };
 

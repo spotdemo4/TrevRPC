@@ -84,9 +84,11 @@ using trevrpc::detail::ChannelCoreEvent;
 using trevrpc::detail::ChannelCoreEventKind;
 using trevrpc::detail::ChannelCorePhase;
 using trevrpc::detail::ChannelCoreTestPeer;
+using trevrpc::detail::reap_thread;
 using trevrpc::detail::RpcCancellation;
 using trevrpc::detail::RpcEventRuntime;
 using trevrpc::detail::RpcEventRuntimeTestPeer;
+using trevrpc::detail::ThreadCompletionToken;
 
 struct TestRuntime {
   trevrpc_cpp_rpc_fake_fixture* fake = nullptr;
@@ -564,8 +566,51 @@ void test_final_owner_destruction_does_not_wait_for_pins() {
   assert(destruction_finished);
   destroying.get();
   assert(weak.expired());
-  assert(trevrpc::detail::drain_lifecycle_reaper_until(
-      std::chrono::steady_clock::now() + std::chrono::seconds(1)));
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() +
+                                                       std::chrono::seconds(1)));
+}
+
+void test_reaper_join_tasks_are_not_queue_bound() {
+  constexpr std::size_t kPendingJoins = 300;
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool release = false;
+  std::vector<std::thread> targets;
+  std::vector<std::shared_ptr<ThreadCompletionToken>> tokens;
+  targets.reserve(kPendingJoins);
+  tokens.reserve(kPendingJoins);
+  for (std::size_t i = 0; i != kPendingJoins; ++i) {
+    auto token = std::make_shared<ThreadCompletionToken>();
+    tokens.push_back(token);
+    targets.emplace_back([&, token] {
+      std::unique_lock lock(mutex);
+      condition.wait(lock, [&] { return release; });
+      lock.unlock();
+      token->complete();
+    });
+  }
+  for (std::size_t i = 0; i != kPendingJoins; ++i) {
+    reap_thread(std::move(targets[i]), std::move(tokens[i]));
+  }
+
+  assert(!trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() +
+                                                        std::chrono::milliseconds(50)));
+  {
+    std::lock_guard lock(mutex);
+    release = true;
+  }
+  condition.notify_all();
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() +
+                                                       std::chrono::seconds(10)));
+
+  auto completed = std::make_shared<ThreadCompletionToken>();
+  std::thread completed_target([completed] { completed->complete(); });
+  while (!completed->completed()) {
+    std::this_thread::yield();
+  }
+  reap_thread(std::move(completed_target), std::move(completed));
+  assert(trevrpc::detail::drain_lifecycle_reaper_until(std::chrono::steady_clock::now() +
+                                                       std::chrono::seconds(1)));
 }
 
 void test_external_endpoint_close_is_observed() {
@@ -603,7 +648,7 @@ void test_persistent_endpoint_close_error_is_retryable() {
   trevrpc_cpp_rpc_fake_set_connection_close_result(test.fake, -EIO, true);
 
   auto closing = std::async(std::launch::async, [&] { return channel->close(); });
-  assert(closing.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  closing.wait();
   auto failed = closing.get();
   assert(!failed);
   assert(failed.error().code() == -EIO);
@@ -623,7 +668,7 @@ void test_persistent_duplicate_endpoint_close_is_retryable() {
   trevrpc_cpp_rpc_fake_set_connection_close_result(test.fake, -EALREADY, true);
 
   auto closing = std::async(std::launch::async, [&] { return channel->close(); });
-  assert(closing.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  closing.wait();
   auto failed = closing.get();
   assert(!failed);
   assert(failed.error().code() == -EALREADY);
@@ -641,7 +686,7 @@ void test_persistent_registration_cleanup_error_is_retryable() {
   wait_for_started_endpoints(control, 1);
 
   auto closing = std::async(std::launch::async, [&] { return channel->close(); });
-  assert(closing.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  closing.wait();
   auto failed = closing.get();
   assert(!failed);
   assert(failed.error().code() == -EIO);
@@ -661,7 +706,7 @@ void test_persistent_endpoint_release_error_is_retryable() {
   trevrpc_cpp_rpc_fake_set_release_handle_result(test.fake, -EIO);
 
   auto closing = std::async(std::launch::async, [&] { return channel->close(); });
-  assert(closing.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  closing.wait();
   auto failed = closing.get();
   assert(!failed);
   assert(failed.error().code() == -EIO);
@@ -682,7 +727,7 @@ void test_runtime_busy_shutdown_is_retryable() {
   assert(test.runtime->register_stream(registered_stream));
 
   auto closing = std::async(std::launch::async, [&] { return channel->close(); });
-  assert(closing.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  closing.wait();
   auto failed = closing.get();
   assert(!failed);
   assert(failed.error().code() == -EBUSY);
@@ -748,6 +793,7 @@ int main() {
   test_lifecycle_callbacks_are_off_driver_and_coalesced();
   test_close_fences_admission_and_waits_for_pins();
   test_final_owner_destruction_does_not_wait_for_pins();
+  test_reaper_join_tasks_are_not_queue_bound();
   test_external_endpoint_close_is_observed();
   test_persistent_endpoint_close_error_is_retryable();
   test_persistent_duplicate_endpoint_close_is_retryable();

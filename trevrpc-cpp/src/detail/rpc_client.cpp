@@ -531,9 +531,18 @@ void RpcClientStream::adopt_open_handles(trevrpc_rpc_call_v1 call, trevrpc_rpc_s
   stream_unregistering_ = false;
 }
 
+bool RpcClientStream::claim_cleanup_schedule() noexcept {
+  std::lock_guard lock(mutex_);
+  if (cleanup_scheduled_ || cleanup_abandoned_ || closed_) {
+    return false;
+  }
+  cleanup_scheduled_ = true;
+  return true;
+}
+
 void RpcClientStream::schedule_cleanup(std::shared_ptr<RpcClientStream> stream) noexcept {
   auto owner = std::move(stream);
-  if (!owner) {
+  if (!owner || !owner->claim_cleanup_schedule()) {
     return;
   }
   std::shared_ptr<RpcEventRuntime> runtime;
@@ -1445,7 +1454,10 @@ Result<StreamFrame> RpcClientStream::receive() {
       }
       auto cleanup = close_impl();
       if (!cleanup) {
-        return cleanup.error();
+        // The terminal frame is already the authoritative RPC result. Cleanup may
+        // still be waiting for the peer's close event, so retry it independently
+        // instead of turning a successful response into a timing-dependent error.
+        schedule_deferred_cleanup();
       }
       return std::move(terminal).value().value();
     }

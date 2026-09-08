@@ -61,6 +61,7 @@ int main() {
 
   trevrpc::ChannelConfig client_config;
   client_config.skip_certificate_validation = true;
+  client_config.max_frame_size = 64u * 1024u * 1024u + 1024u;
   auto connected = trevrpc::Channel::connect("127.0.0.1", port.value(), client_config);
   assert(connected);
   auto client = std::move(connected).value();

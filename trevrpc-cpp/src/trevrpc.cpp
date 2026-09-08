@@ -383,6 +383,10 @@ Result<Server> Server::listen(const ServerConfig& config) {
   if (error != 0) {
     return Error::runtime(error);
   }
+  if (config.max_frame_size != 0) {
+    runtime_config.max_receive_owned_bytes = static_cast<std::uint64_t>(config.max_frame_size);
+    runtime_config.max_message_size = static_cast<std::uint64_t>(config.max_frame_size);
+  }
   runtime_config.event_capacity = 1024;
   runtime_config.endpoint_capacity = 8;
   runtime_config.call_capacity = 1024;
@@ -451,7 +455,13 @@ Result<Server> Server::listen(const ServerConfig& config) {
         static_cast<std::uint32_t>(config.max_pending_send_count);
   }
   if (config.max_frame_size != 0) {
-    endpoint_config.max_frame_size = config.max_frame_size;
+    const auto max_frame_size = static_cast<std::uint64_t>(config.max_frame_size);
+    if (max_frame_size > (std::numeric_limits<std::uint64_t>::max() - 4096u) / 2u) {
+      (void)rpc_runtime->shutdown();
+      return Error::runtime(-EOVERFLOW, "server max frame size exceeds receive budget limits");
+    }
+    endpoint_config.max_frame_size = max_frame_size;
+    endpoint_config.max_pending_receive_bytes = max_frame_size * 2u + 4096u;
   }
   if (config.max_idle_timeout.count() != 0) {
     endpoint_config.max_idle_timeout_ms =

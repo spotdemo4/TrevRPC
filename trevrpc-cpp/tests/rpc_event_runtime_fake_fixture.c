@@ -251,7 +251,7 @@ int trevrpc_cpp_rpc_fake_push_response_message(trevrpc_cpp_rpc_fake_fixture* fix
   }
   fake = fixture_transport(fixture);
   result =
-      trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_STATUS_OK, NULL,
+      trevrpc_wire_encode_stream_frame(TREVRPC_STREAM_FRAME_KIND_MESSAGE, TREVRPC_RPC_STATUS_OK, NULL,
                                        0, data, data_len, NULL, 1024u * 1024u, &frame, &frame_len);
   if (result != 0) {
     return result;

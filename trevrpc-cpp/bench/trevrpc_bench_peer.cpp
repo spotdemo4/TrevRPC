@@ -486,33 +486,22 @@ enum class ControlCommand { Start, Shutdown, EndOfInput, Interrupted, ServeEnded
 class BenchmarkServerImpl final : public BenchmarkServer {
 public:
   BenchmarkServerImpl(trevrpc::Server server, std::uint16_t port)
-      : state_(std::make_shared<State>(std::move(server))), port_(port),
-        serve_thread_([state = state_] {
-          state->serve_result = state->server.serve();
-          state->stopped.store(true, std::memory_order_release);
-        }) {}
+      : server_(std::move(server)), port_(port) {}
 
-  ~BenchmarkServerImpl() override {
-    shutdown();
-    if (serve_thread_.joinable()) {
-      serve_thread_.detach();
-    }
-  }
+  ~BenchmarkServerImpl() override { shutdown(); }
 
   [[nodiscard]] std::uint16_t port() const override { return port_; }
 
-  [[nodiscard]] bool stopped() const override {
-    return state_->stopped.load(std::memory_order_acquire);
-  }
+  [[nodiscard]] bool stopped() const override { return stopped_; }
 
   void shutdown() override {
-    if (!serve_thread_.joinable()) {
+    if (stopped_) {
       return;
     }
     trevrpc::ShutdownOptions options;
     options.graceful_timeout = std::chrono::seconds(10);
     options.cancellation_timeout = std::chrono::seconds(10);
-    auto report = state_->server.shutdown(options);
+    auto report = server_.shutdown(options);
     if (!report) {
       shutdown_error_ = describe(report.error());
       return;
@@ -522,32 +511,16 @@ public:
       return;
     }
     shutdown_error_.reset();
-    serve_thread_.join();
+    stopped_ = true;
   }
 
-  [[nodiscard]] std::optional<std::string> finish_error() override {
-    if (shutdown_error_) {
-      return shutdown_error_;
-    }
-    if (!state_->serve_result) {
-      return describe(state_->serve_result.error());
-    }
-    return std::nullopt;
-  }
+  [[nodiscard]] std::optional<std::string> finish_error() override { return shutdown_error_; }
 
 private:
-  struct State {
-    explicit State(trevrpc::Server value) : server(std::move(value)) {}
-
-    trevrpc::Server server;
-    trevrpc::Result<void> serve_result;
-    std::atomic<bool> stopped{false};
-  };
-
-  std::shared_ptr<State> state_;
+  trevrpc::Server server_;
   std::uint16_t port_;
+  bool stopped_ = false;
   std::optional<std::string> shutdown_error_;
-  std::thread serve_thread_;
 };
 
 [[nodiscard]] std::unique_ptr<BenchmarkServer> start_server(const ServerConfig& peer_config) {
@@ -588,6 +561,10 @@ private:
   auto port = server.port();
   if (!port) {
     throw PeerError("setup", "listen_failed", describe(port.error()));
+  }
+  auto serving = server.serve();
+  if (!serving) {
+    throw PeerError("setup", "serve_failed", describe(serving.error()));
   }
 
   return std::make_unique<BenchmarkServerImpl>(std::move(server), port.value());

@@ -112,6 +112,7 @@ private:
                                             std::uint64_t operation, std::uint32_t expected_kind,
                                             const char* description);
   [[nodiscard]] bool defer_operation(std::uint64_t operation) noexcept;
+  [[nodiscard]] bool claim_cleanup_schedule() noexcept;
   void schedule_deferred_cleanup() noexcept;
   [[nodiscard]] Result<StreamFrame> decode_receive(trevrpc_rpc_receive* receive);
   [[nodiscard]] Result<RpcEvent> wait_stream_event(const std::shared_ptr<RpcEventRuntime>& runtime,
@@ -162,6 +163,7 @@ private:
   bool stream_released_ = false;
   bool call_released_ = false;
   bool cleanup_in_progress_ = false;
+  bool cleanup_scheduled_ = false;
   std::thread::id cleanup_owner_thread_{};
   bool cleanup_abandoned_ = false;
   int cleanup_result_code_ = 0;

@@ -39,6 +39,28 @@ void test_shutdown_releases_abi1_server() {
   assert(repeated.value().released);
 }
 
+void test_large_frame_webtransport_server_starts() {
+  trevrpc::ServerConfig config;
+  config.host = "127.0.0.1";
+  config.port = 0;
+  config.cert_file = TREVRPC_CPP_TEST_CERT;
+  config.key_file = TREVRPC_CPP_TEST_KEY;
+  config.webtransport_path = "/trevrpc";
+  config.webtransport_origin = "http://127.0.0.1:4443";
+  config.max_frame_size = 64u * 1024u * 1024u + 1024u;
+  auto server = trevrpc::Server::listen(config);
+  assert(server);
+  auto serving = server.value().serve();
+  assert(serving);
+
+  trevrpc::ShutdownOptions options;
+  options.graceful_timeout = 2s;
+  options.cancellation_timeout = 2s;
+  auto released = server.value().shutdown(options);
+  assert(released);
+  assert(released.value().released);
+}
+
 void test_request_stop_reports_stopping() {
   auto server = make_server();
   auto configuring = server.phase();
@@ -66,6 +88,7 @@ void test_request_stop_reports_stopping() {
 
 int main() {
   test_shutdown_releases_abi1_server();
+  test_large_frame_webtransport_server_starts();
   test_request_stop_reports_stopping();
   return 0;
 }

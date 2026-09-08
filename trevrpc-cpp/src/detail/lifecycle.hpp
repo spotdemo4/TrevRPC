@@ -17,6 +17,25 @@ struct MetricsCallbackState;
 struct LoggerCallbackState;
 class RpcServerCore;
 
+class ThreadCompletionToken final {
+public:
+  using Notifier = void (*)(void*) noexcept;
+
+  ThreadCompletionToken() noexcept = default;
+  ThreadCompletionToken(const ThreadCompletionToken&) = delete;
+  ThreadCompletionToken& operator=(const ThreadCompletionToken&) = delete;
+
+  void complete() noexcept;
+  [[nodiscard]] bool completed() const noexcept;
+  void set_notifier(Notifier notifier, void* context) noexcept;
+
+private:
+  mutable std::mutex mutex_;
+  bool completed_ = false;
+  Notifier notifier_ = nullptr;
+  void* notifier_context_ = nullptr;
+};
+
 class AsyncServerScopeControl {
 public:
   virtual ~AsyncServerScopeControl() = default;
@@ -65,7 +84,7 @@ private:
 
 [[nodiscard]] bool
 drain_lifecycle_reaper_until(std::chrono::steady_clock::time_point deadline) noexcept;
-void reap_thread(std::thread worker) noexcept;
+void reap_thread(std::thread worker, std::shared_ptr<ThreadCompletionToken> token) noexcept;
 void abandon_server(std::shared_ptr<ServerState> state) noexcept;
 
 class ServerCallbackContextGuard final {
