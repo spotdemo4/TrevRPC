@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "c_standard": "c11",
+  "include_paths": ["include", "src"],
+  "platform_definitions": {
+    "linux": ["TREVRPC_ENGINE_HAVE_PIPE2"],
+    "darwin": []
+  },
+  "support_sources": ["internal/cabi/bridge.c"],
+  "translation_units": [
+    {
+      "cmake_target": "trevrpc_engine",
+      "source": "src/trevrpc_engine.c",
+      "wrapper": "internal/cabi/engine.c"
+    },
+    {
+      "cmake_target": "trevrpc_transport",
+      "source": "src/trevrpc_transport.c",
+      "wrapper": "internal/cabi/transport.c"
+    }
+  ],
+  "headers": [
+    "include/trevrpc_engine.h",
+    "include/trevrpc_engine_provider.h",
+    "include/trevrpc_transport.h",
+    "include/trevrpc_transport_provider.h",
+    "src/trevrpc_credential_internal.h",
+    "src/trevrpc_engine_internal.h",
+    "src/trevrpc_rpc_transport_internal.h",
+    "internal/cabi/bridge.h"
+  ]
+}

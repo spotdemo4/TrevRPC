@@ -72,3 +72,4 @@ trevrpc-c/tests/golden/** linguist-generated=true
 # Vendored third-party patches: blank context lines carry a single space that
 # upstream generated; git whitespace checks must not flag the patch file itself.
 nix/patches/*.patch -whitespace
+trevrpc-c/provider/msquic/provenance/*.patch -whitespace

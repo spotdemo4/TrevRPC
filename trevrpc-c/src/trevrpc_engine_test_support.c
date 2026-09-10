@@ -28,6 +28,8 @@ static void trevrpc_engine_test_destroy(void* context) {
 
 int trevrpc_engine_testing_create(const trevrpc_engine_config_v1* config, trevrpc_engine** out_engine) {
     static const trevrpc_engine_provider_ops operations = {
+        .struct_size = sizeof(trevrpc_engine_provider_ops),
+        .struct_version = TREVRPC_ENGINE_PROVIDER_STRUCT_VERSION_1,
         .attach = trevrpc_engine_test_attach,
         .close = trevrpc_engine_test_close,
         .destroy = trevrpc_engine_test_destroy,

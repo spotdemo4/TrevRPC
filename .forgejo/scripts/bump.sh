@@ -11,6 +11,20 @@ git fetch --prune --prune-tags --tags --force origin
 
 bumper --no-push
 
+# The MsQuic provider has its own version source and may not be handled by the
+# repository-wide bumper. Keep that path explicit instead of guessing a
+# generated archive update on a runner that cannot build the provider.
+if [[ -n "${TREVRPC_PROVIDER_BUMP_COMMAND-}" ]]; then
+  TREVRPC_MODULE_DIR="trevrpc-c/provider/msquic" \
+    TREVRPC_MODULE_PATH="trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2" \
+    bash -c "$TREVRPC_PROVIDER_BUMP_COMMAND"
+fi
+if [[ -n "${TREVRPC_ARTIFACT_UPDATE_COMMAND-}" ]]; then
+  TREVRPC_MODULE_DIR="trevrpc-c/provider/msquic" \
+    TREVRPC_MODULE_PATH="trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2" \
+    bash -c "$TREVRPC_ARTIFACT_UPDATE_COMMAND"
+fi
+
 final_head="$(git rev-parse HEAD)"
 remote_tags="$(mktemp)"
 local_tags="$(mktemp)"

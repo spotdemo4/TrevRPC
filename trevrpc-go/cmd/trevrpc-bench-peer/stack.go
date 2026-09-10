@@ -29,7 +29,6 @@ func listenBenchmarkServer(config serverConfig) (benchmarkListener, error) {
 		server := newNativeBenchmarkServer()
 		options := server.Options()
 		options.EnableWebTransport = true
-		options.WebTransportDraft07Only = config.webTransportDraft07Only
 		options.WebTransportAdmission = func(request trevrpc.WebTransportAdmissionRequest) bool {
 			return request.Path == trevrpc.DefaultHTTP3Path && request.Origin == config.webTransportOrigin
 		}
@@ -43,11 +42,11 @@ func listenBenchmarkServer(config serverConfig) (benchmarkListener, error) {
 func dialBenchmarkClient(ctx context.Context, config clientConfig) (benchmarkClient, func() error, error) {
 	switch config.stack {
 	case stackNativeQUIC:
-		tlsConfig, err := benchutil.VerifiedClientTLSConfig(config.certFile, config.address)
+		credentials, err := benchutil.VerifiedClientCredentials(config.certFile, config.address)
 		if err != nil {
 			return nil, nil, err
 		}
-		transport, err := benchutil.DialNativeQUICWithMaxFrameSize(ctx, config.address, tlsConfig, maxBenchmarkFrameSize)
+		transport, err := benchutil.DialNativeQUICWithMaxFrameSize(ctx, config.address, credentials, maxBenchmarkFrameSize)
 		if err != nil {
 			return nil, nil, err
 		}

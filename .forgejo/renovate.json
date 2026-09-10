@@ -9,10 +9,12 @@
   "repositories": ["llc/TrevRPC"],
   "allowedCommands": [
     "^nix run \\.#update-go-deps$",
+    "^nix run \\.#update-go-quic-go-deps$",
     "^npm audit fix --prefix trevrpc-js$",
     "^nix run \\.#update-kotlin-deps$",
     "^nix run \\.#sync-playwright$",
-    "^nix run \\.#update-benchmark-proto$"
+    "^nix run \\.#update-benchmark-proto$",
+    "^\\.forgejo/scripts/update-go-module-artifacts\\.sh (trevrpc-c|trevrpc-c/provider/msquic)$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
   // Renovate sanitizes child environments, so configure this through its
@@ -42,14 +44,25 @@
     "postUpgradeTasks": {
       "commands": [
         "nix run .#update-go-deps",
+        "nix run .#update-go-quic-go-deps",
         "npm audit fix --prefix trevrpc-js",
         "nix run .#sync-playwright",
-        "nix run .#update-benchmark-proto"
+        "nix run .#update-benchmark-proto",
+        ".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c",
+        ".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c/provider/msquic"
       ],
       "fileFilters": [
         "trevrpc-go/go.mod",
         "trevrpc-go/go.sum",
+        "trevrpc-go/go.work",
         "trevrpc-go/default.nix",
+        "trevrpc-go/quic-go/go.mod",
+        "trevrpc-go/quic-go/go.sum",
+        "trevrpc-go/quic-go/default.nix",
+        "trevrpc-c/go.mod",
+        "trevrpc-c/go.sum",
+        "trevrpc-c/provider/msquic/go.mod",
+        "trevrpc-c/provider/msquic/go.sum",
         "trevrpc-js/package.json",
         "trevrpc-js/package-lock.json",
         "trevrpc-js/bench-browser/package.json",
@@ -63,6 +76,19 @@
       "executionMode": "branch"
     }
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^trevrpc-go\\/go\\.work$/"],
+      "matchStrings": [
+        "replace\\s+(?<depName>trev\\.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2)\\s+(?<currentValue>v2\\S+)\\s+=>\\s+\\.\\./trevrpc-c/provider/msquic",
+        "replace\\s+(?<depName>trev\\.zip/llc/trevrpc/trevrpc-c)\\s+(?<currentValue>v\\S+)\\s+=>\\s+\\.\\./trevrpc-c",
+        "replace\\s+(?<depName>trev\\.zip/llc/trevrpc/trevrpc-go)\\s+(?<currentValue>v\\S+)\\s+=>\\s+\\."
+      ],
+      "datasourceTemplate": "go",
+      "versioningTemplate": "go"
+    }
+  ],
   "packageRules": [
     {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
@@ -97,7 +123,28 @@
     },
     {
       "matchManagers": ["gomod"],
-      "addLabels": ["go"],
+      "addLabels": ["go"]
+    },
+    {
+      "matchManagers": ["gomod", "custom.regex"],
+      "matchFileNames": [
+        "trevrpc-go/go.mod",
+        "trevrpc-go/quic-go/go.mod",
+        "trevrpc-go/go.work",
+        "trevrpc-c/go.mod",
+        "trevrpc-c/provider/msquic/go.mod"
+      ],
+      "matchPackageNames": [
+        "trev.zip/llc/trevrpc/trevrpc-go",
+        "trev.zip/llc/trevrpc/trevrpc-c",
+        "trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2"
+      ],
+      "groupName": "TrevRPC workspace dependency",
+      "groupSlug": "trevrpc-workspace-dependency"
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchFileNames": ["trevrpc-go/go.mod"],
       "postUpgradeTasks": {
         "commands": ["nix run .#update-go-deps"],
         "fileFilters": ["trevrpc-go/go.mod", "trevrpc-go/go.sum", "trevrpc-go/default.nix"],
@@ -105,8 +152,53 @@
       }
     },
     {
+      "matchManagers": ["gomod"],
+      "matchFileNames": ["trevrpc-go/quic-go/go.mod"],
+      "postUpgradeTasks": {
+        "commands": ["nix run .#update-go-quic-go-deps"],
+        "fileFilters": [
+          "trevrpc-go/go.work",
+          "trevrpc-go/quic-go/go.mod",
+          "trevrpc-go/quic-go/go.sum",
+          "trevrpc-go/quic-go/default.nix"
+        ],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchFileNames": ["trevrpc-c/go.mod"],
+      "addLabels": ["go"],
+      "postUpgradeTasks": {
+        "commands": [".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c"],
+        "fileFilters": ["trevrpc-c/go.mod", "trevrpc-c/go.sum"],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchFileNames": ["trevrpc-c/provider/msquic/go.mod"],
+      "addLabels": ["go", "msquic"],
+      "postUpgradeTasks": {
+        "commands": [".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c/provider/msquic"],
+        "fileFilters": [
+          "trevrpc-c/provider/msquic/go.mod",
+          "trevrpc-c/provider/msquic/go.sum",
+          "trevrpc-c/provider/msquic/provider.go",
+          "trevrpc-c/provider/msquic/provenance/**",
+          "trevrpc-c/provider/msquic/lib/**",
+          "trevrpc-go/go.mod",
+          "trevrpc-go/go.work",
+          "trevrpc-go/default.nix",
+          "trevrpc-c/tests/go-provider-spike/consumer/go.mod"
+        ],
+        "executionMode": "branch"
+      }
+    },
+    {
       // quic-go and webtransport-go release as a compatible pair.
       "matchManagers": ["gomod"],
+      "matchFileNames": ["trevrpc-go/quic-go/go.mod"],
       "matchPackageNames": ["github.com/quic-go/quic-go", "github.com/quic-go/webtransport-go"],
       "groupName": "quic-go transport stack",
       "groupSlug": "quic-go-transport-stack",

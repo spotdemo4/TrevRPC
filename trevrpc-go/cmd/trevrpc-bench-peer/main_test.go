@@ -11,10 +11,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,8 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/http3"
-	"google.golang.org/protobuf/proto"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-bench-peer/internal/benchutil"
@@ -93,21 +89,24 @@ func TestWebTransportServerOperationsAndAdmission(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	tlsConfig, err := benchutil.VerifiedClientTLSConfigForProtocol(certFile, address, http3.NextProtoH3)
+	credentials, err := benchutil.VerifiedClientCredentials(certFile, address)
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport, err := trevrpc.Advanced.DialRawWebTransport(ctx, "https://"+address+trevrpc.DefaultHTTP3Path, trevrpc.RawWebTransportDialOptions{
-		TLSClientConfig: tlsConfig,
-		QUICConfig:      trevrpc.WebTransportQUICClientConfig(maxBenchmarkFrameSize, benchutil.QUICConfig()),
-		RequestHeader:   http.Header{"Origin": []string{origin}},
+	transport, err := trevrpc.Dial(ctx, "https://"+address+trevrpc.DefaultHTTP3Path, trevrpc.DialOptions{
+		Transport:    trevrpc.TransportConfig{MaxIdleTimeout: 10 * time.Minute, KeepAlive: 5 * time.Second},
+		Credentials:  credentials,
+		MaxFrameSize: maxBenchmarkFrameSize,
+		WebTransport: trevrpc.WebTransportOptions{
+			RequestHeaders: trevrpc.HeaderFields{{Name: "Origin", Value: origin}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer transport.Close()
 	client := nativeBenchmarkClient{
-		client:              benchmarkpb.NewNativeBenchmarkServiceClient(transport.WithMaxFrameSize(maxBenchmarkFrameSize)),
+		client:              benchmarkpb.NewNativeBenchmarkServiceClient(transport),
 		maxResponseMessages: 4,
 	}
 	for _, kind := range []rpcKind{rpcUnary, rpcClientStream, rpcServerStream, rpcBidi} {
@@ -122,88 +121,19 @@ func TestWebTransportServerOperationsAndAdmission(t *testing.T) {
 		"origin": {trevrpc.DefaultHTTP3Path, "https://wrong.example"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			badTLS := tlsConfig.Clone()
-			badTransport, err := trevrpc.Advanced.DialRawWebTransport(ctx, "https://"+address+target[0], trevrpc.RawWebTransportDialOptions{
-				TLSClientConfig: badTLS,
-				QUICConfig:      trevrpc.WebTransportQUICClientConfig(maxBenchmarkFrameSize, benchutil.QUICConfig()),
-				RequestHeader:   http.Header{"Origin": []string{target[1]}},
+			badTransport, err := trevrpc.Dial(ctx, "https://"+address+target[0], trevrpc.DialOptions{
+				Transport:    trevrpc.TransportConfig{MaxIdleTimeout: 10 * time.Minute, KeepAlive: 5 * time.Second},
+				Credentials:  credentials,
+				MaxFrameSize: maxBenchmarkFrameSize,
+				WebTransport: trevrpc.WebTransportOptions{
+					RequestHeaders: trevrpc.HeaderFields{{Name: "Origin", Value: target[1]}},
+				},
 			})
 			if err == nil {
 				badTransport.Close()
 				t.Fatal("WebTransport admission unexpectedly succeeded")
 			}
 		})
-	}
-}
-
-func TestHTTP3ServerAcceptsPOSTAndWebTransportServerRejectsPOST(t *testing.T) {
-	certFile, keyFile := writeTestCertificate(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	http3Address, stopHTTP3 := startTestBenchmarkServer(t, stackHTTP3, certFile, keyFile)
-	defer stopHTTP3()
-	http3TLS, err := benchutil.VerifiedClientTLSConfigForProtocol(certFile, http3Address, http3.NextProtoH3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	roundTripper := &http3.Transport{TLSClientConfig: http3TLS, QUICConfig: benchutil.QUICConfig()}
-	defer roundTripper.Close()
-	httpClient := &http.Client{Transport: roundTripper}
-	requestBody, err := proto.Marshal(&benchmarkpb.BenchmarkRequest{Sequence: 42, ResponseBytes: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	frame, err := trevrpc.EncodeFrame(trevrpc.NewRpcRequest(
-		"trevrpc.benchmark.v1.BenchmarkService",
-		"Unary",
-		requestBody,
-	), maxBenchmarkFrameSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+http3Address+trevrpc.DefaultHTTP3Path, bytes.NewReader(frame))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Content-Type", trevrpc.HTTP3ContentType)
-	response, err := httpClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("HTTP/3 status = %d, want %d", response.StatusCode, http.StatusOK)
-	}
-	var rpcResponse trevrpc.RpcResponse
-	if err := trevrpc.ReadFrame(response.Body, &rpcResponse, maxBenchmarkFrameSize); err != nil {
-		t.Fatal(err)
-	}
-	if rpcResponse.Status != uint32(trevrpc.CodeOK) {
-		t.Fatalf("RPC status = %d, want %d", rpcResponse.Status, trevrpc.CodeOK)
-	}
-	var benchmarkResponse benchmarkpb.BenchmarkResponse
-	if err := proto.Unmarshal(rpcResponse.Body, &benchmarkResponse); err != nil {
-		t.Fatal(err)
-	}
-	if benchmarkResponse.GetSequence() != 42 || len(benchmarkResponse.GetPayload()) != 3 {
-		t.Fatalf("HTTP/3 response = %+v, want sequence 42 and 3-byte payload", &benchmarkResponse)
-	}
-
-	webTransportAddress, stopWebTransport := startTestBenchmarkServerWithOrigin(t, stackWebTransport, certFile, keyFile, "https://benchmark.example")
-	defer stopWebTransport()
-	webTransportRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+webTransportAddress+trevrpc.DefaultHTTP3Path, bytes.NewReader(frame))
-	if err != nil {
-		t.Fatal(err)
-	}
-	webTransportRequest.Header.Set("Content-Type", trevrpc.HTTP3ContentType)
-	webTransportResponse, err := httpClient.Do(webTransportRequest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer webTransportResponse.Body.Close()
-	if webTransportResponse.StatusCode != http.StatusNotFound {
-		t.Fatalf("WebTransport-only POST status = %d, want %d", webTransportResponse.StatusCode, http.StatusNotFound)
 	}
 }
 
@@ -408,6 +338,7 @@ func TestServerSHUTDOWNEmitsReadyAndStopped(t *testing.T) {
 				config.webTransportOrigin = "https://benchmark.example"
 			}
 			if err := runServer(config, strings.NewReader("SHUTDOWN\n"), newEventEmitter(&output)); err != nil {
+				skipIfNativeBackendUnavailable(t, err)
 				t.Fatal(err)
 			}
 			events := decodeEvents(t, output.Bytes())
@@ -481,27 +412,6 @@ func TestClientConfigRejectsDuplicateAndOversizedOptions(t *testing.T) {
 	}
 }
 
-func TestDraft07OnlyGlobalFlag(t *testing.T) {
-	var output bytes.Buffer
-	if err := run([]string{"--webtransport-draft07-only", "capabilities"}, strings.NewReader(""), newEventEmitter(&output)); err != nil {
-		t.Fatalf("capabilities with global draft-07 flag: %v", err)
-	}
-	if events := decodeEvents(t, output.Bytes()); len(events) != 1 || events[0]["event"] != "capabilities" {
-		t.Fatalf("events = %v", events)
-	}
-
-	nativeArgs := []string{
-		"--webtransport-draft07-only", "server",
-		"--stack", "trevrpc_native_quic",
-		"--listen", "127.0.0.1:0",
-		"--cert", "cert.pem",
-		"--key", "key.pem",
-	}
-	if err := run(nativeArgs, strings.NewReader(""), newEventEmitter(io.Discard)); err == nil {
-		t.Fatal("native server accepted the draft-07-only flag")
-	}
-}
-
 func TestServerConfigRequiresSupportedStack(t *testing.T) {
 	base := []string{
 		"--stack", "trevrpc_native_quic",
@@ -557,6 +467,13 @@ func testClientConfig(stack stackKind, address, certFile string, kind rpcKind) c
 	}
 }
 
+func skipIfNativeBackendUnavailable(t *testing.T, err error) {
+	t.Helper()
+	if err != nil && strings.Contains(err.Error(), "bundled native transport requires") {
+		t.Skipf("native transport backend unavailable: %v", err)
+	}
+}
+
 func startTestBenchmarkServer(t *testing.T, stack stackKind, certFile, keyFile string) (string, func()) {
 	return startTestBenchmarkServerWithOrigin(t, stack, certFile, keyFile, "")
 }
@@ -571,6 +488,7 @@ func startTestBenchmarkServerWithOrigin(t *testing.T, stack stackKind, certFile,
 		webTransportOrigin: origin,
 	})
 	if err != nil {
+		skipIfNativeBackendUnavailable(t, err)
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

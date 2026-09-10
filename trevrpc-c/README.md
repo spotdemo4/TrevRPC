@@ -109,6 +109,11 @@ See [`examples/greeter`](examples/greeter) and `tests/generated_service_test.c` 
 
 ## Linking
 
+> **Scope:** this section describes installed C ABI consumers using the CMake and
+> pkg-config distribution. Go consumers should instead use the nested
+> [`provider/msquic`](provider/msquic) module, which compiles the provider-neutral
+> sources and links its pinned static MsQuic archive without host MsQuic discovery.
+
 Generated code is transport-neutral and links against `trevrpc_rpc` plus protobuf-c. An executable that constructs the MsQuic provider also links `trevrpc_rpc_msquic`:
 
 ```sh

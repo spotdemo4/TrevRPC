@@ -1,4 +1,4 @@
-#include "trevrpc_engine.h"
+#include "trevrpc_engine_provider.h"
 
 #include <errno.h> // NOLINT(misc-include-cleaner)
 #include <stddef.h>
@@ -124,6 +124,14 @@ OFFSET(trevrpc_engine_diagnostics_v1, reserved, 184);
 static int check_signatures(void) {
     uint32_t (*abi_version)(void) = trevrpc_engine_abi_version;
     void (*anchor)(void) = trevrpc_engine_abi_1_anchor;
+    uint32_t (*provider_abi_version)(void) = trevrpc_engine_provider_abi_version;
+    void (*provider_anchor)(void) = trevrpc_engine_provider_abi_1_anchor;
+    int (*provider_descriptor_init)(trevrpc_engine_provider_descriptor_v1*, size_t) =
+        trevrpc_engine_provider_descriptor_v1_init;
+    const trevrpc_engine_provider_host_v1* (*provider_host)(void) = trevrpc_engine_provider_host_v1_get;
+    int (*provider_adopt)(
+        const trevrpc_engine_config_v1*, const trevrpc_engine_provider_descriptor_v1*, trevrpc_engine**) =
+        trevrpc_engine_provider_adopt_v1;
     int (*config_init)(trevrpc_engine_config_v1*, size_t) = trevrpc_engine_config_v1_init;
     int (*wake_init)(trevrpc_engine_wake_source_v1*, size_t) = trevrpc_engine_wake_source_v1_init;
     int (*endpoint_init)(trevrpc_engine_endpoint_config_v1*, size_t) = trevrpc_engine_endpoint_config_v1_init;
@@ -162,14 +170,16 @@ static int check_signatures(void) {
     int (*drain)(trevrpc_engine*) = trevrpc_engine_drain;
     int (*release)(trevrpc_engine*) = trevrpc_engine_release;
     anchor();
-    return abi_version == NULL || config_init == NULL || wake_init == NULL || endpoint_init == NULL ||
-           event_init == NULL || receive_init == NULL || diagnostics_init == NULL || get_wake == NULL ||
-           next_event == NULL || event_get_info == NULL || event_release == NULL || receive_get_info == NULL ||
-           receive_release == NULL || diagnostics == NULL || listen == NULL || listener_port == NULL || dial == NULL ||
-           dial_cancel == NULL || open_stream == NULL || send == NULL || receive == NULL || finish == NULL ||
-           abort_receive == NULL || abort_send == NULL || abort_stream == NULL || close_stream == NULL ||
-           close_connection == NULL || close_listener == NULL || close_engine == NULL || drain == NULL ||
-           release == NULL;
+    provider_anchor();
+    return abi_version == NULL || provider_abi_version == NULL || provider_descriptor_init == NULL ||
+           provider_host == NULL || provider_adopt == NULL || config_init == NULL || wake_init == NULL ||
+           endpoint_init == NULL || event_init == NULL || receive_init == NULL || diagnostics_init == NULL ||
+           get_wake == NULL || next_event == NULL || event_get_info == NULL || event_release == NULL ||
+           receive_get_info == NULL || receive_release == NULL || diagnostics == NULL || listen == NULL ||
+           listener_port == NULL || dial == NULL || dial_cancel == NULL || open_stream == NULL || send == NULL ||
+           receive == NULL || finish == NULL || abort_receive == NULL || abort_send == NULL || abort_stream == NULL ||
+           close_stream == NULL || close_connection == NULL || close_listener == NULL || close_engine == NULL ||
+           drain == NULL || release == NULL;
 }
 
 int main(void) {

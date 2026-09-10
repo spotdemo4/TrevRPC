@@ -2,101 +2,15 @@ package trevrpc
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"math"
-	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 )
 
 const channelTestTimeout = time.Second
-
-func TestChannelNativeRoundTrip(t *testing.T) {
-	running := startTestQUICServer(t, func(*Server) {})
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-	channel, err := Dial(ctx, running.addr, DialOptions{TLSConfig: running.clientTLS})
-	if err != nil {
-		t.Fatalf("dial channel: %v", err)
-	}
-
-	reply, err := Unary(ctx, channel, testServiceName, "SayHello", &testMessage{Value: "channel"}, func() *testMessage { return &testMessage{} })
-	if err != nil {
-		channel.Close()
-		t.Fatalf("channel RPC: %v", err)
-	}
-	if reply.Value != "hello, channel" {
-		t.Fatalf("channel RPC = %q, want hello, channel", reply.Value)
-	}
-	if err := channel.Close(); err != nil {
-		t.Fatalf("close channel: %v", err)
-	}
-}
-
-func TestChannelWebTransportReconnects(t *testing.T) {
-	running := startTestWebTransportServer(t, func(*Server) {})
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-	events := make(chan ChannelEvent, 8)
-	channel, err := Dial(ctx, "https://"+running.addr+"/trevrpc", DialOptions{
-		TLSConfig: running.clientTLS,
-		OnEvent: func(event ChannelEvent) {
-			events <- event
-		},
-	})
-	if err != nil {
-		t.Fatalf("dial WebTransport channel: %v", err)
-	}
-	defer channel.Close()
-
-	session, err := Advanced.Channel(channel).RawWebTransportSession()
-	if err != nil {
-		t.Fatalf("get WebTransport session: %v", err)
-	}
-	if err := session.CloseWithError(cancelledWebTransportSessionCode, "test reconnect"); err != nil {
-		t.Fatalf("close WebTransport session: %v", err)
-	}
-	deadline := time.Now().Add(testTimeout)
-	for channel.Generation() < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if generation := channel.Generation(); generation != 2 {
-		t.Fatalf("WebTransport generation = %d, want 2", generation)
-	}
-	if event := waitChannelEvent(t, events); event.Type != ChannelEventReady {
-		t.Fatalf("first event type = %v, want ready", event.Type)
-	}
-	disconnected := waitChannelEvent(t, events)
-	if disconnected.Type != ChannelEventDisconnected {
-		t.Fatalf(
-			"second event type = %v, want disconnected",
-			disconnected.Type,
-		)
-	}
-	if !disconnected.CloseReason.Local || disconnected.CloseReason.Peer ||
-		disconnected.CloseReason.ApplicationCode !=
-			uint64(cancelledWebTransportSessionCode) ||
-		disconnected.CloseReason.Message != "test reconnect" {
-		t.Fatalf(
-			"WebTransport disconnect reason = %+v",
-			disconnected.CloseReason,
-		)
-	}
-
-	reply, err := Unary(ctx, channel, testServiceName, "SayHello", &testMessage{Value: "WebTransport"}, func() *testMessage { return &testMessage{} })
-	if err != nil {
-		t.Fatalf("WebTransport RPC after reconnect: %v", err)
-	}
-	if reply.Value != "hello, WebTransport" {
-		t.Fatalf("WebTransport RPC = %q, want hello, WebTransport", reply.Value)
-	}
-}
 
 func TestChannelDoesNotReplayAndRecoversFutureCalls(t *testing.T) {
 	initial := newFakeChannelGeneration(true, "initial")
@@ -283,35 +197,6 @@ func TestChannelBackoffLargeJitterDoesNotWrap(t *testing.T) {
 	}
 }
 
-func TestAdvancedChannelAddPathUsesCurrentGeneration(t *testing.T) {
-	initial := newFakeChannelGeneration(false, "initial")
-	connector := newFakeChannelConnector()
-	client := newTestChannel(initial, connector, realReconnectClock{}, nil)
-	defer client.Close()
-
-	if _, err := Advanced.Channel(client).AddPath(nil); StatusFromError(err).Code != CodeInvalidArgument {
-		t.Fatalf("nil migration transport error = %v, want invalid argument", err)
-	}
-	if _, err := Advanced.Channel(client).AddPath(&quic.Transport{}); err != nil {
-		t.Fatalf("add path: %v", err)
-	}
-	if paths := initial.addPaths.Load(); paths != 1 {
-		t.Fatalf("add path calls = %d, want 1", paths)
-	}
-	if generation := client.Generation(); generation != 1 {
-		t.Fatalf("generation after migration = %d, want 1", generation)
-	}
-
-	initial.fail(errors.New("connection lost"))
-	_ = waitChannelAttempt(t, connector)
-	if _, err := Advanced.Channel(client).AddPath(&quic.Transport{}); StatusFromError(err).Code != CodeUnavailable {
-		t.Fatalf("add path while reconnecting = %v, want unavailable", err)
-	}
-	if paths := initial.addPaths.Load(); paths != 1 {
-		t.Fatalf("add path calls after disconnect = %d, want 1", paths)
-	}
-}
-
 func TestChannelEventDispatcherBoundsSlowConsumerQueue(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -363,81 +248,6 @@ func TestChannelEventDispatcherRecoversCallbackPanicAndContinues(t *testing.T) {
 	}
 }
 
-func TestChannelConnectorReusesSessionAndTokenStores(t *testing.T) {
-	baseTLS := &tls.Config{}
-	baseQUIC := &quic.Config{}
-	connector, err := newNativeQUICConnector("127.0.0.1:1", DialOptions{TLSConfig: baseTLS, QUICConfig: baseQUIC})
-	if err != nil {
-		t.Fatalf("create connector: %v", err)
-	}
-	if connector.tlsConfig == baseTLS || connector.quicConfig == baseQUIC {
-		t.Fatal("channel connector should clone caller-owned configs")
-	}
-	if connector.tlsConfig.ClientSessionCache == nil {
-		t.Fatal("channel connector did not install a long-lived TLS session cache")
-	}
-	if connector.quicConfig.TokenStore == nil {
-		t.Fatal("channel connector did not install a long-lived QUIC token store")
-	}
-	if baseTLS.ClientSessionCache != nil || baseQUIC.TokenStore != nil {
-		t.Fatal("channel connector mutated caller-owned configs")
-	}
-
-	sessionCache := tls.NewLRUClientSessionCache(2)
-	tokenStore := quic.NewLRUTokenStore(2, 2)
-	connector, err = newNativeQUICConnector("127.0.0.1:1", DialOptions{
-		TLSConfig:  &tls.Config{ClientSessionCache: sessionCache},
-		QUICConfig: &quic.Config{TokenStore: tokenStore},
-	})
-	if err != nil {
-		t.Fatalf("create connector with stores: %v", err)
-	}
-	if connector.tlsConfig.ClientSessionCache != sessionCache || connector.quicConfig.TokenStore != tokenStore {
-		t.Fatal("channel connector did not preserve configured long-lived stores")
-	}
-}
-
-func TestWebTransportChannelConnectorOwnsReusableConfig(t *testing.T) {
-	baseTLS := &tls.Config{}
-	baseQUIC := &quic.Config{}
-	header := http.Header{"Origin": {"https://example.com"}}
-	protocols := []string{"example.v1"}
-	connector, err := newWebTransportChannelConnector("https://127.0.0.1:1/trevrpc", DialOptions{
-		TLSConfig:  baseTLS,
-		QUICConfig: baseQUIC,
-		WebTransport: WebTransportOptions{
-			RequestHeader:        header,
-			ApplicationProtocols: protocols,
-		},
-	})
-	if err != nil {
-		t.Fatalf("create WebTransport connector: %v", err)
-	}
-	if connector.tlsConfig == baseTLS || connector.quicConfig == baseQUIC {
-		t.Fatal("WebTransport connector should clone caller-owned configs")
-	}
-	if len(connector.tlsConfig.NextProtos) != 1 || connector.tlsConfig.NextProtos[0] != http3.NextProtoH3 {
-		t.Fatalf("WebTransport ALPN = %v, want %q", connector.tlsConfig.NextProtos, http3.NextProtoH3)
-	}
-	if connector.tlsConfig.ClientSessionCache == nil || connector.quicConfig.TokenStore == nil {
-		t.Fatal("WebTransport connector did not install reusable handshake stores")
-	}
-	if !connector.quicConfig.EnableDatagrams || !connector.quicConfig.EnableStreamResetPartialDelivery {
-		t.Fatal("WebTransport connector did not enable required QUIC features")
-	}
-	header.Set("Origin", "https://changed.example.com")
-	protocols[0] = "changed"
-	if got := connector.requestHeader.Get("Origin"); got != "https://example.com" {
-		t.Fatalf("connector request origin = %q, want cloned original", got)
-	}
-	if got := connector.applicationProtocols[0]; got != "example.v1" {
-		t.Fatalf("connector application protocol = %q, want cloned original", got)
-	}
-	if len(baseTLS.NextProtos) != 0 || baseTLS.ClientSessionCache != nil || baseQUIC.TokenStore != nil {
-		t.Fatal("WebTransport connector mutated caller-owned configs")
-	}
-}
-
 func newTestChannel(initial channelGeneration, connector channelConnector, clock reconnectClock, onEvent func(ChannelEvent)) *Channel {
 	config := reconnectConfig{InitialBackoff: time.Millisecond, MaxBackoff: time.Second, Multiplier: 2}
 	return newChannel(initial, connector, clock, config, func() float64 { return 0.5 }, onEvent)
@@ -453,7 +263,6 @@ type fakeChannelGeneration struct {
 	err         error
 	calls       atomic.Int64
 	closes      atomic.Int64
-	addPaths    atomic.Int64
 }
 
 func newFakeChannelGeneration(blockCalls bool, message string) *fakeChannelGeneration {
@@ -504,11 +313,6 @@ func (g *fakeChannelGeneration) Info() ConnectionInfo {
 
 func (g *fakeChannelGeneration) CloseReason(err error) TransportCloseReason {
 	return TransportCloseReason{Err: err, Message: errorString(err)}
-}
-
-func (g *fakeChannelGeneration) AddPath(*quic.Transport) (*quic.Path, error) {
-	g.addPaths.Add(1)
-	return nil, nil
 }
 
 func (g *fakeChannelGeneration) fail(err error) {

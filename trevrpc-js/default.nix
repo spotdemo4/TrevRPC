@@ -18,6 +18,7 @@
   benchProto,
   wireGolden,
   trevrpcC,
+  trevrpcCSrc,
 }:
 let
   jsPackage = builtins.fromJSON (builtins.readFile ./package.json);
@@ -26,7 +27,7 @@ let
     if stdenv.hostPlatform.system == "x86_64-linux" then
       callPackage ./npm/native-linux-x64-gnu {
         sourceTree = ../.;
-        trevrpcCSrc = ../trevrpc-c;
+        inherit trevrpcCSrc;
         jsNativeSrc = ./native;
         jsNativePackageSrc = ./npm/native-linux-x64-gnu;
         jsLicense = ./LICENSE;

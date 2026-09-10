@@ -1,11 +1,12 @@
-//go:build !trevrpc_native || !cgo || (!linux && !darwin) || (!amd64 && !arm64)
+//go:build !cgo || !linux || (!amd64 && !arm64)
 
 package native
 
 import (
 	"context"
 
-	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
+	trevrpcc "trev.zip/llc/trevrpc/trevrpc-c"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/transport"
 )
 
 type Engine struct{}
@@ -16,11 +17,11 @@ type Connection struct{}
 
 type Stream struct{}
 
-func NewEngine(EngineConfig) (*Engine, error) {
+func NewEngine(trevrpcc.Provider, EngineConfig) (*Engine, error) {
 	return nil, ErrUnavailable
 }
 
-func NewTransport(EngineConfig) (*Engine, error) {
+func NewTransport(trevrpcc.Provider, EngineConfig) (*Engine, error) {
 	return nil, ErrUnavailable
 }
 

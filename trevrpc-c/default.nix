@@ -16,6 +16,9 @@
   threadSanitizer ? false,
 }:
 assert !(sanitizers && threadSanitizer);
+let
+  cSources = import ./source.nix { inherit lib; };
+in
 stdenv.mkDerivation (
   final: with lib; {
     pname = "trevrpc-c";
@@ -32,7 +35,7 @@ stdenv.mkDerivation (
         benchProto
         wireGolden
         ../bench/http3-lifecycle-test.sh
-        ./.
+        cSources.msquic
       ];
     };
     sourceRoot = "${final.src.name}/trevrpc-c";
@@ -87,7 +90,7 @@ stdenv.mkDerivation (
     checkPhase = ''
       runHook preCheck
       export HOME=$TMPDIR
-      find examples src tests tools -name '*.c' \
+      find examples src provider/msquic/src tests tools -name '*.c' \
         ! -path 'tests/golden/*' \
         ! -path 'tests/install/*' -print0 | \
         xargs -0 -P $NIX_BUILD_CORES -I{} clang-tidy --quiet {} -- \
@@ -104,12 +107,14 @@ stdenv.mkDerivation (
         '-DTREVRPC_GENERATED_SOURCE="build/generated-service-test/greeter.trevrpc.c"' \
         -Iinclude \
         -Isrc \
+        -Iprovider/msquic/include \
+        -Iprovider/msquic/src \
         -Ibuild/protoc-gen-trevrpc-c-protos \
         -Ibuild/generated-service-test \
         -Ibuild/generated-greeter-example \
         -isystem ${libmsquic}/include
       ctest --test-dir build --output-on-failure -j $NIX_BUILD_CORES \
-        ${optionalString threadSanitizer "-E '^trevrpc_bench_peer_(http3_lifecycle|webtransport_smoke)$'"}
+        ${optionalString threadSanitizer "-E '^(trevrpc_bench_peer_(http3_lifecycle|webtransport_smoke)|trevrpc_generated_service_http3)$'"}
       runHook postCheck
     '';
 

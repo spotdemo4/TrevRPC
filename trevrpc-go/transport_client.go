@@ -6,8 +6,14 @@ import (
 	"sync"
 	"time"
 
-	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/transport"
 )
+
+var cancelledTransportReason = TransportCloseReason{
+	Local:           true,
+	ApplicationCode: 1,
+	Message:         "RPC cancelled",
+}
 
 type transportStatusMapper func(context.Context, error) error
 

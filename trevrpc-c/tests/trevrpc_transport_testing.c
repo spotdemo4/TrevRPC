@@ -411,8 +411,10 @@ static int testing_next_event(trevrpc_rpc_transport* transport, trevrpc_rpc_tran
     return 0;
 }
 
-static int testing_event_get_info(
-    const trevrpc_rpc_transport_event* transport_event, trevrpc_rpc_transport_event_info* info) {
+static int testing_event_get_info(trevrpc_rpc_transport* context,
+    const trevrpc_rpc_transport_event* transport_event,
+    trevrpc_rpc_transport_event_info* info) {
+    (void)context;
     const testing_event* event = (const testing_event*)transport_event;
     if (event == NULL || info == NULL) {
         return -EINVAL;
@@ -421,8 +423,10 @@ static int testing_event_get_info(
     return 0;
 }
 
-static int testing_event_get_admission_info(
-    const trevrpc_rpc_transport_event* transport_event, trevrpc_rpc_transport_admission_info* info) {
+static int testing_event_get_admission_info(trevrpc_rpc_transport* context,
+    const trevrpc_rpc_transport_event* transport_event,
+    trevrpc_rpc_transport_admission_info* info) {
+    (void)context;
     const testing_event* event = (const testing_event*)transport_event;
     if (event == NULL || info == NULL) {
         return -EINVAL;
@@ -430,8 +434,10 @@ static int testing_event_get_admission_info(
     return event->is_admission ? ((*info = event->admission), 0) : -ENOTSUP;
 }
 
-static int testing_event_get_protocol_info(
-    const trevrpc_rpc_transport_event* transport_event, trevrpc_rpc_transport_event_protocol_info* info) {
+static int testing_event_get_protocol_info(trevrpc_rpc_transport* context,
+    const trevrpc_rpc_transport_event* transport_event,
+    trevrpc_rpc_transport_event_protocol_info* info) {
+    (void)context;
     const testing_event* event = (const testing_event*)transport_event;
     if (event == NULL || info == NULL) {
         return -EINVAL;
@@ -440,7 +446,8 @@ static int testing_event_get_protocol_info(
     return 0;
 }
 
-static void testing_event_release(trevrpc_rpc_transport_event* transport_event) {
+static void testing_event_release(trevrpc_rpc_transport* context, trevrpc_rpc_transport_event* transport_event) {
+    (void)context;
     testing_event* event = (testing_event*)transport_event;
     if (event == NULL) {
         return;
@@ -451,7 +458,9 @@ static void testing_event_release(trevrpc_rpc_transport_event* transport_event) 
     free_event(event);
 }
 
-static int testing_admission_respond(const trevrpc_rpc_transport_event* transport_event, uint16_t status) {
+static int testing_admission_respond(
+    trevrpc_rpc_transport* context, const trevrpc_rpc_transport_event* transport_event, uint16_t status) {
+    (void)context;
     testing_event* event = (testing_event*)transport_event;
     trevrc_testing_control* control;
     int result;
@@ -469,8 +478,10 @@ static int testing_admission_respond(const trevrpc_rpc_transport_event* transpor
     return result;
 }
 
-static int testing_receive_get_info(
-    const trevrpc_rpc_transport_receive* transport_receive, trevrpc_rpc_transport_receive_info* info) {
+static int testing_receive_get_info(trevrpc_rpc_transport* context,
+    const trevrpc_rpc_transport_receive* transport_receive,
+    trevrpc_rpc_transport_receive_info* info) {
+    (void)context;
     const testing_receive* receive = (const testing_receive*)transport_receive;
     if (receive == NULL || info == NULL) {
         return -EINVAL;
@@ -479,7 +490,8 @@ static int testing_receive_get_info(
     return 0;
 }
 
-static void testing_receive_release(trevrpc_rpc_transport_receive* transport_receive) {
+static void testing_receive_release(trevrpc_rpc_transport* context, trevrpc_rpc_transport_receive* transport_receive) {
+    (void)context;
     testing_receive* receive = (testing_receive*)transport_receive;
     if (receive == NULL) {
         return;
@@ -902,6 +914,7 @@ int trevrpc_transport_testing_create_v1(const trevrpc_transport_config_v1* trans
     trevrc_testing_control* control;
     size_t index;
     int descriptors[2];
+    int result;
     (void)transport_config;
     if (out_transport == NULL || out_control == NULL || provider_config == NULL ||
         valid_structure(
@@ -960,7 +973,10 @@ int trevrpc_transport_testing_create_v1(const trevrpc_transport_config_v1* trans
     control->base.ops = &testing_ops;
     control->counters.struct_size = sizeof(control->counters);
     control->counters.struct_version = TREVRPC_TRANSPORT_TESTING_STRUCT_VERSION_1;
-    *out_transport = (trevrpc_transport*)control;
+    result = trevrpc_transport_adopt_rpc_private((trevrpc_rpc_transport*)control, out_transport);
+    if (result != 0) {
+        return result;
+    }
     *out_control = control;
     return 0;
 }

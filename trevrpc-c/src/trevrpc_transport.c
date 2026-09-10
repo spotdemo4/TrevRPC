@@ -4,13 +4,349 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "trevrpc_transport.h"
+#include "trevrpc_transport_provider.h"
 
 #include "trevrpc_rpc_transport_internal.h"
 #include "trevrpc_credential_internal.h"
 
 #include <errno.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
+
+struct trevrpc_transport {
+    trevrpc_transport_provider_ops_v1 provider_ops;
+    void* provider_context;
+};
+
+static int trevrpc_transport_provider_get_wake_sources(
+    trevrpc_transport* transport, trevrpc_transport_provider_wake_v1* wakes, size_t capacity, size_t* out_count) {
+    return transport->provider_ops.get_wake_sources(transport->provider_context, wakes, capacity, out_count);
+}
+
+static int trevrpc_transport_provider_poll_timeout_ms(trevrpc_transport* transport) {
+    return transport->provider_ops.poll_timeout_ms(transport->provider_context);
+}
+
+static int trevrpc_transport_provider_next_event(trevrpc_transport* transport, trevrpc_transport_event_v1** out_event) {
+    return transport->provider_ops.next_event(transport->provider_context, out_event);
+}
+
+static int trevrpc_transport_provider_event_get_info(trevrpc_transport* transport,
+    const trevrpc_transport_event_v1* event,
+    trevrpc_transport_provider_event_info_v1* info) {
+    return transport->provider_ops.event_get_info(transport->provider_context, event, info);
+}
+
+static int trevrpc_transport_provider_event_get_admission_info(trevrpc_transport* transport,
+    const trevrpc_transport_event_v1* event,
+    trevrpc_transport_provider_admission_info_v1* info) {
+    return transport->provider_ops.event_get_admission_info(transport->provider_context, event, info);
+}
+
+static int trevrpc_transport_provider_event_get_protocol_info(trevrpc_transport* transport,
+    const trevrpc_transport_event_v1* event,
+    trevrpc_transport_provider_event_protocol_info_v1* info) {
+    return transport->provider_ops.event_get_protocol_info(transport->provider_context, event, info);
+}
+
+static int trevrpc_transport_provider_admission_respond(
+    trevrpc_transport* transport, const trevrpc_transport_event_v1* event, uint16_t status) {
+    return transport->provider_ops.admission_respond(transport->provider_context, event, status);
+}
+
+static void trevrpc_transport_provider_event_release(trevrpc_transport* transport, trevrpc_transport_event_v1* event) {
+    transport->provider_ops.event_release(transport->provider_context, event);
+}
+
+static int trevrpc_transport_provider_receive_get_info(trevrpc_transport* transport,
+    const trevrpc_transport_receive_v1* receive,
+    trevrpc_transport_provider_receive_info_v1* info) {
+    return transport->provider_ops.receive_get_info(transport->provider_context, receive, info);
+}
+
+static void trevrpc_transport_provider_receive_release(
+    trevrpc_transport* transport, trevrpc_transport_receive_v1* receive) {
+    transport->provider_ops.receive_release(transport->provider_context, receive);
+}
+
+static int trevrpc_transport_provider_get_diagnostics(
+    trevrpc_transport* transport, trevrpc_transport_provider_diagnostics_v1* diagnostics) {
+    return transport->provider_ops.get_diagnostics(transport->provider_context, diagnostics);
+}
+
+static int trevrpc_transport_provider_listen(trevrpc_transport* transport,
+    const trevrpc_transport_provider_endpoint_config_v1* config,
+    trevrpc_transport_handle_v1* listener) {
+    return transport->provider_ops.listen(transport->provider_context, config, listener);
+}
+
+static int trevrpc_transport_provider_listener_get_port(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 listener, uint16_t* port) {
+    return transport->provider_ops.listener_get_port(transport->provider_context, listener, port);
+}
+
+static int trevrpc_transport_provider_dial(trevrpc_transport* transport,
+    const trevrpc_transport_provider_endpoint_config_v1* config,
+    uint64_t operation_id,
+    trevrpc_transport_handle_v1* connection) {
+    return transport->provider_ops.dial(transport->provider_context, config, operation_id, connection);
+}
+
+static int trevrpc_transport_provider_dial_cancel(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 connection) {
+    return transport->provider_ops.dial_cancel(transport->provider_context, connection);
+}
+
+static int trevrpc_transport_provider_stream_open(trevrpc_transport* transport,
+    trevrpc_transport_handle_v1 connection,
+    uint64_t operation_id,
+    trevrpc_transport_handle_v1* stream) {
+    return transport->provider_ops.connection_open_bidi_stream(
+        transport->provider_context, connection, operation_id, stream);
+}
+
+static int trevrpc_transport_provider_stream_send(trevrpc_transport* transport,
+    trevrpc_transport_handle_v1 stream,
+    uint64_t operation_id,
+    const uint8_t* body,
+    size_t body_len) {
+    return transport->provider_ops.stream_send(transport->provider_context, stream, operation_id, body, body_len);
+}
+
+static int trevrpc_transport_provider_stream_receive(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, trevrpc_transport_receive_v1** receive) {
+    return transport->provider_ops.stream_receive(transport->provider_context, stream, receive);
+}
+
+static int trevrpc_transport_provider_stream_finish_send(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 stream) {
+    return transport->provider_ops.stream_finish_send(transport->provider_context, stream);
+}
+
+static int trevrpc_transport_provider_stream_abort_receive(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, uint64_t error_code) {
+    return transport->provider_ops.stream_abort_receive(transport->provider_context, stream, error_code);
+}
+
+static int trevrpc_transport_provider_stream_abort_send(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, uint64_t error_code) {
+    return transport->provider_ops.stream_abort_send(transport->provider_context, stream, error_code);
+}
+
+static int trevrpc_transport_provider_stream_abort(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, uint64_t error_code) {
+    return transport->provider_ops.stream_abort(transport->provider_context, stream, error_code);
+}
+
+static int trevrpc_transport_provider_stream_close(trevrpc_transport* transport, trevrpc_transport_handle_v1 stream) {
+    return transport->provider_ops.stream_close(transport->provider_context, stream);
+}
+
+static int trevrpc_transport_provider_connection_close(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 connection, uint64_t error_code) {
+    return transport->provider_ops.connection_close(transport->provider_context, connection, error_code);
+}
+
+static int trevrpc_transport_provider_listener_close(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 listener) {
+    return transport->provider_ops.listener_close(transport->provider_context, listener);
+}
+
+static int trevrpc_transport_provider_release_handle(
+    trevrpc_transport* transport, trevrpc_transport_handle_v1 handle, uint32_t object_kind) {
+    return transport->provider_ops.release_handle(transport->provider_context, handle, object_kind);
+}
+
+static int trevrpc_transport_provider_close(trevrpc_transport* transport) {
+    return transport->provider_ops.close(transport->provider_context);
+}
+
+static int trevrpc_transport_provider_drain(trevrpc_transport* transport) {
+    return transport->provider_ops.drain(transport->provider_context);
+}
+
+static int trevrpc_transport_provider_prepare_release(trevrpc_transport* transport) {
+    return transport->provider_ops.prepare_release(transport->provider_context);
+}
+
+static void trevrpc_transport_provider_destroy(trevrpc_transport* transport) {
+    transport->provider_ops.destroy(transport->provider_context);
+}
+
+static int trevrpc_transport_rpc_get_wake_sources(
+    void* context, trevrpc_transport_provider_wake_v1* wakes, size_t capacity, size_t* out_count) {
+    return trevrpc_rpc_transport_get_wake_sources(context, wakes, capacity, out_count);
+}
+
+static int trevrpc_transport_rpc_poll_timeout_ms(void* context) {
+    return trevrpc_rpc_transport_poll_timeout_ms(context);
+}
+
+static int trevrpc_transport_rpc_next_event(void* context, trevrpc_transport_event_v1** out_event) {
+    return trevrpc_rpc_transport_next_event(context, (trevrpc_rpc_transport_event**)out_event);
+}
+
+static int trevrpc_transport_rpc_event_get_info(
+    void* context, const trevrpc_transport_event_v1* event, trevrpc_transport_provider_event_info_v1* info) {
+    return trevrpc_rpc_transport_event_get_info(context, (const trevrpc_rpc_transport_event*)event, info);
+}
+
+static int trevrpc_transport_rpc_event_get_admission_info(
+    void* context, const trevrpc_transport_event_v1* event, trevrpc_transport_provider_admission_info_v1* info) {
+    return trevrpc_rpc_transport_event_get_admission_info(context, (const trevrpc_rpc_transport_event*)event, info);
+}
+
+static int trevrpc_transport_rpc_event_get_protocol_info(
+    void* context, const trevrpc_transport_event_v1* event, trevrpc_transport_provider_event_protocol_info_v1* info) {
+    return trevrpc_rpc_transport_event_get_protocol_info(context, (const trevrpc_rpc_transport_event*)event, info);
+}
+
+static int trevrpc_transport_rpc_admission_respond(
+    void* context, const trevrpc_transport_event_v1* event, uint16_t status) {
+    return trevrpc_rpc_transport_admission_respond(context, (const trevrpc_rpc_transport_event*)event, status);
+}
+
+static void trevrpc_transport_rpc_event_release(void* context, trevrpc_transport_event_v1* event) {
+    trevrpc_rpc_transport_event_release(context, (trevrpc_rpc_transport_event*)event);
+}
+
+static int trevrpc_transport_rpc_receive_get_info(
+    void* context, const trevrpc_transport_receive_v1* receive, trevrpc_transport_provider_receive_info_v1* info) {
+    return trevrpc_rpc_transport_receive_get_info(context, (const trevrpc_rpc_transport_receive*)receive, info);
+}
+
+static void trevrpc_transport_rpc_receive_release(void* context, trevrpc_transport_receive_v1* receive) {
+    trevrpc_rpc_transport_receive_release(context, (trevrpc_rpc_transport_receive*)receive);
+}
+
+static int trevrpc_transport_rpc_get_diagnostics(
+    void* context, trevrpc_transport_provider_diagnostics_v1* diagnostics) {
+    return trevrpc_rpc_transport_get_diagnostics(context, diagnostics);
+}
+
+static int trevrpc_transport_rpc_listen(
+    void* context, const trevrpc_transport_provider_endpoint_config_v1* config, trevrpc_transport_handle_v1* listener) {
+    return trevrpc_rpc_transport_endpoint_listen(context, config, listener);
+}
+
+static int trevrpc_transport_rpc_listener_get_port(
+    void* context, trevrpc_transport_handle_v1 listener, uint16_t* port) {
+    return trevrpc_rpc_transport_endpoint_get_port(context, listener, port);
+}
+
+static int trevrpc_transport_rpc_dial(void* context,
+    const trevrpc_transport_provider_endpoint_config_v1* config,
+    uint64_t operation_id,
+    trevrpc_transport_handle_v1* connection) {
+    return trevrpc_rpc_transport_endpoint_dial(context, config, operation_id, connection);
+}
+
+static int trevrpc_transport_rpc_dial_cancel(void* context, trevrpc_transport_handle_v1 connection) {
+    return trevrpc_rpc_transport_dial_cancel(context, connection);
+}
+
+static int trevrpc_transport_rpc_stream_open(
+    void* context, trevrpc_transport_handle_v1 connection, uint64_t operation_id, trevrpc_transport_handle_v1* stream) {
+    return trevrpc_rpc_transport_stream_open(context, connection, operation_id, stream);
+}
+
+static int trevrpc_transport_rpc_stream_send(
+    void* context, trevrpc_transport_handle_v1 stream, uint64_t operation_id, const uint8_t* body, size_t body_len) {
+    return trevrpc_rpc_transport_stream_send(context, stream, operation_id, body, body_len);
+}
+
+static int trevrpc_transport_rpc_stream_receive(
+    void* context, trevrpc_transport_handle_v1 stream, trevrpc_transport_receive_v1** receive) {
+    return trevrpc_rpc_transport_stream_receive(context, stream, (trevrpc_rpc_transport_receive**)receive);
+}
+
+static int trevrpc_transport_rpc_stream_finish_send(void* context, trevrpc_transport_handle_v1 stream) {
+    return trevrpc_rpc_transport_stream_finish_send(context, stream);
+}
+
+static int trevrpc_transport_rpc_stream_abort_receive(
+    void* context, trevrpc_transport_handle_v1 stream, uint64_t error_code) {
+    return trevrpc_rpc_transport_stream_abort_receive(context, stream, error_code);
+}
+
+static int trevrpc_transport_rpc_stream_abort_send(
+    void* context, trevrpc_transport_handle_v1 stream, uint64_t error_code) {
+    return trevrpc_rpc_transport_stream_abort_send(context, stream, error_code);
+}
+
+static int trevrpc_transport_rpc_stream_abort(void* context, trevrpc_transport_handle_v1 stream, uint64_t error_code) {
+    return trevrpc_rpc_transport_stream_abort(context, stream, error_code);
+}
+
+static int trevrpc_transport_rpc_stream_close(void* context, trevrpc_transport_handle_v1 stream) {
+    return trevrpc_rpc_transport_stream_close(context, stream);
+}
+
+static int trevrpc_transport_rpc_connection_close(
+    void* context, trevrpc_transport_handle_v1 connection, uint64_t error_code) {
+    return trevrpc_rpc_transport_connection_close(context, connection, error_code);
+}
+
+static int trevrpc_transport_rpc_listener_close(void* context, trevrpc_transport_handle_v1 listener) {
+    return trevrpc_rpc_transport_listener_close(context, listener);
+}
+
+static int trevrpc_transport_rpc_release_handle(
+    void* context, trevrpc_transport_handle_v1 handle, uint32_t object_kind) {
+    return trevrpc_rpc_transport_release_handle(context, handle, object_kind);
+}
+
+static int trevrpc_transport_rpc_close(void* context) {
+    return trevrpc_rpc_transport_close(context);
+}
+
+static int trevrpc_transport_rpc_drain(void* context) {
+    return trevrpc_rpc_transport_drain(context);
+}
+
+static int trevrpc_transport_rpc_prepare_release(void* context) {
+    return trevrpc_rpc_transport_prepare_release(context);
+}
+
+static void trevrpc_transport_rpc_destroy(void* context) {
+    trevrpc_rpc_transport_destroy(context);
+}
+
+static const trevrpc_transport_provider_ops_v1 trevrpc_transport_rpc_provider_ops = {
+    .struct_size = sizeof(trevrpc_transport_provider_ops_v1),
+    .struct_version = TREVRPC_TRANSPORT_PROVIDER_STRUCT_VERSION_1,
+    .get_wake_sources = trevrpc_transport_rpc_get_wake_sources,
+    .poll_timeout_ms = trevrpc_transport_rpc_poll_timeout_ms,
+    .next_event = trevrpc_transport_rpc_next_event,
+    .event_get_info = trevrpc_transport_rpc_event_get_info,
+    .event_get_admission_info = trevrpc_transport_rpc_event_get_admission_info,
+    .event_get_protocol_info = trevrpc_transport_rpc_event_get_protocol_info,
+    .admission_respond = trevrpc_transport_rpc_admission_respond,
+    .event_release = trevrpc_transport_rpc_event_release,
+    .receive_get_info = trevrpc_transport_rpc_receive_get_info,
+    .receive_release = trevrpc_transport_rpc_receive_release,
+    .get_diagnostics = trevrpc_transport_rpc_get_diagnostics,
+    .listen = trevrpc_transport_rpc_listen,
+    .listener_get_port = trevrpc_transport_rpc_listener_get_port,
+    .dial = trevrpc_transport_rpc_dial,
+    .dial_cancel = trevrpc_transport_rpc_dial_cancel,
+    .connection_open_bidi_stream = trevrpc_transport_rpc_stream_open,
+    .stream_send = trevrpc_transport_rpc_stream_send,
+    .stream_receive = trevrpc_transport_rpc_stream_receive,
+    .stream_finish_send = trevrpc_transport_rpc_stream_finish_send,
+    .stream_abort_receive = trevrpc_transport_rpc_stream_abort_receive,
+    .stream_abort_send = trevrpc_transport_rpc_stream_abort_send,
+    .stream_abort = trevrpc_transport_rpc_stream_abort,
+    .stream_close = trevrpc_transport_rpc_stream_close,
+    .connection_close = trevrpc_transport_rpc_connection_close,
+    .listener_close = trevrpc_transport_rpc_listener_close,
+    .release_handle = trevrpc_transport_rpc_release_handle,
+    .close = trevrpc_transport_rpc_close,
+    .drain = trevrpc_transport_rpc_drain,
+    .prepare_release = trevrpc_transport_rpc_prepare_release,
+    .destroy = trevrpc_transport_rpc_destroy,
+};
 
 static int trevrpc_transport_initialize_structure(void* structure, size_t struct_size, size_t required_size) {
     uint32_t size_field;
@@ -176,6 +512,101 @@ static void trevrpc_transport_internal_endpoint_config(
     destination->unresolved_stream_timeout_ms = source->unresolved_stream_timeout_ms;
 }
 
+static int trevrpc_transport_validate_provider_ops(const trevrpc_transport_provider_ops_v1* operations) {
+    if (operations == NULL || operations->struct_size < sizeof(*operations)) {
+        return -EINVAL;
+    }
+    if (operations->struct_version != TREVRPC_TRANSPORT_PROVIDER_STRUCT_VERSION_1) {
+        return -ENOTSUP;
+    }
+    if (!trevrpc_transport_reserved_is_zero(
+            operations->reserved, sizeof(operations->reserved) / sizeof(operations->reserved[0])) ||
+        operations->get_wake_sources == NULL || operations->poll_timeout_ms == NULL || operations->next_event == NULL ||
+        operations->event_get_info == NULL || operations->event_get_admission_info == NULL ||
+        operations->event_get_protocol_info == NULL || operations->admission_respond == NULL ||
+        operations->event_release == NULL || operations->receive_get_info == NULL ||
+        operations->receive_release == NULL || operations->get_diagnostics == NULL || operations->listen == NULL ||
+        operations->listener_get_port == NULL || operations->dial == NULL || operations->dial_cancel == NULL ||
+        operations->connection_open_bidi_stream == NULL || operations->stream_send == NULL ||
+        operations->stream_receive == NULL || operations->stream_finish_send == NULL ||
+        operations->stream_abort_receive == NULL || operations->stream_abort_send == NULL ||
+        operations->stream_abort == NULL || operations->stream_close == NULL || operations->connection_close == NULL ||
+        operations->listener_close == NULL || operations->release_handle == NULL || operations->close == NULL ||
+        operations->drain == NULL || operations->prepare_release == NULL || operations->destroy == NULL) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+uint32_t trevrpc_transport_provider_abi_version(void) {
+    return TREVRPC_TRANSPORT_PROVIDER_ABI_VERSION;
+}
+
+void trevrpc_transport_provider_abi_1_anchor(void) {
+}
+
+int trevrpc_transport_provider_descriptor_v1_init(
+    trevrpc_transport_provider_descriptor_v1* descriptor, size_t struct_size) {
+    uint32_t size_field;
+    if (descriptor == NULL || struct_size < sizeof(*descriptor)) {
+        return -EINVAL;
+    }
+    if (struct_size > UINT32_MAX) {
+        return -EOVERFLOW;
+    }
+    size_field = (uint32_t)struct_size;
+    memset(descriptor, 0, struct_size);
+    descriptor->struct_size = size_field;
+    descriptor->struct_version = TREVRPC_TRANSPORT_PROVIDER_STRUCT_VERSION_1;
+    return 0;
+}
+
+int trevrpc_transport_provider_adopt_v1(
+    const trevrpc_transport_provider_descriptor_v1* descriptor, trevrpc_transport** out_transport) {
+    trevrpc_transport* transport;
+    int result;
+    if (out_transport == NULL) {
+        return -EINVAL;
+    }
+    *out_transport = NULL;
+    if (descriptor == NULL || descriptor->struct_size < sizeof(*descriptor) ||
+        !trevrpc_transport_reserved_is_zero(
+            descriptor->reserved, sizeof(descriptor->reserved) / sizeof(descriptor->reserved[0]))) {
+        return -EINVAL;
+    }
+    if (descriptor->struct_version != TREVRPC_TRANSPORT_PROVIDER_STRUCT_VERSION_1) {
+        return -ENOTSUP;
+    }
+    result = trevrpc_transport_validate_provider_ops(descriptor->operations);
+    if (result != 0) {
+        return result;
+    }
+    transport = calloc(1, sizeof(*transport));
+    if (transport == NULL) {
+        descriptor->operations->destroy(descriptor->context);
+        return -ENOMEM;
+    }
+    transport->provider_ops = *descriptor->operations;
+    transport->provider_context = descriptor->context;
+    *out_transport = transport;
+    return 0;
+}
+
+int trevrpc_transport_adopt_rpc_private(trevrpc_rpc_transport* provider, trevrpc_transport** out_transport) {
+    trevrpc_transport_provider_descriptor_v1 descriptor;
+    int result;
+    if (provider == NULL || out_transport == NULL) {
+        return -EINVAL;
+    }
+    result = trevrpc_transport_provider_descriptor_v1_init(&descriptor, sizeof(descriptor));
+    if (result != 0) {
+        return result;
+    }
+    descriptor.operations = &trevrpc_transport_rpc_provider_ops;
+    descriptor.context = provider;
+    return trevrpc_transport_provider_adopt_v1(&descriptor, out_transport);
+}
+
 uint32_t trevrpc_transport_abi_version(void) {
     return TREVRPC_TRANSPORT_ABI_VERSION;
 }
@@ -268,7 +699,7 @@ int trevrpc_transport_get_wake_sources_v1(
         }
     }
     result = trevrpc_transport_normalize_result(
-        trevrpc_rpc_transport_get_wake_sources(transport, internal, capacity, &count));
+        trevrpc_transport_provider_get_wake_sources(transport, internal, capacity, &count));
     if (result != 0) {
         return result;
     }
@@ -282,7 +713,7 @@ int trevrpc_transport_get_wake_sources_v1(
 }
 
 int trevrpc_transport_poll_timeout_ms(trevrpc_transport* transport) {
-    return transport == NULL ? -EINVAL : trevrpc_rpc_transport_poll_timeout_ms(transport);
+    return transport == NULL ? -EINVAL : trevrpc_transport_provider_poll_timeout_ms(transport);
 }
 
 int trevrpc_transport_next_event(trevrpc_transport* transport, trevrpc_transport_event_v1** out_event) {
@@ -292,13 +723,14 @@ int trevrpc_transport_next_event(trevrpc_transport* transport, trevrpc_transport
         return -EINVAL;
     }
     for (;;) {
-        result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_next_event(transport, out_event));
+        result = trevrpc_transport_normalize_result(trevrpc_transport_provider_next_event(transport, out_event));
         if (result != 0 || *out_event == NULL) {
             return result;
         }
-        result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_event_get_info(transport, *out_event, &info));
+        result =
+            trevrpc_transport_normalize_result(trevrpc_transport_provider_event_get_info(transport, *out_event, &info));
         if (result != 0) {
-            trevrpc_rpc_transport_event_release(transport, *out_event);
+            trevrpc_transport_provider_event_release(transport, *out_event);
             *out_event = NULL;
             return result;
         }
@@ -307,7 +739,7 @@ int trevrpc_transport_next_event(trevrpc_transport* transport, trevrpc_transport
         }
         /* This event coordinates the RPC runtime with HTTP/3 and is not part of
          * the canonical Transport ABI event vocabulary. */
-        trevrpc_rpc_transport_event_release(transport, *out_event);
+        trevrpc_transport_provider_event_release(transport, *out_event);
         *out_event = NULL;
     }
 }
@@ -326,7 +758,7 @@ int trevrpc_transport_event_get_info_v1(
     if (!trevrpc_transport_reserved_is_zero(info->reserved, sizeof(info->reserved) / sizeof(info->reserved[0]))) {
         return -EINVAL;
     }
-    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_event_get_info(transport, event, &source));
+    result = trevrpc_transport_normalize_result(trevrpc_transport_provider_event_get_info(transport, event, &source));
     if (result != 0) {
         return result;
     }
@@ -357,8 +789,8 @@ int trevrpc_transport_event_get_admission_info_v1(
     if (info->reserved0 != 0 ||
         !trevrpc_transport_reserved_is_zero(info->reserved, sizeof(info->reserved) / sizeof(info->reserved[0])))
         return -EINVAL;
-    result =
-        trevrpc_transport_normalize_result(trevrpc_rpc_transport_event_get_admission_info(transport, event, &source));
+    result = trevrpc_transport_normalize_result(
+        trevrpc_transport_provider_event_get_admission_info(transport, event, &source));
     if (result != 0)
         return result;
     info->protocol = source.protocol;
@@ -389,8 +821,8 @@ int trevrpc_transport_event_get_protocol_info_v1(trevrpc_transport* transport,
     if (info->reserved0 != 0 ||
         !trevrpc_transport_reserved_is_zero(info->reserved, sizeof(info->reserved) / sizeof(info->reserved[0])))
         return -EINVAL;
-    result =
-        trevrpc_transport_normalize_result(trevrpc_rpc_transport_event_get_protocol_info(transport, event, &source));
+    result = trevrpc_transport_normalize_result(
+        trevrpc_transport_provider_event_get_protocol_info(transport, event, &source));
     if (result == 0)
         info->protocol = source.protocol;
     return result;
@@ -400,12 +832,13 @@ int trevrpc_transport_admission_respond_v1(
     trevrpc_transport* transport, const trevrpc_transport_event_v1* event, uint16_t http_status) {
     if (transport == NULL || event == NULL || (http_status != 200 && (http_status < 400 || http_status > 599)))
         return -EINVAL;
-    return trevrpc_transport_normalize_result(trevrpc_rpc_transport_admission_respond(transport, event, http_status));
+    return trevrpc_transport_normalize_result(
+        trevrpc_transport_provider_admission_respond(transport, event, http_status));
 }
 
 void trevrpc_transport_event_release(trevrpc_transport* transport, trevrpc_transport_event_v1* event) {
     if (transport != NULL && event != NULL) {
-        trevrpc_rpc_transport_event_release(transport, event);
+        trevrpc_transport_provider_event_release(transport, event);
     }
 }
 
@@ -425,7 +858,8 @@ int trevrpc_transport_receive_get_info_v1(trevrpc_transport* transport,
         !trevrpc_transport_reserved_is_zero(info->reserved, sizeof(info->reserved) / sizeof(info->reserved[0]))) {
         return -EINVAL;
     }
-    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_receive_get_info(transport, receive, &source));
+    result =
+        trevrpc_transport_normalize_result(trevrpc_transport_provider_receive_get_info(transport, receive, &source));
     if (result == 0) {
         info->flags = source.flags;
         info->data = source.data;
@@ -436,7 +870,7 @@ int trevrpc_transport_receive_get_info_v1(trevrpc_transport* transport,
 
 void trevrpc_transport_receive_release(trevrpc_transport* transport, trevrpc_transport_receive_v1* receive) {
     if (transport != NULL && receive != NULL) {
-        trevrpc_rpc_transport_receive_release(transport, receive);
+        trevrpc_transport_provider_receive_release(transport, receive);
     }
 }
 
@@ -455,7 +889,7 @@ int trevrpc_transport_get_diagnostics_v1(trevrpc_transport* transport, trevrpc_t
             diagnostics->reserved, sizeof(diagnostics->reserved) / sizeof(diagnostics->reserved[0]))) {
         return -EINVAL;
     }
-    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_get_diagnostics(transport, &source));
+    result = trevrpc_transport_normalize_result(trevrpc_transport_provider_get_diagnostics(transport, &source));
     if (result != 0) {
         return result;
     }
@@ -503,7 +937,7 @@ int trevrpc_transport_listen_v1(trevrpc_transport* transport,
     if (config->protocol == TREVRPC_TRANSPORT_PROTOCOL_MULTIPLEXED && config->alpn_len != 0)
         return -EINVAL;
     trevrpc_transport_internal_endpoint_config(config, &source);
-    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_endpoint_listen(transport, &source, &listener));
+    result = trevrpc_transport_normalize_result(trevrpc_transport_provider_listen(transport, &source, &listener));
     if (result == 0) {
         *out_listener = trevrpc_transport_public_handle(listener);
     }
@@ -514,7 +948,7 @@ int trevrpc_transport_listener_get_port_v1(
     trevrpc_transport* transport, trevrpc_transport_handle_v1 listener, uint16_t* out_port) {
     return transport == NULL || out_port == NULL
                ? -EINVAL
-               : trevrpc_transport_normalize_result(trevrpc_rpc_transport_endpoint_get_port(
+               : trevrpc_transport_normalize_result(trevrpc_transport_provider_listener_get_port(
                      transport, trevrpc_transport_internal_handle(listener), out_port));
 }
 
@@ -537,7 +971,7 @@ int trevrpc_transport_dial_v1(trevrpc_transport* transport,
         return -ENOTSUP;
     trevrpc_transport_internal_endpoint_config(config, &source);
     result = trevrpc_transport_normalize_result(
-        trevrpc_rpc_transport_endpoint_dial(transport, &source, operation_id, &connection));
+        trevrpc_transport_provider_dial(transport, &source, operation_id, &connection));
     if (result == 0) {
         *out_connection = trevrpc_transport_public_handle(connection);
     }
@@ -546,7 +980,7 @@ int trevrpc_transport_dial_v1(trevrpc_transport* transport,
 
 int trevrpc_transport_dial_cancel(trevrpc_transport* transport, trevrpc_transport_handle_v1 connection) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_dial_cancel(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_dial_cancel(
                                    transport, trevrpc_transport_internal_handle(connection)));
 }
 
@@ -559,7 +993,7 @@ int trevrpc_transport_connection_open_bidi_stream_v1(trevrpc_transport* transpor
     if (transport == NULL || out_stream == NULL || operation_id == 0) {
         return -EINVAL;
     }
-    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_open(
+    result = trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_open(
         transport, trevrpc_transport_internal_handle(connection), operation_id, &stream));
     if (result == 0) {
         *out_stream = trevrpc_transport_public_handle(stream);
@@ -575,7 +1009,7 @@ int trevrpc_transport_stream_send_v1(trevrpc_transport* transport,
     if (transport == NULL || operation_id == 0 || (data == NULL && data_len != 0)) {
         return -EINVAL;
     }
-    return trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_send(
+    return trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_send(
         transport, trevrpc_transport_internal_handle(stream), operation_id, data, data_len));
 }
 
@@ -583,53 +1017,53 @@ int trevrpc_transport_stream_receive(
     trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, trevrpc_transport_receive_v1** out_receive) {
     return transport == NULL || out_receive == NULL
                ? -EINVAL
-               : trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_receive(
+               : trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_receive(
                      transport, trevrpc_transport_internal_handle(stream), out_receive));
 }
 
 int trevrpc_transport_stream_finish_send(trevrpc_transport* transport, trevrpc_transport_handle_v1 stream) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_finish_send(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_finish_send(
                                    transport, trevrpc_transport_internal_handle(stream)));
 }
 
 int trevrpc_transport_stream_abort_receive(
     trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, uint64_t application_error_code) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_abort_receive(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_abort_receive(
                                    transport, trevrpc_transport_internal_handle(stream), application_error_code));
 }
 
 int trevrpc_transport_stream_abort_send(
     trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, uint64_t application_error_code) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_abort_send(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_abort_send(
                                    transport, trevrpc_transport_internal_handle(stream), application_error_code));
 }
 
 int trevrpc_transport_stream_abort(
     trevrpc_transport* transport, trevrpc_transport_handle_v1 stream, uint64_t application_error_code) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_abort(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_abort(
                                    transport, trevrpc_transport_internal_handle(stream), application_error_code));
 }
 
 int trevrpc_transport_stream_close(trevrpc_transport* transport, trevrpc_transport_handle_v1 stream) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_stream_close(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_stream_close(
                                    transport, trevrpc_transport_internal_handle(stream)));
 }
 
 int trevrpc_transport_connection_close(
     trevrpc_transport* transport, trevrpc_transport_handle_v1 connection, uint64_t application_error_code) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_connection_close(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_connection_close(
                                    transport, trevrpc_transport_internal_handle(connection), application_error_code));
 }
 
 int trevrpc_transport_listener_close(trevrpc_transport* transport, trevrpc_transport_handle_v1 listener) {
     return transport == NULL ? -EINVAL
-                             : trevrpc_transport_normalize_result(trevrpc_rpc_transport_listener_close(
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_listener_close(
                                    transport, trevrpc_transport_internal_handle(listener)));
 }
 
@@ -640,15 +1074,17 @@ int trevrpc_transport_release_handle(
         return -EINVAL;
     }
     return trevrpc_transport_normalize_result(
-        trevrpc_rpc_transport_release_handle(transport, trevrpc_transport_internal_handle(handle), object_kind));
+        trevrpc_transport_provider_release_handle(transport, trevrpc_transport_internal_handle(handle), object_kind));
 }
 
 int trevrpc_transport_close(trevrpc_transport* transport) {
-    return transport == NULL ? -EINVAL : trevrpc_transport_normalize_result(trevrpc_rpc_transport_close(transport));
+    return transport == NULL ? -EINVAL
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_close(transport));
 }
 
 int trevrpc_transport_drain(trevrpc_transport* transport) {
-    return transport == NULL ? -EINVAL : trevrpc_transport_normalize_result(trevrpc_rpc_transport_drain(transport));
+    return transport == NULL ? -EINVAL
+                             : trevrpc_transport_normalize_result(trevrpc_transport_provider_drain(transport));
 }
 
 int trevrpc_transport_release(trevrpc_transport* transport) {
@@ -656,14 +1092,15 @@ int trevrpc_transport_release(trevrpc_transport* transport) {
     if (transport == NULL) {
         return -EINVAL;
     }
-    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_drain(transport));
+    result = trevrpc_transport_normalize_result(trevrpc_transport_provider_drain(transport));
     if (result != 0) {
         return result;
     }
-    result = trevrpc_transport_normalize_result(trevrpc_rpc_transport_prepare_release(transport));
+    result = trevrpc_transport_normalize_result(trevrpc_transport_provider_prepare_release(transport));
     if (result != 0) {
         return result;
     }
-    trevrpc_rpc_transport_destroy(transport);
+    trevrpc_transport_provider_destroy(transport);
+    free(transport);
     return 0;
 }

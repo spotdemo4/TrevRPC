@@ -17,7 +17,7 @@
     },
     {
       "id": "go",
-      "command": ["trevrpc-bench-peer-go", "--webtransport-draft07-only"]
+      "command": ["trevrpc-bench-peer-go"]
     },
     {
       "id": "rust",

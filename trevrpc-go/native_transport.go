@@ -5,7 +5,6 @@ import (
 	"errors"
 	"math/bits"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,42 +13,45 @@ import (
 	"sync"
 	"time"
 
-	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
+	trevrpcc "trev.zip/llc/trevrpc/trevrpc-c"
 	"trev.zip/llc/trevrpc/trevrpc-go/internal/transport/native"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/transport"
 )
 
 const (
-	nativeStatusInvalidArgument   = -22
-	nativeStatusNotSupportedBSD   = -45
-	nativeStatusNotSupportedLinux = -95
+	nativeStatusInvalidArgument          = -22
+	nativeStatusNotSupportedBSD          = -45
+	nativeStatusNotSupportedLinux        = -95
+	nativeTransportReceiveBudgetOverhead = 4096
 )
 
-func newNativeChannelConnector(
+func newNativeChannelConnectorWithProvider(
+	provider trevrpcc.Provider,
 	target string,
 	options DialOptions,
-) (channelConnector, error) {
+	requestedBackend TransportBackend,
+) (BackendConnector, error) {
 	if strings.HasPrefix(target, "https://") {
-		return newNativeWebTransportConnector(target, options)
+		return newNativeWebTransportConnectorWithProvider(provider, target, options, requestedBackend)
 	}
-	return newNativeEngineQUICConnector(target, options)
+	return newNativeEngineQUICConnectorWithProvider(provider, target, options, requestedBackend)
 }
 
 type nativeEngineQUICConnector struct {
+	provider         trevrpcc.Provider
 	endpoint         native.EndpointConfig
 	engineConfig     native.EngineConfig
 	credentials      *TransportCredentials
-	maxFrameSize     int
 	requestedBackend TransportBackend
 }
 
-func newNativeEngineQUICConnector(
+func newNativeEngineQUICConnectorWithProvider(
+	provider trevrpcc.Provider,
 	target string,
 	options DialOptions,
+	requestedBackend TransportBackend,
 ) (*nativeEngineQUICConnector, error) {
-	if options.TLSConfig != nil || options.QUICConfig != nil || len(options.WebTransport.RequestHeader) != 0 {
-		return nil, InvalidArgument("native dial does not accept legacy TLSConfig, QUICConfig, or RequestHeader")
-	}
-	if !native.Available() {
+	if !native.Available() || provider == nil {
 		return nil, nativeBackendUnavailable()
 	}
 	if strings.HasPrefix(target, "https://") {
@@ -59,7 +61,6 @@ func newNativeEngineQUICConnector(
 		return nil, InvalidArgument("unsupported dial target scheme " + scheme)
 	}
 	if len(options.WebTransport.RequestHeaders) != 0 ||
-		len(options.WebTransport.ApplicationProtocols) != 0 ||
 		options.WebTransport.StreamReorderingTimeout != 0 {
 		return nil, InvalidArgument("native QUIC dial does not accept WebTransport options")
 	}
@@ -92,40 +93,40 @@ func newNativeEngineQUICConnector(
 	engineConfig := native.DefaultEngineConfig()
 	engineConfig.ListenerCapacity = 1
 	engineConfig.ConnectionCapacity = 1
-	if engineConfig.MaxReceiveOwnedBytes < endpoint.MaxFrameSize {
-		engineConfig.MaxReceiveOwnedBytes = endpoint.MaxFrameSize
+	minimumReceiveOwnedBytes := nativeEndpointReceiveOwnedBytes(endpoint)
+	if engineConfig.MaxReceiveOwnedBytes < minimumReceiveOwnedBytes {
+		engineConfig.MaxReceiveOwnedBytes = minimumReceiveOwnedBytes
 	}
 	return &nativeEngineQUICConnector{
+		provider:         provider,
 		endpoint:         endpoint,
 		engineConfig:     engineConfig,
 		credentials:      credentials,
-		maxFrameSize:     maxFrameSize,
-		requestedBackend: options.Backend,
+		requestedBackend: requestedBackend,
 	}, nil
 }
 
 func (c *nativeEngineQUICConnector) Connect(
 	ctx context.Context,
-) (channelGeneration, error) {
-	engine, err := native.NewEngine(c.engineConfig)
+) (BackendConnection, error) {
+	engine, err := native.NewEngine(c.provider, c.engineConfig)
 	if err != nil {
-		return nil, nativeTransportOrContextStatus(ctx, err)
+		return BackendConnection{}, nativeTransportOrContextStatus(ctx, err)
 	}
-	return connectNativeGeneration(
+	return connectNativeBackend(
 		ctx,
 		engine,
 		c.endpoint,
 		c.credentials,
-		c.maxFrameSize,
 		c.requestedBackend,
 	)
 }
 
 type nativeWebTransportConnector struct {
+	provider         trevrpcc.Provider
 	endpoint         native.EndpointConfig
 	engineConfig     native.EngineConfig
 	credentials      *TransportCredentials
-	maxFrameSize     int
 	requestedBackend TransportBackend
 }
 
@@ -133,14 +134,22 @@ func newNativeWebTransportConnector(
 	target string,
 	options DialOptions,
 ) (*nativeWebTransportConnector, error) {
-	if options.TLSConfig != nil || options.QUICConfig != nil || len(options.WebTransport.RequestHeader) != 0 {
-		return nil, InvalidArgument("native WebTransport dial does not accept legacy TLSConfig, QUICConfig, or RequestHeader")
-	}
-	if !native.Available() {
+	return newNativeWebTransportConnectorWithProvider(
+		defaultNativeProvider(),
+		target,
+		options,
+		TransportBackendAuto,
+	)
+}
+
+func newNativeWebTransportConnectorWithProvider(
+	provider trevrpcc.Provider,
+	target string,
+	options DialOptions,
+	requestedBackend TransportBackend,
+) (*nativeWebTransportConnector, error) {
+	if !native.Available() || provider == nil {
 		return nil, nativeBackendUnavailable()
-	}
-	if len(options.WebTransport.ApplicationProtocols) != 0 {
-		return nil, InvalidArgument("native WebTransport dial does not support application protocols")
 	}
 	origin, err := nativeWebTransportOrigin(options.WebTransport.RequestHeaders)
 	if err != nil {
@@ -203,46 +212,46 @@ func newNativeWebTransportConnector(
 			return nil, err
 		}
 	}
+	ensureNativeTransportReceiveBudget(&endpoint)
 	engineConfig := native.DefaultEngineConfig()
 	engineConfig.ListenerCapacity = 1
 	engineConfig.ConnectionCapacity = 1
-	if engineConfig.MaxReceiveOwnedBytes < endpoint.MaxFrameSize {
-		engineConfig.MaxReceiveOwnedBytes = endpoint.MaxFrameSize
+	minimumReceiveOwnedBytes := nativeEndpointReceiveOwnedBytes(endpoint)
+	if engineConfig.MaxReceiveOwnedBytes < minimumReceiveOwnedBytes {
+		engineConfig.MaxReceiveOwnedBytes = minimumReceiveOwnedBytes
 	}
 	return &nativeWebTransportConnector{
+		provider:         provider,
 		endpoint:         endpoint,
 		engineConfig:     engineConfig,
 		credentials:      credentials,
-		maxFrameSize:     maxFrameSize,
-		requestedBackend: options.Backend,
+		requestedBackend: requestedBackend,
 	}, nil
 }
 
 func (c *nativeWebTransportConnector) Connect(
 	ctx context.Context,
-) (channelGeneration, error) {
-	engine, err := native.NewTransport(c.engineConfig)
+) (BackendConnection, error) {
+	engine, err := native.NewTransport(c.provider, c.engineConfig)
 	if err != nil {
-		return nil, nativeTransportOrContextStatus(ctx, err)
+		return BackendConnection{}, nativeTransportOrContextStatus(ctx, err)
 	}
-	return connectNativeGeneration(
+	return connectNativeBackend(
 		ctx,
 		engine,
 		c.endpoint,
 		c.credentials,
-		c.maxFrameSize,
 		c.requestedBackend,
 	)
 }
 
-func connectNativeGeneration(
+func connectNativeBackend(
 	ctx context.Context,
 	engine *native.Engine,
 	endpoint native.EndpointConfig,
 	credentials *TransportCredentials,
-	maxFrameSize int,
 	requestedBackend TransportBackend,
-) (channelGeneration, error) {
+) (BackendConnection, error) {
 	endpoint, cleanup, err := materializeNativeCredentials(
 		endpoint,
 		credentials,
@@ -250,28 +259,56 @@ func connectNativeGeneration(
 	)
 	if err != nil {
 		_ = engine.Close()
-		return nil, err
+		return BackendConnection{}, err
 	}
 	connection, dialErr := engine.Dial(ctx, endpoint)
 	cleanupErr := cleanup()
 	if dialErr != nil || cleanupErr != nil {
 		_ = engine.Close()
 		if dialErr != nil {
-			return nil, nativeTransportOrContextStatus(ctx, dialErr)
+			return BackendConnection{}, nativeTransportOrContextStatus(ctx, dialErr)
 		}
-		return nil, Internal("remove native credential files: " + cleanupErr.Error())
+		return BackendConnection{}, Internal("remove native credential files: " + cleanupErr.Error())
 	}
 
-	return &nativeEngineQUICGeneration{
-		engine:           engine,
-		connection:       connection,
+	wrapped := &nativeBackendEndpoint{
+		Connection:       connection,
 		requestedBackend: requestedBackend,
-		client: newTransportStreamClient(
-			connection,
-			maxFrameSize,
-			nativeTransportOrContextStatus,
-		),
+	}
+	var closeOnce sync.Once
+	var closeErr error
+	return BackendConnection{
+		Endpoint: wrapped,
+		Close: func() error {
+			closeOnce.Do(func() {
+				var connectionErr error
+				select {
+				case <-connection.Done():
+				default:
+					connectionErr = connection.Close(TransportCloseReason{
+						Local:   true,
+						Clean:   true,
+						Message: "client closed",
+					})
+				}
+				closeErr = errors.Join(connectionErr, engine.Close())
+			})
+			return closeErr
+		},
+		MapStatus:   nativeTransportOrContextStatus,
+		CloseReason: nativeCloseReason,
 	}, nil
+}
+
+type nativeBackendEndpoint struct {
+	transportinternal.Connection
+	requestedBackend TransportBackend
+}
+
+func (e *nativeBackendEndpoint) Info() ConnectionInfo {
+	info := e.Connection.Info()
+	info.RequestedBackend = e.requestedBackend
+	return info
 }
 
 func nativeWebTransportOrigin(headers HeaderFields) (string, error) {
@@ -291,302 +328,13 @@ func nativeWebTransportOrigin(headers HeaderFields) (string, error) {
 	return origin, nil
 }
 
-type nativeEngineQUICGeneration struct {
-	engine           *native.Engine
-	connection       *native.Connection
-	client           *transportStreamClient
-	requestedBackend TransportBackend
-	closeOnce        sync.Once
-	closeErr         error
-}
-
-func (g *nativeEngineQUICGeneration) Call(
-	ctx context.Context,
-	request *RpcRequest,
-) (*RpcResponse, error) {
-	return g.client.Call(ctx, request)
-}
-
-func (g *nativeEngineQUICGeneration) StreamingCall(
-	ctx context.Context,
-	request *RpcRequest,
-	requestBody ByteStream,
-) (FrameStream, error) {
-	return g.client.StreamingCall(ctx, request, requestBody)
-}
-
-func (g *nativeEngineQUICGeneration) Close() error {
-	if g == nil {
-		return nil
-	}
-	g.closeOnce.Do(func() {
-		var connectionErr error
-		select {
-		case <-g.connection.Done():
-		default:
-			connectionErr = g.connection.Close(TransportCloseReason{
-				Local:   true,
-				Clean:   true,
-				Message: "client closed",
-			})
-		}
-		g.closeErr = errors.Join(connectionErr, g.engine.Close())
-	})
-	return g.closeErr
-}
-
-func (g *nativeEngineQUICGeneration) Done() <-chan struct{} {
-	return g.connection.Done()
-}
-
-func (g *nativeEngineQUICGeneration) Err() error {
-	return g.connection.Err()
-}
-
-func (g *nativeEngineQUICGeneration) Info() ConnectionInfo {
-	info := g.connection.Info()
-	info.RequestedBackend = g.requestedBackend
-	return info
-}
-
-func (g *nativeEngineQUICGeneration) CloseReason(err error) TransportCloseReason {
-	return nativeCloseReason(err)
-}
-
-func (g *nativeEngineQUICGeneration) releaseDisconnected() {
-	_ = g.Close()
-}
-
 func nativeServerAdmissionHandler(server *Server) native.AdmissionHandler {
 	runtime := server.freeze()
-	return func(request native.AdmissionRequest) uint16 {
-		headers := make(HeaderFields, len(request.Headers))
-		for index, header := range request.Headers {
-			headers[index] = HeaderField{Name: header.Name, Value: header.Value}
-		}
-		switch request.Kind {
-		case native.AdmissionHTTP3:
-			if !runtime.options.EnableHTTP3 || request.Path != http3Path(runtime.options) {
-				return http.StatusNotFound
-			}
-			if request.Method != http.MethodPost {
-				return http.StatusMethodNotAllowed
-			}
-			if !isTrevRPCMediaType(headerFieldValues(headers, "Content-Type")) {
-				return http.StatusUnsupportedMediaType
-			}
-			admitted, err := runtime.invokeHTTP3Admission(HTTP3AdmissionRequest{
-				Headers:   headers,
-				Path:      request.Path,
-				Method:    request.Method,
-				Authority: request.Authority,
-				Secure:    request.Secure,
-			})
-			if err != nil {
-				if errors.Is(err, errAdmissionSaturated) {
-					return http.StatusServiceUnavailable
-				}
-				return http.StatusInternalServerError
-			}
-			if !admitted {
-				return http.StatusForbidden
-			}
-			return http.StatusOK
-		case native.AdmissionWebTransport:
-			if !runtime.options.EnableWebTransport || request.Path != http3Path(runtime.options) {
-				return http.StatusNotFound
-			}
-			admitted, err := runtime.invokeWebTransportAdmission(WebTransportAdmissionRequest{
-				Headers:   headers,
-				Path:      request.Path,
-				Authority: request.Authority,
-				Origin:    request.Origin,
-				Secure:    request.Secure,
-			})
-			if err != nil {
-				if errors.Is(err, errAdmissionSaturated) {
-					return http.StatusServiceUnavailable
-				}
-				return http.StatusInternalServerError
-			}
-			if !admitted {
-				return http.StatusForbidden
-			}
-			return http.StatusOK
-		default:
-			return http.StatusInternalServerError
-		}
-	}
-}
-
-type nativeQUICServerListener struct {
-	engine   *native.Engine
-	listener *native.Listener
-	server   *Server
-
-	mu        sync.Mutex
-	serving   bool
-	closeOnce sync.Once
-	closeErr  error
-}
-
-func newNativeQUICServerListener(
-	addr string,
-	server *Server,
-	options ListenOptions,
-) (ServerListener, error) {
-	if options.TLSConfig != nil || options.QUICConfig != nil {
-		return nil, InvalidArgument("native listener does not accept legacy TLSConfig or QUICConfig")
-	}
-	if !native.Available() {
-		return nil, nativeBackendUnavailable()
-	}
-	credentials := cloneTransportCredentials(options.Credentials)
-	if err := validateNativeServerCredentials(credentials); err != nil {
-		return nil, err
-	}
-
-	runtime := server.freeze()
-	serverOptions := runtime.options
-	host, port, err := splitNativeAddress(addr, true)
-	if err != nil {
-		return nil, err
-	}
-	endpoint, err := nativeServerEndpointConfig(
-		host,
-		port,
-		serverOptions,
-		options.Transport,
-		options.Limits,
-	)
-	if err != nil {
-		return nil, err
-	}
-	engineConfig, err := nativeServerEngineConfig(serverOptions, endpoint.MaxFrameSize)
-	if err != nil {
-		return nil, err
-	}
-	openRuntime := native.NewEngine
-	if endpoint.Protocol == native.ProtocolMultiplexed {
-		endpoint.Admission = nativeServerAdmissionHandler(server)
-		openRuntime = native.NewTransport
-	}
-	engine, err := openRuntime(engineConfig)
-	if err != nil {
-		return nil, nativeTransportStatus(err)
-	}
-	endpoint, cleanup, err := materializeNativeCredentials(endpoint, credentials, true)
-	if err != nil {
-		_ = engine.Close()
-		return nil, err
-	}
-	listener, listenErr := engine.Listen(context.Background(), endpoint)
-	cleanupErr := cleanup()
-	if listenErr != nil || cleanupErr != nil {
-		_ = engine.Close()
-		if listenErr != nil {
-			return nil, nativeTransportStatus(listenErr)
-		}
-		return nil, Internal("remove native credential files: " + cleanupErr.Error())
-	}
-	return &nativeQUICServerListener{
-		engine:   engine,
-		listener: listener,
-		server:   server,
-	}, nil
-}
-
-func (l *nativeQUICServerListener) Addr() net.Addr {
-	address := l.listener.Address()
-	return transportStringAddress{network: address.Network, value: address.String()}
-}
-
-func (l *nativeQUICServerListener) Serve(ctx context.Context) error {
-	l.mu.Lock()
-	if l.serving {
-		l.mu.Unlock()
-		return InvalidArgument("native listener is already serving")
-	}
-	l.serving = true
-	l.mu.Unlock()
-
-	defer func() { _ = l.engine.Close() }()
-	return serveTransportListener(
-		ctx,
-		l.listener,
-		l.server,
-		func(
-			connectionsCtx context.Context,
-			connection transportinternal.Connection,
-			server *Server,
-			requestLimit semaphore,
-		) {
-			handleNativeServerConnection(
-				connectionsCtx,
-				connection,
-				server,
-				requestLimit,
-			)
-		},
-		nativeListenerClosed,
-		nativeTransportStatus,
-	)
-}
-
-func handleNativeServerConnection(
-	ctx context.Context,
-	connection transportinternal.Connection,
-	server *Server,
-	requestLimit semaphore,
-) {
-	switch connection.Info().Protocol {
-	case transportinternal.ProtocolNativeQUIC:
-		handleTransportConnection(ctx, connection, server, requestLimit, true)
-	case transportinternal.ProtocolHTTP3:
-		handleTransportStreamEndpoint(
-			ctx,
-			connection,
-			server,
-			requestLimit,
-			transportStreamEndpointOptions{
-				overloadMessage:     "too many concurrent HTTP/3 requests",
-				drainTimeoutMessage: "server HTTP/3 request drain timed out",
-				closeOnShutdown:     true,
-				shutdownMessage:     "server drained HTTP/3 request",
-			},
-		)
-	case transportinternal.ProtocolWebTransport:
-		handleWebTransportSession(ctx, connection, server, requestLimit)
-	default:
-		_ = connection.Close(TransportCloseReason{
-			Local:   true,
-			Message: "unsupported native transport protocol",
-		})
-	}
-}
-
-func (l *nativeQUICServerListener) Close() error {
-	if l == nil {
-		return nil
-	}
-	l.closeOnce.Do(func() {
-		select {
-		case <-l.engine.Done():
-			l.closeErr = l.engine.Err()
-			return
-		default:
-		}
-		listenerErr := l.listener.Close()
-		l.mu.Lock()
-		serving := l.serving
-		l.mu.Unlock()
-		if serving {
-			l.closeErr = listenerErr
-			return
-		}
-		l.closeErr = errors.Join(listenerErr, l.engine.Close())
+	return nativeBackendAdmissionHandler(BackendListenOptions{
+		Server:            backendServerOptions(runtime.options),
+		AdmitHTTP3:        runtime.invokeHTTP3Admission,
+		AdmitWebTransport: runtime.invokeWebTransportAdmission,
 	})
-	return l.closeErr
 }
 
 func nativeListenerClosed(err error) bool {
@@ -654,9 +402,8 @@ func nativeServerEndpointConfig(
 		if !options.EnableWebTransport {
 			endpoint.WebTransportProfiles = 0
 			endpoint.MaxSessions = 0
-		} else if options.WebTransportDraft07Only {
-			endpoint.WebTransportProfiles = native.WebTransportProfileDraft07
 		}
+		ensureNativeTransportReceiveBudget(&endpoint)
 	}
 
 	serverLimits := transportLimitsFromServerOptions(options)
@@ -716,9 +463,29 @@ func applyNativeEndpointSettings(
 	return err
 }
 
+func ensureNativeTransportReceiveBudget(endpoint *native.EndpointConfig) {
+	minimum := saturatingAddUint64(
+		saturatingMulUint64(endpoint.MaxFrameSize, 2),
+		nativeTransportReceiveBudgetOverhead,
+	)
+	if endpoint.MaxPendingReceiveBytes < minimum {
+		endpoint.MaxPendingReceiveBytes = minimum
+	}
+}
+
+func nativeEndpointReceiveOwnedBytes(endpoint native.EndpointConfig) uint64 {
+	return max(
+		endpoint.MaxFrameSize,
+		endpoint.MaxPendingReceiveBytes,
+		endpoint.UnresolvedStreamBytes,
+		uint64(endpoint.StreamReceiveWindow),
+		uint64(endpoint.ConnectionFlowControlWindow),
+	)
+}
+
 func nativeServerEngineConfig(
 	options ServerOptions,
-	maxFrameSize uint64,
+	minimumReceiveOwnedBytes uint64,
 ) (native.EngineConfig, error) {
 	config := native.DefaultEngineConfig()
 	config.ListenerCapacity = 1
@@ -735,8 +502,8 @@ func nativeServerEngineConfig(
 	}
 	config.ConnectionCapacity = connectionCapacity
 	config.StreamCapacity = streamCapacity
-	if config.MaxReceiveOwnedBytes < maxFrameSize {
-		config.MaxReceiveOwnedBytes = maxFrameSize
+	if config.MaxReceiveOwnedBytes < minimumReceiveOwnedBytes {
+		config.MaxReceiveOwnedBytes = minimumReceiveOwnedBytes
 	}
 	return config, nil
 }
@@ -967,7 +734,6 @@ func nativeCloseReason(err error) TransportCloseReason {
 }
 
 var (
-	_ channelConnector  = (*nativeEngineQUICConnector)(nil)
-	_ channelGeneration = (*nativeEngineQUICGeneration)(nil)
-	_ ServerListener    = (*nativeQUICServerListener)(nil)
+	_ BackendConnector = (*nativeEngineQUICConnector)(nil)
+	_ BackendConnector = (*nativeWebTransportConnector)(nil)
 )

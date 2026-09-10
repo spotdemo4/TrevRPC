@@ -2,7 +2,6 @@ package benchutil
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -11,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 )
 
@@ -21,50 +18,57 @@ const (
 	keepAlive   = 5 * time.Second
 )
 
-// QUICConfig returns the common long-lived benchmark connection settings.
-func QUICConfig() *quic.Config {
-	return &quic.Config{MaxIdleTimeout: idleTimeout, KeepAlivePeriod: keepAlive}
-}
-
 // ListenHTTP3 starts an HTTP/3-only TrevRPC listener.
 func ListenHTTP3(addr, certFile, keyFile string, server *trevrpc.Server) (trevrpc.ServerListener, error) {
-	return listenQUIC(addr, certFile, keyFile, http3.NextProtoH3, "HTTP/3", server)
+	return listenQUIC(addr, certFile, keyFile, "HTTP/3", server)
 }
 
 // ListenNativeQUIC starts a native TrevRPC listener with the supplied identity.
 func ListenNativeQUIC(addr, certFile, keyFile string, server *trevrpc.Server) (trevrpc.ServerListener, error) {
-	return listenQUIC(addr, certFile, keyFile, trevrpc.ALPN, "quic", server)
+	return listenQUIC(addr, certFile, keyFile, "quic", server)
 }
 
 func listenQUIC(
-	addr, certFile, keyFile, protocol, serverKind string,
+	addr, certFile, keyFile, serverKind string,
 	server *trevrpc.Server,
 ) (trevrpc.ServerListener, error) {
-	if certFile == "" || keyFile == "" {
-		return nil, fmt.Errorf("%s server requires -cert and -key", serverKind)
-	}
-	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	credentials, err := loadServerCredentials(certFile, keyFile, serverKind)
 	if err != nil {
 		return nil, err
 	}
 	return trevrpc.Listen(addr, server, trevrpc.ListenOptions{
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{certificate},
-			MinVersion:   tls.VersionTLS13,
-			NextProtos:   []string{protocol},
+		Transport: benchmarkTransportConfig(),
+		Limits: trevrpc.TransportLimits{
+			ConnectionReceiveWindow: 256 * 1024 * 1024,
 		},
-		QUICConfig: QUICConfig(),
+		Credentials: credentials,
 	})
 }
 
-// VerifiedClientTLSConfig trusts certFile and verifies the host in address.
-func VerifiedClientTLSConfig(certFile, address string) (*tls.Config, error) {
-	return VerifiedClientTLSConfigForProtocol(certFile, address, trevrpc.ALPN)
+func benchmarkTransportConfig() trevrpc.TransportConfig {
+	return trevrpc.TransportConfig{MaxIdleTimeout: idleTimeout, KeepAlive: keepAlive}
 }
 
-// VerifiedClientTLSConfigForProtocol trusts certFile, verifies the address host,
-// and negotiates protocol over TLS.
-func VerifiedClientTLSConfigForProtocol(certFile, address, protocol string) (*tls.Config, error) {
+func loadServerCredentials(certFile, keyFile, serverKind string) (*trevrpc.TransportCredentials, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("%s server requires -cert and -key", serverKind)
+	}
+	certificate, err := os.ReadFile(certFile)
+	if err != nil {
+		return nil, err
+	}
+	privateKey, err := os.ReadFile(keyFile)
+	if err != nil {
+		return nil, err
+	}
+	return &trevrpc.TransportCredentials{
+		CertificateChainPEM: certificate,
+		PrivateKeyPEM:       privateKey,
+	}, nil
+}
+
+// VerifiedClientCredentials trusts certFile and validates the native dial address.
+func VerifiedClientCredentials(certFile, address string) (*trevrpc.TransportCredentials, error) {
 	if certFile == "" {
 		return nil, errors.New("client requires certificate")
 	}
@@ -86,24 +90,19 @@ func VerifiedClientTLSConfigForProtocol(certFile, address, protocol string) (*tl
 	if host == "" {
 		return nil, errors.New("server address has an empty host")
 	}
-	return &tls.Config{
-		RootCAs:    roots,
-		ServerName: host,
-		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{protocol},
-	}, nil
+	return &trevrpc.TransportCredentials{RootCAPEM: certificatePEM}, nil
 }
 
-// DialNativeQUIC establishes one caller-owned native TrevRPC connection.
-func DialNativeQUIC(ctx context.Context, address string, tlsConfig *tls.Config) (*trevrpc.RawQUICClient, error) {
-	return DialNativeQUICWithMaxFrameSize(ctx, address, tlsConfig, trevrpc.DefaultMaxFrameSize)
+// DialNativeQUIC establishes one caller-owned native TrevRPC channel.
+func DialNativeQUIC(ctx context.Context, address string, credentials *trevrpc.TransportCredentials) (*trevrpc.Channel, error) {
+	return DialNativeQUICWithMaxFrameSize(ctx, address, credentials, trevrpc.DefaultMaxFrameSize)
 }
 
-// DialNativeQUICWithMaxFrameSize establishes one connection with an explicit frame limit.
-func DialNativeQUICWithMaxFrameSize(ctx context.Context, address string, tlsConfig *tls.Config, maxFrameSize int) (*trevrpc.RawQUICClient, error) {
-	connection, err := quic.DialAddr(ctx, address, tlsConfig, trevrpc.QUICClientConfig(maxFrameSize, QUICConfig()))
-	if err != nil {
-		return nil, err
-	}
-	return trevrpc.Advanced.NewRawQUICClient(connection).WithMaxFrameSize(maxFrameSize), nil
+// DialNativeQUICWithMaxFrameSize establishes one channel with an explicit frame limit.
+func DialNativeQUICWithMaxFrameSize(ctx context.Context, address string, credentials *trevrpc.TransportCredentials, maxFrameSize int) (*trevrpc.Channel, error) {
+	return trevrpc.Dial(ctx, address, trevrpc.DialOptions{
+		Transport:    benchmarkTransportConfig(),
+		Credentials:  credentials,
+		MaxFrameSize: maxFrameSize,
+	})
 }

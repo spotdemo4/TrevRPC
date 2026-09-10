@@ -1,4 +1,4 @@
-#include "trevrpc_transport.h"
+#include "trevrpc_transport_provider.h"
 
 #include <cerrno>
 #include <cstddef>
@@ -56,6 +56,12 @@ OFFSET(trevrpc_transport_diagnostics_v1, provider_error_code, 168);
 
 SIGNATURE(trevrpc_transport_abi_version, std::uint32_t (*)(void));
 SIGNATURE(trevrpc_transport_abi_1_anchor, void (*)(void));
+SIGNATURE(trevrpc_transport_provider_abi_version, std::uint32_t (*)(void));
+SIGNATURE(trevrpc_transport_provider_abi_1_anchor, void (*)(void));
+SIGNATURE(
+    trevrpc_transport_provider_descriptor_v1_init, int (*)(trevrpc_transport_provider_descriptor_v1*, std::size_t));
+SIGNATURE(
+    trevrpc_transport_provider_adopt_v1, int (*)(const trevrpc_transport_provider_descriptor_v1*, trevrpc_transport**));
 SIGNATURE(trevrpc_transport_config_v1_init, int (*)(trevrpc_transport_config_v1*, std::size_t));
 SIGNATURE(trevrpc_transport_endpoint_config_v1_init, int (*)(trevrpc_transport_endpoint_config_v1*, std::size_t));
 SIGNATURE(trevrpc_transport_wake_source_v1_init, int (*)(trevrpc_transport_wake_source_v1*, std::size_t));

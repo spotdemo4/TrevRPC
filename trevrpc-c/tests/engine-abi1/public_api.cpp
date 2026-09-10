@@ -1,4 +1,4 @@
-#include "trevrpc_engine.h"
+#include "trevrpc_engine_provider.h"
 
 #include <cerrno>
 #include <cstddef>
@@ -28,6 +28,11 @@ static_assert(std::is_standard_layout_v<trevrpc_engine_diagnostics_v1>);
 int main() {
     auto* abi_version = &trevrpc_engine_abi_version;
     auto* anchor = &trevrpc_engine_abi_1_anchor;
+    auto* provider_abi_version = &trevrpc_engine_provider_abi_version;
+    auto* provider_anchor = &trevrpc_engine_provider_abi_1_anchor;
+    auto* provider_descriptor_init = &trevrpc_engine_provider_descriptor_v1_init;
+    auto* provider_host = &trevrpc_engine_provider_host_v1_get;
+    auto* provider_adopt = &trevrpc_engine_provider_adopt_v1;
     auto* listen = &trevrpc_engine_listen_v1;
     auto* dial = &trevrpc_engine_dial_v1;
     auto* open_stream = &trevrpc_engine_connection_open_bidi_stream_v1;
@@ -40,9 +45,12 @@ int main() {
     trevrpc_engine_config_v1 config{};
     trevrpc_engine_endpoint_config_v1 endpoint{};
     anchor();
-    if (abi_version() != 1u || listen == nullptr || dial == nullptr || open_stream == nullptr || send == nullptr ||
-        receive == nullptr || abort_receive == nullptr || abort_send == nullptr || next == nullptr ||
-        release == nullptr || trevrpc_engine_config_v1_init(&config, sizeof(config)) != 0 ||
+    provider_anchor();
+    if (abi_version() != 1u || provider_abi_version() != 1u || provider_descriptor_init == nullptr ||
+        provider_host == nullptr || provider_adopt == nullptr || listen == nullptr || dial == nullptr ||
+        open_stream == nullptr || send == nullptr || receive == nullptr || abort_receive == nullptr ||
+        abort_send == nullptr || next == nullptr || release == nullptr ||
+        trevrpc_engine_config_v1_init(&config, sizeof(config)) != 0 ||
         trevrpc_engine_endpoint_config_v1_init(&endpoint, sizeof(endpoint)) != 0 ||
         config.event_capacity != TREVRPC_ENGINE_DEFAULT_EVENT_CAPACITY ||
         config.listener_capacity != TREVRPC_ENGINE_DEFAULT_LISTENER_CAPACITY ||

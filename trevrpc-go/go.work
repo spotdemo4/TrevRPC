@@ -1,0 +1,14 @@
+go 1.26.0
+
+use (
+	.
+	../trevrpc-c
+	../trevrpc-c/provider/msquic
+	./quic-go
+)
+
+replace trev.zip/llc/trevrpc/trevrpc-go v0.3.0 => .
+
+replace trev.zip/llc/trevrpc/trevrpc-c v0.3.0 => ../trevrpc-c
+
+replace trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2 v2.6.0-trevrpc.1 => ../trevrpc-c/provider/msquic

@@ -2,14 +2,10 @@ package trevrpc
 
 import (
 	"context"
-	"crypto/tls"
 	"math/rand/v2"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -17,9 +13,6 @@ const (
 	defaultReconnectMaxBackoff     = 30 * time.Second
 	defaultReconnectMultiplier     = 2
 	defaultReconnectJitter         = 0.2
-	defaultChannelSessionCache     = 64
-	defaultChannelTokenOrigins     = 32
-	defaultChannelTokensPerOrigin  = 4
 	channelEventQueueCapacity      = 64
 )
 
@@ -118,9 +111,9 @@ type Channel struct {
 	events     *channelEventDispatcher
 }
 
-// Dial establishes the initial connection and returns a reconnecting Channel. A
-// target with an https URL uses WebTransport; other targets use native QUIC.
-// The context applies only to the initial dial; Close controls the Channel.
+// Dial establishes a reconnecting Channel with the built-in native C backend.
+// An https target uses WebTransport; other targets use native QUIC. The context
+// applies only to the initial dial; Close controls the Channel.
 func Dial(ctx context.Context, target string, options DialOptions) (*Channel, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
@@ -129,29 +122,82 @@ func Dial(ctx context.Context, target string, options DialOptions) (*Channel, er
 	if err != nil {
 		return nil, err
 	}
+	return dialChannel(ctx, connector, options.OnEvent)
+}
+
+// DialWithBackend establishes a reconnecting Channel with an explicit optional backend.
+// Backend packages normally wrap this function with their own typed options.
+func DialWithBackend(
+	ctx context.Context,
+	target string,
+	options DialOptions,
+	backend DialBackend,
+) (*Channel, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
+	}
+	connector, err := newBackendChannelConnector(target, options, backend)
+	if err != nil {
+		return nil, err
+	}
+	return dialChannel(ctx, connector, options.OnEvent)
+}
+
+func dialChannel(
+	ctx context.Context,
+	connector channelConnector,
+	onEvent func(ChannelEvent),
+) (*Channel, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, statusFromContextError(err)
+	}
 	initial, err := connector.Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	return newChannel(initial, connector, realReconnectClock{}, defaultReconnectConfig(), rand.Float64, options.OnEvent), nil
+	return newChannel(initial, connector, realReconnectClock{}, defaultReconnectConfig(), rand.Float64, onEvent), nil
 }
 
 func newChannelConnector(target string, options DialOptions) (channelConnector, error) {
-	backend, err := resolveTransportBackend(options.Backend)
+	return newBackendChannelConnector(
+		target,
+		options,
+		defaultNativeBackend(),
+	)
+}
+
+func newBackendChannelConnector(
+	target string,
+	options DialOptions,
+	backend DialBackend,
+) (channelConnector, error) {
+	if backend == nil {
+		return nil, InvalidArgument("dial backend is nil")
+	}
+	if _, err := resolveExplicitBackend(backend.Backend()); err != nil {
+		return nil, err
+	}
+	maxFrameSize := options.MaxFrameSize
+	if maxFrameSize <= 0 {
+		maxFrameSize = DefaultMaxFrameSize
+	}
+	connector, err := backend.NewConnector(target, BackendDialOptions{
+		Transport:    options.Transport,
+		Limits:       options.Limits,
+		Credentials:  cloneTransportCredentials(options.Credentials),
+		MaxFrameSize: maxFrameSize,
+		WebTransport: cloneWebTransportOptions(options.WebTransport),
+	})
 	if err != nil {
 		return nil, err
 	}
-	if backend == TransportBackendNative {
-		return newNativeChannelConnector(target, options)
+	if connector == nil {
+		return nil, InvalidArgument("dial backend returned a nil connector")
 	}
-	if strings.HasPrefix(target, "https://") {
-		return newWebTransportChannelConnector(target, options)
-	}
-	if scheme, _, ok := strings.Cut(target, "://"); ok {
-		return nil, InvalidArgument("unsupported dial target scheme " + scheme)
-	}
-	return newNativeQUICConnector(target, options)
+	return backendChannelConnector{
+		connector:    connector,
+		maxFrameSize: maxFrameSize,
+	}, nil
 }
 
 // Ready reports whether new calls can snapshot a ready connection generation.
@@ -438,109 +484,92 @@ func generationCloseReason(
 	return generation.CloseReason(err)
 }
 
-type nativeQUICGeneration struct {
-	client   *RawQUICClient
-	endpoint *legacyQUICConnection
-}
-
-func (g *nativeQUICGeneration) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
-	return g.client.Call(ctx, request)
-}
-
-func (g *nativeQUICGeneration) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
-	return g.client.StreamingCall(ctx, request, requestBody)
-}
-
-func (g *nativeQUICGeneration) Close() error {
-	return g.client.Close()
-}
-
-func (g *nativeQUICGeneration) Done() <-chan struct{} {
-	return g.endpoint.Done()
-}
-
-func (g *nativeQUICGeneration) Err() error {
-	return g.endpoint.Err()
-}
-
-func (g *nativeQUICGeneration) Info() ConnectionInfo {
-	return g.endpoint.Info()
-}
-
-func (g *nativeQUICGeneration) CloseReason(err error) TransportCloseReason {
-	return legacyQUICCloseReason(err)
-}
-
-func (g *nativeQUICGeneration) AddPath(transport *quic.Transport) (*quic.Path, error) {
-	return g.endpoint.conn.AddPath(transport)
-}
-
 type channelConnector interface {
 	Connect(context.Context) (channelGeneration, error)
 }
 
-type nativeQUICConnector struct {
-	addr             string
-	tlsConfig        *tls.Config
-	quicConfig       *quic.Config
-	maxFrameSize     int
-	requestedBackend TransportBackend
+type backendChannelConnector struct {
+	connector    BackendConnector
+	maxFrameSize int
 }
 
-func newNativeQUICConnector(addr string, options DialOptions) (*nativeQUICConnector, error) {
-	backend, err := resolveTransportBackend(options.Backend)
+func (c backendChannelConnector) Connect(ctx context.Context) (channelGeneration, error) {
+	connection, err := c.connector.Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if backend == TransportBackendNative {
-		if options.TLSConfig != nil || options.QUICConfig != nil {
-			return nil, InvalidArgument("native dial does not accept legacy TLSConfig or QUICConfig")
+	if connection.Endpoint == nil {
+		if connection.Close != nil {
+			_ = connection.Close()
 		}
-		return nil, nativeBackendUnavailable()
+		return nil, InvalidArgument("dial backend returned a nil endpoint")
 	}
-	tlsConfig, err := legacyClientTLSConfig(options.TLSConfig, cloneTransportCredentials(options.Credentials))
-	if err != nil {
-		return nil, err
-	}
-	if options.Credentials != nil {
-		tlsConfig.NextProtos = []string{ALPN}
-	}
-
-	maxFrameSize := options.MaxFrameSize
-	if maxFrameSize <= 0 {
-		maxFrameSize = DefaultMaxFrameSize
-	}
-	if tlsConfig.ClientSessionCache == nil {
-		tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(defaultChannelSessionCache)
-	}
-	quicConfig := QUICClientConfig(maxFrameSize, options.QUICConfig)
-	applyDefaultQUICTransportConfig(quicConfig, options.Transport)
-	applyQUICTransportLimits(quicConfig, options.Limits)
-	if quicConfig.TokenStore == nil {
-		quicConfig.TokenStore = quic.NewLRUTokenStore(defaultChannelTokenOrigins, defaultChannelTokensPerOrigin)
-	}
-
-	return &nativeQUICConnector{
-		addr:             addr,
-		tlsConfig:        tlsConfig,
-		quicConfig:       quicConfig,
-		maxFrameSize:     maxFrameSize,
-		requestedBackend: options.Backend,
+	return &backendChannelGeneration{
+		connection: connection,
+		client: newTransportStreamClient(
+			connection.Endpoint,
+			c.maxFrameSize,
+			connection.MapStatus,
+		),
 	}, nil
 }
 
-func (c *nativeQUICConnector) Connect(ctx context.Context) (channelGeneration, error) {
-	// DialAddr completes the handshake before returning, so RPC bytes are never sent as 0-RTT data.
-	conn, err := quic.DialAddr(ctx, c.addr, c.tlsConfig, c.quicConfig)
-	if err != nil {
-		return nil, transportOrContextStatus(ctx, err)
+type backendChannelGeneration struct {
+	connection BackendConnection
+	client     *transportStreamClient
+	closeOnce  sync.Once
+	closeErr   error
+}
+
+func (g *backendChannelGeneration) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+	return g.client.Call(ctx, request)
+}
+
+func (g *backendChannelGeneration) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+	return g.client.StreamingCall(ctx, request, requestBody)
+}
+
+func (g *backendChannelGeneration) Close() error {
+	g.closeOnce.Do(func() {
+		if g.connection.Close != nil {
+			g.closeErr = g.connection.Close()
+			return
+		}
+		g.closeErr = g.connection.Endpoint.Close(TransportCloseReason{
+			Local:   true,
+			Clean:   true,
+			Message: "client closed",
+		})
+	})
+	return g.closeErr
+}
+
+func (g *backendChannelGeneration) releaseDisconnected() {
+	_ = g.Close()
+}
+
+func (g *backendChannelGeneration) Done() <-chan struct{} {
+	return g.connection.Endpoint.Done()
+}
+
+func (g *backendChannelGeneration) Err() error {
+	return g.connection.Endpoint.Err()
+}
+
+func (g *backendChannelGeneration) Info() ConnectionInfo {
+	return g.connection.Endpoint.Info()
+}
+
+func (g *backendChannelGeneration) CloseReason(err error) TransportCloseReason {
+	if g.connection.CloseReason != nil {
+		return g.connection.CloseReason(err)
 	}
-	endpoint := newLegacyQUICConnection(conn, c.requestedBackend)
-	return &nativeQUICGeneration{
-		client: newRawQUICClientForEndpoint(conn, endpoint).
-			WithMaxFrameSize(c.maxFrameSize),
-		endpoint: endpoint,
-	}, nil
+	if mapper, ok := g.connection.Endpoint.(interface {
+		CloseReason(error) TransportCloseReason
+	}); ok {
+		return mapper.CloseReason(err)
+	}
+	return TransportCloseReason{Err: err, Message: errorString(err)}
 }
 
 type reconnectBackoff struct {

@@ -725,6 +725,126 @@ int trevrpc_engine_diagnostics_v1_init(trevrpc_engine_diagnostics_v1* diagnostic
     return trevrpc_engine_initialize_structure(diagnostics, struct_size, sizeof(*diagnostics));
 }
 
+static int trevrpc_engine_validate_provider_ops(const trevrpc_engine_provider_ops_v1* operations) {
+    if (operations == NULL || operations->struct_size < sizeof(*operations) || operations->close == NULL ||
+        operations->destroy == NULL) {
+        return -EINVAL;
+    }
+    if (operations->struct_version != TREVRPC_ENGINE_PROVIDER_STRUCT_VERSION_1) {
+        return -ENOTSUP;
+    }
+    return trevrpc_engine_u64_fields_zero(
+               operations->reserved, sizeof(operations->reserved) / sizeof(operations->reserved[0]))
+               ? 0
+               : -EINVAL;
+}
+
+static const trevrpc_engine_provider_runtime_v1 trevrpc_engine_provider_runtime = {
+    .struct_size = sizeof(trevrpc_engine_provider_runtime_v1),
+    .struct_version = TREVRPC_ENGINE_PROVIDER_STRUCT_VERSION_1,
+    .config_init = trevrpc_engine_config_v1_init,
+    .wake_source_init = trevrpc_engine_wake_source_v1_init,
+    .endpoint_config_init = trevrpc_engine_endpoint_config_v1_init,
+    .event_info_init = trevrpc_engine_event_info_v1_init,
+    .receive_info_init = trevrpc_engine_receive_info_v1_init,
+    .diagnostics_init = trevrpc_engine_diagnostics_v1_init,
+    .adopt = trevrpc_engine_provider_adopt_v1,
+    .get_wake_source = trevrpc_engine_get_wake_source_v1,
+    .next_event = trevrpc_engine_next_event,
+    .event_get_info = trevrpc_engine_event_get_info_v1,
+    .event_release = trevrpc_engine_event_release,
+    .receive_get_info = trevrpc_engine_receive_get_info_v1,
+    .receive_release = trevrpc_engine_receive_release,
+    .get_diagnostics = trevrpc_engine_get_diagnostics_v1,
+    .listen = trevrpc_engine_listen_v1,
+    .listener_get_port = trevrpc_engine_listener_get_port_v1,
+    .dial = trevrpc_engine_dial_v1,
+    .dial_cancel = trevrpc_engine_dial_cancel,
+    .connection_open_bidi_stream = trevrpc_engine_connection_open_bidi_stream_v1,
+    .stream_send_frame = trevrpc_engine_stream_send_frame_v1,
+    .stream_receive_frame = trevrpc_engine_stream_receive_frame,
+    .stream_finish_send = trevrpc_engine_stream_finish_send,
+    .stream_abort_receive = trevrpc_engine_stream_abort_receive,
+    .stream_abort_send = trevrpc_engine_stream_abort_send,
+    .stream_abort = trevrpc_engine_stream_abort,
+    .stream_close = trevrpc_engine_stream_close,
+    .connection_close = trevrpc_engine_connection_close,
+    .listener_close = trevrpc_engine_listener_close,
+    .close = trevrpc_engine_close,
+    .drain = trevrpc_engine_drain,
+    .release = trevrpc_engine_release,
+};
+
+static const trevrpc_engine_provider_host_v1 trevrpc_engine_provider_host = {
+    .struct_size = sizeof(trevrpc_engine_provider_host_v1),
+    .struct_version = TREVRPC_ENGINE_PROVIDER_STRUCT_VERSION_1,
+    .callback_enter = trevrpc_engine_provider_callback_enter,
+    .callback_leave = trevrpc_engine_provider_callback_leave,
+    .operation_pin = trevrpc_engine_provider_operation_pin,
+    .operation_unpin = trevrpc_engine_provider_operation_unpin,
+    .reserve_mandatory = trevrpc_engine_provider_reserve_mandatory,
+    .publish_reserved = trevrpc_engine_provider_publish_reserved,
+    .cancel_reservation = trevrpc_engine_provider_cancel_reservation,
+    .publish_event = trevrpc_engine_provider_publish_event,
+    .fail = trevrpc_engine_provider_fail,
+    .stopped = trevrpc_engine_provider_stopped,
+    .receive_create_copy = trevrpc_engine_receive_create_copy,
+    .receive_create_owned = trevrpc_engine_receive_create_owned,
+    .owner_cookie = trevrpc_engine_provider_owner_cookie,
+    .provider_context = trevrpc_engine_provider_context,
+    .runtime = &trevrpc_engine_provider_runtime,
+};
+
+uint32_t trevrpc_engine_provider_abi_version(void) {
+    return TREVRPC_ENGINE_PROVIDER_ABI_VERSION;
+}
+
+void trevrpc_engine_provider_abi_1_anchor(void) {
+}
+
+int trevrpc_engine_provider_descriptor_v1_init(trevrpc_engine_provider_descriptor_v1* descriptor, size_t struct_size) {
+    uint32_t size_field;
+    if (descriptor == NULL || struct_size < sizeof(*descriptor)) {
+        return -EINVAL;
+    }
+    if (struct_size > UINT32_MAX) {
+        return -EOVERFLOW;
+    }
+    size_field = (uint32_t)struct_size;
+    memset(descriptor, 0, struct_size);
+    descriptor->struct_size = size_field;
+    descriptor->struct_version = TREVRPC_ENGINE_PROVIDER_STRUCT_VERSION_1;
+    return 0;
+}
+
+const trevrpc_engine_provider_host_v1* trevrpc_engine_provider_host_v1_get(void) {
+    return &trevrpc_engine_provider_host;
+}
+
+int trevrpc_engine_provider_adopt_v1(const trevrpc_engine_config_v1* config,
+    const trevrpc_engine_provider_descriptor_v1* descriptor,
+    trevrpc_engine** out_engine) {
+    int result;
+    if (out_engine == NULL) {
+        return -EINVAL;
+    }
+    *out_engine = NULL;
+    if (descriptor == NULL || descriptor->struct_size < sizeof(*descriptor) || descriptor->owner_cookie == 0 ||
+        !trevrpc_engine_u64_fields_zero(
+            descriptor->reserved, sizeof(descriptor->reserved) / sizeof(descriptor->reserved[0]))) {
+        return -EINVAL;
+    }
+    if (descriptor->struct_version != TREVRPC_ENGINE_PROVIDER_STRUCT_VERSION_1) {
+        return -ENOTSUP;
+    }
+    result = trevrpc_engine_validate_provider_ops(descriptor->operations);
+    if (result != 0) {
+        return result;
+    }
+    return trevrpc_engine_provider_create_v1(
+        config, descriptor->operations, descriptor->context, descriptor->owner_cookie, out_engine);
+}
+
 int trevrpc_engine_provider_create_v1(const trevrpc_engine_config_v1* config,
     const trevrpc_engine_provider_ops* provider_ops,
     void* provider_context,
@@ -740,9 +860,12 @@ int trevrpc_engine_provider_create_v1(const trevrpc_engine_config_v1* config,
     bool lifetime_condition_initialized = false;
     bool test_mutex_initialized = false;
     bool test_condition_initialized = false;
-    if (out_engine == NULL || provider_ops == NULL || provider_ops->close == NULL || provider_ops->destroy == NULL ||
-        owner_cookie == 0) {
+    if (out_engine == NULL || owner_cookie == 0) {
         return -EINVAL;
+    }
+    result = trevrpc_engine_validate_provider_ops(provider_ops);
+    if (result != 0) {
+        return result;
     }
     result = trevrpc_engine_validate_config(config);
     if (result != 0) {

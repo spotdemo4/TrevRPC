@@ -1,0 +1,205 @@
+{
+  "schema": 1,
+  "c_standard": "c11",
+  "go_build_constraint": "cgo && linux && (amd64 || arm64)",
+  "include_paths": ["include", "src", "third_party/msquic/include"],
+  "definitions": [
+    "QUIC_API_ENABLE_PREVIEW_FEATURES",
+    "QUIC_API_ENABLE_VERSIONED_FEATURES=1",
+    "TREVRPC_MSQUIC_PROVIDER_CAPABILITIES",
+    "TREVRPC_GO_PROVIDER_BUILD"
+  ],
+  "translation_units": [
+    {
+      "cmake_target": "trevrpc_engine_msquic",
+      "source": "src/trevrpc_engine_msquic.c",
+      "wrapper": "internal/cabi/engine_msquic.c"
+    },
+    {
+      "cmake_target": "trevrpc_core",
+      "source": "src/trevrpc_frame.c",
+      "wrapper": "internal/cabi/frame.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_h3_demux.c",
+      "wrapper": "internal/cabi/h3_demux.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_h3_ingress.c",
+      "wrapper": "internal/cabi/h3_ingress.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_http3_frame.c",
+      "wrapper": "internal/cabi/http3_frame.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_http3_headers.c",
+      "wrapper": "internal/cabi/http3_headers.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_http3_settings.c",
+      "wrapper": "internal/cabi/http3_settings.c"
+    },
+    {
+      "cmake_target": "trevrpc_msquic_api_owner",
+      "source": "src/trevrpc_msquic_api_owner.c",
+      "wrapper": "internal/cabi/msquic_api_owner.c"
+    },
+    {
+      "cmake_target": "trevrpc_msquic_native_core",
+      "source": "src/trevrpc_msquic_core.c",
+      "wrapper": "internal/cabi/msquic_core.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_msquic_features.c",
+      "wrapper": "internal/cabi/msquic_features.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_qpack_static.c",
+      "wrapper": "internal/cabi/qpack_static.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_quic_varint.c",
+      "wrapper": "internal/cabi/quic_varint.c"
+    },
+    {
+      "cmake_target": "trevrpc_transport_msquic_private",
+      "source": "src/trevrpc_rpc_transport_engine.c",
+      "wrapper": "internal/cabi/rpc_transport_engine.c"
+    },
+    {
+      "cmake_target": "trevrpc_transport_msquic_private",
+      "source": "src/trevrpc_rpc_transport_h3.c",
+      "wrapper": "internal/cabi/rpc_transport_h3.c"
+    },
+    {
+      "cmake_target": "trevrpc_transport_msquic_private",
+      "source": "src/trevrpc_rpc_transport_msquic.c",
+      "wrapper": "internal/cabi/rpc_transport_msquic.c"
+    },
+    {
+      "cmake_target": "trevrpc_transport_msquic_private",
+      "source": "src/trevrpc_rpc_transport_provider_adapter.c",
+      "wrapper": "internal/cabi/rpc_transport_provider_adapter.c"
+    },
+    {
+      "cmake_target": "trevrpc_transport_msquic",
+      "source": "src/trevrpc_transport_msquic.c",
+      "wrapper": "internal/cabi/transport_msquic.c"
+    },
+    {
+      "cmake_target": "trevrpc_core",
+      "source": "src/trevrpc_values.c",
+      "wrapper": "internal/cabi/values.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_webtransport_capsule.c",
+      "wrapper": "internal/cabi/webtransport_capsule.c"
+    },
+    {
+      "cmake_target": "trevrpc_protocol_core",
+      "source": "src/trevrpc_webtransport_profile.c",
+      "wrapper": "internal/cabi/webtransport_profile.c"
+    },
+    {
+      "cmake_target": "trevrpc_core",
+      "source": "src/trevrpc_wire.c",
+      "wrapper": "internal/cabi/wire.c"
+    }
+  ],
+  "deferred_sources": ["src/trevrpc_rpc_msquic.c"],
+  "headers": [
+    "include/trevrpc_engine.h",
+    "include/trevrpc_engine_msquic.h",
+    "include/trevrpc_engine_provider.h",
+    "include/trevrpc_rpc_msquic.h",
+    "include/trevrpc_transport.h",
+    "include/trevrpc_transport_msquic.h",
+    "include/trevrpc_transport_provider.h",
+    "src/trevrpc_credential_internal.h",
+    "src/trevrpc_engine_msquic_internal.h",
+    "src/trevrpc_engine_provider_host_validate.h",
+    "src/trevrpc_frame_internal.h",
+    "src/trevrpc_h3_demux_internal.h",
+    "src/trevrpc_h3_ingress_internal.h",
+    "src/trevrpc_http3_frame_internal.h",
+    "src/trevrpc_http3_headers_internal.h",
+    "src/trevrpc_http3_settings_internal.h",
+    "src/trevrpc_msquic_accept_internal.h",
+    "src/trevrpc_msquic_api_owner.h",
+    "src/trevrpc_msquic_features_internal.h",
+    "src/trevrpc_msquic_internal.h",
+    "src/trevrpc_msquic_objects_internal.h",
+    "src/trevrpc_msquic_types_internal.h",
+    "src/trevrpc_owned_bytes_internal.h",
+    "src/trevrpc_qpack_static_internal.h",
+    "src/trevrpc_quic_varint_internal.h",
+    "src/trevrpc_rpc_transport_engine_internal.h",
+    "src/trevrpc_rpc_transport_h3_internal.h",
+    "src/trevrpc_rpc_transport_internal.h",
+    "src/trevrpc_rpc_transport_msquic_internal.h",
+    "src/trevrpc_rpc_transport_provider_adapter.h",
+    "src/trevrpc_values_internal.h",
+    "src/trevrpc_webtransport_capsule_internal.h",
+    "src/trevrpc_webtransport_profile_internal.h",
+    "src/trevrpc_wire_internal.h"
+  ],
+  "third_party_headers": [
+    "third_party/msquic/include/msquic.h",
+    "third_party/msquic/include/msquic_fuzz.h",
+    "third_party/msquic/include/msquic_posix.h",
+    "third_party/msquic/include/msquic_winkernel.h",
+    "third_party/msquic/include/msquic_winuser.h",
+    "third_party/msquic/include/msquichelper.h",
+    "third_party/msquic/include/msquicp.h",
+    "third_party/msquic/include/quic_cert.h",
+    "third_party/msquic/include/quic_crypt.h",
+    "third_party/msquic/include/quic_datapath.h",
+    "third_party/msquic/include/quic_driver_helpers.h",
+    "third_party/msquic/include/quic_hashtable.h",
+    "third_party/msquic/include/quic_pcp.h",
+    "third_party/msquic/include/quic_platform.h",
+    "third_party/msquic/include/quic_platform_posix.h",
+    "third_party/msquic/include/quic_platform_winkernel.h",
+    "third_party/msquic/include/quic_platform_winuser.h",
+    "third_party/msquic/include/quic_sal_stub.h",
+    "third_party/msquic/include/quic_storage.h",
+    "third_party/msquic/include/quic_tls.h",
+    "third_party/msquic/include/quic_toeplitz.h",
+    "third_party/msquic/include/quic_trace.h",
+    "third_party/msquic/include/quic_trace_manifested_etw.h",
+    "third_party/msquic/include/quic_var_int.h",
+    "third_party/msquic/include/quic_versions.h"
+  ],
+  "archives": [
+    {
+      "target": "linux/amd64",
+      "path": "lib/linux_amd64/libmsquic.a",
+      "sha256": "5c2f43b9d0898486d679129ce210199823ff3dcf5cc9e0a7480b7a1ea18e27cd",
+      "provenance": "provenance/linux_amd64.json"
+    },
+    {
+      "target": "linux/arm64",
+      "path": "lib/linux_arm64/libmsquic.a",
+      "sha256": "4a4ae100e71c85dadd586473e0e41618da4b9f7a2662faa8f40808c17d430712",
+      "provenance": "provenance/linux_arm64.json"
+    }
+  ],
+  "licenses": ["licenses/MSQUIC-LICENSE.txt", "licenses/OPENSSL-LICENSE.txt"],
+  "patch": "provenance/trevrpc-msquic-reset-at.patch",
+  "mirrored_parent_headers": [
+    "include/trevrpc_engine.h",
+    "include/trevrpc_engine_provider.h",
+    "include/trevrpc_transport.h",
+    "include/trevrpc_transport_provider.h"
+  ]
+}

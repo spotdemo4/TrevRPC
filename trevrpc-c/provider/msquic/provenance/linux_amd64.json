@@ -1,0 +1,42 @@
+{
+  "archive": "lib/libmsquic.a",
+  "archiveSHA256": "5c2f43b9d0898486d679129ce210199823ff3dcf5cc9e0a7480b7a1ea18e27cd",
+  "buildOutput": "/nix/store/25pip2hbxhr3ca6c07nmm89wbmw25bmf-libmsquic-static-2.6.0",
+  "cmake": {
+    "QUIC_BUILD_SHARED": false,
+    "QUIC_ENABLE_LOGGING": false,
+    "QUIC_TLS_LIB": "openssl",
+    "QUIC_USE_EXTERNAL_OPENSSL": true
+  },
+  "package": "libmsquic-static",
+  "patch": {
+    "applications": 1,
+    "path": "nix/patches/trevrpc-msquic-reset-at.patch",
+    "sha256": "d501b1e89fc3865236ea19f6ac6ee4ee2f435619650c569ab43096a89431988f",
+    "storePath": "/nix/store/ymnjy5jf6bfc7g1i9ja6fzn4f3rgmmwl-trevrpc-msquic-reset-at.patch"
+  },
+  "portability": {
+    "archivePathPolicy": "reject-nix-store-build-and-temporary-paths",
+    "targetIndependentRuntimePaths": true
+  },
+  "providerVersion": "2.6.0-trevrpc.1",
+  "source": {
+    "hash": "sha256-DdS/95hUk3FHIzlYRKMM/8W1NFHZ/YKSYARzdJmlAjA=",
+    "rev": "refs/tags/v2.6.0",
+    "url": "https://github.com/microsoft/msquic.git"
+  },
+  "target": "linux/amd64",
+  "tls": {
+    "portable": true,
+    "provider": "openssl",
+    "runtimePaths": {
+      "certificateFile": "/etc/ssl/certs/ca-certificates.crt",
+      "enginesDir": "/etc/ssl/engines-3",
+      "modulesDir": "/etc/ssl/ossl-modules",
+      "opensslDir": "/etc/ssl"
+    },
+    "static": true,
+    "version": "3.6.3"
+  },
+  "version": "2.6.0"
+}

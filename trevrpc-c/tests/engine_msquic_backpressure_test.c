@@ -1,7 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #define TREVRPC_ENGINE_MSQUIC_TESTING
 
-#include "../src/trevrpc_engine_msquic.c"
+#include "../src/trevrpc_engine_internal.h"
+#include "../provider/msquic/src/trevrpc_engine_msquic.c"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -210,6 +211,7 @@ static receive_fixture fixture_create_with_capacities(
     fixture.adapter->accept_admission_open = true;
     fixture.adapter->max_receive_owned_count = 1;
     fixture.adapter->max_receive_owned_bytes = 1024;
+    fixture.adapter->host = trevrpc_engine_provider_host_v1_get();
     assert(trevrpc_engine_provider_create_v1(
                &config, &MsQuicProviderOps, fixture.adapter, fixture.adapter->owner, &fixture.engine) == 0);
 

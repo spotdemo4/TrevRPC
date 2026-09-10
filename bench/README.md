@@ -84,10 +84,11 @@ process-peer HTTP/3 campaign is included.
 `chromium-smoke.example.json`, `firefox-smoke.example.json`, and
 `webkit-smoke.example.json` each start the respective browser client before
 each RPC server. Chromium, Firefox, and WebKit run against all six server
-implementations for 24 functional samples. WebKit uses a temporary
-`webtransport-go` fork for the Go server to test Safari compatibility and keeps
-the Rust server covered while [h3#347](https://github.com/hyperium/h3/issues/347)
-remains open. The client first reports its prepared browser origin; the
+implementations for 24 functional samples. The Go benchmark server uses the
+native C/MsQuic backend; the separately imported optional QUIC-go module is not
+part of the benchmark peer. WebKit keeps the Rust server covered while
+[h3#347](https://github.com/hyperium/h3/issues/347) remains open. The client first
+reports its prepared browser origin; the
 controller passes that origin to the server, sends
 the ready server address back with `CONNECT`, waits for `armed`, and then starts
 measurement.

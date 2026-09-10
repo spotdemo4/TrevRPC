@@ -1,4 +1,4 @@
-#include "trevrpc_transport.h"
+#include "trevrpc_transport_provider.h"
 
 #include <errno.h> // NOLINT(misc-include-cleaner)
 #include <stddef.h>
@@ -22,6 +22,12 @@ LAYOUT(trevrpc_transport_diagnostics_v1, 208, 8);
 static int check_signatures(void) {
     uint32_t (*abi_version)(void) = trevrpc_transport_abi_version;
     void (*anchor)(void) = trevrpc_transport_abi_1_anchor;
+    uint32_t (*provider_abi_version)(void) = trevrpc_transport_provider_abi_version;
+    void (*provider_anchor)(void) = trevrpc_transport_provider_abi_1_anchor;
+    int (*provider_descriptor_init)(trevrpc_transport_provider_descriptor_v1*, size_t) =
+        trevrpc_transport_provider_descriptor_v1_init;
+    int (*provider_adopt)(const trevrpc_transport_provider_descriptor_v1*, trevrpc_transport**) =
+        trevrpc_transport_provider_adopt_v1;
     int (*config_init)(trevrpc_transport_config_v1*, size_t) = trevrpc_transport_config_v1_init;
     int (*endpoint_init)(trevrpc_transport_endpoint_config_v1*, size_t) = trevrpc_transport_endpoint_config_v1_init;
     int (*wake_init)(trevrpc_transport_wake_source_v1*, size_t) = trevrpc_transport_wake_source_v1_init;
@@ -70,7 +76,9 @@ static int check_signatures(void) {
     int (*drain)(trevrpc_transport*) = trevrpc_transport_drain;
     int (*release)(trevrpc_transport*) = trevrpc_transport_release;
     anchor();
-    return abi_version == NULL || config_init == NULL || endpoint_init == NULL || wake_init == NULL ||
+    provider_anchor();
+    return abi_version == NULL || provider_abi_version == NULL || provider_descriptor_init == NULL ||
+           provider_adopt == NULL || config_init == NULL || endpoint_init == NULL || wake_init == NULL ||
            event_init == NULL || receive_init == NULL || admission_init == NULL || protocol_init == NULL ||
            diagnostics_init == NULL || get_wakes == NULL || poll_timeout == NULL || next_event == NULL ||
            event_info == NULL || admission_info == NULL || protocol_info == NULL || admission_respond == NULL ||

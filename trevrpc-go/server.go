@@ -8,7 +8,6 @@ import (
 	"io"
 	"maps"
 	"math"
-	"net/http"
 	"net/url"
 	"reflect"
 	"runtime/debug"
@@ -71,19 +70,12 @@ type ServerOptions struct {
 	HTTP3Path                         string
 	HTTP3Admission                    HTTP3Admission
 	EnableWebTransport                bool
-	// WebTransportDraft07Only advertises only the draft-07 WebTransport setting.
-	// It is an interoperability escape hatch and is effective only when WebTransport is enabled.
-	WebTransportDraft07Only bool
-	WebTransportAdmission   WebTransportAdmission
+	WebTransportAdmission             WebTransportAdmission
 }
 
 // HTTP3AdmissionRequest contains HTTP/3 request information available before accepting an RPC.
 type HTTP3AdmissionRequest struct {
-	// Request is a Legacy-backend compatibility projection.
-	// Deprecated: use the backend-neutral request fields and Headers.
-	Request *http.Request
-	// Headers preserves backend-provided ordering and duplicates. The Legacy
-	// backend's upstream http.Header API cannot retain ordering between names.
+	// Headers preserves backend-provided ordering and duplicates.
 	Headers   HeaderFields
 	Path      string
 	Method    string
@@ -97,11 +89,7 @@ type HTTP3Admission func(HTTP3AdmissionRequest) bool
 
 // WebTransportAdmissionRequest contains HTTP/3 CONNECT information available before accepting a WebTransport session.
 type WebTransportAdmissionRequest struct {
-	// Request is a Legacy-backend compatibility projection.
-	// Deprecated: use the backend-neutral request fields and Headers.
-	Request *http.Request
-	// Headers preserves backend-provided ordering and duplicates. The Legacy
-	// backend's upstream http.Header API cannot retain ordering between names.
+	// Headers preserves backend-provided ordering and duplicates.
 	Headers   HeaderFields
 	Path      string
 	Authority string

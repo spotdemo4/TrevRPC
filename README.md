@@ -32,7 +32,7 @@ Protobuf over QUIC, HTTP/3 & WebTransport, with C, C++20, Go, Rust, JavaScript, 
 
 Safari interoperability issues:
 
-- Go server: [quic-go#355](https://github.com/quic-go/webtransport-go/issues/355)
+- Optional Go QUIC-go backend: [webtransport-go#355](https://github.com/quic-go/webtransport-go/issues/355)
 - Rust server: [h3#347](https://github.com/hyperium/h3/issues/347)
 
 [smoke]: https://github.com/spotdemo4/TrevRPC/actions/workflows/smoke.yaml

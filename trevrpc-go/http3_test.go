@@ -3,27 +3,25 @@ package trevrpc
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"errors"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	transportapi "trev.zip/llc/trevrpc/trevrpc-go/transport"
 )
 
 const (
-	settingsEnableWebTransportDraft06         = 0x2b603742
-	settingsWebTransportEnabled               = 0x2c7cf000
-	settingsWebTransportMaxSessionsDraft07    = 0xc671706a
-	settingsWebTransportMaxSessions           = 0x14e9cd29
-	settingsWebTransportInitialMaxData        = 0x2b61
-	settingsWebTransportInitialMaxStreamsUni  = 0x2b64
-	settingsWebTransportInitialMaxStreamsBidi = 0x2b65
+	httpStatusOK                  = 200
+	httpStatusForbidden           = 403
+	httpStatusNotFound            = 404
+	httpStatusMethodNotAllowed    = 405
+	httpStatusInternalServerError = 500
+	httpStatusServiceUnavailable  = 503
+	httpStatusUnsupportedMedia    = 415
+	http3TestTimeout              = 2 * time.Second
 )
 
 func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
@@ -31,19 +29,14 @@ func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
 	if options.EnableHTTP3 {
 		t.Fatal("HTTP/3 RPC should be opt-in")
 	}
-	if options.EnableWebTransport || options.WebTransportDraft07Only {
-		t.Fatal("WebTransport and its draft-07 compatibility mode should be opt-in")
+	if options.EnableWebTransport {
+		t.Fatal("WebTransport should be opt-in")
 	}
 	if options.HTTP3Path != DefaultHTTP3Path || http3Path(ServerOptions{}) != DefaultHTTP3Path {
 		t.Fatalf("unexpected default HTTP/3 path: options=%q zero-value=%q", options.HTTP3Path, http3Path(ServerOptions{}))
 	}
 	if path := http3Path(ServerOptions{HTTP3Path: "/rpc"}); path != "/rpc" {
 		t.Fatalf("configured HTTP/3 path = %q", path)
-	}
-	options.EnableHTTP3 = true
-	config := QUICServerConfig(options, nil)
-	if config.MaxIncomingUniStreams != 0 || config.EnableDatagrams {
-		t.Fatalf("HTTP/3 QUIC config has uni=%d datagrams=%t", config.MaxIncomingUniStreams, config.EnableDatagrams)
 	}
 
 	for _, value := range []string{HTTP3ContentType, "Application/TrevRPC"} {
@@ -65,266 +58,143 @@ func TestHTTP3DefaultsAndMediaTypeValidation(t *testing.T) {
 	}
 }
 
-func TestWebTransportServerAdvertisesSingleSessionWithoutFlowControl(t *testing.T) {
-	serverSettings := readWebTransportServerSettings(t, func(*Server) {})
-	if value := serverSettings[settingsWebTransportMaxSessions]; value != 1 {
-		t.Fatalf("server SETTINGS_WT_MAX_SESSIONS = %d, want 1", value)
-	}
-	for _, setting := range []uint64{
-		settingsWebTransportMaxSessionsDraft07,
-		settingsWebTransportInitialMaxData,
-		settingsWebTransportInitialMaxStreamsUni,
-		settingsWebTransportInitialMaxStreamsBidi,
-	} {
-		if value, ok := serverSettings[setting]; ok {
-			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
-		}
-	}
-}
-
-func TestWebTransportServerAdvertisesDraft07Only(t *testing.T) {
-	serverSettings := readWebTransportServerSettings(t, func(server *Server) {
-		options := server.Options()
-		options.WebTransportDraft07Only = true
-		server.SetOptions(options)
-	})
-	if value := serverSettings[settingsWebTransportMaxSessionsDraft07]; value != 1 {
-		t.Fatalf("server draft-07 WEBTRANSPORT_MAX_SESSIONS = %d, want 1", value)
-	}
-	for _, setting := range []uint64{
-		settingsEnableWebTransportDraft06,
-		settingsWebTransportEnabled,
-		settingsWebTransportMaxSessions,
-		settingsWebTransportInitialMaxData,
-		settingsWebTransportInitialMaxStreamsUni,
-		settingsWebTransportInitialMaxStreamsBidi,
-	} {
-		if value, ok := serverSettings[setting]; ok {
-			t.Fatalf("server SETTINGS %#x = %d, want omitted", setting, value)
-		}
-	}
-}
-
-func readWebTransportServerSettings(t *testing.T, configure func(*Server)) map[uint64]uint64 {
-	t.Helper()
-	running := startTestWebTransportServer(t, configure)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	conn, err := quic.DialAddr(ctx, running.addr, running.clientTLS.Clone(), WebTransportQUICClientConfig(DefaultMaxFrameSize, nil))
-	if err != nil {
-		t.Fatalf("dial WebTransport server: %v", err)
-	}
-	defer conn.CloseWithError(0, "test complete")
-
-	clientConn := (&http3.Transport{
-		EnableDatagrams: true,
-		AdditionalSettings: map[uint64]uint64{
-			settingsWebTransportEnabled:               1,
-			settingsWebTransportInitialMaxData:        1,
-			settingsWebTransportInitialMaxStreamsUni:  1,
-			settingsWebTransportInitialMaxStreamsBidi: 1,
-		},
-	}).NewClientConn(conn)
-	select {
-	case <-clientConn.ReceivedSettings():
-		return clientConn.Settings().Other
-	case <-conn.Context().Done():
-		t.Fatalf("WebTransport connection closed before server SETTINGS: %v", context.Cause(conn.Context()))
-	case <-ctx.Done():
-		t.Fatalf("wait for server SETTINGS: %v", context.Cause(ctx))
-	}
-	return nil
-}
-
-func TestHTTP3RoundTripsUnaryAndAllStreamingModes(t *testing.T) {
-	running := startTestHTTP3Server(t, false, func(server *Server) {
-		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
-	})
-	transport := connectTestHTTP3Client(t, running)
-
-	for index := range 4 {
-		if err := runMixedQUICCall(transport, index); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func TestHTTP3RejectsInvalidRequestsBeforeRPCHandling(t *testing.T) {
-	metrics := &recordingMetrics{}
-	running := startTestHTTP3Server(t, false, func(server *Server) {
-		server.SetMetrics(metrics)
-	})
-	client := newTestHTTP3HTTPClient(t, running)
-	body := encodeTestHTTP3Request(t, NewRpcRequest(testServiceName, "SayHello", nil))
+func TestHTTP3HandlerRejectsInvalidRequestsBeforeRPCHandling(t *testing.T) {
+	server := newHTTP3TestServer(t, nil)
+	body := encodeHTTP3TestRequest(t, NewRpcRequest("example.Greeter", "SayHello", nil))
 
 	tests := []struct {
-		name           string
-		method         string
-		path           string
-		contentType    string
-		addContentType string
-		wantStatus     int
+		name        string
+		method      string
+		path        string
+		headers     transportapi.HeaderFields
+		wantStatus  int
+		wantAllow   string
+		wantMessage string
 	}{
-		{name: "path", method: http.MethodPost, path: "/wrong", contentType: HTTP3ContentType, wantStatus: http.StatusNotFound},
-		{name: "method", method: http.MethodGet, path: DefaultHTTP3Path, contentType: HTTP3ContentType, wantStatus: http.StatusMethodNotAllowed},
-		{name: "missing media type", method: http.MethodPost, path: DefaultHTTP3Path, wantStatus: http.StatusUnsupportedMediaType},
-		{name: "wrong media type", method: http.MethodPost, path: DefaultHTTP3Path, contentType: "application/octet-stream", wantStatus: http.StatusUnsupportedMediaType},
-		{name: "media type parameter", method: http.MethodPost, path: DefaultHTTP3Path, contentType: HTTP3ContentType + "; charset=utf-8", wantStatus: http.StatusUnsupportedMediaType},
-		{name: "multiple media type values", method: http.MethodPost, path: DefaultHTTP3Path, contentType: HTTP3ContentType, addContentType: HTTP3ContentType, wantStatus: http.StatusUnsupportedMediaType},
+		{name: "path", method: "POST", path: "/wrong", headers: validHTTP3Headers(), wantStatus: httpStatusNotFound},
+		{name: "method", method: "GET", path: DefaultHTTP3Path, headers: validHTTP3Headers(), wantStatus: httpStatusMethodNotAllowed, wantAllow: "POST"},
+		{name: "missing media type", method: "POST", path: DefaultHTTP3Path, wantStatus: httpStatusUnsupportedMedia},
+		{name: "wrong media type", method: "POST", path: DefaultHTTP3Path, headers: transportapi.HeaderFields{{Name: "Content-Type", Value: "application/octet-stream"}}, wantStatus: httpStatusUnsupportedMedia},
+		{name: "media type parameter", method: "POST", path: DefaultHTTP3Path, headers: transportapi.HeaderFields{{Name: "Content-Type", Value: HTTP3ContentType + "; charset=utf-8"}}, wantStatus: httpStatusUnsupportedMedia},
+		{name: "multiple media type values", method: "POST", path: DefaultHTTP3Path, headers: transportapi.HeaderFields{{Name: "Content-Type", Value: HTTP3ContentType}, {Name: "Content-Type", Value: HTTP3ContentType}}, wantStatus: httpStatusUnsupportedMedia},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			request, err := http.NewRequest(test.method, "https://"+running.addr+test.path, bytes.NewReader(body))
-			if err != nil {
-				t.Fatalf("create request: %v", err)
-			}
-			if test.contentType != "" {
-				request.Header.Set("Content-Type", test.contentType)
-			}
-			if test.addContentType != "" {
-				request.Header.Add("Content-Type", test.addContentType)
-			}
+			request := newFakeHTTP3Request(body)
+			request.method = test.method
+			request.path = test.path
+			request.headers = test.headers
 
-			response, err := client.Do(request)
-			if err != nil {
-				t.Fatalf("send request: %v", err)
+			handleTransportHTTP3RPC(request, server, nil, newSemaphore(1))
+			if request.errorStatus != test.wantStatus {
+				t.Fatalf("error status = %d, want %d", request.errorStatus, test.wantStatus)
 			}
-			defer response.Body.Close()
-			if response.StatusCode != test.wantStatus {
-				t.Fatalf("status = %d, want %d", response.StatusCode, test.wantStatus)
+			if request.responseStatus != 0 {
+				t.Fatalf("response status = %d, want no response header", request.responseStatus)
 			}
-			if test.wantStatus == http.StatusMethodNotAllowed && response.Header.Get("Allow") != http.MethodPost {
-				t.Fatalf("Allow = %q, want POST", response.Header.Get("Allow"))
+			if test.wantAllow != "" && responseHeader(request, "Allow") != test.wantAllow {
+				t.Fatalf("Allow = %q, want %q", responseHeader(request, "Allow"), test.wantAllow)
+			}
+			if request.stream.writes.Len() != 0 {
+				t.Fatal("rejected request wrote an RPC response frame")
 			}
 		})
 	}
-
-	started, _ := metrics.snapshot()
-	if len(started) != 0 {
-		t.Fatalf("invalid HTTP requests reached RPC handling: %#v", started)
-	}
 }
 
-func TestHTTP3AdmissionReceivesRequestAndCanReject(t *testing.T) {
-	seen := make(chan HTTP3AdmissionRequest, 2)
-	running := startTestHTTP3Server(t, false, func(server *Server) {
+func TestHTTP3AdmissionReceivesSnapshotAndCanDeny(t *testing.T) {
+	var seen HTTP3AdmissionRequest
+	server := newHTTP3TestServer(t, func(server *Server) {
 		options := server.Options()
 		options.HTTP3Admission = func(request HTTP3AdmissionRequest) bool {
-			seen <- request
-			return request.Request.Header.Get("X-Allow") == "yes"
+			seen = request
+			request.Headers[0].Value = "mutated"
+			return headerValue(request.Headers, "X-Allow") == "yes"
 		}
 		server.SetOptions(options)
 	})
-	client := newTestHTTP3HTTPClient(t, running)
-	body := encodeTestHTTP3Request(t, NewRpcRequest(testServiceName, "SayHello", nil))
+	server.Route("example.Greeter", "SayHello", func(context.Context, []byte) ([]byte, error) {
+		return []byte("hello"), nil
+	})
+	body := encodeHTTP3TestRequest(t, NewRpcRequest("example.Greeter", "SayHello", nil))
 
-	request, err := http.NewRequest(http.MethodPost, "https://"+running.addr+DefaultHTTP3Path, bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("create denied request: %v", err)
+	denied := newFakeHTTP3Request(body)
+	denied.headers = transportapi.HeaderFields{
+		{Name: "Content-Type", Value: HTTP3ContentType},
+		{Name: "X-Allow", Value: "no"},
 	}
-	request.Header.Set("Content-Type", HTTP3ContentType)
-	response, err := client.Do(request)
-	if err != nil {
-		t.Fatalf("send denied request: %v", err)
+	handleTransportHTTP3RPC(denied, server, nil, newSemaphore(1))
+	if denied.errorStatus != httpStatusForbidden {
+		t.Fatalf("denied status = %d, want %d", denied.errorStatus, httpStatusForbidden)
 	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusForbidden {
-		t.Fatalf("denied status = %d, want %d", response.StatusCode, http.StatusForbidden)
+	if denied.headers[0].Value != HTTP3ContentType {
+		t.Fatalf("admission callback mutated original headers: %#v", denied.headers)
 	}
-
-	request, err = http.NewRequest(http.MethodPost, "https://"+running.addr+DefaultHTTP3Path, bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("create admitted request: %v", err)
-	}
-	request.Header.Set("Content-Type", HTTP3ContentType)
-	request.Header.Set("X-Allow", "yes")
-	response, err = client.Do(request)
-	if err != nil {
-		t.Fatalf("send admitted request: %v", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("admitted status = %d, want %d", response.StatusCode, http.StatusOK)
-	}
-	if response.Header.Get("Content-Type") != HTTP3ContentType {
-		t.Fatalf("response content type = %q", response.Header.Get("Content-Type"))
+	if seen.Path != DefaultHTTP3Path || seen.Method != "POST" || seen.Authority != "example.test" || !seen.Secure {
+		t.Fatalf("incomplete admission snapshot: %#v", seen)
 	}
 
-	for range 2 {
-		admission := <-seen
-		if admission.Request == nil || admission.Path != DefaultHTTP3Path || admission.Method != http.MethodPost || admission.Authority == "" || !admission.Secure {
-			t.Fatalf("incomplete admission request: %#v", admission)
+	allowed := newFakeHTTP3Request(body)
+	allowed.headers = transportapi.HeaderFields{
+		{Name: "Content-Type", Value: HTTP3ContentType},
+		{Name: "X-Allow", Value: "yes"},
+	}
+	handleTransportHTTP3RPC(allowed, server, nil, newSemaphore(1))
+	if allowed.responseStatus != httpStatusOK || allowed.errorStatus != 0 {
+		t.Fatalf("allowed request status=%d error=%d", allowed.responseStatus, allowed.errorStatus)
+	}
+	if responseHeader(allowed, "Content-Type") != HTTP3ContentType {
+		t.Fatalf("response content type = %q", responseHeader(allowed, "Content-Type"))
+	}
+	if allowed.flushes != 1 {
+		t.Fatalf("flush count = %d, want 1", allowed.flushes)
+	}
+}
+
+func TestHTTP3AdmissionSaturationIsBounded(t *testing.T) {
+	entered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	server := newHTTP3TestServer(t, func(server *Server) {
+		options := server.Options()
+		options.MaxConcurrentAdmissionCallbacks = 1
+		options.HTTP3Admission = func(HTTP3AdmissionRequest) bool {
+			close(entered)
+			<-releaseCallback
+			return true
 		}
+		server.SetOptions(options)
+	})
+	runtime := server.freeze()
+	request := newFakeHTTP3Request(nil)
+	first := make(chan error, 1)
+	go func() {
+		_, err := runtime.transportHTTP3Admitted(request)
+		first <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(http3TestTimeout):
+		t.Fatal("admission callback did not start")
+	}
+	if admitted, err := runtime.transportHTTP3Admitted(request); admitted || !errors.Is(err, errAdmissionSaturated) {
+		t.Fatalf("saturated admission = %t, %v", admitted, err)
+	}
+	close(releaseCallback)
+	select {
+	case err := <-first:
+		if err != nil {
+			t.Fatalf("first admission: %v", err)
+		}
+	case <-time.After(http3TestTimeout):
+		t.Fatal("first admission did not finish")
 	}
 }
 
-func TestServerAdmissionCallbacksUseSnapshotsAndAreBounded(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		configure func(*Server, chan struct{}, chan struct{})
-		invoke    func(*serverRuntime, *http.Request) (bool, error)
-	}{
-		{name: "http3", configure: func(server *Server, entered, release chan struct{}) {
-			server.SetOptions(ServerOptions{MaxConcurrentAdmissionCallbacks: 1, HTTP3Admission: func(request HTTP3AdmissionRequest) bool {
-				request.Request.Header.Set("X-Mutated", "yes")
-				request.Request.URL.Path = "/mutated"
-				close(entered)
-				<-release
-				return true
-			}})
-		}, invoke: func(runtime *serverRuntime, request *http.Request) (bool, error) {
-			return runtime.http3Admitted(request)
-		}},
-		{name: "webtransport", configure: func(server *Server, entered, release chan struct{}) {
-			server.SetOptions(ServerOptions{MaxConcurrentAdmissionCallbacks: 1, WebTransportAdmission: func(request WebTransportAdmissionRequest) bool {
-				request.Request.Header.Set("X-Mutated", "yes")
-				request.Request.URL.Path = "/mutated"
-				close(entered)
-				<-release
-				return true
-			}})
-		}, invoke: func(runtime *serverRuntime, request *http.Request) (bool, error) {
-			return runtime.webTransportAdmitted(request)
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			server := NewServer()
-			entered := make(chan struct{})
-			release := make(chan struct{})
-			test.configure(server, entered, release)
-			runtime := server.freeze()
-			request := httptest.NewRequest(http.MethodPost, "https://example.test/trevrpc", nil)
-			request.Header.Set("X-Original", "yes")
-			first := make(chan error, 1)
-			go func() { _, err := test.invoke(runtime, request); first <- err }()
-			select {
-			case <-entered:
-			case <-time.After(testTimeout):
-				t.Fatal("admission callback did not start")
-			}
-			if admitted, err := test.invoke(runtime, request); admitted || err != errAdmissionSaturated {
-				t.Fatalf("saturated admission = %t, %v", admitted, err)
-			}
-			if request.Header.Get("X-Mutated") != "" || request.URL.Path != "/trevrpc" {
-				t.Fatalf("admission callback mutated original request: %s %#v", request.URL.Path, request.Header)
-			}
-			close(release)
-			select {
-			case err := <-first:
-				if err != nil {
-					t.Fatalf("first admission: %v", err)
-				}
-			case <-time.After(testTimeout):
-				t.Fatal("first admission did not finish")
-			}
-		})
-	}
-}
-
-func TestHTTP3AdmissionPanicIsGenericAndFutureRequestsContinue(t *testing.T) {
+func TestHTTP3AdmissionPanicIsContainedAndFutureRequestsContinue(t *testing.T) {
 	var calls atomic.Int64
-	running := startTestHTTP3Server(t, false, func(server *Server) {
+	server := newHTTP3TestServer(t, func(server *Server) {
 		options := server.Options()
 		options.HTTP3Admission = func(HTTP3AdmissionRequest) bool {
 			if calls.Add(1) == 1 {
@@ -334,448 +204,76 @@ func TestHTTP3AdmissionPanicIsGenericAndFutureRequestsContinue(t *testing.T) {
 		}
 		server.SetOptions(options)
 	})
-	client := newTestHTTP3HTTPClient(t, running)
-	body := encodeTestHTTP3Request(t, NewRpcRequest(testServiceName, "SayHello", mustEncodeTestMessage(t, "after panic")))
-	request, err := http.NewRequest(http.MethodPost, "https://"+running.addr+DefaultHTTP3Path, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Content-Type", HTTP3ContentType)
-	response, err := client.Do(request)
-	if err != nil {
-		t.Fatalf("panic request: %v", err)
-	}
-	failureBody, _ := io.ReadAll(response.Body)
-	response.Body.Close()
-	if response.StatusCode != http.StatusInternalServerError || string(failureBody) != "internal server error\n" {
-		t.Fatalf("admission panic leaked remotely: status=%d body=%q", response.StatusCode, failureBody)
+	server.Route("example.Greeter", "SayHello", func(context.Context, []byte) ([]byte, error) {
+		return []byte("hello"), nil
+	})
+	body := encodeHTTP3TestRequest(t, NewRpcRequest("example.Greeter", "SayHello", nil))
+
+	panicRequest := newFakeHTTP3Request(body)
+	handleTransportHTTP3RPC(panicRequest, server, nil, newSemaphore(1))
+	if panicRequest.errorStatus != httpStatusInternalServerError || panicRequest.errorMessage != "internal server error" {
+		t.Fatalf("admission panic leaked: status=%d message=%q", panicRequest.errorStatus, panicRequest.errorMessage)
 	}
 
-	request, err = http.NewRequest(http.MethodPost, "https://"+running.addr+DefaultHTTP3Path, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Content-Type", HTTP3ContentType)
-	response, err = client.Do(request)
-	if err != nil {
-		t.Fatalf("request after admission panic: %v", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("status after admission panic = %d", response.StatusCode)
+	futureRequest := newFakeHTTP3Request(body)
+	handleTransportHTTP3RPC(futureRequest, server, nil, newSemaphore(1))
+	if futureRequest.responseStatus != httpStatusOK || futureRequest.errorStatus != 0 {
+		t.Fatalf("request after admission panic status=%d error=%d", futureRequest.responseStatus, futureRequest.errorStatus)
 	}
 }
 
-func TestAdmissionCallbackPanicsAreContainedForBothTransports(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		set  func(*Server)
-		call func(*serverRuntime, *http.Request) (bool, error)
-	}{
-		{name: "http3", set: func(server *Server) {
-			server.SetOptions(ServerOptions{HTTP3Admission: func(HTTP3AdmissionRequest) bool { panic("boom") }})
-		}, call: func(runtime *serverRuntime, request *http.Request) (bool, error) {
-			return runtime.http3Admitted(request)
-		}},
-		{name: "webtransport", set: func(server *Server) {
-			server.SetOptions(ServerOptions{WebTransportAdmission: func(WebTransportAdmissionRequest) bool { panic("boom") }})
-		}, call: func(runtime *serverRuntime, request *http.Request) (bool, error) {
-			return runtime.webTransportAdmitted(request)
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			server := NewServer()
-			test.set(server)
-			admitted, err := test.call(server.freeze(), httptest.NewRequest(http.MethodPost, "https://example.test/trevrpc", nil))
-			if admitted || err == nil {
-				t.Fatalf("panic admission = %t, %v", admitted, err)
-			}
-		})
+func TestHTTP3RequestSaturationAndUnaryRoundTrip(t *testing.T) {
+	server := newHTTP3TestServer(t, nil)
+	server.Route("example.Greeter", "SayHello", func(_ context.Context, body []byte) ([]byte, error) {
+		return append([]byte("reply:"), body...), nil
+	})
+	body := encodeHTTP3TestRequest(t, NewRpcRequest("example.Greeter", "SayHello", []byte("request")))
+
+	streamLimit := newSemaphore(1)
+	streamLimit <- struct{}{}
+	rejected := newFakeHTTP3Request(body)
+	handleTransportHTTP3RPC(rejected, server, nil, streamLimit)
+	if rejected.errorStatus != httpStatusServiceUnavailable {
+		t.Fatalf("stream saturation status = %d, want %d", rejected.errorStatus, httpStatusServiceUnavailable)
+	}
+	if rejected.responseStatus != 0 || rejected.stream.writes.Len() != 0 {
+		t.Fatal("stream-saturated request wrote an RPC response")
+	}
+
+	request := newFakeHTTP3Request(body)
+	handleTransportHTTP3RPC(request, server, nil, newSemaphore(1))
+	if request.responseStatus != httpStatusOK || request.errorStatus != 0 {
+		t.Fatalf("unary status=%d error=%d", request.responseStatus, request.errorStatus)
+	}
+	if request.flushes != 1 {
+		t.Fatalf("flush count = %d, want 1", request.flushes)
+	}
+	response := &RpcResponse{}
+	if err := ReadFrame(bytes.NewReader(request.stream.writes.Bytes()), response, DefaultMaxFrameSize); err != nil {
+		t.Fatalf("decode unary response: %v", err)
+	}
+	if Code(response.Status) != CodeOK || string(response.Body) != "reply:request" {
+		t.Fatalf("unary response = %#v, want OK reply", response)
 	}
 }
 
-func TestHTTP3CoexistsWithWebTransport(t *testing.T) {
-	running := startTestHTTP3Server(t, true, func(server *Server) {
-		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
-	})
-	httpTransport := connectTestHTTP3Client(t, running)
-	if err := runMixedQUICCall(httpTransport, 0); err != nil {
-		t.Fatalf("HTTP/3 RPC: %v", err)
-	}
-
-	webTransport := connectTestWebTransportClient(t, running)
-	defer webTransport.Session().CloseWithError(cancelledWebTransportSessionCode, "test complete")
-	if err := runMixedQUICCall(webTransport, 1); err != nil {
-		t.Fatalf("WebTransport RPC: %v", err)
-	}
-}
-
-func TestHTTP3ShutdownWithPartialPOSTAndActiveWebTransport(t *testing.T) {
-	const shutdownTimeout = 100 * time.Millisecond
-	postStarted := make(chan struct{})
-	postDone := make(chan struct{})
-	running := startTestHTTP3Server(t, true, func(server *Server) {
-		registerHTTP3PendingResponseRoute(server)
-		server.RouteStreaming(testServiceName, "PartialUpload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests ByteStream) (ByteStream, error) {
-			close(postStarted)
-			_, err := requests.Recv()
-			close(postDone)
-			return nil, err
-		})
-		options := server.Options()
-		options.GracefulShutdownTimeout = shutdownTimeout
-		server.SetOptions(options)
-		server.SetAuthorizer(BearerAuthorizer(testAuthToken))
-	})
-
-	webTransport := connectTestWebTransportClient(t, running)
-	webTransportResponses := holdServerStreamOpen(t, webTransport)
-
-	httpClient := newTestHTTP3HTTPClient(t, running)
-	bodyReader, bodyWriter := io.Pipe()
-	requestContext, cancelRequest := context.WithCancel(context.Background())
-	defer cancelRequest()
-	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, "https://"+running.addr+DefaultHTTP3Path, bodyReader)
-	if err != nil {
-		t.Fatalf("create partial request: %v", err)
-	}
-	request.Header.Set("Content-Type", HTTP3ContentType)
-
-	responseResult := make(chan struct {
-		response *http.Response
-		err      error
-	}, 1)
-	go func() {
-		response, err := httpClient.Do(request)
-		responseResult <- struct {
-			response *http.Response
-			err      error
-		}{response: response, err: err}
-	}()
-
-	partialWritten := make(chan error, 1)
-	go func() {
-		rpcRequest := NewRpcRequest(testServiceName, "PartialUpload", nil)
-		rpcRequest.Kind = RpcKindClientStreaming
-		rpcRequest.Metadata["authorization"] = []byte("Bearer " + testAuthToken)
-		if err := WriteFrame(bodyWriter, rpcRequest, DefaultMaxFrameSize); err != nil {
-			partialWritten <- err
-			return
-		}
-		_, err := bodyWriter.Write([]byte{0, 0})
-		partialWritten <- err
-	}()
-
-	if err := waitTestHTTP3Result(t, partialWritten, "write partial request body"); err != nil {
-		t.Fatalf("write partial request body: %v", err)
-	}
-	waitTestHTTP3Signal(t, postStarted, "partial POST handler did not start")
-
-	var response *http.Response
-	select {
-	case result := <-responseResult:
-		if result.err != nil {
-			t.Fatalf("start partial POST: %v", result.err)
-		}
-		response = result.response
-		if response.StatusCode != http.StatusOK {
-			t.Fatalf("partial POST status = %d, want %d", response.StatusCode, http.StatusOK)
-		}
-	case <-time.After(testTimeout):
-		t.Fatal("partial POST did not receive response headers")
-	}
-
-	startedAt := time.Now()
-	running.stop(t)
-	if elapsed := time.Since(startedAt); elapsed > shutdownTimeout+500*time.Millisecond {
-		t.Fatalf("shutdown took %s with timeout %s", elapsed, shutdownTimeout)
-	}
-
-	waitTestHTTP3Signal(t, postDone, "partial POST handler did not stop")
-	waitTestHTTP3Signal(t, webTransport.Session().Context().Done(), "WebTransport session did not close")
-	cancelRequest()
-	_ = bodyWriter.Close()
-	_ = bodyReader.Close()
-	_ = response.Body.Close()
-	_ = webTransportResponses.Close()
-}
-
-func TestHTTP3CancellationDeadlineAndRequestLimits(t *testing.T) {
-	t.Run("cancellation", func(t *testing.T) {
-		metrics := &recordingMetrics{}
-		running := startTestHTTP3Server(t, false, func(server *Server) {
-			registerHTTP3PendingResponseRoute(server)
-			server.SetMetrics(metrics)
-			server.SetAuthorizer(BearerAuthorizer(testAuthToken))
-		})
-		responses := holdServerStreamOpen(t, connectTestHTTP3Client(t, running))
-		if err := responses.Close(); err != nil {
-			t.Fatalf("close response stream: %v", err)
-		}
-		waitForMetricCode(t, metrics, CodeCancelled)
-	})
-
-	t.Run("deadline", func(t *testing.T) {
-		running := startTestHTTP3Server(t, false, func(server *Server) {
-			registerHTTP3PendingResponseRoute(server)
-			server.SetAuthorizer(BearerAuthorizer(testAuthToken))
-		})
-		responses, err := ServerStreaming(context.Background(), connectTestHTTP3Client(t, running), testServiceName, "LotsOfReplies", &testMessage{Value: "cancel"}, func() *testMessage { return &testMessage{} }, append(authenticatedOptions(), WithTimeout(500*time.Millisecond))...)
-		if err != nil {
-			t.Fatalf("start deadline stream: %v", err)
-		}
-		defer responses.Close()
-		if _, err := responses.Recv(); err != nil {
-			t.Fatalf("receive first response: %v", err)
-		}
-		if _, err := responses.Recv(); StatusFromError(err).Code != CodeDeadlineExceeded {
-			t.Fatalf("deadline status = %v, want %v", err, CodeDeadlineExceeded)
-		}
-	})
-
-	t.Run("request message limit", func(t *testing.T) {
-		running := startTestHTTP3Server(t, false, func(server *Server) {
-			options := server.Options()
-			options.MaxStreamMessages = 1
-			server.SetOptions(options)
-			server.SetAuthorizer(BearerAuthorizer(testAuthToken))
-		})
-		_, err := runTestClientStreaming(context.Background(), connectTestHTTP3Client(t, running), testServiceName, "LotsOfGreetings", []string{"one", "two"}, authenticatedOptions()...)
-		if StatusFromError(err).Code != CodeResourceExhausted {
-			t.Fatalf("limit status = %v, want %v", err, CodeResourceExhausted)
-		}
-	})
-
-	t.Run("connection stream limit", func(t *testing.T) {
-		running := startTestHTTP3Server(t, false, func(server *Server) {
-			registerHTTP3PendingResponseRoute(server)
-			options := server.Options()
-			options.MaxConcurrentStreamsPerConnection = 1
-			server.SetOptions(options)
-			server.SetAuthorizer(BearerAuthorizer(testAuthToken))
-		})
-		transport := connectTestHTTP3Client(t, running)
-		responses := holdServerStreamOpen(t, transport)
-		defer responses.Close()
-
-		request := NewRpcRequest(testServiceName, "SayHello", mustEncodeTestMessage(t, "second"))
-		request.Metadata = Metadata{"authorization": []byte("Bearer " + testAuthToken)}
-		body := encodeTestHTTP3Request(t, request)
-		httpRequest, err := http.NewRequest(http.MethodPost, transport.url, bytes.NewReader(body))
-		if err != nil {
-			t.Fatalf("create over-limit request: %v", err)
-		}
-		httpRequest.Header.Set("Content-Type", HTTP3ContentType)
-		response, err := transport.client.Do(httpRequest)
-		if err != nil {
-			t.Fatalf("send over-limit request: %v", err)
-		}
-		defer response.Body.Close()
-		if response.StatusCode != http.StatusServiceUnavailable {
-			t.Fatalf("stream limit HTTP status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
-		}
-	})
-}
-
-func mustEncodeTestMessage(t *testing.T, value string) []byte {
+func newHTTP3TestServer(t *testing.T, configure func(*Server)) *Server {
 	t.Helper()
-	body, err := MarshalMessage(&testMessage{Value: value})
-	if err != nil {
-		t.Fatalf("encode test message: %v", err)
-	}
-	return body
-}
-
-func startTestHTTP3Server(t *testing.T, enableWebTransport bool, configure func(*Server)) *runningTestQUICServer {
-	t.Helper()
-	serverTLS, clientTLS := testTLSConfig(t)
-	serverTLS.NextProtos = []string{http3.NextProtoH3}
-	clientTLS.NextProtos = []string{http3.NextProtoH3}
-	return startTestQUICServerWithTLS(t, serverTLS, clientTLS, func(server *Server) {
+	server := NewServer()
+	options := server.Options()
+	options.EnableHTTP3 = true
+	server.SetOptions(options)
+	if configure != nil {
 		configure(server)
-		options := server.Options()
-		options.EnableHTTP3 = true
-		options.EnableWebTransport = enableWebTransport
-		if enableWebTransport {
-			options.WebTransportAdmission = func(request WebTransportAdmissionRequest) bool {
-				return request.Path == DefaultHTTP3Path
-			}
-		}
-		server.SetOptions(options)
-	})
+	}
+	return server
 }
 
-func newTestHTTP3HTTPClient(t *testing.T, running *runningTestQUICServer) *http.Client {
-	t.Helper()
-	roundTripper := &http3.Transport{
-		TLSClientConfig: running.clientTLS.Clone(),
-		QUICConfig:      &quic.Config{},
-	}
-	t.Cleanup(func() { _ = roundTripper.Close() })
-	return &http.Client{Transport: roundTripper}
+func validHTTP3Headers() transportapi.HeaderFields {
+	return transportapi.HeaderFields{{Name: "Content-Type", Value: HTTP3ContentType}}
 }
 
-func connectTestHTTP3Client(t *testing.T, running *runningTestQUICServer) *testHTTP3Transport {
-	t.Helper()
-	return &testHTTP3Transport{
-		client:       newTestHTTP3HTTPClient(t, running),
-		url:          "https://" + running.addr + DefaultHTTP3Path,
-		maxFrameSize: DefaultMaxFrameSize,
-	}
-}
-
-type testHTTP3Transport struct {
-	client       *http.Client
-	url          string
-	maxFrameSize int
-}
-
-func (t *testHTTP3Transport) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
-	body, err := EncodeFrame(request, t.maxFrameSize)
-	if err != nil {
-		return nil, err
-	}
-	response, err := t.post(ctx, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-
-	rpcResponse := &RpcResponse{}
-	if err := ReadFrame(response.Body, rpcResponse, t.maxFrameSize); err != nil {
-		return nil, err
-	}
-	return rpcResponse, nil
-}
-
-func (t *testHTTP3Transport) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
-	streamCtx, cancel := context.WithCancel(ctx)
-	reader, writer := io.Pipe()
-	writerDone := make(chan error, 1)
-	go func() {
-		err := writeTestHTTP3StreamingRequest(streamCtx, writer, request, requestBody, t.maxFrameSize)
-		if err != nil {
-			_ = writer.CloseWithError(err)
-		} else {
-			_ = writer.Close()
-		}
-		writerDone <- err
-	}()
-
-	response, err := t.post(streamCtx, reader)
-	if err != nil {
-		cancel()
-		_ = reader.CloseWithError(err)
-		return nil, err
-	}
-	return &testHTTP3ResponseStream{body: response.Body, writerDone: writerDone, cancel: cancel, maxFrameSize: t.maxFrameSize}, nil
-}
-
-func (t *testHTTP3Transport) post(ctx context.Context, body io.Reader) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, body)
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Content-Type", HTTP3ContentType)
-	response, err := t.client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	if response.StatusCode != http.StatusOK {
-		response.Body.Close()
-		return nil, fmt.Errorf("HTTP/3 status %d", response.StatusCode)
-	}
-	if response.Header.Get("Content-Type") != HTTP3ContentType {
-		response.Body.Close()
-		return nil, fmt.Errorf("HTTP/3 content type %q", response.Header.Get("Content-Type"))
-	}
-	return response, nil
-}
-
-func writeTestHTTP3StreamingRequest(ctx context.Context, writer io.Writer, request *RpcRequest, requestBody ByteStream, maxFrameSize int) error {
-	requestBody = closeStreamOnContext(ctx, requestBody)
-	defer closeMessageStream(requestBody)
-	if err := WriteFrame(writer, request, maxFrameSize); err != nil {
-		return err
-	}
-	return writeRequestBodyFrames(ctx, writer, requestBody, maxFrameSize)
-}
-
-type testHTTP3ResponseStream struct {
-	body         io.ReadCloser
-	writerDone   <-chan error
-	cancel       context.CancelFunc
-	maxFrameSize int
-	done         atomic.Bool
-	finishOnce   sync.Once
-}
-
-func (s *testHTTP3ResponseStream) trevrpcContextCancelsRecv() bool { return true }
-
-func (s *testHTTP3ResponseStream) Recv() (*RpcStreamFrame, error) {
-	if s.done.Load() {
-		return nil, io.EOF
-	}
-	frame := &RpcStreamFrame{}
-	read, err := ReadFrameOrEOF(s.body, frame, s.maxFrameSize)
-	if err != nil {
-		s.finish()
-		return nil, err
-	}
-	if !read {
-		s.finish()
-		return nil, io.EOF
-	}
-	if frame.Kind == RpcStreamFrameKindStatus {
-		s.done.Store(true)
-		s.finish()
-	}
-	return frame, nil
-}
-
-func (s *testHTTP3ResponseStream) Close() error {
-	s.done.Store(true)
-	s.finish()
-	return nil
-}
-
-func (s *testHTTP3ResponseStream) finish() {
-	s.finishOnce.Do(func() {
-		s.cancel()
-		_ = s.body.Close()
-		<-s.writerDone
-	})
-}
-
-func registerHTTP3PendingResponseRoute(server *Server) {
-	server.RouteStreaming(testServiceName, "LotsOfReplies", RpcKindServerStreaming, func(ctx context.Context, _ []byte, _ ByteStream) (ByteStream, error) {
-		responses := NewMessagePipe[*testMessage](ctx)
-		go func() { _ = responses.Send(&testMessage{Value: "first"}) }()
-		return EncodeStream(responses), nil
-	})
-}
-
-func waitTestHTTP3Signal(t *testing.T, signal <-chan struct{}, message string) {
-	t.Helper()
-	select {
-	case <-signal:
-	case <-time.After(testTimeout):
-		t.Fatal(message)
-	}
-}
-
-func waitTestHTTP3Result(t *testing.T, result <-chan error, message string) error {
-	t.Helper()
-	select {
-	case err := <-result:
-		return err
-	case <-time.After(testTimeout):
-		t.Fatal(message)
-		return nil
-	}
-}
-
-func encodeTestHTTP3Request(t *testing.T, request *RpcRequest) []byte {
+func encodeHTTP3TestRequest(t *testing.T, request *RpcRequest) []byte {
 	t.Helper()
 	body, err := EncodeFrame(request, DefaultMaxFrameSize)
 	if err != nil {
@@ -784,4 +282,126 @@ func encodeTestHTTP3Request(t *testing.T, request *RpcRequest) []byte {
 	return body
 }
 
-var _ Transport = (*testHTTP3Transport)(nil)
+type fakeHTTP3Request struct {
+	ctx       context.Context
+	method    string
+	path      string
+	authority string
+	secure    bool
+	headers   transportapi.HeaderFields
+	stream    *fakeBidirectionalStream
+
+	responseHeaders transportapi.HeaderFields
+	responseStatus  int
+	errorMessage    string
+	errorStatus     int
+	flushes         int
+	flushErr        error
+}
+
+func newFakeHTTP3Request(body []byte) *fakeHTTP3Request {
+	return &fakeHTTP3Request{
+		ctx:       context.Background(),
+		method:    "POST",
+		path:      DefaultHTTP3Path,
+		authority: "example.test",
+		secure:    true,
+		headers:   validHTTP3Headers(),
+		stream:    &fakeBidirectionalStream{reader: bytes.NewReader(body)},
+	}
+}
+
+func (r *fakeHTTP3Request) Context() context.Context                 { return r.ctx }
+func (r *fakeHTTP3Request) Method() string                           { return r.method }
+func (r *fakeHTTP3Request) Path() string                             { return r.path }
+func (r *fakeHTTP3Request) Authority() string                        { return r.authority }
+func (r *fakeHTTP3Request) Secure() bool                             { return r.secure }
+func (r *fakeHTTP3Request) Headers() transportapi.HeaderFields       { return r.headers }
+func (r *fakeHTTP3Request) Stream() transportapi.BidirectionalStream { return r.stream }
+
+func (r *fakeHTTP3Request) SetResponseHeader(name, value string) {
+	for index := range r.responseHeaders {
+		if equalHeaderName(r.responseHeaders[index].Name, name) {
+			r.responseHeaders[index].Value = value
+			return
+		}
+	}
+	r.responseHeaders = append(r.responseHeaders, transportapi.HeaderField{Name: name, Value: value})
+}
+
+func (r *fakeHTTP3Request) WriteResponseHeader(status int) { r.responseStatus = status }
+
+func (r *fakeHTTP3Request) WriteError(message string, status int) {
+	r.errorMessage = message
+	r.errorStatus = status
+}
+
+func (r *fakeHTTP3Request) Flush() error {
+	r.flushes++
+	return r.flushErr
+}
+
+func responseHeader(request *fakeHTTP3Request, name string) string {
+	for _, header := range request.responseHeaders {
+		if equalHeaderName(header.Name, name) {
+			return header.Value
+		}
+	}
+	return ""
+}
+
+func headerValue(headers transportapi.HeaderFields, name string) string {
+	for _, header := range headers {
+		if equalHeaderName(header.Name, name) {
+			return header.Value
+		}
+	}
+	return ""
+}
+
+func equalHeaderName(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		leftByte, rightByte := left[index], right[index]
+		if leftByte >= 'A' && leftByte <= 'Z' {
+			leftByte += 'a' - 'A'
+		}
+		if rightByte >= 'A' && rightByte <= 'Z' {
+			rightByte += 'a' - 'A'
+		}
+		if leftByte != rightByte {
+			return false
+		}
+	}
+	return true
+}
+
+type fakeBidirectionalStream struct {
+	reader *bytes.Reader
+	mu     sync.Mutex
+	writes bytes.Buffer
+	closed bool
+}
+
+func (s *fakeBidirectionalStream) Read(data []byte) (int, error) { return s.reader.Read(data) }
+
+func (s *fakeBidirectionalStream) Write(data []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, io.ErrClosedPipe
+	}
+	return s.writes.Write(data)
+}
+
+func (s *fakeBidirectionalStream) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	return nil
+}
+
+var _ transportapi.HTTP3Request = (*fakeHTTP3Request)(nil)
+var _ transportapi.BidirectionalStream = (*fakeBidirectionalStream)(nil)

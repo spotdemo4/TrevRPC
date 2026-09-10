@@ -4,23 +4,21 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"net/http"
-	"sort"
 	"strings"
 
-	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/transport"
 )
 
 // TransportBackend identifies the implementation used for an endpoint.
 type TransportBackend = transportinternal.Backend
 
 const (
-	// TransportBackendAuto applies the current release policy. It resolves to Legacy in this release.
+	// TransportBackendAuto selects the built-in native C transport backend.
 	TransportBackendAuto = transportinternal.BackendAuto
-	// TransportBackendNative selects the canonical C transport backend.
+	// TransportBackendNative selects the built-in native C transport backend.
 	TransportBackendNative = transportinternal.BackendNative
-	// TransportBackendLegacy selects the quic-go and webtransport-go backend.
-	TransportBackendLegacy = transportinternal.BackendLegacy
+	// TransportBackendQUICGo selects the optional quic-go and webtransport-go backend.
+	TransportBackendQUICGo = transportinternal.BackendQUICGo
 )
 
 // TransportProtocol identifies the wire protocol carried by an endpoint.
@@ -55,17 +53,28 @@ type ConnectionInfo = transportinternal.ConnectionInfo
 
 func resolveTransportBackend(backend TransportBackend) (TransportBackend, error) {
 	switch backend {
-	case TransportBackendAuto, TransportBackendLegacy:
-		return TransportBackendLegacy, nil
-	case TransportBackendNative:
+	case TransportBackendAuto, TransportBackendNative:
 		return TransportBackendNative, nil
+	case TransportBackendQUICGo:
+		return TransportBackendQUICGo, nil
 	default:
 		return TransportBackendAuto, InvalidArgument(fmt.Sprintf("unsupported transport backend %d", backend))
 	}
 }
 
+func resolveExplicitBackend(backend TransportBackend) (TransportBackend, error) {
+	switch backend {
+	case TransportBackendNative, TransportBackendQUICGo:
+		return backend, nil
+	case TransportBackendAuto:
+		return TransportBackendAuto, InvalidArgument("explicit backend must not identify as Auto")
+	default:
+		return TransportBackendAuto, InvalidArgument(fmt.Sprintf("unsupported explicit transport backend %d", backend))
+	}
+}
+
 func nativeBackendUnavailable() error {
-	return Unimplemented("native transport backend is not available in this build")
+	return Unimplemented("bundled native transport requires cgo on glibc-based linux/amd64 or linux/arm64; no host TrevRPC or MsQuic installation is required")
 }
 
 func cloneTransportCredentials(credentials *TransportCredentials) *TransportCredentials {
@@ -124,75 +133,6 @@ func transportRootPool(
 	return roots, nil
 }
 
-func legacyServerTLSConfig(config *tls.Config, credentials *TransportCredentials) (*tls.Config, error) {
-	if config != nil && credentials != nil {
-		return nil, InvalidArgument("TLSConfig and Credentials cannot both be set")
-	}
-	if config != nil {
-		return config.Clone(), nil
-	}
-	if err := validateTransportCredentials(credentials); err != nil {
-		return nil, err
-	}
-	if credentials == nil || len(credentials.CertificateChainPEM) == 0 {
-		return nil, InvalidArgument("legacy listener requires TLSConfig or certificate credentials")
-	}
-	certificate, err := transportCertificate(credentials)
-	if err != nil {
-		return nil, err
-	}
-	roots, err := transportRootPool(credentials)
-	if err != nil {
-		return nil, err
-	}
-	result := &tls.Config{
-		Certificates:       []tls.Certificate{*certificate},
-		InsecureSkipVerify: credentials.InsecureSkipVerify,
-		ServerName:         credentials.ServerName,
-		ClientCAs:          roots,
-	}
-	if roots != nil {
-		if credentials.RequireClientCertificate {
-			result.ClientAuth = tls.RequireAndVerifyClientCert
-		} else {
-			result.ClientAuth = tls.VerifyClientCertIfGiven
-		}
-	}
-	return result, nil
-}
-
-func legacyClientTLSConfig(config *tls.Config, credentials *TransportCredentials) (*tls.Config, error) {
-	if config != nil && credentials != nil {
-		return nil, InvalidArgument("TLSConfig and Credentials cannot both be set")
-	}
-	if config != nil {
-		return config.Clone(), nil
-	}
-	if err := validateTransportCredentials(credentials); err != nil {
-		return nil, err
-	}
-	if credentials == nil {
-		return nil, InvalidArgument("legacy dial requires TLSConfig or transport credentials")
-	}
-	certificate, err := transportCertificate(credentials)
-	if err != nil {
-		return nil, err
-	}
-	roots, err := transportRootPool(credentials)
-	if err != nil {
-		return nil, err
-	}
-	result := &tls.Config{
-		ServerName:         credentials.ServerName,
-		InsecureSkipVerify: credentials.InsecureSkipVerify,
-		RootCAs:            roots,
-	}
-	if certificate != nil {
-		result.Certificates = []tls.Certificate{*certificate}
-	}
-	return result, nil
-}
-
 func validateHeaderFields(fields HeaderFields) error {
 	for _, field := range fields {
 		if strings.TrimSpace(field.Name) == "" {
@@ -206,45 +146,6 @@ func validateHeaderFields(fields HeaderFields) error {
 		}
 	}
 	return nil
-}
-
-func legacyRequestHeaders(fields HeaderFields, legacy http.Header) (http.Header, error) {
-	if len(fields) != 0 && len(legacy) != 0 {
-		return nil, InvalidArgument("RequestHeaders and RequestHeader cannot both be set")
-	}
-	if err := validateHeaderFields(fields); err != nil {
-		return nil, err
-	}
-	if len(fields) != 0 {
-		return headerFieldsToHTTP(fields), nil
-	}
-	return legacy.Clone(), nil
-}
-
-func headerFieldsToHTTP(fields HeaderFields) http.Header {
-	headers := make(http.Header)
-	for _, field := range fields {
-		headers.Add(field.Name, field.Value)
-	}
-	return headers
-}
-
-func headerFieldsFromHTTP(headers http.Header) HeaderFields {
-	if len(headers) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(headers))
-	for name := range headers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	var fields HeaderFields
-	for _, name := range names {
-		for _, value := range headers[name] {
-			fields = append(fields, HeaderField{Name: name, Value: value})
-		}
-	}
-	return fields
 }
 
 func headerFieldValues(fields HeaderFields, name string) []string {

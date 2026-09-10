@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"io"
 	"log"
 	"os"
@@ -25,7 +23,7 @@ func main() {
 		name = os.Args[1]
 	}
 
-	tlsConfig, err := clientTLSConfig()
+	credentials, err := clientCredentials()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -33,7 +31,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	transport, err := trevrpc.Dial(ctx, serverAddr, trevrpc.DialOptions{TLSConfig: tlsConfig})
+	transport, err := trevrpc.Dial(ctx, serverAddr, trevrpc.DialOptions{Credentials: credentials})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -109,7 +107,7 @@ func main() {
 	}
 }
 
-func clientTLSConfig() (*tls.Config, error) {
+func clientCredentials() (*trevrpc.TransportCredentials, error) {
 	certPath, err := examplecert.Path()
 	if err != nil {
 		return nil, err
@@ -119,10 +117,6 @@ func clientTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	certPool := x509.NewCertPool()
-	if !certPool.AppendCertsFromPEM(certPEM) {
-		return nil, x509.CertificateInvalidError{Reason: x509.NotAuthorizedToSign, Detail: "failed to parse server certificate"}
-	}
 
-	return &tls.Config{RootCAs: certPool, ServerName: "localhost", NextProtos: []string{trevrpc.ALPN}}, nil
+	return &trevrpc.TransportCredentials{RootCAPEM: certPEM, ServerName: "localhost"}, nil
 }

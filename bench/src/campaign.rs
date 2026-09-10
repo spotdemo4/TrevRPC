@@ -583,19 +583,16 @@ mod tests {
                     && cell.id == format!("{browser}-to-{}", cell.server)
                     && cell.stack == Stack::TrevrpcWebtransport
             }));
-            let go = campaign.peer("go").expect("Go peer");
+            assert_eq!(
+                campaign.peer("go").expect("Go peer").command,
+                ["trevrpc-bench-peer-go"]
+            );
             if browser == "webkit" {
-                assert_eq!(
-                    go.command,
-                    ["trevrpc-bench-peer-go", "--webtransport-draft07-only"]
-                );
                 assert_eq!(
                     campaign.peer("rust").expect("Rust peer").command,
                     ["trevrpc-bench-peer-rust"]
                 );
                 assert!(campaign.cells.iter().any(|cell| cell.server == "rust"));
-            } else {
-                assert_eq!(go.command, ["trevrpc-bench-peer-go"]);
             }
             let sample_count = usize::try_from(campaign.repetitions).unwrap()
                 * campaign.cells.len()

@@ -396,7 +396,7 @@ func runFixtureTests(t *testing.T, runtimeRoot, relativeRoot string) {
 	t.Helper()
 	command := exec.Command("go", "test", "./"+filepath.ToSlash(relativeRoot)+"/...")
 	command.Dir = runtimeRoot
-	command.Env = append(os.Environ(), "GOWORK=off")
+	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("generated fixture should compile and pass: %v\n%s", err, output)

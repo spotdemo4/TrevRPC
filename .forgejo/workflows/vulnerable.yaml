@@ -35,8 +35,28 @@ jobs:
           niks3_url: https://niks3.trev.zip
           shell: vulnerable
 
-      - name: Run govulncheck
+      - name: Run base module govulncheck
         working-directory: trevrpc-go
+        env:
+          GOWORK: "off"
+        run: govulncheck ./...
+
+      - name: Run QUIC-go module govulncheck
+        working-directory: trevrpc-go/quic-go
+        env:
+          GOWORK: "off"
+        run: govulncheck ./...
+
+      - name: Run C module govulncheck
+        working-directory: trevrpc-c
+        env:
+          GOWORK: "off"
+        run: govulncheck ./...
+
+      - name: Run MsQuic provider module govulncheck
+        working-directory: trevrpc-c/provider/msquic
+        env:
+          GOWORK: "off"
         run: govulncheck ./...
 
   npm:

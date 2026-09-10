@@ -17,6 +17,7 @@ set(TREVRPC_C_FAMILY_C_ROOT "${TREVRPC_REPO_ROOT}/trevrpc-c" CACHE PATH
     "Path to the trevrpc-c source tree")
 set(TREVRPC_C_FAMILY_CPP_ROOT "${TREVRPC_REPO_ROOT}/trevrpc-cpp" CACHE PATH
     "Path to the trevrpc-cpp source tree")
+include_directories("${TREVRPC_C_FAMILY_C_ROOT}/provider/msquic/src")
 option(TREVRPC_C_FAMILY_ENABLE_SANITIZERS "Enable ASan and UBSan" OFF)
 option(TREVRPC_C_FAMILY_C_ONLY
   "Build only the direct RPC ABI 1 C conformance peer" OFF)

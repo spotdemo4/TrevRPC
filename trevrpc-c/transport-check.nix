@@ -6,6 +6,9 @@
   pkg-config,
   sanitizers ? false,
 }:
+let
+  cSources = import ./source.nix { inherit lib; };
+in
 stdenv.mkDerivation (final: {
   pname = "trevrpc-c-transport-check";
   outputs = [
@@ -16,7 +19,7 @@ stdenv.mkDerivation (final: {
 
   src = lib.fileset.toSource {
     root = ../.;
-    fileset = ./.;
+    fileset = cSources.neutral;
   };
   sourceRoot = "${final.src.name}/trevrpc-c";
 
@@ -50,6 +53,7 @@ stdenv.mkDerivation (final: {
     runHook preBuild
     cmake --build build --parallel $NIX_BUILD_CORES --target \
       trevrpc_transport \
+      trevrpc_transport_provider_abi_test \
       trevrpc_transport_api_test \
       trevrpc_transport_api_cpp_test \
       trevrpc_transport_testing_test
@@ -60,7 +64,7 @@ stdenv.mkDerivation (final: {
   checkPhase = ''
     runHook preCheck
     ctest --test-dir build --output-on-failure \
-      -R '^trevrpc_transport_(api|api_cpp|abi1_symbols|testing)$'
+      -R '^trevrpc_transport_(api|api_cpp|provider_abi|abi1_symbols|testing)$'
     runHook postCheck
   '';
 

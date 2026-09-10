@@ -37,6 +37,20 @@ func TestNativeStreamReceiveWindowPreservesRequiredCapacity(t *testing.T) {
 	}
 }
 
+func TestNativeTransportReceiveBudgetScalesWithFrameSize(t *testing.T) {
+	endpoint := native.DefaultEndpointConfig()
+	endpoint.MaxFrameSize = 64 * 1024 * 1024
+	ensureNativeTransportReceiveBudget(&endpoint)
+
+	want := uint64(2*endpoint.MaxFrameSize + nativeTransportReceiveBudgetOverhead)
+	if endpoint.MaxPendingReceiveBytes != want {
+		t.Fatalf("MaxPendingReceiveBytes = %d, want %d", endpoint.MaxPendingReceiveBytes, want)
+	}
+	if got := nativeEndpointReceiveOwnedBytes(endpoint); got < want {
+		t.Fatalf("nativeEndpointReceiveOwnedBytes() = %d, want at least %d", got, want)
+	}
+}
+
 func TestNativeServerHTTP3AdmissionValidationAndProjection(t *testing.T) {
 	var calls atomic.Int64
 	var seen HTTP3AdmissionRequest
@@ -66,7 +80,7 @@ func TestNativeServerHTTP3AdmissionValidationAndProjection(t *testing.T) {
 	if status := handler(request); status != http.StatusOK {
 		t.Fatalf("valid HTTP/3 admission status = %d", status)
 	}
-	if calls.Load() != 1 || seen.Request != nil || seen.Method != request.Method ||
+	if calls.Load() != 1 || seen.Method != request.Method ||
 		seen.Path != request.Path || seen.Authority != request.Authority || !seen.Secure ||
 		len(seen.Headers) != len(request.Headers) {
 		t.Fatalf("HTTP/3 admission projection = %#v, calls = %d", seen, calls.Load())
@@ -142,7 +156,6 @@ func TestNativeServerMultiplexedEndpointSettings(t *testing.T) {
 
 	options.EnableWebTransport = true
 	options.HTTP3Path = "/rpc"
-	options.WebTransportDraft07Only = true
 	endpoint, err = nativeServerEndpointConfig(
 		"127.0.0.1",
 		8443,
@@ -155,7 +168,7 @@ func TestNativeServerMultiplexedEndpointSettings(t *testing.T) {
 	}
 	if endpoint.Protocol != native.ProtocolMultiplexed || len(endpoint.ALPN) != 0 ||
 		!endpoint.DeferAdmission || endpoint.Path != "/rpc" ||
-		endpoint.WebTransportProfiles != native.WebTransportProfileDraft07 {
+		endpoint.WebTransportProfiles != native.WebTransportProfileAllSupported {
 		t.Fatalf("multiplexed endpoint = %+v", endpoint)
 	}
 }

@@ -1,95 +1,21 @@
 #ifndef TREVRPC_ENGINE_INTERNAL_H
 #define TREVRPC_ENGINE_INTERNAL_H
 
-#include "trevrpc_engine.h"
+#include "trevrpc_engine_provider.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct trevrpc_engine_reservation trevrpc_engine_reservation;
-
-typedef void (*trevrpc_engine_detach_hook)(void* provider_context, void* hook_context);
-typedef void (*trevrpc_engine_owned_release)(void* owner, void* release_context);
-
-typedef struct trevrpc_engine_event_spec {
-    uint32_t kind;
-    uint32_t flags;
-    int32_t status;
-    uint32_t subject_kind;
-    trevrpc_engine_handle_v1 subject;
-    trevrpc_engine_handle_v1 parent;
-    uint64_t operation_id;
-    uint64_t application_error_code;
-    uint64_t provider_error_code;
-    const void* data;
-    size_t data_len;
-    trevrpc_engine_detach_hook dequeue_hook;
-    trevrpc_engine_detach_hook drop_hook;
-    void* hook_context;
-    /* Mandatory publication commits while the queue mutex still excludes consumers. */
-    trevrpc_engine_detach_hook mandatory_commit_hook;
-    trevrpc_engine_detach_hook mandatory_abort_hook;
-    void* mandatory_hook_context;
-} trevrpc_engine_event_spec;
-
-typedef struct trevrpc_engine_provider_diagnostics {
-    uint64_t receive_owned_count;
-    uint64_t peak_receive_owned_count;
-    uint64_t receive_owned_bytes;
-    uint64_t peak_receive_owned_bytes;
-    uint64_t pending_send_bytes;
-    uint64_t pending_send_count;
-    uint64_t live_listeners;
-    uint64_t live_connections;
-    uint64_t live_streams;
-} trevrpc_engine_provider_diagnostics;
-
-typedef struct trevrpc_engine_provider_ops {
-    int (*attach)(void* provider_context, trevrpc_engine* engine);
-    int (*listen)(void* provider_context,
-        const trevrpc_engine_endpoint_config_v1* config,
-        trevrpc_engine_reservation* terminal_reservation,
-        trevrpc_engine_handle_v1* out_listener);
-    int (*listener_get_port)(void* provider_context, trevrpc_engine_handle_v1 listener, uint16_t* out_port);
-    int (*dial)(void* provider_context,
-        const trevrpc_engine_endpoint_config_v1* config,
-        uint64_t operation_id,
-        trevrpc_engine_reservation* completion_reservation,
-        trevrpc_engine_reservation* terminal_reservation,
-        trevrpc_engine_handle_v1* out_connection);
-    int (*dial_cancel)(void* provider_context, trevrpc_engine_handle_v1 connection);
-    int (*connection_open_bidi_stream)(void* provider_context,
-        trevrpc_engine_handle_v1 connection,
-        uint64_t operation_id,
-        trevrpc_engine_reservation* completion_reservation,
-        trevrpc_engine_reservation* terminal_reservation,
-        trevrpc_engine_handle_v1* out_stream);
-    int (*stream_send_frame)(void* provider_context,
-        trevrpc_engine_handle_v1 stream,
-        uint64_t operation_id,
-        const uint8_t* body,
-        size_t body_len,
-        trevrpc_engine_reservation* completion_reservation);
-    int (*stream_receive_frame)(
-        void* provider_context, trevrpc_engine_handle_v1 stream, trevrpc_engine_receive** out_receive);
-    int (*stream_finish_send)(void* provider_context, trevrpc_engine_handle_v1 stream);
-    int (*stream_abort_receive)(
-        void* provider_context, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
-    int (*stream_abort_send)(void* provider_context, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
-    int (*stream_abort)(void* provider_context, trevrpc_engine_handle_v1 stream, uint64_t application_error_code);
-    int (*stream_close)(void* provider_context, trevrpc_engine_handle_v1 stream);
-    int (*connection_close)(
-        void* provider_context, trevrpc_engine_handle_v1 connection, uint64_t application_error_code);
-    int (*listener_close)(void* provider_context, trevrpc_engine_handle_v1 listener);
-    /* close starts shutdown; even on error the provider must report quiescence with provider_stopped. */
-    int (*close)(void* provider_context);
-    void (*get_diagnostics)(void* provider_context, trevrpc_engine_provider_diagnostics* diagnostics);
-    void (*destroy)(void* provider_context);
-} trevrpc_engine_provider_ops;
+typedef trevrpc_engine_provider_reservation_v1 trevrpc_engine_reservation;
+typedef trevrpc_engine_provider_detach_hook_v1 trevrpc_engine_detach_hook;
+typedef trevrpc_engine_provider_owned_release_v1 trevrpc_engine_owned_release;
+typedef trevrpc_engine_provider_event_spec_v1 trevrpc_engine_event_spec;
+typedef trevrpc_engine_provider_diagnostics_v1 trevrpc_engine_provider_diagnostics;
+typedef trevrpc_engine_provider_ops_v1 trevrpc_engine_provider_ops;
 
 int trevrpc_engine_provider_create_v1(const trevrpc_engine_config_v1* config,
-    const trevrpc_engine_provider_ops* provider_ops,
+    const trevrpc_engine_provider_ops_v1* provider_ops,
     void* provider_context,
     uint64_t owner_cookie,
     trevrpc_engine** out_engine);

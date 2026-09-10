@@ -7,13 +7,16 @@
   pkg-config,
   libmsquic,
 }:
+let
+  cSources = import ./source.nix { inherit lib; };
+in
 stdenv.mkDerivation (final: {
   pname = "trevrpc-c-engine-msquic-check";
   version = "0.2.2";
 
   src = lib.fileset.toSource {
     root = ../.;
-    fileset = ./.;
+    fileset = cSources.msquic;
   };
   sourceRoot = "${final.src.name}/trevrpc-c";
 

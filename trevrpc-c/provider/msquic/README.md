@@ -1,0 +1,104 @@
+# TrevRPC MsQuic provider
+
+This nested Go module supplies TrevRPC's bundled native MsQuic provider.
+
+```text
+module: trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2
+import: trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2
+```
+
+It depends on the provider-neutral `trevrpc-c` module. It does not register itself
+through `init`, a blank import, or a global provider registry. Construct a
+`Provider` explicitly and bind it to the endpoint that will use it.
+
+```go
+package example
+
+import (
+    trevrpcc "trev.zip/llc/trevrpc/trevrpc-c"
+    msquic "trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2"
+)
+
+func open() error {
+    provider := msquic.New()
+    metadata := provider.Metadata()
+    _ = metadata // Name, Version, and capability bits.
+
+    engine, err := provider.NewEngine(trevrpcc.DefaultEngineConfig())
+    if err != nil {
+        return err
+    }
+    defer engine.Release()
+
+    transport, err := provider.NewTransport(trevrpcc.DefaultTransportConfig())
+    if err != nil {
+        return err
+    }
+    _, err = transport.Release()
+    return err
+}
+```
+
+## Versions and releases
+
+The Go module has semantic import major version `v2`. Its release tags use this
+shape:
+
+```text
+trevrpc-c/provider/msquic/v2.6.0-trevrpc.1
+```
+
+`2.6.0` identifies the patched upstream MsQuic source version. The
+`trevrpc.N` suffix identifies TrevRPC's immutable provider revision (archive,
+patch, provenance, or adapter changes). The `Version` constant in `provider.go`,
+both provenance records, the provider pins in `trevrpc-go/go.mod`,
+`trevrpc-go/go.work`, `trevrpc-go/default.nix`, and the isolated consumer fixture
+must agree with the release tag. The provider's own `go.mod` separately pins its
+provider-neutral parent-module requirement. `verify-msquic-provider-release.py`
+checks those invariants before a provider tag can seed the public Go proxy.
+
+The parent C module must be available from the Go proxy before this provider, and
+this provider before any `trevrpc-go` module that pins it. The repository bumper
+may push tags atomically; the release jobs enforce this actual publication order by
+waiting for each exact predecessor module at the public proxy. A bad published Go
+tag cannot be replaced: publish a new `-trevrpc.N` revision and record the affected
+revision in that tag's GitHub/Forgejo release body.
+
+## Supported builds
+
+| Target                         | Bundled archive               | Status                           |
+| ------------------------------ | ----------------------------- | -------------------------------- |
+| `linux/amd64`                  | `lib/linux_amd64/libmsquic.a` | supported with cgo               |
+| `linux/arm64`                  | `lib/linux_arm64/libmsquic.a` | supported with cgo               |
+| other targets, `CGO_ENABLED=0` | none                          | actionable `ErrUnavailable` stub |
+
+The Linux artifacts are built and checked against glibc. No Darwin archive is
+currently published, so Darwin deliberately selects the unavailable stub rather
+than a fallback implementation.
+
+The provider links the committed static MsQuic/OpenSSL closure directly. Consumers
+need a C compiler and cgo, but do **not** need `pkg-config`, a host MsQuic package,
+or a system TrevRPC C installation. Platform system libraries remain external as
+recorded in the target cgo directives.
+
+## Provenance and artifact updates
+
+The committed artifacts are accompanied by:
+
+- `provenance/SHA256SUMS` — archive and patch hashes;
+- `provenance/linux_*.json` — source, patch, build, TLS-path, and portability
+  records;
+- `provenance/trevrpc-msquic-reset-at.patch` — the patch used for the bundle;
+- `licenses/` — MsQuic and OpenSSL license notices.
+
+Regenerate artifacts only through the repository's `libmsquic-static` Nix
+derivation. Begin by choosing the next `-trevrpc.N` revision, then build the
+native and cross artifacts with `nix build .#libmsquic-static` and
+`nix build .#libmsquic-static-aarch64-linux`. Copy each resulting
+`lib/libmsquic.a` into the matching `lib/linux_*` path, normalize its provenance
+record, and update the provider version plus every pin named above as one change.
+`SHA256SUMS` is derived from the two committed archives; do not hand-edit a
+checksum. Run
+`python3 .forgejo/scripts/verify-msquic-provider-release.py`, the focused static
+checks, and provider tests before tagging. The patch copy and checksums are part
+of the published module; update them atomically with the archive revision.

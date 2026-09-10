@@ -1,1 +1,1 @@
-# Transport ABI 1 production archive has no exported internal symbols.
+trevrpc_transport_adopt_rpc_private

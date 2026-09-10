@@ -5,13 +5,16 @@
   ninja,
   pkg-config,
 }:
+let
+  cSources = import ./source.nix { inherit lib; };
+in
 stdenv.mkDerivation (final: {
   pname = "trevrpc-c-engine-check";
   version = "0.2.2";
 
   src = lib.fileset.toSource {
     root = ../.;
-    fileset = ./.;
+    fileset = cSources.neutral;
   };
   sourceRoot = "${final.src.name}/trevrpc-c";
 
@@ -43,6 +46,7 @@ stdenv.mkDerivation (final: {
     runHook preBuild
     cmake --build build --parallel $NIX_BUILD_CORES --target \
       trevrpc_engine \
+      trevrpc_engine_provider_abi_test \
       trevrpc_engine_api_test \
       trevrpc_engine_api_cpp_test \
       trevrpc_engine_queue_test \

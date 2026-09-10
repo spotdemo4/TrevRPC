@@ -5,18 +5,37 @@
   go-tools,
   gotools,
   gnugrep,
-  pkg-config,
-  trevrpcC,
   benchProto,
   wireGolden,
 }:
 let
-  goSource = lib.fileset.difference ./. ./default.nix;
-  nativeSupported =
-    (stdenv.hostPlatform.isLinux || stdenv.hostPlatform.isDarwin)
-    && (stdenv.hostPlatform.isx86_64 || stdenv.hostPlatform.isAarch64);
+  goSource = lib.fileset.difference ./. (
+    lib.fileset.unions [
+      ./default.nix
+      ./go.work
+      ./go.work.sum
+      ./quic-go
+    ]
+  );
+  neutralModuleSource = lib.fileset.difference ../trevrpc-c (
+    lib.fileset.unions [
+      ../trevrpc-c/default.nix
+      ../trevrpc-c/provider/msquic
+      ../trevrpc-c/tests
+    ]
+  );
+  providerBaseSource = lib.fileset.difference ../trevrpc-c/provider/msquic ../trevrpc-c/provider/msquic/lib;
+  providerArchive =
+    if stdenv.hostPlatform.system == "x86_64-linux" then
+      ../trevrpc-c/provider/msquic/lib/linux_amd64/libmsquic.a
+    else if stdenv.hostPlatform.system == "aarch64-linux" then
+      ../trevrpc-c/provider/msquic/lib/linux_arm64/libmsquic.a
+    else
+      null;
+  providerModuleSource = lib.fileset.unions (
+    [ providerBaseSource ] ++ lib.optional (providerArchive != null) providerArchive
+  );
   canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
-  nativeTagArgs = lib.optionalString nativeSupported "-tags=trevrpc_native";
 in
 buildGoModule (final: {
   pname = "trevrpc-go";
@@ -28,13 +47,21 @@ buildGoModule (final: {
       benchProto
       wireGolden
       goSource
+      neutralModuleSource
+      providerModuleSource
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-yOGuL+KfNDMO/gkzVQUa0MgaNh88Taw9hLhHtZnjazo=";
-  tags = lib.optionals nativeSupported [ "trevrpc_native" ];
-  nativeBuildInputs = lib.optionals nativeSupported [ pkg-config ];
-  buildInputs = lib.optionals nativeSupported [ trevrpcC ];
+  vendorHash = "sha256-qCcEkaeYDS9jsGnL2fyIvFmd5OpWetEZOr8ofMqSaLI=";
+  proxyVendor = true;
+
+  postPatch = ''
+    go mod edit \
+      -replace=trev.zip/llc/trevrpc/trevrpc-c@v0.3.0=../trevrpc-c
+    go mod edit \
+      -replace=trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2@v2.6.0-trevrpc.1=../trevrpc-c/provider/msquic
+  '';
+
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
     "cmd/trevrpc-bench-peer"
@@ -53,10 +80,11 @@ buildGoModule (final: {
   checkPhase = ''
     runHook preCheck
     export HOME=$(mktemp -d)
-    go test ${nativeTagArgs} ./...
-    go vet ${nativeTagArgs} ./...
-    staticcheck ${nativeTagArgs} ./...
-    modernize ${nativeTagArgs} ./...
+    export GOWORK=off
+    go test ./...
+    go vet ./...
+    staticcheck ./...
+    modernize ./...
     runHook postCheck
   '';
 
@@ -64,6 +92,16 @@ buildGoModule (final: {
   nativeInstallCheckInputs = [ gnugrep ];
   installCheckPhase = ''
     runHook preInstallCheck
+    export GOWORK=off
+    test "$(go list -m)" = 'trev.zip/llc/trevrpc/trevrpc-go'
+    go list -m \
+      trev.zip/llc/trevrpc/trevrpc-c \
+      trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2 > modules.out
+    grep -Eq '^trev\.zip/llc/trevrpc/trevrpc-c v0\.3\.0 => \.\./trevrpc-c$' modules.out
+    grep -Eq '^trev\.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2 v2\.6\.0-trevrpc\.1 => \.\./trevrpc-c/provider/msquic$' modules.out
+    go list -deps ./... > packages.out
+    ! grep -Eq '^github.com/(quic-go|spotdemo4)/' packages.out
+    ! grep -Eq 'github.com/(quic-go/(quic-go|webtransport-go|qpack)|spotdemo4/webtransport-go)|trev\.zip/llc/trevrpc/trevrpc-go/quic-go' go.mod go.sum
     ! grep -q 'google.golang.org/grpc' go.mod
     test -x "$out/bin/trevrpc-bench-peer-go"
     test -x "$out/bin/trevrpc-conformance-go"

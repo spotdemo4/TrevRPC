@@ -11,6 +11,9 @@ enable-openid-connect: true
 jobs:
   check:
     if: >-
+      startsWith(github.ref, 'refs/tags/trevrpc-c/provider/msquic/v2.') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-c/v') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-rust/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-js/v') ||
@@ -29,7 +32,8 @@ jobs:
 
   forgejo:
     if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
+      (startsWith(github.ref, 'refs/tags/trevrpc-go/v') &&
+        !startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v')) ||
       startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     # zizmor: ignore[excessive-permissions]
     needs: check
@@ -190,7 +194,11 @@ jobs:
           echo "Bundle trevrpc-kotlin-$version uploaded with AUTOMATIC publishing"
 
   pkg:
-    if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
+    if: >-
+      startsWith(github.ref, 'refs/tags/trevrpc-c/provider/msquic/v2.') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-c/v') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-go/v')
     # zizmor: ignore[excessive-permissions]
     needs: check
     name: pkg.go.dev
@@ -203,26 +211,5 @@ jobs:
           niks3_url: https://niks3.trev.zip
           fetch_depth: 0
 
-      - name: Seed proxy.golang.org
-        run: |
-          set -euo pipefail
-          if [[ ! "${GITHUB_REF_NAME-}" =~ ^trevrpc-go/v[^/]+$ ]] || [[ "${GITHUB_REF-}" != "refs/tags/${GITHUB_REF_NAME-}" ]]; then
-            echo "pkg.go.dev release requires a trevrpc-go/v* tag ref" >&2
-            exit 1
-          fi
-          tag="${GITHUB_REF_NAME#trevrpc-go/}"
-          module="trev.zip/llc/trevrpc/trevrpc-go"
-          echo "module=$module tag=$tag ref=$GITHUB_REF"
-
-          fetch() {
-            url="$1"
-            echo "GET $url"
-            curl --fail --show-error --retry 5 --retry-delay 5 --retry-all-errors "$url"
-          }
-
-          fetch "https://proxy.golang.org/${module}/@v/${tag}.info"
-          fetch "https://proxy.golang.org/${module}/@v/${tag}.mod"
-          # Warm sumdb (best-effort)
-          curl --fail --show-error --retry 3 --retry-delay 2 --retry-all-errors "https://sum.golang.org/lookup/${module}@${tag}" || true
-
-          echo "Done. index.golang.org will be updated within minutes; pkg.go.dev follows (see https://pkg.go.dev/about#adding-a-package)."
+      - name: Seed proxy.golang.org and pkg.go.dev
+        run: .forgejo/scripts/release-go-module.sh

@@ -40,10 +40,12 @@ int trevrpc_credential_test_fail_cleanup(void) {
     return 1;
 }
 
-int trevrpc_engine_msquic_adopt_accepted_connection_v1(trevrpc_engine* engine,
+int trevrpc_engine_msquic_adopt_accepted_connection_with_host_v1(const trevrpc_engine_provider_host_v1* host,
+    trevrpc_engine* engine,
     const trevrpc_engine_endpoint_config_v1* config,
     trevrpc_msquic_accepted_connection* accepted,
     trevrpc_engine_handle_v1* out_connection) {
+    (void)host;
     (void)engine;
     (void)config;
     (void)accepted;
@@ -146,6 +148,8 @@ static void destroy_provider(void* context) {
 
 int main(void) {
     static const trevrpc_engine_provider_ops operations = {
+        .struct_size = sizeof(trevrpc_engine_provider_ops),
+        .struct_version = TREVRPC_ENGINE_PROVIDER_STRUCT_VERSION_1,
         .attach = attach_provider,
         .listen = listen_provider,
         .dial = dial_provider,

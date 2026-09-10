@@ -1,16 +1,11 @@
 package trevrpc
 
 import (
-	"crypto/tls"
 	"net"
-	"net/http"
 	"testing"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	webtransport "github.com/quic-go/webtransport-go"
-	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
 	"trev.zip/llc/trevrpc/trevrpc-go/internal/transport/native"
+	transportapi "trev.zip/llc/trevrpc/trevrpc-go/transport"
 )
 
 func TestTransportBackendResolution(t *testing.T) {
@@ -20,9 +15,9 @@ func TestTransportBackendResolution(t *testing.T) {
 		resolved TransportBackend
 		code     Code
 	}{
-		{name: "auto", backend: TransportBackendAuto, resolved: TransportBackendLegacy},
-		{name: "legacy", backend: TransportBackendLegacy, resolved: TransportBackendLegacy},
+		{name: "auto", backend: TransportBackendAuto, resolved: TransportBackendNative},
 		{name: "native", backend: TransportBackendNative, resolved: TransportBackendNative},
+		{name: "quic-go", backend: TransportBackendQUICGo, resolved: TransportBackendQUICGo},
 		{name: "invalid", backend: TransportBackend(99), code: CodeInvalidArgument},
 	}
 	for _, test := range tests {
@@ -44,35 +39,32 @@ func TestTransportBackendResolution(t *testing.T) {
 	}
 }
 
-func TestNativeBackendDoesNotFallBack(t *testing.T) {
-	connector, err := newChannelConnector("127.0.0.1:1", DialOptions{
-		Backend: TransportBackendNative,
-	})
+func TestRootDialSelectsNativeWithoutFallback(t *testing.T) {
+	connector, err := newChannelConnector("127.0.0.1:1", DialOptions{})
 	if native.Available() {
 		if err != nil {
 			t.Fatalf("native connector error = %v", err)
 		}
-		if _, ok := connector.(*nativeEngineQUICConnector); !ok {
+		backendConnector, ok := connector.(backendChannelConnector)
+		if !ok {
 			t.Fatalf("native connector type = %T", connector)
+		}
+		nativeConnector, ok := backendConnector.connector.(*nativeEngineQUICConnector)
+		if !ok {
+			t.Fatalf("native backend connector type = %T", backendConnector.connector)
+		}
+		if nativeConnector.requestedBackend != TransportBackendAuto {
+			t.Fatalf("requested backend = %v, want Auto", nativeConnector.requestedBackend)
 		}
 	} else if StatusFromError(err).Code != CodeUnimplemented {
 		t.Fatalf("native connector error = %v, want Unimplemented", err)
 	}
-
-	_, err = newChannelConnector("127.0.0.1:1", DialOptions{
-		Backend:   TransportBackendNative,
-		TLSConfig: &tls.Config{},
-	})
-	if StatusFromError(err).Code != CodeInvalidArgument {
-		t.Fatalf("native legacy-option error = %v, want InvalidArgument", err)
-	}
 }
 
-func TestNativeListenerDoesNotFallBack(t *testing.T) {
+func TestRootListenSelectsNativeWithoutFallback(t *testing.T) {
 	server := NewServer()
 	certificate, key := testCertificateMaterial(t)
 	listener, err := Listen("127.0.0.1:0", server, ListenOptions{
-		Backend: TransportBackendNative,
 		Credentials: &TransportCredentials{
 			CertificateChainPEM: certificate,
 			PrivateKeyPEM:       key,
@@ -82,8 +74,12 @@ func TestNativeListenerDoesNotFallBack(t *testing.T) {
 		if err != nil {
 			t.Fatalf("native listener error = %v", err)
 		}
-		if _, ok := listener.(*nativeQUICServerListener); !ok {
+		backendListener, ok := listener.(*backendServerListener)
+		if !ok {
 			t.Fatalf("native listener type = %T", listener)
+		}
+		if _, ok := backendListener.listener.(*nativeBackendListener); !ok {
+			t.Fatalf("native backend listener type = %T", backendListener.listener)
 		}
 		if err := listener.Close(); err != nil {
 			t.Fatalf("native listener close error = %v", err)
@@ -91,25 +87,19 @@ func TestNativeListenerDoesNotFallBack(t *testing.T) {
 	} else if StatusFromError(err).Code != CodeUnimplemented {
 		t.Fatalf("native listener error = %v, want Unimplemented", err)
 	}
-
-	_, err = Listen("127.0.0.1:0", server, ListenOptions{
-		Backend:   TransportBackendNative,
-		TLSConfig: &tls.Config{},
-	})
-	if StatusFromError(err).Code != CodeInvalidArgument {
-		t.Fatalf("native legacy-option error = %v, want InvalidArgument", err)
-	}
 }
 
-func TestNativeWebTransportRejectsLegacyHeaders(t *testing.T) {
-	_, err := newChannelConnector("https://example.test/trevrpc", DialOptions{
-		Backend: TransportBackendNative,
+func TestNativeQUICRejectsWebTransportOptions(t *testing.T) {
+	if !native.Available() {
+		t.Skip("native transport unavailable")
+	}
+	_, err := newChannelConnector("127.0.0.1:1", DialOptions{
 		WebTransport: WebTransportOptions{
-			RequestHeader: http.Header{"X-Test": {"value"}},
+			RequestHeaders: HeaderFields{{Name: "X-Test", Value: "value"}},
 		},
 	})
 	if StatusFromError(err).Code != CodeInvalidArgument {
-		t.Fatalf("native legacy-header error = %v, want InvalidArgument", err)
+		t.Fatalf("native WebTransport option error = %v, want InvalidArgument", err)
 	}
 }
 
@@ -131,80 +121,48 @@ func TestTransportCredentialsClone(t *testing.T) {
 	}
 }
 
-func TestOrderedRequestHeaders(t *testing.T) {
-	fields := HeaderFields{
+func TestWebTransportOptionsClone(t *testing.T) {
+	original := WebTransportOptions{
+		RequestHeaders: HeaderFields{{Name: "X-Test", Value: "value"}},
+	}
+	clone := cloneWebTransportOptions(original)
+	original.RequestHeaders[0].Value = "changed"
+	if clone.RequestHeaders[0].Value != "value" {
+		t.Fatalf("options clone changed with source: %+v", clone)
+	}
+}
+
+func TestHeaderFieldValidation(t *testing.T) {
+	valid := HeaderFields{
 		{Name: "x-first", Value: "one"},
 		{Name: "x-repeat", Value: "two"},
 		{Name: "x-repeat", Value: "three"},
 	}
-	headers, err := legacyRequestHeaders(fields, nil)
-	if err != nil {
-		t.Fatal(err)
+	if err := validateHeaderFields(valid); err != nil {
+		t.Fatalf("valid fields error = %v", err)
 	}
-	fields[0].Value = "changed"
-	if got := headers.Values("x-first"); len(got) != 1 || got[0] != "one" {
-		t.Fatalf("converted headers = %v", headers)
-	}
-	if got := headers.Values("x-repeat"); len(got) != 2 || got[0] != "two" || got[1] != "three" {
-		t.Fatalf("duplicate headers = %v", got)
+	if values := headerFieldValues(valid, "X-Repeat"); len(values) != 2 || values[0] != "two" || values[1] != "three" {
+		t.Fatalf("duplicate header values = %v", values)
 	}
 
-	_, err = legacyRequestHeaders(HeaderFields{{Name: "x", Value: "one"}}, http.Header{"X": {"two"}})
-	if StatusFromError(err).Code != CodeInvalidArgument {
-		t.Fatalf("ambiguous headers error = %v, want InvalidArgument", err)
+	for _, fields := range []HeaderFields{
+		{{Name: "", Value: "value"}},
+		{{Name: ":authority", Value: "example.test"}},
+		{{Name: "X-Test\nOther", Value: "value"}},
+		{{Name: "X-Test", Value: "value\r\nOther"}},
+	} {
+		if StatusFromError(validateHeaderFields(fields)).Code != CodeInvalidArgument {
+			t.Fatalf("invalid fields accepted: %+v", fields)
+		}
 	}
 }
 
 func TestTransportAddressCopiesNetAddress(t *testing.T) {
-	address := transportinternal.AddressFromNet(&net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443, Zone: "eth0"})
+	address := transportapi.AddressFromNet(&net.TCPAddr{IP: net.ParseIP("2001:db8::1"), Port: 443, Zone: "eth0"})
 	if address.Network != "tcp" || address.Host != "2001:db8::1" || address.Port != 443 || address.Zone != "eth0" {
 		t.Fatalf("address = %+v", address)
 	}
 	if address.String() != "[2001:db8::1%eth0]:443" {
 		t.Fatalf("address string = %q", address.String())
-	}
-}
-
-func TestLegacyCloseReasonsPreserveProtocolMetadata(t *testing.T) {
-	h3Reason := legacyQUICCloseReason(&http3.Error{
-		Remote:       true,
-		ErrorCode:    http3.ErrCodeNoError,
-		ErrorMessage: "drained",
-	})
-	if !h3Reason.Peer || h3Reason.Local || !h3Reason.Clean ||
-		h3Reason.ApplicationCode != uint64(http3.ErrCodeNoError) ||
-		h3Reason.Message != "drained" {
-		t.Fatalf("HTTP/3 close reason = %+v", h3Reason)
-	}
-
-	transportReason := webTransportCloseReason(&quic.TransportError{
-		Remote:       true,
-		ErrorCode:    0x0a,
-		ErrorMessage: "protocol violation",
-	})
-	if !transportReason.Peer || transportReason.Local ||
-		transportReason.TransportCode != 0x0a ||
-		transportReason.Message != "protocol violation" {
-		t.Fatalf("QUIC transport close reason = %+v", transportReason)
-	}
-
-	sessionReason := webTransportCloseReason(&webtransport.SessionError{
-		Remote:    false,
-		ErrorCode: 0,
-		Message:   "complete",
-	})
-	if sessionReason.Peer || !sessionReason.Local || !sessionReason.Clean ||
-		sessionReason.Message != "complete" {
-		t.Fatalf("WebTransport close reason = %+v", sessionReason)
-	}
-}
-
-func TestPositiveTransportLimitEnablesIncomingStreams(t *testing.T) {
-	config := &quic.Config{MaxIncomingStreams: -1}
-	applyQUICTransportLimits(config, TransportLimits{
-		IncomingBidirectionalStreams: 4,
-	})
-	if config.MaxIncomingStreams != 4 {
-		t.Fatalf("MaxIncomingStreams = %d, want 4", config.MaxIncomingStreams)
 	}
 }

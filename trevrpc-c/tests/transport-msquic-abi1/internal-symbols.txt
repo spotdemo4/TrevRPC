@@ -1,1 +1,2 @@
-# Transport MsQuic ABI 1 production archive has no exported internal symbols.
+trevrpc_transport_msquic_create_rpc_private
+trevrpc_transport_msquic_provider_descriptor_create_v1

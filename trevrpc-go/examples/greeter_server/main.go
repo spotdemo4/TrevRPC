@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -17,8 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/internal/examplecert"
@@ -89,7 +86,7 @@ func (s *echoReplies) Close() error {
 }
 
 func main() {
-	tlsConfig, certPath, err := serverTLSConfig()
+	credentials, certPath, err := serverCredentials()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -103,7 +100,7 @@ func main() {
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
 
-	listener, err := quic.ListenAddr(listenAddr, tlsConfig, trevrpc.QUICServerConfig(server.Options(), nil))
+	listener, err := trevrpc.Listen(listenAddr, server, trevrpc.ListenOptions{Credentials: credentials})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -114,7 +111,7 @@ func main() {
 	log.Printf("WebTransport URL: https://%s/trevrpc", listener.Addr())
 	log.Printf("bearer token: %s", authToken)
 	log.Printf("wrote client trust certificate to %s", certPath)
-	if err := trevrpc.ServeQUIC(context.Background(), listener, server); err != nil {
+	if err := listener.Serve(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -155,7 +152,7 @@ func allowedWebTransportAuthorities(addr string) map[string]struct{} {
 	return authorities
 }
 
-func serverTLSConfig() (*tls.Config, string, error) {
+func serverCredentials() (*trevrpc.TransportCredentials, string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, "", err
@@ -184,11 +181,6 @@ func serverTLSConfig() (*tls.Config, string, error) {
 		return nil, "", err
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, "", err
-	}
-
 	certPath, err := examplecert.Path()
 	if err != nil {
 		return nil, "", err
@@ -200,5 +192,8 @@ func serverTLSConfig() (*tls.Config, string, error) {
 		return nil, "", err
 	}
 
-	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{trevrpc.ALPN, http3.NextProtoH3}}, certPath, nil
+	return &trevrpc.TransportCredentials{
+		CertificateChainPEM: certPEM,
+		PrivateKeyPEM:       keyPEM,
+	}, certPath, nil
 }

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/internal/transport"
+	transportinternal "trev.zip/llc/trevrpc/trevrpc-go/transport"
 )
 
 type transportConnectionHandler func(
@@ -15,6 +15,13 @@ type transportConnectionHandler func(
 	*Server,
 	semaphore,
 )
+
+func waitForRuntimeExecutions(runtime *serverRuntime) {
+	if runtime.waitForExecutions(runtime.options.GracefulShutdownTimeout) {
+		return
+	}
+	runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
+}
 
 func serveTransportListener(
 	ctx context.Context,
