@@ -37,13 +37,11 @@ void trevrpc_msquic_api_owner_release(const QUIC_API_TABLE* api) {
     pthread_mutex_lock(&trevrpc_msquic_api_owner_mutex);
     if (api == trevrpc_msquic_api_owner_table && trevrpc_msquic_api_owner_leases != 0) {
         --trevrpc_msquic_api_owner_leases;
-#if !defined(TREVRPC_SANITIZER_BUILD)
         if (trevrpc_msquic_api_owner_leases == 0) {
             const QUIC_API_TABLE* table = trevrpc_msquic_api_owner_table;
             trevrpc_msquic_api_owner_table = NULL;
             MsQuicClose(table);
         }
-#endif
     }
     pthread_mutex_unlock(&trevrpc_msquic_api_owner_mutex);
 }
