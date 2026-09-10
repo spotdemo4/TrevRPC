@@ -3,14 +3,16 @@
   stdenv,
   pkgsBuildBuild,
   file,
-  libmsquicStatic,
+  libmsquic,
 }:
 let
   canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
 in
+assert lib.assertMsg stdenv.hostPlatform.isStatic
+  "msquic-static check requires a static host platform";
 stdenv.mkDerivation {
   pname = "trevrpc-msquic-static-check";
-  version = libmsquicStatic.version;
+  version = libmsquic.version;
   dontUnpack = true;
   strictDeps = true;
   nativeBuildInputs = [
@@ -22,7 +24,7 @@ stdenv.mkDerivation {
     runHook preBuild
     set -eu
 
-    archive=${libmsquicStatic}/lib/libmsquic.a
+    archive=${libmsquic}/lib/libmsquic.a
     test -s "$archive"
     test "$(file -b "$archive")" = "current ar archive"
 
@@ -36,20 +38,15 @@ stdenv.mkDerivation {
     case ${stdenv.hostPlatform.system} in
       x86_64-linux)
         expected_object_format='ELF 64-bit LSB relocatable, x86-64'
-        dynamic_linker=/lib64/ld-linux-x86-64.so.2
-        runtime_loader=${stdenv.cc.libc}/lib/ld-linux-x86-64.so.2
         ;;
       aarch64-linux)
         expected_object_format='ELF 64-bit LSB relocatable, ARM aarch64'
-        dynamic_linker=/lib/ld-linux-aarch64.so.1
-        runtime_loader=${stdenv.cc.libc}/lib/ld-linux-aarch64.so.1
         ;;
       *)
         echo "unsupported static archive check target: ${stdenv.hostPlatform.system}" >&2
         exit 1
         ;;
     esac
-    runtime_library_path=${stdenv.cc.libc}/lib:${stdenv.cc.cc.lib}/lib
     while IFS= read -r object; do
       file -b "$object" | grep -F "$expected_object_format"
     done < <(find members -type f -name '*.o' -print)
@@ -73,20 +70,21 @@ stdenv.mkDerivation {
       printf '%s\n' "$symbols" | grep -Eq "[[:space:]]$symbol$"
     done
 
-    test ! -e ${libmsquicStatic}/lib/libmsquic.so
-    test ! -e ${libmsquicStatic}/lib/libmsquic.so.2
-    test -s ${libmsquicStatic}/share/msquic/provenance.json
-    grep -F '"applications":1' ${libmsquicStatic}/share/msquic/provenance.json
-    grep -F '"archive":"lib/libmsquic.a"' ${libmsquicStatic}/share/msquic/provenance.json
-    grep -F '"portable":true' ${libmsquicStatic}/share/msquic/provenance.json
-    grep -F '"targetIndependentRuntimePaths":true' ${libmsquicStatic}/share/msquic/provenance.json
+    test ! -e ${libmsquic}/lib/libmsquic.so
+    test ! -e ${libmsquic}/lib/libmsquic.so.2
+    test -s ${libmsquic}/share/msquic/provenance.json
+    grep -F '"package":"libmsquic"' ${libmsquic}/share/msquic/provenance.json
+    grep -F '"applications":1' ${libmsquic}/share/msquic/provenance.json
+    grep -F '"archive":"lib/libmsquic.a"' ${libmsquic}/share/msquic/provenance.json
+    grep -F '"portable":true' ${libmsquic}/share/msquic/provenance.json
+    grep -F '"targetIndependentRuntimePaths":true' ${libmsquic}/share/msquic/provenance.json
     grep -F '"archivePathPolicy":"reject-nix-store-and-build-paths"' \
-      ${libmsquicStatic}/share/msquic/provenance.json
-    grep -F '"opensslDir":"/etc/ssl"' ${libmsquicStatic}/share/msquic/provenance.json
+      ${libmsquic}/share/msquic/provenance.json
+    grep -F '"opensslDir":"/etc/ssl"' ${libmsquic}/share/msquic/provenance.json
     grep -F '"certificateFile":"/etc/ssl/certs/ca-certificates.crt"' \
-      ${libmsquicStatic}/share/msquic/provenance.json
-    grep -F '"status":"evaluation-only"' ${libmsquicStatic}/share/msquic/provenance.json
-    grep -F 'aarch64-darwin builder with an Apple SDK' ${libmsquicStatic}/share/msquic/provenance.json
+      ${libmsquic}/share/msquic/provenance.json
+    grep -F '"status":"evaluation-only"' ${libmsquic}/share/msquic/provenance.json
+    grep -F 'aarch64-darwin builder with an Apple SDK' ${libmsquic}/share/msquic/provenance.json
 
     cat > msquic-static-consumer.c <<'EOF'
     #include <msquic.h>
@@ -102,22 +100,21 @@ stdenv.mkDerivation {
         return 0;
     }
     EOF
-    $CC -std=c11 -I${libmsquicStatic}/include msquic-static-consumer.c \
-      ${libmsquicStatic}/lib/libmsquic.a -ldl -pthread -lm \
-      -Wl,--no-as-needed -Wl,--dynamic-linker="$dynamic_linker" \
+    $CC -static -std=c11 -I${libmsquic}/include msquic-static-consumer.c \
+      ${libmsquic}/lib/libmsquic.a -ldl -pthread -lm \
       -o msquic-static-consumer
-    for forbidden in /nix/store /build; do
-      if strings -a msquic-static-consumer | grep -Fq "$forbidden"; then
-        echo "forbidden path '$forbidden' found in final consumer" >&2
-        exit 1
-      fi
-    done
-    dynamic_dependencies=$(readelf -d msquic-static-consumer)
-    printf '%s\n' "$dynamic_dependencies" | grep -Eq 'lib(msquic|ssl|crypto)' && exit 1 || true
+    reject_path_leaks msquic-static-consumer
+    file -b msquic-static-consumer | grep -F 'statically linked'
+    if readelf -l msquic-static-consumer | grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)'; then
+      echo "static consumer unexpectedly has an interpreter" >&2
+      exit 1
+    fi
+    if readelf -d msquic-static-consumer | grep -Fq '(NEEDED)'; then
+      echo "static consumer unexpectedly has dynamic dependencies" >&2
+      exit 1
+    fi
     if ${lib.boolToString canExecute}; then
-      ldd_dependencies=$("$runtime_loader" --library-path "$runtime_library_path" --list "$PWD/msquic-static-consumer")
-      printf '%s\n' "$ldd_dependencies" | grep -Eq 'lib(msquic|ssl|crypto)' && exit 1 || true
-      "$runtime_loader" --library-path "$runtime_library_path" "$PWD/msquic-static-consumer"
+      ./msquic-static-consumer
     fi
 
     runHook postBuild
@@ -130,7 +127,7 @@ stdenv.mkDerivation {
   '';
 
   passthru = {
-    msquicProvider = libmsquicStatic;
+    msquicProvider = libmsquic;
   };
 
   meta = {

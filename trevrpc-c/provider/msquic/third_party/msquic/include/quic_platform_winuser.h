@@ -236,8 +236,8 @@ _IRQL_requires_max_(PASSIVE_LEVEL) QUIC_INLINE void CxPlatCloseHandle(_Pre_notnu
 
 extern uint64_t CxPlatTotalMemory;
 
-_Ret_maybenull_ _Post_writable_byte_size_(ByteCount) DECLSPEC_ALLOCATOR
-    void* CxPlatAlloc(_In_ size_t ByteCount, _In_ uint32_t Tag);
+_Ret_maybenull_ _Post_writable_byte_size_(ByteCount)
+    DECLSPEC_ALLOCATOR void* CxPlatAlloc(_In_ size_t ByteCount, _In_ uint32_t Tag);
 
 void* CxPlatAllocUninitialized(_In_ size_t ByteCount, _In_ uint32_t Tag);
 

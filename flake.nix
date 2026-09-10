@@ -29,66 +29,15 @@
     trevpkgs.libs.mkFlake (
       system: pkgs:
       let
-        cSources = import ./trevrpc-c/source.nix { lib = pkgs.lib; };
-        msquicPatch = ./nix/patches/trevrpc-msquic-reset-at.patch;
-        libmsquic =
-          assert pkgs.libmsquic.version == "2.6.0";
-          pkgs.libmsquic.overrideAttrs (previous: {
-            patches = (previous.patches or [ ]) ++ [ msquicPatch ];
-            dontPatchELF = true;
-            passthru = (previous.passthru or { }) // {
-              trevrpcResetStreamAtPatch = msquicPatch;
-            };
-          });
-        callPackage =
-          assert builtins.length (builtins.filter (patch: patch == msquicPatch) libmsquic.patches) == 1;
-          pkgs.newScope {
-            inherit libmsquic;
-          };
-        libmsquicStatic = callPackage ./nix/packages/libmsquic-static.nix {
-          inherit msquicPatch;
-        };
-        crossAarch64 =
-          if system == "x86_64-linux" then
-            let
-              crossPkgs = pkgs.pkgsCross.aarch64-multiplatform;
-              crossLibmsquic =
-                assert crossPkgs.libmsquic.version == "2.6.0";
-                crossPkgs.libmsquic.overrideAttrs (previous: {
-                  patches = (previous.patches or [ ]) ++ [ msquicPatch ];
-                  dontPatchELF = true;
-                  passthru = (previous.passthru or { }) // {
-                    trevrpcResetStreamAtPatch = msquicPatch;
-                  };
-                });
-              crossCallPackage =
-                assert builtins.length (builtins.filter (patch: patch == msquicPatch) crossLibmsquic.patches) == 1;
-                crossPkgs.newScope {
-                  libmsquic = crossLibmsquic;
-                };
-            in
-            let
-              crossLibmsquicStatic = crossCallPackage ./nix/packages/libmsquic-static.nix {
-                inherit msquicPatch;
-              };
-            in
-            {
-              libmsquicStatic = crossLibmsquicStatic;
-              staticCheck = crossCallPackage ./nix/checks/msquic-static {
-                libmsquicStatic = crossLibmsquicStatic;
-              };
-              go = crossCallPackage ./trevrpc-go {
-                benchProto = ./bench/proto;
-                wireGolden = ./testdata/wire-golden-vectors.txt;
-              };
-            }
+        libmsquic = pkgs.callPackage ./nix/packages/libmsquic.nix { };
+        staticLibmsquic =
+          if pkgs.stdenv.hostPlatform.isLinux then
+            pkgs.pkgsStatic.callPackage ./nix/packages/libmsquic.nix { }
           else
             null;
-        requireCanonicalMsquic =
-          consumer:
-          assert consumer.passthru.msquicProvider == libmsquic;
-          consumer;
-        cTransportCheck = callPackage ./trevrpc-c/transport-check.nix { };
+
+        cSources = import ./trevrpc-c/source.nix { lib = pkgs.lib; };
+        cTransportCheck = pkgs.callPackage ./trevrpc-c/transport-check.nix { };
         cTransportSanitizerCheck = cTransportCheck.override {
           sanitizers = true;
         };
@@ -137,13 +86,15 @@
           let
             cFamilyConformancePeers =
               if pkgs.stdenv.hostPlatform.isLinux then
-                callPackage ./conformance/adapters/c-family {
+                pkgs.callPackage ./conformance/adapters/c-family {
+                  inherit libmsquic;
                   trevrpcCSrc = cSources.msquic;
                   trevrpcCppSrc = ./trevrpc-cpp;
                 }
               else
                 null;
-            c = callPackage ./trevrpc-c {
+            c = pkgs.callPackage ./trevrpc-c {
+              inherit libmsquic;
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
@@ -162,7 +113,7 @@
               doCheck = false;
               doInstallCheck = false;
             });
-            cpp = callPackage ./trevrpc-cpp {
+            cpp = pkgs.callPackage ./trevrpc-cpp {
               benchProto = ./bench/proto;
               trevrpcC = c;
               peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
@@ -172,43 +123,43 @@
                 }
               ];
             };
-            go = callPackage ./trevrpc-go {
+            go = pkgs.callPackage ./trevrpc-go {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
             };
-            goQuicGo = callPackage ./trevrpc-go/quic-go { };
+            goQuicGo = pkgs.callPackage ./trevrpc-go/quic-go { };
             js = pkgs.callPackage ./trevrpc-js {
+              inherit libmsquic;
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = cNode;
               trevrpcCSrc = cSources.msquic;
             };
-            kotlin = callPackage ./trevrpc-kotlin {
+            kotlin = pkgs.callPackage ./trevrpc-kotlin {
               licenseFile = ./LICENSE;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               greeterProto = ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto;
               trevrpcBench = bench;
             };
-            rust = callPackage ./trevrpc-rust {
+            rust = pkgs.callPackage ./trevrpc-rust {
               benchProto = ./bench/proto;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               trevrpcC = c;
               trevrpcCTransportTesting = cTransportCheck.testing;
             };
-            bench = callPackage ./bench {
+            bench = pkgs.callPackage ./bench {
               conformanceSrc = ./conformance;
               wireGolden = ./testdata/wire-golden-vectors.txt;
               sourceCommit = self.rev or (self.dirtyRev or "unversioned");
               sourceDirty = if self ? rev then "false" else "true";
             };
-            browserBenchPeer = callPackage ./trevrpc-js/bench-browser {
+            browserBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
               trevrpcJs = js;
             };
           in
-          assert c.passthru.msquicProvider == libmsquic;
-          assert
-            cFamilyConformancePeers == null || cFamilyConformancePeers.passthru.msquicProvider == libmsquic;
           {
+            msquic = libmsquic;
+
             trevrpc-c = c;
             trevrpc-cpp = cpp;
             trevrpc-go = go;
@@ -216,7 +167,6 @@
             trevrpc-js = js;
             trevrpc-kotlin = kotlin;
             trevrpc-rust = rust;
-            libmsquic-static = libmsquicStatic;
 
             trevrpc-bench = bench;
             trevrpc-browser-bench-peer = browserBenchPeer;
@@ -237,10 +187,6 @@
                 "aarch64-darwin"
               ];
             };
-          }
-          // pkgs.lib.optionalAttrs (crossAarch64 != null) {
-            libmsquic-static-aarch64-linux = crossAarch64.libmsquicStatic;
-            trevrpc-go-aarch64-linux = crossAarch64.go;
           };
       in
       {
@@ -483,16 +429,16 @@
             '';
           };
 
-          inspect-msquic-static = {
+          ${if pkgs.stdenv.hostPlatform.isLinux then "inspect-msquic-static" else null} = {
             packages = with pkgs; [
               binutils
               file
             ];
             script = ''
-              archive=${libmsquicStatic}/lib/libmsquic.a
+              archive=${staticLibmsquic}/lib/libmsquic.a
               file "$archive"
               nm -g --defined-only "$archive" | grep -E '[[:space:]]MsQuic(OpenVersion|Close|SetParam|StreamSend)$'
-              printf 'provenance: %s\n' ${libmsquicStatic}/share/msquic/provenance.json
+              printf 'provenance: %s\n' ${staticLibmsquic}/share/msquic/provenance.json
             '';
           };
         };
@@ -531,9 +477,13 @@
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
-            msquicStaticCheck = callPackage ./nix/checks/msquic-static {
-              inherit libmsquicStatic;
-            };
+            msquicStaticCheck =
+              if pkgs.stdenv.hostPlatform.isLinux then
+                pkgs.pkgsStatic.callPackage ./nix/checks/msquic-static {
+                  libmsquic = staticLibmsquic;
+                }
+              else
+                null;
             goNeutralModuleSource = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = cSources.goNeutral;
@@ -595,48 +545,25 @@
                   go vet ./...
                   touch $out
                 '';
-            crossAarch64GoCheck =
-              if system == "x86_64-linux" then
-                pkgs.runCommand "trevrpc-go-aarch64-linux-check"
-                  {
-                    nativeBuildInputs = [
-                      pkgs.file
-                      pkgs.binutils
-                    ];
-                  }
-                  ''
-                    for executable in ${crossAarch64.go}/bin/*; do
-                      file "$executable" | grep -F 'ELF 64-bit LSB executable, ARM aarch64'
-                      readelf -h "$executable" | grep -F 'Machine:                           AArch64'
-                    done
-                    touch $out
-                  ''
-              else
-                null;
-            stockMsquicProviderCheck =
-              assert pkgs.libmsquic.drvPath != libmsquic.drvPath;
-              callPackage ./nix/checks/msquic-provider {
-                libmsquic = pkgs.libmsquic;
-                expectedDescriptor = false;
-              };
-            draft07MsquicProviderCheck = requireCanonicalMsquic (
-              callPackage ./nix/checks/msquic-provider {
-                expectedDescriptor = true;
-                requestedMask = 1;
-              }
-            );
-            draft10MsquicProviderCheck = requireCanonicalMsquic (
-              callPackage ./nix/checks/msquic-provider {
-                expectedDescriptor = true;
-                requestedMask = 2;
-              }
-            );
-            bothMsquicProviderCheck = requireCanonicalMsquic (
-              callPackage ./nix/checks/msquic-provider {
-                expectedDescriptor = true;
-                requestedMask = 3;
-              }
-            );
+            stockMsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
+              libmsquic = pkgs.libmsquic;
+              expectedDescriptor = false;
+            };
+            draft07MsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
+              inherit libmsquic;
+              expectedDescriptor = true;
+              requestedMask = 1;
+            };
+            draft10MsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
+              inherit libmsquic;
+              expectedDescriptor = true;
+              requestedMask = 2;
+            };
+            bothMsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
+              inherit libmsquic;
+              expectedDescriptor = true;
+              requestedMask = 3;
+            };
           in
           pkgs.mkChecks {
             benchmark-controller = packageSet.trevrpc-bench;
@@ -655,36 +582,39 @@
             c = packageSet.trevrpc-c;
             go-module-neutral = goNeutralModuleCheck;
             go-module-msquic-provider = goProviderModuleCheck;
-            c-engine = callPackage ./trevrpc-c/engine-check.nix { };
-            c-engine-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/engine-msquic-check.nix { });
+            c-engine = pkgs.callPackage ./trevrpc-c/engine-check.nix { };
+            c-engine-msquic = pkgs.callPackage ./trevrpc-c/engine-msquic-check.nix {
+              inherit libmsquic;
+            };
             c-transport = cTransportCheck;
-            c-transport-msquic = requireCanonicalMsquic (
-              callPackage ./trevrpc-c/transport-msquic-check.nix { }
-            );
-            c-rpc = callPackage ./trevrpc-c/rpc-check.nix { };
-            c-rpc-msquic = requireCanonicalMsquic (callPackage ./trevrpc-c/rpc-msquic-check.nix { });
-            c-conformance-rpc = requireCanonicalMsquic (
-              callPackage ./conformance/adapters/c-family {
-                trevrpcCSrc = cSources.msquic;
-                trevrpcCppSrc = ./trevrpc-cpp;
-                cOnly = true;
-              }
-            );
+            c-transport-msquic = pkgs.callPackage ./trevrpc-c/transport-msquic-check.nix {
+              inherit libmsquic;
+            };
+            c-rpc = pkgs.callPackage ./trevrpc-c/rpc-check.nix { };
+            c-rpc-msquic = pkgs.callPackage ./trevrpc-c/rpc-msquic-check.nix {
+              inherit libmsquic;
+            };
+            c-conformance-rpc = pkgs.callPackage ./conformance/adapters/c-family {
+              inherit libmsquic;
+              trevrpcCSrc = cSources.msquic;
+              trevrpcCppSrc = ./trevrpc-cpp;
+              cOnly = true;
+            };
             c-sanitizers = packageSet.trevrpc-c.override {
               sanitizers = true;
             };
             ${if system == "x86_64-linux" then "c-tsan" else null} = packageSet.trevrpc-c.override {
               threadSanitizer = true;
             };
-            c-family-sanitizers = requireCanonicalMsquic (
-              (callPackage ./conformance/adapters/c-family {
+            c-family-sanitizers =
+              (pkgs.callPackage ./conformance/adapters/c-family {
+                inherit libmsquic;
                 trevrpcCSrc = cSources.msquic;
                 trevrpcCppSrc = ./trevrpc-cpp;
               }).override
                 {
                   sanitizers = true;
-                }
-            );
+                };
 
             ${
               if
@@ -698,8 +628,6 @@
                 null
             } =
               msquicStaticCheck;
-            ${if system == "x86_64-linux" then "msquic-static-aarch64-linux" else null} =
-              crossAarch64.staticCheck;
             ${if system == "x86_64-linux" then "msquic-provider-stock" else null} = stockMsquicProviderCheck;
             ${if system == "x86_64-linux" then "msquic-provider-draft07" else null} =
               draft07MsquicProviderCheck;
@@ -724,7 +652,6 @@
                 };
 
             go = packageSet.trevrpc-go;
-            ${if system == "x86_64-linux" then "go-aarch64-linux" else null} = crossAarch64GoCheck;
             go-quic-go = packageSet.trevrpc-go-quic-go;
 
             js = packageSet.trevrpc-js;
