@@ -31,6 +31,7 @@ let
         jsNativeSrc = ./native;
         jsNativePackageSrc = ./npm/native-linux-x64-gnu;
         jsLicense = ./LICENSE;
+        opensslLicense = ../trevrpc-c/provider/msquic/licenses/OPENSSL-LICENSE.txt;
         inherit jsPackage;
         packageManifestWriter = jsPackageManifestWriter;
         publicationVerifier = ./publication-tests/verify.mjs;
@@ -357,7 +358,10 @@ buildNpmPackage (final: {
   meta = {
     mainProgram = "protoc-gen-trevrpc-js";
     description = "JavaScript WebTransport runtime and protobuf.js code generator for TrevRPC";
-    license = lib.licenses.mit;
+    license = with lib.licenses; [
+      mit
+      asl20
+    ];
     platforms = lib.platforms.all;
     badPlatforms = [ lib.systems.inspect.platformPatterns.isStatic ];
     homepage = "https://trev.zip/llc/TrevRPC";

@@ -8,4 +8,4 @@ Supported runtime contract:
 - glibc 2.42 or newer
 - Node.js 24
 
-Install `@trevrpc/trevrpc-js`; its exact optional dependency selects this package automatically. Do not import this package directly. The package contains one N-API `.node` addon and its `$ORIGIN`-resolved `libmsquic.so.2` dependency.
+Install `@trevrpc/trevrpc-js`; its exact optional dependency selects this package automatically. Do not import this package directly. The package contains one N-API `.node` addon and its `$ORIGIN`-resolved `libmsquic.so.2` dependency. MsQuic embeds upstream OpenSSL, so no host OpenSSL package is required.

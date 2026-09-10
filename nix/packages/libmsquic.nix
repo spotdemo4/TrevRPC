@@ -8,15 +8,20 @@
 }:
 let
   isStatic = stdenv.hostPlatform.isStatic;
+  usesExternalOpenSSL = stdenv.hostPlatform.isLinux;
   msquicPatch = ../patches/trevrpc-msquic-reset-at.patch;
   opensslStatic = (openssl.override { static = true; }).overrideAttrs (previous: {
     # Nixpkgs' static OpenSSL build puts OPENSSLDIR in a separate output.
     # That output's store path is compiled into libcrypto.a. Use the host's
     # conventional configuration directory instead so the archive is usable
     # outside Nix and across rebuilds/targets.
-    configureFlags = map (
-      flag: if flag == "--openssldir=/.$(etc)/etc/ssl" then "--openssldir=/etc/ssl" else flag
-    ) previous.configureFlags;
+    configureFlags =
+      map (
+        flag: if flag == "--openssldir=/.$(etc)/etc/ssl" then "--openssldir=/etc/ssl" else flag
+      ) previous.configureFlags
+      # The native MsQuic DSO embeds these archives, so its objects must be
+      # position-independent. Static target archives keep their existing flags.
+      ++ lib.optional (!isStatic) "CFLAGS=-fPIC";
     outputs = [
       "dev"
       "out"
@@ -93,16 +98,18 @@ libmsquic.overrideAttrs (
       ++ lib.optional (
         stdenv.hostPlatform.isLinux && stdenv.hostPlatform.isAarch64
       ) "-DCMAKE_TARGET_ARCHITECTURE=arm64"
+      ++ lib.optionals usesExternalOpenSSL [
+        "-DQUIC_TLS_LIB=openssl"
+        "-DQUIC_USE_EXTERNAL_OPENSSL=ON"
+        "-DQUIC_OPENSSL_INCLUDE_DIR=${opensslStatic.dev}/include"
+        "-DQUIC_OPENSSL_LIB_DIR=${opensslStatic.out}/lib"
+      ]
       ++ lib.optionals isStatic [
         # Keep compiler provenance useful without embedding Nix's ephemeral
         # build directory in the distributable archive.
         "-DCMAKE_C_FLAGS=-ffile-prefix-map=/build/source=/usr/src/msquic"
         "-DCMAKE_CXX_FLAGS=-ffile-prefix-map=/build/source=/usr/src/msquic"
         "-DQUIC_BUILD_SHARED=OFF"
-        "-DQUIC_TLS_LIB=openssl"
-        "-DQUIC_USE_EXTERNAL_OPENSSL=ON"
-        "-DQUIC_OPENSSL_INCLUDE_DIR=${opensslStatic.dev}/include"
-        "-DQUIC_OPENSSL_LIB_DIR=${opensslStatic.out}/lib"
         "-DQUIC_ENABLE_LOGGING=OFF"
         "-DQUIC_BUILD_TOOLS=OFF"
         "-DQUIC_BUILD_TEST=OFF"
@@ -110,7 +117,7 @@ libmsquic.overrideAttrs (
       ];
     buildInputs =
       lib.filter (input: (input.pname or "") != "lttng-tools") (previous.buildInputs or [ ])
-      ++ lib.optionals isStatic [
+      ++ lib.optionals usesExternalOpenSSL [
         opensslStatic.dev
         opensslStatic.out
       ];
@@ -126,6 +133,11 @@ libmsquic.overrideAttrs (
       // {
         trevrpcResetStreamAtPatch = msquicPatch;
       }
+      // lib.optionalAttrs usesExternalOpenSSL {
+        msquicOpenSSL = opensslStatic;
+        msquicOpenSSLLinkage = if isStatic then "static-archive" else "embedded-static";
+        msquicTlsProvider = "openssl";
+      }
       // lib.optionalAttrs isStatic {
         msquicStaticArchive = "lib/libmsquic.a";
         msquicStaticOpenSSL = opensslStatic;
@@ -140,6 +152,17 @@ libmsquic.overrideAttrs (
         };
         trevrpcResetStreamAtPatchApplications = 1;
       };
+    meta =
+      (previous.meta or { })
+      // lib.optionalAttrs usesExternalOpenSSL {
+        license = with lib.licenses; [
+          mit
+          asl20
+        ];
+      }
+      // lib.optionalAttrs isStatic {
+        description = "Patched MsQuic 2.6.0 monolithic static archive with static OpenSSL";
+      };
   }
   // lib.optionalAttrs isStatic {
     postInstall = (previous.postInstall or "") + ''
@@ -148,12 +171,5 @@ libmsquic.overrideAttrs (
       ${provenance}
       EOF
     '';
-    meta = (previous.meta or { }) // {
-      description = "Patched MsQuic 2.6.0 monolithic static archive with static OpenSSL";
-      license = with lib.licenses; [
-        mit
-        asl20
-      ];
-    };
   }
 )

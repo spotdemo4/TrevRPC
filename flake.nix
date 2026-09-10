@@ -477,6 +477,13 @@
               ];
               meta.platforms = [ "x86_64-linux" ];
             };
+            msquicNativeCheck =
+              if pkgs.stdenv.hostPlatform.isLinux then
+                pkgs.callPackage ./nix/checks/msquic-native {
+                  inherit libmsquic;
+                }
+              else
+                null;
             msquicStaticCheck =
               if pkgs.stdenv.hostPlatform.isLinux then
                 pkgs.pkgsStatic.callPackage ./nix/checks/msquic-static {
@@ -616,6 +623,7 @@
                   sanitizers = true;
                 };
 
+            ${if pkgs.stdenv.hostPlatform.isLinux then "msquic-native" else null} = msquicNativeCheck;
             ${
               if
                 builtins.elem system [

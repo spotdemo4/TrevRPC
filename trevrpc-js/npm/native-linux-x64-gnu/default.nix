@@ -15,9 +15,16 @@
   jsNativeSrc,
   jsNativePackageSrc,
   jsLicense,
+  opensslLicense,
   jsPackage,
   stdenv,
 }:
+assert lib.assertMsg (
+  (libmsquic.msquicTlsProvider or null) == "openssl"
+) "native npm package requires MsQuic's OpenSSL TLS provider";
+assert lib.assertMsg (
+  (libmsquic.msquicOpenSSLLinkage or null) == "embedded-static"
+) "native npm package requires MsQuic with statically embedded OpenSSL";
 stdenv.mkDerivation (final: {
   pname = "trevrpc-js-native-linux-x64-gnu";
   inherit (jsPackage) version;
@@ -33,6 +40,7 @@ stdenv.mkDerivation (final: {
       jsNativeSrc
       jsNativePackageSrc
       jsLicense
+      opensslLicense
     ];
   };
 
@@ -82,6 +90,8 @@ stdenv.mkDerivation (final: {
     cp "$src/trevrpc-js/LICENSE" "$out/package/LICENSE"
     cp "$src/trevrpc-js/npm/native-linux-x64-gnu/THIRD_PARTY_NOTICES.md" \
       "$out/package/THIRD_PARTY_NOTICES.md"
+    cp "$src/trevrpc-c/provider/msquic/licenses/OPENSSL-LICENSE.txt" \
+      "$out/package/OPENSSL-LICENSE.txt"
     chmod u+w "$out/package/trevrpc_native.node" "$out/package/libmsquic.so.2"
 
     patchelf --set-rpath '$ORIGIN' "$out/package/trevrpc_native.node"
@@ -117,7 +127,10 @@ stdenv.mkDerivation (final: {
 
   meta = {
     description = "Portable TrevRPC native Node addon for Linux x86-64 glibc";
-    license = lib.licenses.mit;
+    license = with lib.licenses; [
+      mit
+      asl20
+    ];
     platforms = [ "x86_64-linux" ];
   };
 })

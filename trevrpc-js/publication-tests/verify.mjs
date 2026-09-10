@@ -105,6 +105,7 @@ async function verifyNative(native, version) {
       "package/package.json",
       "package/README.md",
       "package/LICENSE",
+      "package/OPENSSL-LICENSE.txt",
       "package/THIRD_PARTY_NOTICES.md",
       "package/trevrpc_native.node",
       "package/libmsquic.so.2",

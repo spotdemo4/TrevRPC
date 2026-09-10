@@ -16,6 +16,7 @@
     "libmsquic.so.2",
     "README.md",
     "LICENSE",
+    "OPENSSL-LICENSE.txt",
     "THIRD_PARTY_NOTICES.md"
   ],
   "os": ["linux"],

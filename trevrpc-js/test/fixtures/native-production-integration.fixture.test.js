@@ -687,7 +687,7 @@ function waitForExit(child, timeoutMs = 10_000, label = "child") {
     }, timeoutMs);
     child.once("close", onClose);
     child.once("error", onError);
-    if (child.exitCode != null) {
+    if (child.exitCode != null || child.signalCode != null) {
       finish({ code: child.exitCode, signal: child.signalCode });
     }
   });
