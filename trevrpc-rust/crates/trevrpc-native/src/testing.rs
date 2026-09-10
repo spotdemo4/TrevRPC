@@ -71,7 +71,9 @@ mod tests {
     use std::time::Duration;
 
     use super::TestingProvider;
-    use crate::ffi::{Handle, TestingAdmission, TestingControl, TestingEvent};
+    #[cfg(target_os = "linux")]
+    use crate::ffi::TestingControl;
+    use crate::ffi::{Handle, TestingAdmission, TestingEvent};
     use crate::{
         BiStream, CloseReason, Connection, EndpointConfig, Listener, ListenerEvent, Protocol,
         TransportConfig, TransportState,
