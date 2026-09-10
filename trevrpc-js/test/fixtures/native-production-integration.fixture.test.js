@@ -11,6 +11,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 
 import { Code, RpcKind, RpcStreamFrameKind } from "../../src/index.js";
+import {
+  childHasExited,
+  stopChild,
+  trackChild,
+  waitForChild,
+} from "../child-process-supervisor.js";
 
 const require = createRequire(import.meta.url);
 const addonPath = join(import.meta.dirname, "..", "..", "build", "native", "trevrpc_native.node");
@@ -32,7 +38,7 @@ if (!available) {
 } else {
   after(async () => {
     if (server != null) {
-      await stopProcess(server, 10_000, "integration fixture");
+      await stopFixture(server, "integration fixture");
       server = null;
     }
     if (temporaryDirectory != null) {
@@ -77,32 +83,36 @@ if (!available) {
     },
   );
 
-  test("legacy listener selectors map to one canonical transport", async () => {
-    const native = require(addonPath);
-    const certificate = await makeCertificate();
-    const http3Server = await native.listenMsQuic({
-      host: "127.0.0.1",
-      port: 0,
-      certFile: certificate.cert,
-      keyFile: certificate.key,
-      enableNative: false,
-      enableHttp3: true,
-      http3Path: "/trevrpc",
-    });
-    http3Server.close();
-    await http3Server.serve();
-
-    await assert.rejects(
-      native.listenMsQuic({
+  test(
+    "legacy listener selectors map to one canonical transport",
+    { timeout: 15_000 },
+    async () => {
+      const native = require(addonPath);
+      const certificate = await makeCertificate();
+      const http3Server = await native.listenMsQuic({
         host: "127.0.0.1",
         port: 0,
         certFile: certificate.cert,
         keyFile: certificate.key,
-        transport: "http3",
         enableNative: false,
-      }),
-    );
-  });
+        enableHttp3: true,
+        http3Path: "/trevrpc",
+      });
+      http3Server.close();
+      await http3Server.serve();
+
+      await assert.rejects(
+        native.listenMsQuic({
+          host: "127.0.0.1",
+          port: 0,
+          certFile: certificate.cert,
+          keyFile: certificate.key,
+          transport: "http3",
+          enableNative: false,
+        }),
+      );
+    },
+  );
 
   test(
     "production ABI1 endpoint, calls, streams, cancellation, and teardown",
@@ -117,12 +127,14 @@ if (!available) {
 
       const certificate = await makeCertificate();
       const port = await freeUdpPort();
-      server = spawn(
-        fixturePath,
-        ["127.0.0.1", String(port), certificate.cert, certificate.key, "native"],
-        {
-          stdio: ["ignore", "pipe", "pipe"],
-        },
+      server = trackChild(
+        spawn(
+          fixturePath,
+          ["127.0.0.1", String(port), certificate.cert, certificate.key, "native"],
+          {
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ),
       );
       await waitForLine(server, /serving native on 127\.0\.0\.1:/u);
 
@@ -326,12 +338,13 @@ if (!available) {
         await settlesWithin(client.closed, 5_000, "client close");
       }
 
-      const child = spawn(
-        process.execPath,
-        [
-          "--input-type=module",
-          "-e",
-          `
+      const child = trackChild(
+        spawn(
+          process.execPath,
+          [
+            "--input-type=module",
+            "-e",
+            `
             import assert from "node:assert/strict";
             import { createRequire } from "node:module";
             const loadAddon = createRequire(import.meta.url);
@@ -357,8 +370,9 @@ if (!available) {
             await client.closed;
             process.stdout.write("natural-exit-ok\\n");
           `,
-        ],
-        { stdio: ["ignore", "pipe", "pipe"] },
+          ],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        ),
       );
       let childOutput = "";
       let childError = "";
@@ -368,7 +382,11 @@ if (!available) {
       child.stderr.on("data", (chunk) => {
         childError += chunk;
       });
-      const { code: childCode, signal: childSignal } = await waitForExit(child);
+      const { code: childCode, signal: childSignal } = await waitForChildWithCleanup(
+        child,
+        10_000,
+        "natural-exit client",
+      );
       assert.equal(childCode, 0, childError);
       assert.equal(childSignal, null, childError);
       assert.match(childOutput, /natural-exit-ok/u, childError);
@@ -404,10 +422,12 @@ if (!available) {
     async () => {
       const certificate = await makeCertificate();
       const port = await freeUdpPort();
-      const admissionServer = spawn(
-        fixturePath,
-        ["127.0.0.1", String(port), certificate.cert, certificate.key, "native"],
-        { stdio: ["ignore", "pipe", "pipe"] },
+      const admissionServer = trackChild(
+        spawn(
+          fixturePath,
+          ["127.0.0.1", String(port), certificate.cert, certificate.key, "native"],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        ),
       );
       try {
         await waitForLine(admissionServer, /serving native on 127\.0\.0\.1:/u);
@@ -417,12 +437,13 @@ if (!available) {
           ["fin-id", "TREVRPC_NODE_FAIL_SEND_OPERATION_ID", "fin"],
           ["fin-record", "TREVRPC_NODE_FAIL_SEND_OPERATION_RECORD", "fin"],
         ]) {
-          const child = spawn(
-            process.execPath,
-            [
-              "--input-type=module",
-              "-e",
-              `
+          const child = trackChild(
+            spawn(
+              process.execPath,
+              [
+                "--input-type=module",
+                "-e",
+                `
                 import assert from "node:assert/strict";
                 import { createRequire } from "node:module";
                 const loadAddon = createRequire(import.meta.url);
@@ -454,11 +475,12 @@ if (!available) {
                 await client.closed;
                 process.stdout.write(${JSON.stringify(`${label}-ok\\n`)});
               `,
-            ],
-            {
-              env: { ...process.env, [flag]: "1" },
-              stdio: ["ignore", "pipe", "pipe"],
-            },
+              ],
+              {
+                env: { ...process.env, [flag]: "1" },
+                stdio: ["ignore", "pipe", "pipe"],
+              },
+            ),
           );
           let output = "";
           let errorOutput = "";
@@ -470,7 +492,7 @@ if (!available) {
           });
           let childResult;
           try {
-            childResult = await waitForExit(child);
+            childResult = await waitForChildWithCleanup(child, 10_000, `${label} client`);
           } catch (error) {
             error.message = `${label}: ${error.message}; stderr: ${errorOutput}`;
             throw error;
@@ -481,7 +503,7 @@ if (!available) {
           assert.match(output, new RegExp(`${label}-ok`), errorOutput);
         }
       } finally {
-        await stopProcess(admissionServer, 10_000, "admission fixture");
+        await stopFixture(admissionServer, "admission fixture");
       }
     },
   );
@@ -492,22 +514,25 @@ if (!available) {
     async () => {
       const certificate = await makeCertificate();
       const port = await freeUdpPort();
-      const closingServer = spawn(
-        fixturePath,
-        ["127.0.0.1", String(port), certificate.cert, certificate.key, "native"],
-        { stdio: ["ignore", "pipe", "pipe"] },
+      const closingServer = trackChild(
+        spawn(
+          fixturePath,
+          ["127.0.0.1", String(port), certificate.cert, certificate.key, "native"],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        ),
       );
       let child;
       let childOutput = "";
       let childError = "";
       try {
         await waitForLine(closingServer, /serving native on 127\.0\.0\.1:/u);
-        child = spawn(
-          process.execPath,
-          [
-            "--input-type=module",
-            "-e",
-            `
+        child = trackChild(
+          spawn(
+            process.execPath,
+            [
+              "--input-type=module",
+              "-e",
+              `
               import { createRequire } from "node:module";
               const loadAddon = createRequire(import.meta.url);
               const native = loadAddon(${JSON.stringify(addonPath)});
@@ -521,8 +546,9 @@ if (!available) {
               await client.closed;
               process.stdout.write("remote-close-ok\\n");
             `,
-          ],
-          { stdio: ["ignore", "pipe", "pipe"] },
+            ],
+            { stdio: ["ignore", "pipe", "pipe"] },
+          ),
         );
         let connectedResolve;
         const connected = new Promise((resolve) => {
@@ -538,15 +564,19 @@ if (!available) {
           childError += chunk;
         });
         await settlesWithin(connected, 5_000, `client connection: ${childError}`);
-        await stopProcess(closingServer, 10_000, "remote-close fixture");
-        const { code: childCode, signal: childSignal } = await waitForExit(child);
+        await stopFixture(closingServer, "remote-close fixture");
+        const { code: childCode, signal: childSignal } = await waitForChildWithCleanup(
+          child,
+          10_000,
+          "remote-close client",
+        );
         assert.equal(childCode, 0, childError);
         assert.equal(childSignal, null, childError);
         assert.match(childOutput, /remote-close-ok/u, childError);
       } finally {
-        await stopProcess(closingServer, 10_000, "remote-close fixture");
-        if (child != null && child.exitCode == null)
-          await stopProcess(child, 10_000, "remote-close client");
+        await stopFixture(closingServer, "remote-close fixture");
+        if (child != null && !childHasExited(child))
+          await stopChild(child, { label: "remote-close client" });
       }
     },
   );
@@ -624,15 +654,22 @@ function waitForLine(child, pattern) {
   });
 }
 
-async function stopProcess(child, timeoutMs, label) {
-  if (child.exitCode == null) {
-    child.kill("SIGTERM");
-  }
+async function stopFixture(child, label) {
+  const result = await stopChild(child, { label });
+  assert.notEqual(result.signal, "SIGKILL", `${label} required SIGKILL`);
+  return result;
+}
+
+async function waitForChildWithCleanup(child, timeoutMs, label) {
   try {
-    return await waitForExit(child, timeoutMs, label);
-  } catch {
-    child.kill("SIGKILL");
-    return await waitForExit(child, timeoutMs, `${label} after SIGKILL`);
+    return await waitForChild(child, timeoutMs, label);
+  } catch (error) {
+    try {
+      await stopChild(child, { graceMs: 0, label: `${label} cleanup` });
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `${label} failed and cleanup failed`);
+    }
+    throw error;
   }
 }
 
@@ -650,46 +687,6 @@ function settlesWithin(promise, timeoutMs, label) {
         reject(error);
       },
     );
-  });
-}
-
-function waitForExit(child, timeoutMs = 10_000, label = "child") {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let timeoutError;
-    const cleanup = () => {
-      clearTimeout(timer);
-      child.off("close", onClose);
-      child.off("error", onError);
-    };
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (timeoutError == null) resolve(result);
-      else reject(timeoutError);
-    };
-    const onClose = (code, signal) => finish({ code, signal });
-    const onError = (error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-    const timer = setTimeout(() => {
-      if (settled) return;
-      timeoutError = new Error(`${label} did not exit within ${timeoutMs}ms`);
-      if (!child.kill("SIGKILL")) {
-        settled = true;
-        cleanup();
-        reject(timeoutError);
-      }
-    }, timeoutMs);
-    child.once("close", onClose);
-    child.once("error", onError);
-    if (child.exitCode != null) {
-      finish({ code: child.exitCode, signal: child.signalCode });
-    }
   });
 }
 
@@ -724,18 +721,16 @@ function onceWorkerMessage(worker, expected, timeoutMs) {
   });
 }
 
-function run(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.once("error", reject);
-    child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+async function run(command, args) {
+  const child = trackChild(spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] }));
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
   });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const result = await waitForChildWithCleanup(child, 10_000, command);
+  return { ...result, stdout, stderr };
 }

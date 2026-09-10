@@ -6,6 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import {
+  ChildExitTimeoutError,
+  stopDetachedChildGroup,
+  trackChild,
+  waitForChild,
+} from "./child-process-supervisor.js";
+
 const addonPath = join(import.meta.dirname, "..", "build", "native", "trevrpc_native.node");
 const greeterFixturePath =
   process.env.TREVRPC_GREETER_SERVER ??
@@ -25,6 +32,9 @@ const requiredFixtureTests = [
   "send and FIN admission failures reject deterministically",
   "connected idle endpoint keeps client.closed live until remote fixture closure",
 ];
+const fixtureTimeoutMs = 150_000;
+const fixtureKillWaitMs = 10_000;
+const integrationTimeoutMs = fixtureTimeoutMs + fixtureKillWaitMs + 5_000;
 
 if (!available) {
   const unavailableReason = `missing addon or fixture: ${greeterFixturePath}`;
@@ -35,7 +45,7 @@ if (!available) {
     () => assert.equal(fixtureRequired, false, unavailableReason),
   );
 } else {
-  test("production ABI1 integration fixture", { timeout: 120_000 }, async () => {
+  test("production ABI1 integration fixture", { timeout: integrationTimeoutMs }, async () => {
     const temporaryDirectory = await mkdtemp(
       join(tmpdir(), "trevrpc-js-native-integration-parent-"),
     );
@@ -59,9 +69,11 @@ if (!available) {
         "full native trace:",
         result.trace,
       ].join("\n");
-      assert.equal(result.timedOut, false, details);
-      assert.equal(result.code, 0, details);
-      assert.equal(result.signal, null, details);
+      assert.deepEqual(
+        { code: result.code, signal: result.signal, timedOut: result.timedOut },
+        { code: 0, signal: null, timedOut: false },
+        details,
+      );
       const expectedPasses = nativeTestHooksAvailable ? 5 : 4;
       const expectedSkips = nativeTestHooksAvailable ? 0 : 1;
       assert.match(
@@ -82,20 +94,11 @@ if (!available) {
   });
 }
 
-function terminateFixture(child, signal) {
-  try {
-    if (process.platform !== "win32" && child.pid != null) process.kill(-child.pid, signal);
-    else child.kill(signal);
-  } catch {
-    // The fixture or its process group has already exited.
-  }
-}
-
-function runFixture({ env }) {
-  return new Promise((resolve, reject) => {
-    const fixtureEnvironment = { ...env };
-    delete fixtureEnvironment.NODE_TEST_CONTEXT;
-    const child = spawn(
+async function runFixture({ env }) {
+  const fixtureEnvironment = { ...env };
+  delete fixtureEnvironment.NODE_TEST_CONTEXT;
+  const child = trackChild(
+    spawn(
       process.execPath,
       [
         "--test",
@@ -109,43 +112,53 @@ function runFixture({ env }) {
         env: fixtureEnvironment,
         stdio: ["ignore", "pipe", "pipe"],
       },
-    );
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let settled = false;
-    const timeout = setTimeout(() => {
-      if (settled) return;
-      timedOut = true;
-      terminateFixture(child, "SIGKILL");
-    }, 100_000);
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      terminateFixture(child, "SIGKILL");
-      reject(error);
-    });
-    child.once("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (timedOut || code !== 0 || signal !== null) terminateFixture(child, "SIGKILL");
-      let trace = "";
-      try {
-        trace = readFileSync(env.TREVRPC_NODE_TRACE_FILE, "utf8");
-      } catch (error) {
-        trace = `unable to read native trace: ${error.message}`;
-      }
-      resolve({ code, signal, stderr, stdout, timedOut, trace });
-    });
+    ),
+  );
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
   });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  let result;
+  try {
+    result = await waitForChild(child, fixtureTimeoutMs, "production integration fixture");
+  } catch (error) {
+    if (!(error instanceof ChildExitTimeoutError)) {
+      await stopDetachedChildGroup(child, {
+        graceMs: 0,
+        killWaitMs: fixtureKillWaitMs,
+        label: "production integration fixture after error",
+      }).catch(() => {});
+      throw error;
+    }
+    timedOut = true;
+    result = await stopDetachedChildGroup(child, {
+      graceMs: 0,
+      killWaitMs: fixtureKillWaitMs,
+      label: "production integration fixture",
+    });
+  }
+
+  if (result.code !== 0 || result.signal !== null) {
+    await stopDetachedChildGroup(child, {
+      graceMs: 0,
+      killWaitMs: fixtureKillWaitMs,
+      label: "failed production integration fixture",
+    });
+  }
+
+  let trace = "";
+  try {
+    trace = readFileSync(env.TREVRPC_NODE_TRACE_FILE, "utf8");
+  } catch (error) {
+    trace = `unable to read native trace: ${error.message}`;
+  }
+  return { ...result, stderr, stdout, timedOut, trace };
 }

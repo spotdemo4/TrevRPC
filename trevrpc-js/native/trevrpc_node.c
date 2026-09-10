@@ -243,6 +243,7 @@ struct node_call {
     bool status_seen;
     bool message_seen;
     bool receive_finished;
+    bool receive_succeeded;
     bool response_settled;
     bool terminal_settled;
     bool close_requested;
@@ -3357,7 +3358,7 @@ static int node_call_make_body_batch(node_call* call, node_receive_waiter* waite
     if (status != NULL && napi_set_named_property(env, *out, "status", status) != napi_ok) {
         return -ENOMEM;
     }
-    bool eof = call->fin_seen && call->receive_head == NULL && call->status_seen;
+    bool eof = call->fin_seen && call->fin_clean && call->receive_head == NULL && call->status_seen;
     napi_value eof_value;
     if (napi_get_boolean(env, eof, &eof_value) != napi_ok ||
         napi_set_named_property(env, *out, "eof", eof_value) != napi_ok) {
@@ -3365,6 +3366,7 @@ static int node_call_make_body_batch(node_call* call, node_receive_waiter* waite
     }
     if (eof) {
         call->receive_finished = true;
+        call->receive_succeeded = true;
         node_call_request_close(call);
     }
     return 0;
@@ -3432,14 +3434,17 @@ static void node_call_process_stream_waiters(node_call* call) {
                     }
                 }
                 call->receive_finished = true;
+                call->receive_succeeded = true;
                 node_call_request_close(call);
             }
         } else {
             break;
         }
         if (result == 0) {
-            if (!waiter->body_batch && call->fin_seen && call->status_seen && call->receive_head == NULL) {
+            if (!waiter->body_batch && call->fin_seen && call->fin_clean && call->status_seen &&
+                call->receive_head == NULL) {
                 call->receive_finished = true;
+                call->receive_succeeded = true;
             }
             (void)napi_resolve_deferred(call->runtime->env, waiter->deferred, value);
         } else {
@@ -4819,8 +4824,7 @@ static napi_value node_stream_recv_common(
     if (napi_unwrap(env, this_value, (void**)&call) != napi_ok || call == NULL) {
         return node_rejected_native_promise(env, -EPIPE, "receive");
     }
-    bool cached_eof =
-        !call->server_side && call->kind != TREVRPC_RPC_KIND_UNARY && !call->failed && call->receive_finished;
+    bool cached_eof = !call->server_side && call->kind != TREVRPC_RPC_KIND_UNARY && call->receive_succeeded;
     if (!cached_eof && (!node_call_usable(call) || call->failed)) {
         return node_rejected_native_promise(env, -EPIPE, "receive");
     }
