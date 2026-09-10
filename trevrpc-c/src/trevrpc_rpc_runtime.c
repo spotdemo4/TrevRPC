@@ -2238,9 +2238,17 @@ static void trevrpc_rpc_fail_call_operations_locked(
                                                             operation->subject_generation},
                                    record->stream));
             if (belongs && operation != record->close_operation && operation->kind != TREVRPC_RPC_OPERATION_CALL_OPEN) {
+                bool peer_settles_local_finish =
+                    record->local && operation->kind == TREVRPC_RPC_OPERATION_STREAM_FINISH && info->status == 0 &&
+                    (info->flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER) != 0 &&
+                    (info->flags & TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN) != 0 &&
+                    (info->flags & (TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER_RESET |
+                                       TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TRANSPORT_ERROR)) == 0 &&
+                    record->peer_status_received && !record->cancelled && !record->deadline_expired &&
+                    !record->runtime_close_target;
                 trevrpc_rpc_event* event = operation->event;
                 event->flags = trevrpc_rpc_map_transport_flags(info->flags);
-                event->status = failure_status;
+                event->status = peer_settles_local_finish ? 0 : failure_status;
                 event->application_error_code = info->application_error_code;
                 event->provider_error_code = info->provider_error_code;
                 event->subject_kind = trevrpc_rpc_operation_completion_subject(operation);
@@ -2803,6 +2811,24 @@ static void trevrpc_rpc_reject_unknown_stream(trevrpc_rpc_runtime* runtime, trev
     }
 }
 
+static void trevrpc_rpc_terminalize_live_objects_locked(
+    trevrpc_rpc_runtime* runtime, const trevrpc_rpc_transport_event_info* info) {
+    trevrpc_rpc_call_record* call;
+    trevrpc_rpc_endpoint_record* endpoint;
+    for (call = runtime->calls; call != NULL; call = call->next) {
+        if (!call->stream_terminal_committed) {
+            call->closing = true;
+            call->cancelled = true;
+            trevrpc_rpc_publish_call_terminals_locked(runtime, call, info);
+        }
+    }
+    for (endpoint = runtime->endpoints; endpoint != NULL; endpoint = endpoint->next) {
+        if (!endpoint->terminal_committed) {
+            trevrpc_rpc_publish_endpoint_terminal_locked(runtime, endpoint, info);
+        }
+    }
+}
+
 static int trevrpc_rpc_handle_transport_event(
     trevrpc_rpc_runtime* runtime, trevrpc_rpc_transport_event* transport_event) {
     trevrpc_rpc_transport_event_info info;
@@ -2829,6 +2855,14 @@ static int trevrpc_rpc_handle_transport_event(
         return 0;
     case TREVRPC_RPC_TRANSPORT_EVENT_STOPPED:
         pthread_mutex_lock(&runtime->mutex);
+        if (runtime->state == TREVRPC_RPC_STATE_STOPPING &&
+            (runtime->live_calls != 0 || runtime->live_endpoints != 0 || runtime->operations != NULL)) {
+            trevrpc_rpc_transport_event_info terminal_info = info;
+            terminal_info.flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_LOCAL;
+            terminal_info.status = info.status != 0 ? info.status : -ECANCELED;
+            terminal_info.application_error_code = TREVRPC_RPC_STATUS_CANCELLED;
+            trevrpc_rpc_terminalize_live_objects_locked(runtime, &terminal_info);
+        }
         if (runtime->live_calls != 0 || runtime->live_endpoints != 0 || runtime->operations != NULL) {
             trevrpc_rpc_transition_fatal_locked(runtime, info.status != 0 ? info.status : -EIO);
         } else {
@@ -3278,8 +3312,6 @@ static void trevrpc_rpc_wait_for_queue_capacity_locked(trevrpc_rpc_runtime* runt
 
 static void trevrpc_rpc_transition_fatal_locked(trevrpc_rpc_runtime* runtime, int32_t status) {
     trevrpc_rpc_transport_event_info info = {0};
-    trevrpc_rpc_call_record* call;
-    trevrpc_rpc_endpoint_record* endpoint;
     trevrpc_rpc_event* stop_event;
     if (runtime->state == TREVRPC_RPC_STATE_STOPPED || runtime->state == TREVRPC_RPC_STATE_RELEASING) {
         return;
@@ -3289,18 +3321,7 @@ static void trevrpc_rpc_transition_fatal_locked(trevrpc_rpc_runtime* runtime, in
     info.status = status != 0 ? status : -EIO;
     runtime->state = TREVRPC_RPC_STATE_STOPPED;
     runtime->terminal_status = info.status;
-    for (call = runtime->calls; call != NULL; call = call->next) {
-        if (!call->stream_terminal_committed) {
-            call->closing = true;
-            call->cancelled = true;
-            trevrpc_rpc_publish_call_terminals_locked(runtime, call, &info);
-        }
-    }
-    for (endpoint = runtime->endpoints; endpoint != NULL; endpoint = endpoint->next) {
-        if (!endpoint->terminal_committed) {
-            trevrpc_rpc_publish_endpoint_terminal_locked(runtime, endpoint, &info);
-        }
-    }
+    trevrpc_rpc_terminalize_live_objects_locked(runtime, &info);
     stop_event = runtime->close_event;
     runtime->close_event = NULL;
     if (stop_event != NULL) {

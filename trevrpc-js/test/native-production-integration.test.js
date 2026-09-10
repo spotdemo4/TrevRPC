@@ -88,10 +88,26 @@ if (!available) {
         details,
       );
       for (const name of requiredFixtureTests) assert.ok(result.stdout.includes(name), details);
+      if (nativeTestHooksAvailable) assertListenerDetachOrdering(result.trace, details);
     } finally {
       await rm(temporaryDirectory, { force: true, recursive: true });
     }
   });
+}
+
+function assertListenerDetachOrdering(trace, details) {
+  const firstDetach = trace.match(/^pid=(\d+) runtime=(\d+) event=server-detached$/mu);
+  assert.notEqual(firstDetach, null, details);
+  const prefix = `pid=${firstDetach[1]} runtime=${firstDetach[2]} event=`;
+  const events = trace
+    .split("\n")
+    .filter((line) => line.startsWith(prefix))
+    .map((line) => line.slice(prefix.length));
+  const first = events.indexOf("server-detached");
+  const second = events.indexOf("server-detached", first + 1);
+  const cleanup = events.indexOf("cleanup-complete", second + 1);
+  const freed = events.indexOf("free", cleanup + 1);
+  assert.ok(first >= 0 && second > first && cleanup > second && freed > cleanup, details);
 }
 
 async function runFixture({ env }) {

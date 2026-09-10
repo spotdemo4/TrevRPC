@@ -361,6 +361,7 @@ static int node_route_admission(node_runtime* runtime, trevrpc_rpc_event* event,
 static void node_process_call(node_call* call);
 static void node_call_request_close(node_call* call);
 static void node_call_maybe_release(node_call* call);
+static void node_call_detach_server(node_runtime* runtime, node_call* call);
 static int node_client_request_close(node_client* client);
 static void node_resolve_undefined(napi_env env, napi_deferred deferred);
 static int node_reject_deferred_native(napi_env env, napi_deferred deferred, int error_code, const char* operation);
@@ -372,6 +373,7 @@ static bool node_close_retryable(int result);
 static napi_value node_make_server_call_object(napi_env env, node_call* call);
 static int node_call_server_fail(node_call* call, uint32_t status, const char* message);
 static void node_server_free_routes(napi_env env, node_server* server);
+static void node_client_detach_server(node_runtime* runtime, node_client* client);
 
 #ifdef TREVRPC_NODE_TEST_HOOKS
 static bool node_test_flag(const char* name) {
@@ -1817,28 +1819,12 @@ static void node_runtime_free(node_runtime* runtime) {
     if (runtime == NULL) {
         return;
     }
-    for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
-        if (subject->core != NULL) {
-            node_client* client = subject->core;
-            node_client_detach_cancellation(client);
-            if (client->server != NULL) {
-                node_server* server = client->server;
-                server->runtime = NULL;
-                server->endpoint = NULL;
-                node_server_free_routes(runtime->env, server);
-                client->server = NULL;
-                if (!server->wrapper_alive) {
-                    free(server);
-                }
-            }
-            client->runtime = NULL;
-        }
-    }
     for (node_subject* subject = runtime->calls.head; subject != NULL; subject = subject->next) {
         node_call* call = subject->core;
         if (call == NULL) {
             continue;
         }
+        node_call_detach_server(runtime, call);
         call->runtime = NULL;
         node_call_dispose_buffers(call);
         subject->core = NULL;
@@ -1847,6 +1833,14 @@ static void node_runtime_free(node_runtime* runtime) {
         }
         if (!call->wrapper_alive) {
             free(call);
+        }
+    }
+    for (node_subject* subject = runtime->endpoints.head; subject != NULL; subject = subject->next) {
+        if (subject->core != NULL) {
+            node_client* client = subject->core;
+            node_client_detach_cancellation(client);
+            node_client_detach_server(runtime, client);
+            client->runtime = NULL;
         }
     }
     for (node_subject* subject = runtime->streams.head; subject != NULL; subject = subject->next) {
@@ -2962,6 +2956,7 @@ static void node_client_maybe_release(node_client* client) {
         return;
     }
     node_client_detach_cancellation(client);
+    node_client_detach_server(runtime, client);
     node_subject* subject = client->subject;
     client->subject = NULL;
     client->release_retry_pending = false;
@@ -3645,6 +3640,24 @@ static napi_value node_stream_close(napi_env env, napi_callback_info info);
 static void node_client_finalizer(napi_env env, void* data, void* hint);
 static void node_call_finalizer(napi_env env, void* data, void* hint);
 
+static void node_call_detach_server(node_runtime* runtime, node_call* call) {
+    if (call == NULL) {
+        return;
+    }
+    node_server* server = call->server;
+    if (call->route != NULL && call->route->active_calls > 0) {
+        call->route->active_calls--;
+    }
+    call->route = NULL;
+    call->server = NULL;
+    if (server != NULL && (server->closed || server->runtime == NULL)) {
+        node_server_free_routes(runtime == NULL ? NULL : runtime->env, server);
+        if (!server->wrapper_alive && server->endpoint == NULL && server->routes == NULL) {
+            free(server);
+        }
+    }
+}
+
 static void node_call_maybe_release(node_call* call) {
     if (call == NULL || !call->call_closed || !call->stream_closed || call->runtime == NULL ||
         call->runtime->rpc == NULL || call->send_inflight != NULL || call->receive_head != NULL ||
@@ -3686,13 +3699,7 @@ static void node_call_maybe_release(node_call* call) {
     call->server_response_body_len = 0;
     call->server_response_body_set = false;
     node_status_free(&call->status);
-    node_server* route_server = call->server;
-    if (call->route != NULL && call->route->active_calls > 0) {
-        call->route->active_calls--;
-    }
-    if (route_server != NULL && route_server->closed) {
-        node_server_free_routes(runtime->env, route_server);
-    }
+    node_call_detach_server(runtime, call);
     node_runtime_update_liveness(runtime);
     call->runtime = NULL;
     if (!call->wrapper_alive) {
@@ -5566,6 +5573,35 @@ static void node_server_free_routes(napi_env env, node_server* server) {
     }
 }
 
+static void node_client_detach_server(node_runtime* runtime, node_client* client) {
+    if (client == NULL || client->server == NULL) {
+        return;
+    }
+    node_server* server = client->server;
+    if (node_runtime_napi_legal(runtime)) {
+        if (server->wrapper_ref != NULL) {
+            (void)napi_delete_reference(runtime->env, server->wrapper_ref);
+            server->wrapper_ref = NULL;
+        }
+        if (server->serve_promise_ref != NULL) {
+            (void)napi_delete_reference(runtime->env, server->serve_promise_ref);
+            server->serve_promise_ref = NULL;
+        }
+        if (server->admission_ref != NULL) {
+            (void)napi_delete_reference(runtime->env, server->admission_ref);
+            server->admission_ref = NULL;
+        }
+    }
+    node_server_free_routes(runtime == NULL ? NULL : runtime->env, server);
+    client->server = NULL;
+    server->endpoint = NULL;
+    server->runtime = NULL;
+    node_test_trace_runtime(runtime, "server-detached");
+    if (!server->wrapper_alive && server->routes == NULL) {
+        free(server);
+    }
+}
+
 static napi_value node_server_register(napi_env env, napi_callback_info info) {
     napi_value argv[4] = {NULL, NULL, NULL, NULL};
     napi_value this_value;
@@ -5682,7 +5718,9 @@ static void node_server_finalizer(napi_env env, void* data, void* hint) {
     }
     if (server->runtime == NULL) {
         node_server_free_routes(env, server);
-        free(server);
+        if (server->routes == NULL) {
+            free(server);
+        }
     }
 }
 

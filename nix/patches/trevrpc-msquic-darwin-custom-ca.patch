@@ -1,0 +1,227 @@
+diff --git a/src/inc/quic_cert.h b/src/inc/quic_cert.h
+index a0c1e4c..ab3d88c 100644
+--- a/src/inc/quic_cert.h
++++ b/src/inc/quic_cert.h
+@@ -169,5 +169,6 @@ CxPlatCertVerifyRawCertificate(
+     _In_ int X509CertLength,
+     _In_opt_ const char* SNI,
+     _In_ QUIC_CREDENTIAL_FLAGS CredFlags,
++    _In_opt_ void* TrustStore,
+     _Out_opt_ uint32_t* PlatformVerificationError
+     );
+diff --git a/src/platform/certificates_capi.c b/src/platform/certificates_capi.c
+index 8c9a21b..8a6514e 100644
+--- a/src/platform/certificates_capi.c
++++ b/src/platform/certificates_capi.c
+@@ -50,12 +50,14 @@ CxPlatCertVerifyRawCertificate(
+     _In_ int X509CertLength,
+     _In_opt_ const char* SNI,
+     _In_ QUIC_CREDENTIAL_FLAGS CredFlags,
++    _In_opt_ void* TrustStore,
+     _Out_opt_ uint32_t* PlatformVerificationError
+     )
+ {
+     BOOLEAN Result = FALSE;
+     PCCERT_CONTEXT CertContext = NULL;
+ 
++    UNREFERENCED_PARAMETER(TrustStore);
+     CertContext =
+         (PCCERT_CONTEXT)
+             CertCreateContext(
+diff --git a/src/platform/certificates_darwin.c b/src/platform/certificates_darwin.c
+index 71e2ca7..22a27da 100644
+--- a/src/platform/certificates_darwin.c
++++ b/src/platform/certificates_darwin.c
+@@ -18,6 +18,8 @@ Environment:
+ 
+ #include <Security/Security.h>
+ 
++#include <openssl/x509_vfy.h>
++
+ #ifdef QUIC_CLOG
+ #include "certificates_darwin.c.clog.h"
+ #endif
+@@ -40,6 +42,80 @@ CxPlatTlsMapTrustResultToQuicStatus(
+     }
+ }
+ 
++static
++CFMutableArrayRef
++CxPlatCertCreateTrustAnchors(
++    _In_ X509_STORE* TrustStore
++    )
++{
++    const STACK_OF(X509_OBJECT)* Objects = X509_STORE_get0_objects(TrustStore);
++    if (Objects == NULL) {
++        return NULL;
++    }
++
++    CFMutableArrayRef Anchors =
++        CFArrayCreateMutable(
++            NULL,
++            sk_X509_OBJECT_num(Objects),
++            &kCFTypeArrayCallBacks);
++    if (Anchors == NULL) {
++        return NULL;
++    }
++
++    for (int Index = 0; Index < sk_X509_OBJECT_num(Objects); ++Index) {
++        X509_OBJECT* Object = sk_X509_OBJECT_value(Objects, Index);
++        if (X509_OBJECT_get_type(Object) != X509_LU_X509) {
++            continue;
++        }
++
++        X509* X509Cert = X509_OBJECT_get0_X509(Object);
++        int CertLength = i2d_X509(X509Cert, NULL);
++        if (CertLength <= 0) {
++            CFRelease(Anchors);
++            return NULL;
++        }
++
++        unsigned char* CertBuffer = OPENSSL_malloc((size_t)CertLength);
++        if (CertBuffer == NULL) {
++            CFRelease(Anchors);
++            return NULL;
++        }
++        unsigned char* Cursor = CertBuffer;
++        if (i2d_X509(X509Cert, &Cursor) != CertLength) {
++            OPENSSL_free(CertBuffer);
++            CFRelease(Anchors);
++            return NULL;
++        }
++
++        CFDataRef CertData =
++            CFDataCreate(
++                NULL,
++                CertBuffer,
++                CertLength);
++        OPENSSL_free(CertBuffer);
++        if (CertData == NULL) {
++            CFRelease(Anchors);
++            return NULL;
++        }
++
++        SecCertificateRef Certificate =
++            SecCertificateCreateWithData(NULL, CertData);
++        CFRelease(CertData);
++        if (Certificate == NULL) {
++            CFRelease(Anchors);
++            return NULL;
++        }
++        CFArrayAppendValue(Anchors, Certificate);
++        CFRelease(Certificate);
++    }
++
++    if (CFArrayGetCount(Anchors) == 0) {
++        CFRelease(Anchors);
++        return NULL;
++    }
++    return Anchors;
++}
++
+ _Success_(return != FALSE)
+ BOOLEAN
+ CxPlatCertVerifyRawCertificate(
+@@ -47,6 +123,7 @@ CxPlatCertVerifyRawCertificate(
+     _In_ int X509CertLength,
+     _In_opt_ const char* SNI,
+     _In_ QUIC_CREDENTIAL_FLAGS CredFlags,
++    _In_opt_ void* TrustStore,
+     _Out_opt_ uint32_t* PlatformVerificationError
+     )
+ {
+@@ -60,6 +137,7 @@ CxPlatCertVerifyRawCertificate(
+     SecPolicyRef SSLPolicy = NULL;
+     SecPolicyRef RevocationPolicy = NULL;
+     CFErrorRef ErrorRef = NULL;
++    CFMutableArrayRef TrustAnchors = NULL;
+ 
+     CfData =
+         CFDataCreateWithBytesNoCopy(
+@@ -149,6 +227,31 @@ CxPlatCertVerifyRawCertificate(
+         goto Exit;
+     }
+ 
++    if (CredFlags & QUIC_CREDENTIAL_FLAG_SET_CA_CERTIFICATE_FILE) {
++        if (TrustStore == NULL ||
++            (TrustAnchors =
++                CxPlatCertCreateTrustAnchors(
++                    (X509_STORE*)TrustStore)) == NULL) {
++            QuicTraceEvent(
++                LibraryError,
++                "[ lib] ERROR, %s.",
++                "Creating custom trust anchors failed");
++            goto Exit;
++        }
++        Status =
++            SecTrustSetAnchorCertificates(
++                TrustRef,
++                TrustAnchors);
++        if (Status != noErr) {
++            QuicTraceEvent(
++                LibraryErrorStatus,
++                "[ lib] ERROR, %u, %s.",
++                Status,
++                "SecTrustSetAnchorCertificates failed");
++            goto Exit;
++        }
++    }
++
+     Result = SecTrustEvaluateWithError(TrustRef, &ErrorRef);
+ 
+     if (!Result) {
+@@ -165,6 +268,10 @@ Exit:
+         CFRelease(ErrorRef);
+     }
+ 
++    if (TrustAnchors != NULL) {
++        CFRelease(TrustAnchors);
++    }
++
+     if (TrustRef != NULL) {
+         CFRelease(TrustRef);
+     }
+diff --git a/src/platform/certificates_posix.c b/src/platform/certificates_posix.c
+index 281b8ad..4850f5b 100644
+--- a/src/platform/certificates_posix.c
++++ b/src/platform/certificates_posix.c
+@@ -41,6 +41,7 @@ CxPlatCertVerifyRawCertificate(
+     _In_ int X509CertLength,
+     _In_opt_ const char* SNI,
+     _In_ QUIC_CREDENTIAL_FLAGS CredFlags,
++    _In_opt_ void* TrustStore,
+     _Out_opt_ uint32_t* PlatformVerificationError
+     )
+ {
+@@ -48,6 +49,7 @@ CxPlatCertVerifyRawCertificate(
+     UNREFERENCED_PARAMETER(X509CertLength);
+     UNREFERENCED_PARAMETER(SNI);
+     UNREFERENCED_PARAMETER(CredFlags);
++    UNREFERENCED_PARAMETER(TrustStore);
+     UNREFERENCED_PARAMETER(PlatformVerificationError);
+     return 0;
+ }
+diff --git a/src/platform/tls_openssl.c b/src/platform/tls_openssl.c
+index 61c42fe..911df0c 100644
+--- a/src/platform/tls_openssl.c
++++ b/src/platform/tls_openssl.c
+@@ -1020,6 +1020,7 @@ CxPlatTlsCertificateVerifyCallback(
+                         OpenSSLCertLength,
+                         TlsContext->SNI,
+                         TlsContext->SecConfig->Flags,
++                        X509_STORE_CTX_get0_store(X509Ctx),
+                         IsDeferredValidationOrClientAuth?
+                             (uint32_t*)&ValidationResult :
+                             NULL);
+diff --git a/src/platform/tls_quictls.c b/src/platform/tls_quictls.c
+index 668e925..2e704c1 100644
+--- a/src/platform/tls_quictls.c
++++ b/src/platform/tls_quictls.c
+@@ -269,6 +269,7 @@ CxPlatTlsCertificateVerifyCallback(
+                         OpenSSLCertLength,
+                         TlsContext->SNI,
+                         TlsContext->SecConfig->Flags,
++                        X509_STORE_CTX_get0_store(x509_ctx),
+                         IsDeferredValidationOrClientAuth?
+                             (uint32_t*)&ValidationResult :
+                             NULL);

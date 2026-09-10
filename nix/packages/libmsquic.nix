@@ -9,6 +9,7 @@
 let
   isStatic = stdenv.hostPlatform.isStatic;
   msquicPatch = ../patches/trevrpc-msquic-reset-at.patch;
+  msquicDarwinCustomCaPatch = ../patches/trevrpc-msquic-darwin-custom-ca.patch;
   opensslStatic = (openssl.override { static = true; }).overrideAttrs (previous: {
     # Nixpkgs' static OpenSSL build puts OPENSSLDIR in a separate output.
     # That output's store path is compiled into libcrypto.a. Use the host's
@@ -55,6 +56,12 @@ let
       sha256 = builtins.hashFile "sha256" msquicPatch;
       applications = 1;
     };
+    darwinCustomCaPatch = {
+      path = "nix/patches/trevrpc-msquic-darwin-custom-ca.patch";
+      storePath = "${msquicDarwinCustomCaPatch}";
+      sha256 = builtins.hashFile "sha256" msquicDarwinCustomCaPatch;
+      applications = 1;
+    };
     cmake = {
       QUIC_BUILD_SHARED = false;
       QUIC_TLS_LIB = "openssl";
@@ -87,7 +94,10 @@ in
 libmsquic.overrideAttrs (
   previous:
   {
-    patches = (previous.patches or [ ]) ++ [ msquicPatch ];
+    patches = (previous.patches or [ ]) ++ [
+      msquicPatch
+      msquicDarwinCustomCaPatch
+    ];
     cmakeFlags =
       (previous.cmakeFlags or [ ])
       ++ lib.optional (
@@ -125,6 +135,7 @@ libmsquic.overrideAttrs (
       (previous.passthru or { })
       // {
         trevrpcResetStreamAtPatch = msquicPatch;
+        trevrpcDarwinCustomCaPatch = msquicDarwinCustomCaPatch;
       }
       // lib.optionalAttrs isStatic {
         msquicStaticArchive = "lib/libmsquic.a";

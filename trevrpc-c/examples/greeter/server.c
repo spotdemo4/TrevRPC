@@ -400,6 +400,10 @@ static int handle_incoming(server_state* state, trevrpc_rpc_event* event, const 
     }
     trevrpc_rpc_receive_release(initial);
     trevrpc_rpc_event_release(event);
+    if (rc == 0 && state->stopping) {
+        abort_call(state, call);
+        return 0;
+    }
     if (rc != 0) {
         if (call->call.owner != 0) {
             abort_call(state, call);
@@ -487,13 +491,8 @@ static int drain_events(server_state* state) {
                    info.endpoint.generation == state->listener.generation) {
             state->listener_closed = true;
         } else if (info.kind == TREVRPC_RPC_EVENT_CALL_INCOMING) {
-            if (state->stopping) {
-                trevrpc_rpc_event_release(event);
-                event = NULL;
-            } else {
-                (void)handle_incoming(state, event, &info);
-                event = NULL;
-            }
+            (void)handle_incoming(state, event, &info);
+            event = NULL;
         } else if (info.kind == TREVRPC_RPC_EVENT_CALL_ACCEPTED) {
             /* The accept completion is useful to consumers, but the call was marked admitted synchronously. */
         } else if (info.kind == TREVRPC_RPC_EVENT_SEND_COMPLETE) {
@@ -546,10 +545,13 @@ static int drain_events(server_state* state) {
                 call->call_closed = true;
                 release_call(state, call);
             }
-        } else if ((info.flags & TREVRPC_RPC_EVENT_FLAG_FATAL) != 0 || info.kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
-            set_error(state, info.status != 0 ? info.status : -ECONNABORTED);
         } else if (info.kind == TREVRPC_RPC_EVENT_STOPPED) {
             state->runtime_stopped = true;
+            if ((info.flags & TREVRPC_RPC_EVENT_FLAG_FATAL) != 0 || info.status != 0) {
+                set_error(state, info.status != 0 ? info.status : -ECONNABORTED);
+            }
+        } else if ((info.flags & TREVRPC_RPC_EVENT_FLAG_FATAL) != 0 || info.kind == TREVRPC_RPC_EVENT_ENDPOINT_FAILED) {
+            set_error(state, info.status != 0 ? info.status : -ECONNABORTED);
         }
         if (event != NULL) {
             trevrpc_rpc_event_release(event);
@@ -586,9 +588,8 @@ static void close_calls(server_state* state) {
     }
 }
 
-static int shutdown_server(server_state* state) {
+static int shutdown_calls(server_state* state) {
     int rc = 0;
-    state->stopping = true;
     close_calls(state);
     for (int attempt = 0; attempt < SERVER_WAIT_ATTEMPTS && !calls_empty(state); ++attempt) {
         int drain_rc = drain_events(state);
@@ -602,6 +603,16 @@ static int shutdown_server(server_state* state) {
             }
         }
     }
+    if (!calls_empty(state) && rc == 0) {
+        rc = -ETIMEDOUT;
+    }
+    return rc;
+}
+
+static int shutdown_server(server_state* state) {
+    int rc;
+    state->stopping = true;
+    rc = shutdown_calls(state);
     if (state->listener.owner != 0 && !state->listener_closed) {
         uint64_t operation;
         int close_rc = next_operation(state, &operation);
@@ -631,6 +642,12 @@ static int shutdown_server(server_state* state) {
             if (rc == 0 && release_rc != 0) {
                 rc = release_rc;
             }
+        }
+    }
+    {
+        int calls_rc = shutdown_calls(state);
+        if (rc == 0 && calls_rc != 0) {
+            rc = calls_rc;
         }
     }
     if (state->runtime != NULL) {

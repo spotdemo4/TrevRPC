@@ -656,7 +656,7 @@ function waitForLine(child, pattern) {
 
 async function stopFixture(child, label) {
   const result = await stopChild(child, { label });
-  assert.notEqual(result.signal, "SIGKILL", `${label} required SIGKILL`);
+  assert.deepEqual(result, { code: 0, signal: null }, `${label} did not stop gracefully`);
   return result;
 }
 
