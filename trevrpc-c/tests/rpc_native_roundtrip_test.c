@@ -1,4 +1,5 @@
 #include "trevrpc_rpc_msquic.h"
+#include "../src/trevrpc_credential_testing_internal.h"
 
 #include <dirent.h>
 #include <assert.h>
@@ -20,12 +21,16 @@
 
 static int credential_cleanup_failures;
 
-int trevrpc_credential_test_fail_cleanup(void) {
+static int credential_test_fail_cleanup(void) {
     if (credential_cleanup_failures == 0)
         return 0;
     --credential_cleanup_failures;
     return 1;
 }
+
+static const trevrpc_credential_test_hooks credential_test_hooks = {
+    .fail_cleanup = credential_test_fail_cleanup,
+};
 
 static size_t credential_bundle_count(void) {
     DIR* directory = opendir("/tmp");
@@ -294,6 +299,7 @@ int main(void) {
     size_t client_key_len;
     size_t client_ca_len;
 
+    trevrpc_credential_testing_set_hooks(&credential_test_hooks);
     server_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &server_cert_len);
     server_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &server_key_len);
     client_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_cert_len);

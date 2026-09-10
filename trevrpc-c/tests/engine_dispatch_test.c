@@ -2,6 +2,7 @@
 #include "trevrpc_engine_internal.h"
 #include "trevrpc_engine_testing_internal.h"
 #include "trevrpc_rpc_transport_engine_internal.h"
+#include "../src/trevrpc_credential_testing_internal.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -33,12 +34,17 @@ static int credential_cleanup_failures;
 static int accepted_connection_result;
 static unsigned accepted_connection_calls;
 
-int trevrpc_credential_test_fail_cleanup(void) {
+static int credential_test_fail_cleanup(void) {
     if (credential_cleanup_failures == 0)
         return 0;
     --credential_cleanup_failures;
     return 1;
 }
+
+static const trevrpc_credential_test_hooks credential_test_hooks = {
+    .fail_cleanup = credential_test_fail_cleanup,
+    /* Leave before_cleanup unset to cover the optional no-op path. */
+};
 
 int trevrpc_engine_msquic_adopt_accepted_connection_with_host_v1(const trevrpc_engine_provider_host_v1* host,
     trevrpc_engine* engine,
@@ -177,6 +183,7 @@ int main(void) {
     trevrpc_rpc_transport_event_info transport_info;
     bool destroyed = false;
     uint8_t byte = 1;
+    trevrpc_credential_testing_set_hooks(&credential_test_hooks);
     CHECK(provider != NULL);
     CHECK(trevrpc_engine_config_v1_init(&config, sizeof(config)) == 0);
     CHECK(trevrpc_engine_endpoint_config_v1_init(&endpoint, sizeof(endpoint)) == 0);

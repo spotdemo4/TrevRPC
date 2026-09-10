@@ -1,4 +1,5 @@
 #include "trevrpc_rpc_msquic.h"
+#include "../src/trevrpc_credential_testing_internal.h"
 
 #include <dirent.h>
 #include <assert.h>
@@ -28,12 +29,16 @@
 static uint32_t test_webtransport_profiles;
 static int credential_cleanup_failures;
 
-int trevrpc_credential_test_fail_cleanup(void) {
+static int credential_test_fail_cleanup(void) {
     if (credential_cleanup_failures == 0)
         return 0;
     --credential_cleanup_failures;
     return 1;
 }
+
+static const trevrpc_credential_test_hooks credential_test_hooks = {
+    .fail_cleanup = credential_test_fail_cleanup,
+};
 
 static size_t credential_bundle_count(void) {
     DIR* directory = opendir("/tmp");
@@ -830,6 +835,7 @@ static void teardown_harness(harness* state) {
 
 int main(int argc, char** argv) {
     harness state;
+    trevrpc_credential_testing_set_hooks(&credential_test_hooks);
     if (argc == 2) {
         char* end = NULL;
         unsigned long value = strtoul(argv[1], &end, 0);

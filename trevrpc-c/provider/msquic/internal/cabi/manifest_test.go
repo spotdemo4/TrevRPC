@@ -135,7 +135,7 @@ func TestMirroredParentHeadersMatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		parentContents, err := os.ReadFile(filepath.Join(root, "..", "..", "include", filepath.Base(header)))
+		parentContents, err := os.ReadFile(filepath.Join(root, "..", "..", filepath.FromSlash(header)))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -200,6 +200,7 @@
     "include/trevrpc_engine.h",
     "include/trevrpc_engine_provider.h",
     "include/trevrpc_transport.h",
-    "include/trevrpc_transport_provider.h"
+    "include/trevrpc_transport_provider.h",
+    "src/trevrpc_credential_internal.h"
   ]
 }

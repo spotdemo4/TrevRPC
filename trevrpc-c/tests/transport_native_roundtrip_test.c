@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../src/trevrpc_credential_internal.h"
+#include "../src/trevrpc_credential_testing_internal.h"
 #include "trevrpc_transport_msquic.h"
 
 #include <dirent.h>
@@ -49,14 +50,14 @@ static int credential_cleanup_failures;
 static int credential_cleanup_obstructions;
 static char credential_cleanup_obstruction[PATH_MAX];
 
-int trevrpc_credential_test_fail_cleanup(void) {
+static int credential_test_fail_cleanup(void) {
     if (credential_cleanup_failures == 0)
         return 0;
     --credential_cleanup_failures;
     return 1;
 }
 
-void trevrpc_credential_test_before_cleanup(trevrpc_credential_files* files) {
+static void credential_test_before_cleanup(trevrpc_credential_files* files) {
     if (credential_cleanup_obstructions == 0)
         return;
     --credential_cleanup_obstructions;
@@ -66,6 +67,11 @@ void trevrpc_credential_test_before_cleanup(trevrpc_credential_files* files) {
     assert(strlen(files->key_file) < sizeof(credential_cleanup_obstruction));
     memcpy(credential_cleanup_obstruction, files->key_file, strlen(files->key_file) + 1u);
 }
+
+static const trevrpc_credential_test_hooks credential_test_hooks = {
+    .fail_cleanup = credential_test_fail_cleanup,
+    .before_cleanup = credential_test_before_cleanup,
+};
 
 typedef struct observations {
     trevrpc_transport_handle_v1 listener;
@@ -335,6 +341,7 @@ static void test_credential_cleanup_reservations(void) {
 }
 
 int main(void) {
+    trevrpc_credential_testing_set_hooks(&credential_test_hooks);
     test_credential_cleanup_failure();
     test_credential_cleanup_reservations();
     trevrpc_transport_config_v1 transport_config;

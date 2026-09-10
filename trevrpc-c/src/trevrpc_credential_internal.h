@@ -28,17 +28,9 @@ typedef struct trevrpc_credential_files {
     unsigned char ca_cert_created;
 } trevrpc_credential_files;
 
-#if defined(TREVRPC_CREDENTIAL_TESTING) && defined(__GNUC__)
-#if defined(__APPLE__)
-#define TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE __attribute__((weak_import))
-#else
-#define TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE __attribute__((weak))
-#endif
-
-extern int trevrpc_credential_test_fail_cleanup(void) TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE;
-extern void trevrpc_credential_test_before_cleanup(trevrpc_credential_files*) TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE;
-
-#undef TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE
+#if defined(TREVRPC_CREDENTIAL_TESTING)
+extern int trevrpc_credential_testing_should_fail_cleanup(void);
+extern void trevrpc_credential_testing_before_cleanup(trevrpc_credential_files* files);
 #endif
 
 typedef struct trevrpc_credential_cleanup_lease {
@@ -129,9 +121,8 @@ static inline int trevrpc_credential_files_cleanup(trevrpc_credential_files* fil
 
     if (files == NULL)
         return -EINVAL;
-#if defined(TREVRPC_CREDENTIAL_TESTING) && defined(__GNUC__)
-    if (trevrpc_credential_test_before_cleanup != NULL)
-        trevrpc_credential_test_before_cleanup(files);
+#if defined(TREVRPC_CREDENTIAL_TESTING)
+    trevrpc_credential_testing_before_cleanup(files);
 #endif
     result = trevrpc_credential_unlink(files->cert_file, &files->cert_created);
     if (result != 0 && first_error == 0)
@@ -153,8 +144,8 @@ static inline int trevrpc_credential_files_cleanup(trevrpc_credential_files* fil
     }
     if (first_error == 0) {
         memset(files, 0, sizeof(*files));
-#if defined(TREVRPC_CREDENTIAL_TESTING) && defined(__GNUC__)
-        if (trevrpc_credential_test_fail_cleanup != NULL && trevrpc_credential_test_fail_cleanup() != 0)
+#if defined(TREVRPC_CREDENTIAL_TESTING)
+        if (trevrpc_credential_testing_should_fail_cleanup() != 0)
             return -EIO;
 #endif
     }

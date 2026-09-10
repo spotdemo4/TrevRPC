@@ -234,6 +234,12 @@ if(TREVRPC_BUILD_ENGINE)
         target_link_libraries(trevrpc_engine_testing PUBLIC trevrpc_engine)
         trevrpc_c_warnings(trevrpc_engine_testing)
         trevrpc_c_sanitizers(trevrpc_engine_testing)
+
+        add_library(trevrpc_credential_testing STATIC src/trevrpc_credential_testing.c)
+        target_include_directories(trevrpc_credential_testing PRIVATE src)
+        target_compile_definitions(trevrpc_credential_testing PRIVATE TREVRPC_CREDENTIAL_TESTING)
+        trevrpc_c_warnings(trevrpc_credential_testing)
+        trevrpc_c_sanitizers(trevrpc_credential_testing)
     endif()
 endif()
 
@@ -493,16 +499,17 @@ if(TREVRPC_BUILD_TRANSPORT_MSQUIC)
             ${TREVRPC_MSQUIC_SOURCE_DIR}/trevrpc_rpc_transport_msquic.c
             ${TREVRPC_MSQUIC_SOURCE_DIR}/trevrpc_rpc_transport_provider_adapter.c
         )
-    target_include_directories(trevrpc_transport_msquic_private_testing PRIVATE include src)
-    target_compile_definitions(trevrpc_transport_msquic_private_testing PRIVATE TREVRPC_CREDENTIAL_TESTING)
-    target_link_libraries(trevrpc_transport_msquic_private_testing PRIVATE
-        trevrpc_engine_msquic
-        trevrpc_msquic_native_core
-        trevrpc_protocol_core
-        trevrpc_msquic_api_owner
-        msquic::msquic
-        Threads::Threads
-    )
+        target_include_directories(trevrpc_transport_msquic_private_testing PRIVATE include src)
+        target_compile_definitions(trevrpc_transport_msquic_private_testing PRIVATE TREVRPC_CREDENTIAL_TESTING)
+        target_link_libraries(trevrpc_transport_msquic_private_testing PRIVATE
+            trevrpc_credential_testing
+            trevrpc_engine_msquic
+            trevrpc_msquic_native_core
+            trevrpc_protocol_core
+            trevrpc_msquic_api_owner
+            msquic::msquic
+            Threads::Threads
+        )
         trevrpc_c_warnings(trevrpc_transport_msquic_private_testing)
         trevrpc_c_sanitizers(trevrpc_transport_msquic_private_testing)
     endif()
@@ -1304,7 +1311,7 @@ if(TREVRPC_BUILD_TESTS)
             ${TREVRPC_MSQUIC_SOURCE_DIR}
         )
         target_compile_definitions(trevrpc_engine_dispatch_test PRIVATE TREVRPC_CREDENTIAL_TESTING)
-        target_link_libraries(trevrpc_engine_dispatch_test PRIVATE trevrpc_engine)
+        target_link_libraries(trevrpc_engine_dispatch_test PRIVATE trevrpc_engine trevrpc_credential_testing)
         trevrpc_c_warnings(trevrpc_engine_dispatch_test)
         trevrpc_c_sanitizers(trevrpc_engine_dispatch_test)
         add_test(NAME trevrpc_engine_dispatch COMMAND trevrpc_engine_dispatch_test)
