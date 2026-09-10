@@ -54,7 +54,7 @@ stdenv.mkDerivation {
     reject_path_leaks() {
       file=$1
       for forbidden in /nix/store /build; do
-        if strings -a "$file" | grep -Fq "$forbidden"; then
+        if strings -a "$file" | grep -F "$forbidden" >/dev/null; then
           echo "forbidden path '$forbidden' found in $file" >&2
           exit 1
         fi
@@ -67,7 +67,7 @@ stdenv.mkDerivation {
 
     symbols=$("$NM" -g --defined-only "$archive" 2>/dev/null || true)
     for symbol in MsQuicOpenVersion MsQuicClose MsQuicSetParam MsQuicStreamSend; do
-      printf '%s\n' "$symbols" | grep -Eq "[[:space:]]$symbol$"
+      grep -Eq "[[:space:]]$symbol$" <<<"$symbols"
     done
 
     test ! -e ${libmsquic}/lib/libmsquic.so
@@ -105,11 +105,11 @@ stdenv.mkDerivation {
       -o msquic-static-consumer
     reject_path_leaks msquic-static-consumer
     file -b msquic-static-consumer | grep -F 'statically linked'
-    if readelf -l msquic-static-consumer | grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)'; then
+    if readelf -l msquic-static-consumer | grep -E '(^|[[:space:]])INTERP([[:space:]]|$)' >/dev/null; then
       echo "static consumer unexpectedly has an interpreter" >&2
       exit 1
     fi
-    if readelf -d msquic-static-consumer | grep -Fq '(NEEDED)'; then
+    if readelf -d msquic-static-consumer | grep -F '(NEEDED)' >/dev/null; then
       echo "static consumer unexpectedly has dynamic dependencies" >&2
       exit 1
     fi
