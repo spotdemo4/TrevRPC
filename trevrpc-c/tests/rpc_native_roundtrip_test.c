@@ -68,7 +68,8 @@ typedef struct observed_state {
     bool listener_closed;
     bool client_endpoint_closed;
     bool cancellation_completed;
-    bool duplicate_send_completed;
+    bool operation_16_send_completed;
+    unsigned operation_16_send_completions;
     bool server_message_readable;
     bool hold_incoming;
     bool expect_deadline;
@@ -159,7 +160,12 @@ static void drain_events(trevrpc_rpc_runtime* runtime, observed_state* observed)
         } else if (info.kind == TREVRPC_RPC_EVENT_SEND_COMPLETE && info.operation_id == 5) {
             observed->response_sent = true;
         } else if (info.kind == TREVRPC_RPC_EVENT_SEND_COMPLETE && info.operation_id == 16) {
-            observed->duplicate_send_completed = true;
+            assert(info.status == 0);
+            assert(info.stream.owner == observed->client_stream.owner);
+            assert(info.stream.slot == observed->client_stream.slot);
+            assert(info.stream.generation == observed->client_stream.generation);
+            observed->operation_16_send_completed = true;
+            ++observed->operation_16_send_completions;
         } else if (info.kind == TREVRPC_RPC_EVENT_STREAM_READABLE &&
                    info.stream.owner == observed->client_stream.owner &&
                    info.stream.slot == observed->client_stream.slot &&
@@ -517,13 +523,8 @@ int main(void) {
                (const uint8_t*)"first",
                strlen("first"),
                TREVRPC_RPC_SEND_FLAG_NONE) == 0);
-    assert(trevrpc_rpc_stream_send_copy_v1(runtime,
-               observed.client_stream,
-               16,
-               (const uint8_t*)"duplicate",
-               strlen("duplicate"),
-               TREVRPC_RPC_SEND_FLAG_NONE) == -EALREADY);
-    pump_until(runtime, &wake, &observed, &observed.duplicate_send_completed);
+    pump_until(runtime, &wake, &observed, &observed.operation_16_send_completed);
+    assert(observed.operation_16_send_completions == 1);
     pump_until(runtime, &wake, &observed, &observed.server_message_readable);
     {
         trevrpc_rpc_receive* receive = NULL;
@@ -537,7 +538,7 @@ int main(void) {
         trevrpc_rpc_receive_release(receive);
         finish_readable(runtime, observed.server_stream);
     }
-    observed.duplicate_send_completed = false;
+    observed.operation_16_send_completed = false;
     observed.server_message_readable = false;
     assert(trevrpc_rpc_stream_send_copy_v1(runtime,
                observed.client_stream,
@@ -545,7 +546,8 @@ int main(void) {
                (const uint8_t*)"second",
                strlen("second"),
                TREVRPC_RPC_SEND_FLAG_NONE) == 0);
-    pump_until(runtime, &wake, &observed, &observed.duplicate_send_completed);
+    pump_until(runtime, &wake, &observed, &observed.operation_16_send_completed);
+    assert(observed.operation_16_send_completions == 2);
     pump_until(runtime, &wake, &observed, &observed.server_message_readable);
     {
         trevrpc_rpc_receive* receive = NULL;

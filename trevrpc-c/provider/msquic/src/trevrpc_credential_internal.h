@@ -29,8 +29,16 @@ typedef struct trevrpc_credential_files {
 } trevrpc_credential_files;
 
 #if defined(TREVRPC_CREDENTIAL_TESTING) && defined(__GNUC__)
-extern int trevrpc_credential_test_fail_cleanup(void) __attribute__((weak));
-extern void trevrpc_credential_test_before_cleanup(trevrpc_credential_files*) __attribute__((weak));
+#if defined(__APPLE__)
+#define TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE __attribute__((weak_import))
+#else
+#define TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE __attribute__((weak))
+#endif
+
+extern int trevrpc_credential_test_fail_cleanup(void) TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE;
+extern void trevrpc_credential_test_before_cleanup(trevrpc_credential_files*) TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE;
+
+#undef TREVRPC_CREDENTIAL_TEST_HOOK_ATTRIBUTE
 #endif
 
 typedef struct trevrpc_credential_cleanup_lease {

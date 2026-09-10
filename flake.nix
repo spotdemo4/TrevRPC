@@ -551,6 +551,9 @@
             goNeutralModuleCheck =
               pkgs.runCommand "trevrpc-c-go-module-check"
                 {
+                  buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+                    pkgs.darwin.libresolv
+                  ];
                   nativeBuildInputs = [
                     pkgs.go
                     pkgs.stdenv.cc
