@@ -63,6 +63,15 @@ func (a *transportAdmission) respond(httpStatus uint16) error {
 	return err
 }
 
+func (c EndpointConfig) providerConfig() trevrpcc.EndpointConfig {
+	result := c.EndpointConfig
+	result.ALPN = append([]byte(nil), result.ALPN...)
+	result.Certificate = append([]byte(nil), result.Certificate...)
+	result.PrivateKey = append([]byte(nil), result.PrivateKey...)
+	result.CACertificate = append([]byte(nil), result.CACertificate...)
+	return result
+}
+
 func Available() bool {
 	return true
 }

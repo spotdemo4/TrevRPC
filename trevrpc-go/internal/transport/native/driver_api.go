@@ -44,8 +44,6 @@ const (
 	WebTransportProfileAllSupported = trevrpcc.WebTransportProfileAllSupported
 )
 
-var errNativeWouldBlock = trevrpcc.ErrWouldBlock
-
 type EngineConfig = trevrpcc.EngineConfig
 
 func DefaultEngineConfig() EngineConfig {
@@ -67,15 +65,6 @@ type EndpointConfig struct {
 
 func DefaultEndpointConfig() EndpointConfig {
 	return EndpointConfig{EndpointConfig: trevrpcc.DefaultEndpointConfig()}
-}
-
-func (c EndpointConfig) providerConfig() trevrpcc.EndpointConfig {
-	result := c.EndpointConfig
-	result.ALPN = append([]byte(nil), result.ALPN...)
-	result.Certificate = append([]byte(nil), result.Certificate...)
-	result.PrivateKey = append([]byte(nil), result.PrivateKey...)
-	result.CACertificate = append([]byte(nil), result.CACertificate...)
-	return result
 }
 
 type EventError = trevrpcc.EventError

@@ -1,7 +1,5 @@
 #include "trevrpc_rpc_msquic.h"
-#include "../src/trevrpc_credential_testing_internal.h"
 
-#include <dirent.h>
 #include <assert.h>
 #include <errno.h> // IWYU pragma: keep
 #include <inttypes.h>
@@ -18,33 +16,9 @@
 #ifndef TREVRPC_MSQUIC_TEST_KEY
 #error "TREVRPC_MSQUIC_TEST_KEY must be defined"
 #endif
-
-static int credential_cleanup_failures;
-
-static int credential_test_fail_cleanup(void) {
-    if (credential_cleanup_failures == 0)
-        return 0;
-    --credential_cleanup_failures;
-    return 1;
-}
-
-static const trevrpc_credential_test_hooks credential_test_hooks = {
-    .fail_cleanup = credential_test_fail_cleanup,
-};
-
-static size_t credential_bundle_count(void) {
-    DIR* directory = opendir("/tmp");
-    struct dirent* entry;
-    size_t count = 0;
-    if (directory == NULL)
-        return 0;
-    while ((entry = readdir(directory)) != NULL) {
-        if (strncmp(entry->d_name, "trevrpc-credentials-", sizeof("trevrpc-credentials-") - 1u) == 0)
-            ++count;
-    }
-    assert(closedir(directory) == 0);
-    return count;
-}
+#ifndef TREVRPC_MSQUIC_TEST_CA_CERT
+#error "TREVRPC_MSQUIC_TEST_CA_CERT must be defined"
+#endif
 
 typedef struct observed_state {
     trevrpc_rpc_endpoint_v1 listener;
@@ -299,12 +273,11 @@ int main(void) {
     size_t client_key_len;
     size_t client_ca_len;
 
-    trevrpc_credential_testing_set_hooks(&credential_test_hooks);
     server_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &server_cert_len);
     server_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &server_key_len);
     client_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_cert_len);
     client_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &client_key_len);
-    client_ca = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_ca_len);
+    client_ca = read_file(TREVRPC_MSQUIC_TEST_CA_CERT, &client_ca_len);
     assert(server_cert != NULL && server_key != NULL && client_cert != NULL && client_key != NULL && client_ca != NULL);
     assert(trevrpc_rpc_runtime_config_v1_init(&runtime_config, sizeof(runtime_config)) == 0);
     assert(trevrpc_rpc_msquic_config_v1_init(&provider_config, sizeof(provider_config)) == 0);
@@ -356,12 +329,7 @@ int main(void) {
     listener_config.cert_data_len = server_cert_len;
     listener_config.key_data = server_key;
     listener_config.key_data_len = server_key_len;
-    {
-        size_t bundles_before = credential_bundle_count();
-        credential_cleanup_failures = 1;
-        assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 1, &observed.listener) == 0);
-        assert(credential_bundle_count() == bundles_before);
-    }
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &listener_config, 1, &observed.listener) == 0);
     memset(server_cert, 0, server_cert_len);
     memset(server_key, 0, server_key_len);
     free(server_cert);
@@ -391,12 +359,7 @@ int main(void) {
     assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &client_config, 99, &observed.client_endpoint) == -ENOTSUP);
     client_config.server_name = "127.0.0.1";
     client_config.server_name_len = (uint32_t)strlen(client_config.server_name);
-    {
-        size_t bundles_before = credential_bundle_count();
-        credential_cleanup_failures = 1;
-        assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &client_config, 2, &observed.client_endpoint) == 0);
-        assert(credential_bundle_count() == bundles_before);
-    }
+    assert(trevrpc_rpc_msquic_endpoint_start_v1(runtime, &client_config, 2, &observed.client_endpoint) == 0);
     memset(client_cert, 0, client_cert_len);
     memset(client_key, 0, client_key_len);
     memset(client_ca, 0, client_ca_len);

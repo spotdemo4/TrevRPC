@@ -130,18 +130,6 @@ type nativeWebTransportConnector struct {
 	requestedBackend TransportBackend
 }
 
-func newNativeWebTransportConnector(
-	target string,
-	options DialOptions,
-) (*nativeWebTransportConnector, error) {
-	return newNativeWebTransportConnectorWithProvider(
-		defaultNativeProvider(),
-		target,
-		options,
-		TransportBackendAuto,
-	)
-}
-
 func newNativeWebTransportConnectorWithProvider(
 	provider trevrpcc.Provider,
 	target string,

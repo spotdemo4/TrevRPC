@@ -19,6 +19,18 @@ func nativeAuthenticatedOptions() []CallOption {
 	}
 }
 
+func newNativeWebTransportConnector(
+	target string,
+	options DialOptions,
+) (*nativeWebTransportConnector, error) {
+	return newNativeWebTransportConnectorWithProvider(
+		defaultNativeProvider(),
+		target,
+		options,
+		TransportBackendAuto,
+	)
+}
+
 func TestNativeBackendRoundTripsAllRPCShapes(t *testing.T) {
 	certificate, key := testCertificateMaterial(t)
 	server := NewServer()

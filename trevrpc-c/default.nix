@@ -101,6 +101,7 @@ stdenv.mkDerivation (
         -DTREVRPC_H3_INGRESS_TESTING \
         -DTREVRPC_RPC_TRANSPORT_H3_TESTING \
         -DTREVRPC_MSQUIC_PROVIDER_CAPABILITIES \
+        '-DTREVRPC_MSQUIC_TEST_CA_CERT="build/msquic-test-ca-cert.pem"' \
         '-DTREVRPC_MSQUIC_TEST_CERT="build/msquic-test-cert.pem"' \
         '-DTREVRPC_MSQUIC_TEST_KEY="build/msquic-test-key.pem"' \
         '-DTREVRPC_GENERATED_HEADER="build/generated-service-test/greeter.trevrpc.h"' \

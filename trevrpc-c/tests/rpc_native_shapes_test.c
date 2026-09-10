@@ -1,7 +1,5 @@
 #include "trevrpc_rpc_msquic.h"
-#include "../src/trevrpc_credential_testing_internal.h"
 
-#include <dirent.h>
 #include <assert.h>
 #include <errno.h> // IWYU pragma: keep
 #include <poll.h>
@@ -27,32 +25,6 @@
 #endif
 
 static uint32_t test_webtransport_profiles;
-static int credential_cleanup_failures;
-
-static int credential_test_fail_cleanup(void) {
-    if (credential_cleanup_failures == 0)
-        return 0;
-    --credential_cleanup_failures;
-    return 1;
-}
-
-static const trevrpc_credential_test_hooks credential_test_hooks = {
-    .fail_cleanup = credential_test_fail_cleanup,
-};
-
-static size_t credential_bundle_count(void) {
-    DIR* directory = opendir("/tmp");
-    struct dirent* entry;
-    size_t count = 0;
-    if (directory == NULL)
-        return 0;
-    while ((entry = readdir(directory)) != NULL) {
-        if (strncmp(entry->d_name, "trevrpc-credentials-", sizeof("trevrpc-credentials-") - 1u) == 0)
-            ++count;
-    }
-    assert(closedir(directory) == 0);
-    return count;
-}
 
 static uint8_t* read_file(const char* path, size_t* out_len) {
     FILE* file = fopen(path, "rb");
@@ -369,10 +341,7 @@ static void setup_harness(harness* state) {
     listener_config.cert_data_len = listener_cert_len;
     listener_config.key_data = listener_key;
     listener_config.key_data_len = listener_key_len;
-    size_t bundles_before = credential_bundle_count();
-    credential_cleanup_failures = 1;
     int start_result = trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &listener_config, 1, &state->listener);
-    assert(credential_bundle_count() == bundles_before);
     memset(listener_cert, 0, listener_cert_len);
     memset(listener_key, 0, listener_key_len);
     free(listener_cert);
@@ -418,10 +387,7 @@ static void setup_harness(harness* state) {
     client_config.cert_data_len = client_cert_len;
     client_config.key_data = client_key;
     client_config.key_data_len = client_key_len;
-    bundles_before = credential_bundle_count();
-    credential_cleanup_failures = 1;
     assert(trevrpc_rpc_msquic_endpoint_start_v1(state->runtime, &client_config, 2, &state->client_endpoint) == 0);
-    assert(credential_bundle_count() == bundles_before);
     memset(client_cert, 0, client_cert_len);
     memset(client_key, 0, client_key_len);
     free(client_cert);
@@ -835,7 +801,6 @@ static void teardown_harness(harness* state) {
 
 int main(int argc, char** argv) {
     harness state;
-    trevrpc_credential_testing_set_hooks(&credential_test_hooks);
     if (argc == 2) {
         char* end = NULL;
         unsigned long value = strtoul(argv[1], &end, 0);

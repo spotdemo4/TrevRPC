@@ -115,14 +115,24 @@ static inline int trevrpc_credential_unlink(char path[PATH_MAX], unsigned char* 
     return 0;
 }
 
+static inline int trevrpc_credential_files_have_pending_cleanup(const trevrpc_credential_files* files) {
+    return files != NULL &&
+           (files->directory_created || files->cert_created || files->key_created || files->ca_cert_created);
+}
+
 static inline int trevrpc_credential_files_cleanup(trevrpc_credential_files* files) {
     int first_error = 0;
     int result;
+#if defined(TREVRPC_CREDENTIAL_TESTING)
+    int test_hooks_enabled;
+#endif
 
     if (files == NULL)
         return -EINVAL;
 #if defined(TREVRPC_CREDENTIAL_TESTING)
-    trevrpc_credential_testing_before_cleanup(files);
+    test_hooks_enabled = trevrpc_credential_files_have_pending_cleanup(files);
+    if (test_hooks_enabled)
+        trevrpc_credential_testing_before_cleanup(files);
 #endif
     result = trevrpc_credential_unlink(files->cert_file, &files->cert_created);
     if (result != 0 && first_error == 0)
@@ -145,16 +155,11 @@ static inline int trevrpc_credential_files_cleanup(trevrpc_credential_files* fil
     if (first_error == 0) {
         memset(files, 0, sizeof(*files));
 #if defined(TREVRPC_CREDENTIAL_TESTING)
-        if (trevrpc_credential_testing_should_fail_cleanup() != 0)
+        if (test_hooks_enabled && trevrpc_credential_testing_should_fail_cleanup() != 0)
             return -EIO;
 #endif
     }
     return first_error;
-}
-
-static inline int trevrpc_credential_files_have_pending_cleanup(const trevrpc_credential_files* files) {
-    return files != NULL &&
-           (files->directory_created || files->cert_created || files->key_created || files->ca_cert_created);
 }
 
 static inline int trevrpc_credential_cleanup_required(

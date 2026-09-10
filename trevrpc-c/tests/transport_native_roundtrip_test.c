@@ -15,6 +15,7 @@
 #include <errno.h> // NOLINT(misc-include-cleaner)
 #include <poll.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,9 @@
 #endif
 #ifndef TREVRPC_MSQUIC_TEST_KEY
 #define TREVRPC_MSQUIC_TEST_KEY ""
+#endif
+#ifndef TREVRPC_MSQUIC_TEST_CA_CERT
+#define TREVRPC_MSQUIC_TEST_CA_CERT ""
 #endif
 #ifndef TREVRPC_TRANSPORT_TEST_PROTOCOL
 #define TREVRPC_TRANSPORT_TEST_PROTOCOL TREVRPC_TRANSPORT_PROTOCOL_NATIVE
@@ -46,21 +50,17 @@
 #define SEEN_STOPPED 0x1000u
 #define EVENT_TRACE_CAPACITY 64u
 
-static int credential_cleanup_failures;
-static int credential_cleanup_obstructions;
+static atomic_int credential_cleanup_failures;
+static atomic_int credential_cleanup_obstructions;
 static char credential_cleanup_obstruction[PATH_MAX];
 
 static int credential_test_fail_cleanup(void) {
-    if (credential_cleanup_failures == 0)
-        return 0;
-    --credential_cleanup_failures;
-    return 1;
+    return atomic_exchange_explicit(&credential_cleanup_failures, 0, memory_order_relaxed) != 0;
 }
 
 static void credential_test_before_cleanup(trevrpc_credential_files* files) {
-    if (credential_cleanup_obstructions == 0)
+    if (atomic_exchange_explicit(&credential_cleanup_obstructions, 0, memory_order_relaxed) == 0)
         return;
-    --credential_cleanup_obstructions;
     assert(files != NULL && files->key_created);
     assert(unlink(files->key_file) == 0);
     assert(mkdir(files->key_file, S_IRWXU) == 0);
@@ -295,6 +295,19 @@ static size_t credential_bundle_count(void) {
     return count;
 }
 
+static void test_credential_cleanup_hook_scope(void) {
+    static const uint8_t certificate[] = "certificate";
+    trevrpc_credential_files files = {0};
+
+    atomic_store_explicit(&credential_cleanup_failures, 1, memory_order_relaxed);
+    assert(trevrpc_credential_files_cleanup(&files) == 0);
+    assert(atomic_load_explicit(&credential_cleanup_failures, memory_order_relaxed) == 1);
+    assert(trevrpc_credential_files_prepare(&files, certificate, sizeof(certificate), NULL, 0, NULL, 0) == 0);
+    assert(trevrpc_credential_files_cleanup(&files) == -EIO);
+    assert(!trevrpc_credential_files_have_pending_cleanup(&files));
+    assert(atomic_load_explicit(&credential_cleanup_failures, memory_order_relaxed) == 0);
+}
+
 static void test_credential_cleanup_failure(void) {
     trevrpc_credential_cleanup_owner owner;
     trevrpc_credential_cleanup_lease* lease = NULL;
@@ -342,6 +355,7 @@ static void test_credential_cleanup_reservations(void) {
 
 int main(void) {
     trevrpc_credential_testing_set_hooks(&credential_test_hooks);
+    test_credential_cleanup_hook_scope();
     test_credential_cleanup_failure();
     test_credential_cleanup_reservations();
     trevrpc_transport_config_v1 transport_config;
@@ -369,7 +383,7 @@ int main(void) {
     server_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &server_key_len);
     client_cert = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_cert_len);
     client_key = read_file(TREVRPC_MSQUIC_TEST_KEY, &client_key_len);
-    client_ca = read_file(TREVRPC_MSQUIC_TEST_CERT, &client_ca_len);
+    client_ca = read_file(TREVRPC_MSQUIC_TEST_CA_CERT, &client_ca_len);
     assert(server_cert != NULL && server_key != NULL && client_cert != NULL && client_key != NULL && client_ca != NULL);
 
     assert(trevrpc_transport_config_v1_init(&transport_config, sizeof(transport_config)) == 0);
@@ -431,8 +445,9 @@ int main(void) {
     endpoint.key_data_len = server_key_len;
     {
         size_t bundles_before = credential_bundle_count();
-        credential_cleanup_failures = 1;
+        atomic_store_explicit(&credential_cleanup_failures, 1, memory_order_relaxed);
         assert(trevrpc_transport_listen_v1(transport, &endpoint, &observed.listener) == 0);
+        assert(atomic_load_explicit(&credential_cleanup_failures, memory_order_relaxed) == 0);
         assert(credential_bundle_count() == bundles_before);
     }
     memset(server_cert, 0, server_cert_len);
@@ -465,8 +480,9 @@ int main(void) {
     endpoint.server_name_len = 9;
 #endif
     client_bundles_before = credential_bundle_count();
-    credential_cleanup_obstructions = 1;
+    atomic_store_explicit(&credential_cleanup_obstructions, 1, memory_order_relaxed);
     assert(trevrpc_transport_dial_v1(transport, &endpoint, 2, &observed.client_connection) == 0);
+    assert(atomic_load_explicit(&credential_cleanup_obstructions, memory_order_relaxed) == 0);
     assert(credential_cleanup_obstruction[0] != '\0');
     assert(credential_bundle_count() == client_bundles_before + 1u);
     memset(client_cert, 0, client_cert_len);
@@ -532,5 +548,6 @@ int main(void) {
     credential_cleanup_obstruction[0] = '\0';
     assert(trevrpc_transport_release(transport) == 0);
     assert(credential_bundle_count() == client_bundles_before);
+    trevrpc_credential_testing_set_hooks(NULL);
     return 0;
 }

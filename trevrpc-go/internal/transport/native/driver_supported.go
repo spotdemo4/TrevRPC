@@ -48,7 +48,10 @@ const (
 	pollTimeoutReady uint32 = 1 << 2
 )
 
-var errEngineClosed = errors.New("native Engine is closed")
+var (
+	errEngineClosed     = errors.New("native Engine is closed")
+	errNativeWouldBlock = trevrpcc.ErrWouldBlock
+)
 
 type driverRuntime interface {
 	WakeSources() ([]WakeSource, error)

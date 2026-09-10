@@ -1,0 +1,17 @@
+[ca_extensions]
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always, issuer
+
+[endpoint_extensions]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid, issuer
+subjectAltName = @endpoint_subject_alt_names
+
+[endpoint_subject_alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1

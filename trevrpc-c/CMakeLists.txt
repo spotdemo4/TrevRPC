@@ -603,15 +603,30 @@ endif()
 if((TREVRPC_BUILD_ENGINE_MSQUIC AND TREVRPC_BUILD_TESTS)
     OR (TREVRPC_BUILD_RPC_MSQUIC AND (TREVRPC_BUILD_EXAMPLES OR TREVRPC_BUILD_BENCHMARKS)))
     find_program(OPENSSL_EXECUTABLE openssl REQUIRED)
+    set(trevrpc_msquic_test_pki_config "${CMAKE_CURRENT_SOURCE_DIR}/tests/msquic-test-pki.cnf")
+    set(trevrpc_msquic_test_ca_cert "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-ca-cert.pem")
+    set(trevrpc_msquic_test_ca_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-ca-key.pem")
     set(trevrpc_msquic_test_cert "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-cert.pem")
+    set(trevrpc_msquic_test_csr "${CMAKE_CURRENT_BINARY_DIR}/msquic-test.csr")
     set(trevrpc_msquic_test_key "${CMAKE_CURRENT_BINARY_DIR}/msquic-test-key.pem")
     add_custom_command(
-        OUTPUT "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}"
-        COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj /CN=localhost -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature" -addext "extendedKeyUsage=serverAuth" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" -keyout "${trevrpc_msquic_test_key}" -out "${trevrpc_msquic_test_cert}"
+        OUTPUT
+            "${trevrpc_msquic_test_ca_cert}"
+            "${trevrpc_msquic_test_ca_key}"
+            "${trevrpc_msquic_test_cert}"
+            "${trevrpc_msquic_test_csr}"
+            "${trevrpc_msquic_test_key}"
+        COMMAND ${OPENSSL_EXECUTABLE} req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj "/CN=TrevRPC test root CA" -config "${trevrpc_msquic_test_pki_config}" -extensions ca_extensions -keyout "${trevrpc_msquic_test_ca_key}" -out "${trevrpc_msquic_test_ca_cert}"
+        COMMAND ${OPENSSL_EXECUTABLE} req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj /CN=localhost -keyout "${trevrpc_msquic_test_key}" -out "${trevrpc_msquic_test_csr}"
+        COMMAND ${OPENSSL_EXECUTABLE} x509 -req -in "${trevrpc_msquic_test_csr}" -CA "${trevrpc_msquic_test_ca_cert}" -CAkey "${trevrpc_msquic_test_ca_key}" -set_serial 1 -days 3650 -extfile "${trevrpc_msquic_test_pki_config}" -extensions endpoint_extensions -out "${trevrpc_msquic_test_cert}"
+        DEPENDS "${trevrpc_msquic_test_pki_config}"
         VERBATIM
     )
     add_custom_target(trevrpc_msquic_test_certificates
-        DEPENDS "${trevrpc_msquic_test_cert}" "${trevrpc_msquic_test_key}"
+        DEPENDS
+            "${trevrpc_msquic_test_ca_cert}"
+            "${trevrpc_msquic_test_cert}"
+            "${trevrpc_msquic_test_key}"
     )
 endif()
 
@@ -1441,6 +1456,8 @@ if(TREVRPC_BUILD_TESTS)
         add_executable(trevrpc_transport_native_roundtrip_test tests/transport_native_roundtrip_test.c)
         add_dependencies(trevrpc_transport_native_roundtrip_test trevrpc_msquic_test_certificates)
         target_compile_definitions(trevrpc_transport_native_roundtrip_test PRIVATE
+            TREVRPC_CREDENTIAL_TESTING
+            TREVRPC_MSQUIC_TEST_CA_CERT="${trevrpc_msquic_test_ca_cert}"
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
@@ -1456,6 +1473,8 @@ if(TREVRPC_BUILD_TESTS)
         add_executable(trevrpc_transport_h3_memory_roundtrip_test tests/transport_native_roundtrip_test.c)
         add_dependencies(trevrpc_transport_h3_memory_roundtrip_test trevrpc_msquic_test_certificates)
         target_compile_definitions(trevrpc_transport_h3_memory_roundtrip_test PRIVATE
+            TREVRPC_CREDENTIAL_TESTING
+            TREVRPC_MSQUIC_TEST_CA_CERT="${trevrpc_msquic_test_ca_cert}"
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
             TREVRPC_TRANSPORT_TEST_PROTOCOL=TREVRPC_TRANSPORT_PROTOCOL_HTTP3
@@ -1594,6 +1613,7 @@ if(TREVRPC_BUILD_TESTS)
         add_executable(trevrpc_rpc_native_roundtrip_test tests/rpc_native_roundtrip_test.c)
         add_dependencies(trevrpc_rpc_native_roundtrip_test trevrpc_msquic_test_certificates)
         target_compile_definitions(trevrpc_rpc_native_roundtrip_test PRIVATE
+            TREVRPC_MSQUIC_TEST_CA_CERT="${trevrpc_msquic_test_ca_cert}"
             TREVRPC_MSQUIC_TEST_CERT="${trevrpc_msquic_test_cert}"
             TREVRPC_MSQUIC_TEST_KEY="${trevrpc_msquic_test_key}"
         )
@@ -1704,6 +1724,7 @@ if(TREVRPC_BUILD_TESTS)
                 $<TARGET_FILE:trevrpc_bench_peer_c>
                 "${trevrpc_msquic_test_cert}"
                 "${trevrpc_msquic_test_key}"
+                "${trevrpc_msquic_test_ca_cert}"
         )
         set_tests_properties(trevrpc_bench_peer_native_smoke PROPERTIES TIMEOUT 90)
         trevrpc_c_msquic_loopback_test(trevrpc_bench_peer_native_smoke)
@@ -1728,6 +1749,7 @@ if(TREVRPC_BUILD_TESTS)
                 $<TARGET_FILE:trevrpc_bench_peer_c>
                 "${trevrpc_msquic_test_cert}"
                 "${trevrpc_msquic_test_key}"
+                "${trevrpc_msquic_test_ca_cert}"
         )
         set_tests_properties(trevrpc_bench_peer_webtransport_smoke PROPERTIES TIMEOUT 90)
         trevrpc_c_msquic_loopback_test(trevrpc_bench_peer_webtransport_smoke)

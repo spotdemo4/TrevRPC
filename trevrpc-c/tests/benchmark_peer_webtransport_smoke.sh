@@ -14,6 +14,7 @@ esac
 peer=$1
 certificate=$2
 private_key=$3
+ca_certificate=$4
 directory=$(mktemp -d "${TMPDIR:-/tmp}/trevrpc-c-webtransport-smoke.XXXXXX")
 server_pid=
 server_wait_status=
@@ -62,7 +63,7 @@ for rpc in unary client_stream server_stream bidi; do
 
     "$peer" client \
         --stack trevrpc_webtransport \
-        --cert "$certificate" \
+        --cert "$ca_certificate" \
         --rpc "$rpc" \
         --concurrency 1 \
         --warmup-ms 0 \

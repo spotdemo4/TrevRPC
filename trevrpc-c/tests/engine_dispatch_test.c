@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,15 +31,12 @@ struct test_provider {
     bool* destroyed;
 };
 
-static int credential_cleanup_failures;
+static atomic_int credential_cleanup_failures;
 static int accepted_connection_result;
 static unsigned accepted_connection_calls;
 
 static int credential_test_fail_cleanup(void) {
-    if (credential_cleanup_failures == 0)
-        return 0;
-    --credential_cleanup_failures;
-    return 1;
+    return atomic_exchange_explicit(&credential_cleanup_failures, 0, memory_order_relaxed) != 0;
 }
 
 static const trevrpc_credential_test_hooks credential_test_hooks = {
@@ -231,21 +229,23 @@ int main(void) {
     transport_endpoint.cert_data_len = sizeof(byte);
     transport_endpoint.key_data = &byte;
     transport_endpoint.key_data_len = sizeof(byte);
-    credential_cleanup_failures = 1;
+    atomic_store_explicit(&credential_cleanup_failures, 1, memory_order_relaxed);
     accepted_connection_result = 0;
     accepted_connection_calls = 0;
     CHECK(trevrpc_rpc_transport_engine_adopt_accepted_connection(
               transport, &transport_endpoint, (trevrpc_msquic_accepted_connection*)(uintptr_t)1, &adopted_connection) ==
           0);
     CHECK(accepted_connection_calls == 1);
+    CHECK(atomic_load_explicit(&credential_cleanup_failures, memory_order_relaxed) == 0);
     CHECK(adopted_connection.owner == TEST_OWNER && adopted_connection.slot == 123 &&
           adopted_connection.generation == 456);
-    credential_cleanup_failures = 1;
+    atomic_store_explicit(&credential_cleanup_failures, 1, memory_order_relaxed);
     accepted_connection_result = -EALREADY;
     CHECK(trevrpc_rpc_transport_engine_adopt_accepted_connection(
               transport, &transport_endpoint, (trevrpc_msquic_accepted_connection*)(uintptr_t)1, &adopted_connection) ==
           -EALREADY);
     CHECK(accepted_connection_calls == 2);
+    CHECK(atomic_load_explicit(&credential_cleanup_failures, memory_order_relaxed) == 0);
     CHECK(trevrpc_rpc_transport_close(transport) == -EIO);
     CHECK(trevrpc_rpc_transport_next_event(transport, &transport_event) == 0);
     CHECK(trevrpc_rpc_transport_event_get_info(transport, transport_event, &transport_info) == 0);
@@ -322,5 +322,6 @@ int main(void) {
     CHECK(diagnostics.state == TREVRPC_ENGINE_STATE_STOPPED);
     CHECK(diagnostics.terminal_status == -EBADF);
     CHECK(trevrpc_engine_release(engine) == 0);
+    trevrpc_credential_testing_set_hooks(NULL);
     return 0;
 }
