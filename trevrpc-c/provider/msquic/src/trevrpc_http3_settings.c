@@ -106,6 +106,10 @@ trevrpc_h3_settings_status trevrpc_h3_settings_build(const trevrpc_h3_settings_p
     if (out_capacity < required) {
         return TREV_H3_SETTINGS_OUTPUT_TOO_SMALL;
     }
+    if (out == NULL) {
+        *out_payload_len = 0;
+        return TREV_H3_SETTINGS_OK;
+    }
 
     size_t offset = 0;
     uint64_t previous_id = 0;
