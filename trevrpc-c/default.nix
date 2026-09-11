@@ -3,6 +3,7 @@
   lib,
   clang-tools,
   cmake,
+  coreutils,
   ninja,
   libmsquic,
   openssl,
@@ -72,6 +73,7 @@ stdenv.mkDerivation (
     nativeBuildInputs = [
       clang-tools
       cmake
+      coreutils
       ninja
       openssl
       pkg-config
@@ -114,8 +116,8 @@ stdenv.mkDerivation (
         -Ibuild/generated-service-test \
         -Ibuild/generated-greeter-example \
         -isystem ${libmsquic}/include
-      ctest --test-dir build --verbose --timeout 30 \
-        -R '^trevrpc_h3_ingress$'
+      printf 'trevrpc-c: running trevrpc_h3_ingress directly\n' >&2
+      timeout --kill-after=5s 30s build/trevrpc_h3_ingress_test
       ctest --test-dir build --output-on-failure -j $NIX_BUILD_CORES \
         -E '^(trevrpc_h3_ingress${optionalString threadSanitizer "|trevrpc_bench_peer_(http3_lifecycle|webtransport_smoke)|trevrpc_generated_service_http3"})$'
       runHook postCheck
