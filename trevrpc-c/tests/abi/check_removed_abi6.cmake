@@ -87,9 +87,11 @@ foreach(archive IN LISTS archives)
         RESULT_VARIABLE nm_result
         OUTPUT_VARIABLE nm_output
         ERROR_VARIABLE nm_error
+        TIMEOUT 60
     )
-    if(NOT nm_result EQUAL 0)
-        message(FATAL_ERROR "nm failed for ${archive}: ${nm_error}")
+    if(NOT nm_result STREQUAL "0")
+        message(FATAL_ERROR
+            "nm failed or timed out for ${archive}: ${nm_result}: ${nm_error}")
     endif()
     foreach(symbol IN LISTS removed_abi_symbols)
         if(nm_output MATCHES "(^|[^A-Za-z0-9_])_?${symbol}([^A-Za-z0-9_]|$)")
@@ -102,9 +104,11 @@ foreach(archive IN LISTS archives)
         RESULT_VARIABLE ar_result
         OUTPUT_VARIABLE ar_output
         ERROR_VARIABLE ar_error
+        TIMEOUT 60
     )
-    if(NOT ar_result EQUAL 0)
-        message(FATAL_ERROR "ar failed for ${archive}: ${ar_error}")
+    if(NOT ar_result STREQUAL "0")
+        message(FATAL_ERROR
+            "ar failed or timed out for ${archive}: ${ar_result}: ${ar_error}")
     endif()
     string(REPLACE "\n" ";" archive_members "${ar_output}")
     foreach(member IN LISTS archive_members)

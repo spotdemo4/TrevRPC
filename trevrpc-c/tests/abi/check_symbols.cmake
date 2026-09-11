@@ -54,9 +54,10 @@ execute_process(
     RESULT_VARIABLE nm_result
     OUTPUT_VARIABLE nm_output
     ERROR_VARIABLE nm_error
+    TIMEOUT 60
 )
-if(NOT nm_result EQUAL 0)
-    message(FATAL_ERROR "nm failed: ${nm_error}")
+if(NOT nm_result STREQUAL "0")
+    message(FATAL_ERROR "nm failed or timed out: ${nm_result}: ${nm_error}")
 endif()
 
 string(REPLACE "\n" ";" nm_lines "${nm_output}")

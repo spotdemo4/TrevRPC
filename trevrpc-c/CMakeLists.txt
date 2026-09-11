@@ -1500,6 +1500,7 @@ if(TREVRPC_BUILD_TESTS)
         trevrpc_c_warnings(trevrpc_rpc_api_test)
         trevrpc_c_sanitizers(trevrpc_rpc_api_test)
         add_test(NAME trevrpc_rpc_api COMMAND trevrpc_rpc_api_test)
+        set_tests_properties(trevrpc_rpc_api PROPERTIES TIMEOUT 30)
 
         add_executable(trevrpc_rpc_api_cpp_test tests/rpc-abi1/public_api.cpp)
         if(TARGET trevrpc_rpc_msquic)
@@ -1513,6 +1514,7 @@ if(TREVRPC_BUILD_TESTS)
         endif()
         trevrpc_c_sanitizers(trevrpc_rpc_api_cpp_test)
         add_test(NAME trevrpc_rpc_api_cpp COMMAND trevrpc_rpc_api_cpp_test)
+        set_tests_properties(trevrpc_rpc_api_cpp PROPERTIES TIMEOUT 30)
 
         add_executable(trevrpc_rpc_fake_transport_test tests/rpc_fake_transport_test.c)
         target_include_directories(trevrpc_rpc_fake_transport_test PRIVATE
@@ -1545,6 +1547,7 @@ if(TREVRPC_BUILD_TESTS)
                 -DTREVRPC_PUBLIC_HEADERS=${CMAKE_CURRENT_SOURCE_DIR}/include/trevrpc_rpc.h
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc-abi1/check_symbols.cmake"
         )
+        set_tests_properties(trevrpc_rpc_abi1_symbols PROPERTIES TIMEOUT 30)
 
     endif()
 
@@ -1556,6 +1559,7 @@ if(TREVRPC_BUILD_TESTS)
                 -DTREVRPC_PUBLIC_HEADERS=${TREVRPC_MSQUIC_INCLUDE_DIR}/trevrpc_rpc_msquic.h
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc-abi1/check_msquic_symbols.cmake"
         )
+        set_tests_properties(trevrpc_rpc_msquic_abi1_symbols PROPERTIES TIMEOUT 30)
 
         add_executable(trevrpc_rpc_msquic_smoke_test tests/rpc_msquic_smoke_test.c)
         target_link_libraries(trevrpc_rpc_msquic_smoke_test PRIVATE trevrpc_rpc_msquic)
