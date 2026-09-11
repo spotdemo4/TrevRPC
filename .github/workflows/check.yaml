@@ -16,6 +16,7 @@ permissions:
 jobs:
   check:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -31,4 +32,4 @@ jobs:
         run: python3 .forgejo/tests/release_automation_test.py
 
       - name: Check
-        run: nix flake check --option log-lines 100
+        run: nix flake check -L --option log-lines 100
