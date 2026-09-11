@@ -183,6 +183,9 @@ async fn handle_h3_connection(
     let mut stream_tasks = JoinSet::new();
 
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
             accepted = h3_connection.accept(), if !*shutdown.borrow() => {
                 let Ok(Some(request_resolver)) = accepted else {
@@ -486,6 +489,9 @@ async fn handle_webtransport_session(
     let mut stream_tasks = JoinSet::new();
 
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
             accepted = session.accept_bi(), if !*shutdown.borrow() => {
                 match accepted {

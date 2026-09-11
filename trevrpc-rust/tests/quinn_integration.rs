@@ -11,7 +11,7 @@ use prost::Message;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use quinn::rustls::server::WebPkiClientVerifier;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{CallOptions, RpcTransport, StreamingRpcTransport};
 use trevrpc::server::{
@@ -144,6 +144,7 @@ impl greeter::Greeter for TestGreeter {
 struct RunningServer {
     addr: SocketAddr,
     cert_der: CertificateDer<'static>,
+    ready: watch::Receiver<bool>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<trevrpc::Result<()>>>,
 }
@@ -155,7 +156,7 @@ impl RunningServer {
         }
 
         if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(TEST_TIMEOUT, task).await??;
+            tokio::time::timeout(TEST_TIMEOUT, task).await???;
         }
 
         Ok(())
@@ -177,6 +178,7 @@ impl Drop for RunningServer {
 struct RunningWebTransportServer {
     addr: SocketAddr,
     cert_der: CertificateDer<'static>,
+    ready: watch::Receiver<bool>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<trevrpc::Result<()>>>,
 }
@@ -315,7 +317,7 @@ impl RunningWebTransportServer {
         }
 
         if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(TEST_TIMEOUT, task).await??;
+            tokio::time::timeout(TEST_TIMEOUT, task).await???;
         }
 
         Ok(())
@@ -332,6 +334,20 @@ impl Drop for RunningWebTransportServer {
             task.abort();
         }
     }
+}
+
+async fn wait_for_server_ready(ready: &watch::Receiver<bool>) -> TestResult {
+    let mut ready = ready.clone();
+    tokio::time::timeout(TEST_TIMEOUT, ready.wait_for(|is_ready| *is_ready)).await??;
+    Ok(())
+}
+
+async fn signal_ready_then_wait_for_shutdown(
+    ready: watch::Sender<bool>,
+    shutdown: oneshot::Receiver<()>,
+) {
+    let _ = ready.send(true);
+    let _ = shutdown.await;
 }
 
 #[derive(Clone, Default)]
@@ -2175,6 +2191,7 @@ async fn webtransport_terminal_ok_surfaces_local_upload_error() -> TestResult {
 async fn quinn_shutdown_closes_active_connections() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, client) = connect_client(&server).await?;
+    assert_greeter_ready(&client).await?;
 
     server.shutdown().await?;
 
@@ -2197,6 +2214,7 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
 async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
     let server = spawn_webtransport_greeter_server(|_| {})?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+    assert_greeter_ready(&greeter_client).await?;
 
     server.shutdown().await?;
     tokio::time::timeout(TEST_TIMEOUT, session.closed())
@@ -2222,9 +2240,37 @@ async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
 }
 
 #[tokio::test]
+async fn http3_shutdown_closes_active_connections() -> TestResult {
+    let server = spawn_http3_greeter_server(|_| {})?;
+    let (endpoint, connection, client) = connect_http3_client(&server).await?;
+    assert_greeter_ready(&client).await?;
+
+    server.shutdown().await?;
+    tokio::time::timeout(TEST_TIMEOUT, connection.closed())
+        .await
+        .expect("client should observe HTTP/3 server shutdown");
+
+    let error = client
+        .say_hello_with_options(
+            greeter::HelloRequest {
+                name: "after shutdown".to_owned(),
+            },
+            CallOptions::new().with_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect_err("RPC on drained HTTP/3 connection should fail");
+    assert!(matches!(
+        error.into_status().code(),
+        Code::Cancelled | Code::Unavailable
+    ));
+
+    close_client(endpoint, connection).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
-    let started = Arc::new(Notify::new());
-    let started_server = Arc::clone(&started);
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let server = spawn_greeter_server(move |server| {
         server.set_options(
             fast_server_options().with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
@@ -2233,9 +2279,9 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
             greeter::GreeterClient::<()>::SERVICE,
             "Never",
             move |_body| {
-                let started = Arc::clone(&started_server);
+                let started_tx = started_tx.clone();
                 async move {
-                    started.notify_waiters();
+                    let _ = started_tx.send(());
                     std::future::pending::<trevrpc::Result<Vec<u8>>>().await
                 }
             },
@@ -2256,9 +2302,10 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
         .await
     });
 
-    tokio::time::timeout(TEST_TIMEOUT, started.notified())
+    tokio::time::timeout(TEST_TIMEOUT, started_rx.recv())
         .await
-        .expect("pending unary handler should start");
+        .expect("pending unary handler should start")
+        .expect("pending unary handler signal should remain open");
     server.shutdown().await?;
     let result = tokio::time::timeout(TEST_TIMEOUT, call)
         .await
@@ -2274,8 +2321,7 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
 
 #[tokio::test]
 async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
-    let started = Arc::new(Notify::new());
-    let started_server = Arc::clone(&started);
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let server = spawn_webtransport_greeter_server(move |server| {
         server.set_options(
             fast_server_options().with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
@@ -2284,9 +2330,9 @@ async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestRe
             greeter::GreeterClient::<()>::SERVICE,
             "Never",
             move |_body| {
-                let started = Arc::clone(&started_server);
+                let started_tx = started_tx.clone();
                 async move {
-                    started.notify_waiters();
+                    let _ = started_tx.send(());
                     std::future::pending::<trevrpc::Result<Vec<u8>>>().await
                 }
             },
@@ -2307,9 +2353,10 @@ async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestRe
         .await
     });
 
-    tokio::time::timeout(TEST_TIMEOUT, started.notified())
+    tokio::time::timeout(TEST_TIMEOUT, started_rx.recv())
         .await
-        .expect("pending WebTransport unary handler should start");
+        .expect("pending WebTransport unary handler should start")
+        .expect("pending WebTransport unary handler signal should remain open");
     server.shutdown().await?;
     let result = tokio::time::timeout(TEST_TIMEOUT, call)
         .await
@@ -2987,18 +3034,21 @@ fn spawn_configured_greeter_server(
 ) -> TestResult<RunningServer> {
     let addr = endpoint.local_addr()?;
     greeter::register_greeter(&mut server, TestGreeter);
+    let (ready_tx, ready_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         server
-            .serve_quinn_with_shutdown(endpoint, async {
-                let _ = shutdown_rx.await;
-            })
+            .serve_quinn_with_shutdown(
+                endpoint,
+                signal_ready_then_wait_for_shutdown(ready_tx, shutdown_rx),
+            )
             .await
     });
 
     Ok(RunningServer {
         addr,
         cert_der,
+        ready: ready_rx,
         shutdown: Some(shutdown_tx),
         task: Some(task),
     })
@@ -3017,18 +3067,21 @@ fn spawn_webtransport_greeter_server(
     )?;
     let addr = endpoint.local_addr()?;
     greeter::register_greeter(&mut server, TestGreeter);
+    let (ready_tx, ready_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         server
-            .serve_quinn_and_webtransport_with_shutdown(endpoint, async {
-                let _ = shutdown_rx.await;
-            })
+            .serve_quinn_and_webtransport_with_shutdown(
+                endpoint,
+                signal_ready_then_wait_for_shutdown(ready_tx, shutdown_rx),
+            )
             .await
     });
 
     Ok(RunningWebTransportServer {
         addr,
         cert_der,
+        ready: ready_rx,
         shutdown: Some(shutdown_tx),
         task: Some(task),
     })
@@ -3051,18 +3104,21 @@ fn spawn_http3_greeter_server(
     )?;
     let addr = endpoint.local_addr()?;
     greeter::register_greeter(&mut server, TestGreeter);
+    let (ready_tx, ready_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         server
-            .serve_http3_with_shutdown(endpoint, async {
-                let _ = shutdown_rx.await;
-            })
+            .serve_http3_with_shutdown(
+                endpoint,
+                signal_ready_then_wait_for_shutdown(ready_tx, shutdown_rx),
+            )
             .await
     });
 
     Ok(RunningWebTransportServer {
         addr,
         cert_der,
+        ready: ready_rx,
         shutdown: Some(shutdown_tx),
         task: Some(task),
     })
@@ -3107,6 +3163,7 @@ async fn connect_client(
     quinn::Connection,
     greeter::GreeterClient<trevrpc::advanced::RawQuinnTransport>,
 )> {
+    wait_for_server_ready(&server.ready).await?;
     let endpoint = make_client_endpoint(server.cert_der.clone())?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
     let transport = trevrpc::advanced::RawQuinnTransport::new(connection.clone());
@@ -3122,6 +3179,7 @@ async fn connect_webtransport_client(
     web_transport_quinn::Session,
     greeter::GreeterClient<trevrpc::advanced::RawWebTransport>,
 )> {
+    wait_for_server_ready(&server.ready).await?;
     let webtransport_client = make_webtransport_client(server)?;
     let session = webtransport_client
         .connect(web_transport_quinn::proto::ConnectRequest::new(
@@ -3148,6 +3206,7 @@ async fn connect_http3_client(
 async fn connect_http3_transport(
     server: &RunningWebTransportServer,
 ) -> TestResult<(quinn::Endpoint, quinn::Connection, Http3Transport)> {
+    wait_for_server_ready(&server.ready).await?;
     let endpoint = make_http3_client_endpoint(server.cert_der.clone())?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
     let (mut driver, sender) =
@@ -3345,6 +3404,24 @@ fn authenticated_options() -> CallOptions {
     CallOptions::new()
         .with_timeout(TEST_TIMEOUT)
         .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
+}
+
+async fn assert_greeter_ready<T>(client: &greeter::GreeterClient<T>) -> TestResult
+where
+    T: RpcTransport,
+{
+    let reply = tokio::time::timeout(
+        TEST_TIMEOUT,
+        client.say_hello_with_options(
+            greeter::HelloRequest {
+                name: "readiness".to_owned(),
+            },
+            CallOptions::new().with_timeout(TEST_TIMEOUT),
+        ),
+    )
+    .await??;
+    assert_eq!(reply.message, "hello, readiness");
+    Ok(())
 }
 
 fn short_authenticated_options() -> CallOptions {

@@ -814,6 +814,9 @@ pub(crate) async fn handle_connection(
     let mut stream_tasks = JoinSet::new();
 
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
             accepted = connection.accept_bi(), if !*shutdown.borrow() => {
                 let Ok((send, recv)) = accepted else {

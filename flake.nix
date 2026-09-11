@@ -575,6 +575,16 @@
               expectedDescriptor = true;
               requestedMask = 3;
             };
+            darwinSanitizerToolchain = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+              stdenv = pkgs.llvmPackages_22.stdenv;
+              clang-tools = pkgs.llvmPackages_22.clang-tools;
+            };
+            cSanitizerCheck = packageSet.trevrpc-c.override (
+              {
+                sanitizers = true;
+              }
+              // darwinSanitizerToolchain
+            );
           in
           pkgs.mkChecks {
             benchmark-controller = packageSet.trevrpc-bench;
@@ -624,9 +634,7 @@
               trevrpcCppSrc = ./trevrpc-cpp;
               cOnly = true;
             };
-            c-sanitizers = packageSet.trevrpc-c.override {
-              sanitizers = true;
-            };
+            c-sanitizers = cSanitizerCheck;
             ${if system == "x86_64-linux" then "c-tsan" else null} = packageSet.trevrpc-c.override {
               threadSanitizer = true;
             };
@@ -660,12 +668,13 @@
             ${if system == "x86_64-linux" then "msquic-provider-both" else null} = bothMsquicProviderCheck;
 
             cpp = packageSet.trevrpc-cpp;
-            cpp-sanitizers = packageSet.trevrpc-cpp.override {
-              sanitizers = true;
-              trevrpcC = packageSet.trevrpc-c.override {
+            cpp-sanitizers = packageSet.trevrpc-cpp.override (
+              {
                 sanitizers = true;
-              };
-            };
+                trevrpcC = cSanitizerCheck;
+              }
+              // darwinSanitizerToolchain
+            );
 
             rust = packageSet.trevrpc-rust;
             ${if system == "x86_64-linux" then "rust-native-ffi-sanitizers" else null} =
