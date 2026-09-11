@@ -360,6 +360,7 @@ static int node_route_incoming_call(
 static int node_route_admission(node_runtime* runtime, trevrpc_rpc_event* event, const trevrpc_rpc_event_info_v1* info);
 static void node_process_call(node_call* call);
 static void node_call_request_close(node_call* call);
+static void node_call_maybe_finish_client_receive(node_call* call);
 static void node_call_maybe_release(node_call* call);
 static void node_call_detach_server(node_runtime* runtime, node_call* call);
 static int node_client_request_close(node_client* client);
@@ -1140,7 +1141,10 @@ static bool node_runtime_needs_liveness(const node_runtime* runtime) {
         if (call == NULL || call->runtime != runtime) {
             continue;
         }
-        if (!call->call_closed || !call->stream_closed || call->has_response_deferred || call->waiter_head != NULL ||
+        bool server_is_closing = call->server != NULL && (call->server->closing || call->server->closed);
+        bool terminal_keeps_runtime_live = !(call->server_side && call->response_settled && server_is_closing) &&
+                                           (!call->call_closed || !call->stream_closed);
+        if (terminal_keeps_runtime_live || call->has_response_deferred || call->waiter_head != NULL ||
             call->send_inflight != NULL || call->close_retry_pending || call->stream_close_retry_pending ||
             call->call_release_retry_pending || call->stream_release_retry_pending ||
             (!call->server_side && call->kind != TREVRPC_RPC_KIND_UNARY &&
@@ -3448,6 +3452,7 @@ static void node_call_process_stream_waiters(node_call* call) {
         }
         free(waiter);
     }
+    node_call_maybe_finish_client_receive(call);
     node_call_maybe_release(call);
 }
 
@@ -3591,9 +3596,21 @@ static void node_call_process_server_waiters(node_call* call) {
     }
 }
 
+static void node_call_maybe_finish_client_receive(node_call* call) {
+    if (call == NULL || call->server_side || call->kind == TREVRPC_RPC_KIND_UNARY || call->terminal_settled ||
+        !call->fin_seen || !call->fin_clean || !call->status_seen || call->receive_head != NULL) {
+        return;
+    }
+    call->receive_finished = true;
+    call->receive_succeeded = true;
+    if (!call->close_requested) {
+        node_call_request_close(call);
+    }
+}
+
 static void node_process_call(node_call* call) {
     if (call == NULL || call->runtime == NULL || call->runtime->rpc == NULL || call->failed || call->receive_finished ||
-        (call->kind == TREVRPC_RPC_KIND_UNARY && call->response_settled)) {
+        (!call->server_side && call->kind == TREVRPC_RPC_KIND_UNARY && call->response_settled)) {
         return;
     }
     int result = node_call_fetch_receives(call);
@@ -3602,7 +3619,17 @@ static void node_process_call(node_call* call) {
         return;
     }
     if (call->server_side) {
-        node_call_process_server_waiters(call);
+        if (call->response_settled) {
+            /* Once the application response is complete, request-side frames are
+             * no longer observable. Release them while continuing to drain until
+             * the peer FIN arrives so natural stream and call terminals can retire
+             * the native handles without an abortive close. */
+            node_call_clear_receives(call);
+            call->receive_finished = call->fin_seen;
+            node_call_maybe_release(call);
+        } else {
+            node_call_process_server_waiters(call);
+        }
         return;
     }
     result = call->kind == TREVRPC_RPC_KIND_UNARY ? node_call_process_unary(call) : 0;
@@ -3812,8 +3839,8 @@ static void node_call_complete_server_response(node_call* call, bool succeeded) 
     call->response_submitted = false;
     if (!succeeded) {
         call->close_abort = true;
+        node_call_request_close(call);
     }
-    node_call_request_close(call);
 }
 
 static void node_send_pump(node_call* call);
