@@ -126,6 +126,7 @@ static trevrpc_h3_ingress* trevrpc_h3_ingress_registry_head;
 static trevrpc_h3_ingress* trevrpc_h3_ingress_graveyard_head;
 static _Thread_local trevrpc_h3_ingress_runtime* trevrpc_h3_ingress_shutdown_callback_runtime;
 #ifdef TREVRPC_H3_INGRESS_TESTING
+#define TREV_H3_INGRESS_TEST_WAIT_SECONDS 10
 static size_t trevrpc_h3_ingress_test_released_count;
 static bool trevrpc_h3_ingress_test_recycle_runtime;
 static trevrpc_h3_ingress_runtime* trevrpc_h3_ingress_test_recycled_runtime;
@@ -266,12 +267,29 @@ void trevrpc_h3_ingress_test_force_next_timed_wait_timeout(void) {
     pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
 }
 
-void trevrpc_h3_ingress_test_wait_timed_wait_entered(void) {
+int trevrpc_h3_ingress_test_wait_timed_wait_entered(void) {
+    struct timespec deadline;
+    int err = clock_gettime(CLOCK_REALTIME, &deadline);
+    if (err != 0) {
+        return -errno;
+    }
+    if (deadline.tv_sec < 0 || deadline.tv_sec > INT64_MAX - TREV_H3_INGRESS_TEST_WAIT_SECONDS) {
+        return -EOVERFLOW;
+    }
+    deadline.tv_sec += TREV_H3_INGRESS_TEST_WAIT_SECONDS;
+
     pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
     while (!trevrpc_h3_ingress_test_timed_wait_entered) {
-        pthread_cond_wait(&trevrpc_h3_ingress_test_timed_wait_cond, &trevrpc_h3_ingress_test_timed_wait_mutex);
+        err = pthread_cond_timedwait(
+            &trevrpc_h3_ingress_test_timed_wait_cond, &trevrpc_h3_ingress_test_timed_wait_mutex, &deadline);
+        if (err != 0) {
+            trevrpc_h3_ingress_test_force_timed_wait_timeout = false;
+            pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+            return err == ETIMEDOUT ? -ETIMEDOUT : -err;
+        }
     }
     pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+    return 0;
 }
 
 static int trevrpc_h3_ingress_cond_timedwait(trevrpc_h3_ingress_runtime* runtime,
@@ -280,6 +298,7 @@ static int trevrpc_h3_ingress_cond_timedwait(trevrpc_h3_ingress_runtime* runtime
     const struct timespec* deadline) {
     pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
     bool force_timeout = trevrpc_h3_ingress_test_force_timed_wait_timeout;
+    trevrpc_h3_ingress_test_force_timed_wait_timeout = false;
     if (force_timeout) {
         trevrpc_h3_ingress_test_timed_wait_entered = true;
         pthread_cond_broadcast(&trevrpc_h3_ingress_test_timed_wait_cond);
@@ -287,13 +306,7 @@ static int trevrpc_h3_ingress_cond_timedwait(trevrpc_h3_ingress_runtime* runtime
     pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
 
     int err = trevrpc_h3_ingress_platform_cond_timedwait(runtime, cond, mutex, deadline);
-    pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
-    if (force_timeout && trevrpc_h3_ingress_test_force_timed_wait_timeout && err == 0) {
-        trevrpc_h3_ingress_test_force_timed_wait_timeout = false;
-        err = ETIMEDOUT;
-    }
-    pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
-    return err;
+    return force_timeout ? ETIMEDOUT : err;
 }
 #else
 static int trevrpc_h3_ingress_cond_timedwait(trevrpc_h3_ingress_runtime* runtime,

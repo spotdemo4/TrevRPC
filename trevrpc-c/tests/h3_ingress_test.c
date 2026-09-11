@@ -3131,7 +3131,7 @@ static int test_deadline_boundary_enqueue_wins_over_timeout(void) {
     trevrpc_h3_ingress_test_force_next_timed_wait_timeout();
     CHECK_GOTO(pthread_create(&pop_thread, NULL, pop_wait_main, &pop) == 0);
     pop_started = true;
-    trevrpc_h3_ingress_test_wait_timed_wait_entered();
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_timed_wait_entered() == 0);
     CHECK_GOTO(fake_conn_enqueue(&conn, &stream) == 0);
     CHECK_GOTO(pthread_join(pop_thread, NULL) == 0);
     pop_started = false;
@@ -3261,51 +3261,60 @@ cleanup:
 }
 
 int main(void) {
-    int (*const tests[])(void) = {
-        test_handoff_unclassified_bidi_skips_classifier,
-        test_transport_ops_and_item_own_callback_table,
-        test_closed_stream_id_retires_only_accepted_stream,
-        test_classifies_and_hands_off_without_overread,
-        test_request_classification_skips_unknown_frames_without_overread,
-        test_pop_bidi_preserves_classification_ready_order,
-        test_fragmented_coalesced_wakes_and_terminal_after_classification,
-        test_pending_profile_wakes_fragmented_webtransport_streams,
-        test_none_profile_treats_bidi_marker_as_unknown_and_retires_uni,
-        test_invalid_webtransport_session_ids_are_direction_independent,
-        test_profile_publication_release_race_closes_parked_stream,
-        test_shutdown_closes_profile_parked_stream,
-        test_deadline_boundary_enqueue_wins_over_timeout,
-        test_pop_timeout_uses_monotonic_clock,
-        test_fragmented_legal_four_byte_request_prefix,
-        test_fragmented_legal_eight_byte_request_prefix,
-        test_unknown_slot_is_reused_sequentially,
-        test_unknown_and_terminal_unidirectional_are_reclaimed,
-        test_terminal_error_is_first_wins_and_wakes_settings,
-        test_duplicate_qpack_roles_are_fatal,
-        test_duplicate_role_and_capacity_overflow_errors,
-        test_queue_overflow_and_settings_publication,
-        test_unclassified_bidi_queue_overflow_is_first_wins,
-        test_settings_profile_publication_validation,
-        test_settings_failure_publication_is_fatal,
-        test_concurrent_first_fatal_arbitration,
-        test_settings_barrier_observes_fatal_and_normal_stop_wins,
-        test_shutdown_wakes_blocked_waiters,
-        test_bidi_pop_waiters_wake_on_shutdown,
-        test_start_shutdown_race_is_serialized,
-        test_closed_prefix_read_retires_only_accepted_stream,
-        test_transport_failures_publish_exact_h3_errors,
-        test_release_rejects_pre_registry_call_after_runtime_address_reuse,
-        test_release_admission_gate_covers_runtime_apis,
-        test_shutdown_waits_for_observer_install,
-        test_shutdown_waits_for_active_observer_callback,
-        test_release_waits_for_pop_finalization,
-        test_release_waits_for_concurrent_shutdown_leader,
-        test_shutdown_callbacks_allow_synchronous_release_reentry,
-        test_internal_shutdown_callback_reentry_reaps_after_thread_exit,
-        test_release_unlinks_tombstone_and_bounds_registry,
+    typedef struct ingress_test_case {
+        const char* name;
+        int (*run)(void);
+    } ingress_test_case;
+#define TEST_CASE(test_function) ((ingress_test_case){#test_function, test_function})
+    const ingress_test_case tests[] = {
+        TEST_CASE(test_handoff_unclassified_bidi_skips_classifier),
+        TEST_CASE(test_transport_ops_and_item_own_callback_table),
+        TEST_CASE(test_closed_stream_id_retires_only_accepted_stream),
+        TEST_CASE(test_classifies_and_hands_off_without_overread),
+        TEST_CASE(test_request_classification_skips_unknown_frames_without_overread),
+        TEST_CASE(test_pop_bidi_preserves_classification_ready_order),
+        TEST_CASE(test_fragmented_coalesced_wakes_and_terminal_after_classification),
+        TEST_CASE(test_pending_profile_wakes_fragmented_webtransport_streams),
+        TEST_CASE(test_none_profile_treats_bidi_marker_as_unknown_and_retires_uni),
+        TEST_CASE(test_invalid_webtransport_session_ids_are_direction_independent),
+        TEST_CASE(test_profile_publication_release_race_closes_parked_stream),
+        TEST_CASE(test_shutdown_closes_profile_parked_stream),
+        TEST_CASE(test_deadline_boundary_enqueue_wins_over_timeout),
+        TEST_CASE(test_pop_timeout_uses_monotonic_clock),
+        TEST_CASE(test_fragmented_legal_four_byte_request_prefix),
+        TEST_CASE(test_fragmented_legal_eight_byte_request_prefix),
+        TEST_CASE(test_unknown_slot_is_reused_sequentially),
+        TEST_CASE(test_unknown_and_terminal_unidirectional_are_reclaimed),
+        TEST_CASE(test_terminal_error_is_first_wins_and_wakes_settings),
+        TEST_CASE(test_duplicate_qpack_roles_are_fatal),
+        TEST_CASE(test_duplicate_role_and_capacity_overflow_errors),
+        TEST_CASE(test_queue_overflow_and_settings_publication),
+        TEST_CASE(test_unclassified_bidi_queue_overflow_is_first_wins),
+        TEST_CASE(test_settings_profile_publication_validation),
+        TEST_CASE(test_settings_failure_publication_is_fatal),
+        TEST_CASE(test_concurrent_first_fatal_arbitration),
+        TEST_CASE(test_settings_barrier_observes_fatal_and_normal_stop_wins),
+        TEST_CASE(test_shutdown_wakes_blocked_waiters),
+        TEST_CASE(test_bidi_pop_waiters_wake_on_shutdown),
+        TEST_CASE(test_start_shutdown_race_is_serialized),
+        TEST_CASE(test_closed_prefix_read_retires_only_accepted_stream),
+        TEST_CASE(test_transport_failures_publish_exact_h3_errors),
+        TEST_CASE(test_release_rejects_pre_registry_call_after_runtime_address_reuse),
+        TEST_CASE(test_release_admission_gate_covers_runtime_apis),
+        TEST_CASE(test_shutdown_waits_for_observer_install),
+        TEST_CASE(test_shutdown_waits_for_active_observer_callback),
+        TEST_CASE(test_release_waits_for_pop_finalization),
+        TEST_CASE(test_release_waits_for_concurrent_shutdown_leader),
+        TEST_CASE(test_shutdown_callbacks_allow_synchronous_release_reentry),
+        TEST_CASE(test_internal_shutdown_callback_reentry_reaps_after_thread_exit),
+        TEST_CASE(test_release_unlinks_tombstone_and_bounds_registry),
     };
-    for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
-        int err = tests[i]();
+#undef TEST_CASE
+    const size_t test_count = sizeof(tests) / sizeof(tests[0]);
+    for (size_t i = 0; i < test_count; i++) {
+        fprintf(stderr, "trevrpc_h3_ingress: running case %zu/%zu: %s\n", i + 1, test_count, tests[i].name);
+        fflush(stderr);
+        int err = tests[i].run();
         if (err != 0) {
             return err;
         }
