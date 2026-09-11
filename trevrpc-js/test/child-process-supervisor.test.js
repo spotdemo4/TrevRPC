@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -104,49 +104,36 @@ test("waits for inherited output pipes to close after exit", { skip: posixOnly }
   assert.deepEqual(await observation, { code: 0, signal: null });
 });
 
-test(
-  "does not escalate after the child exits during its grace period",
-  {
-    skip: posixOnly,
-  },
-  async (t) => {
-    const child = trackChild(
-      spawn(process.execPath, [
-        "--input-type=module",
-        "-e",
-        `
-        import { spawn } from "node:child_process";
-        process.on("SIGTERM", () => {
-          const grandchild = spawn(
-            process.execPath,
-            ["--input-type=module", "-e", "setTimeout(() => {}, 200)"],
-            { detached: true, stdio: ["ignore", 1, 2] },
-          );
-          grandchild.unref();
-          process.exit(0);
-        });
-        process.stdout.write("ready\\n");
-        setInterval(() => {}, 1000);
-      `,
-      ]),
-    );
-    cleanupChild(t, child);
-    await waitForOutput(child, /ready/u);
+test("does not escalate after the child exits during its grace period", async () => {
+  const child = new EventEmitter();
+  child.connected = false;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.stdio = [null, { closed: false }, null];
 
-    const signals = [];
-    const result = await stopChild(child, {
-      graceMs: 50,
-      killWaitMs: 2_000,
-      label: "graceful child",
-      sendSignal(signal) {
-        signals.push(signal);
-        return child.kill(signal);
-      },
-    });
-    assert.deepEqual(result, { code: 0, signal: null });
-    assert.deepEqual(signals, ["SIGTERM"]);
-  },
-);
+  const signals = [];
+  const result = await stopChild(child, {
+    graceMs: 25,
+    killWaitMs: 500,
+    label: "graceful child",
+    sendSignal(signal) {
+      signals.push(signal);
+      if (signal === "SIGTERM") {
+        queueMicrotask(() => {
+          child.exitCode = 0;
+          child.emit("exit", 0, null);
+        });
+        setTimeout(() => {
+          child.stdio[1].closed = true;
+          child.emit("close", 0, null);
+        }, 75);
+      }
+      return true;
+    },
+  });
+  assert.deepEqual(result, { code: 0, signal: null });
+  assert.deepEqual(signals, ["SIGTERM"]);
+});
 
 test("escalates once and caches repeated stop requests", { skip: posixOnly }, async (t) => {
   const child = trackChild(

@@ -2272,7 +2272,7 @@ static int test_release_rejects_pre_registry_call_after_runtime_address_reuse(vo
     trevrpc_h3_ingress_test_pause_before_reference(old_handle, 1);
     CHECK_GOTO(pthread_create(&call_thread, NULL, admitted_api_call_main, &call) == 0);
     call_started = true;
-    trevrpc_h3_ingress_test_wait_before_reference_paused(old_handle);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_before_reference_paused(old_handle) == 0);
 
     trevrpc_h3_ingress_release(old_handle);
     CHECK_GOTO(trevrpc_h3_ingress_create_with_ops(&new_conn, &fake_ops, &config, &new_handle) == 0);
@@ -2339,13 +2339,13 @@ static int run_release_admission_case(admitted_api_kind kind) {
     trevrpc_h3_ingress_test_pause_after_admission(runtime, 1);
     CHECK_GOTO(pthread_create(&call_thread, NULL, admitted_api_call_main, &call) == 0);
     call_started = true;
-    trevrpc_h3_ingress_test_wait_admission_paused(runtime);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_admission_paused(runtime) == 0);
     CHECK_GOTO(lifecycle_wait_init(&release, runtime, true) == 0);
     release_initialized = true;
     CHECK_GOTO(pthread_create(&release_thread, NULL, lifecycle_wait_main, &release) == 0);
     release_started = true;
     lifecycle_wait_started(&release);
-    trevrpc_h3_ingress_test_wait_runtime_detached(runtime);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_runtime_detached(runtime) == 0);
     CHECK_GOTO(!lifecycle_wait_finished(&release));
 
     trevrpc_h3_ingress_test_pause_after_admission(runtime, 0);
@@ -2708,7 +2708,7 @@ static int run_shutdown_callback_release_reentry(bool fatal) {
     } else {
         trevrpc_h3_ingress_shutdown(runtime);
     }
-    trevrpc_h3_ingress_test_wait_runtime_reaped(runtime);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_runtime_reaped(runtime) == 0);
     CHECK_GOTO(trevrpc_h3_ingress_test_runtime_reap_count(runtime) == 1);
     trevrpc_h3_ingress_release(runtime);
     CHECK_GOTO(trevrpc_h3_ingress_test_runtime_reap_count(runtime) == 1);
@@ -2767,8 +2767,8 @@ static int test_internal_shutdown_callback_reentry_reaps_after_thread_exit(void)
     stream.read_error = -EIO;
     pthread_mutex_unlock(&stream.mutex);
     fake_stream_notify(&stream, TREV_MSQUIC_STREAM_OBSERVER_TERMINAL);
-    trevrpc_h3_ingress_test_wait_runtime_detached(runtime);
-    trevrpc_h3_ingress_test_wait_runtime_reaped(runtime);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_runtime_detached(runtime) == 0);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_runtime_reaped(runtime) == 0);
     CHECK_GOTO(trevrpc_h3_ingress_test_runtime_reap_count(runtime) == 1);
     trevrpc_h3_ingress_release(runtime);
     CHECK_GOTO(trevrpc_h3_ingress_test_runtime_reap_count(runtime) == 1);
@@ -3005,13 +3005,13 @@ static int test_profile_publication_release_race_closes_parked_stream(void) {
     trevrpc_h3_ingress_test_pause_after_admission(runtime, 1);
     CHECK_GOTO(pthread_create(&publish_thread, NULL, admitted_api_call_main, &publish) == 0);
     publish_started = true;
-    trevrpc_h3_ingress_test_wait_admission_paused(runtime);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_admission_paused(runtime) == 0);
     CHECK_GOTO(lifecycle_wait_init(&release, runtime, true) == 0);
     release_initialized = true;
     CHECK_GOTO(pthread_create(&release_thread, NULL, lifecycle_wait_main, &release) == 0);
     release_started = true;
     lifecycle_wait_started(&release);
-    trevrpc_h3_ingress_test_wait_runtime_detached(runtime);
+    CHECK_GOTO(trevrpc_h3_ingress_test_wait_runtime_detached(runtime) == 0);
     CHECK_GOTO(!lifecycle_wait_finished(&release));
     CHECK_GOTO(fake_stream_wait_close_calls(&stream, 1) == 0);
 
@@ -3226,7 +3226,7 @@ static int test_release_unlinks_tombstone_and_bounds_registry(void) {
         trevrpc_h3_ingress_test_pause_before_reference(released, 1);
         CHECK_GOTO(pthread_create(&call_thread, NULL, admitted_api_call_main, &call) == 0);
         call_started = true;
-        trevrpc_h3_ingress_test_wait_before_reference_paused(released);
+        CHECK_GOTO(trevrpc_h3_ingress_test_wait_before_reference_paused(released) == 0);
 
         trevrpc_h3_ingress_release(released);
         CHECK_GOTO(trevrpc_h3_ingress_test_registry_size() == baseline);

@@ -260,14 +260,10 @@ static int trevrpc_h3_ingress_platform_cond_timedwait(trevrpc_h3_ingress_runtime
 }
 
 #ifdef TREVRPC_H3_INGRESS_TESTING
-void trevrpc_h3_ingress_test_force_next_timed_wait_timeout(void) {
-    pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
-    trevrpc_h3_ingress_test_force_timed_wait_timeout = true;
-    trevrpc_h3_ingress_test_timed_wait_entered = false;
-    pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
-}
+typedef bool (*trevrpc_h3_ingress_test_wait_ready)(void* context);
 
-int trevrpc_h3_ingress_test_wait_timed_wait_entered(void) {
+static int trevrpc_h3_ingress_test_wait_until(
+    pthread_cond_t* cond, pthread_mutex_t* mutex, trevrpc_h3_ingress_test_wait_ready ready, void* context) {
     struct timespec deadline;
     int err = clock_gettime(CLOCK_REALTIME, &deadline);
     if (err != 0) {
@@ -278,18 +274,41 @@ int trevrpc_h3_ingress_test_wait_timed_wait_entered(void) {
     }
     deadline.tv_sec += TREV_H3_INGRESS_TEST_WAIT_SECONDS;
 
-    pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
-    while (!trevrpc_h3_ingress_test_timed_wait_entered) {
-        err = pthread_cond_timedwait(
-            &trevrpc_h3_ingress_test_timed_wait_cond, &trevrpc_h3_ingress_test_timed_wait_mutex, &deadline);
+    pthread_mutex_lock(mutex);
+    while (!ready(context)) {
+        err = pthread_cond_timedwait(cond, mutex, &deadline);
         if (err != 0) {
-            trevrpc_h3_ingress_test_force_timed_wait_timeout = false;
-            pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+            pthread_mutex_unlock(mutex);
             return err == ETIMEDOUT ? -ETIMEDOUT : -err;
         }
     }
-    pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+    pthread_mutex_unlock(mutex);
     return 0;
+}
+
+static bool trevrpc_h3_ingress_test_timed_wait_is_entered(void* context) {
+    (void)context;
+    return trevrpc_h3_ingress_test_timed_wait_entered;
+}
+
+void trevrpc_h3_ingress_test_force_next_timed_wait_timeout(void) {
+    pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+    trevrpc_h3_ingress_test_force_timed_wait_timeout = true;
+    trevrpc_h3_ingress_test_timed_wait_entered = false;
+    pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+}
+
+int trevrpc_h3_ingress_test_wait_timed_wait_entered(void) {
+    int result = trevrpc_h3_ingress_test_wait_until(&trevrpc_h3_ingress_test_timed_wait_cond,
+        &trevrpc_h3_ingress_test_timed_wait_mutex,
+        trevrpc_h3_ingress_test_timed_wait_is_entered,
+        NULL);
+    if (result != 0) {
+        pthread_mutex_lock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+        trevrpc_h3_ingress_test_force_timed_wait_timeout = false;
+        pthread_mutex_unlock(&trevrpc_h3_ingress_test_timed_wait_mutex);
+    }
+    return result;
 }
 
 static int trevrpc_h3_ingress_cond_timedwait(trevrpc_h3_ingress_runtime* runtime,
@@ -1052,15 +1071,19 @@ void trevrpc_h3_ingress_test_pause_before_reference(trevrpc_h3_ingress* handle, 
     pthread_mutex_unlock(&handle->test_admission_mutex);
 }
 
-void trevrpc_h3_ingress_test_wait_before_reference_paused(trevrpc_h3_ingress* handle) {
+static bool trevrpc_h3_ingress_test_before_reference_is_paused(void* context) {
+    trevrpc_h3_ingress* handle = context;
+    return handle->test_before_reference_paused;
+}
+
+int trevrpc_h3_ingress_test_wait_before_reference_paused(trevrpc_h3_ingress* handle) {
     if (handle == NULL) {
-        return;
+        return -EINVAL;
     }
-    pthread_mutex_lock(&handle->test_admission_mutex);
-    while (!handle->test_before_reference_paused) {
-        pthread_cond_wait(&handle->test_admission_cond, &handle->test_admission_mutex);
-    }
-    pthread_mutex_unlock(&handle->test_admission_mutex);
+    return trevrpc_h3_ingress_test_wait_until(&handle->test_admission_cond,
+        &handle->test_admission_mutex,
+        trevrpc_h3_ingress_test_before_reference_is_paused,
+        handle);
 }
 
 void trevrpc_h3_ingress_test_pause_after_admission(trevrpc_h3_ingress* handle, int pause) {
@@ -1073,15 +1096,19 @@ void trevrpc_h3_ingress_test_pause_after_admission(trevrpc_h3_ingress* handle, i
     pthread_mutex_unlock(&handle->test_admission_mutex);
 }
 
-void trevrpc_h3_ingress_test_wait_admission_paused(trevrpc_h3_ingress* handle) {
+static bool trevrpc_h3_ingress_test_admission_is_paused(void* context) {
+    trevrpc_h3_ingress* handle = context;
+    return handle->test_admission_paused;
+}
+
+int trevrpc_h3_ingress_test_wait_admission_paused(trevrpc_h3_ingress* handle) {
     if (handle == NULL) {
-        return;
+        return -EINVAL;
     }
-    pthread_mutex_lock(&handle->test_admission_mutex);
-    while (!handle->test_admission_paused) {
-        pthread_cond_wait(&handle->test_admission_cond, &handle->test_admission_mutex);
-    }
-    pthread_mutex_unlock(&handle->test_admission_mutex);
+    return trevrpc_h3_ingress_test_wait_until(&handle->test_admission_cond,
+        &handle->test_admission_mutex,
+        trevrpc_h3_ingress_test_admission_is_paused,
+        handle);
 }
 
 void trevrpc_h3_ingress_test_recycle_runtime_allocations(int recycle) {
@@ -1106,26 +1133,32 @@ void* trevrpc_h3_ingress_test_runtime_address(trevrpc_h3_ingress* handle) {
     return address;
 }
 
-void trevrpc_h3_ingress_test_wait_runtime_detached(trevrpc_h3_ingress* handle) {
-    if (handle == NULL) {
-        return;
-    }
-    pthread_mutex_lock(&trevrpc_h3_ingress_registry_mutex);
-    while (*trevrpc_h3_ingress_registry_find_slot(handle) != NULL && handle->runtime != NULL) {
-        pthread_cond_wait(&trevrpc_h3_ingress_registry_cond, &trevrpc_h3_ingress_registry_mutex);
-    }
-    pthread_mutex_unlock(&trevrpc_h3_ingress_registry_mutex);
+static bool trevrpc_h3_ingress_test_runtime_is_detached(void* context) {
+    trevrpc_h3_ingress* handle = context;
+    return *trevrpc_h3_ingress_registry_find_slot(handle) == NULL || handle->runtime == NULL;
 }
 
-void trevrpc_h3_ingress_test_wait_runtime_reaped(trevrpc_h3_ingress* handle) {
+int trevrpc_h3_ingress_test_wait_runtime_detached(trevrpc_h3_ingress* handle) {
     if (handle == NULL) {
-        return;
+        return -EINVAL;
     }
-    pthread_mutex_lock(&handle->test_admission_mutex);
-    while (handle->test_runtime_reap_count == 0) {
-        pthread_cond_wait(&handle->test_admission_cond, &handle->test_admission_mutex);
+    return trevrpc_h3_ingress_test_wait_until(&trevrpc_h3_ingress_registry_cond,
+        &trevrpc_h3_ingress_registry_mutex,
+        trevrpc_h3_ingress_test_runtime_is_detached,
+        handle);
+}
+
+static bool trevrpc_h3_ingress_test_runtime_is_reaped(void* context) {
+    trevrpc_h3_ingress* handle = context;
+    return handle->test_runtime_reap_count != 0;
+}
+
+int trevrpc_h3_ingress_test_wait_runtime_reaped(trevrpc_h3_ingress* handle) {
+    if (handle == NULL) {
+        return -EINVAL;
     }
-    pthread_mutex_unlock(&handle->test_admission_mutex);
+    return trevrpc_h3_ingress_test_wait_until(
+        &handle->test_admission_cond, &handle->test_admission_mutex, trevrpc_h3_ingress_test_runtime_is_reaped, handle);
 }
 
 size_t trevrpc_h3_ingress_test_runtime_reap_count(trevrpc_h3_ingress* handle) {

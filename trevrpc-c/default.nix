@@ -114,8 +114,10 @@ stdenv.mkDerivation (
         -Ibuild/generated-service-test \
         -Ibuild/generated-greeter-example \
         -isystem ${libmsquic}/include
+      ctest --test-dir build --verbose --timeout 30 \
+        -R '^trevrpc_h3_ingress$'
       ctest --test-dir build --output-on-failure -j $NIX_BUILD_CORES \
-        ${optionalString threadSanitizer "-E '^(trevrpc_bench_peer_(http3_lifecycle|webtransport_smoke)|trevrpc_generated_service_http3)$'"}
+        -E '^(trevrpc_h3_ingress${optionalString threadSanitizer "|trevrpc_bench_peer_(http3_lifecycle|webtransport_smoke)|trevrpc_generated_service_http3"})$'
       runHook postCheck
     '';
 

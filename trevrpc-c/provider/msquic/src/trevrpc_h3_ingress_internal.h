@@ -108,13 +108,13 @@ void trevrpc_h3_ingress_release(trevrpc_h3_ingress* runtime);
 
 #ifdef TREVRPC_H3_INGRESS_TESTING
 void trevrpc_h3_ingress_test_pause_before_reference(trevrpc_h3_ingress* runtime, int pause);
-void trevrpc_h3_ingress_test_wait_before_reference_paused(trevrpc_h3_ingress* runtime);
+int trevrpc_h3_ingress_test_wait_before_reference_paused(trevrpc_h3_ingress* runtime);
 void trevrpc_h3_ingress_test_pause_after_admission(trevrpc_h3_ingress* runtime, int pause);
-void trevrpc_h3_ingress_test_wait_admission_paused(trevrpc_h3_ingress* runtime);
+int trevrpc_h3_ingress_test_wait_admission_paused(trevrpc_h3_ingress* runtime);
 void trevrpc_h3_ingress_test_recycle_runtime_allocations(int recycle);
 void* trevrpc_h3_ingress_test_runtime_address(trevrpc_h3_ingress* runtime);
-void trevrpc_h3_ingress_test_wait_runtime_detached(trevrpc_h3_ingress* runtime);
-void trevrpc_h3_ingress_test_wait_runtime_reaped(trevrpc_h3_ingress* runtime);
+int trevrpc_h3_ingress_test_wait_runtime_detached(trevrpc_h3_ingress* runtime);
+int trevrpc_h3_ingress_test_wait_runtime_reaped(trevrpc_h3_ingress* runtime);
 size_t trevrpc_h3_ingress_test_runtime_reap_count(trevrpc_h3_ingress* runtime);
 void trevrpc_h3_ingress_test_force_next_timed_wait_timeout(void);
 int trevrpc_h3_ingress_test_wait_timed_wait_entered(void);
