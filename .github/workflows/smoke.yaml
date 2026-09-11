@@ -27,45 +27,7 @@ jobs:
 
       - name: Discover smoke cells
         id: matrix
-        run: |
-          jq --null-input --raw-output \
-            --slurpfile native bench/campaigns/native-smoke.example.json \
-            --slurpfile chromium bench/campaigns/chromium-smoke.example.json \
-            --slurpfile firefox bench/campaigns/firefox-smoke.example.json \
-            --slurpfile webkit bench/campaigns/webkit-smoke.example.json \
-            '[
-              "linux=" + ({include: (
-                ($native[0].cells | map({
-                  cell: .id,
-                  campaign: "bench/campaigns/native-smoke.example.json",
-                  client_package: ("trevrpc-" + .client),
-                  server_package: ("trevrpc-" + .server)
-                })) +
-                ($chromium[0].cells | map({
-                  cell: .id,
-                  campaign: "bench/campaigns/chromium-smoke.example.json",
-                  client_package: "trevrpc-browser-bench-peer",
-                  server_package: ("trevrpc-" + .server)
-                })) +
-                ($firefox[0].cells | map({
-                  cell: .id,
-                  campaign: "bench/campaigns/firefox-smoke.example.json",
-                  client_package: "trevrpc-browser-bench-peer",
-                  server_package: ("trevrpc-" + .server)
-                }))
-              )} | tojson),
-              "webkit=" + ({include: ($webkit[0].cells | map({
-                cell: .id,
-                campaign: "bench/campaigns/webkit-smoke.example.json",
-                client_package: "trevrpc-browser-bench-peer",
-                server_package: ("trevrpc-" + .server)
-              }))} | tojson),
-              "android=" + ({include: ($native[0].peers | map({
-                server: .id,
-                server_command: .command[0],
-                server_package: ("trevrpc-" + .id)
-              }))} | tojson)
-            ] | .[]' >> "$GITHUB_OUTPUT"
+        run: python3 bench/ci/discover-smoke-cells.py >> "$GITHUB_OUTPUT"
 
   prepare:
     name: prepare-${{ matrix.platform }}

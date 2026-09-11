@@ -3807,6 +3807,15 @@ static void node_call_request_close(node_call* call) {
         call, call != NULL && call->close_abort ? TREVRPC_RPC_CLOSE_FLAG_ABORT : TREVRPC_RPC_CLOSE_FLAG_NONE);
 }
 
+static void node_call_complete_server_response(node_call* call, bool succeeded) {
+    call->response_settled = succeeded;
+    call->response_submitted = false;
+    if (!succeeded) {
+        call->close_abort = true;
+    }
+    node_call_request_close(call);
+}
+
 static void node_send_pump(node_call* call);
 
 static napi_value node_new_promise(napi_env env, napi_deferred* deferred) {
@@ -4157,13 +4166,10 @@ static int node_complete_operation(
             if (operation->has_deferred) {
                 (void)node_reject_deferred_native(env, operation->deferred, info->status, "respond");
             }
-            call->close_abort = true;
-            node_call_request_close(call);
         } else if (operation->has_deferred) {
             node_resolve_undefined(env, operation->deferred);
         }
-        call->response_settled = info->status == 0;
-        call->response_submitted = false;
+        node_call_complete_server_response(call, info->status == 0);
         return 0;
     }
     case NODE_OPERATION_CALL_FINISH: {
@@ -4176,13 +4182,10 @@ static int node_complete_operation(
             if (operation->has_deferred) {
                 (void)node_reject_deferred_native(env, operation->deferred, info->status, "finishStream");
             }
-            call->close_abort = true;
-            node_call_request_close(call);
         } else if (operation->has_deferred) {
             node_resolve_undefined(env, operation->deferred);
         }
-        call->response_settled = info->status == 0;
-        call->response_submitted = false;
+        node_call_complete_server_response(call, info->status == 0);
         return 0;
     }
     case NODE_OPERATION_CALL_CLOSE: {

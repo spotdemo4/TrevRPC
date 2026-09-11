@@ -82,25 +82,29 @@ smoke harness supplies the current direct-HTTP/3 client coverage, so no unusable
 process-peer HTTP/3 campaign is included.
 
 `chromium-smoke.example.json`, `firefox-smoke.example.json`, and
-`webkit-smoke.example.json` each start the respective browser client before
-each RPC server. Chromium, Firefox, and WebKit run against all six server
-implementations for 24 functional samples. The Go benchmark server uses the
-native C/MsQuic backend; the separately imported optional QUIC-go module is not
-part of the benchmark peer. WebKit keeps the Rust server covered while
-[h3#347](https://github.com/hyperium/h3/issues/347) remains open. The client first
-reports its prepared browser origin; the
-controller passes that origin to the server, sends
-the ready server address back with `CONNECT`, waits for `armed`, and then starts
-measurement.
+`webkit-smoke.example.json` each describe the respective browser client against
+all six server implementations for 24 possible functional samples. The client
+first reports its prepared browser origin; the controller passes that origin to
+the server, sends the ready server address back with `CONNECT`, waits for
+`armed`, and then starts measurement.
 
-The GitHub smoke workflow runs Chromium and Firefox cells on Linux and WebKit
-cells on `aarch64-darwin`. Playwright WebKit uses WPE on Linux, whose network
-process does not implement WebTransport, so the WebKit browser bundle is not
-selected and the peer does not advertise WebTransport coverage there. On
-Apple Silicon macOS, Playwright launches the pinned Cocoa WebKit build. The
-Darwin campaign uses the loopback backend; Linux-only `netns` emulation is not
-substituted. Process-group procfs metrics are unavailable on Darwin and are
-recorded explicitly as unavailable with zero-valued metric fields.
+The GitHub smoke workflow runs all Chromium and Firefox cells on Linux. On
+`aarch64-darwin`, its centralized compatibility policy schedules four WebKit
+cells—C, C++, JavaScript, and Kotlin—for 16 functional samples. WebKit-to-Go is
+excluded because the bundled Go native transport currently supports cgo on
+Linux amd64 and arm64 only. WebKit-to-Rust is excluded because the Rust `h3`
+server's draft-02 profile does not interoperate with Network.framework's legacy
+profile; see [h3#347](https://github.com/hyperium/h3/issues/347). The canonical
+campaign retains both cells so removing a compatibility rule restores coverage
+when the underlying limitation is fixed.
+
+Playwright WebKit uses WPE on Linux, whose network process does not implement
+WebTransport, so the WebKit browser bundle is not selected and the peer does not
+advertise WebTransport coverage there. On Apple Silicon macOS, Playwright
+launches the pinned Cocoa WebKit build. The Darwin campaign uses the loopback
+backend; Linux-only `netns` emulation is not substituted. Process-group procfs
+metrics are unavailable on Darwin and are recorded explicitly as unavailable
+with zero-valued metric fields.
 
 ### Single-Host Network Emulation
 

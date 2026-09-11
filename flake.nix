@@ -484,6 +484,17 @@
                 }
               else
                 null;
+            smokeDiscoverySource = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./bench/campaigns/chromium-smoke.example.json
+                ./bench/campaigns/firefox-smoke.example.json
+                ./bench/campaigns/native-smoke.example.json
+                ./bench/campaigns/webkit-smoke.example.json
+                ./bench/ci/discover-smoke-cells.py
+                ./bench/ci/tests/test_discover_smoke_cells.py
+              ];
+            };
             goNeutralModuleSource = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = cSources.goNeutral;
@@ -576,6 +587,19 @@
                 ''
                   ANDROID_SMOKE_RUNNER=${./bench/ci/run-android-smoke-cell.py} \
                     python3 ${./bench/ci/tests/test_run_android_smoke_cell.py}
+                  touch $out
+                '';
+
+            smoke-discovery =
+              pkgs.runCommand "trevrpc-smoke-discovery-tests"
+                {
+                  nativeBuildInputs = [ pkgs.python3 ];
+                  src = smokeDiscoverySource;
+                }
+                ''
+                  SMOKE_CELL_DISCOVERY="$src/bench/ci/discover-smoke-cells.py" \
+                  SMOKE_REPOSITORY_ROOT="$src" \
+                    python3 "$src/bench/ci/tests/test_discover_smoke_cells.py"
                   touch $out
                 '';
 

@@ -4074,6 +4074,9 @@ static int provider_stream_abort_receive(
     if (released_receive_credit) {
         resume_paused_receives(adapter);
     }
+    if (stream_shutdown_drained(stream)) {
+        publish_stream_terminal(stream, false, 0);
+    }
     return 0;
 }
 

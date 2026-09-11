@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"time"
@@ -46,7 +47,12 @@ func (c *transportStreamClient) Call(
 	if err != nil {
 		return nil, c.status(ctx, err)
 	}
-	defer cancelTransportStreamRead(stream)
+	cancelRead := true
+	defer func() {
+		if cancelRead {
+			cancelTransportStreamRead(stream)
+		}
+	}()
 	stopCancel := cancelTransportStreamOnContext(ctx, stream)
 	defer stopCancel()
 
@@ -62,7 +68,29 @@ func (c *transportStreamClient) Call(
 	if err := ReadFrame(stream, response, c.maxFrameSize); err != nil {
 		return nil, c.status(ctx, err)
 	}
+	if err := waitForCleanTransportStreamEOF(stream); err != nil {
+		return nil, c.status(ctx, err)
+	}
+	cancelRead = false
 	return response, nil
+}
+
+func waitForCleanTransportStreamEOF(reader io.Reader) error {
+	trailing := [1]byte{}
+	for {
+		read, err := reader.Read(trailing[:])
+		if read != 0 {
+			return &FrameDecodeError{
+				Err: errors.New("unexpected trailing data after unary response"),
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 func (c *transportStreamClient) StreamingCall(

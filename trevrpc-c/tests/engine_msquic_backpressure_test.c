@@ -1011,6 +1011,23 @@ static void test_receive_abort_failure_preserves_retryable_state(void) {
     fixture_destroy(&fixture);
 }
 
+static void test_synchronous_receive_abort_shutdown_publishes_terminal(void) {
+    receive_fixture fixture = fixture_create(1024);
+    fixture.stream->send_finished = true;
+    FakeMsQuic.deliver_shutdown_complete = true;
+
+    assert(trevrpc_engine_stream_abort_receive(fixture.engine, fixture.stream_handle, 9) == 0);
+    assert(fixture.stream->receive_aborted);
+    assert(FakeMsQuic.shutdown_complete_delivered);
+    assert(fixture.stream->base.terminal_published);
+    assert(FakeMsQuic.close_calls == 1);
+
+    stream_event_counts counts = drain_stream_events(&fixture);
+    assert(counts.terminal == 1);
+    fixture.stream = NULL;
+    fixture_destroy_stopped(&fixture);
+}
+
 static void test_local_receive_abort_suppresses_late_peer_fin(void) {
     receive_fixture fixture = fixture_create(1024);
     assert(trevrpc_engine_stream_abort_receive(fixture.engine, fixture.stream_handle, 9) == 0);
@@ -1500,6 +1517,7 @@ int main(void) {
     test_peer_send_abort_retires_pause();
     test_peer_receive_abort_publishes_send_stopped_once();
     test_receive_abort_failure_preserves_retryable_state();
+    test_synchronous_receive_abort_shutdown_publishes_terminal();
     test_local_receive_abort_suppresses_late_peer_fin();
     test_peer_abort_resume_race_is_nonfatal();
     test_callback_entry_failure_aborts_explicitly();
