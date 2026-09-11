@@ -13,7 +13,6 @@
 #include <deque>
 #include <limits>
 #include <mutex>
-#include <new>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -238,7 +237,7 @@ RpcCancellation::attach(const std::shared_ptr<RpcEventRuntime>& runtime) const {
 }
 
 Result<RpcCancellation::Subscription>
-RpcCancellation::subscribe(std::function<void()> callback) const {
+RpcCancellation::subscribe(const std::function<void()>& callback) const {
   if (!callback) {
     return Error::runtime(-EINVAL, "cancellation callback must not be empty");
   }

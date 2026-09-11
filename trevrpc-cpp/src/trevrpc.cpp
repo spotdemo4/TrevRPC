@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <limits>
-#include <new>
 #include <system_error>
 
 namespace trevrpc {
@@ -225,8 +224,8 @@ Result<std::shared_ptr<Channel>> Channel::connect(std::string_view host, std::ui
   }
   if (config.callback_exception_sink) {
     auto sink = config.callback_exception_sink;
-    native.callback_exception_sink = [sink = std::move(sink)](std::exception_ptr exception) {
-      sink->callback_exception("channel_lifecycle", std::move(exception));
+    native.callback_exception_sink = [sink = std::move(sink)](const std::exception_ptr& exception) {
+      sink->callback_exception("channel_lifecycle", exception);
     };
   }
   auto core = detail::ChannelCore::connect(std::move(native));

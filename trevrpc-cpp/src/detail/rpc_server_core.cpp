@@ -19,12 +19,12 @@ namespace trevrpc::detail {
 namespace {
 
 void callback_exception(const CallbackExceptionState& state, std::string_view name,
-                        std::exception_ptr exception) noexcept {
+                        const std::exception_ptr& exception) noexcept {
   if (!state.sink) {
     return;
   }
   try {
-    state.sink->callback_exception(name, std::move(exception));
+    state.sink->callback_exception(name, exception);
   } catch (...) {
     (void)std::current_exception();
   }

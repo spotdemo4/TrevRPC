@@ -94,7 +94,7 @@ public:
   [[nodiscard]] bool cancelled() const noexcept;
   [[nodiscard]] Result<AttachmentLease>
   attach(const std::shared_ptr<RpcEventRuntime>& runtime) const;
-  [[nodiscard]] Result<Subscription> subscribe(std::function<void()> callback) const;
+  [[nodiscard]] Result<Subscription> subscribe(const std::function<void()>& callback) const;
 
 private:
   std::shared_ptr<SharedState> state_;
