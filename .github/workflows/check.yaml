@@ -32,4 +32,8 @@ jobs:
         run: python3 .forgejo/tests/release_automation_test.py
 
       - name: Check
-        run: nix flake check -L --option log-lines 100
+        run: >-
+          nix flake check -L
+          --max-silent-time 300
+          --timeout 1800
+          --option log-lines 100
