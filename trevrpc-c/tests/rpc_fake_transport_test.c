@@ -1297,7 +1297,8 @@ static void run_terminal_before_drained_response(uint32_t kind, response_termina
     uint32_t terminal_flags = TREVRPC_RPC_TRANSPORT_EVENT_FLAG_TERMINAL | TREVRPC_RPC_TRANSPORT_EVENT_FLAG_PEER |
                               TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLIENT;
 
-    assert(kind == TREVRPC_RPC_KIND_UNARY || kind == TREVRPC_RPC_KIND_CLIENT_STREAMING);
+    assert(kind == TREVRPC_RPC_KIND_UNARY || kind == TREVRPC_RPC_KIND_CLIENT_STREAMING ||
+           kind == TREVRPC_RPC_KIND_SERVER_STREAMING);
     if (resolution != RESPONSE_TERMINAL_OPTIONAL_FIN) {
         terminal_flags |= TREVRPC_RPC_TRANSPORT_EVENT_FLAG_CLEAN_FIN;
     }
@@ -1356,6 +1357,7 @@ static void run_terminal_before_drained_response(uint32_t kind, response_termina
         trevrpc_rpc_receive_release(receive);
         receive = NULL;
     }
+    atomic_store_explicit(&fake->stream_receive_result, -EPIPE, memory_order_release);
     assert(trevrpc_rpc_stream_receive(runtime, stream, &receive) == -EAGAIN);
     assert(receive == NULL);
     if (resolution == RESPONSE_TERMINAL_OPTIONAL_FIN) {
@@ -4350,6 +4352,7 @@ int main(void) {
     run_clean_terminal_waits_for_late_receive_fin();
     run_terminal_before_drained_response(TREVRPC_RPC_KIND_UNARY, RESPONSE_TERMINAL_LATE_FIN);
     run_terminal_before_drained_response(TREVRPC_RPC_KIND_CLIENT_STREAMING, RESPONSE_TERMINAL_LATE_FIN);
+    run_terminal_before_drained_response(TREVRPC_RPC_KIND_SERVER_STREAMING, RESPONSE_TERMINAL_LATE_FIN);
     run_terminal_before_drained_response(TREVRPC_RPC_KIND_UNARY, RESPONSE_TERMINAL_OPTIONAL_FIN);
     run_terminal_before_drained_response(TREVRPC_RPC_KIND_CLIENT_STREAMING, RESPONSE_TERMINAL_OPTIONAL_FIN);
     run_terminal_before_drained_response(TREVRPC_RPC_KIND_UNARY, RESPONSE_TERMINAL_GRACEFUL_CLOSE);

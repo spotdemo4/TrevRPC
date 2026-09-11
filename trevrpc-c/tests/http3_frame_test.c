@@ -222,6 +222,8 @@ static int test_prefix_builder_atomic_failures(void) {
     CHECK(trevrpc_h3_frame_prefix_build(0x40, 0x40, output, 3, &output_len) == TREV_H3_FRAME_OUTPUT_TOO_SMALL);
     CHECK(memcmp(output, before, sizeof(output)) == 0);
     CHECK(output_len == 0xaaaa);
+    CHECK(trevrpc_h3_frame_prefix_build(0, 0, NULL, 0, &output_len) == TREV_H3_FRAME_OUTPUT_TOO_SMALL);
+    CHECK(output_len == 0xaaaa);
 
     CHECK(trevrpc_h3_frame_prefix_build(TREV_QUIC_VARINT_MAX + 1, 0, output, sizeof(output), &output_len) ==
           TREV_H3_FRAME_INVALID_ARGUMENT);

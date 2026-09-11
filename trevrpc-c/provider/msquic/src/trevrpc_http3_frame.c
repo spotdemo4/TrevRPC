@@ -147,7 +147,7 @@ trevrpc_h3_frame_status trevrpc_h3_frame_prefix_build(
         return TREV_H3_FRAME_INVALID_ARGUMENT;
     }
     size_t required = type_size + length_size;
-    if (out_capacity < required) {
+    if (out == NULL || out_capacity < required) {
         return TREV_H3_FRAME_OUTPUT_TOO_SMALL;
     }
 

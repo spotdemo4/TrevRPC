@@ -873,6 +873,36 @@ static int registry_get(msquic_provider* adapter,
     return registry_get_with_policy(adapter, handle, expected_kind, out_object, require_ready, REGISTRY_REQUIRE_OPEN);
 }
 
+static int registry_get_active_or_retired(
+    msquic_provider* adapter, trevrpc_engine_handle_v1 handle, uint32_t expected_kind, adapter_object** out_object) {
+    if (handle.owner == 0 || handle.generation == 0) {
+        return -EINVAL;
+    }
+    if (handle.owner != adapter->owner || handle.slot >= adapter->slot_count) {
+        return -ESTALE;
+    }
+    pthread_mutex_lock(&adapter->mutex);
+    adapter_slot* slot = &adapter->slots[handle.slot];
+    adapter_object* object = NULL;
+    if (slot->object != NULL && slot->generation == handle.generation) {
+        if (slot->kind != expected_kind) {
+            pthread_mutex_unlock(&adapter->mutex);
+            return -EINVAL;
+        }
+        object = slot->object;
+    } else {
+        object = registry_find_retired_locked(adapter, handle, expected_kind);
+    }
+    if (object == NULL) {
+        pthread_mutex_unlock(&adapter->mutex);
+        return -ESTALE;
+    }
+    object->active_operations++;
+    *out_object = object;
+    pthread_mutex_unlock(&adapter->mutex);
+    return 0;
+}
+
 typedef struct adapter_object_scope {
     adapter_object* object;
 } adapter_object_scope;
@@ -1895,28 +1925,9 @@ static int provider_stream_receive_frame(
         return -EINVAL;
     }
     adapter_object* object = NULL;
-    int result = registry_get(adapter, stream_handle, TREVRPC_ENGINE_OBJECT_STREAM, &object, false);
+    int result = registry_get_active_or_retired(adapter, stream_handle, TREVRPC_ENGINE_OBJECT_STREAM, &object);
     if (result != 0) {
-        if (result != -EPIPE && result != -ESTALE) {
-            return result;
-        }
-        pthread_mutex_lock(&adapter->mutex);
-        adapter_slot* slot = stream_handle.owner == adapter->owner && stream_handle.slot < adapter->slot_count
-                                 ? &adapter->slots[stream_handle.slot]
-                                 : NULL;
-        if (slot != NULL && slot->object != NULL && slot->kind == TREVRPC_ENGINE_OBJECT_STREAM &&
-            slot->generation == stream_handle.generation) {
-            object = slot->object;
-        } else {
-            object = registry_find_retired_locked(adapter, stream_handle, TREVRPC_ENGINE_OBJECT_STREAM);
-        }
-        if (object != NULL) {
-            object->active_operations++;
-        }
-        pthread_mutex_unlock(&adapter->mutex);
-        if (object == NULL) {
-            return result;
-        }
+        return result;
     }
     ADAPTER_OBJECT_SCOPE(object);
     adapter_stream* stream = (adapter_stream*)object;

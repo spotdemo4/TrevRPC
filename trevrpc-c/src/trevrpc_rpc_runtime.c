@@ -4626,11 +4626,11 @@ receive_next:
                 trevrpc_rpc_abort_or_terminal(
                     runtime, transport_stream, TREVRPC_RPC_STATUS_RESOURCE_EXHAUSTED, restore_result);
             }
-        } else if (result == -EAGAIN || result == -ESTALE) {
+        } else if (result == -EAGAIN || result == -ESTALE || result == -EPIPE) {
             pthread_mutex_lock(&runtime->mutex);
             record = trevrpc_rpc_find_stream_locked(runtime, stream);
             trevrpc_rpc_mark_readable_drained_locked(runtime, record, readable_epoch);
-            if (result == -ESTALE && record != NULL) {
+            if ((result == -ESTALE || result == -EPIPE) && record != NULL) {
                 result = -EAGAIN;
             }
             pthread_mutex_unlock(&runtime->mutex);
