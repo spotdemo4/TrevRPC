@@ -403,12 +403,24 @@ function isCleanupWriterError(error) {
   }
 
   const message = error?.statusMessage ?? error?.message ?? "";
-  return error?.code === Code.Unavailable && /stream canceled with error code 0/i.test(message);
+  return (
+    error?.code === Code.Unavailable &&
+    (/stream canceled with error code 0/i.test(message) || isClosedOrErroredWriterMessage(message))
+  );
 }
 
 function isRemoteStopSendingWriterError(error) {
   const message = error?.statusMessage ?? error?.message ?? "";
-  return error?.code === Code.Unavailable && /received stop_sending/i.test(message);
+  return (
+    error?.code === Code.Unavailable &&
+    (/received stop_sending/i.test(message) || isClosedOrErroredWriterMessage(message))
+  );
+}
+
+function isClosedOrErroredWriterMessage(message) {
+  // WebKit uses this generic Streams error when the peer has already stopped
+  // or closed the WebTransport stream's send direction.
+  return /cannot close a writable stream that is closed or errored/i.test(message);
 }
 
 function closeUnaryRequestWriter(writer) {

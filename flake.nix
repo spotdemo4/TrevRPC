@@ -579,11 +579,23 @@
               stdenv = pkgs.llvmPackages_22.stdenv;
               clang-tools = pkgs.llvmPackages_22.clang-tools;
             };
-            cSanitizerCheck = packageSet.trevrpc-c.override (
-              {
-                sanitizers = true;
-              }
-              // darwinSanitizerToolchain
+            withDarwinSanitizerTools =
+              package:
+              if pkgs.stdenv.hostPlatform.isDarwin then
+                package.overrideAttrs (old: {
+                  nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                    (pkgs.lib.getBin pkgs.llvmPackages_22.llvm)
+                  ];
+                })
+              else
+                package;
+            cSanitizerCheck = withDarwinSanitizerTools (
+              packageSet.trevrpc-c.override (
+                {
+                  sanitizers = true;
+                }
+                // darwinSanitizerToolchain
+              )
             );
           in
           pkgs.mkChecks {
@@ -668,12 +680,14 @@
             ${if system == "x86_64-linux" then "msquic-provider-both" else null} = bothMsquicProviderCheck;
 
             cpp = packageSet.trevrpc-cpp;
-            cpp-sanitizers = packageSet.trevrpc-cpp.override (
-              {
-                sanitizers = true;
-                trevrpcC = cSanitizerCheck;
-              }
-              // darwinSanitizerToolchain
+            cpp-sanitizers = withDarwinSanitizerTools (
+              packageSet.trevrpc-cpp.override (
+                {
+                  sanitizers = true;
+                  trevrpcC = cSanitizerCheck;
+                }
+                // darwinSanitizerToolchain
+              )
             );
 
             rust = packageSet.trevrpc-rust;

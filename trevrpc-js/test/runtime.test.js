@@ -2282,6 +2282,40 @@ test("WebTransport terminal OK does not hide local upload error", async () => {
   await assert.rejects(iterator.return(), (error) => error.code === Code.InvalidArgument);
 });
 
+test("WebTransport server streaming accepts WebKit peer-closed upload", async () => {
+  const Hello = helloTestType();
+  const stream = fakeBidirectionalStream({
+    closeError: new Error("Cannot close a writable stream that is closed or errored"),
+    readableChunks: [
+      encodeFrame(
+        RpcStreamFrame,
+        RpcStreamFrame.create({
+          kind: RpcStreamFrameKind.Status,
+          status: Code.Ok,
+          metadata: {},
+        }),
+      ),
+    ],
+  });
+  const client = new RawWebTransport({
+    ready: Promise.resolve(),
+    createBidirectionalStream() {
+      return Promise.resolve(stream);
+    },
+  });
+
+  const responses = await serverStreaming(
+    client,
+    "hello.v1.Greeter",
+    "LotsOfReplies",
+    Hello,
+    Hello,
+    { value: "Trev" },
+  );
+
+  assert.equal((await responses[Symbol.asyncIterator]().next()).done, true);
+});
+
 test("WebTransport terminal OK ignores browser upload cleanup transport closes", async () => {
   const root = createRoot({
     nested: {
@@ -2304,6 +2338,7 @@ test("WebTransport terminal OK ignores browser upload cleanup transport closes",
   for (const closeError of [
     new Error("stream canceled with error code 0"),
     new Error("Received STOP_SENDING."),
+    new Error("Cannot close a writable stream that is closed or errored"),
   ]) {
     const stream = fakeBidirectionalStream({
       closeError,
