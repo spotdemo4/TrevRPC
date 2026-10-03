@@ -4,7 +4,7 @@ import org.gradle.api.attributes.Usage
 import org.gradle.api.attributes.java.TargetJvmVersion
 
 plugins {
-    kotlin("jvm") version "2.4.10" apply false
+    kotlin("jvm") version "2.4.20" apply false
     id("com.google.protobuf") version "0.10.0" apply false
 }
 
