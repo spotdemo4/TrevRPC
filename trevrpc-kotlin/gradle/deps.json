@@ -2325,6 +2325,74 @@
     },
     "org/jetbrains/kotlin/jvm#org.jetbrains.kotlin.jvm.gradle.plugin/2.4.20": {
       "pom": "sha256-87J5EARcHh4hy0jWin4XfqGko92kZ+VGwVwwucCYGHw="
+    },
+    "io/netty#netty-bom/4.2.18.Final": {
+      "pom": "sha256-EnSGndEVWbhJAJmn5vPtlO3freKCvpFieGPKyPxwVmM="
+    },
+    "io/netty#netty-buffer/4.2.18.Final": {
+      "jar": "sha256-/fI20rdqqXEGhEAf2tff+d7FbkPaXTkXLJpVul8Us2A=",
+      "pom": "sha256-3p+oFHAT9N91wou6Aw/cYqSVqDMTFLMX79AnpR6rQ8k="
+    },
+    "io/netty#netty-codec-base/4.2.18.Final": {
+      "jar": "sha256-fkYSvq17qIrG95CPpyL5CtaDXqllBcnkCy+TaGwfYfM=",
+      "pom": "sha256-7PI7EwlDASnwU+fgA24ymbasKUeWaytSxkj2BL+lNto="
+    },
+    "io/netty#netty-codec-classes-quic/4.2.18.Final": {
+      "jar": "sha256-0cTEMn/eK/bsdzsHA0SQenpIRPGENSiukXkF4sNUdHg=",
+      "pom": "sha256-sAcx9mcahPis3JRo49FnTuz2xNVjpTq50AvwgEXCt+Q="
+    },
+    "io/netty#netty-codec-compression/4.2.18.Final": {
+      "jar": "sha256-nYpLmmoqFm7FpLvlGni09qcmRXxR2BSVdDx+fMufR2U=",
+      "pom": "sha256-IJcGIpJfWDjjsyyCPdxJXdWvBjyCnB4wQbZ5/aiV6KM="
+    },
+    "io/netty#netty-codec-http/4.2.18.Final": {
+      "jar": "sha256-LVB2XrWFkc41FGxUygMqJXgI0hZdiYWoUixw6hRw6Nc=",
+      "pom": "sha256-qNroD18DyIS1yAi6tsb50e/uTHwp2y/K772B6zGvRfM="
+    },
+    "io/netty#netty-codec-http3/4.2.18.Final": {
+      "jar": "sha256-zBZS7OER41p2d8gmBJnMZwmVAGGZj50aNklrNS9FYnM=",
+      "pom": "sha256-U/Szs+zg9MIS42y5zyOSb43WVpaduNZMY2GS8uCFNYc="
+    },
+    "io/netty#netty-codec-native-quic/4.2.18.Final": {
+      "pom": "sha256-0LmjaSDWmyBlx1ZKBYhsA9F/4gVuIZjDGhvbzkLxFrs="
+    },
+    "io/netty#netty-codec-native-quic/4.2.18.Final/linux-aarch_64": {
+      "jar": "sha256-300U7cH24DsnumPtinJoeyPAIcril5xat270bpr5+jg="
+    },
+    "io/netty#netty-codec-native-quic/4.2.18.Final/linux-x86_64": {
+      "jar": "sha256-RZUtz6IAMXrdJ1+77fMpZ8s+VSj8hKXSt8zEQ56NP4g="
+    },
+    "io/netty#netty-codec-native-quic/4.2.18.Final/osx-aarch_64": {
+      "jar": "sha256-+ZvWdBOcDnDYKu5kkRBHp71p5aj7fCj8go4QdkkKlHE="
+    },
+    "io/netty#netty-codec-native-quic/4.2.18.Final/osx-x86_64": {
+      "jar": "sha256-gnyHGEbqshniItJK8Zw7cTVJpR7LxnaccOwRjuoD7vw="
+    },
+    "io/netty#netty-codec-native-quic/4.2.18.Final/windows-x86_64": {
+      "jar": "sha256-FJvcAyYsFFq1CaZGTSe+TzL6WgJyPReOHyxEV2b1EC8="
+    },
+    "io/netty#netty-common/4.2.18.Final": {
+      "jar": "sha256-XZfK5WaWhYcjOWmO/hP3T+PNstzNs2ljsjUr2VrPcHA=",
+      "pom": "sha256-2HGU+APhvchLuNWpgqKLV7mdodbnHswXL1LkzQDkaRQ="
+    },
+    "io/netty#netty-handler/4.2.18.Final": {
+      "jar": "sha256-bVoI2d1tfQIRIC4i27FimyOmJVAzXH6AiS2h1MsRVUA=",
+      "pom": "sha256-9IDdCtarzopOxk1ZC8fy+mfw+0vKGPgRpU+kkRdvLd0="
+    },
+    "io/netty#netty-parent/4.2.18.Final": {
+      "pom": "sha256-6rqKAefae5E+rLkVj5UprByCj5LO68W8El3akT2TaFU="
+    },
+    "io/netty#netty-resolver/4.2.18.Final": {
+      "jar": "sha256-aDc+xUTPdpuhe/LvRVFm2Y8sJg3/U27fNe9XBnqcFV8=",
+      "pom": "sha256-2HlY2fXiteYiI/jHr3mHC5a5HryPt3uEZDKYn8txr3g="
+    },
+    "io/netty#netty-transport-native-unix-common/4.2.18.Final": {
+      "jar": "sha256-ytpwI9CRNq8ShRHKlEIdadyE0PH2TJ4fEnoScbtikyo=",
+      "pom": "sha256-st/wNcZHlfOvG/5PxZ6tJzjge7lLKEOWyMF/CtP7Nd4="
+    },
+    "io/netty#netty-transport/4.2.18.Final": {
+      "jar": "sha256-6sTxIGjbRInmDGUg+tZj5dhy8ENqfGQaqeCNtkmUeGM=",
+      "pom": "sha256-KEn1fDOvTXdWArsWH60nvwL7XLqS43p67bXr3lRIBHA="
     }
   }
 }
