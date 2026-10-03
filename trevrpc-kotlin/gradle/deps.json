@@ -2325,6 +2325,16 @@
     },
     "org/jetbrains/kotlin/jvm#org.jetbrains.kotlin.jvm.gradle.plugin/2.4.20": {
       "pom": "sha256-87J5EARcHh4hy0jWin4XfqGko92kZ+VGwVwwucCYGHw="
+    },
+    "com/google/protobuf#protobuf-bom/4.36.2": {
+      "pom": "sha256-1lkquqM14CUChU4j9UJaavSr+qWArUTdY9Kgf2o5ZkU="
+    },
+    "com/google/protobuf#protobuf-java/4.36.2": {
+      "jar": "sha256-B3PnLq83XhKF3zMFdb/sW9pdpnTVRNDhQqF/icj3VNo=",
+      "pom": "sha256-fNQuWC/v85TJbbSzNxTxnroYlpHP6Ew013S2hlux2SM="
+    },
+    "com/google/protobuf#protobuf-parent/4.36.2": {
+      "pom": "sha256-rKdv5XH8kEU2fRTkWm+theKmuPH1tBHSo4bfCJ4hEbI="
     }
   }
 }
