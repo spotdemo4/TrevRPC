@@ -2325,6 +2325,13 @@
     },
     "org/jetbrains/kotlin/jvm#org.jetbrains.kotlin.jvm.gradle.plugin/2.4.20": {
       "pom": "sha256-87J5EARcHh4hy0jWin4XfqGko92kZ+VGwVwwucCYGHw="
+    },
+    "org/jetbrains/kotlin#kotlin-maven-plugin/2.4.20": {
+      "jar": "sha256-Iq3JEoYzIZn4m/4OMyICgTs+dYAA2KK1oH555jPCZl8=",
+      "pom": "sha256-rCZpZFKr/BYXnqwa0eTY7xWw0AiyJF490klS8DdGS3E="
+    },
+    "org/jetbrains/kotlin#kotlin-project/2.4.20": {
+      "pom": "sha256-PiMoTFVlJKn34R0DL8dHEzMACNlm4VcZipSkILhPW8o="
     }
   }
 }
