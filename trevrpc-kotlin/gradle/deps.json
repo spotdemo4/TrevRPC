@@ -2342,6 +2342,14 @@
     },
     "com/google/protobuf#protobuf-parent/4.36.2": {
       "pom": "sha256-rKdv5XH8kEU2fRTkWm+theKmuPH1tBHSo4bfCJ4hEbI="
+    },
+    "org/jetbrains/kotlin#kotlin-reflect/2.4.10": {
+      "jar": "sha256-JaGu90VNRlSOyq9RAhsOUuOBQaYu11rxJNoQm3MkxOU=",
+      "pom": "sha256-QljwIS9L1y4wR/farOOODeLr/z9+kj6DZDH9j1sZGJ0="
+    },
+    "org/jetbrains/kotlin#kotlin-stdlib-common/2.4.10": {
+      "module": "sha256-Xa9+3NbWMF0LASG+WXqdUElrq/0pkL32sI/XACWpTdE=",
+      "pom": "sha256-AG6dbnsq+nfK5w4W2Ak1yeaqv1r/WUOClXrgcV8tNoc="
     }
   }
 }
