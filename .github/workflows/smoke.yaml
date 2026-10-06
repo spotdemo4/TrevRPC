@@ -23,7 +23,7 @@ jobs:
       webkit: ${{ steps.matrix.outputs.webkit }}
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@af9aaf53d1ae2230cb82617c563c9427a22a8c15 # v1.66.0
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
       - name: Discover smoke cells
         id: matrix
@@ -46,7 +46,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@af9aaf53d1ae2230cb82617c563c9427a22a8c15 # v1.66.0
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
       - name: Build benchmark suite
         run: nix build .#trevrpc-bench-suite --no-link
@@ -59,7 +59,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@af9aaf53d1ae2230cb82617c563c9427a22a8c15 # v1.66.0
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
       - name: Build Android smoke harness
         run: nix build .#trevrpc-kotlin.benchPeerCronet --no-link
@@ -83,7 +83,7 @@ jobs:
       SERVER_PACKAGE: ${{ matrix.server_package }}
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@af9aaf53d1ae2230cb82617c563c9427a22a8c15 # v1.66.0
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
       - name: Run smoke cell
         run: |
@@ -115,7 +115,7 @@ jobs:
       WORK_DIR: /nix/trevrpc-android/work
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@af9aaf53d1ae2230cb82617c563c9427a22a8c15 # v1.66.0
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
       - name: Prepare Android work directory
         run: sudo install -d -o "$USER" -g "$(id -gn)" "$WORK_DIR"
@@ -168,7 +168,7 @@ jobs:
       SERVER_PACKAGE: ${{ matrix.server_package }}
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@af9aaf53d1ae2230cb82617c563c9427a22a8c15 # v1.66.0
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
       - name: Run smoke cell
         run: |
