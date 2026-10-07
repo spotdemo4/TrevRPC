@@ -2350,6 +2350,25 @@
     "org/jetbrains/kotlin#kotlin-stdlib-common/2.4.10": {
       "module": "sha256-Xa9+3NbWMF0LASG+WXqdUElrq/0pkL32sI/XACWpTdE=",
       "pom": "sha256-AG6dbnsq+nfK5w4W2Ak1yeaqv1r/WUOClXrgcV8tNoc="
+    },
+    "org/codehaus/mojo#exec-maven-plugin/3.6.4": {
+      "jar": "sha256-AjbeMmqtJXy7zN9+QVXN6VxTJrSdvXL+n7rVJo507Mo=",
+      "pom": "sha256-8snCOiY0qZZdWwDatPfKMDciPAVtiwevKc6pCJJ4N4Y="
+    },
+    "org/codehaus/mojo#mojo-parent/97": {
+      "pom": "sha256-iIsBYq1/q9627jT/YSMCW//jTgZHYdqWLofeXIzOXTk="
+    },
+    "org/codehaus/plexus#plexus-utils/4.1.0": {
+      "jar": "sha256-ai/mnpgwGIK7K7Ba/jZBTrgtb3xjKZzM2y3AK0NYqWg=",
+      "pom": "sha256-RJ8A7PCKnnjsZ2Yaw7FVtqRJPJCutNy34oae7x8GcSc="
+    },
+    "org/ow2/asm#asm-commons/9.10.1": {
+      "jar": "sha256-bQq++3y/ly6hbts37BSDU3JQUGOkX5dqt+qIntlJeJU=",
+      "pom": "sha256-zrLEPzonPbiK+GUtie1jEvPpGhoeD/xveCMWknjPeVw="
+    },
+    "org/ow2/asm#asm-tree/9.10.1": {
+      "jar": "sha256-PfsNW2oQbNQLWyUOOZNfvy+Sf0R3VGpTaaOsYJzwUGs=",
+      "pom": "sha256-lj7r3qbi4f8lyQaLZKI44Vhcmfis1FVZWsFZp/UrbEE="
     }
   }
 }
