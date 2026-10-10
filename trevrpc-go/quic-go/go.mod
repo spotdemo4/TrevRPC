@@ -3,7 +3,7 @@ module trev.zip/llc/trevrpc/trevrpc-go/quic-go
 go 1.26.0
 
 require (
-	github.com/quic-go/quic-go v0.62.0
+	github.com/quic-go/quic-go v0.63.0
 	github.com/quic-go/webtransport-go v0.13.0
 	trev.zip/llc/trevrpc/trevrpc-go v0.3.0
 )
