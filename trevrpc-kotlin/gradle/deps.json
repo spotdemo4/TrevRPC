@@ -2437,6 +2437,18 @@
     "io/netty#netty-transport/4.2.19.Final": {
       "jar": "sha256-2C1OIARWuMXYoWR6NyRgP4Bhbls1ua2m56INBI8XUHU=",
       "pom": "sha256-SLydtxxJ7Y/qFnnS09vqe6T/Yc0JcuXh6hFZAuu/pKI="
+    },
+    "org/bouncycastle#bcpkix-jdk18on/1.86": {
+      "jar": "sha256-jYtBpLFJva6NMx8FmleIcJVNHj/yn4Jpqes+4Zp+Tvc=",
+      "pom": "sha256-RJiYRPsXs56wjqvq+B4f0WrFDJlNXAIRn4kSIMOsWHg="
+    },
+    "org/bouncycastle#bcprov-jdk18on/1.86": {
+      "jar": "sha256-KvGQswDLsLNeJIzPX0oGtgcgMK6z2nqY7HOr5bTLNx8=",
+      "pom": "sha256-lwtwy3WhhGObb7m6PEZaympOGl8//01lzoV0sv157zg="
+    },
+    "org/bouncycastle#bcutil-jdk18on/1.86": {
+      "jar": "sha256-HCaOFfeFqvseRnDY1uX4VvaUdelsFi2tzR/5s1DpE58=",
+      "pom": "sha256-Igmz5dHrK7PFk7gkwbjxQrBd6o6d90ALDzPyuRoHQfo="
     }
   }
 }
