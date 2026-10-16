@@ -37,7 +37,7 @@ prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
 protoc-gen-trevrpc-rust = { path = "../protoc-gen-trevrpc-rust" }
-protox = "0.9.1"
+protox = "0.10.0"
 
 [dev-dependencies]
 rcgen = "0.14"

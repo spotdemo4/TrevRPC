@@ -17,4 +17,4 @@ prost = "0.14.4"
 prost-types = "0.14.4"
 
 [dev-dependencies]
-protox = "0.9"
+protox = "0.10"
