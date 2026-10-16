@@ -45,7 +45,7 @@
     "prepack": "node -e 'if (process.env.TREVRPC_NIX_RELEASE !== \"1\") throw new Error(\"Build release tarballs with nix build .#trevrpc-js^npm\")'"
   },
   "dependencies": {
-    "protobufjs": "^8.8.0"
+    "protobufjs": "^8.8.1"
   },
   "devDependencies": {
     "esbuild": "^0.28.2",
