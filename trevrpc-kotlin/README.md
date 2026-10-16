@@ -45,7 +45,7 @@ protoc \
 
 ## Client
 
-The application owns the `CronetEngine` and callback executor; the channel never shuts them down. `transport-cronet` is a JVM 17 library that compiles against Cronet but does not ship it, so the application adds Cronet and chooses its provider: `org.chromium.net:cronet-bundled` embeds the native library, while `org.chromium.net:cronet` alone uses the platform `HttpEngine` (Android 14+) or a Google Play services provider. Cronet 500.x requires `minSdk` 24 (Android 7.0).
+The application owns the `CronetEngine` and callback executor; the channel never shuts them down. `transport-cronet` is a JVM 17 library that compiles against Cronet but does not ship it, so the application adds Cronet and chooses its provider: `org.chromium.net:cronet-bundled` embeds the native library, while `org.chromium.net:cronet` alone uses the platform `HttpEngine` (Android 14+) or a Google Play services provider. Cronet 500.x requires `minSdk` 24 (Android 7.0) and no longer merges its permissions into the app, so the application must declare `android.permission.INTERNET` and `android.permission.ACCESS_NETWORK_STATE`.
 
 ```kotlin
 val engine = CronetEngine.Builder(context).enableQuic(true).build()
