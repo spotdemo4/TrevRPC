@@ -456,7 +456,7 @@
             in
             {
               root = ./.;
-              filter = file: file.hasExt "py";
+              filter = file: file.hasExt "py" || file.name == "pyrightconfig.json";
               packages = [ pkgs.ruff ] ++ pkgs.lib.optional enableBasedpyright pkgs.basedpyright;
               script = ''
                 ruff check

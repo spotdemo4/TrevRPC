@@ -21,8 +21,10 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO, cast
 
 EMULATOR_HOST = "10.0.2.2"
 EMULATOR_PORT = 5554
@@ -96,7 +98,7 @@ def stop(
     for signal_number in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, signal_number)
-            process.wait(timeout=timeout)
+            _ = process.wait(timeout=timeout)
             return
         except (OSError, subprocess.TimeoutExpired):
             continue
@@ -125,15 +127,15 @@ def generate_certificates(
     )
     extensions = directory / "server.ext"
     alt_names = ",".join(["DNS:localhost", *(f"IP:{host}" for host in hosts)])
-    extensions.write_text(
-        f"subjectAltName={alt_names}\n"
-        "basicConstraints=critical,CA:FALSE\n"
-        "keyUsage=critical,digitalSignature\n"
-        "extendedKeyUsage=serverAuth\n",
-        encoding="utf-8",
-    )
+    lines = [
+        f"subjectAltName={alt_names}",
+        "basicConstraints=critical,CA:FALSE",
+        "keyUsage=critical,digitalSignature",
+        "extendedKeyUsage=serverAuth",
+    ]
+    _ = extensions.write_text("\n".join(lines) + "\n", encoding="utf-8")
     curve = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"]
-    run(
+    _ = run(
         [
             "openssl",
             "req",
@@ -155,7 +157,7 @@ def generate_certificates(
             "keyUsage=critical,keyCertSign,cRLSign",
         ]
     )
-    run(
+    _ = run(
         [
             "openssl",
             "req",
@@ -169,7 +171,7 @@ def generate_certificates(
             "/CN=localhost",
         ]
     )
-    run(
+    _ = run(
         [
             "openssl",
             "x509",
@@ -193,12 +195,13 @@ def generate_certificates(
 def parse_ports(line: str) -> dict[str, int]:
     """Parses the server's `{"native":N,"http3":N,"webtransport":N}` readiness line."""
     try:
-        value = json.loads(line)
+        value = cast(object, json.loads(line))
     except json.JSONDecodeError as error:
         raise RunnerError(f"server readiness line is not JSON: {line!r}") from error
-    ports = value if isinstance(value, dict) else {}
+    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    ports: dict[str, int] = {}
     for name in ("native", "http3", "webtransport"):
-        port = ports.get(name)
+        port = fields.get(name)
         if (
             not isinstance(port, int)
             or isinstance(port, bool)
@@ -207,6 +210,7 @@ def parse_ports(line: str) -> dict[str, int]:
             raise RunnerError(
                 f"server readiness line has no valid {name!r} port: {line!r}"
             )
+        ports[name] = port
     return ports
 
 
@@ -225,7 +229,7 @@ def start_server(
     ]
     with (output / "server.stderr.log").open("w", encoding="utf-8") as stderr:
         try:
-            process = subprocess.Popen(
+            process: subprocess.Popen[str] = subprocess.Popen(
                 arguments,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -237,9 +241,10 @@ def start_server(
             raise RunnerError(
                 f"could not start server {shlex.join(arguments)}: {error}"
             ) from error
-    assert process.stdout is not None
+    # typeshed types text-mode pipes as IO[Any].
+    stdout = cast(IO[str], process.stdout)
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    _ = selector.register(stdout, selectors.EVENT_READ)
     try:
         if not selector.select(SERVER_TIMEOUT):
             stop(process)
@@ -249,9 +254,9 @@ def start_server(
             )
     finally:
         selector.close()
-    line = process.stdout.readline().strip()
+    line = stdout.readline().strip()
     if not line:
-        process.wait(timeout=SERVER_TIMEOUT)
+        _ = process.wait(timeout=SERVER_TIMEOUT)
         close_pipes(process)
         raise RunnerError(
             f"server exited with {process.returncode} before printing its ports; see {output / 'server.stderr.log'}"
@@ -300,12 +305,15 @@ def adb_probe(*arguments: str) -> str | None:
 class Emulator:
     """A headless emulator with a writable system partition."""
 
+    log_path: Path
+    process: subprocess.Popen[bytes]
+
     def __init__(self, work_dir: Path, output: Path, system_image: str) -> None:
         avd_home = work_dir / "avd"
         avd_home.mkdir(exist_ok=True)
         name = f"trevrpc-interop-{os.getpid()}"
         env = {**os.environ, "ANDROID_AVD_HOME": str(avd_home)}
-        run(
+        _ = run(
             ["avdmanager", "create", "avd", "--force", "--name", name]
             + ["--package", system_image, "--device", "pixel_2"],
             input_text="no\n",
@@ -326,7 +334,9 @@ class Emulator:
                 start_new_session=True,
             )
 
-    def wait_until(self, condition, description: str, timeout: int) -> None:
+    def wait_until(
+        self, condition: Callable[[], bool], description: str, timeout: int
+    ) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._require_running()
@@ -363,11 +373,11 @@ class Emulator:
         previous = adb_probe("shell", "cat", "/proc/sys/kernel/random/boot_id")
         if not previous:
             raise RunnerError("could not read the emulator boot ID before rebooting")
-        adb("reboot")
+        _ = adb("reboot")
         self.wait_for_boot(previous)
 
     def root(self) -> None:
-        adb("root")
+        _ = adb("root")
         self.wait_until(
             lambda: adb_probe("shell", "id", "-u") == "0", "restart adbd as root", 60
         )
@@ -382,17 +392,17 @@ class Emulator:
             ["openssl", "x509", "-subject_hash_old", "-noout", "-in", str(ca)]
         ).stdout.split()[0]
         android_ca = work_dir / f"{subject_hash}.0"
-        shutil.copyfile(ca, android_ca)
+        _ = shutil.copyfile(ca, android_ca)
         destination = f"{CA_DIRECTORY}/{android_ca.name}"
         self.root()
-        adb("disable-verity")
+        _ = adb("disable-verity")
         self.reboot()
         self.root()
-        adb("remount", timeout=90)
-        adb("push", str(android_ca), destination)
-        adb("shell", "chmod", "644", destination)
-        adb("shell", "chown", "0:0", destination)
-        adb("shell", "restorecon", destination)
+        _ = adb("remount", timeout=90)
+        _ = adb("push", str(android_ca), destination)
+        _ = adb("shell", "chmod", "644", destination)
+        _ = adb("shell", "chown", "0:0", destination)
+        _ = adb("shell", "restorecon", destination)
         self.reboot()
         digest = adb("shell", "sha256sum", destination).stdout.split()
         expected = hashlib.sha256(android_ca.read_bytes()).hexdigest()
@@ -403,7 +413,7 @@ class Emulator:
 
     def shutdown(self) -> None:
         if self.process.poll() is None:
-            adb_probe("emu", "kill")
+            _ = adb_probe("emu", "kill")
         stop(self.process, timeout=30)
 
 
@@ -518,7 +528,7 @@ def run_instrumentation(port: int, output: Path) -> Outcomes:
             + _decode(error.stderr)
             + f"\nINSTRUMENTATION_RESULT: shortMsg=timed out after {INSTRUMENTATION_TIMEOUT}s\n"
         )
-    (output / "instrumentation.log").write_text(text, encoding="utf-8")
+    _ = (output / "instrumentation.log").write_text(text, encoding="utf-8")
     return parse_instrumentation(text)
 
 
@@ -531,40 +541,60 @@ def collect_logcat(output: Path) -> None:
         text = adb("logcat", "-d", "-v", "threadtime", timeout=30).stdout
     except RunnerError as error:
         text = f"logcat unavailable: {error}\n"
-    (output / "logcat.log").write_text(text, encoding="utf-8")
+    _ = (output / "logcat.log").write_text(text, encoding="utf-8")
 
 
 # --- main ------------------------------------------------------------------------------------
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
+@dataclass(frozen=True)
+class Options:
+    server_command: str
+    output: Path
+    work_dir: Path
+    app_apk: Path
+    test_apk: Path
+    server_host: str
+    system_image: str
+
+
+def parse_args(argv: list[str]) -> Options:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--server-command",
         required=True,
         help="command that starts an interop server; --host, --cert and --key are appended",
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--output", type=Path, required=True, help="directory for logs and diagnostics"
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "--work-dir",
         type=Path,
         required=True,
         help="scratch directory for the AVD (needs 6 GiB free)",
     )
-    parser.add_argument("--app-apk", type=Path, required=True)
-    parser.add_argument("--test-apk", type=Path, required=True)
-    parser.add_argument(
+    _ = parser.add_argument("--app-apk", type=Path, required=True)
+    _ = parser.add_argument("--test-apk", type=Path, required=True)
+    _ = parser.add_argument(
         "--server-host", default="0.0.0.0", help="address the server binds to"
     )
-    parser.add_argument("--system-image", default=DEFAULT_SYSTEM_IMAGE)
-    return parser.parse_args(argv)
+    _ = parser.add_argument("--system-image", default=DEFAULT_SYSTEM_IMAGE)
+    args = parser.parse_args(argv)
+    return Options(
+        server_command=cast(str, args.server_command),
+        output=cast(Path, args.output),
+        work_dir=cast(Path, args.work_dir),
+        app_apk=cast(Path, args.app_apk),
+        test_apk=cast(Path, args.test_apk),
+        server_host=cast(str, args.server_host),
+        system_image=cast(str, args.system_image),
+    )
 
 
-def execute(args: argparse.Namespace) -> Outcomes:
+def execute(args: Options) -> Outcomes:
     for tool in ("adb", "avdmanager", "emulator", "openssl"):
         if shutil.which(tool) is None:
             raise RunnerError(f"required command not found: {tool}")
@@ -596,10 +626,10 @@ def execute(args: argparse.Namespace) -> Outcomes:
             "transition_animation_scale",
             "animator_duration_scale",
         ):
-            adb("shell", "settings", "put", "global", setting, "0")
-        adb("install", "-r", str(args.app_apk), timeout=90)
-        adb("install", "-r", str(args.test_apk), timeout=90)
-        adb("logcat", "-c")
+            _ = adb("shell", "settings", "put", "global", setting, "0")
+        _ = adb("install", "-r", str(args.app_apk), timeout=90)
+        _ = adb("install", "-r", str(args.test_apk), timeout=90)
+        _ = adb("logcat", "-c")
         outcomes = run_instrumentation(ports["http3"], args.output)
         try:
             shutdown_server(server)

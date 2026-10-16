@@ -111,7 +111,7 @@ class ParsePortsTest(unittest.TestCase):
             '{"native":1,"webtransport":1}',
         ]:
             with self.subTest(line=line), self.assertRaises(run.RunnerError):
-                run.parse_ports(line)
+                _ = run.parse_ports(line)
 
 
 class StartServerTest(unittest.TestCase):
@@ -119,13 +119,13 @@ class StartServerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             server = root / "fake-server"
-            server.write_text(
-                "#!/bin/sh\n"
-                'echo "$@" >&2\n'
-                'echo \'{"native":1,"http3":4434,"webtransport":1}\'\n'
-                "cat >/dev/null\n",
-                encoding="utf-8",
-            )
+            script = [
+                "#!/bin/sh",
+                'echo "$@" >&2',
+                'echo \'{"native":1,"http3":4434,"webtransport":1}\'',
+                "cat >/dev/null",
+            ]
+            _ = server.write_text("\n".join(script) + "\n", encoding="utf-8")
             server.chmod(server.stat().st_mode | stat.S_IXUSR)
             certificates = run.Certificates(
                 root / "ca.pem", root / "server.pem", root / "server.key"
@@ -150,7 +150,7 @@ class StartServerTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(run.RunnerError, "exited with 3"):
-                run.start_server("sh -c 'exit 3' --", certificates, "0.0.0.0", root)
+                _ = run.start_server("sh -c 'exit 3' --", certificates, "0.0.0.0", root)
 
 
 class CertificatesTest(unittest.TestCase):
@@ -210,4 +210,4 @@ class CertificatesTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    _ = unittest.main()
