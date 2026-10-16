@@ -12,23 +12,23 @@ import (
 func TestWireGoldenVectors(t *testing.T) {
 	vectors := loadWireGoldenVectors(t)
 
-	timeoutRequest := NewRpcRequest("svc", "m", []byte("hi"))
+	timeoutRequest := newWireRequest("svc", "m", []byte("hi"))
 	timeoutRequest.TimeoutNanos = 123456
 
-	metadataRequest := NewRpcRequest("svc", "m", []byte("hi"))
+	metadataRequest := newWireRequest("svc", "m", []byte("hi"))
 	metadataRequest.Metadata["authorization"] = []byte("ok")
 
 	tests := []struct {
 		name    string
 		message ProtoMessage
 	}{
-		{name: "rpc_request.unary", message: NewRpcRequest("svc", "m", []byte("hi"))},
+		{name: "rpc_request.unary", message: newWireRequest("svc", "m", []byte("hi"))},
 		{name: "rpc_request.timeout", message: timeoutRequest},
 		{name: "rpc_request.metadata", message: metadataRequest},
-		{name: "rpc_stream_frame.message", message: MessageFrame([]byte("hi"))},
-		{name: "rpc_stream_frame.status", message: StatusFrame(Unavailable("down"))},
-		{name: "rpc_response.ok_body", message: OKResponse([]byte("hi"))},
-		{name: "rpc_response.unavailable", message: Unavailable("down").IntoResponse(nil)},
+		{name: "rpc_stream_frame.message", message: messageFrame([]byte("hi"))},
+		{name: "rpc_stream_frame.status", message: statusFrame(Unavailable("down"))},
+		{name: "rpc_response.ok_body", message: okWireResponse([]byte("hi"))},
+		{name: "rpc_response.unavailable", message: Unavailable("down").intoResponse(nil)},
 	}
 
 	for _, tt := range tests {
@@ -41,13 +41,13 @@ func TestWireGoldenVectors(t *testing.T) {
 func assertWireGoldenVector(t *testing.T, vectors map[string][]byte, name string, message ProtoMessage) {
 	t.Helper()
 
-	body, err := MarshalMessage(message)
+	body, err := marshalMessage(message)
 	if err != nil {
 		t.Fatalf("marshal %s: %v", name, err)
 	}
 	assertGoldenBytes(t, name+".body", body, vectors)
 
-	frame, err := EncodeFrame(message, DefaultMaxFrameSize)
+	frame, err := encodeFrame(message, DefaultMaxFrameSize)
 	if err != nil {
 		t.Fatalf("encode frame %s: %v", name, err)
 	}

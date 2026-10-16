@@ -76,9 +76,9 @@ func (s *unaryTransportTestStream) cancelWrite() {
 
 func encodeUnaryTestResponse(t *testing.T) []byte {
 	t.Helper()
-	frame, err := EncodeFrame(OKResponse([]byte("response")), DefaultMaxFrameSize)
+	frame, err := encodeFrame(okWireResponse([]byte("response")), DefaultMaxFrameSize)
 	if err != nil {
-		t.Fatalf("EncodeFrame() error = %v", err)
+		t.Fatalf("encodeFrame() error = %v", err)
 	}
 	return frame
 }
@@ -87,22 +87,22 @@ func callUnaryTestClient(
 	t *testing.T,
 	ctx context.Context,
 	stream *unaryTransportTestStream,
-) (*RpcResponse, error) {
+) (*wireResponse, error) {
 	t.Helper()
 	client := newStreamClient(unaryTestOpener{stream: stream}, DefaultMaxFrameSize)
-	return client.Call(ctx, NewRpcRequest("service", "method", []byte("request")))
+	return client.call(ctx, newWireRequest("service", "method", []byte("request")))
 }
 
 func TestTransportUnaryWaitsForCleanPeerEOF(t *testing.T) {
 	stream := newUnaryTransportTestStream(encodeUnaryTestResponse(t))
 	result := make(chan struct {
-		response *RpcResponse
+		response *wireResponse
 		err      error
 	}, 1)
 	go func() {
 		response, err := callUnaryTestClient(t, context.Background(), stream)
 		result <- struct {
-			response *RpcResponse
+			response *wireResponse
 			err      error
 		}{response: response, err: err}
 	}()

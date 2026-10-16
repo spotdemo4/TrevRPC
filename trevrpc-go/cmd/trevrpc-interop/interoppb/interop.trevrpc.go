@@ -14,9 +14,9 @@ type EchoServer interface {
 	// ClientStream handles the ClientStream RPC.
 	ClientStream(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (*trevrpc_go.Response[*EchoResponse], error)
 	// ServerStream handles the ServerStream RPC.
-	ServerStream(context.Context, *EchoRequest) (trevrpc_go.ResponseStream[*EchoResponse], error)
+	ServerStream(context.Context, *EchoRequest) (trevrpc_go.MessageStream[*EchoResponse], error)
 	// Bidi handles the Bidi RPC.
-	Bidi(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (trevrpc_go.ResponseStream[*EchoResponse], error)
+	Bidi(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (trevrpc_go.MessageStream[*EchoResponse], error)
 }
 
 // EchoClient calls the Echo service.
@@ -48,39 +48,14 @@ func (c *EchoClient) Unary(ctx context.Context, request *EchoRequest, options ..
 	return trevrpc_go.Unary[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "Unary", request, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
 }
 
-// UnaryResponse calls the Unary RPC and exposes response metadata.
-func (c *EchoClient) UnaryResponse(ctx context.Context, request *EchoRequest, options ...trevrpc_go.CallOption) (*trevrpc_go.Response[*EchoResponse], error) {
-	return trevrpc_go.UnaryResponse[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "Unary", request, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
 // ClientStream calls the ClientStream RPC.
 func (c *EchoClient) ClientStream(ctx context.Context, options ...trevrpc_go.CallOption) (trevrpc_go.ClientStreamingCall[*EchoRequest, *EchoResponse], error) {
 	return trevrpc_go.ClientStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "ClientStream", func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
 }
 
-// ClientStreamResponse calls the ClientStream RPC and exposes response metadata.
-func (c *EchoClient) ClientStreamResponse(ctx context.Context, options ...trevrpc_go.CallOption) (trevrpc_go.ClientStreamingResponseCall[*EchoRequest, *EchoResponse], error) {
-	return trevrpc_go.ClientStreamingResponse[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "ClientStream", func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
-// ClientStreamFromStream calls the ClientStream RPC from an existing request stream.
-func (c *EchoClient) ClientStreamFromStream(ctx context.Context, requests trevrpc_go.MessageStream[*EchoRequest], options ...trevrpc_go.CallOption) (*EchoResponse, error) {
-	return trevrpc_go.ClientStreamingFromStream[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "ClientStream", requests, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
-// ClientStreamFromStreamResponse calls the ClientStream RPC and exposes response metadata.
-func (c *EchoClient) ClientStreamFromStreamResponse(ctx context.Context, requests trevrpc_go.MessageStream[*EchoRequest], options ...trevrpc_go.CallOption) (*trevrpc_go.Response[*EchoResponse], error) {
-	return trevrpc_go.ClientStreamingFromStreamResponse[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "ClientStream", requests, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
 // ServerStream calls the ServerStream RPC.
-func (c *EchoClient) ServerStream(ctx context.Context, request *EchoRequest, options ...trevrpc_go.CallOption) (trevrpc_go.MessageStream[*EchoResponse], error) {
+func (c *EchoClient) ServerStream(ctx context.Context, request *EchoRequest, options ...trevrpc_go.CallOption) (trevrpc_go.ResponseStream[*EchoResponse], error) {
 	return trevrpc_go.ServerStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "ServerStream", request, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
-// ServerStreamResponse calls the ServerStream RPC and exposes terminal metadata.
-func (c *EchoClient) ServerStreamResponse(ctx context.Context, request *EchoRequest, options ...trevrpc_go.CallOption) (trevrpc_go.ResponseStream[*EchoResponse], error) {
-	return trevrpc_go.ServerStreamingResponse[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "ServerStream", request, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
 }
 
 // Bidi calls the Bidi RPC.
@@ -88,25 +63,10 @@ func (c *EchoClient) Bidi(ctx context.Context, options ...trevrpc_go.CallOption)
 	return trevrpc_go.BidirectionalStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "Bidi", func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
 }
 
-// BidiResponse calls the Bidi RPC and exposes terminal metadata.
-func (c *EchoClient) BidiResponse(ctx context.Context, options ...trevrpc_go.CallOption) (trevrpc_go.BidirectionalStreamingResponseCall[*EchoRequest, *EchoResponse], error) {
-	return trevrpc_go.BidirectionalStreamingResponse[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "Bidi", func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
-// BidiFromStream calls the Bidi RPC from an existing request stream.
-func (c *EchoClient) BidiFromStream(ctx context.Context, requests trevrpc_go.MessageStream[*EchoRequest], options ...trevrpc_go.CallOption) (trevrpc_go.MessageStream[*EchoResponse], error) {
-	return trevrpc_go.BidirectionalStreamingFromStream[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "Bidi", requests, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
-// BidiFromStreamResponse calls the Bidi RPC and exposes terminal metadata.
-func (c *EchoClient) BidiFromStreamResponse(ctx context.Context, requests trevrpc_go.MessageStream[*EchoRequest], options ...trevrpc_go.CallOption) (trevrpc_go.ResponseStream[*EchoResponse], error) {
-	return trevrpc_go.BidirectionalStreamingFromStreamResponse[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "Bidi", requests, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
-}
-
 // RegisterEchoServer registers handlers for the Echo service.
 func RegisterEchoServer(server *trevrpc_go.Server, implementation EchoServer) {
-	trevrpc_go.RegisterUnaryResponse[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "Unary", func() *EchoRequest { return &EchoRequest{} }, implementation.Unary)
-	trevrpc_go.RegisterClientStreamingResponse[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "ClientStream", func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream)
-	trevrpc_go.RegisterServerStreamingResponse[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "ServerStream", func() *EchoRequest { return &EchoRequest{} }, implementation.ServerStream)
-	trevrpc_go.RegisterBidirectionalStreamingResponse[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "Bidi", func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi)
+	trevrpc_go.RegisterUnary[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "Unary", func() *EchoRequest { return &EchoRequest{} }, implementation.Unary)
+	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "ClientStream", func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream)
+	trevrpc_go.RegisterServerStreaming[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "ServerStream", func() *EchoRequest { return &EchoRequest{} }, implementation.ServerStream)
+	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, "trevrpc.interop.v1.Echo", "Bidi", func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi)
 }

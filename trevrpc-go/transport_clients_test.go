@@ -43,7 +43,7 @@ func (o http3TestOpener) openStream(ctx context.Context) (clientStream, error) {
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Content-Type", HTTP3ContentType)
+	request.Header.Set("Content-Type", http3ContentType)
 	stream := &http3TestStream{writer: writer, ready: make(chan struct{})}
 	go func() {
 		defer close(stream.ready)

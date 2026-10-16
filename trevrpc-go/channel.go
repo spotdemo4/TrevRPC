@@ -187,21 +187,21 @@ func (c *Channel) Snapshot() ChannelSnapshot {
 }
 
 // Call sends a unary RPC on the connection generation ready when the call starts.
-func (c *Channel) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (c *Channel) call(ctx context.Context, request *wireRequest) (*wireResponse, error) {
 	generation, err := c.callGeneration(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return generation.Call(ctx, request)
+	return generation.call(ctx, request)
 }
 
-// StreamingCall starts a streaming RPC on the connection generation ready when the call starts.
-func (c *Channel) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+// streamingCall starts a streaming RPC on the connection generation ready when the call starts.
+func (c *Channel) streamingCall(ctx context.Context, request *wireRequest, requestBody byteStream) (frameStream, error) {
 	generation, err := c.callGeneration(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return generation.StreamingCall(ctx, request, requestBody)
+	return generation.streamingCall(ctx, request, requestBody)
 }
 
 // Close stops reconnecting and closes the current connection generation.

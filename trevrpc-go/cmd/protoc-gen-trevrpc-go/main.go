@@ -180,9 +180,7 @@ func generatedServiceNames(service *protogen.Service, options pluginOptions) []s
 		"(*" + clientName + ").mergedCallOptions",
 	}
 	for _, method := range service.Methods {
-		for _, methodName := range generatedClientMethodNames(method) {
-			names = append(names, "(*"+clientName+")."+methodName)
-		}
+		names = append(names, "(*"+clientName+")."+method.GoName)
 	}
 	return names
 }
@@ -190,22 +188,12 @@ func generatedServiceNames(service *protogen.Service, options pluginOptions) []s
 func validateGeneratedMethodNames(service *protogen.Service) error {
 	owners := make(map[string]*protogen.Method)
 	for _, method := range service.Methods {
-		for _, generatedName := range generatedClientMethodNames(method) {
-			if owner, exists := owners[generatedName]; exists && owner != method {
-				return fmt.Errorf("service %s RPC methods %s and %s (%s and %s) both require generated Go method %s", service.Desc.FullName(), owner.GoName, method.GoName, owner.Desc.FullName(), method.Desc.FullName(), generatedName)
-			}
-			owners[generatedName] = method
+		if owner, exists := owners[method.GoName]; exists {
+			return fmt.Errorf("service %s RPC methods %s and %s (%s and %s) both require generated Go method %s", service.Desc.FullName(), owner.GoName, method.GoName, owner.Desc.FullName(), method.Desc.FullName(), method.GoName)
 		}
+		owners[method.GoName] = method
 	}
 	return nil
-}
-
-func generatedClientMethodNames(method *protogen.Method) []string {
-	names := []string{method.GoName, method.GoName + "Response"}
-	if method.Desc.IsStreamingClient() {
-		names = append(names, method.GoName+"FromStream", method.GoName+"FromStreamResponse")
-	}
-	return names
 }
 
 func (g fileGenerator) generateService(service *protogen.Service) {
@@ -276,78 +264,23 @@ func (g fileGenerator) generateClientMethods(clientName, serviceName string, met
 	merged := "c.mergedCallOptions(options)..."
 	methodName := method.GoName
 	protoMethodName := string(method.Desc.Name())
+	callPrefix := "(ctx, c.transport, " + quoted(serviceName) + ", " + quoted(protoMethodName) + ", "
 
 	g.generated.P("// ", methodName, " calls the ", method.Desc.Name(), " RPC.")
 	switch {
 	case method.Desc.IsStreamingClient() && method.Desc.IsStreamingServer():
 		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", ", options, ") (", g.runtime("BidirectionalStreamingCall"), "[", inputType, ", ", outputType, "], error) {")
-		g.generated.P("return ", g.runtime("BidirectionalStreaming"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
-		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes terminal metadata.")
-		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", ", options, ") (", g.runtime("BidirectionalStreamingResponseCall"), "[", inputType, ", ", outputType, "], error) {")
-		g.generated.P("return ", g.runtime("BidirectionalStreamingResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
-		g.generateBidiFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged)
+		g.generated.P("return ", g.runtime("BidirectionalStreaming"), "[", inputType, ", ", outputType, "]", callPrefix, factory, ", ", merged, ")")
 	case method.Desc.IsStreamingClient():
 		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", ", options, ") (", g.runtime("ClientStreamingCall"), "[", inputType, ", ", outputType, "], error) {")
-		g.generated.P("return ", g.runtime("ClientStreaming"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
-		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes response metadata.")
-		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", ", options, ") (", g.runtime("ClientStreamingResponseCall"), "[", inputType, ", ", outputType, "], error) {")
-		g.generated.P("return ", g.runtime("ClientStreamingResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
-		g.generateClientFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged)
+		g.generated.P("return ", g.runtime("ClientStreaming"), "[", inputType, ", ", outputType, "]", callPrefix, factory, ", ", merged, ")")
 	case method.Desc.IsStreamingServer():
-		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", g.runtime("MessageStream"), "[", outputType, "], error) {")
-		g.generated.P("return ", g.runtime("ServerStreaming"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
-		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes terminal metadata.")
-		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", request ", inputType, ", ", options, ") (", g.runtime("ResponseStream"), "[", outputType, "], error) {")
-		g.generated.P("return ", g.runtime("ServerStreamingResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
+		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", g.runtime("ResponseStream"), "[", outputType, "], error) {")
+		g.generated.P("return ", g.runtime("ServerStreaming"), "[", inputType, ", ", outputType, "]", callPrefix, "request, ", factory, ", ", merged, ")")
 	default:
 		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", outputType, ", error) {")
-		g.generated.P("return ", g.runtime("Unary"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
-		g.generated.P("// ", methodName, "Response calls the ", method.Desc.Name(), " RPC and exposes response metadata.")
-		g.generated.P("func (c *", clientName, ") ", methodName, "Response(ctx ", contextType, ", request ", inputType, ", ", options, ") (*", g.runtime("Response"), "[", outputType, "], error) {")
-		g.generated.P("return ", g.runtime("UnaryResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", request, ", factory, ", ", merged, ")")
-		g.generated.P("}")
-		g.generated.P()
+		g.generated.P("return ", g.runtime("Unary"), "[", inputType, ", ", outputType, "]", callPrefix, "request, ", factory, ", ", merged, ")")
 	}
-}
-
-func (g fileGenerator) generateClientFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged string) {
-	requests := "requests " + g.runtime("MessageStream") + "[" + inputType + "]"
-	g.generated.P("// ", methodName, "FromStream calls the ", protoMethodName, " RPC from an existing request stream.")
-	g.generated.P("func (c *", clientName, ") ", methodName, "FromStream(ctx ", contextType, ", ", requests, ", ", options, ") (", outputType, ", error) {")
-	g.generated.P("return ", g.runtime("ClientStreamingFromStream"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
-	g.generated.P("}")
-	g.generated.P()
-	g.generated.P("// ", methodName, "FromStreamResponse calls the ", protoMethodName, " RPC and exposes response metadata.")
-	g.generated.P("func (c *", clientName, ") ", methodName, "FromStreamResponse(ctx ", contextType, ", ", requests, ", ", options, ") (*", g.runtime("Response"), "[", outputType, "], error) {")
-	g.generated.P("return ", g.runtime("ClientStreamingFromStreamResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
-	g.generated.P("}")
-	g.generated.P()
-}
-
-func (g fileGenerator) generateBidiFromStreamMethods(clientName, serviceName, protoMethodName, methodName, contextType, inputType, outputType, factory, options, merged string) {
-	requests := "requests " + g.runtime("MessageStream") + "[" + inputType + "]"
-	g.generated.P("// ", methodName, "FromStream calls the ", protoMethodName, " RPC from an existing request stream.")
-	g.generated.P("func (c *", clientName, ") ", methodName, "FromStream(ctx ", contextType, ", ", requests, ", ", options, ") (", g.runtime("MessageStream"), "[", outputType, "], error) {")
-	g.generated.P("return ", g.runtime("BidirectionalStreamingFromStream"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
-	g.generated.P("}")
-	g.generated.P()
-	g.generated.P("// ", methodName, "FromStreamResponse calls the ", protoMethodName, " RPC and exposes terminal metadata.")
-	g.generated.P("func (c *", clientName, ") ", methodName, "FromStreamResponse(ctx ", contextType, ", ", requests, ", ", options, ") (", g.runtime("ResponseStream"), "[", outputType, "], error) {")
-	g.generated.P("return ", g.runtime("BidirectionalStreamingFromStreamResponse"), "[", inputType, ", ", outputType, "](ctx, c.transport, ", quoted(serviceName), ", ", quoted(protoMethodName), ", requests, ", factory, ", ", merged, ")")
 	g.generated.P("}")
 	g.generated.P()
 }
@@ -359,13 +292,13 @@ func (g fileGenerator) generateServerRegistration(serviceName string, method *pr
 	var helper string
 	switch {
 	case method.Desc.IsStreamingClient() && method.Desc.IsStreamingServer():
-		helper = g.runtime("RegisterBidirectionalStreamingResponse")
+		helper = g.runtime("RegisterBidirectionalStreaming")
 	case method.Desc.IsStreamingClient():
-		helper = g.runtime("RegisterClientStreamingResponse")
+		helper = g.runtime("RegisterClientStreaming")
 	case method.Desc.IsStreamingServer():
-		helper = g.runtime("RegisterServerStreamingResponse")
+		helper = g.runtime("RegisterServerStreaming")
 	default:
-		helper = g.runtime("RegisterUnaryResponse")
+		helper = g.runtime("RegisterUnary")
 	}
 	g.generated.P(helper, "[", inputType, ", ", outputType, "](server, ", quoted(serviceName), ", ", quoted(string(method.Desc.Name())), ", ", factory, ", implementation.", method.GoName, ")")
 }
@@ -380,7 +313,7 @@ func (g fileGenerator) serverRequestType(method *protogen.Method) string {
 func (g fileGenerator) serverResponseType(method *protogen.Method) string {
 	outputType := g.messageType(method.Output)
 	if method.Desc.IsStreamingServer() {
-		return g.runtime("ResponseStream") + "[" + outputType + "]"
+		return g.runtime("MessageStream") + "[" + outputType + "]"
 	}
 	return "*" + g.runtime("Response") + "[" + outputType + "]"
 }

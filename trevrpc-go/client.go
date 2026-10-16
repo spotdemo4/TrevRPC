@@ -5,23 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"sync"
 	"time"
 )
 
-// Transport sends unary and streaming TrevRPC requests.
+// Transport carries RPCs for generated clients. *Channel implements it; the
+// interface is sealed because requests and responses use the internal wire
+// format.
 type Transport interface {
-	// Call sends a unary RPC request and returns its response.
-	Call(context.Context, *RpcRequest) (*RpcResponse, error)
-	// StreamingCall sends a streaming RPC request and returns response frames.
-	StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error)
-}
-
-// ResponseStream yields decoded messages and exposes the terminal stream status.
-type ResponseStream[T ProtoMessage] interface {
-	MessageStream[T]
-	TerminalStatus() (*Status, bool)
+	// call sends a unary RPC request and returns its response.
+	call(context.Context, *wireRequest) (*wireResponse, error)
+	// streamingCall sends a streaming RPC request and returns response frames.
+	streamingCall(context.Context, *wireRequest, byteStream) (frameStream, error)
 }
 
 // ClientStreamingCall sends request messages and receives the final response.
@@ -29,16 +24,10 @@ type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// Send sends one request message.
 	Send(Req) error
 	// CloseAndRecv closes the request stream and returns the unary response.
+	// Response metadata is reported through CaptureResponseMetadata.
 	CloseAndRecv() (Res, error)
 	// Close releases call resources without waiting for a response.
 	Close() error
-}
-
-// ClientStreamingResponseCall is a client-streaming call that exposes response metadata.
-type ClientStreamingResponseCall[Req ProtoMessage, Res ProtoMessage] interface {
-	ClientStreamingCall[Req, Res]
-	// CloseAndRecvResponse closes the request stream and returns the response envelope.
-	CloseAndRecvResponse() (*Response[Res], error)
 }
 
 // BidirectionalStreamingCall sends request messages and receives response messages.
@@ -51,12 +40,8 @@ type BidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	CloseSend() error
 	// Close releases call resources without waiting for more responses.
 	Close() error
-}
-
-// BidirectionalStreamingResponseCall is a bidirectional call that exposes terminal status metadata.
-type BidirectionalStreamingResponseCall[Req ProtoMessage, Res ProtoMessage] interface {
-	BidirectionalStreamingCall[Req, Res]
-	// TerminalStatus returns the terminal status after the status frame has been consumed.
+	// TerminalStatus returns the server's final status, including its
+	// metadata, once the status frame has been consumed.
 	TerminalStatus() (*Status, bool)
 }
 
@@ -64,334 +49,187 @@ type responseStreamFrameFieldsReceiver interface {
 	trevrpcRecvStreamFrameFields() (streamFrameFields, error)
 }
 
-// CallOptions controls client-side timeouts, response limits, and request metadata.
-type CallOptions struct {
-	Timeout                   time.Duration
-	HasTimeout                bool
-	MaxResponseBodySize       int
-	MaxResponseMessages       int
-	MaxResponseStreamBodySize int
-	StreamIdleTimeout         time.Duration
-	Metadata                  Metadata
+// callConfig holds the resolved options of one RPC call.
+type callConfig struct {
+	timeout          time.Duration
+	hasTimeout       bool
+	maxResponseSize  int
+	metadata         Metadata
+	responseMetadata *Metadata
 }
 
-// CallOption mutates CallOptions for a single RPC call.
-type CallOption func(*CallOptions)
+// CallOption customizes a single RPC call.
+type CallOption func(*callConfig)
 
-// DefaultCallOptions returns the default client call options.
-func DefaultCallOptions() CallOptions {
-	return CallOptions{
-		MaxResponseBodySize:       DefaultMaxFrameSize,
-		MaxResponseMessages:       4096,
-		MaxResponseStreamBodySize: 16 * 1024 * 1024,
-		StreamIdleTimeout:         30 * time.Second,
-		Metadata:                  Metadata{},
-	}
+func defaultCallConfig() callConfig {
+	return callConfig{maxResponseSize: DefaultMaxFrameSize, metadata: Metadata{}}
 }
 
-// WithTimeout sets a deadline for the RPC call.
+// WithTimeout bounds the RPC by timeout. The earlier of this and any deadline
+// on the call context applies; there is no timeout by default.
 func WithTimeout(timeout time.Duration) CallOption {
-	return func(options *CallOptions) {
-		options.Timeout = timeout
-		options.HasTimeout = true
+	return func(config *callConfig) {
+		config.timeout = timeout
+		config.hasTimeout = true
 	}
 }
 
-// WithoutTimeout clears the RPC call deadline.
-func WithoutTimeout() CallOption {
-	return func(options *CallOptions) {
-		options.Timeout = 0
-		options.HasTimeout = false
-	}
-}
-
-// WithMaxResponseBodySize sets the maximum unary response body size in bytes.
-func WithMaxResponseBodySize(max int) CallOption {
-	return func(options *CallOptions) {
-		options.MaxResponseBodySize = max
-	}
-}
-
-// WithMaxResponseMessages sets the maximum number of response messages allowed on a stream.
-func WithMaxResponseMessages(max int) CallOption {
-	return func(options *CallOptions) {
-		options.MaxResponseMessages = max
-	}
-}
-
-// WithoutMaxResponseMessages disables the response message count limit.
-func WithoutMaxResponseMessages() CallOption {
-	return func(options *CallOptions) {
-		options.MaxResponseMessages = -1
-	}
-}
-
-// WithMaxResponseStreamBodySize sets the maximum total response stream body size in bytes.
-func WithMaxResponseStreamBodySize(max int) CallOption {
-	return func(options *CallOptions) {
-		options.MaxResponseStreamBodySize = max
-	}
-}
-
-// WithoutMaxResponseStreamBodySize disables the response stream body size limit.
-func WithoutMaxResponseStreamBodySize() CallOption {
-	return func(options *CallOptions) {
-		options.MaxResponseStreamBodySize = -1
-	}
-}
-
-// WithStreamIdleTimeout sets the maximum idle time between response stream messages.
-func WithStreamIdleTimeout(timeout time.Duration) CallOption {
-	return func(options *CallOptions) {
-		options.StreamIdleTimeout = timeout
-	}
-}
-
-// WithoutStreamIdleTimeout disables the response stream idle timeout.
-func WithoutStreamIdleTimeout() CallOption {
-	return func(options *CallOptions) {
-		options.StreamIdleTimeout = 0
-	}
-}
-
-// WithMetadata adds request metadata after normalizing the metadata key.
+// WithMetadata adds one request metadata entry. Keys are lowercased; repeating
+// a key replaces its value.
 func WithMetadata(key string, value []byte) CallOption {
 	key = NormalizeMetadataKey(key)
 	value = append([]byte(nil), value...)
-	return func(options *CallOptions) {
-		metadata := cloneMetadata(options.Metadata)
-		if metadata == nil {
-			metadata = Metadata{}
-		}
+	return func(config *callConfig) {
+		metadata := cloneMetadata(config.metadata)
 		metadata[key] = append([]byte(nil), value...)
-		options.Metadata = metadata
+		config.metadata = metadata
 	}
 }
 
-// WithMetadataMap replaces the metadata map sent with the request.
-func WithMetadataMap(metadata Metadata) CallOption {
-	metadata = cloneMetadata(metadata)
-	return func(options *CallOptions) {
-		options.Metadata = cloneMetadata(metadata)
+// WithMaxFrameSize bounds the encoded size of each response message in bytes.
+// It defaults to DefaultMaxFrameSize; the channel's own frame size limit still applies.
+func WithMaxFrameSize(max int) CallOption {
+	return func(config *callConfig) {
+		config.maxResponseSize = max
+	}
+}
+
+// CaptureResponseMetadata stores the response metadata of a successful unary or
+// client-streaming call in *dst, replacing its previous value. It is written
+// before the call returns (for client streaming, before CloseAndRecv returns)
+// and is not touched when the call fails; the metadata of a failed call is on
+// the returned *Status. Streaming responses report metadata through
+// TerminalStatus instead, so server- and bidirectional-streaming calls ignore
+// this option.
+func CaptureResponseMetadata(dst *Metadata) CallOption {
+	return func(config *callConfig) {
+		config.responseMetadata = dst
 	}
 }
 
 // Unary calls a unary RPC and decodes the protobuf response.
 func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (Res, error) {
-	response, err := UnaryResponse(ctx, transport, service, method, request, newResponse, options...)
+	var zero Res
+	config := applyCallOptions(options)
+	deadline, err := resolveClientDeadline(ctx, config, time.Now)
 	if err != nil {
-		var zero Res
 		return zero, err
 	}
 
-	return response.Message, nil
-}
-
-// UnaryResponse calls a unary RPC and returns the decoded response envelope.
-func UnaryResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (*Response[Res], error) {
-	callOptions := applyCallOptions(options)
-	deadline, err := resolveClientDeadline(ctx, callOptions, time.Now)
+	requestBody, err := marshalMessage(request)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 
-	requestBody, err := MarshalMessage(request)
+	rpcRequest, err := prepareClientRequest(service, method, RpcKindUnary, requestBody, config, deadline, time.Now)
 	if err != nil {
-		return nil, err
-	}
-
-	rpcRequest, err := prepareClientRequest(service, method, RpcKindUnary, requestBody, callOptions, deadline, time.Now)
-	if err != nil {
-		return nil, err
+		return zero, err
 	}
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
 	defer cancel()
 
-	response, err := transport.Call(ctx, rpcRequest)
+	response, err := transport.call(ctx, rpcRequest)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 
-	if err := validateResponse(response, callOptions.MaxResponseBodySize); err != nil {
-		return nil, err
+	if err := validateResponse(response, config.maxResponseSize); err != nil {
+		return zero, err
 	}
 
 	message, err := invokeResponseFactory(newResponse)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
-	if err := UnmarshalMessage(response.Body, message); err != nil {
-		return nil, err
+	if err := unmarshalMessage(response.Body, message); err != nil {
+		return zero, err
 	}
 
-	return &Response[Res]{Message: message, Metadata: cloneMetadata(response.Metadata)}, nil
+	config.captureResponseMetadata(response.Metadata)
+	return message, nil
 }
 
-// ServerStreaming calls a server-streaming RPC and returns a decoded response stream.
-func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
-	return ServerStreamingResponse(ctx, transport, service, method, request, newResponse, options...)
-}
-
-// ServerStreamingResponse calls a server-streaming RPC and returns an envelope-aware response stream.
-func ServerStreamingResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (ResponseStream[Res], error) {
-	callOptions := applyCallOptions(options)
-	deadline, err := resolveClientDeadline(ctx, callOptions, time.Now)
+// ServerStreaming calls a server-streaming RPC and returns its response stream.
+// The terminal status and metadata are available from TerminalStatus after Recv
+// reports io.EOF or the stream's error.
+func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (ResponseStream[Res], error) {
+	config := applyCallOptions(options)
+	deadline, err := resolveClientDeadline(ctx, config, time.Now)
 	if err != nil {
 		return nil, err
 	}
 
-	requestBody, err := MarshalMessage(request)
+	requestBody, err := marshalMessage(request)
 	if err != nil {
 		return nil, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, RpcKindServerStreaming, requestBody, callOptions, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(service, method, RpcKindServerStreaming, requestBody, config, deadline, time.Now)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
-	response, err := transport.StreamingCall(ctx, rpcRequest, EmptyStream[[]byte]())
+	response, err := transport.streamingCall(ctx, rpcRequest, newEmptyStream[[]byte]())
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	return newResponseMessageStream(response, newResponse, callOptions, ctx, cancel), nil
+	return newResponseMessageStream(response, newResponse, config, ctx, cancel), nil
 }
 
 // ClientStreaming starts a client-streaming RPC.
 func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (ClientStreamingCall[Req, Res], error) {
-	return ClientStreamingResponse[Req, Res](ctx, transport, service, method, newResponse, options...)
-}
-
-// ClientStreamingResponse starts a client-streaming RPC that exposes response metadata.
-func ClientStreamingResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (ClientStreamingResponseCall[Req, Res], error) {
-	callOptions := applyCallOptions(options)
-	deadline, err := resolveClientDeadline(ctx, callOptions, time.Now)
+	config := applyCallOptions(options)
+	requests, responses, cancel, err := startStreamingCall[Req](ctx, transport, service, method, RpcKindClientStreaming, newResponse, config)
 	if err != nil {
 		return nil, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, RpcKindClientStreaming, nil, callOptions, deadline, time.Now)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := callContext(ctx, deadline)
-	requests := NewMessagePipe[Req](ctx)
-	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	return &clientStreamingCall[Req, Res]{
-		requests:  requests,
-		responses: newResponseMessageStream(response, newResponse, callOptions, ctx, cancel),
-		cancel:    cancel,
-	}, nil
-}
-
-// ClientStreamingFromStream calls a client-streaming RPC from an existing request stream.
-func ClientStreamingFromStream[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (Res, error) {
-	response, err := ClientStreamingFromStreamResponse(ctx, transport, service, method, requests, newResponse, options...)
-	if err != nil {
-		var zero Res
-		return zero, err
-	}
-
-	return response.Message, nil
-}
-
-// ClientStreamingFromStreamResponse calls a client-streaming RPC and returns its response envelope.
-func ClientStreamingFromStreamResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (*Response[Res], error) {
-	responses, _, err := startRequestStreaming(ctx, transport, service, method, RpcKindClientStreaming, requests, newResponse, options)
-	if err != nil {
-		return nil, err
-	}
-
-	return readUnaryResponseFromResponseStream(responses)
+	return &clientStreamingCall[Req, Res]{requests: requests, responses: responses, cancel: cancel, config: config}, nil
 }
 
 // BidirectionalStreaming starts a bidirectional-streaming RPC.
 func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (BidirectionalStreamingCall[Req, Res], error) {
-	return BidirectionalStreamingResponse[Req, Res](ctx, transport, service, method, newResponse, options...)
-}
-
-// BidirectionalStreamingResponse starts a bidirectional RPC that exposes terminal status metadata.
-func BidirectionalStreamingResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (BidirectionalStreamingResponseCall[Req, Res], error) {
-	callOptions := applyCallOptions(options)
-	deadline, err := resolveClientDeadline(ctx, callOptions, time.Now)
+	requests, responses, _, err := startStreamingCall[Req](ctx, transport, service, method, RpcKindBidirectionalStreaming, newResponse, applyCallOptions(options))
 	if err != nil {
 		return nil, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, RpcKindBidirectionalStreaming, nil, callOptions, deadline, time.Now)
+	return &bidirectionalStreamingCall[Req, Res]{requests: requests, responses: responses}, nil
+}
+
+// startStreamingCall opens a streaming RPC whose requests are sent through the
+// returned pipe.
+func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, kind RpcKind, newResponse func() Res, config callConfig) (*messagePipe[Req], *responseMessageStream[Res], context.CancelFunc, error) {
+	deadline, err := resolveClientDeadline(ctx, config, time.Now)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
+	}
+
+	rpcRequest, err := prepareClientRequest(service, method, kind, nil, config, deadline, time.Now)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	ctx, cancel := callContext(ctx, deadline)
-	requests := NewMessagePipe[Req](ctx)
-	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
+	requests := newMessagePipe[Req](ctx)
+	response, err := transport.streamingCall(ctx, rpcRequest, newEncodeStream(requests))
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, nil, nil, err
 	}
 
-	return &bidirectionalStreamingCall[Req, Res]{
-		requests:  requests,
-		responses: newResponseMessageStream(response, newResponse, callOptions, ctx, cancel),
-	}, nil
-}
-
-// BidirectionalStreamingFromStream calls a bidirectional-streaming RPC from an existing request stream.
-func BidirectionalStreamingFromStream[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (MessageStream[Res], error) {
-	return BidirectionalStreamingFromStreamResponse(ctx, transport, service, method, requests, newResponse, options...)
-}
-
-// BidirectionalStreamingFromStreamResponse calls a bidirectional RPC and exposes terminal status metadata.
-func BidirectionalStreamingFromStreamResponse[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, requests MessageStream[Req], newResponse func() Res, options ...CallOption) (ResponseStream[Res], error) {
-	responses, _, err := startRequestStreaming(ctx, transport, service, method, RpcKindBidirectionalStreaming, requests, newResponse, options)
-	if err != nil {
-		return nil, err
-	}
-
-	return responses, nil
-}
-
-func startRequestStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, kind RpcKind, requests MessageStream[Req], newResponse func() Res, options []CallOption) (ResponseStream[Res], context.CancelFunc, error) {
-	if requests == nil {
-		return nil, func() {}, InvalidArgument("request stream is nil")
-	}
-
-	callOptions := applyCallOptions(options)
-	deadline, err := resolveClientDeadline(ctx, callOptions, time.Now)
-	if err != nil {
-		return nil, func() {}, err
-	}
-
-	rpcRequest, err := prepareClientRequest(service, method, kind, nil, callOptions, deadline, time.Now)
-	if err != nil {
-		return nil, func() {}, err
-	}
-
-	ctx, cancel := callContextForRequestStream(ctx, deadline, requests)
-	response, err := transport.StreamingCall(ctx, rpcRequest, EncodeStream(requests))
-	if err != nil {
-		cancel()
-		return nil, func() {}, err
-	}
-
-	return newResponseMessageStream(response, newResponse, callOptions, ctx, cancel), cancel, nil
+	return requests, newResponseMessageStream(response, newResponse, config, ctx, cancel), cancel, nil
 }
 
 type clientStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {
-	requests  *MessagePipe[Req]
-	responses ResponseStream[Res]
+	requests  *messagePipe[Req]
+	responses *responseMessageStream[Res]
 	cancel    context.CancelFunc
+	config    callConfig
 }
 
 func (c *clientStreamingCall[Req, Res]) Send(request Req) error {
@@ -399,21 +237,17 @@ func (c *clientStreamingCall[Req, Res]) Send(request Req) error {
 }
 
 func (c *clientStreamingCall[Req, Res]) CloseAndRecv() (Res, error) {
-	response, err := c.CloseAndRecvResponse()
-	if err != nil {
-		var zero Res
+	var zero Res
+	if err := c.requests.Close(); err != nil {
 		return zero, err
 	}
 
-	return response.Message, nil
-}
-
-func (c *clientStreamingCall[Req, Res]) CloseAndRecvResponse() (*Response[Res], error) {
-	if err := c.requests.Close(); err != nil {
-		return nil, err
+	message, metadata, err := readSingleResponse(c.responses)
+	if err != nil {
+		return zero, err
 	}
-
-	return readUnaryResponseFromResponseStream(c.responses)
+	c.config.captureResponseMetadata(metadata)
+	return message, nil
 }
 
 func (c *clientStreamingCall[Req, Res]) Close() error {
@@ -422,8 +256,8 @@ func (c *clientStreamingCall[Req, Res]) Close() error {
 }
 
 type bidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {
-	requests  *MessagePipe[Req]
-	responses ResponseStream[Res]
+	requests  *messagePipe[Req]
+	responses *responseMessageStream[Res]
 }
 
 func (c *bidirectionalStreamingCall[Req, Res]) Send(request Req) error {
@@ -446,13 +280,19 @@ func (c *bidirectionalStreamingCall[Req, Res]) TerminalStatus() (*Status, bool) 
 	return c.responses.TerminalStatus()
 }
 
-func applyCallOptions(options []CallOption) CallOptions {
-	callOptions := DefaultCallOptions()
+func applyCallOptions(options []CallOption) callConfig {
+	config := defaultCallConfig()
 	for _, option := range options {
-		option(&callOptions)
+		option(&config)
 	}
 
-	return callOptions
+	return config
+}
+
+func (c callConfig) captureResponseMetadata(metadata Metadata) {
+	if c.responseMetadata != nil {
+		*c.responseMetadata = cloneMetadata(metadata)
+	}
 }
 
 type clientDeadline struct {
@@ -460,14 +300,14 @@ type clientDeadline struct {
 	set bool
 }
 
-func resolveClientDeadline(ctx context.Context, options CallOptions, now func() time.Time) (clientDeadline, error) {
-	if options.HasTimeout && options.Timeout < 0 {
+func resolveClientDeadline(ctx context.Context, config callConfig, now func() time.Time) (clientDeadline, error) {
+	if config.hasTimeout && config.timeout < 0 {
 		return clientDeadline{}, InvalidArgument("RPC timeout is negative")
 	}
 
 	deadline, hasDeadline := ctx.Deadline()
-	if options.HasTimeout {
-		optionDeadline := now().Add(options.Timeout)
+	if config.hasTimeout {
+		optionDeadline := now().Add(config.timeout)
 		if !hasDeadline || optionDeadline.Before(deadline) {
 			deadline = optionDeadline
 			hasDeadline = true
@@ -477,13 +317,13 @@ func resolveClientDeadline(ctx context.Context, options CallOptions, now func() 
 	return clientDeadline{at: deadline, set: hasDeadline}, nil
 }
 
-func prepareClientRequest(service, method string, kind RpcKind, body []byte, options CallOptions, deadline clientDeadline, now func() time.Time) (*RpcRequest, error) {
-	metadata := cloneMetadata(options.Metadata)
-	if err := ValidateMetadata(metadata); err != nil {
+func prepareClientRequest(service, method string, kind RpcKind, body []byte, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
+	metadata := cloneMetadata(config.metadata)
+	if err := validateMetadata(metadata); err != nil {
 		return nil, err
 	}
 
-	request := NewRpcRequest(service, method, body)
+	request := newWireRequest(service, method, body)
 	request.Kind = kind
 	request.Metadata = metadata
 	request.TimeoutNanos = deadlineTimeoutNanos(deadline, now)
@@ -520,20 +360,12 @@ func callContextWithoutLocalCancel(ctx context.Context, deadline clientDeadline)
 	return ctx, func() {}
 }
 
-func callContextForRequestStream[Req ProtoMessage](ctx context.Context, deadline clientDeadline, requests MessageStream[Req]) (context.Context, context.CancelFunc) {
-	if isNonBlockingStream(requests) {
-		return callContextWithoutLocalCancel(ctx, deadline)
-	}
-
-	return callContext(ctx, deadline)
-}
-
-func validateResponse(response *RpcResponse, maxBodySize int) error {
+func validateResponse(response *wireResponse, maxBodySize int) error {
 	if response == nil {
 		return Internal("missing RPC response")
 	}
 
-	if err := ValidateMetadata(response.Metadata); err != nil {
+	if err := validateMetadata(response.Metadata); err != nil {
 		return Internal("invalid response metadata: " + err.Error())
 	}
 
@@ -542,7 +374,7 @@ func validateResponse(response *RpcResponse, maxBodySize int) error {
 	}
 
 	if CodeFromUint32(response.Status) != CodeOK {
-		return StatusFromResponse(response)
+		return statusFromWireResponse(response)
 	}
 
 	return nil
@@ -569,27 +401,18 @@ type responseStreamFailure struct {
 func (e *responseStreamFailure) Error() string { return e.status.Error() }
 func (e *responseStreamFailure) Unwrap() error { return e.status }
 
-// ResponseStreamFailureReason returns the stable production reason for a response-stream failure.
-func ResponseStreamFailureReason(err error) (string, bool) {
-	var failure *responseStreamFailure
-	if !errors.As(err, &failure) {
-		return "", false
-	}
-	return failure.reason, true
-}
-
 func newResponseStreamFailure(reason string, status *Status, cause error) error {
 	return &responseStreamFailure{reason: reason, status: status, cause: cause}
 }
 
+// responseMessageStream decodes the response frames of one streaming call. It
+// implements ResponseStream.
 type responseMessageStream[T ProtoMessage] struct {
-	inner          FrameStream
+	inner          frameStream
 	newMessage     func() T
-	options        CallOptions
+	config         callConfig
 	ctx            context.Context
 	cancel         context.CancelFunc
-	messages       int
-	streamBodySize int
 	finishOnce     sync.Once
 	mu             sync.Mutex
 	done           bool
@@ -599,28 +422,26 @@ type responseMessageStream[T ProtoMessage] struct {
 	terminalStatus *Status
 }
 
-func newResponseMessageStream[T ProtoMessage](inner FrameStream, newMessage func() T, options CallOptions, ctx context.Context, cancel context.CancelFunc) *responseMessageStream[T] {
-	return &responseMessageStream[T]{inner: inner, newMessage: newMessage, options: options, ctx: ctx, cancel: cancel}
+func newResponseMessageStream[T ProtoMessage](inner frameStream, newMessage func() T, config callConfig, ctx context.Context, cancel context.CancelFunc) *responseMessageStream[T] {
+	return &responseMessageStream[T]{inner: inner, newMessage: newMessage, config: config, ctx: ctx, cancel: cancel}
 }
 
 func (s *responseMessageStream[T]) Recv() (T, error) {
+	var zero T
 	s.mu.Lock()
 	done := s.done
 	s.mu.Unlock()
 	if done {
-		var zero T
 		return zero, io.EOF
 	}
 
-	frame, err := recvFrameFieldsWithTimeout(s.ctx, s.inner, s.options.StreamIdleTimeout)
+	frame, err := recvClientFrame(s.ctx, s.inner)
 	if err != nil {
 		if s.wasClosedLocally() {
-			var zero T
 			return zero, io.EOF
 		}
 
 		s.finish()
-		var zero T
 		if err == io.EOF {
 			return zero, newResponseStreamFailure(
 				"missing_terminal_status",
@@ -628,7 +449,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 				err,
 			)
 		}
-		var decodeError *FrameDecodeError
+		var decodeError *frameDecodeError
 		if errors.As(err, &decodeError) {
 			return zero, newResponseStreamFailure(
 				"malformed_protobuf",
@@ -641,36 +462,19 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 	}
 
 	switch frame.kind {
-	case RpcStreamFrameKindMessage:
-		if s.options.MaxResponseMessages >= 0 && s.messages >= s.options.MaxResponseMessages {
+	case wireFrameMessage:
+		if len(frame.body) > s.config.maxResponseSize {
 			s.finish()
-			var zero T
-			return zero, ResourceExhausted(fmt.Sprintf("response stream exceeded maximum of %d messages", s.options.MaxResponseMessages))
-		}
-
-		if len(frame.body) > s.options.MaxResponseBodySize {
-			s.finish()
-			var zero T
-			return zero, &FrameTooLargeError{Len: len(frame.body), Max: s.options.MaxResponseBodySize}
-		}
-
-		s.messages++
-		s.streamBodySize = saturatingAdd(s.streamBodySize, len(frame.body))
-		if s.options.MaxResponseStreamBodySize >= 0 && s.streamBodySize > s.options.MaxResponseStreamBodySize {
-			s.finish()
-			var zero T
-			return zero, ResourceExhausted(fmt.Sprintf("response stream exceeded maximum body size of %d bytes", s.options.MaxResponseStreamBodySize))
+			return zero, &FrameTooLargeError{Len: len(frame.body), Max: s.config.maxResponseSize}
 		}
 
 		message, err := invokeResponseFactory(s.newMessage)
 		if err != nil {
 			s.finish()
-			var zero T
 			return zero, err
 		}
-		if err := UnmarshalMessage(frame.body, message); err != nil {
+		if err := unmarshalMessage(frame.body, message); err != nil {
 			s.finish()
-			var zero T
 			return zero, newResponseStreamFailure(
 				"malformed_protobuf",
 				Internal("failed to decode response: "+err.Error()),
@@ -679,10 +483,9 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		}
 
 		return message, nil
-	case RpcStreamFrameKindStatus:
-		if err := ValidateMetadata(frame.metadata); err != nil {
+	case wireFrameStatus:
+		if err := validateMetadata(frame.metadata); err != nil {
 			s.finish()
-			var zero T
 			return zero, newResponseStreamFailure(
 				"invalid_metadata",
 				Internal("invalid response metadata: "+err.Error()),
@@ -690,10 +493,9 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 			)
 		}
 		status := frame.statusValue()
-		_, trailingErr := recvFrameFieldsWithTimeout(s.ctx, s.inner, s.options.StreamIdleTimeout)
+		_, trailingErr := recvClientFrame(s.ctx, s.inner)
 		if trailingErr == nil {
 			s.finish()
-			var zero T
 			return zero, newResponseStreamFailure(
 				"trailing_frame",
 				Internal("response stream contained data after final status"),
@@ -702,7 +504,6 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		}
 		if trailingErr != io.EOF {
 			s.finish()
-			var zero T
 			return zero, newResponseStreamFailure(
 				"trailing_frame",
 				Internal("response stream did not end cleanly after final status"),
@@ -716,18 +517,14 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 
 		if status.IsOK() {
 			if cleanupErr != nil {
-				var zero T
 				return zero, cleanupErr
 			}
-			var zero T
 			return zero, io.EOF
 		}
 
-		var zero T
 		return zero, newResponseStreamFailure("remote_status", status, nil)
 	default:
 		s.finish()
-		var zero T
 		return zero, newResponseStreamFailure(
 			"unsupported_frame_kind",
 			InvalidArgument("response stream contained an unknown frame kind"),
@@ -743,7 +540,7 @@ func (s *responseMessageStream[T]) TerminalStatus() (*Status, bool) {
 		return nil, false
 	}
 
-	return cloneResponseStatus(s.terminalStatus), true
+	return cloneStatus(s.terminalStatus), true
 }
 
 func (s *responseMessageStream[T]) finish() error {
@@ -782,210 +579,104 @@ func (s *responseMessageStream[T]) Close() error {
 	return s.finish()
 }
 
-func recvFrameWithTimeout(ctx context.Context, stream FrameStream, idleTimeout time.Duration) (*RpcStreamFrame, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, statusFromContextError(err)
+// recvClientFrame receives the next response frame fields, ending early with a
+// status when ctx is cancelled or its deadline passes.
+func recvClientFrame(ctx context.Context, stream frameStream) (streamFrameFields, error) {
+	if fieldsReceiver, ok := stream.(responseStreamFrameFieldsReceiver); ok {
+		return recvWithContext(ctx, stream, fieldsReceiver.trevrpcRecvStreamFrameFields)
 	}
-	deadline, source, hasDeadline := responseReadDeadline(ctx, idleTimeout)
+
+	return recvWithContext(ctx, stream, func() (streamFrameFields, error) {
+		frame, err := stream.Recv()
+		if err != nil {
+			return streamFrameFields{}, err
+		}
+
+		return streamFrameFields{
+			kind:     frame.Kind,
+			status:   frame.Status,
+			message:  frame.Message,
+			body:     frame.Body,
+			metadata: frame.Metadata,
+		}, nil
+	})
+}
+
+// recvWithContext runs recv on stream so that ctx cancellation and its deadline
+// interrupt it. Streams that support read deadlines or cancel reads on context
+// avoid the helper goroutine.
+func recvWithContext[T any](ctx context.Context, stream any, recv func() (T, error)) (T, error) {
+	var zero T
+	if err := ctx.Err(); err != nil {
+		return zero, statusFromContextError(err)
+	}
+	deadline, hasDeadline := ctx.Deadline()
 	if deadlineStream, ok := stream.(readDeadlineStream); ok && (hasDeadline || streamContextCancelsRecv(stream)) {
 		if hasDeadline {
 			_ = deadlineStream.SetReadDeadline(deadline)
 			defer deadlineStream.SetReadDeadline(time.Time{})
 		}
 
-		frame, err := stream.Recv()
+		value, err := recv()
 		if err != nil {
-			if deadlineErr := responseReadDeadlineError(ctx, source, err); deadlineErr != nil {
-				return nil, deadlineErr
+			if deadlineErr := readDeadlineError(ctx, hasDeadline, err); deadlineErr != nil {
+				return zero, deadlineErr
 			}
 		}
 
-		return frame, err
+		return value, err
 	}
-	if idleTimeout <= 0 && (isNonBlockingStream(stream) || streamContextCancelsRecv(stream)) {
-		frame, err := stream.Recv()
+	if isNonBlockingStream(stream) || streamContextCancelsRecv(stream) {
+		value, err := recv()
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, statusFromContextError(ctxErr)
+				return zero, statusFromContextError(ctxErr)
 			}
 		}
 
-		return frame, err
+		return value, err
 	}
 
 	type recvResult struct {
-		frame *RpcStreamFrame
+		value T
 		err   error
 	}
 
 	results := make(chan recvResult, 1)
 	go func() {
-		frame, err := stream.Recv()
-		results <- recvResult{frame: frame, err: err}
+		value, err := recv()
+		results <- recvResult{value: value, err: err}
 	}()
-
-	var idle <-chan time.Time
-	var timer *time.Timer
-	if idleTimeout > 0 {
-		timer = time.NewTimer(idleTimeout)
-		idle = timer.C
-		defer timer.Stop()
-	}
 
 	select {
 	case result := <-results:
 		if result.err != nil {
 			if err := ctx.Err(); err != nil {
-				return nil, statusFromContextError(err)
+				return zero, statusFromContextError(err)
 			}
 		}
 
-		return result.frame, result.err
+		return result.value, result.err
 	case <-ctx.Done():
-		return nil, statusFromContextError(ctx.Err())
-	case <-idle:
-		if err := ctx.Err(); err != nil {
-			return nil, statusFromContextError(err)
-		}
-
-		return nil, Unavailable("response stream idle timeout")
+		return zero, statusFromContextError(ctx.Err())
 	}
 }
 
-func recvFrameFieldsWithTimeout(ctx context.Context, stream FrameStream, idleTimeout time.Duration) (streamFrameFields, error) {
-	if fieldsReceiver, ok := stream.(responseStreamFrameFieldsReceiver); ok {
-		return recvOptimizedFrameFieldsWithTimeout(ctx, fieldsReceiver, idleTimeout, streamContextCancelsRecv(stream))
-	}
-
-	frame, err := recvFrameWithTimeout(ctx, stream, idleTimeout)
-	if err != nil {
-		return streamFrameFields{}, err
-	}
-
-	return streamFrameFields{
-		kind:     frame.Kind,
-		status:   frame.Status,
-		message:  frame.Message,
-		body:     frame.Body,
-		metadata: frame.Metadata,
-	}, nil
-}
-
-func recvOptimizedFrameFieldsWithTimeout(ctx context.Context, stream responseStreamFrameFieldsReceiver, idleTimeout time.Duration, contextCancelsRecv bool) (streamFrameFields, error) {
-	if err := ctx.Err(); err != nil {
-		return streamFrameFields{}, statusFromContextError(err)
-	}
-	deadline, source, hasDeadline := responseReadDeadline(ctx, idleTimeout)
-	if deadlineStream, ok := stream.(readDeadlineStream); ok && (hasDeadline || contextCancelsRecv) {
-		if hasDeadline {
-			_ = deadlineStream.SetReadDeadline(deadline)
-			defer deadlineStream.SetReadDeadline(time.Time{})
-		}
-
-		frame, err := stream.trevrpcRecvStreamFrameFields()
-		if err != nil {
-			if deadlineErr := responseReadDeadlineError(ctx, source, err); deadlineErr != nil {
-				return streamFrameFields{}, deadlineErr
-			}
-		}
-
-		return frame, err
-	}
-	if idleTimeout <= 0 && contextCancelsRecv {
-		frame, err := stream.trevrpcRecvStreamFrameFields()
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return streamFrameFields{}, statusFromContextError(ctxErr)
-			}
-		}
-
-		return frame, err
-	}
-
-	type recvResult struct {
-		frame streamFrameFields
-		err   error
-	}
-
-	results := make(chan recvResult, 1)
-	go func() {
-		frame, err := stream.trevrpcRecvStreamFrameFields()
-		results <- recvResult{frame: frame, err: err}
-	}()
-
-	var idle <-chan time.Time
-	var timer *time.Timer
-	if idleTimeout > 0 {
-		timer = time.NewTimer(idleTimeout)
-		idle = timer.C
-		defer timer.Stop()
-	}
-
-	select {
-	case result := <-results:
-		if result.err != nil {
-			if err := ctx.Err(); err != nil {
-				return streamFrameFields{}, statusFromContextError(err)
-			}
-		}
-
-		return result.frame, result.err
-	case <-ctx.Done():
-		return streamFrameFields{}, statusFromContextError(ctx.Err())
-	case <-idle:
-		if err := ctx.Err(); err != nil {
-			return streamFrameFields{}, statusFromContextError(err)
-		}
-
-		return streamFrameFields{}, Unavailable("response stream idle timeout")
-	}
-}
-
-type responseReadDeadlineSource uint8
-
-const (
-	responseReadDeadlineNone responseReadDeadlineSource = iota
-	responseReadDeadlineContext
-	responseReadDeadlineIdle
-)
-
-func responseReadDeadline(ctx context.Context, idleTimeout time.Duration) (time.Time, responseReadDeadlineSource, bool) {
-	var deadline time.Time
-	source := responseReadDeadlineNone
-	if contextDeadline, ok := ctx.Deadline(); ok {
-		deadline = contextDeadline
-		source = responseReadDeadlineContext
-	}
-	if idleTimeout > 0 {
-		idleDeadline := time.Now().Add(idleTimeout)
-		if source == responseReadDeadlineNone || idleDeadline.Before(deadline) {
-			deadline = idleDeadline
-			source = responseReadDeadlineIdle
-		}
-	}
-
-	return deadline, source, source != responseReadDeadlineNone
-}
-
-func responseReadDeadlineError(ctx context.Context, source responseReadDeadlineSource, err error) error {
+func readDeadlineError(ctx context.Context, hasDeadline bool, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return statusFromContextError(ctxErr)
 	}
-	if !isTimeoutError(err) {
-		return nil
-	}
-	switch source {
-	case responseReadDeadlineContext:
+	if hasDeadline && isTimeoutError(err) {
 		return statusFromContextError(context.DeadlineExceeded)
-	case responseReadDeadlineIdle:
-		return Unavailable("response stream idle timeout")
-	default:
-		return nil
 	}
+	return nil
 }
 
-func readUnaryResponseFromResponseStream[Res ProtoMessage](responses ResponseStream[Res]) (*Response[Res], error) {
-	var first Res
+// readSingleResponse drains a client-streaming response stream and returns its
+// only message with the terminal metadata. The whole stream is read first so a
+// server-reported failure takes precedence over a cardinality error.
+func readSingleResponse[Res ProtoMessage](responses ResponseStream[Res]) (Res, Metadata, error) {
+	var first, zero Res
 	responseCount := 0
 	for {
 		response, err := responses.Recv()
@@ -997,29 +688,21 @@ func readUnaryResponseFromResponseStream[Res ProtoMessage](responses ResponseStr
 			continue
 		}
 		if err != io.EOF {
-			return nil, err
+			return zero, nil, err
 		}
 		break
 	}
 
 	status, ok := responses.TerminalStatus()
 	if !ok || status == nil {
-		return nil, Internal("response stream ended before final status")
+		return zero, nil, Internal("response stream ended before final status")
 	}
 	if responseCount != 1 {
-		return nil, newResponseStreamFailure(
+		return zero, nil, newResponseStreamFailure(
 			"response_cardinality",
 			Internal(fmt.Sprintf("client-streaming RPC returned %d response messages; expected exactly one", responseCount)),
 			nil,
 		)
 	}
-	return &Response[Res]{Message: first, Metadata: cloneMetadata(status.Metadata)}, nil
-}
-
-func saturatingAdd(left, right int) int {
-	if right > 0 && left > math.MaxInt-right {
-		return math.MaxInt
-	}
-
-	return left + right
+	return first, status.Metadata, nil
 }

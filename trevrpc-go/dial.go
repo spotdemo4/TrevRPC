@@ -80,12 +80,12 @@ type connGeneration struct {
 	client *streamClient
 }
 
-func (g *connGeneration) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
-	return g.client.Call(ctx, request)
+func (g *connGeneration) call(ctx context.Context, request *wireRequest) (*wireResponse, error) {
+	return g.client.call(ctx, request)
 }
 
-func (g *connGeneration) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
-	return g.client.StreamingCall(ctx, request, requestBody)
+func (g *connGeneration) streamingCall(ctx context.Context, request *wireRequest, requestBody byteStream) (frameStream, error) {
+	return g.client.streamingCall(ctx, request, requestBody)
 }
 
 func (g *connGeneration) Close() error {

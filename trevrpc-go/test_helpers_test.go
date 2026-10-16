@@ -65,12 +65,12 @@ func (s *bidiTestStream) Close() error {
 }
 
 type closeErrorFrameStream struct {
-	frames []*RpcStreamFrame
+	frames []*wireStreamFrame
 	err    error
 	closed int
 }
 
-func (s *closeErrorFrameStream) Recv() (*RpcStreamFrame, error) {
+func (s *closeErrorFrameStream) Recv() (*wireStreamFrame, error) {
 	if len(s.frames) == 0 {
 		return nil, io.EOF
 	}
@@ -88,7 +88,7 @@ type uploadErrorFrameStream struct {
 	errors <-chan error
 }
 
-func (s uploadErrorFrameStream) Recv() (*RpcStreamFrame, error) {
+func (s uploadErrorFrameStream) Recv() (*wireStreamFrame, error) {
 	return nil, <-s.errors
 }
 
@@ -229,13 +229,13 @@ func (s *requestThenBlockingRPCStream) trevrpcCancelReadOnContext(ctx context.Co
 	return func() { stopOnce.Do(func() { close(done) }) }
 }
 
-func readStreamFramesFromBytes(t *testing.T, data []byte, maxFrameSize int) []*RpcStreamFrame {
+func readStreamFramesFromBytes(t *testing.T, data []byte, maxFrameSize int) []*wireStreamFrame {
 	t.Helper()
 	reader := bytes.NewReader(data)
-	var frames []*RpcStreamFrame
+	var frames []*wireStreamFrame
 	for {
-		frame := &RpcStreamFrame{}
-		read, err := ReadFrameOrEOF(reader, frame, maxFrameSize)
+		frame := &wireStreamFrame{}
+		read, err := readFrameOrEOF(reader, frame, maxFrameSize)
 		if err != nil {
 			t.Fatalf("read stream frame %d: %v", len(frames), err)
 		}
@@ -248,12 +248,12 @@ func readStreamFramesFromBytes(t *testing.T, data []byte, maxFrameSize int) []*R
 
 type contextBlockingTransport struct{}
 
-func (contextBlockingTransport) Call(ctx context.Context, _ *RpcRequest) (*RpcResponse, error) {
+func (contextBlockingTransport) call(ctx context.Context, _ *wireRequest) (*wireResponse, error) {
 	<-ctx.Done()
 	return nil, statusFromContextError(ctx.Err())
 }
 
-func (contextBlockingTransport) StreamingCall(ctx context.Context, _ *RpcRequest, _ ByteStream) (FrameStream, error) {
+func (contextBlockingTransport) streamingCall(ctx context.Context, _ *wireRequest, _ byteStream) (frameStream, error) {
 	return contextBlockingFrameStream{ctx: ctx}, nil
 }
 
@@ -261,7 +261,7 @@ type contextBlockingFrameStream struct {
 	ctx context.Context
 }
 
-func (s contextBlockingFrameStream) Recv() (*RpcStreamFrame, error) {
+func (s contextBlockingFrameStream) Recv() (*wireStreamFrame, error) {
 	<-s.ctx.Done()
 	return nil, statusFromContextError(s.ctx.Err())
 }
@@ -270,15 +270,102 @@ func (contextBlockingFrameStream) Close() error { return nil }
 
 type uploadWaitingTransport struct{}
 
-func (uploadWaitingTransport) Call(context.Context, *RpcRequest) (*RpcResponse, error) {
+func (uploadWaitingTransport) call(context.Context, *wireRequest) (*wireResponse, error) {
 	return nil, Unimplemented("unary not implemented")
 }
 
-func (uploadWaitingTransport) StreamingCall(ctx context.Context, _ *RpcRequest, requestBody ByteStream) (FrameStream, error) {
+func (uploadWaitingTransport) streamingCall(ctx context.Context, _ *wireRequest, requestBody byteStream) (frameStream, error) {
 	errors := make(chan error, 1)
 	go func() {
 		_, err := recvRequestBody(ctx, requestBody)
 		errors <- err
 	}()
 	return uploadErrorFrameStream{errors: errors}, nil
+}
+
+// routeBytes registers a unary handler that works on encoded request and
+// response bodies.
+func routeBytes(server *Server, service, method string, handler func(context.Context, []byte) ([]byte, error)) {
+	server.routeUnary(service, method, func(ctx context.Context, body []byte) (*wireResponse, error) {
+		responseBody, err := handler(ctx, body)
+		if err != nil {
+			return nil, err
+		}
+		return okWireResponse(responseBody), nil
+	})
+}
+
+// testResponse wraps message in a handler Response without metadata.
+func testResponse[T ProtoMessage](message T) *Response[T] {
+	return &Response[T]{Message: message}
+}
+
+// handleRequest runs a unary request through the server as the transports do,
+// including the concurrency admission check.
+func (s *Server) handleRequest(ctx context.Context, request *wireRequest) *wireResponse {
+	runtime := s.freeze()
+	lease, ok := runtime.tryRequestLease(request)
+	if !ok {
+		startedAt := time.Now()
+		service, method, bodyLen := requestService(request), requestMethod(request), 0
+		if request != nil {
+			bodyLen = len(request.Body)
+		}
+		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: bodyLen}, request)
+		return runtime.finishResponse(service, method, bodyLen, startedAt, Unavailable("too many concurrent RPCs").intoResponse(nil), request)
+	}
+	defer lease.release()
+	return runtime.handleRequest(ctx, request, lease)
+}
+
+// handleStreamingRequest runs a streaming request through the server as the
+// transports do, including the concurrency admission check.
+func (s *Server) handleStreamingRequest(ctx context.Context, request *wireRequest, requestBody byteStream) frameStream {
+	runtime := s.freeze()
+	lease, ok := runtime.tryRequestLease(request)
+	if !ok {
+		startedAt := time.Now()
+		service, method := requestService(request), requestMethod(request)
+		bodyLen := 0
+		if request != nil {
+			bodyLen = len(request.Body)
+		}
+		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: bodyLen}, request)
+		return runtime.finishStreamingStatus(service, method, bodyLen, startedAt, Unavailable("too many concurrent RPCs"), request)
+	}
+	return runtime.handleStreamingRequest(ctx, request, requestBody, lease)
+}
+
+// okWireResponse creates a successful RPC response with the provided body.
+func okWireResponse(body []byte) *wireResponse {
+	return &wireResponse{Status: uint32(CodeOK), Body: body, Metadata: Metadata{}}
+}
+
+// frameKind returns the decoded stream frame kind.
+func (m *wireStreamFrame) frameKind() (wireFrameKind, bool) {
+	switch m.Kind {
+	case wireFrameMessage, wireFrameStatus:
+		return m.Kind, true
+	default:
+		return 0, false
+	}
+}
+
+// statusValue returns the status represented by the frame status fields.
+func (m *wireStreamFrame) statusValue() *Status {
+	return NewStatus(CodeFromUint32(m.Status), m.Message).WithMetadata(m.Metadata)
+}
+
+// singleMessageStream returns a byte stream containing one encoded protobuf message.
+func singleMessageStream[T ProtoMessage](message T) byteStream {
+	return newEncodeStream(newSliceStream(message))
+}
+
+// responseStreamFailureReason returns the stable reason for a response-stream failure.
+func responseStreamFailureReason(err error) (string, bool) {
+	var failure *responseStreamFailure
+	if !errors.As(err, &failure) {
+		return "", false
+	}
+	return failure.reason, true
 }

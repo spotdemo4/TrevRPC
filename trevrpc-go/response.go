@@ -5,51 +5,30 @@ import (
 	"sync"
 )
 
-// Response is a decoded unary response together with response metadata.
+// Response is what unary and client-streaming handlers return: the response
+// message and optional response metadata. Metadata keys must be lowercase (see
+// NormalizeMetadataKey).
 type Response[T ProtoMessage] struct {
 	Message  T
 	Metadata Metadata
 }
 
-// ResponseOption mutates a response envelope.
-type ResponseOption[T ProtoMessage] func(*Response[T])
-
-// NewResponse creates a response envelope for handlers that need metadata.
-func NewResponse[T ProtoMessage](message T, options ...ResponseOption[T]) *Response[T] {
-	response := &Response[T]{Message: message, Metadata: Metadata{}}
-	for _, option := range options {
-		option(response)
-	}
-	return response
+// ResponseStream is a MessageStream that also reports the stream's terminal
+// status, and with it the terminal metadata. Clients receive one from
+// ServerStreaming; streaming handlers may return one, created with
+// NewResponseStream, to send terminal metadata.
+type ResponseStream[T ProtoMessage] interface {
+	MessageStream[T]
+	// TerminalStatus returns the final status once the stream has ended. A
+	// client sees it after Recv has returned io.EOF or the server's status
+	// error; a server sends it after Recv returns io.EOF.
+	TerminalStatus() (*Status, bool)
 }
 
-// WithResponseMetadata sets one normalized response metadata entry.
-func WithResponseMetadata[T ProtoMessage](key string, value []byte) ResponseOption[T] {
-	key = NormalizeMetadataKey(key)
-	value = append([]byte(nil), value...)
-	return func(response *Response[T]) {
-		metadata := cloneMetadata(response.Metadata)
-		metadata[key] = append([]byte(nil), value...)
-		response.Metadata = metadata
-	}
-}
-
-// WithResponseMetadataMap replaces response metadata.
-func WithResponseMetadataMap[T ProtoMessage](metadata Metadata) ResponseOption[T] {
-	metadata = cloneMetadata(metadata)
-	return func(response *Response[T]) {
-		response.Metadata = cloneMetadata(metadata)
-	}
-}
-
-// NewResponseStream wraps a successful message stream with zero terminal metadata.
-func NewResponseStream[T ProtoMessage](stream MessageStream[T]) ResponseStream[T] {
-	return WithResponseStreamMetadata(stream, nil)
-}
-
-// WithResponseStreamMetadata wraps a successful message stream with terminal metadata.
-// The terminal status becomes available only after Recv reports io.EOF.
-func WithResponseStreamMetadata[T ProtoMessage](stream MessageStream[T], metadata Metadata) ResponseStream[T] {
+// NewResponseStream wraps a successful message stream so that metadata is sent
+// with the final OK status. The terminal status becomes available only after
+// Recv reports io.EOF.
+func NewResponseStream[T ProtoMessage](stream MessageStream[T], metadata Metadata) ResponseStream[T] {
 	if stream == nil {
 		return nil
 	}
@@ -80,7 +59,7 @@ func (s *responseEnvelopeStream[T]) Recv() (T, error) {
 	s.terminal = OK().WithMetadata(s.metadata)
 	if inner, ok := s.inner.(ResponseStream[T]); ok {
 		if status, present := inner.TerminalStatus(); present && status != nil && !status.IsOK() {
-			s.terminal = cloneResponseStatus(status)
+			s.terminal = cloneStatus(status)
 		}
 	}
 	return message, io.EOF
@@ -90,7 +69,7 @@ func (s *responseEnvelopeStream[T]) TerminalStatus() (*Status, bool) {
 	if s.terminal == nil {
 		return nil, false
 	}
-	return cloneResponseStatus(s.terminal), true
+	return cloneStatus(s.terminal), true
 }
 
 func (s *responseEnvelopeStream[T]) Close() error {
@@ -108,7 +87,7 @@ func (s *responseEnvelopeStream[T]) trevrpcContextCancelsRecv() bool {
 	return streamContextCancelsRecv(s.inner)
 }
 
-func cloneResponseStatus(status *Status) *Status {
+func cloneStatus(status *Status) *Status {
 	if status == nil {
 		return nil
 	}

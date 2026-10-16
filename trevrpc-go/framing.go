@@ -18,19 +18,20 @@ const DefaultMaxFrameSize = 4 * 1024 * 1024
 // ProtoMessage is the protobuf message interface accepted by the runtime.
 type ProtoMessage = protoadapt.MessageV1
 
-// FrameTooLargeError reports a frame whose body exceeds the configured limit.
+// FrameTooLargeError reports a message whose encoded size exceeds the
+// configured frame size limit. StatusFromError maps it to ResourceExhausted.
 type FrameTooLargeError struct {
 	Len int
 	Max int
 }
 
-// FrameDecodeError wraps protobuf decode failures for RPC frames.
-type FrameDecodeError struct {
+// frameDecodeError wraps protobuf decode failures for RPC frames.
+type frameDecodeError struct {
 	Err error
 }
 
 type streamFrameFields struct {
-	kind     RpcStreamFrameKind
+	kind     wireFrameKind
 	status   uint32
 	message  string
 	body     []byte
@@ -43,22 +44,22 @@ func (e *FrameTooLargeError) Error() string {
 }
 
 // Error returns a human-readable frame decode error.
-func (e *FrameDecodeError) Error() string {
+func (e *frameDecodeError) Error() string {
 	return "failed to decode RPC frame: " + e.Err.Error()
 }
 
 // Unwrap returns the underlying protobuf decode error.
-func (e *FrameDecodeError) Unwrap() error {
+func (e *frameDecodeError) Unwrap() error {
 	return e.Err
 }
 
-// MarshalMessage encodes a protobuf message body.
-func MarshalMessage(message ProtoMessage) ([]byte, error) {
+// marshalMessage encodes a protobuf message body.
+func marshalMessage(message ProtoMessage) ([]byte, error) {
 	return proto.Marshal(protoMessageV2(message))
 }
 
-// UnmarshalMessage decodes a protobuf message body into message.
-func UnmarshalMessage(body []byte, message ProtoMessage) error {
+// unmarshalMessage decodes a protobuf message body into message.
+func unmarshalMessage(body []byte, message ProtoMessage) error {
 	protoMessage := protoMessageV2(message)
 	if err := preflightWireMessage(body, protoMessage.ProtoReflect().Descriptor()); err != nil {
 		return err
@@ -74,8 +75,8 @@ func protoMessageV2(message ProtoMessage) proto.Message {
 	return protoadapt.MessageV2Of(message)
 }
 
-// EncodeFrame encodes a protobuf message into a length-prefixed TrevRPC frame.
-func EncodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
+// encodeFrame encodes a protobuf message into a length-prefixed TrevRPC frame.
+func encodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
 	if frame, ok, err := encodeKnownFrame(message, maxFrameSize); ok || err != nil {
 		return frame, err
 	}
@@ -103,13 +104,13 @@ func EncodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
 
 func encodeKnownFrame(message ProtoMessage, maxFrameSize int) ([]byte, bool, error) {
 	switch message := any(message).(type) {
-	case *RpcRequest:
+	case *wireRequest:
 		frame, err := encodeRpcRequestFrame(message, maxFrameSize)
 		return frame, frame != nil || err != nil, err
-	case *RpcResponse:
+	case *wireResponse:
 		frame, err := encodeRpcResponseFrame(message, maxFrameSize)
 		return frame, frame != nil || err != nil, err
-	case *RpcStreamFrame:
+	case *wireStreamFrame:
 		frame, err := encodeRpcStreamFrame(message, maxFrameSize)
 		return frame, frame != nil || err != nil, err
 	default:
@@ -117,7 +118,7 @@ func encodeKnownFrame(message ProtoMessage, maxFrameSize int) ([]byte, bool, err
 	}
 }
 
-func encodeRpcRequestFrame(request *RpcRequest, maxFrameSize int) ([]byte, error) {
+func encodeRpcRequestFrame(request *wireRequest, maxFrameSize int) ([]byte, error) {
 	if request == nil || len(request.Metadata) > 0 {
 		return nil, nil
 	}
@@ -143,7 +144,7 @@ func encodeRpcRequestFrame(request *RpcRequest, maxFrameSize int) ([]byte, error
 	return frame, nil
 }
 
-func encodeRpcResponseFrame(response *RpcResponse, maxFrameSize int) ([]byte, error) {
+func encodeRpcResponseFrame(response *wireResponse, maxFrameSize int) ([]byte, error) {
 	if response == nil || len(response.Metadata) > 0 {
 		return nil, nil
 	}
@@ -163,7 +164,7 @@ func encodeRpcResponseFrame(response *RpcResponse, maxFrameSize int) ([]byte, er
 	return frame, nil
 }
 
-func encodeRpcStreamFrame(frameMessage *RpcStreamFrame, maxFrameSize int) ([]byte, error) {
+func encodeRpcStreamFrame(frameMessage *wireStreamFrame, maxFrameSize int) ([]byte, error) {
 	if frameMessage == nil || len(frameMessage.Metadata) > 0 {
 		return nil, nil
 	}
@@ -185,10 +186,10 @@ func encodeRpcStreamFrame(frameMessage *RpcStreamFrame, maxFrameSize int) ([]byt
 	return frame, nil
 }
 
-// DecodeFrame decodes a protobuf message from a TrevRPC frame body.
-func DecodeFrame(body []byte, message ProtoMessage) error {
-	if err := UnmarshalMessage(body, message); err != nil {
-		return &FrameDecodeError{Err: err}
+// decodeFrame decodes a protobuf message from a TrevRPC frame body.
+func decodeFrame(body []byte, message ProtoMessage) error {
+	if err := unmarshalMessage(body, message); err != nil {
+		return &frameDecodeError{Err: err}
 	}
 
 	return nil
@@ -314,9 +315,9 @@ func preflightPackedValues(data []byte, wireType protowire.Type) bool {
 	return true
 }
 
-// WriteFrame writes one length-prefixed protobuf frame.
-func WriteFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error {
-	frame, err := EncodeFrame(message, maxFrameSize)
+// writeFrame writes one length-prefixed protobuf frame.
+func writeFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error {
+	frame, err := encodeFrame(message, maxFrameSize)
 	if err != nil {
 		return err
 	}
@@ -444,9 +445,9 @@ func appendVarintField(data []byte, fieldNumber int, value uint64) []byte {
 	return appendVarint(data, value)
 }
 
-// ReadFrame reads and decodes one length-prefixed protobuf frame.
-func ReadFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
-	read, err := ReadFrameOrEOF(reader, message, maxFrameSize)
+// readFrame reads and decodes one length-prefixed protobuf frame.
+func readFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
+	read, err := readFrameOrEOF(reader, message, maxFrameSize)
 	if err != nil {
 		return err
 	}
@@ -458,19 +459,19 @@ func ReadFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
 	return nil
 }
 
-// ReadFrameOrEOF reads one frame and reports false when the stream is already at EOF.
-func ReadFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (bool, error) {
-	body, read, err := ReadRawFrameOrEOF(reader, maxFrameSize)
+// readFrameOrEOF reads one frame and reports false when the stream is already at EOF.
+func readFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (bool, error) {
+	body, read, err := readRawFrameOrEOF(reader, maxFrameSize)
 	if err != nil || !read {
 		return read, err
 	}
 
-	return true, DecodeFrame(body, message)
+	return true, decodeFrame(body, message)
 }
 
-// ReadRawFrameOrEOF reads one length-prefixed frame without interpreting its body.
+// readRawFrameOrEOF reads one length-prefixed frame without interpreting its body.
 // It reports false when the stream is already at EOF.
-func ReadRawFrameOrEOF(reader io.Reader, maxFrameSize int) ([]byte, bool, error) {
+func readRawFrameOrEOF(reader io.Reader, maxFrameSize int) ([]byte, bool, error) {
 	header := [4]byte{}
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
 		if err == io.EOF {
@@ -507,7 +508,7 @@ func readFrameBody(reader io.Reader, length int) ([]byte, error) {
 }
 
 func readStreamFrameFieldsOrEOF(reader io.Reader, maxFrameSize int) (streamFrameFields, bool, error) {
-	body, read, err := ReadRawFrameOrEOF(reader, maxFrameSize)
+	body, read, err := readRawFrameOrEOF(reader, maxFrameSize)
 	if err != nil || !read {
 		return streamFrameFields{}, read, err
 	}
@@ -516,8 +517,8 @@ func readStreamFrameFieldsOrEOF(reader io.Reader, maxFrameSize int) (streamFrame
 	return fields, true, err
 }
 
-func (f streamFrameFields) rpcStreamFrame() *RpcStreamFrame {
-	return &RpcStreamFrame{
+func (f streamFrameFields) rpcStreamFrame() *wireStreamFrame {
+	return &wireStreamFrame{
 		Kind:     f.kind,
 		Status:   f.status,
 		Message:  f.message,
@@ -531,11 +532,11 @@ func (f streamFrameFields) statusValue() *Status {
 }
 
 func parseStreamFrameFields(data []byte, copyBytes bool) (streamFrameFields, error) {
-	fields := streamFrameFields{kind: RpcStreamFrameKindMessage}
+	fields := streamFrameFields{kind: wireFrameMessage}
 	for offset := 0; offset < len(data); {
 		tag, ok := consumeVarint(data, &offset)
 		if !ok || tag == 0 {
-			return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame field tag")}
+			return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame field tag")}
 		}
 
 		field := tag >> 3
@@ -543,47 +544,47 @@ func parseStreamFrameFields(data []byte, copyBytes bool) (streamFrameFields, err
 		switch field {
 		case 1:
 			if wireType != 0 {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame kind wire type")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame kind wire type")}
 			}
 			kind, ok := consumeVarint(data, &offset)
 			if !ok {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("truncated stream frame kind")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("truncated stream frame kind")}
 			}
-			fields.kind = RpcStreamFrameKind(kind)
+			fields.kind = wireFrameKind(kind)
 		case 2:
 			if wireType != 0 {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame status wire type")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame status wire type")}
 			}
 			status, ok := consumeVarint(data, &offset)
 			if !ok {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("truncated stream frame status")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("truncated stream frame status")}
 			}
 			fields.status = uint32(status)
 		case 3:
 			if wireType != 2 {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame message")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame message")}
 			}
 			value, ok := consumeLengthDelimited(data, &offset)
 			if !ok {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame message")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame message")}
 			}
 			fields.message = string(value)
 		case 4:
 			if wireType != 2 {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame body")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame body")}
 			}
 			value, ok := consumeLengthDelimited(data, &offset)
 			if !ok {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame body")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame body")}
 			}
 			fields.body = maybeCopyBytes(value, copyBytes)
 		case 5:
 			if wireType != 2 {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame metadata")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame metadata")}
 			}
 			value, ok := consumeLengthDelimited(data, &offset)
 			if !ok {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame metadata")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame metadata")}
 			}
 			key, metadataValue, err := parseMetadataEntry(value, copyBytes)
 			if err != nil {
@@ -595,13 +596,13 @@ func parseStreamFrameFields(data []byte, copyBytes bool) (streamFrameFields, err
 			fields.metadata[key] = metadataValue
 		default:
 			if !skipProtoField(data, &offset, wireType) {
-				return streamFrameFields{}, &FrameDecodeError{Err: fmt.Errorf("invalid stream frame unknown field")}
+				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame unknown field")}
 			}
 		}
 	}
 
 	switch fields.kind {
-	case RpcStreamFrameKindMessage, RpcStreamFrameKindStatus:
+	case wireFrameMessage, wireFrameStatus:
 		return fields, nil
 	default:
 		return streamFrameFields{}, InvalidArgument("stream frame contained an unknown frame kind")
@@ -614,7 +615,7 @@ func parseMetadataEntry(data []byte, copyBytes bool) (string, []byte, error) {
 	for offset := 0; offset < len(data); {
 		tag, ok := consumeVarint(data, &offset)
 		if !ok || tag == 0 {
-			return "", nil, &FrameDecodeError{Err: fmt.Errorf("invalid metadata field tag")}
+			return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata field tag")}
 		}
 
 		field := tag >> 3
@@ -622,25 +623,25 @@ func parseMetadataEntry(data []byte, copyBytes bool) (string, []byte, error) {
 		switch field {
 		case 1:
 			if wireType != 2 {
-				return "", nil, &FrameDecodeError{Err: fmt.Errorf("invalid metadata key")}
+				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata key")}
 			}
 			keyBytes, ok := consumeLengthDelimited(data, &offset)
 			if !ok {
-				return "", nil, &FrameDecodeError{Err: fmt.Errorf("invalid metadata key")}
+				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata key")}
 			}
 			key = string(keyBytes)
 		case 2:
 			if wireType != 2 {
-				return "", nil, &FrameDecodeError{Err: fmt.Errorf("invalid metadata value")}
+				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata value")}
 			}
 			valueBytes, ok := consumeLengthDelimited(data, &offset)
 			if !ok {
-				return "", nil, &FrameDecodeError{Err: fmt.Errorf("invalid metadata value")}
+				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata value")}
 			}
 			value = maybeCopyBytes(valueBytes, copyBytes)
 		default:
 			if !skipProtoField(data, &offset, wireType) {
-				return "", nil, &FrameDecodeError{Err: fmt.Errorf("invalid metadata unknown field")}
+				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata unknown field")}
 			}
 		}
 	}

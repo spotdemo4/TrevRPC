@@ -73,7 +73,7 @@ func (echoServer) Unary(ctx context.Context, request *interoppb.EchoRequest) (*t
 		return nil, failure(request)
 	}
 	suffix := trevrpc.RequestMetadataFromContext(ctx)["interop-suffix"]
-	return trevrpc.NewResponse(&interoppb.EchoResponse{Message: request.Message + string(suffix)}), nil
+	return &trevrpc.Response[*interoppb.EchoResponse]{Message: &interoppb.EchoResponse{Message: request.Message + string(suffix)}}, nil
 }
 
 func (echoServer) ClientStream(_ context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*trevrpc.Response[*interoppb.EchoResponse], error) {
@@ -89,11 +89,11 @@ func (echoServer) ClientStream(_ context.Context, requests trevrpc.MessageStream
 		message.WriteString(request.Message)
 		count++
 	}
-	return trevrpc.NewResponse(&interoppb.EchoResponse{Message: message.String(), Index: count}), nil
+	return &trevrpc.Response[*interoppb.EchoResponse]{Message: &interoppb.EchoResponse{Message: message.String(), Index: count}}, nil
 }
 
-func (echoServer) ServerStream(_ context.Context, request *interoppb.EchoRequest) (trevrpc.ResponseStream[*interoppb.EchoResponse], error) {
-	return trevrpc.NewResponseStream[*interoppb.EchoResponse](&countedEcho{request: request}), nil
+func (echoServer) ServerStream(_ context.Context, request *interoppb.EchoRequest) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
+	return &countedEcho{request: request}, nil
 }
 
 // countedEcho yields request.Count echoes and then ends with the requested status.
@@ -116,8 +116,8 @@ func (s *countedEcho) Recv() (*interoppb.EchoResponse, error) {
 
 func (*countedEcho) Close() error { return nil }
 
-func (echoServer) Bidi(_ context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.ResponseStream[*interoppb.EchoResponse], error) {
-	return trevrpc.NewResponseStream[*interoppb.EchoResponse](&bidiEcho{requests: requests}), nil
+func (echoServer) Bidi(_ context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
+	return &bidiEcho{requests: requests}, nil
 }
 
 // bidiEcho answers each request in order and ends when the requests end.

@@ -20,15 +20,15 @@ func FuzzFrameDecodeNeverPanics(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, body []byte) {
-		request := &RpcRequest{}
-		err := DecodeFrame(body, request)
+		request := &wireRequest{}
+		err := decodeFrame(body, request)
 		if err == nil {
 			return
 		}
 
-		var decodeErr *FrameDecodeError
+		var decodeErr *frameDecodeError
 		if !errors.As(err, &decodeErr) {
-			t.Fatalf("expected FrameDecodeError for malformed frame body, got %T: %v", err, err)
+			t.Fatalf("expected frameDecodeError for malformed frame body, got %T: %v", err, err)
 		}
 		if status := StatusFromError(err); status.Code != CodeInvalidArgument {
 			t.Fatalf("expected invalid argument status, got %v", status)
@@ -45,7 +45,7 @@ func FuzzFrameLengthParsing(f *testing.F) {
 		header := make([]byte, 4)
 		binary.BigEndian.PutUint32(header, length)
 
-		read, err := ReadFrameOrEOF(bytes.NewReader(header), &RpcRequest{}, 16)
+		read, err := readFrameOrEOF(bytes.NewReader(header), &wireRequest{}, 16)
 		if length > 16 {
 			var tooLarge *FrameTooLargeError
 			if !errors.As(err, &tooLarge) {
@@ -76,8 +76,8 @@ func FuzzMetadataValidationDeterministic(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, key string, value []byte) {
 		metadata := Metadata{key: value}
-		first := StatusFromError(ValidateMetadata(metadata)).Code
-		second := StatusFromError(ValidateMetadata(metadata)).Code
+		first := StatusFromError(validateMetadata(metadata)).Code
+		second := StatusFromError(validateMetadata(metadata)).Code
 		if first != second {
 			t.Fatalf("metadata validation was not deterministic for key %q: %v != %v", key, first, second)
 		}

@@ -70,7 +70,7 @@ func newTestMessage() *testMessage { return &testMessage{} }
 
 // registerTestService registers one handler per RPC shape.
 func registerTestService(server *Server) {
-	RegisterUnary(server, testServiceName, "Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*testMessage, error) {
+	RegisterUnary(server, testServiceName, "Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*Response[*testMessage], error) {
 		switch request.Value {
 		case "missing":
 			return nil, NotFound("nothing here")
@@ -78,16 +78,16 @@ func registerTestService(server *Server) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
-		return &testMessage{Value: request.Value + string(RequestMetadataFromContext(ctx)["suffix"])}, nil
+		return testResponse(&testMessage{Value: request.Value + string(RequestMetadataFromContext(ctx)["suffix"])}), nil
 	})
-	RegisterServerStreamingResponse(server, testServiceName, "Count", newTestMessage, func(_ context.Context, request *testMessage) (ResponseStream[*testMessage], error) {
+	RegisterServerStreaming(server, testServiceName, "Count", newTestMessage, func(_ context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		replies := make([]*testMessage, 0, 3)
 		for _, suffix := range []string{"1", "2", "3"} {
 			replies = append(replies, &testMessage{Value: request.Value + suffix})
 		}
-		return NewResponseStream(FromSlice(replies...)), nil
+		return newSliceStream(replies...), nil
 	})
-	RegisterClientStreamingResponse(server, testServiceName, "Concat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
+	RegisterClientStreaming(server, testServiceName, "Concat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
 		var joined strings.Builder
 		for request, err := range Messages(requests) {
 			if err != nil {
@@ -95,14 +95,14 @@ func registerTestService(server *Server) {
 			}
 			joined.WriteString(request.Value)
 		}
-		return NewResponse(&testMessage{Value: joined.String()}), nil
+		return testResponse(&testMessage{Value: joined.String()}), nil
 	})
 	// FailFast fails a bidirectional call without reading any request message.
-	server.RouteStreaming(testServiceName, "FailFast", RpcKindBidirectionalStreaming, func(context.Context, []byte, ByteStream) (ByteStream, error) {
+	server.routeStreaming(testServiceName, "FailFast", RpcKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return nil, NewStatus(CodeAborted, "abort")
 	})
-	RegisterBidirectionalStreamingResponse(server, testServiceName, "Chat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (ResponseStream[*testMessage], error) {
-		return NewResponseStream[*testMessage](&upperStream{requests: requests}), nil
+	RegisterBidirectionalStreaming(server, testServiceName, "Chat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
+		return &upperStream{requests: requests}, nil
 	})
 }
 
@@ -407,7 +407,7 @@ func TestShutdownCancelsInFlightHandlers(t *testing.T) {
 	handlerCancelled := make(chan struct{})
 	handlerStarted := make(chan struct{})
 	server := NewServer()
-	server.Route(testServiceName, "Block", func(ctx context.Context, _ []byte) ([]byte, error) {
+	routeBytes(server, testServiceName, "Block", func(ctx context.Context, _ []byte) ([]byte, error) {
 		close(handlerStarted)
 		<-ctx.Done()
 		close(handlerCancelled)
@@ -424,7 +424,7 @@ func TestShutdownCancelsInFlightHandlers(t *testing.T) {
 
 	callDone := make(chan error, 1)
 	go func() {
-		_, err := channel.Call(context.Background(), NewRpcRequest(testServiceName, "Block", nil))
+		_, err := channel.call(context.Background(), newWireRequest(testServiceName, "Block", nil))
 		callDone <- err
 	}()
 	<-handlerStarted
@@ -570,19 +570,19 @@ func TestHTTP3RequestsOverTheWire(t *testing.T) {
 		return response
 	}
 
-	if got := do(http.MethodPost, url+"x", HTTP3ContentType, "").StatusCode; got != http.StatusNotFound {
+	if got := do(http.MethodPost, url+"x", http3ContentType, "").StatusCode; got != http.StatusNotFound {
 		t.Errorf("unknown path status = %d", got)
 	}
-	if response := do(http.MethodGet, url, HTTP3ContentType, ""); response.StatusCode != http.StatusMethodNotAllowed || response.Header.Get("Allow") != "POST" {
+	if response := do(http.MethodGet, url, http3ContentType, ""); response.StatusCode != http.StatusMethodNotAllowed || response.Header.Get("Allow") != "POST" {
 		t.Errorf("GET status = %d, Allow = %q", response.StatusCode, response.Header.Get("Allow"))
 	}
 	if got := do(http.MethodPost, url, "text/plain", "").StatusCode; got != http.StatusUnsupportedMediaType {
 		t.Errorf("wrong media type status = %d", got)
 	}
-	if got := do(http.MethodPost, url, HTTP3ContentType, "no").StatusCode; got != http.StatusForbidden {
+	if got := do(http.MethodPost, url, http3ContentType, "no").StatusCode; got != http.StatusForbidden {
 		t.Errorf("denied admission status = %d", got)
 	}
-	if response := do(http.MethodPost, url, HTTP3ContentType, "yes"); response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != HTTP3ContentType {
+	if response := do(http.MethodPost, url, http3ContentType, "yes"); response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != http3ContentType {
 		t.Errorf("admitted status = %d, content type = %q", response.StatusCode, response.Header.Get("Content-Type"))
 	}
 	if admissions.Load() != 2 {
@@ -666,18 +666,18 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request := NewRpcRequest(testServiceName, "FailFast", nil)
+			request := newWireRequest(testServiceName, "FailFast", nil)
 			request.Kind = RpcKindBidirectionalStreaming
-			if err := WriteFrame(stream, request, DefaultMaxFrameSize); err != nil {
+			if err := writeFrame(stream, request, DefaultMaxFrameSize); err != nil {
 				t.Fatal(err)
 			}
 
 			// The status arrives although the request side is still open.
-			frame := &RpcStreamFrame{}
-			if err := ReadFrame(stream, frame, DefaultMaxFrameSize); err != nil {
+			frame := &wireStreamFrame{}
+			if err := readFrame(stream, frame, DefaultMaxFrameSize); err != nil {
 				t.Fatalf("read terminal status: %v", err)
 			}
-			if status := StatusFromError(&Status{Code: CodeFromUint32(frame.Status), Message: frame.Message}); frame.Kind != RpcStreamFrameKindStatus || status.Code != CodeAborted || status.Message != "abort" {
+			if status := StatusFromError(&Status{Code: CodeFromUint32(frame.Status), Message: frame.Message}); frame.Kind != wireFrameStatus || status.Code != CodeAborted || status.Message != "abort" {
 				t.Fatalf("frame = %+v, want Aborted \"abort\" status", frame)
 			}
 			if _, err := stream.Read(make([]byte, 1)); err != io.EOF {
@@ -720,12 +720,12 @@ func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := NewRpcRequest(testServiceName, "FailFast", nil)
+	request := newWireRequest(testServiceName, "FailFast", nil)
 	request.Kind = RpcKindBidirectionalStreaming
-	if err := WriteFrame(stream, request, DefaultMaxFrameSize); err != nil {
+	if err := writeFrame(stream, request, DefaultMaxFrameSize); err != nil {
 		t.Fatal(err)
 	}
-	if err := ReadFrame(stream, &RpcStreamFrame{}, DefaultMaxFrameSize); err != nil {
+	if err := readFrame(stream, &wireStreamFrame{}, DefaultMaxFrameSize); err != nil {
 		t.Fatal(err)
 	}
 

@@ -79,6 +79,19 @@ fmt.Println(r.Message)
 bidi.CloseSend()
 ```
 
+Each RPC has exactly one client method. Per-call options are `trevrpc.WithTimeout`, `WithMetadata`, `WithMaxFrameSize` and `CaptureResponseMetadata`:
+
+```go
+var md trevrpc.Metadata
+reply, _ := client.SayHello(ctx, request,
+	trevrpc.WithTimeout(5*time.Second),
+	trevrpc.WithMetadata("authorization", []byte("Bearer "+token)),
+	trevrpc.CaptureResponseMetadata(&md), // unary and client streaming
+)
+```
+
+Server-streaming and bidirectional calls expose the final status, and its metadata, through `TerminalStatus()` once the stream has ended.
+
 `Dial` returns a `*Channel` that reconnects with backoff after connection loss. Each RPC uses exactly one connection and is never retried or replayed; calls fail fast with `Unavailable` while the channel is reconnecting. `DialOptions.TLSConfig` and `DialOptions.QUICConfig` are cloned before use.
 
 ## Server
@@ -87,11 +100,11 @@ bidi.CloseSend()
 type greeterService struct{}
 
 func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
-	return trevrpc.NewResponse(&greeter.HelloReply{Message: "hello, " + r.Name}), nil
+	return &trevrpc.Response[*greeter.HelloReply]{Message: &greeter.HelloReply{Message: "hello, " + r.Name}}, nil
 }
 
-// LotsOfReplies, LotsOfGreetings and BidiHello are implemented the same way:
-// see examples/greeter_server.
+// LotsOfReplies and BidiHello return a trevrpc.MessageStream; LotsOfGreetings
+// returns a *trevrpc.Response like SayHello. See examples/greeter_server.
 
 server := trevrpc.NewServer()
 options := server.Options()
@@ -112,6 +125,8 @@ if err != nil {
 defer listener.Close()
 return listener.Serve(ctx) // returns nil after ctx is cancelled and handlers drain
 ```
+
+Unary and client-streaming handlers return a `*trevrpc.Response` whose `Metadata` is sent with the response; streaming handlers may wrap their stream with `trevrpc.NewResponseStream(stream, metadata)` to send terminal metadata.
 
 WebTransport sessions are rejected unless `WebTransportAdmission` admits them; HTTP/3 requests are admitted unless `HTTP3Admission` denies them. Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
 

@@ -33,11 +33,11 @@ func Messages[T any](stream MessageStream[T]) iter.Seq2[T, error] {
 	}
 }
 
-// ByteStream is a stream of encoded protobuf message bodies.
-type ByteStream = MessageStream[[]byte]
+// byteStream is a stream of encoded protobuf message bodies.
+type byteStream = MessageStream[[]byte]
 
-// FrameStream is a stream of TrevRPC stream frames.
-type FrameStream = MessageStream[*RpcStreamFrame]
+// frameStream is a stream of TrevRPC stream frames.
+type frameStream = MessageStream[*wireStreamFrame]
 
 type nonBlockingStream interface {
 	trevrpcNonBlockingStream() bool
@@ -51,8 +51,8 @@ type contextCancelReadStream interface {
 	trevrpcCancelReadOnContext(context.Context) func()
 }
 
-// MessagePipe is a sendable message stream.
-type MessagePipe[T any] struct {
+// messagePipe is a sendable message stream.
+type messagePipe[T any] struct {
 	ctx       context.Context
 	messages  chan T
 	done      chan struct{}
@@ -61,17 +61,17 @@ type MessagePipe[T any] struct {
 	err       error
 }
 
-// NewMessagePipe returns a stream that yields messages sent with Send until closed.
-func NewMessagePipe[T any](ctx context.Context) *MessagePipe[T] {
+// newMessagePipe returns a stream that yields messages sent with Send until closed.
+func newMessagePipe[T any](ctx context.Context) *messagePipe[T] {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	return &MessagePipe[T]{ctx: ctx, messages: make(chan T), done: make(chan struct{})}
+	return &messagePipe[T]{ctx: ctx, messages: make(chan T), done: make(chan struct{})}
 }
 
 // Send adds one message to the stream.
-func (s *MessagePipe[T]) Send(message T) error {
+func (s *messagePipe[T]) Send(message T) error {
 	select {
 	case <-s.done:
 		return s.closedError()
@@ -88,7 +88,7 @@ func (s *MessagePipe[T]) Send(message T) error {
 	}
 }
 
-func (s *MessagePipe[T]) Recv() (T, error) {
+func (s *messagePipe[T]) Recv() (T, error) {
 	select {
 	case message := <-s.messages:
 		return message, nil
@@ -105,12 +105,12 @@ func (s *MessagePipe[T]) Recv() (T, error) {
 }
 
 // Close completes the stream successfully.
-func (s *MessagePipe[T]) Close() error {
+func (s *messagePipe[T]) Close() error {
 	return s.CloseWithError(nil)
 }
 
 // CloseWithError completes the stream with err.
-func (s *MessagePipe[T]) CloseWithError(err error) error {
+func (s *messagePipe[T]) CloseWithError(err error) error {
 	s.closeOnce.Do(func() {
 		s.errMu.Lock()
 		s.err = err
@@ -120,13 +120,13 @@ func (s *MessagePipe[T]) CloseWithError(err error) error {
 	return nil
 }
 
-func (s *MessagePipe[T]) closeError() error {
+func (s *messagePipe[T]) closeError() error {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()
 	return s.err
 }
 
-func (s *MessagePipe[T]) closedError() error {
+func (s *messagePipe[T]) closedError() error {
 	if err := s.closeError(); err != nil {
 		return err
 	}
@@ -135,8 +135,8 @@ func (s *MessagePipe[T]) closedError() error {
 
 type emptyStream[T any] struct{}
 
-// EmptyStream returns a stream that immediately ends.
-func EmptyStream[T any]() MessageStream[T] {
+// newEmptyStream returns a stream that immediately ends.
+func newEmptyStream[T any]() MessageStream[T] {
 	return emptyStream[T]{}
 }
 
@@ -154,8 +154,8 @@ type sliceStream[T any] struct {
 	next  int
 }
 
-// FromSlice returns a stream that yields the provided items in order.
-func FromSlice[T any](items ...T) MessageStream[T] {
+// newSliceStream returns a stream that yields the provided items in order.
+func newSliceStream[T any](items ...T) MessageStream[T] {
 	return &sliceStream[T]{items: items}
 }
 
@@ -182,18 +182,18 @@ type statusFrameStream struct {
 	done   bool
 }
 
-// StatusStream returns a frame stream containing a single terminal status frame.
-func StatusStream(status *Status) FrameStream {
+// statusStream returns a frame stream containing a single terminal status frame.
+func statusStream(status *Status) frameStream {
 	return &statusFrameStream{status: status}
 }
 
-func (s *statusFrameStream) Recv() (*RpcStreamFrame, error) {
+func (s *statusFrameStream) Recv() (*wireStreamFrame, error) {
 	if s.done {
 		return nil, io.EOF
 	}
 
 	s.done = true
-	return StatusFrame(s.status), nil
+	return statusFrame(s.status), nil
 }
 
 func (s *statusFrameStream) trevrpcNonBlockingStream() bool { return true }
@@ -216,9 +216,9 @@ type terminalStatusByteStream interface {
 	trevrpcTerminalStatus() (*Status, bool)
 }
 
-// EncodeStream wraps a protobuf message stream and yields encoded message bodies.
+// newEncodeStream wraps a protobuf message stream and yields encoded message bodies.
 // ResponseStream inputs retain their terminal status for the server transport.
-func EncodeStream[T ProtoMessage](inner MessageStream[T]) ByteStream {
+func newEncodeStream[T ProtoMessage](inner MessageStream[T]) byteStream {
 	encoded := &encodeStream[T]{inner: inner}
 	if terminal, ok := inner.(ResponseStream[T]); ok {
 		return &terminalEncodeStream[T]{encodeStream: encoded, terminal: terminal}
@@ -244,7 +244,7 @@ func (s *encodeStream[T]) Recv() ([]byte, error) {
 		return nil, err
 	}
 
-	return MarshalMessage(message)
+	return marshalMessage(message)
 }
 
 func (s *encodeStream[T]) Close() error {
@@ -252,12 +252,12 @@ func (s *encodeStream[T]) Close() error {
 }
 
 type decodeStream[T ProtoMessage] struct {
-	inner      ByteStream
+	inner      byteStream
 	newMessage func() T
 }
 
-// DecodeStream wraps a byte stream and yields decoded protobuf messages.
-func DecodeStream[T ProtoMessage](inner ByteStream, newMessage func() T) MessageStream[T] {
+// newDecodeStream wraps a byte stream and yields decoded protobuf messages.
+func newDecodeStream[T ProtoMessage](inner byteStream, newMessage func() T) MessageStream[T] {
 	return &decodeStream[T]{inner: inner, newMessage: newMessage}
 }
 
@@ -269,7 +269,7 @@ func (s *decodeStream[T]) Recv() (T, error) {
 	}
 
 	message := s.newMessage()
-	if err := UnmarshalMessage(body, message); err != nil {
+	if err := unmarshalMessage(body, message); err != nil {
 		var zero T
 		return zero, InvalidArgument("failed to decode message: " + err.Error())
 	}
@@ -353,11 +353,6 @@ func streamContextCancelsRecv(stream any) bool {
 	}
 	cancellable, ok := stream.(contextCancelsRecvStream)
 	return ok && cancellable.trevrpcContextCancelsRecv()
-}
-
-// SingleMessageStream returns a byte stream containing one encoded protobuf message.
-func SingleMessageStream[T ProtoMessage](message T) ByteStream {
-	return EncodeStream(FromSlice(message))
 }
 
 func closeMessageStream(stream any) (err error) {

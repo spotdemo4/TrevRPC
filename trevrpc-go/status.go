@@ -120,22 +120,22 @@ func (s *Status) IsOK() bool {
 	return s != nil && s.Code == CodeOK
 }
 
-// IntoResponse converts the status and response body into an RPC response.
-func (s *Status) IntoResponse(body []byte) *RpcResponse {
+// intoResponse converts the status and response body into an RPC response.
+func (s *Status) intoResponse(body []byte) *wireResponse {
 	if s == nil || len(s.Metadata) == 0 {
-		return s.IntoResponseWithMetadata(body, Metadata{})
+		return s.intoResponseWithMetadata(body, Metadata{})
 	}
 
-	return s.IntoResponseWithMetadata(body, s.Metadata)
+	return s.intoResponseWithMetadata(body, s.Metadata)
 }
 
-// IntoResponseWithMetadata converts the status, response body, and metadata into an RPC response.
-func (s *Status) IntoResponseWithMetadata(body []byte, metadata Metadata) *RpcResponse {
+// intoResponseWithMetadata converts the status, response body, and metadata into an RPC response.
+func (s *Status) intoResponseWithMetadata(body []byte, metadata Metadata) *wireResponse {
 	if s == nil {
 		s = OK()
 	}
 
-	return &RpcResponse{
+	return &wireResponse{
 		Status:   uint32(s.Code),
 		Message:  s.Message,
 		Body:     body,
@@ -143,8 +143,8 @@ func (s *Status) IntoResponseWithMetadata(body []byte, metadata Metadata) *RpcRe
 	}
 }
 
-// StatusFromResponse builds a status from an RPC response.
-func StatusFromResponse(response *RpcResponse) *Status {
+// statusFromWireResponse builds a status from an RPC response.
+func statusFromWireResponse(response *wireResponse) *Status {
 	if response == nil {
 		return Internal("missing RPC response")
 	}
@@ -168,7 +168,7 @@ func StatusFromError(err error) *Status {
 		return ResourceExhausted(frameTooLarge.Error())
 	}
 
-	var frameDecode *FrameDecodeError
+	var frameDecode *frameDecodeError
 	if errors.As(err, &frameDecode) {
 		return InvalidArgument(frameDecode.Error())
 	}

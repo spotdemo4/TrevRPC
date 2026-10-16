@@ -37,10 +37,10 @@ func newStreamClient(opener streamOpener, maxFrameSize int) *streamClient {
 	return &streamClient{opener: opener, maxFrameSize: maxFrameSize}
 }
 
-func (c *streamClient) Call(
+func (c *streamClient) call(
 	ctx context.Context,
-	request *RpcRequest,
-) (*RpcResponse, error) {
+	request *wireRequest,
+) (*wireResponse, error) {
 	stream, err := c.opener.openStream(ctx)
 	if err != nil {
 		return nil, callStatus(ctx, err)
@@ -54,7 +54,7 @@ func (c *streamClient) Call(
 	stopCancel := cancelStreamOnContext(ctx, stream)
 	defer stopCancel()
 
-	if err := WriteFrame(stream, request, c.maxFrameSize); err != nil {
+	if err := writeFrame(stream, request, c.maxFrameSize); err != nil {
 		stream.cancelWrite()
 		return nil, callStatus(ctx, err)
 	}
@@ -62,8 +62,8 @@ func (c *streamClient) Call(
 		return nil, callStatus(ctx, err)
 	}
 
-	response := &RpcResponse{}
-	if err := ReadFrame(stream, response, c.maxFrameSize); err != nil {
+	response := &wireResponse{}
+	if err := readFrame(stream, response, c.maxFrameSize); err != nil {
 		return nil, callStatus(ctx, err)
 	}
 	if err := waitForCleanStreamEOF(stream); err != nil {
@@ -78,7 +78,7 @@ func waitForCleanStreamEOF(reader io.Reader) error {
 	for {
 		read, err := reader.Read(trailing[:])
 		if read != 0 {
-			return &FrameDecodeError{
+			return &frameDecodeError{
 				Err: errors.New("unexpected trailing data after unary response"),
 			}
 		}
@@ -91,11 +91,11 @@ func waitForCleanStreamEOF(reader io.Reader) error {
 	}
 }
 
-func (c *streamClient) StreamingCall(
+func (c *streamClient) streamingCall(
 	ctx context.Context,
-	request *RpcRequest,
-	requestBody ByteStream,
-) (FrameStream, error) {
+	request *wireRequest,
+	requestBody byteStream,
+) (frameStream, error) {
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := c.opener.openStream(streamCtx)
 	if err != nil {
@@ -123,13 +123,13 @@ func (c *streamClient) StreamingCall(
 func (c *streamClient) writeStreamingRequest(
 	ctx context.Context,
 	stream clientStream,
-	request *RpcRequest,
-	requestBody ByteStream,
+	request *wireRequest,
+	requestBody byteStream,
 ) error {
 	requestBody = closeStreamOnContext(ctx, requestBody)
 	defer closeMessageStream(requestBody)
 
-	if err := WriteFrame(stream, request, c.maxFrameSize); err != nil {
+	if err := writeFrame(stream, request, c.maxFrameSize); err != nil {
 		stream.cancelWrite()
 		return callStatus(ctx, err)
 	}
@@ -169,7 +169,7 @@ func (s *transportResponseStream) SetReadDeadline(deadline time.Time) error {
 	return s.stream.SetReadDeadline(deadline)
 }
 
-func (s *transportResponseStream) Recv() (*RpcStreamFrame, error) {
+func (s *transportResponseStream) Recv() (*wireStreamFrame, error) {
 	frame, err := s.trevrpcRecvStreamFrameFields()
 	if err != nil {
 		return nil, err
@@ -198,7 +198,7 @@ func (s *transportResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFie
 		}
 		return streamFrameFields{}, io.EOF
 	}
-	if frame.kind == RpcStreamFrameKindStatus {
+	if frame.kind == wireFrameStatus {
 		s.finish(false)
 		if frame.statusValue().IsOK() {
 			if err := s.writerError(true); err != nil {

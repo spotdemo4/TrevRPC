@@ -4,7 +4,9 @@ import "context"
 
 type handlerContextKey struct{}
 
-// HandlerContext contains request information exposed to generated handlers.
+// HandlerContext describes the request being handled. Handlers receive it
+// through HandlerContextFromContext and authorizers as an argument. Metadata
+// keys are lowercase.
 type HandlerContext struct {
 	Service  string
 	Method   string
@@ -28,17 +30,21 @@ func RequestMetadataFromContext(ctx context.Context) Metadata {
 	return info.Metadata
 }
 
-func contextWithHandlerContext(ctx context.Context, request *RpcRequest) context.Context {
+func newHandlerContext(request *wireRequest) HandlerContext {
+	return HandlerContext{
+		Service:  request.Service,
+		Method:   request.Method,
+		Kind:     request.rpcKind(),
+		Metadata: cloneMetadata(request.Metadata),
+	}
+}
+
+func contextWithHandlerContext(ctx context.Context, request *wireRequest) context.Context {
 	if request == nil {
 		return ctx
 	}
 
-	return context.WithValue(ctx, handlerContextKey{}, HandlerContext{
-		Service:  request.Service,
-		Method:   request.Method,
-		Kind:     request.RPCKind(),
-		Metadata: cloneMetadata(request.Metadata),
-	})
+	return context.WithValue(ctx, handlerContextKey{}, newHandlerContext(request))
 }
 
 func cloneMetadata(metadata Metadata) Metadata {

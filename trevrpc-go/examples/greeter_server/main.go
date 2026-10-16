@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -37,15 +38,39 @@ var (
 
 type greeterService struct{}
 
-func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
-	return trevrpc.NewResponse(&greeter.HelloReply{Message: "hello " + request.Name}), nil
+func reply(message string) *trevrpc.Response[*greeter.HelloReply] {
+	return &trevrpc.Response[*greeter.HelloReply]{Message: &greeter.HelloReply{Message: message}}
 }
 
-func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.ResponseStream[*greeter.HelloReply], error) {
-	return trevrpc.NewResponseStream(trevrpc.FromSlice(
-		&greeter.HelloReply{Message: "hello " + request.Name},
-		&greeter.HelloReply{Message: "welcome to TrevRPC over QUIC"},
-	)), nil
+func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
+	return reply("hello " + request.Name), nil
+}
+
+func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
+	return &fixedReplies{replies: []*greeter.HelloReply{
+		{Message: "hello " + request.Name},
+		{Message: "welcome to TrevRPC over QUIC"},
+	}}, nil
+}
+
+// fixedReplies streams a fixed list of replies.
+type fixedReplies struct {
+	replies []*greeter.HelloReply
+}
+
+func (s *fixedReplies) Recv() (*greeter.HelloReply, error) {
+	if len(s.replies) == 0 {
+		return nil, io.EOF
+	}
+
+	next := s.replies[0]
+	s.replies = s.replies[1:]
+	return next, nil
+}
+
+func (s *fixedReplies) Close() error {
+	s.replies = nil
+	return nil
 }
 
 func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*trevrpc.Response[*greeter.HelloReply], error) {
@@ -59,14 +84,14 @@ func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.Messag
 	}
 
 	if len(names) == 0 {
-		return trevrpc.NewResponse(&greeter.HelloReply{Message: "hello, nobody"}), nil
+		return reply("hello, nobody"), nil
 	}
 
-	return trevrpc.NewResponse(&greeter.HelloReply{Message: "hello, " + strings.Join(names, ", ")}), nil
+	return reply("hello, " + strings.Join(names, ", ")), nil
 }
 
-func (greeterService) BidiHello(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (trevrpc.ResponseStream[*greeter.HelloReply], error) {
-	return trevrpc.NewResponseStream[*greeter.HelloReply](&echoReplies{requests: requests}), nil
+func (greeterService) BidiHello(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (trevrpc.MessageStream[*greeter.HelloReply], error) {
+	return &echoReplies{requests: requests}, nil
 }
 
 type echoReplies struct {

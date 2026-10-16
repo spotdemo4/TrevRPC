@@ -19,8 +19,8 @@ import (
 const (
 	// DefaultHTTP3Path is the default endpoint for TrevRPC over HTTP/3 and WebTransport.
 	DefaultHTTP3Path = "/trevrpc"
-	// HTTP3ContentType is the media type for TrevRPC request and response bodies.
-	HTTP3ContentType = "application/trevrpc"
+	// http3ContentType is the media type for TrevRPC request and response bodies.
+	http3ContentType = "application/trevrpc"
 )
 
 // http3ConnState is per-connection state shared by every HTTP/3 request on it.
@@ -123,7 +123,7 @@ func (l *Listener) handleHTTP3RPC(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release(streamLimit)
 
-	w.Header().Set("Content-Type", HTTP3ContentType)
+	w.Header().Set("Content-Type", http3ContentType)
 	w.WriteHeader(http.StatusOK)
 	controller := http.NewResponseController(w)
 	if err := controller.Flush(); err != nil {
@@ -137,7 +137,7 @@ func isTrevRPCMediaType(values []string) bool {
 		return false
 	}
 	mediaType, parameters, err := mime.ParseMediaType(values[0])
-	return err == nil && strings.EqualFold(mediaType, HTTP3ContentType) && len(parameters) == 0
+	return err == nil && strings.EqualFold(mediaType, http3ContentType) && len(parameters) == 0
 }
 
 // http3Body exposes the request body and response writer of one HTTP/3 request

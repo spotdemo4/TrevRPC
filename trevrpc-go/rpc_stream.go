@@ -12,7 +12,7 @@ import (
 
 const maxMessageFrameBatch = 16
 
-func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody ByteStream, maxFrameSize int) error {
+func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody byteStream, maxFrameSize int) error {
 	nonBlocking := isNonBlockingStream(requestBody)
 	var batch [maxMessageFrameBatch][]byte
 	for {
@@ -47,7 +47,7 @@ func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody B
 	}
 }
 
-func recvRequestBody(ctx context.Context, requestBody ByteStream) ([]byte, error) {
+func recvRequestBody(ctx context.Context, requestBody byteStream) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
@@ -104,11 +104,11 @@ type transportResponseFramesWriter interface {
 func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	runtime := server.freeze()
 	startedAt := time.Now()
-	request := &RpcRequest{}
+	request := &wireRequest{}
 	if err := readInitialRequestFrame(ctx, runtime.options, startedAt, stream, request); err != nil {
 		status := requestFrameStatus(err)
 		runtime.recordPreHandlerFailure(startedAt, status)
-		_ = WriteFrame(stream, status.IntoResponse(nil), runtime.options.MaxFrameSize)
+		_ = writeFrame(stream, status.intoResponse(nil), runtime.options.MaxFrameSize)
 		abortRPCStream(stream)
 		return
 	}
@@ -121,7 +121,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
 	defer cancelRequest()
 
-	if requestEndsAfterInitialFrame(request.RPCKind()) {
+	if requestEndsAfterInitialFrame(request.rpcKind()) {
 		if err := drainRequestEnd(requestCtx, runtime.options, startedAt, stream); err != nil {
 			status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
 			runtime.recordRequestFailure(startedAt, request, status)
@@ -138,14 +138,14 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 		return
 	}
 
-	if request.RPCKind() == RpcKindUnary {
+	if request.rpcKind() == RpcKindUnary {
 		defer lease.release()
 		response := runtime.handleRequest(requestCtx, request, lease)
 		if ctx.Err() != nil {
 			abortRPCStream(stream)
 			return
 		}
-		if err := WriteFrame(stream, response, runtime.options.MaxFrameSize); err != nil {
+		if err := writeFrame(stream, response, runtime.options.MaxFrameSize); err != nil {
 			abortRPCStream(stream)
 			return
 		}
@@ -154,7 +154,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	}
 
 	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: runtime.options.MaxFrameSize}
-	if request.RPCKind() == RpcKindClientStreaming || request.RPCKind() == RpcKindBidirectionalStreaming {
+	if request.rpcKind() == RpcKindClientStreaming || request.rpcKind() == RpcKindBidirectionalStreaming {
 		if cancellable, ok := stream.(contextCancelReadStream); ok {
 			requestBody.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
 		}
@@ -216,11 +216,11 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 		}
 
 		if err != nil {
-			frame = StatusFrame(runtime.wireStatus(err, ServerDiagnosticInternalError, request))
+			frame = statusFrame(runtime.wireStatus(err, ServerDiagnosticInternalError, request))
 		}
 
-		isStatus := frame.Kind == RpcStreamFrameKindStatus
-		if err := WriteFrame(stream, frame, runtime.options.MaxFrameSize); err != nil {
+		isStatus := frame.Kind == wireFrameStatus
+		if err := writeFrame(stream, frame, runtime.options.MaxFrameSize); err != nil {
 			abortRPCStream(stream)
 			return
 		}
@@ -264,7 +264,7 @@ func isTimeoutError(err error) bool {
 	return errors.As(err, &netError) && netError.Timeout()
 }
 
-func recvResponseFrame(ctx context.Context, response FrameStream) (*RpcStreamFrame, error) {
+func recvResponseFrame(ctx context.Context, response frameStream) (*wireStreamFrame, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -280,7 +280,7 @@ func recvResponseFrame(ctx context.Context, response FrameStream) (*RpcStreamFra
 	}
 
 	type recvResult struct {
-		frame *RpcStreamFrame
+		frame *wireStreamFrame
 		err   error
 	}
 
@@ -324,7 +324,7 @@ type readDeadlineStream interface {
 	SetReadDeadline(time.Time) error
 }
 
-func readInitialRequestFrame(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, request *RpcRequest) error {
+func readInitialRequestFrame(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, request *wireRequest) error {
 	stopCancelRead := cancelReadOnContext(ctx, stream)
 	defer stopCancelRead()
 
@@ -335,7 +335,7 @@ func readInitialRequestFrame(ctx context.Context, options ServerOptions, started
 		}
 	}
 
-	err := ReadFrame(stream, request, options.MaxFrameSize)
+	err := readFrame(stream, request, options.MaxFrameSize)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
@@ -407,15 +407,15 @@ func cancelReadOnContext(ctx context.Context, stream rpcStream) func() {
 }
 
 func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {
-	_ = WriteFrame(stream, status.IntoResponse(nil), maxFrameSize)
+	_ = writeFrame(stream, status.intoResponse(nil), maxFrameSize)
 	abortRPCStream(stream)
 }
 
-func writeRPCStatus(options ServerOptions, stream rpcStream, request *RpcRequest, status *Status) {
-	if request.RPCKind() == RpcKindUnary {
-		_ = WriteFrame(stream, status.IntoResponse(nil), options.MaxFrameSize)
+func writeRPCStatus(options ServerOptions, stream rpcStream, request *wireRequest, status *Status) {
+	if request.rpcKind() == RpcKindUnary {
+		_ = writeFrame(stream, status.intoResponse(nil), options.MaxFrameSize)
 	} else {
-		_ = WriteFrame(stream, StatusFrame(status), options.MaxFrameSize)
+		_ = writeFrame(stream, statusFrame(status), options.MaxFrameSize)
 	}
 	abortRPCStream(stream)
 }
@@ -462,7 +462,7 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	if frame.kind == RpcStreamFrameKindStatus {
+	if frame.kind == wireFrameStatus {
 		s.done = true
 		status := frame.statusValue()
 		if status.IsOK() {
@@ -490,7 +490,7 @@ func transportStatus(err error) error {
 		return status
 	}
 
-	var frameDecode *FrameDecodeError
+	var frameDecode *frameDecodeError
 	if errors.As(err, &frameDecode) {
 		return InvalidArgument(frameDecode.Error())
 	}

@@ -31,7 +31,6 @@ func TestResolveClientDeadline(t *testing.T) {
 		{name: "context only", ctx: contextDeadline(7 * time.Second), wantSet: true, wantOffset: 7 * time.Second, wantNanos: uint64(7 * time.Second)},
 		{name: "option earlier", ctx: contextDeadline(7 * time.Second), options: []CallOption{WithTimeout(5 * time.Second)}, wantSet: true, wantOffset: 5 * time.Second, wantNanos: uint64(5 * time.Second)},
 		{name: "context earlier", ctx: contextDeadline(3 * time.Second), options: []CallOption{WithTimeout(5 * time.Second)}, wantSet: true, wantOffset: 3 * time.Second, wantNanos: uint64(3 * time.Second)},
-		{name: "without timeout preserves context", ctx: contextDeadline(4 * time.Second), options: []CallOption{WithTimeout(time.Second), WithoutTimeout()}, wantSet: true, wantOffset: 4 * time.Second, wantNanos: uint64(4 * time.Second)},
 		{name: "zero option", ctx: context.Background(), options: []CallOption{WithTimeout(0)}, wantSet: true, wantOffset: 0, wantNanos: 1},
 		{name: "expired context", ctx: contextDeadline(-time.Second), wantSet: true, wantOffset: -time.Second, wantNanos: 1},
 		{name: "negative option", ctx: context.Background(), options: []CallOption{WithTimeout(-time.Nanosecond)}, wantCode: CodeInvalidArgument},
@@ -63,7 +62,7 @@ func TestResolveClientDeadline(t *testing.T) {
 }
 
 func TestClientEntryPointsTransmitEffectiveDeadline(t *testing.T) {
-	responseBody, err := MarshalMessage(&testMessage{Value: "response"})
+	responseBody, err := marshalMessage(&testMessage{Value: "response"})
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
@@ -73,40 +72,29 @@ func TestClientEntryPointsTransmitEffectiveDeadline(t *testing.T) {
 		call func(context.Context, Transport, ...CallOption) error
 	}{
 		{name: "unary", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			_, err := UnaryResponse(ctx, transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
+			_, err := Unary(ctx, transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
 			return err
 		}},
 		{name: "server streaming", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			stream, err := ServerStreamingResponse(ctx, transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
+			stream, err := ServerStreaming(ctx, transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
 			if err != nil {
 				return err
 			}
 			return stream.Close()
 		}},
 		{name: "client streaming", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			call, err := ClientStreamingResponse[*testMessage, *testMessage](ctx, transport, "service", "method", func() *testMessage { return &testMessage{} }, options...)
+			call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, "service", "method", func() *testMessage { return &testMessage{} }, options...)
 			if err != nil {
 				return err
 			}
 			return call.Close()
-		}},
-		{name: "client streaming from stream", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			_, err := ClientStreamingFromStreamResponse(ctx, transport, "service", "method", EmptyStream[*testMessage](), func() *testMessage { return &testMessage{} }, options...)
-			return err
 		}},
 		{name: "bidirectional", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			call, err := BidirectionalStreamingResponse[*testMessage, *testMessage](ctx, transport, "service", "method", func() *testMessage { return &testMessage{} }, options...)
+			call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "service", "method", func() *testMessage { return &testMessage{} }, options...)
 			if err != nil {
 				return err
 			}
 			return call.Close()
-		}},
-		{name: "bidirectional from stream", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			stream, err := BidirectionalStreamingFromStreamResponse(ctx, transport, "service", "method", EmptyStream[*testMessage](), func() *testMessage { return &testMessage{} }, options...)
-			if err != nil {
-				return err
-			}
-			return stream.Close()
 		}},
 	}
 
@@ -118,7 +106,7 @@ func TestClientEntryPointsTransmitEffectiveDeadline(t *testing.T) {
 	}{
 		{name: "option earlier", parentTimeout: 5 * time.Second, options: []CallOption{WithTimeout(2 * time.Second)}, maxTimeout: 2 * time.Second},
 		{name: "context earlier", parentTimeout: 2 * time.Second, options: []CallOption{WithTimeout(5 * time.Second)}, maxTimeout: 2 * time.Second},
-		{name: "without explicit timeout", parentTimeout: 2 * time.Second, options: []CallOption{WithTimeout(time.Second), WithoutTimeout()}, maxTimeout: 2 * time.Second},
+		{name: "without explicit timeout", parentTimeout: 2 * time.Second, maxTimeout: 2 * time.Second},
 	}
 
 	for _, test := range tests {
@@ -152,20 +140,18 @@ func TestClientEntryPointsTransmitEffectiveDeadline(t *testing.T) {
 	}
 }
 
-func TestWithoutTimeoutPreservesParentCancellation(t *testing.T) {
+func TestParentCancellationWithoutTimeoutOption(t *testing.T) {
 	transport := &contextWaitingClientTransport{entered: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := UnaryResponse(
+		_, err := Unary(
 			ctx,
 			transport,
 			"service",
 			"method",
 			&testMessage{},
 			func() *testMessage { return &testMessage{} },
-			WithTimeout(time.Hour),
-			WithoutTimeout(),
 		)
 		done <- err
 	}()
@@ -181,46 +167,40 @@ func TestWithoutTimeoutPreservesParentCancellation(t *testing.T) {
 }
 
 func TestClientMetadataOptionsOwnSnapshots(t *testing.T) {
-	responseBody, err := MarshalMessage(&testMessage{Value: "response"})
+	responseBody, err := marshalMessage(&testMessage{Value: "response"})
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
 
-	mapValue := []byte("map-original")
-	singleValue := []byte("single-original")
-	source := Metadata{"first": mapValue}
-	options := []CallOption{WithMetadataMap(source), WithMetadata("Second", singleValue)}
+	firstValue := []byte("first-original")
+	secondValue := []byte("second-original")
+	options := []CallOption{WithMetadata("First", firstValue), WithMetadata("Second", secondValue)}
 
-	mapValue[0] = 'X'
-	singleValue[0] = 'Y'
-	source["first"] = []byte("map-replaced")
-	source["third"] = []byte("unexpected")
+	firstValue[0] = 'X'
+	secondValue[0] = 'Y'
 
 	transport := &mutatingClientTransport{responseBody: responseBody}
 	for range 2 {
-		if _, err := UnaryResponse(context.Background(), transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...); err != nil {
+		if _, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...); err != nil {
 			t.Fatalf("unary call failed: %v", err)
 		}
 	}
 
 	for index, metadata := range transport.snapshots {
-		if got := string(metadata["first"]); got != "map-original" {
-			t.Fatalf("call %d first metadata = %q, want map-original", index, got)
+		if got := string(metadata["first"]); got != "first-original" {
+			t.Fatalf("call %d first metadata = %q, want first-original", index, got)
 		}
-		if got := string(metadata["second"]); got != "single-original" {
-			t.Fatalf("call %d second metadata = %q, want single-original", index, got)
-		}
-		if _, ok := metadata["third"]; ok {
-			t.Fatalf("call %d unexpectedly included later map mutation", index)
+		if got := string(metadata["second"]); got != "second-original" {
+			t.Fatalf("call %d second metadata = %q, want second-original", index, got)
 		}
 	}
-	if got := string(source["first"]); got != "map-replaced" {
+	if got := string(firstValue); got != "Xirst-original" {
 		t.Fatalf("transport mutation changed caller metadata: %q", got)
 	}
 }
 
 func TestPrepareClientRequestClonesCustomOptionMetadataForAsyncUse(t *testing.T) {
-	responseBody, err := MarshalMessage(&testMessage{Value: "response"})
+	responseBody, err := marshalMessage(&testMessage{Value: "response"})
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
@@ -230,14 +210,14 @@ func TestPrepareClientRequestClonesCustomOptionMetadataForAsyncUse(t *testing.T)
 	transport := newReadingClientTransport(responseBody)
 	done := make(chan error, 1)
 	go func() {
-		_, err := UnaryResponse(
+		_, err := Unary(
 			context.Background(),
 			transport,
 			"service",
 			"method",
 			&testMessage{},
 			func() *testMessage { return &testMessage{} },
-			func(options *CallOptions) { options.Metadata = metadata },
+			func(config *callConfig) { config.metadata = metadata },
 		)
 		done <- err
 	}()
@@ -252,8 +232,58 @@ func TestPrepareClientRequestClonesCustomOptionMetadataForAsyncUse(t *testing.T)
 	}
 }
 
-func TestClientStreamingResponseMetadata(t *testing.T) {
-	responseBody, err := MarshalMessage(&testMessage{Value: "response"})
+func TestResponseMetadataIsCapturedForUnaryAndClientStreaming(t *testing.T) {
+	responseBody, err := marshalMessage(&testMessage{Value: "response"})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	transport := &capturingClientTransport{
+		responseBody: responseBody,
+		metadata:     Metadata{"result": []byte("ok")},
+	}
+	newMessage := func() *testMessage { return &testMessage{} }
+
+	var unaryMetadata Metadata
+	unary, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, newMessage, CaptureResponseMetadata(&unaryMetadata))
+	if err != nil {
+		t.Fatalf("unary call: %v", err)
+	}
+	if unary.Value != "response" || string(unaryMetadata["result"]) != "ok" {
+		t.Fatalf("unexpected unary response %#v with metadata %#v", unary, unaryMetadata)
+	}
+
+	var streamMetadata Metadata
+	call, err := ClientStreaming[*testMessage, *testMessage](context.Background(), transport, "service", "method", newMessage, CaptureResponseMetadata(&streamMetadata))
+	if err != nil {
+		t.Fatalf("start client stream: %v", err)
+	}
+	if streamMetadata != nil {
+		t.Fatalf("metadata captured before the response arrived: %#v", streamMetadata)
+	}
+	response, err := call.CloseAndRecv()
+	if err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+	if response.Value != "response" || string(streamMetadata["result"]) != "ok" {
+		t.Fatalf("unexpected client-streaming response %#v with metadata %#v", response, streamMetadata)
+	}
+}
+
+func TestResponseMetadataIsNotCapturedOnFailure(t *testing.T) {
+	transport := &capturingClientTransport{status: Unavailable("down"), metadata: Metadata{"result": []byte("ok")}}
+	captured := Metadata{"sentinel": []byte("kept")}
+	_, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, CaptureResponseMetadata(&captured))
+	status := StatusFromError(err)
+	if status.Code != CodeUnavailable || string(status.Metadata["result"]) != "ok" {
+		t.Fatalf("failure status = %#v, want Unavailable carrying the response metadata", status)
+	}
+	if string(captured["sentinel"]) != "kept" || len(captured) != 1 {
+		t.Fatalf("failed call overwrote captured metadata: %#v", captured)
+	}
+}
+
+func TestBidirectionalStreamingExposesTerminalMetadata(t *testing.T) {
+	responseBody, err := marshalMessage(&testMessage{Value: "response"})
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
@@ -262,21 +292,12 @@ func TestClientStreamingResponseMetadata(t *testing.T) {
 		metadata:     Metadata{"result": []byte("ok")},
 	}
 
-	call, err := ClientStreamingResponse[*testMessage, *testMessage](context.Background(), transport, "service", "method", func() *testMessage { return &testMessage{} })
-	if err != nil {
-		t.Fatalf("start client stream: %v", err)
-	}
-	response, err := call.CloseAndRecvResponse()
-	if err != nil {
-		t.Fatalf("CloseAndRecvResponse: %v", err)
-	}
-	if response.Message.Value != "response" || string(response.Metadata["result"]) != "ok" {
-		t.Fatalf("unexpected response envelope: %#v", response)
-	}
-
-	bidi, err := BidirectionalStreamingFromStreamResponse(context.Background(), transport, "service", "method", EmptyStream[*testMessage](), func() *testMessage { return &testMessage{} })
+	bidi, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), transport, "service", "method", func() *testMessage { return &testMessage{} })
 	if err != nil {
 		t.Fatalf("start bidi stream: %v", err)
+	}
+	if _, ok := bidi.TerminalStatus(); ok {
+		t.Fatal("terminal status reported before the stream ended")
 	}
 	if _, err := bidi.Recv(); err != nil {
 		t.Fatalf("receive bidi message: %v", err)
@@ -293,50 +314,50 @@ func TestClientStreamingResponseMetadata(t *testing.T) {
 func TestResponseMessageStreamClassifiesMalformedReadAfterTerminalAsTrailing(t *testing.T) {
 	stream := newResponseMessageStream[*testMessage](
 		&errorAfterFramesStream{
-			frames:   []*RpcStreamFrame{StatusFrame(OK())},
-			finalErr: &FrameDecodeError{Err: errors.New("malformed trailing frame")},
+			frames:   []*wireStreamFrame{statusFrame(OK())},
+			finalErr: &frameDecodeError{Err: errors.New("malformed trailing frame")},
 		},
 		func() *testMessage { return &testMessage{} },
-		DefaultCallOptions(),
+		defaultCallConfig(),
 		context.Background(),
 		func() {},
 	)
 
 	_, err := stream.Recv()
-	if reason, ok := ResponseStreamFailureReason(err); !ok || reason != "trailing_frame" {
+	if reason, ok := responseStreamFailureReason(err); !ok || reason != "trailing_frame" {
 		t.Fatalf("Recv() reason = %q, %t, want trailing_frame: %v", reason, ok, err)
 	}
 }
 
 func TestClientStreamingResponseDrainsBeforeCardinality(t *testing.T) {
-	body, err := MarshalMessage(&testMessage{Value: "response"})
+	body, err := marshalMessage(&testMessage{Value: "response"})
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
 
 	tests := []struct {
 		name     string
-		frames   []*RpcStreamFrame
+		frames   []*wireStreamFrame
 		finalErr error
 		reason   string
 		code     Code
 	}{
 		{
 			name:   "remote status",
-			frames: []*RpcStreamFrame{MessageFrame(body), MessageFrame(body), StatusFrame(Unavailable("down"))},
+			frames: []*wireStreamFrame{messageFrame(body), messageFrame(body), statusFrame(Unavailable("down"))},
 			reason: "remote_status",
 			code:   CodeUnavailable,
 		},
 		{
 			name:   "missing terminal",
-			frames: []*RpcStreamFrame{MessageFrame(body), MessageFrame(body)},
+			frames: []*wireStreamFrame{messageFrame(body), messageFrame(body)},
 			reason: "missing_terminal_status",
 			code:   CodeInternal,
 		},
 		{
 			name:     "malformed trailing read",
-			frames:   []*RpcStreamFrame{MessageFrame(body), MessageFrame(body), StatusFrame(OK())},
-			finalErr: &FrameDecodeError{Err: errors.New("malformed trailing frame")},
+			frames:   []*wireStreamFrame{messageFrame(body), messageFrame(body), statusFrame(OK())},
+			finalErr: &frameDecodeError{Err: errors.New("malformed trailing frame")},
 			reason:   "trailing_frame",
 			code:     CodeInternal,
 		},
@@ -347,13 +368,13 @@ func TestClientStreamingResponseDrainsBeforeCardinality(t *testing.T) {
 			responses := newResponseMessageStream[*testMessage](
 				&errorAfterFramesStream{frames: test.frames, finalErr: test.finalErr},
 				func() *testMessage { return &testMessage{} },
-				DefaultCallOptions(),
+				defaultCallConfig(),
 				context.Background(),
 				func() {},
 			)
 
-			_, err := readUnaryResponseFromResponseStream[*testMessage](responses)
-			if reason, ok := ResponseStreamFailureReason(err); !ok || reason != test.reason {
+			_, _, err := readSingleResponse[*testMessage](responses)
+			if reason, ok := responseStreamFailureReason(err); !ok || reason != test.reason {
 				t.Fatalf("failure reason = %q, %t, want %q: %v", reason, ok, test.reason, err)
 			}
 			if code := StatusFromError(err).Code; code != test.code {
@@ -365,9 +386,9 @@ func TestClientStreamingResponseDrainsBeforeCardinality(t *testing.T) {
 
 func TestResponseMessageStreamTerminalStatusReturnsOwnedSnapshots(t *testing.T) {
 	stream := newResponseMessageStream[*testMessage](
-		&countingFrameStream{frames: []*RpcStreamFrame{StatusFrameWithMetadata(OK(), Metadata{"result": []byte("original")})}},
+		&countingFrameStream{frames: []*wireStreamFrame{statusFrameWithMetadata(OK(), Metadata{"result": []byte("original")})}},
 		func() *testMessage { return &testMessage{} },
-		DefaultCallOptions(),
+		defaultCallConfig(),
 		context.Background(),
 		func() {},
 	)
@@ -394,17 +415,17 @@ func TestResponseMessageStreamTerminalStatusReturnsOwnedSnapshots(t *testing.T) 
 }
 
 func TestResponseMessageStreamContainsFactoryPanicAndFinishes(t *testing.T) {
-	body, err := MarshalMessage(&testMessage{Value: "response"})
+	body, err := marshalMessage(&testMessage{Value: "response"})
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
 
-	inner := &countingFrameStream{frames: []*RpcStreamFrame{MessageFrame(body)}}
+	inner := &countingFrameStream{frames: []*wireStreamFrame{messageFrame(body)}}
 	cancels := 0
 	stream := newResponseMessageStream[*testMessage](
 		inner,
 		func() *testMessage { panic("caller-controlled panic detail") },
-		DefaultCallOptions(),
+		defaultCallConfig(),
 		context.Background(),
 		func() { cancels++ },
 	)
@@ -434,7 +455,7 @@ func TestResponseMessageStreamContainsFactoryPanicAndFinishes(t *testing.T) {
 
 func TestResponseMessageStreamCloseMayRaceBlockedRecv(t *testing.T) {
 	inner := &blockingFrameStream{entered: make(chan struct{}), closed: make(chan struct{})}
-	stream := newResponseMessageStream[*testMessage](inner, func() *testMessage { return &testMessage{} }, DefaultCallOptions(), context.Background(), func() {})
+	stream := newResponseMessageStream[*testMessage](inner, func() *testMessage { return &testMessage{} }, defaultCallConfig(), context.Background(), func() {})
 
 	recvDone := make(chan error, 1)
 	go func() {
@@ -479,23 +500,28 @@ func (c deadlineTestContext) Deadline() (time.Time, bool) { return c.deadline, t
 
 type capturingClientTransport struct {
 	mu           sync.Mutex
-	request      *RpcRequest
+	request      *wireRequest
 	callDeadline time.Time
 	responseBody []byte
 	metadata     Metadata
+	status       *Status // unary status; OK when nil
 }
 
-func (t *capturingClientTransport) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *capturingClientTransport) call(ctx context.Context, request *wireRequest) (*wireResponse, error) {
 	t.capture(ctx, request)
-	return OK().IntoResponseWithMetadata(t.responseBody, t.metadata), nil
+	status := t.status
+	if status == nil {
+		status = OK()
+	}
+	return status.intoResponseWithMetadata(t.responseBody, t.metadata), nil
 }
 
-func (t *capturingClientTransport) StreamingCall(ctx context.Context, request *RpcRequest, _ ByteStream) (FrameStream, error) {
+func (t *capturingClientTransport) streamingCall(ctx context.Context, request *wireRequest, _ byteStream) (frameStream, error) {
 	t.capture(ctx, request)
-	return FromSlice(MessageFrame(t.responseBody), StatusFrameWithMetadata(OK(), t.metadata)), nil
+	return newSliceStream(messageFrame(t.responseBody), statusFrameWithMetadata(OK(), t.metadata)), nil
 }
 
-func (t *capturingClientTransport) capture(ctx context.Context, request *RpcRequest) {
+func (t *capturingClientTransport) capture(ctx context.Context, request *wireRequest) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	copy := *request
@@ -504,7 +530,7 @@ func (t *capturingClientTransport) capture(ctx context.Context, request *RpcRequ
 	t.callDeadline, _ = ctx.Deadline()
 }
 
-func (t *capturingClientTransport) snapshot() (*RpcRequest, time.Time) {
+func (t *capturingClientTransport) snapshot() (*wireRequest, time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.request, t.callDeadline
@@ -515,14 +541,14 @@ type contextWaitingClientTransport struct {
 	timeoutNanos uint64
 }
 
-func (t *contextWaitingClientTransport) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *contextWaitingClientTransport) call(ctx context.Context, request *wireRequest) (*wireResponse, error) {
 	t.timeoutNanos = request.TimeoutNanos
 	close(t.entered)
 	<-ctx.Done()
 	return nil, statusFromContextError(ctx.Err())
 }
 
-func (t *contextWaitingClientTransport) StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error) {
+func (t *contextWaitingClientTransport) streamingCall(context.Context, *wireRequest, byteStream) (frameStream, error) {
 	return nil, errors.New("unexpected streaming call")
 }
 
@@ -531,7 +557,7 @@ type mutatingClientTransport struct {
 	snapshots    []Metadata
 }
 
-func (t *mutatingClientTransport) Call(_ context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *mutatingClientTransport) call(_ context.Context, request *wireRequest) (*wireResponse, error) {
 	t.snapshots = append(t.snapshots, cloneMetadata(request.Metadata))
 	for key, value := range request.Metadata {
 		if len(value) > 0 {
@@ -540,10 +566,10 @@ func (t *mutatingClientTransport) Call(_ context.Context, request *RpcRequest) (
 		delete(request.Metadata, key)
 	}
 	request.Metadata["transport"] = []byte("mutation")
-	return OK().IntoResponse(t.responseBody), nil
+	return OK().intoResponse(t.responseBody), nil
 }
 
-func (t *mutatingClientTransport) StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error) {
+func (t *mutatingClientTransport) streamingCall(context.Context, *wireRequest, byteStream) (frameStream, error) {
 	return nil, errors.New("unexpected streaming call")
 }
 
@@ -557,12 +583,12 @@ func newReadingClientTransport(responseBody []byte) *readingClientTransport {
 	return &readingClientTransport{responseBody: responseBody, entered: make(chan struct{}), release: make(chan struct{})}
 }
 
-func (t *readingClientTransport) Call(_ context.Context, request *RpcRequest) (*RpcResponse, error) {
+func (t *readingClientTransport) call(_ context.Context, request *wireRequest) (*wireResponse, error) {
 	close(t.entered)
 	for {
 		select {
 		case <-t.release:
-			return OK().IntoResponse(t.responseBody), nil
+			return OK().intoResponse(t.responseBody), nil
 		default:
 			value := request.Metadata["custom"]
 			if len(value) > 0 {
@@ -572,19 +598,19 @@ func (t *readingClientTransport) Call(_ context.Context, request *RpcRequest) (*
 	}
 }
 
-func (t *readingClientTransport) StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error) {
+func (t *readingClientTransport) streamingCall(context.Context, *wireRequest, byteStream) (frameStream, error) {
 	return nil, errors.New("unexpected streaming call")
 }
 
 type errorAfterFramesStream struct {
-	frames   []*RpcStreamFrame
+	frames   []*wireStreamFrame
 	finalErr error
 	closed   bool
 }
 
 func (s *errorAfterFramesStream) trevrpcNonBlockingStream() bool { return true }
 
-func (s *errorAfterFramesStream) Recv() (*RpcStreamFrame, error) {
+func (s *errorAfterFramesStream) Recv() (*wireStreamFrame, error) {
 	if s.closed {
 		return nil, io.EOF
 	}
@@ -607,11 +633,11 @@ func (s *errorAfterFramesStream) Close() error {
 }
 
 type countingFrameStream struct {
-	frames []*RpcStreamFrame
+	frames []*wireStreamFrame
 	closed int
 }
 
-func (s *countingFrameStream) Recv() (*RpcStreamFrame, error) {
+func (s *countingFrameStream) Recv() (*wireStreamFrame, error) {
 	if len(s.frames) == 0 {
 		return nil, io.EOF
 	}
@@ -633,7 +659,7 @@ type blockingFrameStream struct {
 	closed    chan struct{}
 }
 
-func (s *blockingFrameStream) Recv() (*RpcStreamFrame, error) {
+func (s *blockingFrameStream) Recv() (*wireStreamFrame, error) {
 	s.enterOnce.Do(func() { close(s.entered) })
 	<-s.closed
 	return nil, io.EOF

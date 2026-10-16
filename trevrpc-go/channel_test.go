@@ -24,7 +24,7 @@ func TestChannelDoesNotReplayAndRecoversFutureCalls(t *testing.T) {
 
 	callDone := make(chan error, 1)
 	go func() {
-		_, err := client.Call(context.Background(), &RpcRequest{})
+		_, err := client.call(context.Background(), &wireRequest{})
 		callDone <- err
 	}()
 	waitChannelSignal(t, initial.callStarted, "initial call did not start")
@@ -44,7 +44,7 @@ func TestChannelDoesNotReplayAndRecoversFutureCalls(t *testing.T) {
 		t.Fatalf("recovered generation calls = %d, want no replay", calls)
 	}
 
-	response, err := client.Call(context.Background(), &RpcRequest{})
+	response, err := client.call(context.Background(), &wireRequest{})
 	if err != nil {
 		t.Fatalf("future call: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestChannelCallsFailFastWhileReconnecting(t *testing.T) {
 		t.Fatalf("reconnecting snapshot = %+v, want reconnecting generation 1", snapshot)
 	}
 
-	if _, err := client.Call(context.Background(), &RpcRequest{}); StatusFromError(err).Code != CodeUnavailable {
+	if _, err := client.call(context.Background(), &wireRequest{}); StatusFromError(err).Code != CodeUnavailable {
 		t.Fatalf("call while reconnecting = %v, want unavailable", err)
 	}
 	if calls := initial.calls.Load(); calls != 0 {
@@ -87,7 +87,7 @@ func TestChannelCallsFailFastWhileReconnecting(t *testing.T) {
 	if err := client.WaitUntilReady(context.Background()); err != nil {
 		t.Fatalf("wait after reconnect: %v", err)
 	}
-	if _, err := client.Call(context.Background(), &RpcRequest{}); err != nil {
+	if _, err := client.call(context.Background(), &wireRequest{}); err != nil {
 		t.Fatalf("call after reconnect: %v", err)
 	}
 }
@@ -269,14 +269,14 @@ func newFakeChannelGeneration(blockCalls bool, message string) *fakeChannelGener
 	return &fakeChannelGeneration{done: make(chan struct{}), callStarted: make(chan struct{}, 1), blockCalls: blockCalls, message: message}
 }
 
-func (g *fakeChannelGeneration) Call(ctx context.Context, _ *RpcRequest) (*RpcResponse, error) {
+func (g *fakeChannelGeneration) call(ctx context.Context, _ *wireRequest) (*wireResponse, error) {
 	g.calls.Add(1)
 	select {
 	case g.callStarted <- struct{}{}:
 	default:
 	}
 	if !g.blockCalls {
-		return &RpcResponse{Message: g.message}, nil
+		return &wireResponse{Message: g.message}, nil
 	}
 	select {
 	case <-g.done:
@@ -286,7 +286,7 @@ func (g *fakeChannelGeneration) Call(ctx context.Context, _ *RpcRequest) (*RpcRe
 	}
 }
 
-func (g *fakeChannelGeneration) StreamingCall(context.Context, *RpcRequest, ByteStream) (FrameStream, error) {
+func (g *fakeChannelGeneration) streamingCall(context.Context, *wireRequest, byteStream) (frameStream, error) {
 	g.calls.Add(1)
 	return nil, Unavailable("fake streaming call unavailable")
 }

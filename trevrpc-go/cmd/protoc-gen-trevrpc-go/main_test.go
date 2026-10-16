@@ -35,17 +35,24 @@ func TestGenerateAllRPCShapes(t *testing.T) {
 		"BidiHello(context.Context",
 		"func NewGreeterClient",
 		"func (c *GreeterClient) mergedCallOptions",
-		"func (c *GreeterClient) LotsOfGreetingsResponse",
-		"func (c *GreeterClient) LotsOfGreetingsFromStreamResponse",
-		"func (c *GreeterClient) BidiHelloResponse",
-		"func (c *GreeterClient) BidiHelloFromStreamResponse",
-		"RegisterUnaryResponse[*HelloRequest, *HelloReply]",
-		"RegisterClientStreamingResponse[*HelloRequest, *HelloReply]",
-		"RegisterServerStreamingResponse[*HelloRequest, *HelloReply]",
-		"RegisterBidirectionalStreamingResponse[*HelloRequest, *HelloReply]",
+		"func (c *GreeterClient) SayHello(",
+		"func (c *GreeterClient) LotsOfReplies(",
+		"func (c *GreeterClient) LotsOfGreetings(",
+		"func (c *GreeterClient) BidiHello(",
+		"RegisterUnary[*HelloRequest, *HelloReply]",
+		"RegisterClientStreaming[*HelloRequest, *HelloReply]",
+		"RegisterServerStreaming[*HelloRequest, *HelloReply]",
+		"RegisterBidirectionalStreaming[*HelloRequest, *HelloReply]",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("generated content missing %q:\n%s", want, content)
+		}
+	}
+	// Each RPC has exactly one client method; there are no metadata or
+	// request-stream variants.
+	for _, unwanted := range []string{"Response(ctx", "FromStream", "ResponseCall"} {
+		if strings.Contains(content, unwanted) {
+			t.Fatalf("generated content contains duplicate-shape variant %q:\n%s", unwanted, content)
 		}
 	}
 	if strings.Contains(content, "func mergeTrevrpcCallOptions") {
@@ -85,93 +92,196 @@ func (*HelloReply) ProtoMessage() {}
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"io"
+	"math/big"
+	"net"
 	"testing"
+	"time"
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 )
 
-type directTransport struct{ server *trevrpc.Server }
-func (t directTransport) Call(ctx context.Context, request *trevrpc.RpcRequest) (*trevrpc.RpcResponse, error) {
-	return t.server.HandleRequest(ctx, request), nil
-}
-func (t directTransport) StreamingCall(ctx context.Context, request *trevrpc.RpcRequest, body trevrpc.ByteStream) (trevrpc.FrameStream, error) {
-	return t.server.HandleStreamingRequest(ctx, request, body), nil
-}
-
 type service struct{}
 
-type terminalResponseStream struct {
-	*trevrpc.MessagePipe[*HelloReply]
-	status *trevrpc.Status
+// replyThenStatus answers one request with one reply and ends with status.
+type replyThenStatus struct {
+	requests trevrpc.MessageStream[*HelloRequest]
+	answered bool
+	status   *trevrpc.Status
 }
-func (s *terminalResponseStream) TerminalStatus() (*trevrpc.Status, bool) { return s.status, true }
+
+func (s *replyThenStatus) Recv() (*HelloReply, error) {
+	if s.answered {
+		return nil, io.EOF
+	}
+	if _, err := s.requests.Recv(); err != nil {
+		return nil, err
+	}
+	s.answered = true
+	return &HelloReply{Value: "bidi"}, nil
+}
+func (s *replyThenStatus) Close() error                             { return s.requests.Close() }
+func (s *replyThenStatus) TerminalStatus() (*trevrpc.Status, bool) { return s.status, true }
+
+// oneReply yields a single reply.
+type oneReply struct{ sent bool }
+
+func (s *oneReply) Recv() (*HelloReply, error) {
+	if s.sent {
+		return nil, io.EOF
+	}
+	s.sent = true
+	return &HelloReply{Value: "server-stream"}, nil
+}
+func (*oneReply) Close() error { return nil }
 
 func (service) SayHello(context.Context, *HelloRequest) (*trevrpc.Response[*HelloReply], error) {
-	return trevrpc.NewResponse(&HelloReply{Value: "unary"}, trevrpc.WithResponseMetadata[*HelloReply]("result", []byte("unary-meta"))), nil
+	return &trevrpc.Response[*HelloReply]{Message: &HelloReply{Value: "unary"}, Metadata: trevrpc.Metadata{"result": []byte("unary-meta")}}, nil
 }
-func (service) LotsOfReplies(ctx context.Context, _ *HelloRequest) (trevrpc.ResponseStream[*HelloReply], error) {
-	responses := trevrpc.NewMessagePipe[*HelloReply](ctx)
-	go func() {
-		_ = responses.Send(&HelloReply{Value: "server-stream"})
-		_ = responses.Close()
-	}()
-	return trevrpc.WithResponseStreamMetadata(responses, trevrpc.Metadata{"result": []byte("server-meta")}), nil
+func (service) LotsOfReplies(context.Context, *HelloRequest) (trevrpc.MessageStream[*HelloReply], error) {
+	return trevrpc.NewResponseStream[*HelloReply](&oneReply{}, trevrpc.Metadata{"result": []byte("server-meta")}), nil
 }
 func (service) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*HelloRequest]) (*trevrpc.Response[*HelloReply], error) {
-	for {
-		_, err := requests.Recv()
-		if err == io.EOF { break }
-		if err != nil { return nil, err }
+	for _, err := range trevrpc.Messages(requests) {
+		if err != nil {
+			return nil, err
+		}
 	}
-	return trevrpc.NewResponse(&HelloReply{Value: "client-stream"}, trevrpc.WithResponseMetadata[*HelloReply]("result", []byte("client-meta"))), nil
+	return &trevrpc.Response[*HelloReply]{Message: &HelloReply{Value: "client-stream"}, Metadata: trevrpc.Metadata{"result": []byte("client-meta")}}, nil
 }
-func (service) BidiHello(ctx context.Context, _ trevrpc.MessageStream[*HelloRequest]) (trevrpc.ResponseStream[*HelloReply], error) {
-	responses := trevrpc.NewMessagePipe[*HelloReply](ctx)
-	go func() {
-		_ = responses.Send(&HelloReply{Value: "bidi"})
-		_ = responses.Close()
-	}()
-	return &terminalResponseStream{
-		MessagePipe: responses,
-		status: trevrpc.FailedPrecondition("terminal").WithMetadata(trevrpc.Metadata{"result": []byte("bidi-meta")}),
+func (service) BidiHello(_ context.Context, requests trevrpc.MessageStream[*HelloRequest]) (trevrpc.MessageStream[*HelloReply], error) {
+	return &replyThenStatus{
+		requests: requests,
+		status:   trevrpc.FailedPrecondition("terminal").WithMetadata(trevrpc.Metadata{"result": []byte("bidi-meta")}),
 	}, nil
 }
 
-func TestGeneratedMetadataAdapters(t *testing.T) {
+// dialLoopback serves implementation over native QUIC on a loopback port and
+// returns a connected channel.
+func dialLoopback(t *testing.T, implementation GreeterServer) *trevrpc.Channel {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+
 	server := trevrpc.NewServer()
-	RegisterGreeterServer(server, service{})
-	client := NewGreeterClient(directTransport{server: server})
-	ctx := context.Background()
+	RegisterGreeterServer(server, implementation)
+	listener, err := trevrpc.Listen("127.0.0.1:0", server, trevrpc.ListenOptions{
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = listener.Serve(ctx) }()
 
-	unary, err := client.SayHelloResponse(ctx, &HelloRequest{})
-	if err != nil || unary.Message.Value != "unary" || string(unary.Metadata["result"]) != "unary-meta" {
-		t.Fatalf("unary response = %#v, %v", unary, err)
+	channel, err := trevrpc.Dial(ctx, listener.Addr().String(), trevrpc.DialOptions{TLSConfig: &tls.Config{RootCAs: roots, ServerName: "localhost"}})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = channel.Close()
+		cancel()
+		<-done
+		_ = listener.Close()
+	})
+	return channel
+}
+
+func TestGeneratedClientAndServerRoundTripMetadata(t *testing.T) {
+	client := NewGreeterClient(dialLoopback(t, service{}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var unaryMetadata trevrpc.Metadata
+	unary, err := client.SayHello(ctx, &HelloRequest{}, trevrpc.CaptureResponseMetadata(&unaryMetadata))
+	if err != nil || unary.Value != "unary" || string(unaryMetadata["result"]) != "unary-meta" {
+		t.Fatalf("unary response = %#v, metadata %#v, %v", unary, unaryMetadata, err)
 	}
 
-	clientStreaming, err := client.LotsOfGreetingsFromStreamResponse(ctx, trevrpc.FromSlice(&HelloRequest{}))
-	if err != nil || clientStreaming.Message.Value != "client-stream" || string(clientStreaming.Metadata["result"]) != "client-meta" {
-		t.Fatalf("client-streaming response = %#v, %v", clientStreaming, err)
+	var clientMetadata trevrpc.Metadata
+	upload, err := client.LotsOfGreetings(ctx, trevrpc.CaptureResponseMetadata(&clientMetadata))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upload.Send(&HelloRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	clientStreaming, err := upload.CloseAndRecv()
+	if err != nil || clientStreaming.Value != "client-stream" || string(clientMetadata["result"]) != "client-meta" {
+		t.Fatalf("client-streaming response = %#v, metadata %#v, %v", clientStreaming, clientMetadata, err)
 	}
 
-	serverStreaming, err := client.LotsOfRepliesResponse(ctx, &HelloRequest{})
-	if err != nil { t.Fatal(err) }
-	if _, err := serverStreaming.Recv(); err != nil { t.Fatal(err) }
-	if _, err := serverStreaming.Recv(); err != io.EOF { t.Fatalf("server stream terminal err = %v", err) }
+	serverStreaming, err := client.LotsOfReplies(ctx, &HelloRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverStreaming.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := serverStreaming.Recv(); err != io.EOF {
+		t.Fatalf("server stream terminal err = %v", err)
+	}
 	serverStatus, ok := serverStreaming.TerminalStatus()
-	if !ok || string(serverStatus.Metadata["result"]) != "server-meta" { t.Fatalf("server status = %#v, %v", serverStatus, ok) }
+	if !ok || string(serverStatus.Metadata["result"]) != "server-meta" {
+		t.Fatalf("server status = %#v, %v", serverStatus, ok)
+	}
 
-	bidi, err := client.BidiHelloFromStreamResponse(ctx, trevrpc.FromSlice(&HelloRequest{}))
-	if err != nil { t.Fatal(err) }
-	if _, err := bidi.Recv(); err != nil { t.Fatal(err) }
-	if _, err := bidi.Recv(); trevrpc.StatusFromError(err).Code != trevrpc.CodeFailedPrecondition { t.Fatalf("bidi terminal err = %v", err) }
+	bidi, err := client.BidiHello(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bidi.Send(&HelloRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bidi.CloseSend(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bidi.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bidi.Recv(); trevrpc.StatusFromError(err).Code != trevrpc.CodeFailedPrecondition {
+		t.Fatalf("bidi terminal err = %v", err)
+	}
 	bidiStatus, ok := bidi.TerminalStatus()
-	if !ok || bidiStatus.Code != trevrpc.CodeFailedPrecondition || bidiStatus.Message != "terminal" || string(bidiStatus.Metadata["result"]) != "bidi-meta" { t.Fatalf("bidi status = %#v, %v", bidiStatus, ok) }
+	if !ok || bidiStatus.Code != trevrpc.CodeFailedPrecondition || bidiStatus.Message != "terminal" || string(bidiStatus.Metadata["result"]) != "bidi-meta" {
+		t.Fatalf("bidi status = %#v, %v", bidiStatus, ok)
+	}
 
+	// Every RPC has exactly one client method.
+	var _ func(context.Context, *HelloRequest, ...trevrpc.CallOption) (*HelloReply, error) = client.SayHello
+	var _ func(context.Context, *HelloRequest, ...trevrpc.CallOption) (trevrpc.ResponseStream[*HelloReply], error) = client.LotsOfReplies
 	var _ func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*HelloRequest, *HelloReply], error) = client.LotsOfGreetings
-	var _ func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingResponseCall[*HelloRequest, *HelloReply], error) = client.LotsOfGreetingsResponse
 	var _ func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*HelloRequest, *HelloReply], error) = client.BidiHello
-	var _ func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingResponseCall[*HelloRequest, *HelloReply], error) = client.BidiHelloResponse
 }
 `)
 	runFixtureTests(t, runtimeRoot, relativeRoot)
@@ -255,17 +365,6 @@ func TestGeneratorRejectsInvalidInputs(t *testing.T) {
 		response := generate(request)
 		if !strings.Contains(response.GetError(), "unable to determine Go import path") {
 			t.Fatalf("unexpected error: %q", response.GetError())
-		}
-	})
-
-	t.Run("convenience method collision", func(t *testing.T) {
-		request := greeterRequest("")
-		request.ProtoFile[0].Service[0].Method = append(request.ProtoFile[0].Service[0].Method, &descriptor.MethodDescriptorProto{
-			Name: new("SayHelloResponse"), InputType: new(".hello.v1.HelloRequest"), OutputType: new(".hello.v1.HelloReply"),
-		})
-		response := generate(request)
-		if !strings.Contains(response.GetError(), "SayHello and SayHelloResponse") || !strings.Contains(response.GetError(), "SayHelloResponse") {
-			t.Fatalf("unexpected collision error: %q", response.GetError())
 		}
 	})
 
