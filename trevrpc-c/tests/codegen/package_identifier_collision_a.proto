@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package foo.bar;
-
-message Empty {}
-
-service Service {
-  rpc Call(Empty) returns (Empty);
-}

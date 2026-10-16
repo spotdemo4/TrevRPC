@@ -1,2 +1,0 @@
-trevrpc_transport_msquic_create_rpc_private
-trevrpc_transport_msquic_provider_descriptor_create_v1

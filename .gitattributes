@@ -6,12 +6,7 @@
 *.bash text eol=lf
 
 # Explicit text attrs for common sources (ensures LF even if auto misdetects).
-*.c text eol=lf
-*.cc text eol=lf
-*.cpp text eol=lf
 *.go text eol=lf
-*.h text eol=lf
-*.hpp text eol=lf
 *.js text eol=lf
 *.json text eol=lf
 *.kts text eol=lf
@@ -27,7 +22,6 @@
 *.yml text eol=lf
 
 # Binary files - no EOL conversion, no textual diff.
-*.a binary
 *.bin binary
 *.bmp binary
 *.bz2 binary
@@ -42,7 +36,6 @@
 *.jar binary linguist-vendored=true
 *.jpeg binary
 *.jpg binary
-*.o binary
 *.otf binary
 *.pdf binary
 *.png binary
@@ -65,11 +58,3 @@ package-lock.json linguist-generated=true
 
 # Generated protobuf / codegen - matches treefmt excludes; keeps PR diffs readable.
 *.pb.go linguist-generated=true
-trevrpc-js/src/node-generated.* linguist-generated=true
-trevrpc-kotlin/examples/generated/** linguist-generated=true linguist-vendored=true
-trevrpc-c/tests/golden/** linguist-generated=true
-
-# Vendored third-party patches: blank context lines carry a single space that
-# upstream generated; git whitespace checks must not flag the patch file itself.
-nix/patches/*.patch -whitespace
-trevrpc-c/provider/msquic/provenance/*.patch -whitespace

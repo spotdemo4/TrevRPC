@@ -14,23 +14,10 @@ includes = ["*.go"]
 command = "nixfmt"
 includes = ["*.nix"]
 
-[formatter.clang-format]
-command = "clang-format"
-options = ["-i"]
-includes = ["*.c", "*.cc", "*.cpp", "*.h", "*.hpp"]
-excludes = [
-  "trevrpc-c/tests/golden/**",
-  # cgo wrapper translation units carry exact //go:build directives checked by
-  # their source manifests; clang-format rewrites those directives.
-  "trevrpc-c/internal/cabi/**",
-  "trevrpc-c/provider/msquic/internal/cabi/**",
-]
-
 [formatter.ktlint]
 command = "ktlint"
 options = ["--format"]
 includes = ["*.kt", "*.kts"]
-excludes = ["trevrpc-kotlin/examples/generated/**"]
 
 [formatter.ruff]
 command = "ruff"

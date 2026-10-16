@@ -8,6 +8,9 @@
 .codex/
 .cache/
 
+# crash dumps
+core.*
+
 # nix
 /build/
 /result*
@@ -16,7 +19,6 @@
 # rust
 /target/
 /trevrpc-rust/target/
-/bench/target/
 
 # go
 /trevrpc-go/bin/
@@ -31,15 +33,6 @@ node_modules/
 /trevrpc-kotlin/build/
 /trevrpc-kotlin/**/build/
 /trevrpc-kotlin/**/target/
-
-# c
-core.*
-/trevrpc-c/build/
-/trevrpc-c/build-asan/
-/trevrpc-c/build-tsan/
-
-# cpp
-/trevrpc-cpp/build/
 
 # python
 /.venv

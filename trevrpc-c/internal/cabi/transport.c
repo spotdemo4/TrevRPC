@@ -1,3 +1,0 @@
-//go:build cgo && (linux || darwin)
-
-#include "../../src/trevrpc_transport.c"

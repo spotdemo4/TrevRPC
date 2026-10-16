@@ -1,2 +1,0 @@
-trevrpc_rpc_event_take_receive
-trevrpc_rpc_object_release

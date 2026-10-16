@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package trevrpc.cpp.test.common;
-
-option optimize_for = LITE_RUNTIME;
-
-message ImportedReply {
-  optional string message = 1;
-}

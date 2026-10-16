@@ -1,7 +1,0 @@
-syntax = "proto3";
-
-package trevrpc.cpp.test.full;
-
-message FullMessage {
-  string value = 1;
-}

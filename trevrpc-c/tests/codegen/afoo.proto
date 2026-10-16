@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package file_prefix;
-
-message EmptyB {}
-
-service ServiceB {
-  rpc Call(EmptyB) returns (EmptyB);
-}
