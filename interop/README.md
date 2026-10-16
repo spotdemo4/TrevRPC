@@ -12,7 +12,7 @@ over the transport that client speaks:
 | Kotlin (Cronet, Android) | HTTP/3       | Go, Rust                    |
 | JavaScript (Safari)      | WebTransport | Go, Rust (expected to fail) |
 
-`run.sh` drives the desktop matrix, which `nix flake check` runs on Linux for
+`run.sh` (packaged with its tools as `nix run .#trevrpc-interop`) drives the desktop matrix, which `nix flake check` runs on Linux for
 Chromium and Firefox. CI runs the Android client on an emulator because it needs
 KVM, and runs Safari on macOS. Safari's WebTransport profile does not yet
 interoperate with either server, so that lane is expected to fail; it lives in

@@ -32,6 +32,7 @@
         interopProto = ./interop/proto;
         packageSet = {
           trevrpc-go = pkgs.callPackage ./trevrpc-go { inherit wireGolden interopProto; };
+          trevrpc-interop = pkgs.callPackage ./interop/runner.nix { };
           trevrpc-js = pkgs.callPackage ./trevrpc-js { inherit wireGolden interopProto; };
           trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
             inherit wireGolden interopProto;
@@ -243,7 +244,14 @@
           js = packageSet.trevrpc-js;
           kotlin = packageSet.trevrpc-kotlin;
           rust = packageSet.trevrpc-rust;
-          interop = pkgs.callPackage ./interop { inherit (packageSet) trevrpc-go trevrpc-js trevrpc-rust; };
+          interop = pkgs.callPackage ./interop {
+            inherit (packageSet)
+              trevrpc-go
+              trevrpc-interop
+              trevrpc-js
+              trevrpc-rust
+              ;
+          };
           ${if packageSet.trevrpc-kotlin.interopAndroid != null then "kotlin-interop-android" else null} =
             packageSet.trevrpc-kotlin.interopAndroid;
 
@@ -492,7 +500,8 @@
             '';
           };
 
-          renovate = {
+          # The config is platform-independent, and renovate is often a slow uncached build on Darwin.
+          ${if pkgs.stdenv.hostPlatform.isLinux then "renovate" else null} = {
             root = ./.forgejo;
             files = ./.forgejo/renovate.json;
             packages = with pkgs; [

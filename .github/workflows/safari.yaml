@@ -44,11 +44,8 @@ jobs:
           nix shell \
             .#trevrpc-js \
             ".#trevrpc-$SERVER" \
-            nixpkgs#bash \
-            nixpkgs#coreutils \
-            nixpkgs#jq \
-            nixpkgs#openssl \
-            --command ./interop/run.sh \
+            .#trevrpc-interop \
+            --command trevrpc-interop \
               --out "$OUTPUT" \
               --server "$SERVER=trevrpc-interop-$SERVER" \
               --browser webkit

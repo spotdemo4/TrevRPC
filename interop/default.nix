@@ -2,10 +2,8 @@
   lib,
   stdenv,
   runCommand,
-  coreutils,
-  jq,
-  openssl,
   trevrpc-go,
+  trevrpc-interop,
   trevrpc-js,
   trevrpc-rust,
 }:
@@ -27,17 +25,12 @@ let
     browser = browsers;
   };
 in
-runCommand "trevrpc-interop"
+runCommand "trevrpc-interop-check"
   {
-    nativeBuildInputs = [
-      coreutils
-      jq
-      openssl
-    ]
-    ++ lib.optional (browsers != [ ]) trevrpc-js;
+    nativeBuildInputs = [ trevrpc-interop ] ++ lib.optional (browsers != [ ]) trevrpc-js;
     __darwinAllowLocalNetworking = true;
   }
   ''
     export HOME=$TMPDIR
-    bash ${./run.sh} --out "$out" ${args}
+    trevrpc-interop --out "$out" ${args}
   ''
