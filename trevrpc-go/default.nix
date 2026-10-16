@@ -26,7 +26,7 @@ buildGoModule (final: {
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-081X+epiMADg+iTcUesNRPNs14gS8pwR+hKdHnwND6E=";
+  vendorHash = "sha256-+vboYsh6morKhTflTxYIAHVkeUUJwV8hlv4+I6TmF0s=";
   proxyVendor = true;
 
   subPackages = [
