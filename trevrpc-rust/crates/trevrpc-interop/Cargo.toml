@@ -1,8 +1,10 @@
 [package]
-name = "trevrpc-bench-peer"
+name = "trevrpc-interop"
 version = "0.1.11"
 edition = "2024"
 rust-version = "1.95.0"
+description = "Cross-runtime interop executable for TrevRPC"
+license = "MIT"
 publish = false
 
 [lints.clippy]
@@ -10,12 +12,14 @@ pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 module_name_repetitions = "allow"
 
+[[bin]]
+name = "trevrpc-interop-rust"
+path = "src/main.rs"
+
 [dependencies]
 futures-util = "0.3"
 prost = "0.14.4"
-quinn = "0.11.11"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+quinn = "0.11.8"
 tokio = { version = "1.48.0", features = [
   "io-std",
   "io-util",
@@ -26,14 +30,7 @@ tokio = { version = "1.48.0", features = [
   "sync",
   "time",
 ] }
-tokio-stream = { version = "0.1.17", features = ["net"] }
-trevrpc = { path = "../..", default-features = false, features = [
-  "client",
-  "server",
-  "quinn",
-  "webtransport-client",
-  "webtransport-server",
-] }
+trevrpc = { path = "../.." }
 
 [build-dependencies]
 prost = "0.14.4"
@@ -44,9 +41,3 @@ protox = "0.9.1"
 
 [dev-dependencies]
 rcgen = "0.14"
-url = "2"
-web-transport-quinn = { version = "0.12.0", default-features = false, features = ["ring"] }
-
-[[bin]]
-name = "trevrpc-bench-peer-rust"
-path = "src/main.rs"

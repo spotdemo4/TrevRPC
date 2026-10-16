@@ -1,52 +1,35 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
-#[cfg(feature = "client")]
+//! `TrevRPC`: protobuf RPC over QUIC.
+//!
+//! Clients speak native QUIC through [`client::Channel`]. A [`server::Server`] serves native QUIC
+//! (ALPN [`ALPN`]), ordinary HTTP/3 (`POST /trevrpc`), and `WebTransport` (`/trevrpc`) from one
+//! Quinn endpoint, dispatching on the negotiated ALPN.
+
 extern crate self as trevrpc;
 
-#[cfg(feature = "client")]
-mod client_transport;
-#[cfg(feature = "client")]
-mod client_upload;
+pub mod client;
 pub mod error;
-#[cfg(feature = "quinn")]
-pub(crate) mod framed;
+mod framed;
 pub mod framing;
-#[cfg(all(feature = "server", any(feature = "quinn", feature = "native-c")))]
+mod http3;
+mod native;
+mod quic;
 mod request_pump;
 pub mod response;
-#[cfg(feature = "client")]
 mod response_state;
-#[cfg(all(feature = "server", any(feature = "quinn", feature = "native-c")))]
+mod serve;
+pub mod server;
 mod server_transport;
 pub mod status;
 pub mod stream;
 pub mod wire;
 
+/// ALPN protocol identifier for native `TrevRPC` over QUIC.
 pub const ALPN: &[u8] = b"trevrpc/1";
-#[cfg(feature = "http3")]
+/// ALPN protocol identifier for HTTP/3 and `WebTransport`.
 pub const HTTP3_ALPN: &[u8] = b"h3";
-
-#[cfg(feature = "client")]
-pub mod client;
-
-#[cfg(any(feature = "quinn", feature = "native-c"))]
-pub mod advanced;
-
-#[cfg(feature = "quinn")]
-pub mod quinn;
-
-#[cfg(feature = "native-c")]
-pub mod native;
-
-#[cfg(feature = "http3")]
-pub mod http3;
-
-#[cfg(feature = "server")]
-pub mod server;
-
-#[cfg(feature = "webtransport-client")]
-pub mod webtransport;
 
 pub use async_trait::async_trait;
 pub use error::{Error, Result};

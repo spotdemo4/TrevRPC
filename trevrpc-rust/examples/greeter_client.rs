@@ -1,10 +1,8 @@
 use std::error::Error;
 use std::net::{Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use quinn::crypto::rustls::QuicClientConfig;
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
 
@@ -101,19 +99,12 @@ fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync
     let mut roots = quinn::rustls::RootCertStore::empty();
     roots.add(cert_der)?;
 
-    let mut client_crypto = quinn::rustls::ClientConfig::builder()
+    let client_crypto = quinn::rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
 
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
-    let mut client_config =
-        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
-    trevrpc::quinn::configure_client_config(
-        &mut client_config,
-        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
-        trevrpc::quinn::TransportMode::Native,
-    );
+    let client_config = trevrpc::client::ChannelConfig::new().quic_config(client_crypto)?;
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)

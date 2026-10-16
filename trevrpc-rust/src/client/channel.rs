@@ -1,6 +1,3 @@
-#[cfg(any(feature = "quinn", feature = "webtransport-client"))]
-use std::future::pending;
-#[cfg(feature = "quinn")]
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,20 +5,12 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
-#[cfg(feature = "quinn")]
-use crate::advanced::RawQuinnTransport;
-#[cfg(feature = "webtransport-client")]
-use crate::advanced::RawWebTransport;
-use crate::client::{RpcTransport, StreamingRpcTransport};
-#[cfg(feature = "native-c")]
-use crate::native::{RawNativeTransport, validate_native_frame_capacity};
+use super::{QuicTransport, RpcTransport, StreamingRpcTransport};
 use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
-#[cfg(feature = "native-c")]
-use trevrpc_native::{EndpointConfig, NativeTransport};
 
 const EVENT_CAPACITY: usize = 32;
-#[cfg(feature = "quinn")]
 const CLOSE_REASON: &[u8] = b"channel closed";
+
 static NEXT_BACKOFF_SEED: AtomicU64 = AtomicU64::new(0x6a09_e667_f3bc_c909);
 
 /// Supplies the delay before a channel makes a reconnect attempt.
@@ -136,12 +125,33 @@ impl ChannelConfig {
         self
     }
 
-    pub(crate) fn with_reconnect_backoff_advanced(
-        mut self,
-        reconnect_backoff: impl ReconnectBackoff,
-    ) -> Self {
+    /// Replaces the bounded exponential reconnect backoff.
+    #[must_use]
+    pub fn with_reconnect_backoff(mut self, reconnect_backoff: impl ReconnectBackoff) -> Self {
         self.reconnect_backoff = Arc::new(reconnect_backoff);
         self
+    }
+}
+
+impl ChannelConfig {
+    /// Builds the Quinn client configuration for an endpoint used by a [`Channel`].
+    ///
+    /// The configuration advertises [`crate::ALPN`] and sizes the QUIC stream windows for this
+    /// configuration's maximum frame size. Native clients never accept peer-initiated streams, so
+    /// those limits are zero.
+    pub fn quic_config(&self, mut tls: quinn::rustls::ClientConfig) -> Result<quinn::ClientConfig> {
+        tls.alpn_protocols = vec![crate::ALPN.to_vec()];
+        let crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(Error::transport)?;
+        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut transport = quinn::TransportConfig::default();
+        let window = crate::quic::frame_receive_window(self.max_frame_size);
+        transport.stream_receive_window(crate::quic::varint(window));
+        transport.receive_window(crate::quic::varint(window));
+        transport.max_concurrent_bidi_streams(0_u8.into());
+        transport.max_concurrent_uni_streams(0_u8.into());
+        config.transport_config(Arc::new(transport));
+        Ok(config)
     }
 }
 
@@ -203,47 +213,32 @@ pub enum ChannelEvent {
     Closed { generation: u64 },
 }
 
-/// A reconnecting `TrevRPC` application channel for generated clients.
+/// A reconnecting native QUIC channel for generated clients.
 ///
-/// Each RPC snapshots exactly one established connection generation and is delegated once to the
-/// raw transport. RPCs are never retried or replayed. Calls started before connection loss receive
-/// the transport's normal stream or connection error, while calls made during reconnection fail
-/// immediately with `Unavailable`.
+/// Each RPC snapshots exactly one established connection generation. RPCs are never retried or
+/// replayed. Calls started before connection loss receive the stream or connection error, while
+/// calls made during reconnection fail immediately with `Unavailable`.
 ///
-/// Quinn-backed channels retain one endpoint for every redial, preserving the rustls TLS
-/// session-resumption cache. Native C channels retain one native transport across generations.
-/// All transports await a complete connection handshake before becoming ready, and native QUIC
-/// never calls `Connecting::into_0rtt`.
+/// The channel retains one Quinn endpoint for every redial, preserving the rustls TLS
+/// session-resumption cache. It always awaits a complete handshake before becoming ready and never
+/// calls `Connecting::into_0rtt`.
 #[derive(Clone)]
 pub struct Channel {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    #[cfg(feature = "quinn")]
-    backend: Backend,
+    dialer: Dialer,
     shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
-enum Backend {
-    #[cfg(feature = "quinn")]
-    Quinn {
-        endpoint: quinn::Endpoint,
-        remote_addr: SocketAddr,
-        server_name: String,
-    },
-    #[cfg(feature = "native-c")]
-    Native {
-        transport: NativeTransport,
-        endpoint: EndpointConfig,
-    },
-    #[cfg(feature = "webtransport-client")]
-    WebTransport {
-        client: Arc<web_transport_quinn::Client>,
-        request: Arc<web_transport_quinn::proto::ConnectRequest>,
-    },
+struct Dialer {
+    endpoint: quinn::Endpoint,
+    remote_addr: SocketAddr,
+    server_name: String,
+    max_frame_size: usize,
 }
 
 struct Shared {
@@ -254,34 +249,15 @@ struct Shared {
 
 struct Slot {
     state: ChannelState,
-    transport: Option<Transport>,
-}
-
-#[derive(Clone)]
-enum Transport {
-    #[cfg(feature = "quinn")]
-    Quinn(RawQuinnTransport),
-    #[cfg(feature = "native-c")]
-    Native(RawNativeTransport),
-    #[cfg(feature = "webtransport-client")]
-    WebTransport(RawWebTransport),
-}
-
-enum Connection {
-    #[cfg(feature = "quinn")]
-    Quinn(quinn::Connection),
-    #[cfg(feature = "native-c")]
-    Native(trevrpc_native::Connection),
-    #[cfg(feature = "webtransport-client")]
-    WebTransport(RawWebTransport),
+    transport: Option<QuicTransport>,
 }
 
 impl Channel {
     /// Establishes an initial native QUIC connection and starts its reconnect supervisor.
     ///
-    /// The returned future covers the complete initial handshake and may be bounded or cancelled
-    /// with the caller's normal future, task, or request-context deadline semantics.
-    #[cfg(feature = "quinn")]
+    /// Build the endpoint's client configuration with [`ChannelConfig::quic_config`]. The returned
+    /// future covers the complete initial handshake and may be bounded or cancelled with the
+    /// caller's normal future, task, or request-context deadline semantics.
     pub async fn connect(
         endpoint: quinn::Endpoint,
         remote_addr: SocketAddr,
@@ -291,107 +267,19 @@ impl Channel {
     }
 
     /// Establishes an initial native QUIC connection with explicit channel configuration.
-    #[cfg(feature = "quinn")]
     pub async fn connect_with_config(
         endpoint: quinn::Endpoint,
         remote_addr: SocketAddr,
         server_name: impl Into<String>,
         config: ChannelConfig,
     ) -> Result<Self> {
-        Self::connect_backend(
-            Backend::Quinn {
-                endpoint,
-                remote_addr,
-                server_name: server_name.into(),
-            },
-            config,
-        )
-        .await
-    }
-
-    /// Establishes a channel over an existing native C transport.
-    ///
-    /// The native transport is retained and reused for every reconnect generation. The endpoint
-    /// configuration is cloned for each dial, and the initial dial waits for its complete
-    /// handshake before the channel becomes ready.
-    #[cfg(feature = "native-c")]
-    pub async fn connect_native(
-        transport: NativeTransport,
-        endpoint: EndpointConfig,
-    ) -> Result<Self> {
-        Self::connect_native_with_config(transport, endpoint, ChannelConfig::new()).await
-    }
-
-    /// Establishes a native C transport channel with explicit channel configuration.
-    #[cfg(feature = "native-c")]
-    pub async fn connect_native_with_config(
-        transport: NativeTransport,
-        mut endpoint: EndpointConfig,
-        config: ChannelConfig,
-    ) -> Result<Self> {
-        validate_native_frame_capacity(config.max_frame_size, transport.max_receive_owned_bytes())?;
-        endpoint.max_frame_size = u64::try_from(config.max_frame_size).unwrap_or(u64::MAX);
-        Self::connect_backend(
-            Backend::Native {
-                transport,
-                endpoint,
-            },
-            config,
-        )
-        .await
-    }
-
-    /// Establishes a WebTransport channel at the conventional `/trevrpc` path.
-    ///
-    /// `origin` must be an HTTPS origin such as `https://example.com:443`; any supplied path,
-    /// query, or fragment is discarded. Use the advanced constructor for custom CONNECT requests.
-    #[cfg(feature = "webtransport-client")]
-    pub async fn connect_webtransport(
-        client: web_transport_quinn::Client,
-        origin: &str,
-    ) -> Result<Self> {
-        Self::connect_webtransport_with_config(client, origin, ChannelConfig::new()).await
-    }
-
-    /// Establishes a WebTransport channel with explicit channel configuration.
-    #[cfg(feature = "webtransport-client")]
-    pub async fn connect_webtransport_with_config(
-        client: web_transport_quinn::Client,
-        origin: &str,
-        config: ChannelConfig,
-    ) -> Result<Self> {
-        let mut url = origin.parse::<url::Url>().map_err(Error::transport)?;
-        if url.scheme() != "https" || url.host().is_none() {
-            return Err(Error::transport(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "WebTransport origin must be an absolute HTTPS URL",
-            )));
-        }
-        url.set_path("/trevrpc");
-        url.set_query(None);
-        url.set_fragment(None);
-        let request = web_transport_quinn::proto::ConnectRequest::new(url);
-        Self::connect_webtransport_request(client, request, config).await
-    }
-
-    #[cfg(feature = "webtransport-client")]
-    pub(crate) async fn connect_webtransport_request(
-        client: web_transport_quinn::Client,
-        request: web_transport_quinn::proto::ConnectRequest,
-        config: ChannelConfig,
-    ) -> Result<Self> {
-        Self::connect_backend(
-            Backend::WebTransport {
-                client: Arc::new(client),
-                request: Arc::new(request),
-            },
-            config,
-        )
-        .await
-    }
-
-    async fn connect_backend(backend: Backend, config: ChannelConfig) -> Result<Self> {
-        let (transport, connection) = backend.connect(config.max_frame_size).await?;
+        let dialer = Dialer {
+            endpoint,
+            remote_addr,
+            server_name: server_name.into(),
+            max_frame_size: config.max_frame_size,
+        };
+        let connection = dialer.dial().await?;
         let initial_state = ChannelState {
             phase: ChannelPhase::Ready,
             generation: 1,
@@ -402,7 +290,10 @@ impl Channel {
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot {
                 state: initial_state,
-                transport: Some(transport),
+                transport: Some(
+                    QuicTransport::new(connection.clone())
+                        .with_max_frame_size(config.max_frame_size),
+                ),
             }),
             state_tx,
             event_tx,
@@ -410,7 +301,7 @@ impl Channel {
         let (shutdown, shutdown_rx) = watch::channel(false);
 
         tokio::spawn(supervise(
-            backend.clone(),
+            dialer.clone(),
             config,
             Arc::clone(&shared),
             shutdown_rx,
@@ -419,8 +310,7 @@ impl Channel {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                #[cfg(feature = "quinn")]
-                backend,
+                dialer,
                 shared,
                 shutdown,
             }),
@@ -479,28 +369,32 @@ impl Channel {
         if closed {
             let _ = self.inner.shutdown.send(true);
             if let Some(connection) = connection {
-                connection.close();
+                connection.close(0_u32.into(), CLOSE_REASON);
             }
         }
     }
 
-    fn snapshot(&self) -> Result<Transport> {
+    /// Returns the remote address this channel dials.
+    #[must_use]
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.inner.dialer.remote_addr
+    }
+
+    /// Returns the local address of the channel's Quinn endpoint.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.dialer.endpoint.local_addr()
+    }
+
+    /// Switches the UDP socket used by the channel's Quinn endpoint, for example after a network
+    /// change.
+    ///
+    /// Rebinding is endpoint-wide and does not itself change the channel generation.
+    pub fn rebind(&self, socket: UdpSocket) -> std::io::Result<()> {
+        self.inner.dialer.endpoint.rebind(socket)
+    }
+
+    fn snapshot(&self) -> Result<QuicTransport> {
         self.inner.shared.snapshot()
-    }
-
-    #[cfg(feature = "quinn")]
-    pub(crate) fn advanced_quinn_remote_addr(&self) -> Option<SocketAddr> {
-        self.inner.backend.quinn_remote_addr()
-    }
-
-    #[cfg(feature = "quinn")]
-    pub(crate) fn advanced_quinn_local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
-        self.inner.backend.quinn_local_addr()
-    }
-
-    #[cfg(feature = "quinn")]
-    pub(crate) fn advanced_rebind_quinn(&self, socket: UdpSocket) -> std::io::Result<()> {
-        self.inner.backend.rebind_quinn(socket)
     }
 }
 
@@ -522,35 +416,13 @@ impl StreamingRpcTransport for Channel {
     }
 }
 
-#[crate::async_trait]
-impl RpcTransport for Transport {
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn(transport) => transport.call(request).await,
-            #[cfg(feature = "native-c")]
-            Self::Native(transport) => transport.call(request).await,
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport(transport) => transport.call(request).await,
-        }
-    }
-}
-
-#[crate::async_trait]
-impl StreamingRpcTransport for Transport {
-    async fn streaming_call(
-        &self,
-        request: RpcRequest,
-        request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>> {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn(transport) => transport.streaming_call(request, request_body).await,
-            #[cfg(feature = "native-c")]
-            Self::Native(transport) => transport.streaming_call(request, request_body).await,
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport(transport) => transport.streaming_call(request, request_body).await,
-        }
+impl Dialer {
+    async fn dial(&self) -> Result<quinn::Connection> {
+        self.endpoint
+            .connect(self.remote_addr, &self.server_name)
+            .map_err(Error::transport)?
+            .await
+            .map_err(Error::transport)
     }
 }
 
@@ -559,7 +431,7 @@ impl Shared {
         self.slot.lock().expect("channel lock poisoned").state
     }
 
-    fn snapshot(&self) -> Result<Transport> {
+    fn snapshot(&self) -> Result<QuicTransport> {
         let slot = self.slot.lock().expect("channel lock poisoned");
         match slot.state.phase {
             ChannelPhase::Ready => slot
@@ -611,7 +483,7 @@ impl Shared {
         });
     }
 
-    fn install(&self, previous_generation: u64, transport: Transport) -> Option<u64> {
+    fn install(&self, previous_generation: u64, transport: QuicTransport) -> Option<u64> {
         let state = {
             let mut slot = self.slot.lock().expect("channel lock poisoned");
             if !matches!(slot.state.phase, ChannelPhase::Reconnecting)
@@ -634,7 +506,7 @@ impl Shared {
         Some(state.generation)
     }
 
-    fn close(&self) -> (bool, Option<Connection>) {
+    fn close(&self) -> (bool, Option<quinn::Connection>) {
         let (state, connection) = {
             let mut slot = self.slot.lock().expect("channel lock poisoned");
             if matches!(slot.state.phase, ChannelPhase::Closed) {
@@ -643,7 +515,7 @@ impl Shared {
             let connection = slot
                 .transport
                 .take()
-                .map(|transport| transport.connection());
+                .map(|transport| transport.connection().clone());
             slot.state.phase = ChannelPhase::Closed;
             slot.state.reconnect_attempt = None;
             (slot.state, connection)
@@ -657,27 +529,19 @@ impl Shared {
 }
 
 async fn supervise(
-    backend: Backend,
+    dialer: Dialer,
     config: ChannelConfig,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
-    mut connection: Connection,
+    mut connection: quinn::Connection,
 ) {
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => return,
-            () = backend.shutdown_started() => {
-                close_permanently(&shared);
-                return;
-            }
-            () = connection.closed() => {}
+            _ = connection.closed() => {}
         }
 
-        if !backend.is_running() {
-            close_permanently(&shared);
-            return;
-        }
         let Some(generation) = shared.begin_reconnect() else {
             return;
         };
@@ -691,10 +555,6 @@ async fn supervise(
             tokio::select! {
                 biased;
                 _ = shutdown.changed() => return,
-                () = backend.shutdown_started() => {
-                    close_permanently(&shared);
-                    return;
-                }
                 () = tokio::time::sleep(delay) => {}
             }
             let _ = shared.event_tx.send(ChannelEvent::ReconnectAttempt {
@@ -705,199 +565,20 @@ async fn supervise(
             let connected = tokio::select! {
                 biased;
                 _ = shutdown.changed() => return,
-                () = backend.shutdown_started() => {
-                    close_permanently(&shared);
-                    return;
-                }
-                connected = backend.connect(config.max_frame_size) => connected,
+                connected = dialer.dial() => connected,
             };
-            if let Ok((transport, new_connection)) = connected {
+            if let Ok(new_connection) = connected {
+                let transport = QuicTransport::new(new_connection.clone())
+                    .with_max_frame_size(dialer.max_frame_size);
                 if shared.install(generation, transport).is_none() {
-                    new_connection.close();
+                    new_connection.close(0_u32.into(), CLOSE_REASON);
                     return;
                 }
                 connection = new_connection;
                 break;
             }
-            if !backend.is_running() {
-                close_permanently(&shared);
-                return;
-            }
             shared.reconnect_failed(generation, attempt);
             attempt = attempt.saturating_add(1);
-        }
-    }
-}
-
-fn close_permanently(shared: &Shared) {
-    let (closed, connection) = shared.close();
-    if closed && let Some(connection) = connection {
-        connection.close();
-    }
-}
-
-impl Backend {
-    fn is_running(&self) -> bool {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn { .. } => true,
-            #[cfg(feature = "native-c")]
-            Self::Native { transport, .. } => transport.is_running(),
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport { .. } => true,
-        }
-    }
-
-    async fn shutdown_started(&self) {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn { .. } => pending().await,
-            #[cfg(feature = "native-c")]
-            Self::Native { transport, .. } => transport.shutdown_started().await,
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport { .. } => pending().await,
-        }
-    }
-
-    async fn connect(&self, max_frame_size: usize) -> Result<(Transport, Connection)> {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn {
-                endpoint,
-                remote_addr,
-                server_name,
-            } => {
-                let connection = endpoint
-                    .connect(*remote_addr, server_name)
-                    .map_err(Error::transport)?
-                    .await
-                    .map_err(Error::transport)?;
-                let transport =
-                    RawQuinnTransport::new(connection.clone()).with_max_frame_size(max_frame_size);
-                Ok((Transport::Quinn(transport), Connection::Quinn(connection)))
-            }
-            #[cfg(feature = "native-c")]
-            Self::Native {
-                transport,
-                endpoint,
-            } => {
-                let connection = transport
-                    .dial(endpoint.clone())
-                    .await
-                    .map_err(Error::transport)?;
-                let raw = RawNativeTransport::from_connection(
-                    transport.clone(),
-                    connection.clone(),
-                    max_frame_size,
-                );
-                Ok((Transport::Native(raw), Connection::Native(connection)))
-            }
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport { client, request } => {
-                let session = client
-                    .connect(request.as_ref().clone())
-                    .await
-                    .map_err(Error::transport)?;
-                let transport = RawWebTransport::new(session).with_max_frame_size(max_frame_size);
-                Ok((
-                    Transport::WebTransport(transport.clone()),
-                    Connection::WebTransport(transport),
-                ))
-            }
-        }
-    }
-
-    #[cfg(feature = "quinn")]
-    #[cfg_attr(
-        not(any(feature = "native-c", feature = "webtransport-client")),
-        allow(clippy::unnecessary_wraps)
-    )]
-    fn quinn_remote_addr(&self) -> Option<SocketAddr> {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn { remote_addr, .. } => Some(*remote_addr),
-            #[cfg(feature = "native-c")]
-            Self::Native { .. } => None,
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport { .. } => None,
-        }
-    }
-
-    #[cfg(feature = "quinn")]
-    fn quinn_local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn { endpoint, .. } => endpoint.local_addr().map(Some),
-            #[cfg(feature = "native-c")]
-            Self::Native { .. } => Ok(None),
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport { .. } => Ok(None),
-        }
-    }
-
-    #[cfg(feature = "quinn")]
-    fn rebind_quinn(&self, socket: UdpSocket) -> std::io::Result<()> {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn { endpoint, .. } => endpoint.rebind(socket),
-            #[cfg(feature = "native-c")]
-            Self::Native { .. } => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "channel does not use a Quinn endpoint",
-            )),
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport { .. } => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "channel does not use a Quinn endpoint",
-            )),
-        }
-    }
-}
-
-impl Transport {
-    fn connection(&self) -> Connection {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn(transport) => Connection::Quinn(transport.connection().clone()),
-            #[cfg(feature = "native-c")]
-            Self::Native(transport) => Connection::Native(transport.connection()),
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport(transport) => Connection::WebTransport(transport.clone()),
-        }
-    }
-}
-
-impl Connection {
-    async fn closed(&self) {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn(connection) => {
-                connection.closed().await;
-            }
-            #[cfg(feature = "native-c")]
-            Self::Native(connection) => {
-                let _ = connection.closed().await;
-            }
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport(transport) => {
-                transport.session().closed().await;
-            }
-        }
-    }
-
-    fn close(&self) {
-        match self {
-            #[cfg(feature = "quinn")]
-            Self::Quinn(connection) => connection.close(0_u32.into(), CLOSE_REASON),
-            #[cfg(feature = "native-c")]
-            Self::Native(connection) => {
-                let connection = connection.clone();
-                tokio::spawn(async move {
-                    let _ = connection.close(0).await;
-                });
-            }
-            #[cfg(feature = "webtransport-client")]
-            Self::WebTransport(transport) => transport.session().close(0, CLOSE_REASON),
         }
     }
 }

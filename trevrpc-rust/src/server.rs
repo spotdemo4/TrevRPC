@@ -130,7 +130,6 @@ impl CancellationToken {
         })
     }
 
-    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn set_completion_code(&self, code: Code) {
         let mut completion_code = self
             .state
@@ -270,8 +269,6 @@ pub struct WebTransportAdmissionRequest<'a> {
 }
 
 pub type WebTransportAdmission = for<'a> fn(&WebTransportAdmissionRequest<'a>) -> bool;
-
-#[cfg(any(feature = "http3", feature = "native-c"))]
 #[derive(Clone, Copy)]
 pub struct Http3AdmissionRequest<'a> {
     pub request: &'a http::Request<()>,
@@ -281,7 +278,6 @@ pub struct Http3AdmissionRequest<'a> {
     pub headers: &'a [AdmissionHeader<'a>],
 }
 
-#[cfg(any(feature = "http3", feature = "native-c"))]
 pub type Http3Admission = for<'a> fn(&Http3AdmissionRequest<'a>) -> bool;
 
 #[derive(Debug, Clone)]
@@ -295,13 +291,10 @@ pub struct ServerOptions {
     stream_messages: Option<usize>,
     stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
-    #[cfg(any(feature = "http3", feature = "native-c"))]
     http3_enabled: bool,
-    #[cfg(any(feature = "http3", feature = "native-c"))]
     http3_path: String,
-    #[cfg(any(feature = "http3", feature = "native-c"))]
     http3_admission: Option<Http3Admission>,
-    webtransport_path: String,
+    webtransport_enabled: bool,
     webtransport_allowed_authorities: Vec<String>,
     webtransport_allowed_origins: Vec<String>,
     webtransport_admission: Option<WebTransportAdmission>,
@@ -319,13 +312,10 @@ impl Default for ServerOptions {
             stream_messages: Some(4096),
             stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
-            #[cfg(any(feature = "http3", feature = "native-c"))]
             http3_enabled: false,
-            #[cfg(any(feature = "http3", feature = "native-c"))]
             http3_path: "/trevrpc".to_owned(),
-            #[cfg(any(feature = "http3", feature = "native-c"))]
             http3_admission: None,
-            webtransport_path: "/trevrpc".to_owned(),
+            webtransport_enabled: false,
             webtransport_allowed_authorities: Vec::new(),
             webtransport_allowed_origins: Vec::new(),
             webtransport_admission: None,
@@ -394,31 +384,30 @@ impl ServerOptions {
         self.stream_idle_timeout
     }
 
-    /// Returns whether ordinary HTTP/3 POST requests are accepted.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
+    /// Returns whether ordinary HTTP/3 POST requests are accepted. Off by default.
     #[must_use]
     pub const fn http3_enabled(&self) -> bool {
         self.http3_enabled
     }
 
-    /// Returns the HTTP/3 POST path accepted by the server.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
+    /// Returns the path shared by HTTP/3 `POST` RPCs and `WebTransport` sessions, `/trevrpc` by
+    /// default.
     #[must_use]
     pub fn http3_path(&self) -> &str {
         &self.http3_path
     }
 
     /// Returns the HTTP/3 POST admission callback, if configured.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub const fn http3_admission(&self) -> Option<Http3Admission> {
         self.http3_admission
     }
 
-    /// Returns the `WebTransport` request path accepted by the server.
+    /// Returns whether `WebTransport` sessions are accepted. Off by default: every `WebTransport`
+    /// CONNECT is answered with 404.
     #[must_use]
-    pub fn webtransport_path(&self) -> &str {
-        &self.webtransport_path
+    pub const fn webtransport_enabled(&self) -> bool {
+        self.webtransport_enabled
     }
 
     /// Returns the allowed `WebTransport` authorities, or an empty list to allow any authority.
@@ -427,13 +416,16 @@ impl ServerOptions {
         &self.webtransport_allowed_authorities
     }
 
-    /// Returns the allowed `WebTransport` origins, or an empty list to reject origin-bearing requests.
+    /// Returns the allowed `WebTransport` origins. A request that carries an `Origin` header, as
+    /// every browser does, is rejected unless its origin is listed here or an admission callback
+    /// admits it; requests without an `Origin` are not affected.
     #[must_use]
     pub fn webtransport_allowed_origins(&self) -> &[String] {
         &self.webtransport_allowed_origins
     }
 
-    /// Returns the `WebTransport` admission callback, if configured.
+    /// Returns the `WebTransport` admission callback, if configured. When set, it replaces the
+    /// authority and origin allowlists; the shared path is always checked first.
     #[must_use]
     pub const fn webtransport_admission(&self) -> Option<WebTransportAdmission> {
         self.webtransport_admission
@@ -517,16 +509,17 @@ impl ServerOptions {
         self
     }
 
-    /// Enables or disables ordinary HTTP/3 POST requests.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
+    /// Enables or disables ordinary HTTP/3 `POST` RPCs (disabled by default).
+    ///
+    /// The `h3` ALPN is advertised by [`Server::quic_config`] only when HTTP/3 or `WebTransport`
+    /// is enabled.
     #[must_use]
     pub const fn with_http3_enabled(mut self, http3_enabled: bool) -> Self {
         self.http3_enabled = http3_enabled;
         self
     }
 
-    /// Sets the HTTP/3 POST request path accepted by the server.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
+    /// Sets the path shared by HTTP/3 `POST` RPCs and `WebTransport` sessions.
     #[must_use]
     pub fn with_http3_path(mut self, http3_path: impl Into<String>) -> Self {
         self.http3_path = http3_path.into();
@@ -534,17 +527,21 @@ impl ServerOptions {
     }
 
     /// Sets the HTTP/3 POST admission callback.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[must_use]
     pub const fn with_http3_admission(mut self, http3_admission: Option<Http3Admission>) -> Self {
         self.http3_admission = http3_admission;
         self
     }
 
-    /// Sets the `WebTransport` request path accepted by the server.
+    /// Enables or disables `WebTransport` sessions (disabled by default).
+    ///
+    /// Enabled `WebTransport` still applies the shared path, then the authority and origin
+    /// allowlists, or the admission callback when one is set. With no allowlists, requests that
+    /// carry an `Origin` header (every browser) are denied, so browsers need an allowed origin or
+    /// an admission callback.
     #[must_use]
-    pub fn with_webtransport_path(mut self, webtransport_path: impl Into<String>) -> Self {
-        self.webtransport_path = webtransport_path.into();
+    pub const fn with_webtransport_enabled(mut self, webtransport_enabled: bool) -> Self {
+        self.webtransport_enabled = webtransport_enabled;
         self
     }
 
@@ -731,143 +728,6 @@ impl Server {
         self
     }
 
-    /// Sets the maximum `TrevRPC` frame size in bytes.
-    pub fn set_max_frame_size(&mut self, max_frame_size: usize) -> &mut Self {
-        self.options.frame_size = max_frame_size;
-        self
-    }
-
-    /// Sets the maximum number of concurrent transport connections.
-    pub fn set_max_concurrent_connections(
-        &mut self,
-        max_concurrent_connections: Option<usize>,
-    ) -> &mut Self {
-        self.options.connections = max_concurrent_connections;
-        self
-    }
-
-    /// Sets the maximum number of concurrent streams per connection.
-    pub fn set_max_concurrent_streams_per_connection(
-        &mut self,
-        max_concurrent_streams_per_connection: Option<usize>,
-    ) -> &mut Self {
-        self.options.streams_per_connection = max_concurrent_streams_per_connection;
-        self
-    }
-
-    /// Sets the maximum number of concurrent RPC requests.
-    pub fn set_max_concurrent_requests(
-        &mut self,
-        max_concurrent_requests: Option<usize>,
-    ) -> &mut Self {
-        self.options.requests = max_concurrent_requests;
-        self
-    }
-
-    /// Sets the timeout used while draining connections during graceful shutdown.
-    pub fn set_graceful_shutdown_timeout(
-        &mut self,
-        graceful_shutdown_timeout: Option<Duration>,
-    ) -> &mut Self {
-        self.options.shutdown_timeout = graceful_shutdown_timeout;
-        self
-    }
-
-    /// Sets the timeout allowed for receiving the initial request frame.
-    pub fn set_initial_request_timeout(
-        &mut self,
-        initial_request_timeout: Option<Duration>,
-    ) -> &mut Self {
-        self.options.initial_request_timeout = initial_request_timeout;
-        self
-    }
-
-    /// Sets the maximum number of messages allowed on a stream.
-    pub fn set_max_stream_messages(&mut self, max_stream_messages: Option<usize>) -> &mut Self {
-        self.options.stream_messages = max_stream_messages;
-        self
-    }
-
-    /// Sets the maximum total body bytes allowed on a stream.
-    pub fn set_max_stream_body_size(&mut self, max_stream_body_size: Option<usize>) -> &mut Self {
-        self.options.stream_body_size = max_stream_body_size;
-        self
-    }
-
-    /// Sets the maximum idle time allowed while waiting for the next stream message.
-    pub fn set_stream_idle_timeout(&mut self, stream_idle_timeout: Option<Duration>) -> &mut Self {
-        self.options.stream_idle_timeout = stream_idle_timeout;
-        self
-    }
-
-    /// Enables or disables ordinary HTTP/3 POST requests.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
-    pub fn set_http3_enabled(&mut self, http3_enabled: bool) -> &mut Self {
-        self.options.http3_enabled = http3_enabled;
-        self
-    }
-
-    /// Sets the HTTP/3 POST request path accepted by the server.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
-    pub fn set_http3_path(&mut self, http3_path: impl Into<String>) -> &mut Self {
-        self.options.http3_path = http3_path.into();
-        self
-    }
-
-    /// Sets the HTTP/3 POST admission callback.
-    #[cfg(any(feature = "http3", feature = "native-c"))]
-    pub fn set_http3_admission(&mut self, http3_admission: Option<Http3Admission>) -> &mut Self {
-        self.options.http3_admission = http3_admission;
-        self
-    }
-
-    /// Sets the `WebTransport` request path accepted by the server.
-    pub fn set_webtransport_path(&mut self, webtransport_path: impl Into<String>) -> &mut Self {
-        self.options.webtransport_path = webtransport_path.into();
-        self
-    }
-
-    /// Sets the `WebTransport` authorities allowed by the server.
-    pub fn set_webtransport_allowed_authorities<I, S>(
-        &mut self,
-        webtransport_allowed_authorities: I,
-    ) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.options.webtransport_allowed_authorities = webtransport_allowed_authorities
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        self
-    }
-
-    /// Sets the `WebTransport` origins allowed by the server.
-    pub fn set_webtransport_allowed_origins<I, S>(
-        &mut self,
-        webtransport_allowed_origins: I,
-    ) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.options.webtransport_allowed_origins = webtransport_allowed_origins
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        self
-    }
-
-    /// Sets the `WebTransport` admission callback.
-    pub fn set_webtransport_admission(
-        &mut self,
-        webtransport_admission: Option<WebTransportAdmission>,
-    ) -> &mut Self {
-        self.options.webtransport_admission = webtransport_admission;
-        self
-    }
-
     /// Installs an authorizer that runs before route lookup.
     pub fn set_authorizer<A>(&mut self, authorizer: A) -> &mut Self
     where
@@ -1039,7 +899,6 @@ impl Server {
             request_body_len,
         );
 
-        #[cfg(feature = "tracing")]
         tracing::info!(
             service = %request.service,
             method = %request.method,
@@ -1141,7 +1000,6 @@ impl Server {
             request_body_len,
         );
 
-        #[cfg(feature = "tracing")]
         tracing::info!(
             service = %request.service,
             method = %request.method,
@@ -1309,7 +1167,6 @@ impl Server {
             elapsed,
         );
 
-        #[cfg(feature = "tracing")]
         tracing::info!(
             service = %service,
             method = %method,
@@ -1362,7 +1219,6 @@ impl Server {
         status_stream(status)
     }
 
-    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn record_rejected_request(&self, request: &RpcRequest, status: &Status) {
         let started_at = Instant::now();
         record_rpc_started(
@@ -1381,7 +1237,6 @@ impl Server {
         );
     }
 
-    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn record_active_request_failure(&self, request: &RpcRequest, status: &Status) {
         self.finish_streaming_response(
             &request.service,
@@ -1393,7 +1248,6 @@ impl Server {
         );
     }
 
-    #[cfg(any(feature = "quinn", feature = "native-c"))]
     pub(crate) fn record_pre_handler_failure(&self, status: &Status) {
         let started_at = Instant::now();
         record_rpc_started(self.metrics.as_ref(), "", "", 0);
@@ -1850,7 +1704,6 @@ fn finish_streaming_response(
         elapsed,
     );
 
-    #[cfg(feature = "tracing")]
     tracing::info!(
         service = %service,
         method = %method,
@@ -2390,30 +2243,26 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
-        #[cfg(any(feature = "http3", feature = "native-c"))]
         {
             assert!(!options.http3_enabled());
+            assert!(!options.webtransport_enabled());
             assert_eq!(options.http3_path(), "/trevrpc");
             assert!(options.http3_admission().is_none());
         }
     }
 
-    #[cfg(any(feature = "http3", feature = "native-c"))]
     #[test]
     fn options_own_runtime_paths_and_allowlists() {
         let http3_path = String::from("/owned-http3");
-        let webtransport_path = String::from("/owned-webtransport");
         let authority = String::from("rpc.example");
         let origin = String::from("https://app.example");
         let options = ServerOptions::new()
             .with_http3_path(http3_path.clone())
-            .with_webtransport_path(webtransport_path.clone())
             .with_webtransport_allowed_authorities([authority.clone()])
             .with_webtransport_allowed_origins([origin.clone()]);
-        drop((http3_path, webtransport_path, authority, origin));
+        drop((http3_path, authority, origin));
 
         assert_eq!(options.http3_path(), "/owned-http3");
-        assert_eq!(options.webtransport_path(), "/owned-webtransport");
         assert_eq!(options.webtransport_allowed_authorities(), ["rpc.example"]);
         assert_eq!(
             options.webtransport_allowed_origins(),

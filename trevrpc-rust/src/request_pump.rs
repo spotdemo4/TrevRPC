@@ -1,12 +1,19 @@
 use std::future::Future;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::framed::FrameRead;
 use crate::server::{CancellationSource, check_stream_message_body_limits};
 use crate::{BoxStream, Code, Error, Result, RpcStreamFrameKind, Status};
 
 pub(crate) const REQUEST_BODY_CHANNEL_CAPACITY: usize = 1;
+
+/// How long, and how many bytes, the server keeps discarding the request side of a call it has
+/// already answered before giving up and stopping it.
+const DISCARD_TIMEOUT: Duration = Duration::from_secs(1);
+const DISCARD_LIMIT: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RequestInputKind {
@@ -96,7 +103,7 @@ pub(crate) enum RequestTransportEvent {
     ConnectionLost(Status),
 }
 
-pub(crate) trait RequestPumpReader: Send + 'static {
+pub(crate) trait RequestPumpReader: FrameRead + Send + 'static {
     fn stop_trevrpc(&mut self);
 
     fn backpressure_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
@@ -111,25 +118,73 @@ pub(crate) trait RequestPumpReader: Send + 'static {
     fn validate_transport_end(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
+/// Owns the request reader while the pump runs and decides its fate when the pump ends.
 struct PumpReaderGuard<R: RequestPumpReader> {
-    reader: R,
+    reader: Option<R>,
+    /// The reader needs no `STOP_SENDING`: it finished, or the peer or connection ended it.
     settled: bool,
+    /// The call was answered while the request side may still be open.
+    discard: bool,
 }
 
 impl<R: RequestPumpReader> PumpReaderGuard<R> {
     const fn new(reader: R) -> Self {
         Self {
-            reader,
+            reader: Some(reader),
             settled: false,
+            discard: false,
         }
+    }
+
+    fn reader(&mut self) -> &mut R {
+        self.reader
+            .as_mut()
+            .expect("request reader is present until the guard drops")
     }
 }
 
 impl<R: RequestPumpReader> Drop for PumpReaderGuard<R> {
     fn drop(&mut self) {
-        if !self.settled {
-            self.reader.stop_trevrpc();
+        let Some(mut reader) = self.reader.take() else {
+            return;
+        };
+        if self.discard {
+            // Peers such as Firefox tear down the whole stream, unread response included, when
+            // the request side is stopped. Let the request finish on its own, detached from the
+            // handler so it holds no handler resources.
+            tokio::spawn(discard_request(reader));
+        } else if !self.settled {
+            reader.stop_trevrpc();
         }
+    }
+}
+
+/// Discards the rest of an answered call's request until its EOF or reset, stopping it only if
+/// the peer keeps sending for longer than `DISCARD_TIMEOUT` or past `DISCARD_LIMIT` bytes.
+///
+/// The task ends within `DISCARD_TIMEOUT`, and sooner when the connection closes, so it cannot
+/// outlive a shutdown by more than that.
+async fn discard_request<R: RequestPumpReader>(mut reader: R) {
+    let mut buffer = [0_u8; 4096];
+    let finished = tokio::time::timeout(DISCARD_TIMEOUT, async {
+        let mut discarded = 0_usize;
+        loop {
+            match reader.read_frame_bytes(&mut buffer).await {
+                Ok(Some(read)) => {
+                    discarded = discarded.saturating_add(read);
+                    if discarded > DISCARD_LIMIT {
+                        return false;
+                    }
+                }
+                // End of stream, a peer reset, or a lost connection: nothing is left to stop.
+                Ok(None) | Err(_) => return true,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !finished {
+        reader.stop_trevrpc();
     }
 }
 
@@ -259,38 +314,32 @@ async fn run_unary_pump<R>(
 where
     R: RequestPumpReader,
 {
-    let mut read = Box::pin(reader.reader.read_unary_end());
-    loop {
-        let result = tokio::select! {
-            biased;
-            changed = settle_rx.changed() => {
-                let _ = changed;
-                let reason = settle_rx
-                    .borrow_and_update()
-                    .unwrap_or(RequestPumpSettle::ResponseStopped);
-                if matches!(reason, RequestPumpSettle::ResponseCommitted) {
-                    continue;
-                }
-                drop(read);
-                return settle_reader(reader, reason);
-            }
-            result = &mut read => result,
-        };
-        drop(read);
-        match result {
-            Ok(()) => {
-                if let Err(error) = reader.reader.validate_transport_end().await {
-                    return fail_and_wait(reader, classify_error(error), state_tx, settle_rx, None)
-                        .await;
-                }
-                reader.settled = true;
-                return RequestPumpOutcome::CleanFin;
-            }
-            Err(error) => {
+    let mut read = Box::pin(reader.reader().read_unary_end());
+    let result = tokio::select! {
+        biased;
+        changed = settle_rx.changed() => {
+            let _ = changed;
+            let reason = settle_rx
+                .borrow_and_update()
+                .unwrap_or(RequestPumpSettle::ResponseStopped);
+            // The logical read only validates the request before the response exists. Once the
+            // response is committed, the rest of the request goes to the bounded drain.
+            drop(read);
+            return settle_reader(reader, reason);
+        }
+        result = &mut read => result,
+    };
+    drop(read);
+    match result {
+        Ok(()) => {
+            if let Err(error) = reader.reader().validate_transport_end().await {
                 return fail_and_wait(reader, classify_error(error), state_tx, settle_rx, None)
                     .await;
             }
+            reader.settled = true;
+            RequestPumpOutcome::CleanFin
         }
+        Err(error) => fail_and_wait(reader, classify_error(error), state_tx, settle_rx, None).await,
     }
 }
 
@@ -312,7 +361,7 @@ where
     loop {
         let permit = tokio::select! {
             biased;
-            event = reader.reader.backpressure_event() => {
+            event = reader.reader().backpressure_event() => {
                 match event {
                     Some(RequestTransportEvent::PeerReset(status)) => {
                         reader.settled = true;
@@ -345,7 +394,7 @@ where
                 if let Ok(permit) = permit {
                     permit
                 } else {
-                    reader.reader.stop_trevrpc();
+                    reader.reader().stop_trevrpc();
                     reader.settled = true;
                     return RequestPumpOutcome::LocallyStopped;
                 }
@@ -359,7 +408,7 @@ where
                 drop(permit);
                 return settle_reader(reader, settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped));
             }
-            frame = reader.reader.read_stream_frame_or_eof(max_frame_size) => frame,
+            frame = reader.reader().read_stream_frame_or_eof(max_frame_size) => frame,
         };
 
         match frame {
@@ -421,7 +470,7 @@ where
             },
             Ok(None) => {
                 drop(permit);
-                if let Err(error) = reader.reader.validate_transport_end().await {
+                if let Err(error) = reader.reader().validate_transport_end().await {
                     return fail_and_wait(reader, classify_error(error), state_tx, settle_rx, None)
                         .await;
                 }
@@ -460,14 +509,14 @@ where
                     reason => return Ok(settle_reader(reader, reason)),
                 }
             }
-            frame = reader.reader.read_stream_frame_or_eof(max_frame_size) => frame?,
+            frame = reader.reader().read_stream_frame_or_eof(max_frame_size) => frame?,
         };
         if frame.is_some() {
             return Err(Error::from(Status::internal(
                 "request stream continued after terminal status",
             )));
         }
-        reader.reader.validate_transport_end().await?;
+        reader.reader().validate_transport_end().await?;
         return Ok(RequestPumpOutcome::CleanFin);
     }
 }
@@ -533,11 +582,14 @@ where
             reader.settled = true;
             RequestPumpOutcome::ConnectionLost
         }
-        RequestPumpSettle::ResponseCommitted
-        | RequestPumpSettle::ResponseStopped
-        | RequestPumpSettle::ServerShutdown => {
+        RequestPumpSettle::ResponseCommitted => {
             reader.settled = true;
-            reader.reader.stop_trevrpc();
+            reader.discard = true;
+            RequestPumpOutcome::LocallyStopped
+        }
+        RequestPumpSettle::ResponseStopped | RequestPumpSettle::ServerShutdown => {
+            reader.settled = true;
+            reader.reader().stop_trevrpc();
             RequestPumpOutcome::LocallyStopped
         }
     }
@@ -567,8 +619,6 @@ fn transport_failure_kind(error: &Error) -> Option<TransportFailureKind> {
     let Error::Transport(error) = error else {
         return Some(TransportFailureKind::Protocol);
     };
-
-    #[cfg(feature = "quinn")]
     if let Some(error) = error.downcast_ref::<quinn::ReadError>() {
         return Some(match error {
             quinn::ReadError::Reset(_) => TransportFailureKind::PeerReset,
@@ -580,19 +630,6 @@ fn transport_failure_kind(error: &Error) -> Option<TransportFailureKind> {
             }
         });
     }
-
-    #[cfg(feature = "webtransport-client")]
-    if let Some(error) = error.downcast_ref::<web_transport_quinn::ReadError>() {
-        return Some(match error {
-            web_transport_quinn::ReadError::Reset(_)
-            | web_transport_quinn::ReadError::InvalidReset(_) => TransportFailureKind::PeerReset,
-            web_transport_quinn::ReadError::SessionError(_) => TransportFailureKind::ConnectionLost,
-            web_transport_quinn::ReadError::ClosedStream
-            | web_transport_quinn::ReadError::IllegalOrderedRead => TransportFailureKind::Protocol,
-        });
-    }
-
-    #[cfg(feature = "http3")]
     if let Some(error) = error.downcast_ref::<h3::error::StreamError>() {
         return Some(match error {
             h3::error::StreamError::RemoteTerminate { .. } => TransportFailureKind::PeerReset,
@@ -601,8 +638,6 @@ fn transport_failure_kind(error: &Error) -> Option<TransportFailureKind> {
             _ => TransportFailureKind::ConnectionLost,
         });
     }
-
-    #[cfg(feature = "http3")]
     if let Some(error) = error.downcast_ref::<h3::quic::StreamErrorIncoming>() {
         return Some(match error {
             h3::quic::StreamErrorIncoming::StreamTerminated { .. } => {
@@ -613,23 +648,12 @@ fn transport_failure_kind(error: &Error) -> Option<TransportFailureKind> {
         });
     }
 
-    #[cfg(feature = "native-c")]
-    if let Some(error) = error.downcast_ref::<trevrpc_native::NativeError>() {
-        return Some(if error.is_peer_reset() {
-            TransportFailureKind::PeerReset
-        } else if error.is_message_too_large() {
-            TransportFailureKind::Protocol
-        } else {
-            TransportFailureKind::ConnectionLost
-        });
-    }
-
     error
         .downcast_ref::<std::io::Error>()
         .map(|_| TransportFailureKind::ConnectionLost)
 }
 
-#[cfg(all(test, feature = "quinn"))]
+#[cfg(test)]
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
@@ -642,7 +666,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::sync::{mpsc, oneshot};
 
-    use crate::framed::{self, FrameRead, NoopFrameTrace};
+    use crate::framed::{self, FrameRead};
     use crate::{Code, Error, Result, RpcStreamFrame, Status};
 
     use super::{
@@ -681,7 +705,7 @@ mod tests {
             &mut self,
             max_frame_size: usize,
         ) -> Result<Option<crate::RpcStreamFrame>> {
-            framed::read_stream_frame_or_eof::<_, NoopFrameTrace>(self, max_frame_size).await
+            framed::read_stream_frame_or_eof(self, max_frame_size).await
         }
 
         async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
@@ -759,10 +783,20 @@ mod tests {
         completion: Option<oneshot::Receiver<()>>,
         starts: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl FrameRead for TrackedUnaryReader {
+        /// The raw drain read: the client never sends or finishes.
+        async fn read_frame_bytes(&mut self, _bytes: &mut [u8]) -> Result<Option<usize>> {
+            std::future::pending().await
+        }
     }
 
     impl RequestPumpReader for TrackedUnaryReader {
-        fn stop_trevrpc(&mut self) {}
+        fn stop_trevrpc(&mut self) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+        }
 
         fn read_unary_end(&mut self) -> impl Future<Output = Result<()>> + Send {
             self.starts.fetch_add(1, Ordering::SeqCst);
@@ -838,35 +872,38 @@ mod tests {
             .expect("message frame should encode")
     }
 
-    #[tokio::test]
-    async fn unary_response_commit_does_not_restart_logical_read() {
-        let (completion_tx, completion_rx) = oneshot::channel();
+    #[tokio::test(start_paused = true)]
+    async fn unary_response_commit_hands_open_request_to_bounded_drain() {
+        // Keep the sender alive: the client never finishes its request.
+        let (_completion_tx, completion_rx) = oneshot::channel();
         let starts = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
         let reader = TrackedUnaryReader {
             completion: Some(completion_rx),
             starts: Arc::clone(&starts),
             drops: Arc::clone(&drops),
+            stops: Arc::clone(&stops),
         };
         let (_body, pump) = start_request_pump(reader, RequestInputKind::Unary, 1024);
 
         wait_for(&starts, 1).await;
-        let settlement = tokio::spawn(pump.settle(RequestPumpSettle::ResponseCommitted));
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-
-        completion_tx
-            .send(())
-            .expect("tracked unary read should still be pending");
+        // Settling returns at once instead of waiting for the client's EOF.
+        let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+        assert_eq!(outcome, super::RequestPumpOutcome::LocallyStopped);
         assert_eq!(
-            settlement.await.unwrap(),
-            super::RequestPumpOutcome::CleanFin
+            starts.load(Ordering::SeqCst),
+            1,
+            "the read is not restarted"
         );
-        assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        // The detached drain stops the request only at its time bound.
+        tokio::time::sleep(super::DISCARD_TIMEOUT / 2).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(super::DISCARD_TIMEOUT).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 
     fn streaming() -> RequestInputKind {
@@ -965,24 +1002,6 @@ mod tests {
         assert_eq!(io.stops.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(feature = "webtransport-client")]
-    #[test]
-    fn webtransport_session_close_is_connection_loss_not_peer_reset() {
-        let session_error = web_transport_quinn::SessionError::WebTransportError(
-            web_transport_quinn::WebTransportError::Closed(7, "session closed".to_owned()),
-        );
-        let failure = classify_error(Error::transport(
-            web_transport_quinn::ReadError::SessionError(session_error),
-        ));
-
-        assert!(matches!(failure, RequestPumpFailure::ConnectionLost(_)));
-        assert_eq!(
-            failure.cancellation_source(),
-            Some(crate::server::CancellationSource::ConnectionLost)
-        );
-    }
-
-    #[cfg(feature = "quinn")]
     #[test]
     fn locally_closed_quinn_connection_is_not_a_peer_reset() {
         let failure = classify_error(Error::transport(quinn::ReadError::ConnectionLost(
@@ -996,7 +1015,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn observed_limit_error_wakes_control_before_body_poll() {
         let mut io = test_io(None);
         io.writer.write_all(&message(b"over limit")).await.unwrap();
@@ -1012,6 +1031,8 @@ mod tests {
         let failure = pump.failure().await;
         assert_eq!(failure.status().code(), Code::ResourceExhausted);
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+        // The request side stays open, so it is discarded and then stopped at the time bound.
+        tokio::time::sleep(super::DISCARD_TIMEOUT * 2).await;
         assert_eq!(io.stops.load(Ordering::SeqCst), 1);
     }
 
@@ -1077,14 +1098,48 @@ mod tests {
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
     }
 
-    #[tokio::test]
-    async fn response_commit_stops_nonterminal_request_with_code_one() {
+    #[tokio::test(start_paused = true)]
+    async fn response_commit_discards_open_request_then_stops_at_time_bound() {
         let io = test_io(None);
         let (_body, pump) = start_request_pump(io.reader, streaming(), 1024);
         let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
 
         assert_eq!(outcome, super::RequestPumpOutcome::LocallyStopped);
+        // Settling does not stop the request side immediately...
+        tokio::time::sleep(super::DISCARD_TIMEOUT / 2).await;
+        assert_eq!(io.stops.load(Ordering::SeqCst), 0);
+        // ...only the time bound does.
+        tokio::time::sleep(super::DISCARD_TIMEOUT).await;
         assert_eq!(io.stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn response_commit_lets_open_request_finish_without_stop() {
+        let mut io = test_io(None);
+        let (_body, pump) = start_request_pump(io.reader, streaming(), 1024);
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+
+        io.writer.write_all(&[7; 100]).await.unwrap();
+        drop(io.writer);
+        wait_for(&io.reads, 100).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(io.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn response_commit_discard_stops_at_byte_bound() {
+        let mut io = test_io(None);
+        let (_body, pump) = start_request_pump(io.reader, streaming(), 1024);
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+
+        let chunk = [0_u8; 4096];
+        let mut sent = 0;
+        while sent <= super::DISCARD_LIMIT {
+            io.writer.write_all(&chunk).await.unwrap();
+            sent += chunk.len();
+        }
+        wait_for(&io.stops, 1).await;
+        assert!(io.reads.load(Ordering::SeqCst) <= super::DISCARD_LIMIT + chunk.len());
     }
 
     #[tokio::test]

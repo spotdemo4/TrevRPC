@@ -4,6 +4,7 @@ use std::sync::Arc;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
+use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, is_plain_message_frame};
 use crate::request_pump::{
     RequestInputKind, RequestPumpReader, RequestPumpSettle, start_request_pump,
 };
@@ -12,8 +13,6 @@ use crate::{
     Code, Error, Result, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind,
     Status,
 };
-
-const MESSAGE_FRAME_BATCH: usize = 32;
 
 /// Sends complete `TrevRPC` response messages without imposing a transport framing format.
 ///
@@ -37,7 +36,22 @@ pub(crate) trait ResponseWriter: Send + 'static {
 
     fn reset(&mut self);
 
-    fn finish(&mut self, detail: &'static str) -> impl Future<Output = Result<()>> + Send;
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Reads the initial request frame, bounded by the server's initial request timeout.
+pub(crate) async fn read_initial_request<R>(server: &Server, recv: &mut R) -> Result<RpcRequest>
+where
+    R: FrameRead,
+{
+    let read = framed::read_frame::<_, RpcRequest>(recv, server.max_frame_size());
+    if let Some(timeout) = server.options().initial_request_timeout() {
+        tokio::time::timeout(timeout, read)
+            .await
+            .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
+    } else {
+        read.await
+    }
 }
 
 /// Handles one already-decoded RPC stream using a transport-neutral response writer and reader.
@@ -59,7 +73,7 @@ pub(crate) async fn handle_stream<W, R>(
             if request.rpc_kind() == RpcKind::Unary {
                 drain_unary_request_end_or_stop(&server, &mut recv).await;
             }
-            let _ = send.finish("server_rpc_status").await;
+            let _ = send.finish().await;
         }
         return;
     };
@@ -95,7 +109,6 @@ pub(crate) async fn handle_stream<W, R>(
                 CancellationSource::ConnectionLost
             });
             let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-            #[cfg(feature = "tracing")]
             tracing::debug!("client stopped response stream before RPC completed");
             return;
         }
@@ -109,7 +122,7 @@ pub(crate) async fn handle_stream<W, R>(
 
     match send.write_response(&response).await {
         Ok(()) => {
-            let _ = send.finish("server_unary_response").await;
+            let _ = send.finish().await;
             drop(request_permit);
             let _ = request_pump
                 .settle(RequestPumpSettle::ResponseCommitted)
@@ -138,7 +151,7 @@ pub(crate) async fn reject_stream<W, R>(
         if request.rpc_kind() == RpcKind::Unary {
             drain_unary_request_end_or_stop(&server, &mut recv).await;
         }
-        let _ = send.finish("server_stream_status").await;
+        let _ = send.finish().await;
     }
 }
 
@@ -160,9 +173,7 @@ where
         read.await
     };
     if let Err(error) = result {
-        let _ = &error;
         recv.stop_trevrpc();
-        #[cfg(feature = "tracing")]
         tracing::debug!(%error, "failed to drain unary request stream");
     }
 }
@@ -216,7 +227,6 @@ async fn handle_streaming_rpc<W, R>(
                 CancellationSource::ConnectionLost
             });
             let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-            #[cfg(feature = "tracing")]
             tracing::debug!("client stopped response stream before streaming RPC handler completed");
             return;
         }
@@ -252,7 +262,6 @@ async fn handle_streaming_rpc<W, R>(
                     CancellationSource::ConnectionLost
                 });
                 let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-                #[cfg(feature = "tracing")]
                 tracing::debug!("client stopped response stream before streaming RPC completed");
                 return;
             }
@@ -326,7 +335,7 @@ async fn handle_streaming_rpc<W, R>(
         }
     }
 
-    let _ = send.finish("server_streaming_response").await;
+    let _ = send.finish().await;
     let _ = request_pump
         .settle(RequestPumpSettle::ResponseCommitted)
         .await;
@@ -352,7 +361,7 @@ where
     let response = status.into_response(Vec::new());
 
     if send.write_response(&response).await.is_ok() {
-        let _ = send.finish("server_status").await;
+        let _ = send.finish().await;
     }
 }
 
@@ -377,13 +386,6 @@ fn cancel_from_transport_error(cancellation: &CancellationToken, error: &Error) 
             CancellationSource::ConnectionLost
         });
     }
-}
-
-fn is_plain_message_frame(frame: &RpcStreamFrame) -> bool {
-    frame.frame_kind() == Some(RpcStreamFrameKind::Message)
-        && frame.status == Code::Ok.as_u32()
-        && frame.message.is_empty()
-        && frame.metadata.is_empty()
 }
 
 #[cfg(test)]

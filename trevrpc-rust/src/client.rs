@@ -18,11 +18,15 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-#[cfg(any(feature = "quinn", feature = "native-c"))]
-pub(crate) mod channel;
+mod channel;
+mod quic;
+mod upload;
 
-#[cfg(any(feature = "quinn", feature = "native-c"))]
-pub use channel::{Channel, ChannelConfig, ChannelEvent, ChannelPhase, ChannelState};
+pub use channel::{
+    Channel, ChannelConfig, ChannelEvent, ChannelPhase, ChannelState, ExponentialBackoff,
+    ReconnectBackoff,
+};
+pub use quic::QuicTransport;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
@@ -575,10 +579,6 @@ pub struct BidirectionalCall<Req, Res> {
     sender: RequestSender<Req>,
     response: ResponseStream<Res>,
 }
-
-/// Compatibility alias for the pre-Milestone 5 bidirectional call name.
-#[deprecated(since = "0.1.0", note = "use BidirectionalCall")]
-pub type BidirectionalStreamingCall<Req, Res> = BidirectionalCall<Req, Res>;
 
 impl<Req, Res> BidirectionalCall<Req, Res> {
     const fn new(sender: RequestSender<Req>, response: ResponseStream<Res>) -> Self {

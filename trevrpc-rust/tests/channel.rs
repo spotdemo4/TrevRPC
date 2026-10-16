@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::task::JoinHandle;
-use trevrpc::advanced::ChannelOperations;
-use trevrpc::advanced::{ChannelConfigOperations, ReconnectBackoff};
-use trevrpc::client::{Channel, ChannelConfig, ChannelEvent, ChannelPhase, RpcTransport};
-use trevrpc::quinn::TransportMode;
+use trevrpc::client::{
+    Channel, ChannelConfig, ChannelEvent, ChannelPhase, ReconnectBackoff, RpcTransport,
+};
 use trevrpc::{Code, RpcRequest, RpcResponse, Status};
+
+mod support;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FRAME_SIZE: usize = trevrpc::framing::DEFAULT_MAX_FRAME_SIZE;
@@ -40,17 +40,10 @@ impl RawServer {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let cert_der = CertificateDer::from(cert.cert);
         let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-        let mut crypto = quinn::rustls::ServerConfig::builder()
+        let crypto = quinn::rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
-        crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
-        let mut server_config =
-            quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
-        trevrpc::quinn::configure_server_config(
-            &mut server_config,
-            &trevrpc::server::ServerOptions::new(),
-            TransportMode::Native,
-        );
+        let server_config = trevrpc::server::Server::new().quic_config(crypto)?;
         let endpoint =
             quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
         let addr = endpoint.local_addr()?;
@@ -98,7 +91,7 @@ async fn run_raw_server(
         tokio::spawn(async move {
             while let Ok((mut send, mut recv)) = connection.accept_bi().await {
                 let Ok(request) =
-                    trevrpc::quinn::read_frame::<RpcRequest>(&mut recv, MAX_FRAME_SIZE).await
+                    support::read_frame::<_, RpcRequest>(&mut recv, MAX_FRAME_SIZE).await
                 else {
                     break;
                 };
@@ -109,7 +102,7 @@ async fn run_raw_server(
                 }
 
                 let response = RpcResponse::ok(request.body);
-                if trevrpc::quinn::write_frame(&mut send, &response, MAX_FRAME_SIZE)
+                if support::write_frame(&mut send, &response, MAX_FRAME_SIZE)
                     .await
                     .is_err()
                 {
@@ -124,12 +117,10 @@ async fn run_raw_server(
 fn make_client_endpoint(cert: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
     let mut roots = quinn::rustls::RootCertStore::empty();
     roots.add(cert)?;
-    let mut crypto = quinn::rustls::ClientConfig::builder()
+    let crypto = quinn::rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
-    let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
-    trevrpc::quinn::configure_client_config(&mut config, MAX_FRAME_SIZE, TransportMode::Native);
+    let config = ChannelConfig::new().quic_config(crypto)?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
@@ -232,7 +223,7 @@ async fn close_stops_reconnect_and_rebind_preserves_generation() -> TestResult {
     assert!(client.is_ready());
 
     let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    client.rebind_quinn(socket)?;
+    client.rebind(socket)?;
     assert_eq!(client.state().generation(), generation);
 
     client.close();

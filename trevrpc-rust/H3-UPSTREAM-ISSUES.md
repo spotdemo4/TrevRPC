@@ -23,7 +23,6 @@ The reproductions below omit routine TLS, certificate, endpoint, and h3 connecti
 |   7 | `AsyncWrite` reduces typed stream failures to `io::ErrorKind::Other`          | `h3 0.0.8`, `h3-webtransport 0.1.2` | [#55](https://github.com/hyperium/h3/issues/55)                                                             | Strong historical architectural match; closed                   |
 |   8 | Invalid WebTransport CONNECT returns `Ok(WebTransportSession)` after HTTP 400 | `h3-webtransport 0.1.2`             | [#293](https://github.com/hyperium/h3/issues/293)                                                           | Related validation-ownership discussion; no direct report found |
 |   9 | `max_webtransport_sessions` is advertised but not enforced                    | `h3 0.0.8`                          | [#71](https://github.com/hyperium/h3/issues/71), [#293](https://github.com/hyperium/h3/issues/293)          | Related umbrella issues; no direct report found                 |
-|  10 | Safari/Network.framework hybrid negotiation is unsupported                    | `h3-webtransport 0.1.2`             | [#347](https://github.com/hyperium/h3/issues/347)                                                           | Exact; open                                                     |
 
 GitHub searches also checked the relevant API names and protocol terms, including `accept_bi`, `CloseWebTransportSession`, `STOP_SENDING`, `max_webtransport_sessions`, invalid CONNECT handling, and the h3-quinn stream methods. “No direct report found” means no issue specifically describing the behavior was found; it does not prove that no duplicate exists under different wording.
 
@@ -555,64 +554,11 @@ No direct issue was found. [#71](https://github.com/hyperium/h3/issues/71) and [
 
 Clarify whether the setting is declarative or enforced. Add active-session lifecycle hooks and admission enforcement, or rename the builder operation to make its settings-only behavior explicit. `h3-webtransport` should support multiple session drivers on one h3 connection if values greater than one are intended to be usable.
 
-## 10. Safari/Network.framework hybrid WebTransport negotiation is unsupported
-
-**Owner:** `h3`/`h3-webtransport` WebTransport negotiation and capsule support
-
-**Confirmed in:** `h3-webtransport 0.1.2` on macOS 26 Safari 26.4+ and Cocoa WebKit
-
-### Actual behavior
-
-Safari and Cocoa WebKit builds backed by Apple's Network.framework advertise a hybrid set of draft WebTransport settings and require initial session flow-control capsules on the successful CONNECT stream. `h3-webtransport 0.1.2` does not negotiate that dialect or send the required grants. `WebTransport.ready` remains pending and eventually times out; in partially compatible settings experiments, `createBidirectionalStream()` remains pending instead.
-
-The same TrevRPC browser client and certificates complete all RPC shapes against TrevRPC's C, C++, JavaScript, and Kotlin WebTransport servers, isolating the interoperability gap to the Rust h3-WebTransport path.
-
-### Expected behavior
-
-The server should identify the peer's supported WebTransport dialect, select compatible settings behavior, and send the initial session flow-control capsules required by Network.framework.
-
-### Minimal reproduction
-
-Server:
-
-```rust
-let mut builder = h3::server::builder();
-builder
-    .enable_extended_connect(true)
-    .enable_datagram(true)
-    .enable_webtransport(true)
-    .max_webtransport_sessions(1);
-```
-
-Safari 26.4+ or Cocoa WebKit on macOS 26:
-
-```javascript
-const transport = new WebTransport(url, {
-  serverCertificateHashes: certificateHashes,
-});
-await transport.ready; // does not resolve against h3-webtransport 0.1.2
-```
-
-Use a loopback HTTPS URL, a valid short-lived certificate hash, and an allowed `Origin`. The upstream issue lists the exact hybrid settings and required `WT_MAX_DATA`, `WT_MAX_STREAMS_BIDI`, and `WT_MAX_STREAMS_UNI` capsules.
-
-### TrevRPC impact and workaround
-
-The Rust server is not currently interoperable with this Safari/Network.framework path. Chromium remains the primary browser path for Rust WebTransport. Deployments requiring Safari can use another TrevRPC server runtime with the compatibility path or wait for upstream negotiation and capsule support.
-
-### Existing upstream issue
-
-Exact open report: [#347: Support Safari/Network.framework hybrid WebTransport negotiation and initial flow-control capsules](https://github.com/hyperium/h3/issues/347).
-
-### Suggested upstream fix
-
-Implement dialect-aware settings negotiation and CONNECT-stream capsule support, including the initial flow-control grants described in #347. This overlaps with the general session capsule API required by issue 2.
-
 ## Upstream issue relationship notes
 
 ### Exact reports
 
 - [#330](https://github.com/hyperium/h3/issues/330) exactly reports the `h3-quinn 0.0.10` `stop_sending()` panic. [#331](https://github.com/hyperium/h3/pull/331) is the merged fix.
-- [#347](https://github.com/hyperium/h3/issues/347) exactly reports the Safari/Network.framework interoperability failure.
 
 ### Strong architectural match
 

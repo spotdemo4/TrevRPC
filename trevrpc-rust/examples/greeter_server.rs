@@ -1,10 +1,8 @@
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 
 use futures_util::StreamExt;
-use quinn::crypto::rustls::QuicServerConfig;
 use quinn::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 #[path = "shared/cert.rs"]
@@ -117,6 +115,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_max_concurrent_streams_per_connection(Some(64))
         .with_max_concurrent_requests(Some(1024))
         .with_http3_enabled(true)
+        .with_webtransport_enabled(true)
         .with_webtransport_allowed_authorities(webtransport_authorities)
         .with_webtransport_allowed_origins([browser_example_origin]);
     server.set_options(options);
@@ -125,7 +124,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     ));
     greeter::register_greeter(&mut server, GreeterService);
 
-    let endpoint = make_endpoint(addr, &identity, server.options())?;
+    let endpoint = make_endpoint(addr, &identity, &server)?;
 
     println!(
         "TrevRPC greeter native QUIC server listening on {}",
@@ -144,7 +143,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("press Ctrl+C to shut down");
 
     server
-        .serve_quinn_and_webtransport_with_shutdown(endpoint, shutdown_signal())
+        .serve_with_shutdown(endpoint, shutdown_signal())
         .await?;
 
     Ok(())
@@ -165,23 +164,15 @@ fn make_identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, Box<dyn Error 
 fn make_endpoint(
     addr: SocketAddr,
     identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
-    options: &trevrpc::server::ServerOptions,
+    server: &trevrpc::server::Server,
 ) -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
     let cert_der = identity.cert.der().clone();
     let key_der = PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
 
-    let mut server_crypto = quinn::rustls::ServerConfig::builder()
+    let server_crypto = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], PrivateKeyDer::from(key_der))?;
-    server_crypto.alpn_protocols = vec![trevrpc::ALPN.to_vec(), trevrpc::HTTP3_ALPN.to_vec()];
-
-    let mut server_config =
-        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    trevrpc::quinn::configure_server_config(
-        &mut server_config,
-        options,
-        trevrpc::quinn::TransportMode::WebTransport,
-    );
+    let server_config = server.quic_config(server_crypto)?;
 
     Ok(quinn::Endpoint::server(server_config, addr)?)
 }
