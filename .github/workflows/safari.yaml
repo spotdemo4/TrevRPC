@@ -33,12 +33,13 @@ jobs:
         server: [go, rust]
     env:
       SERVER: ${{ matrix.server }}
-      OUTPUT: ${{ runner.temp }}/safari-to-${{ matrix.server }}
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
       - name: Run Safari interop
+        env:
+          OUTPUT: ${{ runner.temp }}/safari-to-${{ matrix.server }}
         run: |
           nix shell \
             .#trevrpc-js \

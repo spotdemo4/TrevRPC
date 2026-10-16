@@ -469,10 +469,12 @@
             filter = file: file.hasExt "yaml";
             packages = with pkgs; [
               action-validator
+              actionlint
               zizmor
             ];
             script = ''
               action-validator "$file"
+              actionlint "$file"
               zizmor --offline "$file"
             '';
           };

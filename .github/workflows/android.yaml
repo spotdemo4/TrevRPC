@@ -46,7 +46,6 @@ jobs:
         server: [go, rust]
     env:
       SERVER: ${{ matrix.server }}
-      OUTPUT: ${{ runner.temp }}/android-to-${{ matrix.server }}
       WORK_DIR: /nix/trevrpc-android/work
     steps:
       - name: Initialize
@@ -59,6 +58,8 @@ jobs:
         run: sudo chown "$USER" /dev/kvm
 
       - name: Run Android interop
+        env:
+          OUTPUT: ${{ runner.temp }}/android-to-${{ matrix.server }}
         run: |
           nix shell \
             .#trevrpc-kotlin.interopAndroid \
