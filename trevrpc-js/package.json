@@ -1,6 +1,6 @@
 {
   "name": "@trevrpc/trevrpc-js",
-  "version": "0.2.3",
+  "version": "1.0.0",
   "description": "Browser WebTransport client and protobuf.js code generator for TrevRPC",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {

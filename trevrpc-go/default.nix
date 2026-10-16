@@ -13,7 +13,7 @@ let
 in
 buildGoModule (final: {
   pname = "trevrpc-go";
-  version = "0.2.2";
+  version = "1.0.0";
 
   # The module itself plus the shared files its tests read: the wire golden
   # vectors and the interop proto the generated interop bindings must match.

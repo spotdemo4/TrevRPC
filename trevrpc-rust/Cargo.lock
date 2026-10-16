@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc"
-version = "0.1.11"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-interop"
-version = "0.1.11"
+version = "1.0.0"
 dependencies = [
  "futures-util",
  "prost",
