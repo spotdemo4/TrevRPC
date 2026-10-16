@@ -57,6 +57,20 @@ let
       defaultJava = jdk25;
     }).wrapped;
 
+  # Minimal SDK for the Android interop build; also used by `nix run .#update-kotlin-deps`.
+  androidSdk =
+    (androidenv.composeAndroidPackages {
+      platformVersions = [
+        "33"
+        "36"
+      ];
+      buildToolsVersions = [ "37.0.0" ];
+      includeEmulator = true;
+      includeSystemImages = true;
+      systemImageTypes = [ "google_apis" ];
+      abiVersions = [ "x86_64" ];
+    }).androidsdk;
+
   # The emulator needs KVM and an x86_64 host.
   interopAndroid =
     if stdenvNoCC.hostPlatform.system == "x86_64-linux" then
@@ -66,19 +80,8 @@ let
           licenseFile
           wireGolden
           ;
+        inherit androidSdk;
         gradle_9 = gradle9;
-        androidSdk =
-          (androidenv.composeAndroidPackages {
-            platformVersions = [
-              "33"
-              "36"
-            ];
-            buildToolsVersions = [ "37.0.0" ];
-            includeEmulator = true;
-            includeSystemImages = true;
-            systemImageTypes = [ "google_apis" ];
-            abiVersions = [ "x86_64" ];
-          }).androidsdk;
       }
     else
       null;
@@ -86,7 +89,9 @@ in
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
   version = "0.3.4";
-  passthru.interopAndroid = interopAndroid;
+  passthru = {
+    inherit androidSdk interopAndroid;
+  };
 
   src = lib.fileset.toSource {
     root = ../.;

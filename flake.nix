@@ -181,12 +181,11 @@
 
           update-kotlin-deps = {
             packages = with pkgs; [
-              androidenv.androidPkgs.androidsdk
               jdk25
               oxfmt
             ];
             script = ''
-              export ANDROID_HOME=$(dirname "$(dirname "$(command -v sdkmanager)")")/libexec/android-sdk
+              export ANDROID_HOME=${packageSet.trevrpc-kotlin.androidSdk}/libexec/android-sdk
               export ANDROID_SDK_ROOT=$ANDROID_HOME
               trevrpc-kotlin/gradlew \
                 --project-dir trevrpc-kotlin \
