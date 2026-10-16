@@ -4,25 +4,17 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import org.chromium.net.BidirectionalStream
 import org.chromium.net.CronetEngine
 import org.chromium.net.CronetException
 import org.chromium.net.UrlResponseInfo
 import zip.trev.trevrpc.RpcChannel
-import zip.trev.trevrpc.RpcChannelState
-import zip.trev.trevrpc.RpcClientStream
-import zip.trev.trevrpc.RpcRequest
-import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import java.net.URI
 import java.nio.ByteBuffer
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.CoroutineContext
 
@@ -45,44 +37,12 @@ object CronetRpcChannel {
         coroutineContext: CoroutineContext = Dispatchers.IO,
     ): RpcChannel {
         val containedExecutor = DrainableSerialExecutor(callbackExecutor)
-        return CronetChannel(
-            Http3RpcTransport(
-                CronetDuplexStreamFactory(engine, rpcUrl(origin), containedExecutor),
-                options,
-                coroutineContext,
-                containedExecutor,
-            ),
+        return Http3RpcTransport(
+            CronetDuplexStreamFactory(engine, rpcUrl(origin), containedExecutor),
+            options,
+            coroutineContext,
+            containedExecutor,
         )
-    }
-}
-
-internal class CronetChannel(
-    private val delegate: CronetTransport,
-) : RpcChannel {
-    private val closed = AtomicBoolean(false)
-    private val mutableState = MutableStateFlow(RpcChannelState.READY)
-
-    override val state: StateFlow<RpcChannelState> = mutableState.asStateFlow()
-
-    override suspend fun unary(request: RpcRequest): RpcResponse {
-        checkOpen()
-        return delegate.unary(request)
-    }
-
-    override suspend fun openStream(request: RpcRequest): RpcClientStream {
-        checkOpen()
-        return delegate.openStream(request)
-    }
-
-    override suspend fun awaitReady() = checkOpen()
-
-    override suspend fun close() {
-        if (closed.compareAndSet(false, true)) mutableState.value = RpcChannelState.CLOSED
-        delegate.close()
-    }
-
-    private fun checkOpen() {
-        if (closed.get()) throw TrevRpcException(Status.unavailable("RPC channel is closed"))
     }
 }
 

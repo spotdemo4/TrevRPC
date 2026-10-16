@@ -18,12 +18,12 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import zip.trev.trevrpc.DEFAULT_MAX_FRAME_SIZE
 import zip.trev.trevrpc.FrameDecoder
+import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.RpcResponse
 import zip.trev.trevrpc.RpcStreamFrame
 import zip.trev.trevrpc.RpcStreamFrameKind
-import zip.trev.trevrpc.RpcTransport
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
@@ -119,17 +119,13 @@ internal interface DuplexCallback {
     )
 }
 
-internal interface CronetTransport : RpcTransport {
-    suspend fun close()
-}
-
 internal class Http3RpcTransport(
     private val factory: DuplexStreamFactory,
     private val options: CronetTransportOptions = CronetTransportOptions(),
     coroutineContext: CoroutineContext = Dispatchers.IO,
     private val callbackDrain: CallbackDrain = ImmediateCallbackDrain,
     shutdownContext: CoroutineContext = DetachedExternalCalls,
-) : CronetTransport {
+) : RpcChannel {
     private val transportJob = SupervisorJob()
     private val shutdownJob = SupervisorJob()
     private val shutdownScope = CoroutineScope(shutdownJob + shutdownContext.minusKey(Job))

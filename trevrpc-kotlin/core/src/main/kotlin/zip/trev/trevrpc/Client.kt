@@ -56,32 +56,20 @@ interface RpcTransport {
     suspend fun openStream(request: RpcRequest): RpcClientStream
 }
 
-interface RpcTransportStream {
-    suspend fun receive(): RpcStreamFrame?
-
-    /** Receives one frame, then drains up to [maxFrames] frames that are already available. */
-    suspend fun receiveBatch(maxFrames: Int): List<RpcStreamFrame> {
-        require(maxFrames > 0) { "maxFrames must be positive" }
-        return listOfNotNull(receive())
-    }
-
-    suspend fun close(cause: Throwable? = null)
-}
-
 /**
  * A bidirectional client transport stream. Sends are serialized with [finishSend] and complete only
  * after the transport accepts the write. Sending and receiving may proceed concurrently.
  */
-interface RpcClientStream : RpcTransportStream {
+interface RpcClientStream {
     suspend fun send(body: ByteArray)
-
-    /** Sends an ordered batch. Transports may override this to combine immediately ready writes. */
-    suspend fun sendBatch(bodies: List<ByteArray>) {
-        bodies.forEach { send(it) }
-    }
 
     /** Half-closes the request side after prior sends. Repeated calls have no effect. */
     suspend fun finishSend()
+
+    /** Receives the next response frame, or null at transport end of stream. */
+    suspend fun receive(): RpcStreamFrame?
+
+    suspend fun close(cause: Throwable? = null)
 }
 
 class Client(
@@ -200,13 +188,6 @@ internal class RequestWriter(
         write { stream.send(body) }
     }
 
-    suspend fun sendBatch(bodies: List<ByteArray>) {
-        if (sendFinished.get()) {
-            throw TrevRpcException(Status.cancelled("request stream is closed"))
-        }
-        if (bodies.isNotEmpty()) write { stream.sendBatch(bodies) }
-    }
-
     suspend fun finishSend() {
         if (!sendFinished.compareAndSet(false, true)) return
         write { stream.finishSend() }
@@ -237,8 +218,6 @@ class ServerStreamingCall<T> internal constructor(
 
     suspend fun receive(): T? = reader.receive()
 
-    suspend fun receiveBatch(maxMessages: Int = 32): List<T> = reader.receiveBatch(maxMessages)
-
     suspend fun close() = reader.close()
 }
 
@@ -250,8 +229,6 @@ class ClientStreamingCall<Req, Res> internal constructor(
     private val received = AtomicBoolean(false)
 
     suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
-
-    suspend fun sendBatch(requests: List<Req>) = writer.sendBatch(requests.map(requestCodec.encode))
 
     suspend fun closeSend() = writer.finishSend()
 
@@ -299,8 +276,6 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
 
     suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
 
-    suspend fun sendBatch(requests: List<Req>) = writer.sendBatch(requests.map(requestCodec.encode))
-
     suspend fun closeSend() = writer.finishSend()
 
     suspend fun receive(): Res? = reader.receive()
@@ -311,7 +286,7 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
 }
 
 internal class ResponseReader<T>(
-    private val stream: RpcTransportStream,
+    private val stream: RpcClientStream,
     private val codec: MessageCodec<T>,
     private val options: CallOptions,
     private val deadline: TimeMark?,
@@ -320,7 +295,6 @@ internal class ResponseReader<T>(
     private var messages = 0
     private var bodySize = 0L
     private var done = false
-    private var pendingTerminalError: Throwable? = null
 
     var terminalStatus: Status? = null
         private set
@@ -329,10 +303,6 @@ internal class ResponseReader<T>(
         get() = terminalStatus?.metadata ?: Metadata.EMPTY
 
     suspend fun receive(): T? {
-        pendingTerminalError?.let { error ->
-            pendingTerminalError = null
-            throw error
-        }
         if (done) return null
         try {
             val frame = callWithDeadline(deadline, options.streamIdleTimeout) { stream.receive() }
@@ -354,61 +324,6 @@ internal class ResponseReader<T>(
                     throw TrevRpcException(Status.invalidArgument("response stream contained an unknown frame kind"))
                 }
             }
-        } catch (error: CancellationException) {
-            done = true
-            close(error)
-            throw error
-        } catch (error: Throwable) {
-            done = true
-            close(error)
-            throw error
-        }
-    }
-
-    suspend fun receiveBatch(maxMessages: Int): List<T> {
-        require(maxMessages > 0) { "maxMessages must be positive" }
-        pendingTerminalError?.let { error ->
-            pendingTerminalError = null
-            throw error
-        }
-        if (done) return emptyList()
-        try {
-            val frames = callWithDeadline(deadline, options.streamIdleTimeout) { stream.receiveBatch(maxMessages) }
-            if (frames.isEmpty()) {
-                done = true
-                throw TrevRpcException(Status.internal("response stream ended before final status"))
-            }
-            val messages = ArrayList<T>(frames.size)
-            frames.forEachIndexed { index, frame ->
-                when (frame.kind) {
-                    RpcStreamFrameKind.MESSAGE -> {
-                        messages += receiveMessage(frame)
-                    }
-
-                    RpcStreamFrameKind.STATUS -> {
-                        if (index != frames.lastIndex) {
-                            throw TrevRpcException(Status.internal("response stream contained data after final status"))
-                        }
-                        try {
-                            receiveStatus(frame)
-                        } catch (error: CancellationException) {
-                            throw error
-                        } catch (error: Throwable) {
-                            if (messages.isEmpty()) throw error
-                            pendingTerminalError = error
-                        }
-                    }
-
-                    null -> {
-                        throw TrevRpcException(Status.invalidArgument("response stream contained an unknown frame kind"))
-                    }
-                }
-            }
-            return messages
-        } catch (error: CancellationException) {
-            done = true
-            close(error)
-            throw error
         } catch (error: Throwable) {
             done = true
             close(error)

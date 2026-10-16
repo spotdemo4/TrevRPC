@@ -74,7 +74,7 @@ class GeneratorTest {
 
         assertEquals("", response.error)
         val content = response.fileList.single().content
-        assertEquals(4, Regex("fun fooBar\\(").findAll(content).count())
+        assertEquals(2, Regex("fun fooBar\\(").findAll(content).count())
         assertTrue(content.contains("NAMES_FOO_BAR_METHOD_NAME"))
         assertTrue(content.contains("NAMES_FOO__BAR_METHOD_NAME"))
     }
@@ -388,7 +388,7 @@ class GeneratorTest {
 
         assertDeterministicCollision(
             request(first, second),
-            "fun collision.generated.registerFooBar(Server, FooBarService)",
+            "fun collision.generated.FooBarClient.call(collision.generated.Request, zip.trev.trevrpc.CallOptions)",
             "first.FooBar",
             "second.Foo_Bar",
         )
@@ -596,35 +596,24 @@ class GeneratorTest {
                 "decodeProtobuf(",
                 "invalidArgument(",
                 "const val ",
-                "_RPC_KIND:",
-                "interface ",
                 "suspend fun ",
                 " fun ",
                 "class ",
                 "Call(",
                 "Flow<",
                 "client.",
-                "server.route",
-                "requireTrevrpcKind(",
-                "decodeTrevrpcRequest(",
-                ".map(",
-                "ResponseEnvelope(",
+                "ResponseEnvelope<",
             )
     }
 }
 
 class GeneratedCodeCompilationTest {
     @Test
-    fun `protoc generated four shape Greeter code compiles against core and protobuf`(
+    fun `protoc generated four shape Echo client compiles against core and protobuf`(
         @TempDir temp: Path,
     ) {
-        val schemaPath = "trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto"
-        val schema =
-            generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath(), Path::getParent)
-                .map { it.resolve(schemaPath) }
-                .firstOrNull(Path::isRegularFile)
-                ?: error("Greeter schema not found from ${System.getProperty("user.dir")}")
-        check(schema.isRegularFile()) { "Greeter schema not found at $schema" }
+        val schema = Path.of(checkNotNull(System.getProperty("trevrpc.interop.proto")))
+        check(schema.isRegularFile()) { "Interop schema not found at $schema" }
         compileSchemas(
             temp,
             schema.parent,
@@ -767,52 +756,30 @@ class GeneratedCodeCompilationTest {
     private companion object {
         val COMPILE_FIXTURE =
             """
-            package example.greeter
+            package trevrpc.interop.v1
 
             import kotlinx.coroutines.flow.Flow
-            import kotlinx.coroutines.flow.flowOf
             import zip.trev.trevrpc.BidirectionalStreamingCall
             import zip.trev.trevrpc.ClientStreamingCall
-            import zip.trev.trevrpc.RequestContext
             import zip.trev.trevrpc.ResponseEnvelope
             import zip.trev.trevrpc.ServerStreamingCall
 
-            private typealias Request = GreeterOuterClass.HelloRequest
-            private typealias Reply = GreeterOuterClass.HelloReply
-
-            private class CompileService : GreeterService {
-                override suspend fun sayHello(context: RequestContext, request: Request): ResponseEnvelope<Reply> =
-                    ResponseEnvelope(Reply.getDefaultInstance())
-
-                override suspend fun lotsOfReplies(
-                    context: RequestContext,
-                    request: Request,
-                ): ResponseEnvelope<Flow<Reply>> = ResponseEnvelope(flowOf(Reply.getDefaultInstance()))
-
-                override suspend fun lotsOfGreetings(
-                    context: RequestContext,
-                    requests: Flow<Request>,
-                ): ResponseEnvelope<Reply> = ResponseEnvelope(Reply.getDefaultInstance())
-
-                override suspend fun bidiHello(
-                    context: RequestContext,
-                    requests: Flow<Request>,
-                ): ResponseEnvelope<Flow<Reply>> = ResponseEnvelope(flowOf(Reply.getDefaultInstance()))
-            }
+            private typealias Request = Interop.EchoRequest
+            private typealias Reply = Interop.EchoResponse
 
             @Suppress("UNUSED_VARIABLE")
-            private suspend fun typeCheck(client: GreeterClient, request: Request, requests: Flow<Request>) {
-                val unaryResponse: ResponseEnvelope<Reply> = client.sayHelloResponse(request)
-                val unary: Reply = client.sayHello(request)
-                val serverResponse: ServerStreamingCall<Reply> = client.lotsOfRepliesResponse(request)
-                val server: Flow<Reply> = client.lotsOfReplies(request)
-                val clientResponse: ClientStreamingCall<Request, Reply> = client.lotsOfGreetingsResponse()
-                val clientAlias: ClientStreamingCall<Request, Reply> = client.lotsOfGreetings()
-                val clientCollectedResponse: ResponseEnvelope<Reply> = client.lotsOfGreetingsResponse(requests)
-                val clientCollected: Reply = client.lotsOfGreetings(requests)
-                val bidiResponse: BidirectionalStreamingCall<Request, Reply> = client.bidiHelloResponse()
-                val bidiAlias: BidirectionalStreamingCall<Request, Reply> = client.bidiHello()
-                val bidi: Flow<Reply> = client.bidiHello(requests)
+            private suspend fun typeCheck(client: EchoClient, request: Request, requests: Flow<Request>) {
+                val unaryResponse: ResponseEnvelope<Reply> = client.unaryResponse(request)
+                val unary: Reply = client.unary(request)
+                val serverResponse: ServerStreamingCall<Reply> = client.serverStreamResponse(request)
+                val server: Flow<Reply> = client.serverStream(request)
+                val clientResponse: ClientStreamingCall<Request, Reply> = client.clientStreamResponse()
+                val clientAlias: ClientStreamingCall<Request, Reply> = client.clientStream()
+                val clientCollectedResponse: ResponseEnvelope<Reply> = client.clientStreamResponse(requests)
+                val clientCollected: Reply = client.clientStream(requests)
+                val bidiResponse: BidirectionalStreamingCall<Request, Reply> = client.bidiResponse()
+                val bidiAlias: BidirectionalStreamingCall<Request, Reply> = client.bidi()
+                val bidi: Flow<Reply> = client.bidi(requests)
             }
             """.trimIndent()
 
@@ -854,21 +821,6 @@ class GeneratedCodeCompilationTest {
         val OVERLOADS_FIXTURE =
             """
             package generator.compat.overloads
-
-            import zip.trev.trevrpc.RequestContext
-            import zip.trev.trevrpc.ResponseEnvelope
-
-            private class CompileOverloads : LegalOverloadsService {
-                override suspend fun fooBar(
-                    context: RequestContext,
-                    request: FirstRequest,
-                ): ResponseEnvelope<Reply> = ResponseEnvelope(Reply.getDefaultInstance())
-
-                override suspend fun fooBar(
-                    context: RequestContext,
-                    request: SecondRequest,
-                ): ResponseEnvelope<Reply> = ResponseEnvelope(Reply.getDefaultInstance())
-            }
 
             @Suppress("unused")
             private suspend fun typeCheckOverloads(

@@ -66,9 +66,3 @@ class TrevRpcException(
     val status: Status,
     cause: Throwable? = null,
 ) : Exception(status.toString(), cause)
-
-internal fun Throwable.toStatus(): Status =
-    when (this) {
-        is TrevRpcException -> status
-        else -> Status.internal(message ?: "RPC handler failed")
-    }

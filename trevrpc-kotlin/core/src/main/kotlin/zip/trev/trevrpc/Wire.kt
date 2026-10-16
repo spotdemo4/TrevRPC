@@ -37,17 +37,6 @@ data class RpcRequest(
 ) {
     val kind: RpcKind?
         get() = RpcKind.fromValue(kindValue)
-
-    fun validateProtocol() {
-        if (version != WIRE_VERSION) {
-            throw TrevRpcException(
-                Status.failedPrecondition("unsupported TrevRPC wire version $version; expected $WIRE_VERSION"),
-            )
-        }
-        if (kind == null) {
-            throw TrevRpcException(Status.invalidArgument("unsupported TrevRPC RPC kind $kindValue"))
-        }
-    }
 }
 
 data class RpcResponse(

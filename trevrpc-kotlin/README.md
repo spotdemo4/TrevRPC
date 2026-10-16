@@ -1,8 +1,19 @@
 # trevrpc-kotlin
 
-TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients and servers, and run them over QUIC.
+TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients, and call servers over ordinary HTTP/3.
+
+Kotlin is client-only and targets Android: calls are `POST /trevrpc` over HTTP/3 through [Cronet](https://developer.android.com/develop/connectivity/cronet). Servers are written in Go or Rust.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
+
+## Modules
+
+| Module                      | Purpose                                                            |
+| --------------------------- | ------------------------------------------------------------------ |
+| `core`                      | Client runtime: calls, framing, metadata, status, wire codec.      |
+| `transport-cronet`          | `CronetRpcChannel`: the Cronet HTTP/3 transport.                   |
+| `protoc-gen-trevrpc-kotlin` | `protoc` plugin that generates one client class per service.       |
+| `interop-android`           | Android app and instrumented test for the cross-runtime scenarios. |
 
 ## Protobuf
 
@@ -22,16 +33,25 @@ message HelloRequest { string name = 1; }
 message HelloReply { string message = 1; }
 ```
 
-Generate with `protoc-gen-trevrpc-kotlin`.
+Generate Java messages and the client with `protoc`:
+
+```shell
+protoc \
+  --java_out=build/generated \
+  --plugin=protoc-gen-trevrpc-kotlin=path/to/protoc-gen-trevrpc-kotlin \
+  --trevrpc-kotlin_out=build/generated \
+  greeter.proto
+```
 
 ## Client
 
+The application owns the `CronetEngine` and callback executor; the channel never shuts them down. Select the Cronet provider (embedded `org.chromium.net:cronet-embedded`, or Google Play services) in the application, not in RPC code.
+
 ```kotlin
-val channel = NettyRpcChannel.nativeQuic(
-    NettyQuicClientConfig(InetSocketAddress("127.0.0.1", 50051), NettyClientTls("localhost"))
-)
-channel.awaitReady()
-val client = GreeterClient(channel)
+val engine = CronetEngine.Builder(context).enableQuic(true).build()
+val executor = Executors.newSingleThreadExecutor()
+val channel = CronetRpcChannel.create(engine, "https://rpc.example.com", executor)
+val client = GreeterClient(channel, CallOptions(timeout = 10.seconds))
 
 fun req(name: String) = HelloRequest.newBuilder().setName(name).build()
 
@@ -53,35 +73,31 @@ bidi.send(req("Alice"))
 println(bidi.receive()?.message)
 bidi.closeSend()
 
+// A successful close proves every call has settled; only then release the engine and executor.
 channel.close()
+engine.shutdown()
+executor.shutdown()
 ```
 
-## Server
+Failed calls throw `TrevRpcException` carrying a `Status`. Calls are never retried, and deadlines, idle timeouts, and response size limits are set through `CallOptions`.
 
-```kotlin
-class Greeter : GreeterService {
-    override suspend fun sayHello(ctx: RequestContext, req: HelloRequest) =
-        HelloReply.newBuilder().setMessage("hello, ${req.name}").build()
+## Interop tests
 
-    override suspend fun lotsOfReplies(ctx: RequestContext, req: HelloRequest): Flow<HelloReply> =
-        flowOf(
-            HelloReply.newBuilder().setMessage("hello, ${req.name}").build(),
-            HelloReply.newBuilder().setMessage("goodbye, ${req.name}").build(),
-        )
+`interop-android` generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go or Rust server on the host. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:
 
-    override suspend fun lotsOfGreetings(ctx: RequestContext, reqs: Flow<HelloRequest>): HelloReply {
-        val names = reqs.toList().joinToString(", ") { it.name }
-        return HelloReply.newBuilder().setMessage("hello, $names").build()
-    }
+```shell
+nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go --command \
+  trevrpc-interop-android \
+  --server-command "trevrpc-interop-go server" \
+  --output out/interop --work-dir /var/tmp/interop
+```
 
-    override suspend fun bidiHello(ctx: RequestContext, reqs: Flow<HelloRequest>): Flow<HelloReply> =
-        reqs.map { HelloReply.newBuilder().setMessage("hello, ${it.name}").build() }
-}
+The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, appends `--host 0.0.0.0 --cert <pem> --key <pem>` to the server command, and prints `ok <name>` or `fail <name>: <reason>` per scenario. It exits 0 only if every scenario passed.
 
-val server = Server()
-registerGreeter(server, Greeter())
-val listener = NettyRpcServer.bind(server, NettyRpcServerConfig(
-    InetSocketAddress("127.0.0.1", 50051),
-    NettyServerTls.Pem(File("key.pem"), File("cert.pem")),
-))
+## Development
+
+```shell
+./gradlew check                    # core, transport, and generator tests
+./gradlew verifyStagedMavenRepository createCentralBundle
+python3 -I -m unittest discover -s interop-android
 ```

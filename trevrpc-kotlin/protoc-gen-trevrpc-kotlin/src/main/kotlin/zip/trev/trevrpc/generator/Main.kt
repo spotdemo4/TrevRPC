@@ -211,13 +211,7 @@ private fun validateDeclarations(
         for (descriptor in file.serviceList) {
             val service = describeService(file, descriptor, types)
             val serviceSymbol = service.fullProtoName
-            reserveType(packageName, packagePrefix, service.interfaceName, serviceSymbol, reservations)
             reserveType(packageName, packagePrefix, service.clientName, serviceSymbol, reservations)
-            reserve(
-                "function:$packageName:${service.registerName}:Server,${service.interfaceName}",
-                "fun $packagePrefix${service.registerName}(Server, ${service.interfaceName})",
-                serviceSymbol,
-            )
             reserveProperty(
                 packageName,
                 packagePrefix,
@@ -232,13 +226,6 @@ private fun validateDeclarations(
                     packageName,
                     packagePrefix,
                     "${service.constantPrefix}_${method.constantName}_METHOD_NAME",
-                    methodSymbol,
-                    reservations,
-                )
-                reserveProperty(
-                    packageName,
-                    packagePrefix,
-                    "${service.constantPrefix}_${method.constantName}_RPC_KIND",
                     methodSymbol,
                     reservations,
                 )
@@ -336,23 +323,9 @@ private fun reserveMethodFamily(
     reservations: MutableList<DeclarationReservation>,
 ) {
     val renderedPackage = packageName.split('.').filter(String::isNotEmpty).joinToString(".", transform = ::kotlinIdent)
-    val serviceOwner = listOf(renderedPackage, kotlinIdent(service.interfaceName)).filter(String::isNotEmpty).joinToString(".")
     val clientOwner = listOf(renderedPackage, kotlinIdent(service.clientName)).filter(String::isNotEmpty).joinToString(".")
-    val requestContext = "$runtimePackage.RequestContext"
     val callOptions = "$runtimePackage.CallOptions"
     val flowType = "kotlinx.coroutines.flow.Flow"
-    val requestSource = if (method.clientStreaming) "$flowType<${method.input.kotlinType}>" else method.input.kotlinType
-    val requestErasure = if (method.clientStreaming) flowType else method.input.kotlinType
-    reserveMember(
-        reservations,
-        serviceOwner,
-        method.name,
-        listOf(requestContext, requestSource),
-        listOf(requestContext, requestErasure),
-        isSuspend = true,
-        hasDefaultParameters = false,
-        symbol = symbol,
-    )
 
     val options = listOf(callOptions)
     val requestAndOptions = listOf(method.input.kotlinType, callOptions)
@@ -501,22 +474,11 @@ private data class Method(
         get() = kotlinIdent(name)
 
     fun suffixedName(suffix: String): String = kotlinIdent(name + suffix)
-
-    val kind: String
-        get() =
-            when {
-                clientStreaming && serverStreaming -> "BIDIRECTIONAL_STREAMING"
-                clientStreaming -> "CLIENT_STREAMING"
-                serverStreaming -> "SERVER_STREAMING"
-                else -> "UNARY"
-            }
 }
 
 private data class Service(
     val name: String,
-    val interfaceName: String,
     val clientName: String,
-    val registerName: String,
     val constantPrefix: String,
     val fullProtoName: String,
     val methods: List<Method>,
@@ -548,36 +510,9 @@ private fun generateFile(
         appendLine("import kotlinx.coroutines.coroutineScope")
         appendLine("import kotlinx.coroutines.flow.Flow")
         appendLine("import kotlinx.coroutines.flow.flow")
-        appendLine("import kotlinx.coroutines.flow.map")
         appendLine("import kotlinx.coroutines.launch")
-        appendLine("import $runtime.mapReadyResponses")
         appendLine()
         codecs.values.forEach { type -> generateCodec(runtime, type, checkNotNull(codecNames[type.protoName])) }
-        appendLine("private fun <T> decodeTrevrpcRequest(codec: $runtime.MessageCodec<T>, body: ByteArray): T =")
-        appendLine("    try {")
-        appendLine("        codec.decode(body)")
-        appendLine("    } catch (error: $runtime.TrevRpcException) {")
-        appendLine("        throw error")
-        appendLine("    } catch (error: Throwable) {")
-        appendLine("        throw $runtime.TrevRpcException(")
-        appendLine(
-            "            $runtime.Status.invalidArgument(\"failed to decode request: \${error.message ?: error.javaClass.simpleName}\"),",
-        )
-        appendLine("            error,")
-        appendLine("        )")
-        appendLine("    }")
-        appendLine()
-        appendLine("private fun requireTrevrpcKind(")
-        appendLine("    context: $runtime.RequestContext,")
-        appendLine("    expected: $runtime.RpcKind,")
-        appendLine(") {")
-        appendLine("    if (context.kind != expected) {")
-        appendLine("        throw $runtime.TrevRpcException(")
-        appendLine("            $runtime.Status.invalidArgument(\"RPC kind mismatch: expected \$expected, got \${context.kind}\"),")
-        appendLine("        )")
-        appendLine("    }")
-        appendLine("}")
-        appendLine()
         services.forEachIndexed { index, service ->
             if (index > 0) appendLine()
             generateService(runtime, service, codecNames)
@@ -609,9 +544,7 @@ private fun describeService(
     val methods = descriptor.methodList.map { method -> describeMethod(file, method, types) }
     return Service(
         name = typeName,
-        interfaceName = "${typeName}Service",
         clientName = "${typeName}Client",
-        registerName = kotlinIdent("register$typeName"),
         constantPrefix = screamingSnake(descriptor.name),
         fullProtoName = listOf(file.`package`, descriptor.name).filter(String::isNotEmpty).joinToString("."),
         methods = methods,
@@ -644,31 +577,9 @@ private fun StringBuilder.generateService(
         appendLine(
             "public const val ${service.constantPrefix}_${method.constantName}_METHOD_NAME: String = ${method.protoName.quote()}",
         )
-        appendLine(
-            "public val ${service.constantPrefix}_${method.constantName}_RPC_KIND: $runtime.RpcKind = $runtime.RpcKind.${method.kind}",
-        )
     }
     appendLine()
-    appendLine("public interface ${kotlinIdent(service.interfaceName)} {")
-    for (method in service.methods) generateServiceMethod(runtime, method)
-    appendLine("}")
-    appendLine()
     generateClient(runtime, service, serviceConstant, codecNames)
-    appendLine()
-    generateRegistration(runtime, service, serviceConstant, codecNames)
-}
-
-private fun StringBuilder.generateServiceMethod(
-    runtime: String,
-    method: Method,
-) {
-    val requestType = if (method.clientStreaming) "Flow<${method.input.kotlinType}>" else method.input.kotlinType
-    val messageType = if (method.serverStreaming) "Flow<${method.output.kotlinType}>" else method.output.kotlinType
-    appendLine("    public suspend fun ${method.kotlinName}(")
-    appendLine("        context: $runtime.RequestContext,")
-    appendLine("        ${if (method.clientStreaming) "requests" else "request"}: $requestType,")
-    appendLine("    ): $runtime.ResponseEnvelope<$messageType>")
-    appendLine()
 }
 
 private fun StringBuilder.generateClient(
@@ -804,64 +715,6 @@ private fun StringBuilder.generateClientMethod(
         }
     }
     appendLine()
-}
-
-private fun StringBuilder.generateRegistration(
-    runtime: String,
-    service: Service,
-    serviceConstant: String,
-    codecNames: Map<String, String>,
-) {
-    appendLine("public fun ${service.registerName}(")
-    appendLine("    server: $runtime.Server,")
-    appendLine("    service: ${kotlinIdent(service.interfaceName)},")
-    appendLine(") {")
-    for (method in service.methods) {
-        val methodConstant = "${service.constantPrefix}_${method.constantName}_METHOD_NAME"
-        val kindConstant = "${service.constantPrefix}_${method.constantName}_RPC_KIND"
-        val inputCodec = checkNotNull(codecNames[method.input.protoName])
-        val outputCodec = checkNotNull(codecNames[method.output.protoName])
-        when {
-            method.clientStreaming && method.serverStreaming -> {
-                appendLine("    server.routeBidirectionalStreaming($serviceConstant, $methodConstant) { context, requests ->")
-                appendLine("        requireTrevrpcKind(context, $kindConstant)")
-                appendLine("        val decoded = requests.map { body -> decodeTrevrpcRequest($inputCodec, body) }")
-                appendLine("        val response = service.${method.kotlinName}(context, decoded)")
-                appendLine("        $runtime.ResponseEnvelope(response.message.map($outputCodec.encode), response.metadata)")
-                appendLine("    }")
-            }
-
-            method.clientStreaming -> {
-                appendLine("    server.routeClientStreaming($serviceConstant, $methodConstant) { context, requests ->")
-                appendLine("        requireTrevrpcKind(context, $kindConstant)")
-                appendLine("        val decoded = requests.map { body -> decodeTrevrpcRequest($inputCodec, body) }")
-                appendLine("        val response = service.${method.kotlinName}(context, decoded)")
-                appendLine("        $runtime.ResponseEnvelope($outputCodec.encode(response.message), response.metadata)")
-                appendLine("    }")
-            }
-
-            method.serverStreaming -> {
-                appendLine("    server.routeServerStreaming($serviceConstant, $methodConstant) { context, body ->")
-                appendLine("        requireTrevrpcKind(context, $kindConstant)")
-                appendLine("        val request = decodeTrevrpcRequest($inputCodec, body)")
-                appendLine("        val response = service.${method.kotlinName}(context, request)")
-                appendLine(
-                    "        $runtime.ResponseEnvelope(response.message.mapReadyResponses($outputCodec.encode), response.metadata)",
-                )
-                appendLine("    }")
-            }
-
-            else -> {
-                appendLine("    server.routeUnary($serviceConstant, $methodConstant) { context, body ->")
-                appendLine("        requireTrevrpcKind(context, $kindConstant)")
-                appendLine("        val request = decodeTrevrpcRequest($inputCodec, body)")
-                appendLine("        val response = service.${method.kotlinName}(context, request)")
-                appendLine("        $runtime.ResponseEnvelope($outputCodec.encode(response.message), response.metadata)")
-                appendLine("    }")
-            }
-        }
-    }
-    appendLine("}")
 }
 
 private fun javaTypePrefix(file: FileDescriptorProto): List<String> {

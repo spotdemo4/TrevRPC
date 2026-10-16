@@ -25,7 +25,6 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
 import zip.trev.trevrpc.FrameDecoder
-import zip.trev.trevrpc.RpcChannelState
 import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
@@ -54,24 +53,19 @@ import kotlin.time.measureTime
 @OptIn(ExperimentalCoroutinesApi::class)
 class Http3RpcTransportTest {
     @Test
-    fun `provider channel is ready until explicitly closed`() =
+    fun `closed channel rejects new calls and close is idempotent`() =
         runTest {
             val channel =
-                CronetChannel(
-                    Http3RpcTransport(
-                        FakeFactory(),
-                        coroutineContext = coroutineContext,
-                        shutdownContext = coroutineContext,
-                    ),
+                Http3RpcTransport(
+                    FakeFactory(),
+                    coroutineContext = coroutineContext,
+                    shutdownContext = coroutineContext,
                 )
 
-            assertEquals(RpcChannelState.READY, channel.state.value)
-            channel.awaitReady()
             channel.close()
             channel.close()
 
-            assertEquals(RpcChannelState.CLOSED, channel.state.value)
-            val error = runCatching { channel.awaitReady() }.exceptionOrNull()
+            val error = runCatching { channel.unary(RpcRequest("svc", "method")) }.exceptionOrNull()
             assertEquals(Code.UNAVAILABLE, (error as TrevRpcException).status.code)
         }
 

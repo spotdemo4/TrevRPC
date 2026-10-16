@@ -5,31 +5,15 @@ private val trevrpcCodec1: custom.rpc.MessageCodec<example.`class`.ApiTypes.Enve
         decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Envelope.Result.getDescriptor(), example.`class`.ApiTypes.Envelope.Result::parseFrom) },
 private val trevrpcCodec2: custom.rpc.MessageCodec<example.`class`.ApiTypes.Result> =
         decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Result.getDescriptor(), example.`class`.ApiTypes.Result::parseFrom) },
-private fun <T> decodeTrevrpcRequest(codec: custom.rpc.MessageCodec<T>, body: ByteArray): T =
-            custom.rpc.Status.invalidArgument("failed to decode request: ${error.message ?: error.javaClass.simpleName}"),
-private fun requireTrevrpcKind(
-            custom.rpc.Status.invalidArgument("RPC kind mismatch: expected $expected, got ${context.kind}"),
 public const val WHEN_SERVICE_NAME: String = "api.When"
 public const val WHEN_WHEN_METHOD_NAME: String = "When"
-public val WHEN_WHEN_RPC_KIND: custom.rpc.RpcKind = custom.rpc.RpcKind.UNARY
 public const val WHEN_NESTED_METHOD_NAME: String = "Nested"
-public val WHEN_NESTED_RPC_KIND: custom.rpc.RpcKind = custom.rpc.RpcKind.UNARY
-public interface WhenService {
-    public suspend fun `when`(
-    public suspend fun nested(
 public class WhenClient(
     public suspend fun whenResponse(
+    ): custom.rpc.ResponseEnvelope<example.`class`.ApiTypes.Envelope.Result> =
         client.unaryResponse(WHEN_SERVICE_NAME, WHEN_WHEN_METHOD_NAME, request, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun `when`(
     public suspend fun nestedResponse(
+    ): custom.rpc.ResponseEnvelope<shared.`when`.Result> =
         client.unaryResponse(WHEN_SERVICE_NAME, WHEN_NESTED_METHOD_NAME, request, trevrpcCodec2, trevrpcCodec0, options)
     public suspend fun nested(
-public fun registerWhen(
-    server.routeUnary(WHEN_SERVICE_NAME, WHEN_WHEN_METHOD_NAME) { context, body ->
-        requireTrevrpcKind(context, WHEN_WHEN_RPC_KIND)
-        val request = decodeTrevrpcRequest(trevrpcCodec0, body)
-        custom.rpc.ResponseEnvelope(trevrpcCodec1.encode(response.message), response.metadata)
-    server.routeUnary(WHEN_SERVICE_NAME, WHEN_NESTED_METHOD_NAME) { context, body ->
-        requireTrevrpcKind(context, WHEN_NESTED_RPC_KIND)
-        val request = decodeTrevrpcRequest(trevrpcCodec2, body)
-        custom.rpc.ResponseEnvelope(trevrpcCodec0.encode(response.message), response.metadata)

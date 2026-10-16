@@ -42,9 +42,7 @@ dependencies {
 }
 
 val protobufVersion =
-    libs.versions.protobuf
-        .asProvider()
-        .get()
+    libs.versions.protobuf.get()
 val kotlinVersion = libs.versions.kotlin.get()
 
 val executableJar =
@@ -88,6 +86,12 @@ extensions.configure<PublishingExtension> {
 tasks.test {
     dependsOn(tasks.installDist)
     useJUnitPlatform()
+    systemProperty(
+        "trevrpc.interop.proto",
+        rootProject.layout.projectDirectory
+            .file("../interop/proto/interop.proto")
+            .asFile,
+    )
     systemProperty(
         "trevrpc.kotlin.plugin",
         layout.buildDirectory

@@ -4,13 +4,6 @@ pluginManagement {
         mavenCentral()
         gradlePluginPortal()
     }
-    resolutionStrategy {
-        eachPlugin {
-            if (requested.id.id == "com.google.protobuf") {
-                useModule("com.google.protobuf:protobuf-gradle-plugin:${requested.version}")
-            }
-        }
-    }
 }
 
 dependencyResolutionManagement {
@@ -32,15 +25,11 @@ rootProject.name = "trevrpc-kotlin"
 
 include(
     "core",
-    "transport-netty",
     "transport-cronet",
     "protoc-gen-trevrpc-kotlin",
-    "examples",
-    "benchmark-support",
-    "bench-peer-netty",
-    "conformance-peer",
 )
 
-if (providers.gradleProperty("trevrpcCronetBenchPeer").map(String::toBoolean).getOrElse(false)) {
-    include("bench-peer-cronet")
+// The Android interop app needs the Android SDK, so it is opt-in.
+if (providers.gradleProperty("trevrpcAndroidInterop").map(String::toBoolean).getOrElse(false)) {
+    include("interop-android")
 }

@@ -86,21 +86,9 @@ class FramingMetadataTest {
 
     @Test
     fun `versions kinds and all status values are stable`() {
-        assertEquals("trevrpc/1", ALPN)
         assertEquals(1u, WIRE_VERSION)
         assertEquals(listOf(0, 1, 2, 3), RpcKind.entries.map(RpcKind::value))
         assertEquals((0u..16u).toList(), Code.entries.map(Code::value))
-
-        val badVersion = RpcRequest("svc", "method", version = 2u)
-        assertEquals(
-            Code.FAILED_PRECONDITION,
-            assertThrows(TrevRpcException::class.java, badVersion::validateProtocol).status.code,
-        )
-        val badKind = RpcRequest("svc", "method", kindValue = 99)
-        assertEquals(
-            Code.INVALID_ARGUMENT,
-            assertThrows(TrevRpcException::class.java, badKind::validateProtocol).status.code,
-        )
     }
 
     private fun assertInvalid(block: () -> Unit) {
