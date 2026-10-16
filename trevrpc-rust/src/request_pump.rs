@@ -97,15 +97,29 @@ pub(crate) enum RequestPumpSettle {
     ConnectionLost,
 }
 
+/// A transport-level end of the request stream, observed while the pump waits on the consumer.
 #[derive(Clone, Debug)]
 pub(crate) enum RequestTransportEvent {
     PeerReset(Status),
     ConnectionLost(Status),
 }
 
+impl RequestTransportEvent {
+    /// The event for a QUIC connection that ended while a request was still in flight.
+    pub(crate) fn connection_lost(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::ConnectionLost(Error::transport(error).into_status())
+    }
+}
+
 pub(crate) trait RequestPumpReader: FrameRead + Send + 'static {
     fn stop_trevrpc(&mut self);
 
+    /// Resolves when the transport ends the request stream, or never if it cannot tell.
+    ///
+    /// The pump polls this only while the consumer is not taking bodies, the one time it is not
+    /// itself reading the stream. It is dropped without resolving whenever the consumer catches
+    /// up, so it must be cancel-safe and must leave the stream readable and free of stale
+    /// registrations.
     fn backpressure_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
 
     fn read_unary_end(&mut self) -> impl Future<Output = Result<()>> + Send;
@@ -359,8 +373,25 @@ where
     let mut messages = 0_usize;
     let mut body_size = 0_usize;
     loop {
+        // The pump reads the stream only once the consumer has room for the next body. Transport
+        // events are watched solely while it waits for that room, so a consumer that keeps up never
+        // touches the watcher. A settled call outranks a closed consumer, which must not stop a
+        // request that is still being drained.
         let permit = tokio::select! {
             biased;
+            changed = settle_rx.changed() => {
+                let _ = changed;
+                return settle_reader(reader, settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped));
+            }
+            permit = body_tx.reserve() => {
+                if let Ok(permit) = permit {
+                    permit
+                } else {
+                    reader.reader().stop_trevrpc();
+                    reader.settled = true;
+                    return RequestPumpOutcome::LocallyStopped;
+                }
+            }
             event = reader.reader().backpressure_event() => {
                 match event {
                     Some(RequestTransportEvent::PeerReset(status)) => {
@@ -384,19 +415,6 @@ where
                         ).await;
                     }
                     None => continue,
-                }
-            }
-            changed = settle_rx.changed() => {
-                let _ = changed;
-                return settle_reader(reader, settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped));
-            }
-            permit = body_tx.reserve() => {
-                if let Ok(permit) = permit {
-                    permit
-                } else {
-                    reader.reader().stop_trevrpc();
-                    reader.settled = true;
-                    return RequestPumpOutcome::LocallyStopped;
                 }
             }
         };

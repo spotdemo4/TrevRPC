@@ -632,8 +632,8 @@ impl<S: BodySource> RequestPumpReader for BodyReader<S> {
     }
 
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
-        Some(RequestTransportEvent::ConnectionLost(
-            Error::transport(self.connection.closed().await).into_status(),
+        Some(RequestTransportEvent::connection_lost(
+            self.connection.closed().await,
         ))
     }
 

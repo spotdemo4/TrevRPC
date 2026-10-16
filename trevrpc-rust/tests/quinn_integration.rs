@@ -525,6 +525,254 @@ fn assert_response_shape(metadata: &trevrpc::Metadata, expected: &str) {
     );
 }
 
+/// Records every panic raised on the current test thread, including those that tokio catches
+/// inside spawned tasks and would otherwise only log.
+///
+/// Quinn guards its API contracts with `debug_assert!`s, such as the one in `RecvStream::drop`
+/// that rejects a stream with a stale blocked-reader waker. A violation panics inside a detached
+/// server task, so the RPC still succeeds and only the captured test output shows it. These
+/// tests run on a current-thread runtime, so the client, the server and its pump tasks all share
+/// the test's thread, which is how a panic is attributed to the test that caused it.
+mod task_panics {
+    use std::sync::{Mutex, Once, PoisonError};
+
+    static INSTALL: Once = Once::new();
+    static PANICS: Mutex<Vec<(Option<String>, String)>> = Mutex::new(Vec::new());
+
+    /// Installs the recording hook once for the whole test binary, chaining the previous hook so
+    /// panic output is unchanged.
+    pub(super) fn install() {
+        INSTALL.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let thread = std::thread::current().name().map(str::to_owned);
+                PANICS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((thread, info.to_string()));
+                previous(info);
+            }));
+        });
+    }
+
+    /// Returns, and clears, the panics raised on the current thread.
+    pub(super) fn take_current_thread() -> Vec<String> {
+        let current = std::thread::current().name().map(str::to_owned);
+        let mut panics = PANICS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mine, others): (Vec<_>, Vec<_>) =
+            panics.drain(..).partition(|(thread, _)| *thread == current);
+        *panics = others;
+        mine.into_iter().map(|(_, message)| message).collect()
+    }
+}
+
+/// Lets detached server tasks, such as the request pump and the post-response drain, finish.
+async fn settle_detached_server_tasks() {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+fn assert_no_task_panics() {
+    let panics = task_panics::take_current_thread();
+    assert!(
+        panics.is_empty(),
+        "a dependency contract was violated inside a server task: {panics:#?}"
+    );
+}
+
+#[tokio::test]
+async fn quinn_client_streaming_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+    task_panics::install();
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    for round in 0..16 {
+        let names = ["one", "two", "three", "four"];
+        let summary =
+            run_client_greetings(&client, &names[..=round % 4], CallOptions::new()).await?;
+        assert_eq!(summary.message, names[..=round % 4].join(","));
+    }
+
+    settle_detached_server_tasks().await;
+    close_client(endpoint, connection).await;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+#[tokio::test]
+async fn quinn_bidirectional_streaming_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+    task_panics::install();
+    let server = spawn_greeter_server(|_| {})?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    for round in 0..16 {
+        let names = ["left", "right", "up", "down"];
+        let replies = run_bidi_greetings(&client, &names[..=round % 4], CallOptions::new()).await?;
+        assert_eq!(replies.len(), round % 4 + 1);
+    }
+
+    settle_detached_server_tasks().await;
+    close_client(endpoint, connection).await;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+/// The upload is entirely buffered by QUIC, FIN included, while the handler ignores the body, so
+/// the request pump waits on backpressure and then reads the whole request to EOF without ever
+/// blocking on the transport.
+#[tokio::test]
+async fn quinn_backpressured_upload_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+    const MESSAGES: usize = 8;
+
+    task_panics::install();
+    let server = spawn_greeter_server(|server| {
+        server.route_streaming(
+            greeter::GreeterClient::<()>::SERVICE,
+            "BackpressuredUpload",
+            RpcKind::ClientStreaming,
+            |_body, mut requests| async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let mut count = 0_usize;
+                while let Some(request) = requests.next().await {
+                    request?;
+                    count += 1;
+                }
+                let reply = greeter::HelloReply {
+                    message: count.to_string(),
+                }
+                .encode_to_vec();
+                let replies: trevrpc::BoxStream<Vec<u8>> =
+                    Box::pin(trevrpc::stream::from_iter([reply]));
+                Ok(replies)
+            },
+        );
+    })?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let transport = trevrpc::client::QuicTransport::new(connection.clone());
+
+    let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
+        &transport,
+        greeter::GreeterClient::<()>::SERVICE,
+        "BackpressuredUpload",
+        CallOptions::new().with_timeout(TEST_TIMEOUT),
+    )
+    .await?;
+    for index in 0..MESSAGES {
+        call.send(greeter::HelloRequest {
+            name: format!("message {index}"),
+        })
+        .await?;
+    }
+    let reply = call.close_and_recv().await?;
+    assert_eq!(reply.message, MESSAGES.to_string());
+
+    settle_detached_server_tasks().await;
+    close_client(endpoint, connection).await;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+/// The handler answers at once and the client then finishes its request, so the post-response
+/// drain reads the request side to EOF.
+#[tokio::test]
+async fn quinn_post_response_drain_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+    task_panics::install();
+    let server = spawn_greeter_server(register_reject_upload_route)?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+
+    for _ in 0..8 {
+        let (mut send, _recv) = reject_with_open_request(&connection).await?;
+        for _ in 0..3 {
+            support::write_frame(
+                &mut send,
+                &RpcStreamFrame::message(Vec::new()),
+                trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+            )
+            .await?;
+        }
+        send.finish()?;
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??,
+            None
+        );
+    }
+
+    settle_detached_server_tasks().await;
+    close_client(endpoint, connection).await;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+/// A peer reset of the request stream cancels a handler that is not reading the body, whether or
+/// not unread request data is buffered behind the message the pump already queued.
+#[tokio::test]
+async fn quinn_request_reset_cancels_handler_that_is_not_reading_the_body() -> TestResult {
+    task_panics::install();
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(|server| {
+        let source_tx = source_tx.clone();
+        server.route_streaming_with_context(
+            greeter::GreeterClient::<()>::SERVICE,
+            "IgnoredUpload",
+            RpcKind::ClientStreaming,
+            move |context, _body, requests| {
+                let source_tx = source_tx.clone();
+                async move {
+                    // Hold the body without polling it: dropping it would stop the request.
+                    tokio::spawn(async move {
+                        let _unread_requests = requests;
+                        let _ = source_tx.send(context.cancelled_signal().await);
+                    });
+                    let replies: trevrpc::BoxStream<Vec<u8>> =
+                        Box::pin(futures_util::stream::pending());
+                    Ok(replies)
+                }
+            },
+        );
+    })?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+
+    for buffered_messages in [1_usize, 4] {
+        let (mut send, _recv) = connection.open_bi().await?;
+        let request = RpcRequest::new(
+            greeter::GreeterClient::<()>::SERVICE,
+            "IgnoredUpload",
+            Vec::new(),
+        )
+        .with_kind(RpcKind::ClientStreaming);
+        support::write_frame(
+            &mut send,
+            &request,
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )
+        .await?;
+        for _ in 0..buffered_messages {
+            support::write_frame(
+                &mut send,
+                &RpcStreamFrame::message(vec![0; 16]),
+                trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+            )
+            .await?;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send.reset(1_u32.into())?;
+
+        let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+            .await?
+            .expect("handler should report its cancellation source");
+        assert_eq!(source, CancellationSource::PeerReset);
+    }
+
+    settle_detached_server_tasks().await;
+    close_client(endpoint, connection).await;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
 #[tokio::test]
 async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let server = spawn_greeter_server(|server| {
@@ -2280,6 +2528,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
 
 #[tokio::test]
 async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> TestResult {
+    task_panics::install();
     let server = spawn_greeter_server(register_status_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -2331,12 +2580,16 @@ async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> Test
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
     assert_eq!(stopped, None);
 
+    settle_detached_server_tasks().await;
     close_client(endpoint, connection).await;
-    server.shutdown().await
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
 }
 
 #[tokio::test]
 async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
+    task_panics::install();
     let server = spawn_greeter_server(register_accept_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
@@ -2357,8 +2610,11 @@ async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
     replies.close_send()?;
 
     assert!(replies.recv().await?.is_none());
+    settle_detached_server_tasks().await;
     close_client(endpoint, connection).await;
-    server.shutdown().await
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
 }
 
 #[tokio::test]
@@ -2710,6 +2966,7 @@ async fn webtransport_malformed_request_frames_return_invalid_argument_status() 
 
 #[tokio::test]
 async fn quinn_unknown_request_stream_frame_kind_returns_invalid_argument_status() -> TestResult {
+    task_panics::install();
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -2752,8 +3009,11 @@ async fn quinn_unknown_request_stream_frame_kind_returns_invalid_argument_status
     );
     assert_eq!(Code::from_u32(frame.status), Code::InvalidArgument);
 
+    settle_detached_server_tasks().await;
     close_client(endpoint, connection).await;
-    server.shutdown().await
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
 }
 
 #[tokio::test]
