@@ -46,6 +46,7 @@ func (l *Listener) setupHTTP3() {
 		// would reject browsers served from another origin.
 		l.wt = &webtransport.Server{
 			H3:          l.h3,
+			Config:      serverWebTransportConfig(options),
 			CheckOrigin: func(*http.Request) bool { return true },
 		}
 	}

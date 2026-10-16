@@ -122,7 +122,7 @@ trevrpc-interop-browser --browser chromium|firefox|webkit \
   --cert-hash <hex sha256 of the server certificate DER>
 ```
 
-It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. Browsers come from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM`, `TREVRPC_BROWSER_FIREFOX` and `TREVRPC_BROWSER_WEBKIT` when those name an executable. WebKit is expected to fail until it supports the servers' WebTransport; where the browser has no WebTransport at all, every scenario fails with a clear reason.
+It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. Browsers come from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM`, `TREVRPC_BROWSER_FIREFOX` and `TREVRPC_BROWSER_WEBKIT` when those name an executable. WebKit on macOS passes against the Go server but not yet the Rust server ([h3#347](https://github.com/hyperium/h3/issues/347)); where the browser has no WebTransport at all, such as Playwright's WebKit on Linux, every scenario fails with a clear reason.
 
 ## Development
 

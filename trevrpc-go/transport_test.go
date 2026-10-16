@@ -177,9 +177,10 @@ func TestListenerServesEveryRPCShapeOverEveryTransport(t *testing.T) {
 	listener := startTestListener(t, pki, nil)
 
 	transports := map[string]Transport{
-		"native":       dialNative(t, pki, listener),
-		"http3":        newHTTP3TestClient(t, pki, listener),
-		"webtransport": newWebTransportTestClient(t, pki, listener, testOrigin),
+		"native":                    dialNative(t, pki, listener),
+		"http3":                     newHTTP3TestClient(t, pki, listener),
+		"webtransport":              newWebTransportTestClient(t, pki, listener, testOrigin, nil),
+		"webtransport flow control": newWebTransportTestClient(t, pki, listener, testOrigin, flowControlledWebTransportConfig),
 	}
 	for name, transport := range transports {
 		t.Run(name, func(t *testing.T) { exerciseRPCShapes(t, transport) })
@@ -380,7 +381,7 @@ func TestListenerShutdownClosesNativeHTTP3AndWebTransportPromptly(t *testing.T) 
 	for name, transport := range map[string]Transport{
 		"native":       dialNative(t, pki, listener),
 		"http3":        newHTTP3TestClient(t, pki, listener),
-		"webtransport": newWebTransportTestClient(t, pki, listener, ""),
+		"webtransport": newWebTransportTestClient(t, pki, listener, "", nil),
 	} {
 		if _, err := Unary(context.Background(), transport, testServiceName, "Echo", &testMessage{Value: name}, newTestMessage); err != nil {
 			t.Fatalf("%s call: %v", name, err)
@@ -626,6 +627,86 @@ func TestWebTransportAdmissionAndPath(t *testing.T) {
 	}
 }
 
+// WebTransport SETTINGS codepoints from draft-ietf-webtrans-http3-14.
+const (
+	settingWTMaxSessions           = 0x14e9cd29
+	settingWTInitialMaxData        = 0x2b61
+	settingWTInitialMaxStreamsUni  = 0x2b64
+	settingWTInitialMaxStreamsBidi = 0x2b65
+)
+
+// flowControlledWebTransportConfig makes a test client advertise WT_INITIAL_*
+// SETTINGS like Safari, which enables WebTransport session flow control.
+var flowControlledWebTransportConfig = &webtransport.Config{
+	MaxIncomingStreams:    100,
+	MaxIncomingUniStreams: 100,
+	MaxIncomingData:       64 * 1024,
+}
+
+// Safari enables session flow control and then cannot open a stream until the
+// server grants initial stream and data credit, so the server must advertise it.
+func TestWebTransportAdvertisesSessionFlowControl(t *testing.T) {
+	pki := newTestPKI(t)
+	listener := startTestListener(t, pki, func(options *ServerOptions) {
+		options.MaxFrameSize = 1024
+		options.MaxStreamBodySize = 4096
+		options.MaxConcurrentStreamsPerConnection = 10
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	tlsConfig := pki.client.Clone()
+	tlsConfig.NextProtos = []string{http3.NextProtoH3}
+	conn, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConfig, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	client := (&http3.Transport{EnableDatagrams: true}).NewClientConn(conn)
+	select {
+	case <-client.ReceivedSettings():
+	case <-ctx.Done():
+		t.Fatal("server SETTINGS not received")
+	}
+
+	settings := client.Settings().Other
+	if settings[settingWTMaxSessions] <= 1 {
+		t.Errorf("WT_MAX_SESSIONS = %d; Safari needs it, and above 1 it enables flow control", settings[settingWTMaxSessions])
+	}
+	if got := settings[settingWTInitialMaxStreamsBidi]; got != 11 {
+		t.Errorf("WT_INITIAL_MAX_STREAMS_BIDI = %d, want the per-connection limit plus a rejection slot", got)
+	}
+	if got, ok := settings[settingWTInitialMaxStreamsUni]; !ok || got != 0 {
+		t.Errorf("WT_INITIAL_MAX_STREAMS_UNI = %d (sent %t), want an explicit 0", got, ok)
+	}
+	if got := settings[settingWTInitialMaxData]; got != 4096 {
+		t.Errorf("WT_INITIAL_MAX_DATA = %d, want the connection receive window", got)
+	}
+}
+
+// With session flow control enabled, the server must keep granting stream and
+// data credit as calls complete, and honor the client's credit when replying.
+func TestWebTransportSessionFlowControlReplenishesCredit(t *testing.T) {
+	pki := newTestPKI(t)
+	listener := startTestListener(t, pki, func(options *ServerOptions) {
+		options.MaxFrameSize = 64 * 1024
+		options.MaxConcurrentStreamsPerConnection = 2
+	})
+	transport := newWebTransportTestClient(t, pki, listener, testOrigin, flowControlledWebTransportConfig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	// 16 calls exceed the 3-stream grant, and 512 KiB each way exceeds both the
+	// server's ~128 KiB and the client's 64 KiB session data windows.
+	value := strings.Repeat("x", 32*1024)
+	for i := range 16 {
+		reply, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: value}, newTestMessage)
+		if err != nil || reply.Value != value {
+			t.Fatalf("call %d: err = %v", i, err)
+		}
+	}
+}
+
 func TestWebTransportIsRejectedWithoutAdmissionCallback(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, func(options *ServerOptions) { options.WebTransportAdmission = nil })
@@ -656,7 +737,7 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
 	openers := map[string]streamOpener{
 		"native":       connOpener{conn},
-		"webtransport": newWebTransportTestOpener(t, pki, listener, testOrigin),
+		"webtransport": newWebTransportTestOpener(t, pki, listener, testOrigin, nil),
 	}
 	for name, opener := range openers {
 		t.Run(name, func(t *testing.T) {

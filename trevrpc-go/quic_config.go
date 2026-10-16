@@ -5,6 +5,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/quic-go/webtransport-go"
 )
 
 const (
@@ -55,9 +57,7 @@ func serverQUICConfig(base *quic.Config, options ServerOptions) *quic.Config {
 	capWindow(&config.InitialConnectionReceiveWindow, connectionWindow)
 	capWindow(&config.MaxConnectionReceiveWindow, connectionWindow)
 
-	// Keep one extra stream available so over-limit RPCs receive a TrevRPC
-	// status instead of blocking at the QUIC layer.
-	maxStreams := int64(options.MaxConcurrentStreamsPerConnection) + 1
+	maxStreams := serverStreamLimit(options)
 	if config.MaxIncomingStreams <= 0 || config.MaxIncomingStreams > maxStreams {
 		config.MaxIncomingStreams = maxStreams
 	}
@@ -80,6 +80,30 @@ func serverQUICConfig(base *quic.Config, options ServerOptions) *quic.Config {
 		config.MaxIncomingUniStreams = -1
 	}
 	return hardenQUICConfig(config)
+}
+
+// serverWebTransportConfig returns the session flow control a WebTransport
+// session grants its peer, mirroring the QUIC connection limits.
+//
+// Safari needs these SETTINGS. webtransport-go sends SETTINGS_WT_MAX_SESSIONS > 1,
+// which under draft-ietf-webtrans-http3-14 §5.1 enables session flow control when
+// the client also sends WT_INITIAL_* values, as Safari does. Without our own WT_INITIAL_* values the client's initial stream and data
+// limits default to zero and it can never open a stream.
+func serverWebTransportConfig(options ServerOptions) *webtransport.Config {
+	window := connectionReceiveWindow(options, frameReceiveWindow(options.MaxFrameSize))
+	return &webtransport.Config{
+		MaxIncomingStreams: serverStreamLimit(options),
+		// TrevRPC never uses unidirectional WebTransport streams.
+		MaxIncomingUniStreams: -1,
+		MaxIncomingData:       int64(min(window, quicvarint.Max)),
+	}
+}
+
+// serverStreamLimit is how many bidirectional streams a peer may open on one
+// connection or WebTransport session. It keeps one extra stream available so
+// over-limit RPCs receive a TrevRPC status instead of blocking in flow control.
+func serverStreamLimit(options ServerOptions) int64 {
+	return int64(options.MaxConcurrentStreamsPerConnection) + 1
 }
 
 func cloneQUICConfig(base *quic.Config) *quic.Config {

@@ -92,16 +92,18 @@ func (s *http3TestStream) cancelWrite() { _ = s.writer.CloseWithError(errors.New
 
 // newWebTransportTestClient returns a Transport that runs RPCs on the streams
 // of one WebTransport session to /trevrpc.
-func newWebTransportTestClient(t *testing.T, pki testPKI, listener *Listener, origin string) Transport {
+func newWebTransportTestClient(t *testing.T, pki testPKI, listener *Listener, origin string, config *webtransport.Config) Transport {
 	t.Helper()
-	return newStreamClient(newWebTransportTestOpener(t, pki, listener, origin), DefaultMaxFrameSize)
+	return newStreamClient(newWebTransportTestOpener(t, pki, listener, origin, config), DefaultMaxFrameSize)
 }
 
 // newWebTransportTestOpener opens one WebTransport session and returns an
-// opener for raw streams on it.
-func newWebTransportTestOpener(t *testing.T, pki testPKI, listener *Listener, origin string) streamOpener {
+// opener for raw streams on it. A config with limits makes the client advertise
+// WT_INITIAL_* SETTINGS, as Safari does, which enables session flow control.
+func newWebTransportTestOpener(t *testing.T, pki testPKI, listener *Listener, origin string, config *webtransport.Config) streamOpener {
 	t.Helper()
 	wt := &webtransport.Transport{
+		Config:          config,
 		TLSClientConfig: pki.client.Clone(),
 		QUICConfig:      &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
 	}

@@ -3,21 +3,21 @@
 Cross-runtime interoperability tests. Every server is exercised by every client
 over the transport that client speaks:
 
-| Client                   | Transport    | Servers                     |
-| ------------------------ | ------------ | --------------------------- |
-| Go                       | native QUIC  | Go, Rust                    |
-| Rust                     | native QUIC  | Go, Rust                    |
-| JavaScript (Chromium)    | WebTransport | Go, Rust                    |
-| JavaScript (Firefox)     | WebTransport | Go, Rust                    |
-| Kotlin (Cronet, Android) | HTTP/3       | Go, Rust                    |
-| JavaScript (Safari)      | WebTransport | Go, Rust (expected to fail) |
+| Client                   | Transport    | Servers                   |
+| ------------------------ | ------------ | ------------------------- |
+| Go                       | native QUIC  | Go, Rust                  |
+| Rust                     | native QUIC  | Go, Rust                  |
+| JavaScript (Chromium)    | WebTransport | Go, Rust                  |
+| JavaScript (Firefox)     | WebTransport | Go, Rust                  |
+| Kotlin (Cronet, Android) | HTTP/3       | Go, Rust                  |
+| JavaScript (Safari)      | WebTransport | Go; Rust expected to fail |
 
 `run.sh` (packaged with its tools as `nix run .#trevrpc-interop`) drives the desktop matrix, which `nix flake check` runs on Linux for
 Chromium and Firefox. CI runs the Android client on an emulator because it needs
-KVM, and runs Safari on macOS. Safari's WebTransport profile does not yet
-interoperate with either server, so that lane is expected to fail; it lives in
-its own workflow so the failure stays visible without blocking the required
-checks.
+KVM, and runs Safari on macOS. Safari passes against the Go server. Rust's `h3`
+does not yet speak the WebTransport draft Safari uses, so the Rust lane is
+expected to fail; it is an allowed failure in the `safari` workflow, so it stays
+visible without failing the workflow.
 
 ## Service
 

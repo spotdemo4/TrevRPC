@@ -27,11 +27,11 @@ Protobuf over QUIC, HTTP/3 & WebTransport, with Go, Rust, JavaScript, and Kotlin
 | [Kotlin](trevrpc-kotlin) (Android) | —                                     | HTTP/3       |
 
 Every client is tested against every server; see [interop](interop). The
-browser client is supported on Chromium and Firefox. Safari is not currently
-supported: neither `webtransport-go` nor Rust's `h3` interoperates with its
-WebTransport profile ([h3#347](https://github.com/hyperium/h3/issues/347)). The
-`safari` workflow keeps running against both servers so that it shows when
-upstream compatibility returns.
+browser client is supported on Chromium and Firefox with both servers, and on
+Safari with the Go server only: Rust's `h3` does not yet speak the WebTransport
+draft Safari uses ([h3#347](https://github.com/hyperium/h3/issues/347)). The
+`safari` workflow keeps running the Rust lane as an allowed failure so that it
+shows when upstream compatibility arrives.
 
 The wire format is shared by every runtime and pinned by
 [`testdata/wire-golden-vectors.txt`](testdata/wire-golden-vectors.txt).

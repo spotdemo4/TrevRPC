@@ -1,9 +1,9 @@
 name: safari
 
-# Safari's WebTransport profile does not currently interoperate with the Go
-# (webtransport-go) or Rust (h3) servers. This lane is expected to fail until
-# upstream compatibility returns; it is kept separate so the failure stays
-# visible without blocking the required checks.
+# Runs the browser interop suite in Safari on macOS. The Go lane must pass. The
+# Rust server's h3-webtransport does not speak the WebTransport draft Safari
+# uses (hyperium/h3#347), so the Rust lane is an allowed failure: it keeps
+# running so the failure stays visible, without failing the workflow.
 
 on:
   pull_request:
@@ -24,13 +24,18 @@ jobs:
     name: safari-to-${{ matrix.server }}
     runs-on: macos-26
     timeout-minutes: 60
+    continue-on-error: ${{ matrix.allow-failure }}
     permissions:
       contents: read
       id-token: write
     strategy:
       fail-fast: false
       matrix:
-        server: [go, rust]
+        include:
+          - server: go
+            allow-failure: false
+          - server: rust
+            allow-failure: true
     env:
       SERVER: ${{ matrix.server }}
     steps:
