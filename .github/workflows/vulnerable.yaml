@@ -15,7 +15,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
         with:
           shell: vulnerable
 
@@ -29,7 +29,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
         with:
           shell: vulnerable
 
@@ -43,7 +43,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
         with:
           shell: vulnerable
 
@@ -57,7 +57,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
         with:
           shell: vulnerable
 
@@ -70,7 +70,7 @@ jobs:
       id-token: write
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
         with:
           shell: vulnerable
 
