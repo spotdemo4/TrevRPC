@@ -1,7 +1,5 @@
 import org.gradle.api.DefaultTask
 import org.gradle.api.file.RegularFileProperty
-import org.gradle.api.publish.PublishingExtension
-import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.tasks.InputFile
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.PathSensitive
@@ -9,7 +7,12 @@ import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 import java.util.zip.ZipFile
 
-abstract class PrepareCronetApi : DefaultTask() {
+/**
+ * Extracts `classes.jar` from the Cronet AAR so this plain JVM module can compile and test against
+ * the Cronet API. Cronet ships its API and implementation in one Android library, so the classes stay
+ * off the published JAR and the application supplies Cronet with its provider.
+ */
+abstract class ExtractCronetClasses : DefaultTask() {
     @get:InputFile
     @get:PathSensitive(PathSensitivity.NONE)
     abstract val inputAar: RegularFileProperty
@@ -18,7 +21,7 @@ abstract class PrepareCronetApi : DefaultTask() {
     abstract val outputJar: RegularFileProperty
 
     @TaskAction
-    fun prepare() {
+    fun extract() {
         val output = outputJar.get().asFile
         output.parentFile.mkdirs()
         ZipFile(inputAar.get().asFile).use { archive ->
@@ -49,56 +52,32 @@ kotlin {
     }
 }
 
-val cronetApiAar =
-    configurations.create("cronetApiAar") {
+val cronetAar =
+    configurations.create("cronetAar") {
         isCanBeConsumed = false
         isCanBeResolved = true
         isTransitive = false
     }
-val cronetApiJar = layout.buildDirectory.file("cronet-api/classes.jar")
-val prepareCronetApi =
-    tasks.register<PrepareCronetApi>("prepareCronetApi") {
-        inputAar.set(layout.file(providers.provider { cronetApiAar.singleFile }))
-        outputJar.set(cronetApiJar)
+val cronetClassesJar = layout.buildDirectory.file("cronet/classes.jar")
+val extractCronetClasses =
+    tasks.register<ExtractCronetClasses>("extractCronetClasses") {
+        inputAar.set(layout.file(providers.provider { cronetAar.singleFile }))
+        outputJar.set(cronetClassesJar)
     }
 
 dependencies {
-    add(cronetApiAar.name, libs.cronet.api)
+    add(cronetAar.name, libs.cronet.library)
     api(project(":core"))
     implementation(libs.coroutines.core)
-    compileOnly(files(cronetApiJar).builtBy(prepareCronetApi))
+    compileOnly(files(cronetClassesJar).builtBy(extractCronetClasses))
 
     testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
-    testImplementation(files(cronetApiJar).builtBy(prepareCronetApi))
+    testImplementation(files(cronetClassesJar).builtBy(extractCronetClasses))
     testImplementation(libs.coroutines.test)
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
-tasks.jar {
-    dependsOn(prepareCronetApi)
-    from({ zipTree(cronetApiJar.get().asFile) }) {
-        include("org/chromium/net/**")
-    }
-}
-
 tasks.test {
     useJUnitPlatform()
-}
-
-pluginManager.withPlugin("maven-publish") {
-    extensions.configure<PublishingExtension> {
-        publications.named("maven", MavenPublication::class) {
-            pom {
-                description.set("JVM 17 Cronet HTTP/3 API adapter with application-owned provider resources.")
-                licenses {
-                    license {
-                        name.set("Chromium and built-in dependencies")
-                        url.set("https://storage.googleapis.com/chromium-cronet/android/143.0.7445.0/Release/cronet/LICENSE")
-                        distribution.set("repo")
-                    }
-                }
-            }
-        }
-    }
 }

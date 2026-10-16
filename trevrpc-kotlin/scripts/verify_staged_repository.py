@@ -210,20 +210,12 @@ def verify_pom(
         )
         require(
             not any(row[0] == "org.chromium.net" for row in rows),
-            "Cronet POM must not expose bundled API classes or choose a provider",
+            "Cronet POM must leave the Cronet library and provider to the application",
         )
         description = root.findtext("m:description", namespaces=POM_NAMESPACE) or ""
         require(
             "JVM 17" in description,
             f"Cronet POM has an untruthful platform description: {description!r}",
-        )
-        license_names = {
-            license_element.findtext("m:name", namespaces=POM_NAMESPACE)
-            for license_element in root.findall("m:licenses/m:license", POM_NAMESPACE)
-        }
-        require(
-            "Chromium and built-in dependencies" in license_names,
-            "Cronet POM omits bundled class licensing",
         )
     else:
         require(
@@ -263,7 +255,7 @@ def verify_module_metadata(
                     list[dict[str, typing.Any]], variant.get("dependencies", [])
                 )
             ),
-            "Cronet Gradle metadata must not expose bundled API classes or choose a provider",
+            "Cronet Gradle metadata must leave the Cronet library and provider to the application",
         )
 
 
@@ -388,12 +380,8 @@ def main() -> None:
             with zipfile.ZipFile(main_jar) as archive:
                 names = set(archive.namelist())
                 require(
-                    "org/chromium/net/CronetEngine.class" in names,
-                    "Cronet JAR does not bundle its public API classes",
-                )
-                require(
-                    "META-INF/LICENSE.chromium-cronet" in names,
-                    "Cronet JAR omits bundled class licensing",
+                    not any(name.startswith("org/chromium/") for name in names),
+                    "Cronet JAR must not bundle Cronet classes",
                 )
         verify_archive(sources_jar, required_suffixes=(".kt", ".java"))
         verify_archive(javadoc_jar, required_suffixes=(".html",))

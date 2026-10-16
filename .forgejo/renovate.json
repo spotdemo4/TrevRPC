@@ -102,13 +102,6 @@
       "separateMajorMinor": false
     },
     {
-      // cronet-api 500.x is an empty redirect to the aggregate cronet artifact.
-      "matchManagers": ["gradle"],
-      "matchDatasources": ["maven"],
-      "matchPackageNames": ["org.chromium.net:cronet-api"],
-      "allowedVersions": "/^[0-9]+\\.[0-9]{4,}\\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$/"
-    },
-    {
       "matchManagers": ["gradle", "gradle-wrapper"],
       "addLabels": ["kotlin"]
     },

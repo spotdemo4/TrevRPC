@@ -67,7 +67,7 @@ android {
 
     defaultConfig {
         applicationId = "zip.trev.trevrpc.interop.android"
-        minSdk = 23
+        minSdk = 24
         targetSdk = 36
         versionCode = 1
         versionName = "1"
@@ -96,10 +96,7 @@ androidComponents.onVariants { variant ->
 
 dependencies {
     implementation(project(":transport-cronet"))
-    implementation(libs.cronet.embedded) {
-        exclude(group = "org.chromium.net", module = "cronet-api")
-        exclude(group = "com.google.protobuf", module = "protobuf-javalite")
-    }
+    implementation(libs.cronet.bundled)
 
     androidTestImplementation(libs.android.test.junit)
     androidTestImplementation(libs.android.test.runner)
