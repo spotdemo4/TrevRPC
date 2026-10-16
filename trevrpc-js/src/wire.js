@@ -1,5 +1,7 @@
 import protobuf from "protobufjs";
 
+import { byteView } from "./bytes.js";
+
 export { protobuf };
 
 export const WireVersion = 1;
@@ -16,7 +18,7 @@ export const RpcStreamFrameKind = Object.freeze({
   Status: 1,
 });
 
-export const wireRoot = protobuf.Root.fromJSON({
+const wireRoot = protobuf.Root.fromJSON({
   nested: {
     trevrpc: {
       nested: {
@@ -76,61 +78,14 @@ const MaxUint32 = 0xffffffffn;
 const MaxUint64 = 0xffffffffffffffffn;
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
-/** Internal wire-validation failure used by production codec paths. */
-export class WireValidationError extends Error {
-  constructor(reason, message) {
-    super(message);
-    this.name = "WireValidationError";
-    this.reason = reason;
-  }
-}
-
 /** Checks protobuf tags and known-field wire types before protobuf.js decoding. */
 export function preflightWireMessage(messageType, body) {
   scanMessage(messageType, byteView(body), 0);
 }
 
-/** Validates TrevRPC protocol enums and versions after protobuf decoding. */
-export function validateWireMessage(messageType, message) {
-  if (messageType === RpcRequest) {
-    if (message.version !== WireVersion) {
-      throw new WireValidationError(
-        "unsupported_wire_version",
-        `unsupported wire version ${message.version}`,
-      );
-    }
-    if (!Object.values(RpcKind).includes(message.kind)) {
-      throw new WireValidationError("unsupported_rpc_kind", `unsupported RPC kind ${message.kind}`);
-    }
-    return;
-  }
-
-  if (
-    messageType === RpcStreamFrame &&
-    message.kind !== RpcStreamFrameKind.Message &&
-    message.kind !== RpcStreamFrameKind.Status
-  ) {
-    throw new WireValidationError(
-      "unsupported_frame_kind",
-      `unsupported stream frame kind ${message.kind}`,
-    );
-  }
-}
-
 /** Creates a protobuf root from a JSON namespace definition. */
 export function createRoot(json) {
   return protobuf.Root.fromJSON(json);
-}
-
-/** Creates a stream message frame carrying a protobuf body. */
-export function messageFrame(body) {
-  return {
-    kind: RpcStreamFrameKind.Message,
-    status: 0,
-    message: "",
-    body,
-    metadata: {},
-  };
 }
 
 function scanMessage(messageType, bytes, depth) {
@@ -389,15 +344,5 @@ function validateUtf8(bytes, name) {
 }
 
 function malformedWire(message) {
-  return new WireValidationError("malformed_protobuf", message);
-}
-
-function byteView(value) {
-  if (value instanceof Uint8Array) {
-    return value;
-  }
-  if (ArrayBuffer.isView(value)) {
-    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  }
-  return new Uint8Array(value ?? 0);
+  return new Error(message);
 }

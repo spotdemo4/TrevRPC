@@ -1,3 +1,4 @@
-export * from "./runtime.js";
-export { connect } from "./connect.js";
-export { Channel } from "./browser-channel.js";
+export { Channel, connect } from "./channel.js";
+export { createServiceClient } from "./client.js";
+export { Code, TrevRpcError, codeName } from "./status.js";
+export { createRoot, protobuf } from "./wire.js";

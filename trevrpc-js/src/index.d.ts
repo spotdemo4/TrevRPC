@@ -1,6 +1,9 @@
-import type { Long, Message, Root, Type } from "protobufjs";
+import type { INamespace, Root } from "protobufjs";
 
 export const protobuf: typeof import("protobufjs");
+
+/** Creates a protobuf root from a JSON namespace definition. */
+export function createRoot(json: INamespace): Root;
 
 export const Code: Readonly<{
   Ok: 0;
@@ -24,117 +27,48 @@ export const Code: Readonly<{
 
 export type StatusCode = (typeof Code)[keyof typeof Code];
 
-export interface TrevRpcErrorOptions extends ErrorOptions {
-  nativeCode?: number;
-}
+/** Returns the canonical status code name, such as "NotFound". */
+export function codeName(code: number): string;
+
+export type MetadataValue = string | Uint8Array | ArrayBuffer | ArrayBufferView | readonly number[];
+export type MetadataInput = Record<string, MetadataValue> | ReadonlyMap<string, MetadataValue>;
+export type Metadata = Record<string, Uint8Array>;
 
 /** Error carrying a TrevRPC status code, message, and metadata. */
 export class TrevRpcError extends Error {
   readonly code: StatusCode;
   readonly statusMessage: string;
   readonly metadata: Metadata;
-  readonly nativeCode?: number;
-  override readonly cause?: unknown;
 
-  /** Creates a TrevRPC status error. */
-  constructor(code: number, message?: string, metadata?: Metadata, options?: TrevRpcErrorOptions);
+  constructor(code: number, message?: string, metadata?: Metadata, options?: ErrorOptions);
 }
 
-/** Resource-exhausted status reported when a frame exceeds the configured size limit. */
-export class FrameTooLargeError extends TrevRpcError {
-  length: number;
-  max: number;
-
-  /** Creates a frame size error. */
-  constructor(length: number, max: number);
+export interface CallOptions {
+  /** Deadline for the whole call, from the start of the request to its final status. */
+  timeoutMs?: number;
+  /** Largest frame accepted or sent, in bytes. Defaults to 4 MiB. */
+  maxFrameSize?: number;
+  /** Request metadata. Keys are lowercase ASCII; the `trevrpc-` prefix is reserved. */
+  metadata?: MetadataInput;
+  /** Cancels the call. */
+  signal?: AbortSignal;
 }
 
-/** Converts a number into a known status code, defaulting unknown values to Unknown. */
-export function codeFromNumber(code: number): StatusCode;
-/** Returns the canonical status code name. */
-export function codeName(code: number): string;
-/** Creates a TrevRPC status error. */
-export function statusError(code: number, message?: string, metadata?: Metadata): TrevRpcError;
-/** Builds a status error from an RPC response. */
-export function statusFromResponse(response?: RpcResponseMessage | null): TrevRpcError;
-/** Reports whether a status-like value is OK. */
-export function isOkStatus(status?: { code?: number } | null): boolean;
-/** Creates an internal error status. */
-export function internal(message: string): TrevRpcError;
-/** Creates an invalid-argument status. */
-export function invalidArgument(message: string): TrevRpcError;
-/** Creates a deadline-exceeded status. */
-export function deadlineExceeded(message: string): TrevRpcError;
-/** Creates an unavailable status. */
-export function unavailable(message: string): TrevRpcError;
-/** Creates a resource-exhausted status. */
-export function resourceExhausted(message: string): TrevRpcError;
-/** Creates a cancelled status. */
-export function cancelled(message: string): TrevRpcError;
+export interface TransportStream {
+  readable: ReadableStream<Uint8Array>;
+  writable: WritableStream<Uint8Array>;
+}
 
-export const MaxMetadataEntries: 64;
-export const MaxMetadataKeyLen: 128;
-export const MaxMetadataValueLen: number;
-export const MaxMetadataTotalSize: number;
-export const ReservedMetadataPrefix: "trevrpc-";
+/** Anything that opens a bidirectional byte stream per call, such as a Channel or WebTransport. */
+export interface Transport {
+  createBidirectionalStream(): Promise<TransportStream>;
+}
 
-export type MetadataValue = string | Uint8Array | ArrayBuffer | ArrayBufferView | readonly number[];
-export type MetadataInput = Record<string, MetadataValue> | ReadonlyMap<string, MetadataValue>;
-export type Metadata = Record<string, Uint8Array>;
-
-/** Converts a metadata value into bytes. */
-export function metadataValueToBytes(value: MetadataValue): Uint8Array;
-/** Normalizes a metadata key to lowercase ASCII. */
-export function normalizeMetadataKey(key: string): string;
-/** Normalizes metadata keys and converts metadata values to bytes. */
-export function normalizeMetadata(metadata?: MetadataInput): Metadata;
-/** Validates metadata key syntax, value sizes, and total metadata limits. */
-export function validateMetadata(metadata?: MetadataInput): void;
-
-export const WireVersion: 1;
-export const RpcKind: Readonly<{
-  Unary: 0;
-  ClientStreaming: 1;
-  ServerStreaming: 2;
-  BidirectionalStreaming: 3;
-}>;
-export const RpcStreamFrameKind: Readonly<{
-  Message: 0;
-  Status: 1;
-}>;
-
-export type RpcKindValue = (typeof RpcKind)[keyof typeof RpcKind];
-export type RpcStreamFrameKindValue = (typeof RpcStreamFrameKind)[keyof typeof RpcStreamFrameKind];
 export type RpcMethodKind =
   | "unary"
   | "clientStreaming"
   | "serverStreaming"
   | "bidirectionalStreaming";
-
-export interface RpcRequestMessage {
-  service: string;
-  method: string;
-  body: Uint8Array;
-  metadata: Metadata;
-  kind: RpcKindValue;
-  version: number;
-  timeoutNanos?: number | string | Long;
-}
-
-export interface RpcResponseMessage {
-  status?: number;
-  message?: string;
-  body?: Uint8Array;
-  metadata?: Metadata;
-}
-
-export interface RpcStreamFrameMessage {
-  kind: RpcStreamFrameKindValue;
-  status?: number;
-  message?: string;
-  body?: Uint8Array;
-  metadata?: Metadata;
-}
 
 export interface RpcMethodDescriptor {
   name: string;
@@ -143,143 +77,11 @@ export interface RpcMethodDescriptor {
   outputType: string;
 }
 
-export interface RpcServiceDescriptor<
-  TMethods extends Record<string, RpcMethodDescriptor> = Record<string, RpcMethodDescriptor>,
-> {
+export interface RpcServiceDescriptor {
   name: string;
   fullName: string;
   exportName: string;
-  methods: TMethods;
-}
-
-export const wireRoot: Root;
-export const RpcRequest: Type;
-export const RpcResponse: Type;
-export const RpcStreamFrame: Type;
-
-/** Creates a protobuf root from a JSON namespace definition. */
-export function createRoot(json: import("protobufjs").INamespace): Root;
-/** Creates a stream message frame carrying a protobuf body. */
-export function messageFrame(body: Uint8Array): RpcStreamFrameMessage;
-
-export const DefaultMaxFrameSize: number;
-
-/** Encodes a protobuf message body. */
-export function marshalMessage<TRequest extends object>(
-  messageType: Type,
-  message: TRequest,
-): Uint8Array;
-/** Decodes a protobuf message body. */
-export function unmarshalMessage<TResponse = Message<Record<string, unknown>>>(
-  messageType: Type,
-  body: Uint8Array,
-): TResponse;
-/** Encodes a protobuf message into a length-prefixed TrevRPC frame. */
-export function encodeFrame<TMessage extends object>(
-  messageType: Type,
-  message: TMessage,
-  maxFrameSize?: number,
-): Uint8Array;
-/** Encodes one streaming message frame carrying an already-encoded protobuf body. */
-export function encodeMessageStreamFrame(body: Uint8Array, maxFrameSize?: number): Uint8Array;
-/** Encodes multiple streaming message frames into one contiguous write buffer. */
-export function encodeMessageStreamFrames(
-  bodies: Iterable<Uint8Array>,
-  maxFrameSize?: number,
-): Uint8Array;
-/** Decodes a protobuf message from a TrevRPC frame body. */
-export function decodeFrame<TMessage = Message<Record<string, unknown>>>(
-  messageType: Type,
-  body: Uint8Array,
-): TMessage;
-/** Decodes a streaming RPC frame body. */
-export function decodeStreamFrameBody(body: Uint8Array): RpcStreamFrameMessage;
-/** Writes one length-prefixed protobuf frame. */
-export function writeFrame<TMessage extends object>(
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  messageType: Type,
-  message: TMessage,
-  maxFrameSize?: number,
-): Promise<void>;
-/** Writes multiple streaming message frames in one write. */
-export function writeMessageStreamFrames(
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  bodies: Iterable<Uint8Array>,
-  maxFrameSize?: number,
-): Promise<void>;
-/** Decodes and validates the body length stored in a TrevRPC frame header. */
-export function frameBodyLength(header: Uint8Array, maxFrameSize?: number): number;
-
-/** Reads length-prefixed protobuf frames from a byte stream reader. */
-export class FrameReader {
-  /** Creates a frame reader over a stream reader. */
-  constructor(reader: ReadableStreamDefaultReader<Uint8Array>);
-
-  /** Reads and decodes one frame. */
-  readFrame<TMessage = Message<Record<string, unknown>>>(
-    messageType: Type,
-    maxFrameSize?: number,
-  ): Promise<TMessage>;
-  /** Reads and decodes one frame, or returns null when already at EOF. */
-  readFrameOrEOF<TMessage = Message<Record<string, unknown>>>(
-    messageType: Type,
-    maxFrameSize?: number,
-  ): Promise<TMessage | null>;
-  /** Reads and decodes one streaming RPC frame, or returns null when already at EOF. */
-  readStreamFrameOrEOF(maxFrameSize?: number): Promise<RpcStreamFrameMessage | null>;
-  /** Reads one streaming RPC frame, then drains complete frames already buffered. */
-  readStreamFrameBatchOrEOF(
-    maxBatch?: number,
-    maxFrameSize?: number,
-  ): Promise<RpcStreamFrameMessage[] | null>;
-  /** Reads stream message body batches, with at most one terminal status. */
-  readStreamMessageBodyBatchOrEOF(
-    maxBatch?: number,
-    maxFrameSize?: number,
-  ): Promise<{ bodies: Uint8Array[]; status: RpcStreamFrameMessage | null } | null>;
-  /** Reads one raw frame body, or returns null when already at EOF. */
-  readRawFrameBodyOrEOF(maxFrameSize?: number): Promise<Uint8Array | null>;
-  /** Reads exactly size bytes from the underlying reader. */
-  readExact(size: number, allowEofAtStart: boolean): Promise<Uint8Array | null>;
-  /** Reads a complete buffered frame body without waiting, or undefined. */
-  tryReadFrameBody(maxFrameSize?: number): Uint8Array | undefined;
-  /** Removes size bytes from the buffered data. */
-  consume(size: number): Uint8Array;
-  /** Copies size bytes from the buffered data without removing them. */
-  peek(size: number): Uint8Array;
-}
-
-export interface CallOptions {
-  timeoutMs?: number;
-  maxFrameSize?: number;
-  maxResponseBodySize?: number;
-  maxResponseMessages?: number;
-  maxResponseStreamBodySize?: number;
-  streamIdleTimeoutMs?: number;
-  metadata?: MetadataInput;
-  signal?: AbortSignal;
-}
-
-export interface ResolvedCallOptions {
-  timeoutMs?: number;
-  maxFrameSize?: number;
-  maxResponseBodySize: number;
-  maxResponseMessages: number;
-  maxResponseStreamBodySize: number;
-  streamIdleTimeoutMs: number;
-  metadata: Metadata;
-  signal?: AbortSignal;
-}
-
-export interface Transport {
-  /** Sends a unary RPC request and returns its response. */
-  call(request: RpcRequestMessage, options?: ResolvedCallOptions): Promise<RpcResponseMessage>;
-  /** Sends a streaming RPC request and returns response frames. */
-  streamingCall(
-    request: RpcRequestMessage,
-    requestBody: AsyncIterable<Uint8Array>,
-    options?: ResolvedCallOptions,
-  ): Promise<AsyncIterable<RpcStreamFrameMessage>>;
+  methods: Record<string, RpcMethodDescriptor>;
 }
 
 export interface UnaryResponse<TResponse> {
@@ -287,80 +89,45 @@ export interface UnaryResponse<TResponse> {
   readonly metadata: Metadata;
 }
 
+/** The final status of a call that ended with OK. */
 export interface StreamStatus {
   readonly code: StatusCode;
   readonly message: string;
   readonly metadata: Metadata;
 }
 
-export interface ResponseAsyncIterable<TResponse> extends AsyncIterable<TResponse> {
+/**
+ * Responses of a server-streaming call. Iteration ends after the final OK status and throws a
+ * TrevRpcError for any other outcome. Leaving the loop early cancels the call.
+ */
+export interface ResponseStream<TResponse> extends AsyncIterable<TResponse> {
+  /** Settles with the final status, or rejects with the error that ended the call. */
   readonly status: Promise<StreamStatus>;
+  /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;
 }
 
-declare const unaryServerResponseBrand: unique symbol;
-declare const streamingServerResponseBrand: unique symbol;
-
-export interface UnaryServerResponse<T> {
-  /** Opaque brand; construct responses with createUnaryResponse(). */
-  readonly [unaryServerResponseBrand]: true;
-  readonly message: T;
-  readonly metadata: Metadata;
-}
-
-export interface StreamingServerResponse<T> {
-  /** Opaque brand; construct responses with createStreamingResponse(). */
-  readonly [streamingServerResponseBrand]: true;
-  readonly messages: Iterable<T> | AsyncIterable<T>;
-  readonly status: StreamStatus;
-}
-
-/** Creates an opaque unary generated-server response envelope. */
-export function createUnaryResponse<T>(
-  message: T,
-  metadata?: MetadataInput,
-): UnaryServerResponse<T>;
-
-/** Creates an opaque streaming generated-server response envelope. */
-export function createStreamingResponse<T>(
-  messages: Iterable<T> | AsyncIterable<T>,
-  status?: {
-    code?: StatusCode;
-    message?: string;
-    metadata?: MetadataInput;
-  },
-): StreamingServerResponse<T>;
-
-export interface ClientStreamingCall<TRequest extends object, TResponse> {
+export interface ClientStreamingCall<TRequest, TResponse> {
   /** Sends one request message. */
   send(request: TRequest): Promise<void>;
-  /** Sends multiple request messages. */
-  sendMany(requests: Iterable<TRequest>): Promise<void>;
-  /** Closes the request stream. */
-  closeSend(): Promise<void>;
   /** Closes the request stream and returns the final response. */
   closeAndRecv(): Promise<TResponse>;
-  /** Closes the request stream and returns the final response envelope. */
+  /** Closes the request stream and returns the final response with its metadata. */
   closeAndRecvWithResponse(): Promise<UnaryResponse<TResponse>>;
-  /** Releases call resources without waiting for the response. */
+  /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;
 }
 
-export interface BidirectionalStreamingCall<
-  TRequest extends object,
-  TResponse,
-> extends AsyncIterable<TResponse> {
-  /** Resolves to the terminal stream status after completion. */
-  status: Promise<StreamStatus>;
+export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIterable<TResponse> {
+  /** Settles with the final status, or rejects with the error that ended the call. */
+  readonly status: Promise<StreamStatus>;
   /** Sends one request message. */
   send(request: TRequest): Promise<void>;
-  /** Sends multiple request messages. */
-  sendMany(requests: Iterable<TRequest>): Promise<void>;
-  /** Receives one response message, or undefined after the response stream completes. */
+  /** Receives the next response message, or undefined after the final OK status. */
   recv(): Promise<TResponse | undefined>;
   /** Closes the request stream while keeping the response stream readable. */
   closeSend(): Promise<void>;
-  /** Releases call resources without waiting for more responses. */
+  /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;
 }
 
@@ -369,73 +136,6 @@ export type ServiceClient = Record<
   (requestOrOptions?: unknown, options?: CallOptions) => Promise<unknown>
 >;
 
-/** Returns the default client call options. */
-export function defaultCallOptions(): ResolvedCallOptions;
-/** Merges call options and normalizes metadata. */
-export function mergeCallOptions(base?: CallOptions, override?: CallOptions): ResolvedCallOptions;
-/** Calls a unary RPC and decodes the protobuf response. */
-export function unary<
-  TRequest extends object = Record<string, unknown>,
-  TResponse = Message<Record<string, unknown>>,
->(
-  transport: Transport,
-  service: string,
-  method: string,
-  requestType: Type,
-  responseType: Type,
-  request: TRequest,
-  options?: CallOptions,
-): Promise<TResponse>;
-/** Calls a unary RPC and returns the decoded response envelope. */
-export function unaryWithResponse<
-  TRequest extends object = Record<string, unknown>,
-  TResponse = Message<Record<string, unknown>>,
->(
-  transport: Transport,
-  service: string,
-  method: string,
-  requestType: Type,
-  responseType: Type,
-  request: TRequest,
-  options?: CallOptions,
-): Promise<UnaryResponse<TResponse>>;
-/** Calls a server-streaming RPC and returns a decoded response stream. */
-export function serverStreaming<
-  TRequest extends object = Record<string, unknown>,
-  TResponse = Message<Record<string, unknown>>,
->(
-  transport: Transport,
-  service: string,
-  method: string,
-  requestType: Type,
-  responseType: Type,
-  request: TRequest,
-  options?: CallOptions,
-): Promise<ResponseAsyncIterable<TResponse>>;
-/** Calls a client-streaming RPC and returns a sendable call object. */
-export function clientStreaming<
-  TRequest extends object = Record<string, unknown>,
-  TResponse = Message<Record<string, unknown>>,
->(
-  transport: Transport,
-  service: string,
-  method: string,
-  requestType: Type,
-  responseType: Type,
-  options?: CallOptions,
-): Promise<ClientStreamingCall<TRequest, TResponse>>;
-/** Calls a bidirectional-streaming RPC and returns a sendable call object. */
-export function bidirectionalStreaming<
-  TRequest extends object = Record<string, unknown>,
-  TResponse = Message<Record<string, unknown>>,
->(
-  transport: Transport,
-  service: string,
-  method: string,
-  requestType: Type,
-  responseType: Type,
-  options?: CallOptions,
-): Promise<BidirectionalStreamingCall<TRequest, TResponse>>;
 /** Creates a service client from a generated service descriptor. */
 export function createServiceClient<TClient extends ServiceClient = ServiceClient>(
   transport: Transport,
@@ -444,134 +144,61 @@ export function createServiceClient<TClient extends ServiceClient = ServiceClien
   options?: CallOptions,
 ): TClient;
 
-export interface WebTransportCloseInfoLike {
-  closeCode?: number;
-  reason?: string;
-}
-
-export interface WebTransportBidirectionalStreamLike {
-  readable: ReadableStream<Uint8Array>;
-  writable: WritableStream<Uint8Array>;
-}
-
-export interface WebTransportSessionLike {
-  ready: Promise<void>;
-  closed?: Promise<WebTransportCloseInfoLike>;
-  close?(closeInfo?: WebTransportCloseInfoLike): void;
-  createBidirectionalStream?(): Promise<WebTransportBidirectionalStreamLike>;
-}
-
-export interface WebTransportConstructorLike {
-  new (url: string | URL, options?: BrowserWebTransportOptions): WebTransportSessionLike;
-}
-
 export interface WebTransportCertificateHash {
   algorithm: string;
   value: ArrayBuffer | ArrayBufferView;
 }
 
-export interface BrowserWebTransportOptions {
+export interface WebTransportSessionLike extends Transport {
+  readonly ready: Promise<unknown>;
+  readonly closed: Promise<unknown>;
+  close(closeInfo?: { closeCode?: number; reason?: string }): void;
+}
+
+export interface ConnectOptions {
   allowPooling?: boolean;
   congestionControl?: "default" | "low-latency" | "throughput";
   requireUnreliable?: boolean;
+  /** Trusts a self-signed ECDSA certificate (at most 14 days old) by its SHA-256 hash. */
   serverCertificateHashes?: readonly WebTransportCertificateHash[];
+  /** WebTransport implementation to use instead of the global one. */
+  WebTransport?: new (url: string | URL, options?: object) => WebTransportSessionLike;
+  /** Cancels the initial connection attempt only. */
+  signal?: AbortSignal;
+  /** Receives channel state transitions. */
+  onStateChange?(change: ChannelStateChange): void;
 }
 
-export interface WebTransportOptions extends BrowserWebTransportOptions {
-  WebTransport?: WebTransportConstructorLike;
-  maxFrameSize?: number;
-}
+export type ChannelState = "ready" | "reconnecting" | "closed";
 
-export type ChannelState = "connecting" | "ready" | "reconnecting" | "closed";
-
-export interface ChannelLifecycle {
+export interface ChannelStateChange {
   state: ChannelState;
   previousState: ChannelState;
-  generation: number;
+  /** Reconnect attempt number while reconnecting, starting at one. */
   attempt?: number;
+  /** Delay before the reconnect attempt. */
   delayMs?: number;
+  /** Why the session was lost or the previous attempt failed. */
   error?: unknown;
 }
 
-export type ChannelLifecycleEvent = Event & {
-  readonly detail: ChannelLifecycle;
-};
+/** Opens a channel to a WebTransport server and waits for its session to be ready. */
+export function connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
 
-export interface ChannelLifecycleOptions {
-  /** Receives channel lifecycle transitions. */
-  onStateChange?(event: ChannelLifecycle): void;
-}
+/**
+ * A WebTransport session that reconnects in the background after it is lost. Calls fail fast
+ * with Unavailable while it reconnects and are never replayed.
+ */
+export class Channel implements Transport {
+  private constructor();
 
-type TrevRpcEventListener = ((event: Event) => void) | { handleEvent(event: Event): void };
-interface TrevRpcEventListenerOptions {
-  capture?: boolean;
-}
-interface TrevRpcAddEventListenerOptions extends TrevRpcEventListenerOptions {
-  once?: boolean;
-  passive?: boolean;
-  signal?: AbortSignal;
-}
+  /** Opens a channel to a WebTransport server and waits for its session to be ready. */
+  static connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
 
-export interface RpcChannel extends Transport, EventTarget {
-  readonly ready: boolean;
   readonly state: ChannelState;
-  readonly generation: number;
+  createBidirectionalStream(): Promise<TransportStream>;
+  /** Resolves once the channel is ready, immediately if it already is. */
   waitUntilReady(): Promise<void>;
-  close(closeInfo?: WebTransportCloseInfoLike): void;
-}
-
-export interface BrowserChannelOptions extends WebTransportOptions, ChannelLifecycleOptions {
-  /** Bounds initial readiness only. Later reconnects continue until close(). */
-  timeoutMs?: number;
-  /** Cancels initial readiness only. Later reconnects continue until close(). */
-  signal?: AbortSignal;
-}
-
-/** Opens a browser channel and waits for its first ready generation. */
-export function connect(url: string | URL, options?: BrowserChannelOptions): Promise<Channel>;
-
-/** Application channel with background connection reconnection. */
-export class Channel extends EventTarget implements RpcChannel {
-  readonly url: string | URL;
-  readonly options: Readonly<BrowserChannelOptions>;
-  readonly ready: boolean;
-  readonly state: ChannelState;
-  readonly generation: number;
-
-  constructor(url: string | URL, options?: BrowserChannelOptions);
-
-  /** Creates a channel and waits for its first ready generation. */
-  static connect(url: string | URL, options?: BrowserChannelOptions): Promise<Channel>;
-  /** Waits for the current or next connection generation to become ready. */
-  waitUntilReady(): Promise<void>;
-  /** Sends a unary call on the current generation without replaying it. */
-  call(request: RpcRequestMessage, options?: ResolvedCallOptions): Promise<RpcResponseMessage>;
-  /** Starts a streaming call on the current generation without resuming it later. */
-  streamingCall(
-    request: RpcRequestMessage,
-    requestBody: AsyncIterable<Uint8Array>,
-    options?: ResolvedCallOptions,
-  ): Promise<AsyncIterableIterator<RpcStreamFrameMessage>>;
-  /** Stops reconnecting and closes the current generation. */
-  close(closeInfo?: WebTransportCloseInfoLike): void;
-  addEventListener(
-    type: "statechange" | ChannelState,
-    callback: (event: ChannelLifecycleEvent) => void,
-    options?: boolean | TrevRpcAddEventListenerOptions,
-  ): void;
-  addEventListener(
-    type: string,
-    callback: TrevRpcEventListener | null,
-    options?: boolean | TrevRpcAddEventListenerOptions,
-  ): void;
-  removeEventListener(
-    type: "statechange" | ChannelState,
-    callback: (event: ChannelLifecycleEvent) => void,
-    options?: boolean | TrevRpcEventListenerOptions,
-  ): void;
-  removeEventListener(
-    type: string,
-    callback: TrevRpcEventListener | null,
-    options?: boolean | TrevRpcEventListenerOptions,
-  ): void;
+  /** Stops reconnecting and closes the current session. */
+  close(closeInfo?: { closeCode?: number; reason?: string }): void;
 }
