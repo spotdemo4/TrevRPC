@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package trevrpc.interop.v1;
+
+// Echo exercises every RPC shape across runtimes. See interop/README.md for
+// the exact server behavior and client scenarios.
+service Echo {
+  rpc Unary(EchoRequest) returns (EchoResponse);
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  rpc Bidi(stream EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+  // ServerStream: number of responses to send.
+  uint32 count = 2;
+  // Non-zero: terminate the call with this status code.
+  uint32 fail_code = 3;
+  string fail_message = 4;
+}
+
+message EchoResponse {
+  string message = 1;
+  uint32 index = 2;
+}
