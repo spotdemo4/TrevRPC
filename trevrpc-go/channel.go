@@ -73,8 +73,6 @@ type ChannelEvent struct {
 	Generation     uint64
 	Err            error
 	ReconnectDelay time.Duration
-	Connection     ConnectionInfo
-	CloseReason    TransportCloseReason
 }
 
 type reconnectConfig struct {
@@ -111,38 +109,6 @@ type Channel struct {
 	events     *channelEventDispatcher
 }
 
-// Dial establishes a reconnecting Channel with the built-in native C backend.
-// An https target uses WebTransport; other targets use native QUIC. The context
-// applies only to the initial dial; Close controls the Channel.
-func Dial(ctx context.Context, target string, options DialOptions) (*Channel, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, statusFromContextError(err)
-	}
-	connector, err := newChannelConnector(target, options)
-	if err != nil {
-		return nil, err
-	}
-	return dialChannel(ctx, connector, options.OnEvent)
-}
-
-// DialWithBackend establishes a reconnecting Channel with an explicit optional backend.
-// Backend packages normally wrap this function with their own typed options.
-func DialWithBackend(
-	ctx context.Context,
-	target string,
-	options DialOptions,
-	backend DialBackend,
-) (*Channel, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, statusFromContextError(err)
-	}
-	connector, err := newBackendChannelConnector(target, options, backend)
-	if err != nil {
-		return nil, err
-	}
-	return dialChannel(ctx, connector, options.OnEvent)
-}
-
 func dialChannel(
 	ctx context.Context,
 	connector channelConnector,
@@ -156,48 +122,6 @@ func dialChannel(
 		return nil, err
 	}
 	return newChannel(initial, connector, realReconnectClock{}, defaultReconnectConfig(), rand.Float64, onEvent), nil
-}
-
-func newChannelConnector(target string, options DialOptions) (channelConnector, error) {
-	return newBackendChannelConnector(
-		target,
-		options,
-		defaultNativeBackend(),
-	)
-}
-
-func newBackendChannelConnector(
-	target string,
-	options DialOptions,
-	backend DialBackend,
-) (channelConnector, error) {
-	if backend == nil {
-		return nil, InvalidArgument("dial backend is nil")
-	}
-	if _, err := resolveExplicitBackend(backend.Backend()); err != nil {
-		return nil, err
-	}
-	maxFrameSize := options.MaxFrameSize
-	if maxFrameSize <= 0 {
-		maxFrameSize = DefaultMaxFrameSize
-	}
-	connector, err := backend.NewConnector(target, BackendDialOptions{
-		Transport:    options.Transport,
-		Limits:       options.Limits,
-		Credentials:  cloneTransportCredentials(options.Credentials),
-		MaxFrameSize: maxFrameSize,
-		WebTransport: cloneWebTransportOptions(options.WebTransport),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if connector == nil {
-		return nil, InvalidArgument("dial backend returned a nil connector")
-	}
-	return backendChannelConnector{
-		connector:    connector,
-		maxFrameSize: maxFrameSize,
-	}, nil
 }
 
 // Ready reports whether new calls can snapshot a ready connection generation.
@@ -308,13 +232,7 @@ func (c *Channel) Close() error {
 		Type:       ChannelEventClosed,
 		State:      snapshot.State,
 		Generation: snapshot.Generation,
-		Connection: generationConnectionInfo(generation),
-		CloseReason: TransportCloseReason{
-			Local:   true,
-			Clean:   err == nil,
-			Message: "channel closed",
-			Err:     err,
-		},
+		Err:        err,
 	})
 	return err
 }
@@ -356,12 +274,7 @@ func newChannel(initial channelGeneration, connector channelConnector, clock rec
 		backoff:    newReconnectBackoff(reconnect, random),
 		events:     newChannelEventDispatcher(onEvent),
 	}
-	client.events.emit(ChannelEvent{
-		Type:       ChannelEventReady,
-		State:      ChannelStateReady,
-		Generation: 1,
-		Connection: generationConnectionInfo(initial),
-	})
+	client.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: 1})
 	go client.run(initial, 1)
 	return client
 }
@@ -375,11 +288,8 @@ func (c *Channel) run(generation channelGeneration, number uint64) {
 		case <-generation.Done():
 		}
 
-		if !c.beginReconnect(number, generation, generation.Err()) {
+		if !c.beginReconnect(number, generation.Err()) {
 			return
-		}
-		if releaser, ok := generation.(disconnectedGenerationReleaser); ok {
-			releaser.releaseDisconnected()
 		}
 		c.backoff.Reset()
 		delay := c.backoff.Next()
@@ -408,11 +318,7 @@ func (c *Channel) run(generation channelGeneration, number uint64) {
 	}
 }
 
-func (c *Channel) beginReconnect(
-	number uint64,
-	generation channelGeneration,
-	err error,
-) bool {
+func (c *Channel) beginReconnect(number uint64, err error) bool {
 	c.mu.Lock()
 	if c.state == ChannelStateClosed || c.generation != number {
 		c.mu.Unlock()
@@ -424,12 +330,10 @@ func (c *Channel) beginReconnect(
 	snapshot := ChannelSnapshot{State: c.state, Generation: c.generation}
 	c.mu.Unlock()
 	c.events.emit(ChannelEvent{
-		Type:        ChannelEventDisconnected,
-		State:       snapshot.State,
-		Generation:  snapshot.Generation,
-		Err:         err,
-		Connection:  generationConnectionInfo(generation),
-		CloseReason: generationCloseReason(generation, err),
+		Type:       ChannelEventDisconnected,
+		State:      snapshot.State,
+		Generation: snapshot.Generation,
+		Err:        err,
 	})
 	return true
 }
@@ -446,130 +350,21 @@ func (c *Channel) publish(generation channelGeneration) (bool, uint64) {
 	c.state = ChannelStateReady
 	close(c.ready)
 	c.mu.Unlock()
-	c.events.emit(ChannelEvent{
-		Type:       ChannelEventReady,
-		State:      ChannelStateReady,
-		Generation: number,
-		Connection: generationConnectionInfo(generation),
-	})
+	c.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: number})
 	return true, number
 }
 
+// channelGeneration is one established connection. It must close Done when the
+// connection is lost and report why through Err.
 type channelGeneration interface {
-	ClientTransport
+	Transport
+	Close() error
 	Done() <-chan struct{}
 	Err() error
-	Info() ConnectionInfo
-	CloseReason(error) TransportCloseReason
-}
-
-type disconnectedGenerationReleaser interface {
-	releaseDisconnected()
-}
-
-func generationConnectionInfo(generation channelGeneration) ConnectionInfo {
-	if generation == nil {
-		return ConnectionInfo{}
-	}
-	return generation.Info()
-}
-
-func generationCloseReason(
-	generation channelGeneration,
-	err error,
-) TransportCloseReason {
-	if generation == nil {
-		return TransportCloseReason{Err: err}
-	}
-	return generation.CloseReason(err)
 }
 
 type channelConnector interface {
 	Connect(context.Context) (channelGeneration, error)
-}
-
-type backendChannelConnector struct {
-	connector    BackendConnector
-	maxFrameSize int
-}
-
-func (c backendChannelConnector) Connect(ctx context.Context) (channelGeneration, error) {
-	connection, err := c.connector.Connect(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if connection.Endpoint == nil {
-		if connection.Close != nil {
-			_ = connection.Close()
-		}
-		return nil, InvalidArgument("dial backend returned a nil endpoint")
-	}
-	return &backendChannelGeneration{
-		connection: connection,
-		client: newTransportStreamClient(
-			connection.Endpoint,
-			c.maxFrameSize,
-			connection.MapStatus,
-		),
-	}, nil
-}
-
-type backendChannelGeneration struct {
-	connection BackendConnection
-	client     *transportStreamClient
-	closeOnce  sync.Once
-	closeErr   error
-}
-
-func (g *backendChannelGeneration) Call(ctx context.Context, request *RpcRequest) (*RpcResponse, error) {
-	return g.client.Call(ctx, request)
-}
-
-func (g *backendChannelGeneration) StreamingCall(ctx context.Context, request *RpcRequest, requestBody ByteStream) (FrameStream, error) {
-	return g.client.StreamingCall(ctx, request, requestBody)
-}
-
-func (g *backendChannelGeneration) Close() error {
-	g.closeOnce.Do(func() {
-		if g.connection.Close != nil {
-			g.closeErr = g.connection.Close()
-			return
-		}
-		g.closeErr = g.connection.Endpoint.Close(TransportCloseReason{
-			Local:   true,
-			Clean:   true,
-			Message: "client closed",
-		})
-	})
-	return g.closeErr
-}
-
-func (g *backendChannelGeneration) releaseDisconnected() {
-	_ = g.Close()
-}
-
-func (g *backendChannelGeneration) Done() <-chan struct{} {
-	return g.connection.Endpoint.Done()
-}
-
-func (g *backendChannelGeneration) Err() error {
-	return g.connection.Endpoint.Err()
-}
-
-func (g *backendChannelGeneration) Info() ConnectionInfo {
-	return g.connection.Endpoint.Info()
-}
-
-func (g *backendChannelGeneration) CloseReason(err error) TransportCloseReason {
-	if g.connection.CloseReason != nil {
-		return g.connection.CloseReason(err)
-	}
-	if mapper, ok := g.connection.Endpoint.(interface {
-		CloseReason(error) TransportCloseReason
-	}); ok {
-		return mapper.CloseReason(err)
-	}
-	return TransportCloseReason{Err: err, Message: errorString(err)}
 }
 
 type reconnectBackoff struct {
@@ -710,4 +505,4 @@ func (d *channelEventDispatcher) run() {
 	}
 }
 
-var _ ClientTransport = (*Channel)(nil)
+var _ Transport = (*Channel)(nil)

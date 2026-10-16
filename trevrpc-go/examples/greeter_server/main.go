@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -86,7 +87,7 @@ func (s *echoReplies) Close() error {
 }
 
 func main() {
-	credentials, certPath, err := serverCredentials()
+	tlsConfig, certPath, err := serverTLSConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -100,7 +101,7 @@ func main() {
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
 
-	listener, err := trevrpc.Listen(listenAddr, server, trevrpc.ListenOptions{Credentials: credentials})
+	listener, err := trevrpc.Listen(listenAddr, server, trevrpc.ListenOptions{TLSConfig: tlsConfig})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -116,7 +117,7 @@ func main() {
 	}
 }
 
-func allowBrowserExampleSession(request trevrpc.WebTransportAdmissionRequest) bool {
+func allowBrowserExampleSession(request trevrpc.AdmissionRequest) bool {
 	if request.Path != "/trevrpc" {
 		return false
 	}
@@ -152,7 +153,7 @@ func allowedWebTransportAuthorities(addr string) map[string]struct{} {
 	return authorities
 }
 
-func serverCredentials() (*trevrpc.TransportCredentials, string, error) {
+func serverTLSConfig() (*tls.Config, string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, "", err
@@ -176,11 +177,6 @@ func serverCredentials() (*trevrpc.TransportCredentials, string, error) {
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		return nil, "", err
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	certPath, err := examplecert.Path()
 	if err != nil {
 		return nil, "", err
@@ -192,8 +188,7 @@ func serverCredentials() (*trevrpc.TransportCredentials, string, error) {
 		return nil, "", err
 	}
 
-	return &trevrpc.TransportCredentials{
-		CertificateChainPEM: certPEM,
-		PrivateKeyPEM:       keyPEM,
+	return &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{certDER}, PrivateKey: key}},
 	}, certPath, nil
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"net/http"
 	"net/url"
 	"reflect"
 	"runtime/debug"
@@ -68,38 +69,29 @@ type ServerOptions struct {
 	DisableStreamIdleTimeout          bool
 	EnableHTTP3                       bool
 	HTTP3Path                         string
-	HTTP3Admission                    HTTP3Admission
+	HTTP3Admission                    Admission
 	EnableWebTransport                bool
-	WebTransportAdmission             WebTransportAdmission
+	WebTransportAdmission             Admission
 }
 
-// HTTP3AdmissionRequest contains HTTP/3 request information available before accepting an RPC.
-type HTTP3AdmissionRequest struct {
-	// Headers preserves backend-provided ordering and duplicates.
-	Headers   HeaderFields
-	Path      string
+// AdmissionRequest describes an HTTP/3 request or WebTransport CONNECT request
+// before the server accepts it.
+type AdmissionRequest struct {
+	// Header is a private copy of the request headers.
+	Header http.Header
+	Path   string
+	// Method is the HTTP method; it is CONNECT for WebTransport sessions.
 	Method    string
 	Authority string
-	Secure    bool
+	// Origin is the value of the Origin header, if any.
+	Origin string
+	Secure bool
 }
 
-// HTTP3Admission decides whether to accept an otherwise valid HTTP/3 RPC request.
-// When it is nil, valid requests are accepted.
-type HTTP3Admission func(HTTP3AdmissionRequest) bool
-
-// WebTransportAdmissionRequest contains HTTP/3 CONNECT information available before accepting a WebTransport session.
-type WebTransportAdmissionRequest struct {
-	// Headers preserves backend-provided ordering and duplicates.
-	Headers   HeaderFields
-	Path      string
-	Authority string
-	Origin    string
-	Secure    bool
-}
-
-// WebTransportAdmission decides whether to accept a WebTransport session.
-// WebTransport sessions are rejected when it is nil.
-type WebTransportAdmission func(WebTransportAdmissionRequest) bool
+// Admission decides whether to accept an otherwise valid HTTP/3 RPC request or
+// WebTransport session. A nil HTTP3Admission accepts valid requests; a nil
+// WebTransportAdmission rejects every WebTransport session.
+type Admission func(AdmissionRequest) bool
 
 // ServerDiagnosticPhase identifies a local server-runtime failure boundary.
 type ServerDiagnosticPhase string
@@ -128,8 +120,7 @@ const (
 type ServerDiagnostic struct {
 	Phase                  ServerDiagnosticPhase
 	Message                string
-	Connection             ConnectionInfo
-	CloseReason            TransportCloseReason
+	RemoteAddr             string
 	Service                string
 	Method                 string
 	Kind                   RpcKind

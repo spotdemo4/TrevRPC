@@ -29,30 +29,6 @@ type FrameDecodeError struct {
 	Err error
 }
 
-type optimizedFrameReader interface {
-	trevrpcReadFrame(ProtoMessage, int) (bool, error)
-}
-
-type optimizedFrameWriter interface {
-	trevrpcWriteFrame(ProtoMessage, int) error
-}
-
-type optimizedMessageStreamFrameWriter interface {
-	trevrpcWriteMessageStreamFrame([]byte, int) error
-}
-
-type optimizedMessageStreamFramesWriter interface {
-	trevrpcWriteMessageStreamFrames([][]byte, int) error
-}
-
-type optimizedStreamFrameReader interface {
-	trevrpcReadStreamFrame(int) (streamFrameFields, bool, error)
-}
-
-type optimizedReleasableStreamFrameReader interface {
-	trevrpcReadStreamFrameReleasable(int) (streamFrameFields, func(), bool, error)
-}
-
 type streamFrameFields struct {
 	kind     RpcStreamFrameKind
 	status   uint32
@@ -340,10 +316,6 @@ func preflightPackedValues(data []byte, wireType protowire.Type) bool {
 
 // WriteFrame writes one length-prefixed protobuf frame.
 func WriteFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error {
-	if frameWriter, ok := writer.(optimizedFrameWriter); ok {
-		return frameWriter.trevrpcWriteFrame(message, maxFrameSize)
-	}
-
 	frame, err := EncodeFrame(message, maxFrameSize)
 	if err != nil {
 		return err
@@ -354,10 +326,6 @@ func WriteFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error 
 }
 
 func writeMessageStreamFrame(writer io.Writer, body []byte, maxFrameSize int) error {
-	if frameWriter, ok := writer.(optimizedMessageStreamFrameWriter); ok {
-		return frameWriter.trevrpcWriteMessageStreamFrame(body, maxFrameSize)
-	}
-
 	frame, err := encodeMessageStreamFrame(body, maxFrameSize)
 	if err != nil {
 		return err
@@ -374,10 +342,6 @@ func writeMessageStreamFrames(writer io.Writer, bodies [][]byte, maxFrameSize in
 	if len(bodies) == 1 {
 		return writeMessageStreamFrame(writer, bodies[0], maxFrameSize)
 	}
-	if frameWriter, ok := writer.(optimizedMessageStreamFramesWriter); ok {
-		return frameWriter.trevrpcWriteMessageStreamFrames(bodies, maxFrameSize)
-	}
-
 	totalLen := 0
 	for _, body := range bodies {
 		bodyLen := messageStreamFrameBodyLen(body)
@@ -496,10 +460,6 @@ func ReadFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
 
 // ReadFrameOrEOF reads one frame and reports false when the stream is already at EOF.
 func ReadFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (bool, error) {
-	if frameReader, ok := reader.(optimizedFrameReader); ok {
-		return frameReader.trevrpcReadFrame(message, maxFrameSize)
-	}
-
 	body, read, err := ReadRawFrameOrEOF(reader, maxFrameSize)
 	if err != nil || !read {
 		return read, err
@@ -547,10 +507,6 @@ func readFrameBody(reader io.Reader, length int) ([]byte, error) {
 }
 
 func readStreamFrameFieldsOrEOF(reader io.Reader, maxFrameSize int) (streamFrameFields, bool, error) {
-	if frameReader, ok := reader.(optimizedStreamFrameReader); ok {
-		return frameReader.trevrpcReadStreamFrame(maxFrameSize)
-	}
-
 	body, read, err := ReadRawFrameOrEOF(reader, maxFrameSize)
 	if err != nil || !read {
 		return streamFrameFields{}, read, err

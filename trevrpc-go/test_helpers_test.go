@@ -3,15 +3,8 @@ package trevrpc
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"io"
-	"math/big"
-	"net"
 	"sync"
 	"testing"
 	"time"
@@ -288,50 +281,4 @@ func (uploadWaitingTransport) StreamingCall(ctx context.Context, _ *RpcRequest, 
 		errors <- err
 	}()
 	return uploadErrorFrameStream{errors: errors}, nil
-}
-
-type cancellableTransportTestStream struct{}
-
-func (*cancellableTransportTestStream) Read([]byte) (int, error)        { return 0, io.EOF }
-func (*cancellableTransportTestStream) Write(data []byte) (int, error)  { return len(data), nil }
-func (*cancellableTransportTestStream) Close() error                    { return nil }
-func (*cancellableTransportTestStream) CancelRead(TransportCloseReason) {}
-
-func testCertificateMaterial(t *testing.T) ([]byte, []byte) {
-	t.Helper()
-
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "localhost"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-	}
-
-	der, err := x509.CreateCertificate(
-		rand.Reader,
-		template,
-		template,
-		&key.PublicKey,
-		key,
-	)
-	if err != nil {
-		t.Fatalf("create certificate: %v", err)
-	}
-
-	return pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: der,
-		}), pem.EncodeToMemory(&pem.Block{
-			Type:  "RSA PRIVATE KEY",
-			Bytes: x509.MarshalPKCS1PrivateKey(key),
-		})
 }

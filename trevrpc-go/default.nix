@@ -1,86 +1,53 @@
 {
-  stdenv,
   lib,
+  stdenv,
   buildGoModule,
   go-tools,
   gotools,
-  gnugrep,
-  benchProto,
+  protobuf,
   wireGolden,
+  interopProto,
 }:
 let
-  goSource = lib.fileset.difference ./. (
-    lib.fileset.unions [
-      ./default.nix
-      ./go.work
-      ./go.work.sum
-      ./quic-go
-    ]
-  );
-  neutralModuleSource = lib.fileset.difference ../trevrpc-c (
-    lib.fileset.unions [
-      ../trevrpc-c/default.nix
-      ../trevrpc-c/provider/msquic
-      ../trevrpc-c/tests
-    ]
-  );
-  providerBaseSource = lib.fileset.difference ../trevrpc-c/provider/msquic ../trevrpc-c/provider/msquic/lib;
-  providerArchive =
-    if stdenv.hostPlatform.system == "x86_64-linux" then
-      ../trevrpc-c/provider/msquic/lib/linux_amd64/libmsquic.a
-    else if stdenv.hostPlatform.system == "aarch64-linux" then
-      ../trevrpc-c/provider/msquic/lib/linux_arm64/libmsquic.a
-    else
-      null;
-  providerModuleSource = lib.fileset.unions (
-    [ providerBaseSource ] ++ lib.optional (providerArchive != null) providerArchive
-  );
   canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
 in
 buildGoModule (final: {
   pname = "trevrpc-go";
   version = "0.2.2";
 
+  # The module itself plus the shared files its tests read: the wire golden
+  # vectors and the interop proto the generated interop bindings must match.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      benchProto
       wireGolden
-      goSource
-      neutralModuleSource
-      providerModuleSource
+      interopProto
+      (lib.fileset.difference ./. ./default.nix)
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-qCcEkaeYDS9jsGnL2fyIvFmd5OpWetEZOr8ofMqSaLI=";
+  vendorHash = "sha256-081X+epiMADg+iTcUesNRPNs14gS8pwR+hKdHnwND6E=";
   proxyVendor = true;
-
-  postPatch = ''
-    go mod edit \
-      -replace=trev.zip/llc/trevrpc/trevrpc-c@v0.3.0=../trevrpc-c
-    go mod edit \
-      -replace=trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2@v2.6.0-trevrpc.1=../trevrpc-c/provider/msquic
-  '';
 
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
-    "cmd/trevrpc-bench-peer"
-    "cmd/trevrpc-conformance-go"
+    "cmd/trevrpc-interop"
   ];
 
   postInstall = ''
-    mv "$out/bin/trevrpc-bench-peer" "$out/bin/trevrpc-bench-peer-go"
+    mv "$out/bin/trevrpc-interop" "$out/bin/trevrpc-interop-go"
   '';
 
   doCheck = canExecute;
   nativeCheckInputs = [
     go-tools
     gotools
+    # The interop bindings test regenerates code from interop.proto.
+    protobuf
   ];
   checkPhase = ''
     runHook preCheck
     export HOME=$(mktemp -d)
-    export GOWORK=off
     go test ./...
     go vet ./...
     staticcheck ./...
@@ -89,25 +56,16 @@ buildGoModule (final: {
   '';
 
   doInstallCheck = canExecute;
-  nativeInstallCheckInputs = [ gnugrep ];
   installCheckPhase = ''
     runHook preInstallCheck
-    export GOWORK=off
     test "$(go list -m)" = 'trev.zip/llc/trevrpc/trevrpc-go'
-    go list -m \
-      trev.zip/llc/trevrpc/trevrpc-c \
-      trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2 > modules.out
-    grep -Eq '^trev\.zip/llc/trevrpc/trevrpc-c v0\.3\.0 => \.\./trevrpc-c$' modules.out
-    grep -Eq '^trev\.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2 v2\.6\.0-trevrpc\.1 => \.\./trevrpc-c/provider/msquic$' modules.out
-    go list -deps ./... > packages.out
-    ! grep -Eq '^github.com/(quic-go|spotdemo4)/' packages.out
-    ! grep -Eq 'github.com/(quic-go/(quic-go|webtransport-go|qpack)|spotdemo4/webtransport-go)|trev\.zip/llc/trevrpc/trevrpc-go/quic-go' go.mod go.sum
-    ! grep -q 'google.golang.org/grpc' go.mod
-    test -x "$out/bin/trevrpc-bench-peer-go"
-    test -x "$out/bin/trevrpc-conformance-go"
-    printf 'STOP\n' | "$out/bin/trevrpc-conformance-go" --protocol 1 > peer.out
-    grep -q '"event":"ready"' peer.out
-    grep -q '"peer":"go"' peer.out
+    test -x "$out/bin/protoc-gen-trevrpc-go"
+    test -x "$out/bin/trevrpc-interop-go"
+    if "$out/bin/trevrpc-interop-go" 2> usage.out; then
+      echo "trevrpc-interop-go without a subcommand must fail" >&2
+      exit 1
+    fi
+    grep -q 'server|client' usage.out
     runHook postInstallCheck
   '';
 

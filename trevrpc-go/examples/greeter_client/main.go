@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"io"
 	"log"
 	"os"
@@ -23,7 +26,7 @@ func main() {
 		name = os.Args[1]
 	}
 
-	credentials, err := clientCredentials()
+	tlsConfig, err := clientTLSConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -31,7 +34,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	transport, err := trevrpc.Dial(ctx, serverAddr, trevrpc.DialOptions{Credentials: credentials})
+	transport, err := trevrpc.Dial(ctx, serverAddr, trevrpc.DialOptions{TLSConfig: tlsConfig})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -107,7 +110,7 @@ func main() {
 	}
 }
 
-func clientCredentials() (*trevrpc.TransportCredentials, error) {
+func clientTLSConfig() (*tls.Config, error) {
 	certPath, err := examplecert.Path()
 	if err != nil {
 		return nil, err
@@ -118,5 +121,10 @@ func clientCredentials() (*trevrpc.TransportCredentials, error) {
 		return nil, err
 	}
 
-	return &trevrpc.TransportCredentials{RootCAPEM: certPEM, ServerName: "localhost"}, nil
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certPEM) {
+		return nil, errors.New("example certificate contains no certificates")
+	}
+
+	return &tls.Config{RootCAs: roots, ServerName: "localhost"}, nil
 }

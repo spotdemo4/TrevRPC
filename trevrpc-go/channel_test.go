@@ -307,14 +307,6 @@ func (g *fakeChannelGeneration) Err() error {
 	return g.err
 }
 
-func (g *fakeChannelGeneration) Info() ConnectionInfo {
-	return ConnectionInfo{Provider: "fake"}
-}
-
-func (g *fakeChannelGeneration) CloseReason(err error) TransportCloseReason {
-	return TransportCloseReason{Err: err, Message: errorString(err)}
-}
-
 func (g *fakeChannelGeneration) fail(err error) {
 	g.doneOnce.Do(func() {
 		g.errMu.Lock()

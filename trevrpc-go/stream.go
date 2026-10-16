@@ -51,10 +51,6 @@ type contextCancelReadStream interface {
 	trevrpcCancelReadOnContext(context.Context) func()
 }
 
-type releasableByteStream interface {
-	trevrpcRecvBytes() ([]byte, func(), error)
-}
-
 // MessagePipe is a sendable message stream.
 type MessagePipe[T any] struct {
 	ctx       context.Context
@@ -266,10 +262,7 @@ func DecodeStream[T ProtoMessage](inner ByteStream, newMessage func() T) Message
 }
 
 func (s *decodeStream[T]) Recv() (T, error) {
-	body, release, err := recvDecodeBody(s.inner)
-	if release != nil {
-		defer release()
-	}
+	body, err := s.inner.Recv()
 	if err != nil {
 		var zero T
 		return zero, err
@@ -282,15 +275,6 @@ func (s *decodeStream[T]) Recv() (T, error) {
 	}
 
 	return message, nil
-}
-
-func recvDecodeBody(stream ByteStream) ([]byte, func(), error) {
-	if stream, ok := stream.(releasableByteStream); ok {
-		return stream.trevrpcRecvBytes()
-	}
-
-	body, err := stream.Recv()
-	return body, nil, err
 }
 
 func (s *decodeStream[T]) Close() error {

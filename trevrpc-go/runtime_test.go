@@ -1010,7 +1010,7 @@ func TestServerDrainsFiniteRequestBeforeResponseClose(t *testing.T) {
 			}
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-			handleRPCStream(context.Background(), server, nil, stream)
+			handleRPCStream(context.Background(), server, stream)
 
 			if !stream.readEOF {
 				t.Fatal("expected request EOF to be observed")
@@ -1057,7 +1057,7 @@ func TestServerFiniteRequestDrainUsesRPCDeadline(t *testing.T) {
 			stream := newRequestThenBlockingRPCStream(input.Bytes())
 
 			startedAt := time.Now()
-			handleRPCStream(context.Background(), server, nil, stream)
+			handleRPCStream(context.Background(), server, stream)
 			elapsed := time.Since(startedAt)
 
 			if elapsed < 50*time.Millisecond {
@@ -1122,7 +1122,7 @@ func TestServerFiniteRequestDrainReusesInitialRequestDeadline(t *testing.T) {
 			}
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-			handleRPCStream(context.Background(), server, nil, stream)
+			handleRPCStream(context.Background(), server, stream)
 
 			if len(stream.readDeadlines) != 4 {
 				t.Fatalf("read deadlines = %v, want initial set/clear and drain set/clear", stream.readDeadlines)
@@ -1182,7 +1182,7 @@ func TestServerRejectsFiniteRequestTrailingDataBeforeHandler(t *testing.T) {
 			input.WriteString("invalid trailing request data")
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-			handleRPCStream(context.Background(), server, nil, stream)
+			handleRPCStream(context.Background(), server, stream)
 
 			if called {
 				t.Fatal("handler ran before the finite request was validated")
@@ -1236,7 +1236,7 @@ func TestAdmissionRejectedUploadCancelsRead(t *testing.T) {
 			reader := bytes.NewReader(input.Bytes())
 			stream := &countingRPCStream{reader: reader}
 
-			handleRPCStream(context.Background(), server, nil, stream)
+			handleRPCStream(context.Background(), server, stream)
 
 			if reader.Len() != len(trailing) {
 				t.Fatalf("rejected upload consumed %d bytes", len(trailing)-reader.Len())
@@ -1282,7 +1282,7 @@ func TestMalformedFiniteRequestDoesNotWaitForFIN(t *testing.T) {
 			stream := newRequestThenBlockingRPCStream(input.Bytes())
 			done := make(chan struct{})
 			go func() {
-				handleRPCStream(context.Background(), server, nil, stream)
+				handleRPCStream(context.Background(), server, stream)
 				close(done)
 			}()
 
@@ -1347,7 +1347,7 @@ func TestServerAbortsRPCStreamOnResponseWriteError(t *testing.T) {
 			}
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes()), writeErr: writeErr}
 
-			handleRPCStream(context.Background(), server, nil, stream)
+			handleRPCStream(context.Background(), server, stream)
 
 			if stream.cancelReadCount != 1 {
 				t.Fatalf("request read cancellations = %d, want 1", stream.cancelReadCount)
@@ -1377,7 +1377,7 @@ func TestServerAbortsRPCStreamOnLocalResponseFrameTooLarge(t *testing.T) {
 	}
 	stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-	handleRPCStream(context.Background(), server, nil, stream)
+	handleRPCStream(context.Background(), server, stream)
 
 	if stream.writeCount != 0 {
 		t.Fatalf("transport writes = %d, want 0 for local frame rejection", stream.writeCount)
@@ -1412,7 +1412,7 @@ func TestServerResponseBatchWriterBatchesNonBlockingMessages(t *testing.T) {
 	}
 	stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-	handleRPCStream(context.Background(), server, nil, stream)
+	handleRPCStream(context.Background(), server, stream)
 
 	if stream.writeCount != 2 {
 		t.Fatalf("expected one message batch write and one status write, got %d", stream.writeCount)
@@ -1565,13 +1565,6 @@ func TestServerResponseBatchWriterPreservesTerminalStatusAfterBatch(t *testing.T
 	}
 }
 
-func TestTransportResponseStreamAdvertisesContextCancellation(t *testing.T) {
-	stream := &transportResponseStream{stream: &cancellableTransportTestStream{}}
-	if !streamContextCancelsRecv(stream) {
-		t.Fatal("cancellable transport response stream should cancel pending receives from context")
-	}
-}
-
 func TestClientResponseStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
 	options := DefaultCallOptions()
 	options.StreamIdleTimeout = time.Millisecond
@@ -1631,7 +1624,7 @@ func TestClientFrameReceiveMapsTransportDeadlineToContextDeadline(t *testing.T) 
 func TestClientOptimizedFrameReceiveUsesTransportDeadline(t *testing.T) {
 	stream := &deadlineFieldsStream{deadlineFrameStream: deadlineFrameStream{err: os.ErrDeadlineExceeded}}
 
-	_, _, err := recvOptimizedFrameFieldsWithTimeout(context.Background(), stream, time.Minute, true)
+	_, err := recvOptimizedFrameFieldsWithTimeout(context.Background(), stream, time.Minute, true)
 	if code := StatusFromError(err).Code; code != CodeUnavailable {
 		t.Fatalf("expected unavailable idle timeout, got %v (%v)", code, err)
 	}
@@ -2212,8 +2205,8 @@ type deadlineFieldsStream struct {
 	deadlineFrameStream
 }
 
-func (s *deadlineFieldsStream) trevrpcRecvStreamFrameFields() (streamFrameFields, func(), error) {
-	return streamFrameFields{}, nil, s.err
+func (s *deadlineFieldsStream) trevrpcRecvStreamFrameFields() (streamFrameFields, error) {
+	return streamFrameFields{}, s.err
 }
 
 type panickingByteStream struct{}
@@ -2275,39 +2268,5 @@ func expectMetrics(t *testing.T, metrics *recordingMetrics, codes ...Code) {
 		if finished[index].Code != code {
 			t.Fatalf("finished metric %d code = %v, want %v; all=%#v", index, finished[index].Code, code, finished)
 		}
-	}
-}
-
-func TestTransportLimitsFromServerOptions(t *testing.T) {
-	options := DefaultServerOptions()
-	options.MaxFrameSize = 1024
-	options.MaxStreamBodySize = 4096
-	options.MaxConcurrentStreamsPerConnection = 10
-	options.MaxConcurrentRequests = 123
-	options.MaxConcurrentConnections = 7
-	options.StreamIdleTimeout = 20 * time.Second
-
-	limits := transportLimitsFromServerOptions(options)
-
-	if limits.StreamReceiveWindow != 1028 {
-		t.Fatalf("stream receive window should match one TrevRPC frame, got %d", limits.StreamReceiveWindow)
-	}
-	if limits.ConnectionReceiveWindow != 4096 {
-		t.Fatalf("connection receive window should match bounded stream budget, got %d", limits.ConnectionReceiveWindow)
-	}
-	if limits.IncomingBidiStreams != 11 {
-		t.Fatalf("incoming bidi streams should include one rejection slot, got %d", limits.IncomingBidiStreams)
-	}
-	if limits.MaxIdleTimeout != 20*time.Second || limits.KeepAlive != 10*time.Second {
-		t.Fatalf("transport idle defaults should derive from stream idle timeout, got idle=%s keepalive=%s", limits.MaxIdleTimeout, limits.KeepAlive)
-	}
-	if limits.MaxStatelessOperations != 123 || limits.MaxBindingStatelessOperations != 7 {
-		t.Fatalf("stateless operation limits should derive from server concurrency, got max=%d binding=%d", limits.MaxStatelessOperations, limits.MaxBindingStatelessOperations)
-	}
-
-	options.StreamIdleTimeout = -time.Second
-	limits = transportLimitsFromServerOptions(options)
-	if limits.MaxIdleTimeout != 0 || limits.KeepAlive != 0 {
-		t.Fatalf("non-positive idle timeout should disable transport idle defaults, got idle=%s keepalive=%s", limits.MaxIdleTimeout, limits.KeepAlive)
 	}
 }
