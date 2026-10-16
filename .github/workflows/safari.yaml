@@ -1,0 +1,61 @@
+name: safari
+
+# Safari's WebTransport profile does not currently interoperate with the Go
+# (webtransport-go) or Rust (h3) servers. This lane is expected to fail until
+# upstream compatibility returns; it is kept separate so the failure stays
+# visible without blocking the required checks.
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    name: safari-to-${{ matrix.server }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [go, rust]
+    env:
+      SERVER: ${{ matrix.server }}
+      OUTPUT: ${{ runner.temp }}/safari-to-${{ matrix.server }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+
+      - name: Run Safari interop
+        run: |
+          nix shell \
+            .#trevrpc-js \
+            ".#trevrpc-$SERVER" \
+            nixpkgs#bash \
+            nixpkgs#coreutils \
+            nixpkgs#jq \
+            nixpkgs#openssl \
+            --command ./interop/run.sh \
+              --out "$OUTPUT" \
+              --server "$SERVER=trevrpc-interop-$SERVER" \
+              --browser webkit
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: safari-to-${{ matrix.server }}
+          path: ${{ runner.temp }}/safari-to-${{ matrix.server }}
+          if-no-files-found: ignore

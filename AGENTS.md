@@ -2,13 +2,15 @@
 
 ## Task Completion Requirements
 
-- Use focused CMake, CTest, sanitizer, installed-consumer, or individual Nix derivation checks while implementation is in progress.
+- Use focused language-native tests (`go test`, `cargo test`, `npm test`, `gradle check`), `interop/run.sh`, or individual Nix derivation builds while implementation is in progress.
 - Do not repeatedly run the full `nix flake check` during intermediate implementation or review stages; it is intentionally reserved for the final completion gate. Run it earlier only when diagnosing a specific Nix integration failure that cannot be isolated more narrowly.
 - Once the implementation and focused verification have stabilized, intent-to-add (`git add -N`) every new file so Nix can see it, run `nix fmt`, and run the full `nix flake check` exactly once before considering the task completed.
 
 ## Project Snapshot
 
 TrevRPC is a Remote Procedure Call (RPC) framework like gRPC, but uses QUIC as the transport protocol instead of HTTP/2.
+
+Scope is deliberately small: Go and Rust servers (native QUIC, HTTP/3, WebTransport), Go and Rust native-QUIC clients, a browser WebTransport client in JavaScript, and an Android Cronet HTTP/3 client in Kotlin. Each language uses exactly one QUIC stack. `interop/` tests every client against every server.
 
 This repository is a VERY EARLY WIP. Proposing sweeping changes that improve long-term maintainability is encouraged.
 

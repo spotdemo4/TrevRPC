@@ -9,12 +9,9 @@
   "repositories": ["llc/TrevRPC"],
   "allowedCommands": [
     "^nix run \\.#update-go-deps$",
-    "^nix run \\.#update-go-quic-go-deps$",
     "^npm audit fix --prefix trevrpc-js$",
     "^nix run \\.#update-kotlin-deps$",
-    "^nix run \\.#sync-playwright$",
-    "^nix run \\.#update-benchmark-proto$",
-    "^\\.forgejo/scripts/update-go-module-artifacts\\.sh (trevrpc-c|trevrpc-c/provider/msquic)$"
+    "^nix run \\.#sync-playwright$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
   // Renovate sanitizes child environments, so configure this through its
@@ -26,7 +23,7 @@
   // repository
   "extends": ["config:recommended"],
   "addLabels": ["dep"],
-  "ignoreDeps": ["trevrpc-bench-peer-js", "@trevrpc/trevrpc-js"],
+  "ignoreDeps": ["@trevrpc/trevrpc-js"],
   "nix": {
     "enabled": true
   },
@@ -44,51 +41,19 @@
     "postUpgradeTasks": {
       "commands": [
         "nix run .#update-go-deps",
-        "nix run .#update-go-quic-go-deps",
         "npm audit fix --prefix trevrpc-js",
-        "nix run .#sync-playwright",
-        "nix run .#update-benchmark-proto",
-        ".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c",
-        ".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c/provider/msquic"
+        "nix run .#sync-playwright"
       ],
       "fileFilters": [
         "trevrpc-go/go.mod",
         "trevrpc-go/go.sum",
-        "trevrpc-go/go.work",
         "trevrpc-go/default.nix",
-        "trevrpc-go/quic-go/go.mod",
-        "trevrpc-go/quic-go/go.sum",
-        "trevrpc-go/quic-go/default.nix",
-        "trevrpc-c/go.mod",
-        "trevrpc-c/go.sum",
-        "trevrpc-c/provider/msquic/go.mod",
-        "trevrpc-c/provider/msquic/go.sum",
         "trevrpc-js/package.json",
-        "trevrpc-js/package-lock.json",
-        "trevrpc-js/bench-browser/package.json",
-        "trevrpc-js/bench-browser/package-lock.json",
-        "trevrpc-c/bench/proto/benchmark.proto",
-        "trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto",
-        "trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto",
-        "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go",
-        "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go"
+        "trevrpc-js/package-lock.json"
       ],
       "executionMode": "branch"
     }
   },
-  "customManagers": [
-    {
-      "customType": "regex",
-      "managerFilePatterns": ["/^trevrpc-go\\/go\\.work$/"],
-      "matchStrings": [
-        "replace\\s+(?<depName>trev\\.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2)\\s+(?<currentValue>v2\\S+)\\s+=>\\s+\\.\\./trevrpc-c/provider/msquic",
-        "replace\\s+(?<depName>trev\\.zip/llc/trevrpc/trevrpc-c)\\s+(?<currentValue>v\\S+)\\s+=>\\s+\\.\\./trevrpc-c",
-        "replace\\s+(?<depName>trev\\.zip/llc/trevrpc/trevrpc-go)\\s+(?<currentValue>v\\S+)\\s+=>\\s+\\."
-      ],
-      "datasourceTemplate": "go",
-      "versioningTemplate": "go"
-    }
-  ],
   "packageRules": [
     {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
@@ -98,18 +63,8 @@
       "matchManagers": ["nix"],
       "addLabels": ["nix"],
       "postUpgradeTasks": {
-        "commands": ["nix run .#sync-playwright", "nix run .#update-benchmark-proto"],
-        "fileFilters": [
-          "trevrpc-js/package.json",
-          "trevrpc-js/package-lock.json",
-          "trevrpc-js/bench-browser/package.json",
-          "trevrpc-js/bench-browser/package-lock.json",
-          "trevrpc-c/bench/proto/benchmark.proto",
-          "trevrpc-kotlin/bench-peer/src/main/proto/benchmark.proto",
-          "trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto",
-          "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go",
-          "trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go"
-        ],
+        "commands": ["nix run .#sync-playwright"],
+        "fileFilters": ["trevrpc-js/package.json", "trevrpc-js/package-lock.json"],
         "executionMode": "branch"
       }
     },
@@ -126,23 +81,6 @@
       "addLabels": ["go"]
     },
     {
-      "matchManagers": ["gomod", "custom.regex"],
-      "matchFileNames": [
-        "trevrpc-go/go.mod",
-        "trevrpc-go/quic-go/go.mod",
-        "trevrpc-go/go.work",
-        "trevrpc-c/go.mod",
-        "trevrpc-c/provider/msquic/go.mod"
-      ],
-      "matchPackageNames": [
-        "trev.zip/llc/trevrpc/trevrpc-go",
-        "trev.zip/llc/trevrpc/trevrpc-c",
-        "trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2"
-      ],
-      "groupName": "TrevRPC workspace dependency",
-      "groupSlug": "trevrpc-workspace-dependency"
-    },
-    {
       "matchManagers": ["gomod"],
       "matchFileNames": ["trevrpc-go/go.mod"],
       "postUpgradeTasks": {
@@ -152,84 +90,13 @@
       }
     },
     {
-      "matchManagers": ["gomod"],
-      "matchFileNames": ["trevrpc-go/quic-go/go.mod"],
-      "postUpgradeTasks": {
-        "commands": ["nix run .#update-go-quic-go-deps"],
-        "fileFilters": [
-          "trevrpc-go/go.work",
-          "trevrpc-go/quic-go/go.mod",
-          "trevrpc-go/quic-go/go.sum",
-          "trevrpc-go/quic-go/default.nix"
-        ],
-        "executionMode": "branch"
-      }
-    },
-    {
-      "matchManagers": ["gomod"],
-      "matchFileNames": ["trevrpc-c/go.mod"],
-      "addLabels": ["go"],
-      "postUpgradeTasks": {
-        "commands": [".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c"],
-        "fileFilters": ["trevrpc-c/go.mod", "trevrpc-c/go.sum"],
-        "executionMode": "branch"
-      }
-    },
-    {
-      "matchManagers": ["gomod"],
-      "matchFileNames": ["trevrpc-c/provider/msquic/go.mod"],
-      "addLabels": ["go", "msquic"],
-      "postUpgradeTasks": {
-        "commands": [".forgejo/scripts/update-go-module-artifacts.sh trevrpc-c/provider/msquic"],
-        "fileFilters": [
-          "trevrpc-c/provider/msquic/go.mod",
-          "trevrpc-c/provider/msquic/go.sum",
-          "trevrpc-c/provider/msquic/provider.go",
-          "trevrpc-c/provider/msquic/provenance/**",
-          "trevrpc-c/provider/msquic/lib/**",
-          "trevrpc-go/go.mod",
-          "trevrpc-go/go.work",
-          "trevrpc-go/default.nix",
-          "trevrpc-c/tests/go-provider-spike/consumer/go.mod"
-        ],
-        "executionMode": "branch"
-      }
-    },
-    {
       // quic-go and webtransport-go release as a compatible pair.
       "matchManagers": ["gomod"],
-      "matchFileNames": ["trevrpc-go/quic-go/go.mod"],
+      "matchFileNames": ["trevrpc-go/go.mod"],
       "matchPackageNames": ["github.com/quic-go/quic-go", "github.com/quic-go/webtransport-go"],
       "groupName": "quic-go transport stack",
       "groupSlug": "quic-go-transport-stack",
       "separateMajorMinor": false
-    },
-    {
-      // Maven publication checks inject this repository at runtime.
-      "matchManagers": ["maven"],
-      "matchFileNames": [
-        "trevrpc-kotlin/publication-tests/maven/**/pom.xml",
-        "trevrpc-kotlin/publication-tests/cronet/maven/**/pom.xml"
-      ],
-      "registryUrls": ["https://repo.maven.apache.org/maven2"]
-    },
-    {
-      // These coordinates are produced into a staged repository by this build.
-      "matchManagers": ["maven", "gradle"],
-      "matchFileNames": [
-        "trevrpc-kotlin/publication-tests/maven/**/pom.xml",
-        "trevrpc-kotlin/publication-tests/cronet/maven/**/pom.xml",
-        "trevrpc-kotlin/publication-tests/gradle/**/*.gradle.kts",
-        "trevrpc-kotlin/publication-tests/cronet/gradle/**/*.gradle.kts"
-      ],
-      "matchPackageNames": [
-        "zip.trev.trevrpc:core",
-        "zip.trev.trevrpc:transport-netty",
-        "zip.trev.trevrpc:transport-cronet",
-        "zip.trev.trevrpc:protoc-gen-trevrpc-kotlin",
-        "zip.trev.trevrpc.fixture:publication-consumers"
-      ],
-      "enabled": false
     },
     {
       // cronet-api 500.x is an empty redirect to the aggregate cronet artifact.
@@ -259,12 +126,6 @@
       // Nixpkgs supplies the matching browser binaries and is the version authority.
       "matchManagers": ["npm"],
       "matchPackageNames": ["playwright", "playwright-core"],
-      "enabled": false
-    },
-    {
-      // The native package is built and versioned with trevrpc-js in this repository.
-      "matchManagers": ["npm"],
-      "matchPackageNames": ["@trevrpc/trevrpc-js-native-linux-x64-gnu"],
       "enabled": false
     },
     {

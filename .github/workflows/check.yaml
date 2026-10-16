@@ -28,9 +28,6 @@ jobs:
       - name: Initialize
         uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
 
-      - name: Check release automation contracts
-        run: python3 .forgejo/tests/release_automation_test.py
-
       - name: Check
         run: >-
           nix flake check -L

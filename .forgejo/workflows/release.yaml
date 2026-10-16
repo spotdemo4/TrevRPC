@@ -11,9 +11,6 @@ enable-openid-connect: true
 jobs:
   check:
     if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-c/provider/msquic/v2.') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-c/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-rust/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-js/v') ||
@@ -32,8 +29,7 @@ jobs:
 
   forgejo:
     if: >-
-      (startsWith(github.ref, 'refs/tags/trevrpc-go/v') &&
-        !startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v')) ||
+      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     # zizmor: ignore[excessive-permissions]
     needs: check
@@ -111,9 +107,7 @@ jobs:
             exit 1
           fi
           stage="$(nix build '.#trevrpc-js^npm' --no-link --print-out-paths)"
-          echo "stage=$stage"
           ls -lh "$stage"/*.tgz
-          cat "$stage"/manifest.json
           echo "stage=$stage" >> "$GITHUB_ENV"
 
       - name: Release to npm
@@ -121,13 +115,8 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: | # zizmor: ignore[use-trusted-publishing]
           set -euo pipefail
-          cat "${stage}/manifest.json"
-          native_tgz="$(ls "${stage}"/trevrpc-trevrpc-js-native-linux-x64-gnu-*.tgz)"
-          core_tgz="$(ls "${stage}"/trevrpc-trevrpc-js-*.tgz | grep -v native)"
-          echo "native: $native_tgz"
-          echo "core: $core_tgz"
-          test -f "$native_tgz"
-          test -f "$core_tgz"
+          tarball="$(ls "${stage}"/trevrpc-trevrpc-js-*.tgz)"
+          echo "tarball: $tarball"
           # NODE_AUTH_TOKEN alone is not sufficient; npm reads auth from .npmrc.
           # `nix-init` does not configure npm auth like `actions/setup-node` does.
           echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
@@ -137,8 +126,7 @@ jobs:
           # overrides env vars via @npmcli/config flatten (only CLI flags win).
           # Use --provenance=false explicitly and clear any Forgejo-issued tokens.
           unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN NPM_ID_TOKEN SIGSTORE_ID_TOKEN || true
-          npm publish --provenance=false --access public "$native_tgz"
-          npm publish --provenance=false --access public "$core_tgz"
+          npm publish --provenance=false --access public "$tarball"
 
   maven:
     if: startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v')
@@ -194,11 +182,7 @@ jobs:
           echo "Bundle trevrpc-kotlin-$version uploaded with AUTOMATIC publishing"
 
   pkg:
-    if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-c/provider/msquic/v2.') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-c/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-go/v')
+    if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
     # zizmor: ignore[excessive-permissions]
     needs: check
     name: pkg.go.dev

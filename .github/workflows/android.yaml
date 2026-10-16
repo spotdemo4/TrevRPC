@@ -1,0 +1,83 @@
+name: android
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+
+      - name: Build Android interop harness and servers
+        run: >-
+          nix build --no-link
+          .#trevrpc-kotlin.interopAndroid
+          .#trevrpc-go
+          .#trevrpc-rust
+
+  interop:
+    name: android-to-${{ matrix.server }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [go, rust]
+    env:
+      SERVER: ${{ matrix.server }}
+      OUTPUT: ${{ runner.temp }}/android-to-${{ matrix.server }}
+      WORK_DIR: /nix/trevrpc-android/work
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@65167e71611029bf1f64e4dd6492de35ab553ae2 # v1.66.2
+
+      - name: Prepare Android work directory
+        run: sudo install -d -o "$USER" -g "$(id -gn)" "$WORK_DIR"
+
+      - name: Allow KVM access
+        run: sudo chown "$USER" /dev/kvm
+
+      - name: Run Android interop
+        run: |
+          nix shell \
+            .#trevrpc-kotlin.interopAndroid \
+            ".#trevrpc-$SERVER" \
+            --command trevrpc-interop-android \
+              --server-command "trevrpc-interop-$SERVER server" \
+              --output "$OUTPUT" \
+              --work-dir "$WORK_DIR"
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-to-${{ matrix.server }}
+          path: ${{ runner.temp }}/android-to-${{ matrix.server }}
+          if-no-files-found: ignore
+
+      - name: Clean Android work directory
+        if: ${{ always() }}
+        run: |
+          [[ $WORK_DIR == /nix/trevrpc-android/work ]]
+          sudo rm -rf -- "$WORK_DIR"

@@ -14,9 +14,6 @@ permissions:
 jobs:
   check:
     if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-c/provider/msquic/v2.') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-c/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     runs-on: ubuntu-24.04
@@ -31,8 +28,7 @@ jobs:
 
   github:
     if: >-
-      (startsWith(github.ref, 'refs/tags/trevrpc-go/v') &&
-        !startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v')) ||
+      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     needs: check
     name: github
@@ -57,11 +53,7 @@ jobs:
           .forgejo/scripts/release-nix-package.sh "$package"
 
   pkg:
-    if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-c/provider/msquic/v2.') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-c/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-go/quic-go/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-go/v')
+    if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
     needs: check
     runs-on: ubuntu-24.04
     permissions:

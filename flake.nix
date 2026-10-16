@@ -22,172 +22,23 @@
 
   outputs =
     {
-      self,
       trevpkgs,
       ...
     }:
     trevpkgs.libs.mkFlake (
       system: pkgs:
       let
-        libmsquic = pkgs.callPackage ./nix/packages/libmsquic.nix { };
-        staticLibmsquic =
-          if pkgs.stdenv.hostPlatform.isLinux then
-            pkgs.pkgsStatic.callPackage ./nix/packages/libmsquic.nix { }
-          else
-            null;
-
-        cSources = import ./trevrpc-c/source.nix { lib = pkgs.lib; };
-        cTransportCheck = pkgs.callPackage ./trevrpc-c/transport-check.nix { };
-        cTransportSanitizerCheck = cTransportCheck.override {
-          sanitizers = true;
-        };
-        benchmarkProtoGenerator = pkgs.writeShellApplication {
-          name = "generate-trevrpc-benchmark-proto";
-          runtimeInputs = with pkgs; [
-            go
-            protobuf
-            protoc-gen-go
-            python3
-            packageSet.trevrpc-go
-          ];
-          text = ''
-            source_directory="$1"
-            source_proto="$source_directory/benchmark.proto"
-            output_directory="$2"
-            mkdir -p "$output_directory"
-            protoc \
-              --proto_path="$source_directory" \
-              --go_out="$output_directory" \
-              --go_opt=paths=source_relative \
-              "$source_proto"
-            protoc \
-              --proto_path="$source_directory" \
-              --trevrpc-go_out="$output_directory" \
-              --trevrpc-go_opt=paths=source_relative,service_prefix=Native \
-              "$source_proto"
-            # The packaged protoc-gen-go is built with an older Go toolchain.
-            # Normalize its equivalent reflection expression for current Go vet.
-            python3 - "$output_directory/benchmark.pb.go" <<'PY'
-            import pathlib
-            import sys
-
-            path = pathlib.Path(sys.argv[1])
-            old = "reflect.TypeOf(x{}).PkgPath()"
-            new = "reflect.TypeFor[x]().PkgPath()"
-            source = path.read_text()
-            if source.count(old) != 1:
-                raise SystemExit(f"expected exactly one generated reflection expression in {path}")
-            path.write_text(source.replace(old, new))
-            PY
-            gofmt -w "$output_directory/benchmark.pb.go" "$output_directory/benchmark.trevrpc.go"
-          '';
-        };
-        packageSet =
-          let
-            cFamilyConformancePeers =
-              if pkgs.stdenv.hostPlatform.isLinux then
-                pkgs.callPackage ./conformance/adapters/c-family {
-                  inherit libmsquic;
-                  trevrpcCSrc = cSources.msquic;
-                  trevrpcCppSrc = ./trevrpc-cpp;
-                }
-              else
-                null;
-            c = pkgs.callPackage ./trevrpc-c {
-              inherit libmsquic;
-              benchProto = ./bench/proto;
-              wireGolden = ./testdata/wire-golden-vectors.txt;
-              peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-                {
-                  package = cFamilyConformancePeers;
-                  binary = "trevrpc-conformance-c";
-                }
-              ];
-            };
-            # The Node check needs the canonical ABI 1 C installation and its
-            # greeter fixture, but not the full CTest/conformance closure. Keep
-            # this as a canonical (non-legacy) package input while avoiding
-            # unrelated peer-build failures in the JS derivation.
-            cNode = (c.override { peerBinaries = [ ]; }).overrideAttrs (_: {
-              pname = "trevrpc-c-node";
-              doCheck = false;
-              doInstallCheck = false;
-            });
-            cpp = pkgs.callPackage ./trevrpc-cpp {
-              benchProto = ./bench/proto;
-              trevrpcC = c;
-              peerBinaries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-                {
-                  package = cFamilyConformancePeers;
-                  binary = "trevrpc-conformance-cpp";
-                }
-              ];
-            };
-            go = pkgs.callPackage ./trevrpc-go {
-              benchProto = ./bench/proto;
-              wireGolden = ./testdata/wire-golden-vectors.txt;
-            };
-            goQuicGo = pkgs.callPackage ./trevrpc-go/quic-go { };
-            js = pkgs.callPackage ./trevrpc-js {
-              inherit libmsquic;
-              benchProto = ./bench/proto;
-              wireGolden = ./testdata/wire-golden-vectors.txt;
-              trevrpcC = cNode;
-              trevrpcCSrc = cSources.msquic;
-            };
-            kotlin = pkgs.callPackage ./trevrpc-kotlin {
-              licenseFile = ./LICENSE;
-              wireGolden = ./testdata/wire-golden-vectors.txt;
-              greeterProto = ./trevrpc-rust/crates/protoc-gen-trevrpc-rust/tests/proto/greeter.proto;
-              trevrpcBench = bench;
-            };
-            rust = pkgs.callPackage ./trevrpc-rust {
-              benchProto = ./bench/proto;
-              wireGolden = ./testdata/wire-golden-vectors.txt;
-              trevrpcC = c;
-              trevrpcCTransportTesting = cTransportCheck.testing;
-            };
-            bench = pkgs.callPackage ./bench {
-              conformanceSrc = ./conformance;
-              wireGolden = ./testdata/wire-golden-vectors.txt;
-              sourceCommit = self.rev or (self.dirtyRev or "unversioned");
-              sourceDirty = if self ? rev then "false" else "true";
-            };
-            browserBenchPeer = pkgs.callPackage ./trevrpc-js/bench-browser {
-              trevrpcJs = js;
-            };
-          in
-          {
-            msquic = libmsquic;
-
-            trevrpc-c = c;
-            trevrpc-cpp = cpp;
-            trevrpc-go = go;
-            trevrpc-go-quic-go = goQuicGo;
-            trevrpc-js = js;
-            trevrpc-kotlin = kotlin;
-            trevrpc-rust = rust;
-
-            trevrpc-bench = bench;
-            trevrpc-browser-bench-peer = browserBenchPeer;
-            trevrpc-bench-suite = pkgs.symlinkJoin {
-              name = "trevrpc-bench-suite";
-              paths = [
-                c
-                cpp
-                go
-                js
-                kotlin
-                rust
-                bench
-                browserBenchPeer
-              ];
-              meta.platforms = [
-                "x86_64-linux"
-                "aarch64-darwin"
-              ];
-            };
+        wireGolden = ./testdata/wire-golden-vectors.txt;
+        interopProto = ./interop/proto;
+        packageSet = {
+          trevrpc-go = pkgs.callPackage ./trevrpc-go { inherit wireGolden interopProto; };
+          trevrpc-js = pkgs.callPackage ./trevrpc-js { inherit wireGolden interopProto; };
+          trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
+            inherit wireGolden interopProto;
+            licenseFile = ./LICENSE;
           };
+          trevrpc-rust = pkgs.callPackage ./trevrpc-rust { inherit wireGolden interopProto; };
+        };
       in
       {
 
@@ -211,65 +62,50 @@
                 break
               done
             '';
-            packages =
-              (with pkgs; [
-                # rust
-                rustc
-                cargo
-                clippy
-                cargo-audit
-                rustfmt
+            packages = with pkgs; [
+              # rust
+              rustc
+              cargo
+              clippy
+              cargo-audit
+              rustfmt
 
-                # go
-                go
-                gopls
-                gotools
-                go-tools
-                protobuf
+              # go
+              go
+              gopls
+              gotools
+              go-tools
+              protobuf
 
-                # c
-                cmake
-                ninja
-                gcc
-                clang-tools
-                openssl
-                pkg-config
-                protobufc
+              # javascript
+              nodejs_24
+              playwright-driver.browsers
+              oxlint
+              oxfmt
 
-                # javascript
-                nodejs_24
-                playwright-driver.browsers
-                oxlint
-                oxfmt
+              # kotlin / android
+              jdk25
+              gradle_9
+              androidenv.androidPkgs.androidsdk
+              kotlin-lsp
+              ktlint
 
-                # kotlin / android
-                jdk25
-                gradle_9
-                androidenv.androidPkgs.androidsdk
-                kotlin-lsp
-                ktlint
-                protobuf
+              # python
+              python3
+              ruff
+              basedpyright
 
-                # python
-                python3
-                ruff
-                basedpyright
+              # nix
+              nixd
+              nixfmt
 
-                # nix
-                nixd
-                nixfmt
-
-                # util
-                treefmt
-                bumper
-                fix-hash
-                jq
-              ])
-              ++ [
-                libmsquic
-                packageSet.trevrpc-c.dev
-                packageSet.trevrpc-c.lib
-              ];
+              # util
+              treefmt
+              bumper
+              fix-hash
+              jq
+              openssl
+            ];
           };
 
           bump = pkgs.mkShell {
@@ -337,19 +173,8 @@
               fix-hash
             ];
             script = ''
-              GOWORK=off go -C trevrpc-go mod tidy
+              go -C trevrpc-go mod tidy
               fix-hash .#trevrpc-go
-            '';
-          };
-
-          update-go-quic-go-deps = {
-            packages = with pkgs; [
-              go
-              fix-hash
-            ];
-            script = ''
-              GOWORK=off go -C trevrpc-go/quic-go mod tidy
-              fix-hash .#trevrpc-go-quic-go
             '';
           };
 
@@ -357,13 +182,9 @@
             packages = with pkgs; [
               androidenv.androidPkgs.androidsdk
               jdk25
-              jq
               oxfmt
             ];
             script = ''
-              existing_gradle_deps=$(mktemp)
-              cp trevrpc-kotlin/gradle/deps.json "$existing_gradle_deps"
-
               export ANDROID_HOME=$(dirname "$(dirname "$(command -v sdkmanager)")")/libexec/android-sdk
               export ANDROID_SDK_ROOT=$ANDROID_HOME
               trevrpc-kotlin/gradlew \
@@ -372,18 +193,12 @@
                 --refresh-dependencies \
                 --write-locks \
                 --write-verification-metadata sha256 \
-                -PtrevrpcCronetBenchPeer=true \
+                -PtrevrpcAndroidInterop=true \
                 updateGradleDependencyState
 
-              update_script=$(nix build .#trevrpc-kotlin.benchPeerCronet.mitmCache.updateScript --no-link --print-out-paths)
+              update_script=$(nix build .#trevrpc-kotlin.interopAndroid.mitmCache.updateScript --no-link --print-out-paths)
               USE_BWRAP=0 "$update_script"
 
-              merged_gradle_deps=$(mktemp)
-              jq -s '.[0] * .[1]' \
-                "$existing_gradle_deps" \
-                trevrpc-kotlin/gradle/deps.json \
-                > "$merged_gradle_deps"
-              mv "$merged_gradle_deps" trevrpc-kotlin/gradle/deps.json
               oxfmt --write trevrpc-kotlin/gradle/deps.json
             '';
           };
@@ -401,46 +216,9 @@
                 --save-dev \
                 --save-exact \
                 "playwright@${pkgs.playwright-driver.version}"
-              npm install \
-                --prefix trevrpc-js/bench-browser \
-                --package-lock-only \
-                --ignore-scripts \
-                --no-audit \
-                --no-fund \
-                --save-exact \
-                "playwright-core@${pkgs.playwright-driver.version}"
             '';
           };
 
-          update-benchmark-proto = {
-            packages = [ benchmarkProtoGenerator ];
-            script = ''
-              cp bench/proto/benchmark.proto trevrpc-c/bench/proto/benchmark.proto
-              cp bench/proto/benchmark.proto trevrpc-kotlin/benchmark-support/src/main/proto/benchmark.proto
-              cp bench/proto/benchmark.proto trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto
-
-              generated=$(mktemp -d)
-              trap 'rm -rf "$generated"' EXIT
-              generate-trevrpc-benchmark-proto bench/proto "$generated"
-              cp "$generated/benchmark.pb.go" \
-                trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go
-              cp "$generated/benchmark.trevrpc.go" \
-                trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go
-            '';
-          };
-
-          ${if pkgs.stdenv.hostPlatform.isLinux then "inspect-msquic-static" else null} = {
-            packages = with pkgs; [
-              binutils
-              file
-            ];
-            script = ''
-              archive=${staticLibmsquic}/lib/libmsquic.a
-              file "$archive"
-              nm -g --defined-only "$archive" | grep -E '[[:space:]]MsQuic(OpenVersion|Close|SetParam|StreamSend)$'
-              printf 'provenance: %s\n' ${staticLibmsquic}/share/msquic/provenance.json
-            '';
-          };
         };
 
         # nix build [#...]
@@ -452,7 +230,6 @@
           runtimeInputs = with pkgs; [
             rustfmt
             go
-            clang-tools
             nixfmt
             oxfmt
             ktlint
@@ -461,672 +238,281 @@
         };
 
         # nix flake check
-        checks =
-          let
-            linuxBenchSuite = pkgs.symlinkJoin {
-              name = "trevrpc-linux-bench-check-suite";
-              paths = [
-                packageSet.trevrpc-c
-                packageSet.trevrpc-cpp
-                packageSet.trevrpc-go
-                packageSet.trevrpc-js
-                packageSet.trevrpc-kotlin
-                packageSet.trevrpc-rust
-                packageSet.trevrpc-bench
-                packageSet.trevrpc-browser-bench-peer
-              ];
-              meta.platforms = [ "x86_64-linux" ];
-            };
-            msquicStaticCheck =
-              if pkgs.stdenv.hostPlatform.isLinux then
-                pkgs.pkgsStatic.callPackage ./nix/checks/msquic-static {
-                  libmsquic = staticLibmsquic;
+        checks = pkgs.mkChecks {
+          go = packageSet.trevrpc-go;
+          js = packageSet.trevrpc-js;
+          kotlin = packageSet.trevrpc-kotlin;
+          rust = packageSet.trevrpc-rust;
+          interop = pkgs.callPackage ./interop { inherit (packageSet) trevrpc-go trevrpc-js trevrpc-rust; };
+          ${if packageSet.trevrpc-kotlin.interopAndroid != null then "kotlin-interop-android" else null} =
+            packageSet.trevrpc-kotlin.interopAndroid;
+
+          release-contract =
+            pkgs.runCommand "trevrpc-release-contract"
+              {
+                nativeBuildInputs = with pkgs; [
+                  bash
+                  coreutils
+                  git
+                  gnugrep
+                ];
+              }
+              ''
+                set -euo pipefail
+                export HOME="$TMPDIR/home"
+                mkdir -p "$HOME"
+                git config --global user.email release-contract@example.invalid
+                git config --global user.name "Release Contract"
+
+                helper=${./.forgejo/scripts/release-nix-package.sh}
+                fake_bin="$TMPDIR/fake-bin"
+                mkdir -p "$fake_bin"
+
+                cat > "$fake_bin/nix" <<'SH'
+                #!${pkgs.runtimeShell}
+                set -euo pipefail
+                if [ "$#" -ne 3 ] || [ "$1" != "eval" ] || [ "$2" != "--raw" ]; then
+                  echo "unexpected nix invocation: $*" >&2
+                  exit 1
+                fi
+                case "$3" in
+                  .#packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl.version)
+                    printf '%s' "$FAKE_GO_VERSION"
+                    ;;
+                  .#packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl.version)
+                    printf '%s' "$FAKE_RUST_VERSION"
+                    ;;
+                  *)
+                    echo "unexpected Nix output: $3" >&2
+                    exit 1
+                    ;;
+                esac
+                SH
+                chmod +x "$fake_bin/nix"
+
+                cat > "$fake_bin/flake-release" <<'SH'
+                #!${pkgs.runtimeShell}
+                set -euo pipefail
+                test -n "$RELEASE_LOG"
+                printf '%s|%s\n' "$TAG" "$PACKAGES" >> "$RELEASE_LOG"
+                SH
+                chmod +x "$fake_bin/flake-release"
+
+                export PATH="$fake_bin:$PATH"
+                export FAKE_GO_VERSION=0.2.1
+                export FAKE_RUST_VERSION=0.1.10
+                export RELEASE_LOG="$TMPDIR/release.log"
+
+                new_fixture() {
+                  fixture=$(mktemp -d "$TMPDIR/fixture.XXXXXX")
+                  git init --bare --quiet "$fixture/origin.git"
+                  git init --quiet "$fixture/work"
+                  printf 'initial\n' > "$fixture/work/state"
+                  git -C "$fixture/work" add state
+                  git -C "$fixture/work" commit --quiet -m initial
+                  git -C "$fixture/work" remote add origin "$fixture/origin.git"
+                  printf '%s\n' "$fixture/work"
                 }
-              else
-                null;
-            smokeDiscoverySource = pkgs.lib.fileset.toSource {
-              root = ./.;
-              fileset = pkgs.lib.fileset.unions [
-                ./bench/campaigns/chromium-smoke.example.json
-                ./bench/campaigns/firefox-smoke.example.json
-                ./bench/campaigns/native-smoke.example.json
-                ./bench/campaigns/webkit-smoke.example.json
-                ./bench/ci/discover-smoke-cells.py
-                ./bench/ci/tests/test_discover_smoke_cells.py
-              ];
-            };
-            goNeutralModuleSource = pkgs.lib.fileset.toSource {
-              root = ./.;
-              fileset = cSources.goNeutral;
-            };
-            goProviderModuleSource = pkgs.lib.fileset.toSource {
-              root = ./.;
-              fileset = pkgs.lib.fileset.unions [
-                cSources.goNeutral
-                cSources.goProvider
-                # This release-contract check validates every committed target
-                # artifact. Target consumers select only their own archive.
-                ./trevrpc-c/provider/msquic/lib
-              ];
-            };
-            goNeutralModuleCheck =
-              pkgs.runCommand "trevrpc-c-go-module-check"
-                {
-                  buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-                    pkgs.darwin.libresolv
-                  ];
-                  nativeBuildInputs = [
-                    pkgs.go
-                    pkgs.stdenv.cc
-                  ];
-                  src = goNeutralModuleSource;
+
+                add_commit() {
+                  fixture=$1
+                  message=$2
+                  printf '%s\n' "$message" >> "$fixture/state"
+                  git -C "$fixture" add state
+                  git -C "$fixture" commit --quiet -m "$message"
                 }
-                ''
-                  export HOME="$TMPDIR/home"
-                  export GOCACHE="$TMPDIR/go-cache"
-                  export GOWORK=off
-                  test "$(go -C "$src/trevrpc-c" list -m)" = trev.zip/llc/trevrpc/trevrpc-c
-                  test "$(go -C "$src/trevrpc-c" list -m all | wc -l)" -eq 1
-                  go -C "$src/trevrpc-c" test ./...
-                  go -C "$src/trevrpc-c" vet ./...
-                  touch $out
-                '';
-            goProviderModuleCheck =
-              pkgs.runCommand "trevrpc-msquic-provider-go-module-check"
-                {
-                  nativeBuildInputs = [
-                    pkgs.go
-                    pkgs.stdenv.cc
-                  ];
-                  src = goProviderModuleSource;
+
+                push_fixture() {
+                  git -C "$1" push --quiet --force --tags origin HEAD:refs/heads/main
                 }
-                ''
-                  export HOME="$TMPDIR/home"
-                  export GOCACHE="$TMPDIR/go-cache"
-                  export GOWORK=off
-                  cp -R "$src" "$TMPDIR/source"
-                  chmod -R u+w "$TMPDIR/source"
-                  cd "$TMPDIR/source/trevrpc-c/provider/msquic"
-                  go mod edit -replace=trev.zip/llc/trevrpc/trevrpc-c@v0.3.0=../..
-                  test "$(go list -m)" = trev.zip/llc/trevrpc/trevrpc-c/provider/msquic/v2
-                  test "$(go list -m trev.zip/llc/trevrpc/trevrpc-c)" = 'trev.zip/llc/trevrpc/trevrpc-c v0.3.0 => ../..'
-                  test -f lib/linux_amd64/libmsquic.a
-                  test -f lib/linux_arm64/libmsquic.a
-                  go test ./...
-                  go vet ./...
-                  touch $out
-                '';
-            stockMsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
-              libmsquic = pkgs.libmsquic;
-              expectedDescriptor = false;
-            };
-            draft07MsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
-              inherit libmsquic;
-              expectedDescriptor = true;
-              requestedMask = 1;
-            };
-            draft10MsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
-              inherit libmsquic;
-              expectedDescriptor = true;
-              requestedMask = 2;
-            };
-            bothMsquicProviderCheck = pkgs.callPackage ./nix/checks/msquic-provider {
-              inherit libmsquic;
-              expectedDescriptor = true;
-              requestedMask = 3;
-            };
-            darwinSanitizerToolchain = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-              stdenv = pkgs.llvmPackages_22.stdenv;
-              clang-tools = pkgs.llvmPackages_22.clang-tools;
-            };
-            withDarwinSanitizerTools =
-              package:
-              if pkgs.stdenv.hostPlatform.isDarwin then
-                package.overrideAttrs (old: {
-                  nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
-                    (pkgs.lib.getBin pkgs.llvmPackages_22.llvm)
-                  ];
-                })
-              else
-                package;
-            cSanitizerCheck = withDarwinSanitizerTools (
-              packageSet.trevrpc-c.override (
-                {
-                  sanitizers = true;
+
+                set_event() {
+                  export GITHUB_REF_NAME=$1
+                  export GITHUB_REF="refs/tags/$1"
                 }
-                // darwinSanitizerToolchain
-              )
-            );
-          in
-          pkgs.mkChecks {
-            benchmark-controller = packageSet.trevrpc-bench;
 
-            android-smoke-runner =
-              pkgs.runCommand "trevrpc-android-smoke-runner-tests"
-                {
-                  nativeBuildInputs = [ pkgs.python3 ];
+                run_release() {
+                  fixture=$1
+                  package=$2
+                  (cd "$fixture" && bash "$helper" "$package")
                 }
-                ''
-                  ANDROID_SMOKE_RUNNER=${./bench/ci/run-android-smoke-cell.py} \
-                    python3 ${./bench/ci/tests/test_run_android_smoke_cell.py}
-                  touch $out
-                '';
 
-            smoke-discovery =
-              pkgs.runCommand "trevrpc-smoke-discovery-tests"
-                {
-                  nativeBuildInputs = [ pkgs.python3 ];
-                  src = smokeDiscoverySource;
-                }
-                ''
-                  SMOKE_CELL_DISCOVERY="$src/bench/ci/discover-smoke-cells.py" \
-                  SMOKE_REPOSITORY_ROOT="$src" \
-                    python3 "$src/bench/ci/tests/test_discover_smoke_cells.py"
-                  touch $out
-                '';
-
-            c = packageSet.trevrpc-c;
-            go-module-neutral = goNeutralModuleCheck;
-            go-module-msquic-provider = goProviderModuleCheck;
-            c-engine = pkgs.callPackage ./trevrpc-c/engine-check.nix { };
-            c-engine-msquic = pkgs.callPackage ./trevrpc-c/engine-msquic-check.nix {
-              inherit libmsquic;
-            };
-            c-transport = cTransportCheck;
-            c-transport-msquic = pkgs.callPackage ./trevrpc-c/transport-msquic-check.nix {
-              inherit libmsquic;
-            };
-            c-rpc = pkgs.callPackage ./trevrpc-c/rpc-check.nix { };
-            c-rpc-msquic = pkgs.callPackage ./trevrpc-c/rpc-msquic-check.nix {
-              inherit libmsquic;
-            };
-            c-conformance-rpc = pkgs.callPackage ./conformance/adapters/c-family {
-              inherit libmsquic;
-              trevrpcCSrc = cSources.msquic;
-              trevrpcCppSrc = ./trevrpc-cpp;
-              cOnly = true;
-            };
-            c-sanitizers = cSanitizerCheck;
-            ${if system == "x86_64-linux" then "c-tsan" else null} = packageSet.trevrpc-c.override {
-              threadSanitizer = true;
-            };
-            c-family-sanitizers =
-              (pkgs.callPackage ./conformance/adapters/c-family {
-                inherit libmsquic;
-                trevrpcCSrc = cSources.msquic;
-                trevrpcCppSrc = ./trevrpc-cpp;
-              }).override
-                {
-                  sanitizers = true;
-                };
-
-            ${
-              if
-                builtins.elem system [
-                  "x86_64-linux"
-                  "aarch64-linux"
-                ]
-              then
-                "msquic-static"
-              else
-                null
-            } =
-              msquicStaticCheck;
-            ${if system == "x86_64-linux" then "msquic-provider-stock" else null} = stockMsquicProviderCheck;
-            ${if system == "x86_64-linux" then "msquic-provider-draft07" else null} =
-              draft07MsquicProviderCheck;
-            ${if system == "x86_64-linux" then "msquic-provider-draft10" else null} =
-              draft10MsquicProviderCheck;
-            ${if system == "x86_64-linux" then "msquic-provider-both" else null} = bothMsquicProviderCheck;
-
-            cpp = packageSet.trevrpc-cpp;
-            cpp-sanitizers = withDarwinSanitizerTools (
-              packageSet.trevrpc-cpp.override (
-                {
-                  sanitizers = true;
-                  trevrpcC = cSanitizerCheck;
-                }
-                // darwinSanitizerToolchain
-              )
-            );
-
-            rust = packageSet.trevrpc-rust;
-            ${if system == "x86_64-linux" then "rust-native-ffi-sanitizers" else null} =
-              packageSet.trevrpc-rust.override
-                {
-                  trevrpcCTransportTesting = cTransportSanitizerCheck.testing;
-                  nativeFfiSanitizers = true;
-                };
-
-            go = packageSet.trevrpc-go;
-            go-quic-go = packageSet.trevrpc-go-quic-go;
-
-            js = packageSet.trevrpc-js;
-
-            kotlin = packageSet.trevrpc-kotlin;
-
-            benchmark-proto-sync =
-              pkgs.runCommand "trevrpc-benchmark-proto-sync"
-                {
-                  nativeBuildInputs = [ benchmarkProtoGenerator ];
-                }
-                ''
-                  cmp ${./bench/proto/benchmark.proto} ${./trevrpc-c/bench/proto/benchmark.proto}
-                  cmp ${./bench/proto/benchmark.proto} ${./trevrpc-kotlin/benchmark-support/src/main/proto/benchmark.proto}
-                  cmp ${./bench/proto/benchmark.proto} ${./trevrpc-rust/crates/trevrpc-bench-peer/proto/benchmark.proto}
-                  generate-trevrpc-benchmark-proto ${./bench/proto} generated
-                  cmp generated/benchmark.pb.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.pb.go}
-                  cmp generated/benchmark.trevrpc.go ${./trevrpc-go/cmd/trevrpc-bench-peer/benchmarkpb/benchmark.trevrpc.go}
-                  touch $out
-                '';
-
-            release-contract =
-              pkgs.runCommand "trevrpc-release-contract"
-                {
-                  nativeBuildInputs = with pkgs; [
-                    bash
-                    coreutils
-                    git
-                    gnugrep
-                  ];
-                }
-                ''
-                  set -euo pipefail
-                  export HOME="$TMPDIR/home"
-                  mkdir -p "$HOME"
-                  git config --global user.email release-contract@example.invalid
-                  git config --global user.name "Release Contract"
-
-                  helper=${./.forgejo/scripts/release-nix-package.sh}
-                  fake_bin="$TMPDIR/fake-bin"
-                  mkdir -p "$fake_bin"
-
-                  cat > "$fake_bin/nix" <<'SH'
-                  #!${pkgs.runtimeShell}
-                  set -euo pipefail
-                  if [ "$#" -ne 3 ] || [ "$1" != "eval" ] || [ "$2" != "--raw" ]; then
-                    echo "unexpected nix invocation: $*" >&2
+                expect_failure() {
+                  if "$@"; then
+                    echo "command unexpectedly succeeded: $*" >&2
                     exit 1
                   fi
-                  case "$3" in
-                    .#packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl.version)
-                      printf '%s' "$FAKE_GO_VERSION"
-                      ;;
-                    .#packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl.version)
-                      printf '%s' "$FAKE_RUST_VERSION"
-                      ;;
-                    *)
-                      echo "unexpected Nix output: $3" >&2
-                      exit 1
-                      ;;
-                  esac
-                  SH
-                  chmod +x "$fake_bin/nix"
-
-                  cat > "$fake_bin/flake-release" <<'SH'
-                  #!${pkgs.runtimeShell}
-                  set -euo pipefail
-                  test -n "$RELEASE_LOG"
-                  printf '%s|%s\n' "$TAG" "$PACKAGES" >> "$RELEASE_LOG"
-                  SH
-                  chmod +x "$fake_bin/flake-release"
-
-                  export PATH="$fake_bin:$PATH"
-                  export FAKE_GO_VERSION=0.2.1
-                  export FAKE_RUST_VERSION=0.1.10
-                  export RELEASE_LOG="$TMPDIR/release.log"
-
-                  new_fixture() {
-                    fixture=$(mktemp -d "$TMPDIR/fixture.XXXXXX")
-                    git init --bare --quiet "$fixture/origin.git"
-                    git init --quiet "$fixture/work"
-                    printf 'initial\n' > "$fixture/work/state"
-                    git -C "$fixture/work" add state
-                    git -C "$fixture/work" commit --quiet -m initial
-                    git -C "$fixture/work" remote add origin "$fixture/origin.git"
-                    printf '%s\n' "$fixture/work"
-                  }
-
-                  add_commit() {
-                    fixture=$1
-                    message=$2
-                    printf '%s\n' "$message" >> "$fixture/state"
-                    git -C "$fixture" add state
-                    git -C "$fixture" commit --quiet -m "$message"
-                  }
-
-                  push_fixture() {
-                    git -C "$1" push --quiet --force --tags origin HEAD:refs/heads/main
-                  }
-
-                  set_event() {
-                    export GITHUB_REF_NAME=$1
-                    export GITHUB_REF="refs/tags/$1"
-                  }
-
-                  run_release() {
-                    fixture=$1
-                    package=$2
-                    (cd "$fixture" && bash "$helper" "$package")
-                  }
-
-                  expect_failure() {
-                    if "$@"; then
-                      echo "command unexpectedly succeeded: $*" >&2
-                      exit 1
-                    fi
-                  }
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-go/v0.2.1
-                  git -C "$fixture" tag trevrpc-go/tools/v9.9.9
-                  push_fixture "$fixture"
-                  set_event trevrpc-go/v0.2.1
-                  : > "$RELEASE_LOG"
-                  TAG=untrusted PACKAGES=untrusted run_release "$fixture" trevrpc-go
-                  test "$(wc -l < "$RELEASE_LOG")" -eq 1
-                  grep -Fx 'trevrpc-go/v0.2.1|packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl' "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-rust/v0.1.10
-                  git -C "$fixture" tag trevrpc-go/v9.9.9
-                  push_fixture "$fixture"
-                  set_event trevrpc-rust/v0.1.10
-                  : > "$RELEASE_LOG"
-                  run_release "$fixture" trevrpc-rust
-                  test "$(wc -l < "$RELEASE_LOG")" -eq 1
-                  grep -Fx 'trevrpc-rust/v0.1.10|packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl' "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-go/v9.9.9
-                  push_fixture "$fixture"
-                  set_event trevrpc-go/v9.9.9
-                  : > "$RELEASE_LOG"
-                  expect_failure run_release "$fixture" trevrpc-go
-                  test ! -s "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-go/v0.2.1
-                  add_commit "$fixture" newer-head
-                  push_fixture "$fixture"
-                  set_event trevrpc-go/v0.2.1
-                  : > "$RELEASE_LOG"
-                  expect_failure run_release "$fixture" trevrpc-go
-                  test ! -s "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-go/v0.2.1
-                  git -C "$fixture" tag trevrpc-rust/v0.1.10
-                  push_fixture "$fixture"
-                  set_event trevrpc-rust/v0.1.10
-                  : > "$RELEASE_LOG"
-                  expect_failure run_release "$fixture" trevrpc-go
-                  test ! -s "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-go/tools/v0.2.1
-                  push_fixture "$fixture"
-                  set_event trevrpc-go/tools/v0.2.1
-                  : > "$RELEASE_LOG"
-                  expect_failure run_release "$fixture" trevrpc-go
-                  test ! -s "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag v1.0.0
-                  push_fixture "$fixture"
-                  set_event v1.0.0
-                  : > "$RELEASE_LOG"
-                  expect_failure run_release "$fixture" trevrpc-go
-                  test ! -s "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  git -C "$fixture" tag trevrpc-go/v0.2.1
-                  push_fixture "$fixture"
-                  export GITHUB_REF_NAME=trevrpc-go/v0.2.1
-                  export GITHUB_REF=refs/heads/main
-                  : > "$RELEASE_LOG"
-                  expect_failure run_release "$fixture" trevrpc-go
-                  test ! -s "$RELEASE_LOG"
-
-                  fixture=$(new_fixture)
-                  push_fixture "$fixture"
-                  set_event trevrpc-go/v0.2.1
-                  : > "$RELEASE_LOG"
-                  expect_failure run_release "$fixture" trevrpc-go
-                  expect_failure run_release "$fixture" trevrpc-python
-                  test ! -s "$RELEASE_LOG"
-
-                  touch $out
-                '';
-
-            benchmark-peer-capabilities =
-              let
-                c = packageSet.trevrpc-c;
-                cpp = packageSet.trevrpc-cpp;
-                go = packageSet.trevrpc-go;
-                js = packageSet.trevrpc-js;
-                kotlin = packageSet.trevrpc-kotlin;
-                rust = packageSet.trevrpc-rust;
-                browser = packageSet.trevrpc-browser-bench-peer;
-              in
-              pkgs.runCommand "trevrpc-benchmark-peer-capabilities-check"
-                {
-                  nativeBuildInputs = [ pkgs.jq ];
-                  meta.platforms = [ "x86_64-linux" ];
                 }
-                ''
-                  check_native_capabilities() {
-                    test "$($1 capabilities | jq -r .schema_version)" = 5
-                    test "$($1 capabilities | jq -r .peer)" = "$2"
-                    test "$($1 capabilities | jq -c '.roles.client | sort')" = "$3"
-                    test "$($1 capabilities | jq -c '.roles.server | sort')" = '["trevrpc_http3","trevrpc_native_quic","trevrpc_webtransport"]'
-                  }
-                  check_native_capabilities ${c}/bin/trevrpc-bench-peer-c c \
-                    '["trevrpc_native_quic","trevrpc_webtransport"]'
-                  check_native_capabilities ${cpp}/bin/trevrpc-bench-peer-cpp cpp '["trevrpc_native_quic"]'
-                  check_native_capabilities ${go}/bin/trevrpc-bench-peer-go go '["trevrpc_native_quic"]'
-                  check_native_capabilities ${js}/bin/trevrpc-bench-peer-js js '["trevrpc_native_quic"]'
-                  check_native_capabilities ${kotlin}/bin/trevrpc-bench-peer-kotlin kotlin '["trevrpc_native_quic"]'
-                  check_native_capabilities ${rust}/bin/trevrpc-bench-peer-rust rust '["trevrpc_native_quic"]'
-                  test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .schema_version)" = 5
-                  test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -r .peer)" = chromium
-                  test "$(${browser}/bin/trevrpc-bench-peer-chromium capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
-                  test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -r .schema_version)" = 5
-                  test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -r .peer)" = firefox
-                  test "$(${browser}/bin/trevrpc-bench-peer-firefox capabilities | jq -c .roles)" = '{"client":["trevrpc_webtransport"]}'
-                  test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .schema_version)" = 5
-                  test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -r .peer)" = webkit
-                  test "$(${browser}/bin/trevrpc-bench-peer-webkit capabilities | jq -c .roles)" = '{}'
-                  touch $out
-                '';
 
-            nix = {
-              root = ./.;
-              filter = file: file.hasExt "nix";
-              packages = with pkgs; [
-                nixfmt
-              ];
-              script = ''
-                nixfmt --check "$file"
+                fixture=$(new_fixture)
+                git -C "$fixture" tag trevrpc-go/v0.2.1
+                git -C "$fixture" tag trevrpc-go/tools/v9.9.9
+                push_fixture "$fixture"
+                set_event trevrpc-go/v0.2.1
+                : > "$RELEASE_LOG"
+                TAG=untrusted PACKAGES=untrusted run_release "$fixture" trevrpc-go
+                test "$(wc -l < "$RELEASE_LOG")" -eq 1
+                grep -Fx 'trevrpc-go/v0.2.1|packages.x86_64-linux.trevrpc-go.x86_64-unknown-linux-musl' "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                git -C "$fixture" tag trevrpc-rust/v0.1.10
+                git -C "$fixture" tag trevrpc-go/v9.9.9
+                push_fixture "$fixture"
+                set_event trevrpc-rust/v0.1.10
+                : > "$RELEASE_LOG"
+                run_release "$fixture" trevrpc-rust
+                test "$(wc -l < "$RELEASE_LOG")" -eq 1
+                grep -Fx 'trevrpc-rust/v0.1.10|packages.x86_64-linux.trevrpc-rust.x86_64-unknown-linux-musl' "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                git -C "$fixture" tag trevrpc-go/v9.9.9
+                push_fixture "$fixture"
+                set_event trevrpc-go/v9.9.9
+                : > "$RELEASE_LOG"
+                expect_failure run_release "$fixture" trevrpc-go
+                test ! -s "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                git -C "$fixture" tag trevrpc-go/v0.2.1
+                add_commit "$fixture" newer-head
+                push_fixture "$fixture"
+                set_event trevrpc-go/v0.2.1
+                : > "$RELEASE_LOG"
+                expect_failure run_release "$fixture" trevrpc-go
+                test ! -s "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                git -C "$fixture" tag trevrpc-go/v0.2.1
+                git -C "$fixture" tag trevrpc-rust/v0.1.10
+                push_fixture "$fixture"
+                set_event trevrpc-rust/v0.1.10
+                : > "$RELEASE_LOG"
+                expect_failure run_release "$fixture" trevrpc-go
+                test ! -s "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                git -C "$fixture" tag trevrpc-go/tools/v0.2.1
+                push_fixture "$fixture"
+                set_event trevrpc-go/tools/v0.2.1
+                : > "$RELEASE_LOG"
+                expect_failure run_release "$fixture" trevrpc-go
+                test ! -s "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                git -C "$fixture" tag v1.0.0
+                push_fixture "$fixture"
+                set_event v1.0.0
+                : > "$RELEASE_LOG"
+                expect_failure run_release "$fixture" trevrpc-go
+                test ! -s "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                git -C "$fixture" tag trevrpc-go/v0.2.1
+                push_fixture "$fixture"
+                export GITHUB_REF_NAME=trevrpc-go/v0.2.1
+                export GITHUB_REF=refs/heads/main
+                : > "$RELEASE_LOG"
+                expect_failure run_release "$fixture" trevrpc-go
+                test ! -s "$RELEASE_LOG"
+
+                fixture=$(new_fixture)
+                push_fixture "$fixture"
+                set_event trevrpc-go/v0.2.1
+                : > "$RELEASE_LOG"
+                expect_failure run_release "$fixture" trevrpc-go
+                expect_failure run_release "$fixture" trevrpc-python
+                test ! -s "$RELEASE_LOG"
+
+                touch $out
               '';
-            };
 
-            shell = {
-              root = ./.;
-              filter = file: file.hasExt "sh";
-              packages = with pkgs; [
-                shellcheck
-              ];
-              script = ''
-                shellcheck "$file"
-              '';
-            };
-
-            python =
-              let
-                # basedpyright's Nixpkgs build-time test closure pulls in ffmpeg-headless,
-                # whose FATE tests fail on aarch64-darwin; retain Ruff there.
-                enableBasedpyright = !pkgs.stdenv.hostPlatform.isDarwin;
-              in
-              {
-                root = ./.;
-                filter = file: file.hasExt "py";
-                packages = [ pkgs.ruff ] ++ pkgs.lib.optional enableBasedpyright pkgs.basedpyright;
-                script = ''
-                  ruff check
-                  ${pkgs.lib.optionalString enableBasedpyright "basedpyright"}
-                '';
-              };
-
-            actions-gh = {
-              root = ./.github/workflows;
-              filter = file: file.hasExt "yaml";
-              packages = with pkgs; [
-                action-validator
-                zizmor
-              ];
-              script = ''
-                action-validator "$file"
-                zizmor --offline "$file"
-              '';
-            };
-
-            actions-fj = {
-              root = ./.forgejo/workflows;
-              filter = file: file.hasExt "yaml";
-              packages = with pkgs; [
-                forgejo-runner
-                zizmor
-              ];
-              script = ''
-                forgejo-runner validate --workflow --path "$file"
-                zizmor --offline "$file"
-              '';
-            };
-
-            renovate = {
-              root = ./.forgejo;
-              files = ./.forgejo/renovate.json;
-              packages = with pkgs; [
-                renovate
-              ];
-              script = ''
-                renovate-config-validator renovate.json
-              '';
-            };
-
-            config = {
-              root = ./.;
-              filter = file: file.hasExt "json" || file.hasExt "yaml" || file.hasExt "toml" || file.hasExt "md";
-              packages = with pkgs; [
-                oxfmt
-              ];
-              script = ''
-                oxfmt --check
-              '';
-            };
-
-            conformance-m3 =
-              let
-                conformanceSource = pkgs.lib.fileset.toSource {
-                  root = ./.;
-                  fileset = pkgs.lib.fileset.unions [
-                    ./conformance
-                    ./testdata/wire-golden-vectors.txt
-                  ];
-                };
-                controller = packageSet.trevrpc-bench;
-                cPeer = packageSet.trevrpc-c;
-                cppPeer = packageSet.trevrpc-cpp;
-                goPeer = packageSet.trevrpc-go;
-                jsPeer = packageSet.trevrpc-js;
-                kotlinPeer = packageSet.trevrpc-kotlin;
-                rustPeer = packageSet.trevrpc-rust;
-              in
-              pkgs.runCommand "trevrpc-conformance-m3"
-                {
-                  nativeBuildInputs = [
-                    controller
-                    pkgs.coreutils
-                    pkgs.gnugrep
-                    pkgs.jq
-                  ];
-                  meta.platforms = [ "x86_64-linux" ];
-                }
-                ''
-                  set -euo pipefail
-                  ulimit -v 6291456
-                  export JAVA_TOOL_OPTIONS="-Xmx1024m -XX:MaxMetaspaceSize=512m"
-                  m0_suite=${conformanceSource}/conformance/suites/m0.json
-                  suite=${conformanceSource}/conformance/suites/m3.json
-
-                  trevrpc-conformance validate "$m0_suite" | grep -q '63 cases'
-                  timeout --kill-after=5s 60s \
-                    trevrpc-conformance run "$m0_suite" --out "$TMPDIR/m0" \
-                      --peer go=${goPeer}/bin/trevrpc-conformance-go
-                  test "$(wc -l < "$TMPDIR/m0/results.jsonl")" -eq 63
-                  jq -e '
-                    .peers.go == {total:63,passed:63,allowed:0,failed:0,skipped:0} and
-                    .overall == {total:63,passed:63,allowed:0,failed:0,skipped:0} and
-                    .clean_shutdown == true
-                  ' "$TMPDIR/m0/summary.json" >/dev/null
-
-                  trevrpc-conformance validate "$suite" | grep -q '90 cases'
-                  mkdir -p "$out"
-                  timeout --kill-after=5s 300s \
-                    trevrpc-conformance run "$suite" --out "$out" \
-                      --peer c=${cPeer}/bin/trevrpc-conformance-c \
-                      --peer cpp=${cppPeer}/bin/trevrpc-conformance-cpp \
-                      --peer go=${goPeer}/bin/trevrpc-conformance-go \
-                      --peer js=${jsPeer}/bin/trevrpc-conformance-js \
-                      --peer kotlin=${kotlinPeer}/bin/trevrpc-conformance-kotlin \
-                      --peer rust=${rustPeer}/bin/trevrpc-conformance-rust
-
-                  test "$(wc -l < "$out/results.jsonl")" -eq 540
-                  jq -e '
-                    .peers.c == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
-                    .peers.cpp == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
-                    .peers.go == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
-                    .peers.js == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
-                    .peers.kotlin == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
-                    .peers.rust == {total:90,passed:90,allowed:0,failed:0,skipped:0} and
-                    .overall == {total:540,passed:540,allowed:0,failed:0,skipped:0} and
-                    .clean_shutdown == true
-                  ' "$out/summary.json" >/dev/null
-                  jq -e '
-                    .source_revision != "unknown" and
-                    .limits.max_command_bytes == 262144 and
-                    .peer_resolution == "absolute_overrides" and
-                    .allowance_policy == "forbid" and
-                    .suite_path == "inputs/conformance/suites/m3.json" and
-                    .golden_path == "inputs/testdata/wire-golden-vectors.txt" and
-                    (.corpus | length) == 6 and
-                    (.peers | length) == 6 and
-                    all(.peers[];
-                      (.executable | startswith("/nix/store/")) and
-                      (.sha256 | test("^[0-9a-f]{64}$"))
-                    )
-                  ' "$out/manifest.json" >/dev/null
-                  while IFS=$'\t' read -r relative expected; do
-                    test -f "$out/$relative"
-                    test "$(sha256sum "$out/$relative" | cut -d' ' -f1)" = "$expected"
-                  done < <(
-                    jq -r '
-                      [.suite_path,.suite_sha256],
-                      [.golden_path,.golden_sha256],
-                      (.corpus[] | [.path,.sha256]) |
-                      @tsv
-                    ' "$out/manifest.json"
-                  )
-                  trevrpc-conformance validate \
-                    "$out/inputs/conformance/suites/m3.json" | grep -q '90 cases'
-                  while IFS=$'\t' read -r executable expected; do
-                    test "$executable" = "$(realpath "$executable")"
-                    test -x "$executable"
-                    test "$(sha256sum "$executable" | cut -d' ' -f1)" = "$expected"
-                  done < <(jq -r '.peers[] | [.executable,.sha256] | @tsv' "$out/manifest.json")
-                '';
+          nix = {
+            root = ./.;
+            filter = file: file.hasExt "nix";
+            packages = with pkgs; [
+              nixfmt
+            ];
+            script = ''
+              nixfmt --check "$file"
+            '';
           };
+
+          shell = {
+            root = ./.;
+            filter = file: file.hasExt "sh";
+            packages = with pkgs; [
+              shellcheck
+            ];
+            script = ''
+              shellcheck "$file"
+            '';
+          };
+
+          python =
+            let
+              # basedpyright's Nixpkgs build-time test closure pulls in ffmpeg-headless,
+              # whose FATE tests fail on aarch64-darwin; retain Ruff there.
+              enableBasedpyright = !pkgs.stdenv.hostPlatform.isDarwin;
+            in
+            {
+              root = ./.;
+              filter = file: file.hasExt "py";
+              packages = [ pkgs.ruff ] ++ pkgs.lib.optional enableBasedpyright pkgs.basedpyright;
+              script = ''
+                ruff check
+                ${pkgs.lib.optionalString enableBasedpyright "basedpyright"}
+              '';
+            };
+
+          actions-gh = {
+            root = ./.github/workflows;
+            filter = file: file.hasExt "yaml";
+            packages = with pkgs; [
+              action-validator
+              zizmor
+            ];
+            script = ''
+              action-validator "$file"
+              zizmor --offline "$file"
+            '';
+          };
+
+          actions-fj = {
+            root = ./.forgejo/workflows;
+            filter = file: file.hasExt "yaml";
+            packages = with pkgs; [
+              forgejo-runner
+              zizmor
+            ];
+            script = ''
+              forgejo-runner validate --workflow --path "$file"
+              zizmor --offline "$file"
+            '';
+          };
+
+          renovate = {
+            root = ./.forgejo;
+            files = ./.forgejo/renovate.json;
+            packages = with pkgs; [
+              renovate
+            ];
+            script = ''
+              renovate-config-validator renovate.json
+            '';
+          };
+
+          config = {
+            root = ./.;
+            filter = file: file.hasExt "json" || file.hasExt "yaml" || file.hasExt "toml" || file.hasExt "md";
+            packages = with pkgs; [
+              oxfmt
+            ];
+            script = ''
+              oxfmt --check
+            '';
+          };
+
+        };
       }
     );
 }
