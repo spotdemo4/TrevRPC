@@ -26,7 +26,7 @@ mkGoModule (final: {
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-/TkFoSSMp+1mKPRJjcUN9SJRclkhAb1qmAXfbgKAbes=";
+  vendorHash = "sha256-2TK5+VVk28PPLdVgNkQ/hqKcGspK9CiYY8hB9VQns/0=";
 
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
