@@ -145,4 +145,5 @@ client trust root. Browsers trust it through WebTransport
 The WSS lanes cannot pin a hash, so Chromium and Firefox ignore certificate
 errors instead. Safari cannot, so with `--browser safari` `run.sh` adds the
 certificate to the macOS System keychain as a trusted root through `sudo` and
-removes it when the run ends.
+removes it when the run ends. It never prompts: `sudo` must not need a password,
+as on CI runners, or must already be authenticated (`sudo -v`).

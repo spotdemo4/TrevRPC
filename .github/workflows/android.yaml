@@ -22,15 +22,12 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # Loading the android shell builds the harness and both servers once,
+      # so the interop jobs fetch them from the cache.
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-
-      - name: Build Android interop harness and servers
-        run: >-
-          nix build --no-link
-          .#trevrpc-kotlin.interopAndroid
-          .#trevrpc-go
-          .#trevrpc-rust
+        with:
+          shell: android
 
   interop:
     name: android-${{ matrix.transport }}-to-${{ matrix.server }}
@@ -50,9 +47,12 @@ jobs:
       SERVER: ${{ matrix.server }}
       TRANSPORT: ${{ matrix.transport }}
       WORK_DIR: /nix/trevrpc-android/work
+      CELL: android-${{ matrix.transport }}-to-${{ matrix.server }}
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          shell: android
 
       - name: Prepare Android work directory
         run: sudo install -d -o "$USER" -g "$(id -gn)" "$WORK_DIR"
@@ -62,23 +62,20 @@ jobs:
 
       - name: Run Android interop
         env:
-          OUTPUT: ${{ runner.temp }}/android-${{ matrix.transport }}-to-${{ matrix.server }}
+          OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
         run: |
-          nix shell \
-            .#trevrpc-kotlin.interopAndroid \
-            ".#trevrpc-$SERVER" \
-            --command trevrpc-interop-android \
-              --server-command "trevrpc-interop-$SERVER server" \
-              --transport "$TRANSPORT" \
-              --output "$OUTPUT" \
-              --work-dir "$WORK_DIR"
+          trevrpc-interop-android \
+            --server-command "trevrpc-interop-$SERVER server" \
+            --transport "$TRANSPORT" \
+            --output "$OUTPUT" \
+            --work-dir "$WORK_DIR"
 
       - name: Upload failure diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: android-${{ matrix.transport }}-to-${{ matrix.server }}
-          path: ${{ runner.temp }}/android-${{ matrix.transport }}-to-${{ matrix.server }}
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
           if-no-files-found: ignore
 
       - name: Clean Android work directory

@@ -10,7 +10,7 @@
 # default over every lane: WebTransport, QMux over WebSocket, and the fallback
 # from a blocked UDP port to WebSocket. Safari cannot ignore certificate errors,
 # so with `--browser safari` the generated certificate is trusted in the macOS
-# System keychain (through sudo) for the duration of the run.
+# System keychain for the duration of the run, through non-interactive sudo.
 set -euo pipefail
 
 servers=()
@@ -61,24 +61,24 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 cert_hash=$(openssl x509 -in "$cert" -outform der | sha256sum | cut -d' ' -f1)
 
 system_keychain=/Library/Keychains/System.keychain
+# Keychain changes run without prompting and with a deadline, so a missing
+# sudo password or an authorization dialog fails the run instead of hanging it.
+keychain() {
+  timeout --kill-after=5s 30s sudo -n security "$@"
+}
+
 trust_cert() {
   trusted_cert=$(openssl x509 -in "$cert" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d :)
-  sudo security add-trusted-cert -d -r trustRoot -p ssl -k "$system_keychain" "$cert"
+  keychain add-trusted-cert -d -r trustRoot -p ssl -k "$system_keychain" "$cert"
 }
 
 untrust_cert() {
   [[ -n $trusted_cert ]] || return 0
-  sudo security remove-trusted-cert -d "$cert" 2>/dev/null || true
-  sudo security delete-certificate -Z "$trusted_cert" "$system_keychain" >/dev/null 2>&1 || true
+  keychain remove-trusted-cert -d "$cert" || echo "could not remove the certificate's trust settings" >&2
+  keychain delete-certificate -Z "$trusted_cert" "$system_keychain" >/dev/null ||
+    echo "could not delete certificate $trusted_cert from $system_keychain" >&2
   trusted_cert=""
 }
-
-for browser in "${browsers[@]}"; do
-  if [[ $browser == safari ]]; then
-    trust_cert
-    break
-  fi
-done
 
 start_server() {
   local name=$1 command=$2 ports=$out/server-$1.ports
@@ -132,6 +132,13 @@ run_cell() {
 # is below the ephemeral range, so it never collides with a server's own port,
 # and is not on the browsers' list of unsafe ports.
 unreachable_udp=24999
+
+for browser in "${browsers[@]}"; do
+  if [[ $browser == safari ]]; then
+    trust_cert
+    break
+  fi
+done
 
 for server in "${servers[@]}"; do
   server_name=${server%%=*}

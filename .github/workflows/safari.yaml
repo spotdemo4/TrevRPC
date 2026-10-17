@@ -23,8 +23,23 @@ permissions:
   contents: read
 
 jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Loading the safari shell builds the runner, both servers and the
+      # browser CLI once, so the interop jobs fetch them from the cache.
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          shell: safari
+
   interop:
     name: safari-${{ matrix.name }}-to-${{ matrix.server }}
+    needs: build
     runs-on: macos-26
     timeout-minutes: 60
     continue-on-error: ${{ matrix.allow-failure }}
@@ -36,8 +51,12 @@ jobs:
       matrix:
         include:
           - server: go
-            name: all
-            lanes: webtransport,websocket,fallback
+            name: webtransport
+            lanes: webtransport
+            allow-failure: false
+          - server: go
+            name: websocket
+            lanes: websocket,fallback
             allow-failure: false
           - server: rust
             name: websocket
@@ -54,6 +73,8 @@ jobs:
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          shell: safari
 
       - name: Enable safaridriver
         run: sudo safaridriver --enable
@@ -62,15 +83,11 @@ jobs:
         env:
           OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
         run: |
-          nix shell \
-            .#trevrpc-js \
-            ".#trevrpc-$SERVER" \
-            .#trevrpc-interop \
-            --command trevrpc-interop \
-              --out "$OUTPUT" \
-              --server "$SERVER=trevrpc-interop-$SERVER" \
-              --browser safari \
-              --browser-lanes "$LANES"
+          trevrpc-interop \
+            --out "$OUTPUT" \
+            --server "$SERVER=trevrpc-interop-$SERVER" \
+            --browser safari \
+            --browser-lanes "$LANES"
 
       - name: Upload failure diagnostics
         if: ${{ failure() }}
