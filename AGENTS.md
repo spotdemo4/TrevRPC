@@ -12,6 +12,7 @@
 - Commit messages created by agents must follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/).
 - Commits created by agents must include an `Assisted-by: [tool name] ([primary model name and version])` Git commit trailer.
 - Branch names created by agents must follow [Conventional Branch 1.0.0](https://conventionalbranch.org/v1.0.0/).
+- `wiki/` is a Git submodule for the project wiki. When an agent changes it, commit and push those changes in the submodule to its `main` branch, then commit the updated submodule pointer in this repository along with the related changes.
 
 ## Project Snapshot
 
