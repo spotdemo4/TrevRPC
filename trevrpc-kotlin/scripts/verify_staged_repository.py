@@ -449,9 +449,15 @@ def main() -> None:
             published == allowed_artifacts,
             f"unexpected artifacts for {module}: {sorted(published - allowed_artifacts)}",
         )
+        # Unsigned local builds stage no signatures; signed builds must sign every
+        # artifact. Gradle does not checksum signatures and Central does not need them.
+        expected_asc_files = {f"{name}.asc" for name in published}
+        require(
+            not asc_files or asc_files == expected_asc_files,
+            f"signatures for {module} do not match artifacts: missing {sorted(expected_asc_files - asc_files)}, unexpected {sorted(asc_files - expected_asc_files)}",
+        )
         for asc_name in asc_files:
             asc_path = version_directory / asc_name
-            verify_checksums(asc_path)
             require(asc_path.stat().st_size > 0, f"empty signature {asc_path}")
             require(
                 asc_path.read_bytes().startswith(b"-----BEGIN PGP"),
