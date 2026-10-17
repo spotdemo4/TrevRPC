@@ -5,6 +5,11 @@ on:
     tags: ["**"]
   workflow_dispatch:
 
+# each package tag releases independently; a shared group would cancel queued tags
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 # yaml-language-server-disable is not allowed
 enable-openid-connect: true
 

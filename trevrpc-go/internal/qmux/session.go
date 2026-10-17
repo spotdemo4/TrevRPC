@@ -15,6 +15,7 @@ import (
 // with odd IDs.
 type Role int
 
+// The two session roles.
 const (
 	RoleClient Role = iota
 	RoleServer
@@ -320,8 +321,7 @@ func (s *Session) readFailed(err error) {
 		// Keep reading until the writer gives up on the peer.
 		for {
 			if _, err := s.conn.ReadRecord(); err != nil {
-				var again *TransportError
-				if !errors.As(err, &again) {
+				if _, ok := errors.AsType[*TransportError](err); !ok {
 					return
 				}
 			}
@@ -345,8 +345,7 @@ func (s *Session) handleRecord(record []byte) *TransportError {
 	for parser.more() {
 		f, err := parser.next()
 		if err != nil {
-			var transportErr *TransportError
-			if errors.As(err, &transportErr) {
+			if transportErr, ok := errors.AsType[*TransportError](err); ok {
 				return transportErr
 			}
 			return protocolError(FrameEncodingError, 0, "%v", err)
@@ -430,8 +429,7 @@ func (s *Session) handleParametersLocked(f *frame) *TransportError {
 	}
 	peer, err := decodeParameters(f.params, s.version)
 	if err != nil {
-		var transportErr *TransportError
-		if errors.As(err, &transportErr) {
+		if transportErr, ok := errors.AsType[*TransportError](err); ok {
 			return transportErr
 		}
 		return protocolError(TransportParameterError, f.typ, "%v", err)

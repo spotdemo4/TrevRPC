@@ -1,4 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/refs/heads/main/npm/oxlint/configuration_schema.json",
-  "ignorePatterns": ["node_modules/**", "build/**"]
+  "ignorePatterns": ["build/**", "node_modules/**"],
+  "options": {
+    "reportUnusedDisableDirectives": "deny",
+    "typeAware": true,
+    "typeCheck": true
+  }
 }

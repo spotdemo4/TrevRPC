@@ -1,0 +1,52 @@
+# https://github.com/actions/labeler
+
+actions:
+  - changed-files:
+      - any-glob-to-any-file:
+          - .github/workflows/**
+          - .forgejo/workflows/**
+
+go:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.go"
+          - "**/go.mod"
+          - "**/go.sum"
+
+kotlin:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.{kt,kts}"
+          - "**/gradle.lockfile"
+          - "**/gradle.properties"
+
+nix:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.nix"
+          - "**/flake.lock"
+
+node:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}"
+          - "**/package.json"
+          - "**/package-lock.json"
+
+proto:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.proto"
+
+python:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.py"
+          - "**/pyproject.toml"
+
+rust:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.rs"
+          - "**/Cargo.toml"
+          - "**/Cargo.lock"

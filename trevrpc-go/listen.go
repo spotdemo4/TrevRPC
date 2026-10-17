@@ -212,6 +212,21 @@ func (l *Listener) Serve(ctx context.Context) error {
 	return nil
 }
 
+// acceptStopping reports whether an accept error comes from the listener
+// shutting down rather than from a failure.
+func (l *Listener) acceptStopping(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || l.stopped.Load() || errors.Is(err, net.ErrClosed)
+}
+
+// acceptFailure maps an accept error to the result of acceptConns: nil when the
+// listener is shutting down, and the error as a status otherwise.
+func (l *Listener) acceptFailure(ctx context.Context, err error) error {
+	if l.acceptStopping(ctx, err) {
+		return nil
+	}
+	return transportStatus(err)
+}
+
 // acceptConns serves connections from source until it stops accepting. It
 // returns an error only when accepting fails for another reason.
 func (l *Listener) acceptConns(ctx context.Context, source connSource, connectionTasks *sync.WaitGroup) error {
@@ -219,10 +234,7 @@ func (l *Listener) acceptConns(ctx context.Context, source connSource, connectio
 	for {
 		conn, err := source.accept(ctx)
 		if err != nil {
-			if ctx.Err() != nil || l.stopped.Load() || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			return transportStatus(err)
+			return l.acceptFailure(ctx, err)
 		}
 		if !tryAcquire(connectionLimit) {
 			conn.close("too many concurrent connections")

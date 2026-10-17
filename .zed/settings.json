@@ -52,16 +52,16 @@
       "format_on_save": "on",
       "language_servers": ["typescript-ls", "oxlint", "oxfmt"],
       "formatter": [
-        { "code_action": "source.fixAll.oxc" },
-        { "language_server": { "name": "oxfmt" } }
+        { "language_server": { "name": "oxfmt" } },
+        { "code_action": "source.fixAll.oxc" }
       ]
     },
     "JavaScript": {
       "format_on_save": "on",
       "language_servers": ["typescript-ls", "oxlint", "oxfmt"],
       "formatter": [
-        { "code_action": "source.fixAll.oxc" },
-        { "language_server": { "name": "oxfmt" } }
+        { "language_server": { "name": "oxfmt" } },
+        { "code_action": "source.fixAll.oxc" }
       ]
     },
     "Kotlin": {

@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use tokio::sync::watch;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
+use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
     BoxStream, Code, Error, Metadata, ResponseEnvelope, Result, RpcKind, RpcRequest, RpcResponse,
@@ -103,7 +104,8 @@ impl CancellationToken {
     pub async fn cancelled(&self) -> CancellationSource {
         let mut source = self.subscribe();
         loop {
-            if let Some(source) = *source.borrow_and_update() {
+            let cancelled = *source.borrow_and_update();
+            if let Some(source) = cancelled {
                 return source;
             }
             if source.changed().await.is_err() {
@@ -131,22 +133,14 @@ impl CancellationToken {
     }
 
     pub(crate) fn set_completion_code(&self, code: Code) {
-        let mut completion_code = self
-            .state
-            .completion_code
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut completion_code = self.state.completion_code.lock_unpoisoned();
         if completion_code.is_none() {
             *completion_code = Some(code);
         }
     }
 
     fn completion_code(&self) -> Option<Code> {
-        *self
-            .state
-            .completion_code
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self.state.completion_code.lock_unpoisoned()
     }
 }
 
@@ -189,7 +183,7 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn metadata(&self) -> &Metadata {
+    pub const fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
@@ -1339,7 +1333,7 @@ fn request_deadline(request: &RpcRequest) -> std::result::Result<Option<Instant>
         return Ok(None);
     }
 
-    if request.timeout_nanos > i64::MAX as u64 {
+    if request.timeout_nanos > i64::MAX.unsigned_abs() {
         return Err(Status::invalid_argument("RPC timeout is too large"));
     }
 
@@ -1373,7 +1367,7 @@ struct StreamLimits {
 }
 
 impl StreamLimits {
-    fn from_options(options: &ServerOptions, deadline: Option<Instant>) -> Self {
+    const fn from_options(options: &ServerOptions, deadline: Option<Instant>) -> Self {
         Self {
             max_messages: options.max_stream_messages(),
             max_body_size: options.max_stream_body_size(),
@@ -1780,10 +1774,11 @@ mod tests {
 
     impl Metrics for TestMetrics {
         fn rpc_started(&self, _event: &super::RpcStarted) {
-            *self
+            let mut started = self
                 .started
                 .lock()
-                .expect("metrics lock should not be poisoned") += 1;
+                .expect("metrics lock should not be poisoned");
+            *started = started.saturating_add(1);
         }
 
         fn rpc_finished(&self, event: &RpcFinished) {
@@ -2406,7 +2401,8 @@ mod tests {
             "Download",
             RpcKind::ServerStreaming,
             |_body, _requests| async move {
-                Ok(Box::pin(futures_util::stream::pending()) as crate::BoxStream<Vec<u8>>)
+                let stream: crate::BoxStream<Vec<u8>> = Box::pin(futures_util::stream::pending());
+                Ok(stream)
             },
         );
 
@@ -2530,9 +2526,11 @@ mod tests {
             "Download",
             RpcKind::ServerStreaming,
             |_body, _requests| async move {
-                Ok(Box::pin(futures_util::stream::iter([Err(Error::from(
-                    crate::Status::unavailable("down"),
-                ))])) as crate::BoxStream<Vec<u8>>)
+                let stream: crate::BoxStream<Vec<u8>> =
+                    Box::pin(futures_util::stream::iter([Err(Error::from(
+                        crate::Status::unavailable("down"),
+                    ))]));
+                Ok(stream)
             },
         );
 

@@ -1,7 +1,7 @@
 {
   lib,
   stdenv,
-  rustPlatform,
+  mkRustPackage,
   rustfmt,
   clippy,
   gnugrep,
@@ -11,7 +11,7 @@
 let
   canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
 in
-rustPlatform.buildRustPackage (final: {
+mkRustPackage (final: {
   pname = "trevrpc-rust";
   version = "1.0.0";
 
@@ -31,13 +31,15 @@ rustPlatform.buildRustPackage (final: {
   # The tests bind loopback UDP sockets and run the interop executable against itself.
   __darwinAllowLocalNetworking = true;
   nativeCheckInputs = [
+    # The generator tests format its output to compare against the checked-in bindings.
     rustfmt
     clippy
   ];
   checkPhase = ''
-    cargo fmt --check
+    runHook preCheck
     cargo test --workspace --offline
     cargo clippy --workspace --all-targets --offline -- -D warnings
+    runHook postCheck
   '';
 
   installPhase = ''

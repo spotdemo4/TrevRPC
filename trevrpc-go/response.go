@@ -1,6 +1,7 @@
 package trevrpc
 
 import (
+	"errors"
 	"io"
 	"sync"
 )
@@ -51,7 +52,7 @@ func (s *responseEnvelopeStream[T]) Recv() (T, error) {
 	}
 
 	message, err := s.inner.Recv()
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		return message, err
 	}
 

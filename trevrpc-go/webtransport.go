@@ -29,7 +29,7 @@ func (l *Listener) handleWebTransport(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return nil, nil, err
 			}
-			return newDrainingStream(stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }, ctx), stream.Context(), nil
+			return newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }), stream.Context(), nil
 		},
 		close:               func(message string) { _ = session.CloseWithError(0, message) },
 		overloadMessage:     "too many concurrent streams on WebTransport session",

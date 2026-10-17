@@ -10,10 +10,10 @@ use crate::request_pump::RequestTransportEvent;
 use crate::{Error, Result};
 
 /// Application error code for streams a client or server abandons.
-pub(crate) const CANCELLED_STREAM_CODE: u32 = 1;
+pub const CANCELLED_STREAM_CODE: u32 = 1;
 
 /// A multiplexed connection whose peer opens one bidirectional stream per RPC.
-pub(crate) trait MuxConnection: Clone + Send + Sync + 'static {
+pub trait MuxConnection: Clone + Send + Sync + 'static {
     type SendStream: MuxSendStream;
     type RecvStream: MuxRecvStream;
 
@@ -35,7 +35,7 @@ pub(crate) trait MuxConnection: Clone + Send + Sync + 'static {
 }
 
 /// The sending half of a multiplexed stream.
-pub(crate) trait MuxSendStream: FrameWrite + Send + 'static {
+pub trait MuxSendStream: FrameWrite + Send + 'static {
     /// Resolves `Ok` when the peer stops reading (`STOP_SENDING`), and with an error when the
     /// connection is lost first.
     fn peer_stopped(&mut self) -> impl Future<Output = Result<()>> + Send;
@@ -48,7 +48,7 @@ pub(crate) trait MuxSendStream: FrameWrite + Send + 'static {
 }
 
 /// The receiving half of a multiplexed stream.
-pub(crate) trait MuxRecvStream: FrameRead + Send + 'static {
+pub trait MuxRecvStream: FrameRead + Send + 'static {
     /// Asks the peer to stop sending with `STOP_SENDING` and `code`.
     fn stop_stream(&mut self, code: u32);
 

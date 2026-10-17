@@ -49,7 +49,7 @@ type drainingStream struct {
 	draining   bool
 }
 
-func newDrainingStream(rw io.ReadWriteCloser, setReadDeadline func(time.Time) error, stopReading func(), shutdown context.Context) *drainingStream {
+func newDrainingStream(shutdown context.Context, rw io.ReadWriteCloser, setReadDeadline func(time.Time) error, stopReading func()) *drainingStream {
 	s := &drainingStream{
 		rw: rw, setReadDeadline: setReadDeadline, stopReading: stopReading, shutdown: shutdown,
 		drainTimeout: requestDrainTimeout, drainLimit: requestDrainLimit,

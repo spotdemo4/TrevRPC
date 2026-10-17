@@ -18,7 +18,7 @@ use crate::{
 ///
 /// A transport adapter owns encoding, length prefixes, tracing, and the concrete stream
 /// cancellation operations. The server driver only deals in logical RPC responses and frames.
-pub(crate) trait ResponseWriter: Send + 'static {
+pub trait ResponseWriter: Send + 'static {
     fn write_response(&mut self, response: &RpcResponse)
     -> impl Future<Output = Result<()>> + Send;
 
@@ -40,7 +40,7 @@ pub(crate) trait ResponseWriter: Send + 'static {
 }
 
 /// Reads the initial request frame, bounded by the server's initial request timeout.
-pub(crate) async fn read_initial_request<R>(server: &Server, recv: &mut R) -> Result<RpcRequest>
+pub async fn read_initial_request<R>(server: &Server, recv: &mut R) -> Result<RpcRequest>
 where
     R: FrameRead,
 {
@@ -55,7 +55,7 @@ where
 }
 
 /// Handles one already-decoded RPC stream using a transport-neutral response writer and reader.
-pub(crate) async fn handle_stream<W, R>(
+pub async fn handle_stream<W, R>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
     mut send: W,
@@ -136,12 +136,8 @@ pub(crate) async fn handle_stream<W, R>(
 }
 
 /// Rejects an already-decoded RPC because the connection stream limit was reached.
-pub(crate) async fn reject_stream<W, R>(
-    server: Server,
-    mut send: W,
-    mut recv: R,
-    request: RpcRequest,
-) where
+pub async fn reject_stream<W, R>(server: Server, mut send: W, mut recv: R, request: RpcRequest)
+where
     W: ResponseWriter,
     R: RequestPumpReader,
 {
@@ -354,7 +350,7 @@ where
     result.is_ok()
 }
 
-pub(crate) async fn write_status<W>(mut send: W, status: Status)
+pub async fn write_status<W>(mut send: W, status: Status)
 where
     W: ResponseWriter,
 {
@@ -366,9 +362,9 @@ where
 }
 
 #[allow(dead_code)]
-pub(crate) struct Permit(Option<OwnedSemaphorePermit>);
+pub struct Permit(Option<OwnedSemaphorePermit>);
 
-pub(crate) fn try_acquire_permit(limit: Option<&Arc<Semaphore>>) -> Option<Permit> {
+pub fn try_acquire_permit(limit: Option<&Arc<Semaphore>>) -> Option<Permit> {
     limit.map_or(Some(Permit(None)), |semaphore| {
         semaphore
             .clone()
@@ -401,5 +397,6 @@ mod tests {
         let permit = try_acquire_permit(Some(&semaphore));
         assert!(permit.is_some());
         assert!(try_acquire_permit(Some(&semaphore)).is_none());
+        drop(permit);
     }
 }

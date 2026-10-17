@@ -5,7 +5,7 @@ use tokio::task::JoinHandle;
 
 use crate::{Error, Result};
 
-pub(crate) struct UploadWriter {
+pub struct UploadWriter {
     cancel: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
 }

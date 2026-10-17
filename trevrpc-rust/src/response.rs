@@ -27,7 +27,7 @@ impl<T> ResponseEnvelope<T> {
     }
 
     #[must_use]
-    pub fn metadata(&self) -> &Metadata {
+    pub const fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 

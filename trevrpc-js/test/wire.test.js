@@ -293,7 +293,7 @@ test("metadata validation limits are inclusive", () => {
   invalid({ key: new Uint8Array(MaxMetadataValueLen + 1) });
 
   const exactTotal = Object.fromEntries(
-    [..."abcdefgh"].map((key) => [key, new Uint8Array(MaxMetadataTotalSize / 8 - 1)]),
+    "abcdefgh".split("").map((key) => [key, new Uint8Array(MaxMetadataTotalSize / 8 - 1)]),
   );
   validateMetadata(exactTotal);
   invalid({ ...exactTotal, i: new Uint8Array() });

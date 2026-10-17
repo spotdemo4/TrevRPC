@@ -98,7 +98,7 @@ const fn is_metadata_key_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-')
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct RpcRequest {
     #[prost(string, tag = "1")]
     pub service: String,
@@ -125,7 +125,7 @@ impl RpcRequest {
             method: method.into(),
             body,
             metadata: Metadata::new(),
-            kind: RpcKind::Unary as i32,
+            kind: i32::from(RpcKind::Unary),
             version: WIRE_VERSION,
             timeout_nanos: 0,
         }
@@ -158,8 +158,8 @@ impl RpcRequest {
 
     /// Sets the RPC kind encoded in the request.
     #[must_use]
-    pub const fn with_kind(mut self, kind: RpcKind) -> Self {
-        self.kind = kind as i32;
+    pub fn with_kind(mut self, kind: RpcKind) -> Self {
+        self.kind = i32::from(kind);
         self
     }
 
@@ -178,7 +178,7 @@ impl RpcRequest {
     }
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct RpcResponse {
     #[prost(uint32, tag = "1")]
     pub status: u32,
@@ -198,7 +198,7 @@ impl RpcResponse {
     }
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct RpcStreamFrame {
     #[prost(enumeration = "RpcStreamFrameKind", tag = "1")]
     pub kind: i32,
@@ -217,7 +217,7 @@ impl RpcStreamFrame {
     #[must_use]
     pub fn message(body: Vec<u8>) -> Self {
         Self {
-            kind: RpcStreamFrameKind::Message as i32,
+            kind: i32::from(RpcStreamFrameKind::Message),
             status: crate::Code::Ok.as_u32(),
             message: String::new(),
             body,
@@ -238,7 +238,7 @@ impl RpcStreamFrame {
         let (code, message) = status.into_parts();
 
         Self {
-            kind: RpcStreamFrameKind::Status as i32,
+            kind: i32::from(RpcStreamFrameKind::Status),
             status: code.as_u32(),
             message,
             body: Vec::new(),
@@ -450,9 +450,12 @@ mod tests {
                 continue;
             }
 
-            let (name, value) = line
-                .split_once('=')
-                .unwrap_or_else(|| panic!("invalid wire golden vector line {}", index + 1));
+            let (name, value) = line.split_once('=').unwrap_or_else(|| {
+                panic!(
+                    "invalid wire golden vector line {}",
+                    index.saturating_add(1)
+                )
+            });
             vectors.insert(name.trim().to_owned(), decode_hex(value.trim()));
         }
 
@@ -472,11 +475,14 @@ mod tests {
     fn decode_hex(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0, "invalid hex length for {hex:?}");
 
-        (0..hex.len())
-            .step_by(2)
-            .map(|index| {
-                u8::from_str_radix(&hex[index..index + 2], 16)
-                    .unwrap_or_else(|error| panic!("invalid hex byte in {hex:?}: {error}"))
+        let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+        pairs
+            .iter()
+            .map(|pair| {
+                std::str::from_utf8(pair)
+                    .ok()
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .unwrap_or_else(|| panic!("invalid hex byte in {hex:?}"))
             })
             .collect()
     }

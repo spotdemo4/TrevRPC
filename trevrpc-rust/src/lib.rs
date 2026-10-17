@@ -29,6 +29,7 @@ pub mod server;
 mod server_transport;
 pub mod status;
 pub mod stream;
+mod sync;
 pub mod tcp;
 mod transport_error;
 mod websocket;

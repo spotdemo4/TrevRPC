@@ -22,7 +22,7 @@ const SUBPROTOCOL: &str = "qmux-02.trevrpc-1";
 /// Upgrades one HTTP/1.1 connection to a WebSocket and serves its `QMux` session until it ends.
 // The handshake callback must return tungstenite's own, large, error response.
 #[allow(clippy::result_large_err)]
-pub(crate) async fn handle_connection<T>(
+pub async fn handle_connection<T>(
     server: Server,
     io: T,
     handshake_timeout: Duration,

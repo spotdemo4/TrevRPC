@@ -35,7 +35,8 @@ func (l *Listener) listenTCP(addr string, options ListenOptions) (connSource, er
 		host, _, _ := net.SplitHostPort(addr)
 		tcpAddr = net.JoinHostPort(host, strconv.Itoa(l.udp.LocalAddr().(*net.UDPAddr).Port))
 	}
-	ln, err := net.Listen("tcp", tcpAddr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(l.ctx, "tcp", tcpAddr)
 	if err != nil {
 		return connSource{}, err
 	}
@@ -115,7 +116,7 @@ func (l *Listener) serveTCPConn(raw net.Conn) {
 	}
 	switch proto := conn.ConnectionState().NegotiatedProtocol; {
 	case proto == QMuxALPN:
-		session, err := l.openServerQMux(qmux.NewStreamConn(conn, qmuxMaxRecordSize), ctx)
+		session, err := l.openServerQMux(ctx, qmux.NewStreamConn(conn, qmuxMaxRecordSize))
 		if err != nil {
 			_ = conn.Close()
 			return

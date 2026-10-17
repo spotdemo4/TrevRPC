@@ -24,6 +24,8 @@ use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 #[allow(dead_code)]
 #[path = "../examples/shared/greeter.rs"]
 mod greeter;
+#[macro_use]
+mod support;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -192,8 +194,12 @@ fn unary_frame(name: &str) -> TestResult<Vec<u8>> {
 }
 
 fn decode_hello(response: &[u8]) -> TestResult<String> {
-    let response: RpcResponse = trevrpc::framing::decode_frame(&response[4..])?;
-    assert_eq!(response.status, 0, "{}", response.message);
+    let response: RpcResponse = trevrpc::framing::decode_frame(
+        response
+            .get(4..)
+            .ok_or("response is shorter than its frame header")?,
+    )?;
+    ensure_eq!(response.status, 0, "{}", response.message);
     Ok(greeter::HelloReply::decode(response.body.as_slice())?.message)
 }
 
@@ -266,7 +272,7 @@ async fn qmux_over_tls_round_trips_every_rpc_shape() -> TestResult {
             name: large.clone(),
         })
         .await?;
-    assert_eq!(reply.message, format!("hello, {large}"));
+    ensure_eq!(reply.message, format!("hello, {large}"));
     transport.close();
     server.stop().await
 }
@@ -304,8 +310,8 @@ async fn http2_serves_post_rpcs_and_advertises_http3() -> TestResult {
     let (response, mut body) = sender.send_request(request, false)?;
     body.send_data(Bytes::from(unary_frame("h2")?), true)?;
     let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
-    assert_eq!(response.status(), http::StatusCode::OK);
-    assert_eq!(
+    ensure_eq!(response.status(), http::StatusCode::OK);
+    ensure_eq!(
         response.headers().get(http::header::ALT_SVC),
         Some(&http::HeaderValue::try_from(format!(
             "h3=\":{}\"; ma=86400",
@@ -319,7 +325,7 @@ async fn http2_serves_post_rpcs_and_advertises_http3() -> TestResult {
         let _ = body.flow_control().release_capacity(chunk.len());
         bytes.extend_from_slice(&chunk);
     }
-    assert_eq!(decode_hello(&bytes)?, "hello, h2");
+    ensure_eq!(decode_hello(&bytes)?, "hello, h2");
     server.stop().await
 }
 
@@ -357,7 +363,7 @@ async fn http2_rejects_requests_that_are_not_trevrpc() -> TestResult {
             .body(())?;
         let (response, _) = sender.send_request(request, true)?;
         let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
-        assert_eq!(
+        ensure_eq!(
             response.status(),
             expected,
             "{method} {path} {content_type}"
@@ -403,7 +409,7 @@ async fn qmux_over_websocket_serves_rpcs() -> TestResult {
     send.write_all(&unary_frame("websocket")?).await?;
     send.finish()?;
     let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_all()).await??;
-    assert_eq!(decode_hello(&response)?, "hello, websocket");
+    ensure_eq!(decode_hello(&response)?, "hello, websocket");
     session.close(0, "done");
     server.stop().await
 }
@@ -411,13 +417,13 @@ async fn qmux_over_websocket_serves_rpcs() -> TestResult {
 #[tokio::test]
 async fn websocket_upgrades_require_admission_and_the_subprotocol() -> TestResult {
     let server = spawn_server(test_options()).await?;
-    assert_eq!(
+    ensure_eq!(
         websocket_session(&server, "https://evil.example.test", "qmux-02.trevrpc-1")
             .await?
             .err(),
         Some(http::StatusCode::FORBIDDEN)
     );
-    assert_eq!(
+    ensure_eq!(
         websocket_session(&server, ORIGIN, "chat").await?.err(),
         Some(http::StatusCode::BAD_REQUEST)
     );
@@ -428,7 +434,7 @@ async fn websocket_upgrades_require_admission_and_the_subprotocol() -> TestResul
 async fn tcp_offers_only_enabled_protocols() -> TestResult {
     let server = spawn_server(ServerOptions::new()).await?;
     for alpn in [&b"h2"[..], b"http/1.1"] {
-        assert!(
+        ensure!(
             connect_tls(&server, alpn).await.is_err(),
             "{} negotiated with HTTP disabled",
             String::from_utf8_lossy(alpn)
@@ -445,7 +451,7 @@ async fn tcp_offers_only_enabled_protocols() -> TestResult {
             name: "native".to_owned(),
         })
         .await?;
-    assert_eq!(reply.message, "hello, native");
+    ensure_eq!(reply.message, "hello, native");
     server.stop().await
 }
 
@@ -478,7 +484,7 @@ async fn channel_falls_back_to_qmux_when_udp_is_unreachable() -> TestResult {
         ChannelConfig::new().with_fallback_delay(Duration::from_millis(50)),
     )
     .await?;
-    assert_eq!(channel.transport(), Some(TransportKind::Qmux));
+    ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
     tokio::time::timeout(
         TEST_TIMEOUT,
         exercise_greeter(&greeter::GreeterClient::new(channel.clone())),
@@ -492,7 +498,7 @@ async fn channel_falls_back_to_qmux_when_udp_is_unreachable() -> TestResult {
 async fn channel_prefers_quic() -> TestResult {
     let server = spawn_server(test_options()).await?;
     let channel = channel(&server, server.udp, ChannelConfig::new()).await?;
-    assert_eq!(channel.transport(), Some(TransportKind::Quic));
+    ensure_eq!(channel.transport(), Some(TransportKind::Quic));
     channel.close();
     server.stop().await
 }
@@ -506,13 +512,13 @@ async fn channel_can_use_tcp_only() -> TestResult {
         ChannelConfig::new().with_transport_policy(TransportPolicy::TcpOnly),
     )
     .await?;
-    assert_eq!(channel.transport(), Some(TransportKind::Qmux));
+    ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
     let reply = greeter::GreeterClient::new(channel.clone())
         .say_hello(greeter::HelloRequest {
             name: "tcp".to_owned(),
         })
         .await?;
-    assert_eq!(reply.message, "hello, tcp");
+    ensure_eq!(reply.message, "hello, tcp");
     channel.close();
     server.stop().await
 }

@@ -95,6 +95,9 @@ func dialWebSocketTestSession(t *testing.T, pki testPKI, listener *Listener, ori
 		HTTPHeader:   header,
 		Subprotocols: []string{QMuxALPN},
 	})
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
 	if err != nil {
 		if response != nil {
 			return nil, fmt.Errorf("%w (HTTP %d)", err, response.StatusCode)
@@ -120,12 +123,13 @@ func (o httpTestOpener) openStream(ctx context.Context) (clientStream, error) {
 	stream := &http3TestStream{writer: writer, ready: make(chan struct{})}
 	go func() {
 		defer close(stream.ready)
-		stream.response, stream.err = o.roundTripper.RoundTrip(request)
-		if stream.err == nil && stream.response.StatusCode != http.StatusOK {
-			status := stream.response.Status
-			_ = stream.response.Body.Close()
-			stream.err = fmt.Errorf("unexpected HTTP status %s", status)
+		response, err := o.roundTripper.RoundTrip(request)
+		if err == nil && response.StatusCode != http.StatusOK {
+			status := response.Status
+			_ = response.Body.Close()
+			response, err = nil, fmt.Errorf("unexpected HTTP status %s", status)
 		}
+		stream.response, stream.err = response, err
 	}()
 	return stream, nil
 }
@@ -186,12 +190,16 @@ func newWebTransportTestOpener(t *testing.T, pki testPKI, listener *Listener, or
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	_, session, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, header)
+	response, session, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, header)
 	if err != nil {
 		t.Fatalf("WebTransport dial: %v", err)
 	}
 	var closeOnce sync.Once
-	t.Cleanup(func() { closeOnce.Do(func() { _ = session.CloseWithError(0, "test done") }) })
+	t.Cleanup(func() {
+		closeOnce.Do(func() { _ = session.CloseWithError(0, "test done") })
+		// The body is the CONNECT stream the session owns; release it after the session.
+		_ = response.Body.Close()
+	})
 	return webTransportTestOpener{session}
 }
 
@@ -207,5 +215,5 @@ func (o webTransportTestOpener) openStream(ctx context.Context) (clientStream, e
 
 type webTransportTestStream struct{ *webtransport.Stream }
 
-func (s webTransportTestStream) cancelRead()  { s.Stream.CancelRead(streamErrorCancelled) }
-func (s webTransportTestStream) cancelWrite() { s.Stream.CancelWrite(streamErrorCancelled) }
+func (s webTransportTestStream) cancelRead()  { s.CancelRead(streamErrorCancelled) }
+func (s webTransportTestStream) cancelWrite() { s.CancelWrite(streamErrorCancelled) }

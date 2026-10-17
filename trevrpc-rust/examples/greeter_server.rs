@@ -151,11 +151,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 fn make_identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, Box<dyn Error + Send + Sync>> {
     let signing_key = rcgen::KeyPair::generate()?;
-    let not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let not_before = time::OffsetDateTime::now_utc()
+        .checked_sub(time::Duration::hours(1))
+        .ok_or("certificate start time is out of range")?;
     let mut params =
         rcgen::CertificateParams::new(["localhost".to_owned(), "127.0.0.1".to_owned()])?;
     params.not_before = not_before;
-    params.not_after = not_before + time::Duration::hours(25);
+    params.not_after = not_before
+        .checked_add(time::Duration::hours(25))
+        .ok_or("certificate expiry time is out of range")?;
     let cert = params.self_signed(&signing_key)?;
 
     Ok(rcgen::CertifiedKey { cert, signing_key })

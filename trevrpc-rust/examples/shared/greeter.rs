@@ -1,10 +1,10 @@
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct HelloRequest {
     #[prost(string, tag = "1")]
     pub name: String,
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct HelloReply {
     #[prost(string, tag = "1")]
     pub message: String,
@@ -67,7 +67,7 @@ impl<T> GreeterClient<T> {
 
     /// Creates a client with default call options applied to every RPC.
     #[must_use]
-    pub fn with_default_call_options(
+    pub const fn with_default_call_options(
         transport: T,
         default_options: ::trevrpc::client::CallOptions,
     ) -> Self {

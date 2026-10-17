@@ -102,7 +102,7 @@ impl<C: MuxConnection> RequestPumpReader for NativePumpReader<C> {
 }
 
 /// Serves one native connection until it closes or the server shuts down.
-pub(crate) async fn handle_connection<C: MuxConnection>(
+pub async fn handle_connection<C: MuxConnection>(
     server: Server,
     connection: C,
     request_limit: Option<Arc<Semaphore>>,

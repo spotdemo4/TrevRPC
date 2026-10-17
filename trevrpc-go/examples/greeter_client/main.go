@@ -38,7 +38,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer transport.Close()
+	defer func() {
+		if err := transport.Close(); err != nil {
+			log.Printf("close channel: %v", err)
+		}
+	}()
 	// Calls fail fast during reconnects, and in-flight calls are never retried or replayed.
 
 	client := greeter.NewGreeterClient(
@@ -85,7 +89,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer bidi.Close()
+	defer func() {
+		if err := bidi.Close(); err != nil {
+			log.Printf("close BidiHello call: %v", err)
+		}
+	}()
 
 	for _, suffix := range []string{"bidi 1", "bidi 2"} {
 		if err := bidi.Send(&greeter.HelloRequest{Name: name + " " + suffix}); err != nil {
@@ -102,7 +110,7 @@ func main() {
 	if err := bidi.CloseSend(); err != nil {
 		log.Fatal(err)
 	}
-	if reply, err := bidi.Recv(); err != io.EOF {
+	if reply, err := bidi.Recv(); !errors.Is(err, io.EOF) {
 		if err != nil {
 			log.Fatal(err)
 		}

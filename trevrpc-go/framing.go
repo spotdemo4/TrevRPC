@@ -105,20 +105,20 @@ func encodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
 func encodeKnownFrame(message ProtoMessage, maxFrameSize int) ([]byte, bool, error) {
 	switch message := any(message).(type) {
 	case *wireRequest:
-		frame, err := encodeRpcRequestFrame(message, maxFrameSize)
+		frame, err := encodeRPCRequestFrame(message, maxFrameSize)
 		return frame, frame != nil || err != nil, err
 	case *wireResponse:
-		frame, err := encodeRpcResponseFrame(message, maxFrameSize)
+		frame, err := encodeRPCResponseFrame(message, maxFrameSize)
 		return frame, frame != nil || err != nil, err
 	case *wireStreamFrame:
-		frame, err := encodeRpcStreamFrame(message, maxFrameSize)
+		frame, err := encodeRPCStreamFrame(message, maxFrameSize)
 		return frame, frame != nil || err != nil, err
 	default:
 		return nil, false, nil
 	}
 }
 
-func encodeRpcRequestFrame(request *wireRequest, maxFrameSize int) ([]byte, error) {
+func encodeRPCRequestFrame(request *wireRequest, maxFrameSize int) ([]byte, error) {
 	if request == nil || len(request.Metadata) > 0 {
 		return nil, nil
 	}
@@ -144,7 +144,7 @@ func encodeRpcRequestFrame(request *wireRequest, maxFrameSize int) ([]byte, erro
 	return frame, nil
 }
 
-func encodeRpcResponseFrame(response *wireResponse, maxFrameSize int) ([]byte, error) {
+func encodeRPCResponseFrame(response *wireResponse, maxFrameSize int) ([]byte, error) {
 	if response == nil || len(response.Metadata) > 0 {
 		return nil, nil
 	}
@@ -164,7 +164,7 @@ func encodeRpcResponseFrame(response *wireResponse, maxFrameSize int) ([]byte, e
 	return frame, nil
 }
 
-func encodeRpcStreamFrame(frameMessage *wireStreamFrame, maxFrameSize int) ([]byte, error) {
+func encodeRPCStreamFrame(frameMessage *wireStreamFrame, maxFrameSize int) ([]byte, error) {
 	if frameMessage == nil || len(frameMessage.Metadata) > 0 {
 		return nil, nil
 	}

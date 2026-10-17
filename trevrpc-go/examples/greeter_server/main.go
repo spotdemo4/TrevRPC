@@ -130,7 +130,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			log.Printf("close listener: %v", err)
+		}
+	}()
 
 	log.Printf("greeter server listening on %s for native QUIC, HTTP/3, and WebTransport", listener.Addr())
 	log.Printf("HTTP/3 URL: https://%s/trevrpc", listener.Addr())
@@ -162,7 +166,7 @@ func envOr(name, fallback string) string {
 }
 
 func allowedWebTransportAuthorities(addr string) map[string]struct{} {
-	authorities := map[string]struct{}{addr: struct{}{}}
+	authorities := map[string]struct{}{addr: {}}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return authorities

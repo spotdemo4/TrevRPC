@@ -9,7 +9,7 @@ on:
 enable-openid-connect: true
 
 jobs:
-  rust:
+  actions:
     # zizmor: ignore[excessive-permissions]
     runs-on: ubuntu-26.04
     steps:
@@ -20,9 +20,24 @@ jobs:
           niks3_url: https://niks3.trev.zip
           shell: vulnerable
 
-      - name: Run cargo audit
-        working-directory: trevrpc-rust
-        run: cargo-audit audit
+      - name: Run zizmor
+        run: zizmor $(find .forgejo/workflows -name "*.yaml")
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+  nix:
+    # zizmor: ignore[excessive-permissions]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: vulnerable
+
+      - name: Run flake-checker
+        run: flake-checker -f
 
   go:
     # zizmor: ignore[excessive-permissions]
@@ -39,6 +54,20 @@ jobs:
         working-directory: trevrpc-go
         run: govulncheck ./...
 
+  kotlin:
+    # zizmor: ignore[excessive-permissions]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: vulnerable
+
+      - name: Run OSV-Scanner
+        run: .forgejo/scripts/osv-scan-kotlin.sh
+
   npm:
     # zizmor: ignore[excessive-permissions]
     runs-on: ubuntu-26.04
@@ -54,7 +83,7 @@ jobs:
         working-directory: trevrpc-js
         run: npm audit --audit-level moderate
 
-  nix:
+  rust:
     # zizmor: ignore[excessive-permissions]
     runs-on: ubuntu-26.04
     steps:
@@ -65,21 +94,6 @@ jobs:
           niks3_url: https://niks3.trev.zip
           shell: vulnerable
 
-      - name: Run flake-checker
-        run: flake-checker -f
-
-  actions:
-    # zizmor: ignore[excessive-permissions]
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-          shell: vulnerable
-
-      - name: Run zizmor
-        run: find .forgejo/workflows -name "*.yaml" -exec zizmor {} +
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      - name: Run cargo audit
+        working-directory: trevrpc-rust
+        run: cargo-audit audit

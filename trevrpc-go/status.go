@@ -9,6 +9,7 @@ import (
 // Code is a TrevRPC status code.
 type Code uint32
 
+// Status codes, numbered to match the gRPC status codes.
 const (
 	CodeOK                 Code = 0
 	CodeCancelled          Code = 1
@@ -158,18 +159,15 @@ func StatusFromError(err error) *Status {
 		return OK()
 	}
 
-	var status *Status
-	if errors.As(err, &status) {
+	if status, ok := errors.AsType[*Status](err); ok {
 		return status
 	}
 
-	var frameTooLarge *FrameTooLargeError
-	if errors.As(err, &frameTooLarge) {
+	if frameTooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
 		return ResourceExhausted(frameTooLarge.Error())
 	}
 
-	var frameDecode *frameDecodeError
-	if errors.As(err, &frameDecode) {
+	if frameDecode, ok := errors.AsType[*frameDecodeError](err); ok {
 		return InvalidArgument(frameDecode.Error())
 	}
 

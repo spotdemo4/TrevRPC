@@ -43,7 +43,7 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
+	defer closeQuietly(listener)
 
 	udp := listener.Addr().(*net.UDPAddr).Port
 	tcp := listener.TCPAddr().(*net.TCPAddr).Port

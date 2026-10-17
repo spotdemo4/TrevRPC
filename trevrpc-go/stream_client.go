@@ -127,7 +127,7 @@ func (c *streamClient) writeStreamingRequest(
 	requestBody byteStream,
 ) error {
 	requestBody = closeStreamOnContext(ctx, requestBody)
-	defer closeMessageStream(requestBody)
+	defer discardMessageStream(requestBody)
 
 	if err := writeFrame(stream, request, c.maxFrameSize); err != nil {
 		stream.cancelWrite()

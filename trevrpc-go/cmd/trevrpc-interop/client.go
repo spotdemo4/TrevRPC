@@ -60,28 +60,30 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 	if err != nil {
 		return false, fmt.Errorf("dial %s: %w", config.addr, err)
 	}
-	defer channel.Close()
+	defer closeQuietly(channel)
 	if want := config.expectTransport; want != "" && string(channel.Transport()) != want {
 		return false, fmt.Errorf("connected over %s, want %s", channel.Transport(), want)
 	}
-	return runScenarios(ctx, channel, out), nil
+	return runScenarios(ctx, channel, out)
 }
 
-func runScenarios(ctx context.Context, transport trevrpc.Transport, out io.Writer) bool {
+func runScenarios(ctx context.Context, transport trevrpc.Transport, out io.Writer) (bool, error) {
 	client := interoppb.NewEchoClient(transport)
 	passed := true
 	for _, s := range scenarios {
 		scenarioCtx, cancel := context.WithTimeout(ctx, scenarioTimeout)
 		err := s.run(scenarioCtx, client)
 		cancel()
+		line := "ok " + s.name
 		if err != nil {
 			passed = false
-			fmt.Fprintf(out, "fail %s: %v\n", s.name, err)
-		} else {
-			fmt.Fprintf(out, "ok %s\n", s.name)
+			line = fmt.Sprintf("fail %s: %v", s.name, err)
+		}
+		if _, err := fmt.Fprintln(out, line); err != nil {
+			return false, fmt.Errorf("write result: %w", err)
 		}
 	}
-	return passed
+	return passed, nil
 }
 
 var scenarios = []scenario{
@@ -116,7 +118,7 @@ var scenarios = []scenario{
 		if err != nil {
 			return err
 		}
-		defer call.Close()
+		defer closeQuietly(call)
 		for _, message := range []string{"a", "b", "c"} {
 			if err := call.Send(&interoppb.EchoRequest{Message: message}); err != nil {
 				return err
@@ -133,7 +135,7 @@ var scenarios = []scenario{
 		if err != nil {
 			return err
 		}
-		defer stream.Close()
+		defer closeQuietly(stream)
 		if err := expectEchoes(stream, "s", 3); err != nil {
 			return err
 		}
@@ -144,7 +146,7 @@ var scenarios = []scenario{
 		if err != nil {
 			return err
 		}
-		defer stream.Close()
+		defer closeQuietly(stream)
 		if err := expectEchoes(stream, "s", 2); err != nil {
 			return err
 		}
@@ -156,7 +158,7 @@ var scenarios = []scenario{
 		if err != nil {
 			return err
 		}
-		defer call.Close()
+		defer closeQuietly(call)
 		for index, message := range []string{"1", "2", "3"} {
 			if err := call.Send(&interoppb.EchoRequest{Message: message}); err != nil {
 				return err
@@ -179,7 +181,7 @@ var scenarios = []scenario{
 		if err != nil {
 			return err
 		}
-		defer call.Close()
+		defer closeQuietly(call)
 		if err := call.Send(&interoppb.EchoRequest{Message: "1"}); err != nil {
 			return err
 		}

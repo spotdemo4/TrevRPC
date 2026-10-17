@@ -14,8 +14,28 @@ categories = ["network-programming"]
 members = ["crates/protoc-gen-trevrpc-rust", "crates/trevrpc-interop"]
 resolver = "3"
 
-[lints.clippy]
-pedantic = "warn"
+[workspace.lints.clippy]
+# erm, actually
+pedantic = { level = "warn", priority = -1 }
+# developing lints
+nursery = { level = "warn", priority = -1 }
+# deny panics
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+unreachable = "warn"
+unimplemented = "warn"
+unchecked_time_subtraction = "warn"
+todo = "warn"
+string_slice = "warn"
+panic_in_result_fn = "warn"
+panic = "warn"
+exit = "warn"
+as_conversions = "warn"
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/lib.rs"

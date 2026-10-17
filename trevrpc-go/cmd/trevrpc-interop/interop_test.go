@@ -121,7 +121,11 @@ func TestServerAndClientCommandsFollowTheContract(t *testing.T) {
 func TestClientFailsWhenServerNameIsNotCovered(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
 	stdinReader, stdinWriter := io.Pipe()
-	defer stdinWriter.Close()
+	t.Cleanup(func() {
+		if err := stdinWriter.Close(); err != nil {
+			t.Errorf("close server stdin: %v", err)
+		}
+	})
 	stdoutReader, stdoutWriter := io.Pipe()
 	var stderr bytes.Buffer
 	go run([]string{"server", "--cert", certFile, "--key", keyFile}, stdinReader, stdoutWriter, &stderr)

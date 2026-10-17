@@ -23,7 +23,7 @@ func main() {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: trevrpc-interop server|client [flags]")
+		printf(stderr, "usage: trevrpc-interop server|client [flags]\n")
 		return 2
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -42,7 +42,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 2
 		}
 		if config.certFile == "" || config.keyFile == "" {
-			fmt.Fprintln(stderr, "server: --cert and --key are required")
+			printf(stderr, "server: --cert and --key are required\n")
 			return 2
 		}
 		// The server runs until stdin reaches EOF or it is signalled.
@@ -53,7 +53,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			cancel()
 		}()
 		if err := runServer(ctx, config, stdout); err != nil {
-			fmt.Fprintf(stderr, "server: %v\n", err)
+			printf(stderr, "server: %v\n", err)
 			return 1
 		}
 		return 0
@@ -69,16 +69,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 2
 		}
 		if config.addr == "" || config.caFile == "" {
-			fmt.Fprintln(stderr, "client: --addr and --ca are required")
+			printf(stderr, "client: --addr and --ca are required\n")
 			return 2
 		}
 		if _, ok := transportPolicies[config.transport]; !ok {
-			fmt.Fprintf(stderr, "client: unknown --transport %q\n", config.transport)
+			printf(stderr, "client: unknown --transport %q\n", config.transport)
 			return 2
 		}
 		passed, err := runClient(ctx, config, stdout)
 		if err != nil {
-			fmt.Fprintf(stderr, "client: %v\n", err)
+			printf(stderr, "client: %v\n", err)
 			return 1
 		}
 		if !passed {
@@ -86,7 +86,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return 0
 	default:
-		fmt.Fprintf(stderr, "unknown subcommand %q\n", args[0])
+		printf(stderr, "unknown subcommand %q\n", args[0])
 		return 2
 	}
+}
+
+// printf writes a diagnostic to w. The command has nowhere else to report a
+// failed console write, so the error is dropped.
+func printf(w io.Writer, format string, args ...any) {
+	_, _ = fmt.Fprintf(w, format, args...)
+}
+
+// closeQuietly closes c at the end of a scenario or command, once its outcome
+// is already decided and a close error would only mask it.
+func closeQuietly(c io.Closer) {
+	_ = c.Close()
 }

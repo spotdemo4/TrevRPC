@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-pub(super) fn certificate_path() -> io::Result<PathBuf> {
+pub fn certificate_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("TREVRPC_EXAMPLE_CERT") {
         return Ok(PathBuf::from(path));
     }

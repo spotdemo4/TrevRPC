@@ -22,17 +22,17 @@ type drainFixture struct {
 	stopped chan struct{}
 }
 
-func newDrainFixture(t *testing.T, shutdown context.Context) *drainFixture {
+func newDrainFixture(shutdown context.Context, t *testing.T) *drainFixture {
 	t.Helper()
 	serverEnd, clientEnd := net.Pipe()
 	t.Cleanup(func() { _ = serverEnd.Close(); _ = clientEnd.Close() })
 	fixture := &drainFixture{client: clientEnd, stopped: make(chan struct{})}
 	var once atomic.Bool
-	fixture.stream = newDrainingStream(unclosableConn{serverEnd}, serverEnd.SetReadDeadline, func() {
+	fixture.stream = newDrainingStream(shutdown, unclosableConn{serverEnd}, serverEnd.SetReadDeadline, func() {
 		if once.CompareAndSwap(false, true) {
 			close(fixture.stopped)
 		}
-	}, shutdown)
+	})
 	return fixture
 }
 
@@ -66,7 +66,7 @@ func setDrainBounds(t *testing.T, timeout time.Duration, limit int64) {
 
 func TestDrainingStreamDoesNotStopReadingBeforeResponseIsFinished(t *testing.T) {
 	setDrainBounds(t, time.Second, 1<<20)
-	fixture := newDrainFixture(t, context.Background())
+	fixture := newDrainFixture(context.Background(), t)
 
 	readFailed := make(chan error, 1)
 	go func() {
@@ -94,7 +94,7 @@ func TestDrainingStreamDoesNotStopReadingBeforeResponseIsFinished(t *testing.T) 
 
 func TestDrainingStreamDiscardsRequestUntilClientFinishes(t *testing.T) {
 	setDrainBounds(t, time.Second, 1<<20)
-	fixture := newDrainFixture(t, context.Background())
+	fixture := newDrainFixture(context.Background(), t)
 	fixture.stream.trevrpcCancelRead()
 	if err := fixture.stream.Close(); err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestDrainingStreamDiscardsRequestUntilClientFinishes(t *testing.T) {
 
 func TestDrainingStreamStopsAfterByteBound(t *testing.T) {
 	setDrainBounds(t, 10*time.Second, 64*1024)
-	fixture := newDrainFixture(t, context.Background())
+	fixture := newDrainFixture(context.Background(), t)
 	fixture.stream.trevrpcCancelRead()
 	_ = fixture.stream.Close()
 
@@ -136,7 +136,7 @@ func TestDrainingStreamStopsAfterByteBound(t *testing.T) {
 
 func TestDrainingStreamStopsAfterTimeBound(t *testing.T) {
 	setDrainBounds(t, 100*time.Millisecond, 1<<20)
-	fixture := newDrainFixture(t, context.Background())
+	fixture := newDrainFixture(context.Background(), t)
 	fixture.stream.trevrpcCancelRead()
 	_ = fixture.stream.Close()
 	// The client stays silent and never finishes.
@@ -149,7 +149,7 @@ func TestDrainingStreamStopsAfterTimeBound(t *testing.T) {
 func TestDrainingStreamEndsAtServerShutdown(t *testing.T) {
 	setDrainBounds(t, time.Hour, 1<<20)
 	shutdown, stopServer := context.WithCancel(context.Background())
-	fixture := newDrainFixture(t, shutdown)
+	fixture := newDrainFixture(shutdown, t)
 	fixture.stream.trevrpcCancelRead()
 	_ = fixture.stream.Close()
 	fixture.expectNotStopped(t, 50*time.Millisecond)
@@ -161,7 +161,7 @@ func TestDrainingStreamStartedAfterShutdownEndsImmediately(t *testing.T) {
 	setDrainBounds(t, time.Hour, 1<<20)
 	shutdown, stopServer := context.WithCancel(context.Background())
 	stopServer()
-	fixture := newDrainFixture(t, shutdown)
+	fixture := newDrainFixture(shutdown, t)
 	_ = fixture.stream.Close()
 	fixture.stream.trevrpcCancelRead()
 	fixture.waitStopped(t, 5*time.Second)
@@ -169,7 +169,7 @@ func TestDrainingStreamStartedAfterShutdownEndsImmediately(t *testing.T) {
 
 func TestDrainingStreamSkipsDrainWhenRequestAlreadyEnded(t *testing.T) {
 	setDrainBounds(t, 50*time.Millisecond, 1<<20)
-	fixture := newDrainFixture(t, context.Background())
+	fixture := newDrainFixture(context.Background(), t)
 	_ = fixture.client.Close()
 	if _, err := fixture.stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("read = %v, want EOF", err)
@@ -181,7 +181,7 @@ func TestDrainingStreamSkipsDrainWhenRequestAlreadyEnded(t *testing.T) {
 
 func TestDrainingStreamWithoutAbortNeverDrains(t *testing.T) {
 	setDrainBounds(t, 50*time.Millisecond, 1<<20)
-	fixture := newDrainFixture(t, context.Background())
+	fixture := newDrainFixture(context.Background(), t)
 	_ = fixture.stream.Close()
 	fixture.expectNotStopped(t, 150*time.Millisecond)
 }

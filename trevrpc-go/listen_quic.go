@@ -74,7 +74,7 @@ func (l *Listener) serveNative(conn *quic.Conn) {
 			if err != nil {
 				return nil, nil, err
 			}
-			return newDrainingStream(stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }, ctx), stream.Context(), nil
+			return newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }), stream.Context(), nil
 		},
 		close:               func(message string) { _ = conn.CloseWithError(0, message) },
 		overloadMessage:     "too many concurrent streams on connection",

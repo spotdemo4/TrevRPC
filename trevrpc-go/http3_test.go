@@ -62,7 +62,7 @@ func newHandlerTestListener(configure func(*ServerOptions)) (*Listener, *Server)
 
 func newHTTP3TestRequest(t *testing.T, method, path string, body []byte, contentTypes ...string) *http.Request {
 	t.Helper()
-	request := httptest.NewRequest(method, "https://example.test"+path, bytes.NewReader(body))
+	request := httptest.NewRequestWithContext(t.Context(), method, "https://example.test"+path, bytes.NewReader(body))
 	for _, contentType := range contentTypes {
 		request.Header.Add("Content-Type", contentType)
 	}

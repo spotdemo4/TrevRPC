@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut as _, Bytes};
 use tokio::sync::{Semaphore, watch};
 
 use crate::framed::{self, FrameRead, FrameWrite};
@@ -14,7 +14,7 @@ use crate::server_transport::{self, ResponseWriter};
 use crate::{Result, RpcRequest, RpcResponse, RpcStreamFrame};
 
 /// The send half of one HTTP request or `WebTransport` stream.
-pub(crate) trait BodySink: Send + 'static {
+pub trait BodySink: Send + 'static {
     fn write(&mut self, chunk: &[u8]) -> impl Future<Output = Result<()>> + Send;
 
     fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
@@ -27,7 +27,7 @@ pub(crate) trait BodySink: Send + 'static {
 }
 
 /// The receive half of one HTTP request or `WebTransport` stream.
-pub(crate) trait BodySource: Send + 'static {
+pub trait BodySource: Send + 'static {
     fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Bytes>>> + Send;
 
     /// Validates anything that follows the request body, such as HTTP trailers.
@@ -101,7 +101,8 @@ impl<S: BodySource> FrameRead for BodyReader<S> {
             self.chunk = chunk;
         }
         let len = bytes.len().min(self.chunk.len());
-        self.chunk.copy_to_slice(&mut bytes[..len]);
+        let mut dest = bytes;
+        dest.put((&mut self.chunk).take(len));
         Ok(Some(len))
     }
 }
@@ -162,7 +163,7 @@ where
 }
 
 /// Serves one RPC carried by a body.
-pub(crate) async fn handle_rpc_stream<K, S>(
+pub async fn handle_rpc_stream<K, S>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
     sink: K,
@@ -179,7 +180,7 @@ pub(crate) async fn handle_rpc_stream<K, S>(
 }
 
 /// Answers one RPC carried by a body with the over-limit status.
-pub(crate) async fn reject_rpc_stream<K, S>(server: Server, sink: K, source: S)
+pub async fn reject_rpc_stream<K, S>(server: Server, sink: K, source: S)
 where
     K: BodySink,
     S: BodySource,

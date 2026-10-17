@@ -84,6 +84,7 @@ const (
 // TransportErrorCode is a QUIC transport error code (RFC 9000 §20.1).
 type TransportErrorCode uint64
 
+// QUIC transport error codes used by QMux (RFC 9000 §20.1).
 const (
 	NoError                 TransportErrorCode = 0x00
 	InternalError           TransportErrorCode = 0x01

@@ -48,7 +48,7 @@ export function codeName(code) {
 }
 
 /** Creates a TrevRPC status error. */
-export function statusError(code, message = "", metadata = {}, cause = undefined) {
+export function statusError(code, message = "", metadata = {}, cause) {
   return new TrevRpcError(code, message, metadata, { cause });
 }
 

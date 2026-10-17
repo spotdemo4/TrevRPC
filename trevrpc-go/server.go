@@ -24,7 +24,7 @@ type unaryHandler func(context.Context, []byte) (*wireResponse, error)
 type streamingHandler func(context.Context, []byte, byteStream) (byteStream, error)
 
 type route struct {
-	kind      RpcKind
+	kind      RPCKind
 	unary     unaryHandler
 	streaming streamingHandler
 }
@@ -102,6 +102,7 @@ type Admission func(AdmissionRequest) bool
 // ServerDiagnosticPhase identifies a local server-runtime failure boundary.
 type ServerDiagnosticPhase string
 
+// Server diagnostic phases delivered to a [ServerDiagnosticHandler].
 const (
 	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
 	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"
@@ -130,7 +131,7 @@ type ServerDiagnostic struct {
 	RemoteAddr             string
 	Service                string
 	Method                 string
-	Kind                   RpcKind
+	Kind                   RPCKind
 	Err                    error
 	Panic                  any
 	Stack                  []byte
@@ -288,16 +289,16 @@ func (s *Server) routeUnary(service, method string, handler unaryHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
-	validateRoute(service, method, RpcKindUnary, handler != nil)
-	s.routes[methodKey{service: service, method: method}] = route{kind: RpcKindUnary, unary: handler}
+	validateRoute(service, method, RPCKindUnary, handler != nil)
+	s.routes[methodKey{service: service, method: method}] = route{kind: RPCKindUnary, unary: handler}
 }
 
 // routeStreaming registers a streaming route handler for a service, method, and RPC kind.
-func (s *Server) routeStreaming(service, method string, kind RpcKind, handler streamingHandler) {
+func (s *Server) routeStreaming(service, method string, kind RPCKind, handler streamingHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
-	if kind == RpcKindUnary || !kind.isValid() {
+	if kind == RPCKindUnary || !kind.isValid() {
 		panic("trevrpc: streaming route requires a streaming RPC kind")
 	}
 	validateRoute(service, method, kind, handler != nil)
@@ -324,7 +325,7 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, metho
 // RegisterClientStreaming registers a client-streaming handler. The handler
 // may attach response metadata through the returned Response.
 func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (*Response[Res], error)) {
-	s.routeStreaming(service, method, RpcKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	s.routeStreaming(service, method, RPCKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		response, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
 			return nil, err
@@ -340,7 +341,7 @@ func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, serv
 // returned stream implements ResponseStream (see NewResponseStream), its
 // terminal metadata is sent with the final status.
 func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (MessageStream[Res], error)) {
-	s.routeStreaming(service, method, RpcKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (byteStream, error) {
+	s.routeStreaming(service, method, RPCKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (byteStream, error) {
 		request, err := decodeRegisteredRequest(body, newRequest)
 		if err != nil {
 			return nil, err
@@ -361,7 +362,7 @@ func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, serv
 // If the returned stream implements ResponseStream (see NewResponseStream), its
 // terminal metadata is sent with the final status.
 func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (MessageStream[Res], error)) {
-	s.routeStreaming(service, method, RpcKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	s.routeStreaming(service, method, RPCKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		responses, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
 			return nil, err
@@ -497,7 +498,7 @@ func canonicalDuration(name string, value, fallback time.Duration, disabled bool
 	return value
 }
 
-func validateRoute(service, method string, _ RpcKind, hasHandler bool) {
+func validateRoute(service, method string, _ RPCKind, hasHandler bool) {
 	if service == "" || method == "" {
 		panic("trevrpc: route service and method must be non-empty")
 	}
@@ -648,7 +649,7 @@ type requestExecutionLease struct {
 	limit   semaphore
 	service string
 	method  string
-	kind    RpcKind
+	kind    RPCKind
 	refs    atomic.Int64
 }
 
@@ -738,13 +739,11 @@ func (r *serverRuntime) wireStatus(err error, phase ServerDiagnosticPhase, reque
 	if err == nil {
 		return OK()
 	}
-	var panicErr *serverPanicError
-	if errors.As(err, &panicErr) {
+	if panicErr, ok := errors.AsType[*serverPanicError](err); ok {
 		r.emitDiagnostic(ServerDiagnostic{Phase: panicErr.phase, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err, Panic: panicErr.recovered, Stack: panicErr.stack})
 		return internalServerStatus()
 	}
-	var status *Status
-	if errors.As(err, &status) && status.Code != CodeInternal {
+	if status, ok := errors.AsType[*Status](err); ok && status.Code != CodeInternal {
 		if validateMetadata(status.Metadata) == nil {
 			return NewStatus(status.Code, status.Message).WithMetadata(status.Metadata)
 		}
@@ -765,9 +764,9 @@ func requestMethod(request *wireRequest) string {
 	}
 	return request.Method
 }
-func requestKind(request *wireRequest) RpcKind {
+func requestKind(request *wireRequest) RPCKind {
 	if request == nil {
-		return RpcKindUnary
+		return RPCKindUnary
 	}
 	return request.rpcKind()
 }
@@ -963,14 +962,14 @@ func invokeStreamingHandler(
 		select {
 		case result <- resultValue:
 		case <-abandoned:
-			closeMessageStream(resultValue.stream)
+			discardMessageStream(resultValue.stream)
 		}
 	}()
 
 	select {
 	case result := <-result:
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			closeMessageStream(result.stream)
+			discardMessageStream(result.stream)
 			return nil, statusFromContextError(ctxErr)
 		}
 		return result.stream, result.err
@@ -1179,7 +1178,7 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, s.direction, s.lease, s.request)
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, s.direction, s.lease)
 	if err != nil {
 		s.finish()
 		return nil, err
@@ -1196,7 +1195,7 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 func (s *limitedByteStream) Close() error {
 	if !s.done {
 		s.finish()
-		closeMessageStream(s.inner)
+		discardMessageStream(s.inner)
 	}
 
 	return nil
@@ -1214,7 +1213,7 @@ func (s *limitedByteStream) finish() {
 	}
 }
 
-func recvByteWithTimeout(ctx context.Context, stream byteStream, idleTimeout time.Duration, direction string, lease *requestExecutionLease, request *wireRequest) ([]byte, error) {
+func recvByteWithTimeout(ctx context.Context, stream byteStream, idleTimeout time.Duration, direction string, lease *requestExecutionLease) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, statusFromContextError(err)
 	}
@@ -1324,8 +1323,8 @@ func (s *serverResponseStream) Recv() (*wireStreamFrame, error) {
 		return nil, io.EOF
 	}
 
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response", s.lease, s.request)
-	if err == io.EOF {
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response", s.lease)
+	if errors.Is(err, io.EOF) {
 		status := s.terminalResponseStatus()
 		s.finish(status.Code)
 		return statusFrame(status), nil
@@ -1454,7 +1453,7 @@ func (s *serverResponseStream) finish(code Code) {
 	s.finishOnce.Do(func() {
 		s.done = true
 		s.cancel()
-		closeMessageStream(s.inner)
+		discardMessageStream(s.inner)
 		s.runtime.recordFinished(RPCFinished{Service: s.service, Method: s.method, RequestBodyLen: s.requestBodyLen, ResponseBodyLen: s.responseBodyLen, Code: code, Elapsed: time.Since(s.startedAt)}, s.request)
 		s.lease.release()
 	})
@@ -1468,8 +1467,8 @@ func (s *serverResponseStream) readNextResponseItem() responseStreamItem {
 		return responseStreamItem{body: body}
 	}
 
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response", s.lease, s.request)
-	if err == io.EOF {
+	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, "response", s.lease)
+	if errors.Is(err, io.EOF) {
 		return responseStreamItem{status: s.terminalResponseStatus()}
 	}
 	if err != nil {

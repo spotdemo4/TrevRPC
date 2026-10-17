@@ -1,3 +1,4 @@
+import org.gradle.api.artifacts.dsl.LockMode
 import org.gradle.api.publish.PublishingExtension
 import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.api.publish.maven.tasks.PublishToMavenLocal
@@ -66,6 +67,7 @@ allprojects {
 
     dependencyLocking {
         lockAllConfigurations()
+        lockMode = LockMode.STRICT
     }
 
     tasks.withType<PublishToMavenLocal>().configureEach {

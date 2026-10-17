@@ -29,7 +29,7 @@ func TestTCPCanBeDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	closeOnCleanup(t, listener)
 	if listener.TCPAddr() != nil {
 		t.Fatalf("TCPAddr = %v with TCP disabled", listener.TCPAddr())
 	}
@@ -44,7 +44,7 @@ func TestTCPOffersOnlyEnabledProtocols(t *testing.T) {
 	for _, protocol := range []string{http2ALPN, http1ALPN} {
 		config := pki.client.Clone()
 		config.NextProtos = []string{protocol}
-		conn, err := tls.Dial("tcp", listener.TCPAddr().String(), config)
+		conn, err := (&tls.Dialer{Config: config}).DialContext(t.Context(), "tcp", listener.TCPAddr().String())
 		if err == nil {
 			_ = conn.Close()
 			t.Errorf("%s handshake with HTTP disabled succeeded", protocol)
@@ -63,11 +63,11 @@ func TestHTTP2DoesNotAdvertiseExtendedConnect(t *testing.T) {
 	listener := startTestListener(t, pki, nil)
 	config := pki.client.Clone()
 	config.NextProtos = []string{http2ALPN}
-	conn, err := tls.Dial("tcp", listener.TCPAddr().String(), config)
+	conn, err := (&tls.Dialer{Config: config}).DialContext(t.Context(), "tcp", listener.TCPAddr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	closeOnCleanup(t, conn)
 	if _, err := io.WriteString(conn, http2.ClientPreface); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestHTTP2ResponsesAdvertiseHTTP3(t *testing.T) {
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.client.Clone(), ForceAttemptHTTP2: true}}
 	defer client.CloseIdleConnections()
 	body := encodeHTTP3TestRequest(t, newWireRequest(testServiceName, "Echo", nil))
-	request, err := http.NewRequest(http.MethodPost, "https://"+listener.TCPAddr().String()+DefaultHTTPPath, strings.NewReader(string(body)))
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://"+listener.TCPAddr().String()+DefaultHTTPPath, strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,12 @@ func TestHTTP1RequestsAreRefused(t *testing.T) {
 	protocols.SetHTTP1(true)
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.client.Clone(), Protocols: protocols}}
 	defer client.CloseIdleConnections()
-	response, err := client.Post("https://"+listener.TCPAddr().String()+DefaultHTTPPath, httpContentType, strings.NewReader(""))
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://"+listener.TCPAddr().String()+DefaultHTTPPath, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", httpContentType)
+	response, err := client.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +195,9 @@ func TestWebSocketAdmissionPathAndSubprotocol(t *testing.T) {
 		}
 		if response == nil {
 			return 0, err
+		}
+		if response.Body != nil {
+			_ = response.Body.Close()
 		}
 		return response.StatusCode, err
 	}

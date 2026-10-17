@@ -26,7 +26,7 @@ func serverQMuxConfig(options ServerOptions) qmux.Config {
 }
 
 // openServerQMux runs the QMux handshake on conn, bounded by timeout.
-func (l *Listener) openServerQMux(conn qmux.RecordConn, timeout context.Context) (*qmux.Session, error) {
+func (l *Listener) openServerQMux(timeout context.Context, conn qmux.RecordConn) (*qmux.Session, error) {
 	return qmux.Open(timeout, conn, qmux.RoleServer, serverQMuxConfig(l.runtime.options))
 }
 
@@ -38,7 +38,7 @@ func (l *Listener) serveQMuxSession(session *qmux.Session, onClosed func(error))
 			if err != nil {
 				return nil, nil, err
 			}
-			return newDrainingStream(stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }, ctx), stream.Context(), nil
+			return newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }), stream.Context(), nil
 		},
 		close:               func(message string) { _ = session.CloseWithError(0, message) },
 		overloadMessage:     "too many concurrent streams on connection",

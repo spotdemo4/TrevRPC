@@ -70,7 +70,7 @@ func (l *Listener) handleWebSocket(w http.ResponseWriter, r *http.Request, h *ht
 	runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticSessionUpgradeSuccess, Message: "accepted", RemoteAddr: r.RemoteAddr})
 
 	ctx, cancel := context.WithTimeout(l.ctx, l.handshakeTimeout)
-	session, err := l.openServerQMux(qmux.NewMessageConn(newWebSocketMessages(conn), qmuxMaxRecordSize), ctx)
+	session, err := l.openServerQMux(ctx, qmux.NewMessageConn(newWebSocketMessages(conn), qmuxMaxRecordSize))
 	cancel()
 	if err != nil {
 		_ = conn.CloseNow()

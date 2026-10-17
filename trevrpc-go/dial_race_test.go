@@ -157,11 +157,12 @@ func TestDialFallsBackToQMuxWhenUDPIsUnreachable(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
 	// Nothing answers QUIC on this UDP port.
-	dead, err := net.ListenPacket("udp", "127.0.0.1:0")
+	var listenConfig net.ListenConfig
+	dead, err := listenConfig.ListenPacket(t.Context(), "udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dead.Close()
+	closeOnCleanup(t, dead)
 
 	events := make(chan ChannelEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
@@ -175,7 +176,7 @@ func TestDialFallsBackToQMuxWhenUDPIsUnreachable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer channel.Close()
+	closeOnCleanup(t, channel)
 	if transport := channel.Transport(); transport != TransportQMux {
 		t.Fatalf("Transport = %q, want qmux", transport)
 	}
@@ -203,7 +204,7 @@ func TestDialTCPOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer channel.Close()
+	closeOnCleanup(t, channel)
 	if transport := channel.Transport(); transport != TransportQMux {
 		t.Fatalf("Transport = %q, want qmux", transport)
 	}

@@ -14,11 +14,12 @@ on:
           - "true"
           - "false"
 
-# yaml-language-server-disable is not allowed
-enable-openid-connect: true
-
 concurrency:
   group: bump
+  cancel-in-progress: false
+
+# yaml-language-server-disable is not allowed
+enable-openid-connect: true
 
 jobs:
   bump:
@@ -35,7 +36,7 @@ jobs:
           shell: bump
 
       - name: Bump, validate, and push
+        run: .forgejo/scripts/bump.sh
         env:
           GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           FORCE: ${{ inputs.force }}
-        run: .forgejo/scripts/bump.sh

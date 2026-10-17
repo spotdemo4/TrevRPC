@@ -20,7 +20,7 @@ func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody b
 		done := false
 		for count < len(batch) {
 			body, err := recvRequestBody(ctx, requestBody)
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				done = true
 				break
 			}
@@ -138,7 +138,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 		return
 	}
 
-	if request.rpcKind() == RpcKindUnary {
+	if request.rpcKind() == RPCKindUnary {
 		defer lease.release()
 		response := runtime.handleRequest(requestCtx, request, lease)
 		if ctx.Err() != nil {
@@ -154,7 +154,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	}
 
 	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: runtime.options.MaxFrameSize}
-	if request.rpcKind() == RpcKindClientStreaming || request.rpcKind() == RpcKindBidirectionalStreaming {
+	if request.rpcKind() == RPCKindClientStreaming || request.rpcKind() == RPCKindBidirectionalStreaming {
 		if cancellable, ok := stream.(contextCancelReadStream); ok {
 			requestBody.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
 		}
@@ -163,12 +163,12 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 		}
 	}
 	response := runtime.handleStreamingRequest(requestCtx, request, requestBody, lease)
-	defer closeMessageStream(response)
+	defer discardMessageStream(response)
 	if frameWriter, ok := response.(transportResponseFramesWriter); ok {
 		for {
 			done, err := frameWriter.trevrpcWriteNextFrames(ctx, stream, runtime.options.MaxFrameSize)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				closeMessageStream(response)
+				discardMessageStream(response)
 				abortRPCStream(stream)
 				return
 			}
@@ -188,7 +188,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 		for {
 			done, err := frameWriter.trevrpcWriteNextFrame(ctx, stream, runtime.options.MaxFrameSize)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				closeMessageStream(response)
+				discardMessageStream(response)
 				abortRPCStream(stream)
 				return
 			}
@@ -206,11 +206,11 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	}
 	for {
 		frame, err := recvResponseFrame(ctx, response)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			closeMessageStream(response)
+			discardMessageStream(response)
 			abortRPCStream(stream)
 			return
 		}
@@ -238,8 +238,7 @@ func requestFrameStatus(err error) *Status {
 		return OK()
 	}
 
-	var frameTooLarge *FrameTooLargeError
-	if errors.As(err, &frameTooLarge) {
+	if frameTooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
 		return ResourceExhausted(frameTooLarge.Error())
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -331,7 +330,7 @@ func readInitialRequestFrame(ctx context.Context, options ServerOptions, started
 	if deadline, ok := readDeadline(ctx, startedAt, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
-			defer deadlineStream.SetReadDeadline(time.Time{})
+			defer func() { _ = deadlineStream.SetReadDeadline(time.Time{}) }()
 		}
 	}
 
@@ -365,7 +364,7 @@ func readRequestEnd(ctx context.Context, options ServerOptions, startedAt time.T
 	if deadline, ok := readDeadline(ctx, startedAt, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
-			defer deadlineStream.SetReadDeadline(time.Time{})
+			defer func() { _ = deadlineStream.SetReadDeadline(time.Time{}) }()
 		}
 	}
 
@@ -390,8 +389,8 @@ func readRequestEnd(ctx context.Context, options ServerOptions, startedAt time.T
 	}
 }
 
-func requestEndsAfterInitialFrame(kind RpcKind) bool {
-	return kind == RpcKindUnary || kind == RpcKindServerStreaming
+func requestEndsAfterInitialFrame(kind RPCKind) bool {
+	return kind == RPCKindUnary || kind == RPCKindServerStreaming
 }
 
 func abortRPCStream(stream rpcStream) {
@@ -412,7 +411,7 @@ func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {
 }
 
 func writeRPCStatus(options ServerOptions, stream rpcStream, request *wireRequest, status *Status) {
-	if request.rpcKind() == RpcKindUnary {
+	if request.rpcKind() == RPCKindUnary {
 		_ = writeFrame(stream, status.intoResponse(nil), options.MaxFrameSize)
 	} else {
 		_ = writeFrame(stream, statusFrame(status), options.MaxFrameSize)
@@ -485,13 +484,11 @@ func transportStatus(err error) error {
 		return nil
 	}
 
-	var status *Status
-	if errors.As(err, &status) {
+	if status, ok := errors.AsType[*Status](err); ok {
 		return status
 	}
 
-	var frameDecode *frameDecodeError
-	if errors.As(err, &frameDecode) {
+	if frameDecode, ok := errors.AsType[*frameDecodeError](err); ok {
 		return InvalidArgument(frameDecode.Error())
 	}
 

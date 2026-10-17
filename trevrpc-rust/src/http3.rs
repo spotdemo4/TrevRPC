@@ -6,12 +6,13 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes};
 use h3::ext::Protocol;
 use h3::quic::BidiStream as _;
-use http::{Method, Request, Response, StatusCode, header};
+use http::{Method, Request, StatusCode, header};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::http_admission::{
-    MEDIA_TYPE, admission_headers, validate_http_request, validate_webtransport_admission,
+    admission_headers, rejection_head, rpc_response_head, validate_http_request,
+    validate_webtransport_admission,
 };
 use crate::http_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_stream};
 use crate::request_pump::RequestTransportEvent;
@@ -34,7 +35,7 @@ type WebTransportRecvStream = h3_webtransport::stream::RecvStream<h3_quinn::Recv
 
 /// Serves one HTTP/3 connection: ordinary requests, or a single `WebTransport` session.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn handle_connection(
+pub async fn handle_connection(
     server: Server,
     connection: quinn::Connection,
     request_limit: Option<Arc<Semaphore>>,
@@ -190,12 +191,7 @@ async fn handle_http_request(
         return;
     }
 
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, MEDIA_TYPE)
-        .body(())
-        .expect("static HTTP/3 response should be valid");
-    if stream.send_response(response).await.is_err() {
+    if stream.send_response(rpc_response_head(None)).await.is_err() {
         return;
     }
     let (send, recv) = stream.split();
@@ -210,14 +206,7 @@ async fn handle_http_request(
 }
 
 async fn reject_h3(mut stream: H3RequestStream, status: StatusCode) {
-    let mut response = Response::builder().status(status);
-    if status == StatusCode::METHOD_NOT_ALLOWED {
-        response = response.header(header::ALLOW, Method::POST.as_str());
-    }
-    let response = response
-        .body(())
-        .expect("static HTTP/3 rejection should be valid");
-    if stream.send_response(response).await.is_ok() {
+    if stream.send_response(rejection_head(status)).await.is_ok() {
         let _ = stream.finish().await;
     }
 }

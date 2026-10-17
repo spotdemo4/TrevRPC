@@ -69,7 +69,7 @@ fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResp
         Err(error) => {
             return CodeGeneratorResponse {
                 error: Some(error),
-                supported_features: Some(code_generator_response::Feature::Proto3Optional as u64),
+                supported_features: Some(proto3_optional_feature()),
                 file: Vec::new(),
             };
         }
@@ -103,9 +103,7 @@ fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResp
                 Err(error) => {
                     return CodeGeneratorResponse {
                         error: Some(error),
-                        supported_features: Some(
-                            code_generator_response::Feature::Proto3Optional as u64,
-                        ),
+                        supported_features: Some(proto3_optional_feature()),
                         file: Vec::new(),
                     };
                 }
@@ -159,15 +157,19 @@ fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResp
 
     CodeGeneratorResponse {
         error: None,
-        supported_features: Some(code_generator_response::Feature::Proto3Optional as u64),
+        supported_features: Some(proto3_optional_feature()),
         file,
     }
+}
+
+fn proto3_optional_feature() -> u64 {
+    u64::from(i32::from(code_generator_response::Feature::Proto3Optional).unsigned_abs())
 }
 
 fn generator_error(error: String) -> CodeGeneratorResponse {
     CodeGeneratorResponse {
         error: Some(error),
-        supported_features: Some(code_generator_response::Feature::Proto3Optional as u64),
+        supported_features: Some(proto3_optional_feature()),
         file: Vec::new(),
     }
 }
@@ -422,7 +424,7 @@ impl TypeIndex {
         let type_ref = self
             .messages
             .get(&proto_type)
-            .expect("resolved protobuf type must be indexed");
+            .ok_or_else(|| format!("unresolved protobuf message type {proto_type:?}"))?;
 
         if let Some(rust_path) = resolve_extern_path(&proto_type, &options.extern_paths)
             .or_else(|| resolve_default_well_known_type(&proto_type))
@@ -502,16 +504,9 @@ fn resolve_extern_path(proto_type: &str, extern_paths: &[(String, String)]) -> O
         return Some(rust_path.clone());
     }
 
-    let suffix = proto_type
-        .strip_prefix(proto_path)
-        .expect("matching extern path must be a prefix")
-        .trim_start_matches('.');
+    let suffix = proto_type.strip_prefix(proto_path)?.trim_start_matches('.');
     let mut segments = suffix.split('.').collect::<Vec<_>>();
-    let type_name = to_rust_type_name(
-        segments
-            .pop()
-            .expect("external protobuf type must have a type suffix"),
-    );
+    let type_name = to_rust_type_name(segments.pop()?);
     let mut path = rust_path.trim_end_matches("::").to_owned();
     for module in segments {
         if !path.is_empty() {
@@ -746,7 +741,7 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
     ));
 
     buf.push_str(&format!(
-        "impl<T> {client_name}<T> {{\n    pub const SERVICE: &'static str = {service_name:?};\n\n    /// Creates a client backed by the provided transport.\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport, default_options: {runtime_path}::client::CallOptions::new() }}\n    }}\n\n    /// Creates a client with default call options applied to every RPC.\n    #[must_use]\n    pub fn with_default_call_options(transport: T, default_options: {runtime_path}::client::CallOptions) -> Self {{\n        Self {{ transport, default_options }}\n    }}\n\n    /// Returns the default call options.\n    #[must_use]\n    pub const fn default_call_options(&self) -> &{runtime_path}::client::CallOptions {{\n        &self.default_options\n    }}\n\n    /// Returns the underlying transport.\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    /// Consumes the client and returns the underlying transport.\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
+        "impl<T> {client_name}<T> {{\n    pub const SERVICE: &'static str = {service_name:?};\n\n    /// Creates a client backed by the provided transport.\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport, default_options: {runtime_path}::client::CallOptions::new() }}\n    }}\n\n    /// Creates a client with default call options applied to every RPC.\n    #[must_use]\n    pub const fn with_default_call_options(transport: T, default_options: {runtime_path}::client::CallOptions) -> Self {{\n        Self {{ transport, default_options }}\n    }}\n\n    /// Returns the default call options.\n    #[must_use]\n    pub const fn default_call_options(&self) -> &{runtime_path}::client::CallOptions {{\n        &self.default_options\n    }}\n\n    /// Returns the underlying transport.\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    /// Consumes the client and returns the underlying transport.\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
     ));
 
     buf.push_str(&format!(

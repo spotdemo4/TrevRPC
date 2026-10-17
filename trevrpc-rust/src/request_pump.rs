@@ -9,7 +9,7 @@ use crate::server::{CancellationSource, check_stream_message_body_limits};
 use crate::transport_error::{self, TransportFailureKind};
 use crate::{BoxStream, Code, Error, Result, RpcStreamFrameKind, Status};
 
-pub(crate) const REQUEST_BODY_CHANNEL_CAPACITY: usize = 1;
+pub const REQUEST_BODY_CHANNEL_CAPACITY: usize = 1;
 
 /// How long, and how many bytes, the server keeps discarding the request side of a call it has
 /// already answered before giving up and stopping it.
@@ -17,7 +17,7 @@ const DISCARD_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCARD_LIMIT: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum RequestInputKind {
+pub enum RequestInputKind {
     Unary,
     Streaming {
         max_messages: Option<usize>,
@@ -44,7 +44,7 @@ impl RequestInputKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum RequestPumpFailure {
+pub enum RequestPumpFailure {
     Protocol(Status),
     PeerStatus(Status),
     PeerReset(Status),
@@ -75,7 +75,7 @@ impl RequestPumpFailure {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum RequestPumpState {
+pub enum RequestPumpState {
     Receiving,
     DrainingTerminalFin,
     Failed(RequestPumpFailure),
@@ -83,7 +83,7 @@ pub(crate) enum RequestPumpState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RequestPumpOutcome {
+pub enum RequestPumpOutcome {
     CleanFin,
     LocallyStopped,
     PeerReset,
@@ -91,7 +91,7 @@ pub(crate) enum RequestPumpOutcome {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum RequestPumpSettle {
+pub enum RequestPumpSettle {
     ResponseCommitted,
     ResponseStopped,
     ServerShutdown,
@@ -100,7 +100,7 @@ pub(crate) enum RequestPumpSettle {
 
 /// A transport-level end of the request stream, observed while the pump waits on the consumer.
 #[derive(Clone, Debug)]
-pub(crate) enum RequestTransportEvent {
+pub enum RequestTransportEvent {
     PeerReset(Status),
     ConnectionLost(Status),
 }
@@ -112,7 +112,7 @@ impl RequestTransportEvent {
     }
 }
 
-pub(crate) trait RequestPumpReader: FrameRead + Send + 'static {
+pub trait RequestPumpReader: FrameRead + Send + 'static {
     fn stop_trevrpc(&mut self);
 
     /// Resolves when the transport ends the request stream, or never if it cannot tell.
@@ -151,7 +151,11 @@ impl<R: RequestPumpReader> PumpReaderGuard<R> {
         }
     }
 
-    fn reader(&mut self) -> &mut R {
+    #[expect(
+        clippy::expect_used,
+        reason = "`reader` is only taken in `drop`, so it is present for the guard's whole life"
+    )]
+    const fn reader(&mut self) -> &mut R {
         self.reader
             .as_mut()
             .expect("request reader is present until the guard drops")
@@ -203,7 +207,7 @@ async fn discard_request<R: RequestPumpReader>(mut reader: R) {
     }
 }
 
-pub(crate) struct RequestPump {
+pub struct RequestPump {
     state: watch::Receiver<RequestPumpState>,
     settle: watch::Sender<Option<RequestPumpSettle>>,
     task: Option<JoinHandle<RequestPumpOutcome>>,
@@ -236,10 +240,7 @@ impl RequestPump {
         let Some(task) = self.task.take() else {
             return RequestPumpOutcome::LocallyStopped;
         };
-        match task.await {
-            Ok(outcome) => outcome,
-            Err(_) => RequestPumpOutcome::LocallyStopped,
-        }
+        task.await.unwrap_or(RequestPumpOutcome::LocallyStopped)
     }
 }
 
@@ -252,7 +253,7 @@ impl Drop for RequestPump {
     }
 }
 
-pub(crate) fn start_request_pump<R>(
+pub fn start_request_pump<R>(
     reader: R,
     input_kind: RequestInputKind,
     max_frame_size: usize,
@@ -561,7 +562,8 @@ where
     if let Some(permit) = permit {
         permit.send(Err(Error::from(failure.status().clone())));
     }
-    if let Some(reason) = *settle_rx.borrow_and_update() {
+    let settled = *settle_rx.borrow_and_update();
+    if let Some(reason) = settled {
         if !matches!(failure, RequestPumpFailure::Protocol(_)) {
             reader.settled = true;
             return outcome;
@@ -583,7 +585,8 @@ where
         if settle_rx.changed().await.is_err() {
             return settle_reader(reader, RequestPumpSettle::ResponseStopped);
         }
-        if let Some(reason) = *settle_rx.borrow_and_update() {
+        let settled = *settle_rx.borrow_and_update();
+        if let Some(reason) = settled {
             return settle_reader(reader, reason);
         }
     }

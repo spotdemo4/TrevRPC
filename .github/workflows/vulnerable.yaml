@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  rust:
+  actions:
     runs-on: ubuntu-26.04
     permissions:
       id-token: write
@@ -19,9 +19,21 @@ jobs:
         with:
           shell: vulnerable
 
-      - name: Run cargo audit
-        working-directory: trevrpc-rust
-        run: cargo-audit audit
+      - name: Run zizmor
+        run: zizmor $(find .github/workflows -name "*.yaml")
+
+  nix:
+    runs-on: ubuntu-26.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          shell: vulnerable
+
+      - name: Run flake-checker
+        run: flake-checker -f
 
   go:
     runs-on: ubuntu-26.04
@@ -37,6 +49,19 @@ jobs:
         working-directory: trevrpc-go
         run: govulncheck ./...
 
+  kotlin:
+    runs-on: ubuntu-26.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          shell: vulnerable
+
+      - name: Run OSV-Scanner
+        run: .forgejo/scripts/osv-scan-kotlin.sh
+
   npm:
     runs-on: ubuntu-26.04
     permissions:
@@ -51,7 +76,7 @@ jobs:
         working-directory: trevrpc-js
         run: npm audit --audit-level moderate
 
-  nix:
+  rust:
     runs-on: ubuntu-26.04
     permissions:
       id-token: write
@@ -61,18 +86,6 @@ jobs:
         with:
           shell: vulnerable
 
-      - name: Run flake-checker
-        run: flake-checker -f
-
-  actions:
-    runs-on: ubuntu-26.04
-    permissions:
-      id-token: write
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-        with:
-          shell: vulnerable
-
-      - name: Run zizmor
-        run: find .github/workflows -name "*.yaml" -exec zizmor {} +
+      - name: Run cargo audit
+        working-directory: trevrpc-rust
+        run: cargo-audit audit

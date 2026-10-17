@@ -1,3 +1,4 @@
+// Package examplecert locates the TLS certificate the examples share.
 package examplecert
 
 import (
@@ -7,6 +8,8 @@ import (
 
 const envName = "TREVRPC_EXAMPLE_CERT"
 
+// Path returns the example certificate path: $TREVRPC_EXAMPLE_CERT when set,
+// otherwise a file under the user config directory.
 func Path() (string, error) {
 	if path := os.Getenv(envName); path != "" {
 		return path, nil

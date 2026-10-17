@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use http::{HeaderValue, Request, StatusCode};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::http_admission::{MEDIA_TYPE, validate_http_request};
+use crate::http_admission::{rejection_head, rpc_response_head, validate_http_request};
 use crate::http_body::{BodySink, BodySource, handle_rpc_stream};
 use crate::request_pump::RequestTransportEvent;
 use crate::serve::{drain_tasks, log_task_error, transport_limits};
@@ -21,7 +21,7 @@ use crate::server_transport::try_acquire_permit;
 use crate::{Error, Result, Status};
 
 /// Serves one HTTP/2 connection until it closes or the server shuts down.
-pub(crate) async fn handle_connection<T>(
+pub async fn handle_connection<T>(
     server: Server,
     io: T,
     alt_svc: Option<HeaderValue>,
@@ -87,7 +87,7 @@ pub(crate) async fn handle_connection<T>(
                 if changed.is_err() || *shutdown.borrow() {
                     // GOAWAY: in-flight requests finish, and the connection then ends.
                     connection.graceful_shutdown();
-                    drain_deadline = Some(graceful_shutdown_timeout.map(|timeout| Instant::now() + timeout));
+                    drain_deadline = Some(graceful_shutdown_timeout.and_then(|timeout| Instant::now().checked_add(timeout)));
                 }
             }
             () = drained => break,
@@ -122,16 +122,7 @@ async fn handle_request(
         reject(respond, status);
         return;
     }
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, MEDIA_TYPE);
-    if let Some(alt_svc) = alt_svc {
-        response = response.header(header::ALT_SVC, alt_svc);
-    }
-    let response = response
-        .body(())
-        .expect("static HTTP/2 response should be valid");
-    let Ok(send) = respond.send_response(response, false) else {
+    let Ok(send) = respond.send_response(rpc_response_head(alt_svc), false) else {
         return;
     };
     handle_rpc_stream(
@@ -145,14 +136,7 @@ async fn handle_request(
 }
 
 fn reject(mut respond: h2::server::SendResponse<Bytes>, status: StatusCode) {
-    let mut response = Response::builder().status(status);
-    if status == StatusCode::METHOD_NOT_ALLOWED {
-        response = response.header(header::ALLOW, Method::POST.as_str());
-    }
-    let response = response
-        .body(())
-        .expect("static HTTP/2 rejection should be valid");
-    let _ = respond.send_response(response, true);
+    let _ = respond.send_response(rejection_head(status), true);
 }
 
 struct H2Sink(h2::SendStream<Bytes>);
@@ -169,10 +153,13 @@ impl BodySink for H2Sink {
             if len == 0 {
                 continue;
             }
+            let (head, rest) = chunk.split_at_checked(len).ok_or_else(|| {
+                Error::from(Status::internal("HTTP/2 send capacity exceeded chunk"))
+            })?;
             self.0
-                .send_data(Bytes::copy_from_slice(&chunk[..len]), false)
+                .send_data(Bytes::copy_from_slice(head), false)
                 .map_err(Error::transport)?;
-            chunk = &chunk[len..];
+            chunk = rest;
         }
         Ok(())
     }

@@ -6,6 +6,11 @@
 
 #![allow(dead_code)]
 
+#[macro_use]
+mod ensure;
+
+pub use ensure::AssertionFailed;
+
 use std::future::Future;
 
 use futures_util::StreamExt;
@@ -37,9 +42,7 @@ impl RawRecv for quinn::RecvStream {
 
 impl RawSend for quinn::SendStream {
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        quinn::SendStream::write_all(self, bytes)
-            .await
-            .map_err(Error::transport)
+        Self::write_all(self, bytes).await.map_err(Error::transport)
     }
 }
 
@@ -51,9 +54,7 @@ impl RawRecv for web_transport_quinn::RecvStream {
 
 impl RawSend for web_transport_quinn::SendStream {
     async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        web_transport_quinn::SendStream::write_all(self, bytes)
-            .await
-            .map_err(Error::transport)
+        Self::write_all(self, bytes).await.map_err(Error::transport)
     }
 }
 
@@ -66,11 +67,12 @@ fn unexpected_eof() -> Error {
 
 /// Fills `buf`, returning `false` on a clean end of stream before the first byte.
 async fn read_exact_or_eof<R: RawRecv>(recv: &mut R, buf: &mut [u8]) -> Result<bool> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        match recv.read_some(&mut buf[offset..]).await? {
-            Some(read) => offset += read,
-            None if offset == 0 => return Ok(false),
+    let total = buf.len();
+    let mut rest = buf;
+    while !rest.is_empty() {
+        match recv.read_some(rest).await? {
+            Some(read) => rest = rest.get_mut(read..).ok_or_else(unexpected_eof)?,
+            None if rest.len() == total => return Ok(false),
             None => return Err(unexpected_eof()),
         }
     }
@@ -133,20 +135,21 @@ pub struct WebTransportRpc {
 }
 
 impl WebTransportRpc {
-    pub fn new(session: web_transport_quinn::Session) -> Self {
+    pub const fn new(session: web_transport_quinn::Session) -> Self {
         Self { session }
     }
 }
 
 /// Resets a send stream when dropped before it finished cleanly.
 struct ResetOnDrop {
-    stream: Option<web_transport_quinn::SendStream>,
+    stream: web_transport_quinn::SendStream,
+    finished: bool,
 }
 
 impl Drop for ResetOnDrop {
     fn drop(&mut self) {
-        if let Some(stream) = &mut self.stream {
-            let _ = stream.reset(CANCELLED_STREAM_CODE);
+        if !self.finished {
+            let _ = self.stream.reset(CANCELLED_STREAM_CODE);
         }
     }
 }
@@ -178,8 +181,11 @@ impl StreamingRpcTransport for WebTransportRpc {
     ) -> Result<BoxStream<RpcStreamFrame>> {
         let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
         let upload = tokio::spawn(async move {
-            let mut guard = ResetOnDrop { stream: Some(send) };
-            let send = guard.stream.as_mut().expect("send stream is present");
+            let mut guard = ResetOnDrop {
+                stream: send,
+                finished: false,
+            };
+            let send = &mut guard.stream;
             write_frame(send, &request, DEFAULT_MAX_FRAME_SIZE).await?;
             while let Some(body) = request_body.next().await.transpose()? {
                 let frame = framing::encode_message_stream_frame(&body, DEFAULT_MAX_FRAME_SIZE)?;
@@ -187,7 +193,7 @@ impl StreamingRpcTransport for WebTransportRpc {
             }
             send.finish().map_err(Error::transport)?;
             // Finished cleanly: nothing left to reset.
-            guard.stream = None;
+            guard.finished = true;
             Ok::<_, Error>(())
         });
 
@@ -202,7 +208,7 @@ impl StreamingRpcTransport for WebTransportRpc {
                 if state.complete {
                     return None;
                 }
-                let mut recv = state.recv.take().expect("recv stream is present");
+                let mut recv = state.recv.take()?;
                 let item = match read_stream_frame_or_eof(&mut recv, DEFAULT_MAX_FRAME_SIZE).await {
                     Ok(Some(frame)) if frame.frame_kind() == Some(RpcStreamFrameKind::Status) => {
                         state.finish();

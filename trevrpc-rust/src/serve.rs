@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::HeaderValue;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinError, JoinSet};
 
@@ -152,9 +152,9 @@ impl Server {
                         }
                     });
                 }
-                accepted = accept_tcp(tcp.as_ref().map(|tcp| &tcp.listener)) => {
-                    let stream = match accepted {
-                        Ok(stream) => stream,
+                accepted = accept_tcp(tcp.as_ref()) => {
+                    let (stream, fallback) = match accepted {
+                        Ok(accepted) => accepted,
                         Err(error) => {
                             tracing::warn!(%error, "TCP accept failed");
                             tokio::time::sleep(ACCEPT_BACKOFF).await;
@@ -164,7 +164,7 @@ impl Server {
                     let Some(connection_permit) = try_acquire_permit(connection_limit.as_ref()) else {
                         continue;
                     };
-                    let tls = tcp.as_ref().map(|tcp| tcp.tls.clone()).expect("TCP is enabled");
+                    let tls = fallback.tls.clone();
                     let connection = tcp::handle_connection(
                         self.clone(),
                         stream,
@@ -202,23 +202,27 @@ impl Server {
 }
 
 /// Accepts the next TCP connection, or never when TCP is disabled.
-async fn accept_tcp(listener: Option<&TcpListener>) -> std::io::Result<TcpStream> {
-    match listener {
-        Some(listener) => listener.accept().await.map(|(stream, _)| stream),
+async fn accept_tcp(tcp: Option<&TcpFallback>) -> std::io::Result<(TcpStream, &TcpFallback)> {
+    match tcp {
+        Some(fallback) => fallback
+            .listener
+            .accept()
+            .await
+            .map(|(stream, _)| (stream, fallback)),
         None => pending().await,
     }
 }
 
 /// Flow-control limits derived from a server's [`ServerOptions`], shared by QUIC and `QMux`.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct TransportLimits {
+pub struct TransportLimits {
     pub(crate) stream_receive_window: u64,
     pub(crate) connection_receive_window: u64,
     max_concurrent_bidi_streams: Option<u64>,
 }
 
 /// Aligns the QUIC windows and stream limits with the server's `TrevRPC` limits.
-pub(crate) fn transport_limits(options: &ServerOptions) -> TransportLimits {
+pub fn transport_limits(options: &ServerOptions) -> TransportLimits {
     let stream_receive_window = frame_receive_window(options.max_frame_size());
     TransportLimits {
         stream_receive_window,
@@ -243,13 +247,12 @@ fn apply_transport_limits(config: &mut quinn::TransportConfig, options: &ServerO
 }
 
 fn connection_receive_window(options: &ServerOptions, stream_receive_window: u64) -> u64 {
-    let mut connection_receive_window = stream_receive_window;
-    if let Some(max_streams) = options.max_concurrent_streams_per_connection()
-        && max_streams > 1
-    {
-        connection_receive_window =
-            stream_receive_window.saturating_mul(saturating_usize_to_u64(max_streams));
-    }
+    let mut connection_receive_window = match options.max_concurrent_streams_per_connection() {
+        Some(max_streams) if max_streams > 1 => {
+            stream_receive_window.saturating_mul(saturating_usize_to_u64(max_streams))
+        }
+        _ => stream_receive_window,
+    };
 
     if let Some(max_body_size) = options.max_stream_body_size() {
         let stream_body_window = saturating_usize_to_u64(max_body_size);
@@ -262,7 +265,7 @@ fn connection_receive_window(options: &ServerOptions, stream_receive_window: u64
 
 /// Waits for `tasks` to finish, aborting them if `timeout` elapses first. Returns whether they all
 /// finished in time.
-pub(crate) async fn drain_tasks(tasks: &mut JoinSet<()>, timeout: Option<Duration>) -> bool {
+pub async fn drain_tasks(tasks: &mut JoinSet<()>, timeout: Option<Duration>) -> bool {
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             log_task_error(Some(result), "task failed while draining");
@@ -283,7 +286,7 @@ pub(crate) async fn drain_tasks(tasks: &mut JoinSet<()>, timeout: Option<Duratio
 
 /// Drains a connection's stream tasks, calling `close` to end the connection if they overrun
 /// `timeout`.
-pub(crate) async fn drain_streams(
+pub async fn drain_streams(
     stream_tasks: &mut JoinSet<()>,
     timeout: Option<Duration>,
     close: impl FnOnce(),
@@ -316,10 +319,7 @@ async fn drain_connections(
     }
 }
 
-pub(crate) fn log_task_error(
-    result: Option<std::result::Result<(), JoinError>>,
-    message: &'static str,
-) {
+pub fn log_task_error(result: Option<std::result::Result<(), JoinError>>, message: &'static str) {
     if let Some(Err(error)) = result {
         tracing::warn!(%error, "{message}");
     }

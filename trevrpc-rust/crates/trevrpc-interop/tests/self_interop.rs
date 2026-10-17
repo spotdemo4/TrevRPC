@@ -1,7 +1,6 @@
 //! Runs the built `server` and `client` subcommands against each other, checking the
 //! command-line contract in `interop/README.md`.
 
-use std::error::Error;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -36,13 +35,13 @@ impl Drop for TempDir {
 }
 
 #[test]
-fn rust_client_passes_every_scenario_against_rust_server() -> Result<(), Box<dyn Error>> {
-    let dir = TempDir::new()?;
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+fn rust_client_passes_every_scenario_against_rust_server() {
+    let dir = TempDir::new().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     let cert_path = dir.0.join("cert.pem");
     let key_path = dir.0.join("key.pem");
-    std::fs::write(&cert_path, cert.cert.pem())?;
-    std::fs::write(&key_path, cert.signing_key.serialize_pem())?;
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // The server runs until its stdin closes, so keep the pipe open for the whole test.
     let mut server = Command::new(BIN)
@@ -53,14 +52,17 @@ fn rust_client_passes_every_scenario_against_rust_server() -> Result<(), Box<dyn
         .arg(&key_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .unwrap();
     let mut ports = String::new();
-    BufReader::new(server.stdout.take().ok_or("server stdout")?).read_line(&mut ports)?;
+    BufReader::new(server.stdout.take().expect("server stdout"))
+        .read_line(&mut ports)
+        .unwrap();
     let native = ports
         .split("\"native\":")
         .nth(1)
         .and_then(|rest| rest.split([',', '}']).next())
-        .ok_or_else(|| format!("unexpected port line {ports:?}"))?
+        .unwrap_or_else(|| panic!("unexpected port line {ports:?}"))
         .trim()
         .to_owned();
     assert!(ports.contains("\"http3\":") && ports.contains("\"webtransport\":"));
@@ -71,8 +73,9 @@ fn rust_client_passes_every_scenario_against_rust_server() -> Result<(), Box<dyn
         .arg(format!("127.0.0.1:{native}"))
         .arg("--ca")
         .arg(&cert_path)
-        .output()?;
-    let report = String::from_utf8(client.stdout)?;
+        .output()
+        .unwrap();
+    let report = String::from_utf8(client.stdout).unwrap();
     assert!(client.status.success(), "client failed:\n{report}");
     for scenario in SCENARIOS {
         assert!(
@@ -83,6 +86,5 @@ fn rust_client_passes_every_scenario_against_rust_server() -> Result<(), Box<dyn
 
     // Closing stdin asks the server to shut down gracefully.
     drop(server.stdin.take());
-    assert!(server.wait()?.success());
-    Ok(())
+    assert!(server.wait().unwrap().success());
 }

@@ -10,6 +10,16 @@ import (
 	"time"
 )
 
+// closeOnCleanup closes c when the test ends and fails the test if that errors.
+func closeOnCleanup(t testing.TB, c io.Closer) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+}
+
 func runTestClientStreaming(ctx context.Context, transport Transport, service, method string, values []string, options ...CallOption) (*testMessage, error) {
 	stream, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, service, method, func() *testMessage { return &testMessage{} }, options...)
 	if err != nil {
@@ -51,7 +61,7 @@ type bidiTestStream struct {
 
 func (s *bidiTestStream) Recv() (*testMessage, error) {
 	message, err := s.inner.Recv()
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		s.sendOnce.Do(func() { s.sendErr = <-s.sendDone })
 		if s.sendErr != nil {
 			return nil, s.sendErr

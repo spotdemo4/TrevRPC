@@ -302,7 +302,7 @@ func TestBidirectionalStreamingExposesTerminalMetadata(t *testing.T) {
 	if _, err := bidi.Recv(); err != nil {
 		t.Fatalf("receive bidi message: %v", err)
 	}
-	if _, err := bidi.Recv(); err != io.EOF {
+	if _, err := bidi.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("receive bidi terminal status: %v, want EOF", err)
 	}
 	status, ok := bidi.TerminalStatus()
@@ -313,13 +313,13 @@ func TestBidirectionalStreamingExposesTerminalMetadata(t *testing.T) {
 
 func TestResponseMessageStreamClassifiesMalformedReadAfterTerminalAsTrailing(t *testing.T) {
 	stream := newResponseMessageStream[*testMessage](
+		context.Background(),
 		&errorAfterFramesStream{
 			frames:   []*wireStreamFrame{statusFrame(OK())},
 			finalErr: &frameDecodeError{Err: errors.New("malformed trailing frame")},
 		},
 		func() *testMessage { return &testMessage{} },
 		defaultCallConfig(),
-		context.Background(),
 		func() {},
 	)
 
@@ -366,10 +366,10 @@ func TestClientStreamingResponseDrainsBeforeCardinality(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			responses := newResponseMessageStream[*testMessage](
+				context.Background(),
 				&errorAfterFramesStream{frames: test.frames, finalErr: test.finalErr},
 				func() *testMessage { return &testMessage{} },
 				defaultCallConfig(),
-				context.Background(),
 				func() {},
 			)
 
@@ -386,14 +386,14 @@ func TestClientStreamingResponseDrainsBeforeCardinality(t *testing.T) {
 
 func TestResponseMessageStreamTerminalStatusReturnsOwnedSnapshots(t *testing.T) {
 	stream := newResponseMessageStream[*testMessage](
+		context.Background(),
 		&countingFrameStream{frames: []*wireStreamFrame{statusFrameWithMetadata(OK(), Metadata{"result": []byte("original")})}},
 		func() *testMessage { return &testMessage{} },
 		defaultCallConfig(),
-		context.Background(),
 		func() {},
 	)
 
-	if _, err := stream.Recv(); err != io.EOF {
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("Recv() = %v, want EOF", err)
 	}
 	first, ok := stream.TerminalStatus()
@@ -423,10 +423,10 @@ func TestResponseMessageStreamContainsFactoryPanicAndFinishes(t *testing.T) {
 	inner := &countingFrameStream{frames: []*wireStreamFrame{messageFrame(body)}}
 	cancels := 0
 	stream := newResponseMessageStream[*testMessage](
+		context.Background(),
 		inner,
 		func() *testMessage { panic("caller-controlled panic detail") },
 		defaultCallConfig(),
-		context.Background(),
 		func() { cancels++ },
 	)
 
@@ -455,7 +455,7 @@ func TestResponseMessageStreamContainsFactoryPanicAndFinishes(t *testing.T) {
 
 func TestResponseMessageStreamCloseMayRaceBlockedRecv(t *testing.T) {
 	inner := &blockingFrameStream{entered: make(chan struct{}), closed: make(chan struct{})}
-	stream := newResponseMessageStream[*testMessage](inner, func() *testMessage { return &testMessage{} }, defaultCallConfig(), context.Background(), func() {})
+	stream := newResponseMessageStream[*testMessage](context.Background(), inner, func() *testMessage { return &testMessage{} }, defaultCallConfig(), func() {})
 
 	recvDone := make(chan error, 1)
 	go func() {
@@ -483,7 +483,7 @@ func TestResponseMessageStreamCloseMayRaceBlockedRecv(t *testing.T) {
 
 	select {
 	case err := <-recvDone:
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			t.Fatalf("Recv() error = %v, want EOF", err)
 		}
 	case <-time.After(time.Second):
@@ -524,9 +524,9 @@ func (t *capturingClientTransport) streamingCall(ctx context.Context, request *w
 func (t *capturingClientTransport) capture(ctx context.Context, request *wireRequest) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	copy := *request
-	copy.Metadata = cloneMetadata(request.Metadata)
-	t.request = &copy
+	captured := *request
+	captured.Metadata = cloneMetadata(request.Metadata)
+	t.request = &captured
 	t.callDeadline, _ = ctx.Deadline()
 }
 

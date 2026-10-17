@@ -1,9 +1,7 @@
 {
   lib,
   stdenv,
-  buildGoModule,
-  go-tools,
-  gotools,
+  mkGoModule,
   protobuf,
   wireGolden,
   qmuxGolden,
@@ -12,7 +10,7 @@
 let
   canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
 in
-buildGoModule (final: {
+mkGoModule (final: {
   pname = "trevrpc-go";
   version = "1.0.0";
 
@@ -28,8 +26,7 @@ buildGoModule (final: {
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-w2GucM+UjhnMnOA1iDUOyfPBKbK4b/W8D/BlfamNro4=";
-  proxyVendor = true;
+  vendorHash = "sha256-/TkFoSSMp+1mKPRJjcUN9SJRclkhAb1qmAXfbgKAbes=";
 
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
@@ -41,19 +38,12 @@ buildGoModule (final: {
   '';
 
   doCheck = canExecute;
-  nativeCheckInputs = [
-    go-tools
-    gotools
-    # The interop bindings test regenerates code from interop.proto.
-    protobuf
-  ];
+  # The interop bindings test regenerates code from interop.proto.
+  nativeCheckInputs = [ protobuf ];
   checkPhase = ''
     runHook preCheck
     export HOME=$(mktemp -d)
     go test ./...
-    go vet ./...
-    staticcheck ./...
-    modernize ./...
     runHook postCheck
   '';
 

@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -23,6 +23,7 @@ use trevrpc::{Code, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 #[allow(dead_code)]
 #[path = "../examples/shared/greeter.rs"]
 mod greeter;
+#[macro_use]
 mod support;
 
 const AUTH_TOKEN: &str = "integration-token";
@@ -36,7 +37,7 @@ fn reject_http3_admission(request: &trevrpc::server::HttpAdmissionRequest<'_>) -
     false
 }
 
-fn reject_webtransport_admission(
+const fn reject_webtransport_admission(
     _request: &trevrpc::server::WebTransportAdmissionRequest<'_>,
 ) -> bool {
     false
@@ -325,29 +326,24 @@ struct RecordingMetrics {
     notify: Arc<Notify>,
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl RecordingMetrics {
     fn started(&self) -> Vec<RpcStarted> {
-        self.started
-            .lock()
-            .expect("metrics lock should not be poisoned")
-            .clone()
+        lock(&self.started).clone()
     }
 
     fn finished(&self) -> Vec<RpcFinished> {
-        self.finished
-            .lock()
-            .expect("metrics lock should not be poisoned")
-            .clone()
+        lock(&self.finished).clone()
     }
 
     fn codes(&self) -> Vec<Code> {
-        self.codes
-            .lock()
-            .expect("metrics lock should not be poisoned")
-            .clone()
+        lock(&self.codes).clone()
     }
 
-    async fn wait_for_code(&self, code: Code) {
+    async fn wait_for_code(&self, code: Code) -> TestResult {
         let wait = async {
             loop {
                 if self.codes().contains(&code) {
@@ -358,46 +354,41 @@ impl RecordingMetrics {
             }
         };
 
-        tokio::time::timeout(TEST_TIMEOUT, wait)
-            .await
-            .expect("server metrics should record expected code");
+        tokio::time::timeout(TEST_TIMEOUT, wait).await?;
+        Ok(())
     }
 }
 
 impl Metrics for RecordingMetrics {
     fn rpc_started(&self, event: &RpcStarted) {
-        self.started
-            .lock()
-            .expect("metrics lock should not be poisoned")
-            .push(event.clone());
+        lock(&self.started).push(event.clone());
     }
 
     fn rpc_finished(&self, event: &RpcFinished) {
-        self.finished
-            .lock()
-            .expect("metrics lock should not be poisoned")
-            .push(event.clone());
-        self.codes
-            .lock()
-            .expect("metrics lock should not be poisoned")
-            .push(event.code);
+        lock(&self.finished).push(event.clone());
+        lock(&self.codes).push(event.code);
         self.notify.notify_waiters();
     }
 }
 
-fn assert_pre_handler_metrics(metrics: &RecordingMetrics, code: Code) {
+fn assert_pre_handler_metrics(metrics: &RecordingMetrics, code: Code) -> TestResult {
     let started = metrics.started();
     let finished = metrics.finished();
-    assert_eq!(started.len(), 1, "started metrics: {started:#?}");
-    assert_eq!(finished.len(), 1, "finished metrics: {finished:#?}");
-    assert_eq!(started[0].service, "");
-    assert_eq!(started[0].method, "");
-    assert_eq!(started[0].request_body_len, 0);
-    assert_eq!(finished[0].service, "");
-    assert_eq!(finished[0].method, "");
-    assert_eq!(finished[0].request_body_len, 0);
-    assert_eq!(finished[0].response_body_len, 0);
-    assert_eq!(finished[0].code, code);
+    let ([started_event], [finished_event]) = (started.as_slice(), finished.as_slice()) else {
+        return Err(format!(
+            "expected one started and one finished metric\nstarted metrics: {started:#?}\nfinished metrics: {finished:#?}"
+        )
+        .into());
+    };
+    ensure_eq!(started_event.service, "");
+    ensure_eq!(started_event.method, "");
+    ensure_eq!(started_event.request_body_len, 0);
+    ensure_eq!(finished_event.service, "");
+    ensure_eq!(finished_event.method, "");
+    ensure_eq!(finished_event.request_body_len, 0);
+    ensure_eq!(finished_event.response_body_len, 0);
+    ensure_eq!(finished_event.code, code);
+    Ok(())
 }
 
 #[tokio::test]
@@ -415,7 +406,7 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
             authenticated_options(),
         )
         .await?;
-    assert_eq!(reply.message, "hello, unary");
+    ensure_eq!(reply.message, "hello, unary");
 
     let mut replies = client
         .lots_of_replies_with_options(
@@ -429,15 +420,15 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     while let Some(reply) = replies.next().await {
         messages.push(reply?.message);
     }
-    assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
+    ensure_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
 
     let summary = run_client_greetings(&client, &["one", "two"], authenticated_options()).await?;
-    assert_eq!(summary.message, "one,two");
+    ensure_eq!(summary.message, "one,two");
 
     let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
-    assert_eq!(messages, ["echo, left", "echo, right"]);
+    ensure_eq!(messages, ["echo, left", "echo, right"]);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -514,7 +505,7 @@ async fn quinn_preserves_success_metadata_for_every_rpc_shape() -> TestResult {
     let bidi_metadata = receive_task.await??;
     assert_response_shape(&bidi_metadata, "bidirectional-streaming");
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -541,27 +532,27 @@ mod task_panics {
 
     /// Installs the recording hook once for the whole test binary, chaining the previous hook so
     /// panic output is unchanged.
-    pub(super) fn install() {
+    pub fn install() {
         INSTALL.call_once(|| {
             let previous = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 let thread = std::thread::current().name().map(str::to_owned);
-                PANICS
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push((thread, info.to_string()));
+                let mut panics = PANICS.lock().unwrap_or_else(PoisonError::into_inner);
+                panics.push((thread, info.to_string()));
+                drop(panics);
                 previous(info);
             }));
         });
     }
 
     /// Returns, and clears, the panics raised on the current thread.
-    pub(super) fn take_current_thread() -> Vec<String> {
+    pub fn take_current_thread() -> Vec<String> {
         let current = std::thread::current().name().map(str::to_owned);
         let mut panics = PANICS.lock().unwrap_or_else(PoisonError::into_inner);
         let (mine, others): (Vec<_>, Vec<_>) =
             panics.drain(..).partition(|(thread, _)| *thread == current);
         *panics = others;
+        drop(panics);
         mine.into_iter().map(|(_, message)| message).collect()
     }
 }
@@ -589,11 +580,11 @@ async fn quinn_client_streaming_does_not_violate_quinn_recv_stream_contract() ->
         let names = ["one", "two", "three", "four"];
         let summary =
             run_client_greetings(&client, &names[..=round % 4], CallOptions::new()).await?;
-        assert_eq!(summary.message, names[..=round % 4].join(","));
+        ensure_eq!(summary.message, names[..=round % 4].join(","));
     }
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -608,11 +599,11 @@ async fn quinn_bidirectional_streaming_does_not_violate_quinn_recv_stream_contra
     for round in 0..16 {
         let names = ["left", "right", "up", "down"];
         let replies = run_bidi_greetings(&client, &names[..=round % 4], CallOptions::new()).await?;
-        assert_eq!(replies.len(), round % 4 + 1);
+        ensure_eq!(replies.len(), round % 4 + 1);
     }
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -665,10 +656,10 @@ async fn quinn_backpressured_upload_does_not_violate_quinn_recv_stream_contract(
         .await?;
     }
     let reply = call.close_and_recv().await?;
-    assert_eq!(reply.message, MESSAGES.to_string());
+    ensure_eq!(reply.message, MESSAGES.to_string());
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -693,14 +684,14 @@ async fn quinn_post_response_drain_does_not_violate_quinn_recv_stream_contract()
             .await?;
         }
         send.finish()?;
-        assert_eq!(
+        ensure_eq!(
             tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??,
             None
         );
     }
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -763,11 +754,11 @@ async fn quinn_request_reset_cancels_handler_that_is_not_reading_the_body() -> T
         let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
             .await?
             .expect("handler should report its cancellation source");
-        assert_eq!(source, CancellationSource::PeerReset);
+        ensure_eq!(source, CancellationSource::PeerReset);
     }
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -788,7 +779,7 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
             authenticated_options(),
         )
         .await?;
-    assert_eq!(reply.message, "hello, unary");
+    ensure_eq!(reply.message, "hello, unary");
 
     let mut replies = client
         .lots_of_replies_with_options(
@@ -802,15 +793,15 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
     while let Some(reply) = replies.next().await {
         messages.push(reply?.message);
     }
-    assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
+    ensure_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
 
     let summary = run_client_greetings(&client, &["one", "two"], authenticated_options()).await?;
-    assert_eq!(summary.message, "one,two");
+    ensure_eq!(summary.message, "one,two");
 
     let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
-    assert_eq!(messages, ["echo, left", "echo, right"]);
+    ensure_eq!(messages, ["echo, left", "echo, right"]);
 
-    close_webtransport_client(endpoint, connection).await;
+    close_webtransport_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -830,7 +821,7 @@ async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
             authenticated_options(),
         )
         .await?;
-    assert_eq!(reply.message, "hello, unary");
+    ensure_eq!(reply.message, "hello, unary");
 
     let mut replies = client
         .lots_of_replies_with_options(
@@ -844,14 +835,14 @@ async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     while let Some(reply) = replies.next().await {
         messages.push(reply?.message);
     }
-    assert_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
+    ensure_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
 
     let summary = run_client_greetings(&client, &["one", "two"], authenticated_options()).await?;
-    assert_eq!(summary.message, "one,two");
+    ensure_eq!(summary.message, "one,two");
     let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
-    assert_eq!(messages, ["echo, left", "echo, right"]);
+    ensure_eq!(messages, ["echo, left", "echo, right"]);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -860,7 +851,7 @@ async fn direct_http3_rejects_webtransport_connect_without_disabling_post() -> T
     let server = spawn_http3_greeter_server(|_| {})?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
 
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::POST,
@@ -870,15 +861,15 @@ async fn direct_http3_rejects_webtransport_connect_without_disabling_post() -> T
         .await?,
         http::StatusCode::OK
     );
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
 
     let client = make_webtransport_client(&server)?;
     let request =
         web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
     assert_webtransport_connect_rejected(
-        expect_webtransport_connect_error(&client, request).await,
+        expect_webtransport_connect_error(&client, request).await?,
         web_transport_quinn::http::StatusCode::FORBIDDEN,
-    );
+    )?;
 
     server.shutdown().await
 }
@@ -893,7 +884,7 @@ async fn webtransport_is_opt_in_while_http3_post_works() -> TestResult {
         );
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::POST,
@@ -903,13 +894,13 @@ async fn webtransport_is_opt_in_while_http3_post_works() -> TestResult {
         .await?,
         http::StatusCode::OK
     );
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
 
     let client = make_webtransport_client(&server)?;
     let request =
         web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
     // The server does not advertise WebTransport, so the session cannot be established.
-    expect_webtransport_connect_error(&client, request).await;
+    expect_webtransport_connect_error(&client, request).await?;
 
     server.shutdown().await
 }
@@ -924,7 +915,7 @@ async fn http3_post_is_opt_in_while_webtransport_works() -> TestResult {
         );
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::POST,
@@ -934,11 +925,11 @@ async fn http3_post_is_opt_in_while_webtransport_works() -> TestResult {
         .await?,
         http::StatusCode::NOT_FOUND
     );
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
 
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
     assert_greeter_ready(&greeter_client).await?;
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -952,13 +943,13 @@ async fn h3_alpn_is_not_negotiated_unless_http3_or_webtransport_is_enabled() -> 
     let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
         .await
         .expect("ALPN mismatch handshake should complete");
-    assert!(result.is_err(), "h3 must not be negotiated");
+    ensure!(result.is_err(), "h3 must not be negotiated");
     endpoint.close(0_u32.into(), b"test complete");
 
     // Native QUIC is unaffected.
     let (endpoint, connection, client) = connect_client(&server).await?;
     assert_greeter_ready(&client).await?;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -981,8 +972,8 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
             authenticated_options(),
         )
         .await?;
-    assert_eq!(quinn_reply.message, "hello, quinn");
-    close_client(endpoint, connection).await;
+    ensure_eq!(quinn_reply.message, "hello, quinn");
+    close_client(endpoint, connection).await?;
 
     let (webtransport_client, session, greeter_client) =
         connect_webtransport_client(&server).await?;
@@ -994,7 +985,7 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
             authenticated_options(),
         )
         .await?;
-    assert_eq!(webtransport_reply.message, "hello, webtransport");
+    ensure_eq!(webtransport_reply.message, "hello, webtransport");
 
     let (http3_endpoint, http3_connection, http3_client) = connect_http3_client(&server).await?;
     let http3_reply = http3_client
@@ -1005,7 +996,7 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
             authenticated_options(),
         )
         .await?;
-    assert_eq!(http3_reply.message, "hello, http3");
+    ensure_eq!(http3_reply.message, "hello, http3");
 
     let webtransport_reply = greeter_client
         .say_hello_with_options(
@@ -1015,7 +1006,7 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
             authenticated_options(),
         )
         .await?;
-    assert_eq!(
+    ensure_eq!(
         webtransport_reply.message,
         "hello, webtransport interleaved"
     );
@@ -1027,10 +1018,10 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
             authenticated_options(),
         )
         .await?;
-    assert_eq!(http3_reply.message, "hello, http3 interleaved");
+    ensure_eq!(http3_reply.message, "hello, http3 interleaved");
 
-    close_client(http3_endpoint, http3_connection).await;
-    close_webtransport_client(webtransport_client, session).await;
+    close_client(http3_endpoint, http3_connection).await?;
+    close_webtransport_client(webtransport_client, session).await?;
     server.shutdown().await
 }
 
@@ -1064,7 +1055,7 @@ async fn h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> Tes
             authenticated_options(),
         )
         .await?;
-    assert_eq!(
+    ensure_eq!(
         webtransport_replies
             .next()
             .await
@@ -1072,7 +1063,7 @@ async fn h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> Tes
             .message,
         "first"
     );
-    assert_eq!(
+    ensure_eq!(
         http3_replies
             .next()
             .await
@@ -1093,7 +1084,7 @@ async fn h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> Tes
 
     drop(webtransport_replies);
     drop(http3_replies);
-    close_webtransport_client(webtransport_client, session).await;
+    close_webtransport_client(webtransport_client, session).await?;
     http3_endpoint.close(0_u32.into(), b"test complete");
     tokio::time::timeout(TEST_TIMEOUT, http3_endpoint.wait_idle())
         .await
@@ -1114,7 +1105,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
 
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::POST,
@@ -1124,7 +1115,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
         .await?,
         http::StatusCode::NOT_FOUND
     );
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::GET,
@@ -1134,7 +1125,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
         .await?,
         http::StatusCode::METHOD_NOT_ALLOWED
     );
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::POST,
@@ -1144,7 +1135,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
         .await?,
         http::StatusCode::UNSUPPORTED_MEDIA_TYPE
     );
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::POST,
@@ -1154,7 +1145,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
         .await?,
         http::StatusCode::FORBIDDEN
     );
-    assert_eq!(
+    ensure_eq!(
         http3_status(
             &transport,
             http::Method::POST,
@@ -1164,7 +1155,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
         .await?,
         http::StatusCode::UNSUPPORTED_MEDIA_TYPE
     );
-    assert_eq!(
+    ensure_eq!(
         http3_status_with_content_types(
             &transport,
             http::Method::POST,
@@ -1175,7 +1166,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
         http::StatusCode::UNSUPPORTED_MEDIA_TYPE
     );
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1189,7 +1180,7 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
                 .with_max_stream_messages(Some(1)),
         );
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-        register_cancellation_probe_route(server, source_tx.clone());
+        register_cancellation_probe_route(server, source_tx);
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
     let client = greeter::GreeterClient::new(transport.clone());
@@ -1209,7 +1200,7 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
         .close_and_recv()
         .await
         .expect_err("HTTP/3 request stream should exceed message limit");
-    assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+    ensure_eq!(error.into_status().code(), Code::ResourceExhausted);
 
     let mut request = RpcRequest::new("lifecycle.Probe", "Watch", Vec::new())
         .with_kind(RpcKind::ServerStreaming)
@@ -1230,7 +1221,7 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
         .await?
         .expect("HTTP/3 response should contain the first message");
     let first = trevrpc::framing::decode_stream_frame_body(&first)?;
-    assert_eq!(
+    ensure_eq!(
         greeter::HelloReply::decode(first.body.as_slice())?.message,
         "ready"
     );
@@ -1248,9 +1239,9 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
             authenticated_options(),
         )
         .await?;
-    assert_eq!(reply.message, "hello, after cancellation");
+    ensure_eq!(reply.message, "hello, after cancellation");
     drop(recv);
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1261,9 +1252,9 @@ async fn webtransport_rejects_unexpected_path() -> TestResult {
     let request =
         web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/wrong")?);
 
-    let error = expect_webtransport_connect_error(&client, request).await;
+    let error = expect_webtransport_connect_error(&client, request).await?;
 
-    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::NOT_FOUND);
+    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::NOT_FOUND)?;
     server.shutdown().await
 }
 
@@ -1278,9 +1269,9 @@ async fn webtransport_rejects_browser_origin_without_allowlist() -> TestResult {
                 web_transport_quinn::http::HeaderValue::from_static("https://example.invalid"),
             );
 
-    let error = expect_webtransport_connect_error(&client, request).await;
+    let error = expect_webtransport_connect_error(&client, request).await?;
 
-    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::FORBIDDEN);
+    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::FORBIDDEN)?;
     server.shutdown().await
 }
 
@@ -1315,8 +1306,8 @@ async fn webtransport_allows_configured_browser_origin() -> TestResult {
         )
         .await?;
 
-    assert_eq!(reply.message, "hello, origin");
-    close_webtransport_client(client, session).await;
+    ensure_eq!(reply.message, "hello, origin");
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -1335,9 +1326,9 @@ async fn webtransport_admission_receives_generic_request_headers() -> TestResult
     let denied =
         web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
     assert_webtransport_connect_rejected(
-        expect_webtransport_connect_error(&client, denied).await,
+        expect_webtransport_connect_error(&client, denied).await?,
         web_transport_quinn::http::StatusCode::FORBIDDEN,
-    );
+    )?;
 
     let allowed =
         web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?)
@@ -1355,9 +1346,9 @@ async fn webtransport_admission_receives_generic_request_headers() -> TestResult
             authenticated_options(),
         )
         .await?;
-    assert_eq!(reply.message, "hello, admitted");
+    ensure_eq!(reply.message, "hello, admitted");
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -1375,9 +1366,9 @@ async fn webtransport_rejects_unexpected_authority_when_allowlist_is_set() -> Te
     let request =
         web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
 
-    let error = expect_webtransport_connect_error(&client, request).await;
+    let error = expect_webtransport_connect_error(&client, request).await?;
 
-    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::FORBIDDEN);
+    assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::FORBIDDEN)?;
     server.shutdown().await
 }
 
@@ -1398,9 +1389,9 @@ async fn quinn_auth_failures_return_status_errors() -> TestResult {
         .await
         .expect_err("request without auth should fail");
 
-    assert_eq!(error.into_status().code(), Code::Unauthenticated);
+    ensure_eq!(error.into_status().code(), Code::Unauthenticated);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1414,9 +1405,9 @@ async fn quinn_oversized_timeouts_are_rejected_over_the_wire() -> TestResult {
 
     let response = transport.call(request).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+    ensure_eq!(Code::from_u32(response.status), Code::InvalidArgument);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1448,9 +1439,9 @@ async fn quinn_request_stream_limits_return_resource_exhausted() -> TestResult {
         .await
         .expect_err("request stream should exceed message limit");
 
-    assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+    ensure_eq!(error.into_status().code(), Code::ResourceExhausted);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1473,16 +1464,16 @@ async fn quinn_response_stream_limits_return_resource_exhausted() -> TestResult 
         .next()
         .await
         .expect("response stream should yield first item")?;
-    assert_eq!(first.message, "hello, limited");
+    ensure_eq!(first.message, "hello, limited");
 
     let error = replies
         .next()
         .await
         .expect("response stream should yield limit error")
         .expect_err("second response should exceed client limit");
-    assert_eq!(error.into_status().code(), Code::ResourceExhausted);
+    ensure_eq!(error.into_status().code(), Code::ResourceExhausted);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1517,13 +1508,13 @@ async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
     send.finish()?;
     let response = read_raw_quinn_response(&mut recv).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::Unavailable);
+    ensure_eq!(Code::from_u32(response.status), Code::Unavailable);
     read_quinn_fin(&mut recv).await?;
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert_eq!(stopped, None);
+    ensure_eq!(stopped, None);
 
     drop(hanging);
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1547,7 +1538,7 @@ async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResu
         .next()
         .await
         .expect("response stream should yield first item")?;
-    assert_eq!(first.message, "first");
+    ensure_eq!(first.message, "first");
 
     let (mut send, mut recv) = session.open_bi().await?;
     let mut request = RpcRequest::new(
@@ -1570,7 +1561,7 @@ async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResu
     .await?;
     send.finish()?;
     let response = read_raw_webtransport_response(&mut recv).await?;
-    assert_eq!(Code::from_u32(response.status), Code::Unavailable);
+    ensure_eq!(Code::from_u32(response.status), Code::Unavailable);
 
     let (mut send, mut recv) = session.open_bi().await?;
     let mut request = RpcRequest::new(
@@ -1598,14 +1589,14 @@ async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResu
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
     )
     .await?;
-    assert_eq!(
+    ensure_eq!(
         status.frame_kind(),
         Some(trevrpc::RpcStreamFrameKind::Status)
     );
-    assert_eq!(Code::from_u32(status.status), Code::Unavailable);
+    ensure_eq!(Code::from_u32(status.status), Code::Unavailable);
 
     drop((hanging, recv));
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -1643,15 +1634,15 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
     send.finish()?;
     let response = read_raw_quinn_response(&mut recv).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::Unavailable);
+    ensure_eq!(Code::from_u32(response.status), Code::Unavailable);
     read_quinn_fin(&mut recv).await?;
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert_eq!(stopped, None);
-    observed_metrics.wait_for_code(Code::Unavailable).await;
-    assert_eq!(observed_metrics.codes(), vec![Code::Unavailable]);
+    ensure_eq!(stopped, None);
+    observed_metrics.wait_for_code(Code::Unavailable).await?;
+    ensure_eq!(observed_metrics.codes(), vec![Code::Unavailable]);
 
     drop(hanging);
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1675,13 +1666,13 @@ async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload(
                 let ready_tx = ready_tx.clone();
                 async move {
                     let _ = ready_tx.send(());
-                    Ok(Box::pin(futures_util::stream::unfold(
-                        requests,
-                        |requests| async move {
+                    let stream: trevrpc::BoxStream<Vec<u8>> = Box::pin(
+                        futures_util::stream::unfold(requests, |requests| async move {
                             let _requests = requests;
                             std::future::pending().await
-                        },
-                    )) as trevrpc::BoxStream<Vec<u8>>)
+                        }),
+                    );
+                    Ok(stream)
                 }
             },
         );
@@ -1711,22 +1702,22 @@ async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload(
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
     )
     .await?;
-    assert_eq!(
+    ensure_eq!(
         status.frame_kind(),
         Some(trevrpc::RpcStreamFrameKind::Status)
     );
-    assert_eq!(Code::from_u32(status.status), Code::ResourceExhausted);
+    ensure_eq!(Code::from_u32(status.status), Code::ResourceExhausted);
     read_quinn_fin(&mut recv).await?;
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped())
         .await??
         .expect("server should stop the rejected upload");
-    assert_eq!(stopped.into_inner(), 1);
+    ensure_eq!(stopped.into_inner(), 1);
     observed_metrics
         .wait_for_code(Code::ResourceExhausted)
-        .await;
-    assert_eq!(observed_metrics.codes(), vec![Code::ResourceExhausted]);
+        .await?;
+    ensure_eq!(observed_metrics.codes(), vec![Code::ResourceExhausted]);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1764,13 +1755,13 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
         )
         .await
         .expect_err("RPC on refused connection should fail");
-        assert_eq!(error.into_status().code(), Code::Unavailable);
+        ensure_eq!(error.into_status().code(), Code::Unavailable);
         connection.close(0_u32.into(), b"second done");
     }
 
     second_endpoint.close(0_u32.into(), b"second done");
     drop(hanging);
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1796,12 +1787,12 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
         .next()
         .await
         .expect("response stream should yield first item")?;
-    assert_eq!(first.message, "first");
+    ensure_eq!(first.message, "first");
 
     drop(replies);
-    metrics.wait_for_code(Code::Cancelled).await;
+    metrics.wait_for_code(Code::Cancelled).await?;
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1809,7 +1800,7 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
 async fn quinn_response_drop_reports_peer_reset_to_request_context() -> TestResult {
     let (source_tx, mut source_rx) = mpsc::unbounded_channel();
     let server = spawn_greeter_server(move |server| {
-        register_cancellation_probe_route(server, source_tx.clone());
+        register_cancellation_probe_route(server, source_tx);
     })?;
     let (endpoint, connection, _) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
@@ -1831,9 +1822,9 @@ async fn quinn_response_drop_reports_peer_reset_to_request_context() -> TestResu
     let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
         .await?
         .expect("probe should report a cancellation source");
-    assert_eq!(source, CancellationSource::PeerReset);
+    ensure_eq!(source, CancellationSource::PeerReset);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -1841,7 +1832,7 @@ async fn quinn_response_drop_reports_peer_reset_to_request_context() -> TestResu
 async fn quinn_shutdown_reports_server_shutdown_to_request_context() -> TestResult {
     let (source_tx, mut source_rx) = mpsc::unbounded_channel();
     let server = spawn_greeter_server(move |server| {
-        register_cancellation_probe_route(server, source_tx.clone());
+        register_cancellation_probe_route(server, source_tx);
     })?;
     let (_endpoint, connection, _) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
@@ -1862,7 +1853,7 @@ async fn quinn_shutdown_reports_server_shutdown_to_request_context() -> TestResu
     let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
         .await?
         .expect("probe should report a cancellation source");
-    assert_eq!(source, CancellationSource::ServerShutdown);
+    ensure_eq!(source, CancellationSource::ServerShutdown);
     shutdown.await??;
     drop(responses);
     Ok(())
@@ -1873,7 +1864,7 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
     let (source_tx, _source_rx) = mpsc::unbounded_channel();
     let server = spawn_greeter_server(move |server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-        register_cancellation_probe_route(server, source_tx.clone());
+        register_cancellation_probe_route(server, source_tx);
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
     let (mut send, mut recv) = session.open_bi().await?;
@@ -1895,7 +1886,7 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
     )
     .await?;
-    assert_eq!(
+    ensure_eq!(
         greeter::HelloReply::decode(first.body.as_slice())?.message,
         "ready"
     );
@@ -1912,10 +1903,10 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
             authenticated_options(),
         )
         .await?;
-    assert_eq!(reply.message, "hello, after cancellation");
+    ensure_eq!(reply.message, "hello, after cancellation");
     drop(recv);
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -1923,7 +1914,7 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
 async fn webtransport_connection_close_reports_connection_loss() -> TestResult {
     let (source_tx, mut source_rx) = mpsc::unbounded_channel();
     let server = spawn_greeter_server(move |server| {
-        register_cancellation_probe_route(server, source_tx.clone());
+        register_cancellation_probe_route(server, source_tx);
     })?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
     let (mut send, mut recv) = session.open_bi().await?;
@@ -1941,7 +1932,7 @@ async fn webtransport_connection_close_reports_connection_loss() -> TestResult {
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
     )
     .await?;
-    assert_eq!(
+    ensure_eq!(
         greeter::HelloReply::decode(first.body.as_slice())?.message,
         "ready"
     );
@@ -1950,7 +1941,7 @@ async fn webtransport_connection_close_reports_connection_loss() -> TestResult {
     let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
         .await?
         .expect("WebTransport probe should report a cancellation source");
-    assert_eq!(source, CancellationSource::ConnectionLost);
+    ensure_eq!(source, CancellationSource::ConnectionLost);
     tokio::time::timeout(TEST_TIMEOUT, session.closed())
         .await
         .expect("client session should close");
@@ -1978,16 +1969,16 @@ async fn quinn_server_streaming_deadline_while_response_pending() -> TestResult 
         .next()
         .await
         .expect("response stream should yield first item")?;
-    assert_eq!(first.message, "first");
+    ensure_eq!(first.message, "first");
 
     let error = replies
         .next()
         .await
         .expect("deadline error should be emitted")
         .expect_err("pending response should hit deadline");
-    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2010,16 +2001,16 @@ async fn webtransport_server_streaming_deadline_while_response_pending() -> Test
         .next()
         .await
         .expect("response stream should yield first item")?;
-    assert_eq!(first.message, "first");
+    ensure_eq!(first.message, "first");
 
     let error = replies
         .next()
         .await
         .expect("deadline error should be emitted")
         .expect_err("pending response should hit deadline");
-    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -2036,9 +2027,9 @@ async fn quinn_client_streaming_deadline_while_upload_pending() -> TestResult {
         .lots_of_greetings_from_stream_with_options(requests, short_authenticated_options())
         .await
         .expect_err("pending upload should hit deadline");
-    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2055,9 +2046,9 @@ async fn webtransport_client_streaming_deadline_while_upload_pending() -> TestRe
         .lots_of_greetings_from_stream_with_options(requests, short_authenticated_options())
         .await
         .expect_err("pending upload should hit deadline");
-    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -2075,10 +2066,10 @@ async fn quinn_bidi_deadline_while_response_pending() -> TestResult {
         .recv()
         .await
         .expect_err("pending bidi response should hit deadline");
-    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
     drop(replies);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2096,10 +2087,10 @@ async fn webtransport_bidi_deadline_while_response_pending() -> TestResult {
         .recv()
         .await
         .expect_err("pending bidi response should hit deadline");
-    assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
+    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
     drop(replies);
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -2122,8 +2113,8 @@ async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
         .await
         .expect_err("terminal status should reject the stream");
 
-    assert_eq!(error.into_status().code(), Code::PermissionDenied);
-    close_client(endpoint, connection).await;
+    ensure_eq!(error.into_status().code(), Code::PermissionDenied);
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2146,8 +2137,8 @@ async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResu
         .await
         .expect_err("terminal status should reject the stream");
 
-    assert_eq!(error.into_status().code(), Code::PermissionDenied);
-    close_webtransport_client(client, session).await;
+    ensure_eq!(error.into_status().code(), Code::PermissionDenied);
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -2175,8 +2166,8 @@ async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult
     .await?;
 
     let response = read_raw_quinn_response(&mut recv).await?;
-    assert_eq!(Code::from_u32(response.status), Code::Ok);
-    assert_eq!(
+    ensure_eq!(Code::from_u32(response.status), Code::Ok);
+    ensure_eq!(
         greeter::HelloReply::decode(response.body.as_slice())?.message,
         "hello, delayed fin",
     );
@@ -2189,14 +2180,14 @@ async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
-    assert_eq!(concurrent.message, "hello, concurrent");
+    ensure_eq!(concurrent.message, "hello, concurrent");
 
     send.finish()?;
     read_quinn_fin(&mut recv).await?;
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert_eq!(stopped, None);
+    ensure_eq!(stopped, None);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2242,7 +2233,7 @@ async fn quinn_open_request_side_is_drained_not_stopped_after_handler_failure() 
 
     // The response is complete but the request is still open: the server must not stop it, or
     // peers that tear the whole stream down would lose the status above.
-    assert!(
+    ensure!(
         tokio::time::timeout(Duration::from_millis(300), send.stopped())
             .await
             .is_err(),
@@ -2255,12 +2246,12 @@ async fn quinn_open_request_side_is_drained_not_stopped_after_handler_failure() 
     )
     .await?;
     send.finish()?;
-    assert_eq!(
+    ensure_eq!(
         tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??,
         None
     );
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2282,9 +2273,9 @@ async fn quinn_request_discard_after_handler_failure_is_bounded_by_bytes() -> Te
     });
     let send = tokio::time::timeout(TEST_TIMEOUT, writer).await??;
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
+    ensure_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2297,10 +2288,10 @@ async fn quinn_request_discard_after_handler_failure_is_bounded_by_time() -> Tes
     // A client that neither finishes nor sends is stopped after about one second.
     let started = std::time::Instant::now();
     let stopped = tokio::time::timeout(Duration::from_secs(4), send.stopped()).await??;
-    assert_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
-    assert!(started.elapsed() >= Duration::from_millis(900));
+    ensure_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
+    ensure!(started.elapsed() >= Duration::from_millis(900));
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2324,21 +2315,21 @@ async fn webtransport_open_request_side_is_drained_not_stopped_after_handler_fai
         ),
     )
     .await??;
-    assert_eq!(frame.status_value().code(), Code::PermissionDenied);
+    ensure_eq!(frame.status_value().code(), Code::PermissionDenied);
 
-    assert!(
+    ensure!(
         tokio::time::timeout(Duration::from_millis(300), send.stopped())
             .await
             .is_err(),
         "server stopped the request side while the client was still sending"
     );
     send.finish()?;
-    assert_eq!(
+    ensure_eq!(
         tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??,
         None
     );
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -2365,7 +2356,7 @@ async fn quinn_unary_request_left_open_is_bounded_and_frees_the_stream_slot() ->
     )
     .await?;
     let response = read_raw_quinn_response(&mut recv).await?;
-    assert_eq!(Code::from_u32(response.status), Code::Ok);
+    ensure_eq!(Code::from_u32(response.status), Code::Ok);
     read_quinn_fin(&mut recv).await?;
 
     // The unfinished request must not pin the connection's only stream slot.
@@ -2377,15 +2368,15 @@ async fn quinn_unary_request_left_open_is_bounded_and_frees_the_stream_slot() ->
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
-    assert_eq!(reply.message, "hello, second");
+    ensure_eq!(reply.message, "hello, second");
 
     // The server stops the abandoned request after about one second.
     let started = std::time::Instant::now();
     let stopped = tokio::time::timeout(Duration::from_secs(4), send.stopped()).await??;
-    assert_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
-    assert!(started.elapsed() <= Duration::from_secs(3));
+    ensure_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
+    ensure!(started.elapsed() <= Duration::from_secs(3));
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2444,7 +2435,7 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
     });
     next_started_rx.await?;
     status_written_rx.await?;
-    assert!(
+    ensure!(
         !next_task.is_finished(),
         "terminal response status must wait for clean response FIN"
     );
@@ -2452,15 +2443,15 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
     let (frame, response) = tokio::time::timeout(TEST_TIMEOUT, next_task).await??;
     let frame = frame.expect("response status should arrive")?;
 
-    assert_eq!(
+    ensure_eq!(
         frame.frame_kind(),
         Some(trevrpc::RpcStreamFrameKind::Status)
     );
-    assert!(frame.status_value().is_ok());
+    ensure!(frame.status_value().is_ok());
     drop(response);
-    assert_eq!(stopped_rx.await?, None);
+    ensure_eq!(stopped_rx.await?, None);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server_task.await??;
     Ok(())
 }
@@ -2517,11 +2508,11 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
         .await?
         .expect("post-terminal frame should produce an error")
         .expect_err("post-terminal frame should be rejected");
-    assert_eq!(error.into_status().code(), Code::Internal);
+    ensure_eq!(error.into_status().code(), Code::Internal);
     drop(response);
     let _ = done_tx.send(());
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server_task.await??;
     Ok(())
 }
@@ -2563,25 +2554,25 @@ async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> Test
         (frame, recv)
     });
     read_started_rx.await?;
-    assert!(
+    ensure!(
         !response_task.is_finished(),
         "terminal request status must wait for clean request FIN"
     );
     send.finish()?;
     let (frame, mut recv) = tokio::time::timeout(TEST_TIMEOUT, response_task).await??;
     let frame = frame?;
-    assert_eq!(
+    ensure_eq!(
         frame.frame_kind(),
         Some(trevrpc::RpcStreamFrameKind::Status)
     );
-    assert!(frame.status_value().is_ok());
+    ensure!(frame.status_value().is_ok());
     read_quinn_fin(&mut recv).await?;
 
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert_eq!(stopped, None);
+    ensure_eq!(stopped, None);
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -2609,9 +2600,9 @@ async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
         .await?;
     replies.close_send()?;
 
-    assert!(replies.recv().await?.is_none());
+    ensure!(replies.recv().await?.is_none());
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -2638,8 +2629,8 @@ async fn webtransport_terminal_ok_surfaces_local_upload_error() -> TestResult {
         .await?;
     replies.close_send()?;
 
-    assert!(replies.recv().await?.is_none());
-    close_webtransport_client(client, session).await;
+    ensure!(replies.recv().await?.is_none());
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -2660,9 +2651,9 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
         )
         .await
         .expect_err("RPC on drained connection should fail");
-    assert_eq!(error.into_status().code(), Code::Unavailable);
+    ensure_eq!(error.into_status().code(), Code::Unavailable);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     Ok(())
 }
 
@@ -2686,12 +2677,12 @@ async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
         )
         .await
         .expect_err("RPC on drained WebTransport session should fail");
-    assert!(matches!(
+    ensure!(matches!(
         error.into_status().code(),
         Code::Cancelled | Code::Unavailable
     ));
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     Ok(())
 }
 
@@ -2715,12 +2706,12 @@ async fn http3_shutdown_closes_active_connections() -> TestResult {
         )
         .await
         .expect_err("RPC on drained HTTP/3 connection should fail");
-    assert!(matches!(
+    ensure!(matches!(
         error.into_status().code(),
         Code::Cancelled | Code::Unavailable
     ));
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     Ok(())
 }
 
@@ -2767,11 +2758,11 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
         .await
         .expect("pending client call should finish after shutdown")?;
     let error = result.expect_err("shutdown should fail the pending RPC");
-    assert!(matches!(
+    ensure!(matches!(
         error.into_status().code(),
         Code::Cancelled | Code::Unavailable | Code::DeadlineExceeded
     ));
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     Ok(())
 }
 
@@ -2818,12 +2809,12 @@ async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestRe
         .await
         .expect("pending WebTransport client call should finish after shutdown")?;
     let error = result.expect_err("shutdown should fail the pending WebTransport RPC");
-    assert!(matches!(
+    ensure!(matches!(
         error.into_status().code(),
         Code::Cancelled | Code::Unavailable | Code::DeadlineExceeded
     ));
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     Ok(())
 }
 
@@ -2843,7 +2834,7 @@ async fn quinn_local_close_maps_to_cancelled() -> TestResult {
         )
         .await
         .expect_err("RPC on locally closed connection should fail");
-    assert_eq!(error.into_status().code(), Code::Cancelled);
+    ensure_eq!(error.into_status().code(), Code::Cancelled);
 
     tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle())
         .await
@@ -2860,7 +2851,7 @@ async fn quinn_rejects_alpn_mismatch() -> TestResult {
         .await
         .expect("ALPN mismatch handshake should complete");
 
-    assert!(result.is_err(), "ALPN mismatch should reject connection");
+    ensure!(result.is_err(), "ALPN mismatch should reject connection");
 
     endpoint.close(0_u32.into(), b"test complete");
     server.shutdown().await
@@ -2875,7 +2866,7 @@ async fn quinn_rejects_tls_identity_mismatch() -> TestResult {
         .await
         .expect("identity mismatch handshake should complete");
 
-    assert!(result.is_err(), "SNI mismatch should reject connection");
+    ensure!(result.is_err(), "SNI mismatch should reject connection");
 
     endpoint.close(0_u32.into(), b"test complete");
     server.shutdown().await
@@ -2904,7 +2895,7 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
         .await
         .map_err(trevrpc::Error::into_status)
         .expect_err("server requiring mTLS should reject anonymous clients");
-        assert_eq!(status.code(), Code::Unavailable);
+        ensure_eq!(status.code(), Code::Unavailable);
         connection.close(0_u32.into(), b"test complete");
     }
 
@@ -2930,11 +2921,13 @@ async fn quinn_malformed_request_frames_return_invalid_argument_status() -> Test
         support::read_frame::<_, RpcResponse>(&mut recv, trevrpc::framing::DEFAULT_MAX_FRAME_SIZE)
             .await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
-    observed_metrics.wait_for_code(Code::InvalidArgument).await;
-    assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument);
+    ensure_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+    observed_metrics
+        .wait_for_code(Code::InvalidArgument)
+        .await?;
+    assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument)?;
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -2956,11 +2949,13 @@ async fn webtransport_malformed_request_frames_return_invalid_argument_status() 
         support::read_frame::<_, RpcResponse>(&mut recv, trevrpc::framing::DEFAULT_MAX_FRAME_SIZE)
             .await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
-    observed_metrics.wait_for_code(Code::InvalidArgument).await;
-    assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument);
+    ensure_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+    observed_metrics
+        .wait_for_code(Code::InvalidArgument)
+        .await?;
+    assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument)?;
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -3003,14 +2998,14 @@ async fn quinn_unknown_request_stream_frame_kind_returns_invalid_argument_status
     )
     .await?;
 
-    assert_eq!(
+    ensure_eq!(
         frame.frame_kind(),
         Some(trevrpc::RpcStreamFrameKind::Status)
     );
-    assert_eq!(Code::from_u32(frame.status), Code::InvalidArgument);
+    ensure_eq!(Code::from_u32(frame.status), Code::InvalidArgument);
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -3032,10 +3027,12 @@ async fn quinn_initial_request_timeout_rejects_partial_header() -> TestResult {
 
     let response = read_raw_quinn_response(&mut recv).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
-    observed_metrics.wait_for_code(Code::DeadlineExceeded).await;
-    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded);
-    close_client(endpoint, connection).await;
+    ensure_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    observed_metrics
+        .wait_for_code(Code::DeadlineExceeded)
+        .await?;
+    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -3056,10 +3053,12 @@ async fn quinn_initial_request_timeout_rejects_partial_body() -> TestResult {
 
     let response = read_raw_quinn_response(&mut recv).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
-    observed_metrics.wait_for_code(Code::DeadlineExceeded).await;
-    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded);
-    close_client(endpoint, connection).await;
+    ensure_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    observed_metrics
+        .wait_for_code(Code::DeadlineExceeded)
+        .await?;
+    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -3081,10 +3080,12 @@ async fn webtransport_initial_request_timeout_rejects_partial_header() -> TestRe
         support::read_frame::<_, RpcResponse>(&mut recv, trevrpc::framing::DEFAULT_MAX_FRAME_SIZE)
             .await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
-    observed_metrics.wait_for_code(Code::DeadlineExceeded).await;
-    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded);
-    close_webtransport_client(client, session).await;
+    ensure_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    observed_metrics
+        .wait_for_code(Code::DeadlineExceeded)
+        .await?;
+    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -3105,10 +3106,12 @@ async fn webtransport_initial_request_timeout_rejects_partial_body() -> TestResu
 
     let response = read_raw_webtransport_response(&mut recv).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
-    observed_metrics.wait_for_code(Code::DeadlineExceeded).await;
-    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded);
-    close_webtransport_client(client, session).await;
+    ensure_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+    observed_metrics
+        .wait_for_code(Code::DeadlineExceeded)
+        .await?;
+    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -3137,10 +3140,10 @@ async fn quinn_large_partial_initial_body_does_not_hold_request_permit() -> Test
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
-    assert_eq!(reply.message, "hello, after partial");
+    ensure_eq!(reply.message, "hello, after partial");
 
     let _ = send.reset(1_u32.into());
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -3169,10 +3172,10 @@ async fn webtransport_large_partial_initial_body_does_not_hold_request_permit() 
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
-    assert_eq!(reply.message, "hello, after partial");
+    ensure_eq!(reply.message, "hello, after partial");
 
     let _ = send.reset(1);
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -3188,10 +3191,10 @@ async fn quinn_oversized_initial_frame_is_rejected_before_body() -> TestResult {
 
     let response = read_raw_quinn_response(&mut recv).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::ResourceExhausted);
+    ensure_eq!(Code::from_u32(response.status), Code::ResourceExhausted);
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert_eq!(stopped, Some(1_u32.into()));
-    close_client(endpoint, connection).await;
+    ensure_eq!(stopped, Some(1_u32.into()));
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -3207,10 +3210,11 @@ async fn webtransport_oversized_initial_frame_is_rejected_before_body() -> TestR
 
     let response = read_raw_webtransport_response(&mut recv).await?;
 
-    assert_eq!(Code::from_u32(response.status), Code::ResourceExhausted);
+    ensure_eq!(Code::from_u32(response.status), Code::ResourceExhausted);
     let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    assert_eq!(
-        stopped, None,
+    ensure_eq!(
+        stopped,
+        None,
         "h3-WebTransport should use bounded stream drop instead of unsafe stop_sending"
     );
 
@@ -3222,9 +3226,9 @@ async fn webtransport_oversized_initial_frame_is_rejected_before_body() -> TestR
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
-    assert_eq!(reply.message, "hello, after oversized");
+    ensure_eq!(reply.message, "hello, after oversized");
 
-    close_webtransport_client(client, session).await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -3253,12 +3257,12 @@ async fn quinn_handles_many_concurrent_unary_calls() -> TestResult {
     let mut completed = 0;
     while let Some(result) = calls.join_next().await {
         let (name, message) = result??;
-        assert_eq!(message, format!("hello, {name}"));
+        ensure_eq!(message, format!("hello, {name}"));
         completed += 1;
     }
-    assert_eq!(completed, 64);
+    ensure_eq!(completed, 64);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -3289,9 +3293,9 @@ async fn run_mixed_workload(total_calls: usize, batch_size: usize) -> TestResult
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
 
-    let mut completed = 0;
+    let mut completed = 0_usize;
     for batch_start in (0..total_calls).step_by(batch_size.max(1)) {
-        let batch_end = total_calls.min(batch_start + batch_size.max(1));
+        let batch_end = total_calls.min(batch_start.saturating_add(batch_size.max(1)));
         let mut calls = JoinSet::new();
 
         for index in batch_start..batch_end {
@@ -3301,13 +3305,13 @@ async fn run_mixed_workload(total_calls: usize, batch_size: usize) -> TestResult
 
         while let Some(result) = calls.join_next().await {
             result??;
-            completed += 1;
+            completed = completed.saturating_add(1);
         }
     }
 
     assert_eq!(completed, total_calls);
 
-    close_client(endpoint, connection).await;
+    close_client(endpoint, connection).await?;
     server.shutdown().await
 }
 
@@ -3334,10 +3338,10 @@ async fn run_mixed_call(
                     authenticated_options(),
                 )
                 .await?;
-            let mut count = 0;
+            let mut count = 0_usize;
             while let Some(response) = responses.next().await {
                 assert!(response?.message.contains(&name));
-                count += 1;
+                count = count.saturating_add(1);
             }
             assert_eq!(count, 2);
         }
@@ -3390,8 +3394,8 @@ async fn hold_server_stream_open(
     let first = replies
         .next()
         .await
-        .expect("response stream should yield first item")?;
-    assert_eq!(first.message, "first");
+        .ok_or("response stream should yield first item")??;
+    ensure_eq!(first.message, "first");
 
     Ok(replies)
 }
@@ -3676,19 +3680,18 @@ fn decode_single_frame<M>(frame: &[u8]) -> trevrpc::Result<M>
 where
     M: Message + Default,
 {
-    if frame.len() < 4 {
+    let Some((header, body)) = frame.split_first_chunk::<4>() else {
         return Err(trevrpc::Error::transport(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "HTTP/3 response ended before the TrevRPC frame header",
         )));
-    }
-    let len = u32::from_be_bytes(frame[..4].try_into().expect("frame header is four bytes"));
-    if usize::try_from(len).ok() != Some(frame.len() - 4) {
+    };
+    if usize::try_from(u32::from_be_bytes(*header)).ok() != Some(body.len()) {
         return Err(trevrpc::Error::from(Status::invalid_argument(
             "HTTP/3 response did not contain exactly one TrevRPC frame",
         )));
     }
-    M::decode(&frame[4..]).map_err(trevrpc::Error::from)
+    M::decode(body).map_err(trevrpc::Error::from)
 }
 
 async fn read_http3_frame_body(
@@ -3699,7 +3702,7 @@ async fn read_http3_frame_body(
     if !read_http3_exact(recv, chunk, &mut header, true).await? {
         return Ok(None);
     }
-    let len = usize::try_from(u32::from_be_bytes(header)).expect("u32 should fit usize");
+    let len = usize::try_from(u32::from_be_bytes(header)).map_err(trevrpc::Error::transport)?;
     if len > trevrpc::framing::DEFAULT_MAX_FRAME_SIZE {
         return Err(trevrpc::Error::FrameTooLarge {
             len,
@@ -3717,11 +3720,12 @@ async fn read_http3_exact(
     output: &mut [u8],
     allow_clean_eof: bool,
 ) -> trevrpc::Result<bool> {
-    let mut offset = 0;
-    while offset < output.len() {
+    let total = output.len();
+    let mut rest = output;
+    while !rest.is_empty() {
         while chunk.is_empty() {
             let Some(mut next) = recv.recv_data().await.map_err(trevrpc::Error::transport)? else {
-                if allow_clean_eof && offset == 0 {
+                if allow_clean_eof && rest.len() == total {
                     return Ok(false);
                 }
                 return Err(trevrpc::Error::transport(std::io::Error::new(
@@ -3731,9 +3735,9 @@ async fn read_http3_exact(
             };
             *chunk = next.copy_to_bytes(next.remaining());
         }
-        let len = (output.len() - offset).min(chunk.len());
-        chunk.copy_to_slice(&mut output[offset..offset + len]);
-        offset += len;
+        let (filled, remaining) = rest.split_at_mut(rest.len().min(chunk.len()));
+        chunk.copy_to_slice(filled);
+        rest = remaining;
     }
     Ok(true)
 }
@@ -3750,46 +3754,49 @@ fn webtransport_url(server: &RunningServer, path: &str) -> TestResult<url::Url> 
 async fn expect_webtransport_connect_error(
     client: &web_transport_quinn::Client,
     request: web_transport_quinn::proto::ConnectRequest,
-) -> web_transport_quinn::ClientError {
+) -> TestResult<web_transport_quinn::ClientError> {
     match client.connect(request).await {
         Ok(session) => {
             session.close(0, b"unexpected test session");
-            panic!("WebTransport connect should have failed");
+            Err("WebTransport connect should have failed".into())
         }
-        Err(error) => error,
+        Err(error) => Ok(error),
     }
 }
 
 fn assert_webtransport_connect_rejected(
     error: web_transport_quinn::ClientError,
     expected: web_transport_quinn::http::StatusCode,
-) {
+) -> TestResult {
     match error {
         web_transport_quinn::ClientError::HttpError(
             web_transport_quinn::ConnectError::ErrorStatus(actual),
-        ) => assert_eq!(actual, expected),
+        ) => ensure_eq!(actual, expected),
         web_transport_quinn::ClientError::HttpError(
             web_transport_quinn::ConnectError::ProtoError(_),
         ) => {}
-        other => panic!("expected WebTransport HTTP status {expected}, got {other:?}"),
+        other => {
+            return Err(
+                format!("expected WebTransport HTTP status {expected}, got {other:?}").into(),
+            );
+        }
     }
+    Ok(())
 }
 
 async fn close_webtransport_client(
     _client: web_transport_quinn::Client,
     session: web_transport_quinn::Session,
-) {
+) -> TestResult {
     session.close(0, b"test complete");
-    tokio::time::timeout(TEST_TIMEOUT, session.closed())
-        .await
-        .expect("client WebTransport session should close");
+    tokio::time::timeout(TEST_TIMEOUT, session.closed()).await?;
+    Ok(())
 }
 
-async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) {
+async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) -> TestResult {
     connection.close(0_u32.into(), b"test complete");
-    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle())
-        .await
-        .expect("client endpoint should become idle");
+    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle()).await?;
+    Ok(())
 }
 
 fn authenticated_options() -> CallOptions {

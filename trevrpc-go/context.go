@@ -10,7 +10,7 @@ type handlerContextKey struct{}
 type HandlerContext struct {
 	Service  string
 	Method   string
-	Kind     RpcKind
+	Kind     RPCKind
 	Metadata Metadata
 }
 

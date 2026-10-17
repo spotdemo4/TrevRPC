@@ -26,8 +26,7 @@ func FuzzFrameDecodeNeverPanics(f *testing.F) {
 			return
 		}
 
-		var decodeErr *frameDecodeError
-		if !errors.As(err, &decodeErr) {
+		if _, ok := errors.AsType[*frameDecodeError](err); !ok {
 			t.Fatalf("expected frameDecodeError for malformed frame body, got %T: %v", err, err)
 		}
 		if status := StatusFromError(err); status.Code != CodeInvalidArgument {
@@ -47,8 +46,7 @@ func FuzzFrameLengthParsing(f *testing.F) {
 
 		read, err := readFrameOrEOF(bytes.NewReader(header), &wireRequest{}, 16)
 		if length > 16 {
-			var tooLarge *FrameTooLargeError
-			if !errors.As(err, &tooLarge) {
+			if _, ok := errors.AsType[*FrameTooLargeError](err); !ok {
 				t.Fatalf("expected FrameTooLargeError for length %d, got read=%t err=%T %v", length, read, err, err)
 			}
 			return

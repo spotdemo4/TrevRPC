@@ -493,7 +493,7 @@ func newInModuleFixture(t *testing.T) (runtimeRoot, root, relativeRoot, importPr
 
 func runFixtureTests(t *testing.T, runtimeRoot, relativeRoot string) {
 	t.Helper()
-	command := exec.Command("go", "test", "./"+filepath.ToSlash(relativeRoot)+"/...")
+	command := exec.CommandContext(t.Context(), "go", "test", "./"+filepath.ToSlash(relativeRoot)+"/...")
 	command.Dir = runtimeRoot
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()

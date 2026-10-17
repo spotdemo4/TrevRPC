@@ -14,9 +14,6 @@
     "^nix run \\.#sync-playwright$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
-  // update-kotlin-deps refreshes every Gradle dependency and then rebuilds the
-  // mitm-cache, which can exceed the 15-minute default on a cold runner.
-  "executionTimeout": 45,
   // Renovate sanitizes child environments, so configure this through its
   // explicit child-process environment instead of the workflow environment.
   "customEnvVariables": {

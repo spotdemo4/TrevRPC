@@ -171,7 +171,7 @@ impl Status {
 
     /// Returns terminal or response metadata carried by this status.
     #[must_use]
-    pub fn metadata(&self) -> &Metadata {
+    pub const fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 

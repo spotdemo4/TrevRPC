@@ -88,9 +88,9 @@ func WithMetadata(key string, value []byte) CallOption {
 
 // WithMaxFrameSize bounds the encoded size of each response message in bytes.
 // It defaults to DefaultMaxFrameSize; the channel's own frame size limit still applies.
-func WithMaxFrameSize(max int) CallOption {
+func WithMaxFrameSize(size int) CallOption {
 	return func(config *callConfig) {
-		config.maxResponseSize = max
+		config.maxResponseSize = size
 	}
 }
 
@@ -121,7 +121,7 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 		return zero, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, RpcKindUnary, requestBody, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(service, method, RPCKindUnary, requestBody, config, deadline, time.Now)
 	if err != nil {
 		return zero, err
 	}
@@ -165,7 +165,7 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 		return nil, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, RpcKindServerStreaming, requestBody, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(service, method, RPCKindServerStreaming, requestBody, config, deadline, time.Now)
 	if err != nil {
 		return nil, err
 	}
@@ -177,13 +177,13 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 		return nil, err
 	}
 
-	return newResponseMessageStream(response, newResponse, config, ctx, cancel), nil
+	return newResponseMessageStream(ctx, response, newResponse, config, cancel), nil
 }
 
 // ClientStreaming starts a client-streaming RPC.
 func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (ClientStreamingCall[Req, Res], error) {
 	config := applyCallOptions(options)
-	requests, responses, cancel, err := startStreamingCall[Req](ctx, transport, service, method, RpcKindClientStreaming, newResponse, config)
+	requests, responses, cancel, err := startStreamingCall[Req](ctx, transport, service, method, RPCKindClientStreaming, newResponse, config)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +193,7 @@ func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 
 // BidirectionalStreaming starts a bidirectional-streaming RPC.
 func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (BidirectionalStreamingCall[Req, Res], error) {
-	requests, responses, _, err := startStreamingCall[Req](ctx, transport, service, method, RpcKindBidirectionalStreaming, newResponse, applyCallOptions(options))
+	requests, responses, _, err := startStreamingCall[Req](ctx, transport, service, method, RPCKindBidirectionalStreaming, newResponse, applyCallOptions(options))
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +203,7 @@ func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Cont
 
 // startStreamingCall opens a streaming RPC whose requests are sent through the
 // returned pipe.
-func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, kind RpcKind, newResponse func() Res, config callConfig) (*messagePipe[Req], *responseMessageStream[Res], context.CancelFunc, error) {
+func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, kind RPCKind, newResponse func() Res, config callConfig) (*messagePipe[Req], *responseMessageStream[Res], context.CancelFunc, error) {
 	deadline, err := resolveClientDeadline(ctx, config, time.Now)
 	if err != nil {
 		return nil, nil, nil, err
@@ -222,7 +222,7 @@ func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context,
 		return nil, nil, nil, err
 	}
 
-	return requests, newResponseMessageStream(response, newResponse, config, ctx, cancel), cancel, nil
+	return requests, newResponseMessageStream(ctx, response, newResponse, config, cancel), cancel, nil
 }
 
 type clientStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {
@@ -317,7 +317,7 @@ func resolveClientDeadline(ctx context.Context, config callConfig, now func() ti
 	return clientDeadline{at: deadline, set: hasDeadline}, nil
 }
 
-func prepareClientRequest(service, method string, kind RpcKind, body []byte, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
+func prepareClientRequest(service, method string, kind RPCKind, body []byte, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
 	metadata := cloneMetadata(config.metadata)
 	if err := validateMetadata(metadata); err != nil {
 		return nil, err
@@ -422,7 +422,7 @@ type responseMessageStream[T ProtoMessage] struct {
 	terminalStatus *Status
 }
 
-func newResponseMessageStream[T ProtoMessage](inner frameStream, newMessage func() T, config callConfig, ctx context.Context, cancel context.CancelFunc) *responseMessageStream[T] {
+func newResponseMessageStream[T ProtoMessage](ctx context.Context, inner frameStream, newMessage func() T, config callConfig, cancel context.CancelFunc) *responseMessageStream[T] {
 	return &responseMessageStream[T]{inner: inner, newMessage: newMessage, config: config, ctx: ctx, cancel: cancel}
 }
 
@@ -441,16 +441,15 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 			return zero, io.EOF
 		}
 
-		s.finish()
-		if err == io.EOF {
+		s.abort()
+		if errors.Is(err, io.EOF) {
 			return zero, newResponseStreamFailure(
 				"missing_terminal_status",
 				Internal("response stream ended before final status"),
 				err,
 			)
 		}
-		var decodeError *frameDecodeError
-		if errors.As(err, &decodeError) {
+		if _, ok := errors.AsType[*frameDecodeError](err); ok {
 			return zero, newResponseStreamFailure(
 				"malformed_protobuf",
 				Internal("failed to decode response frame: "+err.Error()),
@@ -464,17 +463,17 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 	switch frame.kind {
 	case wireFrameMessage:
 		if len(frame.body) > s.config.maxResponseSize {
-			s.finish()
+			s.abort()
 			return zero, &FrameTooLargeError{Len: len(frame.body), Max: s.config.maxResponseSize}
 		}
 
 		message, err := invokeResponseFactory(s.newMessage)
 		if err != nil {
-			s.finish()
+			s.abort()
 			return zero, err
 		}
 		if err := unmarshalMessage(frame.body, message); err != nil {
-			s.finish()
+			s.abort()
 			return zero, newResponseStreamFailure(
 				"malformed_protobuf",
 				Internal("failed to decode response: "+err.Error()),
@@ -485,7 +484,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		return message, nil
 	case wireFrameStatus:
 		if err := validateMetadata(frame.metadata); err != nil {
-			s.finish()
+			s.abort()
 			return zero, newResponseStreamFailure(
 				"invalid_metadata",
 				Internal("invalid response metadata: "+err.Error()),
@@ -495,15 +494,15 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		status := frame.statusValue()
 		_, trailingErr := recvClientFrame(s.ctx, s.inner)
 		if trailingErr == nil {
-			s.finish()
+			s.abort()
 			return zero, newResponseStreamFailure(
 				"trailing_frame",
 				Internal("response stream contained data after final status"),
 				nil,
 			)
 		}
-		if trailingErr != io.EOF {
-			s.finish()
+		if !errors.Is(trailingErr, io.EOF) {
+			s.abort()
 			return zero, newResponseStreamFailure(
 				"trailing_frame",
 				Internal("response stream did not end cleanly after final status"),
@@ -524,7 +523,7 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 
 		return zero, newResponseStreamFailure("remote_status", status, nil)
 	default:
-		s.finish()
+		s.abort()
 		return zero, newResponseStreamFailure(
 			"unsupported_frame_kind",
 			InvalidArgument("response stream contained an unknown frame kind"),
@@ -564,6 +563,12 @@ func (s *responseMessageStream[T]) finish() error {
 	}
 	s.closeErrRead = true
 	return s.closeErr
+}
+
+// abort finishes the stream on a failure path. The caller already returns a
+// more specific error, so the cleanup error is discarded.
+func (s *responseMessageStream[T]) abort() {
+	_ = s.finish()
 }
 
 func (s *responseMessageStream[T]) wasClosedLocally() bool {
@@ -614,7 +619,7 @@ func recvWithContext[T any](ctx context.Context, stream any, recv func() (T, err
 	if deadlineStream, ok := stream.(readDeadlineStream); ok && (hasDeadline || streamContextCancelsRecv(stream)) {
 		if hasDeadline {
 			_ = deadlineStream.SetReadDeadline(deadline)
-			defer deadlineStream.SetReadDeadline(time.Time{})
+			defer func() { _ = deadlineStream.SetReadDeadline(time.Time{}) }()
 		}
 
 		value, err := recv()
@@ -687,7 +692,7 @@ func readSingleResponse[Res ProtoMessage](responses ResponseStream[Res]) (Res, M
 			}
 			continue
 		}
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			return zero, nil, err
 		}
 		break

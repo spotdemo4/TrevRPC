@@ -180,5 +180,5 @@ func (o connOpener) openStream(ctx context.Context) (clientStream, error) {
 
 type quicClientStream struct{ *quic.Stream }
 
-func (s quicClientStream) cancelRead()  { s.Stream.CancelRead(streamErrorCancelled) }
-func (s quicClientStream) cancelWrite() { s.Stream.CancelWrite(streamErrorCancelled) }
+func (s quicClientStream) cancelRead()  { s.CancelRead(streamErrorCancelled) }
+func (s quicClientStream) cancelWrite() { s.CancelWrite(streamErrorCancelled) }

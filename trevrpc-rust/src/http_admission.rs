@@ -1,16 +1,39 @@
 //! Validation and admission shared by every HTTP binding: HTTP/3 and HTTP/2 requests, and
 //! `WebTransport` and WebSocket browser sessions.
 
-use http::{Method, Request, StatusCode, header};
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 
 use crate::server::{AdmissionHeader, Server};
 
 /// The media type of `TrevRPC` request and response bodies.
-pub(crate) const MEDIA_TYPE: &str = "application/trevrpc";
+pub const MEDIA_TYPE: &str = "application/trevrpc";
+
+/// The head of an accepted RPC response, advertising HTTP/3 through `Alt-Svc` when given.
+pub fn rpc_response_head(alt_svc: Option<HeaderValue>) -> Response<()> {
+    let mut response = Response::new(());
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(MEDIA_TYPE));
+    if let Some(alt_svc) = alt_svc {
+        headers.insert(header::ALT_SVC, alt_svc);
+    }
+    response
+}
+
+/// The head of a response rejecting a request with `status`.
+pub fn rejection_head(status: StatusCode) -> Response<()> {
+    let mut response = Response::new(());
+    *response.status_mut() = status;
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("POST"));
+    }
+    response
+}
 
 /// Validates an HTTP RPC request and runs the HTTP admission callback, returning the rejection
 /// status when it is not accepted.
-pub(crate) fn validate_http_request(server: &Server, request: &Request<()>) -> Option<StatusCode> {
+pub fn validate_http_request(server: &Server, request: &Request<()>) -> Option<StatusCode> {
     let options = server.options();
     if !options.http_enabled() || request.uri().path() != options.http_path() {
         return Some(StatusCode::NOT_FOUND);
@@ -37,7 +60,7 @@ pub(crate) fn validate_http_request(server: &Server, request: &Request<()>) -> O
     None
 }
 
-pub(crate) fn valid_content_type(headers: &http::HeaderMap) -> bool {
+pub fn valid_content_type(headers: &http::HeaderMap) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
         return false;
@@ -45,7 +68,7 @@ pub(crate) fn valid_content_type(headers: &http::HeaderMap) -> bool {
     values.next().is_none() && value.as_bytes().eq_ignore_ascii_case(MEDIA_TYPE.as_bytes())
 }
 
-pub(crate) fn admission_headers(headers: &http::HeaderMap) -> Vec<AdmissionHeader<'_>> {
+pub fn admission_headers(headers: &http::HeaderMap) -> Vec<AdmissionHeader<'_>> {
     headers
         .iter()
         .map(|(name, value)| AdmissionHeader {
@@ -57,7 +80,7 @@ pub(crate) fn admission_headers(headers: &http::HeaderMap) -> Vec<AdmissionHeade
 
 /// Validates a browser session request (`WebTransport` or WebSocket) against the shared path and
 /// the session admission policy, returning the rejection status when it is not accepted.
-pub(crate) fn validate_webtransport_admission(
+pub fn validate_webtransport_admission(
     server: &Server,
     path: &str,
     authority: Option<&str>,

@@ -8,10 +8,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
+use crate::sync::MutexExt as _;
 use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
-pub(crate) const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
-pub(crate) const DEFAULT_REPROBE_INTERVAL: Duration = Duration::from_mins(5);
+pub const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
+pub const DEFAULT_REPROBE_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Which transports a [`super::Channel`] connects with.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -37,7 +38,7 @@ pub enum TransportKind {
 
 /// The established transport of one connection generation.
 #[derive(Clone)]
-pub(crate) enum GenerationTransport {
+pub enum GenerationTransport {
     Quic(QuicTransport),
     Qmux(QmuxTransport),
 }
@@ -96,14 +97,14 @@ impl StreamingRpcTransport for GenerationTransport {
 
 /// How to reach a server's TCP listener.
 #[derive(Clone)]
-pub(crate) struct TcpDialer {
+pub struct TcpDialer {
     pub(crate) addr: Option<SocketAddr>,
     pub(crate) tls: quinn::rustls::ClientConfig,
 }
 
 /// Dials every connection generation of a channel.
 #[derive(Clone)]
-pub(crate) struct Dialer {
+pub struct Dialer {
     pub(crate) endpoint: quinn::Endpoint,
     pub(crate) remote_addr: SocketAddr,
     pub(crate) server_name: String,
@@ -127,13 +128,12 @@ impl Dialer {
                 "TransportPolicy::TcpOnly requires ChannelConfig::with_tcp_fallback",
             ))),
             (TransportPolicy::Auto, Some(tcp)) => {
-                let remembered = *self.quic_failed_at.lock().expect("dialer lock poisoned");
+                let remembered = *self.quic_failed_at.lock_unpoisoned();
                 if remembered.is_some_and(|failed| failed.elapsed() < self.reprobe_interval) {
                     return self.dial_tcp(tcp).await;
                 }
                 let transport = self.race(tcp).await?;
-                *self.quic_failed_at.lock().expect("dialer lock poisoned") = match transport.kind()
-                {
+                *self.quic_failed_at.lock_unpoisoned() = match transport.kind() {
                     TransportKind::Quic => None,
                     TransportKind::Qmux => Some(Instant::now()),
                 };

@@ -7,8 +7,9 @@ on:
     inputs:
       debug:
         description: Enable Renovate debug logging
-        default: false
+        required: false
         type: boolean
+        default: false
 
 # yaml-language-server-disable is not allowed
 enable-openid-connect: true
@@ -29,6 +30,9 @@ jobs:
         run: renovate
         env:
           RENOVATE_CONFIG_FILE: .forgejo/renovate.json
+          # update-kotlin-deps refreshes every Gradle dependency and then rebuilds the
+          # mitm-cache, which can exceed the 15-minute default on a cold runner.
+          RENOVATE_EXECUTION_TIMEOUT: 45
           RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
           RENOVATE_GITHUB_COM_TOKEN: ${{ secrets.GH_TOKEN }}
           LOG_LEVEL: ${{ inputs.debug && 'debug' || 'info' }}

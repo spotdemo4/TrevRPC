@@ -5,7 +5,6 @@
   importNpmLock,
   nodejs_24,
   makeWrapper,
-  oxfmt,
   oxlint,
   protobuf,
   gnugrep,
@@ -73,12 +72,10 @@ buildNpmPackage (final: {
 
   doCheck = true;
   nativeCheckInputs = [
-    oxfmt
     oxlint
   ];
   checkPhase = ''
     runHook preCheck
-    oxfmt --check
     oxlint --deny-warnings
     npm run typecheck
     npm test

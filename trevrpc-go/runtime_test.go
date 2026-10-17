@@ -171,7 +171,7 @@ func TestMetadataValidation(t *testing.T) {
 
 func TestWireProtocolValidation(t *testing.T) {
 	request := newWireRequest("service", "method", nil)
-	if request.rpcKind() != RpcKindUnary {
+	if request.rpcKind() != RPCKindUnary {
 		t.Fatalf("expected unary default kind, got %d", request.rpcKind())
 	}
 	if request.Version != wireVersion {
@@ -184,7 +184,7 @@ func TestWireProtocolValidation(t *testing.T) {
 	}
 
 	request.Version = wireVersion
-	request.Kind = RpcKind(99)
+	request.Kind = RPCKind(99)
 	if status := StatusFromError(request.validateProtocol()); status.Code != CodeInvalidArgument {
 		t.Fatalf("expected invalid argument for unknown RPC kind, got %v", status)
 	}
@@ -223,7 +223,7 @@ func TestUnaryClientServer(t *testing.T) {
 
 func TestStreamingClientServer(t *testing.T) {
 	server := NewServer()
-	server.routeStreaming("example.Greeter", "LotsOfReplies", RpcKindServerStreaming, func(_ context.Context, body []byte, _ byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "LotsOfReplies", RPCKindServerStreaming, func(_ context.Context, body []byte, _ byteStream) (byteStream, error) {
 		request := &testMessage{}
 		if err := unmarshalMessage(body, request); err != nil {
 			return nil, err
@@ -249,7 +249,7 @@ func TestStreamingClientServer(t *testing.T) {
 		t.Fatalf("second response failed: %v", err)
 	}
 	_, err = stream.Recv()
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected final EOF, got %v", err)
 	}
 
@@ -260,11 +260,11 @@ func TestStreamingClientServer(t *testing.T) {
 
 func TestClientStreamingClientServer(t *testing.T) {
 	server := NewServer()
-	server.routeStreaming("example.Greeter", "LotsOfGreetings", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "LotsOfGreetings", RPCKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		var combined strings.Builder
 		for {
 			body, err := requests.Recv()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
@@ -294,7 +294,7 @@ func TestClientStreamingClientServer(t *testing.T) {
 
 func TestBidirectionalStreamingClientServer(t *testing.T) {
 	server := NewServer()
-	server.routeStreaming("example.Greeter", "BidiHello", RpcKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "BidiHello", RPCKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		return newEncodeStream[*testMessage](&echoTestMessages{requests: newDecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })}), nil
 	})
 
@@ -311,7 +311,7 @@ func TestBidirectionalStreamingClientServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second bidi response failed: %v", err)
 	}
-	if _, err := stream.Recv(); err != io.EOF {
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("expected final EOF, got %v", err)
 	}
 
@@ -328,13 +328,13 @@ func TestResponseStreamTerminalOKDoesNotHideCloseError(t *testing.T) {
 	}
 	closeErr := InvalidArgument("local upload failed")
 	stream := newResponseMessageStream[*testMessage](
+		context.Background(),
 		&closeErrorFrameStream{
 			frames: []*wireStreamFrame{messageFrame(body), statusFrame(OK())},
 			err:    closeErr,
 		},
 		func() *testMessage { return &testMessage{} },
 		defaultCallConfig(),
-		context.Background(),
 		func() {},
 	)
 
@@ -355,13 +355,13 @@ func TestResponseStreamTerminalOKDoesNotHideCloseError(t *testing.T) {
 func TestResponseStreamTerminalErrorWinsOverCloseError(t *testing.T) {
 	closeErr := InvalidArgument("local upload failed")
 	stream := newResponseMessageStream[*testMessage](
+		context.Background(),
 		&closeErrorFrameStream{
 			frames: []*wireStreamFrame{statusFrame(NewStatus(CodePermissionDenied, "remote rejected upload"))},
 			err:    closeErr,
 		},
 		func() *testMessage { return &testMessage{} },
 		defaultCallConfig(),
-		context.Background(),
 		func() {},
 	)
 
@@ -377,10 +377,10 @@ func TestResponseStreamLocalCancelWinsOverReadyStreamError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	stream := newResponseMessageStream[*testMessage](
+		ctx,
 		uploadErrorFrameStream{errors: errors},
 		func() *testMessage { return &testMessage{} },
 		defaultCallConfig(),
-		ctx,
 		func() {},
 	)
 
@@ -394,13 +394,13 @@ func TestResponseStreamLocalCancelWinsOverTerminalOKCloseError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	stream := newResponseMessageStream[*testMessage](
+		ctx,
 		&closeErrorFrameStream{
 			frames: []*wireStreamFrame{statusFrame(OK())},
 			err:    InvalidArgument("local close failed"),
 		},
 		func() *testMessage { return &testMessage{} },
 		defaultCallConfig(),
-		ctx,
 		func() {},
 	)
 
@@ -425,10 +425,10 @@ func TestResponseStreamCloseIsIdempotentAndSurfacesCloseError(t *testing.T) {
 	inner := &closeErrorFrameStream{err: closeErr}
 	cancels := 0
 	stream := newResponseMessageStream[*testMessage](
+		context.Background(),
 		inner,
 		func() *testMessage { return &testMessage{} },
 		defaultCallConfig(),
-		context.Background(),
 		func() { cancels++ },
 	)
 
@@ -444,7 +444,7 @@ func TestResponseStreamCloseIsIdempotentAndSurfacesCloseError(t *testing.T) {
 	if cancels != 1 {
 		t.Fatalf("cancel called %d times, want 1", cancels)
 	}
-	if _, err := stream.Recv(); err != io.EOF {
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("closed response stream Recv() = %v, want EOF", err)
 	}
 }
@@ -460,10 +460,10 @@ func TestServerRejectsUnsupportedWireVersionBeforeRouteLookup(t *testing.T) {
 	}
 }
 
-func TestServerRejectsUnsupportedRpcKindBeforeRouteLookup(t *testing.T) {
+func TestServerRejectsUnsupportedRPCKindBeforeRouteLookup(t *testing.T) {
 	server := NewServer()
 	request := newWireRequest("example.Greeter", "Missing", nil)
-	request.Kind = RpcKind(99)
+	request.Kind = RPCKind(99)
 
 	response := server.handleRequest(context.Background(), request)
 	if CodeFromUint32(response.Status) != CodeInvalidArgument {
@@ -624,7 +624,7 @@ func TestServerUnaryCompletionMetricsForTerminalStatuses(t *testing.T) {
 
 func TestServerRequestStreamPanicReturnsInternal(t *testing.T) {
 	server := NewServer()
-	server.routeStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Upload", RPCKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		_, err := requests.Recv()
 		if err != nil {
 			return nil, err
@@ -634,7 +634,7 @@ func TestServerRequestStreamPanicReturnsInternal(t *testing.T) {
 	})
 
 	request := newWireRequest("example.Greeter", "Upload", nil)
-	request.Kind = RpcKindClientStreaming
+	request.Kind = RPCKindClientStreaming
 	response := server.handleStreamingRequest(context.Background(), request, panickingByteStream{})
 	frame, err := response.Recv()
 	if err != nil {
@@ -647,12 +647,12 @@ func TestServerRequestStreamPanicReturnsInternal(t *testing.T) {
 
 func TestServerResponseStreamPanicReturnsInternal(t *testing.T) {
 	server := NewServer()
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return panickingByteStream{}, nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
 	frame, err := response.Recv()
 	if err != nil {
@@ -668,10 +668,10 @@ func TestRequestStreamMessageLimitReturnsResourceExhausted(t *testing.T) {
 	options := DefaultServerOptions()
 	options.MaxStreamMessages = 1
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Upload", RPCKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		for {
 			_, err := requests.Recv()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
@@ -683,7 +683,7 @@ func TestRequestStreamMessageLimitReturnsResourceExhausted(t *testing.T) {
 	})
 
 	request := newWireRequest("example.Greeter", "Upload", nil)
-	request.Kind = RpcKindClientStreaming
+	request.Kind = RPCKindClientStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newSliceStream([]byte("one"), []byte("two")))
 	frame, err := response.Recv()
 	if err != nil {
@@ -702,10 +702,10 @@ func TestRequestStreamLimitBoundaries(t *testing.T) {
 	options.StreamIdleTimeout = 0
 	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Upload", RPCKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		for {
 			_, err := requests.Recv()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
@@ -717,7 +717,7 @@ func TestRequestStreamLimitBoundaries(t *testing.T) {
 	})
 
 	request := newWireRequest("example.Greeter", "Upload", nil)
-	request.Kind = RpcKindClientStreaming
+	request.Kind = RPCKindClientStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newSliceStream([]byte("a"), []byte("bc")))
 	frame, err := response.Recv()
 	if err != nil {
@@ -743,10 +743,10 @@ func TestRequestStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
 	options.MaxStreamMessages = -1
 	options.StreamIdleTimeout = time.Millisecond
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Upload", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Upload", RPCKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
 		for {
 			_, err := requests.Recv()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
@@ -758,7 +758,7 @@ func TestRequestStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
 	})
 
 	request := newWireRequest("example.Greeter", "Upload", nil)
-	request.Kind = RpcKindClientStreaming
+	request.Kind = RPCKindClientStreaming
 	response := server.handleStreamingRequest(context.Background(), request, pendingByteStream{})
 	frame, err := response.Recv()
 	if err != nil {
@@ -774,12 +774,12 @@ func TestResponseStreamBodyLimitReturnsResourceExhausted(t *testing.T) {
 	options := DefaultServerOptions()
 	options.MaxStreamBodySize = 3
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return newSliceStream([]byte("four")), nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
 	frame, err := response.Recv()
 	if err != nil {
@@ -798,12 +798,12 @@ func TestResponseStreamLimitBoundaries(t *testing.T) {
 	options.StreamIdleTimeout = 0
 	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return newSliceStream([]byte("a"), []byte("bc")), nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
 	for _, expected := range [][]byte{[]byte("a"), []byte("bc")} {
 		frame, err := response.Recv()
@@ -826,7 +826,7 @@ func TestResponseStreamLimitBoundaries(t *testing.T) {
 	options.MaxStreamMessages = 1
 	options.MaxStreamBodySize = 3
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return newSliceStream([]byte("a"), []byte("bc")), nil
 	})
 	response = server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
@@ -863,12 +863,12 @@ func TestResponseStreamIdleTimeoutReturnsUnavailable(t *testing.T) {
 	options := DefaultServerOptions()
 	options.StreamIdleTimeout = time.Millisecond
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return pendingByteStream{}, nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
 	frame, err := response.Recv()
 	if err != nil {
@@ -883,15 +883,18 @@ func TestResponseStreamCloseRecordsCancelled(t *testing.T) {
 	metrics := &recordingMetrics{}
 	server := NewServer()
 	server.SetMetrics(metrics)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return pendingByteStream{}, nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
-	closeMessageStream(response)
-	closeMessageStream(response)
+	for range 2 {
+		if err := closeMessageStream(response); err != nil {
+			t.Fatalf("closeMessageStream() error = %v", err)
+		}
+	}
 
 	expectMetrics(t, metrics, CodeCancelled)
 }
@@ -899,12 +902,12 @@ func TestResponseStreamCloseRecordsCancelled(t *testing.T) {
 func TestServerDrainsFiniteRequestBeforeResponseClose(t *testing.T) {
 	tests := []struct {
 		name      string
-		kind      RpcKind
+		kind      RPCKind
 		configure func(*Server)
 	}{
 		{
 			name: "unary",
-			kind: RpcKindUnary,
+			kind: RPCKindUnary,
 			configure: func(server *Server) {
 				routeBytes(server, "example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
 					return []byte("response"), nil
@@ -913,9 +916,9 @@ func TestServerDrainsFiniteRequestBeforeResponseClose(t *testing.T) {
 		},
 		{
 			name: "server streaming",
-			kind: RpcKindServerStreaming,
+			kind: RPCKindServerStreaming,
 			configure: func(server *Server) {
-				server.routeStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+				server.routeStreaming("example.Greeter", "Call", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 					return newSliceStream([]byte("response")), nil
 				})
 			},
@@ -953,19 +956,19 @@ func TestServerDrainsFiniteRequestBeforeResponseClose(t *testing.T) {
 }
 
 func TestServerFiniteRequestDrainUsesRPCDeadline(t *testing.T) {
-	for _, kind := range []RpcKind{RpcKindUnary, RpcKindServerStreaming} {
+	for _, kind := range []RPCKind{RPCKindUnary, RPCKindServerStreaming} {
 		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
 			server := NewServer()
 			options := DefaultServerOptions()
 			options.InitialRequestTimeout = time.Second
 			server.SetOptions(options)
-			if kind == RpcKindUnary {
+			if kind == RPCKindUnary {
 				routeBytes(server, "example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
 					time.Sleep(20 * time.Millisecond)
 					return []byte("response"), nil
 				})
 			} else {
-				server.routeStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+				server.routeStreaming("example.Greeter", "Call", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 					time.Sleep(20 * time.Millisecond)
 					return newSliceStream([]byte("response")), nil
 				})
@@ -1020,19 +1023,19 @@ func TestFiniteRequestDrainPreservesTransportTimeout(t *testing.T) {
 }
 
 func TestServerFiniteRequestDrainReusesInitialRequestDeadline(t *testing.T) {
-	for _, kind := range []RpcKind{RpcKindUnary, RpcKindServerStreaming} {
+	for _, kind := range []RPCKind{RPCKindUnary, RPCKindServerStreaming} {
 		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
 			server := NewServer()
 			options := DefaultServerOptions()
 			options.InitialRequestTimeout = time.Second
 			server.SetOptions(options)
-			if kind == RpcKindUnary {
+			if kind == RPCKindUnary {
 				routeBytes(server, "example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
 					time.Sleep(20 * time.Millisecond)
 					return []byte("response"), nil
 				})
 			} else {
-				server.routeStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+				server.routeStreaming("example.Greeter", "Call", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 					time.Sleep(20 * time.Millisecond)
 					return newSliceStream([]byte("response")), nil
 				})
@@ -1067,12 +1070,12 @@ func TestServerFiniteRequestDrainReusesInitialRequestDeadline(t *testing.T) {
 func TestServerRejectsFiniteRequestTrailingDataBeforeHandler(t *testing.T) {
 	tests := []struct {
 		name      string
-		kind      RpcKind
+		kind      RPCKind
 		configure func(*Server, *bool)
 	}{
 		{
 			name: "unary",
-			kind: RpcKindUnary,
+			kind: RPCKindUnary,
 			configure: func(server *Server, called *bool) {
 				routeBytes(server, "example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
 					*called = true
@@ -1082,9 +1085,9 @@ func TestServerRejectsFiniteRequestTrailingDataBeforeHandler(t *testing.T) {
 		},
 		{
 			name: "server streaming",
-			kind: RpcKindServerStreaming,
+			kind: RPCKindServerStreaming,
 			configure: func(server *Server, called *bool) {
-				server.routeStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+				server.routeStreaming("example.Greeter", "Call", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 					*called = true
 					return newSliceStream([]byte("response")), nil
 				})
@@ -1117,7 +1120,7 @@ func TestServerRejectsFiniteRequestTrailingDataBeforeHandler(t *testing.T) {
 			if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
 				t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
 			}
-			if test.kind == RpcKindUnary {
+			if test.kind == RPCKindUnary {
 				response := &wireResponse{}
 				if err := readFrame(bytes.NewReader(stream.written.Bytes()), response, DefaultMaxFrameSize); err != nil {
 					t.Fatalf("read unary rejection: %v", err)
@@ -1136,7 +1139,7 @@ func TestServerRejectsFiniteRequestTrailingDataBeforeHandler(t *testing.T) {
 }
 
 func TestAdmissionRejectedUploadCancelsRead(t *testing.T) {
-	for _, kind := range []RpcKind{RpcKindClientStreaming, RpcKindBidirectionalStreaming} {
+	for _, kind := range []RPCKind{RPCKindClientStreaming, RPCKindBidirectionalStreaming} {
 		t.Run(fmt.Sprintf("kind-%d", kind), func(t *testing.T) {
 			server := NewServer()
 			options := DefaultServerOptions()
@@ -1187,7 +1190,7 @@ func TestMalformedFiniteRequestDoesNotWaitForFIN(t *testing.T) {
 		name      string
 		configure func(*wireRequest)
 	}{
-		{name: "invalid kind", configure: func(request *wireRequest) { request.Kind = RpcKind(99) }},
+		{name: "invalid kind", configure: func(request *wireRequest) { request.Kind = RPCKind(99) }},
 		{name: "oversized timeout", configure: func(request *wireRequest) { request.TimeoutNanos = math.MaxInt64 + 1 }},
 	}
 
@@ -1236,12 +1239,12 @@ func TestServerAbortsRPCStreamOnResponseWriteError(t *testing.T) {
 	writeErr := errors.New("response write failed")
 	tests := []struct {
 		name      string
-		kind      RpcKind
+		kind      RPCKind
 		configure func(*Server)
 	}{
 		{
 			name: "unary",
-			kind: RpcKindUnary,
+			kind: RPCKindUnary,
 			configure: func(server *Server) {
 				routeBytes(server, "example.Greeter", "Call", func(context.Context, []byte) ([]byte, error) {
 					return []byte("response"), nil
@@ -1250,9 +1253,9 @@ func TestServerAbortsRPCStreamOnResponseWriteError(t *testing.T) {
 		},
 		{
 			name: "server streaming batch",
-			kind: RpcKindServerStreaming,
+			kind: RPCKindServerStreaming,
 			configure: func(server *Server) {
-				server.routeStreaming("example.Greeter", "Call", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+				server.routeStreaming("example.Greeter", "Call", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 					return newSliceStream([]byte("response")), nil
 				})
 			},
@@ -1324,12 +1327,12 @@ func TestServerResponseBatchWriterBatchesNonBlockingMessages(t *testing.T) {
 	options.StreamIdleTimeout = 0
 	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return newSliceStream([]byte("one"), []byte("two"), []byte("three")), nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	var input bytes.Buffer
 	if err := writeFrame(&input, request, DefaultMaxFrameSize); err != nil {
 		t.Fatalf("write request frame: %v", err)
@@ -1365,14 +1368,14 @@ func TestServerResponseBatchWriterSplitsOnByteCap(t *testing.T) {
 	options.StreamIdleTimeout = 0
 	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return newSliceStream([]byte("abcd"), []byte("efgh"), []byte("ijkl")), nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
-	defer closeMessageStream(response)
+	defer discardMessageStream(response)
 	frameWriter, ok := response.(transportResponseFramesWriter)
 	if !ok {
 		t.Fatal("server response stream should expose batched frame writer")
@@ -1415,14 +1418,14 @@ func TestServerResponseBatchWriterFallsBackWithIdleTimeout(t *testing.T) {
 	options.MaxStreamMessages = -1
 	options.StreamIdleTimeout = testTimeout
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return newSliceStream([]byte("one"), []byte("two")), nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
-	defer closeMessageStream(response)
+	defer discardMessageStream(response)
 	frameWriter, ok := response.(transportResponseFramesWriter)
 	if !ok {
 		t.Fatal("server response stream should expose batched frame writer")
@@ -1449,14 +1452,14 @@ func TestServerResponseBatchWriterPreservesTerminalStatusAfterBatch(t *testing.T
 	options.StreamIdleTimeout = 0
 	options.DisableStreamIdleTimeout = true
 	server.SetOptions(options)
-	server.routeStreaming("example.Greeter", "Download", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming("example.Greeter", "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return newSliceStream([]byte("ok"), []byte("too")), nil
 	})
 
 	request := newWireRequest("example.Greeter", "Download", nil)
-	request.Kind = RpcKindServerStreaming
+	request.Kind = RPCKindServerStreaming
 	response := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]())
-	defer closeMessageStream(response)
+	defer discardMessageStream(response)
 	frameWriter, ok := response.(transportResponseFramesWriter)
 	if !ok {
 		t.Fatal("server response stream should expose batched frame writer")
@@ -1492,13 +1495,13 @@ func TestServerResponseBatchWriterPreservesTerminalStatusAfterBatch(t *testing.T
 func TestClientResponseStreamDeadlineReturnsDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	stream := newResponseMessageStream[*testMessage](pendingFrameStream{}, func() *testMessage { return &testMessage{} }, defaultCallConfig(), ctx, func() {})
+	stream := newResponseMessageStream[*testMessage](ctx, pendingFrameStream{}, func() *testMessage { return &testMessage{} }, defaultCallConfig(), func() {})
 
 	_, err := stream.Recv()
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
 	}
-	if _, err := stream.Recv(); err != io.EOF {
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("expected EOF after deadline, got %v", err)
 	}
 }
@@ -1648,13 +1651,14 @@ func TestServerFreezesConfigurationOnDirectHandle(t *testing.T) {
 			server.routeUnary("service", "other", func(context.Context, []byte) (*wireResponse, error) { return okWireResponse(nil), nil })
 		},
 		func() {
-			server.routeStreaming("service", "stream", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) { return newEmptyStream[[]byte](), nil })
+			server.routeStreaming("service", "stream", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) { return newEmptyStream[[]byte](), nil })
 		},
 	}
 	for index, mutate := range mutations {
 		func() {
 			defer func() {
-				if recovered := recover(); recovered != ErrServerFrozen {
+				recovered := recover()
+				if err, ok := recovered.(error); !ok || !errors.Is(err, ErrServerFrozen) {
 					t.Errorf("mutation %d panic = %#v, want ErrServerFrozen", index, recovered)
 				}
 			}()
@@ -1676,12 +1680,12 @@ func TestServerRejectsInvalidRoutesBeforeServing(t *testing.T) {
 		},
 		func(server *Server) { server.routeUnary("service", "method", nil) },
 		func(server *Server) {
-			server.routeStreaming("service", "method", RpcKindUnary, func(context.Context, []byte, byteStream) (byteStream, error) { return nil, nil })
+			server.routeStreaming("service", "method", RPCKindUnary, func(context.Context, []byte, byteStream) (byteStream, error) { return nil, nil })
 		},
 		func(server *Server) {
-			server.routeStreaming("service", "method", RpcKind(99), func(context.Context, []byte, byteStream) (byteStream, error) { return nil, nil })
+			server.routeStreaming("service", "method", RPCKind(99), func(context.Context, []byte, byteStream) (byteStream, error) { return nil, nil })
 		},
-		func(server *Server) { server.routeStreaming("service", "method", RpcKindServerStreaming, nil) },
+		func(server *Server) { server.routeStreaming("service", "method", RPCKindServerStreaming, nil) },
 	}
 	for index, register := range tests {
 		func() {
@@ -1731,7 +1735,7 @@ func TestMetadataValueAuthorizerSnapshotsExpectedValue(t *testing.T) {
 }
 
 func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
-	deadlineRequest := func(method string, kind RpcKind) *wireRequest {
+	deadlineRequest := func(method string, kind RPCKind) *wireRequest {
 		request := newWireRequest("service", method, nil)
 		request.Kind = kind
 		request.TimeoutNanos = uint64(10 * time.Millisecond)
@@ -1744,7 +1748,7 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 			<-ctx.Done()
 			return []byte("late success"), nil
 		})
-		response := server.handleRequest(context.Background(), deadlineRequest("method", RpcKindUnary))
+		response := server.handleRequest(context.Background(), deadlineRequest("method", RPCKindUnary))
 		if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
 			t.Fatalf("response = %#v, want deadline exceeded", response)
 		}
@@ -1756,7 +1760,7 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 			<-ctx.Done()
 			return okWireResponse([]byte("late success")), nil
 		})
-		response := server.handleRequest(context.Background(), deadlineRequest("method", RpcKindUnary))
+		response := server.handleRequest(context.Background(), deadlineRequest("method", RPCKindUnary))
 		if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
 			t.Fatalf("response = %#v, want deadline exceeded", response)
 		}
@@ -1769,7 +1773,7 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 			return nil
 		}))
 		routeBytes(server, "service", "method", func(context.Context, []byte) ([]byte, error) { return nil, nil })
-		response := server.handleRequest(context.Background(), deadlineRequest("method", RpcKindUnary))
+		response := server.handleRequest(context.Background(), deadlineRequest("method", RPCKindUnary))
 		if CodeFromUint32(response.Status) != CodeDeadlineExceeded {
 			t.Fatalf("response = %#v, want deadline exceeded", response)
 		}
@@ -1778,11 +1782,11 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 	t.Run("streaming handler closes late stream", func(t *testing.T) {
 		server := NewServer()
 		late := &closeCountingByteStream{}
-		server.routeStreaming("service", "method", RpcKindServerStreaming, func(ctx context.Context, _ []byte, _ byteStream) (byteStream, error) {
+		server.routeStreaming("service", "method", RPCKindServerStreaming, func(ctx context.Context, _ []byte, _ byteStream) (byteStream, error) {
 			<-ctx.Done()
 			return late, nil
 		})
-		frame, err := server.handleStreamingRequest(context.Background(), deadlineRequest("method", RpcKindServerStreaming), newEmptyStream[[]byte]()).Recv()
+		frame, err := server.handleStreamingRequest(context.Background(), deadlineRequest("method", RPCKindServerStreaming), newEmptyStream[[]byte]()).Recv()
 		if err != nil {
 			t.Fatalf("receive deadline status: %v", err)
 		}
@@ -1799,7 +1803,7 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 	t.Run("stream recv", func(t *testing.T) {
 		server := NewServer()
 		runtime := server.freeze()
-		request := deadlineRequest("method", RpcKindClientStreaming)
+		request := deadlineRequest("method", RPCKindClientStreaming)
 		lease, ok := runtime.tryRequestLease(request)
 		if !ok {
 			t.Fatal("failed to acquire request lease")
@@ -1807,7 +1811,7 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 		defer lease.release()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		_, err := recvByteWithTimeout(ctx, contextResultByteStream{done: ctx.Done()}, time.Minute, "request", lease, request)
+		_, err := recvByteWithTimeout(ctx, contextResultByteStream{done: ctx.Done()}, time.Minute, "request", lease)
 		if StatusFromError(err).Code != CodeDeadlineExceeded {
 			t.Fatalf("recv error = %v, want deadline exceeded", err)
 		}
@@ -1881,16 +1885,16 @@ func TestServerNonCooperativeUnaryRetainsAdmissionUntilExit(t *testing.T) {
 func TestServerNonCooperativeRequestAndResponseRecvRetainAdmission(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		kind RpcKind
+		kind RPCKind
 		run  func(*Server, *controlledByteStream) *wireStreamFrame
 	}{
-		{name: "request recv", kind: RpcKindClientStreaming, run: func(server *Server, blocked *controlledByteStream) *wireStreamFrame {
-			server.routeStreaming("service", "stream", RpcKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
+		{name: "request recv", kind: RPCKindClientStreaming, run: func(server *Server, blocked *controlledByteStream) *wireStreamFrame {
+			server.routeStreaming("service", "stream", RPCKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (byteStream, error) {
 				_, err := requests.Recv()
 				return newEmptyStream[[]byte](), err
 			})
 			request := newWireRequest("service", "stream", nil)
-			request.Kind = RpcKindClientStreaming
+			request.Kind = RPCKindClientStreaming
 			request.TimeoutNanos = uint64(20 * time.Millisecond)
 			frame, err := server.handleStreamingRequest(context.Background(), request, blocked).Recv()
 			if err != nil {
@@ -1898,10 +1902,10 @@ func TestServerNonCooperativeRequestAndResponseRecvRetainAdmission(t *testing.T)
 			}
 			return frame
 		}},
-		{name: "response recv", kind: RpcKindServerStreaming, run: func(server *Server, blocked *controlledByteStream) *wireStreamFrame {
-			server.routeStreaming("service", "stream", RpcKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) { return blocked, nil })
+		{name: "response recv", kind: RPCKindServerStreaming, run: func(server *Server, blocked *controlledByteStream) *wireStreamFrame {
+			server.routeStreaming("service", "stream", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (byteStream, error) { return blocked, nil })
 			request := newWireRequest("service", "stream", nil)
-			request.Kind = RpcKindServerStreaming
+			request.Kind = RPCKindServerStreaming
 			request.TimeoutNanos = uint64(20 * time.Millisecond)
 			frame, err := server.handleStreamingRequest(context.Background(), request, newEmptyStream[[]byte]()).Recv()
 			if err != nil {

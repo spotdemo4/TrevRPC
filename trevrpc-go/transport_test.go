@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -98,7 +99,7 @@ func registerTestService(server *Server) {
 		return testResponse(&testMessage{Value: joined.String()}), nil
 	})
 	// FailFast fails a bidirectional call without reading any request message.
-	server.routeStreaming(testServiceName, "FailFast", RpcKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
+	server.routeStreaming(testServiceName, "FailFast", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
 		return nil, NewStatus(CodeAborted, "abort")
 	})
 	RegisterBidirectionalStreaming(server, testServiceName, "Chat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
@@ -253,7 +254,7 @@ func exerciseRPCShapes(t *testing.T, transport Transport) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer call.Close()
+		closeOnCleanup(t, call)
 		for _, value := range []string{"one", "two", "three"} {
 			if err := call.Send(&testMessage{Value: value}); err != nil {
 				t.Fatal(err)
@@ -266,7 +267,7 @@ func exerciseRPCShapes(t *testing.T, transport Transport) {
 		if err := call.CloseSend(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := call.Recv(); err != io.EOF {
+		if _, err := call.Recv(); !errors.Is(err, io.EOF) {
 			t.Fatalf("expected EOF after CloseSend, got %v", err)
 		}
 	})
@@ -310,7 +311,8 @@ func TestListenerCloseWithoutServeReleasesSocket(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	rebound, err := net.ListenPacket("udp", addr)
+	var listenConfig net.ListenConfig
+	rebound, err := listenConfig.ListenPacket(t.Context(), "udp", addr)
 	if err != nil {
 		t.Fatalf("socket was not released: %v", err)
 	}
@@ -477,7 +479,7 @@ func TestChannelReconnectsToRestartedServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer channel.Close()
+	closeOnCleanup(t, channel)
 	if _, err := Unary(ctx, channel, testServiceName, "Echo", &testMessage{Value: "before"}, newTestMessage); err != nil {
 		t.Fatal(err)
 	}
@@ -557,9 +559,13 @@ func TestHTTP3RequestsOverTheWire(t *testing.T) {
 	roundTripper := &http3.Transport{TLSClientConfig: pki.client}
 	t.Cleanup(func() { _ = roundTripper.Close() })
 
-	do := func(method, target, contentType, allow string) *http.Response {
+	type result struct {
+		StatusCode int
+		Header     http.Header
+	}
+	do := func(method, target, contentType, allow string) result {
 		t.Helper()
-		request, err := http.NewRequest(method, target, strings.NewReader(""))
+		request, err := http.NewRequestWithContext(t.Context(), method, target, strings.NewReader(""))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -574,7 +580,7 @@ func TestHTTP3RequestsOverTheWire(t *testing.T) {
 			t.Fatalf("%s %s: %v", method, target, err)
 		}
 		_ = response.Body.Close()
-		return response
+		return result{StatusCode: response.StatusCode, Header: response.Header}
 	}
 
 	if got := do(http.MethodPost, url+"x", httpContentType, "").StatusCode; got != http.StatusNotFound {
@@ -601,7 +607,7 @@ func TestWebTransportAdmissionAndPath(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
 
-	dial := func(path, origin string) (*http.Response, error) {
+	dial := func(path, origin string) (int, error) {
 		wt := &webtransport.Transport{
 			TLSClientConfig: pki.client.Clone(),
 			QUICConfig:      &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
@@ -616,17 +622,21 @@ func TestWebTransportAdmissionAndPath(t *testing.T) {
 		if session != nil {
 			_ = session.CloseWithError(0, "")
 		}
-		return response, err
+		if response == nil {
+			return 0, err
+		}
+		_ = response.Body.Close()
+		return response.StatusCode, err
 	}
 
-	if response, err := dial(DefaultHTTPPath, "https://evil.example.test"); err == nil || response == nil || response.StatusCode != http.StatusForbidden {
-		t.Errorf("denied origin: response=%v err=%v", response, err)
+	if status, err := dial(DefaultHTTPPath, "https://evil.example.test"); err == nil || status != http.StatusForbidden {
+		t.Errorf("denied origin: status=%d err=%v", status, err)
 	}
-	if response, err := dial(DefaultHTTPPath, ""); err == nil || response == nil || response.StatusCode != http.StatusForbidden {
-		t.Errorf("missing origin: response=%v err=%v", response, err)
+	if status, err := dial(DefaultHTTPPath, ""); err == nil || status != http.StatusForbidden {
+		t.Errorf("missing origin: status=%d err=%v", status, err)
 	}
-	if response, err := dial("/elsewhere", testOrigin); err == nil || response == nil || response.StatusCode != http.StatusNotFound {
-		t.Errorf("wrong path: response=%v err=%v", response, err)
+	if status, err := dial("/elsewhere", testOrigin); err == nil || status != http.StatusNotFound {
+		t.Errorf("wrong path: status=%d err=%v", status, err)
 	}
 	if _, err := dial(DefaultHTTPPath, testOrigin); err != nil {
 		t.Errorf("admitted session: %v", err)
@@ -723,6 +733,9 @@ func TestWebTransportIsRejectedWithoutAdmissionCallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
 	response, _, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, nil)
+	if response != nil {
+		_ = response.Body.Close()
+	}
 	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
 		t.Fatalf("response=%v err=%v, want 403 without an admission callback", response, err)
 	}
@@ -754,7 +767,7 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 				t.Fatal(err)
 			}
 			request := newWireRequest(testServiceName, "FailFast", nil)
-			request.Kind = RpcKindBidirectionalStreaming
+			request.Kind = RPCKindBidirectionalStreaming
 			if err := writeFrame(stream, request, DefaultMaxFrameSize); err != nil {
 				t.Fatal(err)
 			}
@@ -767,7 +780,7 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 			if status := StatusFromError(&Status{Code: CodeFromUint32(frame.Status), Message: frame.Message}); frame.Kind != wireFrameStatus || status.Code != CodeAborted || status.Message != "abort" {
 				t.Fatalf("frame = %+v, want Aborted \"abort\" status", frame)
 			}
-			if _, err := stream.Read(make([]byte, 1)); err != io.EOF {
+			if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 				t.Fatalf("read after status = %v, want EOF", err)
 			}
 
@@ -808,7 +821,7 @@ func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := newWireRequest(testServiceName, "FailFast", nil)
-	request.Kind = RpcKindBidirectionalStreaming
+	request.Kind = RPCKindBidirectionalStreaming
 	if err := writeFrame(stream, request, DefaultMaxFrameSize); err != nil {
 		t.Fatal(err)
 	}

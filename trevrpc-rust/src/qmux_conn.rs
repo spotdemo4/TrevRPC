@@ -18,7 +18,7 @@ use crate::{Error, Result, Status};
 /// The application protocol inside [`crate::QMUX_ALPN`], as the `qmux` crate names it.
 const APPLICATION_PROTOCOL: &str = "trevrpc-1";
 /// The largest `QMux` record a `TrevRPC` endpoint accepts.
-pub(crate) const MAX_RECORD_SIZE: u64 = 64 * 1024;
+pub const MAX_RECORD_SIZE: u64 = 64 * 1024;
 
 /// `QMux` settings shared by every endpoint. The wire version is always pinned: the crate treats
 /// an unknown identifier as its legacy `webtransport` format.
@@ -34,7 +34,7 @@ fn base_config() -> qmux::Config {
 }
 
 /// The `QMux` transport parameters of a server, mirroring its QUIC limits.
-pub(crate) fn server_config(options: &ServerOptions) -> qmux::Config {
+pub fn server_config(options: &ServerOptions) -> qmux::Config {
     let limits = transport_limits(options);
     let mut config = base_config();
     config.max_data = limits.connection_receive_window;
@@ -54,7 +54,7 @@ pub(crate) fn server_config(options: &ServerOptions) -> qmux::Config {
 
 /// The `QMux` transport parameters of a client: like a QUIC client, it receives at most one frame
 /// per stream at a time and accepts no streams from the server.
-pub(crate) fn client_config(max_frame_size: usize) -> qmux::Config {
+pub fn client_config(max_frame_size: usize) -> qmux::Config {
     let window = crate::quic::frame_receive_window(max_frame_size);
     let mut config = base_config();
     config.max_data = window;

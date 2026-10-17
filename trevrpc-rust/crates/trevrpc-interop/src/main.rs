@@ -79,6 +79,9 @@ impl Flags {
         self.0.get(name).map(String::as_str)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the flag was not passed.
     pub fn require(&self, name: &str) -> Result<&str, BoxError> {
         self.get(name)
             .ok_or_else(|| format!("missing required flag --{name}").into())

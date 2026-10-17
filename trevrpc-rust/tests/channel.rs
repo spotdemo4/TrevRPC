@@ -11,6 +11,7 @@ use trevrpc::client::{
 };
 use trevrpc::{Code, RpcRequest, RpcResponse, Status};
 
+#[macro_use]
 mod support;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -142,15 +143,12 @@ async fn wait_for_phase(client: &Channel, phase: ChannelPhase) -> TestResult {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             if states.borrow_and_update().phase() == phase {
-                return;
+                return Ok::<_, tokio::sync::watch::error::RecvError>(());
             }
-            states
-                .changed()
-                .await
-                .expect("channel state sender should remain open");
+            states.changed().await?;
         }
     })
-    .await?;
+    .await??;
     Ok(())
 }
 
@@ -168,7 +166,7 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
     let server = RawServer::spawn(true)?;
     let client = connect_channel(&server, Duration::from_millis(150)).await?;
     let mut events = client.subscribe_events();
-    assert_eq!(client.state().generation(), 1);
+    ensure_eq!(client.state().generation(), 1);
 
     let first_error = client
         .call(request(b"first"))
@@ -184,24 +182,24 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
     .await?
     .expect_err("calls during reconnection must fail");
     assert_unavailable(reconnecting_error);
-    assert_eq!(server.received_requests.load(Ordering::SeqCst), 1);
+    ensure_eq!(server.received_requests.load(Ordering::SeqCst), 1);
 
-    assert_eq!(
+    ensure_eq!(
         tokio::time::timeout(TEST_TIMEOUT, client.wait_until_ready()).await??,
         2
     );
-    assert_eq!(
+    ensure_eq!(
         events.recv().await?,
         ChannelEvent::ConnectionLost { generation: 1 }
     );
-    assert_eq!(
+    ensure_eq!(
         events.recv().await?,
         ChannelEvent::ReconnectAttempt {
             generation: 1,
             attempt: 1,
         }
     );
-    assert_eq!(
+    ensure_eq!(
         events.recv().await?,
         ChannelEvent::Ready {
             generation: 2,
@@ -209,12 +207,12 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
         }
     );
     tokio::time::sleep(Duration::from_millis(25)).await;
-    assert_eq!(server.received_requests.load(Ordering::SeqCst), 1);
+    ensure_eq!(server.received_requests.load(Ordering::SeqCst), 1);
 
     let response = client.call(request(b"future")).await?;
-    assert_eq!(response.body, b"future");
-    assert_eq!(server.received_requests.load(Ordering::SeqCst), 2);
-    assert_eq!(server.accepted_connections.load(Ordering::SeqCst), 2);
+    ensure_eq!(response.body, b"future");
+    ensure_eq!(server.received_requests.load(Ordering::SeqCst), 2);
+    ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 2);
 
     client.close();
     server.shutdown().await
@@ -226,16 +224,16 @@ async fn close_stops_reconnect_and_rebind_preserves_generation() -> TestResult {
     let client = connect_channel(&server, Duration::from_millis(40)).await?;
     let mut events = client.subscribe_events();
     let generation = client.state().generation();
-    assert!(client.is_ready());
+    ensure!(client.is_ready());
 
     let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     client.rebind(socket)?;
-    assert_eq!(client.state().generation(), generation);
+    ensure_eq!(client.state().generation(), generation);
 
     client.close();
-    assert_eq!(events.recv().await?, ChannelEvent::Closed { generation });
-    assert_eq!(client.state().phase(), ChannelPhase::Closed);
-    assert_eq!(client.state().generation(), generation);
+    ensure_eq!(events.recv().await?, ChannelEvent::Closed { generation });
+    ensure_eq!(client.state().phase(), ChannelPhase::Closed);
+    ensure_eq!(client.state().generation(), generation);
     assert_unavailable(
         client
             .call(request(b"closed"))
@@ -250,6 +248,6 @@ async fn close_stops_reconnect_and_rebind_preserves_generation() -> TestResult {
     );
 
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(server.accepted_connections.load(Ordering::SeqCst), 1);
+    ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 1);
     server.shutdown().await
 }

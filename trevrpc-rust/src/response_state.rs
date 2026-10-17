@@ -4,7 +4,7 @@ use prost::Message;
 use trevrpc::{Code, RpcStreamFrame, RpcStreamFrameKind, Status};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResponseStateFailureKind {
+pub enum ResponseStateFailureKind {
     InvalidMetadata,
     MalformedProtobuf,
     MissingTerminalStatus,
@@ -29,14 +29,14 @@ impl ResponseStateFailureKind {
 
 #[allow(dead_code)]
 #[derive(Debug)]
-pub(crate) struct ResponseStateFailure {
+pub struct ResponseStateFailure {
     kind: ResponseStateFailureKind,
     status: Status,
 }
 
 #[allow(dead_code)]
 impl ResponseStateFailure {
-    fn new(kind: ResponseStateFailureKind, status: Status) -> Self {
+    const fn new(kind: ResponseStateFailureKind, status: Status) -> Self {
         Self { kind, status }
     }
 
@@ -53,12 +53,12 @@ impl ResponseStateFailure {
     }
 }
 
-pub(crate) enum ResponseStateEvent<T> {
+pub enum ResponseStateEvent<T> {
     Message(T),
     Terminal,
 }
 
-pub(crate) struct ResponseState<T> {
+pub struct ResponseState<T> {
     pending_terminal_status: Option<Status>,
     terminal_status: Option<Status>,
     finished: bool,
@@ -154,7 +154,7 @@ where
         self.finished = true;
     }
 
-    pub(crate) fn terminal_status(&self) -> Option<&Status> {
+    pub(crate) const fn terminal_status(&self) -> Option<&Status> {
         self.terminal_status.as_ref()
     }
 }

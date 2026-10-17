@@ -4,6 +4,7 @@
 [![vulnerable](https://trev.zip/llc/TrevRPC/actions/workflows/vulnerable.yaml/badge.svg?branch=main&logo=forgejo&logoColor=%23bac2de&label=vulnerable&labelColor=%23313244)](https://trev.zip/llc/TrevRPC/actions?workflow=vulnerable.yaml)
 [![android](https://img.shields.io/github/actions/workflow/status/spotdemo4/TrevRPC/android.yaml?branch=main&logo=android&logoColor=%23bac2de&label=android&labelColor=%23313244)](https://github.com/spotdemo4/TrevRPC/actions/workflows/android.yaml)
 [![safari](https://img.shields.io/github/actions/workflow/status/spotdemo4/TrevRPC/safari.yaml?branch=main&logo=safari&logoColor=%23bac2de&label=safari&labelColor=%23313244)](https://github.com/spotdemo4/TrevRPC/actions/workflows/safari.yaml)
+[![nixpkgs](https://nix-shield.trev.zip/?url=https://trev.zip/llc/TrevRPC/raw/branch/main/flake.lock&input=nixpkgs&logoColor=%23bac2de&labelColor=%23313244&color=%235277C3)](https://nixos.org/)
 
 [![go](<https://img.shields.io/badge/dynamic/regex?url=https://trev.zip/llc/TrevRPC/raw/branch/main/trevrpc-go/go.mod&search=go%20(.*)&replace=%241&logo=go&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%2300ADD8>)](https://go.dev/doc/devel/release)
 [![javascript](https://img.shields.io/badge/dynamic/json?url=https://trev.zip/llc/TrevRPC/raw/branch/main/trevrpc-js/package.json&query=%24.engines.node&logo=javascript&logoColor=%23bac2de&label=version&labelColor=%23313244&color=%23F7DF1E)](https://nodejs.org/en/about/previous-releases)
@@ -40,3 +41,52 @@ The wire format is shared by every runtime and transport and pinned by
 fallbacks is pinned by [`testdata/qmux-golden-vectors.txt`](testdata/qmux-golden-vectors.txt).
 
 Full documentation is available in the [TrevRPC wiki](https://trev.zip/llc/TrevRPC/wiki)
+
+## using
+
+### go
+
+```sh
+go get trev.zip/llc/trevrpc/trevrpc-go
+go install trev.zip/llc/trevrpc/trevrpc-go/cmd/protoc-gen-trevrpc-go@latest
+```
+
+### rust
+
+```sh
+cargo add trevrpc
+```
+
+### javascript
+
+```sh
+npm install @trevrpc/trevrpc-js
+```
+
+### kotlin
+
+```kotlin
+dependencies {
+    implementation("zip.trev.trevrpc:core:<version>")
+    implementation("zip.trev.trevrpc:transport-cronet:<version>")
+}
+```
+
+### nix
+
+each runtime's package provides its `protoc` plugin:
+
+```sh
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
+```
+
+### download
+
+https://trev.zip/llc/TrevRPC/releases
+
+## contributing
+
+see [CONTRIBUTING.md](CONTRIBUTING.md) for requirements and getting started

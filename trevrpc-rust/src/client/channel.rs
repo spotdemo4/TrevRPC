@@ -10,6 +10,7 @@ use super::race::{
     TransportKind, TransportPolicy,
 };
 use super::{RpcTransport, StreamingRpcTransport};
+use crate::sync::MutexExt as _;
 use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
 const EVENT_CAPACITY: usize = 32;
@@ -48,7 +49,7 @@ impl ExponentialBackoff {
 
     /// Sets the maximum proportional jitter in either direction.
     #[must_use]
-    pub fn with_jitter_ratio(mut self, jitter_ratio: f64) -> Self {
+    pub const fn with_jitter_ratio(mut self, jitter_ratio: f64) -> Self {
         self.jitter_ratio = if jitter_ratio.is_nan() {
             0.0
         } else {
@@ -86,9 +87,10 @@ impl ReconnectBackoff for ExponentialBackoff {
         }
 
         let random = splitmix64(self.seed ^ u64::from(attempt));
-        #[allow(clippy::cast_precision_loss)]
-        let unit = random as f64 / u64::MAX as f64;
-        let jitter = (unit * 2.0 - 1.0) * self.jitter_ratio;
+        // The top 32 bits give the jitter far finer resolution than a retry delay needs.
+        let [a, b, c, d, ..] = random.to_be_bytes();
+        let unit = f64::from(u32::from_be_bytes([a, b, c, d])) / f64::from(u32::MAX);
+        let jitter = unit.mul_add(2.0, -1.0) * self.jitter_ratio;
         let delay = if jitter.is_sign_negative() {
             base.saturating_sub(base.mul_f64(-jitter))
         } else {
@@ -98,7 +100,7 @@ impl ReconnectBackoff for ExponentialBackoff {
     }
 }
 
-fn splitmix64(mut value: u64) -> u64 {
+const fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -142,7 +144,7 @@ impl ChannelConfig {
 
     /// Sets the address of the server's TCP listener when it differs from the remote address.
     #[must_use]
-    pub fn with_tcp_addr(mut self, addr: SocketAddr) -> Self {
+    pub const fn with_tcp_addr(mut self, addr: SocketAddr) -> Self {
         if let Some(tcp) = &mut self.tcp {
             tcp.addr = Some(addr);
         }
@@ -487,11 +489,11 @@ impl StreamingRpcTransport for Channel {
 
 impl Shared {
     fn state(&self) -> ChannelState {
-        self.slot.lock().expect("channel lock poisoned").state
+        self.slot.lock_unpoisoned().state
     }
 
     fn snapshot(&self) -> Result<GenerationTransport> {
-        let slot = self.slot.lock().expect("channel lock poisoned");
+        let slot = self.slot.lock_unpoisoned();
         match slot.state.phase {
             ChannelPhase::Ready => slot
                 .transport
@@ -504,7 +506,7 @@ impl Shared {
 
     fn begin_reconnect(&self) -> Option<u64> {
         let state = {
-            let mut slot = self.slot.lock().expect("channel lock poisoned");
+            let mut slot = self.slot.lock_unpoisoned();
             if matches!(slot.state.phase, ChannelPhase::Closed) {
                 return None;
             }
@@ -522,7 +524,7 @@ impl Shared {
 
     fn reconnect_attempt(&self, generation: u64, attempt: u32) -> bool {
         let state = {
-            let mut slot = self.slot.lock().expect("channel lock poisoned");
+            let mut slot = self.slot.lock_unpoisoned();
             if !matches!(slot.state.phase, ChannelPhase::Reconnecting)
                 || slot.state.generation != generation
             {
@@ -545,7 +547,7 @@ impl Shared {
     fn install(&self, previous_generation: u64, transport: GenerationTransport) -> Option<u64> {
         let kind = transport.kind();
         let state = {
-            let mut slot = self.slot.lock().expect("channel lock poisoned");
+            let mut slot = self.slot.lock_unpoisoned();
             if !matches!(slot.state.phase, ChannelPhase::Reconnecting)
                 || slot.state.generation != previous_generation
             {
@@ -569,7 +571,7 @@ impl Shared {
 
     fn close(&self) -> (bool, Option<GenerationTransport>) {
         let (state, transport) = {
-            let mut slot = self.slot.lock().expect("channel lock poisoned");
+            let mut slot = self.slot.lock_unpoisoned();
             if matches!(slot.state.phase, ChannelPhase::Closed) {
                 return (false, None);
             }

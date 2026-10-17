@@ -9,9 +9,9 @@ use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use prost::Message;
 
-pub(crate) const MESSAGE_FRAME_BATCH: usize = 32;
+pub const MESSAGE_FRAME_BATCH: usize = 32;
 
-pub(crate) trait FrameWrite {
+pub trait FrameWrite {
     fn write_frame_bytes(
         &mut self,
         bytes: &[u8],
@@ -23,18 +23,14 @@ pub(crate) trait FrameWrite {
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
-pub(crate) trait FrameRead {
+pub trait FrameRead {
     fn read_frame_bytes(
         &mut self,
         bytes: &mut [u8],
     ) -> impl std::future::Future<Output = Result<Option<usize>>> + Send;
 }
 
-pub(crate) async fn write_frame<W, M>(
-    send: &mut W,
-    message: &M,
-    max_frame_size: usize,
-) -> Result<()>
+pub async fn write_frame<W, M>(send: &mut W, message: &M, max_frame_size: usize) -> Result<()>
 where
     W: FrameWrite,
     M: Message,
@@ -43,7 +39,7 @@ where
     send.write_frame_bytes(&frame).await
 }
 
-pub(crate) async fn write_stream_frame<W>(
+pub async fn write_stream_frame<W>(
     send: &mut W,
     frame: RpcStreamFrame,
     max_frame_size: usize,
@@ -58,7 +54,7 @@ where
     }
 }
 
-pub(crate) async fn write_message_stream_frame<W>(
+pub async fn write_message_stream_frame<W>(
     send: &mut W,
     body: Vec<u8>,
     max_frame_size: usize,
@@ -76,7 +72,7 @@ where
         .await
 }
 
-pub(crate) async fn write_message_stream_frames<W>(
+pub async fn write_message_stream_frames<W>(
     send: &mut W,
     bodies: &mut Vec<Vec<u8>>,
     max_frame_size: usize,
@@ -97,7 +93,7 @@ where
     send.write_frame_chunks(&mut chunks).await
 }
 
-pub(crate) async fn write_request_body_frames<W>(
+pub async fn write_request_body_frames<W>(
     send: &mut W,
     request_body: &mut BoxStream<Vec<u8>>,
     max_frame_size: usize,
@@ -133,14 +129,14 @@ where
     }
 }
 
-pub(crate) fn is_plain_message_frame(frame: &RpcStreamFrame) -> bool {
+pub fn is_plain_message_frame(frame: &RpcStreamFrame) -> bool {
     frame.frame_kind() == Some(RpcStreamFrameKind::Message)
         && frame.status == crate::Code::Ok.as_u32()
         && frame.message.is_empty()
         && frame.metadata.is_empty()
 }
 
-pub(crate) async fn read_frame<R, M>(recv: &mut R, max_frame_size: usize) -> Result<M>
+pub async fn read_frame<R, M>(recv: &mut R, max_frame_size: usize) -> Result<M>
 where
     R: FrameRead,
     M: Message + Default + 'static,
@@ -152,7 +148,7 @@ where
     decode_frame(&body)
 }
 
-pub(crate) async fn read_raw_frame_or_eof<R>(
+pub async fn read_raw_frame_or_eof<R>(
     recv: &mut R,
     max_frame_size: usize,
 ) -> Result<Option<Vec<u8>>>
@@ -168,7 +164,7 @@ where
     read_body(recv, len).await.map(Some)
 }
 
-pub(crate) async fn read_stream_frame_or_eof<R>(
+pub async fn read_stream_frame_or_eof<R>(
     recv: &mut R,
     max_frame_size: usize,
 ) -> Result<Option<RpcStreamFrame>>
@@ -187,25 +183,24 @@ where
     }
 
     let mut prefix = [0_u8; 11];
-    read_exact_body(recv, &mut prefix[..1]).await?;
-    if prefix[0] != STREAM_FRAME_BODY_TAG {
-        let body = read_body_with_prefix(recv, len, &prefix[..1]).await?;
+    let tag = read_prefix_byte(recv, &mut prefix, 0).await?;
+    if tag != STREAM_FRAME_BODY_TAG {
+        let body = read_body_with_prefix(recv, len, prefix_bytes(&prefix, 1)?).await?;
         let frame = decode_stream_frame_body_owned(body)?;
         return Ok(Some(frame));
     }
 
     let mut value = 0_u64;
-    let mut prefix_len = 1;
-    for shift in (0..64).step_by(7) {
+    let mut prefix_len = 1_usize;
+    for shift in (0_u32..64).step_by(7) {
         if prefix_len == len {
-            let body = prefix[..prefix_len].to_vec();
+            let body = prefix_bytes(&prefix, prefix_len)?.to_vec();
             return decode_stream_frame_body_owned(body).map(Some);
         }
 
-        read_exact_body(recv, &mut prefix[prefix_len..=prefix_len]).await?;
-        let byte = prefix[prefix_len];
-        prefix_len += 1;
-        value |= u64::from(byte & 0x7f) << shift;
+        let byte = read_prefix_byte(recv, &mut prefix, prefix_len).await?;
+        prefix_len = prefix_len.saturating_add(1);
+        value |= u64::from(byte & 0x7f).wrapping_shl(shift);
         if byte < 0x80 {
             let body_len = usize::try_from(value).map_err(|_| {
                 Error::from(Status::invalid_argument(
@@ -217,18 +212,18 @@ where
                 return Ok(Some(frame));
             }
 
-            let body = read_body_with_prefix(recv, len, &prefix[..prefix_len]).await?;
+            let body = read_body_with_prefix(recv, len, prefix_bytes(&prefix, prefix_len)?).await?;
             let frame = decode_stream_frame_body_owned(body)?;
             return Ok(Some(frame));
         }
     }
 
-    let body = read_body_with_prefix(recv, len, &prefix[..prefix_len]).await?;
+    let body = read_body_with_prefix(recv, len, prefix_bytes(&prefix, prefix_len)?).await?;
     let frame = decode_stream_frame_body_owned(body)?;
     Ok(Some(frame))
 }
 
-pub(crate) async fn drain_fin_after_terminal_status<R>(
+pub async fn drain_fin_after_terminal_status<R>(
     recv: &mut R,
     max_frame_size: usize,
     stream_name: &'static str,
@@ -248,7 +243,7 @@ where
     Ok(())
 }
 
-pub(crate) async fn drain_unary_request_end<R>(recv: &mut R) -> Result<()>
+pub async fn drain_unary_request_end<R>(recv: &mut R) -> Result<()>
 where
     R: FrameRead,
 {
@@ -284,46 +279,66 @@ async fn read_body_with_prefix<R>(recv: &mut R, len: usize, prefix: &[u8]) -> Re
 where
     R: FrameRead,
 {
-    let remaining = len.checked_sub(prefix.len()).ok_or_else(|| {
-        Error::from(Status::invalid_argument(
-            "stream frame prefix exceeded frame length",
-        ))
-    })?;
     let mut body = Vec::with_capacity(len);
     body.extend_from_slice(prefix);
     body.resize(len, 0);
-    read_exact_body(recv, &mut body[prefix.len()..prefix.len() + remaining]).await?;
+    let (_, remaining) = body
+        .split_at_mut_checked(prefix.len())
+        .ok_or_else(prefix_overflow)?;
+    read_exact_body(recv, remaining).await?;
 
     Ok(body)
+}
+
+/// Reads one byte of a stream frame's tag-and-length prefix into `prefix[index]`.
+async fn read_prefix_byte<R>(recv: &mut R, prefix: &mut [u8; 11], index: usize) -> Result<u8>
+where
+    R: FrameRead,
+{
+    let slot = prefix.get_mut(index).ok_or_else(prefix_overflow)?;
+    read_exact_body(recv, std::slice::from_mut(slot)).await?;
+
+    Ok(*slot)
+}
+
+fn prefix_bytes(prefix: &[u8; 11], len: usize) -> Result<&[u8]> {
+    prefix.get(..len).ok_or_else(prefix_overflow)
+}
+
+fn prefix_overflow() -> Error {
+    Error::from(Status::invalid_argument(
+        "stream frame prefix exceeded frame length",
+    ))
 }
 
 async fn read_exact_body<R>(recv: &mut R, buf: &mut [u8]) -> Result<()>
 where
     R: FrameRead,
 {
-    let mut offset = 0;
-    while offset < buf.len() {
-        match recv.read_frame_bytes(&mut buf[offset..]).await? {
-            Some(0) => {}
-            Some(read) => offset += read,
-            None => return Err(unexpected_eof()),
-        }
+    if read_exact_or_eof(recv, buf).await? {
+        Ok(())
+    } else {
+        Err(unexpected_eof())
     }
-
-    Ok(())
 }
 
+/// Fills `buf`, returning `false` if the stream ended before the first byte.
 async fn read_exact_or_eof<R>(recv: &mut R, buf: &mut [u8]) -> Result<bool>
 where
     R: FrameRead,
 {
-    let mut offset = 0;
+    let total = buf.len();
+    let mut remaining = buf;
 
-    while offset < buf.len() {
-        match recv.read_frame_bytes(&mut buf[offset..]).await? {
+    while !remaining.is_empty() {
+        match recv.read_frame_bytes(remaining).await? {
             Some(0) => {}
-            Some(read) => offset += read,
-            None if offset == 0 => return Ok(false),
+            Some(read) => {
+                remaining = std::mem::take(&mut remaining)
+                    .split_at_mut_checked(read)
+                    .map_or_else(Default::default, |(_, rest)| rest);
+            }
+            None if remaining.len() == total => return Ok(false),
             None => return Err(unexpected_eof()),
         }
     }

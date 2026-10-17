@@ -12,7 +12,7 @@ use super::{RpcTransport, StreamingRpcTransport};
 /// A native `TrevRPC` transport over any multiplexed connection: one RPC per bidirectional
 /// stream.
 #[derive(Clone)]
-pub(crate) struct NativeTransport<C> {
+pub struct NativeTransport<C> {
     pub(crate) connection: C,
     pub(crate) max_frame_size: usize,
 }

@@ -99,5 +99,5 @@ func (o qmuxOpener) openStream(ctx context.Context) (clientStream, error) {
 
 type qmuxClientStream struct{ *qmux.Stream }
 
-func (s qmuxClientStream) cancelRead()  { s.Stream.CancelRead(streamErrorCancelled) }
-func (s qmuxClientStream) cancelWrite() { s.Stream.CancelWrite(streamErrorCancelled) }
+func (s qmuxClientStream) cancelRead()  { s.CancelRead(streamErrorCancelled) }
+func (s qmuxClientStream) cancelWrite() { s.CancelWrite(streamErrorCancelled) }

@@ -20,7 +20,7 @@ func TestChannelDoesNotReplayAndRecoversFutureCalls(t *testing.T) {
 	client := newTestChannel(initial, connector, realReconnectClock{}, func(event ChannelEvent) {
 		events <- event
 	})
-	defer client.Close()
+	closeOnCleanup(t, client)
 
 	callDone := make(chan error, 1)
 	go func() {
@@ -68,7 +68,7 @@ func TestChannelCallsFailFastWhileReconnecting(t *testing.T) {
 	recovered := newFakeChannelGeneration(false, "recovered")
 	connector := newFakeChannelConnector()
 	client := newTestChannel(initial, connector, realReconnectClock{}, nil)
-	defer client.Close()
+	closeOnCleanup(t, client)
 
 	initial.fail(errors.New("connection lost"))
 	attempt := waitChannelAttempt(t, connector)
@@ -135,7 +135,7 @@ func TestChannelBackoffIsExponentialAndBounded(t *testing.T) {
 	clock := newFakeChannelClock()
 	config := reconnectConfig{InitialBackoff: 10 * time.Millisecond, MaxBackoff: 25 * time.Millisecond, Multiplier: 2}
 	client := newChannel(initial, connector, clock, config, func() float64 { return 0.5 }, nil)
-	defer client.Close()
+	closeOnCleanup(t, client)
 
 	initial.fail(errors.New("connection lost"))
 	wantDelays := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 25 * time.Millisecond, 25 * time.Millisecond}

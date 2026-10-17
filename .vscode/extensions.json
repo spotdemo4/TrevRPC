@@ -1,8 +1,12 @@
 {
   "recommendations": [
     "rust-lang.rust-analyzer",
+    "golang.go",
+    "jetbrains.kotlin-server",
+    "TypeScriptTeam.native-preview",
     "jnoortheen.nix-ide",
     "oxc.oxc-vscode",
+    "redhat.vscode-yaml",
     "tombi-toml.tombi"
   ]
 }

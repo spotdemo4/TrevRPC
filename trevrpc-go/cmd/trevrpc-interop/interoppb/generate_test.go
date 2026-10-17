@@ -89,7 +89,7 @@ func TestGeneratedCodeMatchesProto(t *testing.T) {
 
 func run(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
-	command := exec.Command(name, args...)
+	command := exec.CommandContext(t.Context(), name, args...)
 	command.Dir = dir
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("%s %v: %v\n%s", name, args, err, output)

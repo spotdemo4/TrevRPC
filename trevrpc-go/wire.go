@@ -36,18 +36,18 @@ const (
 // each value is at most 8 KiB, and keys and values total at most 64 KiB.
 type Metadata map[string][]byte
 
-// RpcKind identifies the shape of an RPC.
-type RpcKind int32
+// RPCKind identifies the shape of an RPC.
+type RPCKind int32
 
 const (
-	// RpcKindUnary is a single request and a single response.
-	RpcKindUnary RpcKind = 0
-	// RpcKindClientStreaming is a request stream and a single response.
-	RpcKindClientStreaming RpcKind = 1
-	// RpcKindServerStreaming is a single request and a response stream.
-	RpcKindServerStreaming RpcKind = 2
-	// RpcKindBidirectionalStreaming is a request stream and a response stream.
-	RpcKindBidirectionalStreaming RpcKind = 3
+	// RPCKindUnary is a single request and a single response.
+	RPCKindUnary RPCKind = 0
+	// RPCKindClientStreaming is a request stream and a single response.
+	RPCKindClientStreaming RPCKind = 1
+	// RPCKindServerStreaming is a single request and a response stream.
+	RPCKindServerStreaming RPCKind = 2
+	// RPCKindBidirectionalStreaming is a request stream and a response stream.
+	RPCKindBidirectionalStreaming RPCKind = 3
 )
 
 // wireFrameKind identifies whether a streaming frame carries a message or terminal status.
@@ -64,7 +64,7 @@ type wireRequest struct {
 	Method       string   `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
 	Body         []byte   `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
 	Metadata     Metadata `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	Kind         RpcKind  `protobuf:"varint,5,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
+	Kind         RPCKind  `protobuf:"varint,5,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
 	Version      uint32   `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
 	TimeoutNanos uint64   `protobuf:"varint,7,opt,name=timeout_nanos,json=timeoutNanos,proto3" json:"timeout_nanos,omitempty"`
 }
@@ -76,7 +76,7 @@ func newWireRequest(service, method string, body []byte) *wireRequest {
 		Method:   method,
 		Body:     body,
 		Metadata: Metadata{},
-		Kind:     RpcKindUnary,
+		Kind:     RPCKindUnary,
 		Version:  wireVersion,
 	}
 }
@@ -104,9 +104,9 @@ func (m *wireRequest) validateProtocol() error {
 }
 
 // isValid reports whether k is a supported RPC kind.
-func (k RpcKind) isValid() bool {
+func (k RPCKind) isValid() bool {
 	switch k {
-	case RpcKindUnary, RpcKindClientStreaming, RpcKindServerStreaming, RpcKindBidirectionalStreaming:
+	case RPCKindUnary, RPCKindClientStreaming, RPCKindServerStreaming, RPCKindBidirectionalStreaming:
 		return true
 	default:
 		return false
@@ -114,12 +114,12 @@ func (k RpcKind) isValid() bool {
 }
 
 // rpcKind returns the request RPC kind, defaulting to unary for invalid values.
-func (m *wireRequest) rpcKind() RpcKind {
+func (m *wireRequest) rpcKind() RPCKind {
 	if m.Kind.isValid() {
 		return m.Kind
 	}
 
-	return RpcKindUnary
+	return RPCKindUnary
 }
 
 // wireResponse is the wire representation of an RPC response.

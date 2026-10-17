@@ -7,10 +7,10 @@ use prost::Message;
 use prost_types::compiler::{CodeGeneratorRequest, CodeGeneratorResponse};
 
 #[test]
-fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error>> {
+fn generates_services_from_a_real_proto_descriptor() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let proto_dir = manifest_dir.join("tests/proto");
-    let descriptor_set = protox::compile(["greeter.proto"], [&proto_dir])?;
+    let descriptor_set = protox::compile(["greeter.proto"], [&proto_dir]).unwrap();
     let request = CodeGeneratorRequest {
         file_to_generate: vec!["greeter.proto".to_owned()],
         parameter: Some("runtime_path=::trevrpc".to_owned()),
@@ -18,12 +18,12 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
         compiler_version: None,
     };
     let mut input = Vec::new();
-    request.encode(&mut input)?;
+    request.encode(&mut input).unwrap();
     let mut output = Vec::new();
 
-    protoc_gen_trevrpc_rust::run_plugin(input.as_slice(), &mut output)?;
+    protoc_gen_trevrpc_rust::run_plugin(input.as_slice(), &mut output).unwrap();
 
-    let response = CodeGeneratorResponse::decode(output.as_slice())?;
+    let response = CodeGeneratorResponse::decode(output.as_slice()).unwrap();
     assert_eq!(response.error, None);
     assert_eq!(response.file.len(), 1);
     assert_eq!(
@@ -56,16 +56,14 @@ fn generates_services_from_a_real_proto_descriptor() -> Result<(), Box<dyn Error
     assert!(buf_config.contains("protoc-gen-trevrpc-rust"));
 
     let checked_in =
-        std::fs::read_to_string(manifest_dir.join("../../examples/shared/greeter.rs"))?;
-    let formatted = rustfmt_generated(content)?;
+        std::fs::read_to_string(manifest_dir.join("../../examples/shared/greeter.rs")).unwrap();
+    let formatted = rustfmt_generated(content).unwrap();
     assert!(
         checked_in.ends_with(&formatted),
         "checked-in greeter bindings have drifted from generator output"
     );
 
-    compile_generated_service(content)?;
-
-    Ok(())
+    compile_generated_service(content).unwrap();
 }
 
 fn rustfmt_generated(content: &str) -> Result<String, Box<dyn Error>> {
@@ -78,13 +76,12 @@ fn rustfmt_generated(content: &str) -> Result<String, Box<dyn Error>> {
     child
         .stdin
         .take()
-        .expect("rustfmt stdin should be piped")
+        .ok_or("rustfmt stdin should be piped")?
         .write_all(content.as_bytes())?;
     let output = child.wait_with_output()?;
-    assert!(
-        output.status.success(),
-        "rustfmt should format generated code"
-    );
+    if !output.status.success() {
+        return Err("rustfmt should format generated code".into());
+    }
     Ok(String::from_utf8(output.stdout)?)
 }
 
@@ -201,7 +198,9 @@ pub fn register(server: &mut trevrpc::server::Server) {
         .env("CARGO_TARGET_DIR", temp_dir.join("target"))
         .status()?;
 
-    assert!(status.success(), "generated service crate should compile");
+    if !status.success() {
+        return Err("generated service crate should compile".into());
+    }
     std::fs::remove_dir_all(temp_dir)?;
 
     Ok(())

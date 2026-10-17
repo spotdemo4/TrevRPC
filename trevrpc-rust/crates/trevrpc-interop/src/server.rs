@@ -62,7 +62,7 @@ impl Echo for EchoService {
                 return Err(status);
             }
             message.push_str(&request.message);
-            count += 1;
+            count = count.saturating_add(1);
         }
         Ok(ResponseEnvelope::new(EchoResponse {
             message,
@@ -111,7 +111,7 @@ impl Echo for EchoService {
                                 message: request.message,
                                 index,
                             }),
-                            (requests, index + 1, false),
+                            (requests, index.saturating_add(1), false),
                         )),
                     },
                 }
@@ -122,7 +122,7 @@ impl Echo for EchoService {
 }
 
 /// Browsers connect from arbitrary origins, so any session on the shared path is admitted.
-fn admit_webtransport(_request: &WebTransportAdmissionRequest<'_>) -> bool {
+const fn admit_webtransport(_request: &WebTransportAdmissionRequest<'_>) -> bool {
     true
 }
 
@@ -160,13 +160,14 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let serving = tokio::spawn(server.serve_with_tcp(endpoint, fallback, shutdown_requested()));
 
     // One UDP socket serves the QUIC protocols and one TCP socket the fallbacks.
-    let mut stdout = std::io::stdout().lock();
-    writeln!(
-        stdout,
-        r#"{{"native":{udp},"http3":{udp},"webtransport":{udp},"qmux":{tcp},"http2":{tcp},"websocket":{tcp}}}"#
-    )?;
-    stdout.flush()?;
-    drop(stdout);
+    {
+        let mut stdout = std::io::stdout().lock();
+        writeln!(
+            stdout,
+            r#"{{"native":{udp},"http3":{udp},"webtransport":{udp},"qmux":{tcp},"http2":{tcp},"websocket":{tcp}}}"#
+        )?;
+        stdout.flush()?;
+    }
 
     serving.await??;
     Ok(())

@@ -52,22 +52,23 @@
               # rust
               rustc
               cargo
+              rust-analyzer
+              rustfmt
               clippy
               cargo-audit
-              rustfmt
 
               # go
               go
               gopls
               gotools
-              go-tools
+              golangci-lint
               protobuf
 
               # javascript
               nodejs_24
               playwright-driver.browsers
               oxlint
-              oxfmt
+              typescript
 
               # kotlin / android
               jdk25
@@ -80,6 +81,11 @@
               python3
               ruff
               basedpyright
+
+              vscode-json-languageserver # json
+              yaml-language-server # yaml
+              tombi # toml
+              oxfmt # format
 
               # nix
               nixd
@@ -164,6 +170,8 @@
               govulncheck
               # javascript
               nodejs_24
+              # kotlin
+              osv-scanner
               # nix
               flake-checker
               # actions
@@ -248,6 +256,7 @@
           configFile = ./treefmt.toml;
           runtimeInputs = with pkgs; [
             rustfmt
+            golangci-lint
             go
             nixfmt
             oxfmt
@@ -274,6 +283,50 @@
               ;
           };
           kotlin-interop-android = self.packages.${system}.trevrpc-kotlin.interopAndroid;
+
+          golangci-lint = {
+            src = self.packages.${system}.trevrpc-go;
+            packages = with pkgs; [ golangci-lint ];
+            script = ''
+              golangci-lint run ./...
+            '';
+          };
+
+          rustfmt = {
+            root = ./trevrpc-rust;
+            filter = file: file.hasExt "rs" || file.name == "Cargo.toml";
+            include = [ ./trevrpc-rust/Cargo.lock ];
+            packages = with pkgs; [
+              cargo
+              rustfmt
+            ];
+            script = ''
+              cargo fmt --all --check
+            '';
+          };
+
+          oxfmt = {
+            root = ./trevrpc-js;
+            filter = file: file.hasExt "js" || file.hasExt "ts" || file.hasExt "html";
+            include = [ ./trevrpc-js/.oxfmtrc.json ];
+            packages = with pkgs; [
+              oxfmt
+            ];
+            script = ''
+              oxfmt --check
+            '';
+          };
+
+          ktlint = {
+            root = ./trevrpc-kotlin;
+            filter = file: file.hasExt "kt" || file.hasExt "kts";
+            packages = with pkgs; [
+              ktlint
+            ];
+            script = ''
+              ktlint --relative "**/src/**/*.kt" "**/*.gradle.kts"
+            '';
+          };
 
           nix = {
             root = ./.;
@@ -338,7 +391,7 @@
             '';
           };
 
-          renovate = {
+          renovate-fj = {
             root = ./.forgejo;
             files = ./.forgejo/renovate.json;
             packages = with pkgs; [

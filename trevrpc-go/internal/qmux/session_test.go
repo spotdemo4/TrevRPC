@@ -25,12 +25,18 @@ func testParameters() Parameters {
 // sessionPair opens a client and a server session over loopback TCP.
 func sessionPair(t *testing.T, client, server Config) (*Session, *Session) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
-	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	defer func() {
+		if err := listener.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	}()
+	var dialer net.Dialer
+	clientConn, err := dialer.DialContext(t.Context(), "tcp", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

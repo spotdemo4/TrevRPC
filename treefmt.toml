@@ -5,9 +5,9 @@ command = "rustfmt"
 options = ["--edition", "2024"]
 includes = ["*.rs"]
 
-[formatter.gofmt]
-command = "gofmt"
-options = ["-w"]
+[formatter.golangci-lint]
+command = "golangci-lint"
+options = ["fmt"]
 includes = ["*.go"]
 
 [formatter.nixfmt]

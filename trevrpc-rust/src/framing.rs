@@ -25,7 +25,7 @@ where
     let encoded_len = message.encoded_len();
     let frame_len = validate_frame_body_len(encoded_len, max_frame_size)?;
 
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + encoded_len);
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN.saturating_add(encoded_len));
     frame.extend_from_slice(&frame_len.to_be_bytes());
     message.encode(&mut frame)?;
 
@@ -72,7 +72,7 @@ pub fn encode_message_stream_frame(body: &[u8], max_frame_size: usize) -> Result
     let body_len = message_stream_frame_body_len(body.len());
     let frame_len = validate_frame_body_len(body_len, max_frame_size)?;
 
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + body_len);
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN.saturating_add(body_len));
     frame.extend_from_slice(&frame_len.to_be_bytes());
     append_message_stream_frame_body(&mut frame, body);
 
@@ -103,7 +103,7 @@ pub fn encode_message_stream_frames(bodies: &[Vec<u8>], max_frame_size: usize) -
     for body in bodies {
         let body_len = message_stream_frame_body_len(body.len());
         validate_frame_body_len(body_len, max_frame_size)?;
-        total_len = total_len.saturating_add(FRAME_HEADER_LEN + body_len);
+        total_len = total_len.saturating_add(FRAME_HEADER_LEN.saturating_add(body_len));
     }
 
     let mut frames = Vec::with_capacity(total_len);
@@ -124,7 +124,7 @@ pub fn decode_stream_frame_body(body: &[u8]) -> Result<RpcStreamFrame> {
     }
 
     let mut offset = 0;
-    let mut kind = RpcStreamFrameKind::Message as i32;
+    let mut kind = i32::from(RpcStreamFrameKind::Message);
     let mut status = Code::Ok.as_u32();
     let mut message = String::new();
     let mut frame_body = Vec::new();
@@ -285,16 +285,16 @@ fn consume_u64_varint(
     offset: &mut usize,
 ) -> std::result::Result<u64, VarintDecodeError> {
     let mut value = 0_u64;
-    for index in 0..10 {
+    for index in 0_u32..10 {
         let Some(byte) = data.get(*offset).copied() else {
             return Err(VarintDecodeError::Truncated);
         };
-        *offset += 1;
+        *offset = offset.saturating_add(1);
 
         if index == 9 && byte > 1 {
             return Err(VarintDecodeError::Overflow);
         }
-        value |= u64::from(byte & 0x7f) << (index * 7);
+        value |= u64::from(byte & 0x7f).wrapping_shl(index.saturating_mul(7));
         if byte < 0x80 {
             return Ok(value);
         }
@@ -313,15 +313,15 @@ fn consume_proto_varint(data: &[u8], offset: &mut usize) -> Result<u64> {
 fn consume_proto_bytes<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
     let len = usize::try_from(consume_proto_varint(data, offset)?)
         .map_err(|_| malformed_protobuf("protobuf field length exceeded supported range"))?;
-    let end = offset
+    let start = *offset;
+    let end = start
         .checked_add(len)
         .ok_or_else(|| malformed_protobuf("protobuf field length overflowed"))?;
-    if end > data.len() {
-        return Err(malformed_protobuf("truncated protobuf field"));
-    }
-    let start = *offset;
+    let bytes = data
+        .get(start..end)
+        .ok_or_else(|| malformed_protobuf("truncated protobuf field"))?;
     *offset = end;
-    Ok(&data[start..end])
+    Ok(bytes)
 }
 
 fn skip_proto_value(data: &[u8], offset: &mut usize, field: u64, wire_type: u64) -> Result<()> {
@@ -379,12 +379,14 @@ fn validate_frame_body_len(len: usize, max_frame_size: usize) -> Result<u32> {
     })
 }
 
-fn message_stream_frame_body_len(body_len: usize) -> usize {
+const fn message_stream_frame_body_len(body_len: usize) -> usize {
     if body_len == 0 {
         return 0;
     }
 
-    1 + varint_len_usize(body_len) + body_len
+    varint_len_usize(body_len)
+        .saturating_add(1)
+        .saturating_add(body_len)
 }
 
 fn append_message_stream_frame_body(frame: &mut Vec<u8>, body: &[u8]) {
@@ -399,17 +401,18 @@ fn append_message_stream_frame_body(frame: &mut Vec<u8>, body: &[u8]) {
 
 fn append_varint_usize(data: &mut Vec<u8>, mut value: usize) {
     while value >= 0x80 {
-        let byte = u8::try_from(value & 0x7f).expect("masked varint byte should fit in u8");
-        data.push(byte | 0x80);
+        let [low, ..] = value.to_le_bytes();
+        data.push(low | 0x80);
         value >>= 7;
     }
-    data.push(u8::try_from(value).expect("terminal varint byte should fit in u8"));
+    let [low, ..] = value.to_le_bytes();
+    data.push(low);
 }
 
-fn varint_len_usize(mut value: usize) -> usize {
-    let mut len = 1;
+const fn varint_len_usize(mut value: usize) -> usize {
+    let mut len = 1_usize;
     while value >= 0x80 {
-        len += 1;
+        len = len.saturating_add(1);
         value >>= 7;
     }
     len
@@ -433,16 +436,15 @@ fn require_wire_type(actual: u64, expected: u64, message: &'static str) -> Resul
 fn consume_length_delimited<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
     let len = usize::try_from(consume_varint(data, offset)?)
         .map_err(|_| invalid_stream_frame("stream frame field length exceeded supported range"))?;
-    let end = offset
+    let start = *offset;
+    let end = start
         .checked_add(len)
         .ok_or_else(|| invalid_stream_frame("stream frame field length overflowed"))?;
-    if end > data.len() {
-        return Err(invalid_stream_frame("truncated stream frame field"));
-    }
-
-    let start = *offset;
+    let bytes = data
+        .get(start..end)
+        .ok_or_else(|| invalid_stream_frame("truncated stream frame field"))?;
     *offset = end;
-    Ok(&data[start..end])
+    Ok(bytes)
 }
 
 fn skip_proto_field(data: &[u8], offset: &mut usize, field: u64, wire_type: u64) -> Result<()> {
@@ -583,7 +585,7 @@ mod tests {
         for length in [0_u32, 1, 15, 16] {
             let decoded =
                 frame_body_len(length.to_be_bytes(), 16).expect("in-range length should decode");
-            assert_eq!(decoded, length as usize);
+            assert_eq!(decoded, usize::try_from(length).unwrap());
         }
 
         for length in [17_u32, u32::MAX] {

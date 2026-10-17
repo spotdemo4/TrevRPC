@@ -11,14 +11,14 @@ use crate::Status;
 
 /// How a transport failure ended a request stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TransportFailureKind {
+pub enum TransportFailureKind {
     PeerReset,
     ConnectionLost,
     Protocol,
 }
 
 /// The status and failure kind of a transport error.
-pub(crate) struct TransportFailure {
+pub struct TransportFailure {
     pub(crate) status: Status,
     /// `None` when the error does not say how the stream ended.
     pub(crate) kind: Option<TransportFailureKind>,
@@ -31,7 +31,7 @@ impl TransportFailure {
 }
 
 /// Classifies a transport error.
-pub(crate) fn classify(error: &(dyn StdError + Send + Sync + 'static)) -> TransportFailure {
+pub fn classify(error: &(dyn StdError + Send + Sync + 'static)) -> TransportFailure {
     if let Some(error) = error.downcast_ref::<quinn::ConnectionError>() {
         return TransportFailure::new(quinn_connection_status(error), None);
     }

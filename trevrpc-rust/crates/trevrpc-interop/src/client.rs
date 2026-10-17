@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
 use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, TransportPolicy};
@@ -98,10 +99,7 @@ async fn report(name: &str, scenario: impl Future<Output = Scenario>) -> bool {
     passed
 }
 
-type Named<'a> = (
-    &'static str,
-    std::pin::Pin<Box<dyn Future<Output = Scenario> + 'a>>,
-);
+type Named<'a> = (&'static str, BoxFuture<'a, Scenario>);
 
 fn scenarios(client: &Echo) -> Vec<Named<'_>> {
     vec![

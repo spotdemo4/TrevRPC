@@ -84,8 +84,8 @@ func encodeUnaryTestResponse(t *testing.T) []byte {
 }
 
 func callUnaryTestClient(
-	t *testing.T,
 	ctx context.Context,
+	t *testing.T,
 	stream *unaryTransportTestStream,
 ) (*wireResponse, error) {
 	t.Helper()
@@ -100,7 +100,7 @@ func TestTransportUnaryWaitsForCleanPeerEOF(t *testing.T) {
 		err      error
 	}, 1)
 	go func() {
-		response, err := callUnaryTestClient(t, context.Background(), stream)
+		response, err := callUnaryTestClient(context.Background(), t, stream)
 		result <- struct {
 			response *wireResponse
 			err      error
@@ -143,7 +143,7 @@ func TestTransportUnaryRejectsTrailingResponseData(t *testing.T) {
 	stream := newUnaryTransportTestStream(response)
 	close(stream.eof)
 
-	actual, err := callUnaryTestClient(t, context.Background(), stream)
+	actual, err := callUnaryTestClient(context.Background(), t, stream)
 	if actual != nil {
 		t.Fatalf("Call() response = %#v, want nil", actual)
 	}
@@ -160,7 +160,7 @@ func TestTransportUnaryCancellationWhileAwaitingPeerEOF(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := callUnaryTestClient(t, ctx, stream)
+		_, err := callUnaryTestClient(ctx, t, stream)
 		result <- err
 	}()
 

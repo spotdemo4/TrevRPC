@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"errors"
 	"io"
 	"iter"
 	"sync"
@@ -20,10 +21,10 @@ type MessageStream[T any] interface {
 // yielded; use Recv and Close directly when close errors must be observed.
 func Messages[T any](stream MessageStream[T]) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
-		defer stream.Close()
+		defer func() { _ = stream.Close() }()
 		for {
 			message, err := stream.Recv()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return
 			}
 			if !yield(message, err) || err != nil {
@@ -353,6 +354,12 @@ func streamContextCancelsRecv(stream any) bool {
 	}
 	cancellable, ok := stream.(contextCancelsRecvStream)
 	return ok && cancellable.trevrpcContextCancelsRecv()
+}
+
+// discardMessageStream closes stream where the close error cannot be acted on,
+// such as when the call has already failed or the peer is gone.
+func discardMessageStream(stream any) {
+	_ = closeMessageStream(stream)
 }
 
 func closeMessageStream(stream any) (err error) {

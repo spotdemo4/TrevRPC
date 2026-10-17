@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::response_state::{ResponseState, ResponseStateEvent};
+use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
     BoxStream, Code, Error, Metadata, ResponseEnvelope, Result, RpcKind, RpcRequest, RpcResponse,
@@ -95,7 +96,7 @@ impl CallOptions {
 
     /// Returns the metadata sent with the request.
     #[must_use]
-    pub fn metadata(&self) -> &Metadata {
+    pub const fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
@@ -508,11 +509,7 @@ where
 
     fn finish_in_place(&mut self) {
         self.finished = true;
-        self.state
-            .sender
-            .lock()
-            .expect("request sender lock poisoned")
-            .take();
+        self.state.sender.lock_unpoisoned().take();
     }
 }
 
@@ -522,8 +519,7 @@ where
 {
     let sender = state
         .sender
-        .lock()
-        .expect("request sender lock poisoned")
+        .lock_unpoisoned()
         .clone()
         .ok_or_else(|| Error::from(Status::cancelled("request stream is closed")))?;
     sender
@@ -619,7 +615,7 @@ where
     }
 
     #[must_use]
-    pub fn terminal_status(&self) -> Option<&Status> {
+    pub const fn terminal_status(&self) -> Option<&Status> {
         self.response.terminal_status()
     }
 }
@@ -786,20 +782,17 @@ where
         }
     }
 
-    if response_count != 1 {
+    let (Some(first), 1) = (first, response_count) else {
         return Err(Error::from(Status::internal(format!(
             "client-streaming RPC returned {response_count} response messages; expected exactly one"
         ))));
-    }
+    };
 
-    Ok(
-        ResponseEnvelope::new(first.expect("one response message should have been retained"))
-            .with_metadata(
-                response
-                    .terminal_status()
-                    .map_or_else(Metadata::new, |status| status.metadata().clone()),
-            ),
-    )
+    Ok(ResponseEnvelope::new(first).with_metadata(
+        response
+            .terminal_status()
+            .map_or_else(Metadata::new, |status| status.metadata().clone()),
+    ))
 }
 
 /// A decoded response stream that retains the clean terminal status and metadata.
@@ -850,7 +843,7 @@ where
 
     /// Returns the terminal status after the status frame and clean FIN are consumed.
     #[must_use]
-    pub fn terminal_status(&self) -> Option<&Status> {
+    pub const fn terminal_status(&self) -> Option<&Status> {
         self.state.terminal_status()
     }
 
