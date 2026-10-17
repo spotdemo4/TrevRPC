@@ -134,14 +134,14 @@ console.log(channel.transport); // "webtransport" or "websocket"
 `trevrpc-interop-browser` runs the cross-runtime interop scenarios from [`interop/README.md`](../interop/README.md) in a real browser over WebTransport, QMux over WebSocket, or the fallback between them. It is built from `interop/proto/interop.proto` with the generator in this package, so it also serves as a complete example of generated client code.
 
 ```sh
-trevrpc-interop-browser --browser chromium|firefox|webkit \
+trevrpc-interop-browser --browser chromium|firefox|safari \
   --url https://127.0.0.1:4433/trevrpc \
   --cert-hash <hex sha256 of the server certificate DER> \
   [--transport webtransport|websocket|auto] [--ws-url wss://127.0.0.1:4433/trevrpc] \
   [--expect-transport webtransport|websocket]
 ```
 
-It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. Browsers come from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM`, `TREVRPC_BROWSER_FIREFOX` and `TREVRPC_BROWSER_WEBKIT` when those name an executable. The browser contexts ignore certificate errors because WSS cannot pin a certificate hash. WebKit on macOS passes every lane against the Go server and the WebSocket lanes against the Rust server, but not yet Rust's WebTransport lane ([h3#347](https://github.com/hyperium/h3/issues/347)); where the browser has no WebTransport at all, such as Playwright's WebKit on Linux, every scenario fails with a clear reason.
+It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. Chromium and Firefox are launched through Playwright from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM` and `TREVRPC_BROWSER_FIREFOX` when those name an executable, and ignore certificate errors because WSS cannot pin a certificate hash. Safari is driven through `safaridriver` (`TREVRPC_BROWSER_SAFARI` overrides its path), which needs `sudo safaridriver --enable` once; Safari cannot ignore certificate errors, so the server certificate must be trusted by the system, as `interop/run.sh` does. Safari passes every lane against the Go server and the WebSocket lanes against the Rust server, but not yet Rust's WebTransport lane ([h3#347](https://github.com/hyperium/h3/issues/347)). The CLI serves the page from a loopback origin; the page fetches its input from there and posts each result back, so where the browser has no WebTransport at all every scenario fails with a clear reason.
 
 ## Development
 

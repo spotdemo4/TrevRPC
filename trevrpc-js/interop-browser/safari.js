@@ -1,0 +1,107 @@
+// Drives Safari through safaridriver over W3C WebDriver. Playwright's WebKit is not Safari: its
+// builds decide on their own whether to expose WebTransport, so only Safari itself shows what Safari
+// users get. Safari cannot be told to ignore certificate errors, so the interop certificate must be
+// trusted by the system (run.sh does this) and remote automation must be enabled once with
+// `sudo safaridriver --enable`.
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { createServer } from "node:net";
+import { setTimeout as sleep } from "node:timers/promises";
+
+const DefaultDriver = "/usr/bin/safaridriver";
+const RequestTimeoutMs = 30_000;
+const PollIntervalMs = 100;
+
+/**
+ * Starts safaridriver (TREVRPC_BROWSER_SAFARI, or the system one) and opens url in a new Safari
+ * automation session. Resolves with a handle whose close() ends the session and the driver.
+ */
+export async function openSafari(url, { launchTimeoutMs, closeTimeoutMs }) {
+  const port = await freePort();
+  const driver = spawn(process.env.TREVRPC_BROWSER_SAFARI || DefaultDriver, ["--port", port], {
+    stdio: ["ignore", "ignore", "inherit"],
+  });
+  const exited = once(driver, "exit").then(
+    ([code, signal]) => {
+      throw new Error(`safaridriver exited (${signal ?? code})`);
+    },
+    (error) => {
+      throw new Error(`cannot start safaridriver: ${error.message}`);
+    },
+  );
+  // Keeps an early exit from going unhandled; every wait below races it.
+  exited.catch(() => {});
+  const base = `http://127.0.0.1:${port}`;
+
+  let sessionId;
+  const close = async () => {
+    if (sessionId !== undefined) {
+      await webDriver(base, "DELETE", `/session/${sessionId}`, undefined, closeTimeoutMs).catch(
+        () => {},
+      );
+    }
+    if (driver.exitCode === null && driver.signalCode === null) {
+      driver.kill();
+      await Promise.race([exited.catch(() => {}), sleep(closeTimeoutMs)]);
+      driver.kill("SIGKILL");
+    }
+  };
+
+  try {
+    await Promise.race([waitForReady(base, launchTimeoutMs), exited]);
+    ({ sessionId } = await Promise.race([
+      webDriver(base, "POST", "/session", {
+        capabilities: { alwaysMatch: { browserName: "safari" } },
+      }),
+      exited,
+    ]));
+    await Promise.race([webDriver(base, "POST", `/session/${sessionId}/url`, { url }), exited]);
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  return { close };
+}
+
+async function waitForReady(base, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const ready = await webDriver(base, "GET", "/status", undefined, PollIntervalMs * 10).then(
+      (status) => status?.ready === true,
+      () => false,
+    );
+    if (ready) {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("safaridriver did not become ready in time");
+    }
+    await sleep(PollIntervalMs);
+  }
+}
+
+/** Sends one WebDriver command and resolves with its value, or rejects with the WebDriver error. */
+async function webDriver(base, method, path, body, timeoutMs = RequestTimeoutMs) {
+  const init = { method, signal: AbortSignal.timeout(timeoutMs) };
+  if (body !== undefined) {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(`${base}${path}`, init);
+  const { value } = await response.json();
+  if (!response.ok) {
+    const reason = [value?.error, value?.message].filter(Boolean).join(": ");
+    throw new Error(`safaridriver ${method} ${path}: ${reason || `HTTP ${response.status}`}`);
+  }
+  return value;
+}
+
+/** A loopback TCP port that was free a moment ago. */
+async function freePort() {
+  const server = createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return String(port);
+}

@@ -8,7 +8,9 @@
 # Servers and native clients are interop executables taking the `server` and
 # `client` subcommands. Browsers run through `trevrpc-interop-browser`, by
 # default over every lane: WebTransport, QMux over WebSocket, and the fallback
-# from a blocked UDP port to WebSocket.
+# from a blocked UDP port to WebSocket. Safari cannot ignore certificate errors,
+# so with `--browser safari` the generated certificate is trusted in the macOS
+# System keychain (through sudo) for the duration of the run.
 set -euo pipefail
 
 servers=()
@@ -40,8 +42,10 @@ out=${out:-$work/out}
 mkdir -p "$out"
 server_pid=""
 server_stdin=""
+trusted_cert=""
 cleanup() {
   stop_server
+  untrust_cert
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -52,8 +56,29 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 10 -subj /CN=localhost \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
   -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "extendedKeyUsage=serverAuth" \
   -keyout "$key" -out "$cert" 2>/dev/null
 cert_hash=$(openssl x509 -in "$cert" -outform der | sha256sum | cut -d' ' -f1)
+
+system_keychain=/Library/Keychains/System.keychain
+trust_cert() {
+  trusted_cert=$(openssl x509 -in "$cert" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d :)
+  sudo security add-trusted-cert -d -r trustRoot -p ssl -k "$system_keychain" "$cert"
+}
+
+untrust_cert() {
+  [[ -n $trusted_cert ]] || return 0
+  sudo security remove-trusted-cert -d "$cert" 2>/dev/null || true
+  sudo security delete-certificate -Z "$trusted_cert" "$system_keychain" >/dev/null 2>&1 || true
+  trusted_cert=""
+}
+
+for browser in "${browsers[@]}"; do
+  if [[ $browser == safari ]]; then
+    trust_cert
+    break
+  fi
+done
 
 start_server() {
   local name=$1 command=$2 ports=$out/server-$1.ports

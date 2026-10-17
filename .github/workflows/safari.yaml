@@ -1,7 +1,9 @@
 name: safari
 
-# Runs the browser interop suite in Safari on macOS. Every Go lane must pass,
-# and so must the Rust QMux over WebSocket lanes. The Rust server's
+# Runs the browser interop suite in Safari itself, driven through safaridriver,
+# on macOS. Playwright's WebKit is not used: its builds decide on their own
+# whether to expose WebTransport. Every Go lane must pass, and so must the Rust
+# QMux over WebSocket lanes. The Rust server's
 # h3-webtransport does not speak the WebTransport draft Safari uses
 # (hyperium/h3#347), so the Rust WebTransport lane is an allowed failure: it
 # keeps running so the failure stays visible, without failing the workflow.
@@ -48,13 +50,17 @@ jobs:
     env:
       SERVER: ${{ matrix.server }}
       LANES: ${{ matrix.lanes }}
+      CELL: safari-${{ matrix.name }}-to-${{ matrix.server }}
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
 
+      - name: Enable safaridriver
+        run: sudo safaridriver --enable
+
       - name: Run Safari interop
         env:
-          OUTPUT: ${{ runner.temp }}/safari-${{ matrix.name }}-to-${{ matrix.server }}
+          OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
         run: |
           nix shell \
             .#trevrpc-js \
@@ -63,13 +69,13 @@ jobs:
             --command trevrpc-interop \
               --out "$OUTPUT" \
               --server "$SERVER=trevrpc-interop-$SERVER" \
-              --browser webkit \
+              --browser safari \
               --browser-lanes "$LANES"
 
       - name: Upload failure diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: safari-${{ matrix.name }}-to-${{ matrix.server }}
-          path: ${{ runner.temp }}/safari-to-${{ matrix.server }}
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
           if-no-files-found: ignore

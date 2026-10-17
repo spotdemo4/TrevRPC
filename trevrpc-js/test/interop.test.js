@@ -110,9 +110,10 @@ test("a server that closes the session during connect fails every scenario", asy
   }
 });
 
-test("the page bundle is browser-only and exposes the runner", async () => {
+test("the page bundle is browser-only and reports to the CLI", async () => {
   const bundle = await readFile(pageBundle, "utf8");
-  assert.match(bundle, /trevrpcInterop/);
+  assert.match(bundle, /"\/input"/);
+  assert.match(bundle, /"\/result"/);
   assert.doesNotMatch(bundle, /from\s*["']node:|require\(["']node:|process\.binding/);
   assert.equal(Code.Ok, 0);
 });
@@ -135,6 +136,7 @@ test("the CLI validates its arguments before launching a browser", () => {
   for (const bad of [
     [],
     arguments_({ "--browser": "netscape" }),
+    arguments_({ "--browser": "webkit" }),
     arguments_({ "--browser": null }),
     arguments_({ "--url": null }),
     arguments_({ "--cert-hash": "abcd" }),
@@ -146,4 +148,22 @@ test("the CLI validates its arguments before launching a browser", () => {
     assert.match(result.stderr, /usage: trevrpc-interop-browser/);
     assert.equal(result.stdout, "");
   }
+});
+
+test("the CLI fails every scenario cleanly when safaridriver cannot start", () => {
+  const result = spawnSync(
+    process.execPath,
+    [cli, "--browser", "safari", "--url", url, "--cert-hash", "ab".repeat(32)],
+    {
+      encoding: "utf8",
+      env: { ...process.env, TREVRPC_BROWSER_SAFARI: "/nonexistent/safaridriver" },
+    },
+  );
+  assert.equal(result.status, 1, result.stderr);
+  assert.deepEqual(
+    result.stdout.trim().split("\n"),
+    ScenarioNames.map(
+      (name) => `fail ${name}: cannot start safaridriver: spawn /nonexistent/safaridriver ENOENT`,
+    ),
+  );
 });

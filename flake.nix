@@ -42,10 +42,6 @@
                 export TREVRPC_BROWSER_FIREFOX="$firefox"
                 break
               done
-              for webkit in "$PLAYWRIGHT_BROWSERS_PATH"/webkit-*/pw_run.sh; do
-                export TREVRPC_BROWSER_WEBKIT="$webkit"
-                break
-              done
             '';
             env = {
               GOTOOLCHAIN = "local";

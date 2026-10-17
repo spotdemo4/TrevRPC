@@ -16,7 +16,8 @@ client also has a TCP fallback for networks that block UDP.
 `run.sh` (packaged with its tools as `nix run .#trevrpc-interop`) drives the desktop matrix, which `nix flake check` runs on Linux for
 Chromium and Firefox. CI runs the Android client on an emulator because it needs
 KVM (once over HTTP/3 and once over HTTP/2 with QUIC disabled), and runs Safari
-on macOS. Safari passes every lane against the Go server. Against the Rust
+on macOS through `safaridriver` (not Playwright's WebKit, whose builds decide on
+their own whether to expose WebTransport). Safari passes every lane against the Go server. Against the Rust
 server it passes the WebSocket and fallback lanes; Rust's `h3` does not yet
 speak the WebTransport draft Safari uses, so the Rust WebTransport lane is
 expected to fail. It is an allowed failure in the `safari` workflow, so it stays
@@ -114,7 +115,7 @@ have their own entry points but follow the same output contract.
 ### Browser client
 
 ```text
-trevrpc-interop-browser --browser chromium|firefox|webkit --url <https://host:port/trevrpc>
+trevrpc-interop-browser --browser chromium|firefox|safari --url <https://host:port/trevrpc>
                         --cert-hash <hex sha256> [--transport webtransport|websocket|auto]
                         [--ws-url <wss://host:port/trevrpc>]
                         [--expect-transport webtransport|websocket]
@@ -122,8 +123,10 @@ trevrpc-interop-browser --browser chromium|firefox|webkit --url <https://host:po
 
 It follows the same output contract. `--transport` defaults to `webtransport`;
 `--ws-url` defaults to `--url` with the `wss:` scheme. `--expect-transport`
-fails the run unless the channel connected over that transport. The browser
-contexts ignore certificate errors, because WSS cannot pin a certificate hash.
+fails the run unless the channel connected over that transport. Chromium and
+Firefox ignore certificate errors, because WSS cannot pin a certificate hash.
+Safari is driven through `safaridriver`, which needs `sudo safaridriver --enable`
+once, and cannot ignore certificate errors (see [Certificates](#certificates)).
 
 ### Android client
 
@@ -134,9 +137,12 @@ HTTP/2 mapping on its TCP port.
 ### Certificates
 
 `run.sh` generates one self-signed ECDSA P-256 certificate valid for 10 days
-with SANs `DNS:localhost` and `IP:127.0.0.1` and `CA:FALSE` (rustls rejects a CA
-certificate as a server identity). It is both the server certificate and the
+with SANs `DNS:localhost` and `IP:127.0.0.1`, `CA:FALSE` (rustls rejects a CA
+certificate as a server identity) and the `serverAuth` extended key usage (macOS
+requires it of TLS server certificates). It is both the server certificate and the
 client trust root. Browsers trust it through WebTransport
 `serverCertificateHashes`, which requires ECDSA and at most 14 days validity.
-The WSS lanes cannot pin a hash, so the browser contexts ignore certificate
-errors instead.
+The WSS lanes cannot pin a hash, so Chromium and Firefox ignore certificate
+errors instead. Safari cannot, so with `--browser safari` `run.sh` adds the
+certificate to the macOS System keychain as a trusted root through `sudo` and
+removes it when the run ends.

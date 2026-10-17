@@ -94,7 +94,8 @@ buildNpmPackage (final: {
   postInstall = ''
     interop="$out/lib/trevrpc-interop-browser"
     mkdir -p "$interop/interop-browser" "$interop/build/interop"
-    cp interop-browser/cli.js interop-browser/names.js "$interop/interop-browser/"
+    cp interop-browser/cli.js interop-browser/names.js interop-browser/safari.js \
+      "$interop/interop-browser/"
     cp build/interop/page.js "$interop/build/interop/"
     cp -R "$TMPDIR/interop-node_modules" "$interop/node_modules"
     chmod -R u+w "$interop"
