@@ -28,14 +28,32 @@ sumdb="${GO_SUMDB_URL:-https://sum.golang.org}"
 
 fetch() {
   echo "GET $1"
-  curl --fail --show-error --retry 5 --retry-delay 5 --retry-all-errors "$1"
+  curl --fail --show-error --retry 5 --retry-delay 5 --retry-all-errors "$@"
 }
 
 fetch "${proxy%/}/$module/@v/$tag.info"
 fetch "${proxy%/}/$module/@v/$tag.mod"
-fetch "${proxy%/}/$module/@v/$tag.zip"
+fetch "${proxy%/}/$module/@v/$tag.zip" --output /dev/null
 # Checksum lookup is useful but not required for publication to succeed.
 curl --fail --show-error --retry 3 --retry-delay 2 --retry-all-errors \
   "${sumdb%/}/lookup/$module@$tag" || true
 
 echo "Seeded $module@$tag"
+
+# pkg.go.dev only picks new versions up from index.golang.org eventually, which
+# can take hours, so request the version the way its "Request" button does and
+# wait until it is served. The request answers 408 while processing continues.
+pkgsite="${PKGSITE_URL:-https://pkg.go.dev}"
+for _ in $(seq 60); do
+  page=$(curl --silent --output /dev/null --write-out '%{http_code}' "${pkgsite%/}/$module@$tag" || true)
+  if [[ "$page" == 200 ]]; then
+    echo "Published $module@$tag to pkg.go.dev"
+    exit 0
+  fi
+  echo "POST ${pkgsite%/}/fetch/$module@$tag"
+  curl --silent --output /dev/null --max-time 60 -X POST "${pkgsite%/}/fetch/$module@$tag" || true
+  sleep 10
+done
+
+# The module is already published through the proxy, so only warn.
+echo "::warning::pkg.go.dev did not publish $module@$tag yet; request it at ${pkgsite%/}/$module@$tag"
