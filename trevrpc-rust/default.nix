@@ -28,7 +28,7 @@ mkRustPackage (final: {
   cargoBuildFlags = [ "--workspace" ];
 
   doCheck = canExecute;
-  # The tests bind loopback UDP sockets and run the interop executable against itself.
+  # The tests and benchmarks bind loopback UDP sockets and run the interop executable against itself.
   __darwinAllowLocalNetworking = true;
   nativeCheckInputs = [
     # The generator tests format its output to compare against the checked-in bindings.
@@ -38,6 +38,8 @@ mkRustPackage (final: {
   checkPhase = ''
     runHook preCheck
     cargo test --workspace --offline
+    # Run every benchmark once so they keep compiling and working; the numbers are not checked.
+    cargo bench --offline --bench frames --bench loopback -- --test
     cargo clippy --workspace --all-targets --offline -- -D warnings
     runHook postCheck
   '';

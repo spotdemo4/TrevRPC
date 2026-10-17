@@ -5,6 +5,13 @@
 //	trevrpc-interop client --addr host:port --ca cert.pem [--server-name localhost]
 //	                       [--transport quic|tcp|auto] [--tcp-addr host:port]
 //	                       [--expect-transport quic|qmux]
+//	trevrpc-interop bench  --addr host:port --ca cert.pem [--server-name localhost]
+//	                       [--transport quic|tcp] [--tcp-addr host:port]
+//	                       --scenario unary|server-stream|client-stream|bidi
+//	                       [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
+//	                       [--messages 100]
+//
+// bench is the load client described in bench/README.md.
 package main
 
 import (
@@ -23,7 +30,7 @@ func main() {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		printf(stderr, "usage: trevrpc-interop server|client [flags]\n")
+		printf(stderr, "usage: trevrpc-interop server|client|bench [flags]\n")
 		return 2
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -59,21 +66,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	case "client":
 		var config clientConfig
-		flags.StringVar(&config.addr, "addr", "", "server host:port")
-		flags.StringVar(&config.caFile, "ca", "", "trusted server certificate PEM file")
-		flags.StringVar(&config.serverName, "server-name", "localhost", "TLS server name")
-		flags.StringVar(&config.transport, "transport", "quic", "transport policy: quic, tcp (QMux over TLS) or auto (QUIC with TCP fallback)")
-		flags.StringVar(&config.tcpAddr, "tcp-addr", "", "server TCP host:port (defaults to --addr)")
+		config.register(flags, "transport policy: quic, tcp (QMux over TLS) or auto (QUIC with TCP fallback)")
 		flags.StringVar(&config.expectTransport, "expect-transport", "", "fail unless the channel connects over this transport (quic or qmux)")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
-		if config.addr == "" || config.caFile == "" {
-			printf(stderr, "client: --addr and --ca are required\n")
-			return 2
-		}
-		if _, ok := transportPolicies[config.transport]; !ok {
-			printf(stderr, "client: unknown --transport %q\n", config.transport)
+		if err := config.check("client", "quic", "tcp", "auto"); err != nil {
+			printf(stderr, "%v\n", err)
 			return 2
 		}
 		passed, err := runClient(ctx, config, stdout)
@@ -82,6 +81,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 1
 		}
 		if !passed {
+			return 1
+		}
+		return 0
+	case "bench":
+		var config benchConfig
+		config.register(flags)
+		if err := flags.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if err := config.validate(); err != nil {
+			printf(stderr, "%v\n", err)
+			return 2
+		}
+		if err := runBench(ctx, config, stdout); err != nil {
+			printf(stderr, "bench: %v\n", err)
 			return 1
 		}
 		return 0

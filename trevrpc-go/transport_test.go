@@ -187,7 +187,14 @@ func (s *upperStream) Close() error { return s.requests.Close() }
 
 // startTestListener serves the test service on a loopback UDP port until the
 // test ends and checks that Serve shuts down cleanly.
-func startTestListener(t *testing.T, pki testPKI, configure func(*ServerOptions)) *Listener {
+func startTestListener(t testing.TB, pki testPKI, configure func(*ServerOptions)) *Listener {
+	t.Helper()
+	return startTestListenerWith(t, pki, configure, registerTestService)
+}
+
+// startTestListenerWith is startTestListener with register adding the services
+// the listener serves.
+func startTestListenerWith(t testing.TB, pki testPKI, configure func(*ServerOptions), register func(*Server)) *Listener {
 	t.Helper()
 	server := NewServer()
 	options := server.Options()
@@ -198,7 +205,7 @@ func startTestListener(t *testing.T, pki testPKI, configure func(*ServerOptions)
 		configure(&options)
 	}
 	server.SetOptions(options)
-	registerTestService(server)
+	register(server)
 
 	listener, err := Listen("127.0.0.1:0", server, ListenOptions{TLSConfig: pki.server})
 	if err != nil {
@@ -224,7 +231,7 @@ func startTestListener(t *testing.T, pki testPKI, configure func(*ServerOptions)
 	return listener
 }
 
-func dialNative(t *testing.T, pki testPKI, listener *Listener) *Channel {
+func dialNative(t testing.TB, pki testPKI, listener *Listener) *Channel {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()

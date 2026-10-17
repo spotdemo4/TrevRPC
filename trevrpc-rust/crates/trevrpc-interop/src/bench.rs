@@ -1,0 +1,517 @@
+//! The `bench` subcommand: a load client for the contract in `bench/README.md`.
+//!
+//! Workers are tasks that share one connection and keep one call or stream in flight each. They
+//! run for a warmup period and then a measured window, and only operations that start and finish
+//! inside the window count. The client prints one JSON line with the throughput and latency
+//! percentiles.
+
+use std::time::Duration;
+
+use tokio::time::{Instant, timeout_at};
+use trevrpc::Error;
+use trevrpc::client::{
+    BidirectionalCall, CallOptions, ChannelConfig, QmuxTransport, QuicTransport,
+    StreamingRpcTransport,
+};
+
+use crate::proto::{EchoClient, EchoRequest, EchoResponse};
+use crate::{BoxError, Flags, connect};
+
+/// How long past the end of the window an operation may run before it counts as failed, so a
+/// hung call cannot stall the run.
+const STRAGGLER_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    Unary,
+    ServerStream,
+    ClientStream,
+    Bidi,
+}
+
+impl Scenario {
+    fn parse(name: &str) -> Result<Self, BoxError> {
+        match name {
+            "unary" => Ok(Self::Unary),
+            "server-stream" => Ok(Self::ServerStream),
+            "client-stream" => Ok(Self::ClientStream),
+            "bidi" => Ok(Self::Bidi),
+            other => Err(format!("unknown --scenario {other:?}").into()),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Unary => "unary",
+            Self::ServerStream => "server-stream",
+            Self::ClientStream => "client-stream",
+            Self::Bidi => "bidi",
+        }
+    }
+
+    /// The application messages one operation moves.
+    const fn messages_per_op(self, messages: usize) -> usize {
+        match self {
+            Self::Unary | Self::Bidi => 1,
+            Self::ServerStream | Self::ClientStream => messages,
+        }
+    }
+}
+
+struct Params {
+    scenario: Scenario,
+    size: usize,
+    concurrency: usize,
+    duration: Duration,
+    warmup: Duration,
+    messages: usize,
+}
+
+impl Params {
+    fn parse(flags: &Flags) -> Result<Self, BoxError> {
+        let scenario = Scenario::parse(flags.require("scenario")?)?;
+        let size = number(flags, "size", 64)?;
+        let concurrency = number(flags, "concurrency", 1)?;
+        let messages = number(flags, "messages", 100)?;
+        if concurrency == 0 || messages == 0 {
+            return Err("--concurrency and --messages must be positive".into());
+        }
+        let duration = seconds(flags, "duration", 5.0)?;
+        if duration.is_zero() {
+            return Err("--duration must be positive".into());
+        }
+        Ok(Self {
+            scenario,
+            size,
+            concurrency,
+            duration,
+            warmup: seconds(flags, "warmup", 1.0)?,
+            messages,
+        })
+    }
+}
+
+fn number(flags: &Flags, name: &str, default: usize) -> Result<usize, BoxError> {
+    flags.get(name).map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| format!("invalid --{name} {value:?}").into())
+    })
+}
+
+fn seconds(flags: &Flags, name: &str, default: f64) -> Result<Duration, BoxError> {
+    let value = match flags.get(name) {
+        Some(value) => value
+            .parse::<f64>()
+            .map_err(|_| format!("invalid --{name} {value:?}"))?,
+        None => default,
+    };
+    Duration::try_from_secs_f64(value).map_err(|_| format!("invalid --{name} {value}").into())
+}
+
+/// The transport a run measures and how to read its connection statistics.
+enum Link {
+    Quic {
+        endpoint: quinn::Endpoint,
+        transport: QuicTransport,
+    },
+    Qmux(QmuxTransport),
+}
+
+impl Link {
+    async fn connect(flags: &Flags) -> Result<Self, BoxError> {
+        let tls = connect::tls_config(flags)?;
+        let server_name = connect::server_name(flags);
+        match flags.get("transport").unwrap_or("quic") {
+            "quic" => {
+                let addr = connect::resolve(flags, "addr").await?;
+                let endpoint = connect::client_endpoint(addr, &ChannelConfig::new(), tls)?;
+                let connection = endpoint.connect(addr, server_name)?.await?;
+                Ok(Self::Quic {
+                    endpoint,
+                    transport: QuicTransport::new(connection),
+                })
+            }
+            "tcp" => {
+                let addr = connect::resolve(flags, "tcp-addr").await?;
+                Ok(Self::Qmux(
+                    QmuxTransport::connect(addr, server_name, tls).await?,
+                ))
+            }
+            other => Err(format!("unknown --transport {other:?}, want quic or tcp").into()),
+        }
+    }
+
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Quic { .. } => "quic",
+            Self::Qmux(_) => "qmux",
+        }
+    }
+
+    /// Bytes the connection has sent and received so far, where the stack exposes them: the UDP
+    /// payload of the QUIC connection. The `QMux` session hides its TCP stream.
+    fn wire_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Quic { transport, .. } => {
+                let stats = transport.connection().stats();
+                Some(stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes))
+            }
+            Self::Qmux(_) => None,
+        }
+    }
+
+    async fn close(&self) {
+        match self {
+            Self::Quic {
+                endpoint,
+                transport,
+            } => {
+                transport.connection().close(0_u8.into(), b"done");
+                endpoint.wait_idle().await;
+            }
+            Self::Qmux(transport) => transport.close(),
+        }
+    }
+}
+
+/// The measured window, as instants.
+#[derive(Clone, Copy)]
+struct Window {
+    start: Instant,
+    end: Instant,
+}
+
+impl Window {
+    /// When an operation still running counts as hung.
+    fn straggler_deadline(self) -> Instant {
+        self.end.checked_add(STRAGGLER_GRACE).unwrap_or(self.end)
+    }
+}
+
+#[derive(Default)]
+struct WorkerResult {
+    latencies: Vec<Duration>,
+    errors: u64,
+    /// The first failure, reported on stderr to explain a non-zero error count.
+    first_error: Option<String>,
+}
+
+/// One load worker: a client and, for `bidi`, the stream it keeps open.
+struct Worker<T> {
+    client: EchoClient<T>,
+    scenario: Scenario,
+    request: EchoRequest,
+    messages: usize,
+    bidi: Option<BidirectionalCall<EchoRequest, EchoResponse>>,
+}
+
+impl<T> Worker<T>
+where
+    T: StreamingRpcTransport + Clone,
+{
+    fn options() -> CallOptions {
+        // Streams stay open for the whole run, and the loop bounds every operation itself.
+        CallOptions::new()
+            .without_timeout()
+            .with_max_response_messages(None)
+            .with_max_response_stream_body_size(None)
+            .with_stream_idle_timeout(None)
+    }
+
+    /// Runs one operation of the scenario.
+    async fn operation(&mut self) -> Result<(), Error> {
+        match self.scenario {
+            Scenario::Unary => {
+                self.client
+                    .unary_with_options(self.request.clone(), Self::options())
+                    .await?;
+            }
+            Scenario::ServerStream => self.server_stream().await?,
+            Scenario::ClientStream => self.client_stream().await?,
+            Scenario::Bidi => self.bidi().await?,
+        }
+        Ok(())
+    }
+
+    // `&mut self` because the bidi call makes `Worker` not `Sync`, and a shared reference held
+    // across an await would make the spawned worker not `Send`.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn server_stream(&mut self) -> Result<(), Error> {
+        use futures_util::StreamExt as _;
+
+        let request = EchoRequest {
+            count: u32::try_from(self.messages).unwrap_or(u32::MAX),
+            ..self.request.clone()
+        };
+        let mut responses = self
+            .client
+            .server_stream_with_options(request, Self::options())
+            .await?;
+        let mut received = 0_usize;
+        while let Some(response) = responses.next().await {
+            response?;
+            received = received.saturating_add(1);
+        }
+        short_stream_check(received, self.messages)
+    }
+
+    #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
+    async fn client_stream(&mut self) -> Result<(), Error> {
+        let call = self
+            .client
+            .client_stream_with_options(Self::options())
+            .await?;
+        for _ in 0..self.messages {
+            call.send(self.request.clone()).await?;
+        }
+        let response = call.close_and_recv().await?;
+        short_stream_check(
+            usize::try_from(response.index).unwrap_or(usize::MAX),
+            self.messages,
+        )
+    }
+
+    async fn bidi(&mut self) -> Result<(), Error> {
+        let call = match &mut self.bidi {
+            Some(call) => call,
+            empty @ None => empty.insert(self.client.bidi_with_options(Self::options()).await?),
+        };
+        let sent = call.send(self.request.clone()).await;
+        let result = match sent {
+            Ok(()) => call.recv().await.and_then(|response| {
+                response.map(drop).ok_or_else(|| {
+                    Error::from(trevrpc::Status::unavailable("bidi stream ended early"))
+                })
+            }),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            // A failed stream is gone; the next operation opens a fresh one.
+            self.bidi = None;
+        }
+        result
+    }
+}
+
+fn short_stream_check(got: usize, want: usize) -> Result<(), Error> {
+    if got == want {
+        Ok(())
+    } else {
+        Err(Error::from(trevrpc::Status::internal(format!(
+            "stream carried {got} messages, want {want}"
+        ))))
+    }
+}
+
+/// Loops operations until the window ends, recording those that start and finish inside it.
+async fn work<T>(mut worker: Worker<T>, window: Window) -> WorkerResult
+where
+    T: StreamingRpcTransport + Clone,
+{
+    let mut result = WorkerResult::default();
+    loop {
+        let started = Instant::now();
+        if started >= window.end {
+            return result;
+        }
+        let outcome = timeout_at(window.straggler_deadline(), worker.operation()).await;
+        let finished = Instant::now();
+        let measured = started >= window.start;
+        match outcome {
+            Ok(Ok(())) => {
+                if measured && finished <= window.end {
+                    result.latencies.push(finished.duration_since(started));
+                }
+            }
+            failed => {
+                if measured {
+                    result.errors = result.errors.saturating_add(1);
+                    if result.first_error.is_none() {
+                        result.first_error = Some(match &failed {
+                            Ok(Err(error)) => error.to_string(),
+                            _ => "operation timed out".to_owned(),
+                        });
+                    }
+                }
+                worker.bidi = None;
+                // Do not spin on a dead connection.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+}
+
+/// Runs the workers and the wire-byte sampling over `transport`.
+async fn measure<T>(
+    transport: T,
+    params: &Params,
+    link: &Link,
+) -> Result<(Vec<WorkerResult>, Option<u64>), BoxError>
+where
+    T: StreamingRpcTransport + Clone,
+{
+    let request = EchoRequest {
+        message: "x".repeat(params.size),
+        ..EchoRequest::default()
+    };
+    let start = Instant::now()
+        .checked_add(params.warmup)
+        .ok_or("--warmup is too long")?;
+    let window = Window {
+        start,
+        end: start
+            .checked_add(params.duration)
+            .ok_or("--duration is too long")?,
+    };
+    let workers: Vec<_> = (0..params.concurrency)
+        .map(|_| {
+            tokio::spawn(work(
+                Worker {
+                    client: EchoClient::new(transport.clone()),
+                    scenario: params.scenario,
+                    request: request.clone(),
+                    messages: params.messages,
+                    bidi: None,
+                },
+                window,
+            ))
+        })
+        .collect();
+
+    tokio::time::sleep_until(window.start).await;
+    let before = link.wire_bytes();
+    tokio::time::sleep_until(window.end).await;
+    let after = link.wire_bytes();
+    let wire = before
+        .zip(after)
+        .map(|(before, after)| after.saturating_sub(before));
+
+    let mut results = Vec::with_capacity(workers.len());
+    for worker in workers {
+        results.push(worker.await?);
+    }
+    Ok((results, wire))
+}
+
+/// Runs the load and prints the JSON report.
+pub async fn run(flags: &Flags) -> Result<(), BoxError> {
+    let params = Params::parse(flags)?;
+    let link = Link::connect(flags).await?;
+    let measured = match &link {
+        Link::Quic { transport, .. } => measure(transport.clone(), &params, &link).await,
+        Link::Qmux(transport) => measure(transport.clone(), &params, &link).await,
+    };
+    link.close().await;
+    let (results, wire) = measured?;
+
+    let report = Report::new(&params, link.name(), results, wire)?;
+    println!("{}", report.json());
+    Ok(())
+}
+
+struct Report {
+    scenario: Scenario,
+    transport: &'static str,
+    size: usize,
+    concurrency: usize,
+    duration: f64,
+    ops: u64,
+    msgs: u64,
+    errors: u64,
+    /// Sorted ascending.
+    latencies: Vec<Duration>,
+    wire_bytes: Option<u64>,
+}
+
+impl Report {
+    fn new(
+        params: &Params,
+        transport: &'static str,
+        results: Vec<WorkerResult>,
+        wire_bytes: Option<u64>,
+    ) -> Result<Self, BoxError> {
+        let errors = results.iter().map(|result| result.errors).sum();
+        if let Some(error) = results
+            .iter()
+            .find_map(|result| result.first_error.as_ref())
+        {
+            eprintln!("bench: {errors} operations failed; first: {error}");
+        }
+        let mut latencies: Vec<Duration> = results
+            .into_iter()
+            .flat_map(|result| result.latencies)
+            .collect();
+        latencies.sort_unstable();
+        let ops = u64::try_from(latencies.len())?;
+        if ops == 0 {
+            return Err(
+                format!("no operation completed in the measured window ({errors} failed)").into(),
+            );
+        }
+        let per_op = u64::try_from(params.scenario.messages_per_op(params.messages))?;
+        Ok(Self {
+            scenario: params.scenario,
+            transport,
+            size: params.size,
+            concurrency: params.concurrency,
+            duration: params.duration.as_secs_f64(),
+            ops,
+            msgs: ops.saturating_mul(per_op),
+            errors,
+            latencies,
+            wire_bytes,
+        })
+    }
+
+    /// The nearest-rank percentile `permille / 1000` of the latencies, in microseconds.
+    fn percentile(&self, permille: usize) -> f64 {
+        let rank = self
+            .latencies
+            .len()
+            .saturating_mul(permille)
+            .div_ceil(1000)
+            .saturating_sub(1);
+        self.latencies
+            .get(rank)
+            .or_else(|| self.latencies.last())
+            .map_or(0.0, |latency| latency.as_secs_f64() * 1e6)
+    }
+
+    fn json(&self) -> String {
+        let msgs = count(self.msgs);
+        let msgs_per_sec = msgs / self.duration;
+        let wire = self.wire_bytes.map_or_else(String::new, |bytes| {
+            format!(r#","wire_bytes_per_msg":{:.1}"#, count(bytes) / msgs)
+        });
+        format!(
+            concat!(
+                r#"{{"scenario":"{}","transport":"{}","size":{},"concurrency":{},"duration_s":{:?},"#,
+                r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
+                r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{}}}"#,
+            ),
+            self.scenario.name(),
+            self.transport,
+            self.size,
+            self.concurrency,
+            self.duration,
+            self.ops,
+            self.msgs,
+            self.errors,
+            count(self.ops) / self.duration,
+            msgs_per_sec,
+            msgs_per_sec * count(u64::try_from(self.size).unwrap_or(u64::MAX)),
+            self.percentile(500),
+            self.percentile(900),
+            self.percentile(990),
+            self.percentile(999),
+            wire,
+        )
+    }
+}
+
+/// A count as a float for rates; precision loss above 2^53 is irrelevant here.
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+const fn count(value: u64) -> f64 {
+    value as f64
+}

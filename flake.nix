@@ -190,6 +190,8 @@
             script = ''
               go -C trevrpc-go mod tidy
               fix-hash .#trevrpc-go
+              go -C bench/grpc-go mod tidy
+              fix-hash .#trevrpc-bench-grpc
             '';
           };
 
@@ -214,6 +216,37 @@
               USE_BWRAP=0 "$update_script"
 
               oxfmt --write trevrpc-kotlin/gradle/deps.json
+            '';
+          };
+
+          # Load benchmarks: every client against every server, plus grpc-go; see bench/README.md.
+          bench = {
+            packages = [ self.packages.${system}.trevrpc-bench ];
+            script = ''
+              trevrpc-bench ${
+                (pkgs.callPackage ./bench {
+                  inherit (self.packages.${system})
+                    trevrpc-bench
+                    trevrpc-bench-grpc
+                    trevrpc-go
+                    trevrpc-rust
+                    ;
+                }).args
+              } "$@"
+            '';
+          };
+
+          # Go and Rust microbenchmarks, run from the checkout; compare runs with benchstat.
+          bench-micro = {
+            packages = with pkgs; [
+              go
+              cargo
+              rustc
+            ];
+            script = ''
+              go -C trevrpc-go test -run '^$' -bench . -count 5 ./... | tee "''${TMPDIR:-/tmp}/trevrpc-bench-go.txt"
+              (cd trevrpc-rust && cargo bench)
+              echo "Go results: ''${TMPDIR:-/tmp}/trevrpc-bench-go.txt (compare with: go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261009192801-be2c69fb417e old.txt new.txt)"
             '';
           };
 
@@ -249,6 +282,8 @@
             trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin { inherit wireGolden interopProto licenseFile; };
             trevrpc-rust = pkgs.callPackage ./trevrpc-rust { inherit wireGolden interopProto; };
             trevrpc-interop = pkgs.callPackage ./interop/runner.nix { };
+            trevrpc-bench = pkgs.callPackage ./bench/runner.nix { };
+            trevrpc-bench-grpc = pkgs.callPackage ./bench/grpc-go { inherit interopProto; };
           };
 
         # nix fmt
@@ -272,7 +307,28 @@
             trevrpc-js
             trevrpc-kotlin
             trevrpc-rust
+            trevrpc-bench-grpc
             ;
+
+          bench =
+            (pkgs.callPackage ./bench {
+              inherit (self.packages.${system})
+                trevrpc-bench
+                trevrpc-bench-grpc
+                trevrpc-go
+                trevrpc-rust
+                ;
+              extraArgs = [
+                "--duration"
+                "0.2"
+                "--warmup"
+                "0"
+                "--concurrency"
+                "1,4"
+                "--messages"
+                "10"
+              ];
+            }).check;
 
           interop = pkgs.callPackage ./interop {
             inherit (self.packages.${system})
@@ -346,7 +402,7 @@
               shellcheck
             ];
             script = ''
-              shellcheck "$file"
+              shellcheck --external-sources "$file"
             '';
           };
 

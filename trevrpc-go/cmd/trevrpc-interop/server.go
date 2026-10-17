@@ -55,13 +55,20 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 }
 
 // newServer binds a listener for the Echo service. Every browser session is
-// admitted because browsers connect from arbitrary origins.
+// admitted because browsers connect from arbitrary origins. Streams are not
+// limited in messages or bytes, because bench/README.md keeps one Bidi stream
+// open for a whole run, and the per-connection stream limit leaves room for a
+// bench worker to open its next stream before the server has released the
+// previous one.
 func newServer(addr string, tlsConfig *tls.Config) (*trevrpc.Listener, error) {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(trevrpc.AdmissionRequest) bool { return true }
+	options.MaxStreamMessages = -1
+	options.MaxStreamBodySize = -1
+	options.MaxConcurrentStreamsPerConnection = 1024
 	server.SetOptions(options)
 	interoppb.RegisterEchoServer(server, echoServer{})
 	return trevrpc.Listen(addr, server, trevrpc.ListenOptions{TLSConfig: tlsConfig})

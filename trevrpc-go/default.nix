@@ -44,6 +44,8 @@ mkGoModule (final: {
     runHook preCheck
     export HOME=$(mktemp -d)
     go test ./...
+    # One iteration each, so the benchmarks keep compiling and running.
+    go test -run '^$' -bench . -benchtime 1x ./...
     runHook postCheck
   '';
 

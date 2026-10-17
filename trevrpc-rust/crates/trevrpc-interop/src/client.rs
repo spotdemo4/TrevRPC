@@ -3,18 +3,15 @@
 
 use std::future::Future;
 use std::io::Write as _;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
-use quinn::rustls::pki_types::CertificateDer;
-use quinn::rustls::pki_types::pem::PemObject;
 use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, TransportPolicy};
 use trevrpc::{Code, Error, Metadata};
 
 use crate::proto::{EchoClient, EchoRequest, EchoResponse};
-use crate::{BoxError, Flags};
+use crate::{BoxError, Flags, connect};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 /// Backstop for a scenario that hangs despite the per-call deadline.
@@ -25,24 +22,10 @@ type Echo = EchoClient<Channel>;
 
 /// Runs every scenario and returns whether all of them passed.
 pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
-    let server_name = flags.get("server-name").unwrap_or("localhost");
-    let addr = tokio::net::lookup_host(flags.require("addr")?)
-        .await?
-        .next()
-        .ok_or("--addr did not resolve to an address")?;
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(flags.require("ca")?)? {
-        roots.add(cert?)?;
-    }
-    let tls = quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let server_name = connect::server_name(flags);
+    let addr = connect::resolve(flags, "addr").await?;
+    let tls = connect::tls_config(flags)?;
 
-    let bind: SocketAddr = if addr.is_ipv6() {
-        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-    } else {
-        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
-    };
     let policy = match flags.get("transport").unwrap_or("quic") {
         "quic" => TransportPolicy::QuicOnly,
         "tcp" => TransportPolicy::TcpOnly,
@@ -52,15 +35,10 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
     let mut config = ChannelConfig::new()
         .with_transport_policy(policy)
         .with_tcp_fallback(tls.clone());
-    if let Some(tcp_addr) = flags.get("tcp-addr") {
-        let tcp_addr = tokio::net::lookup_host(tcp_addr)
-            .await?
-            .next()
-            .ok_or("--tcp-addr did not resolve to an address")?;
-        config = config.with_tcp_addr(tcp_addr);
+    if flags.get("tcp-addr").is_some() {
+        config = config.with_tcp_addr(connect::resolve(flags, "tcp-addr").await?);
     }
-    let mut endpoint = quinn::Endpoint::client(bind)?;
-    endpoint.set_default_client_config(config.quic_config(tls)?);
+    let endpoint = connect::client_endpoint(addr, &config, tls)?;
     let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config).await?;
     if let Some(expected) = flags.get("expect-transport") {
         let actual = match channel.transport() {

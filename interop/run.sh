@@ -13,6 +13,9 @@
 # System keychain for the duration of the run, through non-interactive sudo.
 set -euo pipefail
 
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 servers=()
 clients=()
 browsers=()
@@ -40,8 +43,6 @@ fi
 work=$(mktemp -d)
 out=${out:-$work/out}
 mkdir -p "$out"
-server_pid=""
-server_stdin=""
 trusted_cert=""
 cleanup() {
   stop_server
@@ -50,14 +51,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cert=$work/cert.pem
-key=$work/key.pem
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -days 10 -subj /CN=localhost \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-  -addext "basicConstraints=critical,CA:FALSE" \
-  -addext "extendedKeyUsage=serverAuth" \
-  -keyout "$key" -out "$cert" 2>/dev/null
+generate_cert
 cert_hash=$(openssl x509 -in "$cert" -outform der | sha256sum | cut -d' ' -f1)
 
 system_keychain=/Library/Keychains/System.keychain
@@ -78,41 +72,6 @@ untrust_cert() {
   keychain delete-certificate -Z "$trusted_cert" "$system_keychain" >/dev/null ||
     echo "could not delete certificate $trusted_cert from $system_keychain" >&2
   trusted_cert=""
-}
-
-start_server() {
-  local name=$1 command=$2 ports=$out/server-$1.ports
-  mkfifo "$work/stdin-$name"
-  # The server exits when its stdin reaches EOF, so hold the write end open.
-  $command server --cert "$cert" --key "$key" \
-    <"$work/stdin-$name" >"$ports" 2>"$out/server-$name.log" &
-  server_pid=$!
-  exec {server_stdin}>"$work/stdin-$name"
-  for _ in $(seq 300); do
-    if [[ -s $ports ]] && jq -e . "$ports" >/dev/null 2>&1; then
-      return 0
-    fi
-    if ! kill -0 "$server_pid" 2>/dev/null; then
-      break
-    fi
-    sleep 0.1
-  done
-  echo "server $name did not report its ports; log:" >&2
-  cat "$out/server-$name.log" >&2
-  return 1
-}
-
-stop_server() {
-  [[ -n $server_pid ]] || return 0
-  [[ -z $server_stdin ]] || exec {server_stdin}>&-
-  for _ in $(seq 100); do
-    kill -0 "$server_pid" 2>/dev/null || break
-    sleep 0.1
-  done
-  kill -9 "$server_pid" 2>/dev/null || true
-  wait "$server_pid" 2>/dev/null || true
-  server_pid=""
-  server_stdin=""
 }
 
 failures=()

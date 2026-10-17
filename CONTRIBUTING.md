@@ -24,6 +24,7 @@ direnv allow
 | `trevrpc-js/`     | browser client, `protoc-gen-trevrpc-js`, browser interop runner |
 | `trevrpc-kotlin/` | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`   |
 | `interop/`        | cross-runtime test suite                                        |
+| `bench/`          | load benchmarks and the grpc-go baseline                        |
 | `testdata/`       | wire and QMux golden vectors shared by every runtime's tests    |
 
 ### run

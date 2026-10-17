@@ -162,9 +162,16 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
         CertificateDer::pem_file_iter(flags.require("cert")?)?.collect::<Result<Vec<_>, _>>()?;
     let key = PrivateKeyDer::from_pem_file(flags.require("key")?)?;
 
+    // No `tracing` subscriber is installed, so the per-RPC logs are not emitted and cannot skew
+    // the load benchmarks. The stream message and size limits are lifted because `bench` keeps one
+    // bidi stream open for a whole run, and the stream limit leaves room for a worker to open its
+    // next stream before the server has released the previous one.
     let mut server = Server::new();
     server.set_options(
         ServerOptions::new()
+            .with_max_stream_messages(None)
+            .with_max_stream_body_size(None)
+            .with_max_concurrent_streams_per_connection(Some(1024))
             .with_http_enabled(true)
             .with_webtransport_enabled(true)
             .with_webtransport_admission(Some(admit_webtransport)),

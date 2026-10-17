@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,12 +19,63 @@ import (
 
 const scenarioTimeout = 10 * time.Second
 
+// connectionConfig holds the flags of the subcommands that dial a server.
+type connectionConfig struct {
+	addr       string
+	caFile     string
+	serverName string
+	transport  string
+	tcpAddr    string
+}
+
+// register defines the connection flags. transportUsage describes the values
+// --transport accepts.
+func (c *connectionConfig) register(flags *flag.FlagSet, transportUsage string) {
+	flags.StringVar(&c.addr, "addr", "", "server host:port")
+	flags.StringVar(&c.caFile, "ca", "", "trusted server certificate PEM file")
+	flags.StringVar(&c.serverName, "server-name", "localhost", "TLS server name")
+	flags.StringVar(&c.transport, "transport", "quic", transportUsage)
+	flags.StringVar(&c.tcpAddr, "tcp-addr", "", "server TCP host:port (defaults to --addr)")
+}
+
+// check reports a usage error for a missing address or CA, or for a transport
+// that is not one of allowed. command names the subcommand in the message.
+func (c *connectionConfig) check(command string, allowed ...string) error {
+	if c.addr == "" || c.caFile == "" {
+		return fmt.Errorf("%s: --addr and --ca are required", command)
+	}
+	if !slices.Contains(allowed, c.transport) {
+		return fmt.Errorf("%s: unknown --transport %q", command, c.transport)
+	}
+	return nil
+}
+
+// dial connects to the server with the configured trust and transport policy.
+// options carries any further settings; its TLS, transport and TCP address
+// fields are overwritten. The context bounds the dial only.
+func (c *connectionConfig) dial(ctx context.Context, options trevrpc.DialOptions) (*trevrpc.Channel, error) {
+	ca, err := os.ReadFile(c.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return nil, fmt.Errorf("CA file %s contains no certificates", c.caFile)
+	}
+	options.TLSConfig = &tls.Config{RootCAs: roots, ServerName: c.serverName}
+	options.Transport = transportPolicies[c.transport]
+	options.TCPAddr = c.tcpAddr
+	dialCtx, cancel := context.WithTimeout(ctx, scenarioTimeout)
+	defer cancel()
+	channel, err := trevrpc.Dial(dialCtx, c.addr, options)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", c.addr, err)
+	}
+	return channel, nil
+}
+
 type clientConfig struct {
-	addr            string
-	caFile          string
-	serverName      string
-	transport       string
-	tcpAddr         string
+	connectionConfig
 	expectTransport string
 }
 
@@ -42,23 +95,9 @@ type scenario struct {
 // and prints "ok <name>" or "fail <name>: <reason>" for each. It reports
 // whether all scenarios passed.
 func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, error) {
-	ca, err := os.ReadFile(config.caFile)
+	channel, err := config.dial(ctx, trevrpc.DialOptions{})
 	if err != nil {
-		return false, fmt.Errorf("read CA: %w", err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(ca) {
-		return false, fmt.Errorf("CA file %s contains no certificates", config.caFile)
-	}
-	dialCtx, cancel := context.WithTimeout(ctx, scenarioTimeout)
-	defer cancel()
-	channel, err := trevrpc.Dial(dialCtx, config.addr, trevrpc.DialOptions{
-		TLSConfig: &tls.Config{RootCAs: roots, ServerName: config.serverName},
-		Transport: transportPolicies[config.transport],
-		TCPAddr:   config.tcpAddr,
-	})
-	if err != nil {
-		return false, fmt.Errorf("dial %s: %w", config.addr, err)
+		return false, err
 	}
 	defer closeQuietly(channel)
 	if want := config.expectTransport; want != "" && string(channel.Transport()) != want {

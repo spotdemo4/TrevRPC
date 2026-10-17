@@ -5,11 +5,20 @@
 //! trevrpc-interop-rust client --addr <host:port> --ca <pem> [--server-name localhost]
 //!                             [--transport quic|tcp|auto] [--tcp-addr <host:port>]
 //!                             [--expect-transport quic|qmux]
+//! trevrpc-interop-rust bench --addr <host:port> [--tcp-addr <host:port>] --ca <pem>
+//!                            [--server-name localhost] --transport quic|tcp
+//!                            --scenario unary|server-stream|client-stream|bidi
+//!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
+//!                            [--messages 100]
 //! ```
+//!
+//! The `bench` subcommand follows `bench/README.md`.
 
 #![forbid(unsafe_code)]
 
+mod bench;
 mod client;
+mod connect;
 mod proto;
 mod server;
 
@@ -36,7 +45,24 @@ async fn main() -> ExitCode {
             ],
         )
         .map(Command::Client),
-        _ => Err("usage: trevrpc-interop-rust (server|client) [--flag value]...".into()),
+        Some("bench") => parse_flags(
+            args,
+            &[
+                "addr",
+                "tcp-addr",
+                "ca",
+                "server-name",
+                "transport",
+                "scenario",
+                "size",
+                "concurrency",
+                "duration",
+                "warmup",
+                "messages",
+            ],
+        )
+        .map(Command::Bench),
+        _ => Err("usage: trevrpc-interop-rust (server|client|bench) [--flag value]...".into()),
     };
     let command = match result {
         Ok(command) => command,
@@ -58,6 +84,10 @@ async fn main() -> ExitCode {
             Ok(false) => ExitCode::FAILURE,
             Err(error) => failure(&error),
         },
+        Command::Bench(flags) => match bench::run(&flags).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => failure(&error),
+        },
     }
 }
 
@@ -69,6 +99,7 @@ fn failure(error: &BoxError) -> ExitCode {
 enum Command {
     Server(Flags),
     Client(Flags),
+    Bench(Flags),
 }
 
 /// Parsed `--name value` flags.

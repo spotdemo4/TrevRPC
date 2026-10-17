@@ -40,6 +40,14 @@ workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bench]]
+name = "frames"
+harness = false
+
+[[bench]]
+name = "loopback"
+harness = false
+
 [dependencies]
 async-trait = "0.1.89"
 bytes = "1"
@@ -59,6 +67,7 @@ tracing = "0.1.44"
 web-transport-trait = "0.5"
 
 [dev-dependencies]
+divan = "0.1.21"
 rcgen = "0.14"
 time = "0.3"
 tokio = { version = "1.48.0", features = [

@@ -25,7 +25,7 @@ import (
 
 // newHTTP3TestClient returns a Transport that sends every RPC as one
 // POST /trevrpc request over HTTP/3.
-func newHTTP3TestClient(t *testing.T, pki testPKI, listener *Listener) Transport {
+func newHTTP3TestClient(t testing.TB, pki testPKI, listener *Listener) Transport {
 	t.Helper()
 	roundTripper := &http3.Transport{TLSClientConfig: pki.client.Clone()}
 	t.Cleanup(func() { _ = roundTripper.Close() })
@@ -38,7 +38,7 @@ func newHTTP3TestClient(t *testing.T, pki testPKI, listener *Listener) Transport
 
 // newHTTP2TestClient returns a Transport that sends every RPC as one
 // POST /trevrpc request over HTTP/2 on the TCP listener.
-func newHTTP2TestClient(t *testing.T, pki testPKI, listener *Listener) Transport {
+func newHTTP2TestClient(t testing.TB, pki testPKI, listener *Listener) Transport {
 	t.Helper()
 	protocols := new(http.Protocols)
 	protocols.SetHTTP2(true)
@@ -52,7 +52,7 @@ func newHTTP2TestClient(t *testing.T, pki testPKI, listener *Listener) Transport
 }
 
 // newQMuxTestClient returns a Channel over QMux over TLS on the TCP listener.
-func newQMuxTestClient(t *testing.T, pki testPKI, listener *Listener) *Channel {
+func newQMuxTestClient(t testing.TB, pki testPKI, listener *Listener) *Channel {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
@@ -71,7 +71,7 @@ func newQMuxTestClient(t *testing.T, pki testPKI, listener *Listener) *Channel {
 
 // newWebSocketTestClient returns a Transport that runs RPCs on the streams of
 // one QMux over WebSocket session to /trevrpc, as the browser fallback does.
-func newWebSocketTestClient(t *testing.T, pki testPKI, listener *Listener, origin string) Transport {
+func newWebSocketTestClient(t testing.TB, pki testPKI, listener *Listener, origin string) Transport {
 	t.Helper()
 	session, err := dialWebSocketTestSession(t, pki, listener, origin)
 	if err != nil {
@@ -81,7 +81,7 @@ func newWebSocketTestClient(t *testing.T, pki testPKI, listener *Listener, origi
 	return newStreamClient(qmuxOpener{session}, DefaultMaxFrameSize)
 }
 
-func dialWebSocketTestSession(t *testing.T, pki testPKI, listener *Listener, origin string) (*qmux.Session, error) {
+func dialWebSocketTestSession(t testing.TB, pki testPKI, listener *Listener, origin string) (*qmux.Session, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
@@ -169,7 +169,7 @@ func (s *http3TestStream) cancelWrite() { _ = s.writer.CloseWithError(errors.New
 
 // newWebTransportTestClient returns a Transport that runs RPCs on the streams
 // of one WebTransport session to /trevrpc.
-func newWebTransportTestClient(t *testing.T, pki testPKI, listener *Listener, origin string, config *webtransport.Config) Transport {
+func newWebTransportTestClient(t testing.TB, pki testPKI, listener *Listener, origin string, config *webtransport.Config) Transport {
 	t.Helper()
 	return newStreamClient(newWebTransportTestOpener(t, pki, listener, origin, config), DefaultMaxFrameSize)
 }
@@ -177,7 +177,7 @@ func newWebTransportTestClient(t *testing.T, pki testPKI, listener *Listener, or
 // newWebTransportTestOpener opens one WebTransport session and returns an
 // opener for raw streams on it. A config with limits makes the client advertise
 // WT_INITIAL_* SETTINGS, as Safari does, which enables session flow control.
-func newWebTransportTestOpener(t *testing.T, pki testPKI, listener *Listener, origin string, config *webtransport.Config) streamOpener {
+func newWebTransportTestOpener(t testing.TB, pki testPKI, listener *Listener, origin string, config *webtransport.Config) streamOpener {
 	t.Helper()
 	wt := &webtransport.Transport{
 		Config:          config,
