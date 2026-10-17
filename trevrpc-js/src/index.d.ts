@@ -116,7 +116,20 @@ export interface ResponseStream<TResponse> extends AsyncIterable<TResponse> {
 }
 
 export interface ClientStreamingCall<TRequest, TResponse> {
-  /** Sends one request message. */
+  /**
+   * Sends one request message; the promise settles when the transport accepted it, which applies
+   * backpressure.
+   *
+   * Rejects as soon as the server ends the call before the upload is done: with the server's
+   * `TrevRpcError` if its final status is not OK, even if the server never reads the rest of the
+   * request, and with `Code.Cancelled` if the status is OK (the call succeeded without the rest
+   * of the upload; `closeAndRecv()` returns its response). A response that fails after the
+   * upload stopped, such as a lost connection, is reported instead of a generic closed-stream
+   * error. A failed send is not retried or reported twice: later sends fail the same way, and
+   * `closeAndRecv()` returns the call's outcome.
+   *
+   * Pending sends are rejected too when the call is cancelled or its deadline expires.
+   */
   send(request: TRequest): Promise<void>;
   /** Closes the request stream and returns the final response. */
   closeAndRecv(): Promise<TResponse>;
@@ -134,11 +147,31 @@ export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIt
    * arrives, before the first message is received, or rejects with the error that ended the call.
    */
   readonly headers: Promise<Metadata>;
-  /** Sends one request message. */
+  /**
+   * Sends one request message; the promise settles when the transport accepted it, which applies
+   * backpressure.
+   *
+   * Rejects as soon as the server ends the call before the upload is done, even if nobody is
+   * calling `recv()` and the server never reads the rest of the request: with the server's
+   * `TrevRpcError` if its final status is not OK, and with `Code.Cancelled` if the status is OK
+   * (`recv()` then returns `undefined` after the responses that were sent). A response that
+   * fails after the upload stopped, such as a lost connection, is reported instead of a generic
+   * closed-stream error. Later sends fail the same way, `closeSend()` resolves, and `recv()` and
+   * `status` report the call's outcome.
+   *
+   * While the request side is open the response is read ahead of `recv()` to find the final
+   * status: at most 32 frames or 1 MiB (plus one frame of at most `maxFrameSize`), after which
+   * reading pauses until `recv()` takes messages. Responses read ahead are delivered in order.
+   *
+   * Pending sends are rejected too when the call is cancelled or its deadline expires.
+   */
   send(request: TRequest): Promise<void>;
   /** Receives the next response message, or undefined after the final OK status. */
   recv(): Promise<TResponse | undefined>;
-  /** Closes the request stream while keeping the response stream readable. */
+  /**
+   * Closes the request stream while keeping the response stream readable. Resolves if the server
+   * already ended the call; its final status is reported by `recv()` and `status`.
+   */
   closeSend(): Promise<void>;
   /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;

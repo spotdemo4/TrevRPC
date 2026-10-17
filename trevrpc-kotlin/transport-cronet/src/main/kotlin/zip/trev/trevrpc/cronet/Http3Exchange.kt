@@ -240,7 +240,13 @@ internal class Http3Exchange(
     private val nativeLock = Any()
     private var sendFinished = false
     private var pendingWrite: PendingWrite? = null
+
+    @Volatile
     private var completionCause: Throwable? = null
+
+    /** The server's terminal status, recorded the moment it is decoded, before it is queued. */
+    @Volatile
+    private var remoteStatus: Status? = null
     private var startInProgress = false
     private var nativeStarted = false
     private var nativeTerminalReceived = false
@@ -461,7 +467,7 @@ internal class Http3Exchange(
         try {
             if (remoteTerminalSeen.get()) {
                 if (endOfStream) return
-                throw CancellationException("remote terminal status received")
+                throw remoteSendError()
             }
             write(bytes(), endOfStream)
         } catch (error: CancellationException) {
@@ -481,9 +487,9 @@ internal class Http3Exchange(
         writeReady.await()
         if (remoteTerminalSeen.get()) {
             if (endOfStream) return
-            throw CancellationException("remote terminal status received")
+            throw remoteSendError()
         }
-        if (completed.get()) throw CancellationException("RPC stream completed")
+        if (completed.get()) throw completedSendError()
         val buffer = ByteBuffer.allocateDirect(bytes.size)
         buffer.put(bytes)
         buffer.flip()
@@ -499,7 +505,9 @@ internal class Http3Exchange(
                             true
                         }
                     }
-                if (canceledByCaller) fail(CancellationException("request write was canceled"))
+                // A write cut short after the server's STATUS has nothing left to cancel: the
+                // remote terminal path already settles the exchange.
+                if (canceledByCaller && !remoteTerminalSeen.get()) fail(CancellationException("request write was canceled"))
             }
             val installed =
                 synchronized(writeLock) {
@@ -515,8 +523,10 @@ internal class Http3Exchange(
                 if (continuation.isActive) {
                     if (endOfStream && remoteTerminalSeen.get()) {
                         continuation.resume(Unit)
+                    } else if (remoteTerminalSeen.get()) {
+                        continuation.resumeWithException(remoteSendError())
                     } else {
-                        continuation.resumeWithException(CancellationException("RPC stream completed"))
+                        continuation.resumeWithException(completedSendError())
                     }
                 }
                 return@suspendCancellableCoroutine
@@ -560,6 +570,7 @@ internal class Http3Exchange(
                     // reject a known frame after the terminal status.
                     if (frame is ResponseFrame.Status && !statusSeen) {
                         statusSeen = true
+                        remoteStatus = frame.status
                         beginRemoteStatus()
                     }
                     responseFrames.send(frame)
@@ -619,7 +630,7 @@ internal class Http3Exchange(
         requestNativeCancel: Boolean,
     ) {
         if (!completeOnce(error)) return
-        val completionError = error ?: CancellationException("RPC stream completed")
+        val completionError = error ?: completedSendError()
         writeReady.completeExceptionally(completionError)
         responseFrames.close(error)
         readChunks.close(error)
@@ -634,7 +645,7 @@ internal class Http3Exchange(
         if (pending.endOfStream) {
             pending.continuation.resume(Unit)
         } else {
-            pending.continuation.resumeWithException(CancellationException("remote terminal status received"))
+            pending.continuation.resumeWithException(remoteSendError())
         }
     }
 
@@ -694,8 +705,34 @@ internal class Http3Exchange(
         }
 
     private fun checkSendOpen() {
-        if (completed.get() || remoteTerminalSeen.get() || sendFinished) {
-            throw TrevRpcException(Status.cancelled("request stream is closed"))
+        if (sendFinished) throw TrevRpcException(Status.cancelled("request stream is closed"))
+        if (remoteTerminalSeen.get()) throw remoteSendError()
+        if (completed.get()) throw completedSendError()
+    }
+
+    /**
+     * Why a send fails once the server has ended the call: its status when that is not OK, or a
+     * cancellation when it completed the call successfully before the upload finished.
+     */
+    private fun remoteSendError(): TrevRpcException {
+        val status = remoteStatus
+        return if (status != null && !status.isOk) {
+            TrevRpcException(status)
+        } else {
+            TrevRpcException(Status.cancelled("the server completed the call before the request stream finished"))
+        }
+    }
+
+    /**
+     * Why a send fails on an exchange that completed without a server status: the transport or
+     * protocol error that ended it, or a plain close.
+     */
+    private fun completedSendError(): TrevRpcException {
+        val cause = completionCause
+        return if (cause is TrevRpcException) {
+            TrevRpcException(cause.status, cause)
+        } else {
+            TrevRpcException(Status.cancelled("request stream is closed"), cause)
         }
     }
 

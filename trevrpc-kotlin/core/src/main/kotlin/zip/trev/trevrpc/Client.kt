@@ -1,13 +1,23 @@
 package zip.trev.trevrpc
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeMark
@@ -73,9 +83,18 @@ interface RpcTransport {
 
 /**
  * A bidirectional client transport stream. Sends are serialized with [finishSend] and complete only
- * after the transport accepts the write. Sending and receiving may proceed concurrently.
+ * after the transport accepts the write. Sending and receiving may proceed concurrently: for calls
+ * that stream their request, [Client] reads the response through [receive] from the moment the
+ * call opens, so it learns of the server's terminal status while a [send] is blocked.
  */
 interface RpcClientStream {
+    /**
+     * Writes one MESSAGE frame. [Client] cancels a send in flight when the response ends the call,
+     * so implementations must stay cancellable. A transport that stops accepting writes because the
+     * server ended the call should fail with a [TrevRpcException]; [Client] reports the server's
+     * status or the response error instead when the response explains the failure, so a transport
+     * that cannot say why may fail with any exception.
+     */
     suspend fun send(body: ByteArray)
 
     /** Half-closes the request side after prior sends. Repeated calls have no effect. */
@@ -90,8 +109,16 @@ interface RpcClientStream {
     suspend fun close(cause: Throwable? = null)
 }
 
+/**
+ * Runs RPCs over [transport].
+ *
+ * Client-streaming and bidirectional calls read their response in a coroutine of [responseContext]
+ * (a `Job` in it is ignored) from the moment they open until STATUS arrives or the call closes, so
+ * the server's terminal status reaches a caller that is only sending. See [ClientStreamingCall.send].
+ */
 class Client(
     private val transport: RpcTransport,
+    private val responseContext: CoroutineContext = Dispatchers.Default,
 ) {
     suspend fun <Req, Res> unary(
         service: String,
@@ -174,9 +201,12 @@ class Client(
     ): OpenedStream<Res> {
         val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
         val stream = callWithDeadline(deadline, null) { transport.openStream(request, firstMessage, finishSend) }
+        val call = CallStream(stream)
+        // A call that streams its request needs to learn of the server's terminal status while it uploads.
+        if (!finishSend) call.pump = ResponsePump(responseContext, call, deadline, options)
         return OpenedStream(
-            RequestWriter(stream, deadline, sendFinished = finishSend),
-            ResponseReader(stream, codec, options, deadline, idleTimeout),
+            RequestWriter(call, deadline, options.streamIdleTimeout, sendFinished = finishSend),
+            ResponseReader(call, codec, options, deadline, idleTimeout),
         )
     }
 }
@@ -186,36 +216,170 @@ private data class OpenedStream<T>(
     val reader: ResponseReader<T>,
 )
 
+/** Stops [RequestWriter.sendAll] once the response has ended the call. */
+private class CallEnded : Exception()
+
+/** How long a failed write waits for the response to explain it. */
+private val EXPLANATION_TIMEOUT = 5.seconds
+
+/**
+ * Writes the request of a call. A write races the end of the call: when the response ends it (the
+ * server's STATUS, a response failure, or a close), the write in flight is cancelled and the send
+ * fails with the reason, so a send never waits on flow control for a server that stopped reading.
+ */
 internal class RequestWriter(
-    private val stream: RpcClientStream,
+    private val call: CallStream,
     private val deadline: TimeMark?,
+    private val idleTimeout: Duration?,
     sendFinished: Boolean = false,
 ) {
     private val sendFinished = AtomicBoolean(sendFinished)
+
+    private sealed interface Outcome {
+        object Written : Outcome
+
+        /** The response ended the call; [error] is why the send fails. */
+        class Ended(
+            val error: TrevRpcException,
+        ) : Outcome
+
+        /** The write failed and the response did not explain why. */
+        class Failed(
+            val error: Throwable,
+        ) : Outcome
+    }
 
     suspend fun send(body: ByteArray) {
         if (sendFinished.get()) {
             throw TrevRpcException(Status.cancelled("request stream is closed"))
         }
-        write { stream.send(body) }
+        call.end.sendError()?.let { throw it }
+        write(reportEnd = true) { call.stream.send(body) }
+    }
+
+    /**
+     * Sends every body of [bodies], then half-closes. When the response ends the call first the
+     * remaining bodies are dropped and nothing is thrown: [ResponseReader] reports the outcome.
+     */
+    suspend fun sendAll(bodies: Flow<ByteArray>) {
+        try {
+            bodies.collect { body ->
+                try {
+                    send(body)
+                } catch (error: TrevRpcException) {
+                    if (call.end.isEnded) throw CallEnded()
+                    throw error
+                }
+            }
+        } catch (_: CallEnded) {
+            // The call ended while uploading; the response says how.
+        }
+        finishSend()
     }
 
     suspend fun finishSend() {
         if (!sendFinished.compareAndSet(false, true)) return
-        write { stream.finishSend() }
+        try {
+            // Half-closing a call that already ended has nothing left to do; the outcome is
+            // reported by receive.
+            if (!call.end.isEnded) write(reportEnd = false) { call.stream.finishSend() }
+        } finally {
+            call.pump?.uploadClosed()
+        }
     }
 
-    private suspend fun write(operation: suspend () -> Unit) {
-        try {
-            callWithDeadline(deadline, null, operation)
-        } catch (error: Throwable) {
-            val closeError =
-                withContext(NonCancellable) {
-                    runCatching { stream.close(error) }.exceptionOrNull()
-                }
-            if (closeError != null && closeError !== error) error.addSuppressed(closeError)
-            throw error
+    private suspend fun write(
+        reportEnd: Boolean,
+        operation: suspend () -> Unit,
+    ) {
+        val outcome =
+            try {
+                attempt(operation)
+            } catch (error: Throwable) {
+                closeAfter(error)
+                throw error
+            }
+        when (outcome) {
+            Outcome.Written -> {}
+
+            is Outcome.Ended -> {
+                // After the server's STATUS the response is still being read. Any other end (a
+                // failure, the call's deadline) leaves a stream that nobody else will close.
+                if (!call.end.endedByStatus) closeAfter(outcome.error)
+                if (reportEnd) throw outcome.error
+            }
+
+            is Outcome.Failed -> {
+                closeAfter(outcome.error)
+                throw outcome.error
+            }
         }
+    }
+
+    private suspend fun attempt(operation: suspend () -> Unit): Outcome {
+        val failure =
+            try {
+                if (raceEnd(operation)) return Outcome.Written
+                null
+            } catch (error: Throwable) {
+                error
+            }
+        if (failure is CancellationException && !currentCoroutineContext().isActive) throw failure
+        call.end.sendError()?.let { ended ->
+            failure?.let(ended::addSuppressed)
+            return Outcome.Ended(ended)
+        }
+        val cause = checkNotNull(failure) { "the write was abandoned without the call ending" }
+        // The write failed. A transport that refuses writes usually does so because the response
+        // ended or failed, and that is what the caller needs to hear, not a generic closed stream.
+        awaitExplanation(cause)?.let { explanation ->
+            explanation.addSuppressed(cause)
+            return Outcome.Ended(explanation)
+        }
+        return Outcome.Failed(
+            if (cause is CancellationException) {
+                TrevRpcException(Status.cancelled("request stream is closed"), cause)
+            } else {
+                cause
+            },
+        )
+    }
+
+    /** Runs [operation]; false if the response ended the call first and the write was cancelled. */
+    private suspend fun raceEnd(operation: suspend () -> Unit): Boolean =
+        coroutineScope {
+            val write = async(start = CoroutineStart.UNDISPATCHED) { callWithDeadline(deadline, null, operation) }
+            select {
+                write.onAwait { true }
+                call.end.onEnd {
+                    write.cancel()
+                    false
+                }
+            }
+        }
+
+    /**
+     * Waits, within the call's deadline and idle timeout, for the response to end the call. Null if
+     * it does not: the call's own deadline cut the write short, or nothing explains the failure.
+     */
+    private suspend fun awaitExplanation(failure: Throwable): TrevRpcException? {
+        if (failure.isCallDeadline()) return null
+        try {
+            callWithDeadline(deadline, minOf(idleTimeout ?: EXPLANATION_TIMEOUT, EXPLANATION_TIMEOUT)) { call.end.await() }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            return null
+        }
+        return call.end.sendError()
+    }
+
+    private suspend fun closeAfter(error: Throwable) {
+        val closeError =
+            withContext(NonCancellable) {
+                runCatching { call.close(error) }.exceptionOrNull()
+            }
+        if (closeError != null && closeError !== error) error.addSuppressed(closeError)
     }
 }
 
@@ -248,8 +412,30 @@ class ClientStreamingCall<Req, Res> internal constructor(
 ) {
     private val received = AtomicBoolean(false)
 
+    /**
+     * Sends one request message, suspending until the transport accepts it.
+     *
+     * The call is watched while it uploads: as soon as the server ends it, [send] stops and fails
+     * instead of waiting on flow control or the deadline for a server that no longer reads, even
+     * when nobody is receiving yet and even when the server did not stop the request side.
+     *
+     * - A non-OK terminal status is thrown as the [TrevRpcException] [receive] reports too.
+     * - An OK status that ends the call before the upload finished is a [TrevRpcException] with
+     *   [Code.CANCELLED]; the response is still available from [receive].
+     * - A failure of the response side (a lost connection, a protocol violation, an exceeded
+     *   response limit) is what [send] throws, rather than a generic "closed" error.
+     * - After [closeSend] or [close] it fails with [Code.CANCELLED].
+     */
     suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
 
+    /**
+     * Sends every request of [requests], then half-closes the request side. If the server ends the
+     * call first the remaining requests are dropped and nothing is thrown; [receive] reports the
+     * outcome. Other failures are thrown like [send] does.
+     */
+    suspend fun sendAll(requests: Flow<Req>) = writer.sendAll(requests.map(requestCodec.encode))
+
+    /** Half-closes the request side. Does nothing if the call already ended. */
     suspend fun closeSend() = writer.finishSend()
 
     /** Response header metadata; see [ServerStreamingCall.headers]. */
@@ -283,8 +469,18 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
     /** Response header metadata; see [ServerStreamingCall.headers]. */
     suspend fun headers(): Metadata = reader.headers()
 
+    /**
+     * Sends one request message, suspending until the transport accepts it. Fails promptly once
+     * the server has ended the call; see [ClientStreamingCall.send] for the exact errors. Sends
+     * need no concurrent [receive]: the response is watched for the server's status while the call
+     * uploads, and responses read ahead for that are returned by later [receive] calls.
+     */
     suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
 
+    /** Sends every request of [requests], then half-closes; see [ClientStreamingCall.sendAll]. */
+    suspend fun sendAll(requests: Flow<Req>) = writer.sendAll(requests.map(requestCodec.encode))
+
+    /** Half-closes the request side. Does nothing if the call already ended. */
     suspend fun closeSend() = writer.finishSend()
 
     suspend fun receive(): Res? = reader.receive()
@@ -295,18 +491,15 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
 }
 
 internal class ResponseReader<T>(
-    private val stream: RpcClientStream,
+    private val call: CallStream,
     private val codec: MessageCodec<T>,
     private val options: CallOptions,
     private val deadline: TimeMark?,
     private val idleTimeout: Duration? = options.streamIdleTimeout,
 ) {
-    private val closed = AtomicBoolean(false)
-
-    /** Serializes reads from [stream], so [headers] and [receive] never race for frames. */
+    /** Serializes reads from the response, so [headers] and [receive] never race for frames. */
     private val readLock = Mutex()
-    private var messages = 0
-    private var bodySize = 0L
+    private val limits = ResponseLimits(options)
 
     @Volatile
     private var done = false
@@ -381,7 +574,26 @@ internal class ResponseReader<T>(
 
     suspend fun close(cause: Throwable? = null) {
         done = true
-        if (closed.compareAndSet(false, true)) stream.close(cause)
+        call.close(cause)
+    }
+
+    /**
+     * Reads the next response frame: from the pump when the call has one, otherwise (and after the
+     * pump stopped at STATUS) from the transport. A frame the pump already queued is delivered even
+     * if the call's deadline has passed since it arrived. Null at the end of the stream.
+     */
+    private suspend fun readResponse(): ResponseFrame? {
+        val pump = call.pump
+        pump?.poll()?.let { return it.unwrap() }
+        return callWithDeadline(deadline, idleTimeout) {
+            val item = pump?.take()
+            if (item != null) item.unwrap() else call.stream.receive()
+        }
+    }
+
+    private fun ResponsePump.Item.unwrap(): ResponseFrame? {
+        error?.let { throw it }
+        return frame
     }
 
     /**
@@ -390,7 +602,7 @@ internal class ResponseReader<T>(
      */
     private suspend fun nextFrame(): ResponseFrame {
         val frame =
-            callWithDeadline(deadline, idleTimeout) { stream.receive() }
+            readResponse()
                 ?: throw TrevRpcException(Status.internal("response stream ended before final status"))
         if (frame is ResponseFrame.Headers) {
             if (headersMetadata != null) {
@@ -407,26 +619,15 @@ internal class ResponseReader<T>(
 
     private suspend fun fail(error: Throwable) {
         done = true
-        if (error !is CancellationException) failure = error
+        if (error !is CancellationException) {
+            failure = error
+            call.end.failure(error)
+        }
         close(error)
     }
 
     private fun receiveMessage(frame: ResponseFrame.Message): T {
-        val maxMessages = options.maxResponseMessages
-        if (maxMessages != null && messages >= maxMessages) {
-            throw TrevRpcException(
-                Status.resourceExhausted("response stream exceeded maximum of $maxMessages messages"),
-            )
-        }
-        enforceBodyLimit(frame.body.size, options.maxResponseBodySize, "response message")
-        val maxBody = options.maxResponseStreamBodySize
-        if (maxBody != null && frame.body.size.toLong() > maxBody - bodySize) {
-            throw TrevRpcException(
-                Status.resourceExhausted("response stream exceeded maximum body size of $maxBody bytes"),
-            )
-        }
-        messages++
-        bodySize += frame.body.size
+        limits.admit(frame.body.size)?.let { throw it }
         return decodeResponse(codec, frame.body)
     }
 
@@ -435,13 +636,22 @@ internal class ResponseReader<T>(
         var trailingError: Throwable? = null
         val trailing =
             try {
-                callWithDeadline(deadline, idleTimeout) { stream.receive() }
+                readResponse()
             } catch (error: CancellationException) {
+                // The caller was cancelled while waiting for the end of the stream. The server's
+                // status already decided the outcome: keep it, release the stream, and let the
+                // cancellation propagate.
+                terminalStatus = status
+                done = true
+                withContext(NonCancellable) { runCatching { close() } }
                 throw error
             } catch (error: Throwable) {
                 trailingError = error
                 null
             }
+        // The call's own deadline cut the wait short. That says nothing about the response, and the
+        // server's status has already decided the outcome.
+        if (trailingError?.isCallDeadline() == true) trailingError = null
         done = true
         val closeError =
             try {
@@ -518,18 +728,6 @@ private fun timeoutNanos(timeout: Duration?): ULong {
     return timeout.inWholeNanoseconds.coerceAtLeast(1).toULong()
 }
 
-private fun enforceBodyLimit(
-    size: Int,
-    maximum: Int,
-    description: String,
-) {
-    if (size > maximum) {
-        throw TrevRpcException(
-            Status.resourceExhausted("$description is $size bytes, maximum is $maximum"),
-        )
-    }
-}
-
 private fun Throwable.isMalformedTrailingData(): Boolean =
     when (this) {
         is TrevRpcException -> {
@@ -556,7 +754,15 @@ private fun <T> decodeResponse(
         throw TrevRpcException(Status.internal("failed to decode response body"), error)
     }
 
-private suspend fun <T> callWithDeadline(
+/** Marks the errors [callWithDeadline] raises when the call's own deadline passes. */
+private class CallDeadlineReached(
+    cause: Throwable? = null,
+) : Exception("RPC deadline exceeded", cause)
+
+/** Whether this is the error [callWithDeadline] raises when the call's own deadline passes. */
+internal fun Throwable.isCallDeadline(): Boolean = this is TrevRpcException && cause is CallDeadlineReached
+
+internal suspend fun <T> callWithDeadline(
     deadline: TimeMark?,
     idleTimeout: Duration?,
     operation: suspend () -> T,
@@ -565,7 +771,7 @@ private suspend fun <T> callWithDeadline(
         deadline?.let {
             val remaining = -it.elapsedNow()
             if (!remaining.isPositive()) {
-                throw TrevRpcException(Status.deadlineExceeded("RPC deadline exceeded"))
+                throw TrevRpcException(Status.deadlineExceeded("RPC deadline exceeded"), CallDeadlineReached())
             }
             remaining
         }
@@ -574,13 +780,10 @@ private suspend fun <T> callWithDeadline(
     return try {
         withTimeout(timeout) { operation() }
     } catch (error: TimeoutCancellationException) {
-        val status =
-            if (deadlineWins) {
-                Status.deadlineExceeded("RPC deadline exceeded")
-            } else {
-                Status.unavailable("response stream idle timeout")
-            }
-        throw TrevRpcException(status, error)
+        if (deadlineWins) {
+            throw TrevRpcException(Status.deadlineExceeded("RPC deadline exceeded"), CallDeadlineReached(error))
+        }
+        throw TrevRpcException(Status.unavailable("response stream idle timeout"), error)
     } catch (error: CancellationException) {
         throw error
     }

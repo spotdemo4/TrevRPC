@@ -406,6 +406,11 @@ export class QMuxWebSocketSession {
     this.#streams.delete(stream.id);
   }
 
+  /** Wakes writers waiting for credit so they notice that their stream failed. */
+  wakeSenders() {
+    this.#wake();
+  }
+
   get closedError() {
     return this.#closedError;
   }
@@ -510,6 +515,15 @@ class QMuxStream {
     this.writable = new WritableStream({
       start: (controller) => {
         this.#writeController = controller;
+        // An abort waits for the write in flight, which may be waiting for credit that never
+        // comes; the controller's signal fires at once, so the stream is reset and the write fails.
+        controller.signal.addEventListener(
+          "abort",
+          () => this.#abortSend(controller.signal.reason),
+          {
+            once: true,
+          },
+        );
       },
       write: (chunk) => this.#write(chunk),
       close: () => this.#finishSend(),
@@ -600,6 +614,19 @@ class QMuxStream {
     });
     this.#resetSend(code);
     this.#writeController.error(this.writeError);
+  }
+
+  /** Resets the send side because the writer was aborted, failing a write waiting for credit. */
+  #abortSend(reason) {
+    if (this.#sendDone) {
+      return;
+    }
+    this.writeError ??= transportError(`stream aborted: ${reason?.message ?? reason}`, {
+      source: "stream",
+      streamErrorCode: CancelledCode,
+    });
+    this.#resetSend(CancelledCode);
+    this.#session.wakeSenders();
   }
 
   onSessionClosed(error) {

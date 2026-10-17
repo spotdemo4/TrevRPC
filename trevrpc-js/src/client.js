@@ -1,7 +1,7 @@
 import { Call, defaultCallOptions, mergeCallOptions } from "./call.js";
 import { FrameType, marshalMessage, unmarshalMessage } from "./framing.js";
 import { validateMetadata } from "./metadata.js";
-import { Code, internal, statusError } from "./status.js";
+import { Code, cancelled, internal, statusError } from "./status.js";
 import { RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
 
 /** Creates a service client from a generated service descriptor. */
@@ -76,7 +76,9 @@ export async function clientStreamingCall(transport, rpc, options) {
     undefined,
     options,
   );
-  return new ClientStreamingCall(new BidirectionalStreamingCall(call, rpc));
+  return new ClientStreamingCall(
+    new BidirectionalStreamingCall(call, rpc, { streamsRequest: true }),
+  );
 }
 
 /** Calls a bidirectional-streaming RPC. */
@@ -87,7 +89,7 @@ export async function bidirectionalStreamingCall(transport, rpc, options) {
     undefined,
     options,
   );
-  return new BidirectionalStreamingCall(call, rpc);
+  return new BidirectionalStreamingCall(call, rpc, { streamsRequest: true });
 }
 
 /**
@@ -118,25 +120,59 @@ async function receiveSingleResponse(stream, kind) {
 }
 
 /**
+ * How much of a response the call reads ahead of recv() while it is still uploading: at most this
+ * many frames or bytes are queued before reading pauses and the transport's flow control applies
+ * to a caller that does not receive. The byte bound is checked before each read, so the queue can
+ * exceed it by at most one frame, which is at most `maxFrameSize`. Without a bound a caller that
+ * only sends could be made to buffer a whole response.
+ */
+const ReadAheadFrames = 32;
+const ReadAheadBytes = 1 << 20;
+
+const EarlyOk = "the server completed the call before the request stream ended";
+
+/**
  * A bidirectional-streaming RPC. Messages are received with recv() or async iteration. The call
  * ends with the server's final status: a non-OK status makes recv() throw it, and `status`
  * settles with the final status or the error that ended the call. `headers` resolves once the
  * first response frame arrived; reading it starts that read, so headers are available before the
  * first message.
+ *
+ * While the request side is open, the response is read ahead of recv() (see ReadAheadFrames), so
+ * a final status reaches a caller that is only sending. It stops the upload at once: pending and
+ * later sends fail with the non-OK status, or with Cancelled if the status is OK. A call that
+ * does not stream its request reads only what recv() or `headers` ask for.
+ *
+ * The final status settles the outcome as soon as it is read. Responses read before it are still
+ * delivered in order, and the call's deadline and abort signal no longer apply to it.
  */
 export class BidirectionalStreamingCall {
   #call;
   #rpc;
+  /** Whether the request side streams, so that responses are read ahead of recv(). */
+  #streamsRequest;
   /** Serializes recv() so concurrent callers never interleave frame reads. */
   #reads = Promise.resolve();
-  #settled = false;
-  #error = null;
-  #uploadError = null;
-  /** Response frame already read ahead for `headers`, consumed by the next recv(). */
-  #peeked;
-  #peekStarted = false;
+  /** Response messages read ahead of recv(), in order. */
+  #queue = [];
+  #queuedBytes = 0;
+  /**
+   * What ends the response, delivered by recv() after the queued messages: `{ status, error }`
+   * for the final status (error unless OK) or `{ error }` for a failed stream.
+   */
+  #terminal;
+  /** An error that ended the call out of order, such as an abort; queued messages are dropped. */
+  #failure;
+  #failingInOrder = false;
+  #outcomeSettled = false;
+  #pumping = false;
+  /** Receivers waiting for a frame. */
+  #demand = 0;
+  #headersWanted = false;
   #sawHeaders = false;
   #sawMessage = false;
+  /** Settles on every change a waiter may care about. */
+  #changed = deferred();
   #resolveStatus;
   #rejectStatus;
   #resolveHeaders;
@@ -149,20 +185,29 @@ export class BidirectionalStreamingCall {
     this.#rejectStatus = reject;
   });
 
-  constructor(call, rpc) {
+  constructor(call, rpc, { streamsRequest = false } = {}) {
     this.#call = call;
     this.#rpc = rpc;
+    this.#streamsRequest = streamsRequest;
     this.status.catch(() => {});
     this.#headers = new Promise((resolve, reject) => {
       this.#resolveHeaders = resolve;
       this.#rejectHeaders = reject;
     });
     this.#headers.catch(() => {});
-    call.signal.addEventListener("abort", () => this.#settleFailure(call.signal.reason), {
-      once: true,
-    });
+    call.signal.addEventListener(
+      "abort",
+      () => {
+        if (!this.#failingInOrder) {
+          this.#settleFailure(call.signal.reason);
+        }
+      },
+      { once: true },
+    );
     if (call.signal.aborted) {
       this.#settleFailure(call.signal.reason);
+    } else {
+      this.#kick();
     }
   }
 
@@ -171,19 +216,38 @@ export class BidirectionalStreamingCall {
    * arrives, or rejects with the error that ended the call first.
    */
   get headers() {
-    this.#peek();
+    this.#headersWanted = true;
+    this.#kick();
     return this.#headers;
   }
 
-  /** Sends one request message. */
+  /**
+   * Sends one request message. Fails with the server's final status if the server ended the
+   * call, as soon as it is known; with Cancelled if that status is OK; and with the error that
+   * ended the call otherwise.
+   */
   async send(message) {
     const body = marshalMessage(this.#rpc.requestType, message);
-    await this.#recordUploadError(this.#call.sendMessage(body));
+    try {
+      await this.#call.sendMessage(body);
+    } catch (error) {
+      throw await this.#explainUploadFailure(error);
+    }
   }
 
-  /** Closes the request stream while keeping the response stream readable. */
+  /**
+   * Closes the request stream while keeping the response stream readable. Resolves if the server
+   * already ended the call: its final status is reported by recv().
+   */
   async closeSend() {
-    await this.#recordUploadError(this.#call.closeSend());
+    try {
+      await this.#call.closeSend();
+    } catch (error) {
+      const reason = await this.#explainUploadFailure(error);
+      if (this.#terminal?.status === undefined) {
+        throw reason;
+      }
+    }
   }
 
   /** Receives the next response message, or undefined after the final OK status. */
@@ -195,8 +259,9 @@ export class BidirectionalStreamingCall {
 
   /** Cancels the call unless it already finished. */
   async close(reason) {
-    if (!this.#settled) {
+    if (this.#terminal === undefined || this.#queue.length > 0) {
       this.#call.cancel(reason);
+      this.#settleFailure(this.#call.signal.reason);
     }
   }
 
@@ -214,65 +279,134 @@ export class BidirectionalStreamingCall {
   }
 
   async #recv() {
-    if (this.#error != null) {
-      throw this.#error;
-    }
-    if (this.#settled) {
-      return undefined;
-    }
-
-    let event;
-    try {
-      event = await this.#nextEvent();
-      if (event.type === FrameType.Message) {
-        return unmarshalMessage(this.#rpc.responseType, event.payload);
+    const item = await this.#take();
+    if (item.payload !== undefined) {
+      try {
+        return unmarshalMessage(this.#rpc.responseType, item.payload);
+      } catch (error) {
+        throw this.#settleFailure(this.#call.fail(error));
       }
-    } catch (error) {
-      throw this.#settleFailure(this.#call.fail(error));
     }
-
-    // A status frame is final: the request side stops and the stream drains in the background.
-    this.#call.finish();
-    this.#settled = true;
-    const { code, message, metadata } = event.status;
-    if (code !== Code.Ok) {
-      this.#error = statusError(code, message, metadata);
-      this.#rejectStatus(this.#error);
-      throw this.#error;
+    if (item.error !== undefined) {
+      throw item.error;
     }
-    this.#resolveStatus({ code: Code.Ok, message, metadata });
     return undefined;
   }
 
-  /**
-   * Reads the first response frames ahead of recv(), so `headers` settles without a receive. Every
-   * completed recv() has already settled `headers`, so the read-ahead only matters before one.
-   */
-  #peek() {
-    if (this.#peekStarted) {
-      return;
-    }
-    this.#peekStarted = true;
-    const next = this.#reads.then(async () => {
-      if (this.#settled || this.#sawMessage) {
-        return;
+  /** Takes the next queued message, or the end of the response once the queue is empty. */
+  async #take() {
+    for (;;) {
+      if (this.#failure !== undefined) {
+        throw this.#failure;
       }
+      const payload = this.#queue.shift();
+      if (payload !== undefined) {
+        this.#queuedBytes -= payload.byteLength;
+        // Room for more read-ahead.
+        this.#kick();
+        return { payload };
+      }
+      if (this.#terminal !== undefined) {
+        // A failure of the stream itself surfaces here, in order, after the responses before it.
+        if (this.#terminal.status === undefined) {
+          throw this.#settleFailure(this.#terminal.error);
+        }
+        return this.#terminal;
+      }
+      const changed = this.#changed.promise;
+      this.#demand += 1;
+      this.#kick();
       try {
-        this.#peeked = await this.#readEvent();
-      } catch (error) {
-        this.#settleFailure(this.#call.fail(error));
+        await changed;
+      } finally {
+        this.#demand -= 1;
       }
-    });
-    this.#reads = next.catch(() => {});
+    }
   }
 
-  async #nextEvent() {
-    if (this.#peeked !== undefined) {
-      const event = this.#peeked;
-      this.#peeked = undefined;
-      return event;
+  /** Starts reading the response unless it is running or has nothing to read for. */
+  #kick() {
+    if (!this.#pumping && this.#wantsRead()) {
+      this.#pumping = true;
+      // The pump handles the errors of the response itself; anything else is a bug that ends the call.
+      this.#pump().catch((error) => this.#settleFailure(this.#call.fail(error)));
     }
-    return await this.#readEvent();
+  }
+
+  #wantsRead() {
+    if (this.#terminal !== undefined || this.#failure !== undefined) {
+      return false;
+    }
+    if (this.#demand > 0 && this.#queue.length === 0) {
+      return true;
+    }
+    if (this.#headersWanted && !this.#sawHeaders && !this.#sawMessage) {
+      return true;
+    }
+    return (
+      this.#streamsRequest &&
+      this.#call.uploadOpen &&
+      this.#queue.length < ReadAheadFrames &&
+      this.#queuedBytes < ReadAheadBytes
+    );
+  }
+
+  /** Reads response events into the queue for as long as someone wants them. */
+  async #pump() {
+    try {
+      while (this.#wantsRead()) {
+        let event;
+        try {
+          event = await this.#readEvent();
+        } catch (error) {
+          this.#endWithError(error);
+          return;
+        }
+        if (this.#failure !== undefined) {
+          return;
+        }
+        if (event.type === FrameType.Message) {
+          this.#queue.push(event.payload);
+          this.#queuedBytes += event.payload.byteLength;
+        } else {
+          this.#endWithStatus(event.status);
+        }
+        this.#notify();
+      }
+    } finally {
+      this.#pumping = false;
+      this.#notify();
+    }
+  }
+
+  /** The final status arrived: it is the outcome, and it ends the upload. */
+  #endWithStatus({ code, message, metadata }) {
+    const error = code === Code.Ok ? undefined : statusError(code, message, metadata);
+    this.#terminal = { status: { code, message, metadata }, error };
+    this.#call.finish(error ?? cancelled(EarlyOk));
+    if (error === undefined) {
+      this.#outcomeSettled = true;
+      this.#resolveStatus({ code, message, metadata });
+    } else {
+      this.#rejectOutcome(error);
+    }
+  }
+
+  /**
+   * The response stream failed or ended without a final status. Responses read before are still
+   * delivered; the error surfaces when recv() reaches it. The call is torn down now, so sends
+   * fail with this error.
+   */
+  #endWithError(error) {
+    if (this.#call.signal.aborted) {
+      return; // an abort already decided the outcome
+    }
+    this.#failingInOrder = true;
+    const reason = this.#call.fail(error);
+    this.#failingInOrder = false;
+    this.#terminal = { error: reason };
+    this.#rejectOutcome(reason);
+    this.#notify();
   }
 
   /**
@@ -283,7 +417,7 @@ export class BidirectionalStreamingCall {
     for (;;) {
       const frame = await this.#call.readFrame();
       if (frame === null) {
-        throw this.#uploadError ?? internal("response stream ended before final status");
+        throw this.#call.uploadFailure ?? internal("response stream ended before final status");
       }
 
       switch (frame.type) {
@@ -315,23 +449,56 @@ export class BidirectionalStreamingCall {
     }
   }
 
+  /** Ends the call out of order: receivers fail with `error` without draining the queue. */
   #settleFailure(error) {
-    if (!this.#settled) {
-      this.#settled = true;
-      this.#error = error;
+    this.#failure ??= error;
+    this.#rejectOutcome(error);
+    this.#notify();
+    return this.#failure;
+  }
+
+  #rejectOutcome(error) {
+    if (!this.#outcomeSettled) {
+      this.#outcomeSettled = true;
       this.#rejectStatus(error);
       this.#rejectHeaders(error);
     }
-    return this.#error;
   }
 
-  async #recordUploadError(upload) {
-    try {
-      await upload;
-    } catch (error) {
-      this.#uploadError ??= error;
-      throw error;
+  /** Wakes everything waiting for a change of the response. */
+  #notify() {
+    const { resolve } = this.#changed;
+    this.#changed = deferred();
+    resolve();
+  }
+
+  /**
+   * Resolves when the response outcome is known, the call failed, or no read is in progress, which
+   * is when nothing more will be learned without the caller receiving.
+   */
+  async #outcomeKnown() {
+    while (this.#terminal === undefined && this.#failure === undefined && this.#pumping) {
+      await this.#changed.promise;
     }
+  }
+
+  /**
+   * The error a failed request-side operation reports. A request side that the transport failed
+   * on its own, typically because the server stopped reading it, says little: the server's
+   * final status, or the failure of the response stream, explains it, so those are awaited.
+   */
+  async #explainUploadFailure(error) {
+    if (error !== this.#call.uploadFailure) {
+      return error;
+    }
+    await this.#outcomeKnown();
+    if (this.#terminal?.status !== undefined) {
+      return this.#terminal.error ?? cancelled(EarlyOk);
+    }
+    if (this.#call.signal.aborted) {
+      return this.#call.signal.reason;
+    }
+    return this.#terminal?.error ?? error;
   }
 }
 
@@ -394,6 +561,14 @@ export class ResponseStream {
   [Symbol.asyncIterator]() {
     return this.#call[Symbol.asyncIterator]();
   }
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function requestFields(rpc, kind) {

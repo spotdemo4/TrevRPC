@@ -113,6 +113,17 @@ export class Call {
   #frames;
   #maxFrameSize;
   #sendClosed = false;
+  /** Set once the close of the request side completed. */
+  #closeCompleted = false;
+  /**
+   * The error every request-side operation fails with once the upload was ended, or undefined
+   * while it is open.
+   */
+  #uploadEnded;
+  /** Rejectors of the request-side operations waiting for the transport. */
+  #pendingUploads = new Set();
+  /** The transport error that made the request side fail on its own, or undefined. */
+  #uploadFailure;
 
   /**
    * Opens a stream on the transport and sends the REQUEST frame. The request carries service,
@@ -143,6 +154,12 @@ export class Call {
     this.#cancelReader = (reason) => reader.cancel(reason);
     this.#frames = new FrameReader(reader);
     this.#maxFrameSize = maxFrameSize;
+    // The transport errors the request side as soon as the server stops reading it.
+    this.#writer.closed.catch((error) => {
+      if (this.#uploadEnded === undefined) {
+        this.#uploadFailure ??= statusFromTransportError(error);
+      }
+    });
     scope.signal.addEventListener("abort", () => this.#teardown(), { once: true });
     if (scope.signal.aborted) {
       this.#teardown();
@@ -154,8 +171,27 @@ export class Call {
     return this.#scope.signal;
   }
 
-  /** Sends one streaming request message; writes are ordered and apply backpressure. */
+  /**
+   * The transport error that made the request side fail on its own, for instance because the
+   * server stopped reading it; undefined while the request side works or was ended by the call.
+   */
+  get uploadFailure() {
+    return this.#uploadFailure;
+  }
+
+  /** Whether the request side can still be written: not ended, not closed. */
+  get uploadOpen() {
+    return this.#uploadEnded === undefined && !this.#closeCompleted;
+  }
+
+  /**
+   * Sends one streaming request message; writes are ordered and apply backpressure. Fails with
+   * the error that ended the upload, if any, even while the transport itself is still blocked.
+   */
   sendMessage(body) {
+    if (this.#uploadEnded !== undefined) {
+      return Promise.reject(this.#uploadEnded);
+    }
     if (this.#sendClosed) {
       return Promise.reject(failedPrecondition("request stream is closed"));
     }
@@ -168,7 +204,9 @@ export class Call {
       return Promise.resolve();
     }
     this.#sendClosed = true;
-    return this.#guard(this.#writer.close());
+    return this.#upload(this.#writer.close()).then(() => {
+      this.#closeCompleted = true;
+    });
   }
 
   /**
@@ -180,16 +218,14 @@ export class Call {
   }
 
   /**
-   * Ends the call after its final status was received. An unfinished request side is reset, and
-   * the rest of the response stream is drained in the background: unknown frames are skipped, and
-   * a known frame after STATUS cancels the stream without changing the outcome.
+   * Ends the call after its final status was received. The request side stops: pending and later
+   * sends fail with `uploadError`, and an unfinished upload is reset. The rest of the response
+   * stream is drained in the background: unknown frames are skipped, and a known frame after
+   * STATUS cancels the stream without changing the outcome.
    */
-  finish() {
+  finish(uploadError) {
     this.#scope.settle();
-    if (!this.#sendClosed) {
-      this.#sendClosed = true;
-      this.#writer.abort(cancelled("RPC completed")).catch(() => {});
-    }
+    this.#endUpload(uploadError, cancelled("RPC completed"));
     this.#frames.expectEnd(this.#maxFrameSize).catch(() => this.#cancelReader().catch(() => {}));
   }
 
@@ -203,8 +239,59 @@ export class Call {
     return this.#scope.abort(failureStatus(error));
   }
 
-  async #write(bytes) {
-    await this.#guard(this.#writer.write(bytes));
+  #write(bytes) {
+    return this.#upload(this.#writer.write(bytes));
+  }
+
+  /**
+   * Waits for a write or close of the request side. Ending the upload settles it at once: a
+   * transport blocked on flow control does not act on an abort while the write is in flight.
+   */
+  #upload(operation) {
+    return new Promise((resolve, reject) => {
+      this.#pendingUploads.add(reject);
+      operation.then(
+        () => {
+          this.#pendingUploads.delete(reject);
+          if (this.signal.aborted) {
+            reject(this.signal.reason);
+          } else {
+            resolve();
+          }
+        },
+        (error) => {
+          this.#pendingUploads.delete(reject);
+          reject(this.#uploadError(error));
+        },
+      );
+    });
+  }
+
+  /** Maps a failed request-side operation to the call's error. */
+  #uploadError(error) {
+    if (this.signal.aborted) {
+      return this.signal.reason;
+    }
+    if (error === this.#uploadEnded) {
+      return error;
+    }
+    this.#uploadFailure ??= statusFromTransportError(error);
+    return this.#uploadFailure;
+  }
+
+  /** Stops the request side with `error` for everything waiting on it; only the first call counts. */
+  #endUpload(error, abortReason = error) {
+    if (this.#uploadEnded !== undefined) {
+      return;
+    }
+    this.#uploadEnded = error;
+    this.#sendClosed = true;
+    this.#writer.abort(abortReason).catch(() => {});
+    const pending = [...this.#pendingUploads];
+    this.#pendingUploads.clear();
+    for (const reject of pending) {
+      reject(error);
+    }
   }
 
   async #guard(operation) {
@@ -221,7 +308,7 @@ export class Call {
 
   #teardown() {
     const reason = this.signal.reason;
-    this.#writer.abort(reason).catch(() => {});
+    this.#endUpload(reason);
     this.#cancelReader(reason).catch(() => {});
   }
 }

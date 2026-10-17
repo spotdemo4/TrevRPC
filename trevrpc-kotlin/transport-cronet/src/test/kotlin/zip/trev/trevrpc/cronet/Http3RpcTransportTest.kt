@@ -23,10 +23,13 @@ import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import zip.trev.trevrpc.CallOptions
+import zip.trev.trevrpc.Client
 import zip.trev.trevrpc.Code
 import zip.trev.trevrpc.Frame
 import zip.trev.trevrpc.FrameDecoder
 import zip.trev.trevrpc.FrameType
+import zip.trev.trevrpc.MessageCodec
 import zip.trev.trevrpc.Metadata
 import zip.trev.trevrpc.QuicVarint
 import zip.trev.trevrpc.ResponseFrame
@@ -50,6 +53,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
+import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTime
@@ -442,7 +446,7 @@ class Http3RpcTransportTest {
                     coroutineContext,
                 )
             val stream = openStreaming(transport, fake)
-            val send = async { stream.send(byteArrayOf(1)) }
+            val send = async { runCatching { stream.send(byteArrayOf(1)) } }
             runCurrent()
             assertFalse(fake.onlyWrite().endOfStream)
             fake.headers(validHeaders())
@@ -450,7 +454,10 @@ class Http3RpcTransportTest {
             runCurrent()
             fake.completeWrite()
             fake.fail(IllegalStateException("late request write failure"))
-            assertTrue(send.isCancelled)
+            // The pending send reports the server's status, not a cancellation.
+            val sendError = send.await().exceptionOrNull() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, sendError.status.code)
+            assertEquals("remote result", sendError.status.message)
 
             assertArrayEquals(byteArrayOf(9), (stream.receive() as ResponseFrame.Message).body)
             runCurrent()
@@ -460,6 +467,167 @@ class Http3RpcTransportTest {
             assertNull(stream.receive())
             assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
+        }
+
+    @Test
+    fun `sends on the exchange report the server's status, a clean completion, or the transport error`() =
+        runTest {
+            val failed = FakeFactory()
+            val failedStream =
+                openStreaming(
+                    Http3RpcTransport(failed, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    failed,
+                )
+            failed.headers(validHeaders())
+            failed.deliverRead(statusFrame(Status(Code.ABORTED, "stop")))
+            runCurrent()
+            val abortedSend = runCatching { failedStream.send(byteArrayOf(1)) }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.ABORTED, abortedSend.status.code)
+            assertEquals("stop", abortedSend.status.message)
+            failedStream.finishSend()
+
+            val completed = FakeFactory()
+            val completedStream =
+                openStreaming(
+                    Http3RpcTransport(completed, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    completed,
+                )
+            completed.headers(validHeaders())
+            completed.deliverRead(statusFrame(Status.ok()))
+            runCurrent()
+            val okSend = runCatching { completedStream.send(byteArrayOf(1)) }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.CANCELLED, okSend.status.code)
+
+            val broken = FakeFactory()
+            val brokenStream =
+                openStreaming(
+                    Http3RpcTransport(broken, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    broken,
+                )
+            broken.fail(IllegalStateException("connection reset"))
+            runCurrent()
+            val brokenSend = runCatching { brokenStream.send(byteArrayOf(1)) }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, brokenSend.status.code)
+            assertEquals("connection reset", brokenSend.rootCause().message)
+        }
+
+    @Test
+    fun `a non-OK status fails a blocked client-streaming send with that status while the request stays open`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            val call =
+                openCall(fake) {
+                    Client(transport, coroutineContext)
+                        .clientStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                }
+            val send = async { runCatching { call.send("a") } }
+            runCurrent()
+            // The server does not read the request: the write never completes.
+            assertEquals(1, fake.pendingWrites)
+
+            fake.headers(validHeaders())
+            fake.deliverRead(statusFrame(Status(Code.ABORTED, "stop")))
+            runCurrent()
+
+            assertTrue(send.isCompleted)
+            val error = send.await().exceptionOrNull() as TrevRpcException
+            assertEquals(Code.ABORTED, error.status.code)
+            assertEquals("stop", error.status.message)
+            val later = runCatching { call.send("b") }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.ABORTED, later.status.code)
+            val outcome = runCatching { call.receive() }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.ABORTED, outcome.status.code)
+            assertTrue(fake.awaitCancel())
+        }
+
+    @Test
+    fun `a non-OK status behind more unread responses than the channel holds still fails the sends of a bidi call`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            val call =
+                openCall(fake) {
+                    Client(transport, coroutineContext)
+                        .bidirectionalStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                }
+            val send = async { runCatching { call.send("a") } }
+            runCurrent()
+            assertEquals(1, fake.pendingWrites)
+
+            val responses = (0 until 20).fold(byteArrayOf()) { bytes, i -> bytes + messageFrame("m$i".encodeToByteArray()) }
+            fake.headers(validHeaders())
+            fake.deliverRead(responses + statusFrame(Status(Code.NOT_FOUND, "gone")))
+            runCurrent()
+
+            // Nobody receives, yet the sender learns why the call ended.
+            assertTrue(send.isCompleted)
+            assertEquals(Code.NOT_FOUND, (send.await().exceptionOrNull() as TrevRpcException).status.code)
+            repeat(20) { assertEquals("m$it", call.receive()) }
+            assertEquals(Code.NOT_FOUND, (runCatching { call.receive() }.exceptionOrNull() as TrevRpcException).status.code)
+        }
+
+    @Test
+    fun `an early OK status ends sends with Cancelled and the response is still received`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            val call =
+                openCall(fake) {
+                    Client(transport, coroutineContext)
+                        .clientStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                }
+            val send = async { runCatching { call.send("a") } }
+            runCurrent()
+            assertEquals(1, fake.pendingWrites)
+
+            fake.headers(validHeaders())
+            fake.deliverRead(messageFrame("early".encodeToByteArray()) + statusFrame(Status.ok()))
+            runCurrent()
+
+            assertTrue(send.isCompleted)
+            assertEquals(Code.CANCELLED, (send.await().exceptionOrNull() as TrevRpcException).status.code)
+            assertEquals("early", call.receive().message)
+        }
+
+    @Test
+    fun `the server's status wins when the call deadline passes after the status but before the end of the stream`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            val call =
+                openCall(fake) {
+                    Client(transport, coroutineContext)
+                        .clientStreaming("svc", "m", strings, strings, CallOptions(timeout = 100.milliseconds))
+                }
+            fake.headers(validHeaders())
+            fake.deliverRead(messageFrame("reply".encodeToByteArray()) + statusFrame(Status.ok()))
+            runCurrent()
+            // The deadline is measured on the real clock.
+            Thread.sleep(250)
+
+            assertEquals("reply", call.receive().message)
+        }
+
+    @Test
+    fun `a transport error after the upload stopped is what send reports`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            val call =
+                openCall(fake) {
+                    Client(transport, coroutineContext)
+                        .bidirectionalStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                }
+            fake.headers(validHeaders())
+            fake.fail(IllegalStateException("connection reset"))
+            runCurrent()
+
+            val error = runCatching { call.send("a") }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, error.status.code)
+            assertEquals("connection reset", error.rootCause().message)
+            val outcome = runCatching { call.receive() }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, outcome.status.code)
         }
 
     @Test
@@ -1068,6 +1236,24 @@ private suspend fun TestScope.openStreaming(
     val initial = fake.onlyWrite()
     assertFalse(initial.endOfStream)
     assertRequestEquals(request, decodeRequestFrame(initial.bytes))
+    fake.completeWrite()
+    return opening.await()
+}
+
+private fun Throwable.rootCause(): Throwable = generateSequence(this) { it.cause }.last()
+
+private val strings = MessageCodec<String>(String::encodeToByteArray, ByteArray::decodeToString)
+
+/** Opens a call through [open], completing the REQUEST write the way a reading server would. */
+@OptIn(ExperimentalCoroutinesApi::class)
+private suspend fun <T> TestScope.openCall(
+    fake: FakeFactory,
+    open: suspend () -> T,
+): T {
+    val opening = async { open() }
+    runCurrent()
+    fake.ready()
+    runCurrent()
     fake.completeWrite()
     return opening.await()
 }

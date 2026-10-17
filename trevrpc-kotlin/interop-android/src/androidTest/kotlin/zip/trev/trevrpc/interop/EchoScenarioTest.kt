@@ -134,7 +134,14 @@ private val SCENARIOS: Map<String, suspend (EchoClient) -> Unit> =
             try {
                 call.send(request("1"))
                 expectEcho(checkNotNull(call.receive()) { "stream ended before echo 0" }, "1", 0)
-                call.send(request("", failCode = 10, failMessage = "abort"))
+                try {
+                    call.send(request("", failCode = 10, failMessage = "abort"))
+                } catch (error: TrevRpcException) {
+                    // The server may end the call before this send returns; send then reports its status.
+                    expect(error.status.code == Code.ABORTED && error.status.message == "abort") {
+                        "expected send to fail with ABORTED \"abort\", got ${error.status}"
+                    }
+                }
                 expectStatus(Code.ABORTED, "abort") { call.receive() }
             } finally {
                 call.close()

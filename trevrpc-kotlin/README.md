@@ -101,6 +101,24 @@ Frames use HTTP/3's layout (QUIC variable-length integer type and length, then t
 
 Failed calls throw `TrevRpcException` carrying a `Status`. Calls are never retried, and deadlines, idle timeouts, and response size limits are set through `CallOptions`.
 
+### Ending a call early
+
+A server may end a call before it has read the whole request. Client-streaming and bidirectional calls therefore read their response while they upload, in a coroutine of the `Client`'s `responseContext` (`Dispatchers.Default` unless you pass another context to `Client(channel, context)`). As soon as the server's terminal `STATUS` arrives, a `send` that is waiting on flow control is cancelled and later sends fail, even if nobody is calling `receive` and the server did not stop the request side:
+
+| What ended the call                           | `send` throws                                                                  |
+| --------------------------------------------- | ------------------------------------------------------------------------------ |
+| Non-OK `STATUS`                               | `TrevRpcException` with that status, the same error `receive` reports          |
+| OK `STATUS` before the upload finished        | `TrevRpcException` with `Code.CANCELLED`; `receive` still returns the response |
+| Response failure (lost connection, bad frame) | `TrevRpcException` carrying that failure, not a generic "closed" error         |
+| Response limit exceeded                       | `Code.RESOURCE_EXHAUSTED`, which is also what `receive` reports                |
+| `closeSend()` or `close()` was called         | `Code.CANCELLED` ("request stream is closed")                                  |
+
+`closeSend` does nothing once the call has ended. To stop at the first sign that the server is done and let `receive` report the outcome, use `sendAll(flow)`: it sends every request, half-closes, and returns normally when the server ends the call early. The generated `Flow` methods use it, so they return the response (or throw the status) rather than a `CANCELLED` error from the upload.
+
+Finding the status can mean reading responses the caller has not asked for yet. While the request side is open, that read-ahead is bounded by the call's own response limits: `maxResponseMessages` and `maxResponseStreamBodySize` (4096 messages and 16 MiB when set to `null`), plus the frame that crosses a limit. A frame that crosses a limit you set ends the call with `RESOURCE_EXHAUSTED`, as it would for `receive`; with no limit set, reaching the bound pauses reading until you receive. After `closeSend` the read-ahead falls back to two frames and the transport's flow control paces the server. The reading coroutine stops at `STATUS` or when the call closes.
+
+If the call's own deadline passes while the client waits for the end of the stream after `STATUS`, the server's status still decides the outcome. Cancelling the caller's coroutine at that point propagates the cancellation, and `terminalStatus` holds the server's status.
+
 ## Interop tests
 
 `interop-android` generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go or Rust server on the host. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:

@@ -46,6 +46,7 @@ This writes `greeter.trevrpc.js` and `greeter.trevrpc.d.ts`. Plugin parameters (
 
 ```js
 import { connect } from "@trevrpc/trevrpc-js";
+
 import { GreeterClient } from "./gen/greeter.trevrpc.js";
 
 const channel = await connect("https://example.com:4433/trevrpc");
@@ -95,7 +96,14 @@ call.
 - Streaming responses end with the server's final status: iteration finishes after `OK` and throws the `TrevRpcError` otherwise. `stream.status` settles with the same outcome and carries trailing metadata. Leaving a `for await` loop early, or calling `close()`, cancels the call.
 - Response headers and trailing metadata are separate. `...WithResponse(request)` (unary) and `closeAndRecvWithResponse()` (client streaming) return `{ message, headers, metadata }`, where `headers` are the server's response headers (empty when it sent none) and `metadata` is the trailing metadata of the final status. Server-streaming and bidirectional calls have a `headers` promise that resolves as soon as the first response frame arrives, so headers are available before the first message, and rejects with the call's error if the call fails first. Reading `headers` is optional.
 - Frames follow the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format): a type, a length and a payload, with messages sent as raw protobuf. The client skips frame types it does not know, and `maxFrameSize` limits every frame, unknown ones included.
-- The server's response decides the outcome of a call: if it ends a call early (for instance with an error), the final status wins over errors from sending the rest of the request.
+- The server's response decides the outcome of a call, and a call reports it as soon as the final status arrives. If the server ends a call before the upload is done (client-streaming and bidirectional calls), the upload is cancelled and `send()` rejects at once, without waiting for the server to stop reading and whether or not the caller receives:
+  - with the server's `TrevRpcError` if its status is not OK, and the same error is the call's outcome (`closeAndRecv()`, `recv()`, `status`);
+  - with `Code.Cancelled` ("the server completed the call before the request stream ended") if its status is `OK`, for instance a server that answers after the first messages. The call itself succeeded: `closeAndRecv()` returns the response, and `recv()` and `status` end with `OK`;
+  - with the failure of the response stream, for instance `Code.Unavailable` for a lost connection, if the server stopped reading the request and the response then failed. A bare "stream closed" error from the transport is used only when the response gives no other explanation.
+
+  `send()` calls that are blocked on backpressure fail the same way, and so do all sends of a call that is cancelled or whose deadline expires. A deadline or abort that fires after the final status arrived does not change the outcome, even if the server has not finished the response stream yet.
+
+- To find the final status while the caller only sends, a client-streaming or bidirectional call reads the response ahead of `recv()` while its request side is open: at most 32 frames or 1 MiB (plus one frame of at most `maxFrameSize`) are held; beyond that reading pauses and flow control applies until `recv()` takes messages. Responses read ahead are delivered in order, including before an error that ended the stream.
 
 ### Connections
 

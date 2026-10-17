@@ -294,6 +294,35 @@ test("cancelling the reader sends STOP_SENDING and aborting the writer sends RES
   session.close();
 });
 
+test("aborting the writer resets a stream whose write is blocked on flow control", async () => {
+  const server = fakeServer({
+    parameters: { ...ServerParameters, initialMaxStreamDataBidiRemote: 100 },
+    onFrame: (_socket, frame) => frame.data !== undefined,
+  });
+  const session = await openSession(server);
+  const stream = await session.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  const blocked = writer.write(new Uint8Array(1000)).then(
+    () => "written",
+    () => "failed",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await writer.abort(new Error("done"));
+  // The write is in flight while the abort arrives; it must not wait for credit that never comes.
+  const settled = await Promise.race([
+    blocked,
+    new Promise((resolve) => setTimeout(() => resolve("pending"), 500)),
+  ]);
+  assert.equal(settled, "failed");
+  assert.ok(
+    server.sockets[0].received.some(
+      (frame) =>
+        frame.type === FrameType.ResetStream && frame.code === 1 && frame.finalSize === 100,
+    ),
+  );
+  session.close();
+});
+
 test("a peer reset errors the readable and STOP_SENDING errors the writable", async () => {
   const server = fakeServer({
     onFrame(socket, frame) {

@@ -1011,3 +1011,262 @@ test("the whole Echo service works against a fake server", async () => {
     isStatus(Code.NotFound, "missing"),
   );
 });
+
+// Call termination: how a call ends when the server answers before the upload is done.
+
+/** Fails the test if the promise does not settle in time; the caller is stuck otherwise. */
+async function within(milliseconds, promise, what = "operation") {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${what} did not finish in ${milliseconds} ms`)),
+      milliseconds,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Sends until a send fails, which must happen long before the sends run out. */
+async function sendUntilRejected(call, limit = 500) {
+  for (let index = 0; index < limit; index += 1) {
+    try {
+      await call.send({ message: "x".repeat(64) });
+    } catch (error) {
+      return error;
+    }
+  }
+  assert.fail(`${limit} sends did not fail`);
+}
+
+const largeDeadline = 60_000;
+
+test("a client-streaming upload fails with an early error status although the server never reads", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus(Code.NotFound, "gone", { why: new Uint8Array([9]) });
+    // Neither reads the request side nor stops it.
+  });
+  const call = await echo.clientStream({ timeoutMs: largeDeadline });
+  try {
+    const error = await within(1000, sendUntilRejected(call), "sends");
+    assert.ok(isStatus(Code.NotFound, "gone")(error), String(error));
+    assert.deepEqual([...error.metadata.why], [9]);
+    await assert.rejects(call.send({ message: "late" }), isStatus(Code.NotFound, "gone"));
+    await assert.rejects(call.closeAndRecv(), isStatus(Code.NotFound, "gone"));
+  } finally {
+    await call.close();
+  }
+});
+
+test("a bidirectional upload fails with an early error status although nobody receives", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeHeaders({ h: new Uint8Array([1]) });
+    await stream.writeStatus(Code.ResourceExhausted, "enough");
+  });
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  try {
+    const error = await within(1000, sendUntilRejected(call), "sends");
+    assert.ok(isStatus(Code.ResourceExhausted, "enough")(error), String(error));
+    await assert.rejects(within(1000, call.status), isStatus(Code.ResourceExhausted, "enough"));
+    await assert.rejects(call.recv(), isStatus(Code.ResourceExhausted, "enough"));
+    assert.deepEqual([...(await call.headers).h], [1]);
+    await call.closeSend(); // the request side is gone; closing it is not an error
+  } finally {
+    await call.close();
+  }
+});
+
+test("a blocked send fails when the server's error status arrives", async () => {
+  const release = deferred();
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await release.promise;
+    await stream.writeStatus(Code.Aborted, "late");
+  });
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  try {
+    // Fill the stream's buffers so that the next sends are blocked on backpressure.
+    const sends = [];
+    for (let index = 0; index < 100; index += 1) {
+      sends.push(call.send({ message: "y" }).catch((error) => error));
+    }
+    await turn();
+    release.resolve();
+    const errors = await within(1000, Promise.all(sends), "blocked sends");
+    assert.ok(errors.some((error) => isStatus(Code.Aborted, "late")(error)));
+    assert.ok(errors.every((error) => error === undefined || isStatus(Code.Aborted)(error)));
+  } finally {
+    await call.close();
+  }
+});
+
+test("a send blocked on backpressure fails promptly when the call is cancelled", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.responseCancelled;
+  });
+  const controller = new AbortController();
+  const call = await echo.bidi({ signal: controller.signal });
+  const sends = [];
+  for (let index = 0; index < 100; index += 1) {
+    sends.push(call.send({ message: "z" }).catch((error) => error));
+  }
+  await turn();
+  controller.abort();
+  const errors = await within(1000, Promise.all(sends), "blocked sends");
+  assert.ok(errors.some((error) => isStatus(Code.Cancelled)(error)));
+});
+
+test("a send after an early OK status reports that the call is already over", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeMessage(EchoResponse, { message: "enough", index: 7 });
+    await stream.writeStatus(Code.Ok, "done", { t: new Uint8Array([3]) });
+  });
+  const call = await echo.clientStream({ timeoutMs: largeDeadline });
+  const error = await within(1000, sendUntilRejected(call), "sends");
+  assert.ok(isStatus(Code.Cancelled)(error), String(error));
+  assert.match(error.statusMessage, /server completed the call/u);
+  // The outcome is the server's OK response; the failed send does not change it.
+  const response = await call.closeAndRecvWithResponse();
+  assert.equal(response.message.message, "enough");
+  assert.deepEqual([...response.metadata.t], [3]);
+});
+
+test("an early OK status ends a bidirectional upload without an error status", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus(Code.Ok);
+  });
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  try {
+    const error = await within(1000, sendUntilRejected(call), "sends");
+    assert.ok(isStatus(Code.Cancelled)(error), String(error));
+    assert.equal(await call.recv(), undefined);
+    assert.equal((await call.status).code, Code.Ok);
+  } finally {
+    await call.close();
+  }
+});
+
+test("the server's status decides when the deadline expires after STATUS but before the end of the stream", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus(Code.PermissionDenied, "no");
+    // The response stream is never finished.
+  });
+  const call = await echo.clientStream({ timeoutMs: 30 });
+  await new Promise((resolve) => setTimeout(resolve, 100)); // past the deadline
+  await assert.rejects(call.send({ message: "x" }), isStatus(Code.PermissionDenied, "no"));
+  await assert.rejects(call.closeAndRecv(), isStatus(Code.PermissionDenied, "no"));
+
+  const bidi = await setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus(Code.Ok, "fine");
+  }).echo.bidi({ timeoutMs: 30 });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(await bidi.recv(), undefined);
+  assert.equal((await bidi.status).message, "fine");
+});
+
+test("the server's status decides when the call is aborted after STATUS but before the end of the stream", async () => {
+  const controller = new AbortController();
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus(Code.DataLoss, "lost");
+  });
+  const call = await echo.bidi({ signal: controller.signal });
+  await assert.rejects(call.status, isStatus(Code.DataLoss, "lost"));
+  controller.abort();
+  await assert.rejects(call.recv(), isStatus(Code.DataLoss, "lost"));
+  await assert.rejects(call.send({ message: "x" }), isStatus(Code.DataLoss, "lost"));
+});
+
+test("a response-side transport error after the upload stopped is what send reports", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.stopSending(new Error("stop requested"));
+    await stream.reset(new Error("connection lost"));
+  });
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  try {
+    await turn();
+    const error = await within(1000, sendUntilRejected(call), "sends");
+    assert.ok(isStatus(Code.Unavailable)(error), String(error));
+    assert.match(error.statusMessage, /connection lost/u);
+    await assert.rejects(call.recv(), (recvError) => recvError === error);
+  } finally {
+    await call.close();
+  }
+});
+
+test("send reports the status that follows the server stopping the request side", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.stopSending(new Error("stop requested"));
+    await turn(10);
+    await stream.writeStatus(Code.ResourceExhausted, "too much");
+    await stream.finish();
+  });
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  try {
+    await assert.rejects(
+      within(1000, sendUntilRejected(call), "sends").then((error) => {
+        throw error;
+      }),
+      isStatus(Code.ResourceExhausted, "too much"),
+    );
+  } finally {
+    await call.close();
+  }
+});
+
+test("responses before a transport error are delivered in order", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeMessage(EchoResponse, { message: "a" });
+    await stream.writeMessage(EchoResponse, { message: "b" });
+    await turn();
+    await stream.reset(new Error("connection lost"));
+  });
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  await call.send({ message: "x" }).catch(() => {});
+  await turn(10);
+  assert.equal((await call.recv()).message, "a");
+  assert.equal((await call.recv()).message, "b");
+  await assert.rejects(call.recv(), isStatus(Code.Unavailable));
+  await assert.rejects(call.status, isStatus(Code.Unavailable));
+});
+
+test("responses are read ahead only up to a bound while the upload runs", async () => {
+  const total = 2000;
+  let written = 0;
+  const { echo, transport } = setup(async (stream) => {
+    await stream.readRequest();
+    for (let index = 0; index < total; index += 1) {
+      await stream.writeMessage(EchoResponse, { message: "r", index });
+      written += 1;
+    }
+    await stream.writeStatus();
+    await stream.finish();
+  });
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  await call.send({ message: "x" });
+  await turn(20);
+  assert.ok(written < 200, `server wrote ${written} responses to a client that was not receiving`);
+  let received = 0;
+  for (; ; received += 1) {
+    const response = await call.recv();
+    if (response === undefined) {
+      break;
+    }
+    assert.equal(response.index, received);
+  }
+  assert.equal(received, total);
+  await transport.settled();
+});
