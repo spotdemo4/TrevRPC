@@ -10,13 +10,13 @@ enable-openid-connect: true
 
 jobs:
   check:
+    # zizmor: ignore[excessive-permissions]
     if: >-
       startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-rust/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-js/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v')
-    # zizmor: ignore[excessive-permissions]
-    runs-on: ubuntu-24.04
+      startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v') ||
+      startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
+    runs-on: ubuntu-26.04
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
@@ -27,173 +27,111 @@ jobs:
       - name: Check
         run: nix flake check
 
-  forgejo:
-    if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
+  go:
     # zizmor: ignore[excessive-permissions]
     needs: check
-    name: forgejo
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-          shell: release
-          token: ${{ secrets.DOCTOR_TOKEN }}
-          fetch_depth: 0
-
-      - name: Release package to Forgejo
-        env:
-          GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          REGISTRY: trev.zip
-          REGISTRY_PASSWORD: ${{ secrets.PACKAGE_TOKEN }}
-        run: |
-          set -euo pipefail
-          package="${GITHUB_REF_NAME%%/*}"
-          .forgejo/scripts/release-nix-package.sh "$package"
-
-  crates:
-    if: startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
-    # zizmor: ignore[excessive-permissions]
-    needs: check
-    name: crates.io
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-          shell: release
-
-      - name: Release to crates.io
-        working-directory: trevrpc-rust
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
-        run: | # zizmor: ignore[use-trusted-publishing]
-          set -euo pipefail
-          if [[ ! "${GITHUB_REF_NAME-}" =~ ^trevrpc-rust/v[^/]+$ ]] || [[ "${GITHUB_REF-}" != "refs/tags/${GITHUB_REF_NAME-}" ]]; then
-            echo "crates.io release requires a trevrpc-rust/v* tag ref" >&2
-            exit 1
-          fi
-          # Bumper only bumps `trevrpc` in Cargo.lock; workspace members keep
-          # their old version until Cargo regenerates the lockfile. Ensure the
-          # lockfile matches all Cargo.toml versions before publishing.
-          cargo update --workspace
-          cargo publish --locked --allow-dirty
-
-  npm:
-    if: startsWith(github.ref, 'refs/tags/trevrpc-js/v')
-    # zizmor: ignore[excessive-permissions]
-    needs: check
-    name: npm
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-          shell: release
-
-      - name: Build npm artifacts
-        run: |
-          set -euo pipefail
-          if [[ ! "${GITHUB_REF_NAME-}" =~ ^trevrpc-js/v[^/]+$ ]] || [[ "${GITHUB_REF-}" != "refs/tags/${GITHUB_REF_NAME-}" ]]; then
-            echo "npm release requires a trevrpc-js/v* tag ref" >&2
-            exit 1
-          fi
-          stage="$(nix build '.#trevrpc-js^npm' --no-link --print-out-paths)"
-          ls -lh "$stage"/*.tgz
-          echo "stage=$stage" >> "$GITHUB_ENV"
-
-      - name: Release to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: | # zizmor: ignore[use-trusted-publishing]
-          set -euo pipefail
-          tarball="$(ls "${stage}"/trevrpc-trevrpc-js-*.tgz)"
-          echo "tarball: $tarball"
-          # NODE_AUTH_TOKEN alone is not sufficient; npm reads auth from .npmrc.
-          # `nix-init` does not configure npm auth like `actions/setup-node` does.
-          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
-          # Forgejo's OIDC issuer (trev.zip) is not trusted by registry.npmjs.org
-          # Sigstore/Fulcio, so provenance must be disabled. NPM_CONFIG_PROVENANCE
-          # is insufficient: publishConfig.provenance=true in the packed tarball
-          # overrides env vars via @npmcli/config flatten (only CLI flags win).
-          # Use --provenance=false explicitly and clear any Forgejo-issued tokens.
-          unset ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN NPM_ID_TOKEN SIGSTORE_ID_TOKEN || true
-          npm publish --provenance=false --access public "$tarball"
-
-  maven:
-    if: startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v')
-    # zizmor: ignore[excessive-permissions]
-    needs: check
-    name: maven central
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-          shell: release
-
-      - name: Build and verify signed Kotlin Maven bundle
-        working-directory: trevrpc-kotlin
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSWORD: ${{ secrets.GPG_PASSWORD }}
-        run: |
-          set -euo pipefail
-          : "${GPG_PRIVATE_KEY:?GPG_PRIVATE_KEY must be configured for Maven Central releases}"
-          if [[ ! "${GITHUB_REF_NAME-}" =~ ^trevrpc-kotlin/v[^/]+$ ]] || [[ "${GITHUB_REF-}" != "refs/tags/${GITHUB_REF_NAME-}" ]]; then
-            echo "Maven release requires a trevrpc-kotlin/v* tag ref" >&2
-            exit 1
-          fi
-          version="${GITHUB_REF_NAME#trevrpc-kotlin/v}"
-          ./gradlew \
-            -PtrevrpcVersion="$version" \
-            verifyStagedMavenRepository \
-            createCentralBundle \
-            --no-configuration-cache
-
-      - name: Publish Kotlin to Maven Central
-        working-directory: trevrpc-kotlin
-        env:
-          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
-          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#trevrpc-kotlin/v}"
-          bundle="build/central-bundle.zip"
-          echo "bundle: $bundle"
-          ls -lh "$bundle"
-          unzip -l "$bundle" > "$bundle.list"
-          head -n 100 "$bundle.list"
-          token=$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w0)
-          curl --fail-with-body --show-error \
-            -H "Authorization: Bearer $token" \
-            -F bundle=@"$bundle" \
-            "https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC&name=trevrpc-kotlin-$version"
-          echo "Bundle trevrpc-kotlin-$version uploaded with AUTOMATIC publishing"
-
-  pkg:
     if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
-    # zizmor: ignore[excessive-permissions]
-    needs: check
-    name: pkg.go.dev
-    runs-on: ubuntu-24.04
+    name: trevrpc-go
+    runs-on: ubuntu-26.04
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
         with:
+          token: ${{ secrets.DOCTOR_TOKEN }}
           github_token: ${{ secrets.GH_TOKEN }}
           niks3_url: https://niks3.trev.zip
           fetch_depth: 0
+          shell: release
+
+      - name: Release to Forgejo
+        run: flake-release
+        env:
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-go
 
       - name: Seed proxy.golang.org and pkg.go.dev
         run: .forgejo/scripts/release-go-module.sh
+
+  js:
+    # zizmor: ignore[excessive-permissions]
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/trevrpc-js/v')
+    name: trevrpc-js
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          fetch_depth: 0
+          shell: release
+
+      - name: Release to Forgejo and npm
+        run: flake-release
+        env:
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          NPMJS_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-js
+
+  kotlin:
+    # zizmor: ignore[excessive-permissions]
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v')
+    name: trevrpc-kotlin
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          fetch_depth: 0
+          shell: release
+
+      - name: Release to Forgejo and Maven Central
+        run: flake-release
+        env:
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_CENTRAL_SIGNING_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          MAVEN_CENTRAL_SIGNING_PASSWORD: ${{ secrets.GPG_PASSWORD }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-kotlin
+
+  rust:
+    # zizmor: ignore[excessive-permissions]
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
+    name: trevrpc-rust
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          token: ${{ secrets.DOCTOR_TOKEN }}
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          fetch_depth: 0
+          shell: release
+
+      - name: Release to Forgejo and crates.io
+        run: flake-release
+        env:
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-rust

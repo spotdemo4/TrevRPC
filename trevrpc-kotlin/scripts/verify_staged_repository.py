@@ -37,16 +37,8 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def artifact_path(
-    repository: pathlib.Path, module: str, suffix: str, version: str
-) -> pathlib.Path:
-    return (
-        repository
-        / GROUP.replace(".", "/")
-        / module
-        / version
-        / f"{module}-{version}{suffix}"
-    )
+def artifact_path(repository: pathlib.Path, module: str, suffix: str, version: str) -> pathlib.Path:
+    return repository / GROUP.replace(".", "/") / module / version / f"{module}-{version}{suffix}"
 
 
 def verify_checksums(path: pathlib.Path) -> None:
@@ -85,9 +77,7 @@ def verify_archive(
             require(bool(classes), f"no class files in {path}")
             for name in classes:
                 data = archive.read(name)
-                require(
-                    data[:4] == b"\xca\xfe\xba\xbe", f"invalid class file {path}!{name}"
-                )
+                require(data[:4] == b"\xca\xfe\xba\xbe", f"invalid class file {path}!{name}")
                 major = int.from_bytes(data[6:8], byteorder="big")
                 if expected_major is not None:
                     require(
@@ -127,18 +117,14 @@ def dependency_rows(
                 dependency.findtext("m:groupId", namespaces=POM_NAMESPACE) or "",
                 dependency.findtext("m:artifactId", namespaces=POM_NAMESPACE) or "",
                 dependency.findtext("m:version", namespaces=POM_NAMESPACE),
-                dependency.findtext(
-                    "m:scope", default="compile", namespaces=POM_NAMESPACE
-                ),
+                dependency.findtext("m:scope", default="compile", namespaces=POM_NAMESPACE),
                 dependency.findtext("m:classifier", namespaces=POM_NAMESPACE),
             ),
         )
     return rows
 
 
-def verify_pom(
-    path: pathlib.Path, module: str, version: str, protobuf_version: str
-) -> None:
+def verify_pom(path: pathlib.Path, module: str, version: str, protobuf_version: str) -> None:
     require(path.is_file(), f"missing POM {path}")
     verify_checksums(path)
     root = ET.parse(path).getroot()
@@ -155,8 +141,7 @@ def verify_pom(
         f"wrong version in {path}",
     )
     require(
-        root.findtext("m:url", namespaces=POM_NAMESPACE)
-        == "https://trev.zip/llc/TrevRPC",
+        root.findtext("m:url", namespaces=POM_NAMESPACE) == "https://trev.zip/llc/TrevRPC",
         f"wrong URL in {path}",
     )
     require(
@@ -164,13 +149,11 @@ def verify_pom(
         f"wrong inception year in {path}",
     )
     require(
-        root.findtext("m:licenses/m:license/m:name", namespaces=POM_NAMESPACE)
-        == "MIT License",
+        root.findtext("m:licenses/m:license/m:name", namespaces=POM_NAMESPACE) == "MIT License",
         f"missing MIT metadata in {path}",
     )
     require(
-        root.findtext("m:developers/m:developer/m:id", namespaces=POM_NAMESPACE)
-        == "trev",
+        root.findtext("m:developers/m:developer/m:id", namespaces=POM_NAMESPACE) == "trev",
         f"missing developer metadata in {path}",
     )
     require(
@@ -224,9 +207,7 @@ def verify_pom(
         )
 
 
-def verify_module_metadata(
-    path: pathlib.Path, module: str, expected_gradle_version: str
-) -> None:
+def verify_module_metadata(path: pathlib.Path, module: str, expected_gradle_version: str) -> None:
     require(path.is_file(), f"missing Gradle module metadata {path}")
     verify_checksums(path)
     data = typing.cast(dict[str, typing.Any], json.loads(path.read_text()))
@@ -277,9 +258,7 @@ def verify_generator_legal_metadata(
 
     inventory = archive.read("META-INF/third-party/THIRD-PARTY.txt").decode("utf-8")
     coordinates = [
-        line
-        for line in inventory.splitlines()
-        if line.count(":") == 2 and not line.startswith(" ")
+        line for line in inventory.splitlines() if line.count(":") == 2 and not line.startswith(" ")
     ]
     require(
         coordinates == expected_coordinates,
@@ -287,23 +266,17 @@ def verify_generator_legal_metadata(
     )
     require(
         "Apache License"
-        in archive.read("META-INF/third-party/kotlin-stdlib/LICENSE.txt").decode(
-            "utf-8"
-        ),
+        in archive.read("META-INF/third-party/kotlin-stdlib/LICENSE.txt").decode("utf-8"),
         f"wrong Kotlin license in {path}",
     )
     require(
         "NOTICE file"
-        in archive.read("META-INF/third-party/kotlin-stdlib/NOTICE.txt").decode(
-            "utf-8"
-        ),
+        in archive.read("META-INF/third-party/kotlin-stdlib/NOTICE.txt").decode("utf-8"),
         f"wrong Kotlin notice in {path}",
     )
     require(
         "Copyright 2008 Google Inc."
-        in archive.read("META-INF/third-party/protobuf-java/LICENSE.txt").decode(
-            "utf-8"
-        ),
+        in archive.read("META-INF/third-party/protobuf-java/LICENSE.txt").decode("utf-8"),
         f"wrong protobuf license in {path}",
     )
 
@@ -350,8 +323,8 @@ def parse_arguments(
 
 
 def main() -> None:
-    repository, version, protobuf_version, kotlin_version, gradle_version = (
-        parse_arguments(sys.argv[1:])
+    repository, version, protobuf_version, kotlin_version, gradle_version = parse_arguments(
+        sys.argv[1:]
     )
     repository = repository.resolve()
     expected_generator_coordinates = [
@@ -414,9 +387,7 @@ def main() -> None:
                 verify_class_major(
                     archive, executable, "zip/trev/trevrpc/generator/MainKt.class", 65
                 )
-                verify_generator_legal_metadata(
-                    archive, executable, expected_generator_coordinates
-                )
+                verify_generator_legal_metadata(archive, executable, expected_generator_coordinates)
             process = subprocess.run(
                 ["java", "-jar", str(executable)],
                 input=b"",
@@ -439,8 +410,7 @@ def main() -> None:
             for path in version_directory.iterdir()
             if path.is_file()
             and not any(
-                path.name.endswith(suffix)
-                for suffix in (".md5", ".sha1", ".sha256", ".sha512")
+                path.name.endswith(suffix) for suffix in (".md5", ".sha1", ".sha256", ".sha512")
             )
         }
         asc_files = {name for name in published_all if name.endswith(".asc")}
@@ -454,7 +424,9 @@ def main() -> None:
         expected_asc_files = {f"{name}.asc" for name in published}
         require(
             not asc_files or asc_files == expected_asc_files,
-            f"signatures for {module} do not match artifacts: missing {sorted(expected_asc_files - asc_files)}, unexpected {sorted(asc_files - expected_asc_files)}",
+            f"signatures for {module} do not match artifacts: "
+            + f"missing {sorted(expected_asc_files - asc_files)}, "
+            + f"unexpected {sorted(asc_files - expected_asc_files)}",
         )
         for asc_name in asc_files:
             asc_path = version_directory / asc_name

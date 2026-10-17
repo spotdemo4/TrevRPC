@@ -71,20 +71,16 @@ let
       abiVersions = [ "x86_64" ];
     }).androidsdk;
 
-  # The emulator needs KVM and an x86_64 host.
-  interopAndroid =
-    if stdenvNoCC.hostPlatform.system == "x86_64-linux" then
-      callPackage ./interop-android {
-        inherit
-          interopProto
-          licenseFile
-          wireGolden
-          ;
-        inherit androidSdk;
-        gradle_9 = gradle9;
-      }
-    else
-      null;
+  # The emulator needs KVM and an x86_64 host; meta.platforms restricts it to x86_64-linux.
+  interopAndroid = callPackage ./interop-android {
+    inherit
+      interopProto
+      licenseFile
+      wireGolden
+      ;
+    inherit androidSdk;
+    gradle_9 = gradle9;
+  };
 in
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
@@ -180,6 +176,7 @@ stdenvNoCC.mkDerivation (final: {
     license = lib.licenses.mit;
     platforms = [
       "x86_64-linux"
+      "aarch64-linux"
       "aarch64-darwin"
     ];
     sourceProvenance = with lib.sourceTypes; [

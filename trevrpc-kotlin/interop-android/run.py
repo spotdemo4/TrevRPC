@@ -66,26 +66,20 @@ def run(
             check=False,
         )
     except subprocess.TimeoutExpired as error:
-        raise RunnerError(
-            f"command timed out after {timeout}s: {shlex.join(command)}"
-        ) from error
+        raise RunnerError(f"command timed out after {timeout}s: {shlex.join(command)}") from error
     except OSError as error:
         raise RunnerError(f"could not run {shlex.join(command)}: {error}") from error
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
-        raise RunnerError(
-            f"command exited {result.returncode}: {shlex.join(command)}\n{detail}"
-        )
+        raise RunnerError(f"command exited {result.returncode}: {shlex.join(command)}\n{detail}")
     return result
 
 
 def probe(command: list[str]) -> str | None:
     """Returns stdout of a quick command, or None if it failed or timed out."""
     try:
-        result = subprocess.run(
-            command, text=True, capture_output=True, timeout=5, check=False
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        result = subprocess.run(command, text=True, capture_output=True, timeout=5, check=False)
+    except OSError, subprocess.TimeoutExpired:
         return None
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -101,7 +95,7 @@ def stop(
             os.killpg(process.pid, signal_number)
             _ = process.wait(timeout=timeout)
             return
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError, subprocess.TimeoutExpired:
             continue
 
 
@@ -150,8 +144,6 @@ def generate_certificates(
             "10",
             "-subj",
             "/CN=TrevRPC interop CA",
-        ]
-        + [
             "-addext",
             "basicConstraints=critical,CA:TRUE",
             "-addext",
@@ -184,8 +176,13 @@ def generate_certificates(
             "-CAkey",
             str(ca_key),
             "-CAcreateserial",
+            "-out",
+            str(certificate),
+            "-days",
+            "10",
+            "-extfile",
+            str(extensions),
         ]
-        + ["-out", str(certificate), "-days", "10", "-extfile", str(extensions)]
     )
     return Certificates(ca, certificate, key)
 
@@ -206,14 +203,8 @@ def parse_ports(line: str) -> dict[str, int]:
     ports: dict[str, int] = {}
     for name in ("native", *TRANSPORTS):
         port = fields.get(name)
-        if (
-            not isinstance(port, int)
-            or isinstance(port, bool)
-            or not 1 <= port <= 65535
-        ):
-            raise RunnerError(
-                f"server readiness line has no valid {name!r} port: {line!r}"
-            )
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise RunnerError(f"server readiness line has no valid {name!r} port: {line!r}")
         ports[name] = port
     return ports
 
@@ -242,9 +233,7 @@ def start_server(
                 start_new_session=True,
             )
         except OSError as error:
-            raise RunnerError(
-                f"could not start server {shlex.join(arguments)}: {error}"
-            ) from error
+            raise RunnerError(f"could not start server {shlex.join(arguments)}: {error}") from error
     # typeshed types text-mode pipes as IO[Any].
     stdout = cast(IO[str], process.stdout)
     selector = selectors.DefaultSelector()
@@ -254,7 +243,8 @@ def start_server(
             stop(process)
             close_pipes(process)
             raise RunnerError(
-                f"server did not print its ports within {SERVER_TIMEOUT}s; see {output / 'server.stderr.log'}"
+                f"server did not print its ports within {SERVER_TIMEOUT}s; "
+                f"see {output / 'server.stderr.log'}"
             )
     finally:
         selector.close()
@@ -263,7 +253,8 @@ def start_server(
         _ = process.wait(timeout=SERVER_TIMEOUT)
         close_pipes(process)
         raise RunnerError(
-            f"server exited with {process.returncode} before printing its ports; see {output / 'server.stderr.log'}"
+            f"server exited with {process.returncode} before printing its ports; "
+            f"see {output / 'server.stderr.log'}"
         )
     try:
         return process, parse_ports(line)
@@ -318,8 +309,18 @@ class Emulator:
         name = f"trevrpc-interop-{os.getpid()}"
         env = {**os.environ, "ANDROID_AVD_HOME": str(avd_home)}
         _ = run(
-            ["avdmanager", "create", "avd", "--force", "--name", name]
-            + ["--package", system_image, "--device", "pixel_2"],
+            [
+                "avdmanager",
+                "create",
+                "avd",
+                "--force",
+                "--name",
+                name,
+                "--package",
+                system_image,
+                "--device",
+                "pixel_2",
+            ],
             input_text="no\n",
             env=env,
         )
@@ -327,7 +328,8 @@ class Emulator:
         command = [
             "emulator", "-avd", name, "-port", str(EMULATOR_PORT),
             "-no-window", "-no-audio", "-no-boot-anim", "-no-snapshot", "-wipe-data",
-            "-writable-system", "-partition-size", "4096", "-gpu", "swiftshader_indirect", "-no-metrics",
+            "-writable-system", "-partition-size", "4096",
+            "-gpu", "swiftshader_indirect", "-no-metrics",
         ]  # fmt: skip
         with self.log_path.open("wb") as log:
             self.process = subprocess.Popen(
@@ -338,9 +340,7 @@ class Emulator:
                 start_new_session=True,
             )
 
-    def wait_until(
-        self, condition: Callable[[], bool], description: str, timeout: int
-    ) -> None:
+    def wait_until(self, condition: Callable[[], bool], description: str, timeout: int) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._require_running()
@@ -382,9 +382,7 @@ class Emulator:
 
     def root(self) -> None:
         _ = adb("root")
-        self.wait_until(
-            lambda: adb_probe("shell", "id", "-u") == "0", "restart adbd as root", 60
-        )
+        self.wait_until(lambda: adb_probe("shell", "id", "-u") == "0", "restart adbd as root", 60)
 
     def install_ca(self, ca: Path, work_dir: Path) -> None:
         """Adds the CA to the system trust store, which Cronet's verifier consults.
@@ -411,9 +409,7 @@ class Emulator:
         digest = adb("shell", "sha256sum", destination).stdout.split()
         expected = hashlib.sha256(android_ca.read_bytes()).hexdigest()
         if not digest or digest[0] != expected:
-            raise RunnerError(
-                f"installed CA digest is {digest[:1]}, expected {expected}"
-            )
+            raise RunnerError(f"installed CA digest is {digest[:1]}, expected {expected}")
 
     def shutdown(self) -> None:
         if self.process.poll() is None:
@@ -436,9 +432,9 @@ _STARTED, _OK = (
 class Outcomes:
     """Scenario outcomes in execution order. A reason of None means the scenario passed."""
 
-    scenarios: dict[str, str | None] = field(default_factory=dict)
-    problems: list[str] = field(default_factory=list)
-    started: set[str] = field(default_factory=set)
+    scenarios: dict[str, str | None] = field(default_factory=dict[str, str | None])
+    problems: list[str] = field(default_factory=list[str])
+    started: set[str] = field(default_factory=set[str])
 
     @property
     def passed(self) -> bool:
@@ -478,9 +474,7 @@ def parse_instrumentation(text: str) -> Outcomes:
         elif last_key and not line.startswith("INSTRUMENTATION_"):
             block[last_key] += "\n" + line
     for name in outcomes.started:
-        outcomes.scenarios[name] = (
-            "the instrumentation process ended before the scenario finished"
-        )
+        outcomes.scenarios[name] = "the instrumentation process ended before the scenario finished"
     if result_code != "-1" and not outcomes.problems:
         outcomes.problems.append(
             f"instrumentation did not complete (INSTRUMENTATION_CODE: {result_code})"
@@ -503,9 +497,7 @@ def _finish_block(outcomes: Outcomes, block: dict[str, str], code: int) -> None:
     if code == _OK:
         outcomes.scenarios[name] = None
     else:
-        stack = [
-            line.strip() for line in block.get("stack", "").splitlines() if line.strip()
-        ]
+        stack = [line.strip() for line in block.get("stack", "").splitlines() if line.strip()]
         outcomes.scenarios[name] = (
             stack[0] if stack else f"test failed with instrumentation status {code}"
         )
@@ -583,9 +575,7 @@ def parse_args(argv: list[str]) -> Options:
     )
     _ = parser.add_argument("--app-apk", type=Path, required=True)
     _ = parser.add_argument("--test-apk", type=Path, required=True)
-    _ = parser.add_argument(
-        "--server-host", default="0.0.0.0", help="address the server binds to"
-    )
+    _ = parser.add_argument("--server-host", default="0.0.0.0", help="address the server binds to")
     _ = parser.add_argument("--system-image", default=DEFAULT_SYSTEM_IMAGE)
     _ = parser.add_argument(
         "--transport",
@@ -642,9 +632,7 @@ def execute(args: Options) -> Outcomes:
         _ = adb("install", "-r", str(args.app_apk), timeout=90)
         _ = adb("install", "-r", str(args.test_apk), timeout=90)
         _ = adb("logcat", "-c")
-        outcomes = run_instrumentation(
-            ports[args.transport], args.transport, args.output
-        )
+        outcomes = run_instrumentation(ports[args.transport], args.transport, args.output)
         try:
             shutdown_server(server)
         except RunnerError as error:

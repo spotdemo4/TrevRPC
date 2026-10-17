@@ -7,11 +7,6 @@
     "Shell Script": [".envrc*"]
   },
   "lsp": {
-    "clangd": {
-      "binary": {
-        "arguments": ["--query-driver=**", "--background-index", "--clang-tidy"]
-      }
-    },
     "oxlint": {
       "initialization_options": {
         "settings": {
@@ -48,165 +43,75 @@
     }
   },
   "languages": {
-    "C": {
-      "format_on_save": "on",
-      "language_servers": ["clangd"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "clangd"
-          }
-        }
-      ]
-    },
-    "C++": {
-      "format_on_save": "on",
-      "language_servers": ["clangd"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "clangd"
-          }
-        }
-      ]
-    },
     "Go": {
       "format_on_save": "on",
       "language_servers": ["gopls"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "gopls"
-          }
-        }
-      ]
+      "formatter": [{ "language_server": { "name": "gopls" } }]
     },
     "TypeScript": {
       "format_on_save": "on",
       "language_servers": ["typescript-ls", "oxlint", "oxfmt"],
       "formatter": [
-        {
-          "language_server": {
-            "name": "oxfmt"
-          }
-        },
-        {
-          "code_action": "source.fixAll.oxc"
-        }
+        { "code_action": "source.fixAll.oxc" },
+        { "language_server": { "name": "oxfmt" } }
       ]
     },
     "JavaScript": {
       "format_on_save": "on",
       "language_servers": ["typescript-ls", "oxlint", "oxfmt"],
       "formatter": [
-        {
-          "language_server": {
-            "name": "oxfmt"
-          }
-        },
-        {
-          "code_action": "source.fixAll.oxc"
-        }
+        { "code_action": "source.fixAll.oxc" },
+        { "language_server": { "name": "oxfmt" } }
       ]
     },
     "Kotlin": {
       "format_on_save": "on",
       "language_servers": ["kotlin-lsp"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "kotlin-lsp"
-          }
-        }
-      ]
+      "formatter": [{ "language_server": { "name": "kotlin-lsp" } }]
     },
     "Rust": {
       "format_on_save": "on",
       "language_servers": ["rust-analyzer"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "rust-analyzer"
-          }
-        }
-      ]
-    },
-    "JSON": {
-      "format_on_save": "on",
-      "language_servers": ["json-language-server", "oxfmt"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "oxfmt"
-          }
-        }
-      ]
-    },
-    "JSONC": {
-      "format_on_save": "on",
-      "language_servers": ["json-language-server", "oxfmt"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "oxfmt"
-          }
-        }
-      ]
-    },
-    "Markdown": {
-      "format_on_save": "on",
-      "language_servers": ["oxfmt"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "oxfmt"
-          }
-        }
-      ]
-    },
-    "YAML": {
-      "format_on_save": "on",
-      "language_servers": ["yaml-language-server", "oxfmt"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "oxfmt"
-          }
-        }
-      ]
-    },
-    "TOML": {
-      "format_on_save": "on",
-      "language_servers": ["tombi", "oxfmt"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "oxfmt"
-          }
-        }
-      ]
+      "formatter": [{ "language_server": { "name": "rust-analyzer" } }]
     },
     "Python": {
       "format_on_save": "on",
-      "language_servers": ["basedpyright", "ruff"],
+      "language_servers": ["pyright", "ruff"],
       "formatter": [
-        {
-          "language_server": {
-            "name": "ruff"
-          }
-        }
+        { "code_action": "source.organizeImports.ruff" },
+        { "code_action": "source.fixAll.ruff" },
+        { "language_server": { "name": "ruff" } }
       ]
     },
     "Nix": {
       "format_on_save": "on",
       "language_servers": ["nixd"],
-      "formatter": [
-        {
-          "language_server": {
-            "name": "nixd"
-          }
-        }
-      ]
+      "formatter": [{ "language_server": { "name": "nixd" } }]
+    },
+    "JSON": {
+      "format_on_save": "on",
+      "language_servers": ["json-language-server", "oxfmt"],
+      "formatter": [{ "language_server": { "name": "oxfmt" } }]
+    },
+    "JSONC": {
+      "format_on_save": "on",
+      "language_servers": ["json-language-server", "oxfmt"],
+      "formatter": [{ "language_server": { "name": "oxfmt" } }]
+    },
+    "YAML": {
+      "format_on_save": "on",
+      "language_servers": ["yaml-language-server", "oxfmt"],
+      "formatter": [{ "language_server": { "name": "oxfmt" } }]
+    },
+    "TOML": {
+      "format_on_save": "on",
+      "language_servers": ["tombi", "oxfmt"],
+      "formatter": [{ "language_server": { "name": "oxfmt" } }]
+    },
+    "Markdown": {
+      "format_on_save": "on",
+      "language_servers": ["oxfmt"],
+      "formatter": [{ "language_server": { "name": "oxfmt" } }]
     }
   }
 }

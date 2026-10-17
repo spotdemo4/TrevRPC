@@ -187,9 +187,8 @@ publishableModules.forEach { (moduleName, metadata) ->
                 }
             }
             repositories {
-                // Local staging repository for Central Portal bundle creation.
-                // Publishing to Maven Central uses the staged repository zipped as a bundle
-                // and uploaded via https://central.sonatype.com/api/v1/publisher/upload
+                // Local staging repository that the Nix build installs and verifies.
+                // Releases publish through flake-release, which adds its own repository
                 // (see .forgejo/workflows/release.yaml). No remote Maven repository is defined here.
                 maven {
                     name = "staging"
@@ -250,17 +249,6 @@ tasks.register<Exec>("verifyStagedMavenRepository") {
         "--gradle-version",
         gradle.gradleVersion,
     )
-}
-
-tasks.register<Zip>("createCentralBundle") {
-    group = "publishing"
-    description = "Creates a Central Publisher Portal bundle from the staged Maven repository."
-    dependsOn("stageMavenRepository")
-    from(stagingRepository)
-    destinationDirectory = layout.buildDirectory
-    archiveFileName = "central-bundle.zip"
-    isPreserveFileTimestamps = false
-    isReproducibleFileOrder = true
 }
 
 gradle.projectsEvaluated {

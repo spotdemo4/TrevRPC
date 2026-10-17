@@ -102,6 +102,6 @@ The runner generates a certificate for `10.0.2.2` (the emulator's alias for the 
 
 ```shell
 ./gradlew check                    # core, transport, and generator tests
-./gradlew verifyStagedMavenRepository createCentralBundle
+./gradlew verifyStagedMavenRepository   # stage and verify the published artifacts
 python3 -I -m unittest discover -s interop-android
 ```

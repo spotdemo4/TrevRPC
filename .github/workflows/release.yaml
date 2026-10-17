@@ -16,7 +16,7 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
       startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
     steps:
@@ -26,17 +26,14 @@ jobs:
       - name: Check
         run: nix flake check
 
-  github:
-    if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
+  go:
     needs: check
-    name: github
-    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
+    name: trevrpc-go
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
       contents: write
-      packages: write
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
@@ -44,25 +41,34 @@ jobs:
           fetch_depth: 0
           shell: release
 
-      - name: Release package to GitHub
+      - name: Release to GitHub
+        run: flake-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          package="${GITHUB_REF_NAME%%/*}"
-          .forgejo/scripts/release-nix-package.sh "$package"
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-go
 
-  pkg:
-    if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
+      - name: Seed proxy.golang.org and pkg.go.dev
+        run: .forgejo/scripts/release-go-module.sh
+
+  rust:
     needs: check
-    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
+    name: trevrpc-rust
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
+      contents: write
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
         with:
           fetch_depth: 0
+          shell: release
 
-      - name: Seed proxy.golang.org and pkg.go.dev
-        run: .forgejo/scripts/release-go-module.sh
+      - name: Release to GitHub
+        run: flake-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-rust

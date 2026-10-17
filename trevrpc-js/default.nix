@@ -37,11 +37,6 @@ assert lib.assertMsg (playwrightCoreVersion == expectedPlaywrightVersion) ''
 buildNpmPackage (final: {
   pname = "trevrpc-js";
   inherit (jsPackage) version;
-  # `npm` holds the release tarball: nix build .#trevrpc-js^npm
-  outputs = [
-    "out"
-    "npm"
-  ];
 
   # The interop client is generated from the shared interop proto, and the wire and QMux tests
   # read the shared golden vectors; both live outside this directory.
@@ -64,7 +59,6 @@ buildNpmPackage (final: {
 
   # Generates the Echo client with protoc and bundles the interop page into build/interop/.
   npmBuildScript = "build";
-  TREVRPC_NIX_RELEASE = "1";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
   nativeBuildInputs = [
@@ -107,11 +101,6 @@ buildNpmPackage (final: {
     makeWrapper ${nodejs_24}/bin/node "$out/bin/trevrpc-interop-browser" \
       --add-flags "$interop/interop-browser/cli.js" \
       --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}"
-
-    export HOME="$TMPDIR/home"
-    mkdir -p "$HOME" "$npm"
-    tarball="$(npm pack . --silent --pack-destination "$npm")"
-    test "$tarball" = "trevrpc-trevrpc-js-${final.version}.tgz"
   '';
 
   doInstallCheck = true;
@@ -126,7 +115,11 @@ buildNpmPackage (final: {
     test -x "$out/bin/trevrpc-interop-browser"
 
     # The published package is the browser client and the generator, nothing else.
-    tar -tzf "$npm/trevrpc-trevrpc-js-${final.version}.tgz" | sort > tarball.list
+    export HOME="$TMPDIR/home"
+    mkdir -p "$HOME"
+    tarball="$(npm pack . --silent --pack-destination "$TMPDIR")"
+    test "$tarball" = "trevrpc-trevrpc-js-${final.version}.tgz"
+    tar -tzf "$TMPDIR/$tarball" | sort > tarball.list
     grep -qx 'package/src/index.js' tarball.list
     grep -qx 'package/src/index.d.ts' tarball.list
     grep -qx 'package/bin/protoc-gen-trevrpc-js.js' tarball.list

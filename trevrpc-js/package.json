@@ -41,8 +41,7 @@
     "pretest": "npm run build",
     "test": "node --test --test-concurrency=1 test/*.test.js",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm test",
-    "interop": "node interop-browser/cli.js",
-    "prepack": "node -e 'if (process.env.TREVRPC_NIX_RELEASE !== \"1\") throw new Error(\"Build release tarballs with nix build .#trevrpc-js^npm\")'"
+    "interop": "node interop-browser/cli.js"
   },
   "dependencies": {
     "protobufjs": "^8.8.1"

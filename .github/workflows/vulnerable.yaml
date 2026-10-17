@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
     steps:
@@ -24,7 +24,7 @@ jobs:
         run: cargo-audit audit
 
   go:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
     steps:
@@ -38,7 +38,7 @@ jobs:
         run: govulncheck ./...
 
   npm:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
     steps:
@@ -52,7 +52,7 @@ jobs:
         run: npm audit --audit-level moderate
 
   nix:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
     steps:
@@ -65,7 +65,7 @@ jobs:
         run: flake-checker -f
 
   actions:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       id-token: write
     steps:
@@ -75,4 +75,4 @@ jobs:
           shell: vulnerable
 
       - name: Run zizmor
-        run: zizmor .github
+        run: find .github/workflows -name "*.yaml" -exec zizmor {} +

@@ -135,9 +135,7 @@ class StartServerTest(unittest.TestCase):
                 root / "ca.pem", root / "server.pem", root / "server.key"
             )
 
-            process, ports = run.start_server(
-                f"{server} server", certificates, "0.0.0.0", root
-            )
+            process, ports = run.start_server(f"{server} server", certificates, "0.0.0.0", root)
             run.shutdown_server(process)
 
             self.assertEqual(4434, ports["http3"])
