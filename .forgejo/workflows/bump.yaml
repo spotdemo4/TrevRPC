@@ -1,8 +1,8 @@
 name: bump
 
 on:
-  schedule:
-    - cron: "0 22 * * 1-5" # every weekday at 22:00 UTC
+  # schedule:
+  #   - cron: "0 22 * * 1-5" # every weekday at 22:00 UTC
   workflow_dispatch:
     inputs:
       force:
