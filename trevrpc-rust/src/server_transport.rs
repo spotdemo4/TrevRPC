@@ -95,9 +95,14 @@ where
 }
 
 /// Handles one already-decoded RPC stream using a transport-neutral response writer and reader.
+///
+/// `stream_permit` is the connection's stream slot. It and the server-wide request slot are
+/// released before the call's terminal STATUS is written or its stream is reset, never after, so
+/// a client that sees the call end can start the next one without finding the slot still taken.
 pub async fn handle_stream<W, R>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
+    stream_permit: Permit,
     mut send: W,
     mut recv: R,
     incoming: IncomingRequest,
@@ -112,12 +117,14 @@ pub async fn handle_stream<W, R>(
         budget,
     } = incoming;
     let request_body_len = body.len();
-    let Some(request_permit) = try_acquire_permit(request_limit.as_ref()) else {
+    let mut slots = StreamSlots::new(stream_permit);
+    if !slots.acquire_request(request_limit.as_ref()) {
         let status = Status::unavailable("too many concurrent RPCs");
         server.record_rejected_request(&request, request_body_len, &status);
+        slots.release();
         reject_with_status(&server, &mut send, &mut recv, &request, budget, status).await;
         return;
-    };
+    }
 
     let cancellation = CancellationToken::new();
     if request.rpc_kind() != RpcKind::Unary {
@@ -126,7 +133,7 @@ pub async fn handle_stream<W, R>(
             body,
             budget,
         };
-        handle_streaming_rpc(server, send, recv, incoming, cancellation, shutdown).await;
+        handle_streaming_rpc(server, slots, send, recv, incoming, cancellation, shutdown).await;
         return;
     }
 
@@ -146,6 +153,7 @@ pub async fn handle_stream<W, R>(
                 cancellation.cancel(source);
             }
             if !failure.response_writable() {
+                slots.release();
                 send.reset();
                 let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
                 return;
@@ -153,6 +161,7 @@ pub async fn handle_stream<W, R>(
             Err(failure.status().clone())
         },
         stopped = send.stopped() => {
+            slots.release();
             cancellation.cancel(if stopped.is_ok() {
                 CancellationSource::PeerReset
             } else {
@@ -166,6 +175,7 @@ pub async fn handle_stream<W, R>(
             let _ = changed;
             cancellation.cancel(CancellationSource::ServerShutdown);
             // Never end a response without its STATUS: the client sees a cancelled call.
+            slots.release();
             send.reset();
             let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
             return;
@@ -173,10 +183,11 @@ pub async fn handle_stream<W, R>(
     };
 
     let mut frames = unary_response_frames(response);
+    // The STATUS ends the call from the client's point of view.
+    drop(slots);
     match send.write_frames(&mut frames).await {
         Ok(()) => {
             let _ = send.finish().await;
-            drop(request_permit);
             let _ = request_pump
                 .settle(RequestPumpSettle::ResponseCommitted)
                 .await;
@@ -288,6 +299,7 @@ struct ResponseBatch {
 #[allow(clippy::too_many_lines)]
 async fn handle_streaming_rpc<W, R>(
     server: Server,
+    mut slots: StreamSlots,
     mut send: W,
     recv: R,
     incoming: IncomingRequest,
@@ -325,6 +337,7 @@ async fn handle_streaming_rpc<W, R>(
                 cancellation.cancel(source);
             }
             if !failure.response_writable() {
+                slots.release();
                 send.reset();
                 let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
                 return;
@@ -332,6 +345,7 @@ async fn handle_streaming_rpc<W, R>(
             crate::stream::from_iter([ResponseFrame::Status(failure.status().clone())])
         },
         stopped = send.stopped() => {
+            slots.release();
             cancellation.cancel(if stopped.is_ok() {
                 CancellationSource::PeerReset
             } else {
@@ -345,6 +359,7 @@ async fn handle_streaming_rpc<W, R>(
             let _ = changed;
             cancellation.cancel(CancellationSource::ServerShutdown);
             // Never end a response without its STATUS: the client sees a cancelled call.
+            slots.release();
             send.reset();
             let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
             return;
@@ -360,6 +375,7 @@ async fn handle_streaming_rpc<W, R>(
                     cancellation.cancel(source);
                 }
                 if !failure.response_writable() {
+                    slots.release();
                     send.reset();
                     let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
                     return;
@@ -368,6 +384,7 @@ async fn handle_streaming_rpc<W, R>(
             },
             frame = response.next() => frame,
             stopped = send.stopped() => {
+                slots.release();
                 cancellation.cancel(if stopped.is_ok() {
                     CancellationSource::PeerReset
                 } else {
@@ -381,6 +398,7 @@ async fn handle_streaming_rpc<W, R>(
                 let _ = changed;
                 cancellation.cancel(CancellationSource::ServerShutdown);
                 // Never end a response without its STATUS: the client sees a cancelled call.
+                slots.release();
                 send.reset();
                 let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
                 return;
@@ -388,6 +406,7 @@ async fn handle_streaming_rpc<W, R>(
         };
 
         let Some(frame) = frame else {
+            slots.release();
             break;
         };
 
@@ -405,6 +424,10 @@ async fn handle_streaming_rpc<W, R>(
             }
         }
 
+        if batch.terminal {
+            // The STATUS ends the call from the client's point of view.
+            slots.release();
+        }
         if let Err(error) = send.write_frames(&mut batch.frames).await {
             cancel_from_transport_error(&cancellation, &error);
             let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
@@ -442,8 +465,21 @@ where
     }
 }
 
-#[allow(dead_code)]
+/// A reserved slot in a concurrency limit, given back when released or dropped.
+#[derive(Debug)]
 pub struct Permit(Option<OwnedSemaphorePermit>);
+
+impl Permit {
+    /// A permit that holds nothing, for streams admitted without a slot.
+    pub const fn none() -> Self {
+        Self(None)
+    }
+
+    /// Gives the slot back now. Releasing again, or dropping afterwards, does nothing.
+    pub fn release(&mut self) {
+        self.0 = None;
+    }
+}
 
 pub fn try_acquire_permit(limit: Option<&Arc<Semaphore>>) -> Option<Permit> {
     limit.map_or(Some(Permit(None)), |semaphore| {
@@ -453,6 +489,50 @@ pub fn try_acquire_permit(limit: Option<&Arc<Semaphore>>) -> Option<Permit> {
             .ok()
             .map(|permit| Permit(Some(permit)))
     })
+}
+
+/// The server capacity one RPC holds: its connection stream slot and its server-wide request slot.
+struct StreamSlots {
+    stream: Permit,
+    request: Permit,
+}
+
+impl StreamSlots {
+    const fn new(stream: Permit) -> Self {
+        Self {
+            stream,
+            request: Permit::none(),
+        }
+    }
+
+    /// Takes the server-wide request slot, or reports that the limit is reached.
+    fn acquire_request(&mut self, limit: Option<&Arc<Semaphore>>) -> bool {
+        try_acquire_permit(limit).is_some_and(|permit| {
+            self.request = permit;
+            true
+        })
+    }
+
+    fn release(&mut self) {
+        self.stream.release();
+        self.request.release();
+    }
+}
+
+/// Answers a request that could not be read with its failure status, after giving back the
+/// stream slot.
+pub async fn reject_unreadable<W>(
+    server: &Server,
+    stream_permit: &mut Permit,
+    send: W,
+    error: Error,
+) where
+    W: ResponseWriter,
+{
+    let status = error.into_status();
+    server.record_pre_handler_failure(&status);
+    stream_permit.release();
+    write_status(send, status).await;
 }
 
 fn cancel_from_transport_error(cancellation: &CancellationToken, error: &Error) {
@@ -486,6 +566,24 @@ mod tests {
         assert!(permit.is_some());
         assert!(try_acquire_permit(Some(&semaphore)).is_none());
         drop(permit);
+    }
+
+    #[test]
+    fn released_permit_frees_its_slot_once() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut permit = try_acquire_permit(Some(&semaphore)).expect("the slot is free");
+        assert_eq!(semaphore.available_permits(), 0);
+
+        permit.release();
+        assert_eq!(semaphore.available_permits(), 1);
+
+        // A second release, and the drop after it, must not give the slot back again.
+        let held = try_acquire_permit(Some(&semaphore)).expect("the slot is free again");
+        permit.release();
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(held);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     fn request_frame(kind: RpcKind) -> Vec<u8> {

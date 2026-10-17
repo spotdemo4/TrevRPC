@@ -33,7 +33,12 @@ type ServerStreamingCall[Res ProtoMessage] interface {
 
 // ClientStreamingCall sends request messages and receives the final response.
 type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
-	// Send sends one request message.
+	// Send sends one request message. Once the server has ended the call, Send
+	// stops uploading and fails promptly instead of blocking until the call
+	// deadline. It returns the terminal status as the error when that status is
+	// not OK, so Send(...) and the final error agree, and io.EOF when the
+	// server finished the call successfully without reading every message.
+	// The same applies to blocked Send calls.
 	Send(Req) error
 	// CloseAndRecv closes the request stream and returns the unary response.
 	// Response headers and trailing metadata are reported through
@@ -45,7 +50,12 @@ type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 
 // BidirectionalStreamingCall sends request messages and receives response messages.
 type BidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
-	// Send sends one request message.
+	// Send sends one request message. Once the server has ended the call, Send
+	// stops uploading and fails promptly instead of blocking until the call
+	// deadline. It returns the terminal status as the error when that status is
+	// not OK, so Send(...) and the final error agree, and io.EOF when the
+	// server finished the call successfully without reading every message.
+	// The same applies to blocked Send calls.
 	Send(Req) error
 	// Recv receives one response message or io.EOF after the response stream completes.
 	Recv() (Res, error)
@@ -520,7 +530,22 @@ func (s *responseMessageStream[T]) finishWithStatus(status *Status) error {
 			nil,
 		)
 	}
-	if !errors.Is(trailingErr, io.EOF) {
+	var cleanupErr error
+	switch {
+	case errors.Is(trailingErr, io.EOF):
+		s.mu.Lock()
+		s.terminalStatus = status
+		s.mu.Unlock()
+		cleanupErr = s.finish()
+	case s.ctx.Err() != nil:
+		// The call's own deadline or cancellation cut the wait for the end of
+		// the stream short. The server's status already decided the outcome,
+		// so report it rather than a protocol error.
+		s.mu.Lock()
+		s.terminalStatus = status
+		s.mu.Unlock()
+		s.abort()
+	default:
 		s.abort()
 		return newResponseStreamFailure(
 			"trailing_frame",
@@ -528,10 +553,6 @@ func (s *responseMessageStream[T]) finishWithStatus(status *Status) error {
 			trailingErr,
 		)
 	}
-	s.mu.Lock()
-	s.terminalStatus = status
-	s.mu.Unlock()
-	cleanupErr := s.finish()
 
 	if status.IsOK() {
 		if cleanupErr != nil {

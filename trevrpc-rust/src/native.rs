@@ -10,7 +10,9 @@ use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStr
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::serve::{drain_streams, log_task_error};
 use crate::server::Server;
-use crate::server_transport::{self, IncomingRequest, ResponseWriter, try_acquire_permit};
+use crate::server_transport::{
+    self, IncomingRequest, Permit, ResponseWriter, reject_unreadable, try_acquire_permit,
+};
 use crate::{ResponseFrame, Result};
 
 struct NativeResponseWriter<S> {
@@ -119,11 +121,15 @@ pub async fn handle_connection<C: MuxConnection>(
                 let stream_connection = connection.clone();
                 let request_limit = request_limit.clone();
                 let shutdown = shutdown.clone();
-                stream_tasks.spawn(async move {
-                    let _stream_permit = stream_permit;
-                    handle_stream(server, stream_connection, request_limit, send, recv, shutdown)
-                        .await;
-                });
+                stream_tasks.spawn(handle_stream(
+                    server,
+                    stream_connection,
+                    request_limit,
+                    stream_permit,
+                    send,
+                    recv,
+                    shutdown,
+                ));
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -148,9 +154,11 @@ pub async fn handle_connection<C: MuxConnection>(
     }
 }
 
-/// Reads the initial request frame, replying with its failure status when it is unusable.
+/// Reads the initial request frame, replying with its failure status when it is unusable. The
+/// stream slot is released before that reply.
 async fn read_request<C: MuxConnection>(
     server: &Server,
+    stream_permit: &mut Permit,
     connection: C,
     send: C::SendStream,
     recv: C::RecvStream,
@@ -169,10 +177,13 @@ async fn read_request<C: MuxConnection>(
         )),
         Err(error) => {
             recv.stop_trevrpc();
-            let status = error.into_status();
-            server.record_pre_handler_failure(&status);
-            server_transport::write_status(NativeResponseWriter::new(send, max_frame_size), status)
-                .await;
+            reject_unreadable(
+                server,
+                stream_permit,
+                NativeResponseWriter::new(send, max_frame_size),
+                error,
+            )
+            .await;
             None
         }
     }
@@ -182,13 +193,24 @@ async fn handle_stream<C: MuxConnection>(
     server: Server,
     connection: C,
     request_limit: Option<Arc<Semaphore>>,
+    mut stream_permit: Permit,
     send: C::SendStream,
     recv: C::RecvStream,
     shutdown: watch::Receiver<bool>,
 ) {
-    if let Some((send, recv, incoming)) = read_request(&server, connection, send, recv).await {
-        server_transport::handle_stream(server, request_limit, send, recv, incoming, shutdown)
-            .await;
+    if let Some((send, recv, incoming)) =
+        read_request(&server, &mut stream_permit, connection, send, recv).await
+    {
+        server_transport::handle_stream(
+            server,
+            request_limit,
+            stream_permit,
+            send,
+            recv,
+            incoming,
+            shutdown,
+        )
+        .await;
     }
 }
 
@@ -198,7 +220,10 @@ async fn reject_stream<C: MuxConnection>(
     send: C::SendStream,
     recv: C::RecvStream,
 ) {
-    if let Some((send, recv, incoming)) = read_request(&server, connection, send, recv).await {
+    let mut no_permit = Permit::none();
+    if let Some((send, recv, incoming)) =
+        read_request(&server, &mut no_permit, connection, send, recv).await
+    {
         server_transport::reject_stream(server, send, recv, incoming).await;
     }
 }

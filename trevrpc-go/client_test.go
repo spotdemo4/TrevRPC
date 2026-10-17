@@ -934,3 +934,41 @@ func TestResponseHeadersAreNotCapturedOnFailure(t *testing.T) {
 		t.Fatalf("failed call overwrote captured headers: %v", captured)
 	}
 }
+
+// A call whose own deadline or cancellation interrupts the wait for the end of
+// the stream after STATUS still reports the server's status.
+func TestResponseStatusSurvivesLocalCancellationAfterStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status *Status
+		check  func(error) bool
+	}{
+		{"non-OK", Unavailable("down"), func(err error) bool { return StatusFromError(err).Code == CodeUnavailable }},
+		{"OK", OK(), func(err error) bool { return errors.Is(err, io.EOF) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// STATUS arrives, but the transport never ends the stream.
+			frames := make(chan responseFrame, 1)
+			frames <- statusFrame(tc.status)
+			stream := newResponseMessageStream[*testMessage](ctx, &channelFrameStream{frames: frames}, func() *testMessage { return &testMessage{} }, defaultCallConfig(), cancel)
+
+			result := make(chan error, 1)
+			go func() {
+				_, err := stream.Recv()
+				result <- err
+			}()
+			time.Sleep(10 * time.Millisecond) // let Recv wait for the end of the stream
+			cancel()
+			select {
+			case err := <-result:
+				if !tc.check(err) {
+					t.Fatalf("Recv() = %v, want the server's %v status", err, tc.status.Code)
+				}
+			case <-time.After(testTimeout):
+				t.Fatal("Recv() did not return after cancellation")
+			}
+		})
+	}
+}

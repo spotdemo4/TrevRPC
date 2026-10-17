@@ -424,7 +424,7 @@ func (s *serverFrames) Recv() (*testFrame, error) {
 			return nil, io.EOF
 		}
 		var buffer bytes.Buffer
-		done, err := s.writer.writeNext(context.Background(), &buffer, s.maxSize)
+		done, err := s.writer.writeNext(context.Background(), &buffer, s.maxSize, nil)
 		if err != nil {
 			return nil, err
 		}

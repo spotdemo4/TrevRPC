@@ -12,7 +12,10 @@ import (
 type MessageStream[T any] interface {
 	// Recv returns the next message or io.EOF when the stream is complete.
 	Recv() (T, error)
-	// Close releases stream resources and cancels any pending work.
+	// Close releases stream resources and cancels any pending work. It may be
+	// called concurrently with Recv, including to unblock a pending Recv, so
+	// implementations must be safe for that; the server closes a handler's
+	// response stream that way when the call is cancelled or times out.
 	Close() error
 }
 
@@ -74,6 +77,8 @@ type messagePipe[T any] struct {
 	closeOnce sync.Once
 	errMu     sync.Mutex
 	err       error
+	// uploadErr is why the receiving side ended the upload, if it did.
+	uploadErr error
 }
 
 // newMessagePipe returns a stream that yields messages sent with Send until closed.
@@ -87,6 +92,9 @@ func newMessagePipe[T any](ctx context.Context) *messagePipe[T] {
 
 // Send adds one message to the stream.
 func (s *messagePipe[T]) Send(message T) error {
+	if err := s.uploadError(); err != nil {
+		return err
+	}
 	select {
 	case <-s.done:
 		return s.closedError()
@@ -141,7 +149,26 @@ func (s *messagePipe[T]) closeError() error {
 	return s.err
 }
 
+// abortUpload records why the consumer ended the upload. Send reports it from
+// then on, in place of a closed pipe. The first reason wins.
+func (s *messagePipe[T]) abortUpload(err error) {
+	s.errMu.Lock()
+	if s.uploadErr == nil {
+		s.uploadErr = err
+	}
+	s.errMu.Unlock()
+}
+
+func (s *messagePipe[T]) uploadError() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.uploadErr
+}
+
 func (s *messagePipe[T]) closedError() error {
+	if err := s.uploadError(); err != nil {
+		return err
+	}
 	if err := s.closeError(); err != nil {
 		return err
 	}
@@ -149,6 +176,7 @@ func (s *messagePipe[T]) closedError() error {
 }
 
 type sliceStream[T any] struct {
+	mu    sync.Mutex
 	items []T
 	next  int
 }
@@ -161,6 +189,8 @@ func newSliceStream[T any](items ...T) MessageStream[T] {
 func (s *sliceStream[T]) trevrpcNonBlockingStream() bool { return true }
 
 func (s *sliceStream[T]) Recv() (T, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.next >= len(s.items) {
 		var zero T
 		return zero, io.EOF
@@ -172,6 +202,8 @@ func (s *sliceStream[T]) Recv() (T, error) {
 }
 
 func (s *sliceStream[T]) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.next = len(s.items)
 	return nil
 }
@@ -205,6 +237,13 @@ func (s *encodeStream[T]) Recv() (encodedMessage, error) {
 
 func (s *encodeStream[T]) Close() error {
 	return closeMessageStream(s.inner)
+}
+
+// abortUpload passes the reason the upload ended to the wrapped stream.
+func (s *encodeStream[T]) abortUpload(err error) {
+	if aborter, ok := s.inner.(uploadAborter); ok {
+		aborter.abortUpload(err)
+	}
 }
 
 type decodeStream[T ProtoMessage] struct {

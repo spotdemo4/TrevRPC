@@ -33,6 +33,14 @@ impl Error {
     pub fn into_status(self) -> Status {
         match self {
             Self::Status(status) => status,
+            other => other.status(),
+        }
+    }
+
+    /// The RPC status this error maps to, without consuming it.
+    pub(crate) fn status(&self) -> Status {
+        match self {
+            Self::Status(status) => status.clone(),
             Self::FrameTooLarge { len, max } => {
                 Status::resource_exhausted(format!("frame length {len} exceeds maximum {max}"))
             }

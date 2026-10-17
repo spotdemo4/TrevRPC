@@ -219,8 +219,10 @@ func TestTransportUnaryCancellationWhileAwaitingPeerEOF(t *testing.T) {
 	cancel()
 	select {
 	case err := <-result:
-		if code := StatusFromError(err).Code; code != CodeCancelled && code != CodeInternal {
-			t.Fatalf("Unary() status = %v, want Cancelled", err)
+		// The server's STATUS arrived before the cancellation, so it decides
+		// the outcome; cancelling only cuts the wait for the end of the stream.
+		if err != nil {
+			t.Fatalf("Unary() = %v, want the completed response", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Unary() did not return after context cancellation")

@@ -58,12 +58,14 @@ func (l *Listener) serveHTTP3Conn(conn *quic.Conn) {
 // closeHTTP3 releases the HTTP/3 servers. Connections are already closed by
 // the caller; the servers are closed asynchronously so that a handler that
 // ignores cancellation cannot block teardown.
+// The servers are captured first: a retried bind replaces them while these
+// goroutines may still run.
 func (l *Listener) closeHTTP3() {
-	switch {
-	case l.wt != nil:
-		go func() { _ = l.wt.Close() }()
-	case l.h3 != nil:
-		go func() { _ = l.h3.Close() }()
+	switch wt, h3 := l.wt, l.h3; {
+	case wt != nil:
+		go func() { _ = wt.Close() }()
+	case h3 != nil:
+		go func() { _ = h3.Close() }()
 	}
 }
 

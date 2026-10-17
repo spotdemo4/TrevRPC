@@ -10,7 +10,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::framed::{self, FrameRead, FrameWrite};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::server::Server;
-use crate::server_transport::{self, IncomingRequest, ResponseWriter};
+use crate::server_transport::{self, IncomingRequest, Permit, ResponseWriter, reject_unreadable};
 use crate::{ResponseFrame, Result};
 
 /// The send half of one HTTP request or `WebTransport` stream.
@@ -108,9 +108,11 @@ impl<S: BodySource> RequestPumpReader for BodyReader<S> {
     }
 }
 
-/// Reads the initial request frame, replying with its failure status when it is unusable.
+/// Reads the initial request frame, replying with its failure status when it is unusable. The
+/// stream slot is released before that reply.
 async fn read_request<K, S>(
     server: &Server,
+    stream_permit: &mut Permit,
     sink: K,
     source: S,
 ) -> Option<(BodyWriter<K>, BodyReader<S>, IncomingRequest)>
@@ -129,18 +131,17 @@ where
     match server_transport::read_initial_request(server, &mut reader).await {
         Ok(incoming) => Some((writer, reader, incoming)),
         Err(error) => {
-            let status = error.into_status();
-            server.record_pre_handler_failure(&status);
-            server_transport::write_status(writer, status).await;
+            reject_unreadable(server, stream_permit, writer, error).await;
             None
         }
     }
 }
 
-/// Serves one RPC carried by a body.
+/// Serves one RPC carried by a body, holding `stream_permit` until its STATUS is written.
 pub async fn handle_rpc_stream<K, S>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
+    mut stream_permit: Permit,
     sink: K,
     source: S,
     shutdown: watch::Receiver<bool>,
@@ -148,9 +149,19 @@ pub async fn handle_rpc_stream<K, S>(
     K: BodySink,
     S: BodySource,
 {
-    if let Some((writer, reader, incoming)) = read_request(&server, sink, source).await {
-        server_transport::handle_stream(server, request_limit, writer, reader, incoming, shutdown)
-            .await;
+    if let Some((writer, reader, incoming)) =
+        read_request(&server, &mut stream_permit, sink, source).await
+    {
+        server_transport::handle_stream(
+            server,
+            request_limit,
+            stream_permit,
+            writer,
+            reader,
+            incoming,
+            shutdown,
+        )
+        .await;
     }
 }
 
@@ -160,7 +171,9 @@ where
     K: BodySink,
     S: BodySource,
 {
-    if let Some((writer, reader, incoming)) = read_request(&server, sink, source).await {
+    if let Some((writer, reader, incoming)) =
+        read_request(&server, &mut Permit::none(), sink, source).await
+    {
         server_transport::reject_stream(server, writer, reader, incoming).await;
     }
 }

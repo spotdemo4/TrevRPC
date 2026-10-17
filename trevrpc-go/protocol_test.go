@@ -48,7 +48,7 @@ func concat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 func serveTestStream(t *testing.T, server *Server, input []byte) (*countingRPCStream, []testFrame) {
 	t.Helper()
 	stream := &countingRPCStream{reader: bytes.NewReader(input)}
-	handleRPCStream(context.Background(), server, stream)
+	handleRPCStream(context.Background(), server, stream, nil)
 	return stream, readTestFrames(t, stream.written.Bytes(), DefaultMaxFrameSize)
 }
 
@@ -281,7 +281,7 @@ func TestServerStreamingHeadersAreWrittenBeforeTheFirstMessageIsPulled(t *testin
 	stream := &lockedRPCStream{reader: bytes.NewReader(request)}
 	done := make(chan struct{})
 	go func() {
-		handleRPCStream(context.Background(), server, stream)
+		handleRPCStream(context.Background(), server, stream, nil)
 		close(done)
 	}()
 

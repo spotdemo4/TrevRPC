@@ -52,11 +52,12 @@ func (l *Listener) handleHTTPRPC(w http.ResponseWriter, r *http.Request) {
 	if state, ok := r.Context().Value(httpConnStateKey{}).(*httpConnState); ok {
 		streamLimit = state.streamLimit
 	}
-	if !tryAcquire(streamLimit) {
+	slot, ok := acquireStreamSlot(streamLimit)
+	if !ok {
 		http.Error(w, "too many concurrent RPCs on HTTP connection", http.StatusServiceUnavailable)
 		return
 	}
-	defer release(streamLimit)
+	defer slot.release()
 
 	w.Header().Set("Content-Type", httpContentType)
 	w.WriteHeader(http.StatusOK)
@@ -64,7 +65,7 @@ func (l *Listener) handleHTTPRPC(w http.ResponseWriter, r *http.Request) {
 	if err := controller.Flush(); err != nil {
 		return
 	}
-	handleRPCStream(r.Context(), l.server, &httpBody{body: r.Body, writer: w, controller: controller})
+	handleRPCStream(r.Context(), l.server, &httpBody{body: r.Body, writer: w, controller: controller}, slot)
 }
 
 func isTrevRPCMediaType(values []string) bool {

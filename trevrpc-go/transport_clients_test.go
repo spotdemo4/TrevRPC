@@ -165,7 +165,21 @@ func (s *http3TestStream) cancelRead() {
 	}
 }
 
-func (s *http3TestStream) cancelWrite() { _ = s.writer.CloseWithError(errors.New("request cancelled")) }
+// cancelWrite aborts the request body. HTTP/2 cannot abort one direction of a
+// stream: failing the body resets the whole stream and discards the response.
+// Once the response is flowing the server has settled the call, so the body is
+// only ended, which leaves the response readable.
+func (s *http3TestStream) cancelWrite() {
+	select {
+	case <-s.ready:
+		if s.response != nil {
+			_ = s.writer.Close()
+			return
+		}
+	default:
+	}
+	_ = s.writer.CloseWithError(errors.New("request cancelled"))
+}
 
 // newWebTransportTestClient returns a Transport that runs RPCs on the streams
 // of one WebTransport session to /trevrpc.

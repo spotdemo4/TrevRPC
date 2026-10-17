@@ -17,7 +17,7 @@ use crate::http_body::{BodySink, BodySource, handle_rpc_stream};
 use crate::request_pump::RequestTransportEvent;
 use crate::serve::{drain_tasks, log_task_error, transport_limits};
 use crate::server::Server;
-use crate::server_transport::try_acquire_permit;
+use crate::server_transport::{Permit, try_acquire_permit};
 use crate::{Error, Result, Status};
 
 /// Serves one HTTP/2 connection until it closes or the server shuts down.
@@ -77,11 +77,16 @@ pub async fn handle_connection<T>(
                 let alt_svc = alt_svc.clone();
                 let closed = closed_rx.clone();
                 let shutdown = shutdown.clone();
-                stream_tasks.spawn(async move {
-                    let _stream_permit = stream_permit;
-                    handle_request(server, request_limit, request, respond, alt_svc, closed, shutdown)
-                        .await;
-                });
+                stream_tasks.spawn(handle_request(
+                    server,
+                    request_limit,
+                    stream_permit,
+                    request,
+                    respond,
+                    alt_svc,
+                    closed,
+                    shutdown,
+                ));
             }
             changed = shutdown.changed(), if drain_deadline.is_none() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -107,9 +112,11 @@ fn window_size(window: u64) -> u32 {
     u32::try_from(window.min((1 << 31) - 1)).unwrap_or(u32::MAX)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
+    mut stream_permit: Permit,
     request: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     alt_svc: Option<HeaderValue>,
@@ -119,6 +126,7 @@ async fn handle_request(
     let (parts, body) = request.into_parts();
     let head = Request::from_parts(parts, ());
     if let Some(status) = validate_http_request(&server, &head) {
+        stream_permit.release();
         reject(respond, status);
         return;
     }
@@ -128,6 +136,7 @@ async fn handle_request(
     handle_rpc_stream(
         server,
         request_limit,
+        stream_permit,
         H2Sink(send),
         H2Source { body, closed },
         shutdown,

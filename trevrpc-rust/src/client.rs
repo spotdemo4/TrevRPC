@@ -20,6 +20,7 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+mod call_end;
 mod channel;
 mod native;
 mod qmux;
@@ -184,6 +185,9 @@ pub trait StreamingRpcTransport: RpcTransport {
     /// terminal [`ResponseFrame::Status`] once the stream has ended cleanly. Frames of unknown type
     /// are skipped by the transport. The call layer checks that the frames follow the response
     /// grammar.
+    ///
+    /// When the transport reads the terminal STATUS while the request body is still uploading, it
+    /// must stop the upload and drop `request_body`.
     async fn streaming_call(
         &self,
         request: RpcRequest,
@@ -327,6 +331,7 @@ where
         transport,
         prepared,
         crate::stream::from_iter([request.encode_to_vec()]),
+        None,
     )
     .await
 }
@@ -344,9 +349,14 @@ where
     Res: Message + Default + Send + 'static,
 {
     let prepared = prepare_streaming_request(service, method, RpcKind::ClientStreaming, options)?;
-    let (sender, requests) = request_channel();
-    let response =
-        open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
+    let (sender, requests, call_end) = request_channel(prepared.deadline);
+    let response = open_response_stream(
+        transport,
+        prepared,
+        crate::stream::encode(requests),
+        Some(call_end),
+    )
+    .await?;
 
     Ok(ClientStreamingCall::new(sender, response))
 }
@@ -387,7 +397,7 @@ where
 {
     let prepared = prepare_streaming_request(service, method, RpcKind::ClientStreaming, options)?;
     let mut response =
-        open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
+        open_response_stream(transport, prepared, crate::stream::encode(requests), None).await?;
 
     read_unary_response_envelope_from_message_stream(&mut response).await
 }
@@ -406,9 +416,14 @@ where
 {
     let prepared =
         prepare_streaming_request(service, method, RpcKind::BidirectionalStreaming, options)?;
-    let (sender, requests) = request_channel();
-    let response =
-        open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
+    let (sender, requests, call_end) = request_channel(prepared.deadline);
+    let response = open_response_stream(
+        transport,
+        prepared,
+        crate::stream::encode(requests),
+        Some(call_end),
+    )
+    .await?;
 
     Ok(BidirectionalCall::new(sender, response))
 }
@@ -428,7 +443,7 @@ where
 {
     let prepared =
         prepare_streaming_request(service, method, RpcKind::BidirectionalStreaming, options)?;
-    open_response_stream(transport, prepared, crate::stream::encode(requests)).await
+    open_response_stream(transport, prepared, crate::stream::encode(requests), None).await
 }
 
 #[derive(Clone, Copy)]
@@ -464,16 +479,22 @@ impl<T> Stream for RequestMessageStream<T> {
     }
 }
 
-fn request_channel<T>() -> (RequestSender<T>, BoxStream<T>)
+/// Creates the request half of a streaming call. The returned [`call_end::EndSender`] belongs to
+/// whoever reads the response; it lets sends fail with the call's terminal status.
+fn request_channel<T>(
+    deadline: Option<Instant>,
+) -> (RequestSender<T>, BoxStream<T>, call_end::EndSender)
 where
     T: Send + 'static,
 {
     let (sender, receiver) = mpsc::channel(1);
     let (control, control_rx) = mpsc::unbounded_channel();
+    let (call_end, call_end_watch) = call_end::channel(deadline);
     (
         RequestSender {
             state: Arc::new(RequestSenderState {
                 sender: Mutex::new(Some(sender)),
+                call_end: call_end_watch,
             }),
             control,
             finished: false,
@@ -483,11 +504,13 @@ where
             control: control_rx,
             cancelled: false,
         }),
+        call_end,
     )
 }
 
 struct RequestSenderState<T> {
     sender: Mutex<Option<mpsc::Sender<T>>>,
+    call_end: call_end::EndWatch,
 }
 
 /// The independently movable request half of a streaming call.
@@ -502,6 +525,14 @@ where
     T: Send + 'static,
 {
     /// Sends one request message with bounded backpressure.
+    ///
+    /// Fails once the server has ended the call, without waiting for a peer that no longer
+    /// reads: with the server's terminal status when it is not `OK`, and with `Cancelled` when
+    /// the server completed the call before the request stream finished. A send after
+    /// [`Self::finish`] or on a closed stream also fails with `Cancelled`. The status is known as
+    /// soon as the server sends it, unless the caller is not reading a response that has more
+    /// than a couple of messages queued ahead of it; sends then fail with `Cancelled` once the
+    /// upload stops.
     pub fn send(
         &self,
         request: T,
@@ -530,10 +561,32 @@ where
         .lock_unpoisoned()
         .clone()
         .ok_or_else(|| Error::from(Status::cancelled("request stream is closed")))?;
-    sender
-        .send(request)
-        .await
-        .map_err(|_| Error::from(Status::cancelled("request stream is closed")))
+    let mut call_end = state.call_end.clone();
+    if let Some(error) = call_end.error_if_ended() {
+        return Err(error);
+    }
+    let request = match sender.try_send(request) {
+        Ok(()) => return Ok(()),
+        Err(mpsc::error::TrySendError::Full(request)) => request,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            call_end.upload_stopped();
+            return Err(call_end.ended().await);
+        }
+    };
+
+    // Waiting for room, the response side reads on to find a STATUS even if nobody reads it.
+    let _waiting = call_end.waiting_send();
+    tokio::select! {
+        biased;
+        error = call_end.ended() => Err(error),
+        sent = sender.send(request) => if sent.is_ok() {
+            Ok(())
+        } else {
+            // The upload stopped: the call has ended, and the response says how.
+            call_end.upload_stopped();
+            Err(call_end.ended().await)
+        },
+    }
 }
 
 impl<T> Drop for RequestSender<T> {
@@ -560,6 +613,8 @@ where
     Req: Send + 'static,
     Res: Message + Default + Send + 'static,
 {
+    /// Sends one request message; see [`RequestSender::send`] for how it fails once the server
+    /// has ended the call.
     pub fn send(
         &self,
         request: Req,
@@ -611,6 +666,8 @@ where
     Req: Send + 'static,
     Res: Message + Default + Send + 'static,
 {
+    /// Sends one request message; see [`RequestSender::send`] for how it fails once the server
+    /// has ended the call.
     pub fn send(
         &self,
         request: Req,
@@ -722,6 +779,7 @@ async fn open_response_stream<T, Res>(
     transport: &T,
     prepared: PreparedStreamingCall,
     request_body: BoxStream<Vec<u8>>,
+    call_end: Option<call_end::EndSender>,
 ) -> Result<ResponseStream<Res>>
 where
     T: StreamingRpcTransport + ?Sized,
@@ -736,6 +794,14 @@ where
         stream_idle_timeout,
     } = prepared;
     let response = streaming_call_with_deadline(transport, request, request_body, deadline).await?;
+    let response = match call_end {
+        Some(call_end) => call_end::read_response(
+            response,
+            call_end,
+            call_end::ReadAhead::new(max_response_messages, max_response_stream_body_size),
+        ),
+        None => response,
+    };
 
     Ok(ResponseStream::<Res>::new(
         response,
@@ -1228,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_sender_finish_gracefully_drains_accepted_messages() {
-        let (sender, mut requests) = request_channel();
+        let (sender, mut requests, _end) = request_channel(None);
         sender.send(7_u8).await.expect("request should be accepted");
         sender.finish().expect("request sender should finish");
 
@@ -1238,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_unfinished_request_sender_emits_cancellation() {
-        let (sender, mut requests) = request_channel::<u8>();
+        let (sender, mut requests, _end) = request_channel::<u8>(None);
         drop(sender);
 
         let error = requests
@@ -1252,7 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_send_future_cannot_outlive_graceful_finish() {
-        let (sender, mut requests) = request_channel::<u8>();
+        let (sender, mut requests, _end) = request_channel::<u8>(None);
         let send = sender.send(7);
         sender.finish().expect("request sender should finish");
 
@@ -1271,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_halves_move_to_independent_tasks() {
-        let (sender, _requests) = request_channel::<TestMessage>();
+        let (sender, _requests, _end) = request_channel::<TestMessage>(None);
         let response = ResponseStream::<TestMessage>::new(
             crate::stream::from_iter([ResponseFrame::Status(Status::ok())]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
@@ -1951,7 +2017,7 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_call_delegates_headers() {
-        let (sender, _requests) = request_channel::<TestMessage>();
+        let (sender, _requests, _end) = request_channel::<TestMessage>(None);
         let mut call = BidirectionalCall::new(
             sender,
             response_stream_of([
@@ -1969,7 +2035,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_streaming_call_delegates_headers_and_fills_the_envelope() {
-        let (sender, _requests) = request_channel::<TestMessage>();
+        let (sender, _requests, _end) = request_channel::<TestMessage>(None);
         let trailers = header_map("x-t", b"2");
         let mut call = super::ClientStreamingCall::new(
             sender,

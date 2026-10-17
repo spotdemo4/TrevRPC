@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -130,7 +131,11 @@ type rpcStream interface {
 	Close() error
 }
 
-func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
+// handleRPCStream runs one RPC on stream. slot is the connection's stream slot
+// the RPC occupies, or nil. It is released before the terminal STATUS is
+// written, so a client that sees the call complete finds the slot free.
+func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot *streamSlot) {
+	defer slot.release()
 	runtime := server.freeze()
 	options := runtime.options
 	startedAt := time.Now()
@@ -139,13 +144,13 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	if err != nil {
 		status := requestFrameStatus(err)
 		runtime.recordPreHandlerFailure(startedAt, status)
-		writeStatusAndAbort(stream, status, options.MaxFrameSize)
+		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
 	if err := validateRequest(request); err != nil {
 		status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
 		runtime.recordRequestFailure(startedAt, request, 0, status)
-		writeStatusAndAbort(stream, status, options.MaxFrameSize)
+		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
 	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
@@ -157,7 +162,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 		if err != nil {
 			status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
 			runtime.recordRequestFailure(startedAt, request, 0, status)
-			writeStatusAndAbort(stream, status, options.MaxFrameSize)
+			writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 			return
 		}
 	}
@@ -166,18 +171,25 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	if !ok {
 		status := Unavailable("too many concurrent RPCs")
 		runtime.recordRejectedRequest(startedAt, request, len(body), status)
-		writeStatusAndAbort(stream, status, options.MaxFrameSize)
+		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
 
 	var response responseWriter
+	// upload is the request stream of a call that the client keeps uploading
+	// to after the request; nil for calls whose request is a single message.
+	var upload *rpcRequestStream
 	if request.rpcKind() == RPCKindUnary {
-		defer lease.release()
 		response = runtime.handleRequest(requestCtx, request, body, lease)
+		// The handler is done. Free the lease before the response goes out,
+		// as the other kinds do when they finish, so a client that sees the
+		// status finds the request limit free.
+		lease.release()
 	} else {
 		reader.chargeMessages = true
 		requests := &rpcRequestStream{reader: reader}
 		if request.rpcKind() == RPCKindClientStreaming || request.rpcKind() == RPCKindBidirectionalStreaming {
+			upload = requests
 			if cancellable, ok := stream.(contextCancelReadStream); ok {
 				requests.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
 			}
@@ -190,13 +202,10 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	defer discardMessageStream(response)
 
 	for {
-		done, err := response.writeNext(ctx, stream, options.MaxFrameSize)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			discardMessageStream(response)
-			abortRPCStream(stream)
-			return
-		}
+		done, err := response.writeNext(ctx, stream, options.MaxFrameSize, slot.release)
 		if err != nil {
+			discardMessageStream(response)
+			slot.release()
 			abortRPCStream(stream)
 			return
 		}
@@ -205,6 +214,13 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 		}
 	}
 
+	slot.release()
+	// A handler that finished without consuming every request leaves the
+	// client's upload unread. Stop it, or the client's writes block on flow
+	// control until its deadline.
+	if upload != nil && !upload.finished() {
+		cancelStreamRead(stream)
+	}
 	_ = stream.Close()
 }
 
@@ -381,9 +397,11 @@ func cancelReadOnContext(ctx context.Context, stream rpcStream) func() {
 }
 
 // writeStatusAndAbort answers a request that failed before any response with a
-// lone STATUS and aborts the stream.
-func writeStatusAndAbort(stream rpcStream, status *Status, maxFrameSize int) {
-	if frames, err := appendStatusFrame(nil, status, maxFrameSize); err == nil {
+// lone STATUS and aborts the stream. It releases slot, if any, before writing.
+func writeStatusAndAbort(stream rpcStream, status *Status, maxFrameSize int, slot *streamSlot) {
+	frames, err := appendStatusFrame(nil, status, maxFrameSize)
+	slot.release()
+	if err == nil {
 		_, _ = stream.Write(frames)
 	}
 	abortRPCStream(stream)
@@ -396,8 +414,17 @@ type rpcRequestStream struct {
 	reader              *frameReader
 	cancelReadOnContext func(context.Context) func()
 	cancelRead          func()
-	done                bool
+	// done and ended are atomic because Close may run on another goroutine
+	// than Recv, and the connection handler reads ended after the response.
+	done atomic.Bool
+	// ended is set once the client finished its request side: the stream
+	// reached its end or carried an OK STATUS.
+	ended atomic.Bool
 }
+
+// finished reports whether the client finished its upload, so that nothing is
+// left to read or stop.
+func (s *rpcRequestStream) finished() bool { return s.ended.Load() }
 
 func (s *rpcRequestStream) trevrpcContextCancelsRecv() bool {
 	return s.cancelReadOnContext != nil
@@ -418,14 +445,15 @@ func (s *rpcRequestStream) trevrpcCancelRead() {
 }
 
 func (s *rpcRequestStream) Recv() ([]byte, error) {
-	if s.done {
+	if s.done.Load() {
 		return nil, io.EOF
 	}
 
 	next, err := s.reader.next()
 	if err != nil {
-		s.done = true
+		s.done.Store(true)
 		if errors.Is(err, io.EOF) {
+			s.ended.Store(true)
 			return nil, io.EOF
 		}
 		return nil, transportStatus(err)
@@ -435,24 +463,25 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 	case frameTypeMessage:
 		return next.payload, nil
 	case frameTypeStatus:
-		s.done = true
+		s.done.Store(true)
 		status, err := decodeStatus(next.payload)
 		if err != nil {
 			return nil, transportStatus(err)
 		}
 		if status.IsOK() {
+			s.ended.Store(true)
 			return nil, io.EOF
 		}
 
 		return nil, status
 	default:
-		s.done = true
+		s.done.Store(true)
 		return nil, InvalidArgument(fmt.Sprintf("request stream carried %s after REQUEST", next.typ))
 	}
 }
 
 func (s *rpcRequestStream) Close() error {
-	s.done = true
+	s.done.Store(true)
 	return nil
 }
 
@@ -517,4 +546,30 @@ func release(limit semaphore) {
 	}
 
 	<-limit
+}
+
+// streamSlot is a slot taken from a connection's stream limit. It is released
+// at most once, however many paths try.
+type streamSlot struct {
+	limit    semaphore
+	released atomic.Bool
+}
+
+// acquireStreamSlot takes a slot from limit. It returns false when the limit
+// is reached. An unlimited connection yields a nil slot, which is valid.
+func acquireStreamSlot(limit semaphore) (*streamSlot, bool) {
+	if limit == nil {
+		return nil, true
+	}
+	if !tryAcquire(limit) {
+		return nil, false
+	}
+	return &streamSlot{limit: limit}, true
+}
+
+// release frees the slot. It is safe on a nil slot and to call repeatedly.
+func (s *streamSlot) release() {
+	if s != nil && s.released.CompareAndSwap(false, true) {
+		release(s.limit)
+	}
 }

@@ -1024,7 +1024,7 @@ func TestServerDrainsFiniteRequestBeforeResponseClose(t *testing.T) {
 			input := bytes.NewBuffer(finiteRequestBytes(t, request))
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-			handleRPCStream(context.Background(), server, stream)
+			handleRPCStream(context.Background(), server, stream, nil)
 
 			if !stream.readEOF {
 				t.Fatal("expected request EOF to be observed")
@@ -1068,7 +1068,7 @@ func TestServerFiniteRequestDrainUsesRPCDeadline(t *testing.T) {
 			stream := newRequestThenBlockingRPCStream(input.Bytes())
 
 			startedAt := time.Now()
-			handleRPCStream(context.Background(), server, stream)
+			handleRPCStream(context.Background(), server, stream, nil)
 			elapsed := time.Since(startedAt)
 
 			if elapsed < 50*time.Millisecond {
@@ -1132,7 +1132,7 @@ func TestServerFiniteRequestDrainReusesInitialRequestDeadline(t *testing.T) {
 			input := bytes.NewBuffer(finiteRequestBytes(t, request))
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-			handleRPCStream(context.Background(), server, stream)
+			handleRPCStream(context.Background(), server, stream, nil)
 
 			if len(stream.readDeadlines) != 4 {
 				t.Fatalf("read deadlines = %v, want initial set/clear and drain set/clear", stream.readDeadlines)
@@ -1189,7 +1189,7 @@ func TestServerRejectsFiniteRequestTrailingDataBeforeHandler(t *testing.T) {
 			input.Write(rawMessage([]byte("trailing")).frame)
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-			handleRPCStream(context.Background(), server, stream)
+			handleRPCStream(context.Background(), server, stream, nil)
 
 			if called {
 				t.Fatal("handler ran before the finite request was validated")
@@ -1227,7 +1227,7 @@ func TestAdmissionRejectedUploadCancelsRead(t *testing.T) {
 			reader := bytes.NewReader(input.Bytes())
 			stream := &countingRPCStream{reader: reader}
 
-			handleRPCStream(context.Background(), server, stream)
+			handleRPCStream(context.Background(), server, stream, nil)
 
 			if reader.Len() != len(trailing) {
 				t.Fatalf("rejected upload consumed %d bytes", len(trailing)-reader.Len())
@@ -1267,7 +1267,7 @@ func TestMalformedFiniteRequestDoesNotWaitForFIN(t *testing.T) {
 			stream := newRequestThenBlockingRPCStream(input.Bytes())
 			done := make(chan struct{})
 			go func() {
-				handleRPCStream(context.Background(), server, stream)
+				handleRPCStream(context.Background(), server, stream, nil)
 				close(done)
 			}()
 
@@ -1323,7 +1323,7 @@ func TestServerAbortsRPCStreamOnResponseWriteError(t *testing.T) {
 			input := bytes.NewBuffer(finiteRequestBytes(t, request))
 			stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes()), writeErr: writeErr}
 
-			handleRPCStream(context.Background(), server, stream)
+			handleRPCStream(context.Background(), server, stream, nil)
 
 			if stream.cancelReadCount != 1 {
 				t.Fatalf("request read cancellations = %d, want 1", stream.cancelReadCount)
@@ -1350,7 +1350,7 @@ func TestServerAbortsRPCStreamOnLocalResponseFrameTooLarge(t *testing.T) {
 	input := bytes.NewBuffer(finiteRequestBytes(t, request))
 	stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-	handleRPCStream(context.Background(), server, stream)
+	handleRPCStream(context.Background(), server, stream, nil)
 
 	if stream.writeCount != 0 {
 		t.Fatalf("transport writes = %d, want 0 for local frame rejection", stream.writeCount)
@@ -1382,7 +1382,7 @@ func TestServerResponseBatchWriterBatchesNonBlockingMessages(t *testing.T) {
 	input := bytes.NewBuffer(finiteRequestBytes(t, request))
 	stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
 
-	handleRPCStream(context.Background(), server, stream)
+	handleRPCStream(context.Background(), server, stream, nil)
 
 	if stream.writeCount != 1 {
 		t.Fatalf("expected the messages and the status in one write, got %d", stream.writeCount)
@@ -1425,7 +1425,7 @@ func TestServerResponseBatchWriterSplitsOnByteCap(t *testing.T) {
 	for _, want := range []string{"abcd", "efgh"} {
 		writer.Reset()
 		writer.writeCount = 0
-		done, err := response.writeNext(context.Background(), writer, 8)
+		done, err := response.writeNext(context.Background(), writer, 8, nil)
 		if err != nil {
 			t.Fatalf("write batch %q: %v", want, err)
 		}
@@ -1442,7 +1442,7 @@ func TestServerResponseBatchWriterSplitsOnByteCap(t *testing.T) {
 	}
 
 	writer.Reset()
-	done, err := response.writeNext(context.Background(), writer, 8)
+	done, err := response.writeNext(context.Background(), writer, 8, nil)
 	if err != nil || !done {
 		t.Fatalf("last batch done = %t, err = %v, want the status to end it", done, err)
 	}
@@ -1468,7 +1468,7 @@ func TestServerResponseBatchWriterFallsBackWithIdleTimeout(t *testing.T) {
 	defer discardMessageStream(response)
 	writer := &countingWriter{}
 
-	done, err := response.writeNext(context.Background(), writer, DefaultMaxFrameSize)
+	done, err := response.writeNext(context.Background(), writer, DefaultMaxFrameSize, nil)
 	if err != nil {
 		t.Fatalf("write first frame: %v", err)
 	}
@@ -1498,7 +1498,7 @@ func TestServerResponseBatchWriterAppendsTerminalStatusToBatch(t *testing.T) {
 	defer discardMessageStream(response)
 	writer := &countingWriter{}
 
-	done, err := response.writeNext(context.Background(), writer, DefaultMaxFrameSize)
+	done, err := response.writeNext(context.Background(), writer, DefaultMaxFrameSize, nil)
 	if err != nil {
 		t.Fatalf("write message batch: %v", err)
 	}

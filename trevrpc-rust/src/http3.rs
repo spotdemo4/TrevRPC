@@ -18,7 +18,7 @@ use crate::http_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_strea
 use crate::request_pump::RequestTransportEvent;
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
 use crate::server::Server;
-use crate::server_transport::try_acquire_permit;
+use crate::server_transport::{Permit, try_acquire_permit};
 use crate::{Error, Result, Status};
 // RFC WebTransport reserves this error-code range for application protocol errors. Code 1 maps
 // to the first application code plus one; the division term is zero for this value.
@@ -172,21 +172,28 @@ fn spawn_http_request(
     };
     let server = server.clone();
     let request_limit = request_limit.cloned();
-    stream_tasks.spawn(async move {
-        let _stream_permit = stream_permit;
-        handle_http_request(server, request_limit, request, stream, connection, shutdown).await;
-    });
+    stream_tasks.spawn(handle_http_request(
+        server,
+        request_limit,
+        stream_permit,
+        request,
+        stream,
+        connection,
+        shutdown,
+    ));
 }
 
 async fn handle_http_request(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
+    mut stream_permit: Permit,
     request: Request<()>,
     mut stream: H3RequestStream,
     connection: quinn::Connection,
     shutdown: watch::Receiver<bool>,
 ) {
     if let Some(status) = validate_http_request(&server, &request) {
+        stream_permit.release();
         reject_h3(stream, status).await;
         return;
     }
@@ -198,6 +205,7 @@ async fn handle_http_request(
     handle_rpc_stream(
         server,
         request_limit,
+        stream_permit,
         H3Sink(send, connection.clone()),
         H3Source(recv, connection),
         shutdown,
@@ -268,11 +276,11 @@ async fn handle_webtransport_session(
                         let stream_connection = connection.clone();
                         let stream_shutdown = shutdown.clone();
                         stream_tasks.spawn(async move {
-                            let _stream_permit = stream_permit;
                             let (send, recv) = stream.split();
                             handle_rpc_stream(
                                 server,
                                 request_limit,
+                                stream_permit,
                                 WebTransportSink(send, stream_connection.clone()),
                                 WebTransportSource(recv, stream_connection),
                                 stream_shutdown,

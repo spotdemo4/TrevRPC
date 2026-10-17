@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
@@ -54,11 +55,16 @@ func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloReq
 }
 
 // fixedReplies streams a fixed list of replies.
+// fixedReplies is safe for Close to run concurrently with Recv, as
+// trevrpc.MessageStream requires.
 type fixedReplies struct {
+	mu      sync.Mutex
 	replies []*greeter.HelloReply
 }
 
 func (s *fixedReplies) Recv() (*greeter.HelloReply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.replies) == 0 {
 		return nil, io.EOF
 	}
@@ -69,6 +75,8 @@ func (s *fixedReplies) Recv() (*greeter.HelloReply, error) {
 }
 
 func (s *fixedReplies) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.replies = nil
 	return nil
 }

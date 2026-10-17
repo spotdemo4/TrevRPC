@@ -302,16 +302,16 @@ func (l *Listener) serveStreams(ctx context.Context, acceptor streamAcceptor) {
 			}
 			break
 		}
-		if !tryAcquire(streamLimit) {
-			writeStatusAndAbort(stream, Unavailable(acceptor.overloadMessage), runtime.options.MaxFrameSize)
+		slot, ok := acquireStreamSlot(streamLimit)
+		if !ok {
+			writeStatusAndAbort(stream, Unavailable(acceptor.overloadMessage), runtime.options.MaxFrameSize, nil)
 			continue
 		}
 
 		streamTasks.Go(func() {
-			defer release(streamLimit)
 			streamCtx, cancel := contextWithAdditionalCancel(streamCtx, ctx)
 			defer cancel()
-			handleRPCStream(streamCtx, l.server, stream)
+			handleRPCStream(streamCtx, l.server, stream, slot)
 		})
 	}
 

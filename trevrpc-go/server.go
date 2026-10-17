@@ -817,7 +817,10 @@ func requestKind(request *wireRequest) RPCKind {
 type responseWriter interface {
 	// writeNext writes the next frames of the response. It reports done once
 	// the terminal STATUS was written or the response cannot continue.
-	writeNext(ctx context.Context, writer io.Writer, maxFrameSize int) (done bool, err error)
+	// beforeStatus, if not nil, is called once just before the write that
+	// carries the terminal STATUS, so the caller can free what a client may
+	// reuse as soon as it sees the call complete.
+	writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (done bool, err error)
 	// Close releases the response without writing the rest of it.
 	Close() error
 }
@@ -828,7 +831,7 @@ type statusResponse struct {
 	status *Status
 }
 
-func (r statusResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int) (bool, error) {
+func (r statusResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, err
 	}
@@ -836,11 +839,19 @@ func (r statusResponse) writeNext(ctx context.Context, writer io.Writer, maxFram
 	if err != nil {
 		return true, err
 	}
+	callBeforeStatus(beforeStatus)
 	_, err = writer.Write(frames)
 	return true, err
 }
 
 func (statusResponse) Close() error { return nil }
+
+// callBeforeStatus runs the beforeStatus hook of writeNext, if there is one.
+func callBeforeStatus(beforeStatus func()) {
+	if beforeStatus != nil {
+		beforeStatus()
+	}
+}
 
 // unaryResponse is the complete response of a unary call: optional HEADERS,
 // then a MESSAGE and an OK STATUS on success, or a lone failure STATUS.
@@ -851,7 +862,7 @@ type unaryResponse struct {
 	status     *Status
 }
 
-func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int) (bool, error) {
+func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, err
 	}
@@ -879,6 +890,7 @@ func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFram
 	if frames, err = appendStatusFrame(frames, r.status, maxFrameSize); err != nil {
 		return true, err
 	}
+	callBeforeStatus(beforeStatus)
 	_, err = writer.Write(frames)
 	return true, err
 }
@@ -1266,14 +1278,17 @@ func cancelStreamRead(stream any) {
 }
 
 type limitedByteStream struct {
-	inner          byteStream
-	ctx            context.Context
-	limits         streamLimits
-	direction      string
-	lease          *requestExecutionLease
-	request        *wireRequest
-	messages       int
-	bodySize       int
+	inner     byteStream
+	ctx       context.Context
+	limits    streamLimits
+	direction string
+	lease     *requestExecutionLease
+	request   *wireRequest
+	messages  int
+	bodySize  int
+	// mu guards done and stopCancelRead: Close may run on another goroutine
+	// than Recv, such as the one that closes the stream when ctx ends.
+	mu             sync.Mutex
 	stopCancelRead func()
 	done           bool
 }
@@ -1288,7 +1303,7 @@ func limitByteStream(ctx context.Context, inner byteStream, limits streamLimits,
 }
 
 func (s *limitedByteStream) Recv() ([]byte, error) {
-	if s.done {
+	if s.isDone() {
 		return nil, io.EOF
 	}
 
@@ -1307,8 +1322,7 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 }
 
 func (s *limitedByteStream) Close() error {
-	if !s.done {
-		s.finish()
+	if s.finish() {
 		discardMessageStream(s.inner)
 	}
 
@@ -1319,12 +1333,24 @@ func (s *limitedByteStream) trevrpcContextCancelsRecv() bool {
 	return s.limits.idleTimeout <= 0 && streamContextCancelsRecv(s.inner)
 }
 
-func (s *limitedByteStream) finish() {
+func (s *limitedByteStream) isDone() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done
+}
+
+// finish ends the stream and reports whether this call did.
+func (s *limitedByteStream) finish() bool {
+	s.mu.Lock()
+	first := !s.done
 	s.done = true
-	if s.stopCancelRead != nil {
-		s.stopCancelRead()
-		s.stopCancelRead = nil
+	stop := s.stopCancelRead
+	s.stopCancelRead = nil
+	s.mu.Unlock()
+	if stop != nil {
+		stop()
 	}
+	return first
 }
 
 func recvByteWithTimeout[T any](ctx context.Context, stream MessageStream[T], idleTimeout time.Duration, direction string, lease *requestExecutionLease) (T, error) {
@@ -1440,7 +1466,7 @@ type responseStreamItem struct {
 // the handler has returned, in a write of their own when pulling the first
 // message may block. A stream that never blocks has its messages written in
 // batches, and the terminal STATUS joins the last batch.
-func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int) (bool, error) {
+func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, err
 	}
@@ -1454,7 +1480,7 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 		s.headersSent = true
 		if len(s.response.headers) > 0 {
 			if frames, err = appendHeadersFrame(frames, s.response.headers, maxFrameSize); err != nil {
-				return s.writeFinalFrames(writer, maxFrameSize, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request))
+				return s.writeFinalFrames(writer, maxFrameSize, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
 			}
 			if !s.trevrpcNonBlockingStream() {
 				if _, err := writer.Write(frames); err != nil {
@@ -1486,7 +1512,7 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 			item.status = s.acceptResponseMessage(item.message)
 		}
 		if item.status != nil {
-			return s.writeFinalFrames(writer, maxFrameSize, frames, item.status)
+			return s.writeFinalFrames(writer, maxFrameSize, frames, item.status, beforeStatus)
 		}
 
 		if frames, err = appendEncodedMessage(frames, item.message, maxFrameSize); err != nil {
@@ -1503,12 +1529,13 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 
 // writeFinalFrames writes frames followed by the terminal STATUS and finishes
 // the response.
-func (s *serverResponseStream) writeFinalFrames(writer io.Writer, maxFrameSize int, frames []byte, status *Status) (bool, error) {
+func (s *serverResponseStream) writeFinalFrames(writer io.Writer, maxFrameSize int, frames []byte, status *Status, beforeStatus func()) (bool, error) {
 	s.finish(status.Code)
 	frames, err := appendStatusFrame(frames, status, maxFrameSize)
 	if err != nil {
 		return true, err
 	}
+	callBeforeStatus(beforeStatus)
 	_, err = writer.Write(frames)
 	return true, err
 }
