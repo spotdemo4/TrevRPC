@@ -19,13 +19,6 @@ pub enum RpcKind {
     BidirectionalStreaming = 3,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, prost::Enumeration)]
-#[repr(i32)]
-pub enum RpcStreamFrameKind {
-    Message = 0,
-    Status = 1,
-}
-
 /// Normalizes a metadata key to lowercase ASCII.
 #[must_use]
 pub fn normalize_metadata_key(key: &str) -> String {
@@ -98,14 +91,15 @@ const fn is_metadata_key_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-')
 }
 
+/// The REQUEST frame payload: everything about a call except its messages.
+///
+/// Field 3 is reserved: it carried the request body before messages moved into MESSAGE frames.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct RpcRequest {
     #[prost(string, tag = "1")]
     pub service: String,
     #[prost(string, tag = "2")]
     pub method: String,
-    #[prost(bytes = "vec", tag = "3")]
-    pub body: Vec<u8>,
     #[prost(map = "string, bytes", tag = "4")]
     pub metadata: Metadata,
     #[prost(enumeration = "RpcKind", tag = "5")]
@@ -114,20 +108,24 @@ pub struct RpcRequest {
     pub version: u32,
     #[prost(uint64, tag = "7")]
     pub timeout_nanos: u64,
+    /// Extensions the client supports. The registry is empty, so clients send none and servers
+    /// ignore the field.
+    #[prost(uint64, repeated, tag = "8")]
+    pub extensions: Vec<u64>,
 }
 
 impl RpcRequest {
     /// Creates a unary RPC request with the current wire version.
     #[must_use]
-    pub fn new(service: impl Into<String>, method: impl Into<String>, body: Vec<u8>) -> Self {
+    pub fn new(service: impl Into<String>, method: impl Into<String>) -> Self {
         Self {
             service: service.into(),
             method: method.into(),
-            body,
             metadata: Metadata::new(),
             kind: i32::from(RpcKind::Unary),
             version: WIRE_VERSION,
             timeout_nanos: 0,
+            extensions: Vec::new(),
         }
     }
 
@@ -178,99 +176,54 @@ impl RpcRequest {
     }
 }
 
+impl RpcKind {
+    /// Returns whether a request of this kind carries exactly one MESSAGE frame, so the server
+    /// reads it before dispatching the handler.
+    #[must_use]
+    pub const fn has_single_request_message(self) -> bool {
+        matches!(self, Self::Unary | Self::ServerStreaming)
+    }
+}
+
+/// The HEADERS frame payload: response header metadata.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct RpcResponse {
+pub struct RpcHeaders {
+    #[prost(map = "string, bytes", tag = "1")]
+    pub metadata: Metadata,
+    /// Extensions the server accepts. The registry is empty, so receivers ignore the field.
+    #[prost(uint64, repeated, tag = "2")]
+    pub extensions: Vec<u64>,
+}
+
+/// The STATUS frame payload: the terminal status and trailing metadata.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct RpcStatus {
     #[prost(uint32, tag = "1")]
-    pub status: u32,
+    pub code: u32,
     #[prost(string, tag = "2")]
     pub message: String,
-    #[prost(bytes = "vec", tag = "3")]
-    pub body: Vec<u8>,
-    #[prost(map = "string, bytes", tag = "4")]
+    #[prost(map = "string, bytes", tag = "3")]
     pub metadata: Metadata,
-}
-
-impl RpcResponse {
-    /// Creates a successful RPC response with the provided body.
-    #[must_use]
-    pub fn ok(body: Vec<u8>) -> Self {
-        crate::Status::ok().into_response(body)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, prost::Message)]
-pub struct RpcStreamFrame {
-    #[prost(enumeration = "RpcStreamFrameKind", tag = "1")]
-    pub kind: i32,
-    #[prost(uint32, tag = "2")]
-    pub status: u32,
-    #[prost(string, tag = "3")]
-    pub message: String,
-    #[prost(bytes = "vec", tag = "4")]
-    pub body: Vec<u8>,
-    #[prost(map = "string, bytes", tag = "5")]
-    pub metadata: Metadata,
-}
-
-impl RpcStreamFrame {
-    /// Creates a stream message frame carrying a protobuf body.
-    #[must_use]
-    pub fn message(body: Vec<u8>) -> Self {
-        Self {
-            kind: i32::from(RpcStreamFrameKind::Message),
-            status: crate::Code::Ok.as_u32(),
-            message: String::new(),
-            body,
-            metadata: Metadata::new(),
-        }
-    }
-
-    /// Creates a terminal status frame without metadata.
-    #[must_use]
-    pub fn status(status: crate::Status) -> Self {
-        let metadata = status.metadata().clone();
-        Self::status_with_metadata(status, metadata)
-    }
-
-    /// Creates a terminal status frame with metadata.
-    #[must_use]
-    pub fn status_with_metadata(status: crate::Status, metadata: Metadata) -> Self {
-        let (code, message) = status.into_parts();
-
-        Self {
-            kind: i32::from(RpcStreamFrameKind::Status),
-            status: code.as_u32(),
-            message,
-            body: Vec::new(),
-            metadata,
-        }
-    }
-
-    /// Returns the decoded stream frame kind.
-    #[must_use]
-    pub fn frame_kind(&self) -> Option<RpcStreamFrameKind> {
-        RpcStreamFrameKind::try_from(self.kind).ok()
-    }
-
-    /// Returns the status represented by this frame.
-    #[must_use]
-    pub fn status_value(&self) -> crate::Status {
-        crate::Status::new(crate::Code::from_u32(self.status), self.message.clone())
-            .with_metadata(self.metadata.clone())
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Code, Metadata};
-
-    use super::{
-        MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN, RpcKind, RpcRequest,
-        RpcResponse, RpcStreamFrame, RpcStreamFrameKind, WIRE_VERSION, normalize_metadata_key,
-        validate_metadata,
-    };
+    use std::collections::{BTreeSet, HashMap};
+    use std::fmt::Debug;
 
     use prost::Message;
+
+    use crate::framed::{next_known_header, read_payload};
+    use crate::framing::{
+        DEFAULT_MAX_FRAME_SIZE, decode_payload, encode_frame, encode_protobuf_frame, frame_type,
+    };
+    use crate::test_io::Script;
+    use crate::{Code, Metadata, Status};
+
+    use super::{
+        MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN, RpcHeaders, RpcKind,
+        RpcRequest, RpcStatus, WIRE_VERSION, normalize_metadata_key, validate_metadata,
+    };
 
     #[test]
     fn validates_well_formed_metadata() {
@@ -343,15 +296,24 @@ mod tests {
 
     #[test]
     fn request_defaults_to_unary_kind() {
-        let request = RpcRequest::new("service", "method", Vec::new());
+        let request = RpcRequest::new("service", "method");
 
         assert_eq!(request.rpc_kind(), RpcKind::Unary);
         assert_eq!(request.version, WIRE_VERSION);
+        assert!(request.extensions.is_empty());
+    }
+
+    #[test]
+    fn single_request_message_kinds_are_unary_and_server_streaming() {
+        assert!(RpcKind::Unary.has_single_request_message());
+        assert!(RpcKind::ServerStreaming.has_single_request_message());
+        assert!(!RpcKind::ClientStreaming.has_single_request_message());
+        assert!(!RpcKind::BidirectionalStreaming.has_single_request_message());
     }
 
     #[test]
     fn rejects_unsupported_wire_versions() {
-        let mut request = RpcRequest::new("service", "method", Vec::new());
+        let mut request = RpcRequest::new("service", "method");
         request.version = WIRE_VERSION + 1;
 
         let status = request
@@ -363,7 +325,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_rpc_kinds() {
-        let mut request = RpcRequest::new("service", "method", Vec::new());
+        let mut request = RpcRequest::new("service", "method");
         request.kind = 99;
 
         let status = request
@@ -374,102 +336,86 @@ mod tests {
     }
 
     #[test]
-    fn stream_frame_carries_status() {
-        let frame = RpcStreamFrame::status(crate::Status::unavailable("retry later"));
-
-        assert_eq!(frame.frame_kind(), Some(RpcStreamFrameKind::Status));
-        assert_eq!(frame.status_value().code(), Code::Unavailable);
-        assert_eq!(frame.status_value().message(), "retry later");
-    }
-
-    #[test]
-    fn wire_golden_vectors_stay_stable() {
-        let vectors = golden_vectors();
-
-        let timeout_request =
-            RpcRequest::new("svc", "m", b"hi".to_vec()).with_timeout_nanos(123_456);
-
+    fn rpc_status_round_trips_through_status() {
         let mut metadata = Metadata::new();
-        metadata.insert("authorization".to_owned(), b"ok".to_vec());
-        let metadata_request = RpcRequest::new("svc", "m", b"hi".to_vec()).with_metadata(metadata);
+        metadata.insert("x-t".to_owned(), b"2".to_vec());
+        let status = Status::new(Code::FailedPrecondition, "stop").with_metadata(metadata);
 
-        assert_wire_golden_vector(
-            &vectors,
-            "rpc_request.unary",
-            &RpcRequest::new("svc", "m", b"hi".to_vec()),
-        );
-        assert_wire_golden_vector(&vectors, "rpc_request.timeout", &timeout_request);
-        assert_wire_golden_vector(&vectors, "rpc_request.metadata", &metadata_request);
-        assert_wire_golden_vector(
-            &vectors,
-            "rpc_stream_frame.message",
-            &RpcStreamFrame::message(b"hi".to_vec()),
-        );
-        assert_wire_golden_vector(
-            &vectors,
-            "rpc_stream_frame.status",
-            &RpcStreamFrame::status(crate::Status::unavailable("down")),
-        );
-        assert_wire_golden_vector(
-            &vectors,
-            "rpc_response.ok_body",
-            &RpcResponse::ok(b"hi".to_vec()),
-        );
-        assert_wire_golden_vector(
-            &vectors,
-            "rpc_response.unavailable",
-            &crate::Status::unavailable("down").into_response(Vec::new()),
+        let wire = RpcStatus::from(status.clone());
+        assert_eq!(wire.code, 9);
+        assert_eq!(Status::from(wire), status);
+        assert_eq!(
+            Status::from(RpcStatus {
+                code: 9999,
+                ..RpcStatus::default()
+            })
+            .code(),
+            Code::Unknown
         );
     }
 
-    fn assert_wire_golden_vector<M>(
-        vectors: &std::collections::HashMap<String, Vec<u8>>,
-        name: &str,
-        message: &M,
-    ) where
-        M: Message,
-    {
-        let body_name = format!("{name}.body");
-        let frame_name = format!("{name}.frame");
-        let body = message.encode_to_vec();
-        let frame = crate::framing::encode_frame(message).expect("frame should encode");
-
-        assert_eq!(body.as_slice(), golden_vector(vectors, &body_name));
-        assert_eq!(frame.as_slice(), golden_vector(vectors, &frame_name));
+    /// The parsed fixture: hex values by name, and the `.frames` entries as written.
+    struct Vectors {
+        bytes: HashMap<String, Vec<u8>>,
+        frames: HashMap<String, String>,
     }
 
-    fn golden_vectors() -> std::collections::HashMap<String, Vec<u8>> {
-        let mut vectors = std::collections::HashMap::new();
+    impl Vectors {
+        fn load() -> Self {
+            let mut vectors = Self {
+                bytes: HashMap::new(),
+                frames: HashMap::new(),
+            };
+            for (index, line) in include_str!("../../testdata/wire-golden-vectors.txt")
+                .lines()
+                .enumerate()
+            {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
 
-        for (index, line) in include_str!("../../testdata/wire-golden-vectors.txt")
-            .lines()
-            .enumerate()
-        {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+                // An empty value has no trailing space, so split on the first `=` and trim.
+                let (name, value) = line.split_once('=').unwrap_or_else(|| {
+                    panic!(
+                        "invalid wire golden vector line {}",
+                        index.saturating_add(1)
+                    )
+                });
+                let (name, value) = (name.trim(), value.trim());
+                if name.ends_with(".frames") {
+                    vectors.frames.insert(name.to_owned(), value.to_owned());
+                } else {
+                    vectors.bytes.insert(name.to_owned(), decode_hex(value));
+                }
             }
-
-            let (name, value) = line.split_once('=').unwrap_or_else(|| {
-                panic!(
-                    "invalid wire golden vector line {}",
-                    index.saturating_add(1)
-                )
-            });
-            vectors.insert(name.trim().to_owned(), decode_hex(value.trim()));
+            vectors
         }
 
-        vectors
-    }
+        fn get(&self, name: &str) -> &[u8] {
+            self.bytes.get(name).map_or_else(
+                || panic!("missing wire golden vector {name:?}"),
+                Vec::as_slice,
+            )
+        }
 
-    fn golden_vector<'a>(
-        vectors: &'a std::collections::HashMap<String, Vec<u8>>,
-        name: &str,
-    ) -> &'a [u8] {
-        vectors.get(name).map_or_else(
-            || panic!("missing wire golden vector {name:?}"),
-            Vec::as_slice,
-        )
+        /// Names that have a `.frame` entry.
+        fn frame_names(&self) -> BTreeSet<String> {
+            self.bytes
+                .keys()
+                .filter_map(|name| name.strip_suffix(".frame"))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// Names that have a `.stream` entry.
+        fn stream_names(&self) -> BTreeSet<String> {
+            self.bytes
+                .keys()
+                .filter_map(|name| name.strip_suffix(".stream"))
+                .map(str::to_owned)
+                .collect()
+        }
     }
 
     fn decode_hex(hex: &str) -> Vec<u8> {
@@ -485,5 +431,287 @@ mod tests {
                     .unwrap_or_else(|| panic!("invalid hex byte in {hex:?}"))
             })
             .collect()
+    }
+
+    /// Reads every known frame of `wire` with the real frame reader, in reads of `read_size`.
+    async fn read_known_frames(wire: &[u8], read_size: usize) -> Vec<(u64, Vec<u8>)> {
+        let mut recv = Script::with_read_size(wire.to_vec(), read_size);
+        let mut frames = Vec::new();
+        while let Some(header) =
+            next_known_header(&mut recv, DEFAULT_MAX_FRAME_SIZE, &mut |_| Ok(()))
+                .await
+                .expect("stream should parse")
+        {
+            let payload = read_payload(&mut recv, header.payload_len)
+                .await
+                .expect("payload should read");
+            frames.push((header.frame_type, payload.to_vec()));
+        }
+        frames
+    }
+
+    /// Checks one protobuf frame: the documented logical value encodes to the fixture's payload
+    /// and frame bytes, the payload decodes back to the value, and the real frame reader reads
+    /// the frame back.
+    async fn check_protobuf_frame<M>(
+        vectors: &Vectors,
+        checked: &mut BTreeSet<String>,
+        name: &str,
+        frame_type: u64,
+        logical: &M,
+    ) where
+        M: Message + Default + PartialEq + Debug + 'static,
+    {
+        let payload = logical.encode_to_vec();
+        let frame = encode_protobuf_frame(frame_type, logical, DEFAULT_MAX_FRAME_SIZE)
+            .expect("frame should encode");
+
+        assert_eq!(payload, vectors.get(&format!("{name}.payload")), "{name}");
+        assert_eq!(frame, vectors.get(&format!("{name}.frame")), "{name}");
+        assert_eq!(
+            &decode_payload::<M>(&payload).expect("payload should decode"),
+            logical,
+            "{name}"
+        );
+        assert_eq!(
+            read_known_frames(&frame, 2).await,
+            [(frame_type, payload)],
+            "{name}"
+        );
+        checked.insert(name.to_owned());
+    }
+
+    async fn check_raw_frame(
+        vectors: &Vectors,
+        checked: &mut BTreeSet<String>,
+        name: &str,
+        frame_type: u64,
+        payload: &[u8],
+    ) {
+        let frame =
+            encode_frame(frame_type, payload, DEFAULT_MAX_FRAME_SIZE).expect("frame should encode");
+
+        assert_eq!(payload, vectors.get(&format!("{name}.payload")), "{name}");
+        assert_eq!(frame, vectors.get(&format!("{name}.frame")), "{name}");
+        // Grease frames are skipped, so only defined types come back from the reader.
+        let expected: Vec<_> = if crate::framing::is_known_frame_type(frame_type) {
+            vec![(frame_type, payload.to_vec())]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(read_known_frames(&frame, 2).await, expected, "{name}");
+        checked.insert(name.to_owned());
+    }
+
+    fn metadata(key: &str, value: &[u8]) -> Metadata {
+        Metadata::from([(key.to_owned(), value.to_vec())])
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn wire_golden_vectors_stay_stable() {
+        let vectors = Vectors::load();
+        let mut checked = BTreeSet::new();
+        let request = || RpcRequest::new("svc", "m");
+
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "request.unary",
+            frame_type::REQUEST,
+            &request(),
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "request.bidi_timeout",
+            frame_type::REQUEST,
+            &request()
+                .with_kind(RpcKind::BidirectionalStreaming)
+                .with_timeout_nanos(123_456),
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "request.metadata",
+            frame_type::REQUEST,
+            &request().with_metadata(metadata("authorization", b"ok")),
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "request.extensions",
+            frame_type::REQUEST,
+            &RpcRequest {
+                extensions: vec![1, 300],
+                ..request()
+            },
+        )
+        .await;
+
+        check_raw_frame(
+            &vectors,
+            &mut checked,
+            "message.hi",
+            frame_type::MESSAGE,
+            b"hi",
+        )
+        .await;
+        check_raw_frame(
+            &vectors,
+            &mut checked,
+            "message.empty",
+            frame_type::MESSAGE,
+            b"",
+        )
+        .await;
+
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "headers.metadata",
+            frame_type::HEADERS,
+            &RpcHeaders {
+                metadata: metadata("x-a", b"1"),
+                extensions: Vec::new(),
+            },
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "headers.empty",
+            frame_type::HEADERS,
+            &RpcHeaders::default(),
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "headers.extensions",
+            frame_type::HEADERS,
+            &RpcHeaders {
+                metadata: Metadata::new(),
+                extensions: vec![1],
+            },
+        )
+        .await;
+
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "status.ok",
+            frame_type::STATUS,
+            &RpcStatus::from(Status::ok()),
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "status.unavailable",
+            frame_type::STATUS,
+            &RpcStatus::from(Status::unavailable("down")),
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "status.metadata",
+            frame_type::STATUS,
+            &RpcStatus::from(
+                Status::new(Code::FailedPrecondition, "stop").with_metadata(metadata("x-t", b"2")),
+            ),
+        )
+        .await;
+
+        check_raw_frame(
+            &vectors,
+            &mut checked,
+            "grease.two_byte_type",
+            0x40,
+            &[0, 1, 2],
+        )
+        .await;
+
+        assert_eq!(
+            checked,
+            vectors.frame_names(),
+            "every .frame vector needs a logical value check"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_golden_streams_parse_to_the_documented_frames() {
+        let vectors = Vectors::load();
+        let names = vectors.stream_names();
+        assert!(!names.is_empty());
+        let frame_entries: BTreeSet<_> = vectors
+            .frames
+            .keys()
+            .filter_map(|name| name.strip_suffix(".frames"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(names, frame_entries, "every .stream needs a .frames");
+
+        for name in names {
+            let expected: Vec<(u64, Vec<u8>)> = vectors
+                .frames
+                .get(&format!("{name}.frames"))
+                .map(|frames| {
+                    frames
+                        .split(',')
+                        .filter(|frame| !frame.is_empty())
+                        .map(|frame| {
+                            let (frame_type, payload) = frame
+                                .split_once(':')
+                                .unwrap_or_else(|| panic!("invalid frames entry {frame:?}"));
+                            (
+                                frame_type.parse().expect("frame type should be decimal"),
+                                decode_hex(payload),
+                            )
+                        })
+                        .collect()
+                })
+                .expect("frames entry was checked");
+            let wire = vectors.get(&format!("{name}.stream"));
+
+            // The same frames come back however the transport slices the bytes.
+            for read_size in [1, 2, 3, 7, 4096] {
+                assert_eq!(
+                    read_known_frames(wire, read_size).await,
+                    expected,
+                    "{name} with reads of {read_size}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn payloads_in_the_golden_streams_decode_as_their_frame_types() {
+        let vectors = Vectors::load();
+        let wire = vectors.get("stream.server_stream.stream");
+        let frames = read_known_frames(wire, 4096).await;
+
+        let types: Vec<u64> = frames.iter().map(|(frame_type, _)| *frame_type).collect();
+        assert_eq!(
+            types,
+            [
+                frame_type::HEADERS,
+                frame_type::MESSAGE,
+                frame_type::MESSAGE,
+                frame_type::STATUS
+            ]
+        );
+        let headers = decode_payload::<RpcHeaders>(&frames[0].1).expect("headers should decode");
+        assert_eq!(headers.metadata, metadata("x-a", b"1"));
+        assert_eq!(frames[1].1, b"hi");
+        assert!(frames[2].1.is_empty());
+        let status = Status::from(decode_payload::<RpcStatus>(&frames[3].1).expect("status"));
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(status.message(), "stop");
+        assert_eq!(status.metadata(), &metadata("x-t", b"2"));
     }
 }

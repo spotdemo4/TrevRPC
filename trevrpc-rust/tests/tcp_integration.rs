@@ -12,13 +12,13 @@ use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use trevrpc::Status;
 use trevrpc::client::{
     CallOptions, Channel, ChannelConfig, QmuxTransport, StreamingRpcTransport, TransportKind,
     TransportPolicy,
 };
 use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissionRequest};
 use trevrpc::tcp::TcpFallback;
-use trevrpc::{RpcResponse, Status};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
 #[allow(dead_code)]
@@ -34,6 +34,10 @@ const ORIGIN: &str = "https://app.example.test";
 
 struct Greeter;
 
+fn response_headers() -> trevrpc::Metadata {
+    trevrpc::Metadata::from([("x-header".to_owned(), b"h".to_vec())])
+}
+
 #[trevrpc::async_trait]
 impl greeter::Greeter for Greeter {
     async fn say_hello(
@@ -43,7 +47,8 @@ impl greeter::Greeter for Greeter {
     ) -> Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
         Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
             message: format!("hello, {}", request.name),
-        }))
+        })
+        .with_headers(response_headers()))
     }
 
     async fn lots_of_replies(
@@ -51,16 +56,15 @@ impl greeter::Greeter for Greeter {
         _context: RequestContext,
         request: greeter::HelloRequest,
     ) -> Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>, Status> {
-        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter(
-            [
-                greeter::HelloReply {
-                    message: format!("hello, {}", request.name),
-                },
-                greeter::HelloReply {
-                    message: format!("goodbye, {}", request.name),
-                },
-            ],
-        )))
+        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter([
+            greeter::HelloReply {
+                message: format!("hello, {}", request.name),
+            },
+            greeter::HelloReply {
+                message: format!("goodbye, {}", request.name),
+            },
+        ]))
+        .with_headers(response_headers()))
     }
 
     async fn lots_of_greetings(
@@ -181,43 +185,62 @@ async fn connect_tls(
         .await?)
 }
 
+/// The request frames of a unary `SayHello` call: REQUEST, then its one MESSAGE.
 fn unary_frame(name: &str) -> TestResult<Vec<u8>> {
-    let request = trevrpc::RpcRequest::new(
-        greeter::GreeterClient::<()>::SERVICE,
-        "SayHello",
-        greeter::HelloRequest {
+    let request = trevrpc::RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello");
+    let mut frames = trevrpc::framing::encode_protobuf_frame(
+        trevrpc::framing::frame_type::REQUEST,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )?;
+    frames.extend(trevrpc::framing::encode_message_frame(
+        &greeter::HelloRequest {
             name: name.to_owned(),
         }
         .encode_to_vec(),
-    );
-    Ok(trevrpc::framing::encode_frame(&request)?)
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )?);
+    Ok(frames)
 }
 
+/// Decodes the response frames of a unary `SayHello` call: the headers, one MESSAGE, and an `OK`
+/// STATUS.
 fn decode_hello(response: &[u8]) -> TestResult<String> {
-    let response: RpcResponse = trevrpc::framing::decode_frame(
-        response
-            .get(4..)
-            .ok_or("response is shorter than its frame header")?,
-    )?;
-    ensure_eq!(response.status, 0, "{}", response.message);
-    Ok(greeter::HelloReply::decode(response.body.as_slice())?.message)
+    use trevrpc::framing::frame_type;
+
+    let frames = support::parse_frames(response)?;
+    let [headers, message, status] = frames.as_slice() else {
+        return Err(format!("expected HEADERS, MESSAGE and STATUS frames, got {frames:?}").into());
+    };
+    ensure_eq!(headers.frame_type, frame_type::HEADERS);
+    let headers = trevrpc::framing::decode_payload::<trevrpc::RpcHeaders>(&headers.payload)?;
+    ensure_eq!(headers.metadata, response_headers());
+    ensure_eq!(message.frame_type, frame_type::MESSAGE);
+    ensure_eq!(status.frame_type, frame_type::STATUS);
+    let status = Status::from(trevrpc::framing::decode_payload::<trevrpc::RpcStatus>(
+        &status.payload,
+    )?);
+    ensure_eq!(status.code(), trevrpc::Code::Ok, "{}", status.message());
+    Ok(greeter::HelloReply::decode(message.payload.as_slice())?.message)
 }
 
 async fn exercise_greeter<T: StreamingRpcTransport>(
     client: &greeter::GreeterClient<T>,
 ) -> TestResult {
     let reply = client
-        .say_hello(greeter::HelloRequest {
+        .say_hello_envelope(greeter::HelloRequest {
             name: "unary".to_owned(),
         })
         .await?;
-    assert_eq!(reply.message, "hello, unary");
+    assert_eq!(reply.message().message, "hello, unary");
+    assert_eq!(reply.headers(), &response_headers());
 
     let mut replies = client
         .lots_of_replies(greeter::HelloRequest {
             name: "stream".to_owned(),
         })
         .await?;
+    assert_eq!(replies.headers().await?, &response_headers());
     let mut messages = Vec::new();
     while let Some(reply) = replies.next().await {
         messages.push(reply?.message);

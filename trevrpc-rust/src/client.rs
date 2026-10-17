@@ -8,13 +8,14 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
-use crate::response_state::{ResponseState, ResponseStateEvent};
+use crate::response_state::{ResponseEvent, ResponseState, ResponseStateFailure, UnaryResponse};
 use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
-    BoxStream, Code, Error, Metadata, ResponseEnvelope, Result, RpcKind, RpcRequest, RpcResponse,
-    RpcStreamFrame, Status,
+    BoxStream, Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest,
+    Status,
 };
+use bytes::Bytes;
 use prost::Message;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -167,19 +168,27 @@ impl CallOptions {
 
 #[crate::async_trait]
 pub trait RpcTransport: Send + Sync + 'static {
-    /// Sends a unary `TrevRPC` request and returns its response.
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse>;
+    /// Sends a unary `TrevRPC` request whose single message is `body` and returns its response.
+    ///
+    /// A failed call, including a non-`OK` status from the server, is the error; the status keeps
+    /// its trailing metadata.
+    async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>>;
 }
 
 /// A transport with explicit support for streaming RPCs.
 #[crate::async_trait]
 pub trait StreamingRpcTransport: RpcTransport {
-    /// Sends a streaming `TrevRPC` request and returns response stream frames.
+    /// Sends a streaming `TrevRPC` request and returns the frames of its response.
+    ///
+    /// The returned frames are the known frames the server sent, in order, ending with the
+    /// terminal [`ResponseFrame::Status`] once the stream has ended cleanly. Frames of unknown type
+    /// are skipped by the transport. The call layer checks that the frames follow the response
+    /// grammar.
     async fn streaming_call(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>>;
+    ) -> Result<BoxStream<ResponseFrame>>;
 }
 
 #[crate::async_trait]
@@ -187,8 +196,8 @@ impl<T> RpcTransport for Arc<T>
 where
     T: RpcTransport + ?Sized,
 {
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        self.as_ref().call(request).await
+    async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
+        self.as_ref().call(request, body).await
     }
 }
 
@@ -201,9 +210,31 @@ where
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>> {
+    ) -> Result<BoxStream<ResponseFrame>> {
         self.as_ref().streaming_call(request, request_body).await
     }
+}
+
+/// Collects a unary response from the frames of a response stream.
+///
+/// This is the unary half of a [`StreamingRpcTransport`] for transports that implement
+/// [`RpcTransport::call`] by opening a stream: the frames must be `[HEADERS] MESSAGE STATUS` and
+/// the stream must end after the status. A non-`OK` status becomes the error.
+pub async fn collect_unary_response(
+    mut frames: BoxStream<ResponseFrame>,
+) -> Result<ResponseEnvelope<Bytes>> {
+    let mut response = UnaryResponse::default();
+    while let Some(frame) = frames.next().await.transpose()? {
+        if response.accept(frame).map_err(Error::from)? {
+            if frames.next().await.transpose()?.is_some() {
+                return Err(Error::from(Status::internal(
+                    "response stream continued after terminal status",
+                )));
+            }
+            break;
+        }
+    }
+    response.finish().map_err(Error::from)
 }
 
 /// Calls a unary RPC and decodes the protobuf response.
@@ -225,7 +256,8 @@ where
         .0)
 }
 
-/// Calls a unary RPC and returns the decoded response envelope.
+/// Calls a unary RPC and returns the decoded response envelope, with the response headers and
+/// trailing metadata.
 pub async fn unary_envelope<T, Req, Res>(
     transport: &T,
     service: &str,
@@ -249,33 +281,32 @@ where
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
 
-    let request = RpcRequest::new(service, method, request.encode_to_vec())
+    let rpc_request = RpcRequest::new(service, method)
         .with_metadata(metadata)
         .with_timeout_nanos(timeout_nanos);
+    let body = request.encode_to_vec();
     let response = if let Some(timeout) = timeout {
-        tokio::time::timeout(timeout, transport.call(request))
+        tokio::time::timeout(timeout, transport.call(rpc_request, body))
             .await
             .map_err(|_| Error::from(Status::deadline_exceeded("RPC deadline exceeded")))??
     } else {
-        transport.call(request).await?
+        transport.call(rpc_request, body).await?
     };
 
     validate_response_metadata(&response)?;
 
-    if response.body.len() > max_response_body_size {
+    if response.message().len() > max_response_body_size {
         return Err(Error::FrameTooLarge {
-            len: response.body.len(),
+            len: response.message().len(),
             max: max_response_body_size,
         });
     }
 
-    let status = Status::from_response(&response);
-    if !status.is_ok() {
-        return Err(Error::from(status));
-    }
-
-    let message = Res::decode(response.body.as_slice()).map_err(Error::from)?;
-    Ok(ResponseEnvelope::new(message).with_metadata(response.metadata))
+    let (body, headers, metadata) = response.into_parts();
+    let message = Res::decode(body).map_err(Error::from)?;
+    Ok(ResponseEnvelope::new(message)
+        .with_headers(headers)
+        .with_metadata(metadata))
 }
 
 /// Calls a server-streaming RPC and returns a terminal-aware response stream.
@@ -291,14 +322,13 @@ where
     Req: Message,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(
-        service,
-        method,
-        RpcKind::ServerStreaming,
-        request.encode_to_vec(),
-        options,
-    )?;
-    open_response_stream(transport, prepared, crate::stream::empty()).await
+    let prepared = prepare_streaming_request(service, method, RpcKind::ServerStreaming, options)?;
+    open_response_stream(
+        transport,
+        prepared,
+        crate::stream::from_iter([request.encode_to_vec()]),
+    )
+    .await
 }
 
 /// Starts a client-streaming RPC and returns a sendable call object.
@@ -313,13 +343,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(
-        service,
-        method,
-        RpcKind::ClientStreaming,
-        Vec::new(),
-        options,
-    )?;
+    let prepared = prepare_streaming_request(service, method, RpcKind::ClientStreaming, options)?;
     let (sender, requests) = request_channel();
     let response =
         open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
@@ -361,13 +385,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(
-        service,
-        method,
-        RpcKind::ClientStreaming,
-        Vec::new(),
-        options,
-    )?;
+    let prepared = prepare_streaming_request(service, method, RpcKind::ClientStreaming, options)?;
     let mut response =
         open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
 
@@ -386,13 +404,8 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(
-        service,
-        method,
-        RpcKind::BidirectionalStreaming,
-        Vec::new(),
-        options,
-    )?;
+    let prepared =
+        prepare_streaming_request(service, method, RpcKind::BidirectionalStreaming, options)?;
     let (sender, requests) = request_channel();
     let response =
         open_response_stream(transport, prepared, crate::stream::encode(requests)).await?;
@@ -413,13 +426,8 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(
-        service,
-        method,
-        RpcKind::BidirectionalStreaming,
-        Vec::new(),
-        options,
-    )?;
+    let prepared =
+        prepare_streaming_request(service, method, RpcKind::BidirectionalStreaming, options)?;
     open_response_stream(transport, prepared, crate::stream::encode(requests)).await
 }
 
@@ -564,6 +572,11 @@ where
         Ok(())
     }
 
+    /// Waits for the server's response headers; see [`ResponseStream::headers`].
+    pub async fn headers(&mut self) -> Result<&Metadata> {
+        self.response.headers().await
+    }
+
     pub async fn close_and_recv(mut self) -> Result<Res> {
         self.close_send()?;
         read_unary_response_from_message_stream(&mut self.response).await
@@ -614,6 +627,11 @@ where
         Ok(())
     }
 
+    /// Waits for the server's response headers; see [`ResponseStream::headers`].
+    pub async fn headers(&mut self) -> Result<&Metadata> {
+        self.response.headers().await
+    }
+
     #[must_use]
     pub const fn terminal_status(&self) -> Option<&Status> {
         self.response.terminal_status()
@@ -644,7 +662,6 @@ fn prepare_streaming_request(
     service: &str,
     method: &str,
     kind: RpcKind,
-    body: Vec<u8>,
     options: CallOptions,
 ) -> Result<PreparedStreamingCall> {
     let CallOptions {
@@ -659,7 +676,7 @@ fn prepare_streaming_request(
     let timeout_nanos = timeout_nanos(timeout)?;
 
     Ok(PreparedStreamingCall {
-        request: RpcRequest::new(service, method, body)
+        request: RpcRequest::new(service, method)
             .with_kind(kind)
             .with_metadata(metadata)
             .with_timeout_nanos(timeout_nanos),
@@ -687,7 +704,7 @@ async fn streaming_call_with_deadline<T>(
     request: RpcRequest,
     request_body: BoxStream<Vec<u8>>,
     deadline: Option<Instant>,
-) -> Result<BoxStream<RpcStreamFrame>>
+) -> Result<BoxStream<ResponseFrame>>
 where
     T: StreamingRpcTransport + ?Sized,
 {
@@ -732,7 +749,7 @@ where
 
 #[cfg(test)]
 async fn read_unary_response_from_stream<Res>(
-    response: BoxStream<RpcStreamFrame>,
+    response: BoxStream<ResponseFrame>,
     max_response_body_size: usize,
     max_response_messages: Option<usize>,
     max_response_stream_body_size: Option<usize>,
@@ -788,16 +805,19 @@ where
         ))));
     };
 
-    Ok(ResponseEnvelope::new(first).with_metadata(
-        response
-            .terminal_status()
-            .map_or_else(Metadata::new, |status| status.metadata().clone()),
-    ))
+    Ok(ResponseEnvelope::new(first)
+        .with_headers(std::mem::take(&mut response.headers))
+        .with_metadata(
+            response
+                .terminal_status()
+                .map_or_else(Metadata::new, |status| status.metadata().clone()),
+        ))
 }
 
-/// A decoded response stream that retains the clean terminal status and metadata.
+/// A decoded response stream that retains the response headers and the clean terminal status and
+/// metadata.
 pub struct ResponseStream<T> {
-    inner: BoxStream<RpcStreamFrame>,
+    inner: BoxStream<ResponseFrame>,
     max_body_size: usize,
     max_messages: Option<usize>,
     max_stream_body_size: Option<usize>,
@@ -808,17 +828,30 @@ pub struct ResponseStream<T> {
     wait: Option<(Pin<Box<tokio::time::Sleep>>, TimeoutReason)>,
     pending_terminal: bool,
     done: bool,
-    state: ResponseState<T>,
+    state: ResponseState,
+    /// The response headers, once [`Self::headers_ready`].
+    headers: Metadata,
+    /// Whether the headers are known: a HEADERS frame arrived, or the first message or the status
+    /// proved there are none.
+    headers_ready: bool,
+    /// An item read ahead while waiting for the headers, returned by the next poll.
+    stashed: Option<Result<T>>,
 }
 
 impl<T> Unpin for ResponseStream<T> {}
+
+/// What one step through the response stream produced.
+enum Step<T> {
+    Headers,
+    Message(T),
+}
 
 impl<T> ResponseStream<T>
 where
     T: Message + Default,
 {
     pub(crate) fn new(
-        inner: BoxStream<RpcStreamFrame>,
+        inner: BoxStream<ResponseFrame>,
         max_body_size: usize,
         max_messages: Option<usize>,
         max_stream_body_size: Option<usize>,
@@ -838,6 +871,9 @@ where
             pending_terminal: false,
             done: false,
             state: ResponseState::default(),
+            headers: Metadata::new(),
+            headers_ready: false,
+            stashed: None,
         }
     }
 
@@ -853,7 +889,45 @@ where
         self.terminal_status().map(Status::metadata)
     }
 
-    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<RpcStreamFrame>>> {
+    /// Waits for the server's response headers.
+    ///
+    /// Resolves as soon as the first response frame arrives: the HEADERS frame, or, when the
+    /// server sent none, the first message or the terminal status, in which case the headers are
+    /// empty. A message read while waiting is not lost; the next poll of the stream returns it.
+    /// If the call fails before any headers arrive, the error is returned here and again by the
+    /// stream.
+    pub async fn headers(&mut self) -> Result<&Metadata> {
+        std::future::poll_fn(|cx| self.poll_headers(cx)).await?;
+        Ok(&self.headers)
+    }
+
+    fn poll_headers(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        loop {
+            if self.headers_ready {
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(Err(Error::Status(status))) = &self.stashed {
+                return Poll::Ready(Err(Error::from(status.clone())));
+            }
+
+            match self.poll_step(cx) {
+                Poll::Pending => return Poll::Pending,
+                // `headers_ready` is now set.
+                Poll::Ready(Some(Ok(Step::Headers))) => {}
+                Poll::Ready(Some(Ok(Step::Message(message)))) => {
+                    self.stashed = Some(Ok(message));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    let status = error.into_status();
+                    self.stashed = Some(Err(Error::from(status.clone())));
+                    return Poll::Ready(Err(Error::from(status)));
+                }
+                Poll::Ready(None) => self.headers_ready = true,
+            }
+        }
+    }
+
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<ResponseFrame>>> {
         if let Err(error) = remaining_timeout(self.deadline) {
             return Poll::Ready(Err(error));
         }
@@ -889,14 +963,100 @@ where
         }
     }
 
-    fn finish(&mut self) -> Poll<Option<Result<T>>> {
+    fn finish(&mut self) -> Option<Result<Step<T>>> {
         self.done = true;
-        Poll::Ready(
-            self.state
-                .finish()
-                .err()
-                .map(|failure| Err(Error::from(failure.into_status()))),
-        )
+        self.headers_ready = true;
+        self.state
+            .finish()
+            .err()
+            .map(|failure| Err(Error::from(failure.into_status())))
+    }
+
+    const fn fail(&mut self, error: Error) -> Poll<Option<Result<Step<T>>>> {
+        self.done = true;
+        Poll::Ready(Some(Err(error)))
+    }
+
+    fn fail_state(&mut self, failure: ResponseStateFailure) -> Poll<Option<Result<Step<T>>>> {
+        self.fail(Error::from(failure.into_status()))
+    }
+
+    /// Reads response frames until one yields headers or a message, or the call ends.
+    fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Step<T>>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            let frame = match self.poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(Some(frame))) => frame,
+                Poll::Ready(Ok(None)) => return Poll::Ready(self.finish()),
+                Poll::Ready(Err(error)) => {
+                    self.done = true;
+                    if self.pending_terminal {
+                        self.state.abort();
+                        return Poll::Ready(Some(Err(post_terminal_error(error))));
+                    }
+                    return Poll::Ready(Some(Err(error)));
+                }
+            };
+
+            if self.pending_terminal {
+                self.state.abort();
+                return self.fail(Error::from(Status::internal(
+                    "response stream continued after terminal status",
+                )));
+            }
+
+            if let ResponseFrame::Message(body) = &frame {
+                if let Some(max) = self.max_messages
+                    && self.messages >= max
+                {
+                    return self.fail(Error::from(Status::resource_exhausted(format!(
+                        "response stream exceeded maximum of {max} messages"
+                    ))));
+                }
+
+                if body.len() > self.max_body_size {
+                    return self.fail(Error::FrameTooLarge {
+                        len: body.len(),
+                        max: self.max_body_size,
+                    });
+                }
+
+                self.messages = self.messages.saturating_add(1);
+                self.stream_body_size = self.stream_body_size.saturating_add(body.len());
+
+                if let Some(max) = self.max_stream_body_size
+                    && self.stream_body_size > max
+                {
+                    return self.fail(Error::from(Status::resource_exhausted(format!(
+                        "response stream exceeded maximum body size of {max} bytes"
+                    ))));
+                }
+            }
+
+            match self.state.accept(frame) {
+                Ok(ResponseEvent::Headers(headers)) => {
+                    self.headers = headers;
+                    self.headers_ready = true;
+                    return Poll::Ready(Some(Ok(Step::Headers)));
+                }
+                Ok(ResponseEvent::Message(body)) => {
+                    self.headers_ready = true;
+                    let Ok(message) = T::decode(body) else {
+                        return self.fail_state(ResponseStateFailure::malformed_protobuf());
+                    };
+                    return Poll::Ready(Some(Ok(Step::Message(message))));
+                }
+                Ok(ResponseEvent::Terminal) => {
+                    self.headers_ready = true;
+                    self.pending_terminal = true;
+                }
+                Err(failure) => return self.fail_state(failure),
+            }
+        }
     }
 }
 
@@ -932,71 +1092,19 @@ where
     type Item = Result<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.done {
-            return Poll::Ready(None);
+        if let Some(item) = self.stashed.take() {
+            return Poll::Ready(Some(item));
         }
 
         loop {
-            let frame = match self.poll_frame(cx) {
+            match self.poll_step(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(Some(frame))) => frame,
-                Poll::Ready(Ok(None)) => return self.finish(),
-                Poll::Ready(Err(error)) => {
-                    self.done = true;
-                    if self.pending_terminal {
-                        self.state.abort();
-                        return Poll::Ready(Some(Err(post_terminal_error(error))));
-                    }
-                    return Poll::Ready(Some(Err(error)));
+                Poll::Ready(Some(Ok(Step::Headers))) => {}
+                Poll::Ready(Some(Ok(Step::Message(message)))) => {
+                    return Poll::Ready(Some(Ok(message)));
                 }
-            };
-
-            if self.pending_terminal {
-                self.done = true;
-                self.state.abort();
-                return Poll::Ready(Some(Err(Error::from(Status::internal(
-                    "response stream continued after terminal status",
-                )))));
-            }
-
-            if frame.frame_kind() == Some(crate::RpcStreamFrameKind::Message) {
-                if let Some(max) = self.max_messages
-                    && self.messages >= max
-                {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(Error::from(Status::resource_exhausted(
-                        format!("response stream exceeded maximum of {max} messages"),
-                    )))));
-                }
-
-                if frame.body.len() > self.max_body_size {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(Error::FrameTooLarge {
-                        len: frame.body.len(),
-                        max: self.max_body_size,
-                    })));
-                }
-
-                self.messages = self.messages.saturating_add(1);
-                self.stream_body_size = self.stream_body_size.saturating_add(frame.body.len());
-
-                if let Some(max) = self.max_stream_body_size
-                    && self.stream_body_size > max
-                {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(Error::from(Status::resource_exhausted(
-                        format!("response stream exceeded maximum body size of {max} bytes"),
-                    )))));
-                }
-            }
-
-            match self.state.accept(&frame) {
-                Ok(ResponseStateEvent::Message(message)) => return Poll::Ready(Some(Ok(message))),
-                Ok(ResponseStateEvent::Terminal) => self.pending_terminal = true,
-                Err(failure) => {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(Error::from(failure.into_status()))));
-                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => return Poll::Ready(None),
             }
         }
     }
@@ -1043,13 +1151,15 @@ fn remaining_timeout(deadline: Option<Instant>) -> Result<Option<Duration>> {
         .ok_or_else(|| Error::from(Status::deadline_exceeded("RPC deadline exceeded")))
 }
 
-fn validate_response_metadata(response: &RpcResponse) -> Result<()> {
-    validate_metadata(&response.metadata).map_err(|status| {
-        Error::from(Status::internal(format!(
-            "invalid response metadata: {}",
-            status.message()
-        )))
-    })
+fn validate_response_metadata<T>(response: &ResponseEnvelope<T>) -> Result<()> {
+    validate_metadata(response.headers())
+        .and_then(|()| validate_metadata(response.metadata()))
+        .map_err(|status| {
+            Error::from(Status::internal(format!(
+                "invalid response metadata: {}",
+                status.message()
+            )))
+        })
 }
 
 #[cfg(test)]
@@ -1063,7 +1173,11 @@ mod tests {
     use futures_core::Stream;
     use futures_util::StreamExt;
 
-    use crate::{Code, Error, Result, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+    use bytes::Bytes;
+
+    use crate::{
+        Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status,
+    };
 
     use super::{
         BidirectionalCall, CallOptions, ResponseStream, RpcTransport, StreamingRpcTransport,
@@ -1094,8 +1208,8 @@ mod tests {
             value: "hello".to_owned(),
         };
         let response = crate::stream::from_iter([
-            RpcStreamFrame::message(prost::Message::encode_to_vec(&message)),
-            RpcStreamFrame::status(Status::ok()),
+            ResponseFrame::message(prost::Message::encode_to_vec(&message)),
+            ResponseFrame::Status(Status::ok()),
         ]);
 
         let decoded = read_unary_response_from_stream::<TestMessage>(
@@ -1159,7 +1273,7 @@ mod tests {
     async fn bidirectional_halves_move_to_independent_tasks() {
         let (sender, _requests) = request_channel::<TestMessage>();
         let response = ResponseStream::<TestMessage>::new(
-            crate::stream::from_iter([RpcStreamFrame::status(Status::ok())]),
+            crate::stream::from_iter([ResponseFrame::Status(Status::ok())]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
             Some(64 * 1024 * 1024),
@@ -1179,34 +1293,45 @@ mod tests {
         assert_eq!(response_task.await.unwrap(), Some(Code::Ok));
     }
 
+    /// A request and the message that travelled beside it.
+    type RecordedCall = (RpcRequest, Vec<u8>);
+
     #[derive(Clone, Default)]
     struct RecordingTransport {
-        request: Arc<Mutex<Option<RpcRequest>>>,
+        request: Arc<Mutex<Option<RecordedCall>>>,
     }
 
     #[crate::async_trait]
     impl RpcTransport for RecordingTransport {
-        async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
+        async fn call(
+            &self,
+            request: RpcRequest,
+            body: Vec<u8>,
+        ) -> Result<ResponseEnvelope<Bytes>> {
             *self
                 .request
                 .lock()
-                .expect("request lock should not be poisoned") = Some(request);
-            Ok(RpcResponse::ok(prost::Message::encode_to_vec(
-                &TestMessage {
+                .expect("request lock should not be poisoned") = Some((request, body));
+            Ok(ResponseEnvelope::new(Bytes::from(
+                prost::Message::encode_to_vec(&TestMessage {
                     value: "response".to_owned(),
-                },
+                }),
             )))
         }
     }
 
     #[derive(Clone)]
     struct StaticResponseTransport {
-        response: RpcResponse,
+        response: ResponseEnvelope<Bytes>,
     }
 
     #[crate::async_trait]
     impl RpcTransport for StaticResponseTransport {
-        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+        async fn call(
+            &self,
+            _request: RpcRequest,
+            _body: Vec<u8>,
+        ) -> Result<ResponseEnvelope<Bytes>> {
             Ok(self.response.clone())
         }
     }
@@ -1229,12 +1354,17 @@ mod tests {
         .expect("unary call should succeed");
 
         assert_eq!(response.value, "response");
-        let recorded = transport
+        let (recorded, body) = transport
             .request
             .lock()
             .expect("request lock should not be poisoned")
             .clone()
             .expect("transport should receive request");
+        assert_eq!(
+            body,
+            prost::Message::encode_to_vec(&request),
+            "the request message travels beside the request"
+        );
         assert_eq!(recorded.service, "example.Greeter");
         assert_eq!(recorded.method, "SayHello");
         assert_eq!(recorded.timeout_nanos, 5_000_000_000);
@@ -1246,7 +1376,7 @@ mod tests {
             value: "response".to_owned(),
         });
         let transport = StaticResponseTransport {
-            response: RpcResponse::ok(body.clone()),
+            response: ResponseEnvelope::new(Bytes::from(body.clone())),
         };
         let request = TestMessage {
             value: "request".to_owned(),
@@ -1284,7 +1414,11 @@ mod tests {
 
     #[crate::async_trait]
     impl RpcTransport for PendingTransport {
-        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+        async fn call(
+            &self,
+            _request: RpcRequest,
+            _body: Vec<u8>,
+        ) -> Result<ResponseEnvelope<Bytes>> {
             std::future::pending().await
         }
     }
@@ -1295,7 +1429,7 @@ mod tests {
             &self,
             _request: RpcRequest,
             _request_body: crate::BoxStream<Vec<u8>>,
-        ) -> Result<crate::BoxStream<RpcStreamFrame>> {
+        ) -> Result<crate::BoxStream<ResponseFrame>> {
             std::future::pending().await
         }
     }
@@ -1341,7 +1475,11 @@ mod tests {
 
     #[crate::async_trait]
     impl RpcTransport for UploadWaitingTransport {
-        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+        async fn call(
+            &self,
+            _request: RpcRequest,
+            _body: Vec<u8>,
+        ) -> Result<ResponseEnvelope<Bytes>> {
             Err(crate::Error::from(Status::unimplemented(
                 "unary not implemented",
             )))
@@ -1354,9 +1492,9 @@ mod tests {
             &self,
             _request: RpcRequest,
             request_body: crate::BoxStream<Vec<u8>>,
-        ) -> Result<crate::BoxStream<RpcStreamFrame>> {
+        ) -> Result<crate::BoxStream<ResponseFrame>> {
             Ok(Box::pin(request_body.map(|result| {
-                result.map(|_| RpcStreamFrame::status(Status::internal("unexpected request body")))
+                result.map(|_| ResponseFrame::Status(Status::internal("unexpected request body")))
             })))
         }
     }
@@ -1409,7 +1547,11 @@ mod tests {
 
     #[crate::async_trait]
     impl RpcTransport for CollectingStreamingTransport {
-        async fn call(&self, _request: RpcRequest) -> Result<RpcResponse> {
+        async fn call(
+            &self,
+            _request: RpcRequest,
+            _body: Vec<u8>,
+        ) -> Result<ResponseEnvelope<Bytes>> {
             Err(crate::Error::from(Status::unimplemented(
                 "unary not implemented",
             )))
@@ -1422,13 +1564,13 @@ mod tests {
             &self,
             request: RpcRequest,
             mut request_body: crate::BoxStream<Vec<u8>>,
-        ) -> Result<crate::BoxStream<RpcStreamFrame>> {
+        ) -> Result<crate::BoxStream<ResponseFrame>> {
             let mut responses = Vec::new();
 
             while let Some(body) = request_body.next().await {
                 let body = body?;
                 let message = <TestMessage as prost::Message>::decode(body.as_slice())?;
-                responses.push(RpcStreamFrame::message(prost::Message::encode_to_vec(
+                responses.push(ResponseFrame::message(prost::Message::encode_to_vec(
                     &message,
                 )));
             }
@@ -1437,12 +1579,12 @@ mod tests {
                 let response = TestMessage {
                     value: responses.len().to_string(),
                 };
-                responses = vec![RpcStreamFrame::message(prost::Message::encode_to_vec(
+                responses = vec![ResponseFrame::message(prost::Message::encode_to_vec(
                     &response,
                 ))];
             }
 
-            responses.push(RpcStreamFrame::status(Status::ok()));
+            responses.push(ResponseFrame::Status(Status::ok()));
             Ok(crate::stream::from_iter(responses))
         }
     }
@@ -1559,9 +1701,9 @@ mod tests {
         };
         let mut response = ResponseStream::<TestMessage>::new(
             crate::stream::from_iter([
-                RpcStreamFrame::message(prost::Message::encode_to_vec(&message)),
-                RpcStreamFrame::message(prost::Message::encode_to_vec(&message)),
-                RpcStreamFrame::status(Status::ok()),
+                ResponseFrame::message(prost::Message::encode_to_vec(&message)),
+                ResponseFrame::message(prost::Message::encode_to_vec(&message)),
+                ResponseFrame::Status(Status::ok()),
             ]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(1),
@@ -1598,9 +1740,9 @@ mod tests {
         };
         let mut response = ResponseStream::<TestMessage>::new(
             crate::stream::from_iter([
-                RpcStreamFrame::message(prost::Message::encode_to_vec(&first)),
-                RpcStreamFrame::message(prost::Message::encode_to_vec(&second)),
-                RpcStreamFrame::status(Status::ok()),
+                ResponseFrame::message(prost::Message::encode_to_vec(&first)),
+                ResponseFrame::message(prost::Message::encode_to_vec(&second)),
+                ResponseFrame::Status(Status::ok()),
             ]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
@@ -1627,55 +1769,344 @@ mod tests {
         assert!(response.next().await.is_none());
     }
 
-    #[tokio::test]
-    async fn unknown_response_frame_kind_returns_invalid_argument() {
-        let mut response = ResponseStream::<TestMessage>::new(
-            crate::stream::from_iter([RpcStreamFrame {
-                kind: 99,
-                status: Code::Ok.as_u32(),
-                message: String::new(),
-                body: Vec::new(),
-                metadata: crate::Metadata::new(),
-            }]),
+    fn response_stream_of(
+        frames: impl IntoIterator<Item = ResponseFrame, IntoIter: Send + Unpin + 'static>,
+    ) -> ResponseStream<TestMessage> {
+        ResponseStream::<TestMessage>::new(
+            crate::stream::from_iter(frames),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
             Some(4096),
             Some(64 * 1024 * 1024),
             Some(Duration::from_secs(30)),
             None,
-        );
+        )
+    }
+
+    fn test_message(value: &str) -> ResponseFrame {
+        ResponseFrame::message(prost::Message::encode_to_vec(&TestMessage {
+            value: value.to_owned(),
+        }))
+    }
+
+    fn header_map(key: &str, value: &[u8]) -> Metadata {
+        Metadata::from([(key.to_owned(), value.to_vec())])
+    }
+
+    #[tokio::test]
+    async fn second_headers_frame_is_an_internal_error() {
+        let mut response = response_stream_of([
+            ResponseFrame::Headers(header_map("x-a", b"1")),
+            ResponseFrame::Headers(header_map("x-a", b"2")),
+            ResponseFrame::Status(Status::ok()),
+        ]);
 
         let error = response
             .next()
             .await
-            .expect("unknown frame kind should yield an error")
-            .expect_err("unknown frame kind should be invalid");
+            .expect("the protocol error should be emitted")
+            .expect_err("a second HEADERS must be rejected");
 
-        assert_eq!(error.into_status().code(), Code::InvalidArgument);
+        assert_eq!(error.into_status().code(), Code::Internal);
         assert!(response.next().await.is_none());
     }
 
-    fn pending_frame_stream() -> crate::BoxStream<RpcStreamFrame> {
+    #[tokio::test]
+    async fn headers_after_a_message_are_an_internal_error() {
+        let mut response = response_stream_of([
+            test_message("one"),
+            ResponseFrame::Headers(Metadata::new()),
+            ResponseFrame::Status(Status::ok()),
+        ]);
+
+        assert_eq!(response.next().await.unwrap().unwrap().value, "one");
+        let error = response
+            .next()
+            .await
+            .expect("the protocol error should be emitted")
+            .expect_err("HEADERS after MESSAGE must be rejected");
+
+        assert_eq!(error.into_status().code(), Code::Internal);
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn headers_arrive_before_any_message() {
+        let mut response = response_stream_of([
+            ResponseFrame::Headers(header_map("x-a", b"1")),
+            test_message("one"),
+            ResponseFrame::Status(Status::ok()),
+        ]);
+
+        assert_eq!(
+            response.headers().await.expect("headers should resolve"),
+            &header_map("x-a", b"1")
+        );
+        assert_eq!(response.next().await.unwrap().unwrap().value, "one");
+        assert!(response.next().await.is_none());
+        // Resolved headers stay available.
+        assert_eq!(
+            response.headers().await.expect("headers should resolve"),
+            &header_map("x-a", b"1")
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_headers_resolve_empty_at_the_first_message_without_losing_it() {
+        let mut response = response_stream_of([
+            test_message("one"),
+            test_message("two"),
+            ResponseFrame::Status(Status::ok()),
+        ]);
+
+        assert!(response.headers().await.expect("headers").is_empty());
+        assert_eq!(response.next().await.unwrap().unwrap().value, "one");
+        assert_eq!(response.next().await.unwrap().unwrap().value, "two");
+        assert!(response.next().await.is_none());
+        assert_eq!(response.terminal_status().map(Status::code), Some(Code::Ok));
+    }
+
+    #[tokio::test]
+    async fn absent_headers_resolve_empty_at_a_lone_status() {
+        let mut ok = response_stream_of([ResponseFrame::Status(Status::ok())]);
+        assert!(ok.headers().await.expect("headers").is_empty());
+        assert!(ok.next().await.is_none());
+
+        let mut failed =
+            response_stream_of([ResponseFrame::Status(Status::new(Code::NotFound, "gone"))]);
+        let error = failed
+            .headers()
+            .await
+            .expect_err("a failed call reports its error through headers");
+        assert_eq!(error.into_status().code(), Code::NotFound);
+        // The stream reports the same error.
+        let error = failed.next().await.unwrap().expect_err("call failed");
+        assert_eq!(error.into_status().code(), Code::NotFound);
+        assert!(failed.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn headers_resolve_before_the_first_streamed_message_arrives() {
+        let (frames, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut response = ResponseStream::<TestMessage>::new(
+            Box::pin(futures_util::stream::unfold(
+                receiver,
+                |mut receiver| async move { receiver.recv().await.map(|frame| (Ok(frame), receiver)) },
+            )),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(64 * 1024 * 1024),
+            None,
+            None,
+        );
+
+        frames
+            .send(ResponseFrame::Headers(header_map("x-a", b"1")))
+            .expect("receiver is alive");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), response.headers())
+                .await
+                .expect("headers must not wait for a message")
+                .expect("headers should resolve"),
+            &header_map("x-a", b"1")
+        );
+
+        frames
+            .send(test_message("late"))
+            .expect("receiver is alive");
+        frames
+            .send(ResponseFrame::Status(Status::ok()))
+            .expect("receiver is alive");
+        drop(frames);
+        assert_eq!(response.next().await.unwrap().unwrap().value, "late");
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn headers_report_a_stream_failure_before_any_frame() {
+        let mut response = ResponseStream::<TestMessage>::new(
+            error_frame_stream(),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            Some(4096),
+            Some(64 * 1024 * 1024),
+            None,
+            None,
+        );
+
+        let error = response.headers().await.expect_err("the stream failed");
+        assert_eq!(error.into_status().code(), Code::InvalidArgument);
+        let error = response.next().await.unwrap().expect_err("same failure");
+        assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn invalid_response_header_metadata_is_internal() {
+        let mut response = response_stream_of([
+            ResponseFrame::Headers(header_map("Bad Key", b"1")),
+            ResponseFrame::Status(Status::ok()),
+        ]);
+
+        let error = response.headers().await.expect_err("metadata is invalid");
+        assert_eq!(error.into_status().code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn bidirectional_call_delegates_headers() {
+        let (sender, _requests) = request_channel::<TestMessage>();
+        let mut call = BidirectionalCall::new(
+            sender,
+            response_stream_of([
+                ResponseFrame::Headers(header_map("x-a", b"1")),
+                ResponseFrame::Status(Status::ok()),
+            ]),
+        );
+
+        assert_eq!(
+            call.headers().await.expect("headers"),
+            &header_map("x-a", b"1")
+        );
+        assert!(call.recv().await.expect("clean end").is_none());
+    }
+
+    #[tokio::test]
+    async fn client_streaming_call_delegates_headers_and_fills_the_envelope() {
+        let (sender, _requests) = request_channel::<TestMessage>();
+        let trailers = header_map("x-t", b"2");
+        let mut call = super::ClientStreamingCall::new(
+            sender,
+            response_stream_of([
+                ResponseFrame::Headers(header_map("x-a", b"1")),
+                test_message("done"),
+                ResponseFrame::Status(Status::ok().with_metadata(trailers.clone())),
+            ]),
+        );
+
+        assert_eq!(
+            call.headers().await.expect("headers"),
+            &header_map("x-a", b"1")
+        );
+        let envelope = call
+            .close_and_recv_envelope()
+            .await
+            .expect("call should complete");
+        assert_eq!(envelope.message().value, "done");
+        assert_eq!(envelope.headers(), &header_map("x-a", b"1"));
+        assert_eq!(envelope.metadata(), &trailers);
+    }
+
+    #[tokio::test]
+    async fn unary_envelope_returns_headers_and_trailing_metadata() {
+        let transport = StaticResponseTransport {
+            response: ResponseEnvelope::new(Bytes::from(prost::Message::encode_to_vec(
+                &TestMessage {
+                    value: "response".to_owned(),
+                },
+            )))
+            .with_headers(header_map("x-a", b"1"))
+            .with_metadata(header_map("x-t", b"2")),
+        };
+
+        let envelope = super::unary_envelope::<_, _, TestMessage>(
+            &transport,
+            "example.Greeter",
+            "SayHello",
+            &TestMessage::default(),
+            CallOptions::new(),
+        )
+        .await
+        .expect("unary call should succeed");
+
+        assert_eq!(envelope.message().value, "response");
+        assert_eq!(envelope.headers(), &header_map("x-a", b"1"));
+        assert_eq!(envelope.metadata(), &header_map("x-t", b"2"));
+    }
+
+    #[tokio::test]
+    async fn unary_envelope_rejects_invalid_header_metadata() {
+        let transport = StaticResponseTransport {
+            response: ResponseEnvelope::new(Bytes::new()).with_headers(header_map("Bad Key", b"1")),
+        };
+
+        let error = super::unary_envelope::<_, _, TestMessage>(
+            &transport,
+            "example.Greeter",
+            "SayHello",
+            &TestMessage::default(),
+            CallOptions::new(),
+        )
+        .await
+        .expect_err("invalid headers must be rejected");
+
+        assert_eq!(error.into_status().code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn collect_unary_response_requires_exactly_one_message_and_a_clean_end() {
+        let collect = |frames: Vec<ResponseFrame>| {
+            super::collect_unary_response(crate::stream::from_iter(frames))
+        };
+
+        let envelope = collect(vec![
+            ResponseFrame::Headers(header_map("x-a", b"1")),
+            ResponseFrame::message(&b"m"[..]),
+            ResponseFrame::Status(Status::ok().with_metadata(header_map("x-t", b"2"))),
+        ])
+        .await
+        .expect("unary response should collect");
+        assert_eq!(envelope.message(), &Bytes::from_static(b"m"));
+        assert_eq!(envelope.headers(), &header_map("x-a", b"1"));
+        assert_eq!(envelope.metadata(), &header_map("x-t", b"2"));
+
+        for frames in [
+            vec![ResponseFrame::Status(Status::ok())],
+            vec![
+                ResponseFrame::message(&b"1"[..]),
+                ResponseFrame::message(&b"2"[..]),
+                ResponseFrame::Status(Status::ok()),
+            ],
+            vec![ResponseFrame::message(&b"1"[..])],
+            vec![
+                ResponseFrame::message(&b"1"[..]),
+                ResponseFrame::Status(Status::ok()),
+                ResponseFrame::message(&b"2"[..]),
+            ],
+        ] {
+            let error = collect(frames)
+                .await
+                .expect_err("a malformed unary response must fail");
+            assert_eq!(error.into_status().code(), Code::Internal);
+        }
+
+        let error = collect(vec![ResponseFrame::Status(Status::new(
+            Code::NotFound,
+            "gone",
+        ))])
+        .await
+        .expect_err("a failed call is an error");
+        assert_eq!(error.into_status().code(), Code::NotFound);
+    }
+
+    fn pending_frame_stream() -> crate::BoxStream<ResponseFrame> {
         Box::pin(futures_util::stream::pending())
     }
 
-    fn error_frame_stream() -> crate::BoxStream<RpcStreamFrame> {
+    fn error_frame_stream() -> crate::BoxStream<ResponseFrame> {
         Box::pin(futures_util::stream::iter([Err(Error::from(
             Status::invalid_argument("response read failed"),
         ))]))
     }
 
-    fn terminal_then_pending_frame_stream() -> crate::BoxStream<RpcStreamFrame> {
+    fn terminal_then_pending_frame_stream() -> crate::BoxStream<ResponseFrame> {
         Box::pin(
-            crate::stream::from_iter([RpcStreamFrame::status(Status::ok())])
+            crate::stream::from_iter([ResponseFrame::Status(Status::ok())])
                 .chain(futures_util::stream::pending()),
         )
     }
 
-    fn terminal_then_decode_error_frame_stream() -> crate::BoxStream<RpcStreamFrame> {
+    fn terminal_then_decode_error_frame_stream() -> crate::BoxStream<ResponseFrame> {
         let error = <TestMessage as prost::Message>::decode(&[0x0a, 0xff][..])
             .expect_err("test payload should be malformed");
         Box::pin(
-            crate::stream::from_iter([RpcStreamFrame::status(Status::ok())])
+            crate::stream::from_iter([ResponseFrame::Status(Status::ok())])
                 .chain(futures_util::stream::iter([Err(Error::from(error))])),
         )
     }
@@ -1706,7 +2137,7 @@ mod tests {
         let mut metadata = crate::Metadata::new();
         metadata.insert("x-terminal".to_owned(), b"complete".to_vec());
         let mut response = ResponseStream::<TestMessage>::new(
-            crate::stream::from_iter([RpcStreamFrame::status(
+            crate::stream::from_iter([ResponseFrame::Status(
                 Status::ok().with_metadata(metadata.clone()),
             )]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
@@ -1728,7 +2159,7 @@ mod tests {
         let mut metadata = crate::Metadata::new();
         metadata.insert("x-error".to_owned(), b"denied".to_vec());
         let mut response = ResponseStream::<TestMessage>::new(
-            crate::stream::from_iter([RpcStreamFrame::status(
+            crate::stream::from_iter([ResponseFrame::Status(
                 Status::new(Code::PermissionDenied, "denied").with_metadata(metadata.clone()),
             )]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,

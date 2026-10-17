@@ -70,6 +70,20 @@ sender.finish()?;
 while let Some(reply) = responses.next().await { println!("{}", reply?.message); }
 ```
 
+### Response headers and trailing metadata
+
+A response carries two metadata maps. Headers are sent before the first response message, so a streaming call sees them without waiting for a message; trailing metadata arrives with the final status. `ResponseStream::headers()` (also on `BidirectionalCall` and `ClientStreamingCall`) resolves once the first response frame arrives, with empty headers if the server sent none, and never loses a message it read ahead. The envelope methods fill `headers()` and `metadata()` (the trailing metadata) once the call completes.
+
+```rust
+let mut replies = client.lots_of_replies(greeter::HelloRequest { name: "Alice".into() }).await?;
+let headers = replies.headers().await?;           // before the first message
+while let Some(reply) = replies.next().await { reply?; }
+let trailers = replies.terminal_metadata();       // after a clean end
+
+let envelope = client.say_hello_envelope(greeter::HelloRequest { name: "Alice".into() }).await?;
+let (reply, headers, trailers) = envelope.into_parts();
+```
+
 ## Server
 
 The complete, runnable version is [`examples/greeter_server.rs`](examples/greeter_server.rs).
@@ -118,6 +132,8 @@ let tls = quinn::rustls::ServerConfig::builder()
 let endpoint = quinn::Endpoint::server(server.quic_config(tls)?, "[::]:50051".parse()?)?;
 server.serve(endpoint).await?;
 ```
+
+Handlers attach response headers with `ResponseEnvelope::with_headers` and trailing metadata with `with_metadata`; both are validated like request metadata, and an invalid map fails the call with `Internal`. For streaming responses the headers go out as soon as the handler returns its envelope, before the first message is polled.
 
 Native QUIC is always served. HTTP/3 and WebTransport are opt-in through `ServerOptions`; the `h3` ALPN is negotiated only when at least one is enabled:
 

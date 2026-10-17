@@ -3,6 +3,7 @@ package trevrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -12,14 +13,26 @@ import (
 
 const maxMessageFrameBatch = 16
 
-func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody byteStream, maxFrameSize int) error {
-	nonBlocking := isNonBlockingStream(requestBody)
-	var batch [maxMessageFrameBatch][]byte
+// writeRequestFrames writes header, the already encoded REQUEST frame, and
+// then the messages of requests as MESSAGE frames until requests ends. When
+// requests never blocks, header and the messages share batched writes;
+// otherwise header goes out first, because the server must see the request
+// before the caller has anything to send.
+func writeRequestFrames(ctx context.Context, writer io.Writer, header []byte, requests encodedStream, maxFrameSize int) error {
+	nonBlocking := isNonBlockingStream(requests)
+	if !nonBlocking && len(header) > 0 {
+		if _, err := writer.Write(header); err != nil {
+			return err
+		}
+		header = nil
+	}
+
+	var batch [maxMessageFrameBatch]encodedMessage
 	for {
 		count := 0
 		done := false
 		for count < len(batch) {
-			body, err := recvRequestBody(ctx, requestBody)
+			message, err := recvRequestBody(ctx, requests)
 			if errors.Is(err, io.EOF) {
 				done = true
 				break
@@ -27,18 +40,22 @@ func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody b
 			if err != nil {
 				return err
 			}
+			if message.size > maxFrameSize {
+				return &FrameTooLargeError{Len: message.size, Max: maxFrameSize}
+			}
 
-			batch[count] = body
+			batch[count] = message
 			count++
 			if !nonBlocking {
 				break
 			}
 		}
 
-		if count > 0 {
-			if err := writeMessageStreamFrames(writer, batch[:count], maxFrameSize); err != nil {
+		if count > 0 || len(header) > 0 {
+			if err := writeMessageFrames(writer, header, batch[:count]); err != nil {
 				return err
 			}
+			header = nil
 			clear(batch[:count])
 		}
 		if done {
@@ -47,43 +64,63 @@ func writeRequestBodyFrames(ctx context.Context, writer io.Writer, requestBody b
 	}
 }
 
-func recvRequestBody(ctx context.Context, requestBody byteStream) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, statusFromContextError(err)
+// writeMessageFrames writes header and messages in one Write, without copying
+// when that is only one message.
+func writeMessageFrames(writer io.Writer, header []byte, messages []encodedMessage) error {
+	if len(header) == 0 && len(messages) == 1 {
+		_, err := writer.Write(messages[0].frame)
+		return err
 	}
-	if isNonBlockingStream(requestBody) || streamContextCancelsRecv(requestBody) {
-		body, err := requestBody.Recv()
+	total := len(header)
+	for _, message := range messages {
+		total += len(message.frame)
+	}
+	frames := make([]byte, 0, total)
+	frames = append(frames, header...)
+	for _, message := range messages {
+		frames = append(frames, message.frame...)
+	}
+	_, err := writer.Write(frames)
+	return err
+}
+
+func recvRequestBody(ctx context.Context, requests encodedStream) (encodedMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return encodedMessage{}, statusFromContextError(err)
+	}
+	if isNonBlockingStream(requests) || streamContextCancelsRecv(requests) {
+		message, err := requests.Recv()
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, statusFromContextError(ctxErr)
+				return encodedMessage{}, statusFromContextError(ctxErr)
 			}
 		}
 
-		return body, err
+		return message, err
 	}
 
 	type recvResult struct {
-		body []byte
-		err  error
+		message encodedMessage
+		err     error
 	}
 
 	results := make(chan recvResult, 1)
 	go func() {
-		body, err := requestBody.Recv()
-		results <- recvResult{body: body, err: err}
+		message, err := requests.Recv()
+		results <- recvResult{message: message, err: err}
 	}()
 
 	select {
 	case result := <-results:
 		if result.err != nil {
 			if err := ctx.Err(); err != nil {
-				return nil, statusFromContextError(err)
+				return encodedMessage{}, statusFromContextError(err)
 			}
 		}
 
-		return result.body, result.err
+		return result.message, result.err
 	case <-ctx.Done():
-		return nil, statusFromContextError(ctx.Err())
+		return encodedMessage{}, statusFromContextError(ctx.Err())
 	}
 }
 
@@ -93,39 +130,34 @@ type rpcStream interface {
 	Close() error
 }
 
-type transportResponseFrameWriter interface {
-	trevrpcWriteNextFrame(context.Context, io.Writer, int) (bool, error)
-}
-
-type transportResponseFramesWriter interface {
-	trevrpcWriteNextFrames(context.Context, io.Writer, int) (bool, error)
-}
-
 func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	runtime := server.freeze()
+	options := runtime.options
 	startedAt := time.Now()
-	request := &wireRequest{}
-	if err := readInitialRequestFrame(ctx, runtime.options, startedAt, stream, request); err != nil {
+	reader := newFrameReader(stream, options.MaxFrameSize, options.MaxStreamBodySize)
+	request, err := readRequestFrame(ctx, options, startedAt, stream, reader)
+	if err != nil {
 		status := requestFrameStatus(err)
 		runtime.recordPreHandlerFailure(startedAt, status)
-		_ = writeFrame(stream, status.intoResponse(nil), runtime.options.MaxFrameSize)
-		abortRPCStream(stream)
+		writeStatusAndAbort(stream, status, options.MaxFrameSize)
 		return
 	}
 	if err := validateRequest(request); err != nil {
 		status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
-		runtime.recordRequestFailure(startedAt, request, status)
-		writeRPCStatus(runtime.options, stream, request, status)
+		runtime.recordRequestFailure(startedAt, request, 0, status)
+		writeStatusAndAbort(stream, status, options.MaxFrameSize)
 		return
 	}
 	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
 	defer cancelRequest()
 
-	if requestEndsAfterInitialFrame(request.rpcKind()) {
-		if err := drainRequestEnd(requestCtx, runtime.options, startedAt, stream); err != nil {
+	var body []byte
+	if requestEndsAfterMessage(request.rpcKind()) {
+		body, err = readRequestMessage(requestCtx, options, startedAt, stream, reader)
+		if err != nil {
 			status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
-			runtime.recordRequestFailure(startedAt, request, status)
-			writeRPCStatus(runtime.options, stream, request, status)
+			runtime.recordRequestFailure(startedAt, request, 0, status)
+			writeStatusAndAbort(stream, status, options.MaxFrameSize)
 			return
 		}
 	}
@@ -133,99 +165,42 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream) {
 	lease, ok := runtime.tryRequestLease(request)
 	if !ok {
 		status := Unavailable("too many concurrent RPCs")
-		runtime.recordRejectedRequest(startedAt, request, status)
-		writeRPCStatus(runtime.options, stream, request, status)
+		runtime.recordRejectedRequest(startedAt, request, len(body), status)
+		writeStatusAndAbort(stream, status, options.MaxFrameSize)
 		return
 	}
 
+	var response responseWriter
 	if request.rpcKind() == RPCKindUnary {
 		defer lease.release()
-		response := runtime.handleRequest(requestCtx, request, lease)
-		if ctx.Err() != nil {
-			abortRPCStream(stream)
-			return
+		response = runtime.handleRequest(requestCtx, request, body, lease)
+	} else {
+		reader.chargeMessages = true
+		requests := &rpcRequestStream{reader: reader}
+		if request.rpcKind() == RPCKindClientStreaming || request.rpcKind() == RPCKindBidirectionalStreaming {
+			if cancellable, ok := stream.(contextCancelReadStream); ok {
+				requests.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
+			}
+			if cancellable, ok := stream.(immediateCancelReadStream); ok {
+				requests.cancelRead = cancellable.trevrpcCancelRead
+			}
 		}
-		if err := writeFrame(stream, response, runtime.options.MaxFrameSize); err != nil {
-			abortRPCStream(stream)
-			return
-		}
-		_ = stream.Close()
-		return
+		response = runtime.handleStreamingRequest(requestCtx, request, body, requests, lease)
 	}
-
-	requestBody := &rpcRequestStream{stream: stream, maxFrameSize: runtime.options.MaxFrameSize}
-	if request.rpcKind() == RPCKindClientStreaming || request.rpcKind() == RPCKindBidirectionalStreaming {
-		if cancellable, ok := stream.(contextCancelReadStream); ok {
-			requestBody.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
-		}
-		if cancellable, ok := stream.(immediateCancelReadStream); ok {
-			requestBody.cancelRead = cancellable.trevrpcCancelRead
-		}
-	}
-	response := runtime.handleStreamingRequest(requestCtx, request, requestBody, lease)
 	defer discardMessageStream(response)
-	if frameWriter, ok := response.(transportResponseFramesWriter); ok {
-		for {
-			done, err := frameWriter.trevrpcWriteNextFrames(ctx, stream, runtime.options.MaxFrameSize)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				discardMessageStream(response)
-				abortRPCStream(stream)
-				return
-			}
-			if err != nil {
-				abortRPCStream(stream)
-				return
-			}
-			if done {
-				break
-			}
-		}
 
-		_ = stream.Close()
-		return
-	}
-	if frameWriter, ok := response.(transportResponseFrameWriter); ok {
-		for {
-			done, err := frameWriter.trevrpcWriteNextFrame(ctx, stream, runtime.options.MaxFrameSize)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				discardMessageStream(response)
-				abortRPCStream(stream)
-				return
-			}
-			if err != nil {
-				abortRPCStream(stream)
-				return
-			}
-			if done {
-				break
-			}
-		}
-
-		_ = stream.Close()
-		return
-	}
 	for {
-		frame, err := recvResponseFrame(ctx, response)
-		if errors.Is(err, io.EOF) {
-			break
-		}
+		done, err := response.writeNext(ctx, stream, options.MaxFrameSize)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			discardMessageStream(response)
 			abortRPCStream(stream)
 			return
 		}
-
 		if err != nil {
-			frame = statusFrame(runtime.wireStatus(err, ServerDiagnosticInternalError, request))
-		}
-
-		isStatus := frame.Kind == wireFrameStatus
-		if err := writeFrame(stream, frame, runtime.options.MaxFrameSize); err != nil {
 			abortRPCStream(stream)
 			return
 		}
-
-		if isStatus {
+		if done {
 			break
 		}
 	}
@@ -238,6 +213,9 @@ func requestFrameStatus(err error) *Status {
 		return OK()
 	}
 
+	if status, ok := errors.AsType[*Status](err); ok {
+		return status
+	}
 	if frameTooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
 		return ResourceExhausted(frameTooLarge.Error())
 	}
@@ -261,40 +239,6 @@ func isTimeoutError(err error) bool {
 
 	var netError net.Error
 	return errors.As(err, &netError) && netError.Timeout()
-}
-
-func recvResponseFrame(ctx context.Context, response frameStream) (*wireStreamFrame, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if isNonBlockingStream(response) || streamContextCancelsRecv(response) {
-		frame, err := response.Recv()
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-		}
-
-		return frame, err
-	}
-
-	type recvResult struct {
-		frame *wireStreamFrame
-		err   error
-	}
-
-	results := make(chan recvResult, 1)
-	go func() {
-		frame, err := response.Recv()
-		results <- recvResult{frame: frame, err: err}
-	}()
-
-	select {
-	case result := <-results:
-		return result.frame, result.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 }
 
 func waitForWaitGroup(group *sync.WaitGroup, timeout time.Duration, onTimeout func()) {
@@ -323,7 +267,8 @@ type readDeadlineStream interface {
 	SetReadDeadline(time.Time) error
 }
 
-func readInitialRequestFrame(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, request *wireRequest) error {
+// readRequestFrame reads the REQUEST frame that opens a request stream.
+func readRequestFrame(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, reader *frameReader) (*wireRequest, error) {
 	stopCancelRead := cancelReadOnContext(ctx, stream)
 	defer stopCancelRead()
 
@@ -334,11 +279,21 @@ func readInitialRequestFrame(ctx context.Context, options ServerOptions, started
 		}
 	}
 
-	err := readFrame(stream, request, options.MaxFrameSize)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+	request := &wireRequest{}
+	first, err := reader.next()
+	if err == nil && first.typ != frameTypeRequest {
+		err = InvalidArgument(fmt.Sprintf("request stream must start with REQUEST, not %s", first.typ))
 	}
-	return err
+	if err == nil {
+		err = decodePayload(first.payload, request)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return request, nil
 }
 
 func readDeadline(ctx context.Context, startedAt time.Time, timeout time.Duration) (time.Time, bool) {
@@ -354,13 +309,14 @@ func readDeadline(ctx context.Context, startedAt time.Time, timeout time.Duratio
 	return deadline, ok
 }
 
-func drainRequestEnd(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream) error {
+// readRequestMessage reads the single MESSAGE of a unary or server-streaming
+// request and then waits for the end of the request stream. Frames of unknown
+// type are skipped; a missing message, a second one, or any other known frame
+// is InvalidArgument.
+func readRequestMessage(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, reader *frameReader) ([]byte, error) {
 	stopCancelRead := cancelReadOnContext(ctx, stream)
 	defer stopCancelRead()
-	return readRequestEnd(ctx, options, startedAt, stream)
-}
 
-func readRequestEnd(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream) error {
 	if deadline, ok := readDeadline(ctx, startedAt, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
@@ -368,28 +324,47 @@ func readRequestEnd(ctx context.Context, options ServerOptions, startedAt time.T
 		}
 	}
 
-	var buf [1024]byte
-	for {
-		read, err := stream.Read(buf[:])
-		if read > 0 {
-			return InvalidArgument("request stream contained data after the initial request frame")
+	body, err := readSingleMessage(reader)
+	if err != nil {
+		if _, ok := errors.AsType[*Status](err); ok {
+			return nil, err
 		}
-		if errors.Is(err, io.EOF) {
-			return nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, statusFromContextError(ctxErr)
 		}
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return statusFromContextError(ctxErr)
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				return DeadlineExceeded("initial request completion timeout")
-			}
-			return transportStatus(err)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil, DeadlineExceeded("initial request completion timeout")
 		}
+		return nil, transportStatus(err)
 	}
+	return body, nil
 }
 
-func requestEndsAfterInitialFrame(kind RPCKind) bool {
+func readSingleMessage(reader *frameReader) ([]byte, error) {
+	message, err := reader.next()
+	if errors.Is(err, io.EOF) {
+		return nil, InvalidArgument("request stream ended before the request message")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if message.typ != frameTypeMessage {
+		return nil, InvalidArgument(fmt.Sprintf("request stream carried %s where the request message belongs", message.typ))
+	}
+
+	extra, err := reader.next()
+	if errors.Is(err, io.EOF) {
+		return message.payload, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, InvalidArgument(fmt.Sprintf("request stream carried %s after the request message", extra.typ))
+}
+
+// requestEndsAfterMessage reports whether the request of kind is exactly one
+// message, which the server reads before dispatching.
+func requestEndsAfterMessage(kind RPCKind) bool {
 	return kind == RPCKindUnary || kind == RPCKindServerStreaming
 }
 
@@ -405,23 +380,20 @@ func cancelReadOnContext(ctx context.Context, stream rpcStream) func() {
 	return func() {}
 }
 
-func writeStatusResponse(stream rpcStream, status *Status, maxFrameSize int) {
-	_ = writeFrame(stream, status.intoResponse(nil), maxFrameSize)
-	abortRPCStream(stream)
-}
-
-func writeRPCStatus(options ServerOptions, stream rpcStream, request *wireRequest, status *Status) {
-	if request.rpcKind() == RPCKindUnary {
-		_ = writeFrame(stream, status.intoResponse(nil), options.MaxFrameSize)
-	} else {
-		_ = writeFrame(stream, statusFrame(status), options.MaxFrameSize)
+// writeStatusAndAbort answers a request that failed before any response with a
+// lone STATUS and aborts the stream.
+func writeStatusAndAbort(stream rpcStream, status *Status, maxFrameSize int) {
+	if frames, err := appendStatusFrame(nil, status, maxFrameSize); err == nil {
+		_, _ = stream.Write(frames)
 	}
 	abortRPCStream(stream)
 }
 
+// rpcRequestStream yields the MESSAGE payloads of a client-streaming or
+// bidirectional request. A request STATUS ends the stream: OK as io.EOF and any
+// other status as an error.
 type rpcRequestStream struct {
-	stream              io.Reader
-	maxFrameSize        int
+	reader              *frameReader
 	cancelReadOnContext func(context.Context) func()
 	cancelRead          func()
 	done                bool
@@ -450,28 +422,33 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
+	next, err := s.reader.next()
 	if err != nil {
 		s.done = true
+		if errors.Is(err, io.EOF) {
+			return nil, io.EOF
+		}
 		return nil, transportStatus(err)
 	}
 
-	if !read {
+	switch next.typ {
+	case frameTypeMessage:
+		return next.payload, nil
+	case frameTypeStatus:
 		s.done = true
-		return nil, io.EOF
-	}
-
-	if frame.kind == wireFrameStatus {
-		s.done = true
-		status := frame.statusValue()
+		status, err := decodeStatus(next.payload)
+		if err != nil {
+			return nil, transportStatus(err)
+		}
 		if status.IsOK() {
 			return nil, io.EOF
 		}
 
 		return nil, status
+	default:
+		s.done = true
+		return nil, InvalidArgument(fmt.Sprintf("request stream carried %s after REQUEST", next.typ))
 	}
-
-	return frame.body, nil
 }
 
 func (s *rpcRequestStream) Close() error {
@@ -490,6 +467,10 @@ func transportStatus(err error) error {
 
 	if frameDecode, ok := errors.AsType[*frameDecodeError](err); ok {
 		return InvalidArgument(frameDecode.Error())
+	}
+
+	if frameTooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
+		return ResourceExhausted(frameTooLarge.Error())
 	}
 
 	if errors.Is(err, context.Canceled) {

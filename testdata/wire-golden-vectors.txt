@@ -1,24 +1,83 @@
 # TrevRPC wire golden vectors.
-# Each entry is hex-encoded protobuf body bytes or a 4-byte big-endian
-# length-prefixed frame using the same body bytes.
+#
+# Every frame is: type (QUIC varint) | length (QUIC varint) | payload.
+# Frame types: 0 MESSAGE, 1 REQUEST, 2 HEADERS, 3 STATUS; 0x1f*N+0x21 grease.
+#
+# Entry kinds (values are lowercase hex; an empty value means zero bytes):
+#   <name>.payload  frame payload bytes (protobuf for REQUEST/HEADERS/STATUS,
+#                   raw message bytes for MESSAGE)
+#   <name>.frame    the complete frame as written by a conforming sender
+#                   (minimal varints)
+#   <name>.stream   a byte stream a conforming receiver must accept
+#   <name>.frames   the known frames a receiver yields from <name>.stream,
+#                   comma separated as <type>:<payload hex>; unknown and grease
+#                   frames are skipped and therefore absent
+#
+# Logical values:
+#   request.unary          RpcRequest{service:"svc", method:"m", version:1}
+#   request.bidi_timeout   RpcRequest{service:"svc", method:"m", kind:3, version:1, timeout_nanos:123456}
+#   request.metadata       RpcRequest{service:"svc", method:"m", metadata:{"authorization":"ok"}, version:1}
+#   request.extensions     RpcRequest{service:"svc", method:"m", version:1, extensions:[1, 300]} (packed)
+#   message.hi             MESSAGE "hi"
+#   message.empty          MESSAGE with an empty payload
+#   headers.metadata       RpcHeaders{metadata:{"x-a":"1"}}
+#   headers.empty          RpcHeaders{}
+#   headers.extensions     RpcHeaders{extensions:[1]} (packed)
+#   status.ok              RpcStatus{code:0}
+#   status.unavailable     RpcStatus{code:14, message:"down"}
+#   status.metadata        RpcStatus{code:9, message:"stop", metadata:{"x-t":"2"}}
+#   grease.two_byte_type   grease frame of type 0x40 (two-byte varint) with payload 000102
+#   stream.unknown_frames  grease, HEADERS, an unknown 4-byte type, a MESSAGE with a
+#                          non-minimal 2-byte length, grease, STATUS with an 8-byte length,
+#                          and an unknown 8-byte type after STATUS
 
-rpc_request.unary.body = 0a0373766312016d1a0268693001
-rpc_request.unary.frame = 0000000e0a0373766312016d1a0268693001
+request.unary.payload = 0a0373766312016d3001
+request.unary.frame = 010a0a0373766312016d3001
 
-rpc_request.timeout.body = 0a0373766312016d1a026869300138c0c407
-rpc_request.timeout.frame = 000000120a0373766312016d1a026869300138c0c407
+request.bidi_timeout.payload = 0a0373766312016d2803300138c0c407
+request.bidi_timeout.frame = 01100a0373766312016d2803300138c0c407
 
-rpc_request.metadata.body = 0a0373766312016d1a02686922130a0d617574686f72697a6174696f6e12026f6b3001
-rpc_request.metadata.frame = 000000230a0373766312016d1a02686922130a0d617574686f72697a6174696f6e12026f6b3001
+request.metadata.payload = 0a0373766312016d22130a0d617574686f72697a6174696f6e12026f6b3001
+request.metadata.frame = 011f0a0373766312016d22130a0d617574686f72697a6174696f6e12026f6b3001
 
-rpc_stream_frame.message.body = 22026869
-rpc_stream_frame.message.frame = 0000000422026869
+request.extensions.payload = 0a0373766312016d3001420301ac02
+request.extensions.frame = 010f0a0373766312016d3001420301ac02
 
-rpc_stream_frame.status.body = 0801100e1a04646f776e
-rpc_stream_frame.status.frame = 0000000a0801100e1a04646f776e
+message.hi.payload = 6869
+message.hi.frame = 00026869
 
-rpc_response.ok_body.body = 1a026869
-rpc_response.ok_body.frame = 000000041a026869
+message.empty.payload =
+message.empty.frame = 0000
 
-rpc_response.unavailable.body = 080e1204646f776e
-rpc_response.unavailable.frame = 00000008080e1204646f776e
+headers.metadata.payload = 0a080a03782d61120131
+headers.metadata.frame = 020a0a080a03782d61120131
+
+headers.empty.payload =
+headers.empty.frame = 0200
+
+headers.extensions.payload = 120101
+headers.extensions.frame = 0203120101
+
+status.ok.payload =
+status.ok.frame = 0300
+
+status.unavailable.payload = 080e1204646f776e
+status.unavailable.frame = 0308080e1204646f776e
+
+status.metadata.payload = 0809120473746f701a080a03782d74120132
+status.metadata.frame = 03120809120473746f701a080a03782d74120132
+
+grease.two_byte_type.payload = 000102
+grease.two_byte_type.frame = 404003000102
+
+stream.unary_request.stream = 010a0a0373766312016d300100026869
+stream.unary_request.frames = 1:0a0373766312016d3001,0:6869
+
+stream.unary_response.stream = 000268690300
+stream.unary_response.frames = 0:6869,3:
+
+stream.server_stream.stream = 020a0a080a03782d6112013100026869000003120809120473746f701a080a03782d74120132
+stream.server_stream.frames = 2:0a080a03782d61120131,0:6869,0:,3:0809120473746f701a080a03782d74120132
+
+stream.unknown_frames.stream = 404003000102020a0a080a03782d61120131923456780000400268692101ff03c000000000000000ffffffffffffffff027a7a
+stream.unknown_frames.frames = 2:0a080a03782d61120131,0:6869,3:

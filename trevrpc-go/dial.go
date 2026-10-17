@@ -152,12 +152,12 @@ type streamGeneration struct {
 	err    func() error
 }
 
-func (g *streamGeneration) call(ctx context.Context, request *wireRequest) (*wireResponse, error) {
-	return g.client.call(ctx, request)
+func (g *streamGeneration) call(ctx context.Context, request *wireRequest, message ProtoMessage) (frameStream, error) {
+	return g.client.call(ctx, request, message)
 }
 
-func (g *streamGeneration) streamingCall(ctx context.Context, request *wireRequest, requestBody byteStream) (frameStream, error) {
-	return g.client.streamingCall(ctx, request, requestBody)
+func (g *streamGeneration) streamingCall(ctx context.Context, request *wireRequest, requests encodedStream) (frameStream, error) {
+	return g.client.streamingCall(ctx, request, requests)
 }
 
 func (g *streamGeneration) Close() error { return g.close() }

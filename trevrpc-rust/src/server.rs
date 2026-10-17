@@ -13,8 +13,8 @@ use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
-    BoxStream, Code, Error, Metadata, ResponseEnvelope, Result, RpcKind, RpcRequest, RpcResponse,
-    RpcStreamFrame, Status,
+    BoxStream, Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest,
+    Status,
 };
 
 type UnaryHandlerFuture =
@@ -781,7 +781,8 @@ impl Server {
         });
     }
 
-    /// Registers a unary route handler that can attach successful response metadata.
+    /// Registers a unary route handler that can attach response headers and successful trailing
+    /// metadata.
     pub fn route_envelope_with_context<F, Fut>(
         &mut self,
         service: impl Into<String>,
@@ -840,7 +841,8 @@ impl Server {
         );
     }
 
-    /// Registers a streaming route handler that can attach terminal success metadata.
+    /// Registers a streaming route handler that can attach response headers, sent before the first
+    /// message, and terminal success metadata.
     pub fn route_streaming_envelope_with_context<F, Fut>(
         &mut self,
         service: impl Into<String>,
@@ -872,19 +874,26 @@ impl Server {
             .cloned()
     }
 
-    /// Handles a unary RPC request and returns a response.
-    pub async fn handle_request(&self, request: RpcRequest) -> RpcResponse {
-        self.handle_request_with_cancellation(request, CancellationToken::new())
+    /// Handles a unary RPC request whose single message is `body`.
+    ///
+    /// Returns the response envelope on success, or the status the call failed with.
+    pub async fn handle_request(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+    ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
+        self.handle_request_with_cancellation(request, body, CancellationToken::new())
             .await
     }
 
     pub(crate) async fn handle_request_with_cancellation(
         &self,
         request: RpcRequest,
+        body: Vec<u8>,
         cancellation: CancellationToken,
-    ) -> RpcResponse {
+    ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
         let started_at = Instant::now();
-        let request_body_len = request.body.len();
+        let request_body_len = body.len();
 
         record_rpc_started(
             self.metrics.as_ref(),
@@ -909,7 +918,7 @@ impl Server {
                     &request.method,
                     request_body_len,
                     started_at,
-                    status.into_response(Vec::new()),
+                    Err(status),
                 );
             }
         };
@@ -920,18 +929,16 @@ impl Server {
                 &request.method,
                 request_body_len,
                 started_at,
-                Status::unimplemented(format!(
+                Err(Status::unimplemented(format!(
                     "unknown RPC method {}/{}",
                     request.service, request.method
-                ))
-                .into_response(Vec::new()),
+                ))),
             );
         };
         let kind = request.rpc_kind();
         let RpcRequest {
             service,
             method,
-            body,
             metadata,
             ..
         } = request;
@@ -944,33 +951,31 @@ impl Server {
             cancellation: cancellation.clone(),
         };
 
-        let response = match invoke_unary_handler(&handler, context, body) {
+        let result = match invoke_unary_handler(&handler, context, body) {
             Ok(future) => match run_handler_with_deadline(future, deadline, &cancellation).await {
-                Ok(Ok(response)) => {
-                    let (body, metadata) = response.into_parts();
-                    match validate_metadata(&metadata) {
-                        Ok(()) => Status::ok().into_response_with_metadata(body, metadata),
-                        Err(_) => Status::internal("invalid successful response metadata")
-                            .into_response(Vec::new()),
-                    }
-                }
-                Ok(Err(error)) => error.into_status().into_response(Vec::new()),
-                Err(status) => status.into_response(Vec::new()),
+                Ok(Ok(response)) => validate_response_metadata(response),
+                Ok(Err(error)) => Err(error.into_status()),
+                Err(status) => Err(status),
             },
-            Err(status) => status.into_response(Vec::new()),
+            Err(status) => Err(status),
         };
 
-        self.finish_response(&service, &method, request_body_len, started_at, response)
+        self.finish_response(&service, &method, request_body_len, started_at, result)
     }
 
     /// Handles a streaming RPC request and returns response frames.
+    ///
+    /// `body` is the single request message of a server-streaming call and empty for the other
+    /// kinds, whose messages arrive on `request_body`.
     pub async fn handle_streaming_request(
         &self,
         request: RpcRequest,
+        body: Vec<u8>,
         request_body: BoxStream<Vec<u8>>,
-    ) -> BoxStream<RpcStreamFrame> {
+    ) -> BoxStream<ResponseFrame> {
         self.handle_streaming_request_with_cancellation(
             request,
+            body,
             request_body,
             CancellationToken::new(),
         )
@@ -981,11 +986,12 @@ impl Server {
     pub(crate) async fn handle_streaming_request_with_cancellation(
         &self,
         request: RpcRequest,
+        body: Vec<u8>,
         request_body: BoxStream<Vec<u8>>,
         cancellation: CancellationToken,
-    ) -> BoxStream<RpcStreamFrame> {
+    ) -> BoxStream<ResponseFrame> {
         let started_at = Instant::now();
-        let request_body_len = request.body.len();
+        let request_body_len = body.len();
 
         record_rpc_started(
             self.metrics.as_ref(),
@@ -1053,7 +1059,6 @@ impl Server {
         let RpcRequest {
             service,
             method,
-            body,
             metadata,
             ..
         } = request;
@@ -1079,18 +1084,22 @@ impl Server {
                 status,
             ),
             Ok(Ok(response)) => {
-                let (response_body, metadata) = response.into_parts();
-                if validate_metadata(&metadata).is_err() {
-                    return self.finish_streaming_status(
-                        &service,
-                        &method,
-                        request_body_len,
-                        started_at,
-                        Status::internal("invalid successful response metadata"),
-                    );
-                }
+                let response = match validate_response_metadata(response) {
+                    Ok(response) => response,
+                    Err(status) => {
+                        return self.finish_streaming_status(
+                            &service,
+                            &method,
+                            request_body_len,
+                            started_at,
+                            status,
+                        );
+                    }
+                };
+                let (response_body, headers, metadata) = response.into_parts();
                 server_response_stream(
                     response_body,
+                    headers,
                     metadata,
                     StreamingCompletion {
                         metrics: Arc::clone(&self.metrics),
@@ -1146,17 +1155,20 @@ impl Server {
         method: &str,
         request_body_len: usize,
         started_at: Instant,
-        response: RpcResponse,
-    ) -> RpcResponse {
+        result: std::result::Result<ResponseEnvelope<Vec<u8>>, Status>,
+    ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
         let elapsed = started_at.elapsed();
-        let code = Code::from_u32(response.status);
+        let (code, response_body_len) = match &result {
+            Ok(response) => (Code::Ok, response.message().len()),
+            Err(status) => (status.code(), 0),
+        };
 
         record_rpc_finished(
             self.metrics.as_ref(),
             service,
             method,
             request_body_len,
-            response.body.len(),
+            response_body_len,
             code,
             elapsed,
         );
@@ -1165,13 +1177,13 @@ impl Server {
             service = %service,
             method = %method,
             request_body_len,
-            response_body_len = response.body.len(),
+            response_body_len,
             status = ?code,
             elapsed_ms = elapsed.as_millis(),
             "rpc finished"
         );
 
-        response
+        result
     }
 
     fn finish_streaming_response(
@@ -1201,7 +1213,7 @@ impl Server {
         request_body_len: usize,
         started_at: Instant,
         status: Status,
-    ) -> BoxStream<RpcStreamFrame> {
+    ) -> BoxStream<ResponseFrame> {
         self.finish_streaming_response(
             service,
             method,
@@ -1213,29 +1225,39 @@ impl Server {
         status_stream(status)
     }
 
-    pub(crate) fn record_rejected_request(&self, request: &RpcRequest, status: &Status) {
+    pub(crate) fn record_rejected_request(
+        &self,
+        request: &RpcRequest,
+        request_body_len: usize,
+        status: &Status,
+    ) {
         let started_at = Instant::now();
         record_rpc_started(
             self.metrics.as_ref(),
             &request.service,
             &request.method,
-            request.body.len(),
+            request_body_len,
         );
         self.finish_streaming_response(
             &request.service,
             &request.method,
-            request.body.len(),
+            request_body_len,
             started_at,
             0,
             status.code(),
         );
     }
 
-    pub(crate) fn record_active_request_failure(&self, request: &RpcRequest, status: &Status) {
+    pub(crate) fn record_active_request_failure(
+        &self,
+        request: &RpcRequest,
+        request_body_len: usize,
+        status: &Status,
+    ) {
         self.finish_streaming_response(
             &request.service,
             &request.method,
-            request.body.len(),
+            request_body_len,
             Instant::now(),
             0,
             status.code(),
@@ -1354,8 +1376,18 @@ fn remaining_deadline(deadline: Option<Instant>) -> std::result::Result<Option<D
         .ok_or_else(|| Status::deadline_exceeded("RPC deadline exceeded"))
 }
 
-fn status_stream(status: Status) -> BoxStream<RpcStreamFrame> {
-    crate::stream::from_iter([RpcStreamFrame::status(status)])
+fn status_stream(status: Status) -> BoxStream<ResponseFrame> {
+    crate::stream::from_iter([ResponseFrame::Status(status)])
+}
+
+/// Rejects a successful response whose header or trailing metadata is invalid.
+fn validate_response_metadata<T>(
+    response: ResponseEnvelope<T>,
+) -> std::result::Result<ResponseEnvelope<T>, Status> {
+    validate_metadata(response.headers())
+        .and_then(|()| validate_metadata(response.metadata()))
+        .map_err(|_| Status::internal("invalid successful response metadata"))?;
+    Ok(response)
 }
 
 #[derive(Clone, Copy)]
@@ -1503,7 +1535,17 @@ pub(crate) fn check_stream_message_body_limits(
     }
 
     *messages = messages.saturating_add(1);
-    *body_size = body_size.saturating_add(item_len);
+    check_stream_body_limit(direction, max_body_size, body_size, item_len)
+}
+
+/// Adds `len` bytes to a stream's running body size and checks it against the limit.
+pub(crate) fn check_stream_body_limit(
+    direction: &str,
+    max_body_size: Option<usize>,
+    body_size: &mut usize,
+    len: usize,
+) -> Result<()> {
+    *body_size = body_size.saturating_add(len);
 
     if let Some(max) = max_body_size
         && *body_size > max
@@ -1514,6 +1556,54 @@ pub(crate) fn check_stream_message_body_limits(
     }
 
     Ok(())
+}
+
+/// What a request stream may still send: a count of messages and a total of bytes.
+///
+/// Frames of unknown type count toward the byte total, so they cannot hold a stream open for free.
+/// The single message of a unary or server-streaming call is bounded by the frame size instead
+/// and is not charged.
+#[derive(Debug, Clone)]
+pub struct RequestBudget {
+    max_messages: Option<usize>,
+    max_body_size: Option<usize>,
+    messages: usize,
+    body_size: usize,
+}
+
+impl RequestBudget {
+    pub(crate) const fn new(max_messages: Option<usize>, max_body_size: Option<usize>) -> Self {
+        Self {
+            max_messages,
+            max_body_size,
+            messages: 0,
+            body_size: 0,
+        }
+    }
+
+    pub(crate) const fn from_options(options: &ServerOptions) -> Self {
+        Self::new(
+            options.max_stream_messages(),
+            options.max_stream_body_size(),
+        )
+    }
+
+    /// Charges one streamed request message.
+    pub(crate) fn charge_message(&mut self, len: usize) -> Result<()> {
+        check_stream_message_body_limits(
+            "request",
+            self.max_messages,
+            self.max_body_size,
+            &mut self.messages,
+            &mut self.body_size,
+            len,
+        )
+    }
+
+    /// Charges a skipped frame by its wire length.
+    pub(crate) fn charge_skipped(&mut self, wire_len: usize) -> Result<()> {
+        check_stream_body_limit("request", self.max_body_size, &mut self.body_size, wire_len)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1577,6 +1667,8 @@ impl StreamingCompletion {
 
 struct ServerResponseStream {
     inner: BoxStream<Vec<u8>>,
+    /// Response headers still to send. Empty headers are never sent.
+    headers: Option<Metadata>,
     metadata: Metadata,
     completion: StreamingCompletion,
     response_body_len: usize,
@@ -1589,6 +1681,7 @@ struct ServerResponseStream {
 impl ServerResponseStream {
     fn new(
         inner: BoxStream<Vec<u8>>,
+        headers: Metadata,
         metadata: Metadata,
         completion: StreamingCompletion,
         limits: StreamLimits,
@@ -1596,6 +1689,7 @@ impl ServerResponseStream {
     ) -> Self {
         Self {
             inner,
+            headers: (!headers.is_empty()).then_some(headers),
             metadata,
             completion,
             response_body_len: 0,
@@ -1612,18 +1706,25 @@ impl ServerResponseStream {
     }
 }
 
+/// Frames a handler's response stream: its headers first, as soon as the handler returns and
+/// before the first message is polled, then its messages, then the terminal status.
 fn server_response_stream(
     inner: BoxStream<Vec<u8>>,
+    headers: Metadata,
     metadata: Metadata,
     completion: StreamingCompletion,
     limits: StreamLimits,
     cancellation: CancellationToken,
-) -> BoxStream<RpcStreamFrame> {
+) -> BoxStream<ResponseFrame> {
     Box::pin(futures_util::stream::unfold(
-        ServerResponseStream::new(inner, metadata, completion, limits, cancellation),
+        ServerResponseStream::new(inner, headers, metadata, completion, limits, cancellation),
         |mut stream| async move {
             if stream.done {
                 return None;
+            }
+
+            if let Some(headers) = stream.headers.take() {
+                return Some((Ok(ResponseFrame::Headers(headers)), stream));
             }
 
             let frame = match next_limited_item(
@@ -1644,19 +1745,21 @@ fn server_response_stream(
                     ) {
                         let status = error.into_status();
                         stream.finish(status.code());
-                        RpcStreamFrame::status(status)
+                        ResponseFrame::Status(status)
                     } else {
-                        RpcStreamFrame::message(body)
+                        ResponseFrame::message(body)
                     }
                 }
                 Err(error) => {
                     let status = error.into_status();
                     stream.finish(status.code());
-                    RpcStreamFrame::status(status)
+                    ResponseFrame::Status(status)
                 }
                 Ok(None) => {
                     stream.finish(Code::Ok);
-                    RpcStreamFrame::status(Status::ok().with_metadata(stream.metadata.clone()))
+                    ResponseFrame::Status(
+                        Status::ok().with_metadata(std::mem::take(&mut stream.metadata)),
+                    )
                 }
             };
 
@@ -1746,12 +1849,6 @@ fn record_rpc_finished(
     let _ = catch_unwind(AssertUnwindSafe(|| metrics.rpc_finished(&event)));
 }
 
-impl From<Error> for RpcResponse {
-    fn from(error: Error) -> Self {
-        error.into_status().into_response(Vec::new())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1759,7 +1856,9 @@ mod tests {
 
     use futures_util::StreamExt;
 
-    use crate::{Code, Error, RpcKind, RpcRequest, RpcStreamFrameKind, Status};
+    use crate::{Code, Error, ResponseFrame, RpcKind, RpcRequest, Status};
+
+    use crate::{Metadata, ResponseEnvelope};
 
     use super::{
         Authorizer, CancellationSource, CancellationToken, MetadataValueAuthorizer, Metrics,
@@ -1840,15 +1939,17 @@ mod tests {
             Ok(b"hello".to_vec())
         });
 
-        let mut request = RpcRequest::new("example.Greeter", "SayHello", Vec::new());
+        let mut request = RpcRequest::new("example.Greeter", "SayHello");
         request
             .metadata
             .insert("authorization".to_owned(), b"ok".to_vec());
 
-        let response = server.handle_request(request).await;
+        let response = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect("authorized request should succeed");
 
-        assert_eq!(Code::from_u32(response.status), Code::Ok);
-        assert_eq!(response.body, b"hello");
+        assert_eq!(response.message(), b"hello");
         assert_eq!(
             *finished
                 .lock()
@@ -1868,12 +1969,12 @@ mod tests {
             Ok(b"hello".to_vec())
         });
 
-        let response = server
-            .handle_request(RpcRequest::new("example.Greeter", "SayHello", Vec::new()))
-            .await;
+        let status = server
+            .handle_request(RpcRequest::new("example.Greeter", "SayHello"), Vec::new())
+            .await
+            .expect_err("missing metadata should be rejected");
 
-        assert_eq!(Code::from_u32(response.status), Code::Unauthenticated);
-        assert!(response.body.is_empty());
+        assert_eq!(status.code(), Code::Unauthenticated);
     }
 
     #[tokio::test]
@@ -1885,11 +1986,11 @@ mod tests {
         });
 
         let response = server
-            .handle_request(RpcRequest::new("example.Greeter", "SayHello", Vec::new()))
-            .await;
+            .handle_request(RpcRequest::new("example.Greeter", "SayHello"), Vec::new())
+            .await
+            .expect("request should succeed despite panicking metrics");
 
-        assert_eq!(Code::from_u32(response.status), Code::Ok);
-        assert_eq!(response.body, b"hello");
+        assert_eq!(response.message(), b"hello");
     }
 
     #[tokio::test]
@@ -1900,7 +2001,7 @@ mod tests {
                     Ok(b"hello".to_vec())
                 });
             },
-            RpcRequest::new("example.Greeter", "SayHello", Vec::new()),
+            RpcRequest::new("example.Greeter", "SayHello"),
             Code::Ok,
         )
         .await;
@@ -1911,7 +2012,7 @@ mod tests {
                     Err(Error::from(Status::new(Code::PermissionDenied, "denied")))
                 });
             },
-            RpcRequest::new("example.Greeter", "Denied", Vec::new()),
+            RpcRequest::new("example.Greeter", "Denied"),
             Code::PermissionDenied,
         )
         .await;
@@ -1922,7 +2023,7 @@ mod tests {
                     panic!("boom");
                 });
             },
-            RpcRequest::new("example.Greeter", "Panic", Vec::new()),
+            RpcRequest::new("example.Greeter", "Panic"),
             Code::Internal,
         )
         .await;
@@ -1934,7 +2035,7 @@ mod tests {
                     Ok(b"hello".to_vec())
                 });
             },
-            RpcRequest::new("example.Greeter", "SayHello", Vec::new()),
+            RpcRequest::new("example.Greeter", "SayHello"),
             Code::Unauthenticated,
         )
         .await;
@@ -1945,12 +2046,12 @@ mod tests {
                     std::future::pending::<crate::Result<Vec<u8>>>().await
                 });
             },
-            RpcRequest::new("example.Greeter", "Slow", Vec::new()).with_timeout_nanos(1_000_000),
+            RpcRequest::new("example.Greeter", "Slow").with_timeout_nanos(1_000_000),
             Code::DeadlineExceeded,
         )
         .await;
 
-        let mut invalid_metadata = RpcRequest::new("example.Greeter", "SayHello", Vec::new());
+        let mut invalid_metadata = RpcRequest::new("example.Greeter", "SayHello");
         invalid_metadata
             .metadata
             .insert("Authorization".to_owned(), b"ok".to_vec());
@@ -1977,9 +2078,12 @@ mod tests {
         server.set_metrics(metrics);
         configure(&mut server);
 
-        let response = server.handle_request(request).await;
+        let code = server
+            .handle_request(request, Vec::new())
+            .await
+            .map_or_else(|status| status.code(), |_| Code::Ok);
 
-        assert_eq!(Code::from_u32(response.status), expected);
+        assert_eq!(code, expected);
         assert_eq!(observed.started_count(), 1);
         assert_eq!(observed.finished_codes(), vec![expected]);
     }
@@ -1991,11 +2095,12 @@ mod tests {
             panic!("boom");
         });
 
-        let response = server
-            .handle_request(RpcRequest::new("example.Greeter", "Panic", Vec::new()))
-            .await;
+        let status = server
+            .handle_request(RpcRequest::new("example.Greeter", "Panic"), Vec::new())
+            .await
+            .expect_err("a panicking handler should fail");
 
-        assert_eq!(Code::from_u32(response.status), Code::Internal);
+        assert_eq!(status.code(), Code::Internal);
     }
 
     #[tokio::test]
@@ -2006,11 +2111,12 @@ mod tests {
             panic!("boom");
         });
 
-        let response = server
-            .handle_request(RpcRequest::new("example.Greeter", "Panic", Vec::new()))
-            .await;
+        let status = server
+            .handle_request(RpcRequest::new("example.Greeter", "Panic"), Vec::new())
+            .await
+            .expect_err("a panicking handler should fail");
 
-        assert_eq!(Code::from_u32(response.status), Code::Internal);
+        assert_eq!(status.code(), Code::Internal);
     }
 
     #[tokio::test]
@@ -2024,11 +2130,11 @@ mod tests {
                 panic!("boom");
             },
         );
-        let request = RpcRequest::new("example.Greeter", "Panic", Vec::new())
-            .with_kind(RpcKind::ServerStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Panic").with_kind(RpcKind::ServerStreaming);
 
         let mut response = server
-            .handle_streaming_request(request, crate::stream::empty())
+            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
             .await;
         let frame = response
             .next()
@@ -2036,8 +2142,7 @@ mod tests {
             .expect("status frame should be emitted")
             .expect("status frame should not be transport error");
 
-        assert_eq!(frame.frame_kind(), Some(RpcStreamFrameKind::Status));
-        assert_eq!(Code::from_u32(frame.status), Code::Internal);
+        assert_eq!(status_code(&frame), Some(Code::Internal));
     }
 
     #[tokio::test]
@@ -2050,12 +2155,14 @@ mod tests {
         server.route("example.Greeter", "SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
-        let request = RpcRequest::new("example.Greeter", "SayHello", Vec::new())
-            .with_timeout_nanos(1_000_000);
+        let request = RpcRequest::new("example.Greeter", "SayHello").with_timeout_nanos(1_000_000);
 
-        let response = server.handle_request(request).await;
+        let status = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect_err("the authorizer should hit the deadline");
 
-        assert_eq!(Code::from_u32(response.status), Code::DeadlineExceeded);
+        assert_eq!(status.code(), Code::DeadlineExceeded);
         assert_eq!(
             *finished
                 .lock()
@@ -2078,14 +2185,17 @@ mod tests {
             Ok(b"hello".to_vec())
         });
 
-        let mut request = RpcRequest::new("example.Greeter", "SayHello", Vec::new());
+        let mut request = RpcRequest::new("example.Greeter", "SayHello");
         request
             .metadata
             .insert("Authorization".to_owned(), b"ok".to_vec());
 
-        let response = server.handle_request(request).await;
+        let status = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect_err("invalid metadata should be rejected");
 
-        assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+        assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(
             *finished
                 .lock()
@@ -2102,11 +2212,12 @@ mod tests {
             b"ok".to_vec(),
         ));
 
-        let response = server
-            .handle_request(RpcRequest::new("example.Greeter", "Missing", Vec::new()))
-            .await;
+        let status = server
+            .handle_request(RpcRequest::new("example.Greeter", "Missing"), Vec::new())
+            .await
+            .expect_err("unauthenticated requests should be rejected");
 
-        assert_eq!(Code::from_u32(response.status), Code::Unauthenticated);
+        assert_eq!(status.code(), Code::Unauthenticated);
     }
 
     #[tokio::test]
@@ -2115,23 +2226,29 @@ mod tests {
         server.route("example.Greeter", "SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
-        let mut request = RpcRequest::new("example.Greeter", "Missing", Vec::new());
+        let mut request = RpcRequest::new("example.Greeter", "Missing");
         request.version = crate::wire::WIRE_VERSION + 1;
 
-        let response = server.handle_request(request).await;
+        let status = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect_err("the version should be rejected");
 
-        assert_eq!(Code::from_u32(response.status), Code::FailedPrecondition);
+        assert_eq!(status.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]
     async fn unsupported_rpc_kinds_are_rejected_before_route_lookup() {
         let server = Server::new();
-        let mut request = RpcRequest::new("example.Greeter", "Missing", Vec::new());
+        let mut request = RpcRequest::new("example.Greeter", "Missing");
         request.kind = 99;
 
-        let response = server.handle_request(request).await;
+        let status = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect_err("the kind should be rejected");
 
-        assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -2182,8 +2299,8 @@ mod tests {
 
     #[tokio::test]
     async fn cloned_request_context_observes_deadline_cancellation() {
-        let request = RpcRequest::new("example.Greeter", "Watch", Vec::new())
-            .with_kind(RpcKind::ServerStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Watch").with_kind(RpcKind::ServerStreaming);
         let context = RequestContext::new(
             &request,
             Some(std::time::Instant::now() + Duration::from_millis(1)),
@@ -2203,8 +2320,8 @@ mod tests {
 
     #[test]
     fn observing_an_expired_deadline_commits_the_first_source() {
-        let request = RpcRequest::new("example.Greeter", "Watch", Vec::new())
-            .with_kind(RpcKind::ServerStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Watch").with_kind(RpcKind::ServerStreaming);
         let context = RequestContext::new(
             &request,
             Some(
@@ -2328,12 +2445,15 @@ mod tests {
     #[tokio::test]
     async fn oversized_timeouts_are_rejected_before_route_lookup() {
         let server = Server::new();
-        let mut request = RpcRequest::new("example.Greeter", "Missing", Vec::new());
+        let mut request = RpcRequest::new("example.Greeter", "Missing");
         request.timeout_nanos = u64::MAX;
 
-        let response = server.handle_request(request).await;
+        let status = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect_err("the timeout should be rejected");
 
-        assert_eq!(Code::from_u32(response.status), Code::InvalidArgument);
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -2352,10 +2472,10 @@ mod tests {
             },
         );
 
-        let request = RpcRequest::new("example.Greeter", "StreamHello", b"request".to_vec())
-            .with_kind(RpcKind::ServerStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "StreamHello").with_kind(RpcKind::ServerStreaming);
         let mut response = server
-            .handle_streaming_request(request, crate::stream::empty())
+            .handle_streaming_request(request, b"request".to_vec(), crate::stream::empty())
             .await;
 
         let first = response
@@ -2363,24 +2483,21 @@ mod tests {
             .await
             .expect("stream should yield first frame")
             .expect("first frame should be ok");
-        assert_eq!(first.frame_kind(), Some(RpcStreamFrameKind::Message));
-        assert_eq!(first.body, b"one".to_vec());
+        assert_eq!(first, ResponseFrame::message(&b"one"[..]));
 
         let second = response
             .next()
             .await
             .expect("stream should yield second frame")
             .expect("second frame should be ok");
-        assert_eq!(second.frame_kind(), Some(RpcStreamFrameKind::Message));
-        assert_eq!(second.body, b"two".to_vec());
+        assert_eq!(second, ResponseFrame::message(&b"two"[..]));
 
         let status = response
             .next()
             .await
             .expect("stream should yield status frame")
             .expect("status frame should be ok");
-        assert_eq!(status.frame_kind(), Some(RpcStreamFrameKind::Status));
-        assert_eq!(Code::from_u32(status.status), Code::Ok);
+        assert_eq!(status, ResponseFrame::Status(Status::ok()));
         assert!(response.next().await.is_none());
         assert_eq!(
             *finished
@@ -2406,10 +2523,10 @@ mod tests {
             },
         );
 
-        let request = RpcRequest::new("example.Greeter", "Download", Vec::new())
-            .with_kind(RpcKind::ServerStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Download").with_kind(RpcKind::ServerStreaming);
         let response = server
-            .handle_streaming_request(request, crate::stream::empty())
+            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
             .await;
 
         drop(response);
@@ -2435,11 +2552,12 @@ mod tests {
             },
         );
 
-        let request = RpcRequest::new("example.Greeter", "Upload", Vec::new())
-            .with_kind(RpcKind::ClientStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Upload").with_kind(RpcKind::ClientStreaming);
         let mut response = server
             .handle_streaming_request(
                 request,
+                Vec::new(),
                 crate::stream::from_iter([b"one".to_vec(), b"two".to_vec()]),
             )
             .await;
@@ -2449,8 +2567,7 @@ mod tests {
             .await
             .expect("stream should yield status frame")
             .expect("status frame should be ok");
-        assert_eq!(status.frame_kind(), Some(RpcStreamFrameKind::Status));
-        assert_eq!(Code::from_u32(status.status), Code::ResourceExhausted);
+        assert_eq!(status_code(&status), Some(Code::ResourceExhausted));
         assert!(response.next().await.is_none());
     }
 
@@ -2465,10 +2582,10 @@ mod tests {
             |_body, _requests| async move { Ok(crate::stream::from_iter([b"four".to_vec()])) },
         );
 
-        let request = RpcRequest::new("example.Greeter", "Download", Vec::new())
-            .with_kind(RpcKind::ServerStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Download").with_kind(RpcKind::ServerStreaming);
         let mut response = server
-            .handle_streaming_request(request, crate::stream::empty())
+            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
             .await;
 
         let status = response
@@ -2476,8 +2593,7 @@ mod tests {
             .await
             .expect("stream should yield status frame")
             .expect("status frame should be ok");
-        assert_eq!(status.frame_kind(), Some(RpcStreamFrameKind::Status));
-        assert_eq!(Code::from_u32(status.status), Code::ResourceExhausted);
+        assert_eq!(status_code(&status), Some(Code::ResourceExhausted));
         assert!(response.next().await.is_none());
     }
 
@@ -2502,10 +2618,14 @@ mod tests {
             },
         );
 
-        let request = RpcRequest::new("example.Greeter", "Upload", Vec::new())
-            .with_kind(RpcKind::ClientStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Upload").with_kind(RpcKind::ClientStreaming);
         let mut response = server
-            .handle_streaming_request(request, Box::pin(futures_util::stream::pending()))
+            .handle_streaming_request(
+                request,
+                Vec::new(),
+                Box::pin(futures_util::stream::pending()),
+            )
             .await;
 
         let status = response
@@ -2513,8 +2633,7 @@ mod tests {
             .await
             .expect("stream should yield status frame")
             .expect("status frame should be ok");
-        assert_eq!(status.frame_kind(), Some(RpcStreamFrameKind::Status));
-        assert_eq!(Code::from_u32(status.status), Code::Unavailable);
+        assert_eq!(status_code(&status), Some(Code::Unavailable));
         assert!(response.next().await.is_none());
     }
 
@@ -2534,10 +2653,10 @@ mod tests {
             },
         );
 
-        let request = RpcRequest::new("example.Greeter", "Download", Vec::new())
-            .with_kind(RpcKind::ServerStreaming);
+        let request =
+            RpcRequest::new("example.Greeter", "Download").with_kind(RpcKind::ServerStreaming);
         let mut response = server
-            .handle_streaming_request(request, crate::stream::empty())
+            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
             .await;
 
         let status = response
@@ -2545,9 +2664,237 @@ mod tests {
             .await
             .expect("stream should yield status frame")
             .expect("status frame should be ok");
-        assert_eq!(status.frame_kind(), Some(RpcStreamFrameKind::Status));
-        assert_eq!(Code::from_u32(status.status), Code::Unavailable);
-        assert_eq!(status.message, "down");
+        assert_eq!(status_code(&status), Some(Code::Unavailable));
+        assert!(matches!(&status, ResponseFrame::Status(status) if status.message() == "down"));
         assert!(response.next().await.is_none());
+    }
+
+    fn status_code(frame: &ResponseFrame) -> Option<Code> {
+        match frame {
+            ResponseFrame::Status(status) => Some(status.code()),
+            ResponseFrame::Headers(_) | ResponseFrame::Message(_) => None,
+        }
+    }
+
+    fn headers_of(key: &str, value: &[u8]) -> Metadata {
+        Metadata::from([(key.to_owned(), value.to_vec())])
+    }
+
+    #[tokio::test]
+    async fn unary_handlers_receive_the_request_message_and_return_headers() {
+        let mut server = Server::new();
+        server.route_envelope_with_context(
+            "example.Greeter",
+            "SayHello",
+            |_context, body| async move {
+                assert_eq!(body, b"request");
+                Ok(ResponseEnvelope::new(b"reply".to_vec())
+                    .with_headers(headers_of("x-header", b"h"))
+                    .with_metadata(headers_of("x-trailer", b"t")))
+            },
+        );
+
+        let response = server
+            .handle_request(
+                RpcRequest::new("example.Greeter", "SayHello"),
+                b"request".to_vec(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.message(), b"reply");
+        assert_eq!(response.headers(), &headers_of("x-header", b"h"));
+        assert_eq!(response.metadata(), &headers_of("x-trailer", b"t"));
+    }
+
+    struct LengthMetrics(TestMetrics, Arc<Mutex<Vec<usize>>>);
+
+    impl Metrics for LengthMetrics {
+        fn rpc_started(&self, event: &super::RpcStarted) {
+            self.1
+                .lock()
+                .expect("lock should not be poisoned")
+                .push(event.request_body_len);
+            self.0.rpc_started(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_see_the_request_message_length() {
+        let metrics = TestMetrics::default();
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        server.set_metrics(LengthMetrics(metrics, Arc::clone(&started)));
+        server.route("example.Greeter", "SayHello", |_| async {
+            Ok(b"hello".to_vec())
+        });
+
+        server
+            .handle_request(
+                RpcRequest::new("example.Greeter", "SayHello"),
+                b"four".to_vec(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(*started.lock().expect("lock should not be poisoned"), [4]);
+    }
+
+    #[tokio::test]
+    async fn invalid_unary_header_or_trailing_metadata_is_internal() {
+        for envelope in [
+            ResponseEnvelope::new(Vec::new()).with_headers(headers_of("Bad Key", b"h")),
+            ResponseEnvelope::new(Vec::new()).with_metadata(headers_of("Bad Key", b"t")),
+        ] {
+            let mut server = Server::new();
+            server.route_envelope_with_context(
+                "example.Greeter",
+                "SayHello",
+                move |_context, _body| {
+                    let envelope = envelope.clone();
+                    async move { Ok(envelope) }
+                },
+            );
+
+            let status = server
+                .handle_request(RpcRequest::new("example.Greeter", "SayHello"), Vec::new())
+                .await
+                .expect_err("invalid metadata should fail the call");
+
+            assert_eq!(status.code(), Code::Internal);
+        }
+    }
+
+    fn headers_route(server: &mut Server, headers: Metadata, messages: crate::BoxStream<Vec<u8>>) {
+        let messages = Arc::new(Mutex::new(Some(messages)));
+        server.route_streaming_envelope_with_context(
+            "example.Greeter",
+            "Watch",
+            RpcKind::ServerStreaming,
+            move |_context, _body, _requests| {
+                let headers = headers.clone();
+                let messages = Arc::clone(&messages);
+                async move {
+                    let messages = messages
+                        .lock()
+                        .expect("lock should not be poisoned")
+                        .take()
+                        .expect("route should be called once");
+                    Ok(ResponseEnvelope::new(messages)
+                        .with_headers(headers)
+                        .with_metadata(headers_of("x-trailer", b"t")))
+                }
+            },
+        );
+    }
+
+    fn watch_request() -> RpcRequest {
+        RpcRequest::new("example.Greeter", "Watch").with_kind(RpcKind::ServerStreaming)
+    }
+
+    #[tokio::test]
+    async fn streaming_headers_precede_the_first_message_poll() {
+        let mut server = Server::new();
+        // The first message never becomes ready, yet the headers are available at once.
+        headers_route(
+            &mut server,
+            headers_of("x-header", b"h"),
+            Box::pin(futures_util::stream::pending()),
+        );
+
+        let mut response = server
+            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .await;
+        let first = response
+            .next()
+            .await
+            .expect("headers should be the first frame")
+            .expect("frame should be ok");
+
+        assert_eq!(first, ResponseFrame::Headers(headers_of("x-header", b"h")));
+    }
+
+    #[tokio::test]
+    async fn streaming_headers_message_and_trailers_are_framed_in_order() {
+        let mut server = Server::new();
+        headers_route(
+            &mut server,
+            headers_of("x-header", b"h"),
+            crate::stream::from_iter([b"one".to_vec()]),
+        );
+
+        let frames: Vec<_> = server
+            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .await
+            .map(|frame| frame.expect("frame should be ok"))
+            .collect()
+            .await;
+
+        assert_eq!(
+            frames,
+            [
+                ResponseFrame::Headers(headers_of("x-header", b"h")),
+                ResponseFrame::message(&b"one"[..]),
+                ResponseFrame::Status(Status::ok().with_metadata(headers_of("x-trailer", b"t"))),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_streaming_headers_send_no_headers_frame() {
+        let mut server = Server::new();
+        headers_route(
+            &mut server,
+            Metadata::new(),
+            crate::stream::from_iter([b"one".to_vec()]),
+        );
+
+        let frames: Vec<_> = server
+            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .await
+            .map(|frame| frame.expect("frame should be ok"))
+            .collect()
+            .await;
+
+        assert!(matches!(frames.first(), Some(ResponseFrame::Message(_))));
+        assert_eq!(frames.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_streaming_headers_fail_the_call_with_a_lone_status() {
+        let mut server = Server::new();
+        headers_route(
+            &mut server,
+            headers_of("Bad Key", b"h"),
+            crate::stream::from_iter([b"one".to_vec()]),
+        );
+
+        let frames: Vec<_> = server
+            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .await
+            .map(|frame| frame.expect("frame should be ok"))
+            .collect()
+            .await;
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames.first().and_then(status_code), Some(Code::Internal));
+    }
+
+    #[test]
+    fn request_budget_charges_skipped_frames_to_the_body_limit() {
+        let mut budget = super::RequestBudget::new(Some(2), Some(10));
+        budget.charge_skipped(6).expect("within the limit");
+        budget.charge_skipped(4).expect("exactly at the limit");
+        let status = budget
+            .charge_skipped(1)
+            .expect_err("one byte over")
+            .into_status();
+        assert_eq!(status.code(), Code::ResourceExhausted);
+
+        // Skipped frames are not messages.
+        let mut budget = super::RequestBudget::new(Some(1), None);
+        budget.charge_skipped(100).expect("no byte limit");
+        budget.charge_message(5).expect("first message");
+        assert!(budget.charge_message(5).is_err(), "second message is over");
     }
 }

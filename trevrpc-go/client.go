@@ -13,10 +13,22 @@ import (
 // interface is sealed because requests and responses use the internal wire
 // format.
 type Transport interface {
-	// call sends a unary RPC request and returns its response.
-	call(context.Context, *wireRequest) (*wireResponse, error)
-	// streamingCall sends a streaming RPC request and returns response frames.
-	streamingCall(context.Context, *wireRequest, byteStream) (frameStream, error)
+	// call sends a request and its single message, as unary and
+	// server-streaming RPCs do, and returns the response frames.
+	call(context.Context, *wireRequest, ProtoMessage) (frameStream, error)
+	// streamingCall sends a request followed by the messages of the stream, as
+	// client-streaming and bidirectional RPCs do, and returns the response frames.
+	streamingCall(context.Context, *wireRequest, encodedStream) (frameStream, error)
+}
+
+// ServerStreamingCall is the response stream of a server-streaming RPC.
+type ServerStreamingCall[Res ProtoMessage] interface {
+	ResponseStream[Res]
+	// Headers returns the response headers. It blocks until the first response
+	// frame (headers, a message, or the final status) arrives and returns empty
+	// metadata if the server sent no headers. It does not consume a message:
+	// Recv still returns it.
+	Headers() (Metadata, error)
 }
 
 // ClientStreamingCall sends request messages and receives the final response.
@@ -24,7 +36,8 @@ type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// Send sends one request message.
 	Send(Req) error
 	// CloseAndRecv closes the request stream and returns the unary response.
-	// Response metadata is reported through CaptureResponseMetadata.
+	// Response headers and trailing metadata are reported through
+	// CaptureResponseHeaders and CaptureResponseMetadata.
 	CloseAndRecv() (Res, error)
 	// Close releases call resources without waiting for a response.
 	Close() error
@@ -43,10 +56,11 @@ type BidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// TerminalStatus returns the server's final status, including its
 	// metadata, once the status frame has been consumed.
 	TerminalStatus() (*Status, bool)
-}
-
-type responseStreamFrameFieldsReceiver interface {
-	trevrpcRecvStreamFrameFields() (streamFrameFields, error)
+	// Headers returns the response headers. It blocks until the first response
+	// frame (headers, a message, or the final status) arrives and returns empty
+	// metadata if the server sent no headers. It does not consume a message:
+	// Recv still returns it.
+	Headers() (Metadata, error)
 }
 
 // callConfig holds the resolved options of one RPC call.
@@ -55,6 +69,7 @@ type callConfig struct {
 	hasTimeout       bool
 	maxResponseSize  int
 	metadata         Metadata
+	responseHeaders  *Metadata
 	responseMetadata *Metadata
 }
 
@@ -94,11 +109,23 @@ func WithMaxFrameSize(size int) CallOption {
 	}
 }
 
-// CaptureResponseMetadata stores the response metadata of a successful unary or
+// CaptureResponseHeaders stores the response headers of a successful unary or
+// client-streaming call in *dst, replacing its previous value. It is written
+// before the call returns (for client streaming, before CloseAndRecv returns)
+// and is not touched when the call fails. Streaming responses report headers
+// through Headers instead, so server- and bidirectional-streaming calls ignore
+// this option.
+func CaptureResponseHeaders(dst *Metadata) CallOption {
+	return func(config *callConfig) {
+		config.responseHeaders = dst
+	}
+}
+
+// CaptureResponseMetadata stores the trailing metadata of a successful unary or
 // client-streaming call in *dst, replacing its previous value. It is written
 // before the call returns (for client streaming, before CloseAndRecv returns)
 // and is not touched when the call fails; the metadata of a failed call is on
-// the returned *Status. Streaming responses report metadata through
+// the returned *Status. Streaming responses report trailing metadata through
 // TerminalStatus instead, so server- and bidirectional-streaming calls ignore
 // this option.
 func CaptureResponseMetadata(dst *Metadata) CallOption {
@@ -116,12 +143,7 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 		return zero, err
 	}
 
-	requestBody, err := marshalMessage(request)
-	if err != nil {
-		return zero, err
-	}
-
-	rpcRequest, err := prepareClientRequest(service, method, RPCKindUnary, requestBody, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(service, method, RPCKindUnary, config, deadline, time.Now)
 	if err != nil {
 		return zero, err
 	}
@@ -129,55 +151,45 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
 	defer cancel()
 
-	response, err := transport.call(ctx, rpcRequest)
+	frames, err := transport.call(ctx, rpcRequest, request)
 	if err != nil {
 		return zero, err
 	}
 
-	if err := validateResponse(response, config.maxResponseSize); err != nil {
-		return zero, err
-	}
-
-	message, err := invokeResponseFactory(newResponse)
+	message, headers, trailers, err := readSingleResponse(newResponseMessageStream(ctx, frames, newResponse, config, cancel))
 	if err != nil {
 		return zero, err
 	}
-	if err := unmarshalMessage(response.Body, message); err != nil {
-		return zero, err
-	}
 
-	config.captureResponseMetadata(response.Metadata)
+	config.captureResponseHeaders(headers)
+	config.captureResponseMetadata(trailers)
 	return message, nil
 }
 
 // ServerStreaming calls a server-streaming RPC and returns its response stream.
-// The terminal status and metadata are available from TerminalStatus after Recv
-// reports io.EOF or the stream's error.
-func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (ResponseStream[Res], error) {
+// The terminal status and trailing metadata are available from TerminalStatus
+// after Recv reports io.EOF or the stream's error, and the response headers
+// from Headers.
+func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (ServerStreamingCall[Res], error) {
 	config := applyCallOptions(options)
 	deadline, err := resolveClientDeadline(ctx, config, time.Now)
 	if err != nil {
 		return nil, err
 	}
 
-	requestBody, err := marshalMessage(request)
-	if err != nil {
-		return nil, err
-	}
-
-	rpcRequest, err := prepareClientRequest(service, method, RPCKindServerStreaming, requestBody, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(service, method, RPCKindServerStreaming, config, deadline, time.Now)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
-	response, err := transport.streamingCall(ctx, rpcRequest, newEmptyStream[[]byte]())
+	frames, err := transport.call(ctx, rpcRequest, request)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	return newResponseMessageStream(ctx, response, newResponse, config, cancel), nil
+	return newResponseMessageStream(ctx, frames, newResponse, config, cancel), nil
 }
 
 // ClientStreaming starts a client-streaming RPC.
@@ -209,7 +221,7 @@ func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context,
 		return nil, nil, nil, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, kind, nil, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(service, method, kind, config, deadline, time.Now)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -242,11 +254,12 @@ func (c *clientStreamingCall[Req, Res]) CloseAndRecv() (Res, error) {
 		return zero, err
 	}
 
-	message, metadata, err := readSingleResponse(c.responses)
+	message, headers, trailers, err := readSingleResponse(c.responses)
 	if err != nil {
 		return zero, err
 	}
-	c.config.captureResponseMetadata(metadata)
+	c.config.captureResponseHeaders(headers)
+	c.config.captureResponseMetadata(trailers)
 	return message, nil
 }
 
@@ -280,6 +293,10 @@ func (c *bidirectionalStreamingCall[Req, Res]) TerminalStatus() (*Status, bool) 
 	return c.responses.TerminalStatus()
 }
 
+func (c *bidirectionalStreamingCall[Req, Res]) Headers() (Metadata, error) {
+	return c.responses.Headers()
+}
+
 func applyCallOptions(options []CallOption) callConfig {
 	config := defaultCallConfig()
 	for _, option := range options {
@@ -287,6 +304,12 @@ func applyCallOptions(options []CallOption) callConfig {
 	}
 
 	return config
+}
+
+func (c callConfig) captureResponseHeaders(headers Metadata) {
+	if c.responseHeaders != nil {
+		*c.responseHeaders = cloneMetadata(headers)
+	}
 }
 
 func (c callConfig) captureResponseMetadata(metadata Metadata) {
@@ -317,13 +340,13 @@ func resolveClientDeadline(ctx context.Context, config callConfig, now func() ti
 	return clientDeadline{at: deadline, set: hasDeadline}, nil
 }
 
-func prepareClientRequest(service, method string, kind RPCKind, body []byte, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
+func prepareClientRequest(service, method string, kind RPCKind, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
 	metadata := cloneMetadata(config.metadata)
 	if err := validateMetadata(metadata); err != nil {
 		return nil, err
 	}
 
-	request := newWireRequest(service, method, body)
+	request := newWireRequest(service, method)
 	request.Kind = kind
 	request.Metadata = metadata
 	request.TimeoutNanos = deadlineTimeoutNanos(deadline, now)
@@ -360,26 +383,6 @@ func callContextWithoutLocalCancel(ctx context.Context, deadline clientDeadline)
 	return ctx, func() {}
 }
 
-func validateResponse(response *wireResponse, maxBodySize int) error {
-	if response == nil {
-		return Internal("missing RPC response")
-	}
-
-	if err := validateMetadata(response.Metadata); err != nil {
-		return Internal("invalid response metadata: " + err.Error())
-	}
-
-	if len(response.Body) > maxBodySize {
-		return &FrameTooLargeError{Len: len(response.Body), Max: maxBodySize}
-	}
-
-	if CodeFromUint32(response.Status) != CodeOK {
-		return statusFromWireResponse(response)
-	}
-
-	return nil
-}
-
 func invokeResponseFactory[T ProtoMessage](factory func() T) (message T, err error) {
 	defer func() {
 		if recover() != nil {
@@ -405,16 +408,31 @@ func newResponseStreamFailure(reason string, status *Status, cause error) error 
 	return &responseStreamFailure{reason: reason, status: status, cause: cause}
 }
 
-// responseMessageStream decodes the response frames of one streaming call. It
-// implements ResponseStream.
+// responseMessageStream decodes the response frames of one call and enforces
+// the response grammar: optional HEADERS, then messages, then one STATUS. It
+// implements ServerStreamingCall.
 type responseMessageStream[T ProtoMessage] struct {
-	inner          frameStream
-	newMessage     func() T
-	config         callConfig
-	ctx            context.Context
-	cancel         context.CancelFunc
-	finishOnce     sync.Once
+	inner      frameStream
+	newMessage func() T
+	config     callConfig
+	ctx        context.Context
+	cancel     context.CancelFunc
+	finishOnce sync.Once
+
+	// readMu serializes frame reads by Recv and Headers.
+	readMu sync.Mutex
+	// ready is closed, once Headers has had to wait on it, when the headers
+	// are known: the first response frame has arrived or the stream finished.
+	// It is guarded by mu.
+	ready chan struct{}
+	// pending is a frame, or the error, that Headers read ahead for Recv.
+	pending    responseFrame
+	hasPending bool
+	pendingErr error
+
 	mu             sync.Mutex
+	headers        Metadata
+	headersClosed  bool // a frame arrived, so HEADERS may no longer
 	done           bool
 	closedLocally  bool
 	closeErr       error
@@ -428,6 +446,9 @@ func newResponseMessageStream[T ProtoMessage](ctx context.Context, inner frameSt
 
 func (s *responseMessageStream[T]) Recv() (T, error) {
 	var zero T
+	if err := s.takePendingError(); err != nil {
+		return zero, err
+	}
 	s.mu.Lock()
 	done := s.done
 	s.mu.Unlock()
@@ -435,101 +456,261 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 		return zero, io.EOF
 	}
 
+	for {
+		frame, err := s.nextFrame()
+		if err != nil {
+			return zero, err
+		}
+
+		switch frame.kind {
+		case frameTypeHeaders:
+			continue
+		case frameTypeMessage:
+			if len(frame.body) > s.config.maxResponseSize {
+				s.abort()
+				return zero, &FrameTooLargeError{Len: len(frame.body), Max: s.config.maxResponseSize}
+			}
+
+			message, err := invokeResponseFactory(s.newMessage)
+			if err != nil {
+				s.abort()
+				return zero, err
+			}
+			if err := unmarshalMessage(frame.body, message); err != nil {
+				s.abort()
+				return zero, newResponseStreamFailure(
+					"malformed_protobuf",
+					Internal("failed to decode response: "+err.Error()),
+					err,
+				)
+			}
+
+			return message, nil
+		case frameTypeStatus:
+			return zero, s.finishWithStatus(frame.status)
+		default:
+			s.abort()
+			return zero, newResponseStreamFailure(
+				"unsupported_frame_kind",
+				Internal(fmt.Sprintf("response stream contained %s", frame.kind)),
+				nil,
+			)
+		}
+	}
+}
+
+// finishWithStatus completes the stream with its terminal status. The
+// transport must end right after it; frames of unknown type are skipped
+// before that.
+func (s *responseMessageStream[T]) finishWithStatus(status *Status) error {
+	if err := validateMetadata(status.Metadata); err != nil {
+		s.abort()
+		return newResponseStreamFailure(
+			"invalid_metadata",
+			Internal("invalid response metadata: "+err.Error()),
+			err,
+		)
+	}
+	_, trailingErr := recvClientFrame(s.ctx, s.inner)
+	if trailingErr == nil {
+		s.abort()
+		return newResponseStreamFailure(
+			"trailing_frame",
+			Internal("response stream contained data after final status"),
+			nil,
+		)
+	}
+	if !errors.Is(trailingErr, io.EOF) {
+		s.abort()
+		return newResponseStreamFailure(
+			"trailing_frame",
+			Internal("response stream did not end cleanly after final status"),
+			trailingErr,
+		)
+	}
+	s.mu.Lock()
+	s.terminalStatus = status
+	s.mu.Unlock()
+	cleanupErr := s.finish()
+
+	if status.IsOK() {
+		if cleanupErr != nil {
+			return cleanupErr
+		}
+		return io.EOF
+	}
+
+	return newResponseStreamFailure("remote_status", status, nil)
+}
+
+// Headers returns the response headers, reading ahead to the first response
+// frame if it has not arrived yet. A message or status read this way is kept
+// for Recv. A failure is returned here and again by Recv.
+func (s *responseMessageStream[T]) Headers() (Metadata, error) {
+	for {
+		if headers, resolved, err := s.resolvedHeaders(); resolved {
+			return headers, err
+		}
+		if !s.readMu.TryLock() {
+			// Recv is waiting for a frame. It records the headers when they
+			// arrive, so Headers does not have to wait for a message.
+			<-s.readySignal()
+			continue
+		}
+		if headers, err := s.readAhead(); headers != nil || err != nil {
+			return headers, err
+		}
+	}
+}
+
+// readAhead reads the first response frame for Headers. The caller holds
+// readMu; readAhead releases it.
+func (s *responseMessageStream[T]) readAhead() (Metadata, error) {
+	defer s.readMu.Unlock()
+	if headers, resolved, err := s.resolvedHeaders(); resolved {
+		return headers, err
+	}
+
+	frame, err := s.readFrame()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, Cancelled("response stream closed")
+		}
+		s.pendingErr = err
+		return nil, err
+	}
+	if frame.kind != frameTypeHeaders {
+		s.pending, s.hasPending = frame, true
+	}
+	headers, _, _ := s.resolvedHeaders()
+	return headers, nil
+}
+
+// readySignal returns a channel that is closed once the headers are known.
+func (s *responseMessageStream[T]) readySignal() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ready == nil {
+		s.ready = make(chan struct{})
+		if s.headersClosed || s.done {
+			close(s.ready)
+		}
+	}
+	return s.ready
+}
+
+// signalReadyLocked wakes the Headers calls that wait for the headers. The
+// caller holds mu.
+func (s *responseMessageStream[T]) signalReadyLocked() {
+	if s.ready == nil {
+		return
+	}
+	select {
+	case <-s.ready:
+	default:
+		close(s.ready)
+	}
+}
+
+// takePendingError returns the failure Headers read ahead for Recv, once.
+func (s *responseMessageStream[T]) takePendingError() error {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	err := s.pendingErr
+	s.pendingErr = nil
+	return err
+}
+
+// resolvedHeaders reports whether the headers are known, either because the
+// first frame arrived or because the stream ended without one.
+func (s *responseMessageStream[T]) resolvedHeaders() (Metadata, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.headersClosed {
+		return cloneMetadata(s.headers), true, nil
+	}
+	if s.done {
+		if s.closedLocally {
+			return nil, true, Cancelled("response stream closed")
+		}
+		return Metadata{}, true, nil
+	}
+	return nil, false, nil
+}
+
+// nextFrame returns the frame to process next: one Headers read ahead, or the
+// next frame of the transport.
+func (s *responseMessageStream[T]) nextFrame() (responseFrame, error) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if s.hasPending {
+		frame := s.pending
+		s.pending, s.hasPending = responseFrame{}, false
+		return frame, nil
+	}
+	return s.readFrame()
+}
+
+// readFrame receives the next frame from the transport. It validates and
+// records HEADERS, and fails the stream when HEADERS comes second or after
+// another frame. On failure the stream has been aborted and the returned error
+// is the one to report; it is io.EOF when the stream was closed locally.
+func (s *responseMessageStream[T]) readFrame() (responseFrame, error) {
 	frame, err := recvClientFrame(s.ctx, s.inner)
 	if err != nil {
 		if s.wasClosedLocally() {
-			return zero, io.EOF
+			return responseFrame{}, io.EOF
 		}
 
 		s.abort()
 		if errors.Is(err, io.EOF) {
-			return zero, newResponseStreamFailure(
+			return responseFrame{}, newResponseStreamFailure(
 				"missing_terminal_status",
 				Internal("response stream ended before final status"),
 				err,
 			)
 		}
 		if _, ok := errors.AsType[*frameDecodeError](err); ok {
-			return zero, newResponseStreamFailure(
+			return responseFrame{}, newResponseStreamFailure(
 				"malformed_protobuf",
 				Internal("failed to decode response frame: "+err.Error()),
 				err,
 			)
 		}
 
-		return zero, err
+		return responseFrame{}, err
 	}
 
-	switch frame.kind {
-	case wireFrameMessage:
-		if len(frame.body) > s.config.maxResponseSize {
+	s.mu.Lock()
+	headersClosed := s.headersClosed
+	s.mu.Unlock()
+	if frame.kind == frameTypeHeaders {
+		if headersClosed {
 			s.abort()
-			return zero, &FrameTooLargeError{Len: len(frame.body), Max: s.config.maxResponseSize}
-		}
-
-		message, err := invokeResponseFactory(s.newMessage)
-		if err != nil {
-			s.abort()
-			return zero, err
-		}
-		if err := unmarshalMessage(frame.body, message); err != nil {
-			s.abort()
-			return zero, newResponseStreamFailure(
-				"malformed_protobuf",
-				Internal("failed to decode response: "+err.Error()),
-				err,
-			)
-		}
-
-		return message, nil
-	case wireFrameStatus:
-		if err := validateMetadata(frame.metadata); err != nil {
-			s.abort()
-			return zero, newResponseStreamFailure(
-				"invalid_metadata",
-				Internal("invalid response metadata: "+err.Error()),
-				err,
-			)
-		}
-		status := frame.statusValue()
-		_, trailingErr := recvClientFrame(s.ctx, s.inner)
-		if trailingErr == nil {
-			s.abort()
-			return zero, newResponseStreamFailure(
-				"trailing_frame",
-				Internal("response stream contained data after final status"),
+			return responseFrame{}, newResponseStreamFailure(
+				"unexpected_headers",
+				Internal("response stream contained HEADERS after another frame"),
 				nil,
 			)
 		}
-		if !errors.Is(trailingErr, io.EOF) {
+		if err := validateMetadata(frame.headers); err != nil {
 			s.abort()
-			return zero, newResponseStreamFailure(
-				"trailing_frame",
-				Internal("response stream did not end cleanly after final status"),
-				trailingErr,
+			return responseFrame{}, newResponseStreamFailure(
+				"invalid_metadata",
+				Internal("invalid response headers: "+err.Error()),
+				err,
 			)
 		}
-		s.mu.Lock()
-		s.terminalStatus = status
-		s.mu.Unlock()
-		cleanupErr := s.finish()
-
-		if status.IsOK() {
-			if cleanupErr != nil {
-				return zero, cleanupErr
-			}
-			return zero, io.EOF
-		}
-
-		return zero, newResponseStreamFailure("remote_status", status, nil)
-	default:
-		s.abort()
-		return zero, newResponseStreamFailure(
-			"unsupported_frame_kind",
-			InvalidArgument("response stream contained an unknown frame kind"),
-			nil,
-		)
 	}
+
+	s.mu.Lock()
+	if frame.kind == frameTypeHeaders {
+		s.headers = frame.headers
+	}
+	s.headersClosed = true
+	s.signalReadyLocked()
+	s.mu.Unlock()
+	return frame, nil
 }
 
 func (s *responseMessageStream[T]) TerminalStatus() (*Status, bool) {
@@ -546,6 +727,7 @@ func (s *responseMessageStream[T]) finish() error {
 	s.finishOnce.Do(func() {
 		s.mu.Lock()
 		s.done = true
+		s.signalReadyLocked()
 		s.mu.Unlock()
 
 		s.cancel()
@@ -584,27 +766,10 @@ func (s *responseMessageStream[T]) Close() error {
 	return s.finish()
 }
 
-// recvClientFrame receives the next response frame fields, ending early with a
+// recvClientFrame receives the next response frame, ending early with a
 // status when ctx is cancelled or its deadline passes.
-func recvClientFrame(ctx context.Context, stream frameStream) (streamFrameFields, error) {
-	if fieldsReceiver, ok := stream.(responseStreamFrameFieldsReceiver); ok {
-		return recvWithContext(ctx, stream, fieldsReceiver.trevrpcRecvStreamFrameFields)
-	}
-
-	return recvWithContext(ctx, stream, func() (streamFrameFields, error) {
-		frame, err := stream.Recv()
-		if err != nil {
-			return streamFrameFields{}, err
-		}
-
-		return streamFrameFields{
-			kind:     frame.Kind,
-			status:   frame.Status,
-			message:  frame.Message,
-			body:     frame.Body,
-			metadata: frame.Metadata,
-		}, nil
-	})
+func recvClientFrame(ctx context.Context, stream frameStream) (responseFrame, error) {
+	return recvWithContext(ctx, stream, stream.Recv)
 }
 
 // recvWithContext runs recv on stream so that ctx cancellation and its deadline
@@ -677,10 +842,11 @@ func readDeadlineError(ctx context.Context, hasDeadline bool, err error) error {
 	return nil
 }
 
-// readSingleResponse drains a client-streaming response stream and returns its
-// only message with the terminal metadata. The whole stream is read first so a
-// server-reported failure takes precedence over a cardinality error.
-func readSingleResponse[Res ProtoMessage](responses ResponseStream[Res]) (Res, Metadata, error) {
+// readSingleResponse drains the response of a unary or client-streaming call
+// and returns its only message with the response headers and trailing
+// metadata. The whole stream is read first so a server-reported failure takes
+// precedence over a cardinality error.
+func readSingleResponse[Res ProtoMessage](responses *responseMessageStream[Res]) (Res, Metadata, Metadata, error) {
 	var first, zero Res
 	responseCount := 0
 	for {
@@ -693,21 +859,25 @@ func readSingleResponse[Res ProtoMessage](responses ResponseStream[Res]) (Res, M
 			continue
 		}
 		if !errors.Is(err, io.EOF) {
-			return zero, nil, err
+			return zero, nil, nil, err
 		}
 		break
 	}
 
 	status, ok := responses.TerminalStatus()
 	if !ok || status == nil {
-		return zero, nil, Internal("response stream ended before final status")
+		return zero, nil, nil, Internal("response stream ended before final status")
 	}
 	if responseCount != 1 {
-		return zero, nil, newResponseStreamFailure(
+		return zero, nil, nil, newResponseStreamFailure(
 			"response_cardinality",
-			Internal(fmt.Sprintf("client-streaming RPC returned %d response messages; expected exactly one", responseCount)),
+			Internal(fmt.Sprintf("RPC returned %d response messages; expected exactly one", responseCount)),
 			nil,
 		)
 	}
-	return first, status.Metadata, nil
+	headers, err := responses.Headers()
+	if err != nil {
+		return zero, nil, nil, err
+	}
+	return first, headers, status.Metadata, nil
 }

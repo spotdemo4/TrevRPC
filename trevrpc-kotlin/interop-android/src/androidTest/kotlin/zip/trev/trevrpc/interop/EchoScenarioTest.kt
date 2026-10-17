@@ -140,7 +140,36 @@ private val SCENARIOS: Map<String, suspend (EchoClient) -> Unit> =
                 call.close()
             }
         },
+        "unary-headers" to { client ->
+            val response = client.unaryResponse(request("hello"), headerOptions())
+            expectEcho(response.message, "hello", 0)
+            expectMetadata("headers", response.headers, "interop-header")
+            expectMetadata("trailing metadata", response.metadata, "interop-trailer")
+        },
+        "server-stream-headers" to { client ->
+            val call = client.serverStreamResponse(request("s", count = 2), headerOptions())
+            try {
+                expectMetadata("headers", call.headers(), "interop-header")
+                expectEcho(checkNotNull(call.receive()) { "stream ended before response 0" }, "s", 0)
+                expectEcho(checkNotNull(call.receive()) { "stream ended before response 1" }, "s", 1)
+                expect(call.receive() == null) { "expected the stream to end with OK" }
+                expectMetadata("trailing metadata", call.responseMetadata, "interop-trailer")
+            } finally {
+                call.close()
+            }
+        },
     )
+
+private fun headerOptions(): CallOptions =
+    CallOptions(timeout = 10.seconds, metadata = Metadata.of("interop-header" to "h".encodeToByteArray()))
+
+private fun expectMetadata(
+    what: String,
+    actual: Metadata,
+    key: String,
+) {
+    expect(actual == Metadata.of(key to "h".encodeToByteArray())) { "expected $what {$key: h}, got $actual" }
+}
 
 private fun request(
     message: String,

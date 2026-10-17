@@ -83,7 +83,8 @@ export class QMuxWebSocketSession {
     if (typeof WebSocketConstructor !== "function") {
       throw transportError("WebSocket is not available in this JavaScript runtime");
     }
-    this.#window = (options.maxFrameSize ?? DefaultMaxFrameSize) + 4;
+    // A frame header is at most 16 bytes, so the window fits one maximum-size frame.
+    this.#window = (options.maxFrameSize ?? DefaultMaxFrameSize) + 16;
     this.#connRecvMax = this.#window;
     this.ready = new Promise((resolve, reject) => {
       this.#settleReady = { resolve, reject };

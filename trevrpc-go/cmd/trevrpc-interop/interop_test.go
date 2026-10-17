@@ -24,6 +24,7 @@ import (
 var wantScenarios = []string{
 	"unary", "unary-metadata", "unary-error", "unary-large", "client-stream",
 	"server-stream", "server-stream-error", "bidi", "bidi-error",
+	"unary-headers", "server-stream-headers",
 }
 
 // writeTestCertificate writes a localhost ECDSA P-256 certificate and key like

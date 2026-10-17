@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(
             transport_limits(&options),
             TransportLimits {
-                stream_receive_window: 1028,
+                stream_receive_window: 1040,
                 connection_receive_window: 4096,
                 max_concurrent_bidi_streams: Some(12),
             }

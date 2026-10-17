@@ -10,8 +10,8 @@ use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStr
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::serve::{drain_streams, log_task_error};
 use crate::server::Server;
-use crate::server_transport::{self, ResponseWriter, try_acquire_permit};
-use crate::{Result, RpcRequest, RpcResponse, RpcStreamFrame};
+use crate::server_transport::{self, IncomingRequest, ResponseWriter, try_acquire_permit};
+use crate::{ResponseFrame, Result};
 
 struct NativeResponseWriter<S> {
     send: S,
@@ -28,16 +28,8 @@ impl<S: MuxSendStream> NativeResponseWriter<S> {
 }
 
 impl<S: MuxSendStream> ResponseWriter for NativeResponseWriter<S> {
-    async fn write_response(&mut self, response: &RpcResponse) -> Result<()> {
-        framed::write_frame(&mut self.send, response, self.max_frame_size).await
-    }
-
-    async fn write_message_stream_frames(&mut self, bodies: &mut Vec<Vec<u8>>) -> Result<()> {
-        framed::write_message_stream_frames(&mut self.send, bodies, self.max_frame_size).await
-    }
-
-    async fn write_stream_frame(&mut self, frame: RpcStreamFrame) -> Result<()> {
-        framed::write_stream_frame(&mut self.send, frame, self.max_frame_size).await
+    async fn write_frames(&mut self, frames: &mut Vec<ResponseFrame>) -> Result<()> {
+        framed::write_response_frames(&mut self.send, frames, self.max_frame_size).await
     }
 
     async fn stopped(&mut self) -> Result<()> {
@@ -73,17 +65,6 @@ impl<C: MuxConnection> FrameRead for NativePumpReader<C> {
 impl<C: MuxConnection> RequestPumpReader for NativePumpReader<C> {
     fn stop_trevrpc(&mut self) {
         self.recv.stop_stream(CANCELLED_STREAM_CODE);
-    }
-
-    async fn read_unary_end(&mut self) -> Result<()> {
-        framed::drain_unary_request_end(&mut self.recv).await
-    }
-
-    async fn read_stream_frame_or_eof(
-        &mut self,
-        max_frame_size: usize,
-    ) -> Result<Option<RpcStreamFrame>> {
-        framed::read_stream_frame_or_eof(&mut self.recv, max_frame_size).await
     }
 
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
@@ -176,15 +157,15 @@ async fn read_request<C: MuxConnection>(
 ) -> Option<(
     NativeResponseWriter<C::SendStream>,
     NativePumpReader<C>,
-    RpcRequest,
+    IncomingRequest,
 )> {
     let max_frame_size = server.max_frame_size();
     let mut recv = NativePumpReader::new(recv, connection);
     match server_transport::read_initial_request(server, &mut recv.recv).await {
-        Ok(request) => Some((
+        Ok(incoming) => Some((
             NativeResponseWriter::new(send, max_frame_size),
             recv,
-            request,
+            incoming,
         )),
         Err(error) => {
             recv.stop_trevrpc();
@@ -205,8 +186,9 @@ async fn handle_stream<C: MuxConnection>(
     recv: C::RecvStream,
     shutdown: watch::Receiver<bool>,
 ) {
-    if let Some((send, recv, request)) = read_request(&server, connection, send, recv).await {
-        server_transport::handle_stream(server, request_limit, send, recv, request, shutdown).await;
+    if let Some((send, recv, incoming)) = read_request(&server, connection, send, recv).await {
+        server_transport::handle_stream(server, request_limit, send, recv, incoming, shutdown)
+            .await;
     }
 }
 
@@ -216,7 +198,7 @@ async fn reject_stream<C: MuxConnection>(
     send: C::SendStream,
     recv: C::RecvStream,
 ) {
-    if let Some((send, recv, request)) = read_request(&server, connection, send, recv).await {
-        server_transport::reject_stream(server, send, recv, request).await;
+    if let Some((send, recv, incoming)) = read_request(&server, connection, send, recv).await {
+        server_transport::reject_stream(server, send, recv, incoming).await;
     }
 }

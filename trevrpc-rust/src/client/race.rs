@@ -9,7 +9,9 @@ use tokio::time::Instant;
 
 use super::{QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
 use crate::sync::MutexExt as _;
-use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+use bytes::Bytes;
+
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
 
 pub const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
 pub const DEFAULT_REPROBE_INTERVAL: Duration = Duration::from_mins(5);
@@ -73,10 +75,10 @@ impl GenerationTransport {
 
 #[crate::async_trait]
 impl RpcTransport for GenerationTransport {
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
+    async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
         match self {
-            Self::Quic(transport) => transport.call(request).await,
-            Self::Qmux(transport) => transport.call(request).await,
+            Self::Quic(transport) => transport.call(request, body).await,
+            Self::Qmux(transport) => transport.call(request, body).await,
         }
     }
 }
@@ -87,7 +89,7 @@ impl StreamingRpcTransport for GenerationTransport {
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>> {
+    ) -> Result<BoxStream<ResponseFrame>> {
         match self {
             Self::Quic(transport) => transport.streaming_call(request, request_body).await,
             Self::Qmux(transport) => transport.streaming_call(request, request_body).await,

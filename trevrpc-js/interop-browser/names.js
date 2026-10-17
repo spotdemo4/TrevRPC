@@ -9,4 +9,6 @@ export const ScenarioNames = Object.freeze([
   "server-stream-error",
   "bidi",
   "bidi-error",
+  "unary-headers",
+  "server-stream-headers",
 ]);

@@ -89,6 +89,35 @@ const scenarios = {
     await call.send({ failCode: Code.Aborted, failMessage: "abort" });
     await expectStatus(Code.Aborted, "abort", () => call.recv());
   },
+
+  async "unary-headers"(echo) {
+    const response = await echo.unaryWithResponse(
+      { message: "hello" },
+      { metadata: { "interop-header": "h" } },
+    );
+    expectEcho(response.message, "hello", 0);
+    expectMetadata(response.headers, { "interop-header": "h" }, "headers");
+    expectMetadata(response.metadata, { "interop-trailer": "h" }, "trailing metadata");
+  },
+
+  async "server-stream-headers"(echo) {
+    const stream = await echo.serverStream(
+      { message: "s", count: 2 },
+      { metadata: { "interop-header": "h" } },
+    );
+    expectMetadata(await stream.headers, { "interop-header": "h" }, "headers");
+    const received = [];
+    for await (const response of stream) {
+      received.push(response);
+    }
+    expectEchoes(received, [
+      ["s", 0],
+      ["s", 1],
+    ]);
+    const status = await stream.status;
+    expect(status.code === Code.Ok, "stream did not end with OK");
+    expectMetadata(status.metadata, { "interop-trailer": "h" }, "trailing metadata");
+  },
 };
 
 /** The channel transports each interop lane allows. */
@@ -185,6 +214,18 @@ function expectEchoes(responses, expected) {
     actual.join(",") === expected.map(([message, index]) => summary(message, index)).join(","),
     `expected ${expected.length} responses [${expected.map(([m, i]) => summary(m, i))}], got ${actual.length} [${actual}]`,
   );
+}
+
+/** Checks a metadata map holds exactly the expected text values. */
+function expectMetadata(metadata, expected, what) {
+  const decoder = new TextDecoder();
+  const actual = Object.fromEntries(
+    Object.entries(metadata ?? {}).map(([key, value]) => [key, decoder.decode(value)]),
+  );
+  const same =
+    Object.keys(actual).length === Object.keys(expected).length &&
+    Object.entries(expected).every(([key, value]) => actual[key] === value);
+  expect(same, `expected ${what} ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
 /** Runs an operation that must fail with the given status code and message. */

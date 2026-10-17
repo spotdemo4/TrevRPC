@@ -1,10 +1,12 @@
 package zip.trev.trevrpc
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
@@ -26,8 +28,12 @@ class ClientRuntimeTest {
             val unary = client.unaryResponse("test.Service", "Unary", "x", strings, strings)
             assertEquals("u:x", unary.message)
             assertEquals(1, unary.metadata["result"]?.single())
+            assertEquals(2, unary.headers["server"]?.single())
+            assertNull(unary.headers["result"])
+            assertNull(unary.metadata["server"])
 
             val serverStream = client.serverStreaming("test.Service", "ServerStream", "s", strings, strings)
+            assertEquals(2, serverStream.headers()["server"]?.single())
             assertEquals("s-1", serverStream.receive())
             assertEquals("s-2", serverStream.receive())
             assertNull(serverStream.receive())
@@ -37,10 +43,14 @@ class ClientRuntimeTest {
             clientStream.send("a")
             clientStream.send("b")
             clientStream.closeSend()
-            assertEquals("a,b", clientStream.receive().message)
+            val clientResponse = clientStream.receive()
+            assertEquals("a,b", clientResponse.message)
+            assertEquals(2, clientResponse.headers["server"]?.single())
+            assertEquals(1, clientResponse.metadata["result"]?.single())
 
             val bidi = client.bidirectionalStreaming("test.Service", "Bidi", strings, strings)
             bidi.send("a")
+            assertEquals(2, bidi.headers()["server"]?.single())
             assertEquals("echo:a", bidi.receive())
             bidi.send("b")
             bidi.closeSend()
@@ -54,7 +64,7 @@ class ClientRuntimeTest {
         runBlocking {
             val trace = Metadata.of("trace" to byteArrayOf(9))
             val call =
-                Client(StaticStreamTransport(RpcStreamFrame.status(Status(Code.ABORTED, "stream failed", trace))))
+                Client(StaticStreamTransport(status(Status(Code.ABORTED, "stream failed", trace))))
                     .serverStreaming("test.Service", "Fail", "request", strings, strings)
 
             val failure = assertThrows(TrevRpcException::class.java) { runBlocking { call.receive() } }
@@ -68,8 +78,8 @@ class ClientRuntimeTest {
         runTest {
             val stream =
                 RecordingClientStream(
-                    RpcStreamFrame.message("reply".encodeToByteArray()),
-                    RpcStreamFrame.status(Status.ok()),
+                    message("reply"),
+                    status(Status.ok()),
                 )
             val call =
                 Client(SingleStreamTransport(stream))
@@ -87,10 +97,46 @@ class ClientRuntimeTest {
             assertEquals("reply", call.receive().message)
             assertEquals(1, stream.closes)
 
-            val serverStream = RecordingClientStream(RpcStreamFrame.status(Status.ok()))
-            Client(SingleStreamTransport(serverStream))
-                .serverStreaming("svc", "method", "request", strings, strings)
-            assertEquals(1, serverStream.finishes)
+            val serverStream = RecordingClientStream(status(Status.ok()))
+            val transport = SingleStreamTransport(serverStream)
+            Client(transport).serverStreaming("svc", "method", "request", strings, strings)
+            // REQUEST, the only MESSAGE, and the half-close travel in the one open; nothing is sent after.
+            assertEquals(listOf("request"), transport.firstMessages.map { it?.decodeToString() })
+            assertEquals(listOf(true), transport.finishSends)
+            assertEquals(RpcKind.SERVER_STREAMING.value, transport.requests.single().kindValue)
+            assertEquals(0, serverStream.finishes)
+            assertEquals(0, serverStream.sent.size)
+        }
+
+    @Test
+    fun `unary writes request and message together with half close and no idle timeout`() =
+        runTest {
+            val stream = RecordingClientStream(message("reply"), status(Status.ok()))
+            val transport = SingleStreamTransport(stream)
+            val response =
+                Client(
+                    transport,
+                ).unary("svc", "method", "request", strings, strings, CallOptions(streamIdleTimeout = 1.milliseconds))
+            assertEquals("reply", response)
+            assertEquals(listOf("request"), transport.firstMessages.map { it?.decodeToString() })
+            assertEquals(listOf(true), transport.finishSends)
+            assertEquals(RpcKind.UNARY.value, transport.requests.single().kindValue)
+            assertEquals(1, stream.closes)
+        }
+
+    @Test
+    fun `client and bidirectional streaming open without a message or half close`() =
+        runTest {
+            val transport = SingleStreamTransport(RecordingClientStream())
+            val client = Client(transport)
+            client.clientStreaming<String, String>("svc", "method", strings, strings)
+            client.bidirectionalStreaming<String, String>("svc", "method", strings, strings)
+            assertEquals(listOf(null, null), transport.firstMessages)
+            assertEquals(listOf(false, false), transport.finishSends)
+            assertEquals(
+                listOf(RpcKind.CLIENT_STREAMING.value, RpcKind.BIDIRECTIONAL_STREAMING.value),
+                transport.requests.map(RpcRequest::kindValue),
+            )
         }
 
     @Test
@@ -112,12 +158,16 @@ class ClientRuntimeTest {
             assertCode(Code.DEADLINE_EXCEEDED) { upload.send("request") }
             assertEquals(1, sendCloses.get())
 
-            val finishCloses = AtomicInteger()
-            val blockedFinish =
-                SequenceStream(onClose = { finishCloses.incrementAndGet() }) { awaitCancellation() }
-                    .apply { finishOperation = { awaitCancellation() } }
+            val blockedOpen =
+                object : RpcTransport {
+                    override suspend fun openStream(
+                        request: RpcRequest,
+                        firstMessage: ByteArray?,
+                        finishSend: Boolean,
+                    ): RpcClientStream = awaitCancellation()
+                }
             assertCode(Code.DEADLINE_EXCEEDED) {
-                Client(SingleStreamTransport(blockedFinish))
+                Client(blockedOpen)
                     .serverStreaming(
                         "svc",
                         "method",
@@ -127,18 +177,12 @@ class ClientRuntimeTest {
                         CallOptions(timeout = 1.seconds),
                     )
             }
-            assertEquals(1, finishCloses.get())
         }
 
     @Test
     fun `client enforces deadline idle message body and per-message limits`() =
         runTest {
-            val pendingTransport =
-                object : RpcTransport {
-                    override suspend fun unary(request: RpcRequest): RpcResponse = awaitCancellation()
-
-                    override suspend fun openStream(request: RpcRequest): RpcClientStream = SequenceStream { awaitCancellation() }
-                }
+            val pendingTransport = SingleStreamTransport(SequenceStream { awaitCancellation() })
             val client = Client(pendingTransport)
             assertCode(Code.DEADLINE_EXCEEDED) {
                 client.unary(
@@ -164,9 +208,9 @@ class ClientRuntimeTest {
             val messageLimited =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("a".encodeToByteArray()),
-                        RpcStreamFrame.message("b".encodeToByteArray()),
-                        RpcStreamFrame.status(Status.ok()),
+                        message("a"),
+                        message("b"),
+                        status(Status.ok()),
                     ),
                 ).serverStreaming(
                     "svc",
@@ -182,8 +226,8 @@ class ClientRuntimeTest {
             val bodyLimited =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("ab".encodeToByteArray()),
-                        RpcStreamFrame.message("c".encodeToByteArray()),
+                        message("ab"),
+                        message("c"),
                     ),
                 ).serverStreaming(
                     "svc",
@@ -199,7 +243,7 @@ class ClientRuntimeTest {
             val frameLimited =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("ab".encodeToByteArray()),
+                        message("ab"),
                     ),
                 ).serverStreaming(
                     "svc",
@@ -218,8 +262,8 @@ class ClientRuntimeTest {
             val closes = AtomicInteger()
             val terminalFrames =
                 listOf(
-                    RpcStreamFrame.message("ok".encodeToByteArray()),
-                    RpcStreamFrame.status(Status.ok(Metadata.of("trace" to byteArrayOf(7)))),
+                    message("ok"),
+                    status(Status.ok(Metadata.of("trace" to byteArrayOf(7)))),
                 ).iterator()
             val terminal =
                 Client(
@@ -237,16 +281,11 @@ class ClientRuntimeTest {
             val eof = Client(StaticStreamTransport()).serverStreaming("svc", "method", "request", strings, strings)
             assertCode(Code.INTERNAL) { eof.receive() }
 
-            val unknown =
-                Client(StaticStreamTransport(RpcStreamFrame(kindValue = 99)))
-                    .serverStreaming("svc", "method", "request", strings, strings)
-            assertCode(Code.INVALID_ARGUMENT) { unknown.receive() }
-
             val trailingCloses = AtomicInteger()
             val trailingFrames =
                 listOf(
-                    RpcStreamFrame.status(Status.unavailable("remote")),
-                    RpcStreamFrame.message("late".encodeToByteArray()),
+                    status(Status.unavailable("remote")),
+                    message("late"),
                 ).iterator()
             val trailing =
                 Client(
@@ -264,7 +303,7 @@ class ClientRuntimeTest {
                 Client(
                     SingleStreamTransport(
                         SequenceStream {
-                            if (pendingTerminalReads++ == 0) RpcStreamFrame.status(Status.ok()) else awaitCancellation()
+                            if (pendingTerminalReads++ == 0) status(Status.ok()) else awaitCancellation()
                         },
                     ),
                 ).serverStreaming(
@@ -284,7 +323,7 @@ class ClientRuntimeTest {
                     SingleStreamTransport(
                         SequenceStream {
                             if (malformedTrailingReads++ == 0) {
-                                RpcStreamFrame.status(Status.ok())
+                                status(Status.ok())
                             } else {
                                 throw TrevRpcException(Status.internal("malformed trailing protobuf"))
                             }
@@ -299,9 +338,9 @@ class ClientRuntimeTest {
             val multiple =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("one".encodeToByteArray()),
-                        RpcStreamFrame.message("two".encodeToByteArray()),
-                        RpcStreamFrame.status(Status.ok()),
+                        message("one"),
+                        message("two"),
+                        status(Status.ok()),
                     ),
                 ).clientStreaming<String, String>("svc", "method", strings, strings)
             assertStatus(
@@ -312,8 +351,8 @@ class ClientRuntimeTest {
             val multipleWithoutStatus =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("one".encodeToByteArray()),
-                        RpcStreamFrame.message("two".encodeToByteArray()),
+                        message("one"),
+                        message("two"),
                     ),
                 ).clientStreaming<String, String>("svc", "method", strings, strings)
             assertStatus(Code.INTERNAL, "response stream ended before final status") {
@@ -323,9 +362,9 @@ class ClientRuntimeTest {
             val multipleThenRemote =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("one".encodeToByteArray()),
-                        RpcStreamFrame.message("two".encodeToByteArray()),
-                        RpcStreamFrame.status(Status.unavailable("remote")),
+                        message("one"),
+                        message("two"),
+                        status(Status.unavailable("remote")),
                     ),
                 ).clientStreaming<String, String>("svc", "method", strings, strings)
             assertStatus(Code.UNAVAILABLE, "remote") { multipleThenRemote.receive() }
@@ -333,10 +372,10 @@ class ClientRuntimeTest {
             val multipleThenTrailing =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("one".encodeToByteArray()),
-                        RpcStreamFrame.message("two".encodeToByteArray()),
-                        RpcStreamFrame.status(Status.ok()),
-                        RpcStreamFrame.message("late".encodeToByteArray()),
+                        message("one"),
+                        message("two"),
+                        status(Status.ok()),
+                        message("late"),
                     ),
                 ).clientStreaming<String, String>("svc", "method", strings, strings)
             assertStatus(Code.INTERNAL, "response stream contained data after final status") {
@@ -346,30 +385,18 @@ class ClientRuntimeTest {
             val oneThenRemote =
                 Client(
                     StaticStreamTransport(
-                        RpcStreamFrame.message("one".encodeToByteArray()),
-                        RpcStreamFrame.status(Status.unavailable("remote")),
+                        message("one"),
+                        status(Status.unavailable("remote")),
                     ),
                 ).clientStreaming<String, String>("svc", "method", strings, strings)
             assertCode(Code.UNAVAILABLE) { oneThenRemote.receive() }
 
             val messageWithoutStatus =
-                Client(StaticStreamTransport(RpcStreamFrame.message("one".encodeToByteArray())))
+                Client(StaticStreamTransport(message("one")))
                     .clientStreaming<String, String>("svc", "method", strings, strings)
             assertCode(Code.INTERNAL) { messageWithoutStatus.receive() }
 
-            val remote =
-                Client(
-                    object : RpcTransport {
-                        override suspend fun unary(request: RpcRequest): RpcResponse =
-                            RpcResponse(
-                                statusValue = Code.UNAVAILABLE.value,
-                                message = "remote down",
-                                body = ByteArray(1024),
-                            )
-
-                        override suspend fun openStream(request: RpcRequest): RpcClientStream = StaticStreamTransport().openStream(request)
-                    },
-                )
+            val remote = Client(StaticStreamTransport(status(Status.unavailable("remote down"))))
             assertCode(Code.UNAVAILABLE) {
                 remote.unary(
                     "svc",
@@ -387,12 +414,7 @@ class ClientRuntimeTest {
         runTest {
             val closes = AtomicInteger()
             val transport =
-                object : RpcTransport {
-                    override suspend fun unary(request: RpcRequest): RpcResponse = RpcResponse.ok(byteArrayOf())
-
-                    override suspend fun openStream(request: RpcRequest): RpcClientStream =
-                        SequenceStream(onClose = { closes.incrementAndGet() }) { awaitCancellation() }
-                }
+                SingleStreamTransport(SequenceStream(onClose = { closes.incrementAndGet() }) { awaitCancellation() })
             val call = Client(transport).bidirectionalStreaming<String, String>("svc", "method", strings, strings)
             call.close()
             call.close()
@@ -408,7 +430,7 @@ class ClientRuntimeTest {
 
                     override suspend fun finishSend() = Unit
 
-                    override suspend fun receive(): RpcStreamFrame = RpcStreamFrame.status(Status.unavailable("remote down"))
+                    override suspend fun receive(): ResponseFrame = status(Status.unavailable("remote down"))
 
                     override suspend fun close(cause: Throwable?): Unit = throw CancellationException("close cancelled")
                 }
@@ -418,6 +440,134 @@ class ClientRuntimeTest {
             val error = runCatching { call.receive() }.exceptionOrNull()
             assertTrue(error is CancellationException)
             assertEquals("close cancelled", error?.message)
+        }
+
+    @Test
+    fun `headers resolve on the first known frame without losing a message`() =
+        runTest {
+            val md = Metadata.of("x-h" to byteArrayOf(4))
+            val trailer = Metadata.of("x-t" to byteArrayOf(5))
+            val call =
+                Client(StaticStreamTransport(headers(md), message("a"), message("b"), status(Status.ok(trailer))))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+
+            assertEquals(md, call.headers())
+            assertEquals(md, call.headers())
+            assertEquals(Metadata.EMPTY, call.responseMetadata)
+            assertEquals("a", call.receive())
+            assertEquals("b", call.receive())
+            assertNull(call.receive())
+            assertEquals(md, call.headers())
+            assertEquals(trailer, call.responseMetadata)
+            assertEquals(trailer, call.terminalStatus?.metadata)
+        }
+
+    @Test
+    fun `absent headers are empty and a message read ahead is not lost`() =
+        runTest {
+            val absent =
+                Client(StaticStreamTransport(message("a"), status(Status.ok())))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertEquals(Metadata.EMPTY, absent.headers())
+            assertEquals("a", absent.receive())
+            assertNull(absent.receive())
+
+            val lone =
+                Client(StaticStreamTransport(status(Status.unavailable("down"))))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertEquals(Metadata.EMPTY, lone.headers())
+            assertCode(Code.UNAVAILABLE) { lone.receive() }
+
+            val afterReceive =
+                Client(StaticStreamTransport(headers(Metadata.of("x-h" to byteArrayOf(1))), message("a"), status(Status.ok())))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertEquals("a", afterReceive.receive())
+            assertEquals(1, afterReceive.headers()["x-h"]?.single())
+        }
+
+    @Test
+    fun `headers wait for the first frame while a receive is pending`() =
+        runTest {
+            val frames = Channel<ResponseFrame>(Channel.UNLIMITED)
+            val call =
+                Client(SingleStreamTransport(SequenceStream { frames.receiveCatching().getOrNull() }))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            val receiving = async { call.receive() }
+            val reading = async { call.headers() }
+            repeat(3) { yield() }
+            assertTrue(receiving.isActive)
+            assertTrue(reading.isActive)
+            frames.send(headers(Metadata.of("x-h" to byteArrayOf(9))))
+            frames.send(message("a"))
+            assertEquals("a", receiving.await())
+            assertEquals(9, reading.await()["x-h"]?.single())
+        }
+
+    @Test
+    fun `headers surface a stream failure and receive reports it too`() =
+        runTest {
+            val call = Client(StaticStreamTransport()).serverStreaming("svc", "method", "request", strings, strings)
+            assertCode(Code.INTERNAL) { call.headers() }
+            assertCode(Code.INTERNAL) { call.receive() }
+            assertNull(call.receive())
+
+            val idle =
+                Client(SingleStreamTransport(SequenceStream { awaitCancellation() }))
+                    .serverStreaming("svc", "method", "request", strings, strings, CallOptions(streamIdleTimeout = 1.seconds))
+            assertCode(Code.UNAVAILABLE) { idle.headers() }
+        }
+
+    @Test
+    fun `second HEADERS and HEADERS after a message or status are internal errors`() =
+        runTest {
+            val duplicate =
+                Client(StaticStreamTransport(headers(), headers(), status(Status.ok())))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertCode(Code.INTERNAL) { duplicate.receive() }
+
+            val afterMessage =
+                Client(StaticStreamTransport(message("a"), headers(), status(Status.ok())))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertEquals("a", afterMessage.receive())
+            assertCode(Code.INTERNAL) { afterMessage.receive() }
+
+            val afterStatus =
+                Client(StaticStreamTransport(message("a"), status(Status.ok()), headers()))
+                    .clientStreaming<String, String>("svc", "method", strings, strings)
+            assertStatus(Code.INTERNAL, "response stream contained data after final status") { afterStatus.receive() }
+
+            val lateHeadersApi =
+                Client(StaticStreamTransport(message("a"), headers()))
+                    .serverStreaming("svc", "method", "request", strings, strings)
+            assertEquals(Metadata.EMPTY, lateHeadersApi.headers())
+            assertEquals("a", lateHeadersApi.receive())
+            assertCode(Code.INTERNAL) { lateHeadersApi.receive() }
+
+            val unary = Client(StaticStreamTransport(message("a"), headers(), status(Status.ok())))
+            assertCode(Code.INTERNAL) { unary.unary("svc", "method", "request", strings, strings) }
+        }
+
+    @Test
+    fun `unary and client streaming envelopes carry headers separately from trailing metadata`() =
+        runTest {
+            val md = Metadata.of("x-h" to byteArrayOf(1))
+            val trailer = Metadata.of("x-t" to byteArrayOf(2))
+            val frames = arrayOf(headers(md), message("r"), status(Status.ok(trailer)))
+            val unary =
+                Client(StaticStreamTransport(*frames)).unaryResponse("svc", "method", "request", strings, strings)
+            assertEquals(ResponseEnvelope("r", trailer, md), unary)
+
+            val upload =
+                Client(StaticStreamTransport(*frames)).clientStreaming<String, String>("svc", "method", strings, strings)
+            assertEquals(ResponseEnvelope("r", trailer, md), upload.receive())
+
+            val noHeaders =
+                Client(StaticStreamTransport(message("r"), status(Status.ok(trailer))))
+                    .unaryResponse("svc", "method", "request", strings, strings)
+            assertEquals(ResponseEnvelope("r", trailer, Metadata.EMPTY), noHeaders)
+
+            val failed = Client(StaticStreamTransport(headers(md), status(Status.unavailable("down"))))
+            assertCode(Code.UNAVAILABLE) { failed.unaryResponse("svc", "method", "request", strings, strings) }
         }
 
     private suspend fun assertCode(
@@ -449,25 +599,42 @@ class ClientRuntimeTest {
         }
 }
 
-private class LoopbackTransport : RpcTransport {
-    override suspend fun unary(request: RpcRequest): RpcResponse =
-        RpcResponse.ok("u:${request.body.decodeToString()}".encodeToByteArray(), Metadata.of("result" to byteArrayOf(1)))
+private fun message(text: String): ResponseFrame = ResponseFrame.Message(text.encodeToByteArray())
 
-    override suspend fun openStream(request: RpcRequest): RpcClientStream {
-        val frames = Channel<RpcStreamFrame>(Channel.UNLIMITED)
+private fun status(status: Status): ResponseFrame = ResponseFrame.Status(status)
+
+private fun headers(metadata: Metadata = Metadata.EMPTY): ResponseFrame = ResponseFrame.Headers(metadata)
+
+private class LoopbackTransport : RpcTransport {
+    override suspend fun openStream(
+        request: RpcRequest,
+        firstMessage: ByteArray?,
+        finishSend: Boolean,
+    ): RpcClientStream {
+        val frames = Channel<ResponseFrame>(Channel.UNLIMITED)
         val kind = request.kind
-        if (kind == RpcKind.SERVER_STREAMING) {
-            val value = request.body.decodeToString()
-            frames.trySend(RpcStreamFrame.message("$value-1".encodeToByteArray()))
-            frames.trySend(RpcStreamFrame.message("$value-2".encodeToByteArray()))
-            frames.trySend(RpcStreamFrame.status(Status.ok()))
+        val serverHeader = Metadata.of("server" to byteArrayOf(2))
+        if (kind == RpcKind.UNARY) {
+            val value = checkNotNull(firstMessage).decodeToString()
+            frames.trySend(headers(serverHeader))
+            frames.trySend(message("u:$value"))
+            frames.trySend(status(Status.ok(Metadata.of("result" to byteArrayOf(1)))))
             frames.close()
+        } else if (kind == RpcKind.SERVER_STREAMING) {
+            val value = checkNotNull(firstMessage).decodeToString()
+            frames.trySend(headers(serverHeader))
+            frames.trySend(message("$value-1"))
+            frames.trySend(message("$value-2"))
+            frames.trySend(status(Status.ok()))
+            frames.close()
+        } else {
+            frames.trySend(headers(serverHeader))
         }
         val uploaded = mutableListOf<String>()
         return object : RpcClientStream {
             override suspend fun send(body: ByteArray) {
                 if (kind == RpcKind.BIDIRECTIONAL_STREAMING) {
-                    frames.send(RpcStreamFrame.message("echo:${body.decodeToString()}".encodeToByteArray()))
+                    frames.send(message("echo:${body.decodeToString()}"))
                 } else {
                     uploaded += body.decodeToString()
                 }
@@ -475,15 +642,15 @@ private class LoopbackTransport : RpcTransport {
 
             override suspend fun finishSend() {
                 if (kind == RpcKind.CLIENT_STREAMING) {
-                    frames.send(RpcStreamFrame.message(uploaded.joinToString(",").encodeToByteArray()))
+                    frames.send(message(uploaded.joinToString(",")))
                 }
-                if (kind != RpcKind.SERVER_STREAMING) {
-                    frames.send(RpcStreamFrame.status(Status.ok()))
+                if (kind == RpcKind.CLIENT_STREAMING || kind == RpcKind.BIDIRECTIONAL_STREAMING) {
+                    frames.send(status(Status.ok(Metadata.of("result" to byteArrayOf(1)))))
                     frames.close()
                 }
             }
 
-            override suspend fun receive(): RpcStreamFrame? = frames.receiveCatching().getOrNull()
+            override suspend fun receive(): ResponseFrame? = frames.receiveCatching().getOrNull()
 
             override suspend fun close(cause: Throwable?) {
                 frames.close()
@@ -493,13 +660,15 @@ private class LoopbackTransport : RpcTransport {
 }
 
 private class StaticStreamTransport(
-    vararg frames: RpcStreamFrame,
+    vararg frames: ResponseFrame,
 ) : RpcTransport {
     private val frames = frames.toList()
 
-    override suspend fun unary(request: RpcRequest): RpcResponse = RpcResponse.fromStatus(Status.unimplemented("unary"))
-
-    override suspend fun openStream(request: RpcRequest): RpcClientStream {
+    override suspend fun openStream(
+        request: RpcRequest,
+        firstMessage: ByteArray?,
+        finishSend: Boolean,
+    ): RpcClientStream {
         val iterator = frames.iterator()
         return SequenceStream { if (iterator.hasNext()) iterator.next() else null }
     }
@@ -508,14 +677,25 @@ private class StaticStreamTransport(
 private class SingleStreamTransport(
     private val stream: RpcClientStream,
 ) : RpcTransport {
-    override suspend fun unary(request: RpcRequest): RpcResponse = RpcResponse.fromStatus(Status.unimplemented("unary"))
+    val requests = mutableListOf<RpcRequest>()
+    val firstMessages = mutableListOf<ByteArray?>()
+    val finishSends = mutableListOf<Boolean>()
 
-    override suspend fun openStream(request: RpcRequest): RpcClientStream = stream
+    override suspend fun openStream(
+        request: RpcRequest,
+        firstMessage: ByteArray?,
+        finishSend: Boolean,
+    ): RpcClientStream {
+        requests += request
+        firstMessages += firstMessage
+        finishSends += finishSend
+        return stream
+    }
 }
 
 private class SequenceStream(
     private val onClose: () -> Unit = {},
-    private val next: suspend () -> RpcStreamFrame?,
+    private val next: suspend () -> ResponseFrame?,
 ) : RpcClientStream {
     var sendOperation: suspend () -> Unit = {}
     var finishOperation: suspend () -> Unit = {}
@@ -524,7 +704,7 @@ private class SequenceStream(
 
     override suspend fun finishSend() = finishOperation()
 
-    override suspend fun receive(): RpcStreamFrame? = next()
+    override suspend fun receive(): ResponseFrame? = next()
 
     override suspend fun close(cause: Throwable?) {
         onClose()
@@ -532,7 +712,7 @@ private class SequenceStream(
 }
 
 private class RecordingClientStream(
-    vararg frames: RpcStreamFrame,
+    vararg frames: ResponseFrame,
 ) : RpcClientStream {
     private val frames = frames.iterator()
     private var sendFinished = false
@@ -553,7 +733,7 @@ private class RecordingClientStream(
         finishes++
     }
 
-    override suspend fun receive(): RpcStreamFrame? = if (frames.hasNext()) frames.next() else null
+    override suspend fun receive(): ResponseFrame? = if (frames.hasNext()) frames.next() else null
 
     override suspend fun close(cause: Throwable?) {
         closes++

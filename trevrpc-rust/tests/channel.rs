@@ -9,13 +9,12 @@ use tokio::task::JoinHandle;
 use trevrpc::client::{
     Channel, ChannelConfig, ChannelEvent, ChannelPhase, ReconnectBackoff, RpcTransport,
 };
-use trevrpc::{Code, RpcRequest, RpcResponse, Status};
+use trevrpc::{Code, RpcRequest, Status};
 
 #[macro_use]
 mod support;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_FRAME_SIZE: usize = trevrpc::framing::DEFAULT_MAX_FRAME_SIZE;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -91,9 +90,10 @@ async fn run_raw_server(
         let fail_first_request = Arc::clone(&fail_first_request);
         tokio::spawn(async move {
             while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-                let Ok(request) =
-                    support::read_frame::<_, RpcRequest>(&mut recv, MAX_FRAME_SIZE).await
-                else {
+                let Ok(_request) = support::read_request(&mut recv).await else {
+                    break;
+                };
+                let Ok(Some(body)) = support::read_message(&mut recv).await else {
                     break;
                 };
                 received_requests.fetch_add(1, Ordering::SeqCst);
@@ -102,10 +102,10 @@ async fn run_raw_server(
                     break;
                 }
 
-                let response = RpcResponse::ok(request.body);
-                if support::write_frame(&mut send, &response, MAX_FRAME_SIZE)
-                    .await
-                    .is_err()
+                if support::write_message(&mut send, &body).await.is_err()
+                    || support::write_status(&mut send, Status::ok())
+                        .await
+                        .is_err()
                 {
                     break;
                 }
@@ -152,8 +152,8 @@ async fn wait_for_phase(client: &Channel, phase: ChannelPhase) -> TestResult {
     Ok(())
 }
 
-fn request(body: &[u8]) -> RpcRequest {
-    RpcRequest::new("test.Service", "Call", body.to_vec())
+fn request() -> RpcRequest {
+    RpcRequest::new("test.Service", "Call")
 }
 
 fn assert_unavailable(error: trevrpc::Error) {
@@ -169,7 +169,7 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
     ensure_eq!(client.state().generation(), 1);
 
     let first_error = client
-        .call(request(b"first"))
+        .call(request(), b"first".to_vec())
         .await
         .expect_err("the first generation should be closed in flight");
     assert_unavailable(first_error);
@@ -177,7 +177,7 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
 
     let reconnecting_error = tokio::time::timeout(
         Duration::from_millis(20),
-        client.call(request(b"must fail fast")),
+        client.call(request(), b"must fail fast".to_vec()),
     )
     .await?
     .expect_err("calls during reconnection must fail");
@@ -209,8 +209,8 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
     tokio::time::sleep(Duration::from_millis(25)).await;
     ensure_eq!(server.received_requests.load(Ordering::SeqCst), 1);
 
-    let response = client.call(request(b"future")).await?;
-    ensure_eq!(response.body, b"future");
+    let response = client.call(request(), b"future".to_vec()).await?;
+    ensure_eq!(response.message(), &bytes::Bytes::from_static(b"future"));
     ensure_eq!(server.received_requests.load(Ordering::SeqCst), 2);
     ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 2);
 
@@ -236,7 +236,7 @@ async fn close_stops_reconnect_and_rebind_preserves_generation() -> TestResult {
     ensure_eq!(client.state().generation(), generation);
     assert_unavailable(
         client
-            .call(request(b"closed"))
+            .call(request(), b"closed".to_vec())
             .await
             .expect_err("closed client calls must fail"),
     );

@@ -279,7 +279,7 @@ func TestGeneratedClientAndServerRoundTripMetadata(t *testing.T) {
 
 	// Every RPC has exactly one client method.
 	var _ func(context.Context, *HelloRequest, ...trevrpc.CallOption) (*HelloReply, error) = client.SayHello
-	var _ func(context.Context, *HelloRequest, ...trevrpc.CallOption) (trevrpc.ResponseStream[*HelloReply], error) = client.LotsOfReplies
+	var _ func(context.Context, *HelloRequest, ...trevrpc.CallOption) (trevrpc.ServerStreamingCall[*HelloReply], error) = client.LotsOfReplies
 	var _ func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*HelloRequest, *HelloReply], error) = client.LotsOfGreetings
 	var _ func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*HelloRequest, *HelloReply], error) = client.BidiHello
 }

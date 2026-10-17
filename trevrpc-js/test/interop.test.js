@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { ScenarioNames } from "../interop-browser/names.js";
 import { runScenarios } from "../interop-browser/scenarios.js";
+import { encodeMessageFrame } from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { createEchoHandler, echoHandler } from "./echo-server.js";
 import { fakeTransport } from "./support.js";
@@ -64,8 +65,10 @@ test("scenarios fail individually when the server misbehaves", () =>
   withWebTransport(
     // A unary server that ignores request metadata and never reports errors.
     createEchoHandler({
-      unary: (stream) =>
-        stream.writeResponse({ body: Uint8Array.of(0x0a, 5, ...Buffer.from("hello")) }),
+      unary: async (stream) => {
+        await stream.write(encodeMessageFrame(Uint8Array.of(0x0a, 5, ...Buffer.from("hello"))));
+        await stream.writeStatus();
+      },
     }),
     async () => {
       const results = await runScenarios({ url });
@@ -73,10 +76,16 @@ test("scenarios fail individually when the server misbehaves", () =>
         results.filter((result) => !result.ok).map((result) => [result.name, result.reason]),
       );
 
-      assert.deepEqual(Object.keys(failed), ["unary-metadata", "unary-error", "unary-large"]);
+      assert.deepEqual(Object.keys(failed), [
+        "unary-metadata",
+        "unary-error",
+        "unary-large",
+        "unary-headers",
+      ]);
       assert.match(failed["unary-metadata"], /expected \(hello!, 0\), got \(hello, 0\)/);
       assert.match(failed["unary-error"], /expected status NotFound "missing", got OK/);
       assert.match(failed["unary-large"], /\[1048576 chars\]/);
+      assert.match(failed["unary-headers"], /expected trailing metadata .*, got \{\}/);
       for (const reason of Object.values(failed)) {
         assert.doesNotMatch(reason, /\n/);
       }

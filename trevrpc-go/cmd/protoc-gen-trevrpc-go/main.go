@@ -275,7 +275,7 @@ func (g fileGenerator) generateClientMethods(clientName, serviceName string, met
 		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", ", options, ") (", g.runtime("ClientStreamingCall"), "[", inputType, ", ", outputType, "], error) {")
 		g.generated.P("return ", g.runtime("ClientStreaming"), "[", inputType, ", ", outputType, "]", callPrefix, factory, ", ", merged, ")")
 	case method.Desc.IsStreamingServer():
-		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", g.runtime("ResponseStream"), "[", outputType, "], error) {")
+		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", g.runtime("ServerStreamingCall"), "[", outputType, "], error) {")
 		g.generated.P("return ", g.runtime("ServerStreaming"), "[", inputType, ", ", outputType, "]", callPrefix, "request, ", factory, ", ", merged, ")")
 	default:
 		g.generated.P("func (c *", clientName, ") ", methodName, "(ctx ", contextType, ", request ", inputType, ", ", options, ") (", outputType, ", error) {")

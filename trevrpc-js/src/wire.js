@@ -13,11 +13,6 @@ export const RpcKind = Object.freeze({
   BidirectionalStreaming: 3,
 });
 
-export const RpcStreamFrameKind = Object.freeze({
-  Message: 0,
-  Status: 1,
-});
-
 const wireRoot = protobuf.Root.fromJSON({
   nested: {
     trevrpc: {
@@ -30,38 +25,30 @@ const wireRoot = protobuf.Root.fromJSON({
             BidirectionalStreaming: 3,
           },
         },
-        RpcStreamFrameKind: {
-          values: {
-            Message: 0,
-            Status: 1,
-          },
-        },
         RpcRequest: {
           fields: {
             service: { type: "string", id: 1 },
             method: { type: "string", id: 2 },
-            body: { type: "bytes", id: 3 },
             metadata: { keyType: "string", type: "bytes", id: 4 },
             kind: { type: "RpcKind", id: 5 },
             version: { type: "uint32", id: 6 },
             timeoutNanos: { type: "uint64", id: 7 },
+            extensions: { rule: "repeated", type: "uint64", id: 8 },
+          },
+          // Field 3 was the request body; it must never be reused.
+          reserved: [[3, 3]],
+        },
+        RpcHeaders: {
+          fields: {
+            metadata: { keyType: "string", type: "bytes", id: 1 },
+            extensions: { rule: "repeated", type: "uint64", id: 2 },
           },
         },
-        RpcResponse: {
+        RpcStatus: {
           fields: {
-            status: { type: "uint32", id: 1 },
+            code: { type: "uint32", id: 1 },
             message: { type: "string", id: 2 },
-            body: { type: "bytes", id: 3 },
-            metadata: { keyType: "string", type: "bytes", id: 4 },
-          },
-        },
-        RpcStreamFrame: {
-          fields: {
-            kind: { type: "RpcStreamFrameKind", id: 1 },
-            status: { type: "uint32", id: 2 },
-            message: { type: "string", id: 3 },
-            body: { type: "bytes", id: 4 },
-            metadata: { keyType: "string", type: "bytes", id: 5 },
+            metadata: { keyType: "string", type: "bytes", id: 3 },
           },
         },
       },
@@ -70,8 +57,8 @@ const wireRoot = protobuf.Root.fromJSON({
 });
 
 export const RpcRequest = wireRoot.lookupType("trevrpc.RpcRequest");
-export const RpcResponse = wireRoot.lookupType("trevrpc.RpcResponse");
-export const RpcStreamFrame = wireRoot.lookupType("trevrpc.RpcStreamFrame");
+export const RpcHeaders = wireRoot.lookupType("trevrpc.RpcHeaders");
+export const RpcStatus = wireRoot.lookupType("trevrpc.RpcStatus");
 
 const MaxFieldNumber = 0x1fffffff;
 const MaxUint32 = 0xffffffffn;

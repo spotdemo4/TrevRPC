@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -79,16 +80,27 @@ func registerTestService(server *Server) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
-		return testResponse(&testMessage{Value: request.Value + string(RequestMetadataFromContext(ctx)["suffix"])}), nil
+		headers, trailers := testHeaderMetadata(ctx)
+		return &Response[*testMessage]{
+			Message:  &testMessage{Value: request.Value + string(RequestMetadataFromContext(ctx)["suffix"])},
+			Headers:  headers,
+			Metadata: trailers,
+		}, nil
 	})
-	RegisterServerStreaming(server, testServiceName, "Count", newTestMessage, func(_ context.Context, request *testMessage) (MessageStream[*testMessage], error) {
+	RegisterServerStreaming(server, testServiceName, "Count", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		replies := make([]*testMessage, 0, 3)
 		for _, suffix := range []string{"1", "2", "3"} {
 			replies = append(replies, &testMessage{Value: request.Value + suffix})
 		}
-		return newSliceStream(replies...), nil
+		return withTestHeaders(ctx, newSliceStream(replies...)), nil
 	})
-	RegisterClientStreaming(server, testServiceName, "Concat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
+	// Gated sends its headers at once and its only message once the test
+	// opens the gate registered under the request value.
+	RegisterServerStreaming(server, testServiceName, "Gated", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
+		gate, _ := testGates.Load(request.Value)
+		return withTestHeaders(ctx, &gatedStream{ctx: ctx, gate: gate.(chan struct{})}), nil
+	})
+	RegisterClientStreaming(server, testServiceName, "Concat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
 		var joined strings.Builder
 		for request, err := range Messages(requests) {
 			if err != nil {
@@ -96,15 +108,66 @@ func registerTestService(server *Server) {
 			}
 			joined.WriteString(request.Value)
 		}
-		return testResponse(&testMessage{Value: joined.String()}), nil
+		headers, trailers := testHeaderMetadata(ctx)
+		return &Response[*testMessage]{Message: &testMessage{Value: joined.String()}, Headers: headers, Metadata: trailers}, nil
 	})
 	// FailFast fails a bidirectional call without reading any request message.
-	server.routeStreaming(testServiceName, "FailFast", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (byteStream, error) {
-		return nil, NewStatus(CodeAborted, "abort")
+	server.routeStreaming(testServiceName, "FailFast", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
+		return streamResponse{}, NewStatus(CodeAborted, "abort")
 	})
-	RegisterBidirectionalStreaming(server, testServiceName, "Chat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
-		return &upperStream{requests: requests}, nil
+	RegisterBidirectionalStreaming(server, testServiceName, "Chat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
+		return withTestHeaders(ctx, &upperStream{requests: requests}), nil
 	})
+}
+
+// testGates holds the gates of Gated calls by request value.
+var testGates sync.Map
+
+// gatedStream yields one message once its gate is open.
+type gatedStream struct {
+	ctx  context.Context
+	gate chan struct{}
+	sent bool
+}
+
+func (s *gatedStream) Recv() (*testMessage, error) {
+	if s.sent {
+		return nil, io.EOF
+	}
+	select {
+	case <-s.gate:
+		s.sent = true
+		return &testMessage{Value: "released"}, nil
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	}
+}
+
+func (*gatedStream) Close() error { return nil }
+
+const (
+	testWantHeadersKey = "want-headers"
+	testHeaderKey      = "x-header"
+	testTrailerKey     = "x-trailer"
+)
+
+// testHeaderMetadata answers the want-headers request metadata with response
+// headers and trailing metadata carrying its value; both are empty without it.
+func testHeaderMetadata(ctx context.Context) (headers, trailers Metadata) {
+	value, ok := RequestMetadataFromContext(ctx)[testWantHeadersKey]
+	if !ok {
+		return nil, nil
+	}
+	return Metadata{testHeaderKey: value}, Metadata{testTrailerKey: value}
+}
+
+// withTestHeaders adds the answer to want-headers to a response stream.
+func withTestHeaders(ctx context.Context, stream MessageStream[*testMessage]) MessageStream[*testMessage] {
+	headers, trailers := testHeaderMetadata(ctx)
+	if headers == nil {
+		return stream
+	}
+	return WithResponseHeaders(NewResponseStream(stream, trailers), headers)
 }
 
 // upperStream answers every request with its upper-cased value.
@@ -221,6 +284,9 @@ func exerciseRPCShapes(t *testing.T, transport Transport) {
 			t.Fatalf("status = %v", status)
 		}
 	})
+	t.Run("response headers", func(t *testing.T) {
+		exerciseResponseHeaders(ctx, t, transport)
+	})
 	t.Run("unary deadline", func(t *testing.T) {
 		_, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "slow"}, newTestMessage, WithTimeout(100*time.Millisecond))
 		if status := StatusFromError(err); status.Code != CodeDeadlineExceeded {
@@ -270,6 +336,141 @@ func exerciseRPCShapes(t *testing.T, transport Transport) {
 		if _, err := call.Recv(); !errors.Is(err, io.EOF) {
 			t.Fatalf("expected EOF after CloseSend, got %v", err)
 		}
+	})
+}
+
+// requireHeaders fails the test unless metadata holds exactly {key: value}.
+func requireHeaders(t *testing.T, what string, metadata Metadata, key, value string) {
+	t.Helper()
+	if len(metadata) != 1 || string(metadata[key]) != value {
+		t.Fatalf("%s = %v, want {%s: %q}", what, metadata, key, value)
+	}
+}
+
+// exerciseResponseHeaders covers response headers and trailing metadata of
+// every RPC shape. A call that asks for none sees none.
+func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transport) {
+	t.Helper()
+	want := WithMetadata(testWantHeadersKey, []byte("v"))
+
+	t.Run("unary", func(t *testing.T) {
+		var headers, trailers Metadata
+		reply, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "hello"}, newTestMessage, want, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers))
+		if err != nil || reply.Value != "hello" {
+			t.Fatalf("reply = %v, err = %v", reply, err)
+		}
+		requireHeaders(t, "headers", headers, testHeaderKey, "v")
+		requireHeaders(t, "trailing metadata", trailers, testTrailerKey, "v")
+
+		headers, trailers = Metadata{"stale": nil}, Metadata{"stale": nil}
+		if _, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "hello"}, newTestMessage, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers)); err != nil {
+			t.Fatal(err)
+		}
+		if len(headers) != 0 || len(trailers) != 0 {
+			t.Fatalf("headers = %v, trailers = %v, want none", headers, trailers)
+		}
+	})
+	t.Run("client streaming", func(t *testing.T) {
+		var headers, trailers Metadata
+		reply, err := runTestClientStreaming(ctx, transport, testServiceName, "Concat", []string{"a", "b"}, want, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers))
+		if err != nil || reply.Value != "ab" {
+			t.Fatalf("reply = %v, err = %v", reply, err)
+		}
+		requireHeaders(t, "headers", headers, testHeaderKey, "v")
+		requireHeaders(t, "trailing metadata", trailers, testTrailerKey, "v")
+	})
+	t.Run("server streaming", func(t *testing.T) {
+		stream, err := ServerStreaming(ctx, transport, testServiceName, "Count", &testMessage{Value: "n"}, newTestMessage, want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = stream.Close() }()
+		headers, err := stream.Headers()
+		if err != nil {
+			t.Fatalf("Headers() error = %v", err)
+		}
+		requireHeaders(t, "headers", headers, testHeaderKey, "v")
+		// Reading the headers consumed no message.
+		for _, value := range []string{"n1", "n2", "n3"} {
+			if reply, err := stream.Recv(); err != nil || reply.Value != value {
+				t.Fatalf("reply = %v, err = %v, want %s", reply, err, value)
+			}
+		}
+		if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+			t.Fatalf("expected EOF, got %v", err)
+		}
+		status, ok := stream.TerminalStatus()
+		if !ok {
+			t.Fatal("no terminal status")
+		}
+		requireHeaders(t, "trailing metadata", status.Metadata, testTrailerKey, "v")
+		if headers, err := stream.Headers(); err != nil || string(headers[testHeaderKey]) != "v" {
+			t.Fatalf("Headers() after the end = %v, %v", headers, err)
+		}
+	})
+	t.Run("server streaming without headers", func(t *testing.T) {
+		stream, err := ServerStreaming(ctx, transport, testServiceName, "Count", &testMessage{Value: "n"}, newTestMessage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = stream.Close() }()
+		if headers, err := stream.Headers(); err != nil || len(headers) != 0 {
+			t.Fatalf("Headers() = %v, %v, want none", headers, err)
+		}
+		if reply, err := stream.Recv(); err != nil || reply.Value != "n1" {
+			t.Fatalf("first reply = %v, err = %v: Headers() consumed the message", reply, err)
+		}
+	})
+	t.Run("server streaming headers precede the first message", func(t *testing.T) {
+		gate := make(chan struct{})
+		testGates.Store("gated", gate)
+		defer testGates.Delete("gated")
+		stream, err := ServerStreaming(ctx, transport, testServiceName, "Gated", &testMessage{Value: "gated"}, newTestMessage, want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = stream.Close() }()
+		// The server cannot send a message before the gate opens, so the
+		// headers must arrive without one.
+		headers, err := stream.Headers()
+		if err != nil {
+			t.Fatalf("Headers() error = %v", err)
+		}
+		requireHeaders(t, "headers", headers, testHeaderKey, "v")
+		close(gate)
+		if reply, err := stream.Recv(); err != nil || reply.Value != "released" {
+			t.Fatalf("reply = %v, err = %v", reply, err)
+		}
+	})
+	t.Run("bidirectional streaming", func(t *testing.T) {
+		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "Chat", newTestMessage, want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeOnCleanup(t, call)
+		// Nothing was sent yet: the server sends the headers on its own.
+		headers, err := call.Headers()
+		if err != nil {
+			t.Fatalf("Headers() error = %v", err)
+		}
+		requireHeaders(t, "headers", headers, testHeaderKey, "v")
+		if err := call.Send(&testMessage{Value: "hi"}); err != nil {
+			t.Fatal(err)
+		}
+		if reply, err := call.Recv(); err != nil || reply.Value != "HI" {
+			t.Fatalf("reply = %v, err = %v", reply, err)
+		}
+		if err := call.CloseSend(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := call.Recv(); !errors.Is(err, io.EOF) {
+			t.Fatalf("expected EOF, got %v", err)
+		}
+		status, ok := call.TerminalStatus()
+		if !ok {
+			t.Fatal("no terminal status")
+		}
+		requireHeaders(t, "trailing metadata", status.Metadata, testTrailerKey, "v")
 	})
 }
 
@@ -433,7 +634,7 @@ func TestShutdownCancelsInFlightHandlers(t *testing.T) {
 
 	callDone := make(chan error, 1)
 	go func() {
-		_, err := channel.call(context.Background(), newWireRequest(testServiceName, "Block", nil))
+		_, err := Unary(context.Background(), channel, testServiceName, "Block", &testMessage{}, newTestMessage)
 		callDone <- err
 	}()
 	<-handlerStarted
@@ -766,18 +967,13 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request := newWireRequest(testServiceName, "FailFast", nil)
+			request := newWireRequest(testServiceName, "FailFast")
 			request.Kind = RPCKindBidirectionalStreaming
-			if err := writeFrame(stream, request, DefaultMaxFrameSize); err != nil {
-				t.Fatal(err)
-			}
+			writeTestRequestFrame(t, stream, request)
 
 			// The status arrives although the request side is still open.
-			frame := &wireStreamFrame{}
-			if err := readFrame(stream, frame, DefaultMaxFrameSize); err != nil {
-				t.Fatalf("read terminal status: %v", err)
-			}
-			if status := StatusFromError(&Status{Code: CodeFromUint32(frame.Status), Message: frame.Message}); frame.Kind != wireFrameStatus || status.Code != CodeAborted || status.Message != "abort" {
+			frame := readTestFrame(t, stream)
+			if status := frame.statusValue(); frame.Kind != frameTypeStatus || status.Code != CodeAborted || status.Message != "abort" {
 				t.Fatalf("frame = %+v, want Aborted \"abort\" status", frame)
 			}
 			if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
@@ -820,14 +1016,10 @@ func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := newWireRequest(testServiceName, "FailFast", nil)
+	request := newWireRequest(testServiceName, "FailFast")
 	request.Kind = RPCKindBidirectionalStreaming
-	if err := writeFrame(stream, request, DefaultMaxFrameSize); err != nil {
-		t.Fatal(err)
-	}
-	if err := readFrame(stream, &wireStreamFrame{}, DefaultMaxFrameSize); err != nil {
-		t.Fatal(err)
-	}
+	writeTestRequestFrame(t, stream, request)
+	readTestFrame(t, stream)
 
 	// A silent client is stopped after about requestDrainTimeout.
 	started := time.Now()

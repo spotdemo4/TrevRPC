@@ -198,6 +198,57 @@ var scenarios = []scenario{
 		_, err = call.Recv()
 		return expectStatus(err, trevrpc.CodeAborted, "abort")
 	}},
+	{"unary-headers", func(ctx context.Context, c *interoppb.EchoClient) error {
+		var headers, trailers trevrpc.Metadata
+		response, err := c.Unary(ctx, &interoppb.EchoRequest{Message: "hello"},
+			trevrpc.WithMetadata("interop-header", []byte("h")),
+			trevrpc.CaptureResponseHeaders(&headers),
+			trevrpc.CaptureResponseMetadata(&trailers),
+		)
+		if err != nil {
+			return err
+		}
+		if err := expectResponse(response, "hello", 0); err != nil {
+			return err
+		}
+		if err := expectMetadata("headers", headers, "interop-header", "h"); err != nil {
+			return err
+		}
+		return expectMetadata("trailing metadata", trailers, "interop-trailer", "h")
+	}},
+	{"server-stream-headers", func(ctx context.Context, c *interoppb.EchoClient) error {
+		stream, err := c.ServerStream(ctx, &interoppb.EchoRequest{Message: "s", Count: 2}, trevrpc.WithMetadata("interop-header", []byte("h")))
+		if err != nil {
+			return err
+		}
+		defer closeQuietly(stream)
+		headers, err := stream.Headers()
+		if err != nil {
+			return fmt.Errorf("headers: %w", err)
+		}
+		if err := expectMetadata("headers", headers, "interop-header", "h"); err != nil {
+			return err
+		}
+		if err := expectEchoes(stream, "s", 2); err != nil {
+			return err
+		}
+		if err := expectEnd(stream); err != nil {
+			return err
+		}
+		status, ok := stream.TerminalStatus()
+		if !ok {
+			return errors.New("no terminal status after the end of the stream")
+		}
+		return expectMetadata("trailing metadata", status.Metadata, "interop-trailer", "h")
+	}},
+}
+
+// expectMetadata checks that metadata holds exactly one entry, key = value.
+func expectMetadata(what string, metadata trevrpc.Metadata, key, value string) error {
+	if len(metadata) != 1 || string(metadata[key]) != value {
+		return fmt.Errorf("%s = %v, want {%s: %q}", what, metadata, key, value)
+	}
+	return nil
 }
 
 func expectResponse(response *interoppb.EchoResponse, message string, index uint32) error {

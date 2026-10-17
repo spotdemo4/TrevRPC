@@ -36,7 +36,9 @@ not yet speak the WebTransport draft Safari uses ([h3#347](https://github.com/hy
 `safari` workflow keeps running that lane as an allowed failure so that it shows when upstream compatibility
 arrives.
 
-The wire format is shared by every runtime and transport and pinned by
+The wire format is shared by every runtime and transport: HTTP/3-style frames (a QUIC varint type and
+length) carrying a REQUEST, raw protobuf MESSAGEs, optional response HEADERS, and a terminal STATUS, with
+unknown frame types skipped. It is pinned by
 [`testdata/wire-golden-vectors.txt`](testdata/wire-golden-vectors.txt). The QMux framing used by the TCP
 fallbacks is pinned by [`testdata/qmux-golden-vectors.txt`](testdata/qmux-golden-vectors.txt).
 

@@ -31,7 +31,10 @@ pub mod status;
 pub mod stream;
 mod sync;
 pub mod tcp;
+#[cfg(test)]
+mod test_io;
 mod transport_error;
+pub mod varint;
 mod websocket;
 pub mod wire;
 
@@ -45,8 +48,9 @@ pub const QMUX_ALPN: &[u8] = b"qmux-02.trevrpc-1";
 
 pub use async_trait::async_trait;
 pub use error::{Error, Result};
+pub use framing::ResponseFrame;
 pub use futures_core::Stream;
 pub use response::ResponseEnvelope;
 pub use status::{Code, Status};
 pub use stream::BoxStream;
-pub use wire::{Metadata, RpcKind, RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind};
+pub use wire::{Metadata, RpcHeaders, RpcKind, RpcRequest, RpcStatus};

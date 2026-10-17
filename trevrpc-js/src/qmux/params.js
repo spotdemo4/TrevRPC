@@ -1,7 +1,7 @@
+import { readVarint, varintLength } from "../varint.js";
 // QX_TRANSPORT_PARAMETERS (draft-ietf-quic-qmux-02 §6): the subset of QUIC transport parameters
 // that QMux keeps, plus max_record_size.
 import { FrameType, FrameWriter, QMuxProtocolError, TransportError } from "./frames.js";
-import { readVarint, varintLength } from "./varint.js";
 
 /** The max_record_size a peer may assume until told otherwise, and the smallest it may set. */
 export const DefaultMaxRecordSize = 16382;

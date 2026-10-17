@@ -107,10 +107,6 @@ impl MuxSendStream for qmux::SendStream {
 }
 
 impl FrameWrite for qmux::SendStream {
-    async fn write_frame_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.write_all(bytes).await.map_err(Error::transport)
-    }
-
     async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
         for chunk in chunks {
             self.write_chunk(std::mem::take(chunk))

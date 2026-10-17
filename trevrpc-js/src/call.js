@@ -1,4 +1,9 @@
-import { DefaultMaxFrameSize, FrameReader, encodeFrame, encodeMessageFrame } from "./framing.js";
+import {
+  DefaultMaxFrameSize,
+  FrameReader,
+  encodeMessageFrame,
+  encodeRequestFrame,
+} from "./framing.js";
 import { normalizeMetadata, validateMetadata } from "./metadata.js";
 import {
   Code,
@@ -10,7 +15,7 @@ import {
   statusError,
   statusFromTransportError,
 } from "./status.js";
-import { RpcRequest, WireVersion } from "./wire.js";
+import { WireVersion } from "./wire.js";
 
 /** Longest delay setTimeout can represent; it fires immediately beyond this. */
 const MaxTimerDelayMs = 2_147_483_647;
@@ -110,13 +115,14 @@ export class Call {
   #sendClosed = false;
 
   /**
-   * Opens a stream on the transport and sends the request header. The request carries service,
-   * method, kind and body; version, metadata and the wire timeout come from the options.
+   * Opens a stream on the transport and sends the REQUEST frame. The request carries service,
+   * method and kind; version, metadata and the wire timeout come from the options. The request
+   * message of a unary or server-streaming call goes out in the same write.
    */
-  static async open(transport, request, options) {
-    const header = encodeFrame(
-      RpcRequest,
+  static async open(transport, request, message, options) {
+    const header = encodeRequestFrame(
       { ...request, version: WireVersion, metadata: options.metadata, ...timeoutField(options) },
+      message,
       options.maxFrameSize,
     );
     const scope = new CallScope(options);
@@ -165,19 +171,18 @@ export class Call {
     return this.#guard(this.#writer.close());
   }
 
-  /** Reads the unary response frame. */
-  readFrame(messageType) {
-    return this.#guard(this.#frames.readFrame(messageType, this.#maxFrameSize));
-  }
-
-  /** Reads the next response stream frame, or null if the stream ended cleanly. */
-  readStreamFrame() {
-    return this.#guard(this.#frames.readStreamFrame(this.#maxFrameSize));
+  /**
+   * Reads the next known response frame as `{ type, payload }`, or null if the stream ended
+   * cleanly. Unknown frames are skipped.
+   */
+  readFrame() {
+    return this.#guard(this.#frames.readFrame(this.#maxFrameSize));
   }
 
   /**
-   * Ends the call after its outcome (a final response or status) was received. An unfinished
-   * request side is reset, and the rest of the response stream is drained in the background.
+   * Ends the call after its final status was received. An unfinished request side is reset, and
+   * the rest of the response stream is drained in the background: unknown frames are skipped, and
+   * a known frame after STATUS cancels the stream without changing the outcome.
    */
   finish() {
     this.#scope.settle();
@@ -185,7 +190,7 @@ export class Call {
       this.#sendClosed = true;
       this.#writer.abort(cancelled("RPC completed")).catch(() => {});
     }
-    this.#frames.expectEnd().catch(() => this.#cancelReader().catch(() => {}));
+    this.#frames.expectEnd(this.#maxFrameSize).catch(() => this.#cancelReader().catch(() => {}));
   }
 
   /** Cancels the call on behalf of the caller; any reason becomes a Cancelled status. */

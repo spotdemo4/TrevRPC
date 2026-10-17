@@ -74,15 +74,46 @@ func failure(request *interoppb.EchoRequest) error {
 	return trevrpc.NewStatus(trevrpc.CodeFromUint32(request.FailCode), request.FailMessage)
 }
 
+// headerKey is the request metadata key that asks for response headers.
+const headerKey = "interop-header"
+
+// trailerKey is the trailing metadata key of the answer to headerKey.
+const trailerKey = "interop-trailer"
+
+// headerMetadata returns the response headers and the trailing metadata that
+// answer the interop-header request metadata of ctx: both are empty without it.
+func headerMetadata(ctx context.Context) (headers, trailers trevrpc.Metadata) {
+	value, ok := trevrpc.RequestMetadataFromContext(ctx)[headerKey]
+	if !ok {
+		return nil, nil
+	}
+	return trevrpc.Metadata{headerKey: value}, trevrpc.Metadata{trailerKey: value}
+}
+
+// withHeaders adds the response headers and trailing metadata that answer
+// interop-header to a response stream.
+func withHeaders(ctx context.Context, stream trevrpc.MessageStream[*interoppb.EchoResponse]) trevrpc.MessageStream[*interoppb.EchoResponse] {
+	headers, trailers := headerMetadata(ctx)
+	if headers == nil {
+		return stream
+	}
+	return trevrpc.WithResponseHeaders(trevrpc.NewResponseStream(stream, trailers), headers)
+}
+
 func (echoServer) Unary(ctx context.Context, request *interoppb.EchoRequest) (*trevrpc.Response[*interoppb.EchoResponse], error) {
 	if request.FailCode != 0 {
 		return nil, failure(request)
 	}
 	suffix := trevrpc.RequestMetadataFromContext(ctx)["interop-suffix"]
-	return &trevrpc.Response[*interoppb.EchoResponse]{Message: &interoppb.EchoResponse{Message: request.Message + string(suffix)}}, nil
+	headers, trailers := headerMetadata(ctx)
+	return &trevrpc.Response[*interoppb.EchoResponse]{
+		Message:  &interoppb.EchoResponse{Message: request.Message + string(suffix)},
+		Headers:  headers,
+		Metadata: trailers,
+	}, nil
 }
 
-func (echoServer) ClientStream(_ context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*trevrpc.Response[*interoppb.EchoResponse], error) {
+func (echoServer) ClientStream(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*trevrpc.Response[*interoppb.EchoResponse], error) {
 	var message strings.Builder
 	var count uint32
 	for request, err := range trevrpc.Messages(requests) {
@@ -95,11 +126,16 @@ func (echoServer) ClientStream(_ context.Context, requests trevrpc.MessageStream
 		message.WriteString(request.Message)
 		count++
 	}
-	return &trevrpc.Response[*interoppb.EchoResponse]{Message: &interoppb.EchoResponse{Message: message.String(), Index: count}}, nil
+	headers, trailers := headerMetadata(ctx)
+	return &trevrpc.Response[*interoppb.EchoResponse]{
+		Message:  &interoppb.EchoResponse{Message: message.String(), Index: count},
+		Headers:  headers,
+		Metadata: trailers,
+	}, nil
 }
 
-func (echoServer) ServerStream(_ context.Context, request *interoppb.EchoRequest) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
-	return &countedEcho{request: request}, nil
+func (echoServer) ServerStream(ctx context.Context, request *interoppb.EchoRequest) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
+	return withHeaders(ctx, &countedEcho{request: request}), nil
 }
 
 // countedEcho yields request.Count echoes and then ends with the requested status.
@@ -122,8 +158,8 @@ func (s *countedEcho) Recv() (*interoppb.EchoResponse, error) {
 
 func (*countedEcho) Close() error { return nil }
 
-func (echoServer) Bidi(_ context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
-	return &bidiEcho{requests: requests}, nil
+func (echoServer) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
+	return withHeaders(ctx, &bidiEcho{requests: requests}), nil
 }
 
 // bidiEcho answers each request in order and ends when the requests end.

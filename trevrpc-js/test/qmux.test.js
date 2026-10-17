@@ -19,8 +19,8 @@ import {
 } from "../src/qmux/frames.js";
 import { decodeTransportParameters, writeTransportParameters } from "../src/qmux/params.js";
 import { QMuxProtocol, QMuxWebSocketSession } from "../src/qmux/session.js";
-import { readVarint, writeVarint } from "../src/qmux/varint.js";
 import { Code } from "../src/status.js";
+import { readVarint, writeVarint } from "../src/varint.js";
 
 const goldenPath = new URL("../../testdata/qmux-golden-vectors.txt", import.meta.url);
 

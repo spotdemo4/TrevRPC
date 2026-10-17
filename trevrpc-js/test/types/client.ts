@@ -47,6 +47,7 @@ unary.message satisfies string | undefined;
 const withResponse = await echo.unaryWithResponse({ message: "hi" });
 withResponse satisfies UnaryResponse<EchoResponse>;
 withResponse.metadata["x"] satisfies Uint8Array;
+withResponse.headers["x"] satisfies Uint8Array;
 
 const stream = await echo.serverStream({ count: 2 });
 stream satisfies ResponseStream<EchoResponse>;
@@ -54,6 +55,7 @@ for await (const response of stream) {
   response.index satisfies number | undefined;
 }
 (await stream.status) satisfies StreamStatus;
+(await stream.headers)["x"] satisfies Uint8Array;
 await stream.close(new Error("done"));
 
 const upload = await echo.clientStream();
@@ -66,6 +68,7 @@ const bidi = await echo.bidi({ signal: new AbortController().signal });
 bidi satisfies BidirectionalStreamingCall<{ message?: string }, EchoResponse>;
 await bidi.send({ message: "a" });
 (await bidi.recv()) satisfies EchoResponse | undefined;
+(await bidi.headers)["x"] satisfies Uint8Array;
 await bidi.closeSend();
 
 try {

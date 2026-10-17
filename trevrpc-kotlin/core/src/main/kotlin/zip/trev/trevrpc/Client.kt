@@ -3,6 +3,8 @@ package zip.trev.trevrpc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicBoolean
@@ -20,9 +22,14 @@ class MessageCodec<T>(
     }
 }
 
+/**
+ * A single response message. [metadata] is the trailing metadata from the terminal status;
+ * [headers] is the response header metadata, empty when the server sent no HEADERS frame.
+ */
 data class ResponseEnvelope<T>(
     val message: T,
     val metadata: Metadata = Metadata.EMPTY,
+    val headers: Metadata = Metadata.EMPTY,
 )
 
 data class CallOptions(
@@ -51,9 +58,17 @@ data class CallOptions(
 }
 
 interface RpcTransport {
-    suspend fun unary(request: RpcRequest): RpcResponse
-
-    suspend fun openStream(request: RpcRequest): RpcClientStream
+    /**
+     * Opens one call stream and writes REQUEST. When [firstMessage] is present (unary and
+     * server-streaming calls) it is written in the same write as REQUEST, and when [finishSend] is
+     * also set the request side is half-closed in that write too. Implementations clean up after
+     * themselves when this fails.
+     */
+    suspend fun openStream(
+        request: RpcRequest,
+        firstMessage: ByteArray? = null,
+        finishSend: Boolean = false,
+    ): RpcClientStream
 }
 
 /**
@@ -66,8 +81,11 @@ interface RpcClientStream {
     /** Half-closes the request side after prior sends. Repeated calls have no effect. */
     suspend fun finishSend()
 
-    /** Receives the next response frame, or null at transport end of stream. */
-    suspend fun receive(): RpcStreamFrame?
+    /**
+     * Receives the next known response frame, or null at transport end of stream. Unknown frames
+     * are skipped by the transport and never surface here.
+     */
+    suspend fun receive(): ResponseFrame?
 
     suspend fun close(cause: Throwable? = null)
 }
@@ -92,11 +110,17 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): ResponseEnvelope<Res> {
-        val wireRequest = request(service, method, RpcKind.UNARY, requestCodec.encode(request), options)
-        val response = callWithTimeout(options.timeout) { transport.unary(wireRequest) }
-        if (!response.status.isOk) throw TrevRpcException(response.status)
-        enforceBodyLimit(response.body.size, options.maxResponseBodySize, "unary response")
-        return ResponseEnvelope(decodeResponse(responseCodec, response.body), response.metadata)
+        // A unary call has no stream-idle bound, only the call deadline.
+        val state =
+            open(
+                request(service, method, RpcKind.UNARY, options),
+                requestCodec.encode(request),
+                responseCodec,
+                options,
+                finishSend = true,
+                idleTimeout = null,
+            )
+        return state.reader.receiveSingle("unary")
     }
 
     suspend fun <Req, Res> serverStreaming(
@@ -109,7 +133,8 @@ class Client(
     ): ServerStreamingCall<Res> {
         val state =
             open(
-                request(service, method, RpcKind.SERVER_STREAMING, requestCodec.encode(request), options),
+                request(service, method, RpcKind.SERVER_STREAMING, options),
+                requestCodec.encode(request),
                 responseCodec,
                 options,
                 finishSend = true,
@@ -124,12 +149,7 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): ClientStreamingCall<Req, Res> {
-        val state =
-            open(
-                request(service, method, RpcKind.CLIENT_STREAMING, byteArrayOf(), options),
-                responseCodec,
-                options,
-            )
+        val state = open(request(service, method, RpcKind.CLIENT_STREAMING, options), null, responseCodec, options)
         return ClientStreamingCall(state.writer, requestCodec, state.reader)
     }
 
@@ -140,33 +160,24 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): BidirectionalStreamingCall<Req, Res> {
-        val state =
-            open(
-                request(service, method, RpcKind.BIDIRECTIONAL_STREAMING, byteArrayOf(), options),
-                responseCodec,
-                options,
-            )
+        val state = open(request(service, method, RpcKind.BIDIRECTIONAL_STREAMING, options), null, responseCodec, options)
         return BidirectionalStreamingCall(state.writer, requestCodec, state.reader)
     }
 
     private suspend fun <Res> open(
         request: RpcRequest,
+        firstMessage: ByteArray?,
         codec: MessageCodec<Res>,
         options: CallOptions,
         finishSend: Boolean = false,
+        idleTimeout: Duration? = options.streamIdleTimeout,
     ): OpenedStream<Res> {
         val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
-        val stream = callWithDeadline(deadline, null) { transport.openStream(request) }
-        var committed = false
-        try {
-            if (finishSend) callWithDeadline(deadline, null) { stream.finishSend() }
-            val writer = RequestWriter(stream, deadline)
-            return OpenedStream(writer, ResponseReader(stream, codec, options, deadline)).also { committed = true }
-        } finally {
-            if (!committed) {
-                withContext(NonCancellable) { runCatching { stream.close() } }
-            }
-        }
+        val stream = callWithDeadline(deadline, null) { transport.openStream(request, firstMessage, finishSend) }
+        return OpenedStream(
+            RequestWriter(stream, deadline, sendFinished = finishSend),
+            ResponseReader(stream, codec, options, deadline, idleTimeout),
+        )
     }
 }
 
@@ -178,8 +189,9 @@ private data class OpenedStream<T>(
 internal class RequestWriter(
     private val stream: RpcClientStream,
     private val deadline: TimeMark?,
+    sendFinished: Boolean = false,
 ) {
-    private val sendFinished = AtomicBoolean(false)
+    private val sendFinished = AtomicBoolean(sendFinished)
 
     suspend fun send(body: ByteArray) {
         if (sendFinished.get()) {
@@ -213,8 +225,16 @@ class ServerStreamingCall<T> internal constructor(
     val terminalStatus: Status?
         get() = reader.terminalStatus
 
+    /** Trailing metadata from the terminal status; empty until the status arrives. */
     val responseMetadata: Metadata
         get() = reader.responseMetadata
+
+    /**
+     * Response header metadata. Suspends until the first known response frame arrives and is empty
+     * when the server sent no HEADERS frame. No message is lost: a message read ahead is returned
+     * by the next [receive].
+     */
+    suspend fun headers(): Metadata = reader.headers()
 
     suspend fun receive(): T? = reader.receive()
 
@@ -232,30 +252,15 @@ class ClientStreamingCall<Req, Res> internal constructor(
 
     suspend fun closeSend() = writer.finishSend()
 
+    /** Response header metadata; see [ServerStreamingCall.headers]. */
+    suspend fun headers(): Metadata = reader.headers()
+
     suspend fun receive(): ResponseEnvelope<Res> {
         if (!received.compareAndSet(false, true)) {
             throw TrevRpcException(Status.failedPrecondition("client-streaming response was already received"))
         }
         closeSend()
-        var response: ResponseEnvelope<Res>? = null
-        var multipleResponses = false
-        while (true) {
-            val message = reader.receive() ?: break
-            if (response == null) {
-                response = ResponseEnvelope(message)
-            } else {
-                multipleResponses = true
-            }
-        }
-        if (response == null) {
-            throw TrevRpcException(Status.internal("response stream ended without a response message"))
-        }
-        if (multipleResponses) {
-            throw TrevRpcException(
-                Status.internal("client-streaming RPC returned more than one response message"),
-            )
-        }
-        return ResponseEnvelope(response.message, reader.responseMetadata)
+        return reader.receiveSingle("client-streaming")
     }
 
     suspend fun close() {
@@ -271,8 +276,12 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
     val terminalStatus: Status?
         get() = reader.terminalStatus
 
+    /** Trailing metadata from the terminal status; empty until the status arrives. */
     val responseMetadata: Metadata
         get() = reader.responseMetadata
+
+    /** Response header metadata; see [ServerStreamingCall.headers]. */
+    suspend fun headers(): Metadata = reader.headers()
 
     suspend fun send(request: Req) = writer.send(requestCodec.encode(request))
 
@@ -290,43 +299,82 @@ internal class ResponseReader<T>(
     private val codec: MessageCodec<T>,
     private val options: CallOptions,
     private val deadline: TimeMark?,
+    private val idleTimeout: Duration? = options.streamIdleTimeout,
 ) {
     private val closed = AtomicBoolean(false)
+
+    /** Serializes reads from [stream], so [headers] and [receive] never race for frames. */
+    private val readLock = Mutex()
     private var messages = 0
     private var bodySize = 0L
+
+    @Volatile
     private var done = false
 
+    /** A message or status that [headers] read ahead and [receive] has not consumed yet. */
+    private var readAhead: ResponseFrame? = null
+    private var failure: Throwable? = null
+    private var failureDelivered = false
+
+    /** Null until the first known response frame arrives; then the header metadata. */
+    @Volatile
+    var headersMetadata: Metadata? = null
+        private set
+
+    @Volatile
     var terminalStatus: Status? = null
         private set
 
     val responseMetadata: Metadata
         get() = terminalStatus?.metadata ?: Metadata.EMPTY
 
-    suspend fun receive(): T? {
+    suspend fun headers(): Metadata {
+        headersMetadata?.let { return it }
+        return readLock.withLock {
+            headersMetadata?.let { return@withLock it }
+            failure?.let { throw it }
+            if (done) return@withLock Metadata.EMPTY
+            try {
+                readAhead = nextFrame()
+                // Reading the first known frame resolves the headers: HEADERS carry them, anything
+                // else means they are absent. A HEADERS frame is consumed here; other frames are
+                // kept for receive().
+                if (readAhead is ResponseFrame.Headers) readAhead = null
+                checkNotNull(headersMetadata)
+            } catch (error: Throwable) {
+                fail(error)
+                throw error
+            }
+        }
+    }
+
+    suspend fun receive(): T? = readLock.withLock { receiveLocked() }
+
+    private suspend fun receiveLocked(): T? {
+        if (!failureDelivered) {
+            failure?.let {
+                failureDelivered = true
+                throw it
+            }
+        }
         if (done) return null
         try {
-            val frame = callWithDeadline(deadline, options.streamIdleTimeout) { stream.receive() }
-            if (frame == null) {
-                done = true
-                throw TrevRpcException(Status.internal("response stream ended before final status"))
-            }
-            return when (frame.kind) {
-                RpcStreamFrameKind.MESSAGE -> {
-                    receiveMessage(frame)
-                }
+            while (true) {
+                when (val frame = readAhead?.also { readAhead = null } ?: nextFrame()) {
+                    is ResponseFrame.Headers -> {}
 
-                RpcStreamFrameKind.STATUS -> {
-                    receiveStatus(frame)
-                }
+                    is ResponseFrame.Message -> {
+                        return receiveMessage(frame)
+                    }
 
-                null -> {
-                    done = true
-                    throw TrevRpcException(Status.invalidArgument("response stream contained an unknown frame kind"))
+                    is ResponseFrame.Status -> {
+                        return receiveStatus(frame)
+                    }
                 }
             }
         } catch (error: Throwable) {
-            done = true
-            close(error)
+            failureDelivered = true
+            fail(error)
             throw error
         }
     }
@@ -336,7 +384,34 @@ internal class ResponseReader<T>(
         if (closed.compareAndSet(false, true)) stream.close(cause)
     }
 
-    private fun receiveMessage(frame: RpcStreamFrame): T {
+    /**
+     * Reads one frame from the transport and applies the response grammar: HEADERS is allowed
+     * once, and only as the first known frame.
+     */
+    private suspend fun nextFrame(): ResponseFrame {
+        val frame =
+            callWithDeadline(deadline, idleTimeout) { stream.receive() }
+                ?: throw TrevRpcException(Status.internal("response stream ended before final status"))
+        if (frame is ResponseFrame.Headers) {
+            if (headersMetadata != null) {
+                throw TrevRpcException(
+                    Status.internal("response HEADERS must be the first frame and appear at most once"),
+                )
+            }
+            headersMetadata = frame.metadata
+        } else if (headersMetadata == null) {
+            headersMetadata = Metadata.EMPTY
+        }
+        return frame
+    }
+
+    private suspend fun fail(error: Throwable) {
+        done = true
+        if (error !is CancellationException) failure = error
+        close(error)
+    }
+
+    private fun receiveMessage(frame: ResponseFrame.Message): T {
         val maxMessages = options.maxResponseMessages
         if (maxMessages != null && messages >= maxMessages) {
             throw TrevRpcException(
@@ -355,12 +430,12 @@ internal class ResponseReader<T>(
         return decodeResponse(codec, frame.body)
     }
 
-    private suspend fun receiveStatus(frame: RpcStreamFrame): T? {
+    private suspend fun receiveStatus(frame: ResponseFrame.Status): T? {
         val status = frame.status
         var trailingError: Throwable? = null
         val trailing =
             try {
-                callWithDeadline(deadline, options.streamIdleTimeout) { stream.receive() }
+                callWithDeadline(deadline, idleTimeout) { stream.receive() }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -400,17 +475,39 @@ internal class ResponseReader<T>(
     }
 }
 
+/**
+ * Reads the single response message of a unary or client-streaming call, then the terminal status.
+ * The stream is drained to its status first so a remote failure wins over a shape violation.
+ */
+internal suspend fun <T> ResponseReader<T>.receiveSingle(kind: String): ResponseEnvelope<T> {
+    var response: T? = null
+    var multipleResponses = false
+    while (true) {
+        val message = receive() ?: break
+        if (response == null) {
+            response = message
+        } else {
+            multipleResponses = true
+        }
+    }
+    if (response == null) {
+        throw TrevRpcException(Status.internal("response stream ended without a response message"))
+    }
+    if (multipleResponses) {
+        throw TrevRpcException(Status.internal("$kind RPC returned more than one response message"))
+    }
+    return ResponseEnvelope(response, responseMetadata, headersMetadata ?: Metadata.EMPTY)
+}
+
 private fun request(
     service: String,
     method: String,
     kind: RpcKind,
-    body: ByteArray,
     options: CallOptions,
 ): RpcRequest =
     RpcRequest(
         service = service,
         method = method,
-        body = body.copyOf(),
         metadata = options.metadata,
         kindValue = kind.value,
         timeoutNanos = timeoutNanos(options.timeout),
@@ -457,20 +554,6 @@ private fun <T> decodeResponse(
         throw error
     } catch (error: Throwable) {
         throw TrevRpcException(Status.internal("failed to decode response body"), error)
-    }
-
-private suspend fun <T> callWithTimeout(
-    timeout: Duration?,
-    operation: suspend () -> T,
-): T =
-    if (timeout == null) {
-        operation()
-    } else {
-        try {
-            withTimeout(timeout) { operation() }
-        } catch (error: TimeoutCancellationException) {
-            throw TrevRpcException(Status.deadlineExceeded("RPC deadline exceeded"), error)
-        }
     }
 
 private suspend fun <T> callWithDeadline(

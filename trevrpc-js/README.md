@@ -93,7 +93,8 @@ call.
 
 - Failed calls throw `TrevRpcError` with a `code` (`Code.NotFound`, ...), `statusMessage` and `metadata`. A deadline surfaces as `Code.DeadlineExceeded`, a cancelled call as `Code.Cancelled` (with the abort reason as `cause`), and a lost connection as `Code.Unavailable`.
 - Streaming responses end with the server's final status: iteration finishes after `OK` and throws the `TrevRpcError` otherwise. `stream.status` settles with the same outcome and carries trailing metadata. Leaving a `for await` loop early, or calling `close()`, cancels the call.
-- Unary metadata is available through `...WithResponse(request)` and `closeAndRecvWithResponse()`.
+- Response headers and trailing metadata are separate. `...WithResponse(request)` (unary) and `closeAndRecvWithResponse()` (client streaming) return `{ message, headers, metadata }`, where `headers` are the server's response headers (empty when it sent none) and `metadata` is the trailing metadata of the final status. Server-streaming and bidirectional calls have a `headers` promise that resolves as soon as the first response frame arrives, so headers are available before the first message, and rejects with the call's error if the call fails first. Reading `headers` is optional.
+- Frames follow the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format): a type, a length and a payload, with messages sent as raw protobuf. The client skips frame types it does not know, and `maxFrameSize` limits every frame, unknown ones included.
 - The server's response decides the outcome of a call: if it ends a call early (for instance with an error), the final status wins over errors from sending the rest of the request.
 
 ### Connections
@@ -154,4 +155,4 @@ npm run interop -- --browser chromium --url ... --cert-hash ...
 
 `nix build .#trevrpc-js` runs the same checks and installs the library, the plugin and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
 
-Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt`, the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the generator, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.
+Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt` (frame bytes, and the frame reader against the shared byte streams), the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the generator, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.

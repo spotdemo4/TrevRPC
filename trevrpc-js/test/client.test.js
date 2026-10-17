@@ -3,9 +3,16 @@ import test from "node:test";
 
 import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
 import { createServiceClient } from "../src/client.js";
-import { encodeFrame, encodeMessageFrame } from "../src/framing.js";
+import {
+  FrameType,
+  encodeFrame,
+  encodeHeadersFrame,
+  encodeMessageFrame,
+  encodeRequestFrame,
+  encodeStatusFrame,
+} from "../src/framing.js";
 import { Code, TrevRpcError } from "../src/status.js";
-import { RpcKind, RpcStreamFrame, WireVersion, createRoot } from "../src/wire.js";
+import { RpcKind, WireVersion, createRoot } from "../src/wire.js";
 import { echoHandler } from "./echo-server.js";
 import { concatBytes, deferred, fakeTransport, turn } from "./support.js";
 
@@ -24,9 +31,15 @@ const isStatus = (code, message) => (error) =>
   error.code === code &&
   (message === undefined || error.statusMessage === message);
 
-async function reply(stream, fields) {
-  await stream.writeResponse({ body: EchoResponse.encode(fields).finish() });
+/** Answers a unary call: one response message and an OK status. */
+async function reply(stream, fields, trailers) {
+  await stream.writeMessage(EchoResponse, fields);
+  await stream.writeStatus(Code.Ok, "", trailers);
 }
+
+const bytes = (value) => new TextEncoder().encode(value);
+const metadataText = (metadata) =>
+  Object.fromEntries(Object.entries(metadata).map(([key, value]) => [key, text.decode(value)]));
 
 test("unary calls send the request header and decode the response", async () => {
   const { echo, transport } = setup(async (stream) => {
@@ -36,12 +49,10 @@ test("unary calls send the request header and decode the response", async () => 
     assert.equal(request.kind, RpcKind.Unary);
     assert.equal(request.version, WireVersion);
     assert.equal(text.decode(request.metadata.trace), "abc");
-    assert.equal(EchoRequest.decode(request.body).message, "hi");
+    assert.equal((await stream.readMessage(EchoRequest)).message, "hi");
     assert.equal(await stream.readFrame(), null, "request side is finished after the request");
-    await stream.writeResponse({
-      body: EchoResponse.encode({ message: "hello", index: 3 }).finish(),
-      metadata: { served: new Uint8Array([1]) },
-    });
+    await stream.writeHeaders({ hdr: new Uint8Array([2]) });
+    await reply(stream, { message: "hello", index: 3 }, { served: new Uint8Array([1]) });
     await stream.finish();
   });
 
@@ -49,17 +60,14 @@ test("unary calls send the request header and decode the response", async () => 
   assert.equal(response.message.message, "hello");
   assert.equal(response.message.index, 3);
   assert.deepEqual([...response.metadata.served], [1]);
+  assert.deepEqual([...response.headers.hdr], [2]);
   await transport.settled();
 });
 
 test("unary calls fail with the status of a non-OK response", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeResponse({
-      status: Code.NotFound,
-      message: "missing",
-      metadata: { why: new Uint8Array([1]) },
-    });
+    await stream.writeStatus(Code.NotFound, "missing", { why: new Uint8Array([1]) });
   });
 
   await assert.rejects(echo.unary({ message: "x" }), (error) => {
@@ -70,11 +78,14 @@ test("unary calls fail with the status of a non-OK response", async () => {
 });
 
 test("unary calls return as soon as the response arrives", async () => {
-  // The server never reads the request or finishes the stream; the response alone decides.
+  // The server never reads the request or finishes the stream; the final status alone decides.
   const { echo } = setup(async (stream) => {
     await reply(stream, { message: "early" });
   });
-  assert.equal((await echo.unary({ message: "x" })).message, "early");
+  const response = await echo.unaryWithResponse({ message: "x" });
+  assert.equal(response.message.message, "early");
+  assert.deepEqual(response.headers, {});
+  assert.deepEqual(response.metadata, {});
 });
 
 test("invalid requests fail before a stream is opened", async () => {
@@ -214,32 +225,376 @@ test("streams that fail mid-response are unavailable", async () => {
   });
 });
 
-test("a stream that ends before the response is unavailable", async () => {
-  const { echo } = setup(async (stream) => {
-    await stream.readRequest();
-    await stream.finish();
-  });
-  await assert.rejects(echo.unary({}), isStatus(Code.Unavailable));
+test("a stream that ends before the final status is an internal error", async () => {
+  for (const write of [
+    async () => {},
+    (stream) => stream.writeHeaders(),
+    (stream) => stream.writeMessage(EchoResponse, { message: "m" }),
+  ]) {
+    const { echo } = setup(async (stream) => {
+      await stream.readRequest();
+      await write(stream);
+      await stream.finish();
+    });
+    await assert.rejects(echo.unary({}), isStatus(Code.Internal));
+  }
+});
+
+test("a stream that ends inside a frame header is unavailable", async () => {
+  const partial = [
+    [0x40], // first byte of a two-byte type
+    [0x21], // a type without its length
+    [0x21, 0x40], // half of a two-byte length
+    [0x00, 0x05, 1], // payload cut short
+  ];
+  for (const wire of partial) {
+    const { echo } = setup(async (stream) => {
+      await stream.readRequest();
+      await stream.write(Uint8Array.from(wire));
+      await stream.finish();
+    });
+    await assert.rejects(echo.unary({}), isStatus(Code.Unavailable), wire.join(","));
+  }
 });
 
 test("malformed or oversized responses fail the call", async () => {
   const cases = [
-    [Code.InvalidArgument, new Uint8Array([0, 0, 0, 2, 0x0a, 0xff])],
-    [Code.ResourceExhausted, new Uint8Array([0, 0, 1, 0])],
+    [Code.InvalidArgument, Uint8Array.of(FrameType.Status, 2, 0x0a, 0xff)],
+    [Code.InvalidArgument, Uint8Array.of(FrameType.Headers, 2, 0x0a, 0xff)],
+    [Code.ResourceExhausted, Uint8Array.of(FrameType.Message, 0x40, 200)],
+    [Code.ResourceExhausted, Uint8Array.of(0x21, 0x40, 200)], // unknown frames are limited too
+    [
+      Code.ResourceExhausted,
+      Uint8Array.of(FrameType.Message, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff),
+    ],
   ];
-  for (const [code, bytes] of cases) {
+  for (const [code, wire] of cases) {
     const { echo } = setup(async (stream) => {
       await stream.readRequest();
-      await stream.write(bytes);
+      await stream.write(wire);
     });
     await assert.rejects(echo.unary({}, { maxFrameSize: 100 }), isStatus(code));
   }
 });
 
 test("a response with invalid metadata is an internal error", async () => {
+  const invalid = { "trevrpc-x": new Uint8Array() };
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeResponse({ metadata: { "trevrpc-x": new Uint8Array() } });
+    await stream.writeMessage(EchoResponse, {});
+    await stream.writeStatus(Code.Ok, "", invalid);
+  });
+  await assert.rejects(echo.unary({}), isStatus(Code.Internal));
+
+  const headers = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeHeaders(invalid);
+  });
+  await assert.rejects(headers.echo.unary({}), isStatus(Code.Internal));
+});
+
+test("unary and server-streaming calls send the request message with the REQUEST frame", async () => {
+  for (const [method, kind] of [
+    ["unary", RpcKind.Unary],
+    ["serverStream", RpcKind.ServerStreaming],
+  ]) {
+    const first = deferred();
+    const { echo } = setup(async (stream) => {
+      first.resolve((await stream.reader.read()).value);
+      await stream.writeStatus(Code.Unimplemented, "stop");
+    });
+    await assert.rejects(
+      (async () => {
+        const result = await echo[method]({ message: "hi" });
+        for await (const _ of result) {
+          // drain
+        }
+      })(),
+      isStatus(Code.Unimplemented),
+    );
+    const expected = encodeRequestFrame(
+      {
+        service: "trevrpc.interop.v1.Echo",
+        method: method === "unary" ? "Unary" : "ServerStream",
+        kind,
+        version: WireVersion,
+      },
+      EchoRequest.encode({ message: "hi" }).finish(),
+    );
+    assert.deepEqual(await first.promise, expected, method);
+  }
+});
+
+test("streaming-request calls send REQUEST alone and their messages later", async () => {
+  const first = deferred();
+  const { echo } = setup(async (stream) => {
+    first.resolve((await stream.reader.read()).value);
+    await stream.readMessage(EchoRequest);
+    await stream.writeStatus();
+  });
+  const call = await echo.bidi();
+  await call.send({ message: "a" });
+  const chunk = await first.promise;
+  assert.equal(chunk[0], FrameType.Request);
+  assert.equal(chunk.byteLength, 2 + chunk[1], "no message in the first write");
+  await call.close();
+});
+
+test("a unary call needs exactly one response message", async () => {
+  for (const count of [0, 2]) {
+    const { echo } = setup(async (stream) => {
+      await stream.readRequest();
+      for (let index = 0; index < count; index += 1) {
+        await stream.writeMessage(EchoResponse, { index });
+      }
+      await stream.writeStatus();
+    });
+    await assert.rejects(echo.unary({}), isStatus(Code.Internal), `${count} responses`);
+  }
+});
+
+test("a lone status fails a unary call before any message", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.writeStatus(Code.Unimplemented, "no such method");
+  });
+  await assert.rejects(echo.unary({}), isStatus(Code.Unimplemented, "no such method"));
+});
+
+test("unary response headers are returned next to the trailing metadata", async () => {
+  const { echo } = setup(echoHandler);
+  const marked = await echo.unaryWithResponse(
+    { message: "hi" },
+    { metadata: { "interop-header": "h" } },
+  );
+  assert.deepEqual(metadataText(marked.headers), { "interop-header": "h" });
+  assert.deepEqual(metadataText(marked.metadata), { "interop-trailer": "h" });
+
+  const plain = await echo.unaryWithResponse({ message: "hi" });
+  assert.deepEqual(plain.headers, {});
+  assert.deepEqual(plain.metadata, {});
+});
+
+test("headers are visible before the first streamed message", async () => {
+  const release = deferred();
+  const { echo, transport } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeHeaders({ early: bytes("yes") });
+    await release.promise;
+    await stream.writeMessage(EchoResponse, { message: "late" });
+    await stream.writeStatus();
+  });
+  const stream = await echo.serverStream({});
+  const headers = await stream.headers; // nobody receives yet
+  assert.deepEqual(metadataText(headers), { early: "yes" });
+  release.resolve();
+
+  const received = [];
+  for await (const response of stream) {
+    received.push(response.message);
+  }
+  assert.deepEqual(received, ["late"]);
+  assert.equal(await stream.headers, headers);
+  await transport.settled();
+});
+
+test("headers resolve empty when the server sends none", async () => {
+  const messages = setup(echoHandler);
+  const stream = await messages.echo.serverStream({ message: "s", count: 1 });
+  assert.deepEqual(await stream.headers, {});
+  assert.equal((await stream[Symbol.asyncIterator]().next()).value.message, "s");
+
+  // The first frame may be a bare status, and headers still settle.
+  const empty = await setup(echoHandler).echo.serverStream({ count: 0 });
+  assert.deepEqual(await empty.headers, {});
+  for await (const _ of empty) {
+    assert.fail("no messages expected");
+  }
+  assert.equal((await empty.status).code, Code.Ok);
+
+  const failed = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus(Code.NotFound, "nope");
+  });
+  const lone = await failed.echo.serverStream({});
+  assert.deepEqual(await lone.headers, {});
+  await assert.rejects(lone[Symbol.asyncIterator]().next(), isStatus(Code.NotFound, "nope"));
+});
+
+test("headers are read when the first receive comes first", async () => {
+  const { echo } = setup(echoHandler);
+  const stream = await echo.serverStream(
+    { message: "s", count: 1 },
+    { metadata: { "interop-header": "h" } },
+  );
+  const iterator = stream[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value.message, "s");
+  assert.deepEqual(metadataText(await stream.headers), { "interop-header": "h" });
+  assert.equal((await iterator.next()).done, true);
+  assert.deepEqual(metadataText((await stream.status).metadata), { "interop-trailer": "h" });
+});
+
+test("bidirectional and client-streaming calls expose headers too", async () => {
+  const { echo } = setup(echoHandler);
+  const call = await echo.bidi({ metadata: { "interop-header": "b" } });
+  await call.send({ message: "1" });
+  assert.deepEqual(metadataText(await call.headers), { "interop-header": "b" });
+  assert.equal((await call.recv()).message, "1");
+  await call.closeSend();
+  assert.equal(await call.recv(), undefined);
+  assert.deepEqual(metadataText((await call.status).metadata), { "interop-trailer": "b" });
+
+  const upload = await echo.clientStream({ metadata: { "interop-header": "c" } });
+  await upload.send({ message: "x" });
+  const response = await upload.closeAndRecvWithResponse();
+  assert.equal(response.message.message, "x");
+  assert.deepEqual(metadataText(response.headers), { "interop-header": "c" });
+  assert.deepEqual(metadataText(response.metadata), { "interop-trailer": "c" });
+});
+
+test("headers reject with the call error when the call ends first", async () => {
+  const reset = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.reset(new Error("connection lost"));
+  });
+  const lost = await reset.echo.serverStream({});
+  await assert.rejects(lost.headers, isStatus(Code.Unavailable));
+
+  const silent = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.responseCancelled;
+  });
+  const timed = await silent.echo.serverStream({}, { timeoutMs: 20 });
+  await assert.rejects(timed.headers, isStatus(Code.DeadlineExceeded));
+
+  const eof = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.finish();
+  });
+  await assert.rejects((await eof.echo.serverStream({})).headers, isStatus(Code.Internal));
+
+  const stopped = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.responseCancelled;
+  });
+  const cancelled = await stopped.echo.bidi();
+  const pending = cancelled.headers;
+  await cancelled.close();
+  await assert.rejects(pending, isStatus(Code.Cancelled));
+});
+
+test("an unobserved rejected headers promise causes no unhandled rejection", async () => {
+  const unhandled = [];
+  const listener = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", listener);
+  try {
+    const { echo } = setup(async (stream) => {
+      await stream.readRequest();
+      await stream.reset(new Error("connection lost"));
+    });
+    const quiet = await echo.serverStream({});
+    await assert.rejects(quiet[Symbol.asyncIterator]().next(), isStatus(Code.Unavailable));
+    const held = (await echo.bidi()).headers; // taken, never awaited
+    await turn(10);
+    assert.ok(held instanceof Promise);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } finally {
+    process.off("unhandledRejection", listener);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
+test("unknown frames are skipped everywhere in a response", async () => {
+  const unknown = (type) => encodeFrame(type, bytes("zz"));
+  const message = (index) => encodeMessageFrame(EchoResponse.encode({ index }).finish());
+  const wire = concatBytes([
+    unknown(0x21),
+    encodeHeadersFrame({ metadata: { h: bytes("1") } }),
+    unknown(0x40),
+    message(1),
+    unknown(2n ** 62n - 1n),
+    message(2),
+    unknown(0x5f),
+    encodeStatusFrame({ code: Code.Ok, metadata: { t: bytes("2") } }),
+    unknown(0x7e),
+    unknown(4),
+  ]);
+
+  for (const size of [1, 5, wire.byteLength]) {
+    const { echo, transport } = setup(async (stream) => {
+      await stream.readRequest();
+      for (let offset = 0; offset < wire.byteLength; offset += size) {
+        await stream.write(wire.subarray(offset, offset + size));
+      }
+      await stream.finish();
+    });
+    const stream = await echo.serverStream({});
+    const received = [];
+    for await (const response of stream) {
+      received.push(response.index);
+    }
+    assert.deepEqual(received, [1, 2]);
+    assert.deepEqual(metadataText(await stream.headers), { h: "1" });
+    assert.deepEqual(metadataText((await stream.status).metadata), { t: "2" });
+    await transport.settled();
+  }
+
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.write(
+      concatBytes([unknown(0x21), message(7), unknown(0x40), encodeStatusFrame({ code: 0 })]),
+    );
+  });
+  const response = await echo.unary({});
+  assert.equal(response.index, 7);
+});
+
+test("a second HEADERS frame fails the call", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.write(
+      concatBytes([encodeHeadersFrame({}), encodeHeadersFrame({ metadata: { b: bytes("2") } })]),
+    );
+  });
+  const stream = await echo.serverStream({});
+  await assert.rejects(stream[Symbol.asyncIterator]().next(), isStatus(Code.Internal));
+  await assert.rejects(stream.status, isStatus(Code.Internal));
+  assert.deepEqual(await stream.headers, {}, "the first HEADERS frame was already delivered");
+
+  const unary = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeHeaders({});
+    await stream.writeHeaders({});
+    await stream.writeMessage(EchoResponse, {});
+    await stream.writeStatus();
+  });
+  await assert.rejects(unary.echo.unary({}), isStatus(Code.Internal));
+});
+
+test("HEADERS after a MESSAGE fails the call", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeMessage(EchoResponse, { message: "m" });
+    await stream.writeHeaders({});
+  });
+  const stream = await echo.serverStream({});
+  const iterator = stream[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value.message, "m");
+  await assert.rejects(iterator.next(), isStatus(Code.Internal));
+  await assert.rejects(stream.status, isStatus(Code.Internal));
+
+  const unary = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeMessage(EchoResponse, { message: "m" });
+    await stream.writeHeaders({});
+    await stream.writeStatus();
+  });
+  await assert.rejects(unary.echo.unary({}), isStatus(Code.Internal));
+});
+
+test("request frames are not valid on a response stream", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.write(encodeRequestFrame({ service: "s", method: "m", version: 1 }));
   });
   await assert.rejects(echo.unary({}), isStatus(Code.Internal));
 });
@@ -365,11 +720,12 @@ test("a stream that ends without a final status is an internal error", async () 
   await assert.rejects(stream.status, isStatus(Code.Internal));
 });
 
-test("unknown frame kinds and undecodable messages fail the stream", async () => {
+test("misplaced frames and undecodable messages fail the stream", async () => {
   const frames = [
-    [Code.InvalidArgument, encodeFrame(RpcStreamFrame, { kind: 9 })],
+    [Code.InvalidArgument, encodeFrame(FrameType.Status, new Uint8Array([0x0a, 0xff]))],
     [Code.InvalidArgument, encodeMessageFrame(new Uint8Array([0x0a, 0xff]))],
-    [Code.Internal, encodeFrame(RpcStreamFrame, { kind: 1, metadata: { "trevrpc-x": [] } })],
+    [Code.Internal, encodeStatusFrame({ metadata: { "trevrpc-x": [] } })],
+    [Code.Internal, encodeRequestFrame({ service: "s", method: "m", version: 1 })],
   ];
   for (const [code, bytes] of frames) {
     const { echo } = setup(async (stream) => {
@@ -403,15 +759,12 @@ test("a failure while draining after the final status does not change the outcom
   assert.equal((await stream.status).code, Code.Ok);
 });
 
-test("data after the final status is ignored and the stream is cancelled", async () => {
+test("a known frame after the final status is ignored and the stream is cancelled", async () => {
   const cancelled = deferred();
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
     await stream.write(
-      concatBytes([
-        encodeFrame(RpcStreamFrame, { kind: 1, status: 0 }),
-        encodeMessageFrame(new Uint8Array([1])),
-      ]),
+      concatBytes([encodeStatusFrame({ code: 0 }), encodeMessageFrame(new Uint8Array([1]))]),
     );
     cancelled.resolve(stream.responseCancelled);
   });
@@ -422,6 +775,24 @@ test("data after the final status is ignored and the stream is cancelled", async
   }
   assert.deepEqual(received, []);
   assert.equal(await cancelled.promise, true);
+  assert.equal((await stream.status).code, Code.Ok);
+});
+
+test("unknown frames after the final status are drained without cancelling", async () => {
+  const { echo, transport } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus();
+    await stream.write(encodeFrame(0x21, bytes("grease")));
+    await turn();
+    await stream.write(encodeFrame(2n ** 62n - 1n, bytes("late"))); // fails if the client cancelled
+    await stream.finish();
+  });
+  const stream = await echo.serverStream({});
+  for await (const _ of stream) {
+    assert.fail("no messages expected");
+  }
+  await transport.settled();
+  assert.equal((await stream.status).code, Code.Ok);
 });
 
 test("client streaming sends ordered messages and returns the single response", async () => {
@@ -518,7 +889,7 @@ test("a message that cannot be encoded does not break the call", async () => {
   const transport = fakeTransport(async (stream) => {
     await stream.readRequest();
     for (let frame; (frame = await stream.readFrame()) !== null;) {
-      await stream.write(encodeMessageFrame(frame.body));
+      await stream.write(encodeMessageFrame(frame.payload));
     }
     await stream.writeStatus();
   });
@@ -594,11 +965,7 @@ test("service clients merge default and per-call options", async () => {
   const seen = [];
   const transport = fakeTransport(async (stream) => {
     const request = await stream.readRequest();
-    seen.push(
-      Object.fromEntries(
-        Object.entries(request.metadata).map(([key, value]) => [key, text.decode(value)]),
-      ),
-    );
+    seen.push(metadataText(request.metadata));
     await reply(stream, {});
   });
   const echo = new EchoClient(transport, { metadata: { Authorization: "base", trace: "t" } });

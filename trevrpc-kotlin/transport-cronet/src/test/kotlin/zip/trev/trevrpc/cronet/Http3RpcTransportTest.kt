@@ -24,17 +24,21 @@ import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.Code
+import zip.trev.trevrpc.Frame
 import zip.trev.trevrpc.FrameDecoder
+import zip.trev.trevrpc.FrameType
+import zip.trev.trevrpc.Metadata
+import zip.trev.trevrpc.QuicVarint
+import zip.trev.trevrpc.ResponseFrame
 import zip.trev.trevrpc.RpcClientStream
+import zip.trev.trevrpc.RpcHeaders
 import zip.trev.trevrpc.RpcKind
 import zip.trev.trevrpc.RpcRequest
-import zip.trev.trevrpc.RpcResponse
-import zip.trev.trevrpc.RpcStreamFrame
-import zip.trev.trevrpc.RpcStreamFrameKind
+import zip.trev.trevrpc.RpcStatus
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
-import zip.trev.trevrpc.frame
+import zip.trev.trevrpc.encodeFrame
 import java.net.URL
 import java.net.URLConnection
 import java.net.URLStreamHandlerFactory
@@ -65,7 +69,7 @@ class Http3RpcTransportTest {
             channel.close()
             channel.close()
 
-            val error = runCatching { channel.unary(RpcRequest("svc", "method")) }.exceptionOrNull()
+            val error = runCatching { channel.openStream(RpcRequest("svc", "method"), byteArrayOf(), true) }.exceptionOrNull()
             assertEquals(Code.UNAVAILABLE, (error as TrevRpcException).status.code)
         }
 
@@ -74,25 +78,33 @@ class Http3RpcTransportTest {
         runTest {
             val fake = FakeFactory()
             val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
-            val request = RpcRequest("example.Service", "Unary", byteArrayOf(1, 2))
-            val call = async { transport.unary(request) }
+            val request = RpcRequest("example.Service", "Unary")
+            val call = async { transport.openStream(request, byteArrayOf(1, 2), true) }
 
             runCurrent()
             fake.ready()
             runCurrent()
             val requestWrite = fake.onlyWrite()
+            // REQUEST, the only MESSAGE and the half-close share one write.
             assertTrue(requestWrite.endOfStream)
-            assertRequestEquals(request, WireCodec.decodeRequest(decodeFrame(requestWrite.bytes)))
+            val written = FrameDecoder().feed(requestWrite.bytes)
+            assertEquals(listOf(FrameType.REQUEST, FrameType.MESSAGE), written.map(Frame::type))
+            assertRequestEquals(request, WireCodec.decodeRequest(written[0].payload))
+            assertArrayEquals(byteArrayOf(1, 2), written[1].payload)
             fake.completeWrite()
+            val stream = call.await()
 
             fake.headers(validHeaders())
-            val response = RpcResponse.ok(byteArrayOf(7, 8, 9))
-            fake.deliverRead(frame(WireCodec.encode(response)), endOfStream = true)
+            fake.deliverRead(
+                headersFrame(Metadata.of("x-h" to byteArrayOf(1))) + messageFrame(byteArrayOf(7, 8, 9)) + statusFrame(Status.ok()),
+                endOfStream = true,
+            )
             runCurrent()
 
-            val actual = call.await()
-            assertEquals(response.statusValue, actual.statusValue)
-            assertArrayEquals(response.body, actual.body)
+            assertEquals(1, (stream.receive() as ResponseFrame.Headers).metadata["x-h"]?.single()?.toInt())
+            assertArrayEquals(byteArrayOf(7, 8, 9), (stream.receive() as ResponseFrame.Message).body)
+            assertTrue((stream.receive() as ResponseFrame.Status).status.isOk)
+            assertNull(stream.receive())
             assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
         }
@@ -115,14 +127,12 @@ class Http3RpcTransportTest {
             assertEquals(1, fake.pendingReads)
             fake.ready()
             runCurrent()
-            assertRequestEquals(request, WireCodec.decodeRequest(decodeFrame(fake.onlyWrite().bytes)))
+            assertRequestEquals(request, decodeRequestFrame(fake.onlyWrite().bytes))
             assertFalse(opening.isCompleted)
             fake.completeWrite()
             val stream = opening.await()
 
-            val message = RpcStreamFrame.message(byteArrayOf(4, 5))
-            val status = RpcStreamFrame.status(Status.ok())
-            val responseBytes = frame(WireCodec.encode(message)) + frame(WireCodec.encode(status))
+            val responseBytes = messageFrame(byteArrayOf(4, 5)) + statusFrame(Status.ok())
             fake.deliverRead(responseBytes.copyOfRange(0, 3))
             runCurrent()
             assertEquals(1, fake.pendingReads)
@@ -131,8 +141,8 @@ class Http3RpcTransportTest {
 
             val actualMessage = stream.receive()
             val actualStatus = stream.receive()
-            assertArrayEquals(message.body, actualMessage?.body)
-            assertEquals(RpcStreamFrameKind.STATUS, actualStatus?.kind)
+            assertArrayEquals(byteArrayOf(4, 5), (actualMessage as ResponseFrame.Message).body)
+            assertInstanceOf(ResponseFrame.Status::class.java, actualStatus)
             assertNull(stream.receive())
             assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
@@ -189,12 +199,12 @@ class Http3RpcTransportTest {
                     fake,
                 )
             fake.headers(validHeaders())
-            fake.deliverRead(frame(WireCodec.encode(RpcStreamFrame.status(Status.ok()))))
+            fake.deliverRead(statusFrame(Status.ok()))
             runCurrent()
 
             stream.finishSend()
             assertEquals(0, fake.pendingWrites)
-            assertEquals(RpcStreamFrameKind.STATUS, stream.receive()?.kind)
+            assertInstanceOf(ResponseFrame.Status::class.java, stream.receive())
             assertNull(stream.receive())
             assertTrue(fake.awaitCancel())
         }
@@ -214,12 +224,12 @@ class Http3RpcTransportTest {
             assertFalse(finish.isCompleted)
 
             fake.headers(validHeaders())
-            fake.deliverRead(frame(WireCodec.encode(RpcStreamFrame.status(Status.ok()))))
+            fake.deliverRead(statusFrame(Status.ok()))
             runCurrent()
 
             finish.await()
             fake.completeWrite()
-            assertEquals(RpcStreamFrameKind.STATUS, stream.receive()?.kind)
+            assertInstanceOf(ResponseFrame.Status::class.java, stream.receive())
             assertNull(stream.receive())
             assertTrue(fake.awaitCancel())
         }
@@ -260,7 +270,7 @@ class Http3RpcTransportTest {
             fake.headers(validHeaders())
             val frames =
                 (1..3).fold(byteArrayOf()) { bytes, value ->
-                    bytes + frame(WireCodec.encode(RpcStreamFrame.message(byteArrayOf(value.toByte()))))
+                    bytes + messageFrame(byteArrayOf(value.toByte()))
                 }
 
             fake.deliverRead(frames)
@@ -268,31 +278,28 @@ class Http3RpcTransportTest {
             assertEquals(0, fake.pendingReads)
             assertEquals(
                 1,
-                stream
-                    .receive()
-                    ?.body
-                    ?.single()
-                    ?.toInt(),
+                (stream.receive() as ResponseFrame.Message)
+                    .body
+                    .single()
+                    .toInt(),
             )
             runCurrent()
             assertEquals(0, fake.pendingReads)
             assertEquals(
                 2,
-                stream
-                    .receive()
-                    ?.body
-                    ?.single()
-                    ?.toInt(),
+                (stream.receive() as ResponseFrame.Message)
+                    .body
+                    .single()
+                    .toInt(),
             )
             runCurrent()
             assertEquals(1, fake.pendingReads)
             assertEquals(
                 3,
-                stream
-                    .receive()
-                    ?.body
-                    ?.single()
-                    ?.toInt(),
+                (stream.receive() as ResponseFrame.Message)
+                    .body
+                    .single()
+                    .toInt(),
             )
             stream.close()
         }
@@ -348,10 +355,80 @@ class Http3RpcTransportTest {
                     partialFake,
                 )
             partialFake.headers(validHeaders())
-            partialFake.deliverRead(byteArrayOf(0, 0), endOfStream = true)
+            partialFake.deliverRead(byteArrayOf(0, 0x40), endOfStream = true)
             runCurrent()
             val error = partial.receiveFailure()
             assertEquals(Code.INTERNAL, (error as TrevRpcException).status.code)
+        }
+
+    @Test
+    fun `unknown frames are skipped everywhere and frames decode once into response frames`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext), fake)
+            fake.headers(validHeaders())
+            val unknown =
+                encodeFrame(0x40, ByteArray(5)) + encodeFrame(0x21, byteArrayOf()) + encodeFrame(QuicVarint.MAX_VALUE, byteArrayOf(1))
+            val bytes = unknown + headersFrame(Metadata.of("x-h" to byteArrayOf(3))) + unknown + messageFrame(byteArrayOf(1)) + unknown
+            // One byte at a time: every header is split across reads at every boundary.
+            bytes.forEach {
+                fake.deliverRead(byteArrayOf(it))
+                runCurrent()
+            }
+            // The exchange stops reading at STATUS, so trailing unknown frames share its read.
+            fake.deliverRead(statusFrame(Status.ok()) + unknown)
+            runCurrent()
+            assertEquals(3, (stream.receive() as ResponseFrame.Headers).metadata["x-h"]?.single()?.toInt())
+            assertArrayEquals(byteArrayOf(1), (stream.receive() as ResponseFrame.Message).body)
+            assertTrue((stream.receive() as ResponseFrame.Status).status.isOk)
+            assertNull(stream.receive())
+        }
+
+    @Test
+    fun `a known frame after status in the same read is forwarded for the reader to reject`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext), fake)
+            fake.headers(validHeaders())
+            fake.deliverRead(statusFrame(Status.ok()) + encodeFrame(0x40, byteArrayOf()) + messageFrame(byteArrayOf(2)))
+            runCurrent()
+            assertInstanceOf(ResponseFrame.Status::class.java, stream.receive())
+            assertInstanceOf(ResponseFrame.Message::class.java, stream.receive())
+            assertNull(stream.receive())
+        }
+
+    @Test
+    fun `oversized frames are rejected from the header and a request frame in a response is internal`() =
+        runTest {
+            val oversizedFake = FakeFactory()
+            val oversized =
+                openStreaming(
+                    Http3RpcTransport(
+                        oversizedFake,
+                        CronetTransportOptions(maxFrameSize = 64),
+                        coroutineContext,
+                        shutdownContext = coroutineContext,
+                    ),
+                    oversizedFake,
+                )
+            oversizedFake.headers(validHeaders())
+            // Grease type 0x21 declaring 100 bytes: no payload needs to arrive.
+            oversizedFake.deliverRead(byteArrayOf(0x21, 0x40, 100))
+            runCurrent()
+            assertEquals(Code.RESOURCE_EXHAUSTED, (oversized.receiveFailure() as TrevRpcException).status.code)
+
+            val requestFake = FakeFactory()
+            val requestFrame =
+                openStreaming(
+                    Http3RpcTransport(requestFake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    requestFake,
+                )
+            requestFake.headers(validHeaders())
+            requestFake.deliverRead(encodeFrame(FrameType.REQUEST, byteArrayOf()))
+            runCurrent()
+            assertEquals(Code.INTERNAL, (requestFrame.receiveFailure() as TrevRpcException).status.code)
         }
 
     @Test
@@ -369,19 +446,17 @@ class Http3RpcTransportTest {
             runCurrent()
             assertFalse(fake.onlyWrite().endOfStream)
             fake.headers(validHeaders())
-            val message = RpcStreamFrame.message(byteArrayOf(9))
-            val terminal = RpcStreamFrame.status(Status.unavailable("remote result"))
-            fake.deliverRead(frame(WireCodec.encode(message)) + frame(WireCodec.encode(terminal)))
+            fake.deliverRead(messageFrame(byteArrayOf(9)) + statusFrame(Status.unavailable("remote result")))
             runCurrent()
             fake.completeWrite()
             fake.fail(IllegalStateException("late request write failure"))
             assertTrue(send.isCancelled)
 
-            assertArrayEquals(message.body, stream.receive()?.body)
+            assertArrayEquals(byteArrayOf(9), (stream.receive() as ResponseFrame.Message).body)
             runCurrent()
-            val actual = stream.receive()
-            assertEquals(Code.UNAVAILABLE, actual?.status?.code)
-            assertEquals("remote result", actual?.status?.message)
+            val actual = stream.receive() as ResponseFrame.Status
+            assertEquals(Code.UNAVAILABLE, actual.status.code)
+            assertEquals("remote result", actual.status.message)
             assertNull(stream.receive())
             assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
@@ -449,7 +524,7 @@ class Http3RpcTransportTest {
                     async {
                         runCatching {
                             if (kind == RpcKind.UNARY) {
-                                transport.unary(request)
+                                transport.openStream(request, byteArrayOf(), true)
                             } else {
                                 transport.openStream(request)
                             }
@@ -514,10 +589,10 @@ class Http3RpcTransportTest {
             val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
             val stream = openStreaming(transport, fake)
             fake.headers(validHeaders())
-            fake.deliverRead(frame(WireCodec.encode(RpcStreamFrame.status(Status.ok()))))
+            fake.deliverRead(statusFrame(Status.ok()))
             runCurrent()
 
-            assertEquals(RpcStreamFrameKind.STATUS, stream.receive()?.kind)
+            assertInstanceOf(ResponseFrame.Status::class.java, stream.receive())
             assertNull(stream.receive())
             assertEquals(1, transport.activeExchangeCount)
 
@@ -765,7 +840,7 @@ class Http3RpcTransportTest {
             fake.ready()
             assertTrue(fake.awaitWrite())
             val initial = fake.onlyWrite()
-            assertRequestEquals(streamRequest(), WireCodec.decodeRequest(decodeFrame(initial.bytes)))
+            assertRequestEquals(streamRequest(), decodeRequestFrame(initial.bytes))
             fake.completeWrite()
             opening.await()
 
@@ -992,7 +1067,7 @@ private suspend fun TestScope.openStreaming(
     assertFalse(opening.isCompleted)
     val initial = fake.onlyWrite()
     assertFalse(initial.endOfStream)
-    assertRequestEquals(request, WireCodec.decodeRequest(decodeFrame(initial.bytes)))
+    assertRequestEquals(request, decodeRequestFrame(initial.bytes))
     fake.completeWrite()
     return opening.await()
 }
@@ -1005,15 +1080,26 @@ private fun streamRequest(): RpcRequest = RpcRequest("example.Service", "Stream"
 private fun validHeaders(contentType: String = TREV_RPC_CONTENT_TYPE): ResponseHeaders =
     ResponseHeaders(200, listOf("Content-Type" to contentType))
 
-private fun decodeFrame(bytes: ByteArray): ByteArray = FrameDecoder().feed(bytes).single()
+private fun decodeRequestFrame(bytes: ByteArray): RpcRequest {
+    val frame = FrameDecoder().feed(bytes).first()
+    assertEquals(FrameType.REQUEST, frame.type)
+    return WireCodec.decodeRequest(frame.payload)
+}
+
+private fun messageFrame(body: ByteArray): ByteArray = encodeFrame(FrameType.MESSAGE, body)
+
+private fun headersFrame(metadata: Metadata = Metadata.EMPTY): ByteArray =
+    encodeFrame(FrameType.HEADERS, WireCodec.encode(RpcHeaders(metadata)))
+
+private fun statusFrame(status: Status): ByteArray = encodeFrame(FrameType.STATUS, WireCodec.encode(RpcStatus.fromStatus(status)))
 
 private fun assertMessageWrite(
     bytes: ByteArray,
     expected: ByteArray,
 ) {
-    val message = WireCodec.decodeStreamFrame(decodeFrame(bytes))
-    assertEquals(RpcStreamFrameKind.MESSAGE, message.kind)
-    assertArrayEquals(expected, message.body)
+    val frame = FrameDecoder().feed(bytes).single()
+    assertEquals(FrameType.MESSAGE, frame.type)
+    assertArrayEquals(expected, frame.payload)
 }
 
 private fun assertRequestEquals(
@@ -1026,7 +1112,7 @@ private fun assertRequestEquals(
     assertEquals(expected.version, actual.version)
     assertEquals(expected.timeoutNanos, actual.timeoutNanos)
     assertEquals(expected.metadata, actual.metadata)
-    assertArrayEquals(expected.body, actual.body)
+    assertEquals(expected.extensions, actual.extensions)
 }
 
 private class FakeFactory : DuplexStreamFactory {

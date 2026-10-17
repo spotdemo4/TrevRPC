@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn protobuf_decode_errors_map_to_invalid_argument() {
-        let status = crate::framing::decode_frame::<RpcRequest>(&[0xff, 0xff])
+        let status = crate::framing::decode_payload::<RpcRequest>(&[0xff, 0xff])
             .expect_err("malformed protobuf should fail")
             .into_status();
 

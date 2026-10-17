@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{Metadata, RpcResponse};
+use crate::{Metadata, RpcStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Code {
@@ -193,34 +193,21 @@ impl Status {
     pub const fn is_ok(&self) -> bool {
         matches!(self.code, Code::Ok)
     }
+}
 
-    /// Converts the status and response body into an RPC response.
-    #[must_use]
-    pub fn into_response(self, body: Vec<u8>) -> RpcResponse {
-        let metadata = self.metadata.clone();
-        self.into_response_with_metadata(body, metadata)
-    }
-
-    /// Converts the status, response body, and metadata into an RPC response.
-    #[must_use]
-    pub fn into_response_with_metadata(
-        self,
-        body: Vec<u8>,
-        metadata: crate::Metadata,
-    ) -> RpcResponse {
-        RpcResponse {
-            status: self.code.as_u32(),
-            message: self.message,
-            body,
-            metadata,
+impl From<Status> for RpcStatus {
+    fn from(status: Status) -> Self {
+        Self {
+            code: status.code.as_u32(),
+            message: status.message,
+            metadata: status.metadata,
         }
     }
+}
 
-    /// Builds a status from an RPC response status code, message, and metadata.
-    #[must_use]
-    pub fn from_response(response: &RpcResponse) -> Self {
-        Self::new(Code::from_u32(response.status), response.message.clone())
-            .with_metadata(response.metadata.clone())
+impl From<RpcStatus> for Status {
+    fn from(status: RpcStatus) -> Self {
+        Self::new(Code::from_u32(status.code), status.message).with_metadata(status.metadata)
     }
 }
 

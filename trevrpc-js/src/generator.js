@@ -359,7 +359,7 @@ function generateServiceMethod(jsName, method) {
   }
 
   if (method.kind === "unary") {
-    return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request, options = {}) {\n    return this._client.${jsName}(request, options);\n  }\n\n  /** Calls the ${method.name} RPC and returns response metadata. */\n  ${jsName}WithResponse(request, options = {}) {\n    return this._client.${jsName}WithResponse(request, options);\n  }`;
+    return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request, options = {}) {\n    return this._client.${jsName}(request, options);\n  }\n\n  /** Calls the ${method.name} RPC and returns response headers and trailing metadata. */\n  ${jsName}WithResponse(request, options = {}) {\n    return this._client.${jsName}WithResponse(request, options);\n  }`;
   }
 
   return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request, options = {}) {\n    return this._client.${jsName}(request, options);\n  }`;
@@ -381,7 +381,7 @@ function generateMethodDeclaration(jsName, method, typeNames) {
 
   switch (method.kind) {
     case "unary":
-      return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request: ${inputType}, options?: CallOptions): Promise<${outputType}>;\n  /** Calls the ${method.name} RPC and returns response metadata. */\n  ${jsName}WithResponse(request: ${inputType}, options?: CallOptions): Promise<UnaryResponse<${outputType}>>;`;
+      return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request: ${inputType}, options?: CallOptions): Promise<${outputType}>;\n  /** Calls the ${method.name} RPC and returns response headers and trailing metadata. */\n  ${jsName}WithResponse(request: ${inputType}, options?: CallOptions): Promise<UnaryResponse<${outputType}>>;`;
     case "serverStreaming":
       return `  /** Calls the ${method.name} RPC. */\n  ${jsName}(request: ${inputType}, options?: CallOptions): Promise<ResponseStream<${outputType}>>;`;
     case "clientStreaming":

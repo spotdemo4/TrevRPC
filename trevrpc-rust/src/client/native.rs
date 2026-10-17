@@ -1,10 +1,11 @@
 //! Native `TrevRPC` call transport over one established multiplexed connection: QUIC or `QMux`.
 
+use bytes::Bytes;
+
 use crate::framed;
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
-use crate::{
-    BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind, Status,
-};
+use crate::response_state::UnaryResponse;
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest};
 
 use super::upload::UploadWriter;
 use super::{RpcTransport, StreamingRpcTransport};
@@ -19,7 +20,7 @@ pub struct NativeTransport<C> {
 
 #[crate::async_trait]
 impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
+    async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
         let (send, recv) = self.connection.open_stream().await?;
         let mut call = UnaryCall {
             send,
@@ -27,21 +28,31 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
             complete: false,
         };
 
-        framed::write_frame(&mut call.send, &request, self.max_frame_size).await?;
+        framed::write_request(
+            &mut call.send,
+            &request,
+            vec![Bytes::from(body)],
+            self.max_frame_size,
+        )
+        .await?;
         call.send.finish_stream()?;
 
-        let response =
-            framed::read_frame::<_, RpcResponse>(&mut call.recv, self.max_frame_size).await?;
-        if framed::read_raw_frame_or_eof(&mut call.recv, self.max_frame_size)
-            .await?
-            .is_some()
+        let mut response = UnaryResponse::default();
+        while let Some(frame) =
+            framed::read_response_frame(&mut call.recv, self.max_frame_size).await?
         {
-            return Err(Error::from(Status::internal(
-                "unary response contained more than one response frame",
-            )));
+            if response.accept(frame).map_err(Error::from)? {
+                framed::drain_fin_after_terminal_status(
+                    &mut call.recv,
+                    self.max_frame_size,
+                    "unary response stream",
+                )
+                .await?;
+                break;
+            }
         }
         call.complete = true;
-        Ok(response)
+        response.finish().map_err(Error::from)
     }
 }
 
@@ -51,7 +62,7 @@ impl<C: MuxConnection> StreamingRpcTransport for NativeTransport<C> {
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>> {
+    ) -> Result<BoxStream<ResponseFrame>> {
         let (send, recv) = self.connection.open_stream().await?;
         let max_frame_size = self.max_frame_size;
         let upload = UploadWriter::spawn(async move {
@@ -107,8 +118,13 @@ async fn write_streaming_request<S: MuxSendStream>(
         send,
         complete: false,
     };
-    framed::write_frame(&mut upload.send, &request, max_frame_size).await?;
-    framed::write_request_body_frames(&mut upload.send, &mut request_body, max_frame_size).await?;
+    framed::write_request_stream(
+        &mut upload.send,
+        &request,
+        &mut request_body,
+        max_frame_size,
+    )
+    .await?;
     upload.send.finish_stream()?;
     upload.complete = true;
     Ok(())
@@ -132,16 +148,15 @@ impl<R: MuxRecvStream> Drop for StreamingCall<R> {
 
 /// Drives the logical lifecycle of a streaming response: upload settlement, terminal-status
 /// precedence, and the clean end of the response stream.
-fn response_stream<R: MuxRecvStream>(call: StreamingCall<R>) -> BoxStream<RpcStreamFrame> {
+fn response_stream<R: MuxRecvStream>(call: StreamingCall<R>) -> BoxStream<ResponseFrame> {
     Box::pin(futures_util::stream::unfold(call, |mut call| async move {
         if call.complete {
             return None;
         }
 
         let max_frame_size = call.max_frame_size;
-        let item = match framed::read_stream_frame_or_eof(&mut call.recv, max_frame_size).await {
-            Ok(Some(frame)) if frame.frame_kind() == Some(RpcStreamFrameKind::Status) => {
-                let status = frame.status_value();
+        let item = match framed::read_response_frame(&mut call.recv, max_frame_size).await {
+            Ok(Some(ResponseFrame::Status(status))) => {
                 let upload_result = call.upload.abort_and_settle().await;
                 let drain_result = framed::drain_fin_after_terminal_status(
                     &mut call.recv,
@@ -154,9 +169,9 @@ fn response_stream<R: MuxRecvStream>(call: StreamingCall<R>) -> BoxStream<RpcStr
                 if let Err(error) = drain_result {
                     Err(error)
                 } else if status.is_ok() {
-                    upload_result.map(|()| frame)
+                    upload_result.map(|()| ResponseFrame::Status(status))
                 } else {
-                    Ok(frame)
+                    Ok(ResponseFrame::Status(status))
                 }
             }
             Ok(Some(frame)) => Ok(frame),

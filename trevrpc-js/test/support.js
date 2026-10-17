@@ -1,15 +1,17 @@
 // Test doubles: an in-memory server for TrevRPC streams built on web streams, so the real client
 // code runs end to end without a network. Cancelling or aborting one side of a stream errors the
 // other side exactly like a QUIC reset would.
-import { FrameReader, encodeFrame, encodeMessageFrame, marshalMessage } from "../src/framing.js";
-import { Code } from "../src/status.js";
 import {
-  RpcRequest,
-  RpcResponse,
-  RpcStreamFrame,
-  RpcStreamFrameKind,
-  WireVersion,
-} from "../src/wire.js";
+  FrameReader,
+  FrameType,
+  encodeHeadersFrame,
+  encodeMessageFrame,
+  encodeStatusFrame,
+  marshalMessage,
+  unmarshalMessage,
+} from "../src/framing.js";
+import { Code } from "../src/status.js";
+import { RpcRequest, WireVersion } from "../src/wire.js";
 
 /** The server end of one bidirectional stream. */
 export class ServerStream {
@@ -24,13 +26,18 @@ export class ServerStream {
     );
   }
 
-  readRequest() {
-    return this.frames.readFrame(RpcRequest);
+  /** Reads the REQUEST frame and returns the decoded RpcRequest. */
+  async readRequest() {
+    const frame = await this.frames.readFrame();
+    if (frame?.type !== FrameType.Request) {
+      throw new Error(`expected a REQUEST frame, got ${frame?.type}`);
+    }
+    return unmarshalMessage(RpcRequest, frame.payload);
   }
 
-  /** Reads the next stream frame from the client, or null once the client finished sending. */
+  /** Reads the next known frame from the client as `{ type, payload }`, null at the end. */
   readFrame() {
-    return this.frames.readStreamFrame();
+    return this.frames.readFrame();
   }
 
   /** Reads the next request message, null at the end of the request stream. */
@@ -39,23 +46,22 @@ export class ServerStream {
     if (frame === null) {
       return null;
     }
-    if (frame.kind !== RpcStreamFrameKind.Message) {
-      throw new Error("client sent a status frame");
+    if (frame.type !== FrameType.Message) {
+      throw new Error(`client sent a frame of type ${frame.type} instead of a message`);
     }
-    return messageType.decode(frame.body);
+    return messageType.decode(frame.payload);
   }
 
-  writeResponse(fields = {}) {
-    return this.write(encodeFrame(RpcResponse, { status: Code.Ok, metadata: {}, ...fields }));
+  writeHeaders(metadata = {}) {
+    return this.write(encodeHeadersFrame({ metadata }));
   }
 
   writeMessage(messageType, message) {
     return this.write(encodeMessageFrame(marshalMessage(messageType, message)));
   }
 
-  writeStatus(status = Code.Ok, message = "", metadata = {}) {
-    const frame = { kind: RpcStreamFrameKind.Status, status, message, metadata };
-    return this.write(encodeFrame(RpcStreamFrame, frame));
+  writeStatus(code = Code.Ok, message = "", metadata = {}) {
+    return this.write(encodeStatusFrame({ code, message, metadata }));
   }
 
   write(bytes) {

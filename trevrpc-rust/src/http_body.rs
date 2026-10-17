@@ -10,8 +10,8 @@ use tokio::sync::{Semaphore, watch};
 use crate::framed::{self, FrameRead, FrameWrite};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::server::Server;
-use crate::server_transport::{self, ResponseWriter};
-use crate::{Result, RpcRequest, RpcResponse, RpcStreamFrame};
+use crate::server_transport::{self, IncomingRequest, ResponseWriter};
+use crate::{ResponseFrame, Result};
 
 /// The send half of one HTTP request or `WebTransport` stream.
 pub trait BodySink: Send + 'static {
@@ -45,10 +45,6 @@ struct BodyWriter<S> {
 }
 
 impl<S: BodySink> FrameWrite for BodyWriter<S> {
-    async fn write_frame_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.sink.write(bytes).await
-    }
-
     async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
         for chunk in chunks {
             self.sink.write(chunk).await?;
@@ -58,19 +54,9 @@ impl<S: BodySink> FrameWrite for BodyWriter<S> {
 }
 
 impl<S: BodySink> ResponseWriter for BodyWriter<S> {
-    async fn write_response(&mut self, response: &RpcResponse) -> Result<()> {
+    async fn write_frames(&mut self, frames: &mut Vec<ResponseFrame>) -> Result<()> {
         let max_frame_size = self.max_frame_size;
-        framed::write_frame(self, response, max_frame_size).await
-    }
-
-    async fn write_message_stream_frames(&mut self, bodies: &mut Vec<Vec<u8>>) -> Result<()> {
-        let max_frame_size = self.max_frame_size;
-        framed::write_message_stream_frames(self, bodies, max_frame_size).await
-    }
-
-    async fn write_stream_frame(&mut self, frame: RpcStreamFrame) -> Result<()> {
-        let max_frame_size = self.max_frame_size;
-        framed::write_stream_frame(self, frame, max_frame_size).await
+        framed::write_response_frames(self, frames, max_frame_size).await
     }
 
     async fn stopped(&mut self) -> Result<()> {
@@ -113,17 +99,6 @@ impl<S: BodySource> RequestPumpReader for BodyReader<S> {
         // panic, see `H3-UPSTREAM-ISSUES.md`), so the bounded body is released when dropped.
     }
 
-    async fn read_unary_end(&mut self) -> Result<()> {
-        framed::drain_unary_request_end(self).await
-    }
-
-    async fn read_stream_frame_or_eof(
-        &mut self,
-        max_frame_size: usize,
-    ) -> Result<Option<RpcStreamFrame>> {
-        framed::read_stream_frame_or_eof(self, max_frame_size).await
-    }
-
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
         self.source.transport_event().await
     }
@@ -138,7 +113,7 @@ async fn read_request<K, S>(
     server: &Server,
     sink: K,
     source: S,
-) -> Option<(BodyWriter<K>, BodyReader<S>, RpcRequest)>
+) -> Option<(BodyWriter<K>, BodyReader<S>, IncomingRequest)>
 where
     K: BodySink,
     S: BodySource,
@@ -152,7 +127,7 @@ where
         chunk: Bytes::new(),
     };
     match server_transport::read_initial_request(server, &mut reader).await {
-        Ok(request) => Some((writer, reader, request)),
+        Ok(incoming) => Some((writer, reader, incoming)),
         Err(error) => {
             let status = error.into_status();
             server.record_pre_handler_failure(&status);
@@ -173,8 +148,8 @@ pub async fn handle_rpc_stream<K, S>(
     K: BodySink,
     S: BodySource,
 {
-    if let Some((writer, reader, request)) = read_request(&server, sink, source).await {
-        server_transport::handle_stream(server, request_limit, writer, reader, request, shutdown)
+    if let Some((writer, reader, incoming)) = read_request(&server, sink, source).await {
+        server_transport::handle_stream(server, request_limit, writer, reader, incoming, shutdown)
             .await;
     }
 }
@@ -185,7 +160,7 @@ where
     K: BodySink,
     S: BodySource,
 {
-    if let Some((writer, reader, request)) = read_request(&server, sink, source).await {
-        server_transport::reject_stream(server, writer, reader, request).await;
+    if let Some((writer, reader, incoming)) = read_request(&server, sink, source).await {
+        server_transport::reject_stream(server, writer, reader, incoming).await;
     }
 }

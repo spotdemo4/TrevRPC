@@ -37,65 +37,56 @@ func newStreamClient(opener streamOpener, maxFrameSize int) *streamClient {
 	return &streamClient{opener: opener, maxFrameSize: maxFrameSize}
 }
 
+// call sends the request and its single message in one write, finishes the
+// request side, and returns the response frames.
 func (c *streamClient) call(
 	ctx context.Context,
 	request *wireRequest,
-) (*wireResponse, error) {
+	message ProtoMessage,
+) (frameStream, error) {
+	frames, err := appendRequestFrame(nil, request, c.maxFrameSize)
+	if err != nil {
+		return nil, err
+	}
+	frames, err = appendLimitedProtoFrame(frames, frameTypeMessage, message, c.maxFrameSize)
+	if err != nil {
+		return nil, err
+	}
+
 	stream, err := c.opener.openStream(ctx)
 	if err != nil {
 		return nil, callStatus(ctx, err)
 	}
-	cancelRead := true
-	defer func() {
-		if cancelRead {
-			stream.cancelRead()
-		}
-	}()
-	stopCancel := cancelStreamOnContext(ctx, stream)
-	defer stopCancel()
+	response := &transportResponseStream{
+		ctx:          ctx,
+		stream:       stream,
+		reader:       newFrameReader(stream, c.maxFrameSize, -1),
+		stopCancel:   cancelStreamOnContext(ctx, stream),
+		maxFrameSize: c.maxFrameSize,
+	}
 
-	if err := writeFrame(stream, request, c.maxFrameSize); err != nil {
+	if _, err := stream.Write(frames); err != nil {
 		stream.cancelWrite()
+		response.finish(true)
 		return nil, callStatus(ctx, err)
 	}
 	if err := stream.Close(); err != nil {
+		response.finish(true)
 		return nil, callStatus(ctx, err)
 	}
-
-	response := &wireResponse{}
-	if err := readFrame(stream, response, c.maxFrameSize); err != nil {
-		return nil, callStatus(ctx, err)
-	}
-	if err := waitForCleanStreamEOF(stream); err != nil {
-		return nil, callStatus(ctx, err)
-	}
-	cancelRead = false
 	return response, nil
-}
-
-func waitForCleanStreamEOF(reader io.Reader) error {
-	trailing := [1]byte{}
-	for {
-		read, err := reader.Read(trailing[:])
-		if read != 0 {
-			return &frameDecodeError{
-				Err: errors.New("unexpected trailing data after unary response"),
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
 }
 
 func (c *streamClient) streamingCall(
 	ctx context.Context,
 	request *wireRequest,
-	requestBody byteStream,
+	requests encodedStream,
 ) (frameStream, error) {
+	header, err := appendRequestFrame(nil, request, c.maxFrameSize)
+	if err != nil {
+		return nil, err
+	}
+
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := c.opener.openStream(streamCtx)
 	if err != nil {
@@ -104,16 +95,21 @@ func (c *streamClient) streamingCall(
 		return nil, statusErr
 	}
 
+	// The upload has a context of its own, so it can be stopped when the
+	// response ends while the response stream stays readable.
+	uploadCtx, cancelUpload := context.WithCancel(streamCtx)
 	writerDone := make(chan error, 1)
 	stopCancel := cancelStreamOnContext(streamCtx, stream)
 	go func() {
-		writerDone <- c.writeStreamingRequest(streamCtx, stream, request, requestBody)
+		writerDone <- c.writeStreamingRequest(uploadCtx, stream, header, requests)
 	}()
 
 	return &transportResponseStream{
 		ctx:          streamCtx,
 		stream:       stream,
+		reader:       newFrameReader(stream, c.maxFrameSize, -1),
 		writerDone:   writerDone,
+		cancelUpload: cancelUpload,
 		cancel:       cancel,
 		stopCancel:   stopCancel,
 		maxFrameSize: c.maxFrameSize,
@@ -123,17 +119,13 @@ func (c *streamClient) streamingCall(
 func (c *streamClient) writeStreamingRequest(
 	ctx context.Context,
 	stream clientStream,
-	request *wireRequest,
-	requestBody byteStream,
+	header []byte,
+	requests encodedStream,
 ) error {
-	requestBody = closeStreamOnContext(ctx, requestBody)
-	defer discardMessageStream(requestBody)
+	requests = closeStreamOnContext(ctx, requests)
+	defer discardMessageStream(requests)
 
-	if err := writeFrame(stream, request, c.maxFrameSize); err != nil {
-		stream.cancelWrite()
-		return callStatus(ctx, err)
-	}
-	if err := writeRequestBodyFrames(ctx, stream, requestBody, c.maxFrameSize); err != nil {
+	if err := writeRequestFrames(ctx, stream, header, requests, c.maxFrameSize); err != nil {
 		stream.cancelWrite()
 		return callStatus(ctx, err)
 	}
@@ -150,13 +142,23 @@ func callStatus(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return statusFromContextError(ctx.Err())
 	}
+	// A read deadline set from the call deadline can fire before the context
+	// reports that the deadline passed.
+	if deadline, ok := ctx.Deadline(); ok && isTimeoutError(err) && !time.Now().Before(deadline) {
+		return statusFromContextError(context.DeadlineExceeded)
+	}
 	return transportStatus(err)
 }
 
+// transportResponseStream reads the response frames of one call from its
+// stream. A call that streams its request has a writer goroutine, whose
+// result is reported together with the response.
 type transportResponseStream struct {
 	ctx          context.Context
 	stream       clientStream
+	reader       *frameReader
 	writerDone   <-chan error
+	cancelUpload context.CancelFunc // set while the request is streamed
 	cancel       context.CancelFunc
 	stopCancel   func()
 	maxFrameSize int
@@ -169,46 +171,64 @@ func (s *transportResponseStream) SetReadDeadline(deadline time.Time) error {
 	return s.stream.SetReadDeadline(deadline)
 }
 
-func (s *transportResponseStream) Recv() (*wireStreamFrame, error) {
-	frame, err := s.trevrpcRecvStreamFrameFields()
-	if err != nil {
-		return nil, err
-	}
-	return frame.rpcStreamFrame(), nil
-}
-
-func (s *transportResponseStream) trevrpcRecvStreamFrameFields() (streamFrameFields, error) {
+// Recv returns the next known response frame. After the STATUS frame it keeps
+// reading, skipping unknown frames, so the end of the stream can be told from
+// more data: the next call returns io.EOF when the stream ended cleanly.
+func (s *transportResponseStream) Recv() (responseFrame, error) {
 	if s.done {
-		return streamFrameFields{}, io.EOF
+		return responseFrame{}, io.EOF
 	}
 
-	frame, read, err := readStreamFrameFieldsOrEOF(s.stream, s.maxFrameSize)
+	next, err := s.reader.next()
 	if err != nil {
-		statusErr := callStatus(s.ctx, err)
+		statusErr := io.EOF
+		if !errors.Is(err, io.EOF) {
+			statusErr = callStatus(s.ctx, err)
+		}
 		s.finish(false)
 		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+			return responseFrame{}, writerErr
 		}
-		return streamFrameFields{}, statusErr
+		return responseFrame{}, statusErr
 	}
-	if !read {
-		s.finish(false)
-		if writerErr := s.writerError(false); writerErr != nil {
-			return streamFrameFields{}, writerErr
+
+	switch next.typ {
+	case frameTypeMessage:
+		return responseFrame{kind: frameTypeMessage, body: next.payload}, nil
+	case frameTypeHeaders:
+		headers, err := decodeHeaders(next.payload)
+		if err != nil {
+			return responseFrame{}, err
 		}
-		return streamFrameFields{}, io.EOF
-	}
-	if frame.kind == wireFrameStatus {
-		s.finish(false)
-		if frame.statusValue().IsOK() {
+		return responseFrame{kind: frameTypeHeaders, headers: headers}, nil
+	case frameTypeStatus:
+		status, err := decodeStatus(next.payload)
+		if err != nil {
+			return responseFrame{}, err
+		}
+		// The call is over: stop uploading and settle the writer. The context
+		// watcher keeps guarding the wait for the end of the stream.
+		s.stopUpload()
+		if status.IsOK() {
 			if err := s.writerError(true); err != nil {
-				return streamFrameFields{}, err
+				return responseFrame{}, err
 			}
 		} else {
 			s.ignoreWriterError()
 		}
+		return responseFrame{kind: frameTypeStatus, status: status}, nil
+	default:
+		return responseFrame{kind: next.typ}, nil
 	}
-	return frame, nil
+}
+
+// stopUpload cancels the request side of a streamed request. The response
+// side stays readable.
+func (s *transportResponseStream) stopUpload() {
+	if s.cancelUpload != nil {
+		s.cancelUpload()
+		s.stream.cancelWrite()
+	}
 }
 
 func (s *transportResponseStream) Close() error {
@@ -223,15 +243,14 @@ func (s *transportResponseStream) finish(cancelRead bool) {
 	s.done = true
 	if s.stopCancel != nil {
 		s.stopCancel()
-		s.stopCancel = nil
 	}
+	s.stopUpload()
 	if s.cancel != nil {
 		s.cancel()
 	}
 	if cancelRead {
 		s.stream.cancelRead()
 	}
-	s.stream.cancelWrite()
 }
 
 func (s *transportResponseStream) writerError(ignoreCancelled bool) error {

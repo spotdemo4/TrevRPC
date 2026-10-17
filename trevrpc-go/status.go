@@ -121,36 +121,14 @@ func (s *Status) IsOK() bool {
 	return s != nil && s.Code == CodeOK
 }
 
-// intoResponse converts the status and response body into an RPC response.
-func (s *Status) intoResponse(body []byte) *wireResponse {
-	if s == nil || len(s.Metadata) == 0 {
-		return s.intoResponseWithMetadata(body, Metadata{})
-	}
-
-	return s.intoResponseWithMetadata(body, s.Metadata)
+// wire returns the STATUS frame payload for s.
+func (s *Status) wire() *wireStatus {
+	return &wireStatus{Code: uint32(s.Code), Message: s.Message, Metadata: s.Metadata}
 }
 
-// intoResponseWithMetadata converts the status, response body, and metadata into an RPC response.
-func (s *Status) intoResponseWithMetadata(body []byte, metadata Metadata) *wireResponse {
-	if s == nil {
-		s = OK()
-	}
-
-	return &wireResponse{
-		Status:   uint32(s.Code),
-		Message:  s.Message,
-		Body:     body,
-		Metadata: metadata,
-	}
-}
-
-// statusFromWireResponse builds a status from an RPC response.
-func statusFromWireResponse(response *wireResponse) *Status {
-	if response == nil {
-		return Internal("missing RPC response")
-	}
-
-	return NewStatus(CodeFromUint32(response.Status), response.Message).WithMetadata(response.Metadata)
+// statusFromWire builds a status from a STATUS frame payload.
+func statusFromWire(status *wireStatus) *Status {
+	return NewStatus(CodeFromUint32(status.Code), status.Message).WithMetadata(status.Metadata)
 }
 
 // StatusFromError converts an error into the status returned to RPC callers.

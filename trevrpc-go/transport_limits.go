@@ -1,8 +1,9 @@
 package trevrpc
 
 const (
-	// frameHeaderSize is the length prefix that precedes every frame body.
-	frameHeaderSize = 4
+	// frameHeaderSize bounds a frame header: a type and a length, each a QUIC
+	// variable-length integer of at most 8 bytes.
+	frameHeaderSize = 16
 
 	// streamErrorCancelled is the stream error code sent when a call is
 	// cancelled locally. Every multiplexed transport (QUIC, WebTransport and

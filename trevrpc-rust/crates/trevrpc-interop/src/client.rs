@@ -11,7 +11,7 @@ use futures_util::future::BoxFuture;
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
 use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, TransportPolicy};
-use trevrpc::{Code, Error};
+use trevrpc::{Code, Error, Metadata};
 
 use crate::proto::{EchoClient, EchoRequest, EchoResponse};
 use crate::{BoxError, Flags};
@@ -112,6 +112,11 @@ fn scenarios(client: &Echo) -> Vec<Named<'_>> {
         ("server-stream-error", Box::pin(server_stream_error(client))),
         ("bidi", Box::pin(bidi(client))),
         ("bidi-error", Box::pin(bidi_error(client))),
+        ("unary-headers", Box::pin(unary_headers(client))),
+        (
+            "server-stream-headers",
+            Box::pin(server_stream_headers(client)),
+        ),
     ]
 }
 
@@ -315,4 +320,59 @@ async fn bidi_error(client: &Echo) -> Scenario {
         Ok(Some(_)) => Err("unexpected response to the failing request".to_owned()),
         Ok(None) => Err("stream ended with OK, expected Aborted".to_owned()),
     }
+}
+
+/// The request metadata that asks the server for response headers and trailing metadata.
+fn header_options() -> CallOptions {
+    options().with_metadata("interop-header", b"h".to_vec())
+}
+
+fn expect_metadata(actual: &Metadata, key: &str, what: &str) -> Scenario {
+    let expected = Metadata::from([(key.to_owned(), b"h".to_vec())]);
+    if actual == &expected {
+        Ok(())
+    } else {
+        Err(format!("expected {what} {expected:?}, got {actual:?}"))
+    }
+}
+
+async fn unary_headers(client: &Echo) -> Scenario {
+    let response = client
+        .unary_envelope_with_options(message("hello"), header_options())
+        .await
+        .map_err(rpc)?;
+    expect_response(response.message(), "hello", 0)?;
+    expect_metadata(response.headers(), "interop-header", "headers")?;
+    expect_metadata(response.metadata(), "interop-trailer", "trailing metadata")
+}
+
+async fn server_stream_headers(client: &Echo) -> Scenario {
+    let request = EchoRequest {
+        count: 2,
+        ..message("s")
+    };
+    let mut responses = client
+        .server_stream_with_options(request, header_options())
+        .await
+        .map_err(rpc)?;
+    // The headers precede the first message.
+    let headers = responses.headers().await.map_err(rpc)?;
+    expect_metadata(headers, "interop-header", "headers")?;
+    for index in 0..2 {
+        let response = responses
+            .next()
+            .await
+            .ok_or("stream ended early")?
+            .map_err(rpc)?;
+        expect_response(&response, "s", index)?;
+    }
+    match responses.next().await {
+        None => {}
+        Some(Ok(_)) => return Err("stream yielded more than 2 responses".to_owned()),
+        Some(Err(error)) => return Err(rpc(error)),
+    }
+    let trailers = responses
+        .terminal_metadata()
+        .ok_or("the stream ended without a terminal status")?;
+    expect_metadata(trailers, "interop-trailer", "trailing metadata")
 }

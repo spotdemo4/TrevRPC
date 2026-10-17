@@ -10,162 +10,96 @@ object WireCodec {
             .apply {
                 string(1, request.service)
                 string(2, request.method)
-                bytes(3, request.body)
                 metadata(4, request.metadata)
                 int32(5, request.kindValue)
                 uint32(6, request.version)
                 uint64(7, request.timeoutNanos)
+                packedUint64(8, request.extensions)
             }.toByteArray()
 
     fun decodeRequest(bytes: ByteArray): RpcRequest {
         val reader = Reader(bytes)
         var service = ""
         var method = ""
-        var body = byteArrayOf()
         val metadata = linkedMapOf<String, ByteArray>()
         var kind = 0
         var version = 0u
         var timeoutNanos = 0uL
+        val extensions = mutableListOf<ULong>()
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
                 1 -> service = reader.string(tag, "request service")
                 2 -> method = reader.string(tag, "request method")
-                3 -> body = reader.bytes(tag)
                 4 -> reader.mapEntry(tag, metadata)
                 5 -> kind = reader.int32(tag)
                 6 -> version = reader.uint32(tag)
                 7 -> timeoutNanos = reader.uint64(tag)
+                8 -> reader.uint64Elements(tag, extensions)
                 else -> reader.skip(tag)
             }
         }
-        return RpcRequest(service, method, body, Metadata.fromWire(metadata), kind, version, timeoutNanos)
+        return RpcRequest(service, method, Metadata.fromWire(metadata), kind, version, timeoutNanos, extensions)
     }
 
-    fun encode(response: RpcResponse): ByteArray =
+    fun encode(headers: RpcHeaders): ByteArray =
         Writer()
             .apply {
-                uint32(1, response.statusValue)
-                string(2, response.message)
-                bytes(3, response.body)
-                metadata(4, response.metadata)
+                metadata(1, headers.metadata)
+                packedUint64(2, headers.extensions)
             }.toByteArray()
 
-    fun decodeResponse(bytes: ByteArray): RpcResponse {
+    fun decodeHeaders(bytes: ByteArray): RpcHeaders {
         val reader = Reader(bytes)
-        var status = 0u
+        val metadata = linkedMapOf<String, ByteArray>()
+        val extensions = mutableListOf<ULong>()
+        while (reader.hasRemaining) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> reader.mapEntry(tag, metadata)
+                2 -> reader.uint64Elements(tag, extensions)
+                else -> reader.skip(tag)
+            }
+        }
+        return RpcHeaders(Metadata.fromWire(metadata), extensions)
+    }
+
+    fun encode(status: RpcStatus): ByteArray =
+        Writer()
+            .apply {
+                uint32(1, status.statusValue)
+                string(2, status.message)
+                metadata(3, status.metadata)
+            }.toByteArray()
+
+    fun decodeStatus(bytes: ByteArray): RpcStatus {
+        val reader = Reader(bytes)
+        var code = 0u
         var message = ""
-        var body = byteArrayOf()
         val metadata = linkedMapOf<String, ByteArray>()
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
-                1 -> status = reader.uint32(tag)
-                2 -> message = reader.string(tag, "response message")
-                3 -> body = reader.bytes(tag)
-                4 -> reader.mapEntry(tag, metadata)
+                1 -> code = reader.uint32(tag)
+                2 -> message = reader.string(tag, "status message")
+                3 -> reader.mapEntry(tag, metadata)
                 else -> reader.skip(tag)
             }
         }
-        return RpcResponse(status, message, body, Metadata.fromWire(metadata))
+        return RpcStatus(code, message, Metadata.fromWire(metadata))
     }
 
-    fun encode(frame: RpcStreamFrame): ByteArray =
-        if (
-            frame.kindValue == RpcStreamFrameKind.MESSAGE.value &&
-            frame.statusValue == Code.OK.value &&
-            frame.message.isEmpty() &&
-            frame.metadata.isEmpty
-        ) {
-            encodeMessageFrame(frame.body)
-        } else {
-            Writer()
-                .apply {
-                    int32(1, frame.kindValue)
-                    uint32(2, frame.statusValue)
-                    string(3, frame.message)
-                    bytes(4, frame.body)
-                    metadata(5, frame.metadata)
-                }.toByteArray()
+    /**
+     * Decodes one known frame read from a response stream exactly once. A REQUEST frame is a known
+     * frame the response grammar does not allow, which is an `Internal` protocol error.
+     */
+    fun decodeResponseFrame(frame: Frame): ResponseFrame =
+        when (frame.type) {
+            FrameType.MESSAGE -> ResponseFrame.Message(frame.payload)
+            FrameType.HEADERS -> ResponseFrame.Headers(decodeHeaders(frame.payload).metadata)
+            FrameType.STATUS -> ResponseFrame.Status(decodeStatus(frame.payload).status)
+            else -> throw TrevRpcException(Status.internal("response stream contained an unexpected frame type ${frame.type}"))
         }
-
-    fun encodeMessageFrame(body: ByteArray): ByteArray {
-        if (body.isEmpty()) return byteArrayOf()
-        val lengthBytes = varintSize(body.size)
-        return ByteArray(1 + lengthBytes + body.size).also { encoded ->
-            encoded[0] = MESSAGE_BODY_TAG
-            val bodyOffset = writeVarint(encoded, 1, body.size)
-            body.copyInto(encoded, bodyOffset)
-        }
-    }
-
-    fun decodeStreamFrame(bytes: ByteArray): RpcStreamFrame {
-        decodeMessageFrame(bytes)?.let { return it }
-        val reader = Reader(bytes)
-        var kind = 0
-        var status = 0u
-        var message = ""
-        var body = byteArrayOf()
-        val metadata = linkedMapOf<String, ByteArray>()
-        while (reader.hasRemaining) {
-            val tag = reader.tag()
-            when (tag.field) {
-                1 -> kind = reader.int32(tag)
-                2 -> status = reader.uint32(tag)
-                3 -> message = reader.string(tag, "stream status message")
-                4 -> body = reader.bytes(tag)
-                5 -> reader.mapEntry(tag, metadata)
-                else -> reader.skip(tag)
-            }
-        }
-        return RpcStreamFrame(kind, status, message, body, Metadata.fromWire(metadata))
-    }
-
-    private fun decodeMessageFrame(bytes: ByteArray): RpcStreamFrame? {
-        if (bytes.isEmpty()) return RpcStreamFrame()
-        if (bytes[0] != MESSAGE_BODY_TAG) return null
-        var length = 0uL
-        var offset = 1
-        for (index in 0 until 10) {
-            if (offset >= bytes.size) return null
-            val value = bytes[offset].toInt() and 0xff
-            offset++
-            if (index == 9 && value > 1) return null
-            length = length or ((value and 0x7f).toULong() shl (index * 7))
-            if (value and 0x80 == 0) {
-                if (length > Int.MAX_VALUE.toULong() || bytes.size - offset != length.toInt()) return null
-                return RpcStreamFrame(body = bytes.copyOfRange(offset, bytes.size))
-            }
-        }
-        return null
-    }
-}
-
-private const val MESSAGE_BODY_TAG: Byte = (4 shl 3 or 2).toByte()
-
-private fun varintSize(value: Int): Int {
-    var remaining = value
-    var size = 1
-    while (remaining >= 0x80) {
-        remaining = remaining ushr 7
-        size++
-    }
-    return size
-}
-
-private fun writeVarint(
-    output: ByteArray,
-    initialOffset: Int,
-    initialValue: Int,
-): Int {
-    var offset = initialOffset
-    var value = initialValue
-    while (value >= 0x80) {
-        output[offset++] = ((value and 0x7f) or 0x80).toByte()
-        value = value ushr 7
-    }
-    output[offset++] = value.toByte()
-    return offset
 }
 
 private data class Tag(
@@ -204,6 +138,17 @@ private class Writer {
             tag(field, 0)
             varint(value)
         }
+    }
+
+    fun packedUint64(
+        field: Int,
+        values: List<ULong>,
+    ) {
+        if (values.isEmpty()) return
+        val packed = Writer().apply { values.forEach { varint(it) } }.toByteArray()
+        tag(field, 2)
+        varint(packed.size.toULong())
+        output.write(packed)
     }
 
     fun string(
@@ -290,6 +235,27 @@ private class Reader(
     fun uint64(tag: Tag): ULong {
         requireWireType(tag, 0)
         return varint()
+    }
+
+    /** Reads a repeated uint64 element: either one unpacked varint or a packed run of them. */
+    fun uint64Elements(
+        tag: Tag,
+        target: MutableList<ULong>,
+    ) {
+        when (tag.wireType) {
+            0 -> {
+                target += varint()
+            }
+
+            2 -> {
+                val packed = Reader(bytes(tag))
+                while (packed.hasRemaining) target += packed.varint()
+            }
+
+            else -> {
+                malformed("field ${tag.field} used wire type ${tag.wireType}, expected 0 or 2")
+            }
+        }
     }
 
     fun bytes(tag: Tag): ByteArray {

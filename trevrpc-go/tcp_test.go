@@ -97,7 +97,7 @@ func TestHTTP2ResponsesAdvertiseHTTP3(t *testing.T) {
 	listener := startTestListener(t, pki, nil)
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.client.Clone(), ForceAttemptHTTP2: true}}
 	defer client.CloseIdleConnections()
-	body := encodeHTTP3TestRequest(t, newWireRequest(testServiceName, "Echo", nil))
+	body := encodeHTTP3TestRequest(t, newWireRequest(testServiceName, "Echo"), "")
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://"+listener.TCPAddr().String()+DefaultHTTPPath, strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)

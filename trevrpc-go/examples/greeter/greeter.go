@@ -88,7 +88,7 @@ func (c *GreeterClient) SayHello(ctx context.Context, request *HelloRequest, opt
 }
 
 // LotsOfReplies calls the LotsOfReplies method.
-func (c *GreeterClient) LotsOfReplies(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (trevrpc.ResponseStream[*HelloReply], error) {
+func (c *GreeterClient) LotsOfReplies(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (trevrpc.ServerStreamingCall[*HelloReply], error) {
 	return trevrpc.ServerStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfReplies, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 

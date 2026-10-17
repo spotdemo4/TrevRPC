@@ -69,18 +69,15 @@ func newHTTP3TestRequest(t *testing.T, method, path string, body []byte, content
 	return request
 }
 
-func encodeHTTP3TestRequest(t *testing.T, request *wireRequest) []byte {
+// encodeHTTP3TestRequest is a request body: a REQUEST frame and the request message.
+func encodeHTTP3TestRequest(t *testing.T, request *wireRequest, message string) []byte {
 	t.Helper()
-	body, err := encodeFrame(request, DefaultMaxFrameSize)
-	if err != nil {
-		t.Fatalf("encode request: %v", err)
-	}
-	return body
+	return testRequestBytes(t, request, message)
 }
 
 func TestHTTP3HandlerRejectsInvalidRequestsBeforeRPCHandling(t *testing.T) {
 	listener, _ := newHandlerTestListener(nil)
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello", nil))
+	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "")
 
 	tests := []struct {
 		name         string
@@ -108,8 +105,8 @@ func TestHTTP3HandlerRejectsInvalidRequestsBeforeRPCHandling(t *testing.T) {
 			if test.wantAllow != "" && recorder.Header().Get("Allow") != test.wantAllow {
 				t.Fatalf("Allow = %q, want %q", recorder.Header().Get("Allow"), test.wantAllow)
 			}
-			if _, err := readFrameOrEOF(recorder.Body, &wireResponse{}, DefaultMaxFrameSize); err == nil {
-				t.Fatal("rejected request wrote an RPC response frame")
+			if recorder.Header().Get("Content-Type") == httpContentType {
+				t.Fatalf("rejected request answered with an RPC response: %x", recorder.Body.Bytes())
 			}
 		})
 	}
@@ -133,7 +130,7 @@ func TestHTTP3AdmissionReceivesSnapshotAndCanDeny(t *testing.T) {
 			return request.Header.Get("X-Allow") == "yes"
 		}
 	})
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello", nil))
+	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "")
 
 	denied := newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType)
 	denied.Header.Set("X-Allow", "no")
@@ -215,7 +212,7 @@ func TestHTTP3AdmissionPanicIsContainedAndFutureRequestsContinue(t *testing.T) {
 			return true
 		}
 	})
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello", nil))
+	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "")
 
 	panicRecorder := httptest.NewRecorder()
 	listener.handleHTTPRPC(panicRecorder, newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType))
@@ -232,7 +229,7 @@ func TestHTTP3AdmissionPanicIsContainedAndFutureRequestsContinue(t *testing.T) {
 
 func TestHTTP3UnaryRoundTripAndStreamSaturation(t *testing.T) {
 	listener, _ := newHandlerTestListener(nil)
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello", []byte("request")))
+	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "request")
 
 	// A connection whose stream limit is exhausted rejects before any RPC work.
 	exhausted := &httpConnState{streamLimit: newSemaphore(1)}
@@ -250,11 +247,8 @@ func TestHTTP3UnaryRoundTripAndStreamSaturation(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("unary status = %d", recorder.Code)
 	}
-	response := &wireResponse{}
-	if err := readFrame(recorder.Body, response, DefaultMaxFrameSize); err != nil {
-		t.Fatalf("decode unary response: %v", err)
-	}
-	if Code(response.Status) != CodeOK || string(response.Body) != "reply:request" {
-		t.Fatalf("unary response = %#v, want OK reply", response)
+	frames := readTestFrames(t, recorder.Body.Bytes(), DefaultMaxFrameSize)
+	if len(frames) != 2 || frames[0].Kind != frameTypeMessage || string(frames[0].Body) != "reply:request" || frames[1].Kind != frameTypeStatus || CodeFromUint32(frames[1].Status) != CodeOK {
+		t.Fatalf("unary response = %#v, want MESSAGE reply and OK STATUS", frames)
 	}
 }

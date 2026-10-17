@@ -6,10 +6,11 @@ use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::RequestTransportEvent;
 use crate::{Error, Result, Status};
 
-/// Bytes of the length prefix that precede every `TrevRPC` frame.
-const FRAME_HEADER_LEN: u64 = 4;
+/// The longest `TrevRPC` frame header: a type and a length, each a QUIC variable-length integer
+/// of at most eight bytes.
+const FRAME_HEADER_LEN: u64 = 16;
 
-/// The stream receive window that fits one maximum-size frame and its length prefix.
+/// The stream receive window that fits one maximum-size frame and its header.
 pub fn frame_receive_window(max_frame_size: usize) -> u64 {
     saturating_usize_to_u64(max_frame_size).saturating_add(FRAME_HEADER_LEN)
 }

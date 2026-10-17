@@ -18,16 +18,16 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import zip.trev.trevrpc.DEFAULT_MAX_FRAME_SIZE
 import zip.trev.trevrpc.FrameDecoder
+import zip.trev.trevrpc.FrameType
+import zip.trev.trevrpc.ResponseFrame
 import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
-import zip.trev.trevrpc.RpcResponse
-import zip.trev.trevrpc.RpcStreamFrame
-import zip.trev.trevrpc.RpcStreamFrameKind
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
-import zip.trev.trevrpc.frame
+import zip.trev.trevrpc.encodeFrame
+import zip.trev.trevrpc.encodeRequestFrames
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.CoroutineContext
@@ -141,22 +141,11 @@ internal class Http3RpcTransport(
     internal val logicallyActiveExchangeCount: Int
         get() = exchanges.logicallyActiveCount
 
-    override suspend fun unary(request: RpcRequest): RpcResponse {
-        val exchange = open(request, endOfStream = true)
-        try {
-            val first = exchange.receiveBody() ?: protocolError("unary response body was empty")
-            if (exchange.receiveBody() != null) protocolError("unary response contained more than one frame")
-            return WireCodec.decodeResponse(first)
-        } catch (error: CancellationException) {
-            exchange.close(error)
-            throw error
-        } catch (error: Throwable) {
-            exchange.close(error)
-            throw error
-        }
-    }
-
-    override suspend fun openStream(request: RpcRequest): RpcClientStream = StreamingTransportStream(open(request, endOfStream = false))
+    override suspend fun openStream(
+        request: RpcRequest,
+        firstMessage: ByteArray?,
+        finishSend: Boolean,
+    ): RpcClientStream = StreamingTransportStream(open(request, firstMessage, finishSend))
 
     override suspend fun close() {
         beginClose().await().getOrThrow()
@@ -164,6 +153,7 @@ internal class Http3RpcTransport(
 
     private suspend fun open(
         request: RpcRequest,
+        firstMessage: ByteArray?,
         endOfStream: Boolean,
     ): Http3Exchange {
         val lease = exchanges.admit()
@@ -175,9 +165,8 @@ internal class Http3RpcTransport(
                 exchangeContext,
                 lease,
                 providerInvocations,
-                streaming = !endOfStream,
             )
-        exchange.start(request, endOfStream)
+        exchange.start(request, firstMessage, endOfStream)
         return exchange
     }
 
@@ -221,7 +210,7 @@ private class StreamingTransportStream(
 
     override suspend fun finishSend() = exchange.finishSend()
 
-    override suspend fun receive(): RpcStreamFrame? = exchange.receiveBody()?.let(WireCodec::decodeStreamFrame)
+    override suspend fun receive(): ResponseFrame? = exchange.receiveFrame()
 
     override suspend fun close(cause: Throwable?) = exchange.close(cause)
 }
@@ -233,7 +222,6 @@ internal class Http3Exchange(
     coroutineContext: CoroutineContext,
     private val lease: ExchangeLease,
     private val providerInvocations: ProviderInvocationTracker,
-    private val streaming: Boolean,
 ) : DuplexCallback {
     private val job =
         CoroutineScope(parentJob + coroutineContext).launch(start = CoroutineStart.LAZY) {
@@ -244,7 +232,7 @@ internal class Http3Exchange(
     private val headersReceived = AtomicBoolean(false)
     private val responseEndReceived = AtomicBoolean(false)
     private val remoteTerminalSeen = AtomicBoolean(false)
-    private val responseBodies = Channel<ByteArray>(options.responseChannelCapacity)
+    private val responseFrames = Channel<ResponseFrame>(options.responseChannelCapacity)
     private val readChunks = Channel<ReadChunk>(1)
     private val writeReady = CompletableDeferred<Unit>()
     private val sendLock = Mutex()
@@ -265,6 +253,7 @@ internal class Http3Exchange(
 
     suspend fun start(
         request: RpcRequest,
+        firstMessage: ByteArray?,
         endOfStream: Boolean,
     ) {
         val opened =
@@ -322,14 +311,14 @@ internal class Http3Exchange(
         writeDirect(
             endOfStream,
             "initial request write failed",
-        ) { frame(WireCodec.encode(request), options.maxFrameSize) }
+        ) { encodeRequestFrames(request, firstMessage, options.maxFrameSize) }
     }
 
     suspend fun send(body: ByteArray) {
         sendLock.withLock {
             checkSendOpen()
             writeDirect(false, "request write failed") {
-                frame(WireCodec.encode(RpcStreamFrame.message(body)), options.maxFrameSize)
+                encodeFrame(FrameType.MESSAGE, body, options.maxFrameSize)
             }
         }
     }
@@ -346,8 +335,8 @@ internal class Http3Exchange(
         }
     }
 
-    suspend fun receiveBody(): ByteArray? {
-        val result = responseBodies.receiveCatching()
+    suspend fun receiveFrame(): ResponseFrame? {
+        val result = responseFrames.receiveCatching()
         return result.getOrNull() ?: result.exceptionOrNull()?.let { throw it }
     }
 
@@ -563,18 +552,21 @@ internal class Http3Exchange(
         val decoder = FrameDecoder(options.maxFrameSize)
         try {
             for (chunk in readChunks) {
-                for (body in decoder.feed(chunk.bytes)) {
-                    if (streaming) {
-                        val decoded = WireCodec.decodeStreamFrame(body)
-                        if (decoded.kind == RpcStreamFrameKind.STATUS) beginRemoteStatus()
-                        responseBodies.send(body)
-                        if (decoded.kind == RpcStreamFrameKind.STATUS) {
-                            finishRemoteStatus()
-                            return
-                        }
-                    } else {
-                        responseBodies.send(body)
+                var statusSeen = false
+                for (raw in decoder.feed(chunk.bytes)) {
+                    // Each frame is decoded exactly once, here; the stream receives the result.
+                    val frame = WireCodec.decodeResponseFrame(raw)
+                    // Frames after STATUS in the same read are still forwarded so the reader can
+                    // reject a known frame after the terminal status.
+                    if (frame is ResponseFrame.Status && !statusSeen) {
+                        statusSeen = true
+                        beginRemoteStatus()
                     }
+                    responseFrames.send(frame)
+                }
+                if (statusSeen) {
+                    finishRemoteStatus()
+                    return
                 }
                 if (chunk.endOfStream) {
                     decoder.finish()
@@ -629,7 +621,7 @@ internal class Http3Exchange(
         if (!completeOnce(error)) return
         val completionError = error ?: CancellationException("RPC stream completed")
         writeReady.completeExceptionally(completionError)
-        responseBodies.close(error)
+        responseFrames.close(error)
         readChunks.close(error)
         cancelPendingWrite(completionError)
         if (requestNativeCancel) cancelNative()

@@ -4,10 +4,10 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::framed::FrameRead;
-use crate::server::{CancellationSource, check_stream_message_body_limits};
+use crate::framed::{self, FrameRead, RequestFrame};
+use crate::server::{CancellationSource, RequestBudget};
 use crate::transport_error::{self, TransportFailureKind};
-use crate::{BoxStream, Code, Error, Result, RpcStreamFrameKind, Status};
+use crate::{BoxStream, Code, Error, Result, Status};
 
 pub const REQUEST_BODY_CHANNEL_CAPACITY: usize = 1;
 
@@ -16,32 +16,29 @@ pub const REQUEST_BODY_CHANNEL_CAPACITY: usize = 1;
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(1);
 const DISCARD_LIMIT: usize = 1 << 20;
 
+/// Why a call's request half is still being read.
 #[derive(Clone, Copy, Debug)]
 pub enum RequestInputKind {
+    /// The single request message was read before dispatch; only the end of the stream is left.
     Unary,
-    Streaming {
-        max_messages: Option<usize>,
-        max_body_size: Option<usize>,
-    },
+    /// Request messages stream to the handler as they arrive.
+    Streaming,
 }
 
 impl RequestInputKind {
-    pub(crate) const fn for_rpc_kind(
-        rpc_kind: crate::RpcKind,
-        max_messages: Option<usize>,
-        max_body_size: Option<usize>,
-    ) -> Self {
-        match rpc_kind {
-            crate::RpcKind::Unary | crate::RpcKind::ServerStreaming => Self::Unary,
-            crate::RpcKind::ClientStreaming | crate::RpcKind::BidirectionalStreaming => {
-                Self::Streaming {
-                    max_messages,
-                    max_body_size,
-                }
-            }
+    pub(crate) const fn for_rpc_kind(rpc_kind: crate::RpcKind) -> Self {
+        if rpc_kind.has_single_request_message() {
+            Self::Unary
+        } else {
+            Self::Streaming
         }
     }
 }
+
+/// The error for a known frame after the single request message of a unary-input call.
+const UNARY_TRAILING_FRAME: &str = "request stream contained a frame after the request message";
+/// The error for a known frame after a request's terminal STATUS.
+const TERMINAL_TRAILING_FRAME: &str = "request stream continued after terminal status";
 
 #[derive(Clone, Debug)]
 pub enum RequestPumpFailure {
@@ -112,7 +109,7 @@ impl RequestTransportEvent {
     }
 }
 
-pub trait RequestPumpReader: FrameRead + Send + 'static {
+pub trait RequestPumpReader: FrameRead + Send + Sized + 'static {
     fn stop_trevrpc(&mut self);
 
     /// Resolves when the transport ends the request stream, or never if it cannot tell.
@@ -123,12 +120,29 @@ pub trait RequestPumpReader: FrameRead + Send + 'static {
     /// registrations.
     fn backpressure_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
 
-    fn read_unary_end(&mut self) -> impl Future<Output = Result<()>> + Send;
-
-    fn read_stream_frame_or_eof(
+    /// Reads the next frame after REQUEST, charging unknown frames to `budget`.
+    fn read_request_frame(
         &mut self,
         max_frame_size: usize,
-    ) -> impl Future<Output = Result<Option<crate::RpcStreamFrame>>> + Send;
+        budget: &mut RequestBudget,
+    ) -> impl Future<Output = Result<Option<RequestFrame>>> + Send {
+        framed::read_request_frame(self, max_frame_size, |len| budget.charge_skipped(len))
+    }
+
+    /// Reads to the end of the request stream, failing on any known frame with `unexpected`.
+    fn read_request_end(
+        &mut self,
+        max_frame_size: usize,
+        budget: &mut RequestBudget,
+        unexpected: &'static str,
+    ) -> impl Future<Output = Result<()>> + Send {
+        framed::read_request_end(
+            self,
+            max_frame_size,
+            |len| budget.charge_skipped(len),
+            unexpected,
+        )
+    }
 
     fn validate_transport_end(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
@@ -257,6 +271,7 @@ pub fn start_request_pump<R>(
     reader: R,
     input_kind: RequestInputKind,
     max_frame_size: usize,
+    budget: RequestBudget,
 ) -> (BoxStream<Vec<u8>>, RequestPump)
 where
     R: RequestPumpReader,
@@ -268,6 +283,7 @@ where
         reader,
         input_kind,
         max_frame_size,
+        budget,
         body_tx,
         state_tx,
         settle_rx,
@@ -290,6 +306,7 @@ async fn run_request_pump<R>(
     reader: R,
     input_kind: RequestInputKind,
     max_frame_size: usize,
+    budget: RequestBudget,
     body_tx: mpsc::Sender<Result<Vec<u8>>>,
     state_tx: watch::Sender<RequestPumpState>,
     mut settle_rx: watch::Receiver<Option<RequestPumpSettle>>,
@@ -300,17 +317,20 @@ where
     let mut reader = PumpReaderGuard::new(reader);
     let outcome = match input_kind {
         RequestInputKind::Unary => {
-            run_unary_pump::<R>(&mut reader, &state_tx, &mut settle_rx).await
+            run_unary_pump::<R>(
+                &mut reader,
+                max_frame_size,
+                budget,
+                &state_tx,
+                &mut settle_rx,
+            )
+            .await
         }
-        RequestInputKind::Streaming {
-            max_messages,
-            max_body_size,
-        } => {
+        RequestInputKind::Streaming => {
             run_streaming_pump::<R>(
                 &mut reader,
                 max_frame_size,
-                max_messages,
-                max_body_size,
+                budget,
                 &body_tx,
                 &state_tx,
                 &mut settle_rx,
@@ -324,13 +344,19 @@ where
 
 async fn run_unary_pump<R>(
     reader: &mut PumpReaderGuard<R>,
+    max_frame_size: usize,
+    mut budget: RequestBudget,
     state_tx: &watch::Sender<RequestPumpState>,
     settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
 {
-    let mut read = Box::pin(reader.reader().read_unary_end());
+    let mut read = Box::pin(reader.reader().read_request_end(
+        max_frame_size,
+        &mut budget,
+        UNARY_TRAILING_FRAME,
+    ));
     let result = tokio::select! {
         biased;
         changed = settle_rx.changed() => {
@@ -359,12 +385,11 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 async fn run_streaming_pump<R>(
     reader: &mut PumpReaderGuard<R>,
     max_frame_size: usize,
-    max_messages: Option<usize>,
-    max_body_size: Option<usize>,
+    mut budget: RequestBudget,
     body_tx: &mpsc::Sender<Result<Vec<u8>>>,
     state_tx: &watch::Sender<RequestPumpState>,
     settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
@@ -372,8 +397,6 @@ async fn run_streaming_pump<R>(
 where
     R: RequestPumpReader,
 {
-    let mut messages = 0_usize;
-    let mut body_size = 0_usize;
     loop {
         // The pump reads the stream only once the consumer has room for the next body. Transport
         // events are watched solely while it waits for that room, so a consumer that keeps up never
@@ -428,66 +451,49 @@ where
                 drop(permit);
                 return settle_reader(reader, settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped));
             }
-            frame = reader.reader().read_stream_frame_or_eof(max_frame_size) => frame,
+            frame = reader.reader().read_request_frame(max_frame_size, &mut budget) => frame,
         };
 
         match frame {
-            Ok(Some(frame)) => match frame.frame_kind() {
-                Some(RpcStreamFrameKind::Message) => {
-                    if let Err(error) = check_stream_message_body_limits(
-                        "request",
-                        max_messages,
-                        max_body_size,
-                        &mut messages,
-                        &mut body_size,
-                        frame.body.len(),
-                    ) {
-                        let failure = RequestPumpFailure::Protocol(error.into_status());
-                        return fail_and_wait(reader, failure, state_tx, settle_rx, Some(permit))
-                            .await;
-                    }
-                    permit.send(Ok(frame.body));
-                }
-                Some(RpcStreamFrameKind::Status) => {
-                    drop(permit);
-                    let status = frame.status_value();
-                    let _ = state_tx.send(RequestPumpState::DrainingTerminalFin);
-                    match drain_terminal::<R>(reader, max_frame_size, settle_rx).await {
-                        Ok(RequestPumpOutcome::CleanFin) if status.is_ok() => {
-                            reader.settled = true;
-                            return RequestPumpOutcome::CleanFin;
-                        }
-                        Ok(RequestPumpOutcome::CleanFin) => {
-                            reader.settled = true;
-                            return fail_and_wait(
-                                reader,
-                                RequestPumpFailure::PeerStatus(status),
-                                state_tx,
-                                settle_rx,
-                                None,
-                            )
-                            .await;
-                        }
-                        Ok(outcome) => return outcome,
-                        Err(error) => {
-                            return fail_and_wait(
-                                reader,
-                                classify_error(error),
-                                state_tx,
-                                settle_rx,
-                                None,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                None => {
-                    let failure = RequestPumpFailure::Protocol(Status::invalid_argument(
-                        "request stream contained an unknown frame kind",
-                    ));
+            Ok(Some(RequestFrame::Message(body))) => {
+                if let Err(error) = budget.charge_message(body.len()) {
+                    let failure = RequestPumpFailure::Protocol(error.into_status());
                     return fail_and_wait(reader, failure, state_tx, settle_rx, Some(permit)).await;
                 }
-            },
+                permit.send(Ok(Vec::from(body)));
+            }
+            Ok(Some(RequestFrame::Status(status))) => {
+                drop(permit);
+                let _ = state_tx.send(RequestPumpState::DrainingTerminalFin);
+                match drain_terminal::<R>(reader, max_frame_size, &mut budget, settle_rx).await {
+                    Ok(RequestPumpOutcome::CleanFin) if status.is_ok() => {
+                        reader.settled = true;
+                        return RequestPumpOutcome::CleanFin;
+                    }
+                    Ok(RequestPumpOutcome::CleanFin) => {
+                        reader.settled = true;
+                        return fail_and_wait(
+                            reader,
+                            RequestPumpFailure::PeerStatus(status),
+                            state_tx,
+                            settle_rx,
+                            None,
+                        )
+                        .await;
+                    }
+                    Ok(outcome) => return outcome,
+                    Err(error) => {
+                        return fail_and_wait(
+                            reader,
+                            classify_error(error),
+                            state_tx,
+                            settle_rx,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+            }
             Ok(None) => {
                 drop(permit);
                 if let Err(error) = reader.reader().validate_transport_end().await {
@@ -511,33 +517,43 @@ where
     }
 }
 
+/// Waits for the clean end of a request stream whose terminal STATUS has been read.
+///
+/// The read stays pinned while the response is committed, so no partially read frame is lost.
 async fn drain_terminal<R>(
     reader: &mut PumpReaderGuard<R>,
     max_frame_size: usize,
+    budget: &mut RequestBudget,
     settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
 ) -> Result<RequestPumpOutcome>
 where
     R: RequestPumpReader,
 {
+    let mut read = Box::pin(reader.reader().read_request_end(
+        max_frame_size,
+        budget,
+        TERMINAL_TRAILING_FRAME,
+    ));
     loop {
-        let frame = tokio::select! {
+        tokio::select! {
             biased;
             changed = settle_rx.changed() => {
                 let _ = changed;
                 match settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped) {
-                    RequestPumpSettle::ResponseCommitted => continue,
-                    reason => return Ok(settle_reader(reader, reason)),
+                    RequestPumpSettle::ResponseCommitted => {}
+                    reason => {
+                        drop(read);
+                        return Ok(settle_reader(reader, reason));
+                    }
                 }
             }
-            frame = reader.reader().read_stream_frame_or_eof(max_frame_size) => frame?,
-        };
-        if frame.is_some() {
-            return Err(Error::from(Status::internal(
-                "request stream continued after terminal status",
-            )));
+            result = &mut read => {
+                drop(read);
+                result?;
+                reader.reader().validate_transport_end().await?;
+                return Ok(RequestPumpOutcome::CleanFin);
+            }
         }
-        reader.reader().validate_transport_end().await?;
-        return Ok(RequestPumpOutcome::CleanFin);
     }
 }
 
@@ -650,13 +666,27 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
     use tokio::sync::{mpsc, oneshot};
 
-    use crate::framed::{self, FrameRead};
-    use crate::{Code, Error, Result, RpcStreamFrame, Status};
+    use crate::framed::FrameRead;
+    use crate::framing::{
+        DEFAULT_MAX_FRAME_SIZE, encode_frame, encode_message_frame, encode_protobuf_frame,
+        frame_type,
+    };
+    use crate::server::RequestBudget;
+    use crate::{Code, Error, Result, RpcRequest, RpcStatus, Status};
 
     use super::{
         RequestInputKind, RequestPumpFailure, RequestPumpReader, RequestPumpSettle,
-        RequestPumpState, RequestTransportEvent, classify_error, start_request_pump,
+        RequestPumpState, RequestTransportEvent, classify_error, start_request_pump as start_pump,
     };
+
+    /// Starts a pump with no request limits.
+    fn start_request_pump<R: RequestPumpReader>(
+        reader: R,
+        kind: RequestInputKind,
+        max_frame_size: usize,
+    ) -> (crate::BoxStream<Vec<u8>>, super::RequestPump) {
+        start_pump(reader, kind, max_frame_size, RequestBudget::new(None, None))
+    }
 
     struct TestReader {
         stream: DuplexStream,
@@ -679,17 +709,6 @@ mod tests {
     impl RequestPumpReader for TestReader {
         fn stop_trevrpc(&mut self) {
             self.stops.fetch_add(1, Ordering::SeqCst);
-        }
-
-        async fn read_unary_end(&mut self) -> Result<()> {
-            framed::drain_unary_request_end(self).await
-        }
-
-        async fn read_stream_frame_or_eof(
-            &mut self,
-            max_frame_size: usize,
-        ) -> Result<Option<crate::RpcStreamFrame>> {
-            framed::read_stream_frame_or_eof(self, max_frame_size).await
         }
 
         async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
@@ -718,17 +737,6 @@ mod tests {
     impl RequestPumpReader for PanicReader {
         fn stop_trevrpc(&mut self) {
             self.stops.fetch_add(1, Ordering::SeqCst);
-        }
-
-        async fn read_unary_end(&mut self) -> Result<()> {
-            panic!("request reader panic");
-        }
-
-        async fn read_stream_frame_or_eof(
-            &mut self,
-            _max_frame_size: usize,
-        ) -> Result<Option<crate::RpcStreamFrame>> {
-            panic!("request reader panic");
         }
 
         async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
@@ -784,7 +792,12 @@ mod tests {
             self.stops.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn read_unary_end(&mut self) -> impl Future<Output = Result<()>> + Send {
+        fn read_request_end(
+            &mut self,
+            _max_frame_size: usize,
+            _budget: &mut RequestBudget,
+            _unexpected: &'static str,
+        ) -> impl Future<Output = Result<()>> + Send {
             self.starts.fetch_add(1, Ordering::SeqCst);
             TrackedUnaryRead {
                 completion: self
@@ -793,13 +806,6 @@ mod tests {
                     .expect("unary read future should start once"),
                 drops: Arc::clone(&self.drops),
             }
-        }
-
-        async fn read_stream_frame_or_eof(
-            &mut self,
-            _max_frame_size: usize,
-        ) -> Result<Option<crate::RpcStreamFrame>> {
-            panic!("stream read should not run for unary request");
         }
 
         async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
@@ -854,8 +860,22 @@ mod tests {
     }
 
     fn message(body: &[u8]) -> Vec<u8> {
-        crate::framing::encode_message_stream_frame(body, crate::framing::DEFAULT_MAX_FRAME_SIZE)
-            .expect("message frame should encode")
+        encode_message_frame(body, DEFAULT_MAX_FRAME_SIZE).expect("message frame should encode")
+    }
+
+    fn status_frame(status: Status) -> Vec<u8> {
+        encode_protobuf_frame(
+            frame_type::STATUS,
+            &RpcStatus::from(status),
+            DEFAULT_MAX_FRAME_SIZE,
+        )
+        .expect("status frame should encode")
+    }
+
+    /// A frame of an unknown (grease) type with `payload` bytes.
+    fn grease(payload: usize) -> Vec<u8> {
+        encode_frame(0x21, &vec![0; payload], DEFAULT_MAX_FRAME_SIZE)
+            .expect("grease frame should encode")
     }
 
     #[tokio::test(start_paused = true)]
@@ -893,10 +913,7 @@ mod tests {
     }
 
     fn streaming() -> RequestInputKind {
-        RequestInputKind::Streaming {
-            max_messages: None,
-            max_body_size: None,
-        }
+        RequestInputKind::Streaming
     }
 
     #[tokio::test]
@@ -1005,13 +1022,11 @@ mod tests {
     async fn observed_limit_error_wakes_control_before_body_poll() {
         let mut io = test_io(None);
         io.writer.write_all(&message(b"over limit")).await.unwrap();
-        let (_body, mut pump) = start_request_pump(
+        let (_body, mut pump) = start_pump(
             io.reader,
-            RequestInputKind::Streaming {
-                max_messages: Some(0),
-                max_body_size: None,
-            },
+            RequestInputKind::Streaming,
             1024,
+            RequestBudget::new(Some(0), None),
         );
 
         let failure = pump.failure().await;
@@ -1025,7 +1040,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_frame_wakes_control_before_body_poll() {
         let mut io = test_io(None);
-        io.writer.write_all(&[0, 0, 0, 1, 0xff]).await.unwrap();
+        // A STATUS frame whose payload is a truncated protobuf varint.
+        io.writer.write_all(&[0x03, 0x01, 0xff]).await.unwrap();
         let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
 
         let failure = pump.failure().await;
@@ -1036,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_status_settlement_waits_for_clean_fin() {
         let mut io = test_io(None);
-        let terminal = crate::framing::encode_frame(&RpcStreamFrame::status(Status::ok())).unwrap();
+        let terminal = status_frame(Status::ok());
         io.writer.write_all(&terminal).await.unwrap();
         let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -1065,9 +1081,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_after_terminal_status_reports_internal() {
+    async fn frame_after_terminal_status_reports_invalid_argument() {
         let mut io = test_io(None);
-        let terminal = crate::framing::encode_frame(&RpcStreamFrame::status(Status::ok())).unwrap();
+        let terminal = status_frame(Status::ok());
         io.writer
             .write_all(&[terminal, message(b"trailing")].concat())
             .await
@@ -1076,7 +1092,7 @@ mod tests {
         let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
 
         let failure = pump.failure().await;
-        assert_eq!(failure.status().code(), Code::Internal);
+        assert_eq!(failure.status().code(), Code::InvalidArgument);
         assert_eq!(
             failure.status().message(),
             "request stream continued after terminal status"
@@ -1212,6 +1228,202 @@ mod tests {
             failure.status().message(),
             "HTTP/3 request trailers are not supported"
         );
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    /// Waits until the pump has read the request stream to a clean end.
+    async fn wait_for_clean_fin(pump: &mut super::RequestPump) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    *pump.state.borrow(),
+                    RequestPumpState::Settled(super::RequestPumpOutcome::CleanFin)
+                ) {
+                    break;
+                }
+                pump.state.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the request should end cleanly");
+    }
+
+    async fn collect_bodies(body: &mut crate::BoxStream<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut bodies = Vec::new();
+        while let Some(item) = body.next().await {
+            bodies.push(item.expect("request body should not fail"));
+        }
+        bodies
+    }
+
+    #[tokio::test]
+    async fn unknown_frames_are_skipped_between_request_messages() {
+        let mut io = test_io(None);
+        let wire = [
+            grease(5),
+            message(b"a"),
+            grease(0),
+            encode_frame(0x1234, b"unknown", 1024).unwrap(),
+            message(b"b"),
+            grease(9),
+        ]
+        .concat();
+        io.writer.write_all(&wire).await.unwrap();
+        io.writer.shutdown().await.unwrap();
+        let (mut body, pump) = start_request_pump(io.reader, streaming(), 1024);
+
+        assert_eq!(
+            collect_bodies(&mut body).await,
+            [b"a".to_vec(), b"b".to_vec()]
+        );
+        let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+        assert_eq!(outcome, super::RequestPumpOutcome::CleanFin);
+        assert_eq!(io.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_frames_are_skipped_after_the_terminal_status() {
+        let mut io = test_io(None);
+        io.writer
+            .write_all(&[status_frame(Status::ok()), grease(3)].concat())
+            .await
+            .unwrap();
+        io.writer.shutdown().await.unwrap();
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
+
+        wait_for_clean_fin(&mut pump).await;
+        let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+        assert_eq!(outcome, super::RequestPumpOutcome::CleanFin);
+        assert_eq!(io.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn grease_is_charged_to_the_stream_body_limit() {
+        let mut io = test_io(None);
+        // Four 32-byte frames against a 100-byte limit; no message is ever sent.
+        io.writer
+            .write_all(&[grease(30), grease(30), grease(30), grease(30)].concat())
+            .await
+            .unwrap();
+        let (_body, mut pump) = start_pump(
+            io.reader,
+            streaming(),
+            1024,
+            RequestBudget::new(None, Some(100)),
+        );
+
+        let failure = pump.failure().await;
+        assert_eq!(failure.status().code(), Code::ResourceExhausted);
+        assert!(matches!(failure, RequestPumpFailure::Protocol(_)));
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    #[tokio::test]
+    async fn grease_and_messages_share_the_stream_body_limit() {
+        let mut io = test_io(None);
+        // 20 message bytes plus 2 x 42 grease bytes pass 100; the grease alone does not.
+        io.writer
+            .write_all(&[message(&[1; 20]), grease(40), grease(40)].concat())
+            .await
+            .unwrap();
+        let (mut body, mut pump) = start_pump(
+            io.reader,
+            streaming(),
+            1024,
+            RequestBudget::new(None, Some(100)),
+        );
+
+        assert_eq!(body.next().await.unwrap().unwrap(), [1; 20]);
+        let failure = pump.failure().await;
+        assert_eq!(failure.status().code(), Code::ResourceExhausted);
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    #[tokio::test]
+    async fn grease_cannot_hold_a_unary_request_stream_open() {
+        let mut io = test_io(None);
+        io.writer
+            .write_all(&[grease(30), grease(30), grease(30), grease(30)].concat())
+            .await
+            .unwrap();
+        let (_body, mut pump) = start_pump(
+            io.reader,
+            RequestInputKind::Unary,
+            1024,
+            RequestBudget::new(None, Some(100)),
+        );
+
+        let failure = pump.failure().await;
+        assert_eq!(failure.status().code(), Code::ResourceExhausted);
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    #[tokio::test]
+    async fn unary_pump_accepts_unknown_frames_until_fin() {
+        let mut io = test_io(None);
+        io.writer.write_all(&grease(3)).await.unwrap();
+        io.writer.shutdown().await.unwrap();
+        let (_body, mut pump) = start_request_pump(io.reader, RequestInputKind::Unary, 1024);
+
+        wait_for_clean_fin(&mut pump).await;
+        let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+        assert_eq!(outcome, super::RequestPumpOutcome::CleanFin);
+    }
+
+    #[tokio::test]
+    async fn unary_pump_rejects_a_second_message_without_reading_it() {
+        let mut io = test_io(None);
+        // The header declares 1000 payload bytes that never arrive.
+        io.writer.write_all(&[0x00, 0x43, 0xe8]).await.unwrap();
+        let (_body, mut pump) = start_request_pump(io.reader, RequestInputKind::Unary, 1024);
+
+        let failure = pump.failure().await;
+        assert_eq!(failure.status().code(), Code::InvalidArgument);
+        assert!(matches!(failure, RequestPumpFailure::Protocol(_)));
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    #[tokio::test]
+    async fn request_streams_reject_headers_and_a_second_request() {
+        let headers = encode_frame(frame_type::HEADERS, &[], 1024).unwrap();
+        let request = encode_protobuf_frame(
+            frame_type::REQUEST,
+            &RpcRequest::new("svc", "m"),
+            DEFAULT_MAX_FRAME_SIZE,
+        )
+        .unwrap();
+        for wire in [headers, request] {
+            let mut io = test_io(None);
+            io.writer.write_all(&wire).await.unwrap();
+            let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
+
+            let failure = pump.failure().await;
+            assert_eq!(failure.status().code(), Code::InvalidArgument);
+            let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_unknown_frame_is_rejected_before_its_payload() {
+        let mut io = test_io(None);
+        // Grease declaring 2000 payload bytes against a 1024-byte limit; none follow.
+        io.writer.write_all(&[0x21, 0x47, 0xd0]).await.unwrap();
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
+
+        let failure = pump.failure().await;
+        assert_eq!(failure.status().code(), Code::ResourceExhausted);
+        let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    #[tokio::test]
+    async fn stream_ending_inside_a_frame_header_is_a_connection_failure() {
+        let mut io = test_io(None);
+        io.writer.write_all(&[0x00]).await.unwrap();
+        io.writer.shutdown().await.unwrap();
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
+
+        let failure = pump.failure().await;
+        assert_eq!(failure.status().code(), Code::Unavailable);
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
     }
 }

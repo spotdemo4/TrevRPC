@@ -4,10 +4,12 @@ import test from "node:test";
 
 import {
   FrameReader,
-  decodeStreamFrame,
+  FrameType,
   encodeFrame,
+  encodeHeadersFrame,
   encodeMessageFrame,
-  frameBodyLength,
+  encodeRequestFrame,
+  encodeStatusFrame,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
@@ -20,12 +22,12 @@ import {
   validateMetadata,
 } from "../src/metadata.js";
 import { Code, TrevRpcError } from "../src/status.js";
+import { readVarint, varintLength, writeVarint } from "../src/varint.js";
 import {
+  RpcHeaders,
   RpcKind,
   RpcRequest,
-  RpcResponse,
-  RpcStreamFrame,
-  RpcStreamFrameKind,
+  RpcStatus,
   WireVersion,
   createRoot,
 } from "../src/wire.js";
@@ -33,127 +35,165 @@ import { chunked, concatBytes, hex, readerOf } from "./support.js";
 
 const goldenPath = new URL("../../testdata/wire-golden-vectors.txt", import.meta.url);
 
-test("wire encodings match the shared golden vectors", async () => {
-  const vectors = await readGoldenVectors();
-  const request = {
-    service: "svc",
-    method: "m",
-    body: new Uint8Array([104, 105]),
-    metadata: {},
-    version: WireVersion,
-  };
-  const cases = {
-    "rpc_request.unary": [RpcRequest, request],
-    "rpc_request.timeout": [RpcRequest, { ...request, timeoutNanos: 123456 }],
-    "rpc_request.metadata": [
-      RpcRequest,
-      { ...request, metadata: { authorization: new Uint8Array([111, 107]) } },
-    ],
-    "rpc_stream_frame.message": [RpcStreamFrame, { body: new Uint8Array([104, 105]) }],
-    "rpc_stream_frame.status": [
-      RpcStreamFrame,
-      { kind: RpcStreamFrameKind.Status, status: Code.Unavailable, message: "down" },
-    ],
-    "rpc_response.ok_body": [RpcResponse, { body: new Uint8Array([104, 105]) }],
-    "rpc_response.unavailable": [RpcResponse, { status: Code.Unavailable, message: "down" }],
-  };
+const bytes = (text) => new TextEncoder().encode(text);
+const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));
 
-  assert.deepEqual(
-    new Set(Object.keys(cases)),
-    new Set([...vectors.keys()].map((name) => name.replace(/\.(body|frame)$/, ""))),
-    "every golden vector needs a case",
-  );
-  for (const [name, [type, message]] of Object.entries(cases)) {
-    assert.equal(hex(marshalMessage(type, message)), vectors.get(`${name}.body`), name);
-    assert.equal(hex(encodeFrame(type, message)), vectors.get(`${name}.frame`), name);
-  }
-});
+const request = { service: "svc", method: "m", version: WireVersion };
 
-test("golden frames decode back to their messages", async () => {
-  const vectors = await readGoldenVectors();
-  const status = unmarshalMessage(
-    RpcStreamFrame,
-    Buffer.from(vectors.get("rpc_stream_frame.status.body"), "hex"),
-  );
-  assert.equal(status.kind, RpcStreamFrameKind.Status);
-  assert.equal(status.status, Code.Unavailable);
-  assert.equal(status.message, "down");
-
-  const request = unmarshalMessage(
+/** The documented logical value of every golden vector: [frame type, message type, fields]. */
+const goldenCases = {
+  "request.unary": [FrameType.Request, RpcRequest, request],
+  "request.bidi_timeout": [
+    FrameType.Request,
     RpcRequest,
-    Buffer.from(vectors.get("rpc_request.metadata.body"), "hex"),
-  );
-  assert.equal(request.service, "svc");
-  assert.equal(request.kind, RpcKind.Unary);
-  assert.equal(Buffer.from(request.metadata.authorization).toString(), "ok");
-});
+    { ...request, kind: RpcKind.BidirectionalStreaming, timeoutNanos: 123456 },
+  ],
+  "request.metadata": [
+    FrameType.Request,
+    RpcRequest,
+    { ...request, metadata: { authorization: bytes("ok") } },
+  ],
+  "request.extensions": [FrameType.Request, RpcRequest, { ...request, extensions: [1, 300] }],
+  "message.hi": [FrameType.Message, undefined, bytes("hi")],
+  "message.empty": [FrameType.Message, undefined, new Uint8Array(0)],
+  "headers.metadata": [FrameType.Headers, RpcHeaders, { metadata: { "x-a": bytes("1") } }],
+  "headers.empty": [FrameType.Headers, RpcHeaders, {}],
+  "headers.extensions": [FrameType.Headers, RpcHeaders, { extensions: [1] }],
+  "status.ok": [FrameType.Status, RpcStatus, { code: Code.Ok }],
+  "status.unavailable": [FrameType.Status, RpcStatus, { code: Code.Unavailable, message: "down" }],
+  "status.metadata": [
+    FrameType.Status,
+    RpcStatus,
+    { code: Code.FailedPrecondition, message: "stop", metadata: { "x-t": bytes("2") } },
+  ],
+  "grease.two_byte_type": [0x40, undefined, new Uint8Array([0, 1, 2])],
+};
 
-test("frame length limits are inclusive", () => {
-  const header = (length) => {
-    const bytes = new Uint8Array(4);
-    new DataView(bytes.buffer).setUint32(0, length, false);
-    return bytes;
-  };
-
-  for (const length of [0, 1, 15, 16]) {
-    assert.equal(frameBodyLength(header(length), 16), length);
+test("every golden vector has a documented logical value", async () => {
+  const vectors = await readGoldenVectors();
+  const names = new Set();
+  const streams = new Set();
+  for (const key of vectors.keys()) {
+    const [name, kind] = [key.slice(0, key.lastIndexOf(".")), key.slice(key.lastIndexOf(".") + 1)];
+    (name.startsWith("stream.") ? streams : names).add(name);
+    assert.ok(["payload", "frame", "stream", "frames"].includes(kind), `unknown entry ${key}`);
   }
-  for (const length of [17, 0xffffffff]) {
-    assert.throws(
-      () => frameBodyLength(header(length), 16),
-      (error) => error instanceof TrevRpcError && error.code === Code.ResourceExhausted,
-    );
+  assert.deepEqual(names, new Set(Object.keys(goldenCases)));
+  for (const name of streams) {
+    assert.ok(vectors.has(`${name}.stream`) && vectors.has(`${name}.frames`), name);
   }
-  assert.throws(
-    () => encodeFrame(RpcResponse, { body: new Uint8Array(32) }, 16),
-    (error) => error.code === Code.ResourceExhausted,
-  );
+  assert.ok(streams.size > 0);
 });
 
-test("message stream frames match generic protobuf encoding", () => {
-  for (const size of [0, 1, 127, 128, 16383, 16384, 70000]) {
-    const body = new Uint8Array(size).fill(7);
-    const generic = encodeFrame(RpcStreamFrame, { body });
-    assert.deepEqual(encodeMessageFrame(body), generic, `${size} byte body`);
+test("wire encodings match the shared golden vectors and decode back", async () => {
+  const vectors = await readGoldenVectors();
+  for (const [name, [type, messageType, fields]] of Object.entries(goldenCases)) {
+    const payload = messageType === undefined ? fields : marshalMessage(messageType, fields);
+    assert.equal(hex(payload), vectors.get(`${name}.payload`), `${name} payload`);
+    const frame = encodeFrame(type, payload);
+    assert.equal(hex(frame), vectors.get(`${name}.frame`), `${name} frame`);
 
-    const decoded = decodeStreamFrame(generic.subarray(4));
-    assert.equal(decoded.kind, RpcStreamFrameKind.Message);
-    assert.deepEqual(decoded.body, body);
+    // The frame reader yields the frame (grease is skipped) and its payload decodes to the value.
+    const read = await new FrameReader(readerOf([frame])).readFrame();
+    if (type === 0x40) {
+      assert.equal(read, null, `${name} is skipped`);
+      continue;
+    }
+    assert.equal(read.type, type, name);
+    assert.equal(hex(read.payload), vectors.get(`${name}.payload`), name);
+    if (messageType !== undefined) {
+      const decoded = unmarshalMessage(messageType, read.payload);
+      assert.equal(hex(marshalMessage(messageType, decoded)), hex(payload), `${name} round trip`);
+    }
   }
-  assert.throws(
-    () => encodeMessageFrame(new Uint8Array(32), 16),
-    (error) => error.code === Code.ResourceExhausted,
+});
+
+test("golden payloads decode to their logical fields", async () => {
+  const vectors = await readGoldenVectors();
+  const decode = (name, type) => unmarshalMessage(type, fromHex(vectors.get(`${name}.payload`)));
+
+  const withExtensions = decode("request.extensions", RpcRequest);
+  assert.deepEqual(withExtensions.extensions.map(Number), [1, 300]);
+  assert.equal(withExtensions.version, WireVersion);
+
+  const timeout = decode("request.bidi_timeout", RpcRequest);
+  assert.equal(timeout.kind, RpcKind.BidirectionalStreaming);
+  assert.equal(Number(timeout.timeoutNanos), 123456);
+
+  assert.equal(
+    Buffer.from(decode("request.metadata", RpcRequest).metadata.authorization) + "",
+    "ok",
+  );
+  assert.deepEqual(decode("headers.extensions", RpcHeaders).extensions.map(Number), [1]);
+  assert.equal(Buffer.from(decode("headers.metadata", RpcHeaders).metadata["x-a"]) + "", "1");
+
+  const status = decode("status.metadata", RpcStatus);
+  assert.equal(status.code, Code.FailedPrecondition);
+  assert.equal(status.message, "stop");
+  assert.equal(Buffer.from(status.metadata["x-t"]) + "", "2");
+  assert.equal(decode("status.ok", RpcStatus).code, Code.Ok);
+});
+
+test("the frame reader yields the golden known frames from every chunking", async () => {
+  const vectors = await readGoldenVectors();
+  const streams = [...vectors.keys()].filter((key) => key.endsWith(".stream"));
+  assert.ok(streams.length > 0);
+  for (const key of streams) {
+    const name = key.slice(0, -".stream".length);
+    const wire = fromHex(vectors.get(key));
+    for (const size of [1, 2, 3, 5, wire.byteLength]) {
+      const reader = new FrameReader(readerOf(chunked(wire, size)));
+      const frames = [];
+      for (let frame; (frame = await reader.readFrame()) !== null;) {
+        frames.push(`${frame.type}:${hex(frame.payload)}`);
+      }
+      assert.equal(frames.join(","), vectors.get(`${name}.frames`), `${name}, chunks of ${size}`);
+    }
+  }
+});
+
+test("request frames carry the request message in the same buffer", () => {
+  const body = bytes("hi");
+  const both = encodeRequestFrame(request, body);
+  const requestOnly = encodeRequestFrame(request);
+  assert.deepEqual(both, concatBytes([requestOnly, encodeMessageFrame(body)]));
+  assert.equal(hex(requestOnly), "010a0a0373766312016d3001");
+  assert.equal(hex(encodeRequestFrame(request, new Uint8Array(0))), `${hex(requestOnly)}0000`);
+});
+
+test("status and headers encoders match the golden frames", async () => {
+  const vectors = await readGoldenVectors();
+  assert.equal(
+    hex(encodeStatusFrame({ code: Code.Unavailable, message: "down" })),
+    vectors.get("status.unavailable.frame"),
+  );
+  assert.equal(
+    hex(encodeHeadersFrame({ metadata: { "x-a": bytes("1") } })),
+    vectors.get("headers.metadata.frame"),
   );
 });
 
-test("a message frame body is returned as a view, not a copy", () => {
-  const frame = encodeMessageFrame(new Uint8Array([1, 2, 3]));
-  const decoded = decodeStreamFrame(frame.subarray(4));
-  assert.equal(decoded.body.buffer, frame.buffer);
+test("encoders enforce the frame size limit inclusively", () => {
+  assert.equal(encodeMessageFrame(new Uint8Array(16), 16).byteLength, 18);
+  const exceeds = (error) => error instanceof TrevRpcError && error.code === Code.ResourceExhausted;
+  assert.throws(() => encodeMessageFrame(new Uint8Array(17), 16), exceeds);
+  assert.throws(() => encodeFrame(0x21, new Uint8Array(17), 16), exceeds);
+  assert.throws(() => encodeRequestFrame(request, new Uint8Array(17), 16), exceeds);
+  assert.throws(() => encodeRequestFrame(request, undefined, 4), exceeds);
 });
 
-test("stream frames with extra fields take the generic decoding path", () => {
-  const frame = encodeFrame(RpcStreamFrame, {
-    kind: RpcStreamFrameKind.Message,
-    body: new Uint8Array([9]),
-    metadata: { key: new Uint8Array([1]) },
-  });
-  const decoded = decodeStreamFrame(frame.subarray(4));
-  assert.deepEqual([...decoded.body], [9]);
-
-  const status = decodeStreamFrame(
-    encodeFrame(RpcStreamFrame, { kind: RpcStreamFrameKind.Status, status: 5 }).subarray(4),
-  );
-  assert.equal(status.kind, RpcStreamFrameKind.Status);
-  assert.equal(status.status, Code.NotFound);
-});
-
-test("unknown stream frame kinds are invalid arguments", () => {
-  const body = new Uint8Array([0x08, 0x07]);
-  assert.throws(
-    () => decodeStreamFrame(body),
-    (error) => error.code === Code.InvalidArgument && /kind 7/.test(error.statusMessage),
-  );
+test("varints round trip, including values beyond 2^53", () => {
+  for (const value of [0, 63, 64, 16383, 16384, 0x3fffffff, 0x40000000, 2 ** 52]) {
+    const encoded = new Uint8Array(8);
+    const end = writeVarint(encoded, 0, value);
+    assert.equal(end, varintLength(value));
+    assert.deepEqual(readVarint(encoded, 0), { value, next: end }, String(value));
+  }
+  const max = (1n << 62n) - 1n;
+  const encoded = new Uint8Array(8);
+  writeVarint(encoded, 0, max);
+  assert.equal(hex(encoded), "ffffffffffffffff");
+  assert.equal(readVarint(encoded, 0).value, max);
 });
 
 test("malformed protobuf maps to invalid argument", () => {
@@ -207,52 +247,150 @@ test("marshalling rejects values that do not fit the schema", () => {
 
 test("frame reader reassembles frames from arbitrary chunking", async () => {
   const bodies = [new Uint8Array([1]), new Uint8Array(0), new Uint8Array(300).fill(2)];
-  const wire = concatBytes(bodies.map((body) => encodeMessageFrame(body)));
+  const wire = concatBytes([
+    ...bodies.map((body) => encodeMessageFrame(body)),
+    encodeFrame(0x3fff, new Uint8Array(16384).fill(3)), // unknown type, 4-byte length
+    encodeStatusFrame({ code: Code.Ok }),
+  ]);
 
-  for (const size of [1, 2, 3, 7, 4096]) {
+  for (const size of [1, 2, 3, 7, 4096, wire.byteLength]) {
     const reader = new FrameReader(readerOf(chunked(wire, size)));
     for (const body of bodies) {
-      assert.deepEqual((await reader.readStreamFrame()).body, body, `chunk size ${size}`);
+      const frame = await reader.readFrame();
+      assert.equal(frame.type, FrameType.Message, `chunk size ${size}`);
+      assert.deepEqual(frame.payload, body, `chunk size ${size}`);
     }
-    assert.equal(await reader.readStreamFrame(), null);
+    assert.equal((await reader.readFrame()).type, FrameType.Status);
+    assert.equal(await reader.readFrame(), null);
   }
+});
+
+test("a frame inside one chunk is returned as a view, not a copy", async () => {
+  const wire = concatBytes([encodeMessageFrame(new Uint8Array([1, 2, 3]))]);
+  const frame = await new FrameReader(readerOf([wire])).readFrame();
+  assert.equal(frame.payload.buffer, wire.buffer);
+});
+
+test("unknown frames are skipped wherever they appear", async () => {
+  const unknown = (type, length = 3) => encodeFrame(type, new Uint8Array(length).fill(9));
+  const wire = concatBytes([
+    unknown(0x21), // grease before everything
+    encodeMessageFrame(bytes("a")),
+    unknown(0x40, 0),
+    unknown(4),
+    unknown(2 ** 40), // 8-byte type that still fits a number
+    encodeFrame(2n ** 62n - 1n, new Uint8Array(2)), // largest type, a bigint
+    encodeMessageFrame(bytes("b")),
+    encodeStatusFrame({ code: Code.Ok }),
+    unknown(0x5f), // grease after STATUS
+    encodeFrame(2n ** 53n, new Uint8Array(1)),
+  ]);
+
+  for (const size of [1, 4, wire.byteLength]) {
+    const reader = new FrameReader(readerOf(chunked(wire, size)));
+    const seen = [];
+    for (let frame; (frame = await reader.readFrame()) !== null;) {
+      seen.push(frame.type);
+    }
+    assert.deepEqual(seen, [FrameType.Message, FrameType.Message, FrameType.Status], `${size}`);
+  }
+});
+
+test("unknown frames count toward the frame size limit", async () => {
+  const wire = encodeFrame(0x21, new Uint8Array(17));
+  await assert.rejects(
+    new FrameReader(readerOf([wire])).readFrame(16),
+    (error) => error.code === Code.ResourceExhausted,
+  );
+  assert.equal(await new FrameReader(readerOf([wire])).readFrame(17), null);
+});
+
+test("frame reader rejects oversized lengths before buffering the payload", async () => {
+  const exceeds = (error) => error instanceof TrevRpcError && error.code === Code.ResourceExhausted;
+  // Only the header arrives; a reader that tried to buffer the payload would hit end of stream.
+  const header = (type, length) => {
+    const out = new Uint8Array(16);
+    return out.subarray(0, writeVarint(out, writeVarint(out, 0, type), length));
+  };
+  for (const type of [FrameType.Message, FrameType.Status, 0x21, 2n ** 60n]) {
+    for (const length of [1025, 1 << 30, 2 ** 40, 2n ** 62n - 1n]) {
+      const reader = new FrameReader(readerOf([header(type, length)]));
+      await assert.rejects(reader.readFrame(1024), exceeds, `type ${type}, length ${length}`);
+    }
+  }
+  // The limit is inclusive.
+  const full = concatBytes([header(FrameType.Message, 1024), new Uint8Array(1024)]);
+  assert.equal((await new FrameReader(readerOf([full])).readFrame(1024)).payload.byteLength, 1024);
 });
 
 test("frame reader fails on streams that end mid-frame", async () => {
-  const wire = encodeMessageFrame(new Uint8Array(20));
-  for (const length of [1, 3, 5, wire.byteLength - 1]) {
-    const reader = new FrameReader(readerOf([wire.subarray(0, length)]));
+  const wire = concatBytes([
+    encodeFrame(0x4000, new Uint8Array(20)), // 4-byte type, 1-byte length
+    encodeFrame(FrameType.Message, new Uint8Array(300)), // 2-byte length
+  ]);
+  const second = encodeFrame(0x4000, new Uint8Array(20)).byteLength;
+  assert.equal(second, 4 + 1 + 20);
+
+  // Cut inside the type varint, between type and length, inside the length varint, and inside
+  // the payload, of both frames.
+  for (const length of [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    24,
+    second + 1,
+    second + 2,
+    second + 3,
+    wire.byteLength - 1,
+  ]) {
+    for (const size of [1, wire.byteLength]) {
+      const reader = new FrameReader(readerOf(chunked(wire.subarray(0, length), size)));
+      await assert.rejects(
+        (async () => {
+          for (;;) {
+            if ((await reader.readFrame()) === null) {
+              return;
+            }
+          }
+        })(),
+        (error) => error.code === Code.Unavailable,
+        `cut at ${length}, chunks of ${size}`,
+      );
+    }
+  }
+  assert.equal(await new FrameReader(readerOf([])).readFrame(), null);
+});
+
+test("frame reader expects only unknown frames and a clean end after the final frame", async () => {
+  const unavailable = (error) => error.code === Code.Unavailable;
+  const internal = (error) => error.code === Code.Internal;
+  await new FrameReader(readerOf([])).expectEnd();
+  await new FrameReader(
+    readerOf([concatBytes([encodeFrame(0x21, bytes("x")), encodeFrame(2n ** 61n, bytes("y"))])]),
+  ).expectEnd();
+
+  for (const known of [FrameType.Message, FrameType.Request, FrameType.Headers, FrameType.Status]) {
     await assert.rejects(
-      reader.readStreamFrame(),
-      (error) => error.code === Code.Unavailable,
-      `${length} bytes`,
+      new FrameReader(readerOf([encodeFrame(known, new Uint8Array(0))])).expectEnd(),
+      internal,
     );
   }
-  await assert.rejects(new FrameReader(readerOf([])).readFrame(RpcResponse), (error) => {
-    return error.code === Code.Unavailable;
-  });
-});
-
-test("frame reader enforces the frame size limit before reading the body", async () => {
-  const header = new Uint8Array(4);
-  new DataView(header.buffer).setUint32(0, 1 << 30, false);
-  const reader = new FrameReader(readerOf([header]));
-  await assert.rejects(reader.readFrame(RpcResponse, 1024), (error) => {
-    return error.code === Code.ResourceExhausted;
-  });
-});
-
-test("frame reader expects a clean end of stream", async () => {
-  await new FrameReader(readerOf([])).expectEnd();
   await assert.rejects(
-    new FrameReader(readerOf([new Uint8Array([0])])).expectEnd(),
-    (error) => error.code === Code.Unavailable,
+    new FrameReader(readerOf([new Uint8Array([0x21])])).expectEnd(),
+    unavailable,
+  );
+  await assert.rejects(
+    new FrameReader(readerOf([encodeFrame(0x21, new Uint8Array(17))])).expectEnd(16),
+    (error) => error.code === Code.ResourceExhausted,
   );
 
-  const wire = concatBytes([encodeMessageFrame(new Uint8Array([1])), new Uint8Array([9])]);
+  const wire = concatBytes([encodeStatusFrame({ code: Code.Ok }), encodeMessageFrame(bytes("x"))]);
   const reader = new FrameReader(readerOf([wire]));
-  await reader.readStreamFrame();
-  await assert.rejects(reader.expectEnd(), (error) => error.code === Code.Unavailable);
+  assert.equal((await reader.readFrame()).type, FrameType.Status);
+  await assert.rejects(reader.expectEnd(), internal);
 });
 
 test("metadata is normalized to lowercase keys and byte values", () => {
@@ -311,8 +449,13 @@ async function readGoldenVectors() {
     if (line === "" || line.startsWith("#")) {
       continue;
     }
-    const [name, value] = line.split("=").map((part) => part.trim());
-    assert.match(value ?? "", /^(?:[0-9a-f]{2})*$/u, `invalid golden vector on line ${index + 1}`);
+    const separator = line.indexOf("=");
+    assert.ok(separator > 0, `invalid golden vector on line ${index + 1}`);
+    const name = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (!name.endsWith(".frames")) {
+      assert.match(value, /^(?:[0-9a-f]{2})*$/u, `invalid golden vector on line ${index + 1}`);
+    }
     vectors.set(name, value);
   }
   return vectors;

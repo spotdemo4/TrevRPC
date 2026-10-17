@@ -16,19 +16,30 @@ export function createEchoHandler({ unary = echoUnary } = {}) {
 
 export const echoHandler = createEchoHandler();
 
+const text = new TextDecoder();
+
 async function serve(stream, request, unary) {
+  // The interop-header rule: echo the value as response header and, on success, as trailer.
+  const marker = request.metadata["interop-header"];
+  const trailers = marker === undefined ? {} : { "interop-trailer": new Uint8Array(marker) };
+  if (marker !== undefined) {
+    await stream.writeHeaders({ "interop-header": new Uint8Array(marker) });
+  }
+  const done = (code = Code.Ok, message = "") =>
+    stream.writeStatus(code, message, code === Code.Ok ? trailers : {});
+
   switch (request.method) {
     case "Unary":
-      await unary(stream, request);
+      await unary(stream, request, await stream.readMessage(EchoRequest), done);
       break;
     case "ClientStream":
-      await clientStream(stream);
+      await clientStream(stream, done);
       break;
     case "ServerStream":
-      await serverStream(stream, EchoRequest.decode(request.body));
+      await serverStream(stream, await stream.readMessage(EchoRequest), done);
       break;
     case "Bidi":
-      await bidi(stream);
+      await bidi(stream, done);
       break;
     default:
       await stream.writeStatus(Code.Unimplemented, request.method);
@@ -37,49 +48,48 @@ async function serve(stream, request, unary) {
   await stream.stopSending();
 }
 
-async function echoUnary(stream, request) {
-  const message = EchoRequest.decode(request.body);
+async function echoUnary(stream, request, message, done) {
   if (message.failCode !== 0) {
-    await stream.writeResponse({ status: message.failCode, message: message.failMessage });
+    await done(message.failCode, message.failMessage);
     return;
   }
-  const suffix = new TextDecoder().decode(request.metadata["interop-suffix"] ?? new Uint8Array());
-  const body = EchoResponse.encode({ message: message.message + suffix, index: 0 }).finish();
-  await stream.writeResponse({ body });
+  const suffix = text.decode(request.metadata["interop-suffix"] ?? new Uint8Array());
+  await stream.writeMessage(EchoResponse, { message: message.message + suffix, index: 0 });
+  await done();
 }
 
-async function clientStream(stream) {
+async function clientStream(stream, done) {
   let message = "";
   let count = 0;
   for (let request; (request = await stream.readMessage(EchoRequest)) !== null; count += 1) {
     if (request.failCode !== 0) {
-      await stream.writeStatus(request.failCode, request.failMessage);
+      await done(request.failCode, request.failMessage);
       return;
     }
     message += request.message;
   }
   await stream.writeMessage(EchoResponse, { message, index: count });
-  await stream.writeStatus();
+  await done();
 }
 
-async function serverStream(stream, request) {
+async function serverStream(stream, request, done) {
   for (let index = 0; index < request.count; index += 1) {
     await stream.writeMessage(EchoResponse, { message: request.message, index });
   }
-  await stream.writeStatus(request.failCode, request.failMessage);
+  await done(request.failCode, request.failMessage);
 }
 
-async function bidi(stream) {
+async function bidi(stream, done) {
   for (
     let index = 0, request;
     (request = await stream.readMessage(EchoRequest)) !== null;
     index += 1
   ) {
     if (request.failCode !== 0) {
-      await stream.writeStatus(request.failCode, request.failMessage);
+      await done(request.failCode, request.failMessage);
       return;
     }
     await stream.writeMessage(EchoResponse, { message: request.message, index });
   }
-  await stream.writeStatus();
+  await done();
 }

@@ -9,14 +9,36 @@ use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
 use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissionRequest};
 use trevrpc::tcp::TcpFallback;
-use trevrpc::{BoxStream, Code, Error, ResponseEnvelope, Status};
+use trevrpc::{BoxStream, Code, Error, Metadata, ResponseEnvelope, Status};
 
 use crate::proto::{self, Echo, EchoRequest, EchoResponse};
 use crate::{BoxError, Flags};
 
 const SUFFIX_METADATA_KEY: &str = "interop-suffix";
+const HEADER_METADATA_KEY: &str = "interop-header";
+const TRAILER_METADATA_KEY: &str = "interop-trailer";
 
 struct EchoService;
+
+/// Wraps a response in an envelope that honors the `interop-header` request metadata.
+///
+/// When the request carries the key with value `v`, the response headers are
+/// `{interop-header: v}` and the `OK` status carries trailing metadata `{interop-trailer: v}`.
+/// Without it the envelope has neither.
+fn envelope<T>(context: &RequestContext, message: T) -> ResponseEnvelope<T> {
+    let Some(value) = context.metadata().get(HEADER_METADATA_KEY) else {
+        return ResponseEnvelope::new(message);
+    };
+    ResponseEnvelope::new(message)
+        .with_headers(Metadata::from([(
+            HEADER_METADATA_KEY.to_owned(),
+            value.clone(),
+        )]))
+        .with_metadata(Metadata::from([(
+            TRAILER_METADATA_KEY.to_owned(),
+            value.clone(),
+        )]))
+}
 
 /// The status a request asks to fail with, if any.
 fn requested_failure(request: &EchoRequest) -> Option<Status> {
@@ -43,15 +65,18 @@ impl Echo for EchoService {
             .get(SUFFIX_METADATA_KEY)
             .map(|value| String::from_utf8_lossy(value).into_owned())
             .unwrap_or_default();
-        Ok(ResponseEnvelope::new(EchoResponse {
-            message: request.message + &suffix,
-            index: 0,
-        }))
+        Ok(envelope(
+            &context,
+            EchoResponse {
+                message: request.message + &suffix,
+                index: 0,
+            },
+        ))
     }
 
     async fn client_stream(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         mut requests: BoxStream<EchoRequest>,
     ) -> Result<ResponseEnvelope<EchoResponse>, Status> {
         let mut message = String::new();
@@ -64,15 +89,18 @@ impl Echo for EchoService {
             message.push_str(&request.message);
             count = count.saturating_add(1);
         }
-        Ok(ResponseEnvelope::new(EchoResponse {
-            message,
-            index: count,
-        }))
+        Ok(envelope(
+            &context,
+            EchoResponse {
+                message,
+                index: count,
+            },
+        ))
     }
 
     async fn server_stream(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         request: EchoRequest,
     ) -> Result<ResponseEnvelope<BoxStream<EchoResponse>>, Status> {
         let failure = requested_failure(&request);
@@ -85,14 +113,15 @@ impl Echo for EchoService {
                 })
             })
             .chain(failure.map(|status| Err(Error::from(status))));
-        Ok(ResponseEnvelope::new(Box::pin(futures_util::stream::iter(
-            responses,
-        ))))
+        Ok(envelope(
+            &context,
+            Box::pin(futures_util::stream::iter(responses)),
+        ))
     }
 
     async fn bidi(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         requests: BoxStream<EchoRequest>,
     ) -> Result<ResponseEnvelope<BoxStream<EchoResponse>>, Status> {
         // `(requests, next index, finished)`: a failing request ends the stream with its status.
@@ -117,7 +146,7 @@ impl Echo for EchoService {
                 }
             },
         );
-        Ok(ResponseEnvelope::new(Box::pin(responses)))
+        Ok(envelope(&context, Box::pin(responses)))
     }
 }
 

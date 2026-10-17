@@ -11,7 +11,9 @@ use super::race::{
 };
 use super::{RpcTransport, StreamingRpcTransport};
 use crate::sync::MutexExt as _;
-use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+use bytes::Bytes;
+
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
 
 const EVENT_CAPACITY: usize = 32;
 const CLOSE_REASON: &[u8] = b"channel closed";
@@ -471,8 +473,8 @@ impl Channel {
 
 #[crate::async_trait]
 impl RpcTransport for Channel {
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        self.snapshot()?.call(request).await
+    async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
+        self.snapshot()?.call(request, body).await
     }
 }
 
@@ -482,7 +484,7 @@ impl StreamingRpcTransport for Channel {
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>> {
+    ) -> Result<BoxStream<ResponseFrame>> {
         self.snapshot()?.streaming_call(request, request_body).await
     }
 }

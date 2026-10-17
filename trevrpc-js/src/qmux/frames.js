@@ -1,6 +1,6 @@
 // QMux frames (draft-ietf-quic-qmux-02): the QUIC v1 frames QMux carries plus its own
 // QX_TRANSPORT_PARAMETERS and QX_PING frames.
-import { readVarint, varintLength, writeVarint } from "./varint.js";
+import { readVarint, varintLength, writeVarint } from "../varint.js";
 
 export const FrameType = Object.freeze({
   Padding: 0x00,

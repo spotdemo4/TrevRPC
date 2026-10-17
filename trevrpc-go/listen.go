@@ -303,7 +303,7 @@ func (l *Listener) serveStreams(ctx context.Context, acceptor streamAcceptor) {
 			break
 		}
 		if !tryAcquire(streamLimit) {
-			writeStatusResponse(stream, Unavailable(acceptor.overloadMessage), runtime.options.MaxFrameSize)
+			writeStatusAndAbort(stream, Unavailable(acceptor.overloadMessage), runtime.options.MaxFrameSize)
 			continue
 		}
 

@@ -18,7 +18,7 @@ func TestServerQUICConfigDerivesLimitsFromServerOptions(t *testing.T) {
 
 	config := serverQUICConfig(nil, options)
 
-	if config.InitialStreamReceiveWindow != 1028 || config.MaxStreamReceiveWindow != 1028 {
+	if config.InitialStreamReceiveWindow != 1040 || config.MaxStreamReceiveWindow != 1040 {
 		t.Fatalf("stream receive window should match one frame, got initial=%d max=%d", config.InitialStreamReceiveWindow, config.MaxStreamReceiveWindow)
 	}
 	if config.InitialConnectionReceiveWindow != 4096 || config.MaxConnectionReceiveWindow != 4096 {
@@ -65,7 +65,7 @@ func TestQUICConfigOnlyTightensCallerLimitsAndDoesNotMutateBase(t *testing.T) {
 	if config == base || config.Allow0RTT {
 		t.Fatalf("0-RTT must be disabled on a copy: %+v", config)
 	}
-	if config.InitialStreamReceiveWindow != 132 || config.MaxStreamReceiveWindow != 64 {
+	if config.InitialStreamReceiveWindow != 144 || config.MaxStreamReceiveWindow != 64 {
 		t.Fatalf("caller windows may only shrink: initial=%d max=%d", config.InitialStreamReceiveWindow, config.MaxStreamReceiveWindow)
 	}
 	if config.MaxIncomingStreams != 2 || config.MaxIdleTimeout != time.Minute {
@@ -76,7 +76,7 @@ func TestQUICConfigOnlyTightensCallerLimitsAndDoesNotMutateBase(t *testing.T) {
 	}
 
 	client := clientQUICConfig(nil, 128)
-	if client.MaxIncomingStreams != -1 || client.MaxIncomingUniStreams != -1 || client.MaxStreamReceiveWindow != 132 {
+	if client.MaxIncomingStreams != -1 || client.MaxIncomingUniStreams != -1 || client.MaxStreamReceiveWindow != 144 {
 		t.Fatalf("clients never accept streams and bound windows to one frame: %+v", client)
 	}
 }

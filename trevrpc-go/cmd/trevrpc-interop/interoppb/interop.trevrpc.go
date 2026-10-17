@@ -54,7 +54,7 @@ func (c *EchoClient) ClientStream(ctx context.Context, options ...trevrpc_go.Cal
 }
 
 // ServerStream calls the ServerStream RPC.
-func (c *EchoClient) ServerStream(ctx context.Context, request *EchoRequest, options ...trevrpc_go.CallOption) (trevrpc_go.ResponseStream[*EchoResponse], error) {
+func (c *EchoClient) ServerStream(ctx context.Context, request *EchoRequest, options ...trevrpc_go.CallOption) (trevrpc_go.ServerStreamingCall[*EchoResponse], error) {
 	return trevrpc_go.ServerStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, "trevrpc.interop.v1.Echo", "ServerStream", request, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options)...)
 }
 

@@ -54,21 +54,29 @@ Servers implement it exactly as follows.
 | `ServerStream` | Send `count` responses `{message: request.message, index: i}` for `i` in `0..count`. Then end with status `fail_code` / `fail_message` if `fail_code != 0`, otherwise `OK`.                                                  |
 | `Bidi`         | For the `i`-th request: if `fail_code != 0`, end with that status; otherwise send `{message: request.message, index: i}`. End with `OK` at request EOF.                                                                      |
 
+Every method also handles headers: when request metadata key `interop-header`
+is present with value `v`, the server sends response headers
+`{interop-header: v}` before its first response message, and its `OK` status
+carries trailing metadata `{interop-trailer: v}`. Without that key the server
+sends no headers and no trailing metadata.
+
 ## Scenarios
 
 Clients run these in order, each with a 10 second deadline.
 
-| Name                  | Call                                                                                                    | Expected                                                       |
-| --------------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `unary`               | `Unary {message: "hello"}`                                                                              | `{message: "hello", index: 0}`                                 |
-| `unary-metadata`      | `Unary {message: "hello"}` with metadata `interop-suffix: "!"`                                          | `{message: "hello!"}`                                          |
-| `unary-error`         | `Unary {fail_code: 5, fail_message: "missing"}`                                                         | status `NotFound` (5), message `"missing"`                     |
-| `unary-large`         | `Unary {message: "x" × 1048576}`                                                                        | same 1 MiB message echoed                                      |
-| `client-stream`       | `ClientStream` sending `"a"`, `"b"`, `"c"`                                                              | `{message: "abc", index: 3}`                                   |
-| `server-stream`       | `ServerStream {message: "s", count: 3}`                                                                 | `("s", 0)`, `("s", 1)`, `("s", 2)`, then `OK`                  |
-| `server-stream-error` | `ServerStream {message: "s", count: 2, fail_code: 9, fail_message: "stop"}`                             | `("s", 0)`, `("s", 1)`, then `FailedPrecondition` (9) `"stop"` |
-| `bidi`                | `Bidi` sending `"1"`, `"2"`, `"3"`, awaiting each echo before the next send, then closing the send side | `("1", 0)`, `("2", 1)`, `("3", 2)`, then `OK`                  |
-| `bidi-error`          | `Bidi` sending `"1"` (await its echo), then `{fail_code: 10, fail_message: "abort"}`                    | `("1", 0)`, then `Aborted` (10) `"abort"`                      |
+| Name                    | Call                                                                                                               | Expected                                                                                                           |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `unary`                 | `Unary {message: "hello"}`                                                                                         | `{message: "hello", index: 0}`                                                                                     |
+| `unary-metadata`        | `Unary {message: "hello"}` with metadata `interop-suffix: "!"`                                                     | `{message: "hello!"}`                                                                                              |
+| `unary-error`           | `Unary {fail_code: 5, fail_message: "missing"}`                                                                    | status `NotFound` (5), message `"missing"`                                                                         |
+| `unary-large`           | `Unary {message: "x" × 1048576}`                                                                                   | same 1 MiB message echoed                                                                                          |
+| `client-stream`         | `ClientStream` sending `"a"`, `"b"`, `"c"`                                                                         | `{message: "abc", index: 3}`                                                                                       |
+| `server-stream`         | `ServerStream {message: "s", count: 3}`                                                                            | `("s", 0)`, `("s", 1)`, `("s", 2)`, then `OK`                                                                      |
+| `server-stream-error`   | `ServerStream {message: "s", count: 2, fail_code: 9, fail_message: "stop"}`                                        | `("s", 0)`, `("s", 1)`, then `FailedPrecondition` (9) `"stop"`                                                     |
+| `bidi`                  | `Bidi` sending `"1"`, `"2"`, `"3"`, awaiting each echo before the next send, then closing the send side            | `("1", 0)`, `("2", 1)`, `("3", 2)`, then `OK`                                                                      |
+| `bidi-error`            | `Bidi` sending `"1"` (await its echo), then `{fail_code: 10, fail_message: "abort"}`                               | `("1", 0)`, then `Aborted` (10) `"abort"`                                                                          |
+| `unary-headers`         | `Unary {message: "hello"}` with metadata `interop-header: "h"`                                                     | `{message: "hello"}`, headers `{interop-header: "h"}`, trailing metadata `{interop-trailer: "h"}`                  |
+| `server-stream-headers` | `ServerStream {message: "s", count: 2}` with metadata `interop-header: "h"`; read headers before the first message | headers `{interop-header: "h"}`, `("s", 0)`, `("s", 1)`, then `OK` with trailing metadata `{interop-trailer: "h"}` |
 
 ## Command-line contract
 

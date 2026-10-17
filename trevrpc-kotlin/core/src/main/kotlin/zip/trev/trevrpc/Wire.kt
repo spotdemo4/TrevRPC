@@ -14,72 +14,57 @@ enum class RpcKind(
     }
 }
 
-enum class RpcStreamFrameKind(
-    val value: Int,
-) {
-    MESSAGE(0),
-    STATUS(1),
-    ;
-
-    companion object {
-        fun fromValue(value: Int): RpcStreamFrameKind? = entries.firstOrNull { it.value == value }
-    }
-}
-
+/** REQUEST frame payload. The request message travels separately in MESSAGE frames. */
 data class RpcRequest(
     val service: String,
     val method: String,
-    val body: ByteArray = byteArrayOf(),
     val metadata: Metadata = Metadata.EMPTY,
     val kindValue: Int = RpcKind.UNARY.value,
     val version: UInt = WIRE_VERSION,
     val timeoutNanos: ULong = 0uL,
+    val extensions: List<ULong> = emptyList(),
 ) {
     val kind: RpcKind?
         get() = RpcKind.fromValue(kindValue)
 }
 
-data class RpcResponse(
+/** HEADERS frame payload. */
+data class RpcHeaders(
+    val metadata: Metadata = Metadata.EMPTY,
+    val extensions: List<ULong> = emptyList(),
+)
+
+/** STATUS frame payload. */
+data class RpcStatus(
     val statusValue: UInt = Code.OK.value,
     val message: String = "",
-    val body: ByteArray = byteArrayOf(),
     val metadata: Metadata = Metadata.EMPTY,
 ) {
     val status: Status
         get() = Status(Code.fromValue(statusValue), message, metadata)
 
     companion object {
-        fun ok(
-            body: ByteArray,
-            metadata: Metadata = Metadata.EMPTY,
-        ): RpcResponse = RpcResponse(body = body.copyOf(), metadata = metadata)
-
-        fun fromStatus(status: Status): RpcResponse = RpcResponse(status.code.value, status.message, metadata = status.metadata)
+        fun fromStatus(status: Status): RpcStatus = RpcStatus(status.code.value, status.message, status.metadata)
     }
 }
 
-data class RpcStreamFrame(
-    val kindValue: Int = RpcStreamFrameKind.MESSAGE.value,
-    val statusValue: UInt = Code.OK.value,
-    val message: String = "",
-    val body: ByteArray = byteArrayOf(),
-    val metadata: Metadata = Metadata.EMPTY,
-) {
-    val kind: RpcStreamFrameKind?
-        get() = RpcStreamFrameKind.fromValue(kindValue)
+/**
+ * A decoded response-stream frame. Unknown frames never reach this type, and extension lists are
+ * dropped because the client negotiates none.
+ */
+sealed interface ResponseFrame {
+    /** Response headers. Absent headers are equivalent to empty ones. */
+    class Headers(
+        val metadata: Metadata = Metadata.EMPTY,
+    ) : ResponseFrame
 
-    val status: Status
-        get() = Status(Code.fromValue(statusValue), message, metadata)
+    /** One raw protobuf-encoded application message. */
+    class Message(
+        val body: ByteArray,
+    ) : ResponseFrame
 
-    companion object {
-        fun message(body: ByteArray): RpcStreamFrame = RpcStreamFrame(body = body.copyOf())
-
-        fun status(status: Status): RpcStreamFrame =
-            RpcStreamFrame(
-                kindValue = RpcStreamFrameKind.STATUS.value,
-                statusValue = status.code.value,
-                message = status.message,
-                metadata = status.metadata,
-            )
-    }
+    /** The terminal status, carrying trailing metadata. */
+    class Status(
+        val status: zip.trev.trevrpc.Status,
+    ) : ResponseFrame
 }

@@ -14,12 +14,12 @@ pub use ensure::AssertionFailed;
 use std::future::Future;
 
 use futures_util::StreamExt;
-use prost::Message;
 use tokio::task::JoinHandle;
 use trevrpc::client::{RpcTransport, StreamingRpcTransport};
-use trevrpc::framing::{self, DEFAULT_MAX_FRAME_SIZE};
+use trevrpc::framing::{self, DEFAULT_MAX_FRAME_SIZE, frame_type};
 use trevrpc::{
-    BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, RpcStreamFrameKind, Status,
+    BoxStream, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcHeaders, RpcRequest,
+    RpcStatus, Status,
 };
 
 const CANCELLED_STREAM_CODE: u32 = 1;
@@ -65,6 +65,10 @@ fn unexpected_eof() -> Error {
     ))
 }
 
+fn invalid(message: &'static str) -> Error {
+    Error::from(Status::invalid_argument(message))
+}
+
 /// Fills `buf`, returning `false` on a clean end of stream before the first byte.
 async fn read_exact_or_eof<R: RawRecv>(recv: &mut R, buf: &mut [u8]) -> Result<bool> {
     let total = buf.len();
@@ -79,53 +83,239 @@ async fn read_exact_or_eof<R: RawRecv>(recv: &mut R, buf: &mut [u8]) -> Result<b
     Ok(true)
 }
 
-/// Reads one length-prefixed frame body, or `None` at a clean end of stream.
-pub async fn read_raw_frame_or_eof<R: RawRecv>(
-    recv: &mut R,
-    max_frame_size: usize,
-) -> Result<Option<Vec<u8>>> {
-    let mut header = [0; 4];
-    if !read_exact_or_eof(recv, &mut header).await? {
+/// Reads one QUIC varint a byte at a time, or `None` at a clean end of stream.
+async fn read_varint<R: RawRecv>(recv: &mut R) -> Result<Option<u64>> {
+    let mut first = [0_u8; 1];
+    if !read_exact_or_eof(recv, &mut first).await? {
         return Ok(None);
     }
-    let len = framing::frame_body_len(header, max_frame_size)?;
-    let mut body = vec![0; len];
-    if len > 0 && !read_exact_or_eof(recv, &mut body).await? {
-        return Err(unexpected_eof());
+    let mut bytes = first.to_vec();
+    let len = 1_usize << (first[0] >> 6);
+    while bytes.len() < len {
+        let mut next = [0_u8; 1];
+        if !read_exact_or_eof(recv, &mut next).await? {
+            return Err(unexpected_eof());
+        }
+        bytes.push(next[0]);
     }
-    Ok(Some(body))
+    Ok(framing_varint(&bytes))
 }
 
-/// Reads and decodes one length-prefixed protobuf frame.
-pub async fn read_frame<R, M>(recv: &mut R, max_frame_size: usize) -> Result<M>
-where
-    R: RawRecv,
-    M: Message + Default + 'static,
-{
-    let body = read_raw_frame_or_eof(recv, max_frame_size)
-        .await?
-        .ok_or_else(unexpected_eof)?;
-    framing::decode_frame(&body)
+fn framing_varint(bytes: &[u8]) -> Option<u64> {
+    trevrpc::varint::decode(bytes).map(|(value, _)| value)
 }
 
-/// Encodes and writes one length-prefixed protobuf frame.
-pub async fn write_frame<S, M>(send: &mut S, message: &M, max_frame_size: usize) -> Result<()>
-where
-    S: RawSend,
-    M: Message,
-{
-    send.write_all(&framing::encode_frame_with_max(message, max_frame_size)?)
-        .await
+/// A frame as it appears on the wire, of any type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawFrame {
+    pub frame_type: u64,
+    pub payload: Vec<u8>,
 }
 
-async fn read_stream_frame_or_eof<R: RawRecv>(
+/// Reads one frame of any type, or `None` at a clean end of stream.
+pub async fn read_any_frame<R: RawRecv>(
     recv: &mut R,
     max_frame_size: usize,
-) -> Result<Option<RpcStreamFrame>> {
-    read_raw_frame_or_eof(recv, max_frame_size)
+) -> Result<Option<RawFrame>> {
+    let Some(frame_type) = read_varint(recv).await? else {
+        return Ok(None);
+    };
+    let length = read_varint(recv).await?.ok_or_else(unexpected_eof)?;
+    let len = usize::try_from(length).unwrap_or(usize::MAX);
+    if len > max_frame_size {
+        return Err(Error::FrameTooLarge {
+            len,
+            max: max_frame_size,
+        });
+    }
+    let mut payload = vec![0; len];
+    if len > 0 && !read_exact_or_eof(recv, &mut payload).await? {
+        return Err(unexpected_eof());
+    }
+    Ok(Some(RawFrame {
+        frame_type,
+        payload,
+    }))
+}
+
+/// Splits a buffer holding whole frames into those frames, of any type.
+pub fn parse_frames(mut bytes: &[u8]) -> Result<Vec<RawFrame>> {
+    let mut frames = Vec::new();
+    while !bytes.is_empty() {
+        let (frame_type, type_len) = trevrpc::varint::decode(bytes).ok_or_else(unexpected_eof)?;
+        let rest = bytes.get(type_len..).ok_or_else(unexpected_eof)?;
+        let (length, length_len) = trevrpc::varint::decode(rest).ok_or_else(unexpected_eof)?;
+        let rest = rest.get(length_len..).ok_or_else(unexpected_eof)?;
+        let length = usize::try_from(length).map_err(|_| unexpected_eof())?;
+        let payload = rest.get(..length).ok_or_else(unexpected_eof)?;
+        frames.push(RawFrame {
+            frame_type,
+            payload: payload.to_vec(),
+        });
+        bytes = rest.get(length..).ok_or_else(unexpected_eof)?;
+    }
+    Ok(frames)
+}
+
+/// Reads the next frame of a defined type, skipping any other, or `None` at a clean end.
+pub async fn read_known_frame<R: RawRecv>(
+    recv: &mut R,
+    max_frame_size: usize,
+) -> Result<Option<RawFrame>> {
+    while let Some(frame) = read_any_frame(recv, max_frame_size).await? {
+        if frame.frame_type <= frame_type::STATUS {
+            return Ok(Some(frame));
+        }
+    }
+    Ok(None)
+}
+
+/// Reads the next response frame, or `None` at a clean end of stream.
+pub async fn read_response_frame<R: RawRecv>(recv: &mut R) -> Result<Option<ResponseFrame>> {
+    let Some(frame) = read_known_frame(recv, DEFAULT_MAX_FRAME_SIZE).await? else {
+        return Ok(None);
+    };
+    Ok(Some(match frame.frame_type {
+        frame_type::MESSAGE => ResponseFrame::message(frame.payload),
+        frame_type::HEADERS => {
+            ResponseFrame::Headers(framing::decode_payload::<RpcHeaders>(&frame.payload)?.metadata)
+        }
+        frame_type::STATUS => ResponseFrame::Status(Status::from(framing::decode_payload::<
+            RpcStatus,
+        >(&frame.payload)?)),
+        _ => {
+            return Err(Error::from(Status::internal(
+                "response stream contained a REQUEST frame",
+            )));
+        }
+    }))
+}
+
+/// Reads the REQUEST frame that opens a request stream.
+pub async fn read_request<R: RawRecv>(recv: &mut R) -> Result<RpcRequest> {
+    let frame = read_known_frame(recv, DEFAULT_MAX_FRAME_SIZE)
         .await?
-        .map(|body| framing::decode_stream_frame_body(&body))
-        .transpose()
+        .ok_or_else(unexpected_eof)?;
+    if frame.frame_type != frame_type::REQUEST {
+        return Err(invalid("request stream must begin with a REQUEST frame"));
+    }
+    framing::decode_payload(&frame.payload)
+}
+
+/// Reads the next request-stream MESSAGE frame's payload, or `None` at a clean end.
+pub async fn read_message<R: RawRecv>(recv: &mut R) -> Result<Option<Vec<u8>>> {
+    match read_known_frame(recv, DEFAULT_MAX_FRAME_SIZE).await? {
+        None => Ok(None),
+        Some(frame) if frame.frame_type == frame_type::MESSAGE => Ok(Some(frame.payload)),
+        Some(_) => Err(invalid("expected a MESSAGE frame")),
+    }
+}
+
+/// Reads a response that must be a lone STATUS frame, as for failures before dispatch.
+pub async fn read_lone_status<R: RawRecv>(recv: &mut R) -> Result<Status> {
+    match read_response_frame(recv).await? {
+        Some(ResponseFrame::Status(status)) => Ok(status),
+        other => Err(Error::from(Status::internal(format!(
+            "expected a lone STATUS frame, got {other:?}"
+        )))),
+    }
+}
+
+/// A unary response read frame by frame: `[HEADERS] [MESSAGE] STATUS`.
+#[derive(Debug)]
+pub struct UnaryReply {
+    pub headers: Metadata,
+    pub messages: Vec<Vec<u8>>,
+    pub status: Status,
+}
+
+/// Reads response frames through the terminal STATUS.
+pub async fn read_unary_reply<R: RawRecv>(recv: &mut R) -> Result<UnaryReply> {
+    let mut headers = Metadata::new();
+    let mut messages = Vec::new();
+    loop {
+        match read_response_frame(recv).await? {
+            Some(ResponseFrame::Headers(metadata)) => headers = metadata,
+            Some(ResponseFrame::Message(body)) => messages.push(body.to_vec()),
+            Some(ResponseFrame::Status(status)) => {
+                return Ok(UnaryReply {
+                    headers,
+                    messages,
+                    status,
+                });
+            }
+            None => return Err(unexpected_eof()),
+        }
+    }
+}
+
+/// Writes raw bytes.
+pub async fn write_raw<S: RawSend>(send: &mut S, bytes: &[u8]) -> Result<()> {
+    send.write_all(bytes).await
+}
+
+/// Writes a REQUEST frame.
+pub async fn write_request<S: RawSend>(send: &mut S, request: &RpcRequest) -> Result<()> {
+    send.write_all(&framing::encode_protobuf_frame(
+        frame_type::REQUEST,
+        request,
+        DEFAULT_MAX_FRAME_SIZE,
+    )?)
+    .await
+}
+
+/// Writes a MESSAGE frame.
+pub async fn write_message<S: RawSend>(send: &mut S, body: &[u8]) -> Result<()> {
+    send.write_all(&framing::encode_message_frame(
+        body,
+        DEFAULT_MAX_FRAME_SIZE,
+    )?)
+    .await
+}
+
+/// Writes a REQUEST frame and its first MESSAGE frame with one write.
+pub async fn write_request_and_message<S: RawSend>(
+    send: &mut S,
+    request: &RpcRequest,
+    body: &[u8],
+) -> Result<()> {
+    let mut bytes =
+        framing::encode_protobuf_frame(frame_type::REQUEST, request, DEFAULT_MAX_FRAME_SIZE)?;
+    bytes.extend(framing::encode_message_frame(body, DEFAULT_MAX_FRAME_SIZE)?);
+    send.write_all(&bytes).await
+}
+
+/// Writes a STATUS frame.
+pub async fn write_status<S: RawSend>(send: &mut S, status: Status) -> Result<()> {
+    send.write_all(&framing::encode_protobuf_frame(
+        frame_type::STATUS,
+        &RpcStatus::from(status),
+        DEFAULT_MAX_FRAME_SIZE,
+    )?)
+    .await
+}
+
+/// Writes a HEADERS frame.
+pub async fn write_headers<S: RawSend>(send: &mut S, metadata: Metadata) -> Result<()> {
+    send.write_all(&framing::encode_protobuf_frame(
+        frame_type::HEADERS,
+        &RpcHeaders {
+            metadata,
+            extensions: Vec::new(),
+        },
+        DEFAULT_MAX_FRAME_SIZE,
+    )?)
+    .await
+}
+
+/// Writes a frame of an unknown (grease) type: type `0x1f * 3 + 0x21`.
+pub async fn write_grease<S: RawSend>(send: &mut S, payload: &[u8]) -> Result<()> {
+    send.write_all(&framing::encode_frame(
+        0x1f * 3 + 0x21,
+        payload,
+        DEFAULT_MAX_FRAME_SIZE,
+    )?)
+    .await
 }
 
 /// A test-only `WebTransport` client transport over one established session.
@@ -156,19 +346,15 @@ impl Drop for ResetOnDrop {
 
 #[trevrpc::async_trait]
 impl RpcTransport for WebTransportRpc {
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        let (mut send, mut recv) = self.session.open_bi().await.map_err(Error::transport)?;
-        let result = async {
-            write_frame(&mut send, &request, DEFAULT_MAX_FRAME_SIZE).await?;
-            send.finish().map_err(Error::transport)?;
-            read_frame::<_, RpcResponse>(&mut recv, DEFAULT_MAX_FRAME_SIZE).await
-        }
-        .await;
-        if result.is_err() {
-            let _ = send.reset(CANCELLED_STREAM_CODE);
-            let _ = recv.stop(CANCELLED_STREAM_CODE);
-        }
-        result
+    async fn call(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+    ) -> Result<ResponseEnvelope<bytes::Bytes>> {
+        let frames = self
+            .streaming_call(request, trevrpc::stream::from_iter([body]))
+            .await?;
+        trevrpc::client::collect_unary_response(frames).await
     }
 }
 
@@ -178,7 +364,7 @@ impl StreamingRpcTransport for WebTransportRpc {
         &self,
         request: RpcRequest,
         mut request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>> {
+    ) -> Result<BoxStream<ResponseFrame>> {
         let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
         let upload = tokio::spawn(async move {
             let mut guard = ResetOnDrop {
@@ -186,10 +372,9 @@ impl StreamingRpcTransport for WebTransportRpc {
                 finished: false,
             };
             let send = &mut guard.stream;
-            write_frame(send, &request, DEFAULT_MAX_FRAME_SIZE).await?;
+            write_request(send, &request).await?;
             while let Some(body) = request_body.next().await.transpose()? {
-                let frame = framing::encode_message_stream_frame(&body, DEFAULT_MAX_FRAME_SIZE)?;
-                send.write_all(&frame).await.map_err(Error::transport)?;
+                write_message(send, &body).await?;
             }
             send.finish().map_err(Error::transport)?;
             // Finished cleanly: nothing left to reset.
@@ -209,18 +394,16 @@ impl StreamingRpcTransport for WebTransportRpc {
                     return None;
                 }
                 let mut recv = state.recv.take()?;
-                let item = match read_stream_frame_or_eof(&mut recv, DEFAULT_MAX_FRAME_SIZE).await {
-                    Ok(Some(frame)) if frame.frame_kind() == Some(RpcStreamFrameKind::Status) => {
+                let item = match read_response_frame(&mut recv).await {
+                    Ok(Some(ResponseFrame::Status(status))) => {
                         state.finish();
-                        let status = frame.status_value();
-                        let drained =
-                            read_stream_frame_or_eof(&mut recv, DEFAULT_MAX_FRAME_SIZE).await;
+                        let drained = read_response_frame(&mut recv).await;
                         match drained {
                             Ok(Some(_)) => Err(Error::from(Status::internal(
                                 "response stream continued after terminal status",
                             ))),
                             Err(error) if status.is_ok() => Err(error),
-                            Ok(None) | Err(_) => Ok(frame),
+                            Ok(None) | Err(_) => Ok(ResponseFrame::Status(status)),
                         }
                     }
                     Ok(Some(frame)) => Ok(frame),

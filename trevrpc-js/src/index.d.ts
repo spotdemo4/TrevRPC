@@ -86,6 +86,9 @@ export interface RpcServiceDescriptor {
 
 export interface UnaryResponse<TResponse> {
   readonly message: TResponse;
+  /** Response headers; empty when the server sent none. */
+  readonly headers: Metadata;
+  /** Trailing metadata from the final status. */
   readonly metadata: Metadata;
 }
 
@@ -103,6 +106,11 @@ export interface StreamStatus {
 export interface ResponseStream<TResponse> extends AsyncIterable<TResponse> {
   /** Settles with the final status, or rejects with the error that ended the call. */
   readonly status: Promise<StreamStatus>;
+  /**
+   * The response headers, empty when the server sent none. Settles when the first response frame
+   * arrives, before the first message is received, or rejects with the error that ended the call.
+   */
+  readonly headers: Promise<Metadata>;
   /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;
 }
@@ -112,7 +120,7 @@ export interface ClientStreamingCall<TRequest, TResponse> {
   send(request: TRequest): Promise<void>;
   /** Closes the request stream and returns the final response. */
   closeAndRecv(): Promise<TResponse>;
-  /** Closes the request stream and returns the final response with its metadata. */
+  /** Closes the request stream and returns the final response with its headers and trailing metadata. */
   closeAndRecvWithResponse(): Promise<UnaryResponse<TResponse>>;
   /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;
@@ -121,6 +129,11 @@ export interface ClientStreamingCall<TRequest, TResponse> {
 export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIterable<TResponse> {
   /** Settles with the final status, or rejects with the error that ended the call. */
   readonly status: Promise<StreamStatus>;
+  /**
+   * The response headers, empty when the server sent none. Settles when the first response frame
+   * arrives, before the first message is received, or rejects with the error that ended the call.
+   */
+  readonly headers: Promise<Metadata>;
   /** Sends one request message. */
   send(request: TRequest): Promise<void>;
   /** Receives the next response message, or undefined after the final OK status. */

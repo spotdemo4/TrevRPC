@@ -1,10 +1,13 @@
-// QUIC variable-length integers (RFC 9000 §16). Values below 2^53 are numbers; the 8-byte
-// codepoints QMux uses for its own frames and parameters are bigints.
+// QUIC variable-length integers (RFC 9000 §16), shared by the frame layer and QMux. Values below
+// 2^53 are numbers; larger codepoints are bigints.
 
 const MaxSafe = BigInt(Number.MAX_SAFE_INTEGER);
 
 /** Encoded length of a varint. */
 export function varintLength(value) {
+  if (typeof value === "number" && value >= 0 && value < 0x4000_0000) {
+    return value < 0x40 ? 1 : value < 0x4000 ? 2 : 4;
+  }
   const v = typeof value === "bigint" ? value : BigInt(value);
   if (v < 0x40n) {
     return 1;
@@ -24,6 +27,16 @@ export function varintLength(value) {
 /** Writes a varint at offset and returns the offset after it. */
 export function writeVarint(bytes, offset, value) {
   const length = varintLength(value);
+  if (typeof value === "number" && length < 8 && Number.isInteger(value)) {
+    // Fast path without BigInt for the common small values.
+    let v = value;
+    for (let i = length - 1; i >= 0; i -= 1) {
+      bytes[offset + i] = v % 256;
+      v = Math.floor(v / 256);
+    }
+    bytes[offset] |= [0, 0x40, 0, 0x80][length - 1];
+    return offset + length;
+  }
   let v = typeof value === "bigint" ? value : BigInt(value);
   for (let i = length - 1; i >= 0; i -= 1) {
     bytes[offset + i] = Number(v & 0xffn);

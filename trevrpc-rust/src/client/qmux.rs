@@ -9,7 +9,9 @@ use web_transport_trait::Session as _;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::qmux_conn::client_config;
-use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
+
+use bytes::Bytes;
 
 use super::native::NativeTransport;
 use super::{RpcTransport, StreamingRpcTransport};
@@ -112,8 +114,8 @@ impl QmuxTransport {
 
 #[crate::async_trait]
 impl RpcTransport for QmuxTransport {
-    async fn call(&self, request: RpcRequest) -> Result<RpcResponse> {
-        self.0.call(request).await
+    async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
+        self.0.call(request, body).await
     }
 }
 
@@ -123,7 +125,7 @@ impl StreamingRpcTransport for QmuxTransport {
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-    ) -> Result<BoxStream<RpcStreamFrame>> {
+    ) -> Result<BoxStream<ResponseFrame>> {
         self.0.streaming_call(request, request_body).await
     }
 }

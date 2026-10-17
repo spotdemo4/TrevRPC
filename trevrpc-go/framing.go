@@ -1,25 +1,27 @@
 package trevrpc
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"slices"
 
+	"github.com/quic-go/quic-go/quicvarint"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/protoadapt"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// DefaultMaxFrameSize is the default maximum TrevRPC frame body size in bytes.
+// DefaultMaxFrameSize is the default maximum TrevRPC frame payload size in bytes.
 const DefaultMaxFrameSize = 4 * 1024 * 1024
 
 // ProtoMessage is the protobuf message interface accepted by the runtime.
 type ProtoMessage = protoadapt.MessageV1
 
-// FrameTooLargeError reports a message whose encoded size exceeds the
-// configured frame size limit. StatusFromError maps it to ResourceExhausted.
+// FrameTooLargeError reports a frame whose payload size exceeds the configured
+// frame size limit. StatusFromError maps it to ResourceExhausted.
 type FrameTooLargeError struct {
 	Len int
 	Max int
@@ -28,14 +30,6 @@ type FrameTooLargeError struct {
 // frameDecodeError wraps protobuf decode failures for RPC frames.
 type frameDecodeError struct {
 	Err error
-}
-
-type streamFrameFields struct {
-	kind     wireFrameKind
-	status   uint32
-	message  string
-	body     []byte
-	metadata Metadata
 }
 
 // Error returns a human-readable frame size error.
@@ -53,18 +47,40 @@ func (e *frameDecodeError) Unwrap() error {
 	return e.Err
 }
 
-// marshalMessage encodes a protobuf message body.
-func marshalMessage(message ProtoMessage) ([]byte, error) {
-	return proto.Marshal(protoMessageV2(message))
+// frameType is the QUIC variable-length integer type of a frame.
+type frameType uint64
+
+// Frame types. Every other type, including the grease types 0x1f*N+0x21, is
+// unknown and skipped by receivers.
+const (
+	frameTypeMessage frameType = 0
+	frameTypeRequest frameType = 1
+	frameTypeHeaders frameType = 2
+	frameTypeStatus  frameType = 3
+)
+
+// known reports whether t is a frame type this runtime interprets.
+func (t frameType) known() bool { return t <= frameTypeStatus }
+
+func (t frameType) String() string {
+	switch t {
+	case frameTypeMessage:
+		return "MESSAGE"
+	case frameTypeRequest:
+		return "REQUEST"
+	case frameTypeHeaders:
+		return "HEADERS"
+	case frameTypeStatus:
+		return "STATUS"
+	default:
+		return fmt.Sprintf("unknown frame type %#x", uint64(t))
+	}
 }
 
-// unmarshalMessage decodes a protobuf message body into message.
-func unmarshalMessage(body []byte, message ProtoMessage) error {
-	protoMessage := protoMessageV2(message)
-	if err := preflightWireMessage(body, protoMessage.ProtoReflect().Descriptor()); err != nil {
-		return err
-	}
-	return proto.Unmarshal(body, protoMessage)
+// frame is one known frame read from a stream.
+type frame struct {
+	typ     frameType
+	payload []byte
 }
 
 func protoMessageV2(message ProtoMessage) proto.Message {
@@ -75,124 +91,279 @@ func protoMessageV2(message ProtoMessage) proto.Message {
 	return protoadapt.MessageV2Of(message)
 }
 
-// encodeFrame encodes a protobuf message into a length-prefixed TrevRPC frame.
-func encodeFrame(message ProtoMessage, maxFrameSize int) ([]byte, error) {
-	if frame, ok, err := encodeKnownFrame(message, maxFrameSize); ok || err != nil {
-		return frame, err
-	}
-
+// unmarshalMessage decodes a protobuf message payload into message.
+func unmarshalMessage(payload []byte, message ProtoMessage) error {
 	protoMessage := protoMessageV2(message)
-	size := proto.Size(protoMessage)
-	if size > maxFrameSize {
-		return nil, &FrameTooLargeError{Len: size, Max: maxFrameSize}
+	if err := preflightWireMessage(payload, protoMessage.ProtoReflect().Descriptor()); err != nil {
+		return err
 	}
-
-	frame := make([]byte, 4, 4+size)
-	frame, err := proto.MarshalOptions{}.MarshalAppend(frame, protoMessage)
-	if err != nil {
-		return nil, err
-	}
-
-	bodyLen := len(frame) - 4
-	if bodyLen > maxFrameSize {
-		return nil, &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
-	}
-	binary.BigEndian.PutUint32(frame[:4], uint32(bodyLen))
-
-	return frame, nil
+	return proto.Unmarshal(payload, protoMessage)
 }
 
-func encodeKnownFrame(message ProtoMessage, maxFrameSize int) ([]byte, bool, error) {
-	switch message := any(message).(type) {
-	case *wireRequest:
-		frame, err := encodeRPCRequestFrame(message, maxFrameSize)
-		return frame, frame != nil || err != nil, err
-	case *wireResponse:
-		frame, err := encodeRPCResponseFrame(message, maxFrameSize)
-		return frame, frame != nil || err != nil, err
-	case *wireStreamFrame:
-		frame, err := encodeRPCStreamFrame(message, maxFrameSize)
-		return frame, frame != nil || err != nil, err
-	default:
-		return nil, false, nil
-	}
-}
-
-func encodeRPCRequestFrame(request *wireRequest, maxFrameSize int) ([]byte, error) {
-	if request == nil || len(request.Metadata) > 0 {
-		return nil, nil
-	}
-
-	bodyLen := bytesFieldLen(1, len(request.Service)) +
-		bytesFieldLen(2, len(request.Method)) +
-		bytesFieldLen(3, len(request.Body)) +
-		varintFieldLen(5, uint64(request.Kind)) +
-		varintFieldLen(6, uint64(request.Version)) +
-		varintFieldLen(7, request.TimeoutNanos)
-	if bodyLen > maxFrameSize {
-		return nil, &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
-	}
-
-	frame := make([]byte, 4, 4+bodyLen)
-	frame = appendBytesField(frame, 1, []byte(request.Service))
-	frame = appendBytesField(frame, 2, []byte(request.Method))
-	frame = appendBytesField(frame, 3, request.Body)
-	frame = appendVarintField(frame, 5, uint64(request.Kind))
-	frame = appendVarintField(frame, 6, uint64(request.Version))
-	frame = appendVarintField(frame, 7, request.TimeoutNanos)
-	binary.BigEndian.PutUint32(frame[:4], uint32(bodyLen))
-	return frame, nil
-}
-
-func encodeRPCResponseFrame(response *wireResponse, maxFrameSize int) ([]byte, error) {
-	if response == nil || len(response.Metadata) > 0 {
-		return nil, nil
-	}
-
-	bodyLen := varintFieldLen(1, uint64(response.Status)) +
-		bytesFieldLen(2, len(response.Message)) +
-		bytesFieldLen(3, len(response.Body))
-	if bodyLen > maxFrameSize {
-		return nil, &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
-	}
-
-	frame := make([]byte, 4, 4+bodyLen)
-	frame = appendVarintField(frame, 1, uint64(response.Status))
-	frame = appendBytesField(frame, 2, []byte(response.Message))
-	frame = appendBytesField(frame, 3, response.Body)
-	binary.BigEndian.PutUint32(frame[:4], uint32(bodyLen))
-	return frame, nil
-}
-
-func encodeRPCStreamFrame(frameMessage *wireStreamFrame, maxFrameSize int) ([]byte, error) {
-	if frameMessage == nil || len(frameMessage.Metadata) > 0 {
-		return nil, nil
-	}
-
-	bodyLen := varintFieldLen(1, uint64(frameMessage.Kind)) +
-		varintFieldLen(2, uint64(frameMessage.Status)) +
-		bytesFieldLen(3, len(frameMessage.Message)) +
-		bytesFieldLen(4, len(frameMessage.Body))
-	if bodyLen > maxFrameSize {
-		return nil, &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
-	}
-
-	frame := make([]byte, 4, 4+bodyLen)
-	frame = appendVarintField(frame, 1, uint64(frameMessage.Kind))
-	frame = appendVarintField(frame, 2, uint64(frameMessage.Status))
-	frame = appendBytesField(frame, 3, []byte(frameMessage.Message))
-	frame = appendBytesField(frame, 4, frameMessage.Body)
-	binary.BigEndian.PutUint32(frame[:4], uint32(bodyLen))
-	return frame, nil
-}
-
-// decodeFrame decodes a protobuf message from a TrevRPC frame body.
-func decodeFrame(body []byte, message ProtoMessage) error {
-	if err := unmarshalMessage(body, message); err != nil {
+// decodePayload decodes the protobuf payload of a REQUEST, HEADERS or STATUS
+// frame, reporting malformed payloads as frameDecodeError.
+func decodePayload(payload []byte, message ProtoMessage) error {
+	if err := unmarshalMessage(payload, message); err != nil {
 		return &frameDecodeError{Err: err}
 	}
 
 	return nil
+}
+
+// decodeStatus decodes the payload of a STATUS frame.
+func decodeStatus(payload []byte) (*Status, error) {
+	if len(payload) == 0 {
+		return OK(), nil
+	}
+	var status wireStatus
+	if err := decodePayload(payload, &status); err != nil {
+		return nil, err
+	}
+	return statusFromWire(&status), nil
+}
+
+// decodeHeaders decodes the payload of a HEADERS frame into its metadata.
+// Extensions are decoded and dropped: the registry is empty.
+func decodeHeaders(payload []byte) (Metadata, error) {
+	if len(payload) == 0 {
+		return Metadata{}, nil
+	}
+	var headers wireHeaders
+	if err := decodePayload(payload, &headers); err != nil {
+		return nil, err
+	}
+	return cloneMetadata(headers.Metadata), nil
+}
+
+// encodedMessage is one message ready to send: a complete MESSAGE frame whose
+// payload was marshalled directly into the frame buffer.
+type encodedMessage struct {
+	frame []byte
+	// size is the length of the payload within frame.
+	size int
+}
+
+// frameTailSlack is the spare capacity encodeMessage leaves behind a frame, so
+// a unary response can append its two-byte OK STATUS without copying the frame.
+const frameTailSlack = 8
+
+// encodeMessage marshals message into a MESSAGE frame. The frame size limit is
+// enforced where the frame is written.
+func encodeMessage(message ProtoMessage) (encodedMessage, error) {
+	protoMessage := protoMessageV2(message)
+	size := proto.Size(protoMessage)
+	frame, err := appendProtoFrame(make([]byte, 0, frameHeaderLen(frameTypeMessage, size)+size+frameTailSlack), frameTypeMessage, protoMessage, size)
+	if err != nil {
+		return encodedMessage{}, err
+	}
+	return encodedMessage{frame: frame, size: size}, nil
+}
+
+// frameHeaderLen is the encoded length of a frame header.
+func frameHeaderLen(typ frameType, length int) int {
+	return quicvarint.Len(uint64(typ)) + quicvarint.Len(uint64(length))
+}
+
+// appendFrameHeader appends a frame header with minimal varints.
+func appendFrameHeader(dst []byte, typ frameType, length int) []byte {
+	dst = quicvarint.Append(dst, uint64(typ))
+	return quicvarint.Append(dst, uint64(length))
+}
+
+// appendProtoFrame appends a frame whose payload is message marshalled
+// straight into dst. size must be proto.Size(message). On error dst is
+// returned unchanged in length.
+func appendProtoFrame(dst []byte, typ frameType, message proto.Message, size int) ([]byte, error) {
+	start := len(dst)
+	dst = slices.Grow(dst, frameHeaderLen(typ, size)+size)
+	dst = appendFrameHeader(dst, typ, size)
+	dst, err := proto.MarshalOptions{UseCachedSize: true}.MarshalAppend(dst, message)
+	if err != nil {
+		return dst[:start], err
+	}
+	return dst, nil
+}
+
+// appendLimitedProtoFrame appends a frame carrying message, rejecting payloads
+// larger than maxFrameSize.
+func appendLimitedProtoFrame(dst []byte, typ frameType, message ProtoMessage, maxFrameSize int) ([]byte, error) {
+	protoMessage := protoMessageV2(message)
+	size := proto.Size(protoMessage)
+	if size > maxFrameSize {
+		return dst, &FrameTooLargeError{Len: size, Max: maxFrameSize}
+	}
+	return appendProtoFrame(dst, typ, protoMessage, size)
+}
+
+// appendRequestFrame appends a REQUEST frame.
+func appendRequestFrame(dst []byte, request *wireRequest, maxFrameSize int) ([]byte, error) {
+	return appendLimitedProtoFrame(dst, frameTypeRequest, request, maxFrameSize)
+}
+
+// appendHeadersFrame appends a HEADERS frame carrying metadata.
+func appendHeadersFrame(dst []byte, metadata Metadata, maxFrameSize int) ([]byte, error) {
+	return appendLimitedProtoFrame(dst, frameTypeHeaders, &wireHeaders{Metadata: metadata}, maxFrameSize)
+}
+
+// appendStatusFrame appends a STATUS frame. An OK status without message or
+// metadata is the two bytes 03 00.
+func appendStatusFrame(dst []byte, status *Status, maxFrameSize int) ([]byte, error) {
+	if status == nil {
+		status = OK()
+	}
+	if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 {
+		return appendFrameHeader(dst, frameTypeStatus, 0), nil
+	}
+	return appendLimitedProtoFrame(dst, frameTypeStatus, status.wire(), maxFrameSize)
+}
+
+// appendEncodedMessage appends a message frame produced by encodeMessage.
+func appendEncodedMessage(dst []byte, message encodedMessage, maxFrameSize int) ([]byte, error) {
+	if message.size > maxFrameSize {
+		return dst, &FrameTooLargeError{Len: message.size, Max: maxFrameSize}
+	}
+	return append(dst, message.frame...), nil
+}
+
+// frameReader reads frames from one stream. Frames of unknown type are
+// skipped without being buffered.
+type frameReader struct {
+	r            io.Reader
+	maxFrameSize int
+	// maxBytes bounds the cumulative bytes of skipped frames (headers included)
+	// and, once chargeMessages is set, of MESSAGE payloads that may be read, or
+	// is negative for no limit.
+	maxBytes int
+	charged  int
+	// chargeMessages counts MESSAGE payloads towards maxBytes. A request that
+	// is a single message is bounded by the frame size alone; a stream of
+	// messages is bounded cumulatively.
+	chargeMessages bool
+}
+
+func newFrameReader(r io.Reader, maxFrameSize, maxBytes int) *frameReader {
+	return &frameReader{r: r, maxFrameSize: maxFrameSize, maxBytes: maxBytes}
+}
+
+// next returns the next frame of known type. It returns io.EOF only when the
+// stream ends at a frame boundary; an end inside a frame is io.ErrUnexpectedEOF.
+// A declared payload length above the frame size limit is rejected before any
+// of the payload is read or allocated, whether or not the type is known.
+func (fr *frameReader) next() (frame, error) {
+	for {
+		typ, length, headerLen, err := fr.readHeader()
+		if err != nil {
+			return frame{}, err
+		}
+		if length > uint64(fr.maxFrameSize) {
+			return frame{}, &FrameTooLargeError{Len: int(min(length, math.MaxInt)), Max: fr.maxFrameSize}
+		}
+		size := int(length)
+
+		if typ.known() {
+			if typ == frameTypeMessage && fr.chargeMessages {
+				if err := fr.charge(size); err != nil {
+					return frame{}, err
+				}
+			}
+			payload, err := readPayload(fr.r, size)
+			if err != nil {
+				return frame{}, err
+			}
+			return frame{typ: typ, payload: payload}, nil
+		}
+
+		if err := fr.charge(headerLen + size); err != nil {
+			return frame{}, err
+		}
+		if _, err := io.CopyN(io.Discard, fr.r, int64(size)); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return frame{}, err
+		}
+	}
+}
+
+// charge accounts n bytes against the cumulative limit.
+func (fr *frameReader) charge(n int) error {
+	if fr.maxBytes < 0 {
+		return nil
+	}
+	fr.charged = saturatingAdd(fr.charged, n)
+	if fr.charged > fr.maxBytes {
+		return ResourceExhausted(fmt.Sprintf("request stream exceeded maximum body size of %d bytes", fr.maxBytes))
+	}
+	return nil
+}
+
+// readHeader reads a frame header. A header is at least two bytes, so the first
+// read takes exactly two; a short type and length then cost one read.
+func (fr *frameReader) readHeader() (typ frameType, length uint64, headerLen int, err error) {
+	var buf [16]byte
+	if _, err := io.ReadFull(fr.r, buf[:2]); err != nil {
+		return 0, 0, 0, err
+	}
+	have := 2
+	fill := func(n int) error {
+		if n <= have {
+			return nil
+		}
+		if _, err := io.ReadFull(fr.r, buf[have:n]); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		have = n
+		return nil
+	}
+
+	typeLen := 1 << (buf[0] >> 6)
+	if err := fill(typeLen); err != nil {
+		return 0, 0, 0, err
+	}
+	typeValue, _, err := quicvarint.Parse(buf[:typeLen])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if err := fill(typeLen + 1); err != nil {
+		return 0, 0, 0, err
+	}
+	lengthLen := 1 << (buf[typeLen] >> 6)
+	if err := fill(typeLen + lengthLen); err != nil {
+		return 0, 0, 0, err
+	}
+	length, _, err = quicvarint.Parse(buf[typeLen : typeLen+lengthLen])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return frameType(typeValue), length, typeLen + lengthLen, nil
+}
+
+// readPayloadChunk is the largest payload allocated before any of it has been
+// received. Larger payloads grow as data arrives, so a declared length alone
+// cannot make the receiver allocate it.
+const readPayloadChunk = 64 * 1024
+
+// readPayload reads exactly length payload bytes.
+func readPayload(r io.Reader, length int) ([]byte, error) {
+	payload := make([]byte, min(length, readPayloadChunk))
+	for read := 0; ; {
+		n, err := io.ReadFull(r, payload[read:])
+		read += n
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+		if read == length {
+			return payload, nil
+		}
+		payload = slices.Grow(payload, min(length-read, max(read, readPayloadChunk)))
+		payload = payload[:min(length, cap(payload))]
+	}
 }
 
 const maxPreflightMessageDepth = 100
@@ -313,401 +484,4 @@ func preflightPackedValues(data []byte, wireType protowire.Type) bool {
 		data = data[valueLength:]
 	}
 	return true
-}
-
-// writeFrame writes one length-prefixed protobuf frame.
-func writeFrame(writer io.Writer, message ProtoMessage, maxFrameSize int) error {
-	frame, err := encodeFrame(message, maxFrameSize)
-	if err != nil {
-		return err
-	}
-
-	_, err = writer.Write(frame)
-	return err
-}
-
-func writeMessageStreamFrame(writer io.Writer, body []byte, maxFrameSize int) error {
-	frame, err := encodeMessageStreamFrame(body, maxFrameSize)
-	if err != nil {
-		return err
-	}
-
-	_, err = writer.Write(frame)
-	return err
-}
-
-func writeMessageStreamFrames(writer io.Writer, bodies [][]byte, maxFrameSize int) error {
-	if len(bodies) == 0 {
-		return nil
-	}
-	if len(bodies) == 1 {
-		return writeMessageStreamFrame(writer, bodies[0], maxFrameSize)
-	}
-	totalLen := 0
-	for _, body := range bodies {
-		bodyLen := messageStreamFrameBodyLen(body)
-		if bodyLen > maxFrameSize {
-			return &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
-		}
-		totalLen += 4 + bodyLen
-	}
-
-	frames := make([]byte, 0, totalLen)
-	for _, body := range bodies {
-		frames = appendMessageStreamFrame(frames, body)
-	}
-
-	_, err := writer.Write(frames)
-	return err
-}
-
-func encodeMessageStreamFrame(body []byte, maxFrameSize int) ([]byte, error) {
-	bodyLen := messageStreamFrameBodyLen(body)
-	if bodyLen > maxFrameSize {
-		return nil, &FrameTooLargeError{Len: bodyLen, Max: maxFrameSize}
-	}
-
-	frame := make([]byte, 0, 4+bodyLen)
-	frame = appendMessageStreamFrame(frame, body)
-	return frame, nil
-}
-
-func appendMessageStreamFrame(frame []byte, body []byte) []byte {
-	bodyLen := messageStreamFrameBodyLen(body)
-	headerOffset := len(frame)
-	frame = append(frame, 0, 0, 0, 0)
-	if len(body) > 0 {
-		frame = append(frame, 0x22)
-		frame = appendVarint(frame, uint64(len(body)))
-		frame = append(frame, body...)
-	}
-	binary.BigEndian.PutUint32(frame[headerOffset:headerOffset+4], uint32(bodyLen))
-	return frame
-}
-
-func messageStreamFrameBodyLen(body []byte) int {
-	if len(body) == 0 {
-		return 0
-	}
-
-	return 1 + varintLen(uint64(len(body))) + len(body)
-}
-
-func appendVarint(data []byte, value uint64) []byte {
-	for value >= 0x80 {
-		data = append(data, byte(value)|0x80)
-		value >>= 7
-	}
-	return append(data, byte(value))
-}
-
-func varintLen(value uint64) int {
-	length := 1
-	for value >= 0x80 {
-		length++
-		value >>= 7
-	}
-	return length
-}
-
-func bytesFieldLen(fieldNumber int, length int) int {
-	if length == 0 {
-		return 0
-	}
-
-	return varintLen(uint64(fieldNumber<<3|2)) + varintLen(uint64(length)) + length
-}
-
-func varintFieldLen(fieldNumber int, value uint64) int {
-	if value == 0 {
-		return 0
-	}
-
-	return varintLen(uint64(fieldNumber<<3)) + varintLen(value)
-}
-
-func appendBytesField(data []byte, fieldNumber int, value []byte) []byte {
-	if len(value) == 0 {
-		return data
-	}
-
-	data = appendVarint(data, uint64(fieldNumber<<3|2))
-	data = appendVarint(data, uint64(len(value)))
-	return append(data, value...)
-}
-
-func appendVarintField(data []byte, fieldNumber int, value uint64) []byte {
-	if value == 0 {
-		return data
-	}
-
-	data = appendVarint(data, uint64(fieldNumber<<3))
-	return appendVarint(data, value)
-}
-
-// readFrame reads and decodes one length-prefixed protobuf frame.
-func readFrame(reader io.Reader, message ProtoMessage, maxFrameSize int) error {
-	read, err := readFrameOrEOF(reader, message, maxFrameSize)
-	if err != nil {
-		return err
-	}
-
-	if !read {
-		return io.ErrUnexpectedEOF
-	}
-
-	return nil
-}
-
-// readFrameOrEOF reads one frame and reports false when the stream is already at EOF.
-func readFrameOrEOF(reader io.Reader, message ProtoMessage, maxFrameSize int) (bool, error) {
-	body, read, err := readRawFrameOrEOF(reader, maxFrameSize)
-	if err != nil || !read {
-		return read, err
-	}
-
-	return true, decodeFrame(body, message)
-}
-
-// readRawFrameOrEOF reads one length-prefixed frame without interpreting its body.
-// It reports false when the stream is already at EOF.
-func readRawFrameOrEOF(reader io.Reader, maxFrameSize int) ([]byte, bool, error) {
-	header := [4]byte{}
-	if _, err := io.ReadFull(reader, header[:]); err != nil {
-		if err == io.EOF {
-			return nil, false, nil
-		}
-
-		return nil, false, err
-	}
-
-	length := int(binary.BigEndian.Uint32(header[:]))
-	if length > maxFrameSize {
-		return nil, false, &FrameTooLargeError{Len: length, Max: maxFrameSize}
-	}
-
-	body, err := readFrameBody(reader, length)
-	if err != nil {
-		return nil, false, err
-	}
-
-	return body, true, nil
-}
-
-func readFrameBody(reader io.Reader, length int) ([]byte, error) {
-	if length == 0 {
-		return []byte{}, nil
-	}
-
-	body := make([]byte, length)
-	if _, err := io.ReadFull(reader, body); err != nil {
-		return nil, err
-	}
-
-	return body, nil
-}
-
-func readStreamFrameFieldsOrEOF(reader io.Reader, maxFrameSize int) (streamFrameFields, bool, error) {
-	body, read, err := readRawFrameOrEOF(reader, maxFrameSize)
-	if err != nil || !read {
-		return streamFrameFields{}, read, err
-	}
-
-	fields, err := parseStreamFrameFields(body, false)
-	return fields, true, err
-}
-
-func (f streamFrameFields) rpcStreamFrame() *wireStreamFrame {
-	return &wireStreamFrame{
-		Kind:     f.kind,
-		Status:   f.status,
-		Message:  f.message,
-		Body:     f.body,
-		Metadata: f.metadata,
-	}
-}
-
-func (f streamFrameFields) statusValue() *Status {
-	return NewStatus(CodeFromUint32(f.status), f.message).WithMetadata(f.metadata)
-}
-
-func parseStreamFrameFields(data []byte, copyBytes bool) (streamFrameFields, error) {
-	fields := streamFrameFields{kind: wireFrameMessage}
-	for offset := 0; offset < len(data); {
-		tag, ok := consumeVarint(data, &offset)
-		if !ok || tag == 0 {
-			return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame field tag")}
-		}
-
-		field := tag >> 3
-		wireType := tag & 0x7
-		switch field {
-		case 1:
-			if wireType != 0 {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame kind wire type")}
-			}
-			kind, ok := consumeVarint(data, &offset)
-			if !ok {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("truncated stream frame kind")}
-			}
-			fields.kind = wireFrameKind(kind)
-		case 2:
-			if wireType != 0 {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame status wire type")}
-			}
-			status, ok := consumeVarint(data, &offset)
-			if !ok {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("truncated stream frame status")}
-			}
-			fields.status = uint32(status)
-		case 3:
-			if wireType != 2 {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame message")}
-			}
-			value, ok := consumeLengthDelimited(data, &offset)
-			if !ok {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame message")}
-			}
-			fields.message = string(value)
-		case 4:
-			if wireType != 2 {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame body")}
-			}
-			value, ok := consumeLengthDelimited(data, &offset)
-			if !ok {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame body")}
-			}
-			fields.body = maybeCopyBytes(value, copyBytes)
-		case 5:
-			if wireType != 2 {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame metadata")}
-			}
-			value, ok := consumeLengthDelimited(data, &offset)
-			if !ok {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame metadata")}
-			}
-			key, metadataValue, err := parseMetadataEntry(value, copyBytes)
-			if err != nil {
-				return streamFrameFields{}, err
-			}
-			if fields.metadata == nil {
-				fields.metadata = Metadata{}
-			}
-			fields.metadata[key] = metadataValue
-		default:
-			if !skipProtoField(data, &offset, wireType) {
-				return streamFrameFields{}, &frameDecodeError{Err: fmt.Errorf("invalid stream frame unknown field")}
-			}
-		}
-	}
-
-	switch fields.kind {
-	case wireFrameMessage, wireFrameStatus:
-		return fields, nil
-	default:
-		return streamFrameFields{}, InvalidArgument("stream frame contained an unknown frame kind")
-	}
-}
-
-func parseMetadataEntry(data []byte, copyBytes bool) (string, []byte, error) {
-	var key string
-	var value []byte
-	for offset := 0; offset < len(data); {
-		tag, ok := consumeVarint(data, &offset)
-		if !ok || tag == 0 {
-			return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata field tag")}
-		}
-
-		field := tag >> 3
-		wireType := tag & 0x7
-		switch field {
-		case 1:
-			if wireType != 2 {
-				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata key")}
-			}
-			keyBytes, ok := consumeLengthDelimited(data, &offset)
-			if !ok {
-				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata key")}
-			}
-			key = string(keyBytes)
-		case 2:
-			if wireType != 2 {
-				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata value")}
-			}
-			valueBytes, ok := consumeLengthDelimited(data, &offset)
-			if !ok {
-				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata value")}
-			}
-			value = maybeCopyBytes(valueBytes, copyBytes)
-		default:
-			if !skipProtoField(data, &offset, wireType) {
-				return "", nil, &frameDecodeError{Err: fmt.Errorf("invalid metadata unknown field")}
-			}
-		}
-	}
-
-	return key, value, nil
-}
-
-func consumeLengthDelimited(data []byte, offset *int) ([]byte, bool) {
-	length, ok := consumeVarint(data, offset)
-	remaining := len(data) - *offset
-	if !ok || length > uint64(remaining) {
-		return nil, false
-	}
-
-	start := *offset
-	*offset += int(length)
-	return data[start:*offset], true
-}
-
-func consumeVarint(data []byte, offset *int) (uint64, bool) {
-	var value uint64
-	for shift := 0; shift < 64; shift += 7 {
-		if *offset >= len(data) {
-			return 0, false
-		}
-
-		b := data[*offset]
-		*offset = *offset + 1
-		value |= uint64(b&0x7f) << shift
-		if b < 0x80 {
-			return value, true
-		}
-	}
-
-	return 0, false
-}
-
-func skipProtoField(data []byte, offset *int, wireType uint64) bool {
-	switch wireType {
-	case 0:
-		_, ok := consumeVarint(data, offset)
-		return ok
-	case 1:
-		if len(data)-*offset < 8 {
-			return false
-		}
-		*offset += 8
-		return true
-	case 2:
-		_, ok := consumeLengthDelimited(data, offset)
-		return ok
-	case 5:
-		if len(data)-*offset < 4 {
-			return false
-		}
-		*offset += 4
-		return true
-	default:
-		return false
-	}
-}
-
-func maybeCopyBytes(data []byte, copyBytes bool) []byte {
-	if !copyBytes || len(data) == 0 {
-		return data
-	}
-
-	return append([]byte(nil), data...)
 }

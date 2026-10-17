@@ -50,31 +50,25 @@ const (
 	RPCKindBidirectionalStreaming RPCKind = 3
 )
 
-// wireFrameKind identifies whether a streaming frame carries a message or terminal status.
-type wireFrameKind int32
-
-const (
-	wireFrameMessage wireFrameKind = 0
-	wireFrameStatus  wireFrameKind = 1
-)
-
-// wireRequest is the wire representation of an RPC request.
+// wireRequest is the payload of a REQUEST frame. Field 3 was the request body
+// and is reserved: the request message travels in a MESSAGE frame.
 type wireRequest struct {
 	Service      string   `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"`
 	Method       string   `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
-	Body         []byte   `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
 	Metadata     Metadata `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	Kind         RPCKind  `protobuf:"varint,5,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
 	Version      uint32   `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
 	TimeoutNanos uint64   `protobuf:"varint,7,opt,name=timeout_nanos,json=timeoutNanos,proto3" json:"timeout_nanos,omitempty"`
+	// Extensions lists the extension IDs the client supports (field 8). The
+	// registry is empty, so clients send none and servers ignore the field.
+	Extensions []uint64 `protobuf:"varint,8,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
 }
 
 // newWireRequest creates a unary RPC request with the current wire version.
-func newWireRequest(service, method string, body []byte) *wireRequest {
+func newWireRequest(service, method string) *wireRequest {
 	return &wireRequest{
 		Service:  service,
 		Method:   method,
-		Body:     body,
 		Metadata: Metadata{},
 		Kind:     RPCKindUnary,
 		Version:  wireVersion,
@@ -122,73 +116,38 @@ func (m *wireRequest) rpcKind() RPCKind {
 	return RPCKindUnary
 }
 
-// wireResponse is the wire representation of an RPC response.
-type wireResponse struct {
-	Status   uint32   `protobuf:"varint,1,opt,name=status,proto3" json:"status,omitempty"`
+// wireHeaders is the payload of a HEADERS frame.
+type wireHeaders struct {
+	Metadata Metadata `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	// Extensions lists the extension IDs the server accepts (field 2). The
+	// registry is empty, so servers send none and clients ignore the field.
+	Extensions []uint64 `protobuf:"varint,2,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
+}
+
+// Reset clears the headers for protobuf compatibility.
+func (m *wireHeaders) Reset() { *m = wireHeaders{} }
+
+// String returns the headers as a debug string for protobuf compatibility.
+func (m *wireHeaders) String() string { return fmt.Sprintf("%+v", *m) }
+
+// ProtoMessage marks wireHeaders as a protobuf message.
+func (*wireHeaders) ProtoMessage() {}
+
+// wireStatus is the payload of a STATUS frame.
+type wireStatus struct {
+	Code     uint32   `protobuf:"varint,1,opt,name=code,proto3" json:"code,omitempty"`
 	Message  string   `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
-	Body     []byte   `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
-	Metadata Metadata `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Metadata Metadata `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 }
 
-// Reset clears the response for protobuf compatibility.
-func (m *wireResponse) Reset() { *m = wireResponse{} }
+// Reset clears the status for protobuf compatibility.
+func (m *wireStatus) Reset() { *m = wireStatus{} }
 
-// String returns the response as a debug string for protobuf compatibility.
-func (m *wireResponse) String() string { return fmt.Sprintf("%+v", *m) }
+// String returns the status as a debug string for protobuf compatibility.
+func (m *wireStatus) String() string { return fmt.Sprintf("%+v", *m) }
 
-// ProtoMessage marks wireResponse as a protobuf message.
-func (*wireResponse) ProtoMessage() {}
-
-// wireStreamFrame is the wire representation of one streaming RPC frame.
-type wireStreamFrame struct {
-	Kind     wireFrameKind `protobuf:"varint,1,opt,name=kind,proto3,enum=trevrpc.RpcStreamFrameKind" json:"kind,omitempty"`
-	Status   uint32        `protobuf:"varint,2,opt,name=status,proto3" json:"status,omitempty"`
-	Message  string        `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
-	Body     []byte        `protobuf:"bytes,4,opt,name=body,proto3" json:"body,omitempty"`
-	Metadata Metadata      `protobuf:"bytes,5,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-}
-
-// messageFrame creates a stream message frame carrying a protobuf body.
-func messageFrame(body []byte) *wireStreamFrame {
-	return &wireStreamFrame{
-		Kind:     wireFrameMessage,
-		Status:   uint32(CodeOK),
-		Body:     body,
-		Metadata: Metadata{},
-	}
-}
-
-// statusFrame creates a terminal status frame without metadata.
-func statusFrame(status *Status) *wireStreamFrame {
-	if status == nil || len(status.Metadata) == 0 {
-		return statusFrameWithMetadata(status, Metadata{})
-	}
-
-	return statusFrameWithMetadata(status, status.Metadata)
-}
-
-// statusFrameWithMetadata creates a terminal status frame with metadata.
-func statusFrameWithMetadata(status *Status, metadata Metadata) *wireStreamFrame {
-	if status == nil {
-		status = OK()
-	}
-
-	return &wireStreamFrame{
-		Kind:     wireFrameStatus,
-		Status:   uint32(status.Code),
-		Message:  status.Message,
-		Metadata: metadata,
-	}
-}
-
-// Reset clears the stream frame for protobuf compatibility.
-func (m *wireStreamFrame) Reset() { *m = wireStreamFrame{} }
-
-// String returns the stream frame as a debug string for protobuf compatibility.
-func (m *wireStreamFrame) String() string { return fmt.Sprintf("%+v", *m) }
-
-// ProtoMessage marks wireStreamFrame as a protobuf message.
-func (*wireStreamFrame) ProtoMessage() {}
+// ProtoMessage marks wireStatus as a protobuf message.
+func (*wireStatus) ProtoMessage() {}
 
 // NormalizeMetadataKey lowercases a metadata key, as the runtime requires of
 // keys in Metadata maps it receives.

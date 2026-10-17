@@ -79,18 +79,19 @@ fmt.Println(r.Message)
 bidi.CloseSend()
 ```
 
-Each RPC has exactly one client method. Per-call options are `trevrpc.WithTimeout`, `WithMetadata`, `WithMaxFrameSize` and `CaptureResponseMetadata`:
+Each RPC has exactly one client method. Per-call options are `trevrpc.WithTimeout`, `WithMetadata`, `WithMaxFrameSize`, `CaptureResponseHeaders` and `CaptureResponseMetadata`:
 
 ```go
-var md trevrpc.Metadata
+var headers, trailers trevrpc.Metadata
 reply, _ := client.SayHello(ctx, request,
 	trevrpc.WithTimeout(5*time.Second),
 	trevrpc.WithMetadata("authorization", []byte("Bearer "+token)),
-	trevrpc.CaptureResponseMetadata(&md), // unary and client streaming
+	trevrpc.CaptureResponseHeaders(&headers), // unary and client streaming
+	trevrpc.CaptureResponseMetadata(&trailers), // unary and client streaming
 )
 ```
 
-Server-streaming and bidirectional calls expose the final status, and its metadata, through `TerminalStatus()` once the stream has ended.
+A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the first response frame arrives (headers, a message, or the final status), returns empty metadata if the server sent none, and does not consume a message. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
 
 `Dial` returns a `*Channel` that reconnects with backoff after connection loss. Each RPC uses exactly one connection and is never retried or replayed; calls fail fast with `Unavailable` while the channel is reconnecting. `DialOptions.TLSConfig` and `DialOptions.QUICConfig` are cloned before use.
 
@@ -143,7 +144,9 @@ defer listener.Close()
 return listener.Serve(ctx) // returns nil after ctx is cancelled and handlers drain
 ```
 
-Unary and client-streaming handlers return a `*trevrpc.Response` whose `Metadata` is sent with the response; streaming handlers may wrap their stream with `trevrpc.NewResponseStream(stream, metadata)` to send terminal metadata.
+Unary and client-streaming handlers return a `*trevrpc.Response` whose `Headers` are sent ahead of the message and whose `Metadata` is trailing metadata, sent with the final status. Streaming handlers may wrap their stream with `trevrpc.WithResponseHeaders(stream, headers)`, which sends the headers as soon as the handler returns, before the first message is pulled, and with `trevrpc.NewResponseStream(stream, metadata)` to send trailing metadata. The two wrappers compose in either order.
+
+On the wire a call is a sequence of frames, each a QUIC variable-length type, a QUIC variable-length length and a payload: `REQUEST MESSAGE* [STATUS]` from the client and `[HEADERS] MESSAGE* STATUS` from the server. `MESSAGE` payloads are the protobuf message itself. Frames of unknown type are skipped everywhere, and count towards `MaxFrameSize` (checked before a payload is read) and, on servers, towards `MaxStreamBodySize`.
 
 Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `WebTransportAdmission` admits them; HTTP requests (HTTP/3 and HTTP/2) are admitted unless `HTTPAdmission` denies them. `AdmissionRequest.Proto` reports the HTTP version (`HTTP/3.0`, `HTTP/2.0`, or `HTTP/1.1`) and `Method` is `POST`, `CONNECT` (WebTransport), or `GET` (WebSocket). Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
 

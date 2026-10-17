@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_trevrpc-interop-rust");
-const SCENARIOS: [&str; 9] = [
+const SCENARIOS: [&str; 11] = [
     "unary",
     "unary-metadata",
     "unary-error",
@@ -16,6 +16,8 @@ const SCENARIOS: [&str; 9] = [
     "server-stream-error",
     "bidi",
     "bidi-error",
+    "unary-headers",
+    "server-stream-headers",
 ];
 
 struct TempDir(PathBuf);

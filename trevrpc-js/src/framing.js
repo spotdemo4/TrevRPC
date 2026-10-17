@@ -1,12 +1,19 @@
 import { byteView } from "./bytes.js";
-import { Code, invalidArgument, resourceExhausted, unavailable } from "./status.js";
-import { RpcStreamFrame, RpcStreamFrameKind, preflightWireMessage } from "./wire.js";
+import { internal, invalidArgument, resourceExhausted, unavailable } from "./status.js";
+import { readVarint, varintLength, writeVarint } from "./varint.js";
+import { RpcHeaders, RpcRequest, RpcStatus, preflightWireMessage } from "./wire.js";
 
 export const DefaultMaxFrameSize = 4 * 1024 * 1024;
 
-const HeaderLength = 4;
-/** Tag of RpcStreamFrame.body: field 4, length-delimited. */
-const StreamFrameBodyTag = (4 << 3) | 2;
+/** Frame types; every other type is unknown and skipped by receivers. */
+export const FrameType = Object.freeze({
+  Message: 0,
+  Request: 1,
+  Headers: 2,
+  Status: 3,
+});
+
+const KnownFrameTypes = new Set(Object.values(FrameType));
 const EmptyBytes = new Uint8Array(0);
 
 /** Encodes a protobuf message body. */
@@ -34,63 +41,51 @@ export function unmarshalMessage(messageType, body) {
   }
 }
 
-/** Encodes a protobuf message into a length-prefixed frame. */
-export function encodeFrame(messageType, message, maxFrameSize = DefaultMaxFrameSize) {
-  const body = marshalMessage(messageType, message);
-  checkFrameLength(body.byteLength, maxFrameSize);
-  const frame = new Uint8Array(HeaderLength + body.byteLength);
-  new DataView(frame.buffer).setUint32(0, body.byteLength, false);
-  frame.set(body, HeaderLength);
+/** Encodes one frame carrying an already-encoded payload. */
+export function encodeFrame(type, payload, maxFrameSize = DefaultMaxFrameSize) {
+  checkFrameLength(payload.byteLength, maxFrameSize);
+  const frame = new Uint8Array(frameSize(type, payload.byteLength));
+  writeFrame(frame, 0, type, payload);
   return frame;
+}
+
+/** Encodes a MESSAGE frame; the payload is the raw protobuf message. */
+export function encodeMessageFrame(body, maxFrameSize = DefaultMaxFrameSize) {
+  return encodeFrame(FrameType.Message, body, maxFrameSize);
 }
 
 /**
- * Encodes a streaming message frame carrying an already-encoded protobuf body.
- * This is byte-identical to encodeFrame(RpcStreamFrame, { body }) without building the
- * intermediate message.
+ * Encodes a REQUEST frame, followed by a MESSAGE frame when message is given, in one buffer so
+ * both go out in a single write.
  */
-export function encodeMessageFrame(body, maxFrameSize = DefaultMaxFrameSize) {
-  const frameLength =
-    body.byteLength === 0 ? 0 : 1 + varintLength(body.byteLength) + body.byteLength;
-  checkFrameLength(frameLength, maxFrameSize);
-
-  const frame = new Uint8Array(HeaderLength + frameLength);
-  new DataView(frame.buffer).setUint32(0, frameLength, false);
-  if (body.byteLength > 0) {
-    let offset = HeaderLength;
-    frame[offset++] = StreamFrameBodyTag;
-    offset = writeVarint(frame, offset, body.byteLength);
-    frame.set(body, offset);
+export function encodeRequestFrame(request, message, maxFrameSize = DefaultMaxFrameSize) {
+  const payload = marshalMessage(RpcRequest, request);
+  checkFrameLength(payload.byteLength, maxFrameSize);
+  if (message === undefined) {
+    return encodeFrame(FrameType.Request, payload, maxFrameSize);
   }
+  checkFrameLength(message.byteLength, maxFrameSize);
+  const requestSize = frameSize(FrameType.Request, payload.byteLength);
+  const frame = new Uint8Array(requestSize + frameSize(FrameType.Message, message.byteLength));
+  writeFrame(frame, requestSize, FrameType.Message, message);
+  writeFrame(frame, 0, FrameType.Request, payload);
   return frame;
 }
 
-/** Decodes the body of a response stream frame, validating its kind. */
-export function decodeStreamFrame(body) {
-  const bytes = byteView(body);
-  const messageBody = bareMessageBody(bytes);
-  if (messageBody !== undefined) {
-    return { kind: RpcStreamFrameKind.Message, status: Code.Ok, message: "", body: messageBody };
-  }
-
-  const frame = unmarshalMessage(RpcStreamFrame, bytes);
-  if (frame.kind !== RpcStreamFrameKind.Message && frame.kind !== RpcStreamFrameKind.Status) {
-    throw invalidArgument(`unsupported stream frame kind ${frame.kind}`);
-  }
-  return frame;
+/** Encodes a HEADERS frame from RpcHeaders fields. */
+export function encodeHeadersFrame(headers, maxFrameSize = DefaultMaxFrameSize) {
+  return encodeFrame(FrameType.Headers, marshalMessage(RpcHeaders, headers), maxFrameSize);
 }
 
-/** Validates the body length stored in a frame header. */
-export function frameBodyLength(header, maxFrameSize = DefaultMaxFrameSize) {
-  const length = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(
-    0,
-    false,
-  );
-  checkFrameLength(length, maxFrameSize);
-  return length;
+/** Encodes a STATUS frame from RpcStatus fields. */
+export function encodeStatusFrame(status, maxFrameSize = DefaultMaxFrameSize) {
+  return encodeFrame(FrameType.Status, marshalMessage(RpcStatus, status), maxFrameSize);
 }
 
-/** Reads length-prefixed frames from a byte stream reader. */
+/**
+ * Reads frames from a byte stream reader. Frame headers may be split across chunks; payloads
+ * inside one chunk are returned as views without copying. Unknown frame types are skipped.
+ */
 export class FrameReader {
   #reader;
   /** Bytes received from the reader but not yet consumed. */
@@ -101,44 +96,61 @@ export class FrameReader {
     this.#reader = reader;
   }
 
-  /** Reads and decodes one frame; a stream that ends first is an error. */
-  async readFrame(messageType, maxFrameSize = DefaultMaxFrameSize) {
-    return unmarshalMessage(messageType, await this.#readBody(maxFrameSize, false));
+  /**
+   * Reads the next known frame as `{ type, payload }`, or returns null when the stream ended
+   * cleanly between frames. The declared length of every frame, unknown ones included, is checked
+   * against maxFrameSize before any payload is read or allocated.
+   */
+  async readFrame(maxFrameSize = DefaultMaxFrameSize) {
+    for (;;) {
+      const type = await this.#readVarint(true);
+      if (type === null) {
+        return null;
+      }
+      const length = await this.#readVarint(false);
+      checkFrameLength(length, maxFrameSize);
+      if (!KnownFrameTypes.has(type)) {
+        // Types of 2^53 and above are bigints, which are never known.
+        await this.#skip(length);
+        continue;
+      }
+      return { type, payload: await this.#readExact(length) };
+    }
   }
 
-  /** Reads one streaming RPC frame, or returns null when the stream ended cleanly. */
-  async readStreamFrame(maxFrameSize = DefaultMaxFrameSize) {
-    const body = await this.#readBody(maxFrameSize, true);
-    return body === null ? null : decodeStreamFrame(body);
+  /**
+   * Resolves when the rest of the stream consists of unknown frames and a clean end; rejects if
+   * a known frame or a malformed frame arrives first.
+   */
+  async expectEnd(maxFrameSize = DefaultMaxFrameSize) {
+    const frame = await this.readFrame(maxFrameSize);
+    if (frame !== null) {
+      throw internal(`frame of type ${frame.type} after the final STATUS frame`);
+    }
   }
 
-  /** Resolves when the stream ends cleanly; rejects if more data arrives first. */
-  async expectEnd() {
-    if (this.#pending.byteLength === 0) {
+  /** Reads a varint; null if allowEnd and the stream ended before its first byte. */
+  async #readVarint(allowEnd) {
+    while (this.#pending.byteLength === 0) {
       const { value, done } = await this.#nextChunk();
       if (done) {
-        return;
+        if (allowEnd) {
+          return null;
+        }
+        throw unavailable("stream ended before a complete frame");
       }
       this.#pending = value;
     }
-    throw unavailable("stream carried data after the final frame");
+    const bytes = await this.#readExact(1 << (this.#pending[0] >> 6));
+    return readVarint(bytes, 0).value;
   }
 
-  async #readBody(maxFrameSize, allowEnd) {
-    const header = await this.#readExact(HeaderLength, allowEnd);
-    if (header === null) {
-      return null;
-    }
-    return await this.#readExact(frameBodyLength(header, maxFrameSize), false);
-  }
-
-  /** Returns exactly size bytes, or null if allowEnd and the stream ended before the first byte. */
-  async #readExact(size, allowEnd) {
+  /** Returns exactly size bytes; copies only when the read spans chunks. */
+  async #readExact(size) {
     if (this.#pending.byteLength >= size) {
       return this.#take(size);
     }
 
-    // Copies are needed only when a read spans chunks; whole frames inside one chunk are views.
     const out = new Uint8Array(size);
     let filled = this.#pending.byteLength;
     out.set(this.#pending);
@@ -146,9 +158,6 @@ export class FrameReader {
     while (filled < size) {
       const { value, done } = await this.#nextChunk();
       if (done) {
-        if (allowEnd && filled === 0) {
-          return null;
-        }
         throw unavailable("stream ended before a complete frame");
       }
       const count = Math.min(value.byteLength, size - filled);
@@ -157,6 +166,23 @@ export class FrameReader {
       this.#pending = value.subarray(count);
     }
     return out;
+  }
+
+  /** Discards size bytes without buffering them. */
+  async #skip(size) {
+    let left = size;
+    while (left > 0) {
+      if (this.#pending.byteLength === 0) {
+        const { value, done } = await this.#nextChunk();
+        if (done) {
+          throw unavailable("stream ended before a complete frame");
+        }
+        this.#pending = value;
+      }
+      const count = Math.min(this.#pending.byteLength, left);
+      this.#pending = this.#pending.subarray(count);
+      left -= count;
+    }
   }
 
   async #nextChunk() {
@@ -178,47 +204,18 @@ export class FrameReader {
   }
 }
 
+/** Rejects payload lengths above the limit; length may be a bigint for huge varints. */
 function checkFrameLength(length, maxFrameSize) {
   if (length > maxFrameSize) {
     throw resourceExhausted(`frame length ${length} exceeds maximum ${maxFrameSize}`);
   }
 }
 
-/** Returns the body of a message-only stream frame, or undefined if it carries anything else. */
-function bareMessageBody(bytes) {
-  if (bytes.byteLength === 0) {
-    return EmptyBytes;
-  }
-  if (bytes[0] !== StreamFrameBodyTag) {
-    return undefined;
-  }
-
-  let length = 0;
-  let offset = 1;
-  for (let shift = 0; shift < 35 && offset < bytes.byteLength; shift += 7) {
-    const byte = bytes[offset++];
-    length += (byte & 0x7f) * 2 ** shift;
-    if (byte < 0x80) {
-      return offset + length === bytes.byteLength ? bytes.subarray(offset) : undefined;
-    }
-  }
-  return undefined;
+function frameSize(type, length) {
+  return varintLength(type) + varintLength(length) + length;
 }
 
-function writeVarint(output, offset, value) {
-  let remaining = value;
-  while (remaining >= 0x80) {
-    output[offset++] = (remaining % 0x80) | 0x80;
-    remaining = Math.floor(remaining / 0x80);
-  }
-  output[offset++] = remaining;
-  return offset;
-}
-
-function varintLength(value) {
-  let length = 1;
-  for (let remaining = value; remaining >= 0x80; remaining = Math.floor(remaining / 0x80)) {
-    length += 1;
-  }
-  return length;
+function writeFrame(output, offset, type, payload) {
+  const next = writeVarint(output, writeVarint(output, offset, type), payload.byteLength);
+  output.set(payload, next);
 }

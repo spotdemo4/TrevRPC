@@ -81,6 +81,24 @@ executor.shutdown()
 
 Cronet decides between HTTP/3 and HTTP/2, so the wire format and the channel API are identical on both. Servers must keep their TCP port reachable for the fallback (Go uses the same port number for TCP and UDP). Their HTTP/2 responses carry an `Alt-Svc` header pointing at the UDP port, so Cronet can move to HTTP/3 when it is available.
 
+### Headers and metadata
+
+A response has two metadata maps. Response headers arrive in an optional `HEADERS` frame before the first message; trailing metadata arrives with the terminal `STATUS` frame. Per-call `*Response` methods expose both. For unary and client-streaming calls the returned `ResponseEnvelope` carries `headers` (empty when the server sent none) and `metadata` (trailing). For streaming calls, `headers()` suspends until the first response frame arrives and never loses a message, and `responseMetadata` is the trailing metadata once the call has ended.
+
+```kotlin
+val envelope = client.sayHelloResponse(req("TrevRPC"))
+println(envelope.headers["x-request-id"])   // response headers
+println(envelope.metadata["x-cost"])        // trailing metadata
+
+val call = client.lotsOfRepliesResponse(req("TrevRPC"))
+println(call.headers()["x-request-id"])     // before the first message
+while (true) println((call.receive() ?: break).message)
+println(call.responseMetadata["x-cost"])
+call.close()
+```
+
+Frames use HTTP/3's layout (QUIC variable-length integer type and length, then the payload), so `core` skips unknown frame types, including after `STATUS`. Request messages are written raw in `MESSAGE` frames, and unary and server-streaming calls send `REQUEST`, the one `MESSAGE`, and the end of the request stream in a single write. See the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format).
+
 Failed calls throw `TrevRpcException` carrying a `Status`. Calls are never retried, and deadlines, idle timeouts, and response size limits are set through `CallOptions`.
 
 ## Interop tests
