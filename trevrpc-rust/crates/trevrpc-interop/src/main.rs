@@ -3,6 +3,8 @@
 //! ```text
 //! trevrpc-interop-rust server --cert <pem> --key <pem> [--host 127.0.0.1] [--port 0]
 //! trevrpc-interop-rust client --addr <host:port> --ca <pem> [--server-name localhost]
+//!                             [--transport quic|tcp|auto] [--tcp-addr <host:port>]
+//!                             [--expect-transport quic|qmux]
 //! ```
 
 #![forbid(unsafe_code)]
@@ -22,7 +24,18 @@ async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let result = match args.next().as_deref() {
         Some("server") => parse_flags(args, &["cert", "key", "host", "port"]).map(Command::Server),
-        Some("client") => parse_flags(args, &["addr", "ca", "server-name"]).map(Command::Client),
+        Some("client") => parse_flags(
+            args,
+            &[
+                "addr",
+                "ca",
+                "server-name",
+                "transport",
+                "tcp-addr",
+                "expect-transport",
+            ],
+        )
+        .map(Command::Client),
         _ => Err("usage: trevrpc-interop-rust (server|client) [--flag value]...".into()),
     };
     let command = match result {

@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -22,15 +24,32 @@ type ListenOptions struct {
 	// control windows and stream limits are capped by the Server's limits, and
 	// 0-RTT is always disabled.
 	QUICConfig *quic.Config
+	// TCPAddr is the address of the TCP listener that serves clients that
+	// cannot use UDP. It defaults to the host of the listen address and the
+	// port number of the UDP socket.
+	TCPAddr string
+	// DisableTCP serves QUIC only.
+	DisableTCP bool
+	// TLSHandshakeTimeout bounds the TLS handshake of TCP connections and the
+	// QMux handshake or HTTP request headers that follow it. It defaults to
+	// 10 seconds.
+	TLSHandshakeTimeout time.Duration
 }
 
-// Listener serves a Server on one UDP socket. Native QUIC (ALPN trevrpc/1) is
-// always served. When enabled in ServerOptions, HTTP/3 (ALPN h3) requests and
-// WebTransport sessions are served on the same socket, dispatched by the
-// negotiated ALPN protocol.
+// Listener serves a Server on one UDP socket and, unless disabled, one TCP
+// socket. The UDP socket always serves native QUIC (ALPN trevrpc/1) and, when
+// enabled in ServerOptions, HTTP/3 (ALPN h3) requests and WebTransport
+// sessions. The TCP socket always serves native QMux over TLS (ALPN
+// qmux-02.trevrpc-1) and, when enabled, HTTP/2 requests and QMux over
+// WebSocket sessions. Connections are dispatched on the negotiated ALPN.
 type Listener struct {
 	server  *Server
 	runtime *serverRuntime
+
+	// sources are the transports connections are accepted from. They share
+	// the connection limit, the connection registry and shutdown.
+	sources []connSource
+	conns   connRegistry
 
 	udp  *net.UDPConn
 	tr   *quic.Transport
@@ -38,74 +57,128 @@ type Listener struct {
 	h3   *http3.Server        // nil unless HTTP/3 or WebTransport is enabled
 	wt   *webtransport.Server // nil unless WebTransport is enabled
 
+	tcp              net.Listener // nil when TCP is disabled
+	tcpTLS           *tls.Config
+	handshakeTimeout time.Duration
+	httpTCP          *httpTCPServer // nil unless HTTP or WebTransport is enabled
+
 	// ctx is cancelled when the listener begins shutting down. In-flight RPCs
 	// observe it through their contexts.
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	serving      atomic.Bool
-	closeOnce    sync.Once
-	closeErr     error
+	stopped      atomic.Bool
+	stopOnce     sync.Once
+	stopErr      error
 	teardownOnce sync.Once
-
-	connMu sync.Mutex
-	conns  map[*quic.Conn]struct{}
 }
 
-// Listen binds a UDP socket on addr and prepares to serve server. The server's
-// configuration is frozen. Call Serve to start accepting connections.
+// connSource is one transport the listener accepts connections from.
+type connSource struct {
+	// accept blocks until the next connection arrives. It fails once stop has
+	// been called.
+	accept func(context.Context) (acceptedConn, error)
+	// stop stops accepting new connections.
+	stop func() error
+	// release frees the source's sockets once its connections are closed.
+	release func()
+}
+
+// acceptedConn is a connection accepted by a connSource.
+type acceptedConn struct {
+	// serve runs the connection until it ends.
+	serve func()
+	// close forces the connection closed with a diagnostic message.
+	close func(message string)
+}
+
+// Listen binds a UDP socket on addr, and a TCP socket unless disabled, and
+// prepares to serve server. The server's configuration is frozen. Call Serve to
+// start accepting connections.
 func Listen(addr string, server *Server, options ListenOptions) (*Listener, error) {
 	if server == nil {
 		return nil, InvalidArgument("server is nil")
 	}
-	runtime := server.freeze()
-	tlsConfig, err := serverTLSConfig(options.TLSConfig, runtime.options)
-	if err != nil {
-		return nil, err
-	}
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, InvalidArgument("invalid listen address: " + err.Error())
-	}
-	udp, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return nil, Unavailable("listen: " + err.Error())
-	}
-	tr := &quic.Transport{Conn: udp}
-	ql, err := tr.Listen(tlsConfig, serverQUICConfig(options.QUICConfig, runtime.options))
-	if err != nil {
-		_ = udp.Close()
-		return nil, Unavailable("listen: " + err.Error())
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
 		server:  server,
-		runtime: runtime,
-		udp:     udp,
-		tr:      tr,
-		quic:    ql,
+		runtime: server.freeze(),
 		ctx:     ctx,
 		cancel:  cancel,
-		conns:   map[*quic.Conn]struct{}{},
 	}
-	if runtime.options.EnableHTTP3 || runtime.options.EnableWebTransport {
-		l.setupHTTP3()
+	if err := l.bind(addr, options); err != nil {
+		cancel()
+		return nil, err
 	}
 	return l, nil
+}
+
+// bindAttempts bounds how often Listen looks for a port number that is free
+// for both UDP and TCP when the caller lets the system choose.
+const bindAttempts = 8
+
+// bind binds the UDP socket and, unless disabled, the TCP socket. When the
+// TCP port defaults to the UDP port and the system chose that port, another
+// pair is tried if the TCP port is taken.
+func (l *Listener) bind(addr string, options ListenOptions) error {
+	_, port, _ := net.SplitHostPort(addr)
+	retry := !options.DisableTCP && options.TCPAddr == "" && (port == "0" || port == "")
+	for attempt := 1; ; attempt++ {
+		quicSource, err := l.listenQUIC(addr, options)
+		if err != nil {
+			return err
+		}
+		if options.DisableTCP {
+			l.sources = []connSource{quicSource}
+			return nil
+		}
+		tcpSource, err := l.listenTCP(addr, options)
+		if err == nil {
+			l.sources = []connSource{quicSource, tcpSource}
+			return nil
+		}
+		_ = quicSource.stop()
+		quicSource.release()
+		if !retry || attempt == bindAttempts || !errors.Is(err, syscall.EADDRINUSE) {
+			return Unavailable("listen tcp: " + err.Error())
+		}
+	}
 }
 
 // Addr returns the local UDP address.
 func (l *Listener) Addr() net.Addr { return l.udp.LocalAddr() }
 
+// TCPAddr returns the local TCP address, or nil when TCP is disabled.
+func (l *Listener) TCPAddr() net.Addr {
+	if l.tcp == nil {
+		return nil
+	}
+	return l.tcp.Addr()
+}
+
 // Close stops accepting connections. A running Serve then drains in-flight work
-// and returns. Closing a listener that is not serving releases its socket.
+// and returns. Closing a listener that is not serving releases its sockets.
 func (l *Listener) Close() error {
-	l.closeOnce.Do(func() { l.closeErr = l.quic.Close() })
+	err := l.stopAccepting()
 	if !l.serving.Load() {
 		l.teardown()
 	}
-	return l.closeErr
+	return err
+}
+
+// stopAccepting stops every source from accepting new connections and reports
+// the first error.
+func (l *Listener) stopAccepting() error {
+	l.stopOnce.Do(func() {
+		l.stopped.Store(true)
+		for _, source := range l.sources {
+			if err := source.stop(); err != nil && l.stopErr == nil {
+				l.stopErr = err
+			}
+		}
+	})
+	return l.stopErr
 }
 
 // Serve accepts connections until ctx is cancelled or the listener is closed,
@@ -119,38 +192,57 @@ func (l *Listener) Serve(ctx context.Context) error {
 	stopOnCancel := context.AfterFunc(ctx, func() { _ = l.Close() })
 	defer stopOnCancel()
 
-	connectionLimit := l.runtime.connectionLimit
-	var connectionTasks sync.WaitGroup
-	for {
-		conn, err := l.quic.Accept(ctx)
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				break
+	var connectionTasks, acceptLoops sync.WaitGroup
+	var acceptErr error
+	var acceptErrOnce sync.Once
+	for _, source := range l.sources {
+		acceptLoops.Go(func() {
+			if err := l.acceptConns(ctx, source, &connectionTasks); err != nil {
+				acceptErrOnce.Do(func() { acceptErr = err })
+				_ = l.stopAccepting()
 			}
-			l.shutdown(&connectionTasks, "server accept failed")
-			return transportStatus(err)
-		}
-		if !tryAcquire(connectionLimit) {
-			_ = conn.CloseWithError(0, "too many concurrent connections")
-			continue
-		}
-		l.track(conn)
-		connectionTasks.Go(func() {
-			defer release(connectionLimit)
-			defer l.untrack(conn)
-			l.serveConn(conn)
 		})
+	}
+	acceptLoops.Wait()
+	if acceptErr != nil {
+		l.shutdown(&connectionTasks, "server accept failed")
+		return acceptErr
 	}
 	l.shutdown(&connectionTasks, "server graceful shutdown timed out")
 	return nil
 }
 
+// acceptConns serves connections from source until it stops accepting. It
+// returns an error only when accepting fails for another reason.
+func (l *Listener) acceptConns(ctx context.Context, source connSource, connectionTasks *sync.WaitGroup) error {
+	connectionLimit := l.runtime.connectionLimit
+	for {
+		conn, err := source.accept(ctx)
+		if err != nil {
+			if ctx.Err() != nil || l.stopped.Load() || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return transportStatus(err)
+		}
+		if !tryAcquire(connectionLimit) {
+			conn.close("too many concurrent connections")
+			continue
+		}
+		untrack := l.conns.add(conn.close)
+		connectionTasks.Go(func() {
+			defer release(connectionLimit)
+			defer untrack()
+			conn.serve()
+		})
+	}
+}
+
 func (l *Listener) shutdown(connectionTasks *sync.WaitGroup, timeoutMessage string) {
-	_ = l.quic.Close()
+	_ = l.stopAccepting()
 	l.cancel()
 	waitForWaitGroup(connectionTasks, l.runtime.options.GracefulShutdownTimeout, func() {
 		l.runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticShutdownIncomplete})
-		l.closeConns(timeoutMessage)
+		l.conns.closeAll(timeoutMessage)
 	})
 	l.teardown()
 	if !l.runtime.waitForExecutions(l.runtime.options.GracefulShutdownTimeout) {
@@ -162,63 +254,11 @@ func (l *Listener) shutdown(connectionTasks *sync.WaitGroup, timeoutMessage stri
 func (l *Listener) teardown() {
 	l.teardownOnce.Do(func() {
 		l.cancel()
-		_ = l.quic.Close()
-		l.closeConns("server closed")
-		l.closeHTTP3()
-		_ = l.tr.Close()
-		_ = l.udp.Close()
-	})
-}
-
-func (l *Listener) track(conn *quic.Conn) {
-	l.connMu.Lock()
-	l.conns[conn] = struct{}{}
-	l.connMu.Unlock()
-}
-
-func (l *Listener) untrack(conn *quic.Conn) {
-	l.connMu.Lock()
-	delete(l.conns, conn)
-	l.connMu.Unlock()
-}
-
-func (l *Listener) closeConns(message string) {
-	l.connMu.Lock()
-	conns := make([]*quic.Conn, 0, len(l.conns))
-	for conn := range l.conns {
-		conns = append(conns, conn)
-	}
-	l.connMu.Unlock()
-	for _, conn := range conns {
-		_ = conn.CloseWithError(0, message)
-	}
-}
-
-// serveConn dispatches one established connection on its negotiated ALPN.
-func (l *Listener) serveConn(conn *quic.Conn) {
-	switch conn.ConnectionState().TLS.NegotiatedProtocol {
-	case ALPN:
-		l.serveNative(conn)
-	case http3.NextProtoH3:
-		l.serveHTTP3Conn(conn)
-	default:
-		_ = conn.CloseWithError(0, "unsupported ALPN")
-	}
-}
-
-func (l *Listener) serveNative(conn *quic.Conn) {
-	l.serveStreams(l.ctx, streamAcceptor{
-		accept: func(ctx context.Context) (rpcStream, context.Context, error) {
-			stream, err := conn.AcceptStream(ctx)
-			if err != nil {
-				return nil, nil, err
-			}
-			return newDrainingStream(stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }, ctx), stream.Context(), nil
-		},
-		close:               func(message string) { _ = conn.CloseWithError(0, message) },
-		overloadMessage:     "too many concurrent streams on connection",
-		drainTimeoutMessage: "server stream drain timed out",
-		shutdownMessage:     "server drained connection",
+		_ = l.stopAccepting()
+		l.conns.closeAll("server closed")
+		for _, source := range l.sources {
+			source.release()
+		}
 	})
 }
 

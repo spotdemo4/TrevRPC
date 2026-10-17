@@ -120,7 +120,7 @@ func main() {
 	server := trevrpc.NewServer()
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
 	options := server.Options()
-	options.EnableHTTP3 = true
+	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = allowBrowserExampleSession
 	server.SetOptions(options)

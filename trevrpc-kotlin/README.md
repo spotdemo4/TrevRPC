@@ -2,7 +2,7 @@
 
 TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients, and call servers over ordinary HTTP/3.
 
-Kotlin is client-only and targets Android: calls are `POST /trevrpc` over HTTP/3 through [Cronet](https://developer.android.com/develop/connectivity/cronet). Servers are written in Go or Rust.
+Kotlin is client-only and targets Android: calls are `POST /trevrpc` over HTTP/3 through [Cronet](https://developer.android.com/develop/connectivity/cronet). When UDP is blocked, Cronet falls back to HTTP/2 over TCP on its own; Go and Rust servers serve the same HTTP mapping over HTTP/2 on their TCP listener, so there is nothing to configure. Servers are written in Go or Rust.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
@@ -79,6 +79,8 @@ engine.shutdown()
 executor.shutdown()
 ```
 
+Cronet decides between HTTP/3 and HTTP/2, so the wire format and the channel API are identical on both. Servers must keep their TCP port reachable for the fallback (Go uses the same port number for TCP and UDP). Their HTTP/2 responses carry an `Alt-Svc` header pointing at the UDP port, so Cronet can move to HTTP/3 when it is available.
+
 Failed calls throw `TrevRpcException` carrying a `Status`. Calls are never retried, and deadlines, idle timeouts, and response size limits are set through `CallOptions`.
 
 ## Interop tests
@@ -91,6 +93,8 @@ nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go --command \
   --server-command "trevrpc-interop-go server" \
   --output out/interop --work-dir /var/tmp/interop
 ```
+
+`--transport http3` (the default) runs the scenarios over HTTP/3. `--transport http2` runs them with Cronet's QUIC disabled, as on a network that blocks UDP, to exercise the HTTP/2 mapping on the server's TCP listener. The GitHub `android` workflow runs both for each server.
 
 The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, appends `--host 0.0.0.0 --cert <pem> --key <pem>` to the server command, and prints `ok <name>` or `fail <name>: <reason>` per scenario. It exits 0 only if every scenario passed.
 

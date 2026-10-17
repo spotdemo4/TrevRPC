@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_max_concurrent_connections(Some(512))
         .with_max_concurrent_streams_per_connection(Some(64))
         .with_max_concurrent_requests(Some(1024))
-        .with_http3_enabled(true)
+        .with_http_enabled(true)
         .with_webtransport_enabled(true)
         .with_webtransport_allowed_authorities(webtransport_authorities)
         .with_webtransport_allowed_origins([browser_example_origin]);

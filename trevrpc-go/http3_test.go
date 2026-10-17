@@ -15,17 +15,17 @@ const http3TestTimeout = 2 * time.Second
 
 func TestHTTP3Defaults(t *testing.T) {
 	options := DefaultServerOptions()
-	if options.EnableHTTP3 {
+	if options.EnableHTTP {
 		t.Fatal("HTTP/3 RPC should be opt-in")
 	}
 	if options.EnableWebTransport {
 		t.Fatal("WebTransport should be opt-in")
 	}
-	if options.HTTP3Path != DefaultHTTP3Path {
-		t.Fatalf("default HTTP/3 path = %q", options.HTTP3Path)
+	if options.HTTPPath != DefaultHTTPPath {
+		t.Fatalf("default HTTP/3 path = %q", options.HTTPPath)
 	}
 
-	for _, value := range []string{http3ContentType, "Application/TrevRPC"} {
+	for _, value := range []string{httpContentType, "Application/TrevRPC"} {
 		if !isTrevRPCMediaType([]string{value}) {
 			t.Errorf("expected media type %q to be accepted", value)
 		}
@@ -36,7 +36,7 @@ func TestHTTP3Defaults(t *testing.T) {
 		{"application/octet-stream"},
 		{"application/trevrpc; charset=utf-8"},
 		{"application/trevrpc; version=1"},
-		{http3ContentType, http3ContentType},
+		{httpContentType, httpContentType},
 	} {
 		if isTrevRPCMediaType(values) {
 			t.Errorf("expected media type values %#v to be rejected", values)
@@ -49,7 +49,7 @@ func TestHTTP3Defaults(t *testing.T) {
 func newHandlerTestListener(configure func(*ServerOptions)) (*Listener, *Server) {
 	server := NewServer()
 	options := server.Options()
-	options.EnableHTTP3 = true
+	options.EnableHTTP = true
 	if configure != nil {
 		configure(&options)
 	}
@@ -90,18 +90,18 @@ func TestHTTP3HandlerRejectsInvalidRequestsBeforeRPCHandling(t *testing.T) {
 		wantStatus   int
 		wantAllow    string
 	}{
-		{name: "path", method: "POST", path: "/wrong", contentTypes: []string{http3ContentType}, wantStatus: http.StatusNotFound},
-		{name: "method", method: "GET", path: DefaultHTTP3Path, contentTypes: []string{http3ContentType}, wantStatus: http.StatusMethodNotAllowed, wantAllow: "POST"},
-		{name: "missing media type", method: "POST", path: DefaultHTTP3Path, wantStatus: http.StatusUnsupportedMediaType},
-		{name: "wrong media type", method: "POST", path: DefaultHTTP3Path, contentTypes: []string{"application/octet-stream"}, wantStatus: http.StatusUnsupportedMediaType},
-		{name: "media type parameter", method: "POST", path: DefaultHTTP3Path, contentTypes: []string{http3ContentType + "; charset=utf-8"}, wantStatus: http.StatusUnsupportedMediaType},
-		{name: "multiple media type values", method: "POST", path: DefaultHTTP3Path, contentTypes: []string{http3ContentType, http3ContentType}, wantStatus: http.StatusUnsupportedMediaType},
+		{name: "path", method: "POST", path: "/wrong", contentTypes: []string{httpContentType}, wantStatus: http.StatusNotFound},
+		{name: "method", method: "GET", path: DefaultHTTPPath, contentTypes: []string{httpContentType}, wantStatus: http.StatusMethodNotAllowed, wantAllow: "POST"},
+		{name: "missing media type", method: "POST", path: DefaultHTTPPath, wantStatus: http.StatusUnsupportedMediaType},
+		{name: "wrong media type", method: "POST", path: DefaultHTTPPath, contentTypes: []string{"application/octet-stream"}, wantStatus: http.StatusUnsupportedMediaType},
+		{name: "media type parameter", method: "POST", path: DefaultHTTPPath, contentTypes: []string{httpContentType + "; charset=utf-8"}, wantStatus: http.StatusUnsupportedMediaType},
+		{name: "multiple media type values", method: "POST", path: DefaultHTTPPath, contentTypes: []string{httpContentType, httpContentType}, wantStatus: http.StatusUnsupportedMediaType},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			listener.handleHTTP3RPC(recorder, newHTTP3TestRequest(t, test.method, test.path, body, test.contentTypes...))
+			listener.handleHTTPRPC(recorder, newHTTP3TestRequest(t, test.method, test.path, body, test.contentTypes...))
 			if recorder.Code != test.wantStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
 			}
@@ -116,9 +116,9 @@ func TestHTTP3HandlerRejectsInvalidRequestsBeforeRPCHandling(t *testing.T) {
 }
 
 func TestHTTP3DisabledRejectsRequests(t *testing.T) {
-	listener, _ := newHandlerTestListener(func(options *ServerOptions) { options.EnableHTTP3 = false })
+	listener, _ := newHandlerTestListener(func(options *ServerOptions) { options.EnableHTTP = false })
 	recorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(recorder, newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, nil, http3ContentType))
+	listener.handleHTTPRPC(recorder, newHTTP3TestRequest(t, "POST", DefaultHTTPPath, nil, httpContentType))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
 	}
@@ -127,7 +127,7 @@ func TestHTTP3DisabledRejectsRequests(t *testing.T) {
 func TestHTTP3AdmissionReceivesSnapshotAndCanDeny(t *testing.T) {
 	var seen AdmissionRequest
 	listener, _ := newHandlerTestListener(func(options *ServerOptions) {
-		options.HTTP3Admission = func(request AdmissionRequest) bool {
+		options.HTTPAdmission = func(request AdmissionRequest) bool {
 			seen = request
 			request.Header.Set("Content-Type", "mutated")
 			return request.Header.Get("X-Allow") == "yes"
@@ -135,29 +135,29 @@ func TestHTTP3AdmissionReceivesSnapshotAndCanDeny(t *testing.T) {
 	})
 	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello", nil))
 
-	denied := newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, body, http3ContentType)
+	denied := newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType)
 	denied.Header.Set("X-Allow", "no")
 	denied.Header.Set("Origin", "https://app.example.test")
 	deniedRecorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(deniedRecorder, denied)
+	listener.handleHTTPRPC(deniedRecorder, denied)
 	if deniedRecorder.Code != http.StatusForbidden {
 		t.Fatalf("denied status = %d, want %d", deniedRecorder.Code, http.StatusForbidden)
 	}
-	if denied.Header.Get("Content-Type") != http3ContentType {
+	if denied.Header.Get("Content-Type") != httpContentType {
 		t.Fatalf("admission callback mutated the original headers: %v", denied.Header)
 	}
-	if seen.Path != DefaultHTTP3Path || seen.Method != "POST" || seen.Authority != "example.test" || seen.Origin != "https://app.example.test" || !seen.Secure {
+	if seen.Path != DefaultHTTPPath || seen.Method != "POST" || seen.Authority != "example.test" || seen.Origin != "https://app.example.test" || !seen.Secure {
 		t.Fatalf("incomplete admission snapshot: %#v", seen)
 	}
 
-	allowed := newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, body, http3ContentType)
+	allowed := newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType)
 	allowed.Header.Set("X-Allow", "yes")
 	allowedRecorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(allowedRecorder, allowed)
+	listener.handleHTTPRPC(allowedRecorder, allowed)
 	if allowedRecorder.Code != http.StatusOK {
 		t.Fatalf("allowed status = %d", allowedRecorder.Code)
 	}
-	if got := allowedRecorder.Header().Get("Content-Type"); got != http3ContentType {
+	if got := allowedRecorder.Header().Get("Content-Type"); got != httpContentType {
 		t.Fatalf("response content type = %q", got)
 	}
 }
@@ -167,17 +167,17 @@ func TestHTTP3AdmissionSaturationIsBounded(t *testing.T) {
 	releaseCallback := make(chan struct{})
 	listener, _ := newHandlerTestListener(func(options *ServerOptions) {
 		options.MaxConcurrentAdmissionCallbacks = 1
-		options.HTTP3Admission = func(AdmissionRequest) bool {
+		options.HTTPAdmission = func(AdmissionRequest) bool {
 			close(entered)
 			<-releaseCallback
 			return true
 		}
 	})
 	runtime := listener.runtime
-	request := newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, nil, http3ContentType)
+	request := newHTTP3TestRequest(t, "POST", DefaultHTTPPath, nil, httpContentType)
 	first := make(chan error, 1)
 	go func() {
-		_, err := runtime.invokeAdmission(runtime.options.HTTP3Admission, true, request)
+		_, err := runtime.invokeAdmission(runtime.options.HTTPAdmission, true, request)
 		first <- err
 	}()
 
@@ -186,11 +186,11 @@ func TestHTTP3AdmissionSaturationIsBounded(t *testing.T) {
 	case <-time.After(http3TestTimeout):
 		t.Fatal("admission callback did not start")
 	}
-	if admitted, err := runtime.invokeAdmission(runtime.options.HTTP3Admission, true, request); admitted || !errors.Is(err, errAdmissionSaturated) {
+	if admitted, err := runtime.invokeAdmission(runtime.options.HTTPAdmission, true, request); admitted || !errors.Is(err, errAdmissionSaturated) {
 		t.Fatalf("saturated admission = %t, %v", admitted, err)
 	}
 	recorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(recorder, request)
+	listener.handleHTTPRPC(recorder, request)
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("saturated admission status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
@@ -208,7 +208,7 @@ func TestHTTP3AdmissionSaturationIsBounded(t *testing.T) {
 func TestHTTP3AdmissionPanicIsContainedAndFutureRequestsContinue(t *testing.T) {
 	var calls atomic.Int64
 	listener, _ := newHandlerTestListener(func(options *ServerOptions) {
-		options.HTTP3Admission = func(AdmissionRequest) bool {
+		options.HTTPAdmission = func(AdmissionRequest) bool {
 			if calls.Add(1) == 1 {
 				panic("secret admission panic")
 			}
@@ -218,13 +218,13 @@ func TestHTTP3AdmissionPanicIsContainedAndFutureRequestsContinue(t *testing.T) {
 	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello", nil))
 
 	panicRecorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(panicRecorder, newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, body, http3ContentType))
+	listener.handleHTTPRPC(panicRecorder, newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType))
 	if panicRecorder.Code != http.StatusInternalServerError || bytes.Contains(panicRecorder.Body.Bytes(), []byte("secret")) {
 		t.Fatalf("admission panic leaked: status=%d body=%q", panicRecorder.Code, panicRecorder.Body.String())
 	}
 
 	futureRecorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(futureRecorder, newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, body, http3ContentType))
+	listener.handleHTTPRPC(futureRecorder, newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType))
 	if futureRecorder.Code != http.StatusOK {
 		t.Fatalf("request after admission panic status=%d", futureRecorder.Code)
 	}
@@ -235,18 +235,18 @@ func TestHTTP3UnaryRoundTripAndStreamSaturation(t *testing.T) {
 	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello", []byte("request")))
 
 	// A connection whose stream limit is exhausted rejects before any RPC work.
-	exhausted := &http3ConnState{streamLimit: newSemaphore(1)}
+	exhausted := &httpConnState{streamLimit: newSemaphore(1)}
 	exhausted.streamLimit <- struct{}{}
-	rejected := newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, body, http3ContentType)
-	rejected = rejected.WithContext(context.WithValue(rejected.Context(), http3ConnStateKey{}, exhausted))
+	rejected := newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType)
+	rejected = rejected.WithContext(context.WithValue(rejected.Context(), httpConnStateKey{}, exhausted))
 	rejectedRecorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(rejectedRecorder, rejected)
+	listener.handleHTTPRPC(rejectedRecorder, rejected)
 	if rejectedRecorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("stream saturation status = %d, want %d", rejectedRecorder.Code, http.StatusServiceUnavailable)
 	}
 
 	recorder := httptest.NewRecorder()
-	listener.handleHTTP3RPC(recorder, newHTTP3TestRequest(t, "POST", DefaultHTTP3Path, body, http3ContentType))
+	listener.handleHTTPRPC(recorder, newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("unary status = %d", recorder.Code)
 	}

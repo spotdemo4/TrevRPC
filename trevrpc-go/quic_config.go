@@ -10,26 +10,10 @@ import (
 )
 
 const (
-	// frameHeaderSize is the length prefix that precedes every frame body.
-	frameHeaderSize = 4
-
 	defaultSessionCacheSize = 64
 	defaultTokenOrigins     = 32
 	defaultTokensPerOrigin  = 4
-
-	// streamErrorCancelled is the QUIC stream error code sent when a call is
-	// cancelled locally.
-	streamErrorCancelled = 1
 )
-
-// frameReceiveWindow is the smallest stream receive window that can hold one
-// maximum-size frame.
-func frameReceiveWindow(maxFrameSize int) uint64 {
-	if maxFrameSize <= 0 {
-		return frameHeaderSize
-	}
-	return saturatingAddUint64(uint64(maxFrameSize), frameHeaderSize)
-}
 
 // clientQUICConfig returns the QUIC configuration for a client connection.
 // Servers never open streams toward clients, so incoming streams are disabled.
@@ -75,7 +59,7 @@ func serverQUICConfig(base *quic.Config, options ServerOptions) *quic.Config {
 		config.EnableDatagrams = true
 		config.EnableStreamResetPartialDelivery = true
 	}
-	if !options.EnableHTTP3 && !options.EnableWebTransport {
+	if !options.EnableHTTP && !options.EnableWebTransport {
 		// Only HTTP/3 needs the control and QPACK unidirectional streams.
 		config.MaxIncomingUniStreams = -1
 	}
@@ -97,13 +81,6 @@ func serverWebTransportConfig(options ServerOptions) *webtransport.Config {
 		MaxIncomingUniStreams: -1,
 		MaxIncomingData:       int64(min(window, quicvarint.Max)),
 	}
-}
-
-// serverStreamLimit is how many bidirectional streams a peer may open on one
-// connection or WebTransport session. It keeps one extra stream available so
-// over-limit RPCs receive a TrevRPC status instead of blocking in flow control.
-func serverStreamLimit(options ServerOptions) int64 {
-	return int64(options.MaxConcurrentStreamsPerConnection) + 1
 }
 
 func cloneQUICConfig(base *quic.Config) *quic.Config {
@@ -130,40 +107,6 @@ func capWindow(value *uint64, limit uint64) {
 	}
 }
 
-func connectionReceiveWindow(options ServerOptions, streamWindow uint64) uint64 {
-	connectionWindow := streamWindow
-	if options.MaxConcurrentStreamsPerConnection > 1 {
-		connectionWindow = saturatingMulUint64(streamWindow, uint64(options.MaxConcurrentStreamsPerConnection))
-	}
-	if options.MaxStreamBodySize > 0 {
-		streamBodyWindow := uint64(options.MaxStreamBodySize)
-		if connectionWindow > streamBodyWindow {
-			connectionWindow = streamBodyWindow
-		}
-		if connectionWindow < streamWindow {
-			connectionWindow = streamWindow
-		}
-	}
-
-	return connectionWindow
-}
-
-func saturatingAddUint64(left, right uint64) uint64 {
-	if ^uint64(0)-left < right {
-		return ^uint64(0)
-	}
-
-	return left + right
-}
-
-func saturatingMulUint64(left, right uint64) uint64 {
-	if left != 0 && right > ^uint64(0)/left {
-		return ^uint64(0)
-	}
-
-	return left * right
-}
-
 // serverTLSConfig clones base and restricts it to the ALPN protocols the
 // listener serves.
 func serverTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, error) {
@@ -172,7 +115,7 @@ func serverTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, erro
 	}
 	config := base.Clone()
 	config.NextProtos = []string{ALPN}
-	if options.EnableHTTP3 || options.EnableWebTransport {
+	if options.EnableHTTP || options.EnableWebTransport {
 		config.NextProtos = append(config.NextProtos, http3.NextProtoH3)
 	}
 	return config, nil

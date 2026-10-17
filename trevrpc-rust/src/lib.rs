@@ -13,8 +13,13 @@ pub mod client;
 pub mod error;
 mod framed;
 pub mod framing;
+mod http2;
 mod http3;
+mod http_admission;
+mod http_body;
+mod mux;
 mod native;
+mod qmux_conn;
 mod quic;
 mod request_pump;
 pub mod response;
@@ -24,12 +29,18 @@ pub mod server;
 mod server_transport;
 pub mod status;
 pub mod stream;
+pub mod tcp;
+mod transport_error;
+mod websocket;
 pub mod wire;
 
 /// ALPN protocol identifier for native `TrevRPC` over QUIC.
 pub const ALPN: &[u8] = b"trevrpc/1";
 /// ALPN protocol identifier for HTTP/3 and `WebTransport`.
 pub const HTTP3_ALPN: &[u8] = b"h3";
+/// Identifier of `TrevRPC` over `QMux` (draft-ietf-quic-qmux-02): the TLS ALPN protocol of `QMux`
+/// over TLS and the WebSocket subprotocol of `QMux` over WebSocket.
+pub const QMUX_ALPN: &[u8] = b"qmux-02.trevrpc-1";
 
 pub use async_trait::async_trait;
 pub use error::{Error, Result};

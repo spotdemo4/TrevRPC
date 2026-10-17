@@ -10,7 +10,7 @@
 
 TrevRPC is a Remote Procedure Call (RPC) framework like gRPC, but uses QUIC as the transport protocol instead of HTTP/2.
 
-Scope is deliberately small: Go and Rust servers (native QUIC, HTTP/3, WebTransport), Go and Rust native-QUIC clients, a browser WebTransport client in JavaScript, and an Android Cronet HTTP/3 client in Kotlin. Each language uses exactly one QUIC stack. `interop/` tests every client against every server.
+Scope is deliberately small: Go and Rust servers (native QUIC, HTTP/3, WebTransport), Go and Rust native-QUIC clients, a browser WebTransport client in JavaScript, and an Android Cronet HTTP/3 client in Kotlin. QUIC is the primary transport; TCP fallbacks cover networks that block UDP and browsers without WebTransport: QMux over TLS (native clients), HTTP/2 (Cronet), and QMux over WebSocket (browsers), all served from one TCP listener. Each language uses exactly one QUIC stack and one QMux implementation (in-tree for Go and JavaScript, the qmux crate for Rust). `interop/` tests every client against every server.
 
 This repository is a VERY EARLY WIP. Proposing sweeping changes that improve long-term maintainability is encouraged.
 

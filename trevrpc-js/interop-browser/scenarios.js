@@ -91,12 +91,30 @@ const scenarios = {
   },
 };
 
+/** The channel transports each interop lane allows. */
+const LaneTransports = {
+  webtransport: ["webtransport"],
+  websocket: ["websocket"],
+  auto: ["webtransport", "websocket"],
+};
+
 /**
  * Runs every scenario against the server at url, reporting each result as it completes through
  * onResult({ name, ok, reason }). Resolves with all results. A server that cannot be reached
  * fails every scenario.
+ *
+ * transport is "webtransport" (the default), "websocket" (QMux over WebSocket at webSocketUrl),
+ * or "auto" (WebTransport with the WebSocket fallback). expectTransport fails every scenario
+ * unless the channel connected over that transport.
  */
-export async function runScenarios({ url, certHash, onResult = () => {} }) {
+export async function runScenarios({
+  url,
+  certHash,
+  transport = "webtransport",
+  webSocketUrl,
+  expectTransport,
+  onResult = () => {},
+}) {
   const results = [];
   const report = (name, error) => {
     const result =
@@ -109,10 +127,16 @@ export async function runScenarios({ url, certHash, onResult = () => {} }) {
   try {
     channel = await connect(url, {
       signal: AbortSignal.timeout(DeadlineMs),
+      transports: LaneTransports[transport],
+      webSocketUrl,
       ...(certHash && {
         serverCertificateHashes: [{ algorithm: "sha-256", value: Uint8Array.from(certHash) }],
       }),
     });
+    if (expectTransport && channel.transport !== expectTransport) {
+      channel.close();
+      throw new Error(`connected over ${channel.transport}, want ${expectTransport}`);
+    }
   } catch (error) {
     for (const name of ScenarioNames) {
       report(name, new Error(`connect: ${describe(error)}`));

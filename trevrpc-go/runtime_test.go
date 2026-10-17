@@ -1589,7 +1589,7 @@ func TestServerOptionsCanonicalizeSafePartialValues(t *testing.T) {
 	if options.MaxConcurrentRequests != 1 || options.MaxFrameSize != defaults.MaxFrameSize || options.MaxConcurrentConnections != defaults.MaxConcurrentConnections || options.MaxConcurrentAdmissionCallbacks != defaults.MaxConcurrentAdmissionCallbacks {
 		t.Fatalf("partial options were not safely canonicalized: %+v", options)
 	}
-	if options.InitialRequestTimeout != defaults.InitialRequestTimeout || options.StreamIdleTimeout != defaults.StreamIdleTimeout || options.GracefulShutdownTimeout != defaults.GracefulShutdownTimeout || options.HTTP3Path != DefaultHTTP3Path {
+	if options.InitialRequestTimeout != defaults.InitialRequestTimeout || options.StreamIdleTimeout != defaults.StreamIdleTimeout || options.GracefulShutdownTimeout != defaults.GracefulShutdownTimeout || options.HTTPPath != DefaultHTTPPath {
 		t.Fatalf("partial options removed safety defaults: %+v", options)
 	}
 
@@ -1614,7 +1614,7 @@ func TestServerOptionsRejectInvalidValues(t *testing.T) {
 		{InitialRequestTimeout: -time.Nanosecond},
 		{StreamIdleTimeout: -time.Nanosecond},
 		{GracefulShutdownTimeout: -time.Nanosecond},
-		{HTTP3Path: "relative"},
+		{HTTPPath: "relative"},
 	}
 	for index, options := range tests {
 		func() {

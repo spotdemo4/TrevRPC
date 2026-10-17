@@ -11,6 +11,7 @@
   gnugrep,
   playwright-driver,
   wireGolden,
+  qmuxGolden,
   interopProto,
 }:
 let
@@ -42,12 +43,13 @@ buildNpmPackage (final: {
     "npm"
   ];
 
-  # The interop client is generated from the shared interop proto, and the wire tests read the
-  # shared golden vectors; both live outside this directory.
+  # The interop client is generated from the shared interop proto, and the wire and QMux tests
+  # read the shared golden vectors; both live outside this directory.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       wireGolden
+      qmuxGolden
       interopProto
       ./.
     ];

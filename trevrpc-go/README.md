@@ -1,19 +1,19 @@
 # trevrpc-go
 
-TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients and servers, and run them over QUIC.
+TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients and servers, and run them over QUIC, with TCP fallbacks for networks that block UDP.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
 ## Transports
 
-The Go runtime is pure Go, built on [quic-go](https://github.com/quic-go/quic-go) and [webtransport-go](https://github.com/quic-go/webtransport-go).
+The Go runtime is pure Go, built on [quic-go](https://github.com/quic-go/quic-go), [webtransport-go](https://github.com/quic-go/webtransport-go), and [coder/websocket](https://github.com/coder/websocket). Its QMux implementation is in-tree (`internal/qmux`).
 
-| Role   | Protocols                                                                                                            |
-| ------ | -------------------------------------------------------------------------------------------------------------------- |
-| Client | Native QUIC only (ALPN `trevrpc/1`). Browsers use WebTransport and Android uses HTTP/3 through their own runtimes.   |
-| Server | Native QUIC always. Ordinary HTTP/3 (`POST /trevrpc`) and WebTransport (`/trevrpc`) when enabled in `ServerOptions`. |
+| Role   | Protocols                                                                                                                                                                                                |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Client | Native QUIC (ALPN `trevrpc/1`), falling back to QMux over TLS (ALPN `qmux-02.trevrpc-1`) when UDP is blocked. Browsers and Android use their own runtimes.                                               |
+| Server | Native QUIC and QMux over TLS always. Ordinary HTTP (`POST /trevrpc`, over HTTP/3 and HTTP/2) and browser sessions (WebTransport and QMux over WebSocket on `/trevrpc`) when enabled in `ServerOptions`. |
 
-A `Listener` serves all three on **one UDP socket** and dispatches each connection on its negotiated ALPN protocol (`trevrpc/1` or `h3`).
+A `Listener` serves QUIC on **one UDP socket** and dispatches each connection on its negotiated ALPN protocol (`trevrpc/1` or `h3`). Unless disabled, it also binds **one TCP socket** on the same port number and dispatches on the TLS ALPN: `qmux-02.trevrpc-1` (native QMux), `h2` (HTTP/2), or `http/1.1` (WebSocket upgrade). See [TCP fallback](#tcp-fallback).
 
 ## Protobuf
 
@@ -94,6 +94,23 @@ Server-streaming and bidirectional calls expose the final status, and its metada
 
 `Dial` returns a `*Channel` that reconnects with backoff after connection loss. Each RPC uses exactly one connection and is never retried or replayed; calls fail fast with `Unavailable` while the channel is reconnecting. `DialOptions.TLSConfig` and `DialOptions.QUICConfig` are cloned before use.
 
+### TCP fallback
+
+By default `Dial` prefers QUIC and falls back to QMux over TLS on the server's TCP listener. QUIC starts first; QMux starts after `FallbackDelay` (300 ms) or immediately if QUIC fails, and the first connection to be ready wins. After QMux wins, reconnects use it directly until `ReprobeInterval` (5 minutes) has passed since QUIC was lost, then race again.
+
+```go
+channel, err := trevrpc.Dial(ctx, "localhost:50051", trevrpc.DialOptions{
+	TLSConfig:       &tls.Config{RootCAs: roots, ServerName: "localhost"},
+	Transport:       trevrpc.TransportAuto, // default; or TransportQUICOnly, TransportTCPOnly
+	TCPAddr:         "localhost:50051",     // default: the dial address
+	FallbackDelay:   300 * time.Millisecond,
+	ReprobeInterval: 5 * time.Minute,
+})
+fmt.Println(channel.Transport()) // trevrpc.TransportQUIC ("quic") or trevrpc.TransportQMux ("qmux")
+```
+
+`ChannelEvent.Transport` is set on `ChannelEventReady`. QUIC and TCP keep separate TLS session caches.
+
 ## Server
 
 ```go
@@ -108,8 +125,8 @@ func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*tre
 
 server := trevrpc.NewServer()
 options := server.Options()
-options.EnableHTTP3 = true          // POST /trevrpc for Android / Cronet
-options.EnableWebTransport = true   // /trevrpc for browsers
+options.EnableHTTP = true          // POST /trevrpc over HTTP/3 and HTTP/2, for Android / Cronet
+options.EnableWebTransport = true   // /trevrpc for browsers: WebTransport and QMux over WebSocket
 options.WebTransportAdmission = func(r trevrpc.AdmissionRequest) bool {
 	return r.Origin == "https://app.example.com"
 }
@@ -128,7 +145,11 @@ return listener.Serve(ctx) // returns nil after ctx is cancelled and handlers dr
 
 Unary and client-streaming handlers return a `*trevrpc.Response` whose `Metadata` is sent with the response; streaming handlers may wrap their stream with `trevrpc.NewResponseStream(stream, metadata)` to send terminal metadata.
 
-WebTransport sessions are rejected unless `WebTransportAdmission` admits them; HTTP/3 requests are admitted unless `HTTP3Admission` denies them. Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
+Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `WebTransportAdmission` admits them; HTTP requests (HTTP/3 and HTTP/2) are admitted unless `HTTPAdmission` denies them. `AdmissionRequest.Proto` reports the HTTP version (`HTTP/3.0`, `HTTP/2.0`, or `HTTP/1.1`) and `Method` is `POST`, `CONNECT` (WebTransport), or `GET` (WebSocket). Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
+
+`Listen` binds TCP on the same host and port number as the UDP socket (with port 0 it retries until a port is free for both). `ListenOptions.TCPAddr` overrides the TCP address, `ListenOptions.DisableTCP` serves QUIC only, and `ListenOptions.TLSHandshakeTimeout` (default 10 s) bounds the TLS handshake. `Listener.TCPAddr()` returns the TCP address, or nil when TCP is disabled. The TCP listener shares the connection limit, request limit, and graceful shutdown with QUIC.
+
+`EnableHTTP3`, `HTTP3Path`, and `HTTP3Admission` were renamed `EnableHTTP`, `HTTPPath`, and `HTTPAdmission`, because the HTTP mapping is now also served over HTTP/2.
 
 ## Interop
 

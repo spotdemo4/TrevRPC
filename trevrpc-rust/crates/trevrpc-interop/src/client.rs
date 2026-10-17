@@ -1,4 +1,5 @@
-//! The `client` subcommand: runs every scenario in `interop/README.md` over native QUIC.
+//! The `client` subcommand: runs every scenario in `interop/README.md` over native QUIC, `QMux`
+//! over TLS, or QUIC with the TCP fallback.
 
 use std::future::Future;
 use std::io::Write as _;
@@ -8,7 +9,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
-use trevrpc::client::{CallOptions, Channel, ChannelConfig};
+use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, TransportPolicy};
 use trevrpc::{Code, Error};
 
 use crate::proto::{EchoClient, EchoRequest, EchoResponse};
@@ -41,9 +42,36 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     };
+    let policy = match flags.get("transport").unwrap_or("quic") {
+        "quic" => TransportPolicy::QuicOnly,
+        "tcp" => TransportPolicy::TcpOnly,
+        "auto" => TransportPolicy::Auto,
+        other => return Err(format!("unknown --transport {other:?}").into()),
+    };
+    let mut config = ChannelConfig::new()
+        .with_transport_policy(policy)
+        .with_tcp_fallback(tls.clone());
+    if let Some(tcp_addr) = flags.get("tcp-addr") {
+        let tcp_addr = tokio::net::lookup_host(tcp_addr)
+            .await?
+            .next()
+            .ok_or("--tcp-addr did not resolve to an address")?;
+        config = config.with_tcp_addr(tcp_addr);
+    }
     let mut endpoint = quinn::Endpoint::client(bind)?;
-    endpoint.set_default_client_config(ChannelConfig::new().quic_config(tls)?);
-    let channel = Channel::connect(endpoint.clone(), addr, server_name).await?;
+    endpoint.set_default_client_config(config.quic_config(tls)?);
+    let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config).await?;
+    if let Some(expected) = flags.get("expect-transport") {
+        let actual = match channel.transport() {
+            Some(TransportKind::Quic) => "quic",
+            Some(TransportKind::Qmux) => "qmux",
+            None => "none",
+        };
+        if actual != expected {
+            channel.close();
+            return Err(format!("connected over {actual}, want {expected}").into());
+        }
+    }
     let client = EchoClient::new(channel.clone());
 
     let mut passed = true;

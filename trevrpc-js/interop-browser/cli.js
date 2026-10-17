@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 // trevrpc-interop-browser: runs the interop scenarios of interop/README.md in a real browser over
-// WebTransport and prints `ok <name>` / `fail <name>: <reason>` per scenario. Exits 0 only if
-// every scenario passed.
+// WebTransport or QMux over WebSocket and prints `ok <name>` / `fail <name>: <reason>` per
+// scenario. Exits 0 only if every scenario passed.
 //
 //   trevrpc-interop-browser --browser chromium|firefox|webkit --url <url> --cert-hash <hex>
+//                           [--transport webtransport|websocket|auto] [--ws-url <url>]
+//                           [--expect-transport webtransport|websocket]
 //
 // --cert-hash is the SHA-256 of the server certificate's DER encoding in hex, trusted through
-// WebTransport serverCertificateHashes. Browsers come from PLAYWRIGHT_BROWSERS_PATH unless
+// WebTransport serverCertificateHashes. WebSocket connections cannot pin a certificate hash, so the
+// browser context ignores certificate errors instead. Browsers come from PLAYWRIGHT_BROWSERS_PATH unless
 // TREVRPC_BROWSER_CHROMIUM, TREVRPC_BROWSER_FIREFOX or TREVRPC_BROWSER_WEBKIT name an executable.
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -17,7 +20,10 @@ import { chromium, firefox, webkit } from "playwright";
 import { ScenarioNames } from "./names.js";
 
 const Usage =
-  "usage: trevrpc-interop-browser --browser chromium|firefox|webkit --url <url> --cert-hash <hex>";
+  "usage: trevrpc-interop-browser --browser chromium|firefox|webkit --url <url> --cert-hash <hex>" +
+  " [--transport webtransport|websocket|auto] [--ws-url <url>]" +
+  " [--expect-transport webtransport|websocket]";
+const Transports = ["webtransport", "websocket", "auto"];
 const LaunchTimeoutMs = 20_000;
 const SetupTimeoutMs = 30_000;
 const CloseTimeoutMs = 5_000;
@@ -47,7 +53,6 @@ const Browsers = {
     type: firefox,
     executableVariable: "TREVRPC_BROWSER_FIREFOX",
     launchOptions: { firefoxUserPrefs: { "network.http.http3.enable": true } },
-    contextOptions: { ignoreHTTPSErrors: true },
   },
   // Playwright's WebKit is WebKitGTK/WPE on Linux, which has no WebTransport, and Cocoa WebKit on
   // macOS. Without WebTransport every scenario fails cleanly.
@@ -82,6 +87,9 @@ function parseArguments() {
         browser: { type: "string" },
         url: { type: "string" },
         "cert-hash": { type: "string" },
+        transport: { type: "string", default: "webtransport" },
+        "ws-url": { type: "string" },
+        "expect-transport": { type: "string" },
       },
       strict: true,
     }));
@@ -100,7 +108,17 @@ function parseArguments() {
   if (!/^(?:[0-9a-fA-F]{2}){32}$/.test(certHash)) {
     usageError("--cert-hash must be the hex SHA-256 of the certificate DER (64 hex digits)");
   }
-  return { browser, url: values.url, certHash: [...Buffer.from(certHash, "hex")] };
+  if (!Transports.includes(values.transport)) {
+    usageError("--transport must be webtransport, websocket or auto");
+  }
+  return {
+    browser,
+    url: values.url,
+    certHash: [...Buffer.from(certHash, "hex")],
+    transport: values.transport,
+    webSocketUrl: values["ws-url"],
+    expectTransport: values["expect-transport"],
+  };
 }
 
 function usageError(message) {
@@ -109,7 +127,7 @@ function usageError(message) {
 }
 
 /** Runs the page's scenarios, resolving with a result per scenario name that completed. */
-async function runInBrowser({ browser, url, certHash }) {
+async function runInBrowser({ browser, ...input }) {
   const results = {};
   const origin = await serveBundle();
   let instance;
@@ -129,7 +147,7 @@ async function runInBrowser({ browser, url, certHash }) {
     const run = page.evaluate(
       (input) =>
         globalThis.trevrpcInterop.run({ ...input, onResult: globalThis.trevrpcInteropResult }),
-      { url, certHash },
+      input,
     );
     await withTimeout(run, RunTimeoutMs, "scenarios did not finish in time");
   } catch (error) {
@@ -145,7 +163,8 @@ async function runInBrowser({ browser, url, certHash }) {
 }
 
 async function openPage(instance, browser, url, results) {
-  const page = await (await instance.newContext(browser.contextOptions)).newPage();
+  // The interop certificate is self-signed: WebTransport trusts it by hash, WebSocket cannot.
+  const page = await (await instance.newContext({ ignoreHTTPSErrors: true })).newPage();
   page.on("console", (message) => {
     if (message.type() === "error" || message.type() === "warning") {
       console.error(`[browser ${message.type()}] ${message.text()}`);

@@ -1,17 +1,24 @@
-//! The server accept loop: one Quinn endpoint serving native QUIC, HTTP/3 and `WebTransport`.
+//! The server accept loop: one Quinn endpoint serving native QUIC, HTTP/3 and `WebTransport`, and
+//! optionally one TCP listener serving the fallbacks.
 
 use std::future::{Future, pending};
 use std::sync::Arc;
 use std::time::Duration;
 
+use http::HeaderValue;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinError, JoinSet};
 
 use crate::quic::{frame_receive_window, negotiated_protocol, saturating_usize_to_u64, varint};
 use crate::server::{Server, ServerOptions};
 use crate::server_transport::try_acquire_permit;
+use crate::tcp::TcpFallback;
 use crate::{Error, Result};
-use crate::{http3, native};
+use crate::{http3, native, tcp};
+
+/// Pause after a TCP accept failure, such as running out of file descriptors.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Spare bidirectional stream slots above the per-connection RPC limit: one so an over-limit RPC
 /// can still receive a status, and one for the long-lived `WebTransport` CONNECT stream.
@@ -21,12 +28,12 @@ impl Server {
     /// Builds the Quinn server configuration for an endpoint served by [`Server::serve`].
     ///
     /// The configuration advertises [`crate::ALPN`] for native `TrevRPC`, and [`crate::HTTP3_ALPN`]
-    /// only when [`ServerOptions::http3_enabled`] or [`ServerOptions::webtransport_enabled`] is
+    /// only when [`ServerOptions::http_enabled`] or [`ServerOptions::webtransport_enabled`] is
     /// set, replacing any ALPN list already on `tls`. It also sizes the QUIC stream and connection
     /// windows from the server's [`ServerOptions`], so call it after the options are final.
     pub fn quic_config(&self, mut tls: quinn::rustls::ServerConfig) -> Result<quinn::ServerConfig> {
         tls.alpn_protocols = vec![crate::ALPN.to_vec()];
-        if self.options().http3_enabled() || self.options().webtransport_enabled() {
+        if self.options().http_enabled() || self.options().webtransport_enabled() {
             tls.alpn_protocols.push(crate::HTTP3_ALPN.to_vec());
         }
         let crypto =
@@ -52,6 +59,45 @@ impl Server {
     where
         S: Future<Output = ()> + Send,
     {
+        self.serve_sources(endpoint, None, shutdown).await
+    }
+
+    /// Serves `TrevRPC` on a Quinn endpoint and a TCP listener until the shutdown future
+    /// completes, then drains in-flight RPCs for up to the configured graceful shutdown timeout.
+    ///
+    /// The TCP listener serves clients that cannot use UDP: `QMux` over TLS ([`crate::QMUX_ALPN`])
+    /// always, HTTP/2 `POST` RPCs when HTTP is enabled, and `QMux` over WebSocket browser
+    /// sessions when `WebTransport` is enabled. Both share the connection and request limits.
+    pub async fn serve_with_tcp<S>(
+        self,
+        endpoint: quinn::Endpoint,
+        tcp: TcpFallback,
+        shutdown: S,
+    ) -> Result<()>
+    where
+        S: Future<Output = ()> + Send,
+    {
+        self.serve_sources(endpoint, Some(tcp), shutdown).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn serve_sources<S>(
+        self,
+        endpoint: quinn::Endpoint,
+        mut tcp: Option<TcpFallback>,
+        shutdown: S,
+    ) -> Result<()>
+    where
+        S: Future<Output = ()> + Send,
+    {
+        // HTTP/2 responses advertise HTTP/3 on the endpoint's port.
+        let alt_svc = if self.options().http_enabled() {
+            endpoint.local_addr().ok().and_then(|addr| {
+                HeaderValue::try_from(format!("h3=\":{}\"; ma=86400", addr.port())).ok()
+            })
+        } else {
+            None
+        };
         let connection_limit = self
             .options()
             .max_concurrent_connections()
@@ -91,7 +137,7 @@ impl Server {
                                     .await;
                             }
                             Some(crate::HTTP3_ALPN)
-                                if server.options().http3_enabled()
+                                if server.options().http_enabled()
                                     || server.options().webtransport_enabled() =>
                             {
                                 Box::pin(http3::handle_connection(
@@ -106,6 +152,32 @@ impl Server {
                         }
                     });
                 }
+                accepted = accept_tcp(tcp.as_ref().map(|tcp| &tcp.listener)) => {
+                    let stream = match accepted {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::warn!(%error, "TCP accept failed");
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                            continue;
+                        }
+                    };
+                    let Some(connection_permit) = try_acquire_permit(connection_limit.as_ref()) else {
+                        continue;
+                    };
+                    let tls = tcp.as_ref().map(|tcp| tcp.tls.clone()).expect("TCP is enabled");
+                    let connection = tcp::handle_connection(
+                        self.clone(),
+                        stream,
+                        tls,
+                        alt_svc.clone(),
+                        request_limit.clone(),
+                        shutdown_rx.clone(),
+                    );
+                    connection_tasks.spawn(async move {
+                        let _connection_permit = connection_permit;
+                        connection.await;
+                    });
+                }
                 () = &mut shutdown => {
                     break;
                 }
@@ -115,6 +187,8 @@ impl Server {
             }
         }
 
+        // Stop accepting TCP connections; the endpoint keeps refusing QUIC ones while draining.
+        drop(tcp.take());
         let _ = shutdown_tx.send(true);
         drain_connections(
             &mut connection_tasks,
@@ -127,16 +201,24 @@ impl Server {
     }
 }
 
-/// QUIC flow-control limits derived from a server's [`ServerOptions`].
+/// Accepts the next TCP connection, or never when TCP is disabled.
+async fn accept_tcp(listener: Option<&TcpListener>) -> std::io::Result<TcpStream> {
+    match listener {
+        Some(listener) => listener.accept().await.map(|(stream, _)| stream),
+        None => pending().await,
+    }
+}
+
+/// Flow-control limits derived from a server's [`ServerOptions`], shared by QUIC and `QMux`.
 #[derive(Debug, Eq, PartialEq)]
-struct TransportLimits {
-    stream_receive_window: u64,
-    connection_receive_window: u64,
+pub(crate) struct TransportLimits {
+    pub(crate) stream_receive_window: u64,
+    pub(crate) connection_receive_window: u64,
     max_concurrent_bidi_streams: Option<u64>,
 }
 
 /// Aligns the QUIC windows and stream limits with the server's `TrevRPC` limits.
-fn transport_limits(options: &ServerOptions) -> TransportLimits {
+pub(crate) fn transport_limits(options: &ServerOptions) -> TransportLimits {
     let stream_receive_window = frame_receive_window(options.max_frame_size());
     TransportLimits {
         stream_receive_window,
@@ -199,14 +281,15 @@ pub(crate) async fn drain_tasks(tasks: &mut JoinSet<()>, timeout: Option<Duratio
     finished
 }
 
-/// Drains a connection's stream tasks, closing the connection if they overrun `timeout`.
+/// Drains a connection's stream tasks, calling `close` to end the connection if they overrun
+/// `timeout`.
 pub(crate) async fn drain_streams(
     stream_tasks: &mut JoinSet<()>,
     timeout: Option<Duration>,
-    connection: &quinn::Connection,
+    close: impl FnOnce(),
 ) {
     if !drain_tasks(stream_tasks, timeout).await {
-        connection.close(0_u32.into(), b"server stream drain timed out");
+        close();
     }
 }
 

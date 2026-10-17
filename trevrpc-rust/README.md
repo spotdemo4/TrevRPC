@@ -1,14 +1,14 @@
 # trevrpc-rust
 
-TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients and servers, and run them over QUIC.
+TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients and servers, and run them over QUIC, with TCP fallbacks for networks that block UDP.
 
 The Rust crate is built on [Quinn](https://github.com/quinn-rs/quinn):
 
-- **Client:** `client::Channel` speaks native QUIC (ALPN `trevrpc/1`) and reconnects automatically. Rust has no HTTP/3 or WebTransport client; Android uses HTTP/3 and browsers use WebTransport.
-- **Server:** `server::Server` serves native QUIC always, plus ordinary HTTP/3 (`POST /trevrpc`) and WebTransport (`/trevrpc`) when enabled, from one Quinn endpoint dispatching on the negotiated ALPN.
+- **Client:** `client::Channel` speaks native QUIC (ALPN `trevrpc/1`) and reconnects automatically. It can fall back to QMux over TLS (ALPN `qmux-02.trevrpc-1`) when UDP is blocked. Rust has no HTTP/3 or WebTransport client; Android uses HTTP/3 and browsers use WebTransport.
+- **Server:** `server::Server` serves native QUIC always, plus ordinary HTTP/3 (`POST /trevrpc`) and WebTransport (`/trevrpc`) when enabled, from one Quinn endpoint dispatching on the negotiated ALPN. With a TCP listener it also serves QMux over TLS, HTTP/2, and QMux over WebSocket; see [TCP fallback](#tcp-fallback).
 - **Codegen:** `protoc-gen-trevrpc-rust` generates service traits, `register_*` functions and typed clients.
 
-There are no Cargo features: the HTTP/3 and WebTransport server is a handful of small crates next to Quinn, so a feature matrix would buy almost no compile time.
+There are no Cargo features: the HTTP/3, WebTransport, and TCP fallback servers are a handful of small crates next to Quinn (`h3`, `h2`, `tokio-rustls`, and the [`qmux`](https://crates.io/crates/qmux) crate), so a feature matrix would buy almost no compile time.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
@@ -124,16 +124,47 @@ Native QUIC is always served. HTTP/3 and WebTransport are opt-in through `Server
 ```rust
 server.set_options(
     trevrpc::server::ServerOptions::new()
-        .with_http3_enabled(true)         // HTTP/3 `POST` RPCs; off by default
+        .with_http_enabled(true)         // HTTP/3 `POST` RPCs; off by default
         .with_webtransport_enabled(true)  // WebTransport sessions; off by default
-        .with_http3_path("/trevrpc")      // one path shared by both (the default)
+        .with_http_path("/trevrpc")      // one path shared by both (the default)
         .with_webtransport_allowed_origins(["https://app.example"]),
 );
 ```
 
-WebTransport policy: a session must use the shared path, then pass the authority and origin allowlists. With no allowlists, requests that carry an `Origin` header (every browser) are denied; requests without one are admitted. `with_webtransport_admission` installs a callback that replaces the allowlists (the path is still checked first). `with_http3_admission` is the equivalent hook for HTTP/3 `POST`.
+WebTransport policy: a session must use the shared path, then pass the authority and origin allowlists. With no allowlists, requests that carry an `Origin` header (every browser) are denied; requests without one are admitted. `with_webtransport_admission` installs a callback that replaces the allowlists (the path is still checked first). `with_http_admission` is the equivalent hook for HTTP/3 `POST`.
 
 `Server::serve_with_shutdown` drains in-flight RPCs for up to `ServerOptions::graceful_shutdown_timeout` before closing the endpoint.
+
+`http3_enabled`, `http3_path`, and `http3_admission` (and their `with_*` builders) were renamed `http_enabled`, `http_path`, and `http_admission`, and `Http3Admission`/`Http3AdmissionRequest` became `HttpAdmission`/`HttpAdmissionRequest`, because the HTTP mapping is now also served over HTTP/2.
+
+## TCP fallback
+
+TCP is opt-in. `Server::tcp_tls_config` builds the TLS configuration for a TCP listener, setting the ALPN list from the options (`qmux-02.trevrpc-1` always, `h2` when HTTP is enabled, `http/1.1` for the WebSocket upgrade when WebTransport is enabled). `Server::serve_with_tcp` then serves QUIC and TCP together, sharing the connection and request limits and graceful shutdown:
+
+```rust
+let tcp = trevrpc::tcp::TcpFallback {
+    listener: tokio::net::TcpListener::bind("[::]:50051").await?,
+    tls: server.tcp_tls_config(tls),         // the same rustls config (clone it for `quic_config`); call after the options are final
+};
+server.serve_with_tcp(endpoint, tcp, shutdown_signal()).await?;
+```
+
+The channel falls back to QMux over TLS when given a rustls client configuration for it. QUIC starts first; QMux starts after the fallback delay (300 ms) or immediately if QUIC fails, and the first to connect wins. After QMux wins, reconnects use it until the reprobe interval (5 minutes) has passed since QUIC was lost.
+
+```rust
+use trevrpc::client::{ChannelConfig, TransportPolicy};
+
+let config = ChannelConfig::new()
+    .with_tcp_fallback(tls.clone())              // enables QMux over TLS
+    .with_tcp_addr("127.0.0.1:50051".parse()?)   // default: the QUIC address
+    .with_transport_policy(TransportPolicy::Auto) // or QuicOnly, TcpOnly
+    .with_fallback_delay(std::time::Duration::from_millis(300))
+    .with_reprobe_interval(std::time::Duration::from_secs(300));
+let channel = trevrpc::client::Channel::connect_with_config(endpoint, addr, "localhost", config).await?;
+println!("{:?}", channel.transport()); // Some(TransportKind::Quic) or Some(TransportKind::Qmux)
+```
+
+`ChannelEvent::Ready` carries the `transport` of the new generation. Without `with_tcp_fallback`, `Auto` is QUIC only. `client::QmuxTransport::connect(addr, server_name, tls)` opens a single QMux connection without reconnection. `remote_addr`, `rebind`, and `local_addr` concern the QUIC endpoint only. See [`crates/trevrpc-interop/src/server.rs`](crates/trevrpc-interop/src/server.rs) and [`tests/tcp_integration.rs`](tests/tcp_integration.rs) for complete usage.
 
 ## Interop
 

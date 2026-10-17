@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Runs the TrevRPC interop scenarios from an Android emulator over Cronet HTTP/3.
+"""Runs the TrevRPC interop scenarios from an Android emulator over Cronet HTTP/3 or HTTP/2.
 
 The runner generates a certificate that is valid for the emulator's view of the host, starts an
 interop server on the host (see interop/README.md), boots an emulator that trusts the certificate,
 runs the instrumented test, and prints one `ok <name>` or `fail <name>: <reason>` line per
-scenario. It exits 0 only if every scenario passed.
+scenario. It exits 0 only if every scenario passed. With `--transport http2` Cronet's QUIC is
+disabled, as when a network blocks UDP, and the scenarios run over the server's TCP listener.
 """
 
 from __future__ import annotations
@@ -192,15 +193,18 @@ def generate_certificates(
 # --- interop server --------------------------------------------------------------------------
 
 
+TRANSPORTS = ("http3", "http2")
+
+
 def parse_ports(line: str) -> dict[str, int]:
-    """Parses the server's `{"native":N,"http3":N,"webtransport":N}` readiness line."""
+    """Parses the server's readiness line, such as `{"native":N,"http3":N,"http2":N,...}`."""
     try:
         value = cast(object, json.loads(line))
     except json.JSONDecodeError as error:
         raise RunnerError(f"server readiness line is not JSON: {line!r}") from error
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     ports: dict[str, int] = {}
-    for name in ("native", "http3", "webtransport"):
+    for name in ("native", *TRANSPORTS):
         port = fields.get(name)
         if (
             not isinstance(port, int)
@@ -507,10 +511,10 @@ def _finish_block(outcomes: Outcomes, block: dict[str, str], code: int) -> None:
         )
 
 
-def run_instrumentation(port: int, output: Path) -> Outcomes:
+def run_instrumentation(port: int, transport: str, output: Path) -> Outcomes:
     command = [
         "adb", "-s", SERIAL, "shell", "am", "instrument", "-w", "-r",
-        "-e", "host", EMULATOR_HOST, "-e", "port", str(port),
+        "-e", "host", EMULATOR_HOST, "-e", "port", str(port), "-e", "transport", transport,
         f"{TEST_PACKAGE}/{TEST_RUNNER}",
     ]  # fmt: skip
     try:
@@ -556,6 +560,7 @@ class Options:
     test_apk: Path
     server_host: str
     system_image: str
+    transport: str
 
 
 def parse_args(argv: list[str]) -> Options:
@@ -582,6 +587,12 @@ def parse_args(argv: list[str]) -> Options:
         "--server-host", default="0.0.0.0", help="address the server binds to"
     )
     _ = parser.add_argument("--system-image", default=DEFAULT_SYSTEM_IMAGE)
+    _ = parser.add_argument(
+        "--transport",
+        choices=TRANSPORTS,
+        default="http3",
+        help="http3, or http2 with Cronet's QUIC disabled",
+    )
     args = parser.parse_args(argv)
     return Options(
         server_command=cast(str, args.server_command),
@@ -591,6 +602,7 @@ def parse_args(argv: list[str]) -> Options:
         test_apk=cast(Path, args.test_apk),
         server_host=cast(str, args.server_host),
         system_image=cast(str, args.system_image),
+        transport=cast(str, args.transport),
     )
 
 
@@ -630,7 +642,9 @@ def execute(args: Options) -> Outcomes:
         _ = adb("install", "-r", str(args.app_apk), timeout=90)
         _ = adb("install", "-r", str(args.test_apk), timeout=90)
         _ = adb("logcat", "-c")
-        outcomes = run_instrumentation(ports["http3"], args.output)
+        outcomes = run_instrumentation(
+            ports[args.transport], args.transport, args.output
+        )
         try:
             shutdown_server(server)
         except RunnerError as error:

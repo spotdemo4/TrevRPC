@@ -201,7 +201,13 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
             attempt: 1,
         }
     );
-    assert_eq!(events.recv().await?, ChannelEvent::Ready { generation: 2 });
+    assert_eq!(
+        events.recv().await?,
+        ChannelEvent::Ready {
+            generation: 2,
+            transport: trevrpc::client::TransportKind::Quic
+        }
+    );
     tokio::time::sleep(Duration::from_millis(25)).await;
     assert_eq!(server.received_requests.load(Ordering::SeqCst), 1);
 

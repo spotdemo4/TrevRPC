@@ -24,12 +24,18 @@ import {
 const channel = await connect("https://localhost:4433/trevrpc", {
   serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(32) }],
   signal: AbortSignal.timeout(5_000),
+  transports: ["webtransport", "websocket"],
+  webSocketUrl: "wss://localhost:4433/trevrpc",
+  fallbackDelayMs: 300,
+  reprobeIntervalMs: 300_000,
   onStateChange(change: ChannelStateChange) {
     change.state satisfies "ready" | "reconnecting" | "closed";
+    change.transport satisfies "webtransport" | "websocket" | undefined;
   },
 });
 channel satisfies Channel satisfies Transport;
 channel.state satisfies "ready" | "reconnecting" | "closed";
+channel.transport satisfies "webtransport" | "websocket";
 await channel.waitUntilReady();
 
 const echo = new EchoClient(channel, { timeoutMs: 10_000, metadata: { trace: "abc" } });

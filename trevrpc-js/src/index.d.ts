@@ -155,11 +155,31 @@ export interface WebTransportSessionLike extends Transport {
   close(closeInfo?: { closeCode?: number; reason?: string }): void;
 }
 
+/** How a channel reaches the server: WebTransport, or QMux over WebSocket as the fallback. */
+export type TransportKind = "webtransport" | "websocket";
+
 export interface ConnectOptions {
+  /**
+   * Transports to use, in order of preference. The default, `["webtransport", "websocket"]`,
+   * starts QMux over WebSocket once WebTransport fails or has not connected within
+   * `fallbackDelayMs`, and uses whichever is ready first.
+   */
+  transports?: readonly TransportKind[];
+  /** The `wss://` URL of the server's TCP listener. Defaults to `url` with a `wss:` scheme. */
+  webSocketUrl?: string | URL;
+  /** How long WebTransport may take before the WebSocket fallback starts. Defaults to 300. */
+  fallbackDelayMs?: number;
+  /** How long reconnects keep using WebSocket after it won, before trying WebTransport again. */
+  reprobeIntervalMs?: number;
+  /** WebSocket implementation to use instead of the global one. */
+  WebSocket?: new (url: string | URL, protocols?: string | string[]) => WebSocket;
   allowPooling?: boolean;
   congestionControl?: "default" | "low-latency" | "throughput";
   requireUnreliable?: boolean;
-  /** Trusts a self-signed ECDSA certificate (at most 14 days old) by its SHA-256 hash. */
+  /**
+   * Trusts a self-signed ECDSA certificate (at most 14 days old) by its SHA-256 hash. WebTransport
+   * only: the WebSocket fallback needs a certificate the browser trusts.
+   */
   serverCertificateHashes?: readonly WebTransportCertificateHash[];
   /** WebTransport implementation to use instead of the global one. */
   WebTransport?: new (url: string | URL, options?: object) => WebTransportSessionLike;
@@ -180,22 +200,27 @@ export interface ChannelStateChange {
   delayMs?: number;
   /** Why the session was lost or the previous attempt failed. */
   error?: unknown;
+  /** The transport of the new session, when it becomes ready. */
+  transport?: TransportKind;
 }
 
-/** Opens a channel to a WebTransport server and waits for its session to be ready. */
+/** Opens a channel to a TrevRPC server and waits for its session to be ready. */
 export function connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
 
 /**
- * A WebTransport session that reconnects in the background after it is lost. Calls fail fast
- * with Unavailable while it reconnects and are never replayed.
+ * A session that reconnects in the background after it is lost: WebTransport, or QMux over
+ * WebSocket when WebTransport is unavailable or blocked. Calls fail fast with Unavailable while it
+ * reconnects and are never replayed.
  */
 export class Channel implements Transport {
   private constructor();
 
-  /** Opens a channel to a WebTransport server and waits for its session to be ready. */
+  /** Opens a channel to a TrevRPC server and waits for its session to be ready. */
   static connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
 
   readonly state: ChannelState;
+  /** The transport of the current or last session. */
+  readonly transport: TransportKind;
   createBidirectionalStream(): Promise<TransportStream>;
   /** Resolves once the channel is ready, immediately if it already is. */
   waitUntilReady(): Promise<void>;

@@ -1,0 +1,60 @@
+# TrevRPC QMux golden vectors (draft-ietf-quic-qmux-02).
+# Each entry is hex. Every implementation must encode the frame, parameter,
+# record and message entries byte for byte, and decode them back.
+#
+# varint.*      RFC 9000 Appendix A.1 variable-length integers.
+# frame.*       single frames.
+# params.*      QX_TRANSPORT_PARAMETERS frames.
+# record.*      Size-prefixed records (QMux over TLS).
+# message.*     the same frames as one WebSocket message (no Size).
+# invalid.<error>.*  frames that must be rejected with <error>
+#               (frame_encoding or transport_parameter).
+
+varint.1byte = 25
+varint.2byte = 7bbd
+varint.4byte = 9d7f3e7d
+varint.8byte = c2197c5eff14e88c
+
+# STREAM id 0, "hi", FIN.
+frame.stream.fin = 0b00026869
+# STREAM id 4, offset 16, "hi".
+frame.stream.offset = 0e0410026869
+# RESET_STREAM id 0, code 1, final size 5.
+frame.reset_stream = 04000105
+# STOP_SENDING id 0, code 1.
+frame.stop_sending = 050001
+# MAX_DATA 65.
+frame.max_data = 104041
+# MAX_STREAM_DATA id 4, 1028.
+frame.max_stream_data = 11044404
+# MAX_STREAMS (bidirectional) 65.
+frame.max_streams_bidi = 124041
+# CONNECTION_CLOSE (application) code 0, "bye".
+frame.application_close = 1d0003627965
+# CONNECTION_CLOSE (transport) PROTOCOL_VIOLATION, frame type 0x08, no reason.
+frame.transport_close = 1c0a0800
+# QX_PING request and response, sequence 1.
+frame.ping = f48c67529ef8c7bd01
+frame.ping_response = f48c67529ef8c7be01
+
+# max_idle_timeout 30000 ms, initial_max_data 16777216,
+# initial_max_stream_data_bidi_remote 4194308, initial_max_streams_bidi 65,
+# max_record_size 65536.
+params.server = ff5153300d0a0d0a2301048000753004048100000006048040000408024041c571c59429cd08450480010000
+# initial_max_stream_data_bidi_local 4194308, initial_max_data 4194308,
+# max_record_size 65536.
+params.client = ff5153300d0a0d0a19040480400004050480400004c571c59429cd08450480010000
+
+record.stream_and_max_data = 080b00026869104041
+message.stream_and_max_data = 0b00026869104041
+
+invalid.frame_encoding.ack = 0200000000
+invalid.frame_encoding.quic_ping = 01
+invalid.frame_encoding.crypto = 06000000
+invalid.frame_encoding.new_token = 0700
+invalid.frame_encoding.datagram = 3000
+invalid.frame_encoding.truncated_stream = 0b00056869
+invalid.frame_encoding.truncated_varint = 1040
+invalid.transport_parameter.original_destination_connection_id = ff5153300d0a0d0a020000
+invalid.transport_parameter.small_max_record_size = ff5153300d0a0d0a0bc571c59429cd08450243e8
+invalid.transport_parameter.duplicate = ff5153300d0a0d0a06040101040102

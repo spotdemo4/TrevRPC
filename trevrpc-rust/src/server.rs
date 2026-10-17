@@ -270,7 +270,7 @@ pub struct WebTransportAdmissionRequest<'a> {
 
 pub type WebTransportAdmission = for<'a> fn(&WebTransportAdmissionRequest<'a>) -> bool;
 #[derive(Clone, Copy)]
-pub struct Http3AdmissionRequest<'a> {
+pub struct HttpAdmissionRequest<'a> {
     pub request: &'a http::Request<()>,
     pub path: &'a str,
     pub authority: Option<&'a str>,
@@ -278,7 +278,7 @@ pub struct Http3AdmissionRequest<'a> {
     pub headers: &'a [AdmissionHeader<'a>],
 }
 
-pub type Http3Admission = for<'a> fn(&Http3AdmissionRequest<'a>) -> bool;
+pub type HttpAdmission = for<'a> fn(&HttpAdmissionRequest<'a>) -> bool;
 
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -291,9 +291,9 @@ pub struct ServerOptions {
     stream_messages: Option<usize>,
     stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
-    http3_enabled: bool,
-    http3_path: String,
-    http3_admission: Option<Http3Admission>,
+    http_enabled: bool,
+    http_path: String,
+    http_admission: Option<HttpAdmission>,
     webtransport_enabled: bool,
     webtransport_allowed_authorities: Vec<String>,
     webtransport_allowed_origins: Vec<String>,
@@ -312,9 +312,9 @@ impl Default for ServerOptions {
             stream_messages: Some(4096),
             stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
-            http3_enabled: false,
-            http3_path: "/trevrpc".to_owned(),
-            http3_admission: None,
+            http_enabled: false,
+            http_path: "/trevrpc".to_owned(),
+            http_admission: None,
             webtransport_enabled: false,
             webtransport_allowed_authorities: Vec::new(),
             webtransport_allowed_origins: Vec::new(),
@@ -386,21 +386,21 @@ impl ServerOptions {
 
     /// Returns whether ordinary HTTP/3 POST requests are accepted. Off by default.
     #[must_use]
-    pub const fn http3_enabled(&self) -> bool {
-        self.http3_enabled
+    pub const fn http_enabled(&self) -> bool {
+        self.http_enabled
     }
 
     /// Returns the path shared by HTTP/3 `POST` RPCs and `WebTransport` sessions, `/trevrpc` by
     /// default.
     #[must_use]
-    pub fn http3_path(&self) -> &str {
-        &self.http3_path
+    pub fn http_path(&self) -> &str {
+        &self.http_path
     }
 
     /// Returns the HTTP/3 POST admission callback, if configured.
     #[must_use]
-    pub const fn http3_admission(&self) -> Option<Http3Admission> {
-        self.http3_admission
+    pub const fn http_admission(&self) -> Option<HttpAdmission> {
+        self.http_admission
     }
 
     /// Returns whether `WebTransport` sessions are accepted. Off by default: every `WebTransport`
@@ -514,22 +514,22 @@ impl ServerOptions {
     /// The `h3` ALPN is advertised by [`Server::quic_config`] only when HTTP/3 or `WebTransport`
     /// is enabled.
     #[must_use]
-    pub const fn with_http3_enabled(mut self, http3_enabled: bool) -> Self {
-        self.http3_enabled = http3_enabled;
+    pub const fn with_http_enabled(mut self, http_enabled: bool) -> Self {
+        self.http_enabled = http_enabled;
         self
     }
 
     /// Sets the path shared by HTTP/3 `POST` RPCs and `WebTransport` sessions.
     #[must_use]
-    pub fn with_http3_path(mut self, http3_path: impl Into<String>) -> Self {
-        self.http3_path = http3_path.into();
+    pub fn with_http_path(mut self, http_path: impl Into<String>) -> Self {
+        self.http_path = http_path.into();
         self
     }
 
     /// Sets the HTTP/3 POST admission callback.
     #[must_use]
-    pub const fn with_http3_admission(mut self, http3_admission: Option<Http3Admission>) -> Self {
-        self.http3_admission = http3_admission;
+    pub const fn with_http_admission(mut self, http_admission: Option<HttpAdmission>) -> Self {
+        self.http_admission = http_admission;
         self
     }
 
@@ -2244,25 +2244,25 @@ mod tests {
         );
         assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
         {
-            assert!(!options.http3_enabled());
+            assert!(!options.http_enabled());
             assert!(!options.webtransport_enabled());
-            assert_eq!(options.http3_path(), "/trevrpc");
-            assert!(options.http3_admission().is_none());
+            assert_eq!(options.http_path(), "/trevrpc");
+            assert!(options.http_admission().is_none());
         }
     }
 
     #[test]
     fn options_own_runtime_paths_and_allowlists() {
-        let http3_path = String::from("/owned-http3");
+        let http_path = String::from("/owned-http3");
         let authority = String::from("rpc.example");
         let origin = String::from("https://app.example");
         let options = ServerOptions::new()
-            .with_http3_path(http3_path.clone())
+            .with_http_path(http_path.clone())
             .with_webtransport_allowed_authorities([authority.clone()])
             .with_webtransport_allowed_origins([origin.clone()]);
-        drop((http3_path, authority, origin));
+        drop((http_path, authority, origin));
 
-        assert_eq!(options.http3_path(), "/owned-http3");
+        assert_eq!(options.http_path(), "/owned-http3");
         assert_eq!(options.webtransport_allowed_authorities(), ["rpc.example"]);
         assert_eq!(
             options.webtransport_allowed_origins(),

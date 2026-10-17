@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
@@ -22,12 +23,49 @@ type DialOptions struct {
 	QUICConfig *quic.Config
 	// MaxFrameSize bounds a single frame in bytes. It defaults to DefaultMaxFrameSize.
 	MaxFrameSize int
+	// Transport selects the transports Dial and reconnects use. The default,
+	// TransportAuto, prefers QUIC and falls back to QMux over TLS when QUIC
+	// does not connect within FallbackDelay.
+	Transport TransportPolicy
+	// TCPAddr is the host:port of the server's TCP listener. It defaults to the
+	// dial address.
+	TCPAddr string
+	// FallbackDelay is how long QUIC may take to connect before QMux over TLS
+	// is tried in parallel. It defaults to 300 milliseconds.
+	FallbackDelay time.Duration
+	// ReprobeInterval is how long reconnects keep using QMux over TLS after it
+	// won a race, before QUIC is tried again. It defaults to 5 minutes.
+	ReprobeInterval time.Duration
 	// OnEvent receives channel lifecycle events asynchronously from a bounded queue.
 	OnEvent func(ChannelEvent)
 }
 
-// Dial connects to a TrevRPC server over native QUIC and returns a Channel that
-// reconnects after connection loss. addr is a host:port. The context applies
+// TransportPolicy selects the transports a Channel connects with.
+type TransportPolicy uint8
+
+const (
+	// TransportAuto prefers QUIC and falls back to QMux over TLS when UDP is
+	// blocked.
+	TransportAuto TransportPolicy = iota
+	// TransportQUICOnly connects over QUIC only.
+	TransportQUICOnly
+	// TransportTCPOnly connects over QMux over TLS only.
+	TransportTCPOnly
+)
+
+// TransportKind identifies the transport of a connection.
+type TransportKind string
+
+const (
+	// TransportQUIC is native TrevRPC over QUIC (ALPN trevrpc/1).
+	TransportQUIC TransportKind = "quic"
+	// TransportQMux is native TrevRPC over QMux over TLS (ALPN qmux-02.trevrpc-1).
+	TransportQMux TransportKind = "qmux"
+)
+
+// Dial connects to a TrevRPC server and returns a Channel that reconnects after
+// connection loss. addr is a host:port. By default QUIC is preferred and QMux
+// over TLS is the fallback; see DialOptions.Transport. The context applies
 // only to the initial dial; Close controls the Channel afterwards.
 //
 // Each RPC uses exactly one connection generation and is never retried or
@@ -38,17 +76,37 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil || host == "" || strings.Contains(addr, "://") {
-		return nil, InvalidArgument("dial address must be host:port; clients speak native QUIC only")
+		return nil, InvalidArgument("dial address must be host:port")
+	}
+	tcpAddr := options.TCPAddr
+	if tcpAddr == "" {
+		tcpAddr = addr
+	} else if _, _, err := net.SplitHostPort(tcpAddr); err != nil {
+		return nil, InvalidArgument("TCP address must be host:port")
 	}
 	maxFrameSize := options.MaxFrameSize
 	if maxFrameSize <= 0 {
 		maxFrameSize = DefaultMaxFrameSize
 	}
-	connector := &quicConnector{
+	quicConnector := &quicConnector{
 		addr:         addr,
 		tls:          clientTLSConfig(options.TLSConfig, host),
 		quic:         clientQUICConfig(options.QUICConfig, maxFrameSize),
 		maxFrameSize: maxFrameSize,
+	}
+	qmuxConnector := &qmuxConnector{
+		addr:         tcpAddr,
+		tls:          clientQMuxTLSConfig(options.TLSConfig, host),
+		maxFrameSize: maxFrameSize,
+	}
+	var connector channelConnector
+	switch options.Transport {
+	case TransportQUICOnly:
+		connector = quicConnector
+	case TransportTCPOnly:
+		connector = qmuxConnector
+	default:
+		connector = newRacingConnector(quicConnector, qmuxConnector, options.FallbackDelay, options.ReprobeInterval)
 	}
 	return dialChannel(ctx, connector, options.OnEvent)
 }
@@ -68,37 +126,47 @@ func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) 
 		}
 		return nil, Unavailable("transport unavailable: " + err.Error())
 	}
-	return &connGeneration{
-		conn:   conn,
+	return &streamGeneration{
+		kind:   TransportQUIC,
 		client: newStreamClient(connOpener{conn}, c.maxFrameSize),
+		close: func() error {
+			err := conn.CloseWithError(0, "client closed")
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		},
+		done: conn.Context().Done(),
+		err:  func() error { return context.Cause(conn.Context()) },
 	}, nil
 }
 
-// connGeneration is one native QUIC connection owned by a Channel.
-type connGeneration struct {
-	conn   *quic.Conn
+// streamGeneration is one connection owned by a Channel. Every transport
+// carries RPCs on one bidirectional stream each, so only opening streams and
+// the connection lifecycle differ between them.
+type streamGeneration struct {
+	kind   TransportKind
 	client *streamClient
+	close  func() error
+	done   <-chan struct{}
+	err    func() error
 }
 
-func (g *connGeneration) call(ctx context.Context, request *wireRequest) (*wireResponse, error) {
+func (g *streamGeneration) call(ctx context.Context, request *wireRequest) (*wireResponse, error) {
 	return g.client.call(ctx, request)
 }
 
-func (g *connGeneration) streamingCall(ctx context.Context, request *wireRequest, requestBody byteStream) (frameStream, error) {
+func (g *streamGeneration) streamingCall(ctx context.Context, request *wireRequest, requestBody byteStream) (frameStream, error) {
 	return g.client.streamingCall(ctx, request, requestBody)
 }
 
-func (g *connGeneration) Close() error {
-	err := g.conn.CloseWithError(0, "client closed")
-	if errors.Is(err, net.ErrClosed) {
-		return nil
-	}
-	return err
-}
+func (g *streamGeneration) Close() error { return g.close() }
 
-func (g *connGeneration) Done() <-chan struct{} { return g.conn.Context().Done() }
+func (g *streamGeneration) Done() <-chan struct{} { return g.done }
 
-func (g *connGeneration) Err() error { return context.Cause(g.conn.Context()) }
+func (g *streamGeneration) Err() error { return g.err() }
+
+func (g *streamGeneration) transportKind() TransportKind { return g.kind }
 
 type connOpener struct{ conn *quic.Conn }
 

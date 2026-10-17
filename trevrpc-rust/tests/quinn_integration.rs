@@ -28,7 +28,7 @@ mod support;
 const AUTH_TOKEN: &str = "integration-token";
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn reject_http3_admission(request: &trevrpc::server::Http3AdmissionRequest<'_>) -> bool {
+fn reject_http3_admission(request: &trevrpc::server::HttpAdmissionRequest<'_>) -> bool {
     assert!(request.headers.iter().any(|header| {
         header.name.eq_ignore_ascii_case("content-type")
             && header.value.eq_ignore_ascii_case(b"application/trevrpc")
@@ -817,7 +817,7 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
 #[tokio::test]
 async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let server = spawn_http3_greeter_server(|server| {
-        server.set_options(server.options().clone().with_http3_enabled(true));
+        server.set_options(server.options().clone().with_http_enabled(true));
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let (endpoint, connection, client) = connect_http3_client(&server).await?;
@@ -889,7 +889,7 @@ async fn webtransport_is_opt_in_while_http3_post_works() -> TestResult {
         server.set_options(
             fast_server_options()
                 .with_webtransport_enabled(false)
-                .with_http3_enabled(true),
+                .with_http_enabled(true),
         );
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
@@ -920,7 +920,7 @@ async fn http3_post_is_opt_in_while_webtransport_works() -> TestResult {
         server.set_options(
             fast_server_options()
                 .with_webtransport_enabled(true)
-                .with_http3_enabled(false),
+                .with_http_enabled(false),
         );
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
@@ -965,7 +965,7 @@ async fn h3_alpn_is_not_negotiated_unless_http3_or_webtransport_is_enabled() -> 
 #[tokio::test]
 async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> TestResult {
     let server = spawn_greeter_server(|server| {
-        server.set_options(server.options().clone().with_http3_enabled(true));
+        server.set_options(server.options().clone().with_http_enabled(true));
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
 
@@ -1039,7 +1039,7 @@ async fn h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> Tes
     let server = spawn_greeter_server(|server| {
         server.set_options(
             fast_server_options()
-                .with_http3_enabled(true)
+                .with_http_enabled(true)
                 .with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
         );
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -1104,12 +1104,12 @@ async fn h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> Tes
 #[tokio::test]
 async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
     let server = spawn_greeter_server(|server| {
-        server.set_options(server.options().clone().with_http3_enabled(true));
+        server.set_options(server.options().clone().with_http_enabled(true));
         server.set_options(
             server
                 .options()
                 .clone()
-                .with_http3_admission(Some(reject_http3_admission)),
+                .with_http_admission(Some(reject_http3_admission)),
         );
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
@@ -1185,7 +1185,7 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
     let server = spawn_greeter_server(move |server| {
         server.set_options(
             fast_server_options()
-                .with_http3_enabled(true)
+                .with_http_enabled(true)
                 .with_max_stream_messages(Some(1)),
         );
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
@@ -3512,7 +3512,7 @@ fn spawn_http3_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult
     spawn_greeter_server(|server| {
         server.set_options(
             fast_server_options()
-                .with_http3_enabled(true)
+                .with_http_enabled(true)
                 .with_webtransport_admission(Some(reject_webtransport_admission)),
         );
         configure(server);

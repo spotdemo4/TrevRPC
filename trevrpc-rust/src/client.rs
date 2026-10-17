@@ -19,14 +19,19 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 mod channel;
+mod native;
+mod qmux;
 mod quic;
+mod race;
 mod upload;
 
 pub use channel::{
     Channel, ChannelConfig, ChannelEvent, ChannelPhase, ChannelState, ExponentialBackoff,
     ReconnectBackoff,
 };
+pub use qmux::QmuxTransport;
 pub use quic::QuicTransport;
+pub use race::{TransportKind, TransportPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {

@@ -3,6 +3,8 @@
 //
 //	trevrpc-interop server --cert cert.pem --key key.pem [--host 127.0.0.1] [--port 0]
 //	trevrpc-interop client --addr host:port --ca cert.pem [--server-name localhost]
+//	                       [--transport quic|tcp|auto] [--tcp-addr host:port]
+//	                       [--expect-transport quic|qmux]
 package main
 
 import (
@@ -60,11 +62,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		flags.StringVar(&config.addr, "addr", "", "server host:port")
 		flags.StringVar(&config.caFile, "ca", "", "trusted server certificate PEM file")
 		flags.StringVar(&config.serverName, "server-name", "localhost", "TLS server name")
+		flags.StringVar(&config.transport, "transport", "quic", "transport policy: quic, tcp (QMux over TLS) or auto (QUIC with TCP fallback)")
+		flags.StringVar(&config.tcpAddr, "tcp-addr", "", "server TCP host:port (defaults to --addr)")
+		flags.StringVar(&config.expectTransport, "expect-transport", "", "fail unless the channel connects over this transport (quic or qmux)")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
 		if config.addr == "" || config.caFile == "" {
 			fmt.Fprintln(stderr, "client: --addr and --ca are required")
+			return 2
+		}
+		if _, ok := transportPolicies[config.transport]; !ok {
+			fmt.Fprintf(stderr, "client: unknown --transport %q\n", config.transport)
 			return 2
 		}
 		passed, err := runClient(ctx, config, stdout)

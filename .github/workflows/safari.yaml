@@ -1,9 +1,10 @@
 name: safari
 
-# Runs the browser interop suite in Safari on macOS. The Go lane must pass. The
-# Rust server's h3-webtransport does not speak the WebTransport draft Safari
-# uses (hyperium/h3#347), so the Rust lane is an allowed failure: it keeps
-# running so the failure stays visible, without failing the workflow.
+# Runs the browser interop suite in Safari on macOS. Every Go lane must pass,
+# and so must the Rust QMux over WebSocket lanes. The Rust server's
+# h3-webtransport does not speak the WebTransport draft Safari uses
+# (hyperium/h3#347), so the Rust WebTransport lane is an allowed failure: it
+# keeps running so the failure stays visible, without failing the workflow.
 
 on:
   pull_request:
@@ -21,7 +22,7 @@ permissions:
 
 jobs:
   interop:
-    name: safari-to-${{ matrix.server }}
+    name: safari-${{ matrix.name }}-to-${{ matrix.server }}
     runs-on: macos-26
     timeout-minutes: 60
     continue-on-error: ${{ matrix.allow-failure }}
@@ -33,18 +34,27 @@ jobs:
       matrix:
         include:
           - server: go
+            name: all
+            lanes: webtransport,websocket,fallback
             allow-failure: false
           - server: rust
+            name: websocket
+            lanes: websocket,fallback
+            allow-failure: false
+          - server: rust
+            name: webtransport
+            lanes: webtransport
             allow-failure: true
     env:
       SERVER: ${{ matrix.server }}
+      LANES: ${{ matrix.lanes }}
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
 
       - name: Run Safari interop
         env:
-          OUTPUT: ${{ runner.temp }}/safari-to-${{ matrix.server }}
+          OUTPUT: ${{ runner.temp }}/safari-${{ matrix.name }}-to-${{ matrix.server }}
         run: |
           nix shell \
             .#trevrpc-js \
@@ -53,12 +63,13 @@ jobs:
             --command trevrpc-interop \
               --out "$OUTPUT" \
               --server "$SERVER=trevrpc-interop-$SERVER" \
-              --browser webkit
+              --browser webkit \
+              --browser-lanes "$LANES"
 
       - name: Upload failure diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: safari-to-${{ matrix.server }}
+          name: safari-${{ matrix.name }}-to-${{ matrix.server }}
           path: ${{ runner.temp }}/safari-to-${{ matrix.server }}
           if-no-files-found: ignore

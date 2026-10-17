@@ -98,17 +98,21 @@ class ParseInstrumentationTest(unittest.TestCase):
 
 class ParsePortsTest(unittest.TestCase):
     def test_accepts_the_readiness_line(self) -> None:
-        ports = run.parse_ports('{"native":4433,"http3":4434,"webtransport":4435}')
+        ports = run.parse_ports(
+            '{"native":4433,"http3":4434,"webtransport":4435,"http2":4436,"qmux":4436}'
+        )
 
         self.assertEqual(4434, ports["http3"])
+        self.assertEqual(4436, ports["http2"])
 
     def test_rejects_malformed_lines(self) -> None:
         for line in [
             "",
             "ready",
             "[]",
-            '{"native":1,"http3":0,"webtransport":1}',
-            '{"native":1,"webtransport":1}',
+            '{"native":1,"http3":0,"http2":1}',
+            '{"native":1,"webtransport":1,"http2":1}',
+            '{"native":1,"http3":1,"webtransport":1}',
         ]:
             with self.subTest(line=line), self.assertRaises(run.RunnerError):
                 _ = run.parse_ports(line)
@@ -122,7 +126,7 @@ class StartServerTest(unittest.TestCase):
             script = [
                 "#!/bin/sh",
                 'echo "$@" >&2',
-                'echo \'{"native":1,"http3":4434,"webtransport":1}\'',
+                'echo \'{"native":1,"http3":4434,"webtransport":1,"http2":1}\'',
                 "cat >/dev/null",
             ]
             _ = server.write_text("\n".join(script) + "\n", encoding="utf-8")

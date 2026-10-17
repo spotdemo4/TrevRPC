@@ -1,23 +1,45 @@
 # Interop
 
 Cross-runtime interoperability tests. Every server is exercised by every client
-over the transport that client speaks:
+over every transport that client speaks. QUIC is the primary transport; each
+client also has a TCP fallback for networks that block UDP.
 
-| Client                   | Transport    | Servers                   |
-| ------------------------ | ------------ | ------------------------- |
-| Go                       | native QUIC  | Go, Rust                  |
-| Rust                     | native QUIC  | Go, Rust                  |
-| JavaScript (Chromium)    | WebTransport | Go, Rust                  |
-| JavaScript (Firefox)     | WebTransport | Go, Rust                  |
-| Kotlin (Cronet, Android) | HTTP/3       | Go, Rust                  |
-| JavaScript (Safari)      | WebTransport | Go; Rust expected to fail |
+| Client                   | Primary transport | TCP fallback        | Servers                                |
+| ------------------------ | ----------------- | ------------------- | -------------------------------------- |
+| Go                       | native QUIC       | QMux over TLS       | Go, Rust                               |
+| Rust                     | native QUIC       | QMux over TLS       | Go, Rust                               |
+| JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust                               |
+| JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust                               |
+| Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust                               |
+| JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go; Rust WebTransport expected to fail |
 
 `run.sh` (packaged with its tools as `nix run .#trevrpc-interop`) drives the desktop matrix, which `nix flake check` runs on Linux for
 Chromium and Firefox. CI runs the Android client on an emulator because it needs
-KVM, and runs Safari on macOS. Safari passes against the Go server. Rust's `h3`
-does not yet speak the WebTransport draft Safari uses, so the Rust lane is
-expected to fail; it is an allowed failure in the `safari` workflow, so it stays
+KVM (once over HTTP/3 and once over HTTP/2 with QUIC disabled), and runs Safari
+on macOS. Safari passes every lane against the Go server. Against the Rust
+server it passes the WebSocket and fallback lanes; Rust's `h3` does not yet
+speak the WebTransport draft Safari uses, so the Rust WebTransport lane is
+expected to fail. It is an allowed failure in the `safari` workflow, so it stays
 visible without failing the workflow.
+
+## Cells
+
+`run.sh` runs one cell per client, server, and transport (`X` is a native client,
+`B` a browser, `S` a server):
+
+| Cell              | Client   | Transport                                                                                       |
+| ----------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `X-to-S`          | Go, Rust | QUIC                                                                                            |
+| `X-qmux-to-S`     | Go, Rust | QMux over TLS on the server's TCP port                                                          |
+| `X-fallback-to-S` | Go, Rust | `auto`, with the QUIC address pointing at UDP port 24999, which nothing answers: must fall back |
+| `B-to-S`          | Browser  | WebTransport                                                                                    |
+| `B-wss-to-S`      | Browser  | QMux over WebSocket (`wss://`)                                                                  |
+| `B-fallback-to-S` | Browser  | `auto`, with the WebTransport URL pointing at UDP port 24999: must fall back to WebSocket       |
+
+`--browser-lanes webtransport,websocket,fallback` selects which browser lanes
+run (default: all three). Each cell asserts the transport it actually used
+(`--expect-transport`), so a cell fails if it connects over the wrong
+transport.
 
 ## Service
 
@@ -59,10 +81,15 @@ have their own entry points but follow the same output contract.
 ```
 
 - Serves `Echo` over native QUIC (ALPN `trevrpc/1`), ordinary HTTP/3
-  (`POST /trevrpc`), and WebTransport (`/trevrpc`).
+  (`POST /trevrpc`), and WebTransport (`/trevrpc`) on a UDP port, and over QMux
+  over TLS (ALPN `qmux-02.trevrpc-1`), HTTP/2 (`POST /trevrpc`), and QMux over
+  WebSocket (`/trevrpc`, subprotocol `qmux-02.trevrpc-1`) on a TCP port.
 - Once every listener is accepting, prints exactly one JSON line to stdout
-  and flushes it: `{"native":<port>,"http3":<port>,"webtransport":<port>}`.
-  The ports may be equal when one UDP socket serves several protocols.
+  and flushes it:
+  `{"native":<P>,"http3":<P>,"webtransport":<P>,"qmux":<T>,"http2":<T>,"websocket":<T>}`.
+  `P` is the UDP port and `T` the TCP port. The ports within each group are
+  equal when one socket serves several protocols. The Go server uses the same
+  number for `P` and `T`; the Rust server may use different ones.
 - Runs until stdin reaches EOF or it receives `SIGTERM`/`SIGINT`, then shuts
   down gracefully and exits `0`.
 - Diagnostics go to stderr.
@@ -71,11 +98,38 @@ have their own entry points but follow the same output contract.
 
 ```text
 <binary> client --addr <host:port> --ca <cert.pem> [--server-name localhost]
+                [--transport quic|tcp|auto] [--tcp-addr <host:port>]
+                [--expect-transport quic|qmux]
 ```
 
+- `--transport` selects QUIC only (`quic`, the default), QMux over TLS only
+  (`tcp`), or QUIC with a QMux fallback (`auto`). `--tcp-addr` is the server's
+  TCP address and defaults to `--addr`.
+- `--expect-transport` fails the run unless the channel connected over that
+  transport.
 - Runs every scenario above in order.
 - Prints `ok <name>` or `fail <name>: <reason>` per scenario to stdout.
 - Exits `0` only if every scenario passed.
+
+### Browser client
+
+```text
+trevrpc-interop-browser --browser chromium|firefox|webkit --url <https://host:port/trevrpc>
+                        --cert-hash <hex sha256> [--transport webtransport|websocket|auto]
+                        [--ws-url <wss://host:port/trevrpc>]
+                        [--expect-transport webtransport|websocket]
+```
+
+It follows the same output contract. `--transport` defaults to `webtransport`;
+`--ws-url` defaults to `--url` with the `wss:` scheme. `--expect-transport`
+fails the run unless the channel connected over that transport. The browser
+contexts ignore certificate errors, because WSS cannot pin a certificate hash.
+
+### Android client
+
+`trevrpc-interop-android` accepts `--transport http3|http2` (default `http3`).
+`http2` runs with Cronet's QUIC disabled, so the scenarios use the server's
+HTTP/2 mapping on its TCP port.
 
 ### Certificates
 
@@ -84,3 +138,5 @@ with SANs `DNS:localhost` and `IP:127.0.0.1` and `CA:FALSE` (rustls rejects a CA
 certificate as a server identity). It is both the server certificate and the
 client trust root. Browsers trust it through WebTransport
 `serverCertificateHashes`, which requires ECDSA and at most 14 days validity.
+The WSS lanes cannot pin a hash, so the browser contexts ignore certificate
+errors instead.

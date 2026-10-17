@@ -18,9 +18,18 @@ import (
 const scenarioTimeout = 10 * time.Second
 
 type clientConfig struct {
-	addr       string
-	caFile     string
-	serverName string
+	addr            string
+	caFile          string
+	serverName      string
+	transport       string
+	tcpAddr         string
+	expectTransport string
+}
+
+var transportPolicies = map[string]trevrpc.TransportPolicy{
+	"quic": trevrpc.TransportQUICOnly,
+	"tcp":  trevrpc.TransportTCPOnly,
+	"auto": trevrpc.TransportAuto,
 }
 
 // scenario is one named call from interop/README.md.
@@ -29,9 +38,9 @@ type scenario struct {
 	run  func(context.Context, *interoppb.EchoClient) error
 }
 
-// runClient runs every scenario against a native QUIC server and prints
-// "ok <name>" or "fail <name>: <reason>" for each. It reports whether all
-// scenarios passed.
+// runClient runs every scenario against a server over the configured transport
+// and prints "ok <name>" or "fail <name>: <reason>" for each. It reports
+// whether all scenarios passed.
 func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, error) {
 	ca, err := os.ReadFile(config.caFile)
 	if err != nil {
@@ -45,11 +54,16 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 	defer cancel()
 	channel, err := trevrpc.Dial(dialCtx, config.addr, trevrpc.DialOptions{
 		TLSConfig: &tls.Config{RootCAs: roots, ServerName: config.serverName},
+		Transport: transportPolicies[config.transport],
+		TCPAddr:   config.tcpAddr,
 	})
 	if err != nil {
 		return false, fmt.Errorf("dial %s: %w", config.addr, err)
 	}
 	defer channel.Close()
+	if want := config.expectTransport; want != "" && string(channel.Transport()) != want {
+		return false, fmt.Errorf("connected over %s, want %s", channel.Transport(), want)
+	}
 	return runScenarios(ctx, channel, out), nil
 }
 

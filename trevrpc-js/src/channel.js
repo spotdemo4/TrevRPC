@@ -1,3 +1,5 @@
+import { QMuxWebSocketSession } from "./qmux/session.js";
+import { dialRace } from "./race.js";
 import { cancelled, statusFromTransportError, unavailable } from "./status.js";
 
 /** WebTransport constructor options passed through unchanged. */
@@ -10,34 +12,45 @@ const WebTransportOptionKeys = [
 
 const Backoff = Object.freeze({ initialDelayMs: 100, maxDelayMs: 30_000, jitter: 0.2 });
 
+const DefaultTransports = Object.freeze(["webtransport", "websocket"]);
+const DefaultFallbackDelayMs = 300;
+const DefaultReprobeIntervalMs = 5 * 60_000;
+
 /**
- * A WebTransport session that reconnects in the background after it is lost. Calls open their
- * streams on the current session and fail fast with Unavailable while it reconnects; a call that
- * was in flight when the session was lost is never replayed.
+ * A session that reconnects in the background after it is lost: WebTransport, or QMux over
+ * WebSocket when WebTransport is unavailable or blocked. Calls open their streams on the current
+ * session and fail fast with Unavailable while it reconnects; a call that was in flight when the
+ * session was lost is never replayed.
  */
 export class Channel {
   #dial;
   #onStateChange;
   #session;
+  #transport;
   #state = "ready";
   #waiters = [];
   #stopped = new AbortController();
 
   /** Opens a channel and waits for its first session; use connect() instead. */
   static async connect(url, options = {}) {
-    const dial = (signal) => dialSession(url, options, signal);
+    const dial = sessionDialer(url, options);
     return new Channel(await dial(options.signal), dial, options.onStateChange);
   }
 
-  constructor(session, dial, onStateChange) {
+  constructor(dialed, dial, onStateChange) {
     this.#dial = dial;
     this.#onStateChange = onStateChange;
-    this.#adopt(session);
+    this.#adopt(dialed);
   }
 
   /** "ready", "reconnecting" while the session is being re-established, or "closed". */
   get state() {
     return this.#state;
+  }
+
+  /** The transport of the current or last session: "webtransport" or "websocket". */
+  get transport() {
+    return this.#transport;
   }
 
   /** Opens a bidirectional stream on the current session. */
@@ -74,8 +87,9 @@ export class Channel {
     closeQuietly(session, closeInfo);
   }
 
-  #adopt(session) {
+  #adopt({ session, transport }) {
     this.#session = session;
+    this.#transport = transport;
     const lost = (reason) => this.#lost(session, reason);
     session.closed.then(lost, lost);
   }
@@ -100,13 +114,13 @@ export class Channel {
       }
 
       try {
-        const session = await this.#dial(signal);
+        const dialed = await this.#dial(signal);
         if (signal.aborted) {
-          closeQuietly(session);
+          closeQuietly(dialed.session);
           return;
         }
-        this.#adopt(session);
-        this.#transition("ready", { attempt });
+        this.#adopt(dialed);
+        this.#transition("ready", { attempt, transport: dialed.transport });
         for (const waiter of this.#waiters.splice(0)) {
           waiter.resolve();
         }
@@ -128,13 +142,70 @@ export class Channel {
   }
 }
 
-/** Opens a channel to a WebTransport server and waits for its session to be ready. */
+/** Opens a channel to a TrevRPC server and waits for its session to be ready. */
 export function connect(url, options = {}) {
   return Channel.connect(url, options);
 }
 
+/**
+ * Returns `dial(signal)`, which establishes the next session as `{ session, transport }`.
+ *
+ * WebTransport is preferred. QMux over WebSocket starts in parallel once WebTransport fails or has
+ * not connected within `fallbackDelayMs`, and the first ready session wins. After WebSocket wins,
+ * reconnects use it directly until `reprobeIntervalMs` has passed.
+ */
+function sessionDialer(url, options) {
+  const webSocketUrl = options.webSocketUrl ?? defaultWebSocketUrl(url);
+  const candidates = {
+    webtransport: {
+      transport: "webtransport",
+      dial: (signal) => dialWebTransport(url, options, signal),
+    },
+    websocket: {
+      transport: "websocket",
+      dial: (signal) => dialWebSocket(webSocketUrl, options, signal),
+    },
+  };
+  const [primary, fallback, ...rest] = (options.transports ?? DefaultTransports).map((name) => {
+    const candidate = candidates[name];
+    if (candidate === undefined) {
+      throw new TypeError(`unknown transport "${name}"`);
+    }
+    return candidate;
+  });
+  if (primary === undefined || rest.length > 0 || primary === fallback) {
+    throw new TypeError("transports must list one or two distinct transports");
+  }
+  const delayMs = options.fallbackDelayMs ?? DefaultFallbackDelayMs;
+  const reprobeIntervalMs = options.reprobeIntervalMs ?? DefaultReprobeIntervalMs;
+  let fallbackWonAt = null;
+
+  const dialOne = async (candidate, signal) => ({
+    session: await candidate.dial(signal),
+    transport: candidate.transport,
+  });
+  return async (signal) => {
+    if (fallback === undefined) {
+      return dialOne(primary, signal);
+    }
+    if (fallbackWonAt !== null && Date.now() - fallbackWonAt < reprobeIntervalMs) {
+      return dialOne(fallback, signal);
+    }
+    const dialed = await dialRace(primary, fallback, { delayMs, signal });
+    fallbackWonAt = dialed.transport === fallback.transport ? Date.now() : null;
+    return dialed;
+  };
+}
+
+/** The `wss://` URL of the same endpoint as an `https://` URL. */
+function defaultWebSocketUrl(url) {
+  const webSocketUrl = new URL(url);
+  webSocketUrl.protocol = webSocketUrl.protocol === "http:" ? "ws:" : "wss:";
+  return webSocketUrl.href;
+}
+
 /** Establishes a ready WebTransport session; aborting the signal abandons the attempt. */
-async function dialSession(url, options, signal) {
+function dialWebTransport(url, options, signal) {
   const WebTransportConstructor = options.WebTransport ?? globalThis.WebTransport;
   if (typeof WebTransportConstructor !== "function") {
     throw unavailable("WebTransport is not available in this JavaScript runtime");
@@ -142,8 +213,29 @@ async function dialSession(url, options, signal) {
   if (signal?.aborted) {
     throw abortError(signal);
   }
+  return establish(
+    new WebTransportConstructor(url, transportOptions(options)),
+    "WebTransport",
+    signal,
+  );
+}
 
-  const session = new WebTransportConstructor(url, transportOptions(options));
+/** Establishes a ready QMux over WebSocket session; aborting the signal abandons the attempt. */
+function dialWebSocket(url, options, signal) {
+  if (signal?.aborted) {
+    throw abortError(signal);
+  }
+  let session;
+  try {
+    session = new QMuxWebSocketSession(url, { WebSocket: options.WebSocket });
+  } catch (error) {
+    throw statusFromTransportError(error);
+  }
+  return establish(session, "WebSocket", signal);
+}
+
+/** Waits for a new session to become ready, closing it if it fails or the signal aborts. */
+async function establish(session, name, signal) {
   const abandon = () => closeQuietly(session);
   signal?.addEventListener("abort", abandon, { once: true });
   try {
@@ -152,7 +244,7 @@ async function dialSession(url, options, signal) {
     await Promise.race([
       session.ready,
       session.closed.then(() => {
-        throw unavailable("WebTransport session closed before becoming ready");
+        throw unavailable(`${name} session closed before becoming ready`);
       }),
     ]);
   } catch (error) {

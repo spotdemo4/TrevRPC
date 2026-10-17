@@ -15,25 +15,28 @@
 [![maven-central](https://img.shields.io/maven-central/v/zip.trev.trevrpc/core?strategy=highestVersion&logo=apachemaven&logoColor=%23bac2de&labelColor=%23313244&color=%237F52FF)](https://central.sonatype.com/search?namespace=zip.trev.trevrpc)
 [![crates.io](https://img.shields.io/crates/v/trevrpc?labelColor=%23313244&color=%23D34516)](https://crates.io/crates/trevrpc)
 
-Protobuf over QUIC, HTTP/3 & WebTransport, with Go, Rust, JavaScript, and Kotlin runtimes
+Protobuf over QUIC, HTTP/3 & WebTransport, with TCP fallbacks (QMux, HTTP/2 & WebSocket), and Go, Rust, JavaScript, and Kotlin runtimes
 
 ## Support
 
-| Runtime                            | Server                                | Client       |
-| ---------------------------------- | ------------------------------------- | ------------ |
-| [Go](trevrpc-go)                   | native QUIC, HTTP/3, and WebTransport | native QUIC  |
-| [Rust](trevrpc-rust)               | native QUIC, HTTP/3, and WebTransport | native QUIC  |
-| [JavaScript](trevrpc-js) (browser) | —                                     | WebTransport |
-| [Kotlin](trevrpc-kotlin) (Android) | —                                     | HTTP/3       |
+QUIC is the primary transport. Every runtime also has a TCP fallback for networks that block UDP and browsers without WebTransport.
 
-Every client is tested against every server; see [interop](interop). The
-browser client is supported on Chromium and Firefox with both servers, and on
-Safari with the Go server only: Rust's `h3` does not yet speak the WebTransport
-draft Safari uses ([h3#347](https://github.com/hyperium/h3/issues/347)). The
-`safari` workflow keeps running the Rust lane as an allowed failure so that it
-shows when upstream compatibility arrives.
+| Runtime                            | Server                                                                                           | Client                                                    |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| [Go](trevrpc-go)                   | native QUIC, HTTP/3, and WebTransport; fallbacks: QMux over TLS, HTTP/2, and QMux over WebSocket | native QUIC; fallback: QMux over TLS                      |
+| [Rust](trevrpc-rust)               | native QUIC, HTTP/3, and WebTransport; fallbacks: QMux over TLS, HTTP/2, and QMux over WebSocket | native QUIC; fallback: QMux over TLS                      |
+| [JavaScript](trevrpc-js) (browser) | —                                                                                                | WebTransport; fallback: QMux over WebSocket               |
+| [Kotlin](trevrpc-kotlin) (Android) | —                                                                                                | HTTP/3; fallback: HTTP/2 (Cronet's built-in TCP fallback) |
 
-The wire format is shared by every runtime and pinned by
-[`testdata/wire-golden-vectors.txt`](testdata/wire-golden-vectors.txt).
+Every client is tested against every server over every transport it speaks; see [interop](interop). The
+browser client is supported on Chromium, Firefox, and Safari with both servers. Safari works with the Rust
+server over the WebSocket fallback; only Rust's WebTransport is still affected on Safari, because `h3` does
+not yet speak the WebTransport draft Safari uses ([h3#347](https://github.com/hyperium/h3/issues/347)). The
+`safari` workflow keeps running that lane as an allowed failure so that it shows when upstream compatibility
+arrives.
+
+The wire format is shared by every runtime and transport and pinned by
+[`testdata/wire-golden-vectors.txt`](testdata/wire-golden-vectors.txt). The QMux framing used by the TCP
+fallbacks is pinned by [`testdata/qmux-golden-vectors.txt`](testdata/qmux-golden-vectors.txt).
 
 Full documentation is available in the [TrevRPC wiki](https://trev.zip/llc/TrevRPC/wiki)

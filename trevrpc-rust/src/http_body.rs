@@ -1,0 +1,190 @@
+//! RPC streams carried in HTTP request and response bodies: HTTP/3 and HTTP/2 requests, and
+//! `WebTransport` streams, which share the same body-oriented libraries.
+
+use std::future::Future;
+use std::sync::Arc;
+
+use bytes::{Buf, Bytes};
+use tokio::sync::{Semaphore, watch};
+
+use crate::framed::{self, FrameRead, FrameWrite};
+use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
+use crate::server::Server;
+use crate::server_transport::{self, ResponseWriter};
+use crate::{Result, RpcRequest, RpcResponse, RpcStreamFrame};
+
+/// The send half of one HTTP request or `WebTransport` stream.
+pub(crate) trait BodySink: Send + 'static {
+    fn write(&mut self, chunk: &[u8]) -> impl Future<Output = Result<()>> + Send;
+
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
+
+    fn reset(&mut self);
+
+    /// Resolves `Ok` when the peer stops reading the response, and with an error when the
+    /// connection is lost first.
+    fn stopped(&mut self) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// The receive half of one HTTP request or `WebTransport` stream.
+pub(crate) trait BodySource: Send + 'static {
+    fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Bytes>>> + Send;
+
+    /// Validates anything that follows the request body, such as HTTP trailers.
+    fn validate_end(&mut self) -> impl Future<Output = Result<()>> + Send;
+
+    /// Resolves when the transport ends the request without consuming its data, or never if it
+    /// cannot tell. It must be cancel-safe.
+    fn transport_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
+}
+
+/// Adapts a body's send half to the server's response writer.
+struct BodyWriter<S> {
+    sink: S,
+    max_frame_size: usize,
+}
+
+impl<S: BodySink> FrameWrite for BodyWriter<S> {
+    async fn write_frame_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.sink.write(bytes).await
+    }
+
+    async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
+        for chunk in chunks {
+            self.sink.write(chunk).await?;
+        }
+        Ok(())
+    }
+}
+
+impl<S: BodySink> ResponseWriter for BodyWriter<S> {
+    async fn write_response(&mut self, response: &RpcResponse) -> Result<()> {
+        let max_frame_size = self.max_frame_size;
+        framed::write_frame(self, response, max_frame_size).await
+    }
+
+    async fn write_message_stream_frames(&mut self, bodies: &mut Vec<Vec<u8>>) -> Result<()> {
+        let max_frame_size = self.max_frame_size;
+        framed::write_message_stream_frames(self, bodies, max_frame_size).await
+    }
+
+    async fn write_stream_frame(&mut self, frame: RpcStreamFrame) -> Result<()> {
+        let max_frame_size = self.max_frame_size;
+        framed::write_stream_frame(self, frame, max_frame_size).await
+    }
+
+    async fn stopped(&mut self) -> Result<()> {
+        self.sink.stopped().await
+    }
+
+    fn reset(&mut self) {
+        self.sink.reset();
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        self.sink.finish().await
+    }
+}
+
+/// Adapts a body's receive half to the server's request reader.
+struct BodyReader<S> {
+    source: S,
+    chunk: Bytes,
+}
+
+impl<S: BodySource> FrameRead for BodyReader<S> {
+    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+        while self.chunk.is_empty() {
+            let Some(chunk) = self.source.next_chunk().await? else {
+                return Ok(None);
+            };
+            self.chunk = chunk;
+        }
+        let len = bytes.len().min(self.chunk.len());
+        self.chunk.copy_to_slice(&mut bytes[..len]);
+        Ok(Some(len))
+    }
+}
+
+impl<S: BodySource> RequestPumpReader for BodyReader<S> {
+    fn stop_trevrpc(&mut self) {
+        // The HTTP libraries cannot stop a request body safely on its own (h3-quinn 0.0.10 can
+        // panic, see `H3-UPSTREAM-ISSUES.md`), so the bounded body is released when dropped.
+    }
+
+    async fn read_unary_end(&mut self) -> Result<()> {
+        framed::drain_unary_request_end(self).await
+    }
+
+    async fn read_stream_frame_or_eof(
+        &mut self,
+        max_frame_size: usize,
+    ) -> Result<Option<RpcStreamFrame>> {
+        framed::read_stream_frame_or_eof(self, max_frame_size).await
+    }
+
+    async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
+        self.source.transport_event().await
+    }
+
+    async fn validate_transport_end(&mut self) -> Result<()> {
+        self.source.validate_end().await
+    }
+}
+
+/// Reads the initial request frame, replying with its failure status when it is unusable.
+async fn read_request<K, S>(
+    server: &Server,
+    sink: K,
+    source: S,
+) -> Option<(BodyWriter<K>, BodyReader<S>, RpcRequest)>
+where
+    K: BodySink,
+    S: BodySource,
+{
+    let writer = BodyWriter {
+        sink,
+        max_frame_size: server.max_frame_size(),
+    };
+    let mut reader = BodyReader {
+        source,
+        chunk: Bytes::new(),
+    };
+    match server_transport::read_initial_request(server, &mut reader).await {
+        Ok(request) => Some((writer, reader, request)),
+        Err(error) => {
+            let status = error.into_status();
+            server.record_pre_handler_failure(&status);
+            server_transport::write_status(writer, status).await;
+            None
+        }
+    }
+}
+
+/// Serves one RPC carried by a body.
+pub(crate) async fn handle_rpc_stream<K, S>(
+    server: Server,
+    request_limit: Option<Arc<Semaphore>>,
+    sink: K,
+    source: S,
+    shutdown: watch::Receiver<bool>,
+) where
+    K: BodySink,
+    S: BodySource,
+{
+    if let Some((writer, reader, request)) = read_request(&server, sink, source).await {
+        server_transport::handle_stream(server, request_limit, writer, reader, request, shutdown)
+            .await;
+    }
+}
+
+/// Answers one RPC carried by a body with the over-limit status.
+pub(crate) async fn reject_rpc_stream<K, S>(server: Server, sink: K, source: S)
+where
+    K: BodySink,
+    S: BodySource,
+{
+    if let Some((writer, reader, request)) = read_request(&server, sink, source).await {
+        server_transport::reject_stream(server, writer, reader, request).await;
+    }
+}

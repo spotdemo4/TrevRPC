@@ -1,28 +1,25 @@
-//! Server side of native `TrevRPC` over QUIC (ALPN `trevrpc/1`): one RPC per bidirectional stream.
+//! Native `TrevRPC` (ALPN `trevrpc/1` over QUIC, and `QMux`): one RPC per bidirectional stream.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::framed::{self, FrameRead};
+use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::serve::{drain_streams, log_task_error};
 use crate::server::Server;
 use crate::server_transport::{self, ResponseWriter, try_acquire_permit};
-use crate::{Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
+use crate::{Result, RpcRequest, RpcResponse, RpcStreamFrame};
 
-/// Application error code for streams the server abandons.
-const CANCELLED_STREAM_CODE: u32 = 1;
-
-struct QuinnResponseWriter {
-    send: quinn::SendStream,
+struct NativeResponseWriter<S> {
+    send: S,
     max_frame_size: usize,
 }
 
-impl QuinnResponseWriter {
-    const fn new(send: quinn::SendStream, max_frame_size: usize) -> Self {
+impl<S: MuxSendStream> NativeResponseWriter<S> {
+    const fn new(send: S, max_frame_size: usize) -> Self {
         Self {
             send,
             max_frame_size,
@@ -30,7 +27,7 @@ impl QuinnResponseWriter {
     }
 }
 
-impl ResponseWriter for QuinnResponseWriter {
+impl<S: MuxSendStream> ResponseWriter for NativeResponseWriter<S> {
     async fn write_response(&mut self, response: &RpcResponse) -> Result<()> {
         framed::write_frame(&mut self.send, response, self.max_frame_size).await
     }
@@ -44,88 +41,38 @@ impl ResponseWriter for QuinnResponseWriter {
     }
 
     async fn stopped(&mut self) -> Result<()> {
-        self.send
-            .stopped()
-            .await
-            .map(|_| ())
-            .map_err(Error::transport)
+        self.send.peer_stopped().await
     }
 
     fn reset(&mut self) {
-        let _ = self.send.reset(CANCELLED_STREAM_CODE.into());
+        self.send.reset_stream(CANCELLED_STREAM_CODE);
     }
 
     async fn finish(&mut self) -> Result<()> {
-        self.send.finish().map_err(Error::transport)
+        self.send.finish_stream()
     }
 }
 
-/// How often a backpressured request stream with unread buffered data is re-checked for a reset.
-const RESET_PROBE_INTERVAL: Duration = Duration::from_millis(250);
-
-struct QuinnPumpReader {
-    recv: quinn::RecvStream,
-    connection: quinn::Connection,
+struct NativePumpReader<C: MuxConnection> {
+    recv: C::RecvStream,
+    connection: C,
 }
 
-impl QuinnPumpReader {
-    const fn new(recv: quinn::RecvStream, connection: quinn::Connection) -> Self {
+impl<C: MuxConnection> NativePumpReader<C> {
+    const fn new(recv: C::RecvStream, connection: C) -> Self {
         Self { recv, connection }
     }
 }
 
-/// Waits for the peer to reset `recv` without consuming any of its data, or never if it cannot
-/// tell.
-///
-/// This deliberately avoids `quinn::RecvStream::received_reset`. Quinn 0.11.12 registers the
-/// stream's blocked-reader waker from it and clears that waker only on the next stream event, a
-/// blocked read, or a drop before EOF. When the whole stream has already arrived, nothing clears
-/// it: reading to EOF then leaves a stale waker, which trips the `debug_assert!` in
-/// `RecvStream::drop` and, in release builds, keeps the pump task allocated until the
-/// connection closes. Fixed on quinn's main branch by commit cdd7940 ("cleanup stale wakers in
-/// `blocked_readers`"), which no release includes yet.
-///
-/// A zero-length chunk read is the one public probe that only registers a waker when the stream
-/// is genuinely blocked, and such a waker is cleared by the data or FIN that unblocks it. It
-/// returns a reset at once, and an empty chunk when unread data is buffered. A reset discards
-/// buffered data, so a buffered stream has not been reset yet, but it cannot wake this probe when
-/// it is. That case is re-checked on a timer instead.
-async fn peer_reset(recv: &mut quinn::RecvStream) -> Option<RequestTransportEvent> {
-    loop {
-        match recv.read_chunk(0, true).await {
-            Ok(Some(_)) => tokio::time::sleep(RESET_PROBE_INTERVAL).await,
-            Err(quinn::ReadError::Reset(code)) => {
-                return Some(RequestTransportEvent::PeerReset(Status::cancelled(
-                    format!(
-                        "request stream reset by peer with code {}",
-                        code.into_inner()
-                    ),
-                )));
-            }
-            Err(
-                error @ (quinn::ReadError::ConnectionLost(_) | quinn::ReadError::ZeroRttRejected),
-            ) => {
-                return Some(RequestTransportEvent::connection_lost(error));
-            }
-            // The request ended cleanly, was stopped locally, or cannot be probed: the reads that
-            // follow report whatever remains.
-            Ok(None)
-            | Err(quinn::ReadError::ClosedStream | quinn::ReadError::IllegalOrderedRead) => {
-                return std::future::pending().await;
-            }
-        }
-    }
-}
-
-impl FrameRead for QuinnPumpReader {
+impl<C: MuxConnection> FrameRead for NativePumpReader<C> {
     async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
         self.recv.read_frame_bytes(bytes).await
     }
 }
 
-impl RequestPumpReader for QuinnPumpReader {
+impl<C: MuxConnection> RequestPumpReader for NativePumpReader<C> {
     fn stop_trevrpc(&mut self) {
-        let _ = self.recv.stop(CANCELLED_STREAM_CODE.into());
+        self.recv.stop_stream(CANCELLED_STREAM_CODE);
     }
 
     async fn read_unary_end(&mut self) -> Result<()> {
@@ -142,8 +89,10 @@ impl RequestPumpReader for QuinnPumpReader {
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
         tokio::select! {
             biased;
-            event = peer_reset(&mut self.recv) => event,
-            closed = self.connection.closed() => Some(RequestTransportEvent::connection_lost(closed)),
+            event = self.recv.peer_reset() => event,
+            error = self.connection.connection_lost() => {
+                Some(RequestTransportEvent::ConnectionLost(error.into_status()))
+            }
         }
     }
 
@@ -153,9 +102,9 @@ impl RequestPumpReader for QuinnPumpReader {
 }
 
 /// Serves one native connection until it closes or the server shuts down.
-pub(crate) async fn handle_connection(
+pub(crate) async fn handle_connection<C: MuxConnection>(
     server: Server,
-    connection: quinn::Connection,
+    connection: C,
     request_limit: Option<Arc<Semaphore>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -170,8 +119,8 @@ pub(crate) async fn handle_connection(
             break;
         }
         tokio::select! {
-            accepted = connection.accept_bi(), if !*shutdown.borrow() => {
-                let Ok((send, recv)) = accepted else {
+            accepted = connection.accept_stream(), if !*shutdown.borrow() => {
+                let Some((send, recv)) = accepted else {
                     break;
                 };
 
@@ -209,27 +158,31 @@ pub(crate) async fn handle_connection(
     drain_streams(
         &mut stream_tasks,
         server.options().graceful_shutdown_timeout(),
-        &connection,
+        || connection.close_connection(b"server stream drain timed out"),
     )
     .await;
 
     if *shutdown.borrow() {
-        connection.close(0_u32.into(), b"server drained connection");
+        connection.close_connection(b"server drained connection");
     }
 }
 
 /// Reads the initial request frame, replying with its failure status when it is unusable.
-async fn read_request(
+async fn read_request<C: MuxConnection>(
     server: &Server,
-    connection: quinn::Connection,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-) -> Option<(QuinnResponseWriter, QuinnPumpReader, RpcRequest)> {
+    connection: C,
+    send: C::SendStream,
+    recv: C::RecvStream,
+) -> Option<(
+    NativeResponseWriter<C::SendStream>,
+    NativePumpReader<C>,
+    RpcRequest,
+)> {
     let max_frame_size = server.max_frame_size();
-    let mut recv = QuinnPumpReader::new(recv, connection);
+    let mut recv = NativePumpReader::new(recv, connection);
     match server_transport::read_initial_request(server, &mut recv.recv).await {
         Ok(request) => Some((
-            QuinnResponseWriter::new(send, max_frame_size),
+            NativeResponseWriter::new(send, max_frame_size),
             recv,
             request,
         )),
@@ -237,19 +190,19 @@ async fn read_request(
             recv.stop_trevrpc();
             let status = error.into_status();
             server.record_pre_handler_failure(&status);
-            server_transport::write_status(QuinnResponseWriter::new(send, max_frame_size), status)
+            server_transport::write_status(NativeResponseWriter::new(send, max_frame_size), status)
                 .await;
             None
         }
     }
 }
 
-async fn handle_stream(
+async fn handle_stream<C: MuxConnection>(
     server: Server,
-    connection: quinn::Connection,
+    connection: C,
     request_limit: Option<Arc<Semaphore>>,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    send: C::SendStream,
+    recv: C::RecvStream,
     shutdown: watch::Receiver<bool>,
 ) {
     if let Some((send, recv, request)) = read_request(&server, connection, send, recv).await {
@@ -257,11 +210,11 @@ async fn handle_stream(
     }
 }
 
-async fn reject_stream(
+async fn reject_stream<C: MuxConnection>(
     server: Server,
-    connection: quinn::Connection,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    connection: C,
+    send: C::SendStream,
+    recv: C::RecvStream,
 ) {
     if let Some((send, recv, request)) = read_request(&server, connection, send, recv).await {
         server_transport::reject_stream(server, send, recv, request).await;

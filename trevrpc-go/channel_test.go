@@ -291,6 +291,8 @@ func (g *fakeChannelGeneration) streamingCall(context.Context, *wireRequest, byt
 	return nil, Unavailable("fake streaming call unavailable")
 }
 
+func (g *fakeChannelGeneration) transportKind() TransportKind { return TransportQUIC }
+
 func (g *fakeChannelGeneration) Close() error {
 	g.closes.Add(1)
 	g.fail(context.Canceled)

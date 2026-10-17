@@ -55,12 +55,17 @@ class EchoScenarioTest(
             val arguments = InstrumentationRegistry.getArguments()
             val host = requireNotNull(arguments.getString("host")) { "the host argument is required" }
             val port = requireNotNull(arguments.getString("port")?.toIntOrNull()) { "the port argument is required" }
-            engine =
+            // "http2" disables QUIC, as on a network that blocks UDP, so Cronet uses the server's
+            // TCP listener; otherwise a QUIC hint makes it use HTTP/3 from the first request.
+            val http3 = arguments.getString("transport", "http3") != "http2"
+            val builder =
                 CronetEngine
                     .Builder(InstrumentationRegistry.getInstrumentation().targetContext)
-                    .enableQuic(true)
-                    .addQuicHint(host, port, port)
-                    .build()
+                    .enableQuic(http3)
+            if (http3) {
+                builder.addQuicHint(host, port, port)
+            }
+            engine = builder.build()
             executor = Executors.newFixedThreadPool(2)
             channel = CronetRpcChannel.create(engine, "https://$host:$port", executor)
         }

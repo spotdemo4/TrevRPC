@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
-# Run every interop client against every interop server; see README.md.
+# Run every interop client against every interop server over every transport;
+# see README.md.
 #
 #   run.sh [--out DIR] --server NAME=CMD... [--client NAME=CMD...] [--browser NAME...]
+#          [--browser-lanes webtransport,websocket,fallback]
 #
 # Servers and native clients are interop executables taking the `server` and
-# `client` subcommands. Browsers run through `trevrpc-interop-browser`.
+# `client` subcommands. Browsers run through `trevrpc-interop-browser`, by
+# default over every lane: WebTransport, QMux over WebSocket, and the fallback
+# from a blocked UDP port to WebSocket.
 set -euo pipefail
 
 servers=()
 clients=()
 browsers=()
+browser_lanes="webtransport,websocket,fallback"
 out=""
 while (($#)); do
   case "$1" in
     --server) servers+=("$2") ;;
     --client) clients+=("$2") ;;
     --browser) browsers+=("$2") ;;
+    --browser-lanes) browser_lanes="$2" ;;
     --out) out="$2" ;;
     *)
       echo "unknown argument: $1" >&2
@@ -97,24 +103,60 @@ run_cell() {
   fi
 }
 
+# A UDP port that nothing answers, for cells that exercise the TCP fallback. It
+# is below the ephemeral range, so it never collides with a server's own port,
+# and is not on the browsers' list of unsafe ports.
+unreachable_udp=24999
+
 for server in "${servers[@]}"; do
   server_name=${server%%=*}
   start_server "$server_name" "${server#*=}"
   ports=$out/server-$server_name.ports
   native=$(jq -r .native "$ports")
   webtransport=$(jq -r .webtransport "$ports")
+  qmux=$(jq -r .qmux "$ports")
 
   for client in "${clients[@]}"; do
     client_name=${client%%=*}
+    # Each native client runs every scenario over QUIC, over QMux over TLS,
+    # and over QUIC with a blocked UDP port, where it must fall back to TCP.
     # shellcheck disable=SC2086 # client commands may carry arguments
     run_cell "$client_name-to-$server_name" ${client#*=} client \
-      --addr "127.0.0.1:$native" --ca "$cert" --server-name localhost
+      --addr "127.0.0.1:$native" --ca "$cert" --server-name localhost \
+      --transport quic --expect-transport quic
+    # shellcheck disable=SC2086
+    run_cell "$client_name-qmux-to-$server_name" ${client#*=} client \
+      --addr "127.0.0.1:$native" --tcp-addr "127.0.0.1:$qmux" --ca "$cert" \
+      --server-name localhost --transport tcp --expect-transport qmux
+    # shellcheck disable=SC2086
+    run_cell "$client_name-fallback-to-$server_name" ${client#*=} client \
+      --addr "127.0.0.1:$unreachable_udp" --tcp-addr "127.0.0.1:$qmux" --ca "$cert" \
+      --server-name localhost --transport auto --expect-transport qmux
   done
+  websocket=$(jq -r .websocket "$ports")
   for browser in "${browsers[@]}"; do
-    run_cell "$browser-to-$server_name" trevrpc-interop-browser \
-      --browser "$browser" \
-      --url "https://127.0.0.1:$webtransport/trevrpc" \
-      --cert-hash "$cert_hash"
+    # Browsers run every scenario over WebTransport, over QMux over WebSocket,
+    # and with a blocked UDP port, where they must fall back to WebSocket.
+    if [[ ,$browser_lanes, == *,webtransport,* ]]; then
+      run_cell "$browser-to-$server_name" trevrpc-interop-browser \
+        --browser "$browser" \
+        --url "https://127.0.0.1:$webtransport/trevrpc" \
+        --cert-hash "$cert_hash"
+    fi
+    if [[ ,$browser_lanes, == *,websocket,* ]]; then
+      run_cell "$browser-wss-to-$server_name" trevrpc-interop-browser \
+        --browser "$browser" \
+        --url "https://127.0.0.1:$webtransport/trevrpc" \
+        --ws-url "wss://127.0.0.1:$websocket/trevrpc" \
+        --cert-hash "$cert_hash" --transport websocket --expect-transport websocket
+    fi
+    if [[ ,$browser_lanes, == *,fallback,* ]]; then
+      run_cell "$browser-fallback-to-$server_name" trevrpc-interop-browser \
+        --browser "$browser" \
+        --url "https://127.0.0.1:$unreachable_udp/trevrpc" \
+        --ws-url "wss://127.0.0.1:$websocket/trevrpc" \
+        --cert-hash "$cert_hash" --transport auto --expect-transport websocket
+    fi
   done
 
   stop_server

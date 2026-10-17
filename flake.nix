@@ -29,11 +29,12 @@
       system: pkgs:
       let
         wireGolden = ./testdata/wire-golden-vectors.txt;
+        qmuxGolden = ./testdata/qmux-golden-vectors.txt;
         interopProto = ./interop/proto;
         packageSet = {
-          trevrpc-go = pkgs.callPackage ./trevrpc-go { inherit wireGolden interopProto; };
+          trevrpc-go = pkgs.callPackage ./trevrpc-go { inherit wireGolden qmuxGolden interopProto; };
           trevrpc-interop = pkgs.callPackage ./interop/runner.nix { };
-          trevrpc-js = pkgs.callPackage ./trevrpc-js { inherit wireGolden interopProto; };
+          trevrpc-js = pkgs.callPackage ./trevrpc-js { inherit wireGolden qmuxGolden interopProto; };
           trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
             inherit wireGolden interopProto;
             licenseFile = ./LICENSE;

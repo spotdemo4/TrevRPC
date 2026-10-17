@@ -127,7 +127,7 @@ func startTestListener(t *testing.T, pki testPKI, configure func(*ServerOptions)
 	t.Helper()
 	server := NewServer()
 	options := server.Options()
-	options.EnableHTTP3 = true
+	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(request AdmissionRequest) bool { return request.Origin == testOrigin }
 	if configure != nil {
@@ -181,6 +181,9 @@ func TestListenerServesEveryRPCShapeOverEveryTransport(t *testing.T) {
 		"http3":                     newHTTP3TestClient(t, pki, listener),
 		"webtransport":              newWebTransportTestClient(t, pki, listener, testOrigin, nil),
 		"webtransport flow control": newWebTransportTestClient(t, pki, listener, testOrigin, flowControlledWebTransportConfig),
+		"http2":                     newHTTP2TestClient(t, pki, listener),
+		"qmux":                      newQMuxTestClient(t, pki, listener),
+		"qmux websocket":            newWebSocketTestClient(t, pki, listener, testOrigin),
 	}
 	for name, transport := range transports {
 		t.Run(name, func(t *testing.T) { exerciseRPCShapes(t, transport) })
@@ -360,11 +363,11 @@ func TestListenerCloseStopsServeAndDrainsConnections(t *testing.T) {
 	}
 }
 
-func TestListenerShutdownClosesNativeHTTP3AndWebTransportPromptly(t *testing.T) {
+func TestListenerShutdownClosesEveryTransportPromptly(t *testing.T) {
 	pki := newTestPKI(t)
 	server := NewServer()
 	options := server.Options()
-	options.EnableHTTP3 = true
+	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(AdmissionRequest) bool { return true }
 	server.SetOptions(options)
@@ -379,9 +382,12 @@ func TestListenerShutdownClosesNativeHTTP3AndWebTransportPromptly(t *testing.T) 
 	go func() { serveDone <- listener.Serve(ctx) }()
 
 	for name, transport := range map[string]Transport{
-		"native":       dialNative(t, pki, listener),
-		"http3":        newHTTP3TestClient(t, pki, listener),
-		"webtransport": newWebTransportTestClient(t, pki, listener, "", nil),
+		"native":         dialNative(t, pki, listener),
+		"http3":          newHTTP3TestClient(t, pki, listener),
+		"webtransport":   newWebTransportTestClient(t, pki, listener, "", nil),
+		"http2":          newHTTP2TestClient(t, pki, listener),
+		"qmux":           newQMuxTestClient(t, pki, listener),
+		"qmux websocket": newWebSocketTestClient(t, pki, listener, ""),
 	} {
 		if _, err := Unary(context.Background(), transport, testServiceName, "Echo", &testMessage{Value: name}, newTestMessage); err != nil {
 			t.Fatalf("%s call: %v", name, err)
@@ -526,7 +532,7 @@ func waitForChannelEvent(t *testing.T, events <-chan ChannelEvent, want ChannelE
 func TestHTTP3AndWebTransportAreRefusedWhenDisabled(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, func(options *ServerOptions) {
-		options.EnableHTTP3 = false
+		options.EnableHTTP = false
 		options.EnableWebTransport = false
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
@@ -542,12 +548,12 @@ func TestHTTP3RequestsOverTheWire(t *testing.T) {
 	pki := newTestPKI(t)
 	var admissions atomic.Int64
 	listener := startTestListener(t, pki, func(options *ServerOptions) {
-		options.HTTP3Admission = func(request AdmissionRequest) bool {
+		options.HTTPAdmission = func(request AdmissionRequest) bool {
 			admissions.Add(1)
 			return request.Header.Get("X-Allow") != "no"
 		}
 	})
-	url := "https://" + listener.Addr().String() + DefaultHTTP3Path
+	url := "https://" + listener.Addr().String() + DefaultHTTPPath
 	roundTripper := &http3.Transport{TLSClientConfig: pki.client}
 	t.Cleanup(func() { _ = roundTripper.Close() })
 
@@ -571,19 +577,19 @@ func TestHTTP3RequestsOverTheWire(t *testing.T) {
 		return response
 	}
 
-	if got := do(http.MethodPost, url+"x", http3ContentType, "").StatusCode; got != http.StatusNotFound {
+	if got := do(http.MethodPost, url+"x", httpContentType, "").StatusCode; got != http.StatusNotFound {
 		t.Errorf("unknown path status = %d", got)
 	}
-	if response := do(http.MethodGet, url, http3ContentType, ""); response.StatusCode != http.StatusMethodNotAllowed || response.Header.Get("Allow") != "POST" {
+	if response := do(http.MethodGet, url, httpContentType, ""); response.StatusCode != http.StatusMethodNotAllowed || response.Header.Get("Allow") != "POST" {
 		t.Errorf("GET status = %d, Allow = %q", response.StatusCode, response.Header.Get("Allow"))
 	}
 	if got := do(http.MethodPost, url, "text/plain", "").StatusCode; got != http.StatusUnsupportedMediaType {
 		t.Errorf("wrong media type status = %d", got)
 	}
-	if got := do(http.MethodPost, url, http3ContentType, "no").StatusCode; got != http.StatusForbidden {
+	if got := do(http.MethodPost, url, httpContentType, "no").StatusCode; got != http.StatusForbidden {
 		t.Errorf("denied admission status = %d", got)
 	}
-	if response := do(http.MethodPost, url, http3ContentType, "yes"); response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != http3ContentType {
+	if response := do(http.MethodPost, url, httpContentType, "yes"); response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != httpContentType {
 		t.Errorf("admitted status = %d, content type = %q", response.StatusCode, response.Header.Get("Content-Type"))
 	}
 	if admissions.Load() != 2 {
@@ -613,16 +619,16 @@ func TestWebTransportAdmissionAndPath(t *testing.T) {
 		return response, err
 	}
 
-	if response, err := dial(DefaultHTTP3Path, "https://evil.example.test"); err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+	if response, err := dial(DefaultHTTPPath, "https://evil.example.test"); err == nil || response == nil || response.StatusCode != http.StatusForbidden {
 		t.Errorf("denied origin: response=%v err=%v", response, err)
 	}
-	if response, err := dial(DefaultHTTP3Path, ""); err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+	if response, err := dial(DefaultHTTPPath, ""); err == nil || response == nil || response.StatusCode != http.StatusForbidden {
 		t.Errorf("missing origin: response=%v err=%v", response, err)
 	}
 	if response, err := dial("/elsewhere", testOrigin); err == nil || response == nil || response.StatusCode != http.StatusNotFound {
 		t.Errorf("wrong path: response=%v err=%v", response, err)
 	}
-	if _, err := dial(DefaultHTTP3Path, testOrigin); err != nil {
+	if _, err := dial(DefaultHTTPPath, testOrigin); err != nil {
 		t.Errorf("admitted session: %v", err)
 	}
 }
@@ -716,7 +722,7 @@ func TestWebTransportIsRejectedWithoutAdmissionCallback(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	response, _, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTP3Path, nil)
+	response, _, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, nil)
 	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
 		t.Fatalf("response=%v err=%v, want 403 without an admission callback", response, err)
 	}
@@ -797,7 +803,7 @@ func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
 	channel := dialNative(t, pki, listener)
-	stream, err := channel.current.(*connGeneration).client.opener.openStream(t.Context())
+	stream, err := channel.current.(*streamGeneration).client.opener.openStream(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}

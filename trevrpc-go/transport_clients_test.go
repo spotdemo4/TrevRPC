@@ -10,40 +10,113 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
+
+	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
 )
 
-// The library ships native QUIC clients only. These test-only clients speak
-// HTTP/3 and WebTransport so the server's handling of both stays covered. Both
-// reuse the production streamClient by adapting their streams to clientStream.
+// The library ships native QUIC and QMux clients only. These test-only
+// clients speak HTTP/3, HTTP/2, WebTransport and QMux over WebSocket so the
+// server's handling of each stays covered. They reuse the production
+// streamClient by adapting their streams to clientStream.
 
 // newHTTP3TestClient returns a Transport that sends every RPC as one
-// POST /trevrpc request.
+// POST /trevrpc request over HTTP/3.
 func newHTTP3TestClient(t *testing.T, pki testPKI, listener *Listener) Transport {
 	t.Helper()
 	roundTripper := &http3.Transport{TLSClientConfig: pki.client.Clone()}
 	t.Cleanup(func() { _ = roundTripper.Close() })
-	opener := http3TestOpener{
+	opener := httpTestOpener{
 		roundTripper: roundTripper,
-		url:          "https://" + listener.Addr().String() + DefaultHTTP3Path,
+		url:          "https://" + listener.Addr().String() + DefaultHTTPPath,
 	}
 	return newStreamClient(opener, DefaultMaxFrameSize)
 }
 
-type http3TestOpener struct {
-	roundTripper *http3.Transport
+// newHTTP2TestClient returns a Transport that sends every RPC as one
+// POST /trevrpc request over HTTP/2 on the TCP listener.
+func newHTTP2TestClient(t *testing.T, pki testPKI, listener *Listener) Transport {
+	t.Helper()
+	protocols := new(http.Protocols)
+	protocols.SetHTTP2(true)
+	roundTripper := &http.Transport{TLSClientConfig: pki.client.Clone(), Protocols: protocols}
+	t.Cleanup(roundTripper.CloseIdleConnections)
+	opener := httpTestOpener{
+		roundTripper: roundTripper,
+		url:          "https://" + listener.TCPAddr().String() + DefaultHTTPPath,
+	}
+	return newStreamClient(opener, DefaultMaxFrameSize)
+}
+
+// newQMuxTestClient returns a Channel over QMux over TLS on the TCP listener.
+func newQMuxTestClient(t *testing.T, pki testPKI, listener *Listener) *Channel {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	connector := &qmuxConnector{
+		addr:         listener.TCPAddr().String(),
+		tls:          clientQMuxTLSConfig(pki.client, "localhost"),
+		maxFrameSize: DefaultMaxFrameSize,
+	}
+	channel, err := dialChannel(ctx, connector, nil)
+	if err != nil {
+		t.Fatalf("QMux dial: %v", err)
+	}
+	t.Cleanup(func() { _ = channel.Close() })
+	return channel
+}
+
+// newWebSocketTestClient returns a Transport that runs RPCs on the streams of
+// one QMux over WebSocket session to /trevrpc, as the browser fallback does.
+func newWebSocketTestClient(t *testing.T, pki testPKI, listener *Listener, origin string) Transport {
+	t.Helper()
+	session, err := dialWebSocketTestSession(t, pki, listener, origin)
+	if err != nil {
+		t.Fatalf("WebSocket dial: %v", err)
+	}
+	t.Cleanup(func() { _ = session.CloseWithError(0, "test done") })
+	return newStreamClient(qmuxOpener{session}, DefaultMaxFrameSize)
+}
+
+func dialWebSocketTestSession(t *testing.T, pki testPKI, listener *Listener, origin string) (*qmux.Session, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	header := http.Header{}
+	if origin != "" {
+		header.Set("Origin", origin)
+	}
+	httpClient := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.client.Clone()}}
+	conn, response, err := websocket.Dial(ctx, "wss://"+listener.TCPAddr().String()+DefaultHTTPPath, &websocket.DialOptions{
+		HTTPClient:   httpClient,
+		HTTPHeader:   header,
+		Subprotocols: []string{QMuxALPN},
+	})
+	if err != nil {
+		if response != nil {
+			return nil, fmt.Errorf("%w (HTTP %d)", err, response.StatusCode)
+		}
+		return nil, err
+	}
+	conn.SetReadLimit(qmuxMaxRecordSize)
+	return qmux.Open(ctx, qmux.NewMessageConn(newWebSocketMessages(conn), qmuxMaxRecordSize), qmux.RoleClient, clientQMuxConfig(DefaultMaxFrameSize))
+}
+
+type httpTestOpener struct {
+	roundTripper http.RoundTripper
 	url          string
 }
 
-func (o http3TestOpener) openStream(ctx context.Context) (clientStream, error) {
+func (o httpTestOpener) openStream(ctx context.Context) (clientStream, error) {
 	body, writer := io.Pipe()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, o.url, body)
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Content-Type", http3ContentType)
+	request.Header.Set("Content-Type", httpContentType)
 	stream := &http3TestStream{writer: writer, ready: make(chan struct{})}
 	go func() {
 		defer close(stream.ready)
@@ -113,7 +186,7 @@ func newWebTransportTestOpener(t *testing.T, pki testPKI, listener *Listener, or
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	_, session, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTP3Path, header)
+	_, session, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, header)
 	if err != nil {
 		t.Fatalf("WebTransport dial: %v", err)
 	}

@@ -95,7 +95,7 @@ func TestTLSConfigsSelectALPN(t *testing.T) {
 		t.Fatalf("native-only ALPN = %v", config.NextProtos)
 	}
 	options := DefaultServerOptions()
-	options.EnableHTTP3 = true
+	options.EnableHTTP = true
 	config, err = serverTLSConfig(base, options)
 	if err != nil {
 		t.Fatal(err)

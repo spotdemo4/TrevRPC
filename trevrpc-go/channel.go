@@ -68,9 +68,12 @@ const (
 
 // ChannelEvent describes a channel lifecycle transition or reconnect failure.
 type ChannelEvent struct {
-	Type           ChannelEventType
-	State          ChannelState
-	Generation     uint64
+	Type       ChannelEventType
+	State      ChannelState
+	Generation uint64
+	// Transport is the transport of the generation that became ready; it is
+	// set on ChannelEventReady only.
+	Transport      TransportKind
 	Err            error
 	ReconnectDelay time.Duration
 }
@@ -156,6 +159,16 @@ func (c *Channel) WaitUntilReady(ctx context.Context) error {
 			return statusFromContextError(ctx.Err())
 		}
 	}
+}
+
+// Transport returns the transport of the current connection, or "" while the
+// channel is not ready.
+func (c *Channel) Transport() TransportKind {
+	generation, err := c.currentGeneration()
+	if err != nil {
+		return ""
+	}
+	return generation.transportKind()
 }
 
 // State returns the current connectivity state.
@@ -274,7 +287,7 @@ func newChannel(initial channelGeneration, connector channelConnector, clock rec
 		backoff:    newReconnectBackoff(reconnect, random),
 		events:     newChannelEventDispatcher(onEvent),
 	}
-	client.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: 1})
+	client.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: 1, Transport: initial.transportKind()})
 	go client.run(initial, 1)
 	return client
 }
@@ -350,7 +363,7 @@ func (c *Channel) publish(generation channelGeneration) (bool, uint64) {
 	c.state = ChannelStateReady
 	close(c.ready)
 	c.mu.Unlock()
-	c.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: number})
+	c.events.emit(ChannelEvent{Type: ChannelEventReady, State: ChannelStateReady, Generation: number, Transport: generation.transportKind()})
 	return true, number
 }
 
@@ -361,6 +374,7 @@ type channelGeneration interface {
 	Close() error
 	Done() <-chan struct{}
 	Err() error
+	transportKind() TransportKind
 }
 
 type channelConnector interface {

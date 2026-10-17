@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 
 use crate::framed::FrameRead;
 use crate::server::{CancellationSource, check_stream_message_body_limits};
+use crate::transport_error::{self, TransportFailureKind};
 use crate::{BoxStream, Code, Error, Result, RpcStreamFrameKind, Status};
 
 pub(crate) const REQUEST_BODY_CHANNEL_CAPACITY: usize = 1;
@@ -613,13 +614,6 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
-enum TransportFailureKind {
-    PeerReset,
-    ConnectionLost,
-    Protocol,
-}
-
 fn classify_error(error: Error) -> RequestPumpFailure {
     let failure_kind = transport_failure_kind(&error);
     let status = error.into_status();
@@ -637,38 +631,7 @@ fn transport_failure_kind(error: &Error) -> Option<TransportFailureKind> {
     let Error::Transport(error) = error else {
         return Some(TransportFailureKind::Protocol);
     };
-    if let Some(error) = error.downcast_ref::<quinn::ReadError>() {
-        return Some(match error {
-            quinn::ReadError::Reset(_) => TransportFailureKind::PeerReset,
-            quinn::ReadError::ConnectionLost(_) | quinn::ReadError::ZeroRttRejected => {
-                TransportFailureKind::ConnectionLost
-            }
-            quinn::ReadError::ClosedStream | quinn::ReadError::IllegalOrderedRead => {
-                TransportFailureKind::Protocol
-            }
-        });
-    }
-    if let Some(error) = error.downcast_ref::<h3::error::StreamError>() {
-        return Some(match error {
-            h3::error::StreamError::RemoteTerminate { .. } => TransportFailureKind::PeerReset,
-            h3::error::StreamError::StreamError { .. }
-            | h3::error::StreamError::HeaderTooBig { .. } => TransportFailureKind::Protocol,
-            _ => TransportFailureKind::ConnectionLost,
-        });
-    }
-    if let Some(error) = error.downcast_ref::<h3::quic::StreamErrorIncoming>() {
-        return Some(match error {
-            h3::quic::StreamErrorIncoming::StreamTerminated { .. } => {
-                TransportFailureKind::PeerReset
-            }
-            h3::quic::StreamErrorIncoming::ConnectionErrorIncoming { .. }
-            | h3::quic::StreamErrorIncoming::Unknown(_) => TransportFailureKind::ConnectionLost,
-        });
-    }
-
-    error
-        .downcast_ref::<std::io::Error>()
-        .map(|_| TransportFailureKind::ConnectionLost)
+    transport_error::classify(error.as_ref()).kind
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 # trevrpc-js
 
-TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients, and call Go or Rust servers over WebTransport.
+TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients, and call Go or Rust servers over WebTransport, falling back to QMux over WebSocket where WebTransport is missing or UDP is blocked.
 
-`trevrpc-js` is the **browser client**: a WebTransport runtime plus `protoc-gen-trevrpc-js`, which generates typed clients (no server code). It has no Node.js runtime; servers are written in Go or Rust, native QUIC clients in Go or Rust, and HTTP/3 clients in Kotlin.
+`trevrpc-js` is the **browser client**: a WebTransport runtime with a QMux over WebSocket fallback, plus `protoc-gen-trevrpc-js`, which generates typed clients (no server code). It has no Node.js runtime; servers are written in Go or Rust, native QUIC clients in Go or Rust, and HTTP/3 clients in Kotlin.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
@@ -98,7 +98,7 @@ call.
 
 ### Connections
 
-`connect()` opens a WebTransport session and resolves when it is ready; it rejects if the session cannot be established. After that the `Channel` re-establishes the session in the background with exponential backoff whenever it is lost. Calls fail fast with `Unavailable` while `channel.state` is `"reconnecting"` and are never replayed; use `await channel.waitUntilReady()` or the `onStateChange` option to follow the state. `channel.close()` stops reconnecting.
+`connect()` opens a session and resolves when it is ready; it rejects if no transport can establish one. After that the `Channel` re-establishes the session in the background with exponential backoff whenever it is lost. Calls fail fast with `Unavailable` while `channel.state` is `"reconnecting"` and are never replayed; use `await channel.waitUntilReady()` or the `onStateChange` option to follow the state. `channel.close()` stops reconnecting.
 
 ```js
 const channel = await connect(url, {
@@ -108,21 +108,40 @@ const channel = await connect(url, {
 });
 ```
 
-`serverCertificateHashes` trusts a self-signed ECDSA certificate that is valid for at most 14 days by its SHA-256 hash, which is how development servers and the interop tests are reached. `allowPooling`, `congestionControl` and `requireUnreliable` are passed to the `WebTransport` constructor.
+`serverCertificateHashes` trusts a self-signed ECDSA certificate that is valid for at most 14 days by its SHA-256 hash, which is how development servers and the interop tests are reached. It applies to WebTransport only: the WebSocket fallback needs a certificate the browser trusts. `allowPooling`, `congestionControl` and `requireUnreliable` are passed to the `WebTransport` constructor.
 
 Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client.
 
+### WebSocket fallback
+
+`connect()` races two transports. WebTransport starts first; QMux over WebSocket (subprotocol `qmux-02.trevrpc-1`, served by Go and Rust on the server's TCP port) starts after `fallbackDelayMs` (default 300) or immediately if WebTransport fails or the browser has no `WebTransport` API. The first session to be ready wins and the other is closed. After the WebSocket wins, reconnects use it directly until `reprobeIntervalMs` (default 5 minutes) has passed since WebTransport was lost, then race again.
+
+```js
+const channel = await connect("https://example.com:4433/trevrpc", {
+  transports: ["webtransport", "websocket"], // default; the first is preferred, a single entry disables the race
+  webSocketUrl: "wss://example.com:4433/trevrpc", // default: `url` with the wss: scheme
+  fallbackDelayMs: 300,
+  reprobeIntervalMs: 5 * 60_000,
+  onStateChange: ({ state, transport }) => console.log(state, transport),
+});
+console.log(channel.transport); // "webtransport" or "websocket"
+```
+
+`channel.transport` and `ChannelStateChange.transport` (set when the channel becomes ready) report which one is in use. `WebSocket` replaces the global WebSocket constructor, like `WebTransport` does for WebTransport. The QMux client is in-tree (`src/qmux/`); WebSocket backpressure polls `bufferedAmount` against a 1 MiB limit.
+
 ## Interop client
 
-`trevrpc-interop-browser` runs the cross-runtime interop scenarios from [`interop/README.md`](../interop/README.md) in a real browser over WebTransport. It is built from `interop/proto/interop.proto` with the generator in this package, so it also serves as a complete example of generated client code.
+`trevrpc-interop-browser` runs the cross-runtime interop scenarios from [`interop/README.md`](../interop/README.md) in a real browser over WebTransport, QMux over WebSocket, or the fallback between them. It is built from `interop/proto/interop.proto` with the generator in this package, so it also serves as a complete example of generated client code.
 
 ```sh
 trevrpc-interop-browser --browser chromium|firefox|webkit \
   --url https://127.0.0.1:4433/trevrpc \
-  --cert-hash <hex sha256 of the server certificate DER>
+  --cert-hash <hex sha256 of the server certificate DER> \
+  [--transport webtransport|websocket|auto] [--ws-url wss://127.0.0.1:4433/trevrpc] \
+  [--expect-transport webtransport|websocket]
 ```
 
-It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. Browsers come from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM`, `TREVRPC_BROWSER_FIREFOX` and `TREVRPC_BROWSER_WEBKIT` when those name an executable. WebKit on macOS passes against the Go server but not yet the Rust server ([h3#347](https://github.com/hyperium/h3/issues/347)); where the browser has no WebTransport at all, such as Playwright's WebKit on Linux, every scenario fails with a clear reason.
+It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. Browsers come from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM`, `TREVRPC_BROWSER_FIREFOX` and `TREVRPC_BROWSER_WEBKIT` when those name an executable. The browser contexts ignore certificate errors because WSS cannot pin a certificate hash. WebKit on macOS passes every lane against the Go server and the WebSocket lanes against the Rust server, but not yet Rust's WebTransport lane ([h3#347](https://github.com/hyperium/h3/issues/347)); where the browser has no WebTransport at all, such as Playwright's WebKit on Linux, every scenario fails with a clear reason.
 
 ## Development
 
@@ -135,4 +154,4 @@ npm run interop -- --browser chromium --url ... --cert-hash ...
 
 `nix build .#trevrpc-js` runs the same checks and installs the library, the plugin and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
 
-Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt`, framing, the generator, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.
+Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt`, the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the generator, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.

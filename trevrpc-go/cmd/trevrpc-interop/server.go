@@ -21,15 +21,19 @@ type serverConfig struct {
 }
 
 // listeningLine is the single JSON line printed once the server accepts
-// connections. One UDP socket serves all three protocols.
+// connections. One UDP socket serves the QUIC protocols and one TCP socket
+// the fallbacks.
 type listeningLine struct {
 	Native       int `json:"native"`
 	HTTP3        int `json:"http3"`
 	WebTransport int `json:"webtransport"`
+	QMux         int `json:"qmux"`
+	HTTP2        int `json:"http2"`
+	WebSocket    int `json:"websocket"`
 }
 
-// runServer serves Echo over native QUIC, HTTP/3 and WebTransport until ctx is
-// cancelled. It writes the listening line to out once the socket is bound.
+// runServer serves Echo over every transport until ctx is cancelled. It writes
+// the listening line to out once the sockets are bound.
 func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 	certificate, err := tls.LoadX509KeyPair(config.certFile, config.keyFile)
 	if err != nil {
@@ -41,19 +45,21 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 	}
 	defer listener.Close()
 
-	port := listener.Addr().(*net.UDPAddr).Port
-	if err := json.NewEncoder(out).Encode(listeningLine{Native: port, HTTP3: port, WebTransport: port}); err != nil {
+	udp := listener.Addr().(*net.UDPAddr).Port
+	tcp := listener.TCPAddr().(*net.TCPAddr).Port
+	line := listeningLine{Native: udp, HTTP3: udp, WebTransport: udp, QMux: tcp, HTTP2: tcp, WebSocket: tcp}
+	if err := json.NewEncoder(out).Encode(line); err != nil {
 		return err
 	}
 	return listener.Serve(ctx)
 }
 
-// newServer binds a listener for the Echo service. Every WebTransport session
-// is admitted because browsers connect from arbitrary origins.
+// newServer binds a listener for the Echo service. Every browser session is
+// admitted because browsers connect from arbitrary origins.
 func newServer(addr string, tlsConfig *tls.Config) (*trevrpc.Listener, error) {
 	server := trevrpc.NewServer()
 	options := server.Options()
-	options.EnableHTTP3 = true
+	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(trevrpc.AdmissionRequest) bool { return true }
 	server.SetOptions(options)

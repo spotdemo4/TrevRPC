@@ -7,6 +7,9 @@ import { Code } from "../src/status.js";
 import { echoHandler } from "./echo-server.js";
 import { deferred, fakeTransport, isPending, turn } from "./support.js";
 
+// These tests cover the WebTransport lifecycle; the WebSocket fallback has its own tests.
+const WebTransportOnly = ["webtransport"];
+
 /** A WebTransport constructor whose sessions the test controls. */
 function fakeWebTransport() {
   const sessions = [];
@@ -52,6 +55,7 @@ test("connect resolves with a channel once the session is ready", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
   const hashes = [{ algorithm: "sha-256", value: new Uint8Array(32) }];
   const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
     WebTransport,
     serverCertificateHashes: hashes,
     allowPooling: true,
@@ -79,7 +83,10 @@ test("connect resolves with a channel once the session is ready", async () => {
 
 test("connect fails when the session cannot be established", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
-  const connecting = connect("https://example.test/trevrpc", { WebTransport });
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+  });
   sessions[0].failToConnect(new Error("handshake failed"));
   await assert.rejects(connecting, (error) => {
     return error.code === Code.Unavailable && /handshake failed/.test(error.statusMessage);
@@ -89,14 +96,20 @@ test("connect fails when the session cannot be established", async () => {
 
 test("connect fails when the session closes before it is ready", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
-  const connecting = connect("https://example.test/trevrpc", { WebTransport });
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+  });
   sessions[0].lose({ closeCode: 1 });
   await assert.rejects(connecting, (error) => error.code === Code.Unavailable);
 });
 
 test("connect fails without a WebTransport implementation", async () => {
   await assert.rejects(
-    connect("https://example.test/trevrpc", { WebTransport: undefined }),
+    connect("https://example.test/trevrpc", {
+      transports: WebTransportOnly,
+      WebTransport: undefined,
+    }),
     (error) => error.code === Code.Unavailable && /not available/.test(error.statusMessage),
   );
 });
@@ -105,6 +118,7 @@ test("aborting the signal abandons the initial connection", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
   const controller = new AbortController();
   const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
     WebTransport,
     signal: controller.signal,
   });
@@ -116,7 +130,11 @@ test("aborting the signal abandons the initial connection", async () => {
   assert.ok(sessions[0].closeCalls.length >= 1, "the abandoned session is closed");
 
   await assert.rejects(
-    connect("https://example.test/trevrpc", { WebTransport, signal: AbortSignal.abort() }),
+    connect("https://example.test/trevrpc", {
+      transports: WebTransportOnly,
+      WebTransport,
+      signal: AbortSignal.abort(),
+    }),
     (error) => error.code === Code.Cancelled,
   );
   assert.equal(sessions.length, 1, "an aborted signal must not start a session");
@@ -126,6 +144,7 @@ test("the channel reconnects after its session is lost", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
   const changes = [];
   const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
     WebTransport,
     onStateChange: (change) => changes.push(change),
   });
@@ -161,6 +180,7 @@ test("the channel keeps retrying with backoff while reconnecting fails", async (
   const { WebTransport, sessions } = fakeWebTransport();
   const changes = [];
   const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
     WebTransport,
     onStateChange: (change) => changes.push(change),
   });
@@ -185,7 +205,10 @@ test("the channel keeps retrying with backoff while reconnecting fails", async (
 
 test("closing the channel stops reconnecting and rejects waiters", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
-  const connecting = connect("https://example.test/trevrpc", { WebTransport });
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+  });
   sessions[0].becomeReady();
   const channel = await connecting;
 
@@ -206,7 +229,10 @@ test("closing the channel stops reconnecting and rejects waiters", async () => {
 
 test("closing during a reconnect attempt abandons the new session", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
-  const connecting = connect("https://example.test/trevrpc", { WebTransport });
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+  });
   sessions[0].becomeReady();
   const channel = await connecting;
 
@@ -221,6 +247,7 @@ test("closing during a reconnect attempt abandons the new session", async () => 
 test("a failing state callback does not break the channel", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
   const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
     WebTransport,
     onStateChange() {
       throw new Error("observer bug");

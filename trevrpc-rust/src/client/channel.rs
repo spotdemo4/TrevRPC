@@ -5,7 +5,11 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
-use super::{QuicTransport, RpcTransport, StreamingRpcTransport};
+use super::race::{
+    DEFAULT_FALLBACK_DELAY, DEFAULT_REPROBE_INTERVAL, Dialer, GenerationTransport, TcpDialer,
+    TransportKind, TransportPolicy,
+};
+use super::{RpcTransport, StreamingRpcTransport};
 use crate::{BoxStream, Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
 
 const EVENT_CAPACITY: usize = 32;
@@ -106,6 +110,10 @@ fn splitmix64(mut value: u64) -> u64 {
 pub struct ChannelConfig {
     max_frame_size: usize,
     reconnect_backoff: Arc<dyn ReconnectBackoff>,
+    policy: TransportPolicy,
+    tcp: Option<TcpDialer>,
+    fallback_delay: Duration,
+    reprobe_interval: Duration,
 }
 
 impl ChannelConfig {
@@ -115,7 +123,54 @@ impl ChannelConfig {
         Self {
             max_frame_size: crate::framing::DEFAULT_MAX_FRAME_SIZE,
             reconnect_backoff: Arc::new(ExponentialBackoff::default()),
+            policy: TransportPolicy::Auto,
+            tcp: None,
+            fallback_delay: DEFAULT_FALLBACK_DELAY,
+            reprobe_interval: DEFAULT_REPROBE_INTERVAL,
         }
+    }
+
+    /// Enables `QMux` over TLS to the server's TCP listener, the fallback for networks that block
+    /// UDP. `tls` verifies the server; its ALPN list is replaced with [`crate::QMUX_ALPN`]. The
+    /// TCP address defaults to the channel's remote address.
+    #[must_use]
+    pub fn with_tcp_fallback(mut self, tls: quinn::rustls::ClientConfig) -> Self {
+        let addr = self.tcp.as_ref().and_then(|tcp| tcp.addr);
+        self.tcp = Some(TcpDialer { addr, tls });
+        self
+    }
+
+    /// Sets the address of the server's TCP listener when it differs from the remote address.
+    #[must_use]
+    pub fn with_tcp_addr(mut self, addr: SocketAddr) -> Self {
+        if let Some(tcp) = &mut self.tcp {
+            tcp.addr = Some(addr);
+        }
+        self
+    }
+
+    /// Selects which transports the channel connects with. The default is
+    /// [`TransportPolicy::Auto`].
+    #[must_use]
+    pub const fn with_transport_policy(mut self, policy: TransportPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Sets how long QUIC may take to connect before `QMux` over TLS is tried in parallel. The
+    /// default is 300 milliseconds.
+    #[must_use]
+    pub const fn with_fallback_delay(mut self, delay: Duration) -> Self {
+        self.fallback_delay = delay;
+        self
+    }
+
+    /// Sets how long reconnects keep using `QMux` over TLS after it won a race, before QUIC is
+    /// tried again. The default is five minutes.
+    #[must_use]
+    pub const fn with_reprobe_interval(mut self, interval: Duration) -> Self {
+        self.reprobe_interval = interval;
+        self
     }
 
     /// Sets the maximum `TrevRPC` frame size for every connection generation.
@@ -206,14 +261,28 @@ impl ChannelState {
 /// Metrics-friendly channel lifecycle event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelEvent {
-    ConnectionLost { generation: u64 },
-    ReconnectAttempt { generation: u64, attempt: u32 },
-    ReconnectFailed { generation: u64, attempt: u32 },
-    Ready { generation: u64 },
-    Closed { generation: u64 },
+    ConnectionLost {
+        generation: u64,
+    },
+    ReconnectAttempt {
+        generation: u64,
+        attempt: u32,
+    },
+    ReconnectFailed {
+        generation: u64,
+        attempt: u32,
+    },
+    Ready {
+        generation: u64,
+        transport: TransportKind,
+    },
+    Closed {
+        generation: u64,
+    },
 }
 
-/// A reconnecting native QUIC channel for generated clients.
+/// A reconnecting native channel for generated clients: QUIC, with `QMux` over TLS as the
+/// optional fallback when UDP is blocked (see [`ChannelConfig::with_tcp_fallback`]).
 ///
 /// Each RPC snapshots exactly one established connection generation. RPCs are never retried or
 /// replayed. Calls started before connection loss receive the stream or connection error, while
@@ -233,14 +302,6 @@ struct Inner {
     shutdown: watch::Sender<bool>,
 }
 
-#[derive(Clone)]
-struct Dialer {
-    endpoint: quinn::Endpoint,
-    remote_addr: SocketAddr,
-    server_name: String,
-    max_frame_size: usize,
-}
-
 struct Shared {
     slot: Mutex<Slot>,
     state_tx: watch::Sender<ChannelState>,
@@ -249,11 +310,11 @@ struct Shared {
 
 struct Slot {
     state: ChannelState,
-    transport: Option<QuicTransport>,
+    transport: Option<GenerationTransport>,
 }
 
 impl Channel {
-    /// Establishes an initial native QUIC connection and starts its reconnect supervisor.
+    /// Establishes an initial connection and starts its reconnect supervisor.
     ///
     /// Build the endpoint's client configuration with [`ChannelConfig::quic_config`]. The returned
     /// future covers the complete initial handshake and may be bounded or cancelled with the
@@ -266,7 +327,7 @@ impl Channel {
         Self::connect_with_config(endpoint, remote_addr, server_name, ChannelConfig::new()).await
     }
 
-    /// Establishes an initial native QUIC connection with explicit channel configuration.
+    /// Establishes an initial connection with explicit channel configuration.
     pub async fn connect_with_config(
         endpoint: quinn::Endpoint,
         remote_addr: SocketAddr,
@@ -278,8 +339,13 @@ impl Channel {
             remote_addr,
             server_name: server_name.into(),
             max_frame_size: config.max_frame_size,
+            policy: config.policy,
+            tcp: config.tcp.clone(),
+            fallback_delay: config.fallback_delay,
+            reprobe_interval: config.reprobe_interval,
+            quic_failed_at: Arc::default(),
         };
-        let connection = dialer.dial().await?;
+        let transport = dialer.dial().await?;
         let initial_state = ChannelState {
             phase: ChannelPhase::Ready,
             generation: 1,
@@ -290,10 +356,7 @@ impl Channel {
         let shared = Arc::new(Shared {
             slot: Mutex::new(Slot {
                 state: initial_state,
-                transport: Some(
-                    QuicTransport::new(connection.clone())
-                        .with_max_frame_size(config.max_frame_size),
-                ),
+                transport: Some(transport.clone()),
             }),
             state_tx,
             event_tx,
@@ -305,7 +368,7 @@ impl Channel {
             config,
             Arc::clone(&shared),
             shutdown_rx,
-            connection,
+            transport,
         ));
 
         Ok(Self {
@@ -321,6 +384,12 @@ impl Channel {
     #[must_use]
     pub fn state(&self) -> ChannelState {
         self.inner.shared.state()
+    }
+
+    /// Returns the transport of the current connection, or `None` while not ready.
+    #[must_use]
+    pub fn transport(&self) -> Option<TransportKind> {
+        self.snapshot().ok().map(|transport| transport.kind())
     }
 
     /// Returns whether a connection can currently be snapshotted for a new RPC.
@@ -365,11 +434,11 @@ impl Channel {
 
     /// Stops reconnecting and closes this channel's current connection.
     pub fn close(&self) {
-        let (closed, connection) = self.inner.shared.close();
+        let (closed, transport) = self.inner.shared.close();
         if closed {
             let _ = self.inner.shutdown.send(true);
-            if let Some(connection) = connection {
-                connection.close(0_u32.into(), CLOSE_REASON);
+            if let Some(transport) = transport {
+                transport.close(CLOSE_REASON);
             }
         }
     }
@@ -393,7 +462,7 @@ impl Channel {
         self.inner.dialer.endpoint.rebind(socket)
     }
 
-    fn snapshot(&self) -> Result<QuicTransport> {
+    fn snapshot(&self) -> Result<GenerationTransport> {
         self.inner.shared.snapshot()
     }
 }
@@ -416,22 +485,12 @@ impl StreamingRpcTransport for Channel {
     }
 }
 
-impl Dialer {
-    async fn dial(&self) -> Result<quinn::Connection> {
-        self.endpoint
-            .connect(self.remote_addr, &self.server_name)
-            .map_err(Error::transport)?
-            .await
-            .map_err(Error::transport)
-    }
-}
-
 impl Shared {
     fn state(&self) -> ChannelState {
         self.slot.lock().expect("channel lock poisoned").state
     }
 
-    fn snapshot(&self) -> Result<QuicTransport> {
+    fn snapshot(&self) -> Result<GenerationTransport> {
         let slot = self.slot.lock().expect("channel lock poisoned");
         match slot.state.phase {
             ChannelPhase::Ready => slot
@@ -483,7 +542,8 @@ impl Shared {
         });
     }
 
-    fn install(&self, previous_generation: u64, transport: QuicTransport) -> Option<u64> {
+    fn install(&self, previous_generation: u64, transport: GenerationTransport) -> Option<u64> {
+        let kind = transport.kind();
         let state = {
             let mut slot = self.slot.lock().expect("channel lock poisoned");
             if !matches!(slot.state.phase, ChannelPhase::Reconnecting)
@@ -502,29 +562,27 @@ impl Shared {
         self.state_tx.send_replace(state);
         let _ = self.event_tx.send(ChannelEvent::Ready {
             generation: state.generation,
+            transport: kind,
         });
         Some(state.generation)
     }
 
-    fn close(&self) -> (bool, Option<quinn::Connection>) {
-        let (state, connection) = {
+    fn close(&self) -> (bool, Option<GenerationTransport>) {
+        let (state, transport) = {
             let mut slot = self.slot.lock().expect("channel lock poisoned");
             if matches!(slot.state.phase, ChannelPhase::Closed) {
                 return (false, None);
             }
-            let connection = slot
-                .transport
-                .take()
-                .map(|transport| transport.connection().clone());
+            let transport = slot.transport.take();
             slot.state.phase = ChannelPhase::Closed;
             slot.state.reconnect_attempt = None;
-            (slot.state, connection)
+            (slot.state, transport)
         };
         self.state_tx.send_replace(state);
         let _ = self.event_tx.send(ChannelEvent::Closed {
             generation: state.generation,
         });
-        (true, connection)
+        (true, transport)
     }
 }
 
@@ -533,13 +591,13 @@ async fn supervise(
     config: ChannelConfig,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
-    mut connection: quinn::Connection,
+    mut transport: GenerationTransport,
 ) {
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => return,
-            _ = connection.closed() => {}
+            () = transport.closed() => {}
         }
 
         let Some(generation) = shared.begin_reconnect() else {
@@ -567,14 +625,12 @@ async fn supervise(
                 _ = shutdown.changed() => return,
                 connected = dialer.dial() => connected,
             };
-            if let Ok(new_connection) = connected {
-                let transport = QuicTransport::new(new_connection.clone())
-                    .with_max_frame_size(dialer.max_frame_size);
-                if shared.install(generation, transport).is_none() {
-                    new_connection.close(0_u32.into(), CLOSE_REASON);
+            if let Ok(new_transport) = connected {
+                if shared.install(generation, new_transport.clone()).is_none() {
+                    new_transport.close(CLOSE_REASON);
                     return;
                 }
-                connection = new_connection;
+                transport = new_transport;
                 break;
             }
             shared.reconnect_failed(generation, attempt);

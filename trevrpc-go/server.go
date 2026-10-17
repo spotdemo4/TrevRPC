@@ -48,7 +48,13 @@ type Server struct {
 	runtime     *serverRuntime
 }
 
-// ServerOptions configures server limits, timeouts, and HTTP/3 behavior.
+// ServerOptions configures server limits, timeouts, and the HTTP and browser
+// session transports.
+//
+// EnableHTTP serves the HTTP mapping (POST to HTTPPath) over HTTP/3 and, on
+// the TCP listener, HTTP/2. EnableWebTransport serves browser sessions at
+// HTTPPath: WebTransport over HTTP/3 and, on the TCP listener, QMux over
+// WebSocket. Native QUIC and QMux over TLS are always served.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -63,53 +69,58 @@ type ServerOptions struct {
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
 	DisableStreamIdleTimeout          bool
-	EnableHTTP3                       bool
-	HTTP3Path                         string
-	HTTP3Admission                    Admission
+	EnableHTTP                        bool
+	HTTPPath                          string
+	HTTPAdmission                     Admission
 	EnableWebTransport                bool
 	WebTransportAdmission             Admission
 }
 
-// AdmissionRequest describes an HTTP/3 request or WebTransport CONNECT request
+// AdmissionRequest describes an HTTP RPC request or a browser session request
 // before the server accepts it.
 type AdmissionRequest struct {
 	// Header is a private copy of the request headers.
 	Header http.Header
 	Path   string
-	// Method is the HTTP method; it is CONNECT for WebTransport sessions.
-	Method    string
+	// Method is the HTTP method: POST for HTTP RPCs, CONNECT for WebTransport
+	// sessions and GET for WebSocket sessions.
+	Method string
+	// Proto is the HTTP version of the request, such as "HTTP/3.0".
+	Proto     string
 	Authority string
 	// Origin is the value of the Origin header, if any.
 	Origin string
 	Secure bool
 }
 
-// Admission decides whether to accept an otherwise valid HTTP/3 RPC request or
-// WebTransport session. A nil HTTP3Admission accepts valid requests; a nil
-// WebTransportAdmission rejects every WebTransport session.
+// Admission decides whether to accept an otherwise valid HTTP RPC request or
+// browser session. A nil HTTPAdmission accepts valid requests; a nil
+// WebTransportAdmission rejects every browser session, over WebTransport and
+// WebSocket alike.
 type Admission func(AdmissionRequest) bool
 
 // ServerDiagnosticPhase identifies a local server-runtime failure boundary.
 type ServerDiagnosticPhase string
 
 const (
-	ServerDiagnosticHandlerPanic               ServerDiagnosticPhase = "handler_panic"
-	ServerDiagnosticAuthorizerPanic            ServerDiagnosticPhase = "authorizer_panic"
-	ServerDiagnosticRequestStreamPanic         ServerDiagnosticPhase = "request_stream_panic"
-	ServerDiagnosticResponseStreamPanic        ServerDiagnosticPhase = "response_stream_panic"
-	ServerDiagnosticMetricsPanic               ServerDiagnosticPhase = "metrics_panic"
-	ServerDiagnosticAdmissionPanic             ServerDiagnosticPhase = "admission_panic"
-	ServerDiagnosticWebTransportConnect        ServerDiagnosticPhase = "webtransport_connect"
-	ServerDiagnosticWebTransportAdmission      ServerDiagnosticPhase = "webtransport_admission"
-	ServerDiagnosticWebTransportUpgrade        ServerDiagnosticPhase = "webtransport_upgrade"
-	ServerDiagnosticWebTransportUpgradeSuccess ServerDiagnosticPhase = "webtransport_upgrade_success"
-	ServerDiagnosticWebTransportSessionClosed  ServerDiagnosticPhase = "webtransport_session_closed"
-	ServerDiagnosticHTTP3ConnectionClosed      ServerDiagnosticPhase = "http3_connection_closed"
-	ServerDiagnosticInvalidResponse            ServerDiagnosticPhase = "invalid_response"
-	ServerDiagnosticInternalError              ServerDiagnosticPhase = "internal_error"
-	ServerDiagnosticExecutionDetached          ServerDiagnosticPhase = "execution_detached"
-	ServerDiagnosticExecutionFinallyExited     ServerDiagnosticPhase = "execution_finally_exited"
-	ServerDiagnosticShutdownIncomplete         ServerDiagnosticPhase = "shutdown_incomplete"
+	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
+	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"
+	ServerDiagnosticRequestStreamPanic     ServerDiagnosticPhase = "request_stream_panic"
+	ServerDiagnosticResponseStreamPanic    ServerDiagnosticPhase = "response_stream_panic"
+	ServerDiagnosticMetricsPanic           ServerDiagnosticPhase = "metrics_panic"
+	ServerDiagnosticAdmissionPanic         ServerDiagnosticPhase = "admission_panic"
+	ServerDiagnosticSessionConnect         ServerDiagnosticPhase = "session_connect"
+	ServerDiagnosticSessionAdmission       ServerDiagnosticPhase = "session_admission"
+	ServerDiagnosticSessionUpgrade         ServerDiagnosticPhase = "session_upgrade"
+	ServerDiagnosticSessionUpgradeSuccess  ServerDiagnosticPhase = "session_upgrade_success"
+	ServerDiagnosticSessionClosed          ServerDiagnosticPhase = "session_closed"
+	ServerDiagnosticHTTP3ConnectionClosed  ServerDiagnosticPhase = "http3_connection_closed"
+	ServerDiagnosticTLSHandshakeFailed     ServerDiagnosticPhase = "tls_handshake_failed"
+	ServerDiagnosticInvalidResponse        ServerDiagnosticPhase = "invalid_response"
+	ServerDiagnosticInternalError          ServerDiagnosticPhase = "internal_error"
+	ServerDiagnosticExecutionDetached      ServerDiagnosticPhase = "execution_detached"
+	ServerDiagnosticExecutionFinallyExited ServerDiagnosticPhase = "execution_finally_exited"
+	ServerDiagnosticShutdownIncomplete     ServerDiagnosticPhase = "shutdown_incomplete"
 )
 
 // ServerDiagnostic describes a local server failure. Request bodies and metadata are never included.
@@ -146,7 +157,7 @@ func DefaultServerOptions() ServerOptions {
 		MaxStreamMessages:                 4096,
 		MaxStreamBodySize:                 16 * 1024 * 1024,
 		StreamIdleTimeout:                 30 * time.Second,
-		HTTP3Path:                         DefaultHTTP3Path,
+		HTTPPath:                          DefaultHTTPPath,
 	}
 }
 
@@ -443,12 +454,12 @@ func canonicalServerOptions(options ServerOptions) ServerOptions {
 	canonical.GracefulShutdownTimeout = canonicalDuration("GracefulShutdownTimeout", options.GracefulShutdownTimeout, defaults.GracefulShutdownTimeout, options.DisableGracefulShutdownTimeout)
 	canonical.InitialRequestTimeout = canonicalDuration("InitialRequestTimeout", options.InitialRequestTimeout, defaults.InitialRequestTimeout, options.DisableInitialRequestTimeout)
 	canonical.StreamIdleTimeout = canonicalDuration("StreamIdleTimeout", options.StreamIdleTimeout, defaults.StreamIdleTimeout, options.DisableStreamIdleTimeout)
-	if canonical.HTTP3Path == "" {
-		canonical.HTTP3Path = defaults.HTTP3Path
+	if canonical.HTTPPath == "" {
+		canonical.HTTPPath = defaults.HTTPPath
 	}
-	parsed, err := url.ParseRequestURI(canonical.HTTP3Path)
-	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" || canonical.HTTP3Path[0] != '/' {
-		panic("trevrpc: HTTP3Path must be an absolute path without query or fragment")
+	parsed, err := url.ParseRequestURI(canonical.HTTPPath)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" || canonical.HTTPPath[0] != '/' {
+		panic("trevrpc: HTTPPath must be an absolute path without query or fragment")
 	}
 	return canonical
 }

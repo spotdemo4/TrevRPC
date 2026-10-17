@@ -8,6 +8,7 @@ use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
 use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissionRequest};
+use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, ResponseEnvelope, Status};
 
 use crate::proto::{self, Echo, EchoRequest, EchoResponse};
@@ -135,7 +136,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let mut server = Server::new();
     server.set_options(
         ServerOptions::new()
-            .with_http3_enabled(true)
+            .with_http_enabled(true)
             .with_webtransport_enabled(true)
             .with_webtransport_admission(Some(admit_webtransport)),
     );
@@ -144,16 +145,25 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    let endpoint = quinn::Endpoint::server(server.quic_config(tls)?, SocketAddr::new(host, port))?;
-    let port = endpoint.local_addr()?.port();
+    let endpoint = quinn::Endpoint::server(
+        server.quic_config(tls.clone())?,
+        SocketAddr::new(host, port),
+    )?;
+    let udp = endpoint.local_addr()?.port();
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(host, port)).await?;
+    let tcp = listener.local_addr()?.port();
+    let fallback = TcpFallback {
+        listener,
+        tls: server.tcp_tls_config(tls),
+    };
 
-    let serving = tokio::spawn(server.serve_with_shutdown(endpoint, shutdown_requested()));
+    let serving = tokio::spawn(server.serve_with_tcp(endpoint, fallback, shutdown_requested()));
 
-    // One UDP socket serves every protocol, so all three ports are the same.
+    // One UDP socket serves the QUIC protocols and one TCP socket the fallbacks.
     let mut stdout = std::io::stdout().lock();
     writeln!(
         stdout,
-        r#"{{"native":{port},"http3":{port},"webtransport":{port}}}"#
+        r#"{{"native":{udp},"http3":{udp},"webtransport":{udp},"qmux":{tcp},"http2":{tcp},"websocket":{tcp}}}"#
     )?;
     stdout.flush()?;
     drop(stdout);

@@ -8,6 +8,10 @@ import (
 const (
 	// ALPN is the QUIC application protocol negotiated by TrevRPC peers.
 	ALPN = "trevrpc/1"
+	// QMuxALPN identifies TrevRPC over QMux (draft-ietf-quic-qmux-02). It is the
+	// TLS application protocol of QMux over TLS and the WebSocket subprotocol of
+	// QMux over WebSocket.
+	QMuxALPN = "qmux-02.trevrpc-1"
 	// wireVersion is the current TrevRPC wire protocol version.
 	wireVersion = uint32(1)
 

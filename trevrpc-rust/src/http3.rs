@@ -1,7 +1,6 @@
 //! Server side of ordinary HTTP/3 (`POST /trevrpc`) and `WebTransport` (`/trevrpc`) over QUIC
 //! (ALPN `h3`).
 
-use std::future::Future;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
@@ -11,14 +10,15 @@ use http::{Method, Request, Response, StatusCode, header};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::framed::{self, FrameRead, FrameWrite};
-use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
+use crate::http_admission::{
+    MEDIA_TYPE, admission_headers, validate_http_request, validate_webtransport_admission,
+};
+use crate::http_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_stream};
+use crate::request_pump::RequestTransportEvent;
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
 use crate::server::Server;
-use crate::server_transport::{self, ResponseWriter, try_acquire_permit};
-use crate::{Error, Result, RpcRequest, RpcResponse, RpcStreamFrame, Status};
-
-const MEDIA_TYPE: &str = "application/trevrpc";
+use crate::server_transport::try_acquire_permit;
+use crate::{Error, Result, Status};
 // RFC WebTransport reserves this error-code range for application protocol errors. Code 1 maps
 // to the first application code plus one; the division term is zero for this value.
 const CANCELLED_STREAM_CODE: u64 = 0x52e4_a40f_a8dc;
@@ -146,7 +146,7 @@ pub(crate) async fn handle_connection(
     drain_streams(
         &mut stream_tasks,
         server.options().graceful_shutdown_timeout(),
-        &raw_connection,
+        || raw_connection.close(0_u32.into(), b"server stream drain timed out"),
     )
     .await;
     if *shutdown.borrow() {
@@ -202,57 +202,11 @@ async fn handle_http_request(
     handle_rpc_stream(
         server,
         request_limit,
-        H3Sink(send),
-        H3Source(recv),
-        connection,
+        H3Sink(send, connection.clone()),
+        H3Source(recv, connection),
         shutdown,
     )
     .await;
-}
-
-fn validate_http_request(server: &Server, request: &Request<()>) -> Option<StatusCode> {
-    let options = server.options();
-    if !options.http3_enabled() || request.uri().path() != options.http3_path() {
-        return Some(StatusCode::NOT_FOUND);
-    }
-    if request.method() != Method::POST {
-        return Some(StatusCode::METHOD_NOT_ALLOWED);
-    }
-    if !valid_content_type(request.headers()) {
-        return Some(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-    if let Some(admission) = options.http3_admission() {
-        let headers = admission_headers(request.headers());
-        let admission_request = crate::server::Http3AdmissionRequest {
-            request,
-            path: request.uri().path(),
-            authority: request.uri().authority().map(http::uri::Authority::as_str),
-            secure: request.uri().scheme_str() == Some("https"),
-            headers: &headers,
-        };
-        if !admission(&admission_request) {
-            return Some(StatusCode::FORBIDDEN);
-        }
-    }
-    None
-}
-
-fn valid_content_type(headers: &http::HeaderMap) -> bool {
-    let mut values = headers.get_all(header::CONTENT_TYPE).iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
-    values.next().is_none() && value.as_bytes().eq_ignore_ascii_case(MEDIA_TYPE.as_bytes())
-}
-
-fn admission_headers(headers: &http::HeaderMap) -> Vec<crate::server::AdmissionHeader<'_>> {
-    headers
-        .iter()
-        .map(|(name, value)| crate::server::AdmissionHeader {
-            name: name.as_str(),
-            value: value.as_bytes(),
-        })
-        .collect()
 }
 
 async fn reject_h3(mut stream: H3RequestStream, status: StatusCode) {
@@ -288,60 +242,6 @@ fn validate_webtransport_request(server: &Server, request: &Request<()>) -> Opti
     )
 }
 
-fn validate_webtransport_admission(
-    server: &Server,
-    path: &str,
-    authority: Option<&str>,
-    origin: Option<&str>,
-    secure: bool,
-    headers: &[crate::server::AdmissionHeader<'_>],
-) -> Option<StatusCode> {
-    let options = server.options();
-    if !options.webtransport_enabled() || path != options.http3_path() {
-        return Some(StatusCode::NOT_FOUND);
-    }
-    if let Some(admission) = options.webtransport_admission() {
-        let request = crate::server::WebTransportAdmissionRequest {
-            path,
-            authority,
-            origin,
-            secure,
-            headers,
-        };
-        return (!admission(&request)).then_some(StatusCode::FORBIDDEN);
-    }
-    let allowed_authorities = options.webtransport_allowed_authorities();
-    if !allowed_authorities.is_empty()
-        && !authority.is_some_and(|authority| {
-            allowed_authorities
-                .iter()
-                .any(|allowed| allowed == authority || allowed == authority_host(authority))
-        })
-    {
-        return Some(StatusCode::FORBIDDEN);
-    }
-    if origin.is_some_and(|origin| {
-        !options
-            .webtransport_allowed_origins()
-            .iter()
-            .any(|allowed| allowed == origin)
-    }) {
-        return Some(StatusCode::FORBIDDEN);
-    }
-    None
-}
-
-fn authority_host(authority: &str) -> &str {
-    if let Some(authority) = authority.strip_prefix('[')
-        && let Some((host, _)) = authority.split_once(']')
-    {
-        return host;
-    }
-    authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _)| host)
-}
-
 async fn handle_webtransport_session(
     server: Server,
     session: WebTransportSession,
@@ -369,9 +269,8 @@ async fn handle_webtransport_session(
                             let (send, recv) = stream.split();
                             stream_tasks.spawn(reject_rpc_stream(
                                 server,
-                                WebTransportSink(send),
-                                WebTransportSource(recv),
-                                stream_connection,
+                                WebTransportSink(send, stream_connection.clone()),
+                                WebTransportSource(recv, stream_connection),
                             ));
                             continue;
                         };
@@ -385,9 +284,8 @@ async fn handle_webtransport_session(
                             handle_rpc_stream(
                                 server,
                                 request_limit,
-                                WebTransportSink(send),
-                                WebTransportSource(recv),
-                                stream_connection,
+                                WebTransportSink(send, stream_connection.clone()),
+                                WebTransportSource(recv, stream_connection),
                                 stream_shutdown,
                             )
                             .await;
@@ -438,24 +336,7 @@ async fn handle_webtransport_session(
     .await;
 }
 
-/// The send half of one HTTP/3 or `WebTransport` stream.
-trait BodySink: Send + 'static {
-    fn write(&mut self, chunk: &[u8]) -> impl Future<Output = Result<()>> + Send;
-
-    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
-
-    fn reset(&mut self);
-}
-
-/// The receive half of one HTTP/3 or `WebTransport` stream.
-trait BodySource: Send + 'static {
-    fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Bytes>>> + Send;
-
-    /// Validates anything that follows the request body, such as HTTP/3 trailers.
-    fn validate_end(&mut self) -> impl Future<Output = Result<()>> + Send;
-}
-
-struct H3Sink(H3SendStream);
+struct H3Sink(H3SendStream, quinn::Connection);
 
 impl BodySink for H3Sink {
     async fn write(&mut self, chunk: &[u8]) -> Result<()> {
@@ -472,9 +353,15 @@ impl BodySink for H3Sink {
     fn reset(&mut self) {
         self.0.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
+
+    /// h3 cannot report a peer `STOP_SENDING` independently of body polling, so only the loss
+    /// of the whole connection is observed.
+    async fn stopped(&mut self) -> Result<()> {
+        Err(Error::transport(self.1.closed().await))
+    }
 }
 
-struct H3Source(H3RecvStream);
+struct H3Source(H3RecvStream, quinn::Connection);
 
 impl BodySource for H3Source {
     async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
@@ -490,9 +377,15 @@ impl BodySource for H3Source {
             None => Ok(()),
         }
     }
+
+    async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
+        Some(RequestTransportEvent::connection_lost(
+            self.1.closed().await,
+        ))
+    }
 }
 
-struct WebTransportSink(WebTransportSendStream);
+struct WebTransportSink(WebTransportSendStream, quinn::Connection);
 
 impl BodySink for WebTransportSink {
     async fn write(&mut self, mut chunk: &[u8]) -> Result<()> {
@@ -520,9 +413,13 @@ impl BodySink for WebTransportSink {
     fn reset(&mut self) {
         h3::quic::SendStream::reset(&mut self.0, CANCELLED_STREAM_CODE);
     }
+
+    async fn stopped(&mut self) -> Result<()> {
+        Err(Error::transport(self.1.closed().await))
+    }
 }
 
-struct WebTransportSource(WebTransportRecvStream);
+struct WebTransportSource(WebTransportRecvStream, quinn::Connection);
 
 impl BodySource for WebTransportSource {
     async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
@@ -536,167 +433,10 @@ impl BodySource for WebTransportSource {
     async fn validate_end(&mut self) -> Result<()> {
         Ok(())
     }
-}
 
-/// Adapts an HTTP/3 or `WebTransport` stream's send half to the server's response writer.
-///
-/// The underlying libraries cannot report a peer `STOP_SENDING` independently of body polling, so
-/// the writer observes only loss of the whole connection.
-struct BodyWriter<S> {
-    sink: S,
-    connection: quinn::Connection,
-    max_frame_size: usize,
-}
-
-impl<S: BodySink> FrameWrite for BodyWriter<S> {
-    async fn write_frame_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.sink.write(bytes).await
-    }
-
-    async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
-        for chunk in chunks {
-            self.sink.write(chunk).await?;
-        }
-        Ok(())
-    }
-}
-
-impl<S: BodySink> ResponseWriter for BodyWriter<S> {
-    async fn write_response(&mut self, response: &RpcResponse) -> Result<()> {
-        let max_frame_size = self.max_frame_size;
-        framed::write_frame(self, response, max_frame_size).await
-    }
-
-    async fn write_message_stream_frames(&mut self, bodies: &mut Vec<Vec<u8>>) -> Result<()> {
-        let max_frame_size = self.max_frame_size;
-        framed::write_message_stream_frames(self, bodies, max_frame_size).await
-    }
-
-    async fn write_stream_frame(&mut self, frame: RpcStreamFrame) -> Result<()> {
-        let max_frame_size = self.max_frame_size;
-        framed::write_stream_frame(self, frame, max_frame_size).await
-    }
-
-    async fn stopped(&mut self) -> Result<()> {
-        Err(Error::transport(self.connection.closed().await))
-    }
-
-    fn reset(&mut self) {
-        self.sink.reset();
-    }
-
-    async fn finish(&mut self) -> Result<()> {
-        self.sink.finish().await
-    }
-}
-
-/// Adapts an HTTP/3 or `WebTransport` stream's receive half to the server's request reader.
-struct BodyReader<S> {
-    source: S,
-    chunk: Bytes,
-    connection: quinn::Connection,
-}
-
-impl<S: BodySource> FrameRead for BodyReader<S> {
-    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
-        while self.chunk.is_empty() {
-            let Some(chunk) = self.source.next_chunk().await? else {
-                return Ok(None);
-            };
-            self.chunk = chunk;
-        }
-        let len = bytes.len().min(self.chunk.len());
-        self.chunk.copy_to_slice(&mut bytes[..len]);
-        Ok(Some(len))
-    }
-}
-
-impl<S: BodySource> RequestPumpReader for BodyReader<S> {
-    fn stop_trevrpc(&mut self) {
-        // h3-quinn 0.0.10 moves its Quinn receive stream into a private reusable read future, and
-        // its public `stop_sending` unwraps an internal slot that may remain empty even after a
-        // read returns, so calling it can panic. h3-WebTransport receive streams delegate to the
-        // same code. Dropping the bounded per-request stream is safe, but this dependency API
-        // cannot guarantee TrevRPC cancellation code 1 over HTTP/3 and WebTransport.
-    }
-
-    async fn read_unary_end(&mut self) -> Result<()> {
-        framed::drain_unary_request_end(self).await
-    }
-
-    async fn read_stream_frame_or_eof(
-        &mut self,
-        max_frame_size: usize,
-    ) -> Result<Option<RpcStreamFrame>> {
-        framed::read_stream_frame_or_eof(self, max_frame_size).await
-    }
-
-    async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {
+    async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
         Some(RequestTransportEvent::connection_lost(
-            self.connection.closed().await,
+            self.1.closed().await,
         ))
-    }
-
-    async fn validate_transport_end(&mut self) -> Result<()> {
-        self.source.validate_end().await
-    }
-}
-
-/// Reads the initial request frame, replying with its failure status when it is unusable.
-async fn read_request<K, S>(
-    server: &Server,
-    connection: quinn::Connection,
-    sink: K,
-    source: S,
-) -> Option<(BodyWriter<K>, BodyReader<S>, RpcRequest)>
-where
-    K: BodySink,
-    S: BodySource,
-{
-    let writer = BodyWriter {
-        sink,
-        connection: connection.clone(),
-        max_frame_size: server.max_frame_size(),
-    };
-    let mut reader = BodyReader {
-        source,
-        chunk: Bytes::new(),
-        connection,
-    };
-    match server_transport::read_initial_request(server, &mut reader).await {
-        Ok(request) => Some((writer, reader, request)),
-        Err(error) => {
-            let status = error.into_status();
-            server.record_pre_handler_failure(&status);
-            server_transport::write_status(writer, status).await;
-            None
-        }
-    }
-}
-
-async fn handle_rpc_stream<K, S>(
-    server: Server,
-    request_limit: Option<Arc<Semaphore>>,
-    sink: K,
-    source: S,
-    connection: quinn::Connection,
-    shutdown: watch::Receiver<bool>,
-) where
-    K: BodySink,
-    S: BodySource,
-{
-    if let Some((writer, reader, request)) = read_request(&server, connection, sink, source).await {
-        server_transport::handle_stream(server, request_limit, writer, reader, request, shutdown)
-            .await;
-    }
-}
-
-async fn reject_rpc_stream<K, S>(server: Server, sink: K, source: S, connection: quinn::Connection)
-where
-    K: BodySink,
-    S: BodySource,
-{
-    if let Some((writer, reader, request)) = read_request(&server, connection, sink, source).await {
-        server_transport::reject_stream(server, writer, reader, request).await;
     }
 }

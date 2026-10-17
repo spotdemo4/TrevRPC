@@ -1,6 +1,5 @@
 use std::error::Error as StdError;
 use std::fmt;
-use std::io;
 
 use crate::Status;
 
@@ -47,98 +46,7 @@ impl Error {
 }
 
 fn transport_status(error: &(dyn StdError + Send + Sync + 'static)) -> Status {
-    if let Some(error) = error.downcast_ref::<quinn::ConnectionError>() {
-        return quinn_connection_status(error);
-    }
-    if let Some(error) = error.downcast_ref::<quinn::ReadError>() {
-        return quinn_read_status(error);
-    }
-    if let Some(error) = error.downcast_ref::<quinn::ReadExactError>() {
-        return quinn_read_exact_status(error);
-    }
-    if let Some(error) = error.downcast_ref::<quinn::WriteError>() {
-        return quinn_write_status(error);
-    }
-    if let Some(error) = error.downcast_ref::<h3::error::StreamError>() {
-        return h3_stream_status(error);
-    }
-    if let Some(error) = error.downcast_ref::<h3::quic::StreamErrorIncoming>() {
-        return h3_quic_stream_status(error);
-    }
-
-    if let Some(error) = error.downcast_ref::<io::Error>() {
-        return io_status(error);
-    }
-
-    transport_unavailable(error)
-}
-
-fn h3_stream_status(error: &h3::error::StreamError) -> Status {
-    match error {
-        h3::error::StreamError::RemoteTerminate { .. } => Status::cancelled(error.to_string()),
-        h3::error::StreamError::StreamError { .. }
-        | h3::error::StreamError::HeaderTooBig { .. } => Status::internal(error.to_string()),
-        _ => transport_unavailable(error),
-    }
-}
-
-fn h3_quic_stream_status(error: &h3::quic::StreamErrorIncoming) -> Status {
-    match error {
-        h3::quic::StreamErrorIncoming::StreamTerminated { .. } => {
-            Status::cancelled(error.to_string())
-        }
-        h3::quic::StreamErrorIncoming::ConnectionErrorIncoming { .. }
-        | h3::quic::StreamErrorIncoming::Unknown(_) => transport_unavailable(error),
-    }
-}
-
-fn io_status(error: &io::Error) -> Status {
-    match error.kind() {
-        io::ErrorKind::BrokenPipe
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::NotConnected
-        | io::ErrorKind::TimedOut
-        | io::ErrorKind::UnexpectedEof => transport_unavailable(error),
-        _ => Status::internal(error.to_string()),
-    }
-}
-
-fn quinn_connection_status(error: &quinn::ConnectionError) -> Status {
-    match error {
-        quinn::ConnectionError::LocallyClosed => Status::cancelled("transport closed locally"),
-        _ => transport_unavailable(error),
-    }
-}
-
-fn quinn_read_status(error: &quinn::ReadError) -> Status {
-    match error {
-        quinn::ReadError::Reset(_)
-        | quinn::ReadError::ClosedStream
-        | quinn::ReadError::ZeroRttRejected => Status::cancelled(error.to_string()),
-        quinn::ReadError::ConnectionLost(error) => quinn_connection_status(error),
-        quinn::ReadError::IllegalOrderedRead => Status::internal(error.to_string()),
-    }
-}
-
-fn quinn_read_exact_status(error: &quinn::ReadExactError) -> Status {
-    match error {
-        quinn::ReadExactError::FinishedEarly(_) => transport_unavailable(error),
-        quinn::ReadExactError::ReadError(error) => quinn_read_status(error),
-    }
-}
-
-fn quinn_write_status(error: &quinn::WriteError) -> Status {
-    match error {
-        quinn::WriteError::Stopped(_)
-        | quinn::WriteError::ClosedStream
-        | quinn::WriteError::ZeroRttRejected => Status::cancelled(error.to_string()),
-        quinn::WriteError::ConnectionLost(error) => quinn_connection_status(error),
-    }
-}
-
-fn transport_unavailable(error: &dyn fmt::Display) -> Status {
-    Status::unavailable(format!("transport unavailable: {error}"))
+    crate::transport_error::classify(error).status
 }
 
 impl From<Status> for Error {
