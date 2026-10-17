@@ -48,8 +48,8 @@ impl<S: MuxSendStream> ResponseWriter for NativeResponseWriter<S> {
         self.send.reset_stream(CANCELLED_STREAM_CODE);
     }
 
-    async fn finish(&mut self) -> Result<()> {
-        self.send.finish_stream()
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(self.send.finish_stream())
     }
 }
 
@@ -96,8 +96,8 @@ impl<C: MuxConnection> RequestPumpReader for NativePumpReader<C> {
         }
     }
 
-    async fn validate_transport_end(&mut self) -> Result<()> {
-        Ok(())
+    fn validate_transport_end(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 

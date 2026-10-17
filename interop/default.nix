@@ -13,17 +13,25 @@ let
     "chromium"
     "firefox"
   ];
-  args = lib.cli.toGNUCommandLineShell { } {
-    server = [
-      "go=${trevrpc-go}/bin/trevrpc-interop-go"
-      "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
-    ];
-    client = [
-      "go=${trevrpc-go}/bin/trevrpc-interop-go"
-      "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
-    ];
-    browser = browsers;
-  };
+  # run.sh parses `--option value`, not GNU `--option=value`.
+  args =
+    lib.cli.toCommandLineShell
+      (name: {
+        option = "--${name}";
+        sep = null;
+        explicitBool = false;
+      })
+      {
+        server = [
+          "go=${trevrpc-go}/bin/trevrpc-interop-go"
+          "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
+        ];
+        client = [
+          "go=${trevrpc-go}/bin/trevrpc-interop-go"
+          "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
+        ];
+        browser = browsers;
+      };
 in
 runCommand "trevrpc-interop-check"
   {

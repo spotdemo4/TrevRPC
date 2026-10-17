@@ -177,10 +177,12 @@ impl BodySink for H2Sink {
         Ok(())
     }
 
-    async fn finish(&mut self) -> Result<()> {
-        self.0
-            .send_data(Bytes::new(), true)
-            .map_err(Error::transport)
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(
+            self.0
+                .send_data(Bytes::new(), true)
+                .map_err(Error::transport),
+        )
     }
 
     fn reset(&mut self) {

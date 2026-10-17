@@ -430,8 +430,8 @@ impl BodySource for WebTransportSource {
         Ok(chunk.map(|mut chunk| chunk.copy_to_bytes(chunk.remaining())))
     }
 
-    async fn validate_end(&mut self) -> Result<()> {
-        Ok(())
+    fn validate_end(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
     }
 
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {

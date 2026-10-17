@@ -693,10 +693,12 @@ mod tests {
             self.events.recv().await
         }
 
-        async fn validate_transport_end(&mut self) -> Result<()> {
-            self.end_error
-                .take()
-                .map_or(Ok(()), |status| Err(Error::from(status)))
+        fn validate_transport_end(&mut self) -> impl Future<Output = Result<()>> + Send {
+            std::future::ready(
+                self.end_error
+                    .take()
+                    .map_or(Ok(()), |status| Err(Error::from(status))),
+            )
         }
     }
 
@@ -730,8 +732,8 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn validate_transport_end(&mut self) -> Result<()> {
-            Ok(())
+        fn validate_transport_end(&mut self) -> impl Future<Output = Result<()>> + Send {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -801,8 +803,8 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn validate_transport_end(&mut self) -> Result<()> {
-            Ok(())
+        fn validate_transport_end(&mut self) -> impl Future<Output = Result<()>> + Send {
+            std::future::ready(Ok(()))
         }
     }
 
