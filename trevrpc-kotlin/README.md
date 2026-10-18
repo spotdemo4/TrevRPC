@@ -79,6 +79,8 @@ engine.shutdown()
 executor.shutdown()
 ```
 
+Requests use `Content-Type: application/trevrpc`, which names wire version 1; frames carry no version, so a server that does not serve it answers `415`. Every call names its method by one path (`/example.greeter.Greeter/SayHello`), which the generator emits as a `GREETER_SAY_HELLO_PATH` constant per method. Calling `Client` directly takes that path: `client.unary(GREETER_SAY_HELLO_PATH, request, requestCodec, responseCodec)`.
+
 Cronet decides between HTTP/3 and HTTP/2, so the wire format and the channel API are identical on both. Servers must keep their TCP port reachable for the fallback (Go uses the same port number for TCP and UDP). Their HTTP/2 responses carry an `Alt-Svc` header pointing at the UDP port, so Cronet can move to HTTP/3 when it is available.
 
 ### Headers and metadata

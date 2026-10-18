@@ -160,7 +160,6 @@ func (r *repeatReader) Read(p []byte) (int, error) {
 // --- End to end over loopback ---
 
 const (
-	benchServiceName = "bench.Echo"
 	// benchCountKey is the request metadata key naming how many messages
 	// Repeat streams.
 	benchCountKey = "count"
@@ -178,17 +177,17 @@ const (
 //   - Sink counts the messages it receives.
 //   - Chat returns every message it receives.
 func registerBenchService(server *Server) {
-	RegisterUnary(server, benchServiceName, "Unary", newTestMessage, func(_ context.Context, request *testMessage) (*Response[*testMessage], error) {
+	RegisterUnary(server, "/bench.Echo/Unary", newTestMessage, func(_ context.Context, request *testMessage) (*Response[*testMessage], error) {
 		return &Response[*testMessage]{Message: request}, nil
 	})
-	RegisterServerStreaming(server, benchServiceName, "Repeat", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
+	RegisterServerStreaming(server, "/bench.Echo/Repeat", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		count, err := strconv.Atoi(string(RequestMetadataFromContext(ctx)[benchCountKey]))
 		if err != nil {
 			return nil, InvalidArgument("count: " + err.Error())
 		}
 		return &repeatStream{message: request, left: count}, nil
 	})
-	RegisterClientStreaming(server, benchServiceName, "Sink", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
+	RegisterClientStreaming(server, "/bench.Echo/Sink", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
 		var count int
 		for _, err := range Messages(requests) {
 			if err != nil {
@@ -198,7 +197,7 @@ func registerBenchService(server *Server) {
 		}
 		return &Response[*testMessage]{Message: &testMessage{Value: strconv.Itoa(count)}}, nil
 	})
-	RegisterBidirectionalStreaming(server, benchServiceName, "Chat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
+	RegisterBidirectionalStreaming(server, "/bench.Echo/Chat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
 		return echoStream{requests}, nil
 	})
 }
@@ -291,7 +290,7 @@ func BenchmarkUnary(b *testing.B) {
 	benchEndToEnd(b, func(ctx context.Context, b *testing.B, transport Transport, payload string) {
 		request := &testMessage{Value: payload}
 		for b.Loop() {
-			reply, err := Unary(ctx, transport, benchServiceName, "Unary", request, newTestMessage)
+			reply, err := Unary(ctx, transport, "/bench.Echo/Unary", request, newTestMessage)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -308,7 +307,7 @@ func BenchmarkServerStream(b *testing.B) {
 		request := &testMessage{Value: payload}
 		b.ResetTimer()
 		eachChunk(b, func(count int) error {
-			stream, err := ServerStreaming(ctx, transport, benchServiceName, "Repeat", request, newTestMessage,
+			stream, err := ServerStreaming(ctx, transport, "/bench.Echo/Repeat", request, newTestMessage,
 				WithMetadata(benchCountKey, []byte(strconv.Itoa(count))))
 			if err != nil {
 				return err
@@ -340,7 +339,7 @@ func BenchmarkClientStream(b *testing.B) {
 		request := &testMessage{Value: payload}
 		b.ResetTimer()
 		eachChunk(b, func(count int) error {
-			call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, benchServiceName, "Sink", newTestMessage)
+			call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, "/bench.Echo/Sink", newTestMessage)
 			if err != nil {
 				return err
 			}
@@ -367,7 +366,7 @@ func BenchmarkClientStream(b *testing.B) {
 // BenchmarkBidiPingPong measures one echo round trip on one open stream.
 func BenchmarkBidiPingPong(b *testing.B) {
 	benchEndToEnd(b, func(ctx context.Context, b *testing.B, transport Transport, payload string) {
-		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, benchServiceName, "Chat", newTestMessage)
+		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/bench.Echo/Chat", newTestMessage)
 		if err != nil {
 			b.Fatal(err)
 		}

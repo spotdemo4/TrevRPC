@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,24 +121,122 @@ func TestBenchScenarios(t *testing.T) {
 	srv := startServer(t)
 	for _, scenario := range scenarios {
 		for _, concurrency := range []int{1, 4} {
-			t.Run(scenario+"/c"+strconv.Itoa(concurrency), func(t *testing.T) {
-				var out bytes.Buffer
+			for _, metadataSize := range []int{0, 300} {
+				t.Run(scenario+"/c"+strconv.Itoa(concurrency)+"/md"+strconv.Itoa(metadataSize), func(t *testing.T) {
+					var out bytes.Buffer
+					args := []string{
+						"bench", "--addr", srv.addr, "--tcp-addr", "ignored:1", "--ca", srv.ca,
+						"--server-name", "localhost", "--transport", "grpc", "--scenario", scenario,
+						"--size", "100", "--metadata-size", strconv.Itoa(metadataSize),
+						"--concurrency", strconv.Itoa(concurrency),
+						"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
+					}
+					if err := run(t.Context(), args, nil, &out); err != nil {
+						t.Fatal(err)
+					}
+					checkResult(t, out.Bytes(), scenario, concurrency, metadataSize)
+				})
+			}
+		}
+	}
+}
+
+// padCounter counts the calls a server handles and those that carry the
+// bench-pad request metadata, and what the pad looked like.
+type padCounter struct {
+	calls, padded, entries atomic.Int64
+	badPads                atomic.Int64
+	size                   int
+}
+
+func (c *padCounter) observe(ctx context.Context) {
+	c.calls.Add(1)
+	md, _ := metadata.FromIncomingContext(ctx)
+	pad := md.Get(padKey)
+	if len(pad) == 0 {
+		return
+	}
+	c.padded.Add(1)
+	c.entries.Add(int64(len(pad)))
+	if len(pad) != 1 || pad[0] != strings.Repeat("x", c.size) {
+		c.badPads.Add(1)
+	}
+}
+
+// startPadCountingServer serves Echo over TLS with interceptors that observe
+// every unary call and stream.
+func startPadCountingServer(t *testing.T, counter *padCounter) *testServer {
+	t.Helper()
+	cert, key := writeCert(t)
+	creds, err := credentials.NewServerTLSFromFile(cert, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lc net.ListenConfig
+	lis, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer(grpc.Creds(creds),
+		grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			counter.observe(ctx)
+			return handler(ctx, req)
+		}),
+		grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			counter.observe(stream.Context())
+			return handler(srv, stream)
+		}))
+	echopb.RegisterEchoServer(srv, echoServer{})
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	return &testServer{addr: lis.Addr().String(), ca: cert}
+}
+
+// TestBenchMetadataSizeAddsOnePadEntryToEveryCall checks what the smoke test
+// cannot see: that every call carries exactly one bench-pad entry of the
+// asked size, and none without --metadata-size.
+func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
+	for _, scenario := range scenarios {
+		for _, size := range []int{0, 1, 4096} {
+			t.Run(scenario+"/md"+strconv.Itoa(size), func(t *testing.T) {
+				counter := &padCounter{size: size}
+				srv := startPadCountingServer(t, counter)
 				args := []string{
-					"bench", "--addr", srv.addr, "--tcp-addr", "ignored:1", "--ca", srv.ca,
-					"--server-name", "localhost", "--transport", "grpc", "--scenario", scenario,
-					"--size", "100", "--concurrency", strconv.Itoa(concurrency),
-					"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
+					"bench", "--addr", srv.addr, "--ca", srv.ca, "--scenario", scenario,
+					"--size", "10", "--metadata-size", strconv.Itoa(size), "--concurrency", "2",
+					"--duration", "0.2", "--warmup", "0.05", "--messages", "3",
 				}
-				if err := run(t.Context(), args, nil, &out); err != nil {
+				if err := run(t.Context(), args, nil, io.Discard); err != nil {
 					t.Fatal(err)
 				}
-				checkResult(t, out.Bytes(), scenario, concurrency)
+				calls, padded := counter.calls.Load(), counter.padded.Load()
+				if calls == 0 {
+					t.Fatal("the server saw no calls")
+				}
+				switch {
+				case size == 0 && padded != 0:
+					t.Errorf("%d of %d calls carried %s, want none", padded, calls, padKey)
+				case size > 0 && padded != calls:
+					t.Errorf("%d of %d calls carried %s, want all", padded, calls, padKey)
+				}
+				if counter.entries.Load() != padded || counter.badPads.Load() != 0 {
+					t.Errorf("%d pad entries on %d calls, %d with the wrong value", counter.entries.Load(), padded, counter.badPads.Load())
+				}
 			})
 		}
 	}
 }
 
-func checkResult(t *testing.T, line []byte, scenario string, concurrency int) {
+func TestBenchRejectsInvalidMetadataSizes(t *testing.T) {
+	for _, size := range []string{"-1", strconv.Itoa(maxMetadataSize + 1)} {
+		err := run(t.Context(), []string{"bench", "--addr", "x:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", size}, nil, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "metadata-size") {
+			t.Errorf("--metadata-size %s: err = %v, want a metadata-size error", size, err)
+		}
+	}
+}
+
+func checkResult(t *testing.T, line []byte, scenario string, concurrency, metadataSize int) {
 	t.Helper()
 	if bytes.Count(line, []byte("\n")) != 1 || !bytes.HasSuffix(line, []byte("\n")) {
 		t.Fatalf("want exactly one JSON line, got %q", line)
@@ -159,6 +258,9 @@ func checkResult(t *testing.T, line []byte, scenario string, concurrency int) {
 	}
 	if num("size") != 100 || int(num("concurrency")) != concurrency || num("duration_s") != 0.2 {
 		t.Errorf("echoed parameters wrong: %s", line)
+	}
+	if int(num("metadata_size")) != metadataSize {
+		t.Errorf("metadata_size = %v, want %d", r["metadata_size"], metadataSize)
 	}
 	if num("errors") != 0 {
 		t.Errorf("errors = %v", r["errors"])

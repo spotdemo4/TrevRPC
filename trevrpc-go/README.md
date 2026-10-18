@@ -146,7 +146,22 @@ return listener.Serve(ctx) // returns nil after ctx is cancelled and handlers dr
 
 Unary and client-streaming handlers return a `*trevrpc.Response` whose `Headers` are sent ahead of the message and whose `Metadata` is trailing metadata, sent with the final status. Streaming handlers may wrap their stream with `trevrpc.WithResponseHeaders(stream, headers)`, which sends the headers as soon as the handler returns, before the first message is pulled, and with `trevrpc.NewResponseStream(stream, metadata)` to send trailing metadata. The two wrappers compose in either order.
 
+Generated code calls the generic functions `trevrpc.Unary`, `ServerStreaming`, `ClientStreaming` and `BidirectionalStreaming` on the client and `trevrpc.RegisterUnary`, `RegisterServerStreaming`, `RegisterClientStreaming` and `RegisterBidirectionalStreaming` on the server, and you can call them directly. Each identifies the method by its full path, `/package.Service/Method`, which generated code exposes as a constant such as `greeter.Greeter_SayHello_FullMethodName`:
+
+```go
+reply, err := trevrpc.Unary(ctx, channel, "/example.greeter.Greeter/SayHello",
+	&greeter.HelloRequest{Name: "TrevRPC"}, func() *greeter.HelloReply { return &greeter.HelloReply{} })
+
+trevrpc.RegisterUnary(server, "/example.greeter.Greeter/SayHello",
+	func() *greeter.HelloRequest { return &greeter.HelloRequest{} },
+	func(ctx context.Context, r *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) { /* ... */ })
+```
+
+`Register*` panics if the path is not exactly `/<service>/<method>` with both parts non-empty. The server answers a request whose path is malformed with `InvalidArgument` and a well-formed path without a handler with `Unimplemented`. `HandlerContext` carries the `FullMethod` path and its `Service` and `Method` parts.
+
 On the wire a call is a sequence of frames, each a QUIC variable-length type, a QUIC variable-length length and a payload: `REQUEST MESSAGE* [STATUS]` from the client and `[HEADERS] MESSAGE* STATUS` from the server. `MESSAGE` payloads are the protobuf message itself. Frames of unknown type are skipped everywhere, and count towards `MaxFrameSize` (checked before a payload is read) and, on servers, towards `MaxStreamBodySize`.
+
+Frames carry no wire version: each transport fixes it while negotiating (ALPN `trevrpc/1`, ALPN or subprotocol `qmux-02.trevrpc-1`, `Content-Type: application/trevrpc`). For WebTransport the server selects the protocol `trevrpc-1` in `WT-Protocol`, answers `400` to a CONNECT whose `WT-Available-Protocols` is a valid list without `"trevrpc-1"`, and treats a missing or malformed field as version 1.
 
 Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `WebTransportAdmission` admits them; HTTP requests (HTTP/3 and HTTP/2) are admitted unless `HTTPAdmission` denies them. `AdmissionRequest.Proto` reports the HTTP version (`HTTP/3.0`, `HTTP/2.0`, or `HTTP/1.1`) and `Method` is `POST`, `CONNECT` (WebTransport), or `GET` (WebSocket). Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
 

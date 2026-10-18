@@ -39,13 +39,13 @@ class WireCodecTest {
         val metadata = Metadata.of("authorization" to "ok".encodeToByteArray())
         val entries: Map<String, Entry<*>> =
             mapOf(
-                "request.unary" to requestEntry(RpcRequest("svc", "m")),
+                "request.unary" to requestEntry(RpcRequest("/svc/m")),
                 "request.bidi_timeout" to
                     requestEntry(
-                        RpcRequest("svc", "m", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value, timeoutNanos = 123_456u),
+                        RpcRequest("/svc/m", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value, timeoutNanos = 123_456u),
                     ),
-                "request.metadata" to requestEntry(RpcRequest("svc", "m", metadata)),
-                "request.extensions" to requestEntry(RpcRequest("svc", "m", extensions = listOf(1uL, 300uL))),
+                "request.metadata" to requestEntry(RpcRequest("/svc/m", metadata)),
+                "request.extensions" to requestEntry(RpcRequest("/svc/m", extensions = listOf(1uL, 300uL))),
                 "headers.metadata" to headersEntry(RpcHeaders(Metadata.of("x-a" to "1".encodeToByteArray()))),
                 "headers.empty" to headersEntry(RpcHeaders()),
                 "headers.extensions" to headersEntry(RpcHeaders(extensions = listOf(1uL))),
@@ -194,11 +194,26 @@ class WireCodecTest {
         val request = WireCodec.decodeRequest(byteArrayOf(0x28, 0x63, 0x30, 0x01, 0x40, 0x07, 0x1a, 0x01, 0x7a))
         assertEquals(99, request.kindValue)
         assertNull(request.kind)
-        assertEquals(WIRE_VERSION, request.version)
+        assertEquals("", request.method)
         assertEquals(Code.UNKNOWN, Code.fromValue(999u))
 
-        val negativeKind = RpcRequest("svc", "method", kindValue = -1)
+        val negativeKind = RpcRequest("/svc/method", kindValue = -1)
         assertEquals(-1, WireCodec.decodeRequest(WireCodec.encode(negativeKind)).kindValue)
+    }
+
+    @Test
+    fun `request codec reads the method path from field 1 and ignores reserved tags 2 3 and 6`() {
+        val path = "/example.greeter.Greeter/SayHello"
+        val encoded = WireCodec.encode(RpcRequest(path))
+        assertEquals(path, WireCodec.decodeRequest(encoded).method)
+        // A peer sending the retired method name (2), request body (3) or wire version (6) is skipped.
+        val withReserved = encoded + byteArrayOf(0x12, 0x01, 0x6d, 0x1a, 0x01, 0x7a, 0x30, 0x01)
+        assertEquals(RpcRequest(path), WireCodec.decodeRequest(withReserved))
+        assertEquals(path, WireCodec.decodeRequest(WireCodec.encode(RpcRequest(path))).method)
+        assertEquals(
+            listOf<Byte>(0x0a, path.length.toByte()),
+            encoded.take(2),
+        )
     }
 
     @Test

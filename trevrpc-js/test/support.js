@@ -11,7 +11,19 @@ import {
   unmarshalMessage,
 } from "../src/framing.js";
 import { Code } from "../src/status.js";
-import { RpcRequest, WireVersion } from "../src/wire.js";
+import { RpcRequest } from "../src/wire.js";
+
+/**
+ * Splits a wire method path into `{ service, method }`, or returns null unless it is exactly
+ * `/<service>/<method>` with both parts non-empty.
+ */
+export function parseMethodPath(path) {
+  const parts = path.split("/");
+  if (parts.length !== 3 || parts[0] !== "" || parts[1] === "" || parts[2] === "") {
+    return null;
+  }
+  return { service: parts[1], method: parts[2] };
+}
 
 /** The server end of one bidirectional stream. */
 export class ServerStream {
@@ -119,11 +131,6 @@ export function fakeTransport(handler, { highWaterMark = 16 } = {}) {
     },
   };
   return transport;
-}
-
-/** A request header as servers see it, with the wire version filled in. */
-export function requestFields(fields) {
-  return { version: WireVersion, ...fields };
 }
 
 export function deferred() {

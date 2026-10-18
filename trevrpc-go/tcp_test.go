@@ -51,7 +51,7 @@ func TestTCPOffersOnlyEnabledProtocols(t *testing.T) {
 		}
 	}
 	qmux := newQMuxTestClient(t, pki, listener)
-	if _, err := Unary(context.Background(), qmux, testServiceName, "Echo", &testMessage{Value: "x"}, newTestMessage); err != nil {
+	if _, err := Unary(context.Background(), qmux, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage); err != nil {
 		t.Fatalf("QMux call: %v", err)
 	}
 }
@@ -97,7 +97,7 @@ func TestHTTP2ResponsesAdvertiseHTTP3(t *testing.T) {
 	listener := startTestListener(t, pki, nil)
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.client.Clone(), ForceAttemptHTTP2: true}}
 	defer client.CloseIdleConnections()
-	body := encodeHTTP3TestRequest(t, newWireRequest(testServiceName, "Echo"), "")
+	body := encodeHTTP3TestRequest(t, newWireRequest(testPath("Echo")), "")
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://"+listener.TCPAddr().String()+DefaultHTTPPath, strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestHTTP2EnforcesTheStreamLimitPerConnection(t *testing.T) {
 	held := make(chan struct{}, 1)
 	hold := func() {
 		go func() {
-			_, _ = Unary(holdCtx, transport, testServiceName, "Echo", &testMessage{Value: "slow"}, newTestMessage)
+			_, _ = Unary(holdCtx, transport, "/example.Greeter/Echo", &testMessage{Value: "slow"}, newTestMessage)
 			held <- struct{}{}
 		}()
 	}
@@ -164,7 +164,7 @@ func TestHTTP2EnforcesTheStreamLimitPerConnection(t *testing.T) {
 			hold()
 		default:
 		}
-		_, err := Unary(context.Background(), transport, testServiceName, "Echo", &testMessage{Value: "x"}, newTestMessage)
+		_, err := Unary(context.Background(), transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage)
 		if err != nil && strings.Contains(err.Error(), "503") {
 			return
 		}

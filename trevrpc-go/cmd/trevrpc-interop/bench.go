@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,10 +31,18 @@ const benchGrace = scenarioTimeout
 // dead connection does not turn into a busy loop.
 const benchErrorBackoff = time.Millisecond
 
+const (
+	// benchPadKey is the request metadata key of --metadata-size.
+	benchPadKey = "bench-pad"
+	// benchMaxMetadataSize is the largest value TrevRPC metadata allows.
+	benchMaxMetadataSize = 8 * 1024
+)
+
 type benchConfig struct {
 	connectionConfig
 	scenario    string
 	size        int
+	metadata    int
 	concurrency int
 	messages    int
 	duration    float64
@@ -44,6 +53,7 @@ func (c *benchConfig) register(flags *flag.FlagSet) {
 	c.connectionConfig.register(flags, "transport: quic or tcp (QMux over TLS)")
 	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream or bidi")
 	flags.IntVar(&c.size, "size", 64, "length of EchoRequest.message in bytes")
+	flags.IntVar(&c.metadata, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	flags.IntVar(&c.concurrency, "concurrency", 1, "workers, each with one call or stream in flight")
 	flags.IntVar(&c.messages, "messages", 100, "messages per streaming call")
 	flags.Float64Var(&c.duration, "duration", 5, "measured seconds")
@@ -60,6 +70,8 @@ func (c *benchConfig) validate() error {
 	switch {
 	case c.size < 0:
 		return errors.New("bench: --size must not be negative")
+	case c.metadata < 0 || c.metadata > benchMaxMetadataSize:
+		return fmt.Errorf("bench: --metadata-size must be between 0 and %d", benchMaxMetadataSize)
 	case c.concurrency < 1:
 		return errors.New("bench: --concurrency must be at least 1")
 	case c.messages < 1 || c.messages > math.MaxUint32:
@@ -70,6 +82,15 @@ func (c *benchConfig) validate() error {
 		return errors.New("bench: --warmup must not be negative")
 	}
 	return nil
+}
+
+// callOptions returns the options every call carries: the bench-pad request
+// metadata entry, if --metadata-size asks for one.
+func (c *benchConfig) callOptions() []trevrpc.CallOption {
+	if c.metadata == 0 {
+		return nil
+	}
+	return []trevrpc.CallOption{trevrpc.WithMetadata(benchPadKey, bytes.Repeat([]byte{'x'}, c.metadata))}
 }
 
 // benchOperation is one worker's unit of work. A worker runs its operations
@@ -87,26 +108,27 @@ type benchOperation interface {
 // bench/README.md.
 var benchScenarios = map[string]func(client *interoppb.EchoClient, config benchConfig) benchOperation{
 	"unary": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &unaryOperation{client: client, message: strings.Repeat("x", config.size)}
+		return &unaryOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size)}
 	},
 	"server-stream": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &serverStreamOperation{client: client, message: strings.Repeat("x", config.size), count: config.messages}
+		return &serverStreamOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
 	},
 	"client-stream": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &clientStreamOperation{client: client, message: strings.Repeat("x", config.size), count: config.messages}
+		return &clientStreamOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
 	},
 	"bidi": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &bidiOperation{client: client, message: strings.Repeat("x", config.size)}
+		return &bidiOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size)}
 	},
 }
 
 type unaryOperation struct {
 	client  *interoppb.EchoClient
+	options []trevrpc.CallOption
 	message string
 }
 
 func (o *unaryOperation) run(ctx context.Context) (int, error) {
-	response, err := o.client.Unary(ctx, &interoppb.EchoRequest{Message: o.message})
+	response, err := o.client.Unary(ctx, &interoppb.EchoRequest{Message: o.message}, o.options...)
 	if err != nil {
 		return 0, err
 	}
@@ -120,12 +142,13 @@ func (*unaryOperation) close() {}
 
 type serverStreamOperation struct {
 	client  *interoppb.EchoClient
+	options []trevrpc.CallOption
 	message string
 	count   int
 }
 
 func (o *serverStreamOperation) run(ctx context.Context) (int, error) {
-	stream, err := o.client.ServerStream(ctx, &interoppb.EchoRequest{Message: o.message, Count: uint32(o.count)})
+	stream, err := o.client.ServerStream(ctx, &interoppb.EchoRequest{Message: o.message, Count: uint32(o.count)}, o.options...)
 	if err != nil {
 		return 0, err
 	}
@@ -154,12 +177,13 @@ func (*serverStreamOperation) close() {}
 
 type clientStreamOperation struct {
 	client  *interoppb.EchoClient
+	options []trevrpc.CallOption
 	message string
 	count   int
 }
 
 func (o *clientStreamOperation) run(ctx context.Context) (int, error) {
-	call, err := o.client.ClientStream(ctx)
+	call, err := o.client.ClientStream(ctx, o.options...)
 	if err != nil {
 		return 0, err
 	}
@@ -187,13 +211,14 @@ func (*clientStreamOperation) close() {}
 // after a failure.
 type bidiOperation struct {
 	client  *interoppb.EchoClient
+	options []trevrpc.CallOption
 	message string
 	call    trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse]
 }
 
 func (o *bidiOperation) run(ctx context.Context) (int, error) {
 	if o.call == nil {
-		call, err := o.client.Bidi(ctx)
+		call, err := o.client.Bidi(ctx, o.options...)
 		if err != nil {
 			return 0, err
 		}
@@ -307,6 +332,7 @@ type benchResult struct {
 	Scenario        string       `json:"scenario"`
 	Transport       string       `json:"transport"`
 	Size            int          `json:"size"`
+	MetadataSize    int          `json:"metadata_size"`
 	Concurrency     int          `json:"concurrency"`
 	DurationS       float64      `json:"duration_s"`
 	Ops             uint64       `json:"ops"`
@@ -408,17 +434,18 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 	seconds := window.Seconds()
 	ops := uint64(len(latencies))
 	return benchResult{
-		Scenario:    config.scenario,
-		Transport:   string(transport),
-		Size:        config.size,
-		Concurrency: config.concurrency,
-		DurationS:   seconds,
-		Ops:         ops,
-		Msgs:        messages,
-		Errors:      failures,
-		OpsPerSec:   float64(ops) / seconds,
-		MsgsPerSec:  float64(messages) / seconds,
-		BytesPerSec: float64(messages) / seconds * float64(config.size),
+		Scenario:     config.scenario,
+		Transport:    string(transport),
+		Size:         config.size,
+		MetadataSize: config.metadata,
+		Concurrency:  config.concurrency,
+		DurationS:    seconds,
+		Ops:          ops,
+		Msgs:         messages,
+		Errors:       failures,
+		OpsPerSec:    float64(ops) / seconds,
+		MsgsPerSec:   float64(messages) / seconds,
+		BytesPerSec:  float64(messages) / seconds * float64(config.size),
 		LatencyUS: benchLatency{
 			P50:  percentileUS(latencies, 0.50),
 			P90:  percentileUS(latencies, 0.90),

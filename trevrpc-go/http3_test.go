@@ -54,7 +54,7 @@ func newHandlerTestListener(configure func(*ServerOptions)) (*Listener, *Server)
 		configure(&options)
 	}
 	server.SetOptions(options)
-	routeBytes(server, "example.Greeter", "SayHello", func(_ context.Context, body []byte) ([]byte, error) {
+	routeBytes(server, "/example.Greeter/SayHello", func(_ context.Context, body []byte) ([]byte, error) {
 		return append([]byte("reply:"), body...), nil
 	})
 	return &Listener{server: server, runtime: server.freeze()}, server
@@ -77,7 +77,7 @@ func encodeHTTP3TestRequest(t *testing.T, request *wireRequest, message string) 
 
 func TestHTTP3HandlerRejectsInvalidRequestsBeforeRPCHandling(t *testing.T) {
 	listener, _ := newHandlerTestListener(nil)
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "")
+	body := encodeHTTP3TestRequest(t, newWireRequest("/example.Greeter/SayHello"), "")
 
 	tests := []struct {
 		name         string
@@ -130,7 +130,7 @@ func TestHTTP3AdmissionReceivesSnapshotAndCanDeny(t *testing.T) {
 			return request.Header.Get("X-Allow") == "yes"
 		}
 	})
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "")
+	body := encodeHTTP3TestRequest(t, newWireRequest("/example.Greeter/SayHello"), "")
 
 	denied := newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType)
 	denied.Header.Set("X-Allow", "no")
@@ -212,7 +212,7 @@ func TestHTTP3AdmissionPanicIsContainedAndFutureRequestsContinue(t *testing.T) {
 			return true
 		}
 	})
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "")
+	body := encodeHTTP3TestRequest(t, newWireRequest("/example.Greeter/SayHello"), "")
 
 	panicRecorder := httptest.NewRecorder()
 	listener.handleHTTPRPC(panicRecorder, newHTTP3TestRequest(t, "POST", DefaultHTTPPath, body, httpContentType))
@@ -229,7 +229,7 @@ func TestHTTP3AdmissionPanicIsContainedAndFutureRequestsContinue(t *testing.T) {
 
 func TestHTTP3UnaryRoundTripAndStreamSaturation(t *testing.T) {
 	listener, _ := newHandlerTestListener(nil)
-	body := encodeHTTP3TestRequest(t, newWireRequest("example.Greeter", "SayHello"), "request")
+	body := encodeHTTP3TestRequest(t, newWireRequest("/example.Greeter/SayHello"), "request")
 
 	// A connection whose stream limit is exhausted rejects before any RPC work.
 	exhausted := &httpConnState{streamLimit: newSemaphore(1)}

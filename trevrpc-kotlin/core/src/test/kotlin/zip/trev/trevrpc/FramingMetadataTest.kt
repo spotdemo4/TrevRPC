@@ -156,8 +156,7 @@ class FramingMetadataTest {
     }
 
     @Test
-    fun `versions kinds and all status values are stable`() {
-        assertEquals(1u, WIRE_VERSION)
+    fun `kinds and all status values are stable`() {
         assertEquals(listOf(0, 1, 2, 3), RpcKind.entries.map(RpcKind::value))
         assertEquals((0u..16u).toList(), Code.entries.map(Code::value))
     }

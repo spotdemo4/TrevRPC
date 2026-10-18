@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 
 	"trev.zip/llc/trevrpc/bench/grpc-go/echopb"
 )
@@ -31,11 +32,17 @@ const (
 	drainGrace = 10 * time.Second
 	// errorBackoff keeps a worker from spinning when every call fails.
 	errorBackoff = time.Millisecond
+	// padKey is the request metadata key of --metadata-size.
+	padKey = "bench-pad"
+	// maxMetadataSize is the largest --metadata-size, the largest value
+	// TrevRPC metadata allows, so both runtimes accept the same sizes.
+	maxMetadataSize = 8 * 1024
 )
 
 type benchConfig struct {
 	addr, ca, serverName, transport, scenario string
 	size, concurrency, messages               int
+	metadataSize                              int
 	duration, warmup                          time.Duration
 }
 
@@ -57,6 +64,7 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 	fs.Float64Var(&duration, "duration", 5, "measured seconds")
 	fs.Float64Var(&warmup, "warmup", 1, "warmup seconds")
 	fs.IntVar(&cfg.messages, "messages", 100, "messages per streaming call")
+	fs.IntVar(&cfg.metadataSize, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -74,6 +82,8 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 		return cfg, fmt.Errorf("--scenario must be one of %s", strings.Join(scenarios, ", "))
 	case cfg.size < 0, cfg.concurrency < 1, cfg.messages < 1:
 		return cfg, errors.New("--size must be >= 0, --concurrency and --messages >= 1")
+	case cfg.metadataSize < 0, cfg.metadataSize > maxMetadataSize:
+		return cfg, fmt.Errorf("--metadata-size must be between 0 and %d", maxMetadataSize)
 	case cfg.duration <= 0, cfg.warmup < 0:
 		return cfg, errors.New("--duration must be > 0 and --warmup >= 0")
 	}
@@ -95,6 +105,7 @@ type benchResult struct {
 	Scenario        string         `json:"scenario"`
 	Transport       string         `json:"transport"`
 	Size            int            `json:"size"`
+	MetadataSize    int            `json:"metadata_size"`
 	Concurrency     int            `json:"concurrency"`
 	DurationS       float64        `json:"duration_s"`
 	Ops             uint64         `json:"ops"`
@@ -148,6 +159,8 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 	// runCtx bounds every call; the deadline is armed once the window is known.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Every call, and the Bidi stream a worker keeps open, derives from runCtx.
+	runCtx = withPadMetadata(runCtx, cfg.metadataSize)
 	workers := make([]worker, cfg.concurrency)
 	for i := range workers {
 		workers[i] = newWorker(runCtx, client, cfg)
@@ -175,6 +188,16 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 		return zero, ctx.Err()
 	}
 	return summarize(cfg, results, wireEnd-wireStart)
+}
+
+// withPadMetadata returns ctx with the bench-pad outgoing metadata entry of
+// size bytes, or ctx itself when size is 0. gRPC metadata values must be
+// printable ASCII, so the pad is made of 'x'.
+func withPadMetadata(ctx context.Context, size int) context.Context {
+	if size == 0 {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, padKey, strings.Repeat("x", size))
 }
 
 func clientCredentials(cfg benchConfig) (credentials.TransportCredentials, error) {
@@ -277,16 +300,17 @@ func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (bench
 
 	seconds := cfg.duration.Seconds()
 	res := benchResult{
-		Scenario:    cfg.scenario,
-		Transport:   "grpc",
-		Size:        cfg.size,
-		Concurrency: cfg.concurrency,
-		DurationS:   seconds,
-		Ops:         uint64(len(latencies)),
-		Msgs:        msgs,
-		Errors:      errs,
-		OpsPerSec:   float64(len(latencies)) / seconds,
-		MsgsPerSec:  float64(msgs) / seconds,
+		Scenario:     cfg.scenario,
+		Transport:    "grpc",
+		Size:         cfg.size,
+		MetadataSize: cfg.metadataSize,
+		Concurrency:  cfg.concurrency,
+		DurationS:    seconds,
+		Ops:          uint64(len(latencies)),
+		Msgs:         msgs,
+		Errors:       errs,
+		OpsPerSec:    float64(len(latencies)) / seconds,
+		MsgsPerSec:   float64(msgs) / seconds,
 		LatencyUS: latencySummary{
 			P50:  percentile(latencies, 0.50),
 			P90:  percentile(latencies, 0.90),

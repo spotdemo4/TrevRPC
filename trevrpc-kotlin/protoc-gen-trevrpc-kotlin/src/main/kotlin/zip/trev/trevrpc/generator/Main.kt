@@ -212,20 +212,13 @@ private fun validateDeclarations(
             val service = describeService(file, descriptor, types)
             val serviceSymbol = service.fullProtoName
             reserveType(packageName, packagePrefix, service.clientName, serviceSymbol, reservations)
-            reserveProperty(
-                packageName,
-                packagePrefix,
-                "${service.constantPrefix}_SERVICE_NAME",
-                serviceSymbol,
-                reservations,
-            )
 
             for (method in service.methods) {
                 val methodSymbol = "$serviceSymbol.${method.protoName}"
                 reserveProperty(
                     packageName,
                     packagePrefix,
-                    "${service.constantPrefix}_${method.constantName}_METHOD_NAME",
+                    method.pathConstant(service),
                     methodSymbol,
                     reservations,
                 )
@@ -474,6 +467,11 @@ private data class Method(
         get() = kotlinIdent(name)
 
     fun suffixedName(suffix: String): String = kotlinIdent(name + suffix)
+
+    /** The wire method path `/package.Service/Method`. */
+    fun path(service: Service): String = "/${service.fullProtoName}/$protoName"
+
+    fun pathConstant(service: Service): String = "${service.constantPrefix}_${constantName}_PATH"
 }
 
 private data class Service(
@@ -571,21 +569,18 @@ private fun StringBuilder.generateService(
     service: Service,
     codecNames: Map<String, String>,
 ) {
-    val serviceConstant = "${service.constantPrefix}_SERVICE_NAME"
-    appendLine("public const val $serviceConstant: String = ${service.fullProtoName.quote()}")
     for (method in service.methods) {
         appendLine(
-            "public const val ${service.constantPrefix}_${method.constantName}_METHOD_NAME: String = ${method.protoName.quote()}",
+            "public const val ${method.pathConstant(service)}: String = ${method.path(service).quote()}",
         )
     }
     appendLine()
-    generateClient(runtime, service, serviceConstant, codecNames)
+    generateClient(runtime, service, codecNames)
 }
 
 private fun StringBuilder.generateClient(
     runtime: String,
     service: Service,
-    serviceConstant: String,
     codecNames: Map<String, String>,
 ) {
     appendLine("public class ${kotlinIdent(service.clientName)}(")
@@ -595,7 +590,7 @@ private fun StringBuilder.generateClient(
     appendLine("    private val client: $runtime.Client = $runtime.Client(transport)")
     appendLine()
     for (method in service.methods) {
-        generateClientMethod(runtime, service, method, serviceConstant, codecNames)
+        generateClientMethod(runtime, service, method, codecNames)
     }
     appendLine("}")
 }
@@ -604,10 +599,9 @@ private fun StringBuilder.generateClientMethod(
     runtime: String,
     service: Service,
     method: Method,
-    serviceConstant: String,
     codecNames: Map<String, String>,
 ) {
-    val methodConstant = "${service.constantPrefix}_${method.constantName}_METHOD_NAME"
+    val pathConstant = method.pathConstant(service)
     val inputCodec = checkNotNull(codecNames[method.input.protoName])
     val outputCodec = checkNotNull(codecNames[method.output.protoName])
     when {
@@ -615,7 +609,7 @@ private fun StringBuilder.generateClientMethod(
             appendLine("    public suspend fun ${method.suffixedName("Response")}(")
             appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
             appendLine("    ): $runtime.BidirectionalStreamingCall<${method.input.kotlinType}, ${method.output.kotlinType}> =")
-            appendLine("        client.bidirectionalStreaming($serviceConstant, $methodConstant, $inputCodec, $outputCodec, options)")
+            appendLine("        client.bidirectionalStreaming($pathConstant, $inputCodec, $outputCodec, options)")
             appendLine()
             appendLine("    public suspend fun ${method.kotlinName}(")
             appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
@@ -647,7 +641,7 @@ private fun StringBuilder.generateClientMethod(
             appendLine("    public suspend fun ${method.suffixedName("Response")}(")
             appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
             appendLine("    ): $runtime.ClientStreamingCall<${method.input.kotlinType}, ${method.output.kotlinType}> =")
-            appendLine("        client.clientStreaming($serviceConstant, $methodConstant, $inputCodec, $outputCodec, options)")
+            appendLine("        client.clientStreaming($pathConstant, $inputCodec, $outputCodec, options)")
             appendLine()
             appendLine("    public suspend fun ${method.kotlinName}(")
             appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
@@ -678,7 +672,7 @@ private fun StringBuilder.generateClientMethod(
             appendLine("        request: ${method.input.kotlinType},")
             appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
             appendLine("    ): $runtime.ServerStreamingCall<${method.output.kotlinType}> =")
-            appendLine("        client.serverStreaming($serviceConstant, $methodConstant, request, $inputCodec, $outputCodec, options)")
+            appendLine("        client.serverStreaming($pathConstant, request, $inputCodec, $outputCodec, options)")
             appendLine()
             appendLine("    public fun ${method.kotlinName}(")
             appendLine("        request: ${method.input.kotlinType},")
@@ -702,7 +696,7 @@ private fun StringBuilder.generateClientMethod(
             appendLine("        request: ${method.input.kotlinType},")
             appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
             appendLine("    ): $runtime.ResponseEnvelope<${method.output.kotlinType}> =")
-            appendLine("        client.unaryResponse($serviceConstant, $methodConstant, request, $inputCodec, $outputCodec, options)")
+            appendLine("        client.unaryResponse($pathConstant, request, $inputCodec, $outputCodec, options)")
             appendLine()
             appendLine("    public suspend fun ${method.kotlinName}(")
             appendLine("        request: ${method.input.kotlinType},")

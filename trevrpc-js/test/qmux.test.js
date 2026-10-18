@@ -436,6 +436,27 @@ test("the channel falls back at once when WebTransport fails or is missing", asy
   }
 });
 
+test("the channel falls back to WebSocket when WebTransport selects another protocol", async () => {
+  const server = fakeServer();
+  const closed = [];
+  class MismatchedWebTransport {
+    ready = Promise.resolve();
+    closed = new Promise(() => {});
+    protocol = "trevrpc-2";
+    close() {
+      closed.push(this);
+    }
+  }
+  const channel = await connect("https://example.test/trevrpc", {
+    WebTransport: MismatchedWebTransport,
+    WebSocket: server.WebSocket,
+    fallbackDelayMs: 10_000,
+  });
+  assert.equal(channel.transport, "websocket");
+  assert.equal(closed.length, 1, "the mismatched WebTransport session is closed");
+  channel.close();
+});
+
 test("the channel uses WebTransport when it connects in time", async () => {
   const server = fakeServer();
   class ReadyWebTransport {

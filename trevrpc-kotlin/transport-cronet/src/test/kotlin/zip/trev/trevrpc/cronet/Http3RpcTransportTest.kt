@@ -73,7 +73,7 @@ class Http3RpcTransportTest {
             channel.close()
             channel.close()
 
-            val error = runCatching { channel.openStream(RpcRequest("svc", "method"), byteArrayOf(), true) }.exceptionOrNull()
+            val error = runCatching { channel.openStream(RpcRequest("/svc/method"), byteArrayOf(), true) }.exceptionOrNull()
             assertEquals(Code.UNAVAILABLE, (error as TrevRpcException).status.code)
         }
 
@@ -82,7 +82,7 @@ class Http3RpcTransportTest {
         runTest {
             val fake = FakeFactory()
             val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
-            val request = RpcRequest("example.Service", "Unary")
+            val request = RpcRequest("/example.Service/Unary")
             val call = async { transport.openStream(request, byteArrayOf(1, 2), true) }
 
             runCurrent()
@@ -120,8 +120,7 @@ class Http3RpcTransportTest {
             val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
             val request =
                 RpcRequest(
-                    "example.Service",
-                    "Bidi",
+                    "/example.Service/Bidi",
                     kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value,
                 )
             val opening = async { transport.openStream(request) }
@@ -519,7 +518,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .clientStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                        .clientStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             val send = async { runCatching { call.send("a") } }
             runCurrent()
@@ -549,7 +548,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .bidirectionalStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                        .bidirectionalStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             val send = async { runCatching { call.send("a") } }
             runCurrent()
@@ -575,7 +574,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .clientStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                        .clientStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             val send = async { runCatching { call.send("a") } }
             runCurrent()
@@ -598,7 +597,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .clientStreaming("svc", "m", strings, strings, CallOptions(timeout = 100.milliseconds))
+                        .clientStreaming("/svc/m", strings, strings, CallOptions(timeout = 100.milliseconds))
                 }
             fake.headers(validHeaders())
             fake.deliverRead(messageFrame("reply".encodeToByteArray()) + statusFrame(Status.ok()))
@@ -617,7 +616,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .bidirectionalStreaming("svc", "m", strings, strings, CallOptions(timeout = 1.hours))
+                        .bidirectionalStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             fake.headers(validHeaders())
             fake.fail(IllegalStateException("connection reset"))
@@ -687,7 +686,7 @@ class Http3RpcTransportTest {
             RpcKind.entries.forEach { kind ->
                 val fake = FakeFactory()
                 val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
-                val request = RpcRequest("example.Service", kind.name, kindValue = kind.value)
+                val request = RpcRequest("/example.Service/${kind.name}", kindValue = kind.value)
                 val call =
                     async {
                         runCatching {
@@ -1261,7 +1260,7 @@ private suspend fun <T> TestScope.openCall(
 private suspend fun RpcClientStream.receiveFailure(): Throwable =
     runCatching { receive() }.exceptionOrNull() ?: error("receive unexpectedly succeeded")
 
-private fun streamRequest(): RpcRequest = RpcRequest("example.Service", "Stream", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value)
+private fun streamRequest(): RpcRequest = RpcRequest("/example.Service/Stream", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value)
 
 private fun validHeaders(contentType: String = TREV_RPC_CONTENT_TYPE): ResponseHeaders =
     ResponseHeaders(200, listOf("Content-Type" to contentType))
@@ -1292,10 +1291,8 @@ private fun assertRequestEquals(
     expected: RpcRequest,
     actual: RpcRequest,
 ) {
-    assertEquals(expected.service, actual.service)
     assertEquals(expected.method, actual.method)
     assertEquals(expected.kindValue, actual.kindValue)
-    assertEquals(expected.version, actual.version)
     assertEquals(expected.timeoutNanos, actual.timeoutNanos)
     assertEquals(expected.metadata, actual.metadata)
     assertEquals(expected.extensions, actual.extensions)

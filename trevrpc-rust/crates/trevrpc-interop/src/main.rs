@@ -9,7 +9,7 @@
 //!                            [--server-name localhost] --transport quic|tcp
 //!                            --scenario unary|server-stream|client-stream|bidi
 //!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
-//!                            [--messages 100]
+//!                            [--messages 100] [--metadata-size 0]
 //! ```
 //!
 //! The `bench` subcommand follows `bench/README.md`.
@@ -59,6 +59,7 @@ async fn main() -> ExitCode {
                 "duration",
                 "warmup",
                 "messages",
+                "metadata-size",
             ],
         )
         .map(Command::Bench),

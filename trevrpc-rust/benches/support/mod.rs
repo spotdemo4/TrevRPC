@@ -34,7 +34,10 @@ pub mod greeter;
 /// Messages per streaming call, as in the load benchmarks' default.
 pub const MESSAGES: usize = 100;
 
-const RAW_SERVICE: &str = "bench.Raw";
+const RAW_UNARY: &str = "/bench.Raw/Unary";
+const RAW_SERVER_STREAM: &str = "/bench.Raw/ServerStream";
+const RAW_CLIENT_STREAM: &str = "/bench.Raw/ClientStream";
+const RAW_BIDI: &str = "/bench.Raw/Bidi";
 
 /// Which transport a benchmark runs over.
 #[derive(Clone, Copy, Debug)]
@@ -63,10 +66,9 @@ pub struct Blob {
 
 fn register_raw(server: &mut Server) {
     // Unary and bidi echo the bytes they receive, undecoded.
-    server.route(RAW_SERVICE, "Unary", |body| async move { Ok(body) });
+    server.route(RAW_UNARY, |body| async move { Ok(body) });
     server.route_streaming(
-        RAW_SERVICE,
-        "ServerStream",
+        RAW_SERVER_STREAM,
         RpcKind::ServerStreaming,
         |body, _requests| async move {
             Ok(trevrpc::stream::from_iter(
@@ -75,8 +77,7 @@ fn register_raw(server: &mut Server) {
         },
     );
     server.route_streaming(
-        RAW_SERVICE,
-        "ClientStream",
+        RAW_CLIENT_STREAM,
         RpcKind::ClientStreaming,
         |_body, mut requests| async move {
             let mut count = 0_usize;
@@ -91,8 +92,7 @@ fn register_raw(server: &mut Server) {
         },
     );
     server.route_streaming(
-        RAW_SERVICE,
-        "Bidi",
+        RAW_BIDI,
         RpcKind::BidirectionalStreaming,
         |_body, requests| async move { Ok(requests) },
     );
@@ -320,10 +320,9 @@ where
     pub async fn unary(&self) {
         match self {
             Self::Raw { transport, request } => {
-                let reply: Blob =
-                    trevrpc::client::unary(transport, RAW_SERVICE, "Unary", request, options())
-                        .await
-                        .unwrap();
+                let reply: Blob = trevrpc::client::unary(transport, RAW_UNARY, request, options())
+                    .await
+                    .unwrap();
                 assert_eq!(reply.data.len(), request.data.len());
             }
             Self::Greeter { client, request } => {
@@ -343,8 +342,7 @@ where
             Self::Raw { transport, request } => {
                 let mut responses = trevrpc::client::server_streaming::<_, _, Blob>(
                     transport,
-                    RAW_SERVICE,
-                    "ServerStream",
+                    RAW_SERVER_STREAM,
                     request,
                     options(),
                 )
@@ -375,8 +373,7 @@ where
             Self::Raw { transport, request } => {
                 let call = trevrpc::client::client_streaming::<_, Blob, Blob>(
                     transport,
-                    RAW_SERVICE,
-                    "ClientStream",
+                    RAW_CLIENT_STREAM,
                     options(),
                 )
                 .await
@@ -410,14 +407,9 @@ where
     pub async fn open_bidi(&self) -> Bidi {
         match self {
             Self::Raw { transport, request } => Bidi::Raw {
-                call: trevrpc::client::bidirectional_streaming(
-                    transport,
-                    RAW_SERVICE,
-                    "Bidi",
-                    options(),
-                )
-                .await
-                .unwrap(),
+                call: trevrpc::client::bidirectional_streaming(transport, RAW_BIDI, options())
+                    .await
+                    .unwrap(),
                 request: request.clone(),
             },
             Self::Greeter { client, request } => Bidi::Greeter {

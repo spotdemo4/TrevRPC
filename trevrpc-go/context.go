@@ -8,10 +8,15 @@ type handlerContextKey struct{}
 // through HandlerContextFromContext and authorizers as an argument. Metadata
 // keys are lowercase.
 type HandlerContext struct {
-	Service  string
-	Method   string
-	Kind     RPCKind
-	Metadata Metadata
+	// Service is the fully-qualified service name, such as
+	// "example.greeter.Greeter".
+	Service string
+	// Method is the method name within the service, such as "SayHello".
+	Method string
+	// FullMethod is the method path "/<Service>/<Method>".
+	FullMethod string
+	Kind       RPCKind
+	Metadata   Metadata
 }
 
 // HandlerContextFromContext returns TrevRPC request information attached to ctx.
@@ -31,11 +36,13 @@ func RequestMetadataFromContext(ctx context.Context) Metadata {
 }
 
 func newHandlerContext(request *wireRequest) HandlerContext {
+	service, method := request.serviceAndMethod()
 	return HandlerContext{
-		Service:  request.Service,
-		Method:   request.Method,
-		Kind:     request.rpcKind(),
-		Metadata: cloneMetadata(request.Metadata),
+		Service:    service,
+		Method:     method,
+		FullMethod: request.Method,
+		Kind:       request.rpcKind(),
+		Metadata:   cloneMetadata(request.Metadata),
 	}
 }
 

@@ -140,11 +140,11 @@ pub const fn validate_payload_len(len: usize, max_frame_size: usize) -> Result<(
 
 fn preflight_known_wire<M: 'static>(body: &[u8]) -> Result<()> {
     // Field 8 of `RpcRequest` and field 2 of `RpcHeaders` are repeated integers, which may be
-    // packed (length-delimited) or not, so they are not pinned to one wire type here. Field 3 of
-    // `RpcRequest` is reserved and skipped like any unknown field.
+    // packed (length-delimited) or not, so they are not pinned to one wire type here. Fields 2, 3
+    // and 6 of `RpcRequest` are reserved and skipped like any unknown field.
     let (fields, metadata_field): (&[(u64, u64)], Option<u64>) =
         if TypeId::of::<M>() == TypeId::of::<RpcRequest>() {
-            (&[(1, 2), (2, 2), (4, 2), (5, 0), (6, 0), (7, 0)], Some(4))
+            (&[(1, 2), (4, 2), (5, 0), (7, 0)], Some(4))
         } else if TypeId::of::<M>() == TypeId::of::<RpcHeaders>() {
             (&[(1, 2)], Some(1))
         } else if TypeId::of::<M>() == TypeId::of::<RpcStatus>() {
@@ -285,7 +285,7 @@ mod tests {
         encode_message_frame, encode_protobuf_frame, frame_type, is_known_frame_type,
         put_frame_header, validate_payload_len,
     };
-    use crate::{Code, Metadata, RpcHeaders, RpcRequest, RpcStatus, Status};
+    use crate::{Code, Metadata, RpcHeaders, RpcKind, RpcRequest, RpcStatus, Status};
 
     #[test]
     fn frame_headers_use_minimal_varints() {
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn known_fields_with_the_wrong_wire_type_are_rejected() {
-        // RpcRequest.service (field 1) as a varint.
+        // RpcRequest.method (field 1) as a varint.
         let status = decode_payload::<RpcRequest>(&[0x08, 0x01])
             .expect_err("wrong wire type should fail")
             .into_status();
@@ -381,14 +381,15 @@ mod tests {
     }
 
     #[test]
-    fn the_reserved_body_field_and_unknown_fields_are_ignored() {
-        // Field 3 (formerly the request body) and field 99 are skipped.
-        let mut payload = vec![0x1a, 0x02, b'x', b'y', 0x9a, 0x06, 0x01, 0x00];
-        payload.extend([0x0a, 0x01, b's', 0x12, 0x01, b'm', 0x30, 0x01]);
+    fn the_reserved_fields_and_unknown_fields_are_ignored() {
+        // Field 2 (formerly the method name, here with the wrong wire type), field 3 (formerly the
+        // request body), field 6 (formerly the wire version), and field 99 are skipped.
+        let mut payload = vec![0x10, 0x07, 0x1a, 0x02, b'x', b'y', 0x30, 0x01];
+        payload.extend([0x9a, 0x06, 0x01, 0x00]);
+        payload.extend([0x0a, 0x04, b'/', b's', b'/', b'm']);
         let request = decode_payload::<RpcRequest>(&payload).expect("request should decode");
-        assert_eq!(request.service, "s");
-        assert_eq!(request.method, "m");
-        assert_eq!(request.version, 1);
+        assert_eq!(request.method, "/s/m");
+        assert_eq!(request.rpc_kind(), RpcKind::Unary);
     }
 
     #[test]

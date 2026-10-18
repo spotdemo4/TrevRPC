@@ -1,6 +1,12 @@
 import { QMuxWebSocketSession } from "./qmux/session.js";
 import { dialRace } from "./race.js";
-import { cancelled, statusFromTransportError, unavailable } from "./status.js";
+import { cancelled, failedPrecondition, statusFromTransportError, unavailable } from "./status.js";
+
+/**
+ * The WebTransport protocol that names wire version 1, offered through the `protocols` constructor
+ * option. It is the protocol version, so callers cannot change it.
+ */
+const WebTransportProtocol = "trevrpc-1";
 
 /** WebTransport constructor options passed through unchanged. */
 const WebTransportOptionKeys = [
@@ -217,7 +223,24 @@ function dialWebTransport(url, options, signal) {
     new WebTransportConstructor(url, transportOptions(options)),
     "WebTransport",
     signal,
+    requireWireVersion,
   );
+}
+
+/**
+ * Fails a ready WebTransport session whose server selected another protocol than version 1. An
+ * empty or missing `protocol` means version 1: older browsers do not support the option, and the
+ * Rust server cannot echo a selection. A mismatch is FailedPrecondition rather than Unavailable
+ * because retrying the same server cannot fix it; the channel still treats it like any failed
+ * dial, so the WebSocket fallback and the reconnect loop carry on.
+ */
+function requireWireVersion(session) {
+  const { protocol } = session;
+  if (typeof protocol === "string" && protocol !== "" && protocol !== WebTransportProtocol) {
+    throw failedPrecondition(
+      `server selected WebTransport protocol "${protocol}", but this client speaks "${WebTransportProtocol}"`,
+    );
+  }
 }
 
 /** Establishes a ready QMux over WebSocket session; aborting the signal abandons the attempt. */
@@ -234,8 +257,11 @@ function dialWebSocket(url, options, signal) {
   return establish(session, "WebSocket", signal);
 }
 
-/** Waits for a new session to become ready, closing it if it fails or the signal aborts. */
-async function establish(session, name, signal) {
+/**
+ * Waits for a new session to become ready, closing it if it fails or the signal aborts. `verify`
+ * may reject the ready session by throwing.
+ */
+async function establish(session, name, signal, verify) {
   const abandon = () => closeQuietly(session);
   signal?.addEventListener("abort", abandon, { once: true });
   try {
@@ -247,6 +273,7 @@ async function establish(session, name, signal) {
         throw unavailable(`${name} session closed before becoming ready`);
       }),
     ]);
+    verify?.(session);
   } catch (error) {
     closeQuietly(session);
     throw signal?.aborted ? abortError(signal) : statusFromTransportError(error);
@@ -261,7 +288,7 @@ async function establish(session, name, signal) {
 }
 
 function transportOptions(options) {
-  const picked = {};
+  const picked = { protocols: [WebTransportProtocol] };
   for (const key of WebTransportOptionKeys) {
     if (options[key] !== undefined) {
       picked[key] = options[key];

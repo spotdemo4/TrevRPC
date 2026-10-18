@@ -4,8 +4,6 @@ import { byteView } from "./bytes.js";
 
 export { protobuf };
 
-export const WireVersion = 1;
-
 export const RpcKind = Object.freeze({
   Unary: 0,
   ClientStreaming: 1,
@@ -27,16 +25,17 @@ const wireRoot = protobuf.Root.fromJSON({
         },
         RpcRequest: {
           fields: {
-            service: { type: "string", id: 1 },
-            method: { type: "string", id: 2 },
+            method: { type: "string", id: 1 },
             metadata: { keyType: "string", type: "bytes", id: 4 },
             kind: { type: "RpcKind", id: 5 },
-            version: { type: "uint32", id: 6 },
             timeoutNanos: { type: "uint64", id: 7 },
             extensions: { rule: "repeated", type: "uint64", id: 8 },
           },
-          // Field 3 was the request body; it must never be reused.
-          reserved: [[3, 3]],
+          // Fields 2 (method name), 3 (request body) and 6 (wire version) must never be reused.
+          reserved: [
+            [2, 3],
+            [6, 6],
+          ],
         },
         RpcHeaders: {
           fields: {

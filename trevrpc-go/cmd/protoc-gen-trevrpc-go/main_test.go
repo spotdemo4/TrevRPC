@@ -39,6 +39,12 @@ func TestGenerateAllRPCShapes(t *testing.T) {
 		"func (c *GreeterClient) LotsOfReplies(",
 		"func (c *GreeterClient) LotsOfGreetings(",
 		"func (c *GreeterClient) BidiHello(",
+		`"/hello.v1.Greeter/SayHello"`,
+		`"/hello.v1.Greeter/LotsOfReplies"`,
+		`"/hello.v1.Greeter/LotsOfGreetings"`,
+		`"/hello.v1.Greeter/BidiHello"`,
+		"(ctx, c.transport, Greeter_SayHello_FullMethodName, request,",
+		"(server, Greeter_SayHello_FullMethodName, func()",
 		"RegisterUnary[*HelloRequest, *HelloReply]",
 		"RegisterClientStreaming[*HelloRequest, *HelloReply]",
 		"RegisterServerStreaming[*HelloRequest, *HelloReply]",
@@ -218,6 +224,9 @@ func dialLoopback(t *testing.T, implementation GreeterServer) *trevrpc.Channel {
 }
 
 func TestGeneratedClientAndServerRoundTripMetadata(t *testing.T) {
+	if Greeter_SayHello_FullMethodName != "/hello.v1.Greeter/SayHello" || Greeter_BidiHello_FullMethodName != "/hello.v1.Greeter/BidiHello" {
+		t.Fatalf("full method constants = %q, %q", Greeter_SayHello_FullMethodName, Greeter_BidiHello_FullMethodName)
+	}
 	client := NewGreeterClient(dialLoopback(t, service{}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -319,7 +328,7 @@ func TestGeneratorParameterBehavior(t *testing.T) {
 		{name: "explicit source relative", parameter: "paths=source_relative", wantName: "hello/v1/greeter.trevrpc.go"},
 		{name: "import paths", parameter: "paths=import", wantName: "example.com/fixture/hello/v1/greeter.trevrpc.go"},
 		{name: "module", parameter: "module=example.com/fixture", wantName: "hello/v1/greeter.trevrpc.go"},
-		{name: "custom options", parameter: "runtime_import=example.com/custom/runtime,file_suffix=.rpc.go,service_prefix=Native", wantName: "hello/v1/greeter.rpc.go", contains: []string{"type NativeGreeterServer interface", "func NewNativeGreeterClient", "func RegisterNativeGreeterServer", `"example.com/custom/runtime"`}},
+		{name: "custom options", parameter: "runtime_import=example.com/custom/runtime,file_suffix=.rpc.go,service_prefix=Native", wantName: "hello/v1/greeter.rpc.go", contains: []string{"type NativeGreeterServer interface", "func NewNativeGreeterClient", "func RegisterNativeGreeterServer", "NativeGreeter_SayHello_FullMethodName", `"example.com/custom/runtime"`}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

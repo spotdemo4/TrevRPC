@@ -22,8 +22,8 @@ func closeOnCleanup(t testing.TB, c io.Closer) {
 	})
 }
 
-func runTestClientStreaming(ctx context.Context, transport Transport, service, method string, values []string, options ...CallOption) (*testMessage, error) {
-	stream, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, service, method, func() *testMessage { return &testMessage{} }, options...)
+func runTestClientStreaming(ctx context.Context, transport Transport, method string, values []string, options ...CallOption) (*testMessage, error) {
+	stream, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, method, func() *testMessage { return &testMessage{} }, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -36,8 +36,8 @@ func runTestClientStreaming(ctx context.Context, transport Transport, service, m
 	return stream.CloseAndRecv()
 }
 
-func runTestBidiStreaming(ctx context.Context, transport Transport, service, method string, values []string, options ...CallOption) (MessageStream[*testMessage], error) {
-	stream, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, service, method, func() *testMessage { return &testMessage{} }, options...)
+func runTestBidiStreaming(ctx context.Context, transport Transport, method string, values []string, options ...CallOption) (MessageStream[*testMessage], error) {
+	stream, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, method, func() *testMessage { return &testMessage{} }, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -573,8 +573,8 @@ func (uploadWaitingTransport) streamingCall(ctx context.Context, _ *wireRequest,
 
 // routeBytes registers a unary handler that works on raw request and response
 // payloads.
-func routeBytes(server *Server, service, method string, handler func(context.Context, []byte) ([]byte, error)) {
-	server.routeUnary(service, method, func(ctx context.Context, body []byte) (*unaryReply, error) {
+func routeBytes(server *Server, method string, handler func(context.Context, []byte) ([]byte, error)) {
+	server.routeUnary(method, func(ctx context.Context, body []byte) (*unaryReply, error) {
 		responseBody, err := handler(ctx, body)
 		if err != nil {
 			return nil, err

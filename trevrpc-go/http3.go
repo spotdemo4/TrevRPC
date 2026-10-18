@@ -28,6 +28,9 @@ func (l *Listener) setupHTTP3() {
 			H3:          l.h3,
 			Config:      serverWebTransportConfig(options),
 			CheckOrigin: func(*http.Request) bool { return true },
+			// Selects webTransportProtocol for clients that offer it, through
+			// WT-Protocol on the CONNECT response.
+			ApplicationProtocols: []string{webTransportProtocol},
 		}
 	}
 }

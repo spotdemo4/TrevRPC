@@ -3,13 +3,19 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
+	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-interop/interoppb"
 )
 
 // startBenchServer runs the server subcommand in-process and returns the
@@ -59,31 +65,39 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 		{"tcp", "qmux", false},
 	} {
 		for _, scenario := range []string{"unary", "server-stream", "client-stream", "bidi"} {
-			t.Run(tc.transport+"/"+scenario, func(t *testing.T) {
-				var stdout, stderr bytes.Buffer
-				args := []string{
-					"bench",
-					"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
-					"--tcp-addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.QMux)),
-					"--ca", certFile,
-					"--transport", tc.transport,
-					"--scenario", scenario,
-					"--size", strconv.Itoa(size),
-					"--messages", strconv.Itoa(messages),
-					"--concurrency", "2",
-					"--duration", "0.2",
-					"--warmup", "0.05",
+			// A metadata size of 0 sends no metadata; the others send one entry
+			// of that many bytes, the largest being the limit.
+			for _, metadataSize := range []int{0, 300, benchMaxMetadataSize} {
+				if metadataSize == benchMaxMetadataSize && scenario != "unary" {
+					continue
 				}
-				if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
-					t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
-				}
-				checkBenchLine(t, stdout.String(), scenario, tc.wantTransport, size, messages, tc.wantWire)
-			})
+				t.Run(fmt.Sprintf("%s/%s/md%d", tc.transport, scenario, metadataSize), func(t *testing.T) {
+					var stdout, stderr bytes.Buffer
+					args := []string{
+						"bench",
+						"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+						"--tcp-addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.QMux)),
+						"--ca", certFile,
+						"--transport", tc.transport,
+						"--scenario", scenario,
+						"--size", strconv.Itoa(size),
+						"--metadata-size", strconv.Itoa(metadataSize),
+						"--messages", strconv.Itoa(messages),
+						"--concurrency", "2",
+						"--duration", "0.2",
+						"--warmup", "0.05",
+					}
+					if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+						t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+					}
+					checkBenchLine(t, stdout.String(), scenario, tc.wantTransport, size, metadataSize, messages, tc.wantWire)
+				})
+			}
 		}
 	}
 }
 
-func checkBenchLine(t *testing.T, output, scenario, transport string, size, messages int, wantWire bool) {
+func checkBenchLine(t *testing.T, output, scenario, transport string, size, metadataSize, messages int, wantWire bool) {
 	t.Helper()
 	if strings.Count(output, "\n") != 1 {
 		t.Fatalf("stdout = %q, want exactly one line", output)
@@ -105,6 +119,9 @@ func checkBenchLine(t *testing.T, output, scenario, transport string, size, mess
 	}
 	if number("size") != float64(size) || number("concurrency") != 2 {
 		t.Errorf("size, concurrency = %v, %v", got["size"], got["concurrency"])
+	}
+	if number("metadata_size") != float64(metadataSize) {
+		t.Errorf("metadata_size = %v, want %d", got["metadata_size"], metadataSize)
 	}
 	if number("duration_s") != 0.2 {
 		t.Errorf("duration_s = %v, want 0.2", got["duration_s"])
@@ -160,10 +177,110 @@ func TestBenchCommandLineErrors(t *testing.T) {
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--transport", "auto"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--concurrency", "0"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--duration", "0"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", "-1"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", strconv.Itoa(benchMaxMetadataSize + 1)},
 	} {
 		var stdout, stderr bytes.Buffer
 		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 {
 			t.Errorf("run(%v) = %d, want usage error 2", args, code)
+		}
+	}
+}
+
+// padRecorder is an Echo server that records the bench-pad metadata of every
+// call it handles. Only Unary and Bidi are implemented.
+type padRecorder struct {
+	interoppb.EchoServer
+	pads chan []byte
+}
+
+func (r padRecorder) record(ctx context.Context) {
+	r.pads <- trevrpc.RequestMetadataFromContext(ctx)[benchPadKey]
+}
+
+func (r padRecorder) Unary(ctx context.Context, request *interoppb.EchoRequest) (*trevrpc.Response[*interoppb.EchoResponse], error) {
+	r.record(ctx)
+	return &trevrpc.Response[*interoppb.EchoResponse]{Message: &interoppb.EchoResponse{Message: request.Message}}, nil
+}
+
+func (r padRecorder) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
+	r.record(ctx)
+	return &echoOnce{requests: requests}, nil
+}
+
+// echoOnce echoes the first request and then ends the stream.
+type echoOnce struct {
+	requests trevrpc.MessageStream[*interoppb.EchoRequest]
+	done     bool
+}
+
+func (s *echoOnce) Recv() (*interoppb.EchoResponse, error) {
+	if s.done {
+		return nil, io.EOF
+	}
+	request, err := s.requests.Recv()
+	if err != nil {
+		return nil, err
+	}
+	s.done = true
+	return &interoppb.EchoResponse{Message: request.Message}, nil
+}
+
+func (s *echoOnce) Close() error { return s.requests.Close() }
+
+// TestBenchMetadataSizeAddsOnePadEntryToEveryCall checks what the smoke test
+// cannot: that the server receives exactly one bench-pad entry of the asked
+// size, and none when the size is 0.
+func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
+	certFile, keyFile := writeTestCertificate(t)
+	certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := padRecorder{pads: make(chan []byte, 8)}
+	server := trevrpc.NewServer()
+	interoppb.RegisterEchoServer(server, recorder)
+	listener, err := trevrpc.Listen("127.0.0.1:0", server, trevrpc.ListenOptions{TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan struct{})
+	go func() { defer close(served); _ = listener.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-served
+		_ = listener.Close()
+	})
+
+	for _, size := range []int{0, 1, 4096} {
+		config := benchConfig{
+			connectionConfig: connectionConfig{addr: listener.Addr().String(), caFile: certFile, serverName: "localhost", transport: "quic"},
+			metadata:         size,
+		}
+		channel, err := config.dial(ctx, trevrpc.DialOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeQuietly(channel)
+		client := interoppb.NewEchoClient(channel)
+		for _, scenario := range []string{"unary", "bidi"} {
+			operation := benchScenarios[scenario](client, config)
+			if _, err := operation.run(ctx); err != nil {
+				t.Fatalf("%s with metadata size %d: %v", scenario, size, err)
+			}
+			operation.close()
+			select {
+			case pad := <-recorder.pads:
+				if size == 0 && pad != nil {
+					t.Errorf("%s sent %d bytes of %s, want no metadata", scenario, len(pad), benchPadKey)
+				}
+				if size > 0 && !bytes.Equal(pad, bytes.Repeat([]byte{'x'}, size)) {
+					t.Errorf("%s sent %d bytes of %s, want %d 'x' bytes", scenario, len(pad), benchPadKey, size)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s with metadata size %d did not reach the server", scenario, size)
+			}
 		}
 	}
 }

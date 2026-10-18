@@ -567,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_and_first_message_share_one_write() {
-        let request = RpcRequest::new("svc", "m");
+        let request = RpcRequest::new("/svc/m");
         let mut sink = Sink::default();
         let mut body = crate::stream::from_iter([b"hi".to_vec()]);
         super::write_request_stream(&mut sink, &request, &mut body, DEFAULT_MAX_FRAME_SIZE)
@@ -732,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn request_streams_reject_misplaced_known_frames() {
         let request =
-            encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new("svc", "m"), 1024).unwrap();
+            encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new("/svc/m"), 1024).unwrap();
         let headers = encode_frame(frame_type::HEADERS, &[], 1024).unwrap();
         let message = encode_message_frame(b"m", 1024).unwrap();
 
@@ -747,7 +747,7 @@ mod tests {
             read_request(&mut Script::new(request.clone()), 1024, |_| Ok(()))
                 .await
                 .unwrap(),
-            RpcRequest::new("svc", "m")
+            RpcRequest::new("/svc/m")
         );
 
         // Afterwards only MESSAGE and STATUS may follow.
@@ -795,7 +795,7 @@ mod tests {
     #[tokio::test]
     async fn request_frames_on_a_response_stream_are_internal_errors() {
         let wire =
-            encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new("s", "m"), 1024).unwrap();
+            encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new("/s/m"), 1024).unwrap();
         let error = read_response_frame(&mut Script::new(wire), 1024)
             .await
             .expect_err("REQUEST has no place on a response stream");

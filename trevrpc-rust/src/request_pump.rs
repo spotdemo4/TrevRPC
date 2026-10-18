@@ -1388,7 +1388,7 @@ mod tests {
         let headers = encode_frame(frame_type::HEADERS, &[], 1024).unwrap();
         let request = encode_protobuf_frame(
             frame_type::REQUEST,
-            &RpcRequest::new("svc", "m"),
+            &RpcRequest::new("/svc/m"),
             DEFAULT_MAX_FRAME_SIZE,
         )
         .unwrap();

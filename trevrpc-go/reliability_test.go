@@ -53,11 +53,11 @@ func TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus(t *testing.T) {
 	})
 	calls := map[string]func(context.Context, Transport) error{
 		"unary": func(ctx context.Context, transport Transport) error {
-			_, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "x"}, newTestMessage)
+			_, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage)
 			return err
 		},
 		"server streaming": func(ctx context.Context, transport Transport) error {
-			stream, err := ServerStreaming(ctx, transport, testServiceName, "Count", &testMessage{Value: "x"}, newTestMessage)
+			stream, err := ServerStreaming(ctx, transport, "/example.Greeter/Count", &testMessage{Value: "x"}, newTestMessage)
 			if err != nil {
 				return err
 			}
@@ -128,7 +128,7 @@ func TestOverLimitStreamStillGetsUnavailable(t *testing.T) {
 			defer cancel()
 			var held []ClientStreamingCall[*testMessage, *testMessage]
 			for range limit {
-				call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "Concat", newTestMessage)
+				call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, "/example.Greeter/Concat", newTestMessage)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -146,7 +146,7 @@ func TestOverLimitStreamStillGetsUnavailable(t *testing.T) {
 			// is processed; give it a moment to start the handlers.
 			deadline := time.Now().Add(time.Second)
 			for {
-				_, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "x"}, newTestMessage)
+				_, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage)
 				if status := StatusFromError(err); status.Code == CodeUnavailable && strings.Contains(status.Message, "too many concurrent streams") {
 					return
 				}
@@ -169,7 +169,7 @@ const uploadRejectionTimeout = 2 * time.Second
 func registerEarlyFinishService(server *Server) {
 	registerTestService(server)
 	for _, kind := range []RPCKind{RPCKindClientStreaming, RPCKindBidirectionalStreaming} {
-		server.routeStreaming(testServiceName, fmt.Sprintf("FailEarly%d", kind), kind, func(context.Context, []byte, byteStream) (streamResponse, error) {
+		server.routeStreaming(testPath(fmt.Sprintf("FailEarly%d", kind)), kind, func(context.Context, []byte, byteStream) (streamResponse, error) {
 			return streamResponse{}, NewStatus(CodeFailedPrecondition, "no uploads")
 		})
 	}
@@ -211,7 +211,7 @@ func TestSendFailsPromptlyAfterServerRejectsUpload(t *testing.T) {
 			defer cancel()
 
 			t.Run("client streaming", func(t *testing.T) {
-				call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "Concat", newTestMessage)
+				call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, "/example.Greeter/Concat", newTestMessage)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -224,7 +224,7 @@ func TestSendFailsPromptlyAfterServerRejectsUpload(t *testing.T) {
 				requireStatus(t, "CloseAndRecv", err, CodeResourceExhausted)
 			})
 			t.Run("bidirectional streaming", func(t *testing.T) {
-				call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "Chat", newTestMessage)
+				call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/example.Greeter/Chat", newTestMessage)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -255,7 +255,7 @@ func TestSendFailsPromptlyAfterHandlerReturnsEarly(t *testing.T) {
 			defer cancel()
 
 			t.Run("client streaming", func(t *testing.T) {
-				call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, fmt.Sprintf("FailEarly%d", RPCKindClientStreaming), newTestMessage)
+				call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, testPath(fmt.Sprintf("FailEarly%d", RPCKindClientStreaming)), newTestMessage)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -265,7 +265,7 @@ func TestSendFailsPromptlyAfterHandlerReturnsEarly(t *testing.T) {
 				requireStatus(t, "CloseAndRecv", err, CodeFailedPrecondition)
 			})
 			t.Run("bidirectional streaming", func(t *testing.T) {
-				call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, fmt.Sprintf("FailEarly%d", RPCKindBidirectionalStreaming), newTestMessage)
+				call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testPath(fmt.Sprintf("FailEarly%d", RPCKindBidirectionalStreaming)), newTestMessage)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -284,7 +284,7 @@ func TestSendReportsEOFAfterServerFinishesCallSuccessfully(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, func(server *Server) {
 		registerTestService(server)
-		server.routeStreaming(testServiceName, "Done", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
+		server.routeStreaming("/example.Greeter/Done", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
 			return rawResponse()
 		})
 	})
@@ -292,7 +292,7 @@ func TestSendReportsEOFAfterServerFinishesCallSuccessfully(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "Done", newTestMessage)
+			call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/example.Greeter/Done", newTestMessage)
 			if err != nil {
 				t.Fatal(err)
 			}

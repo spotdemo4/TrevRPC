@@ -142,7 +142,7 @@ fn number(json: &str, name: &str) -> f64 {
 #[test]
 fn bench_reports_every_scenario_over_both_transports() {
     let server = Server::start("bench");
-    for (transport, name) in [("quic", "quic"), ("tcp", "qmux")] {
+    for (transport, name, metadata_size) in [("quic", "quic", "0"), ("tcp", "qmux", "1024")] {
         for scenario in ["unary", "server-stream", "client-stream", "bidi"] {
             let output = server.run(
                 "bench",
@@ -153,6 +153,8 @@ fn bench_reports_every_scenario_over_both_transports() {
                     scenario,
                     "--size",
                     "32",
+                    "--metadata-size",
+                    metadata_size,
                     "--concurrency",
                     "2",
                     "--duration",
@@ -182,6 +184,12 @@ fn bench_reports_every_scenario_over_both_transports() {
                 "{json}"
             );
             assert_close(number(json, "size"), 32.0, 1e-9, json);
+            assert_close(
+                number(json, "metadata_size"),
+                metadata_size.parse().unwrap(),
+                1e-9,
+                json,
+            );
             assert_close(number(json, "concurrency"), 2.0, 1e-9, json);
             assert_close(number(json, "duration_s"), 0.2, 1e-9, json);
             assert_close(number(json, "errors"), 0.0, 1e-9, json);
@@ -228,12 +236,62 @@ fn bench_reports_every_scenario_over_both_transports() {
 }
 
 #[test]
+fn bench_metadata_size_pads_every_call() {
+    let server = Server::start("bench-metadata");
+    let wire_bytes_per_msg = |metadata_size: &str| {
+        let output = server.run(
+            "bench",
+            &[
+                "--transport",
+                "quic",
+                "--scenario",
+                "unary",
+                "--concurrency",
+                "1",
+                "--duration",
+                "0.3",
+                "--warmup",
+                "0.05",
+                "--metadata-size",
+                metadata_size,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{metadata_size}: {stderr}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let json = stdout.lines().next().expect("one JSON line");
+        assert_close(number(json, "errors"), 0.0, 1e-9, json);
+        assert_close(
+            number(json, "metadata_size"),
+            metadata_size.parse().unwrap(),
+            1e-9,
+            json,
+        );
+        number(json, "wire_bytes_per_msg")
+    };
+
+    let bare = wire_bytes_per_msg("0");
+    let padded = wire_bytes_per_msg("2000");
+
+    // The padding rides in every request, so each call sends at least its bytes more.
+    assert!(
+        padded - bare >= 2000.0,
+        "wire bytes per message: {bare} bare, {padded} padded"
+    );
+    server.finish();
+}
+
+#[test]
 fn bench_rejects_unusable_flags() {
     let server = Server::start("bench-flags");
     for flags in [
         &["--scenario", "nope"][..],
         &["--scenario", "unary", "--transport", "grpc"],
         &["--scenario", "unary", "--concurrency", "0"],
+        &["--scenario", "unary", "--metadata-size", "-1"],
+        &["--scenario", "unary", "--metadata-size", "lots"],
+        // One byte over the 8 KiB metadata value limit.
+        &["--scenario", "unary", "--metadata-size", "8193"],
     ] {
         let output = server.run("bench", flags);
         assert!(!output.status.success(), "{flags:?} should fail");

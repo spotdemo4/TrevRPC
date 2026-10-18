@@ -153,7 +153,7 @@ async fn wait_for_phase(client: &Channel, phase: ChannelPhase) -> TestResult {
 }
 
 fn request() -> RpcRequest {
-    RpcRequest::new("test.Service", "Call")
+    RpcRequest::new("/test.Service/Call")
 }
 
 fn assert_unavailable(error: trevrpc::Error) {

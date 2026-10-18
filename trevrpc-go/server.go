@@ -65,18 +65,13 @@ type route struct {
 	streaming streamingHandler
 }
 
-type methodKey struct {
-	service string
-	method  string
-}
-
 // ErrServerFrozen is the panic value used when a server is mutated after first use.
 var ErrServerFrozen = errors.New("trevrpc: server configuration is frozen")
 
 // Server routes and handles TrevRPC requests.
 type Server struct {
 	mu          sync.Mutex
-	routes      map[methodKey]route
+	routes      map[string]route
 	options     ServerOptions
 	authorizer  Authorizer
 	metrics     Metrics
@@ -268,7 +263,7 @@ type RPCFinished struct {
 // NewServer creates an empty server with default options.
 func NewServer() *Server {
 	return &Server{
-		routes:  map[methodKey]route{},
+		routes:  map[string]route{},
 		options: DefaultServerOptions(),
 		metrics: NoopMetrics{},
 	}
@@ -320,31 +315,33 @@ func (s *Server) SetDiagnostics(handler ServerDiagnosticHandler) {
 	s.diagnostics = handler
 }
 
-// routeUnary registers a unary route handler for a service and method.
-func (s *Server) routeUnary(service, method string, handler unaryHandler) {
+// routeUnary registers a unary route handler for a method path.
+func (s *Server) routeUnary(method string, handler unaryHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
-	validateRoute(service, method, RPCKindUnary, handler != nil)
-	s.routes[methodKey{service: service, method: method}] = route{kind: RPCKindUnary, unary: handler}
+	validateRoute(method, handler != nil)
+	s.routes[method] = route{kind: RPCKindUnary, unary: handler}
 }
 
-// routeStreaming registers a streaming route handler for a service, method, and RPC kind.
-func (s *Server) routeStreaming(service, method string, kind RPCKind, handler streamingHandler) {
+// routeStreaming registers a streaming route handler for a method path and RPC kind.
+func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
 	if kind == RPCKindUnary || !kind.isValid() {
 		panic("trevrpc: streaming route requires a streaming RPC kind")
 	}
-	validateRoute(service, method, kind, handler != nil)
-	s.routes[methodKey{service: service, method: method}] = route{kind: kind, streaming: handler}
+	validateRoute(method, handler != nil)
+	s.routes[method] = route{kind: kind, streaming: handler}
 }
 
-// RegisterUnary registers a unary handler. The handler may attach response
-// headers and trailing metadata through the returned Response.
-func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (*Response[Res], error)) {
-	s.routeUnary(service, method, func(ctx context.Context, body []byte) (*unaryReply, error) {
+// RegisterUnary registers a unary handler for method, the full method path
+// "/package.Service/Method". It panics if method is not of that form. The
+// handler may attach response headers and trailing metadata through the
+// returned Response.
+func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (*Response[Res], error)) {
+	s.routeUnary(method, func(ctx context.Context, body []byte) (*unaryReply, error) {
 		request, err := decodeRegisteredRequest(body, newRequest)
 		if err != nil {
 			return nil, err
@@ -358,11 +355,12 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, service, metho
 	})
 }
 
-// RegisterClientStreaming registers a client-streaming handler. The handler
-// may attach response headers and trailing metadata through the returned
-// Response.
-func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (*Response[Res], error)) {
-	s.routeStreaming(service, method, RPCKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
+// RegisterClientStreaming registers a client-streaming handler for method, the
+// full method path "/package.Service/Method". It panics if method is not of
+// that form. The handler may attach response headers and trailing metadata
+// through the returned Response.
+func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (*Response[Res], error)) {
+	s.routeStreaming(method, RPCKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
 		response, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
 			return streamResponse{}, err
@@ -374,12 +372,13 @@ func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, serv
 	})
 }
 
-// RegisterServerStreaming registers a server-streaming handler. If the
-// returned stream implements ResponseStream (see NewResponseStream), its
+// RegisterServerStreaming registers a server-streaming handler for method, the
+// full method path "/package.Service/Method". It panics if method is not of
+// that form. If the returned stream implements ResponseStream (see NewResponseStream), its
 // trailing metadata is sent with the final status; WithResponseHeaders adds
 // response headers.
-func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, Req) (MessageStream[Res], error)) {
-	s.routeStreaming(service, method, RPCKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (streamResponse, error) {
+func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (MessageStream[Res], error)) {
+	s.routeStreaming(method, RPCKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (streamResponse, error) {
 		request, err := decodeRegisteredRequest(body, newRequest)
 		if err != nil {
 			return streamResponse{}, err
@@ -396,12 +395,13 @@ func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, serv
 	})
 }
 
-// RegisterBidirectionalStreaming registers a bidirectional-streaming handler.
-// If the returned stream implements ResponseStream (see NewResponseStream), its
+// RegisterBidirectionalStreaming registers a bidirectional-streaming handler
+// for method, the full method path "/package.Service/Method". It panics if
+// method is not of that form. If the returned stream implements ResponseStream (see NewResponseStream), its
 // trailing metadata is sent with the final status; WithResponseHeaders adds
 // response headers.
-func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, service, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (MessageStream[Res], error)) {
-	s.routeStreaming(service, method, RPCKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
+func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (MessageStream[Res], error)) {
+	s.routeStreaming(method, RPCKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
 		responses, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
 			return streamResponse{}, err
@@ -468,7 +468,7 @@ func isNilRegisteredValue(value any) bool {
 
 type serverRuntime struct {
 	options          ServerOptions
-	routes           map[methodKey]route
+	routes           map[string]route
 	authorizer       Authorizer
 	metrics          Metrics
 	requestLimit     semaphore
@@ -540,9 +540,9 @@ func canonicalDuration(name string, value, fallback time.Duration, disabled bool
 	return value
 }
 
-func validateRoute(service, method string, _ RPCKind, hasHandler bool) {
-	if service == "" || method == "" {
-		panic("trevrpc: route service and method must be non-empty")
+func validateRoute(method string, hasHandler bool) {
+	if _, _, ok := splitMethodPath(method); !ok {
+		panic(fmt.Sprintf("trevrpc: route method %q must be /<service>/<method>", method))
 	}
 	if !hasHandler {
 		panic("trevrpc: route handler must not be nil")
@@ -702,7 +702,8 @@ func (r *serverRuntime) tryRequestLease(request *wireRequest) (*requestExecution
 	lease := &requestExecutionLease{runtime: r, limit: r.requestLimit}
 	lease.refs.Store(1)
 	if request != nil {
-		lease.service, lease.method, lease.kind = request.Service, request.Method, request.rpcKind()
+		lease.service, lease.method = request.serviceAndMethod()
+		lease.kind = request.rpcKind()
 	}
 	return lease, true
 }
@@ -798,13 +799,15 @@ func requestService(request *wireRequest) string {
 	if request == nil {
 		return ""
 	}
-	return request.Service
+	service, _ := request.serviceAndMethod()
+	return service
 }
 func requestMethod(request *wireRequest) string {
 	if request == nil {
 		return ""
 	}
-	return request.Method
+	_, method := request.serviceAndMethod()
+	return method
 }
 func requestKind(request *wireRequest) RPCKind {
 	if request == nil {
@@ -903,7 +906,8 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 		r.recordStarted(RPCStarted{}, nil)
 		return r.finishResponse("", "", 0, startedAt, failedUnaryResponse(InvalidArgument("RPC request is nil")), nil)
 	}
-	service, method, requestBodyLen := request.Service, request.Method, len(body)
+	service, method := request.serviceAndMethod()
+	requestBodyLen := len(body)
 	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen}, request)
 
 	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
@@ -912,9 +916,9 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 	}
 	defer cancel()
 
-	route, ok := r.routes[methodKey{service: request.Service, method: request.Method}]
+	route, ok := r.routes[request.Method]
 	if !ok || route.unary == nil {
-		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(Unimplemented(fmt.Sprintf("unknown RPC method %s/%s", request.Service, request.Method))), request)
+		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(Unimplemented(fmt.Sprintf("unknown RPC method %s", request.Method))), request)
 	}
 	reply, err := invokeUnaryHandler(ctx, route.unary, body, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
@@ -1005,7 +1009,8 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		lease.release()
 		return r.finishStreamingStatus("", "", 0, startedAt, InvalidArgument("RPC request is nil"), nil)
 	}
-	service, method, requestBodyLen := request.Service, request.Method, len(body)
+	service, method := request.serviceAndMethod()
+	requestBodyLen := len(body)
 	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen}, request)
 
 	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
@@ -1017,16 +1022,16 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 
 	limits := streamLimitsFromOptions(r.options)
 	requestBody = limitByteStream(ctx, requestBody, limits, "request", lease, request)
-	route, ok := r.routes[methodKey{service: request.Service, method: request.Method}]
+	route, ok := r.routes[request.Method]
 	if !ok || route.streaming == nil {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown streaming RPC method %s/%s", request.Service, request.Method)), request)
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown streaming RPC method %s", request.Method)), request)
 	}
 	if route.kind != request.rpcKind() {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s/%s: expected %d, got %d", request.Service, request.Method, route.kind, request.rpcKind())), request)
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s: expected %d, got %d", request.Method, route.kind, request.rpcKind())), request)
 	}
 
 	response, err := invokeStreamingHandler(ctx, route.streaming, body, requestBody, handlerNeedsDeadlineRace(ctx), lease)

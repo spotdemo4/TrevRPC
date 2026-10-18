@@ -5,6 +5,7 @@
 //! inside the window count. The client prints one JSON line with the throughput and latency
 //! percentiles.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use tokio::time::{Instant, timeout_at};
@@ -13,9 +14,16 @@ use trevrpc::client::{
     BidirectionalCall, CallOptions, ChannelConfig, QmuxTransport, QuicTransport,
     StreamingRpcTransport,
 };
+use trevrpc::wire::MAX_METADATA_VALUE_LEN;
 
 use crate::proto::{EchoClient, EchoRequest, EchoResponse};
 use crate::{BoxError, Flags, connect};
+
+/// The request metadata key `--metadata-size` fills.
+const PAD_METADATA_KEY: &str = "bench-pad";
+
+/// How many distinct error messages the stderr breakdown lists.
+const ERROR_BREAKDOWN_LEN: usize = 5;
 
 /// How long past the end of the window an operation may run before it counts as failed, so a
 /// hung call cannot stall the run.
@@ -61,6 +69,8 @@ impl Scenario {
 struct Params {
     scenario: Scenario,
     size: usize,
+    /// Bytes of the `bench-pad` request metadata value on every call; no metadata when zero.
+    metadata_size: usize,
     concurrency: usize,
     duration: Duration,
     warmup: Duration,
@@ -71,6 +81,13 @@ impl Params {
     fn parse(flags: &Flags) -> Result<Self, BoxError> {
         let scenario = Scenario::parse(flags.require("scenario")?)?;
         let size = number(flags, "size", 64)?;
+        let metadata_size = number(flags, "metadata-size", 0)?;
+        if metadata_size > MAX_METADATA_VALUE_LEN {
+            return Err(format!(
+                "--metadata-size {metadata_size} exceeds the {MAX_METADATA_VALUE_LEN}-byte metadata value limit"
+            )
+            .into());
+        }
         let concurrency = number(flags, "concurrency", 1)?;
         let messages = number(flags, "messages", 100)?;
         if concurrency == 0 || messages == 0 {
@@ -83,11 +100,30 @@ impl Params {
         Ok(Self {
             scenario,
             size,
+            metadata_size,
             concurrency,
             duration,
             warmup: seconds(flags, "warmup", 1.0)?,
             messages,
         })
+    }
+}
+
+impl Params {
+    /// The options of every call: streams stay open for the whole run and the loop bounds every
+    /// operation itself, so nothing times out or runs out of messages, and the calls carry the
+    /// padding metadata.
+    fn call_options(&self) -> CallOptions {
+        let options = CallOptions::new()
+            .without_timeout()
+            .with_max_response_messages(None)
+            .with_max_response_stream_body_size(None)
+            .with_stream_idle_timeout(None);
+        if self.metadata_size == 0 {
+            options
+        } else {
+            options.with_metadata(PAD_METADATA_KEY, vec![b'x'; self.metadata_size])
+        }
     }
 }
 
@@ -192,9 +228,8 @@ impl Window {
 #[derive(Default)]
 struct WorkerResult {
     latencies: Vec<Duration>,
-    errors: u64,
-    /// The first failure, reported on stderr to explain a non-zero error count.
-    first_error: Option<String>,
+    /// Failures by message, reported on stderr to explain a non-zero error count.
+    errors: BTreeMap<String, u64>,
 }
 
 /// One load worker: a client and, for `bidi`, the stream it keeps open.
@@ -202,6 +237,7 @@ struct Worker<T> {
     client: EchoClient<T>,
     scenario: Scenario,
     request: EchoRequest,
+    options: CallOptions,
     messages: usize,
     bidi: Option<BidirectionalCall<EchoRequest, EchoResponse>>,
 }
@@ -210,21 +246,12 @@ impl<T> Worker<T>
 where
     T: StreamingRpcTransport + Clone,
 {
-    fn options() -> CallOptions {
-        // Streams stay open for the whole run, and the loop bounds every operation itself.
-        CallOptions::new()
-            .without_timeout()
-            .with_max_response_messages(None)
-            .with_max_response_stream_body_size(None)
-            .with_stream_idle_timeout(None)
-    }
-
     /// Runs one operation of the scenario.
     async fn operation(&mut self) -> Result<(), Error> {
         match self.scenario {
             Scenario::Unary => {
                 self.client
-                    .unary_with_options(self.request.clone(), Self::options())
+                    .unary_with_options(self.request.clone(), self.options.clone())
                     .await?;
             }
             Scenario::ServerStream => self.server_stream().await?,
@@ -246,7 +273,7 @@ where
         };
         let mut responses = self
             .client
-            .server_stream_with_options(request, Self::options())
+            .server_stream_with_options(request, self.options.clone())
             .await?;
         let mut received = 0_usize;
         while let Some(response) = responses.next().await {
@@ -260,7 +287,7 @@ where
     async fn client_stream(&mut self) -> Result<(), Error> {
         let call = self
             .client
-            .client_stream_with_options(Self::options())
+            .client_stream_with_options(self.options.clone())
             .await?;
         for _ in 0..self.messages {
             call.send(self.request.clone()).await?;
@@ -275,7 +302,9 @@ where
     async fn bidi(&mut self) -> Result<(), Error> {
         let call = match &mut self.bidi {
             Some(call) => call,
-            empty @ None => empty.insert(self.client.bidi_with_options(Self::options()).await?),
+            empty @ None => {
+                empty.insert(self.client.bidi_with_options(self.options.clone()).await?)
+            }
         };
         let sent = call.send(self.request.clone()).await;
         let result = match sent {
@@ -326,13 +355,12 @@ where
             }
             failed => {
                 if measured {
-                    result.errors = result.errors.saturating_add(1);
-                    if result.first_error.is_none() {
-                        result.first_error = Some(match &failed {
-                            Ok(Err(error)) => error.to_string(),
-                            _ => "operation timed out".to_owned(),
-                        });
-                    }
+                    let message = match &failed {
+                        Ok(Err(error)) => error.to_string(),
+                        _ => "operation timed out".to_owned(),
+                    };
+                    let count = result.errors.entry(message).or_default();
+                    *count = count.saturating_add(1);
                 }
                 worker.bidi = None;
                 // Do not spin on a dead connection.
@@ -371,6 +399,7 @@ where
                     client: EchoClient::new(transport.clone()),
                     scenario: params.scenario,
                     request: request.clone(),
+                    options: params.call_options(),
                     messages: params.messages,
                     bidi: None,
                 },
@@ -410,10 +439,23 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// The failures of every worker counted by message, most frequent first.
+fn error_breakdown(results: &[WorkerResult]) -> Vec<(&str, u64)> {
+    let mut totals = BTreeMap::<&str, u64>::new();
+    for (message, failures) in results.iter().flat_map(|result| &result.errors) {
+        let total = totals.entry(message).or_default();
+        *total = total.saturating_add(*failures);
+    }
+    let mut breakdown: Vec<_> = totals.into_iter().collect();
+    breakdown.sort_by_key(|&(_, failures)| std::cmp::Reverse(failures));
+    breakdown
+}
+
 struct Report {
     scenario: Scenario,
     transport: &'static str,
     size: usize,
+    metadata_size: usize,
     concurrency: usize,
     duration: f64,
     ops: u64,
@@ -431,12 +473,13 @@ impl Report {
         results: Vec<WorkerResult>,
         wire_bytes: Option<u64>,
     ) -> Result<Self, BoxError> {
-        let errors = results.iter().map(|result| result.errors).sum();
-        if let Some(error) = results
-            .iter()
-            .find_map(|result| result.first_error.as_ref())
-        {
-            eprintln!("bench: {errors} operations failed; first: {error}");
+        let breakdown = error_breakdown(&results);
+        let errors = breakdown.iter().map(|&(_, failures)| failures).sum();
+        if errors > 0 {
+            eprintln!("bench: {errors} operations failed:");
+            for (message, failures) in breakdown.into_iter().take(ERROR_BREAKDOWN_LEN) {
+                eprintln!("bench:   {failures} x {message}");
+            }
         }
         let mut latencies: Vec<Duration> = results
             .into_iter()
@@ -454,6 +497,7 @@ impl Report {
             scenario: params.scenario,
             transport,
             size: params.size,
+            metadata_size: params.metadata_size,
             concurrency: params.concurrency,
             duration: params.duration.as_secs_f64(),
             ops,
@@ -486,13 +530,14 @@ impl Report {
         });
         format!(
             concat!(
-                r#"{{"scenario":"{}","transport":"{}","size":{},"concurrency":{},"duration_s":{:?},"#,
+                r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"concurrency":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
                 r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{}}}"#,
             ),
             self.scenario.name(),
             self.transport,
             self.size,
+            self.metadata_size,
             self.concurrency,
             self.duration,
             self.ops,
@@ -514,4 +559,36 @@ impl Report {
 #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
 const fn count(value: u64) -> f64 {
     value as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkerResult, error_breakdown};
+
+    fn worker(errors: &[(&str, u64)]) -> WorkerResult {
+        WorkerResult {
+            errors: errors
+                .iter()
+                .map(|&(message, failures)| (message.to_owned(), failures))
+                .collect(),
+            ..WorkerResult::default()
+        }
+    }
+
+    #[test]
+    fn error_breakdown_sums_across_workers_and_sorts_by_count() {
+        let results = [
+            worker(&[("operation timed out", 1), ("flow control error", 5)]),
+            worker(&[]),
+            worker(&[("flow control error", 4), ("connection closed", 2)]),
+        ];
+        assert_eq!(
+            error_breakdown(&results),
+            [
+                ("flow control error", 9),
+                ("connection closed", 2),
+                ("operation timed out", 1),
+            ]
+        );
+    }
 }

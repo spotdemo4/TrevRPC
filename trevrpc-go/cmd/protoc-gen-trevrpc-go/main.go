@@ -180,7 +180,7 @@ func generatedServiceNames(service *protogen.Service, options pluginOptions) []s
 		"(*" + clientName + ").mergedCallOptions",
 	}
 	for _, method := range service.Methods {
-		names = append(names, "(*"+clientName+")."+method.GoName)
+		names = append(names, "(*"+clientName+")."+method.GoName, fullMethodConstName(serviceName, method))
 	}
 	return names
 }
@@ -200,8 +200,15 @@ func (g fileGenerator) generateService(service *protogen.Service) {
 	serviceName := g.options.servicePrefix + service.GoName
 	serverName := serviceName + "Server"
 	clientName := serviceName + "Client"
-	fullServiceName := string(service.Desc.FullName())
 	contextType := g.qualified(protogen.GoImportPath("context").Ident("Context"))
+
+	g.generated.P("// Full method paths (\"/package.Service/Method\") of the ", service.GoName, " service.")
+	g.generated.P("const (")
+	for _, method := range service.Methods {
+		g.generated.P(fullMethodConstName(serviceName, method), " = ", quoted(fullMethodPath(method)))
+	}
+	g.generated.P(")")
+	g.generated.P()
 
 	g.generated.P("// ", serverName, " handles the ", service.GoName, " service.")
 	g.generated.P("type ", serverName, " interface {")
@@ -226,13 +233,13 @@ func (g fileGenerator) generateService(service *protogen.Service) {
 	g.generateMergeOptions(clientName)
 
 	for _, method := range service.Methods {
-		g.generateClientMethods(clientName, fullServiceName, method)
+		g.generateClientMethods(clientName, serviceName, method)
 	}
 
 	g.generated.P("// Register", serverName, " registers handlers for the ", service.GoName, " service.")
 	g.generated.P("func Register", serverName, "(server *", g.runtime("Server"), ", implementation ", serverName, ") {")
 	for _, method := range service.Methods {
-		g.generateServerRegistration(fullServiceName, method)
+		g.generateServerRegistration(serviceName, method)
 	}
 	g.generated.P("}")
 	g.generated.P()
@@ -263,8 +270,7 @@ func (g fileGenerator) generateClientMethods(clientName, serviceName string, met
 	options := "options ..." + g.runtime("CallOption")
 	merged := "c.mergedCallOptions(options)..."
 	methodName := method.GoName
-	protoMethodName := string(method.Desc.Name())
-	callPrefix := "(ctx, c.transport, " + quoted(serviceName) + ", " + quoted(protoMethodName) + ", "
+	callPrefix := "(ctx, c.transport, " + fullMethodConstName(serviceName, method) + ", "
 
 	g.generated.P("// ", methodName, " calls the ", method.Desc.Name(), " RPC.")
 	switch {
@@ -300,7 +306,7 @@ func (g fileGenerator) generateServerRegistration(serviceName string, method *pr
 	default:
 		helper = g.runtime("RegisterUnary")
 	}
-	g.generated.P(helper, "[", inputType, ", ", outputType, "](server, ", quoted(serviceName), ", ", quoted(string(method.Desc.Name())), ", ", factory, ", implementation.", method.GoName, ")")
+	g.generated.P(helper, "[", inputType, ", ", outputType, "](server, ", fullMethodConstName(serviceName, method), ", ", factory, ", implementation.", method.GoName, ")")
 }
 
 func (g fileGenerator) serverRequestType(method *protogen.Method) string {
@@ -333,6 +339,18 @@ func (g fileGenerator) runtime(name string) string {
 
 func (g fileGenerator) qualified(ident protogen.GoIdent) string {
 	return g.generated.QualifiedGoIdent(ident)
+}
+
+// fullMethodPath returns the method path "/package.Service/Method" that
+// identifies method on the wire.
+func fullMethodPath(method *protogen.Method) string {
+	return "/" + string(method.Parent.Desc.FullName()) + "/" + string(method.Desc.Name())
+}
+
+// fullMethodConstName returns the name of the generated constant holding
+// method's full path, such as Greeter_SayHello_FullMethodName.
+func fullMethodConstName(serviceName string, method *protogen.Method) string {
+	return serviceName + "_" + method.GoName + "_FullMethodName"
 }
 
 func quoted(value string) string {

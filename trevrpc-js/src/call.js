@@ -15,7 +15,6 @@ import {
   statusError,
   statusFromTransportError,
 } from "./status.js";
-import { WireVersion } from "./wire.js";
 
 /** Longest delay setTimeout can represent; it fires immediately beyond this. */
 const MaxTimerDelayMs = 2_147_483_647;
@@ -126,13 +125,13 @@ export class Call {
   #uploadFailure;
 
   /**
-   * Opens a stream on the transport and sends the REQUEST frame. The request carries service,
-   * method and kind; version, metadata and the wire timeout come from the options. The request
+   * Opens a stream on the transport and sends the REQUEST frame. The request carries the
+   * method path and kind; metadata and the wire timeout come from the options. The request
    * message of a unary or server-streaming call goes out in the same write.
    */
   static async open(transport, request, message, options) {
     const header = encodeRequestFrame(
-      { ...request, version: WireVersion, metadata: options.metadata, ...timeoutField(options) },
+      { ...request, metadata: options.metadata, ...timeoutField(options) },
       message,
       options.maxFrameSize,
     );

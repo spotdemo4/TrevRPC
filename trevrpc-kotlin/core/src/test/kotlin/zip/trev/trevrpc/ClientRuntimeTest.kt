@@ -27,21 +27,21 @@ class ClientRuntimeTest {
         runBlocking {
             val client = Client(LoopbackTransport())
 
-            val unary = client.unaryResponse("test.Service", "Unary", "x", strings, strings)
+            val unary = client.unaryResponse("/test.Service/Unary", "x", strings, strings)
             assertEquals("u:x", unary.message)
             assertEquals(1, unary.metadata["result"]?.single())
             assertEquals(2, unary.headers["server"]?.single())
             assertNull(unary.headers["result"])
             assertNull(unary.metadata["server"])
 
-            val serverStream = client.serverStreaming("test.Service", "ServerStream", "s", strings, strings)
+            val serverStream = client.serverStreaming("/test.Service/ServerStream", "s", strings, strings)
             assertEquals(2, serverStream.headers()["server"]?.single())
             assertEquals("s-1", serverStream.receive())
             assertEquals("s-2", serverStream.receive())
             assertNull(serverStream.receive())
             assertEquals(Code.OK, serverStream.terminalStatus?.code)
 
-            val clientStream = client.clientStreaming("test.Service", "ClientStream", strings, strings)
+            val clientStream = client.clientStreaming("/test.Service/ClientStream", strings, strings)
             clientStream.send("a")
             clientStream.send("b")
             clientStream.closeSend()
@@ -50,7 +50,7 @@ class ClientRuntimeTest {
             assertEquals(2, clientResponse.headers["server"]?.single())
             assertEquals(1, clientResponse.metadata["result"]?.single())
 
-            val bidi = client.bidirectionalStreaming("test.Service", "Bidi", strings, strings)
+            val bidi = client.bidirectionalStreaming("/test.Service/Bidi", strings, strings)
             bidi.send("a")
             assertEquals(2, bidi.headers()["server"]?.single())
             assertEquals("echo:a", bidi.receive())
@@ -67,7 +67,7 @@ class ClientRuntimeTest {
             val trace = Metadata.of("trace" to byteArrayOf(9))
             val call =
                 Client(StaticStreamTransport(status(Status(Code.ABORTED, "stream failed", trace))))
-                    .serverStreaming("test.Service", "Fail", "request", strings, strings)
+                    .serverStreaming("/test.Service/Fail", "request", strings, strings)
 
             val failure = assertThrows(TrevRpcException::class.java) { runBlocking { call.receive() } }
 
@@ -87,7 +87,7 @@ class ClientRuntimeTest {
                 )
             val call =
                 testClient(SingleStreamTransport(stream))
-                    .clientStreaming<String, String>("svc", "method", strings, strings)
+                    .clientStreaming<String, String>("/svc/method", strings, strings)
 
             call.send("request")
             assertEquals(1, stream.sent.size)
@@ -103,7 +103,7 @@ class ClientRuntimeTest {
 
             val serverStream = RecordingClientStream(status(Status.ok()))
             val transport = SingleStreamTransport(serverStream)
-            testClient(transport).serverStreaming("svc", "method", "request", strings, strings)
+            testClient(transport).serverStreaming("/svc/method", "request", strings, strings)
             // REQUEST, the only MESSAGE, and the half-close travel in the one open; nothing is sent after.
             assertEquals(listOf("request"), transport.firstMessages.map { it?.decodeToString() })
             assertEquals(listOf(true), transport.finishSends)
@@ -120,7 +120,7 @@ class ClientRuntimeTest {
             val response =
                 testClient(
                     transport,
-                ).unary("svc", "method", "request", strings, strings, CallOptions(streamIdleTimeout = 1.milliseconds))
+                ).unary("/svc/method", "request", strings, strings, CallOptions(streamIdleTimeout = 1.milliseconds))
             assertEquals("reply", response)
             assertEquals(listOf("request"), transport.firstMessages.map { it?.decodeToString() })
             assertEquals(listOf(true), transport.finishSends)
@@ -133,8 +133,8 @@ class ClientRuntimeTest {
         runTest {
             val transport = SingleStreamTransport(RecordingClientStream())
             val client = testClient(transport)
-            client.clientStreaming<String, String>("svc", "method", strings, strings)
-            client.bidirectionalStreaming<String, String>("svc", "method", strings, strings)
+            client.clientStreaming<String, String>("/svc/method", strings, strings)
+            client.bidirectionalStreaming<String, String>("/svc/method", strings, strings)
             assertEquals(listOf(null, null), transport.firstMessages)
             assertEquals(listOf(false, false), transport.finishSends)
             assertEquals(
@@ -153,8 +153,7 @@ class ClientRuntimeTest {
             val upload =
                 testClient(SingleStreamTransport(blockedSend))
                     .clientStreaming<String, String>(
-                        "svc",
-                        "method",
+                        "/svc/method",
                         strings,
                         strings,
                         CallOptions(timeout = 1.seconds),
@@ -173,8 +172,7 @@ class ClientRuntimeTest {
             assertCode(Code.DEADLINE_EXCEEDED) {
                 testClient(blockedOpen)
                     .serverStreaming(
-                        "svc",
-                        "method",
+                        "/svc/method",
                         "request",
                         strings,
                         strings,
@@ -190,8 +188,7 @@ class ClientRuntimeTest {
             val client = testClient(pendingTransport)
             assertCode(Code.DEADLINE_EXCEEDED) {
                 client.unary(
-                    "svc",
-                    "method",
+                    "/svc/method",
                     "request",
                     strings,
                     strings,
@@ -200,8 +197,7 @@ class ClientRuntimeTest {
             }
             val idle =
                 client.serverStreaming(
-                    "svc",
-                    "method",
+                    "/svc/method",
                     "request",
                     strings,
                     strings,
@@ -217,8 +213,7 @@ class ClientRuntimeTest {
                         status(Status.ok()),
                     ),
                 ).serverStreaming(
-                    "svc",
-                    "method",
+                    "/svc/method",
                     "request",
                     strings,
                     strings,
@@ -234,8 +229,7 @@ class ClientRuntimeTest {
                         message("c"),
                     ),
                 ).serverStreaming(
-                    "svc",
-                    "method",
+                    "/svc/method",
                     "request",
                     strings,
                     strings,
@@ -250,8 +244,7 @@ class ClientRuntimeTest {
                         message("ab"),
                     ),
                 ).serverStreaming(
-                    "svc",
-                    "method",
+                    "/svc/method",
                     "request",
                     strings,
                     strings,
@@ -276,13 +269,13 @@ class ClientRuntimeTest {
                             if (terminalFrames.hasNext()) terminalFrames.next() else null
                         },
                     ),
-                ).serverStreaming("svc", "method", "request", strings, strings)
+                ).serverStreaming("/svc/method", "request", strings, strings)
             assertEquals("ok", terminal.receive())
             assertNull(terminal.receive())
             assertEquals(7, terminal.responseMetadata["trace"]?.single())
             assertEquals(1, closes.get())
 
-            val eof = testClient(StaticStreamTransport()).serverStreaming("svc", "method", "request", strings, strings)
+            val eof = testClient(StaticStreamTransport()).serverStreaming("/svc/method", "request", strings, strings)
             assertCode(Code.INTERNAL) { eof.receive() }
 
             val trailingCloses = AtomicInteger()
@@ -298,7 +291,7 @@ class ClientRuntimeTest {
                             if (trailingFrames.hasNext()) trailingFrames.next() else null
                         },
                     ),
-                ).serverStreaming("svc", "method", "request", strings, strings)
+                ).serverStreaming("/svc/method", "request", strings, strings)
             assertCode(Code.INTERNAL) { trailing.receive() }
             assertEquals(1, trailingCloses.get())
 
@@ -311,8 +304,7 @@ class ClientRuntimeTest {
                         },
                     ),
                 ).serverStreaming(
-                    "svc",
-                    "method",
+                    "/svc/method",
                     "request",
                     strings,
                     strings,
@@ -333,7 +325,7 @@ class ClientRuntimeTest {
                             }
                         },
                     ),
-                ).serverStreaming("svc", "method", "request", strings, strings)
+                ).serverStreaming("/svc/method", "request", strings, strings)
             assertStatus(Code.INTERNAL, "response stream contained data after final status") {
                 malformedTrailing.receive()
             }
@@ -346,7 +338,7 @@ class ClientRuntimeTest {
                         message("two"),
                         status(Status.ok()),
                     ),
-                ).clientStreaming<String, String>("svc", "method", strings, strings)
+                ).clientStreaming<String, String>("/svc/method", strings, strings)
             assertStatus(
                 Code.INTERNAL,
                 "client-streaming RPC returned more than one response message",
@@ -358,7 +350,7 @@ class ClientRuntimeTest {
                         message("one"),
                         message("two"),
                     ),
-                ).clientStreaming<String, String>("svc", "method", strings, strings)
+                ).clientStreaming<String, String>("/svc/method", strings, strings)
             assertStatus(Code.INTERNAL, "response stream ended before final status") {
                 multipleWithoutStatus.receive()
             }
@@ -370,7 +362,7 @@ class ClientRuntimeTest {
                         message("two"),
                         status(Status.unavailable("remote")),
                     ),
-                ).clientStreaming<String, String>("svc", "method", strings, strings)
+                ).clientStreaming<String, String>("/svc/method", strings, strings)
             assertStatus(Code.UNAVAILABLE, "remote") { multipleThenRemote.receive() }
 
             val multipleThenTrailing =
@@ -381,7 +373,7 @@ class ClientRuntimeTest {
                         status(Status.ok()),
                         message("late"),
                     ),
-                ).clientStreaming<String, String>("svc", "method", strings, strings)
+                ).clientStreaming<String, String>("/svc/method", strings, strings)
             assertStatus(Code.INTERNAL, "response stream contained data after final status") {
                 multipleThenTrailing.receive()
             }
@@ -392,19 +384,18 @@ class ClientRuntimeTest {
                         message("one"),
                         status(Status.unavailable("remote")),
                     ),
-                ).clientStreaming<String, String>("svc", "method", strings, strings)
+                ).clientStreaming<String, String>("/svc/method", strings, strings)
             assertCode(Code.UNAVAILABLE) { oneThenRemote.receive() }
 
             val messageWithoutStatus =
                 testClient(StaticStreamTransport(message("one")))
-                    .clientStreaming<String, String>("svc", "method", strings, strings)
+                    .clientStreaming<String, String>("/svc/method", strings, strings)
             assertCode(Code.INTERNAL) { messageWithoutStatus.receive() }
 
             val remote = testClient(StaticStreamTransport(status(Status.unavailable("remote down"))))
             assertCode(Code.UNAVAILABLE) {
                 remote.unary(
-                    "svc",
-                    "method",
+                    "/svc/method",
                     "request",
                     strings,
                     strings,
@@ -419,7 +410,7 @@ class ClientRuntimeTest {
             val closes = AtomicInteger()
             val transport =
                 SingleStreamTransport(SequenceStream(onClose = { closes.incrementAndGet() }) { awaitCancellation() })
-            val call = testClient(transport).bidirectionalStreaming<String, String>("svc", "method", strings, strings)
+            val call = testClient(transport).bidirectionalStreaming<String, String>("/svc/method", strings, strings)
             call.close()
             call.close()
             assertEquals(1, closes.get())
@@ -440,7 +431,7 @@ class ClientRuntimeTest {
                 }
             val call =
                 testClient(SingleStreamTransport(stream))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             val error = runCatching { call.receive() }.exceptionOrNull()
             assertTrue(error is CancellationException)
             assertEquals("close cancelled", error?.message)
@@ -453,7 +444,7 @@ class ClientRuntimeTest {
             val trailer = Metadata.of("x-t" to byteArrayOf(5))
             val call =
                 testClient(StaticStreamTransport(headers(md), message("a"), message("b"), status(Status.ok(trailer))))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
 
             assertEquals(md, call.headers())
             assertEquals(md, call.headers())
@@ -471,20 +462,20 @@ class ClientRuntimeTest {
         runTest {
             val absent =
                 testClient(StaticStreamTransport(message("a"), status(Status.ok())))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             assertEquals(Metadata.EMPTY, absent.headers())
             assertEquals("a", absent.receive())
             assertNull(absent.receive())
 
             val lone =
                 testClient(StaticStreamTransport(status(Status.unavailable("down"))))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             assertEquals(Metadata.EMPTY, lone.headers())
             assertCode(Code.UNAVAILABLE) { lone.receive() }
 
             val afterReceive =
                 testClient(StaticStreamTransport(headers(Metadata.of("x-h" to byteArrayOf(1))), message("a"), status(Status.ok())))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             assertEquals("a", afterReceive.receive())
             assertEquals(1, afterReceive.headers()["x-h"]?.single())
         }
@@ -495,7 +486,7 @@ class ClientRuntimeTest {
             val frames = Channel<ResponseFrame>(Channel.UNLIMITED)
             val call =
                 testClient(SingleStreamTransport(SequenceStream { frames.receiveCatching().getOrNull() }))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             val receiving = async { call.receive() }
             val reading = async { call.headers() }
             repeat(3) { yield() }
@@ -510,14 +501,14 @@ class ClientRuntimeTest {
     @Test
     fun `headers surface a stream failure and receive reports it too`() =
         runTest {
-            val call = testClient(StaticStreamTransport()).serverStreaming("svc", "method", "request", strings, strings)
+            val call = testClient(StaticStreamTransport()).serverStreaming("/svc/method", "request", strings, strings)
             assertCode(Code.INTERNAL) { call.headers() }
             assertCode(Code.INTERNAL) { call.receive() }
             assertNull(call.receive())
 
             val idle =
                 testClient(SingleStreamTransport(SequenceStream { awaitCancellation() }))
-                    .serverStreaming("svc", "method", "request", strings, strings, CallOptions(streamIdleTimeout = 1.seconds))
+                    .serverStreaming("/svc/method", "request", strings, strings, CallOptions(streamIdleTimeout = 1.seconds))
             assertCode(Code.UNAVAILABLE) { idle.headers() }
         }
 
@@ -526,29 +517,29 @@ class ClientRuntimeTest {
         runTest {
             val duplicate =
                 testClient(StaticStreamTransport(headers(), headers(), status(Status.ok())))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             assertCode(Code.INTERNAL) { duplicate.receive() }
 
             val afterMessage =
                 testClient(StaticStreamTransport(message("a"), headers(), status(Status.ok())))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             assertEquals("a", afterMessage.receive())
             assertCode(Code.INTERNAL) { afterMessage.receive() }
 
             val afterStatus =
                 testClient(StaticStreamTransport(message("a"), status(Status.ok()), headers()))
-                    .clientStreaming<String, String>("svc", "method", strings, strings)
+                    .clientStreaming<String, String>("/svc/method", strings, strings)
             assertStatus(Code.INTERNAL, "response stream contained data after final status") { afterStatus.receive() }
 
             val lateHeadersApi =
                 testClient(StaticStreamTransport(message("a"), headers()))
-                    .serverStreaming("svc", "method", "request", strings, strings)
+                    .serverStreaming("/svc/method", "request", strings, strings)
             assertEquals(Metadata.EMPTY, lateHeadersApi.headers())
             assertEquals("a", lateHeadersApi.receive())
             assertCode(Code.INTERNAL) { lateHeadersApi.receive() }
 
             val unary = testClient(StaticStreamTransport(message("a"), headers(), status(Status.ok())))
-            assertCode(Code.INTERNAL) { unary.unary("svc", "method", "request", strings, strings) }
+            assertCode(Code.INTERNAL) { unary.unary("/svc/method", "request", strings, strings) }
         }
 
     @Test
@@ -558,20 +549,20 @@ class ClientRuntimeTest {
             val trailer = Metadata.of("x-t" to byteArrayOf(2))
             val frames = arrayOf(headers(md), message("r"), status(Status.ok(trailer)))
             val unary =
-                testClient(StaticStreamTransport(*frames)).unaryResponse("svc", "method", "request", strings, strings)
+                testClient(StaticStreamTransport(*frames)).unaryResponse("/svc/method", "request", strings, strings)
             assertEquals(ResponseEnvelope("r", trailer, md), unary)
 
             val upload =
-                testClient(StaticStreamTransport(*frames)).clientStreaming<String, String>("svc", "method", strings, strings)
+                testClient(StaticStreamTransport(*frames)).clientStreaming<String, String>("/svc/method", strings, strings)
             assertEquals(ResponseEnvelope("r", trailer, md), upload.receive())
 
             val noHeaders =
                 testClient(StaticStreamTransport(message("r"), status(Status.ok(trailer))))
-                    .unaryResponse("svc", "method", "request", strings, strings)
+                    .unaryResponse("/svc/method", "request", strings, strings)
             assertEquals(ResponseEnvelope("r", trailer, Metadata.EMPTY), noHeaders)
 
             val failed = testClient(StaticStreamTransport(headers(md), status(Status.unavailable("down"))))
-            assertCode(Code.UNAVAILABLE) { failed.unaryResponse("svc", "method", "request", strings, strings) }
+            assertCode(Code.UNAVAILABLE) { failed.unaryResponse("/svc/method", "request", strings, strings) }
         }
 
     /**

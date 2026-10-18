@@ -8,38 +8,32 @@ object WireCodec {
     fun encode(request: RpcRequest): ByteArray =
         Writer()
             .apply {
-                string(1, request.service)
-                string(2, request.method)
+                string(1, request.method)
                 metadata(4, request.metadata)
                 int32(5, request.kindValue)
-                uint32(6, request.version)
                 uint64(7, request.timeoutNanos)
                 packedUint64(8, request.extensions)
             }.toByteArray()
 
     fun decodeRequest(bytes: ByteArray): RpcRequest {
         val reader = Reader(bytes)
-        var service = ""
         var method = ""
         val metadata = linkedMapOf<String, ByteArray>()
         var kind = 0
-        var version = 0u
         var timeoutNanos = 0uL
         val extensions = mutableListOf<ULong>()
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
-                1 -> service = reader.string(tag, "request service")
-                2 -> method = reader.string(tag, "request method")
+                1 -> method = reader.string(tag, "request method")
                 4 -> reader.mapEntry(tag, metadata)
                 5 -> kind = reader.int32(tag)
-                6 -> version = reader.uint32(tag)
                 7 -> timeoutNanos = reader.uint64(tag)
                 8 -> reader.uint64Elements(tag, extensions)
                 else -> reader.skip(tag)
             }
         }
-        return RpcRequest(service, method, Metadata.fromWire(metadata), kind, version, timeoutNanos, extensions)
+        return RpcRequest(method, Metadata.fromWire(metadata), kind, timeoutNanos, extensions)
     }
 
     fun encode(headers: RpcHeaders): ByteArray =

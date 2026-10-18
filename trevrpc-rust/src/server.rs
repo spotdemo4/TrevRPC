@@ -11,7 +11,9 @@ use tokio::sync::watch;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::sync::MutexExt as _;
-use crate::wire::{normalize_metadata_key, validate_metadata};
+use crate::wire::{
+    normalize_metadata_key, split_method_path, validate_metadata, validate_method_path,
+};
 use crate::{
     BoxStream, Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest,
     Status,
@@ -26,7 +28,8 @@ type StreamingHandlerFuture =
 type StreamingHandler = Arc<
     dyn Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> StreamingHandlerFuture + Send + Sync,
 >;
-type RouteMap = HashMap<String, HashMap<String, Route>>;
+/// Routes keyed by the full method path, `/<service>/<method>`.
+type RouteMap = HashMap<String, Route>;
 
 #[derive(Clone)]
 enum Route {
@@ -146,8 +149,10 @@ impl CancellationToken {
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
-    service: String,
-    method: String,
+    /// The method path, `/<service>/<method>`.
+    path: Arc<str>,
+    /// Byte length of the service name, or `None` when `path` is not a well-formed method path.
+    service_len: Option<usize>,
     kind: RpcKind,
     metadata: Metadata,
     deadline: Option<Instant>,
@@ -157,24 +162,59 @@ pub struct RequestContext {
 impl RequestContext {
     #[must_use]
     pub fn new(request: &RpcRequest, deadline: Option<Instant>) -> Self {
-        Self {
-            service: request.service.clone(),
-            method: request.method.clone(),
-            kind: request.rpc_kind(),
-            metadata: request.metadata.clone(),
+        Self::from_parts(
+            Arc::from(request.method.as_str()),
+            request.rpc_kind(),
+            request.metadata.clone(),
             deadline,
-            cancellation: CancellationToken::new(),
+            CancellationToken::new(),
+        )
+    }
+
+    fn from_parts(
+        path: Arc<str>,
+        kind: RpcKind,
+        metadata: Metadata,
+        deadline: Option<Instant>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        let service_len = split_method_path(&path).map(|(service, _)| service.len());
+        Self {
+            path,
+            service_len,
+            kind,
+            metadata,
+            deadline,
+            cancellation,
         }
     }
 
+    /// Returns the fully-qualified service name, such as `example.greeter.Greeter`.
+    ///
+    /// Empty when the context was built from a request with a malformed method path, which the
+    /// server never dispatches.
     #[must_use]
     pub fn service(&self) -> &str {
-        &self.service
+        self.service_len
+            .and_then(|len| self.path.get(1..len.saturating_add(1)))
+            .unwrap_or_default()
     }
 
+    /// Returns the method name, such as `SayHello`.
+    ///
+    /// Empty when the context was built from a request with a malformed method path, which the
+    /// server never dispatches.
     #[must_use]
     pub fn method(&self) -> &str {
-        &self.method
+        self.service_len
+            .and_then(|len| self.path.get(len.saturating_add(2)..))
+            .unwrap_or_default()
+    }
+
+    /// Returns the full method path, `/<service>/<method>`.
+    #[must_use]
+    pub fn full_method(&self) -> &str {
+        &self.path
     }
 
     #[must_use]
@@ -749,33 +789,33 @@ impl Server {
     /// Returns the number of registered routes.
     #[must_use]
     pub fn route_count(&self) -> usize {
-        self.routes.values().map(HashMap::len).sum()
+        self.routes.len()
     }
 
-    /// Registers a unary route handler for a service and method.
-    pub fn route<F, Fut>(
-        &mut self,
-        service: impl Into<String>,
-        method: impl Into<String>,
-        handler: F,
-    ) where
+    /// Registers a unary route handler for a method path, `/<service>/<method>`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
+    pub fn route<F, Fut>(&mut self, path: impl Into<String>, handler: F)
+    where
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
-        self.route_with_context(service, method, move |_context, body| handler(body));
+        self.route_with_context(path, move |_context, body| handler(body));
     }
 
     /// Registers a unary route handler that receives request context.
-    pub fn route_with_context<F, Fut>(
-        &mut self,
-        service: impl Into<String>,
-        method: impl Into<String>,
-        handler: F,
-    ) where
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
+    pub fn route_with_context<F, Fut>(&mut self, path: impl Into<String>, handler: F)
+    where
         F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
-        self.route_envelope_with_context(service, method, move |context, body| {
+        self.route_envelope_with_context(path, move |context, body| {
             let future = handler(context, body);
             async move { future.await.map(ResponseEnvelope::new) }
         });
@@ -783,95 +823,91 @@ impl Server {
 
     /// Registers a unary route handler that can attach response headers and successful trailing
     /// metadata.
-    pub fn route_envelope_with_context<F, Fut>(
-        &mut self,
-        service: impl Into<String>,
-        method: impl Into<String>,
-        handler: F,
-    ) where
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
+    pub fn route_envelope_with_context<F, Fut>(&mut self, path: impl Into<String>, handler: F)
+    where
         F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ResponseEnvelope<Vec<u8>>>> + Send + 'static,
     {
-        Arc::make_mut(&mut self.routes)
-            .entry(service.into())
-            .or_default()
-            .insert(
-                method.into(),
-                Route::Unary(Arc::new(move |context, body| {
-                    Box::pin(handler(context, body))
-                })),
-            );
+        self.insert_route(
+            path.into(),
+            Route::Unary(Arc::new(move |context, body| {
+                Box::pin(handler(context, body))
+            })),
+        );
     }
 
-    /// Registers a streaming route handler for a service, method, and RPC kind.
-    pub fn route_streaming<F, Fut>(
-        &mut self,
-        service: impl Into<String>,
-        method: impl Into<String>,
-        kind: RpcKind,
-        handler: F,
-    ) where
+    /// Registers a streaming route handler for a method path, `/<service>/<method>`, and RPC kind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
+    pub fn route_streaming<F, Fut>(&mut self, path: impl Into<String>, kind: RpcKind, handler: F)
+    where
         F: Fn(Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
-        self.route_streaming_with_context(service, method, kind, move |_context, body, stream| {
+        self.route_streaming_with_context(path, kind, move |_context, body, stream| {
             handler(body, stream)
         });
     }
 
     /// Registers a streaming route handler that receives request context.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
     pub fn route_streaming_with_context<F, Fut>(
         &mut self,
-        service: impl Into<String>,
-        method: impl Into<String>,
+        path: impl Into<String>,
         kind: RpcKind,
         handler: F,
     ) where
         F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
-        self.route_streaming_envelope_with_context(
-            service,
-            method,
-            kind,
-            move |context, body, stream| {
-                let future = handler(context, body, stream);
-                async move { future.await.map(ResponseEnvelope::new) }
-            },
-        );
+        self.route_streaming_envelope_with_context(path, kind, move |context, body, stream| {
+            let future = handler(context, body, stream);
+            async move { future.await.map(ResponseEnvelope::new) }
+        });
     }
 
     /// Registers a streaming route handler that can attach response headers, sent before the first
     /// message, and terminal success metadata.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
     pub fn route_streaming_envelope_with_context<F, Fut>(
         &mut self,
-        service: impl Into<String>,
-        method: impl Into<String>,
+        path: impl Into<String>,
         kind: RpcKind,
         handler: F,
     ) where
         F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static,
     {
-        Arc::make_mut(&mut self.routes)
-            .entry(service.into())
-            .or_default()
-            .insert(
-                method.into(),
-                Route::Streaming {
-                    kind,
-                    handler: Arc::new(move |context, body, stream| {
-                        Box::pin(handler(context, body, stream))
-                    }),
-                },
-            );
+        self.insert_route(
+            path.into(),
+            Route::Streaming {
+                kind,
+                handler: Arc::new(move |context, body, stream| {
+                    Box::pin(handler(context, body, stream))
+                }),
+            },
+        );
     }
 
-    fn route_for(&self, service: &str, method: &str) -> Option<Route> {
-        self.routes
-            .get(service)
-            .and_then(|methods| methods.get(method))
-            .cloned()
+    /// Inserts a route, replacing any earlier route for the same path.
+    #[allow(clippy::panic)] // A malformed path is a programming error found at startup.
+    fn insert_route(&mut self, path: String, route: Route) {
+        if let Err(status) = validate_method_path(&path) {
+            panic!("cannot register route: {}", status.message());
+        }
+        Arc::make_mut(&mut self.routes).insert(path, route);
     }
 
     /// Handles a unary RPC request whose single message is `body`.
@@ -895,16 +931,12 @@ impl Server {
         let started_at = Instant::now();
         let request_body_len = body.len();
 
-        record_rpc_started(
-            self.metrics.as_ref(),
-            &request.service,
-            &request.method,
-            request_body_len,
-        );
+        record_rpc_started(self.metrics.as_ref(), &request.method, request_body_len);
 
+        let (service, method) = split_or_empty(&request.method);
         tracing::info!(
-            service = %request.service,
-            method = %request.method,
+            service,
+            method,
             request_body_len,
             metadata_count = request.metadata.len(),
             "rpc started"
@@ -914,7 +946,6 @@ impl Server {
             Ok(deadline) => deadline,
             Err(status) => {
                 return self.finish_response(
-                    &request.service,
                     &request.method,
                     request_body_len,
                     started_at,
@@ -923,35 +954,33 @@ impl Server {
             }
         };
 
-        let Some(Route::Unary(handler)) = self.route_for(&request.service, &request.method) else {
+        let Some(Route::Unary(handler)) = self.routes.get(request.method.as_str()) else {
             return self.finish_response(
-                &request.service,
                 &request.method,
                 request_body_len,
                 started_at,
                 Err(Status::unimplemented(format!(
-                    "unknown RPC method {}/{}",
-                    request.service, request.method
+                    "unknown RPC method {}",
+                    request.method
                 ))),
             );
         };
         let kind = request.rpc_kind();
         let RpcRequest {
-            service,
-            method,
+            method: path,
             metadata,
             ..
         } = request;
-        let context = RequestContext {
-            service: service.clone(),
-            method: method.clone(),
+        let path: Arc<str> = Arc::from(path);
+        let context = RequestContext::from_parts(
+            Arc::clone(&path),
             kind,
             metadata,
             deadline,
-            cancellation: cancellation.clone(),
-        };
+            cancellation.clone(),
+        );
 
-        let result = match invoke_unary_handler(&handler, context, body) {
+        let result = match invoke_unary_handler(handler, context, body) {
             Ok(future) => match run_handler_with_deadline(future, deadline, &cancellation).await {
                 Ok(Ok(response)) => validate_response_metadata(response),
                 Ok(Err(error)) => Err(error.into_status()),
@@ -960,7 +989,7 @@ impl Server {
             Err(status) => Err(status),
         };
 
-        self.finish_response(&service, &method, request_body_len, started_at, result)
+        self.finish_response(&path, request_body_len, started_at, result)
     }
 
     /// Handles a streaming RPC request and returns response frames.
@@ -993,16 +1022,12 @@ impl Server {
         let started_at = Instant::now();
         let request_body_len = body.len();
 
-        record_rpc_started(
-            self.metrics.as_ref(),
-            &request.service,
-            &request.method,
-            request_body_len,
-        );
+        record_rpc_started(self.metrics.as_ref(), &request.method, request_body_len);
 
+        let (service, method) = split_or_empty(&request.method);
         tracing::info!(
-            service = %request.service,
-            method = %request.method,
+            service,
+            method,
             request_body_len,
             metadata_count = request.metadata.len(),
             kind = ?request.rpc_kind(),
@@ -1013,7 +1038,6 @@ impl Server {
             Ok(deadline) => deadline,
             Err(status) => {
                 return self.finish_streaming_status(
-                    &request.service,
                     &request.method,
                     request_body_len,
                     started_at,
@@ -1025,15 +1049,11 @@ impl Server {
         let request_body =
             limit_stream(request_body, stream_limits, "request", cancellation.clone());
 
-        let Some(Route::Streaming { kind, handler }) =
-            self.route_for(&request.service, &request.method)
+        let Some(Route::Streaming { kind, handler }) = self.routes.get(request.method.as_str())
         else {
-            let status = Status::unimplemented(format!(
-                "unknown streaming RPC method {}/{}",
-                request.service, request.method
-            ));
+            let status =
+                Status::unimplemented(format!("unknown streaming RPC method {}", request.method));
             return self.finish_streaming_status(
-                &request.service,
                 &request.method,
                 request_body_len,
                 started_at,
@@ -1042,13 +1062,12 @@ impl Server {
         };
 
         let request_kind = request.rpc_kind();
-        if request_kind != kind {
+        if request_kind != *kind {
             let status = Status::invalid_argument(format!(
-                "streaming RPC kind mismatch for {}/{}: expected {:?}, got {:?}",
-                request.service, request.method, kind, request_kind
+                "streaming RPC kind mismatch for {}: expected {:?}, got {:?}",
+                request.method, kind, request_kind
             ));
             return self.finish_streaming_status(
-                &request.service,
                 &request.method,
                 request_body_len,
                 started_at,
@@ -1057,39 +1076,33 @@ impl Server {
         }
 
         let RpcRequest {
-            service,
-            method,
+            method: path,
             metadata,
             ..
         } = request;
-        let context = RequestContext {
-            service: service.clone(),
-            method: method.clone(),
-            kind: request_kind,
+        let path: Arc<str> = Arc::from(path);
+        let context = RequestContext::from_parts(
+            Arc::clone(&path),
+            request_kind,
             metadata,
             deadline,
-            cancellation: cancellation.clone(),
-        };
-        let handler_result = match invoke_streaming_handler(&handler, context, body, request_body) {
+            cancellation.clone(),
+        );
+        let handler_result = match invoke_streaming_handler(handler, context, body, request_body) {
             Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,
             Err(status) => Err(status),
         };
 
         match handler_result {
-            Err(status) => self.finish_streaming_status(
-                &service,
-                &method,
-                request_body_len,
-                started_at,
-                status,
-            ),
+            Err(status) => {
+                self.finish_streaming_status(&path, request_body_len, started_at, status)
+            }
             Ok(Ok(response)) => {
                 let response = match validate_response_metadata(response) {
                     Ok(response) => response,
                     Err(status) => {
                         return self.finish_streaming_status(
-                            &service,
-                            &method,
+                            &path,
                             request_body_len,
                             started_at,
                             status,
@@ -1103,8 +1116,7 @@ impl Server {
                     metadata,
                     StreamingCompletion {
                         metrics: Arc::clone(&self.metrics),
-                        service,
-                        method,
+                        path,
                         request_body_len,
                         started_at,
                     },
@@ -1114,13 +1126,7 @@ impl Server {
             }
             Ok(Err(error)) => {
                 let status = error.into_status();
-                self.finish_streaming_status(
-                    &service,
-                    &method,
-                    request_body_len,
-                    started_at,
-                    status,
-                )
+                self.finish_streaming_status(&path, request_body_len, started_at, status)
             }
         }
     }
@@ -1151,8 +1157,7 @@ impl Server {
 
     fn finish_response(
         &self,
-        service: &str,
-        method: &str,
+        path: &str,
         request_body_len: usize,
         started_at: Instant,
         result: std::result::Result<ResponseEnvelope<Vec<u8>>, Status>,
@@ -1165,17 +1170,17 @@ impl Server {
 
         record_rpc_finished(
             self.metrics.as_ref(),
-            service,
-            method,
+            path,
             request_body_len,
             response_body_len,
             code,
             elapsed,
         );
 
+        let (service, method) = split_or_empty(path);
         tracing::info!(
-            service = %service,
-            method = %method,
+            service,
+            method,
             request_body_len,
             response_body_len,
             status = ?code,
@@ -1188,8 +1193,7 @@ impl Server {
 
     fn finish_streaming_response(
         &self,
-        service: &str,
-        method: &str,
+        path: &str,
         request_body_len: usize,
         started_at: Instant,
         response_body_len: usize,
@@ -1197,8 +1201,7 @@ impl Server {
     ) {
         finish_streaming_response(
             self.metrics.as_ref(),
-            service,
-            method,
+            path,
             request_body_len,
             started_at,
             response_body_len,
@@ -1208,20 +1211,12 @@ impl Server {
 
     fn finish_streaming_status(
         &self,
-        service: &str,
-        method: &str,
+        path: &str,
         request_body_len: usize,
         started_at: Instant,
         status: Status,
     ) -> BoxStream<ResponseFrame> {
-        self.finish_streaming_response(
-            service,
-            method,
-            request_body_len,
-            started_at,
-            0,
-            status.code(),
-        );
+        self.finish_streaming_response(path, request_body_len, started_at, 0, status.code());
         status_stream(status)
     }
 
@@ -1232,14 +1227,8 @@ impl Server {
         status: &Status,
     ) {
         let started_at = Instant::now();
-        record_rpc_started(
-            self.metrics.as_ref(),
-            &request.service,
-            &request.method,
-            request_body_len,
-        );
+        record_rpc_started(self.metrics.as_ref(), &request.method, request_body_len);
         self.finish_streaming_response(
-            &request.service,
             &request.method,
             request_body_len,
             started_at,
@@ -1255,7 +1244,6 @@ impl Server {
         status: &Status,
     ) {
         self.finish_streaming_response(
-            &request.service,
             &request.method,
             request_body_len,
             Instant::now(),
@@ -1266,8 +1254,8 @@ impl Server {
 
     pub(crate) fn record_pre_handler_failure(&self, status: &Status) {
         let started_at = Instant::now();
-        record_rpc_started(self.metrics.as_ref(), "", "", 0);
-        self.finish_streaming_response("", "", 0, started_at, 0, status.code());
+        record_rpc_started(self.metrics.as_ref(), "", 0);
+        self.finish_streaming_response("", 0, started_at, 0, status.code());
     }
 }
 
@@ -1645,8 +1633,7 @@ fn stream_next_timeout(
 
 struct StreamingCompletion {
     metrics: Arc<dyn Metrics>,
-    service: String,
-    method: String,
+    path: Arc<str>,
     request_body_len: usize,
     started_at: Instant,
 }
@@ -1655,8 +1642,7 @@ impl StreamingCompletion {
     fn finish(&self, response_body_len: usize, code: Code) {
         finish_streaming_response(
             self.metrics.as_ref(),
-            &self.service,
-            &self.method,
+            &self.path,
             self.request_body_len,
             self.started_at,
             response_body_len,
@@ -1782,8 +1768,7 @@ impl Drop for ServerResponseStream {
 
 fn finish_streaming_response(
     metrics: &dyn Metrics,
-    service: &str,
-    method: &str,
+    path: &str,
     request_body_len: usize,
     started_at: Instant,
     response_body_len: usize,
@@ -1793,17 +1778,17 @@ fn finish_streaming_response(
 
     record_rpc_finished(
         metrics,
-        service,
-        method,
+        path,
         request_body_len,
         response_body_len,
         code,
         elapsed,
     );
 
+    let (service, method) = split_or_empty(path);
     tracing::info!(
-        service = %service,
-        method = %method,
+        service,
+        method,
         request_body_len,
         response_body_len,
         status = ?code,
@@ -1812,11 +1797,17 @@ fn finish_streaming_response(
     );
 }
 
-fn record_rpc_started(metrics: &dyn Metrics, service: &str, method: &str, request_body_len: usize) {
+/// Splits a method path for metrics and logs, yielding empty names for a malformed path.
+fn split_or_empty(path: &str) -> (&str, &str) {
+    split_method_path(path).unwrap_or_default()
+}
+
+fn record_rpc_started(metrics: &dyn Metrics, path: &str, request_body_len: usize) {
     if !metrics.enabled() {
         return;
     }
 
+    let (service, method) = split_or_empty(path);
     let event = RpcStarted {
         service: service.to_owned(),
         method: method.to_owned(),
@@ -1827,8 +1818,7 @@ fn record_rpc_started(metrics: &dyn Metrics, service: &str, method: &str, reques
 
 fn record_rpc_finished(
     metrics: &dyn Metrics,
-    service: &str,
-    method: &str,
+    path: &str,
     request_body_len: usize,
     response_body_len: usize,
     code: Code,
@@ -1838,6 +1828,7 @@ fn record_rpc_finished(
         return;
     }
 
+    let (service, method) = split_or_empty(path);
     let event = RpcFinished {
         service: service.to_owned(),
         method: method.to_owned(),
@@ -1935,11 +1926,11 @@ mod tests {
             b"ok".to_vec(),
         ));
         server.set_metrics(metrics);
-        server.route("example.Greeter", "SayHello", |_| async {
+        server.route("/example.Greeter/SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
 
-        let mut request = RpcRequest::new("example.Greeter", "SayHello");
+        let mut request = RpcRequest::new("/example.Greeter/SayHello");
         request
             .metadata
             .insert("authorization".to_owned(), b"ok".to_vec());
@@ -1965,12 +1956,12 @@ mod tests {
             "authorization",
             b"ok".to_vec(),
         ));
-        server.route("example.Greeter", "SayHello", |_| async {
+        server.route("/example.Greeter/SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
 
         let status = server
-            .handle_request(RpcRequest::new("example.Greeter", "SayHello"), Vec::new())
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
             .await
             .expect_err("missing metadata should be rejected");
 
@@ -1981,12 +1972,12 @@ mod tests {
     async fn metrics_panics_do_not_fail_request() {
         let mut server = Server::new();
         server.set_metrics(PanickingMetrics);
-        server.route("example.Greeter", "SayHello", |_| async {
+        server.route("/example.Greeter/SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
 
         let response = server
-            .handle_request(RpcRequest::new("example.Greeter", "SayHello"), Vec::new())
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
             .await
             .expect("request should succeed despite panicking metrics");
 
@@ -1997,33 +1988,33 @@ mod tests {
     async fn unary_completion_metrics_are_exactly_once_for_terminal_statuses() {
         expect_unary_completion(
             |server| {
-                server.route("example.Greeter", "SayHello", |_| async {
+                server.route("/example.Greeter/SayHello", |_| async {
                     Ok(b"hello".to_vec())
                 });
             },
-            RpcRequest::new("example.Greeter", "SayHello"),
+            RpcRequest::new("/example.Greeter/SayHello"),
             Code::Ok,
         )
         .await;
 
         expect_unary_completion(
             |server| {
-                server.route("example.Greeter", "Denied", |_| async {
+                server.route("/example.Greeter/Denied", |_| async {
                     Err(Error::from(Status::new(Code::PermissionDenied, "denied")))
                 });
             },
-            RpcRequest::new("example.Greeter", "Denied"),
+            RpcRequest::new("/example.Greeter/Denied"),
             Code::PermissionDenied,
         )
         .await;
 
         expect_unary_completion(
             |server| {
-                server.route("example.Greeter", "Panic", |_| async {
+                server.route("/example.Greeter/Panic", |_| async {
                     panic!("boom");
                 });
             },
-            RpcRequest::new("example.Greeter", "Panic"),
+            RpcRequest::new("/example.Greeter/Panic"),
             Code::Internal,
         )
         .await;
@@ -2031,33 +2022,33 @@ mod tests {
         expect_unary_completion(
             |server| {
                 server.set_authorizer(MetadataValueAuthorizer::bearer("token"));
-                server.route("example.Greeter", "SayHello", |_| async {
+                server.route("/example.Greeter/SayHello", |_| async {
                     Ok(b"hello".to_vec())
                 });
             },
-            RpcRequest::new("example.Greeter", "SayHello"),
+            RpcRequest::new("/example.Greeter/SayHello"),
             Code::Unauthenticated,
         )
         .await;
 
         expect_unary_completion(
             |server| {
-                server.route("example.Greeter", "Slow", |_| async {
+                server.route("/example.Greeter/Slow", |_| async {
                     std::future::pending::<crate::Result<Vec<u8>>>().await
                 });
             },
-            RpcRequest::new("example.Greeter", "Slow").with_timeout_nanos(1_000_000),
+            RpcRequest::new("/example.Greeter/Slow").with_timeout_nanos(1_000_000),
             Code::DeadlineExceeded,
         )
         .await;
 
-        let mut invalid_metadata = RpcRequest::new("example.Greeter", "SayHello");
+        let mut invalid_metadata = RpcRequest::new("/example.Greeter/SayHello");
         invalid_metadata
             .metadata
             .insert("Authorization".to_owned(), b"ok".to_vec());
         expect_unary_completion(
             |server| {
-                server.route("example.Greeter", "SayHello", |_| async {
+                server.route("/example.Greeter/SayHello", |_| async {
                     Ok(b"hello".to_vec())
                 });
             },
@@ -2091,12 +2082,12 @@ mod tests {
     #[tokio::test]
     async fn unary_handler_panics_return_internal() {
         let mut server = Server::new();
-        server.route("example.Greeter", "Panic", |_| async {
+        server.route("/example.Greeter/Panic", |_| async {
             panic!("boom");
         });
 
         let status = server
-            .handle_request(RpcRequest::new("example.Greeter", "Panic"), Vec::new())
+            .handle_request(RpcRequest::new("/example.Greeter/Panic"), Vec::new())
             .await
             .expect_err("a panicking handler should fail");
 
@@ -2106,13 +2097,13 @@ mod tests {
     #[tokio::test]
     async fn unary_handler_panics_after_yield_return_internal() {
         let mut server = Server::new();
-        server.route("example.Greeter", "Panic", |_| async {
+        server.route("/example.Greeter/Panic", |_| async {
             tokio::task::yield_now().await;
             panic!("boom");
         });
 
         let status = server
-            .handle_request(RpcRequest::new("example.Greeter", "Panic"), Vec::new())
+            .handle_request(RpcRequest::new("/example.Greeter/Panic"), Vec::new())
             .await
             .expect_err("a panicking handler should fail");
 
@@ -2123,15 +2114,13 @@ mod tests {
     async fn streaming_handler_panics_return_internal_status() {
         let mut server = Server::new();
         server.route_streaming(
-            "example.Greeter",
-            "Panic",
+            "/example.Greeter/Panic",
             RpcKind::ServerStreaming,
             |_, _| async {
                 panic!("boom");
             },
         );
-        let request =
-            RpcRequest::new("example.Greeter", "Panic").with_kind(RpcKind::ServerStreaming);
+        let request = RpcRequest::new("/example.Greeter/Panic").with_kind(RpcKind::ServerStreaming);
 
         let mut response = server
             .handle_streaming_request(request, Vec::new(), crate::stream::empty())
@@ -2152,10 +2141,10 @@ mod tests {
         let mut server = Server::new();
         server.set_authorizer(PendingAuthorizer);
         server.set_metrics(metrics);
-        server.route("example.Greeter", "SayHello", |_| async {
+        server.route("/example.Greeter/SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
-        let request = RpcRequest::new("example.Greeter", "SayHello").with_timeout_nanos(1_000_000);
+        let request = RpcRequest::new("/example.Greeter/SayHello").with_timeout_nanos(1_000_000);
 
         let status = server
             .handle_request(request, Vec::new())
@@ -2181,11 +2170,11 @@ mod tests {
             b"ok".to_vec(),
         ));
         server.set_metrics(metrics);
-        server.route("example.Greeter", "SayHello", |_| async {
+        server.route("/example.Greeter/SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
 
-        let mut request = RpcRequest::new("example.Greeter", "SayHello");
+        let mut request = RpcRequest::new("/example.Greeter/SayHello");
         request
             .metadata
             .insert("Authorization".to_owned(), b"ok".to_vec());
@@ -2213,7 +2202,7 @@ mod tests {
         ));
 
         let status = server
-            .handle_request(RpcRequest::new("example.Greeter", "Missing"), Vec::new())
+            .handle_request(RpcRequest::new("/example.Greeter/Missing"), Vec::new())
             .await
             .expect_err("unauthenticated requests should be rejected");
 
@@ -2221,26 +2210,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_wire_versions_are_rejected_before_route_lookup() {
+    async fn malformed_method_paths_are_rejected_before_route_lookup() {
         let mut server = Server::new();
-        server.route("example.Greeter", "SayHello", |_| async {
+        server.route("/example.Greeter/SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
-        let mut request = RpcRequest::new("example.Greeter", "Missing");
-        request.version = crate::wire::WIRE_VERSION + 1;
+
+        for path in [
+            "",
+            "/",
+            "example.Greeter/SayHello",
+            "/example.Greeter",
+            "/example.Greeter/",
+            "//SayHello",
+            "/example.Greeter/SayHello/",
+            "/example.Greeter/SayHello/Extra",
+            "/example.Greeter//SayHello",
+        ] {
+            let status = server
+                .handle_request(RpcRequest::new(path), Vec::new())
+                .await
+                .expect_err("a malformed path should be rejected");
+            assert_eq!(status.code(), Code::InvalidArgument, "{path:?}");
+
+            assert_eq!(
+                streaming_status_code(&server, path).await,
+                Some(Code::InvalidArgument),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_authorizer_runs_before_the_route_lookup_of_a_well_formed_path() {
+        let mut server = Server::new();
+        server.set_authorizer(MetadataValueAuthorizer::bearer("secret"));
 
         let status = server
-            .handle_request(request, Vec::new())
+            .handle_request(RpcRequest::new("/example.Greeter/Missing"), Vec::new())
             .await
-            .expect_err("the version should be rejected");
+            .expect_err("an unauthenticated request should be rejected");
 
-        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(status.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn unknown_well_formed_methods_are_unimplemented() {
+        let mut server = Server::new();
+        server.route("/example.Greeter/SayHello", |_| async {
+            Ok(b"hello".to_vec())
+        });
+
+        for path in [
+            "/example.Greeter/Missing",
+            "/other.Service/SayHello",
+            "/example/Greeter",
+        ] {
+            let status = server
+                .handle_request(RpcRequest::new(path), Vec::new())
+                .await
+                .expect_err("an unknown method should fail");
+            assert_eq!(status.code(), Code::Unimplemented, "{path:?}");
+
+            assert_eq!(
+                streaming_status_code(&server, path).await,
+                Some(Code::Unimplemented),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_context_exposes_the_service_method_and_path() {
+        let mut server = Server::new();
+        server.route_with_context("/example.Greeter/SayHello", |context, _| async move {
+            Ok(format!(
+                "{}|{}|{}",
+                context.service(),
+                context.method(),
+                context.full_method()
+            )
+            .into_bytes())
+        });
+
+        let response = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect("the call should succeed");
+
+        assert_eq!(
+            response.message().as_slice(),
+            b"example.Greeter|SayHello|/example.Greeter/SayHello"
+        );
+    }
+
+    #[test]
+    fn request_contexts_of_malformed_paths_have_empty_names() {
+        let context = RequestContext::new(&RpcRequest::new("no-slash"), None);
+
+        assert_eq!(context.service(), "");
+        assert_eq!(context.method(), "");
+        assert_eq!(context.full_method(), "no-slash");
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot register route")]
+    fn registering_a_malformed_path_panics() {
+        let mut server = Server::new();
+        server.route("example.Greeter/SayHello", |_| async { Ok(Vec::new()) });
+    }
+
+    #[tokio::test]
+    async fn metrics_events_keep_the_service_and_method() {
+        #[derive(Default)]
+        struct NamedMetrics {
+            names: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        impl Metrics for NamedMetrics {
+            fn rpc_started(&self, event: &super::RpcStarted) {
+                self.names
+                    .lock()
+                    .expect("metrics lock should not be poisoned")
+                    .push((event.service.clone(), event.method.clone()));
+            }
+
+            fn rpc_finished(&self, event: &RpcFinished) {
+                self.names
+                    .lock()
+                    .expect("metrics lock should not be poisoned")
+                    .push((event.service.clone(), event.method.clone()));
+            }
+        }
+
+        let metrics = NamedMetrics::default();
+        let names = Arc::clone(&metrics.names);
+        let mut server = Server::new();
+        server.set_metrics(metrics);
+        server.route("/example.Greeter/SayHello", |_| async { Ok(Vec::new()) });
+
+        server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect("the call should succeed");
+
+        let expected = ("example.Greeter".to_owned(), "SayHello".to_owned());
+        assert_eq!(
+            *names.lock().expect("metrics lock should not be poisoned"),
+            [expected.clone(), expected]
+        );
     }
 
     #[tokio::test]
     async fn unsupported_rpc_kinds_are_rejected_before_route_lookup() {
         let server = Server::new();
-        let mut request = RpcRequest::new("example.Greeter", "Missing");
+        let mut request = RpcRequest::new("/example.Greeter/Missing");
         request.kind = 99;
 
         let status = server
@@ -2299,8 +2423,7 @@ mod tests {
 
     #[tokio::test]
     async fn cloned_request_context_observes_deadline_cancellation() {
-        let request =
-            RpcRequest::new("example.Greeter", "Watch").with_kind(RpcKind::ServerStreaming);
+        let request = RpcRequest::new("/example.Greeter/Watch").with_kind(RpcKind::ServerStreaming);
         let context = RequestContext::new(
             &request,
             Some(std::time::Instant::now() + Duration::from_millis(1)),
@@ -2320,8 +2443,7 @@ mod tests {
 
     #[test]
     fn observing_an_expired_deadline_commits_the_first_source() {
-        let request =
-            RpcRequest::new("example.Greeter", "Watch").with_kind(RpcKind::ServerStreaming);
+        let request = RpcRequest::new("/example.Greeter/Watch").with_kind(RpcKind::ServerStreaming);
         let context = RequestContext::new(
             &request,
             Some(
@@ -2445,7 +2567,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_timeouts_are_rejected_before_route_lookup() {
         let server = Server::new();
-        let mut request = RpcRequest::new("example.Greeter", "Missing");
+        let mut request = RpcRequest::new("/example.Greeter/Missing");
         request.timeout_nanos = u64::MAX;
 
         let status = server
@@ -2463,8 +2585,7 @@ mod tests {
         let mut server = Server::new();
         server.set_metrics(metrics);
         server.route_streaming(
-            "example.Greeter",
-            "StreamHello",
+            "/example.Greeter/StreamHello",
             RpcKind::ServerStreaming,
             |body, _requests| async move {
                 assert_eq!(body, b"request".to_vec());
@@ -2473,7 +2594,7 @@ mod tests {
         );
 
         let request =
-            RpcRequest::new("example.Greeter", "StreamHello").with_kind(RpcKind::ServerStreaming);
+            RpcRequest::new("/example.Greeter/StreamHello").with_kind(RpcKind::ServerStreaming);
         let mut response = server
             .handle_streaming_request(request, b"request".to_vec(), crate::stream::empty())
             .await;
@@ -2514,8 +2635,7 @@ mod tests {
         let mut server = Server::new();
         server.set_metrics(metrics);
         server.route_streaming(
-            "example.Greeter",
-            "Download",
+            "/example.Greeter/Download",
             RpcKind::ServerStreaming,
             |_body, _requests| async move {
                 let stream: crate::BoxStream<Vec<u8>> = Box::pin(futures_util::stream::pending());
@@ -2524,7 +2644,7 @@ mod tests {
         );
 
         let request =
-            RpcRequest::new("example.Greeter", "Download").with_kind(RpcKind::ServerStreaming);
+            RpcRequest::new("/example.Greeter/Download").with_kind(RpcKind::ServerStreaming);
         let response = server
             .handle_streaming_request(request, Vec::new(), crate::stream::empty())
             .await;
@@ -2540,8 +2660,7 @@ mod tests {
         let mut server = Server::new();
         server.set_options(ServerOptions::new().with_max_stream_messages(Some(1)));
         server.route_streaming(
-            "example.Greeter",
-            "Upload",
+            "/example.Greeter/Upload",
             RpcKind::ClientStreaming,
             |_body, mut requests| async move {
                 while let Some(request) = requests.next().await {
@@ -2553,7 +2672,7 @@ mod tests {
         );
 
         let request =
-            RpcRequest::new("example.Greeter", "Upload").with_kind(RpcKind::ClientStreaming);
+            RpcRequest::new("/example.Greeter/Upload").with_kind(RpcKind::ClientStreaming);
         let mut response = server
             .handle_streaming_request(
                 request,
@@ -2576,14 +2695,13 @@ mod tests {
         let mut server = Server::new();
         server.set_options(ServerOptions::new().with_max_stream_body_size(Some(3)));
         server.route_streaming(
-            "example.Greeter",
-            "Download",
+            "/example.Greeter/Download",
             RpcKind::ServerStreaming,
             |_body, _requests| async move { Ok(crate::stream::from_iter([b"four".to_vec()])) },
         );
 
         let request =
-            RpcRequest::new("example.Greeter", "Download").with_kind(RpcKind::ServerStreaming);
+            RpcRequest::new("/example.Greeter/Download").with_kind(RpcKind::ServerStreaming);
         let mut response = server
             .handle_streaming_request(request, Vec::new(), crate::stream::empty())
             .await;
@@ -2606,8 +2724,7 @@ mod tests {
                 .with_stream_idle_timeout(Some(Duration::from_millis(1))),
         );
         server.route_streaming(
-            "example.Greeter",
-            "Upload",
+            "/example.Greeter/Upload",
             RpcKind::ClientStreaming,
             |_body, mut requests| async move {
                 while let Some(request) = requests.next().await {
@@ -2619,7 +2736,7 @@ mod tests {
         );
 
         let request =
-            RpcRequest::new("example.Greeter", "Upload").with_kind(RpcKind::ClientStreaming);
+            RpcRequest::new("/example.Greeter/Upload").with_kind(RpcKind::ClientStreaming);
         let mut response = server
             .handle_streaming_request(
                 request,
@@ -2641,8 +2758,7 @@ mod tests {
     async fn response_stream_errors_are_converted_to_status_frames() {
         let mut server = Server::new();
         server.route_streaming(
-            "example.Greeter",
-            "Download",
+            "/example.Greeter/Download",
             RpcKind::ServerStreaming,
             |_body, _requests| async move {
                 let stream: crate::BoxStream<Vec<u8>> =
@@ -2654,7 +2770,7 @@ mod tests {
         );
 
         let request =
-            RpcRequest::new("example.Greeter", "Download").with_kind(RpcKind::ServerStreaming);
+            RpcRequest::new("/example.Greeter/Download").with_kind(RpcKind::ServerStreaming);
         let mut response = server
             .handle_streaming_request(request, Vec::new(), crate::stream::empty())
             .await;
@@ -2667,6 +2783,20 @@ mod tests {
         assert_eq!(status_code(&status), Some(Code::Unavailable));
         assert!(matches!(&status, ResponseFrame::Status(status) if status.message() == "down"));
         assert!(response.next().await.is_none());
+    }
+
+    /// The code of the status a server-streaming call to `path` ends with, when it starts with one.
+    async fn streaming_status_code(server: &Server, path: &str) -> Option<Code> {
+        let request = RpcRequest::new(path).with_kind(RpcKind::ServerStreaming);
+        let mut response = server
+            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .await;
+        let frame = response
+            .next()
+            .await
+            .expect("a status frame should be emitted")
+            .expect("a status frame should not be a transport error");
+        status_code(&frame)
     }
 
     fn status_code(frame: &ResponseFrame) -> Option<Code> {
@@ -2684,8 +2814,7 @@ mod tests {
     async fn unary_handlers_receive_the_request_message_and_return_headers() {
         let mut server = Server::new();
         server.route_envelope_with_context(
-            "example.Greeter",
-            "SayHello",
+            "/example.Greeter/SayHello",
             |_context, body| async move {
                 assert_eq!(body, b"request");
                 Ok(ResponseEnvelope::new(b"reply".to_vec())
@@ -2696,7 +2825,7 @@ mod tests {
 
         let response = server
             .handle_request(
-                RpcRequest::new("example.Greeter", "SayHello"),
+                RpcRequest::new("/example.Greeter/SayHello"),
                 b"request".to_vec(),
             )
             .await
@@ -2725,13 +2854,13 @@ mod tests {
         let started = Arc::new(Mutex::new(Vec::new()));
         let mut server = Server::new();
         server.set_metrics(LengthMetrics(metrics, Arc::clone(&started)));
-        server.route("example.Greeter", "SayHello", |_| async {
+        server.route("/example.Greeter/SayHello", |_| async {
             Ok(b"hello".to_vec())
         });
 
         server
             .handle_request(
-                RpcRequest::new("example.Greeter", "SayHello"),
+                RpcRequest::new("/example.Greeter/SayHello"),
                 b"four".to_vec(),
             )
             .await
@@ -2748,8 +2877,7 @@ mod tests {
         ] {
             let mut server = Server::new();
             server.route_envelope_with_context(
-                "example.Greeter",
-                "SayHello",
+                "/example.Greeter/SayHello",
                 move |_context, _body| {
                     let envelope = envelope.clone();
                     async move { Ok(envelope) }
@@ -2757,7 +2885,7 @@ mod tests {
             );
 
             let status = server
-                .handle_request(RpcRequest::new("example.Greeter", "SayHello"), Vec::new())
+                .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
                 .await
                 .expect_err("invalid metadata should fail the call");
 
@@ -2768,8 +2896,7 @@ mod tests {
     fn headers_route(server: &mut Server, headers: Metadata, messages: crate::BoxStream<Vec<u8>>) {
         let messages = Arc::new(Mutex::new(Some(messages)));
         server.route_streaming_envelope_with_context(
-            "example.Greeter",
-            "Watch",
+            "/example.Greeter/Watch",
             RpcKind::ServerStreaming,
             move |_context, _body, _requests| {
                 let headers = headers.clone();
@@ -2789,7 +2916,7 @@ mod tests {
     }
 
     fn watch_request() -> RpcRequest {
-        RpcRequest::new("example.Greeter", "Watch").with_kind(RpcKind::ServerStreaming)
+        RpcRequest::new("/example.Greeter/Watch").with_kind(RpcKind::ServerStreaming)
     }
 
     #[tokio::test]

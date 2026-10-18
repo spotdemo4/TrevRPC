@@ -5,15 +5,14 @@ private val trevrpcCodec1: custom.rpc.MessageCodec<example.`class`.ApiTypes.Enve
         decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Envelope.Result.getDescriptor(), example.`class`.ApiTypes.Envelope.Result::parseFrom) },
 private val trevrpcCodec2: custom.rpc.MessageCodec<example.`class`.ApiTypes.Result> =
         decode = { body -> custom.rpc.decodeProtobuf(body, example.`class`.ApiTypes.Result.getDescriptor(), example.`class`.ApiTypes.Result::parseFrom) },
-public const val WHEN_SERVICE_NAME: String = "api.When"
-public const val WHEN_WHEN_METHOD_NAME: String = "When"
-public const val WHEN_NESTED_METHOD_NAME: String = "Nested"
+public const val WHEN_WHEN_PATH: String = "/api.When/When"
+public const val WHEN_NESTED_PATH: String = "/api.When/Nested"
 public class WhenClient(
     public suspend fun whenResponse(
     ): custom.rpc.ResponseEnvelope<example.`class`.ApiTypes.Envelope.Result> =
-        client.unaryResponse(WHEN_SERVICE_NAME, WHEN_WHEN_METHOD_NAME, request, trevrpcCodec0, trevrpcCodec1, options)
+        client.unaryResponse(WHEN_WHEN_PATH, request, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun `when`(
     public suspend fun nestedResponse(
     ): custom.rpc.ResponseEnvelope<shared.`when`.Result> =
-        client.unaryResponse(WHEN_SERVICE_NAME, WHEN_NESTED_METHOD_NAME, request, trevrpcCodec2, trevrpcCodec0, options)
+        client.unaryResponse(WHEN_NESTED_PATH, request, trevrpcCodec2, trevrpcCodec0, options)
     public suspend fun nested(

@@ -242,9 +242,10 @@ pub async fn collect_unary_response(
 }
 
 /// Calls a unary RPC and decodes the protobuf response.
+///
+/// `method` is the method path `/package.Service/Method`; generated code exposes it as a constant.
 pub async fn unary<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     request: &Req,
     options: CallOptions,
@@ -254,7 +255,7 @@ where
     Req: Message,
     Res: Message + Default,
 {
-    Ok(unary_envelope(transport, service, method, request, options)
+    Ok(unary_envelope(transport, method, request, options)
         .await?
         .into_parts()
         .0)
@@ -264,7 +265,6 @@ where
 /// trailing metadata.
 pub async fn unary_envelope<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     request: &Req,
     options: CallOptions,
@@ -285,7 +285,7 @@ where
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
 
-    let rpc_request = RpcRequest::new(service, method)
+    let rpc_request = RpcRequest::new(method)
         .with_metadata(metadata)
         .with_timeout_nanos(timeout_nanos);
     let body = request.encode_to_vec();
@@ -316,7 +316,6 @@ where
 /// Calls a server-streaming RPC and returns a terminal-aware response stream.
 pub async fn server_streaming<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     request: &Req,
     options: CallOptions,
@@ -326,7 +325,7 @@ where
     Req: Message,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(service, method, RpcKind::ServerStreaming, options)?;
+    let prepared = prepare_streaming_request(method, RpcKind::ServerStreaming, options)?;
     open_response_stream(
         transport,
         prepared,
@@ -339,7 +338,6 @@ where
 /// Starts a client-streaming RPC and returns a sendable call object.
 pub async fn client_streaming<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     options: CallOptions,
 ) -> Result<ClientStreamingCall<Req, Res>>
@@ -348,7 +346,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(service, method, RpcKind::ClientStreaming, options)?;
+    let prepared = prepare_streaming_request(method, RpcKind::ClientStreaming, options)?;
     let (sender, requests, call_end) = request_channel(prepared.deadline);
     let response = open_response_stream(
         transport,
@@ -364,7 +362,6 @@ where
 /// Calls a client-streaming RPC with a caller-provided request stream.
 pub async fn client_streaming_from_stream<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     requests: BoxStream<Req>,
     options: CallOptions,
@@ -375,7 +372,7 @@ where
     Res: Message + Default + Send + 'static,
 {
     Ok(
-        client_streaming_from_stream_envelope(transport, service, method, requests, options)
+        client_streaming_from_stream_envelope(transport, method, requests, options)
             .await?
             .into_parts()
             .0,
@@ -385,7 +382,6 @@ where
 /// Calls a client-streaming RPC and preserves successful terminal metadata.
 pub async fn client_streaming_from_stream_envelope<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     requests: BoxStream<Req>,
     options: CallOptions,
@@ -395,7 +391,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared = prepare_streaming_request(service, method, RpcKind::ClientStreaming, options)?;
+    let prepared = prepare_streaming_request(method, RpcKind::ClientStreaming, options)?;
     let mut response =
         open_response_stream(transport, prepared, crate::stream::encode(requests), None).await?;
 
@@ -405,7 +401,6 @@ where
 /// Starts a bidirectional-streaming RPC and returns a splittable call object.
 pub async fn bidirectional_streaming<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     options: CallOptions,
 ) -> Result<BidirectionalCall<Req, Res>>
@@ -414,8 +409,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared =
-        prepare_streaming_request(service, method, RpcKind::BidirectionalStreaming, options)?;
+    let prepared = prepare_streaming_request(method, RpcKind::BidirectionalStreaming, options)?;
     let (sender, requests, call_end) = request_channel(prepared.deadline);
     let response = open_response_stream(
         transport,
@@ -431,7 +425,6 @@ where
 /// Starts a bidirectional-streaming RPC with a caller-provided request stream.
 pub async fn bidirectional_streaming_from_stream<T, Req, Res>(
     transport: &T,
-    service: &str,
     method: &str,
     requests: BoxStream<Req>,
     options: CallOptions,
@@ -441,8 +434,7 @@ where
     Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
-    let prepared =
-        prepare_streaming_request(service, method, RpcKind::BidirectionalStreaming, options)?;
+    let prepared = prepare_streaming_request(method, RpcKind::BidirectionalStreaming, options)?;
     open_response_stream(transport, prepared, crate::stream::encode(requests), None).await
 }
 
@@ -716,7 +708,6 @@ struct PreparedStreamingCall {
 }
 
 fn prepare_streaming_request(
-    service: &str,
     method: &str,
     kind: RpcKind,
     options: CallOptions,
@@ -733,7 +724,7 @@ fn prepare_streaming_request(
     let timeout_nanos = timeout_nanos(timeout)?;
 
     Ok(PreparedStreamingCall {
-        request: RpcRequest::new(service, method)
+        request: RpcRequest::new(method)
             .with_kind(kind)
             .with_metadata(metadata)
             .with_timeout_nanos(timeout_nanos),
@@ -1411,8 +1402,7 @@ mod tests {
 
         let response = unary::<_, _, TestMessage>(
             &transport,
-            "example.Greeter",
-            "SayHello",
+            "/example.Greeter/SayHello",
             &request,
             CallOptions::new().with_timeout(Duration::from_secs(5)),
         )
@@ -1431,8 +1421,7 @@ mod tests {
             prost::Message::encode_to_vec(&request),
             "the request message travels beside the request"
         );
-        assert_eq!(recorded.service, "example.Greeter");
-        assert_eq!(recorded.method, "SayHello");
+        assert_eq!(recorded.method, "/example.Greeter/SayHello");
         assert_eq!(recorded.timeout_nanos, 5_000_000_000);
     }
 
@@ -1450,8 +1439,7 @@ mod tests {
 
         let decoded = unary::<_, _, TestMessage>(
             &transport,
-            "example.Greeter",
-            "SayHello",
+            "/example.Greeter/SayHello",
             &request,
             CallOptions::new().with_max_response_body_size(body.len()),
         )
@@ -1461,8 +1449,7 @@ mod tests {
 
         let error = unary::<_, _, TestMessage>(
             &transport,
-            "example.Greeter",
-            "SayHello",
+            "/example.Greeter/SayHello",
             &request,
             CallOptions::new().with_max_response_body_size(body.len() - 1),
         )
@@ -1504,8 +1491,7 @@ mod tests {
     async fn unary_deadline_cancels_pending_transport() {
         let error = unary::<_, _, TestMessage>(
             &PendingTransport,
-            "example.Greeter",
-            "SayHello",
+            "/example.Greeter/SayHello",
             &TestMessage {
                 value: "request".to_owned(),
             },
@@ -1521,8 +1507,7 @@ mod tests {
     async fn server_streaming_deadline_cancels_pending_open() {
         let Err(error) = server_streaming::<_, _, TestMessage>(
             &PendingTransport,
-            "example.Greeter",
-            "LotsOfReplies",
+            "/example.Greeter/LotsOfReplies",
             &TestMessage {
                 value: "request".to_owned(),
             },
@@ -1588,8 +1573,7 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let call = client_streaming_from_stream::<_, TestMessage, TestMessage>(
             &UploadWaitingTransport,
-            "example.Greeter",
-            "LotsOfGreetings",
+            "/example.Greeter/LotsOfGreetings",
             Box::pin(DropTrackedPendingStream {
                 dropped: Arc::clone(&dropped),
             }),
@@ -1659,8 +1643,7 @@ mod tests {
     async fn client_streaming_from_stream_sends_all_requests() {
         let response = client_streaming_from_stream::<_, TestMessage, TestMessage>(
             &CollectingStreamingTransport,
-            "example.Greeter",
-            "LotsOfGreetings",
+            "/example.Greeter/LotsOfGreetings",
             crate::stream::from_iter([
                 TestMessage {
                     value: "one".to_owned(),
@@ -1683,8 +1666,7 @@ mod tests {
         let transport: &dyn StreamingRpcTransport = &concrete;
         let response = client_streaming_from_stream::<_, TestMessage, TestMessage>(
             transport,
-            "example.Greeter",
-            "LotsOfGreetings",
+            "/example.Greeter/LotsOfGreetings",
             crate::stream::from_iter([TestMessage {
                 value: "one".to_owned(),
             }]),
@@ -1697,8 +1679,7 @@ mod tests {
         let transport: Arc<dyn StreamingRpcTransport> = Arc::new(CollectingStreamingTransport);
         let response = client_streaming_from_stream::<_, TestMessage, TestMessage>(
             &transport,
-            "example.Greeter",
-            "LotsOfGreetings",
+            "/example.Greeter/LotsOfGreetings",
             crate::stream::from_iter([TestMessage {
                 value: "two".to_owned(),
             }]),
@@ -1713,8 +1694,7 @@ mod tests {
     async fn bidirectional_streaming_from_stream_sends_all_requests() {
         let mut response = bidirectional_streaming_from_stream::<_, TestMessage, TestMessage>(
             &CollectingStreamingTransport,
-            "example.Greeter",
-            "BidiHello",
+            "/example.Greeter/BidiHello",
             crate::stream::from_iter([
                 TestMessage {
                     value: "one".to_owned(),
@@ -1740,8 +1720,7 @@ mod tests {
     async fn bidirectional_streaming_deadline_cancels_pending_response_read() {
         let mut responses = bidirectional_streaming::<_, TestMessage, TestMessage>(
             &UploadWaitingTransport,
-            "example.Greeter",
-            "BidiHello",
+            "/example.Greeter/BidiHello",
             CallOptions::new().with_timeout(Duration::from_millis(1)),
         )
         .await
@@ -2073,8 +2052,7 @@ mod tests {
 
         let envelope = super::unary_envelope::<_, _, TestMessage>(
             &transport,
-            "example.Greeter",
-            "SayHello",
+            "/example.Greeter/SayHello",
             &TestMessage::default(),
             CallOptions::new(),
         )
@@ -2094,8 +2072,7 @@ mod tests {
 
         let error = super::unary_envelope::<_, _, TestMessage>(
             &transport,
-            "example.Greeter",
-            "SayHello",
+            "/example.Greeter/SayHello",
             &TestMessage::default(),
             CallOptions::new(),
         )

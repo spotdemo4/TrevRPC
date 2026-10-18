@@ -2,7 +2,9 @@
 // Go and Rust interop servers do.
 import { root } from "../build/interop/gen/interop.trevrpc.js";
 import { Code } from "../src/status.js";
+import { parseMethodPath } from "./support.js";
 
+const EchoService = "trevrpc.interop.v1.Echo";
 const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
 const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
 
@@ -28,7 +30,16 @@ async function serve(stream, request, unary) {
   const done = (code = Code.Ok, message = "") =>
     stream.writeStatus(code, message, code === Code.Ok ? trailers : {});
 
-  switch (request.method) {
+  // A malformed path is a protocol error; a well-formed path with no handler is unimplemented.
+  const path = parseMethodPath(request.method);
+  if (path === null) {
+    await stream.writeStatus(Code.InvalidArgument, `malformed method path "${request.method}"`);
+    await stream.finish();
+    await stream.stopSending();
+    return;
+  }
+
+  switch (path.service === EchoService ? path.method : undefined) {
     case "Unary":
       await unary(stream, request, await stream.readMessage(EchoRequest), done);
       break;
@@ -42,7 +53,7 @@ async function serve(stream, request, unary) {
       await bidi(stream, done);
       break;
     default:
-      await stream.writeStatus(Code.Unimplemented, request.method);
+      await stream.writeStatus(Code.Unimplemented, `unknown method ${request.method}`);
   }
   await stream.finish();
   await stream.stopSending();

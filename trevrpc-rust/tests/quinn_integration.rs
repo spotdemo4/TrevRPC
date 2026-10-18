@@ -674,8 +674,7 @@ async fn quinn_backpressured_upload_does_not_violate_quinn_recv_stream_contract(
     task_panics::install();
     let server = spawn_greeter_server(|server| {
         server.route_streaming(
-            greeter::GreeterClient::<()>::SERVICE,
-            "BackpressuredUpload",
+            support::greeter_path("BackpressuredUpload"),
             RpcKind::ClientStreaming,
             |_body, mut requests| async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -699,8 +698,7 @@ async fn quinn_backpressured_upload_does_not_violate_quinn_recv_stream_contract(
 
     let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
         &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "BackpressuredUpload",
+        &support::greeter_path("BackpressuredUpload"),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
     )
     .await?;
@@ -756,8 +754,7 @@ async fn quinn_request_reset_cancels_handler_that_is_not_reading_the_body() -> T
     let server = spawn_greeter_server(|server| {
         let source_tx = source_tx.clone();
         server.route_streaming_with_context(
-            greeter::GreeterClient::<()>::SERVICE,
-            "IgnoredUpload",
+            support::greeter_path("IgnoredUpload"),
             RpcKind::ClientStreaming,
             move |context, _body, requests| {
                 let source_tx = source_tx.clone();
@@ -778,7 +775,7 @@ async fn quinn_request_reset_cancels_handler_that_is_not_reading_the_body() -> T
 
     for buffered_messages in [1_usize, 4] {
         let (mut send, _recv) = connection.open_bi().await?;
-        let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "IgnoredUpload")
+        let request = RpcRequest::new(support::greeter_path("IgnoredUpload"))
             .with_kind(RpcKind::ClientStreaming);
         support::write_request(&mut send, &request).await?;
         for _ in 0..buffered_messages {
@@ -1238,7 +1235,7 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
         .expect_err("HTTP/3 request stream should exceed message limit");
     ensure_eq!(error.into_status().code(), Code::ResourceExhausted);
 
-    let mut request = RpcRequest::new("lifecycle.Probe", "Watch")
+    let mut request = RpcRequest::new("/lifecycle.Probe/Watch")
         .with_kind(RpcKind::ServerStreaming)
         .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
     request.metadata.insert(
@@ -1308,6 +1305,85 @@ async fn webtransport_rejects_unexpected_path() -> TestResult {
 
     assert_webtransport_connect_rejected(error, web_transport_quinn::http::StatusCode::NOT_FOUND)?;
     server.shutdown().await
+}
+
+/// Connects with the WebTransport protocols `protocols` offered and calls `SayHello`.
+async fn say_hello_over_webtransport_offering(protocols: &[&str]) -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let client = make_webtransport_client(&server)?;
+    let mut request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?);
+    for protocol in protocols {
+        request = request.with_protocol(*protocol);
+    }
+    let session = client.connect(request).await?;
+    let greeter_client =
+        greeter::GreeterClient::new(support::WebTransportRpc::new(session.clone()));
+
+    let reply = greeter_client
+        .say_hello_with_options(
+            greeter::HelloRequest {
+                name: "version".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+
+    ensure_eq!(reply.message, "hello, version");
+    close_webtransport_client(client, session).await?;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_rejects_an_offer_without_trevrpc_1() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let client = make_webtransport_client(&server)?;
+    let request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?)
+            .with_protocol("trevrpc-2");
+
+    let error = expect_webtransport_connect_error(&client, request).await?;
+
+    assert_webtransport_connect_rejected(
+        error,
+        web_transport_quinn::http::StatusCode::BAD_REQUEST,
+    )?;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_rejects_a_list_of_offers_without_trevrpc_1() -> TestResult {
+    let server = spawn_greeter_server(|_| {})?;
+    let client = make_webtransport_client(&server)?;
+    let request =
+        web_transport_quinn::proto::ConnectRequest::new(webtransport_url(&server, "/trevrpc")?)
+            .with_protocol("trevrpc-2")
+            .with_protocol("other");
+
+    let error = expect_webtransport_connect_error(&client, request).await?;
+
+    assert_webtransport_connect_rejected(
+        error,
+        web_transport_quinn::http::StatusCode::BAD_REQUEST,
+    )?;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_accepts_an_offer_of_trevrpc_1() -> TestResult {
+    say_hello_over_webtransport_offering(&["trevrpc-1"]).await
+}
+
+#[tokio::test]
+async fn webtransport_accepts_an_offer_that_includes_trevrpc_1() -> TestResult {
+    say_hello_over_webtransport_offering(&["trevrpc-2", "trevrpc-1"]).await
+}
+
+#[tokio::test]
+async fn webtransport_accepts_no_offer_as_version_1() -> TestResult {
+    say_hello_over_webtransport_offering(&[]).await
 }
 
 #[tokio::test]
@@ -1452,8 +1528,7 @@ async fn quinn_oversized_timeouts_are_rejected_over_the_wire() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "Missing")
-        .with_timeout_nanos(u64::MAX);
+    let request = RpcRequest::new(support::greeter_path("Missing")).with_timeout_nanos(u64::MAX);
 
     let error = transport
         .call(request, Vec::new())
@@ -1545,7 +1620,7 @@ async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
     let hanging = hold_server_stream_open(&client).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello");
+    let request = RpcRequest::new(support::greeter_path("SayHello"));
 
     support::write_request_and_message(
         &mut send,
@@ -1592,7 +1667,7 @@ async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResu
     ensure_eq!(first.message, "first");
 
     let (mut send, mut recv) = session.open_bi().await?;
-    let mut request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello");
+    let mut request = RpcRequest::new(support::greeter_path("SayHello"));
     request.metadata.insert(
         "authorization".to_owned(),
         format!("Bearer {AUTH_TOKEN}").into_bytes(),
@@ -1611,8 +1686,8 @@ async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResu
     ensure_eq!(status.code(), Code::Unavailable);
 
     let (mut send, mut recv) = session.open_bi().await?;
-    let mut request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "LotsOfReplies")
-        .with_kind(RpcKind::ServerStreaming);
+    let mut request =
+        RpcRequest::new(support::greeter_path("LotsOfReplies")).with_kind(RpcKind::ServerStreaming);
     request.metadata.insert(
         "authorization".to_owned(),
         format!("Bearer {AUTH_TOKEN}").into_bytes(),
@@ -1651,7 +1726,7 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
     let hanging = hold_server_stream_open(&client).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello");
+    let request = RpcRequest::new(support::greeter_path("SayHello"));
 
     support::write_request_and_message(
         &mut send,
@@ -1690,8 +1765,7 @@ async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload(
         );
         server.set_metrics(metrics);
         server.route_streaming(
-            "lifecycle.LateFailure",
-            "Upload",
+            "/lifecycle.LateFailure/Upload",
             RpcKind::ClientStreaming,
             move |_body, requests| {
                 let ready_tx = ready_tx.clone();
@@ -1711,7 +1785,7 @@ async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload(
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let request =
-        RpcRequest::new("lifecycle.LateFailure", "Upload").with_kind(RpcKind::ClientStreaming);
+        RpcRequest::new("/lifecycle.LateFailure/Upload").with_kind(RpcKind::ClientStreaming);
     support::write_request(&mut send, &request).await?;
     tokio::time::timeout(TEST_TIMEOUT, ready_rx.recv())
         .await?
@@ -1759,8 +1833,7 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
         let transport = trevrpc::client::QuicTransport::new(connection.clone());
         let error = trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "SayHello",
+            &support::greeter_path("SayHello"),
             &greeter::HelloRequest {
                 name: "refused".to_owned(),
             },
@@ -1819,8 +1892,7 @@ async fn quinn_response_drop_reports_peer_reset_to_request_context() -> TestResu
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
         &transport,
-        "lifecycle.Probe",
-        "Watch",
+        "/lifecycle.Probe/Watch",
         &greeter::HelloRequest::default(),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
     )
@@ -1851,8 +1923,7 @@ async fn quinn_shutdown_reports_server_shutdown_to_request_context() -> TestResu
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let mut responses = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
         &transport,
-        "lifecycle.Probe",
-        "Watch",
+        "/lifecycle.Probe/Watch",
         &greeter::HelloRequest::default(),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
     )
@@ -1881,7 +1952,7 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
     let (mut send, mut recv) = session.open_bi().await?;
-    let mut request = RpcRequest::new("lifecycle.Probe", "Watch")
+    let mut request = RpcRequest::new("/lifecycle.Probe/Watch")
         .with_kind(RpcKind::ServerStreaming)
         .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
     request.metadata.insert(
@@ -1918,7 +1989,7 @@ async fn webtransport_connection_close_reports_connection_loss() -> TestResult {
     })?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
     let (mut send, mut recv) = session.open_bi().await?;
-    let request = RpcRequest::new("lifecycle.Probe", "Watch")
+    let request = RpcRequest::new("/lifecycle.Probe/Watch")
         .with_kind(RpcKind::ServerStreaming)
         .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
     support::write_request_and_message(&mut send, &request, &[]).await?;
@@ -2089,8 +2160,7 @@ async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "RejectUpload",
+            &support::greeter_path("RejectUpload"),
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
@@ -2113,8 +2183,7 @@ async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResu
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "RejectUpload",
+            &support::greeter_path("RejectUpload"),
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
@@ -2136,7 +2205,7 @@ async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello");
+    let request = RpcRequest::new(support::greeter_path("SayHello"));
 
     support::write_request_and_message(
         &mut send,
@@ -2178,7 +2247,7 @@ async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult
 }
 
 fn rejected_bidi_request() -> RpcRequest {
-    RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "RejectUpload")
+    RpcRequest::new(support::greeter_path("RejectUpload"))
         .with_kind(RpcKind::BidirectionalStreaming)
 }
 
@@ -2297,7 +2366,7 @@ async fn quinn_unary_request_left_open_is_bounded_and_frees_the_stream_slot() ->
     let mut send = send;
     support::write_request_and_message(
         &mut send,
-        &RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello"),
+        &RpcRequest::new(support::greeter_path("SayHello")),
         &greeter::HelloRequest {
             name: "never finished".to_owned(),
         }
@@ -2362,7 +2431,7 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let mut response = transport
         .streaming_call(
-            RpcRequest::new("example.greeter.Greeter", "StatusOnly")
+            RpcRequest::new("/example.greeter.Greeter/StatusOnly")
                 .with_kind(RpcKind::ServerStreaming),
             trevrpc::stream::from_iter([Vec::new()]),
         )
@@ -2422,7 +2491,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let mut response = transport
         .streaming_call(
-            RpcRequest::new("example.greeter.Greeter", "StatusThenMessage")
+            RpcRequest::new("/example.greeter.Greeter/StatusThenMessage")
                 .with_kind(RpcKind::ServerStreaming),
             trevrpc::stream::from_iter([Vec::new()]),
         )
@@ -2447,8 +2516,8 @@ async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> Test
     let server = spawn_greeter_server(register_status_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "StatusUpload")
-        .with_kind(RpcKind::ClientStreaming);
+    let request =
+        RpcRequest::new(support::greeter_path("StatusUpload")).with_kind(RpcKind::ClientStreaming);
 
     support::write_request(&mut send, &request).await?;
     support::write_status(&mut send, Status::ok()).await?;
@@ -2488,8 +2557,7 @@ async fn quinn_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "AcceptUpload",
+            &support::greeter_path("AcceptUpload"),
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
@@ -2517,8 +2585,7 @@ async fn webtransport_terminal_ok_surfaces_local_upload_error() -> TestResult {
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "AcceptUpload",
+            &support::greeter_path("AcceptUpload"),
             CallOptions::new().with_timeout(TEST_TIMEOUT),
         )
         .await?;
@@ -2623,25 +2690,20 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
         server.set_options(
             fast_server_options().with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
         );
-        server.route(
-            greeter::GreeterClient::<()>::SERVICE,
-            "Never",
-            move |_body| {
-                let started_tx = started_tx.clone();
-                async move {
-                    let _ = started_tx.send(());
-                    std::future::pending::<trevrpc::Result<Vec<u8>>>().await
-                }
-            },
-        );
+        server.route(support::greeter_path("Never"), move |_body| {
+            let started_tx = started_tx.clone();
+            async move {
+                let _ = started_tx.send(());
+                std::future::pending::<trevrpc::Result<Vec<u8>>>().await
+            }
+        });
     })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let call = tokio::spawn(async move {
         trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "Never",
+            &support::greeter_path("Never"),
             &greeter::HelloRequest {
                 name: "shutdown".to_owned(),
             },
@@ -2674,25 +2736,20 @@ async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestRe
         server.set_options(
             fast_server_options().with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
         );
-        server.route(
-            greeter::GreeterClient::<()>::SERVICE,
-            "Never",
-            move |_body| {
-                let started_tx = started_tx.clone();
-                async move {
-                    let _ = started_tx.send(());
-                    std::future::pending::<trevrpc::Result<Vec<u8>>>().await
-                }
-            },
-        );
+        server.route(support::greeter_path("Never"), move |_body| {
+            let started_tx = started_tx.clone();
+            async move {
+                let _ = started_tx.send(());
+                std::future::pending::<trevrpc::Result<Vec<u8>>>().await
+            }
+        });
     })?;
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
     let transport = support::WebTransportRpc::new(session.clone());
     let call = tokio::spawn(async move {
         trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "Never",
+            &support::greeter_path("Never"),
             &greeter::HelloRequest {
                 name: "shutdown".to_owned(),
             },
@@ -2786,8 +2843,7 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
         let transport = trevrpc::client::QuicTransport::new(connection.clone());
         let status = trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "SayHello",
+            &support::greeter_path("SayHello"),
             &greeter::HelloRequest {
                 name: "anonymous".to_owned(),
             },
@@ -2861,7 +2917,7 @@ async fn quinn_misplaced_request_stream_frames_return_invalid_argument_status() 
     task_panics::install();
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "LotsOfGreetings")
+    let request = RpcRequest::new(support::greeter_path("LotsOfGreetings"))
         .with_kind(RpcKind::ClientStreaming);
     let second_request = trevrpc::framing::encode_protobuf_frame(
         trevrpc::framing::frame_type::REQUEST,
@@ -3297,8 +3353,7 @@ fn register_cancellation_probe_route(
     source_tx: mpsc::UnboundedSender<CancellationSource>,
 ) {
     server.route_streaming_envelope_with_context(
-        "lifecycle.Probe",
-        "Watch",
+        "/lifecycle.Probe/Watch",
         RpcKind::ServerStreaming,
         move |context, _body, _requests| {
             let source_tx = source_tx.clone();
@@ -3322,8 +3377,7 @@ fn register_cancellation_probe_route(
 
 fn register_reject_upload_route(server: &mut Server) {
     server.route_streaming(
-        greeter::GreeterClient::<()>::SERVICE,
-        "RejectUpload",
+        support::greeter_path("RejectUpload"),
         trevrpc::RpcKind::BidirectionalStreaming,
         |_body, _requests| async {
             Err(trevrpc::Error::from(Status::new(
@@ -3336,8 +3390,7 @@ fn register_reject_upload_route(server: &mut Server) {
 
 fn register_accept_upload_route(server: &mut Server) {
     server.route_streaming(
-        greeter::GreeterClient::<()>::SERVICE,
-        "AcceptUpload",
+        support::greeter_path("AcceptUpload"),
         trevrpc::RpcKind::BidirectionalStreaming,
         |_body, _requests| async { Ok(trevrpc::stream::empty()) },
     );
@@ -3345,8 +3398,7 @@ fn register_accept_upload_route(server: &mut Server) {
 
 fn register_status_upload_route(server: &mut Server) {
     server.route_streaming(
-        greeter::GreeterClient::<()>::SERVICE,
-        "StatusUpload",
+        support::greeter_path("StatusUpload"),
         trevrpc::RpcKind::ClientStreaming,
         |_body, mut requests| async move {
             match requests.next().await {
@@ -3886,8 +3938,7 @@ async fn http3_response_headers_reach_every_rpc_shape() -> TestResult {
 /// A server-streaming route that sends its headers at once and its only message once released.
 fn register_gated_headers_route(server: &mut Server, gate: Arc<Notify>) {
     server.route_streaming_envelope_with_context(
-        "test.Headers",
-        "Gate",
+        "/test.Headers/Gate",
         RpcKind::ServerStreaming,
         move |_context, _body, _requests| {
             let gate = Arc::clone(&gate);
@@ -3918,8 +3969,7 @@ async fn quinn_streaming_headers_arrive_before_the_first_message_exists() -> Tes
 
     let mut replies = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
         &transport,
-        "test.Headers",
-        "Gate",
+        "/test.Headers/Gate",
         &greeter::HelloRequest::default(),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
     )
@@ -3946,7 +3996,7 @@ async fn quinn_streaming_headers_arrive_before_the_first_message_exists() -> Tes
 async fn quinn_server_skips_unknown_frames_everywhere_on_a_request() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello");
+    let request = RpcRequest::new(support::greeter_path("SayHello"));
     let body = greeter::HelloRequest {
         name: "grease".to_owned(),
     }
@@ -3973,7 +4023,7 @@ async fn quinn_server_skips_unknown_frames_everywhere_on_a_request() -> TestResu
     read_quinn_fin(&mut recv).await?;
 
     // Unknown frames also interleave with streamed request messages and the request status.
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "LotsOfGreetings")
+    let request = RpcRequest::new(support::greeter_path("LotsOfGreetings"))
         .with_kind(RpcKind::ClientStreaming);
     let (mut send, mut recv) = connection.open_bi().await?;
     support::write_request(&mut send, &request).await?;
@@ -4008,17 +4058,13 @@ async fn quinn_server_skips_unknown_frames_everywhere_on_a_request() -> TestResu
 #[tokio::test]
 async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     let server = spawn_greeter_server(|server| {
-        server.route(
-            greeter::GreeterClient::<()>::SERVICE,
-            "Slow",
-            |body| async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                Ok(body)
-            },
-        );
+        server.route(support::greeter_path("Slow"), |body| async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(body)
+        });
     })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "Slow");
+    let request = RpcRequest::new(support::greeter_path("Slow"));
 
     // No message at all.
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -4058,8 +4104,8 @@ async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     ensure_eq!(status.code(), Code::InvalidArgument);
 
     // Server-streaming requests are held to the same rule.
-    let streaming = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "LotsOfReplies")
-        .with_kind(RpcKind::ServerStreaming);
+    let streaming =
+        RpcRequest::new(support::greeter_path("LotsOfReplies")).with_kind(RpcKind::ServerStreaming);
     let (mut send, mut recv) = connection.open_bi().await?;
     support::write_request(&mut send, &streaming).await?;
     send.finish()?;
@@ -4078,7 +4124,7 @@ async fn quinn_grease_is_charged_to_the_request_body_limit() -> TestResult {
         server.set_options(fast_server_options().with_max_stream_body_size(Some(256)));
     })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "LotsOfGreetings")
+    let request = RpcRequest::new(support::greeter_path("LotsOfGreetings"))
         .with_kind(RpcKind::ClientStreaming);
 
     // No message is ever sent: only unknown frames, 102 bytes each.
@@ -4100,7 +4146,7 @@ async fn quinn_oversized_unknown_frame_is_rejected_before_its_payload() -> TestR
         server.set_options(fast_server_options().with_max_frame_size(1024));
     })?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
-    let request = RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "LotsOfGreetings")
+    let request = RpcRequest::new(support::greeter_path("LotsOfGreetings"))
         .with_kind(RpcKind::ClientStreaming);
 
     // A grease frame that declares 1025 payload bytes and sends none.

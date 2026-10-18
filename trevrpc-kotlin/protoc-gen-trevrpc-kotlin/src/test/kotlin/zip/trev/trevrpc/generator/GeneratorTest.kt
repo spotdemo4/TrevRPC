@@ -75,8 +75,8 @@ class GeneratorTest {
         assertEquals("", response.error)
         val content = response.fileList.single().content
         assertEquals(2, Regex("fun fooBar\\(").findAll(content).count())
-        assertTrue(content.contains("NAMES_FOO_BAR_METHOD_NAME"))
-        assertTrue(content.contains("NAMES_FOO__BAR_METHOD_NAME"))
+        assertTrue(content.contains("NAMES_FOO_BAR_PATH"))
+        assertTrue(content.contains("NAMES_FOO__BAR_PATH"))
     }
 
     @Test
@@ -165,7 +165,7 @@ class GeneratorTest {
 
         assertDeterministicCollision(
             request(file),
-            "val collision.generated.A_B_C_METHOD_NAME",
+            "val collision.generated.A_B_C_PATH",
             "collision.A.B_C",
             "collision.A_B.C",
         )
@@ -830,8 +830,8 @@ class GeneratedCodeCompilationTest {
             ) {
                 val firstReply: Reply = client.fooBar(first)
                 val secondReply: Reply = client.fooBar(second)
-                val firstMethod: String = LEGAL_OVERLOADS_FOO_BAR_METHOD_NAME
-                val secondMethod: String = LEGAL_OVERLOADS_FOO__BAR_METHOD_NAME
+                val firstMethod: String = LEGAL_OVERLOADS_FOO_BAR_PATH
+                val secondMethod: String = LEGAL_OVERLOADS_FOO__BAR_PATH
             }
             """.trimIndent()
     }

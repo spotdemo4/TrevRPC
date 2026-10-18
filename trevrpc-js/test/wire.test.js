@@ -23,14 +23,7 @@ import {
 } from "../src/metadata.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
-import {
-  RpcHeaders,
-  RpcKind,
-  RpcRequest,
-  RpcStatus,
-  WireVersion,
-  createRoot,
-} from "../src/wire.js";
+import { RpcHeaders, RpcKind, RpcRequest, RpcStatus, createRoot } from "../src/wire.js";
 import { chunked, concatBytes, hex, readerOf } from "./support.js";
 
 const goldenPath = new URL("../../testdata/wire-golden-vectors.txt", import.meta.url);
@@ -38,7 +31,7 @@ const goldenPath = new URL("../../testdata/wire-golden-vectors.txt", import.meta
 const bytes = (text) => new TextEncoder().encode(text);
 const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));
 
-const request = { service: "svc", method: "m", version: WireVersion };
+const request = { method: "/svc/m" };
 
 /** The documented logical value of every golden vector: [frame type, message type, fields]. */
 const goldenCases = {
@@ -114,7 +107,7 @@ test("golden payloads decode to their logical fields", async () => {
 
   const withExtensions = decode("request.extensions", RpcRequest);
   assert.deepEqual(withExtensions.extensions.map(Number), [1, 300]);
-  assert.equal(withExtensions.version, WireVersion);
+  assert.equal(withExtensions.method, "/svc/m");
 
   const timeout = decode("request.bidi_timeout", RpcRequest);
   assert.equal(timeout.kind, RpcKind.BidirectionalStreaming);
@@ -157,8 +150,17 @@ test("request frames carry the request message in the same buffer", () => {
   const both = encodeRequestFrame(request, body);
   const requestOnly = encodeRequestFrame(request);
   assert.deepEqual(both, concatBytes([requestOnly, encodeMessageFrame(body)]));
-  assert.equal(hex(requestOnly), "010a0a0373766312016d3001");
+  assert.equal(hex(requestOnly), "01080a062f7376632f6d");
   assert.equal(hex(encodeRequestFrame(request, new Uint8Array(0))), `${hex(requestOnly)}0000`);
+});
+
+test("the reserved request fields are ignored when decoding", () => {
+  // Field 2 (old method name), field 3 and field 6 (old version) from an older peer.
+  const payload = fromHex("0a062f7376632f6d" + "12016d" + "1a0100" + "3001");
+  const decoded = unmarshalMessage(RpcRequest, payload);
+  assert.equal(decoded.method, "/svc/m");
+  assert.equal(decoded.version, undefined);
+  assert.equal(hex(marshalMessage(RpcRequest, decoded)), "0a062f7376632f6d");
 });
 
 test("status and headers encoders match the golden frames", async () => {

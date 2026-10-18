@@ -37,6 +37,7 @@ fn generates_services_from_a_real_proto_descriptor() {
         .expect("plugin should generate content");
     assert!(content.contains("pub trait Greeter"));
     assert!(content.contains("pub struct GreeterClient<T>"));
+    assert!(content.contains("pub const SAY_HELLO: &str = \"/example.greeter.Greeter/SayHello\";"));
     assert!(content.contains("async fn say_hello"));
     assert!(content.contains("async fn lots_of_replies"));
     assert!(content.contains("async fn lots_of_greetings"));

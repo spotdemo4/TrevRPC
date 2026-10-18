@@ -193,18 +193,7 @@ func newWebTransportTestClient(t testing.TB, pki testPKI, listener *Listener, or
 // WT_INITIAL_* SETTINGS, as Safari does, which enables session flow control.
 func newWebTransportTestOpener(t testing.TB, pki testPKI, listener *Listener, origin string, config *webtransport.Config) streamOpener {
 	t.Helper()
-	wt := &webtransport.Transport{
-		Config:          config,
-		TLSClientConfig: pki.client.Clone(),
-		QUICConfig:      &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
-	}
-	header := http.Header{}
-	if origin != "" {
-		header.Set("Origin", origin)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
-	defer cancel()
-	response, session, err := wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, header)
+	response, session, err := dialWebTransportTest(pki, listener, webTransportTestDial{origin: origin, config: config})
 	if err != nil {
 		t.Fatalf("WebTransport dial: %v", err)
 	}
@@ -215,6 +204,40 @@ func newWebTransportTestOpener(t testing.TB, pki testPKI, listener *Listener, or
 		_ = response.Body.Close()
 	})
 	return webTransportTestOpener{session}
+}
+
+// webTransportTestDial describes one WebTransport CONNECT request.
+type webTransportTestDial struct {
+	origin string
+	config *webtransport.Config
+	// protocols are the application protocols the client offers in
+	// WT-Available-Protocols; none sends no header.
+	protocols []string
+	// available, if set, is sent as WT-Available-Protocols verbatim and takes
+	// precedence over protocols, which lets tests send malformed fields.
+	available string
+}
+
+// dialWebTransportTest opens one WebTransport session to /trevrpc. Like
+// webtransport.Transport.Dial it returns the CONNECT response even when the
+// server refuses the session, together with the error.
+func dialWebTransportTest(pki testPKI, listener *Listener, dial webTransportTestDial) (*http.Response, *webtransport.Session, error) {
+	wt := &webtransport.Transport{
+		Config:               dial.config,
+		TLSClientConfig:      pki.client.Clone(),
+		QUICConfig:           &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
+		ApplicationProtocols: dial.protocols,
+	}
+	header := http.Header{}
+	if dial.origin != "" {
+		header.Set("Origin", dial.origin)
+	}
+	if dial.available != "" {
+		header.Set(wtAvailableProtocolsHeader, dial.available)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	return wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, header)
 }
 
 type webTransportTestOpener struct{ session *webtransport.Session }

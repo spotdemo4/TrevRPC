@@ -115,8 +115,8 @@ func (b *httpBody) trevrpcCancelReadOnContext(ctx context.Context) func() {
 	return watchContextCancellation(ctx, b.trevrpcCancelRead)
 }
 
-// admitBrowserSession validates the path of a browser session request and runs
-// WebTransportAdmission, writing the HTTP rejection when the session is not
+// admitBrowserSession validates the path and offered protocols of a browser
+// session request and runs WebTransportAdmission, writing the HTTP rejection when the session is not
 // admitted. A nil WebTransportAdmission rejects every session.
 func (r *serverRuntime) admitBrowserSession(w http.ResponseWriter, request *http.Request) bool {
 	options := r.options
@@ -129,6 +129,16 @@ func (r *serverRuntime) admitBrowserSession(w http.ResponseWriter, request *http
 		Message:    "proto=" + request.Proto + " path=" + request.URL.Path + " authority=" + request.Host + " origin=" + request.Header.Get("Origin"),
 		RemoteAddr: request.RemoteAddr,
 	})
+
+	if offersOnlyOtherWebTransportProtocols(request.Header) {
+		r.emitDiagnostic(ServerDiagnostic{
+			Phase:      ServerDiagnosticSessionAdmission,
+			Message:    "unsupported WebTransport protocol; offered " + truncateDiagnostic(request.Header.Get(wtAvailableProtocolsHeader)),
+			RemoteAddr: request.RemoteAddr,
+		})
+		http.Error(w, "unsupported WebTransport protocol; this server speaks "+webTransportProtocol, http.StatusBadRequest)
+		return false
+	}
 
 	admitted, err := r.invokeAdmission(options.WebTransportAdmission, false, request)
 	if err != nil {

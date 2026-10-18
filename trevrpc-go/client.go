@@ -144,8 +144,9 @@ func CaptureResponseMetadata(dst *Metadata) CallOption {
 	}
 }
 
-// Unary calls a unary RPC and decodes the protobuf response.
-func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (Res, error) {
+// Unary calls the unary RPC at method, the full method path
+// "/package.Service/Method", and decodes the protobuf response.
+func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, method string, request Req, newResponse func() Res, options ...CallOption) (Res, error) {
 	var zero Res
 	config := applyCallOptions(options)
 	deadline, err := resolveClientDeadline(ctx, config, time.Now)
@@ -153,7 +154,7 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 		return zero, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, RPCKindUnary, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(method, RPCKindUnary, config, deadline, time.Now)
 	if err != nil {
 		return zero, err
 	}
@@ -176,18 +177,19 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 	return message, nil
 }
 
-// ServerStreaming calls a server-streaming RPC and returns its response stream.
+// ServerStreaming calls the server-streaming RPC at method, the full method
+// path "/package.Service/Method", and returns its response stream.
 // The terminal status and trailing metadata are available from TerminalStatus
 // after Recv reports io.EOF or the stream's error, and the response headers
 // from Headers.
-func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, request Req, newResponse func() Res, options ...CallOption) (ServerStreamingCall[Res], error) {
+func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, method string, request Req, newResponse func() Res, options ...CallOption) (ServerStreamingCall[Res], error) {
 	config := applyCallOptions(options)
 	deadline, err := resolveClientDeadline(ctx, config, time.Now)
 	if err != nil {
 		return nil, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, RPCKindServerStreaming, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(method, RPCKindServerStreaming, config, deadline, time.Now)
 	if err != nil {
 		return nil, err
 	}
@@ -202,10 +204,11 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 	return newResponseMessageStream(ctx, frames, newResponse, config, cancel), nil
 }
 
-// ClientStreaming starts a client-streaming RPC.
-func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (ClientStreamingCall[Req, Res], error) {
+// ClientStreaming starts the client-streaming RPC at method, the full method
+// path "/package.Service/Method".
+func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, method string, newResponse func() Res, options ...CallOption) (ClientStreamingCall[Req, Res], error) {
 	config := applyCallOptions(options)
-	requests, responses, cancel, err := startStreamingCall[Req](ctx, transport, service, method, RPCKindClientStreaming, newResponse, config)
+	requests, responses, cancel, err := startStreamingCall[Req](ctx, transport, method, RPCKindClientStreaming, newResponse, config)
 	if err != nil {
 		return nil, err
 	}
@@ -213,9 +216,10 @@ func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 	return &clientStreamingCall[Req, Res]{requests: requests, responses: responses, cancel: cancel, config: config}, nil
 }
 
-// BidirectionalStreaming starts a bidirectional-streaming RPC.
-func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, newResponse func() Res, options ...CallOption) (BidirectionalStreamingCall[Req, Res], error) {
-	requests, responses, _, err := startStreamingCall[Req](ctx, transport, service, method, RPCKindBidirectionalStreaming, newResponse, applyCallOptions(options))
+// BidirectionalStreaming starts the bidirectional-streaming RPC at method, the
+// full method path "/package.Service/Method".
+func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, method string, newResponse func() Res, options ...CallOption) (BidirectionalStreamingCall[Req, Res], error) {
+	requests, responses, _, err := startStreamingCall[Req](ctx, transport, method, RPCKindBidirectionalStreaming, newResponse, applyCallOptions(options))
 	if err != nil {
 		return nil, err
 	}
@@ -225,13 +229,13 @@ func BidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Cont
 
 // startStreamingCall opens a streaming RPC whose requests are sent through the
 // returned pipe.
-func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, service, method string, kind RPCKind, newResponse func() Res, config callConfig) (*messagePipe[Req], *responseMessageStream[Res], context.CancelFunc, error) {
+func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, method string, kind RPCKind, newResponse func() Res, config callConfig) (*messagePipe[Req], *responseMessageStream[Res], context.CancelFunc, error) {
 	deadline, err := resolveClientDeadline(ctx, config, time.Now)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	rpcRequest, err := prepareClientRequest(service, method, kind, config, deadline, time.Now)
+	rpcRequest, err := prepareClientRequest(method, kind, config, deadline, time.Now)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -350,13 +354,13 @@ func resolveClientDeadline(ctx context.Context, config callConfig, now func() ti
 	return clientDeadline{at: deadline, set: hasDeadline}, nil
 }
 
-func prepareClientRequest(service, method string, kind RPCKind, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
+func prepareClientRequest(method string, kind RPCKind, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
 	metadata := cloneMetadata(config.metadata)
 	if err := validateMetadata(metadata); err != nil {
 		return nil, err
 	}
 
-	request := newWireRequest(service, method)
+	request := newWireRequest(method)
 	request.Kind = kind
 	request.Metadata = metadata
 	request.TimeoutNanos = deadlineTimeoutNanos(deadline, now)

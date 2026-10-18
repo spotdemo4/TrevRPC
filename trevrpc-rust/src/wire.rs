@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 pub type Metadata = HashMap<String, Vec<u8>>;
 
-pub const WIRE_VERSION: u32 = 1;
-
 pub const MAX_METADATA_ENTRIES: usize = 64;
 pub const MAX_METADATA_KEY_LEN: usize = 128;
 pub const MAX_METADATA_VALUE_LEN: usize = 8 * 1024;
@@ -91,21 +89,42 @@ const fn is_metadata_key_byte(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-')
 }
 
+/// Splits a method path `/<service>/<method>` into its service and method.
+///
+/// Returns `None` unless the path is a leading slash, a non-empty service, a slash, and a
+/// non-empty method with no further slash.
+#[must_use]
+pub fn split_method_path(path: &str) -> Option<(&str, &str)> {
+    let (service, method) = path.strip_prefix('/')?.split_once('/')?;
+    (!service.is_empty() && !method.is_empty() && !method.contains('/'))
+        .then_some((service, method))
+}
+
+/// Validates the syntax of a method path; see [`split_method_path`].
+pub fn validate_method_path(path: &str) -> std::result::Result<(), crate::Status> {
+    if split_method_path(path).is_some() {
+        Ok(())
+    } else {
+        Err(crate::Status::invalid_argument(format!(
+            "method {path:?} is not of the form /<service>/<method>"
+        )))
+    }
+}
+
 /// The REQUEST frame payload: everything about a call except its messages.
 ///
-/// Field 3 is reserved: it carried the request body before messages moved into MESSAGE frames.
+/// Tags 2, 3 and 6 are reserved and must never be reused: 2 carried the method name, 3 the
+/// request body before messages moved into MESSAGE frames, and 6 the wire version, which each
+/// transport now negotiates for the whole connection or request instead.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct RpcRequest {
+    /// The method path `/package.Service/Method`; see [`split_method_path`].
     #[prost(string, tag = "1")]
-    pub service: String,
-    #[prost(string, tag = "2")]
     pub method: String,
     #[prost(map = "string, bytes", tag = "4")]
     pub metadata: Metadata,
     #[prost(enumeration = "RpcKind", tag = "5")]
     pub kind: i32,
-    #[prost(uint32, tag = "6")]
-    pub version: u32,
     #[prost(uint64, tag = "7")]
     pub timeout_nanos: u64,
     /// Extensions the client supports. The registry is empty, so clients send none and servers
@@ -115,28 +134,21 @@ pub struct RpcRequest {
 }
 
 impl RpcRequest {
-    /// Creates a unary RPC request with the current wire version.
+    /// Creates a unary RPC request for the method path `/package.Service/Method`.
     #[must_use]
-    pub fn new(service: impl Into<String>, method: impl Into<String>) -> Self {
+    pub fn new(method: impl Into<String>) -> Self {
         Self {
-            service: service.into(),
             method: method.into(),
             metadata: Metadata::new(),
             kind: i32::from(RpcKind::Unary),
-            version: WIRE_VERSION,
             timeout_nanos: 0,
             extensions: Vec::new(),
         }
     }
 
-    /// Validates the request wire version and RPC kind.
+    /// Validates the method path and the RPC kind.
     pub fn validate_protocol(&self) -> std::result::Result<(), crate::Status> {
-        if self.version != WIRE_VERSION {
-            return Err(crate::Status::failed_precondition(format!(
-                "unsupported TrevRPC wire version {}; expected {WIRE_VERSION}",
-                self.version
-            )));
-        }
+        validate_method_path(&self.method)?;
 
         if RpcKind::try_from(self.kind).is_err() {
             return Err(crate::Status::invalid_argument(format!(
@@ -222,7 +234,7 @@ mod tests {
 
     use super::{
         MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN, RpcHeaders, RpcKind,
-        RpcRequest, RpcStatus, WIRE_VERSION, normalize_metadata_key, validate_metadata,
+        RpcRequest, RpcStatus, normalize_metadata_key, split_method_path, validate_metadata,
     };
 
     #[test]
@@ -296,10 +308,9 @@ mod tests {
 
     #[test]
     fn request_defaults_to_unary_kind() {
-        let request = RpcRequest::new("service", "method");
+        let request = RpcRequest::new("/service/method");
 
         assert_eq!(request.rpc_kind(), RpcKind::Unary);
-        assert_eq!(request.version, WIRE_VERSION);
         assert!(request.extensions.is_empty());
     }
 
@@ -312,20 +323,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_wire_versions() {
-        let mut request = RpcRequest::new("service", "method");
-        request.version = WIRE_VERSION + 1;
+    fn splits_well_formed_method_paths() {
+        assert_eq!(split_method_path("/svc/m"), Some(("svc", "m")));
+        assert_eq!(
+            split_method_path("/example.greeter.Greeter/SayHello"),
+            Some(("example.greeter.Greeter", "SayHello"))
+        );
+    }
 
-        let status = request
-            .validate_protocol()
-            .expect_err("version should be rejected");
+    #[test]
+    fn rejects_malformed_method_paths() {
+        for path in [
+            "", "/", "//", "svc/m", "/svc", "/svc/", "//m", "/svc/m/", "/svc/m/x", "svc.m",
+            "/svc//m",
+        ] {
+            assert_eq!(split_method_path(path), None, "{path:?}");
 
-        assert_eq!(status.code(), Code::FailedPrecondition);
+            let status = RpcRequest::new(path)
+                .validate_protocol()
+                .expect_err("malformed method path should be rejected");
+            assert_eq!(status.code(), Code::InvalidArgument, "{path:?}");
+        }
     }
 
     #[test]
     fn rejects_unknown_rpc_kinds() {
-        let mut request = RpcRequest::new("service", "method");
+        let mut request = RpcRequest::new("/service/method");
         request.kind = 99;
 
         let status = request
@@ -512,7 +535,7 @@ mod tests {
     async fn wire_golden_vectors_stay_stable() {
         let vectors = Vectors::load();
         let mut checked = BTreeSet::new();
-        let request = || RpcRequest::new("svc", "m");
+        let request = || RpcRequest::new("/svc/m");
 
         check_protobuf_frame(
             &vectors,

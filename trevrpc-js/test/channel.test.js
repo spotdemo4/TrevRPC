@@ -66,7 +66,11 @@ test("connect resolves with a channel once the session is ready", async () => {
 
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].url, "https://example.test/trevrpc");
-  assert.deepEqual(sessions[0].options, { serverCertificateHashes: hashes, allowPooling: true });
+  assert.deepEqual(sessions[0].options, {
+    protocols: ["trevrpc-1"],
+    serverCertificateHashes: hashes,
+    allowPooling: true,
+  });
   sessions[0].becomeReady();
 
   const channel = await connecting;
@@ -79,6 +83,80 @@ test("connect resolves with a channel once the session is ready", async () => {
   channel.close({ closeCode: 7, reason: "bye" });
   assert.deepEqual(sessions[0].closeCalls, [{ closeCode: 7, reason: "bye" }]);
   assert.equal(channel.state, "closed");
+});
+
+test("the protocols option is the protocol version and cannot be overridden", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    protocols: ["trevrpc-99"],
+  });
+  assert.deepEqual(sessions[0].options, { protocols: ["trevrpc-1"] });
+  sessions[0].becomeReady();
+  (await connecting).close();
+});
+
+test("connect accepts the selected protocol trevrpc-1 and an empty or missing selection", async () => {
+  for (const protocol of ["trevrpc-1", "", undefined]) {
+    const { WebTransport, sessions } = fakeWebTransport();
+    const connecting = connect("https://example.test/trevrpc", {
+      transports: WebTransportOnly,
+      WebTransport,
+    });
+    sessions[0].protocol = protocol;
+    sessions[0].becomeReady();
+    const channel = await connecting;
+    assert.equal(channel.state, "ready", JSON.stringify(protocol));
+    assert.equal(sessions[0].closeCalls.length, 0, JSON.stringify(protocol));
+    channel.close();
+  }
+});
+
+test("connect fails and closes the session when the server selects another protocol", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+  });
+  sessions[0].protocol = "trevrpc-2";
+  sessions[0].becomeReady();
+  await assert.rejects(connecting, (error) => {
+    return (
+      error.code === Code.FailedPrecondition &&
+      /"trevrpc-2"/.test(error.statusMessage) &&
+      /"trevrpc-1"/.test(error.statusMessage)
+    );
+  });
+  assert.equal(sessions[0].closeCalls.length, 1, "the mismatched session is closed");
+});
+
+test("the channel keeps reconnecting when a reconnect selects another protocol", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const changes = [];
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    onStateChange: (change) => changes.push(change),
+  });
+  sessions[0].becomeReady();
+  const channel = await connecting;
+
+  sessions[0].lose();
+  await waitFor(() => sessions.length === 2);
+  sessions[1].protocol = "trevrpc-2";
+  sessions[1].becomeReady();
+  await waitFor(() => sessions.length === 3);
+  assert.equal(channel.state, "reconnecting");
+  assert.equal(sessions[1].closeCalls.length, 1);
+  const mismatch = changes.filter((change) => change.state === "reconnecting").at(-1);
+  assert.equal(mismatch.error.code, Code.FailedPrecondition);
+
+  sessions[2].protocol = "trevrpc-1";
+  sessions[2].becomeReady();
+  await channel.waitUntilReady();
+  assert.equal(channel.state, "ready");
+  channel.close();
 });
 
 test("connect fails when the session cannot be established", async () => {

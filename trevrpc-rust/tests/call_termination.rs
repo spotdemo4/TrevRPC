@@ -101,8 +101,7 @@ const REJECT: &str = "Reject";
 
 fn register_routes(server: &mut Server) {
     server.route_streaming(
-        greeter::GreeterClient::<()>::SERVICE,
-        HOLD,
+        support::greeter_path(HOLD),
         RpcKind::ServerStreaming,
         |_body, _requests| async {
             let reply = prost::Message::encode_to_vec(&greeter::HelloReply::default());
@@ -117,8 +116,7 @@ fn register_routes(server: &mut Server) {
         ("RejectBidi", RpcKind::BidirectionalStreaming),
     ] {
         server.route_streaming(
-            greeter::GreeterClient::<()>::SERVICE,
-            method,
+            support::greeter_path(method),
             kind,
             |_body, _requests| async {
                 Err(trevrpc::Error::from(Status::new(
@@ -382,8 +380,7 @@ over_each_transport!(
         let client = greeter::GreeterClient::new(Arc::clone(&transport));
         let mut held = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
             transport.as_ref(),
-            greeter::GreeterClient::<()>::SERVICE,
-            HOLD,
+            &support::greeter_path(HOLD),
             &name(0),
             long_options(),
         )
@@ -487,8 +484,7 @@ over_each_transport!(
         let call =
             trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
                 transport.as_ref(),
-                greeter::GreeterClient::<()>::SERVICE,
-                REJECT,
+                &support::greeter_path(REJECT),
                 long_options(),
             )
             .await?;
@@ -513,8 +509,7 @@ over_each_transport!(
             greeter::HelloReply,
         >(
             transport.as_ref(),
-            greeter::GreeterClient::<()>::SERVICE,
-            "RejectBidi",
+            &support::greeter_path("RejectBidi"),
             long_options(),
         )
         .await?;
@@ -635,8 +630,7 @@ async fn client_streaming_upload_stops_on_a_status_the_server_never_follows_up()
     let (_endpoint, transport) = connect_quic_to(server.addr, &server.cert).await?;
     let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
         &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "Deaf",
+        &support::greeter_path("Deaf"),
         long_options(),
     )
     .await?;
@@ -656,14 +650,12 @@ async fn client_streaming_upload_stops_on_a_status_the_server_never_follows_up()
 async fn bidi_upload_stops_on_a_status_the_server_never_follows_up() -> TestResult {
     let server = spawn_deaf_server(rejection())?;
     let (_endpoint, transport) = connect_quic_to(server.addr, &server.cert).await?;
-    let mut call =
-        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-            &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "Deaf",
-            long_options(),
-        )
-        .await?;
+    let mut call = trevrpc::client::bidirectional_streaming::<
+        _,
+        greeter::HelloRequest,
+        greeter::HelloReply,
+    >(&transport, &support::greeter_path("Deaf"), long_options())
+    .await?;
 
     // Nobody reads the responses while the upload runs.
     let error = send_until_failure(|| call.send(large_message())).await?;
@@ -679,8 +671,7 @@ async fn send_reports_an_ok_status_as_cancelled() -> TestResult {
     let (_endpoint, transport) = connect_quic_to(server.addr, &server.cert).await?;
     let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
         &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "Deaf",
+        &support::greeter_path("Deaf"),
         long_options(),
     )
     .await?;
@@ -701,14 +692,12 @@ async fn bidi_send_reports_a_status_queued_behind_unread_responses() -> TestResu
         status: Some(rejection()),
     })?;
     let (_endpoint, transport) = connect_quic_to(server.addr, &server.cert).await?;
-    let mut call =
-        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-            &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "Deaf",
-            long_options(),
-        )
-        .await?;
+    let mut call = trevrpc::client::bidirectional_streaming::<
+        _,
+        greeter::HelloRequest,
+        greeter::HelloReply,
+    >(&transport, &support::greeter_path("Deaf"), long_options())
+    .await?;
 
     let error = send_until_failure(|| call.send(large_message())).await?;
     ensure_eq!(error.into_status().code(), Code::PermissionDenied);
@@ -735,8 +724,7 @@ async fn send_reports_resource_exhausted_when_the_status_is_beyond_the_buffer_bo
     let call =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
-            greeter::GreeterClient::<()>::SERVICE,
-            "Deaf",
+            &support::greeter_path("Deaf"),
             long_options().with_max_response_messages(Some(8)),
         )
         .await?;
@@ -812,8 +800,7 @@ async fn send_after_upload_stops_first(connection_lost: bool) -> TestResult<trev
     };
     let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
         &transport,
-        greeter::GreeterClient::<()>::SERVICE,
-        "Teardown",
+        &support::greeter_path("Teardown"),
         long_options(),
     )
     .await?;

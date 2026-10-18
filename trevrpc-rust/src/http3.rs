@@ -224,6 +224,13 @@ fn is_webtransport_request(request: &Request<()>) -> bool {
         && request.extensions().get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
 }
 
+/// The WebTransport protocol that names wire version 1.
+const WEBTRANSPORT_PROTOCOL: &str = "trevrpc-1";
+
+/// The CONNECT header listing the WebTransport protocols the client offers, an RFC 9651 list of
+/// strings (draft-ietf-webtrans-http3).
+const WT_AVAILABLE_PROTOCOLS: &str = "wt-available-protocols";
+
 fn validate_webtransport_request(server: &Server, request: &Request<()>) -> Option<StatusCode> {
     let origin = request
         .headers()
@@ -237,6 +244,39 @@ fn validate_webtransport_request(server: &Server, request: &Request<()>) -> Opti
         request.uri().scheme_str() == Some("https"),
         &admission_headers(request.headers()),
     )
+    .or_else(|| validate_webtransport_protocols(request.headers()))
+}
+
+/// Rejects a CONNECT that offers WebTransport protocols but not `trevrpc-1`.
+///
+/// A missing header means version 1, because older browsers cannot send it. A header that is not
+/// a list of strings is ignored, and so is an empty list, which RFC 9651 section 3.1 represents by
+/// not sending the field.
+///
+/// This server cannot answer with `WT-Protocol` to select `trevrpc-1`: `h3-webtransport` 0.1.2
+/// builds the CONNECT response itself, so its sessions carry no selected protocol, which clients
+/// treat as version 1. See "WebTransport Protocol Selection" in `wiki/Current-Limitations.md`.
+fn validate_webtransport_protocols(headers: &http::HeaderMap) -> Option<StatusCode> {
+    let offered = webtransport_offered_protocols(headers)?;
+    (!offered
+        .iter()
+        .any(|offered| offered == WEBTRANSPORT_PROTOCOL))
+    .then_some(StatusCode::BAD_REQUEST)
+}
+
+/// Returns the protocols the CONNECT offers, or `None` when the header is missing, malformed, or
+/// an empty list. Repeated header lines are combined into one list, as RFC 9651 specifies.
+fn webtransport_offered_protocols(headers: &http::HeaderMap) -> Option<Vec<String>> {
+    let mut values = headers.get_all(WT_AVAILABLE_PROTOCOLS).iter().peekable();
+    values.peek()?;
+    let mut combined = String::new();
+    for value in values {
+        if !combined.is_empty() {
+            combined.push(',');
+        }
+        combined.push_str(value.to_str().ok()?);
+    }
+    crate::structured_fields::parse_string_list(&combined).filter(|offered| !offered.is_empty())
 }
 
 async fn handle_webtransport_session(
@@ -435,5 +475,86 @@ impl BodySource for WebTransportSource {
         Some(RequestTransportEvent::connection_lost(
             self.1.closed().await,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::{HeaderMap, HeaderValue, StatusCode};
+
+    use super::{WT_AVAILABLE_PROTOCOLS, validate_webtransport_protocols};
+
+    fn headers(lines: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for line in lines {
+            headers.append(
+                WT_AVAILABLE_PROTOCOLS,
+                HeaderValue::from_str(line).expect("test header value should be valid"),
+            );
+        }
+        headers
+    }
+
+    fn check(lines: &[&str]) -> Option<StatusCode> {
+        validate_webtransport_protocols(&headers(lines))
+    }
+
+    #[test]
+    fn a_missing_header_means_version_1() {
+        assert_eq!(check(&[]), None);
+    }
+
+    #[test]
+    fn an_offer_that_includes_trevrpc_1_is_accepted() {
+        assert_eq!(check(&[r#""trevrpc-1""#]), None);
+        assert_eq!(check(&[r#""trevrpc-2", "trevrpc-1";v=2"#]), None);
+        assert_eq!(check(&[r#""trevrpc-2""#, r#""trevrpc-1""#]), None);
+    }
+
+    #[test]
+    fn an_offer_without_trevrpc_1_is_a_bad_request() {
+        for lines in [
+            &[r#""trevrpc-2""#][..],
+            &[r#""trevrpc-2", "other""#],
+            &[r#""trevrpc-2""#, r#""other""#],
+            // An empty field line contributes no members.
+            &["", r#""trevrpc-2""#],
+            &[r#""TREVRPC-1""#],
+            &[r#""trevrpc-1 ""#],
+            &[r#""trevrpc-11""#],
+        ] {
+            assert_eq!(check(lines), Some(StatusCode::BAD_REQUEST), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_list_is_treated_as_an_absent_header() {
+        assert_eq!(check(&[""]), None);
+        assert_eq!(check(&["   "]), None);
+        assert_eq!(check(&["", "  "]), None);
+    }
+
+    #[test]
+    fn a_malformed_header_is_ignored() {
+        for lines in [
+            &["trevrpc-2"][..],
+            &[r#""trevrpc-2"#],
+            &[r#""trevrpc-2","#],
+            &[r#"("trevrpc-2")"#],
+            &[r#""trevrpc-2""other""#],
+        ] {
+            assert_eq!(check(lines), None, "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_header_that_is_not_text_is_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            WT_AVAILABLE_PROTOCOLS,
+            HeaderValue::from_bytes(b"\"trevrpc-2\xff\"").expect("opaque bytes are allowed"),
+        );
+
+        assert_eq!(validate_webtransport_protocols(&headers), None);
     }
 }

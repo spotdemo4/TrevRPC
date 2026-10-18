@@ -197,6 +197,11 @@ export interface WebTransportCertificateHash {
 
 export interface WebTransportSessionLike extends Transport {
   readonly ready: Promise<unknown>;
+  /**
+   * The WebTransport protocol the server selected. An empty or missing value means wire version 1.
+   * Any other value than "trevrpc-1" fails the connection attempt with FailedPrecondition.
+   */
+  readonly protocol?: string;
   readonly closed: Promise<unknown>;
   close(closeInfo?: { closeCode?: number; reason?: string }): void;
 }
@@ -227,7 +232,10 @@ export interface ConnectOptions {
    * only: the WebSocket fallback needs a certificate the browser trusts.
    */
   serverCertificateHashes?: readonly WebTransportCertificateHash[];
-  /** WebTransport implementation to use instead of the global one. */
+  /**
+   * WebTransport implementation to use instead of the global one. It is constructed with
+   * `protocols: ["trevrpc-1"]`, the wire version, which cannot be changed.
+   */
   WebTransport?: new (url: string | URL, options?: object) => WebTransportSessionLike;
   /** Cancels the initial connection attempt only. */
   signal?: AbortSignal;

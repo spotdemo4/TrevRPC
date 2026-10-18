@@ -36,6 +36,10 @@ import kotlin.coroutines.resumeWithException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
+/**
+ * The media type that names TrevRPC wire version 1. Frames carry no version, so a server that
+ * does not serve this media type rejects the request with `415` before any RPC runs.
+ */
 internal const val TREV_RPC_CONTENT_TYPE = "application/trevrpc"
 
 /**

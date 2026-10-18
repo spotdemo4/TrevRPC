@@ -24,6 +24,11 @@ use trevrpc::{
 
 const CANCELLED_STREAM_CODE: u32 = 1;
 
+/// The path of a method of the example `Greeter` service, including ones it does not define.
+pub fn greeter_path(method: &str) -> String {
+    format!("/example.greeter.Greeter/{method}")
+}
+
 /// A receive stream that can be read for raw frames.
 pub trait RawRecv: Send {
     fn read_some(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<Option<usize>>> + Send;

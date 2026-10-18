@@ -97,7 +97,7 @@ func callUnaryTestClient(
 	stream *unaryTransportTestStream,
 ) (*testMessage, error) {
 	client := newStreamClient(unaryTestOpener{stream: stream}, DefaultMaxFrameSize)
-	return Unary(ctx, client, "service", "method", &testMessage{Value: "request"}, func() *testMessage { return &testMessage{} })
+	return Unary(ctx, client, "/service/method", &testMessage{Value: "request"}, func() *testMessage { return &testMessage{} })
 }
 
 func TestTransportUnaryWaitsForCleanPeerEOF(t *testing.T) {
@@ -238,7 +238,7 @@ func streamingTestResponse(t *testing.T, data []byte) (ServerStreamingCall[*test
 	stream := newUnaryTransportTestStream(data)
 	close(stream.eof)
 	client := newStreamClient(unaryTestOpener{stream: stream}, DefaultMaxFrameSize)
-	call, err := ServerStreaming(context.Background(), client, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} })
+	call, err := ServerStreaming(context.Background(), client, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestTransportRejectsOversizedResponseFrameBeforeReadingIt(t *testing.T) {
 	close(stream.eof)
 	client := newStreamClient(unaryTestOpener{stream: stream}, 1024)
 	allocated := measureAllocation(func() {
-		_, err := Unary(context.Background(), client, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} })
+		_, err := Unary(context.Background(), client, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} })
 		if StatusFromError(err).Code != CodeResourceExhausted {
 			t.Fatalf("Unary() = %v, want ResourceExhausted", err)
 		}

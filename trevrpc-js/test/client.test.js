@@ -12,7 +12,7 @@ import {
   encodeStatusFrame,
 } from "../src/framing.js";
 import { Code, TrevRpcError } from "../src/status.js";
-import { RpcKind, WireVersion, createRoot } from "../src/wire.js";
+import { RpcKind, createRoot } from "../src/wire.js";
 import { echoHandler } from "./echo-server.js";
 import { concatBytes, deferred, fakeTransport, turn } from "./support.js";
 
@@ -44,10 +44,8 @@ const metadataText = (metadata) =>
 test("unary calls send the request header and decode the response", async () => {
   const { echo, transport } = setup(async (stream) => {
     const request = await stream.readRequest();
-    assert.equal(request.service, "trevrpc.interop.v1.Echo");
-    assert.equal(request.method, "Unary");
+    assert.equal(request.method, "/trevrpc.interop.v1.Echo/Unary");
     assert.equal(request.kind, RpcKind.Unary);
-    assert.equal(request.version, WireVersion);
     assert.equal(text.decode(request.metadata.trace), "abc");
     assert.equal((await stream.readMessage(EchoRequest)).message, "hi");
     assert.equal(await stream.readFrame(), null, "request side is finished after the request");
@@ -314,10 +312,8 @@ test("unary and server-streaming calls send the request message with the REQUEST
     );
     const expected = encodeRequestFrame(
       {
-        service: "trevrpc.interop.v1.Echo",
-        method: method === "unary" ? "Unary" : "ServerStream",
+        method: `/trevrpc.interop.v1.Echo/${method === "unary" ? "Unary" : "ServerStream"}`,
         kind,
-        version: WireVersion,
       },
       EchoRequest.encode({ message: "hi" }).finish(),
     );
@@ -594,7 +590,7 @@ test("HEADERS after a MESSAGE fails the call", async () => {
 test("request frames are not valid on a response stream", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.write(encodeRequestFrame({ service: "s", method: "m", version: 1 }));
+    await stream.write(encodeRequestFrame({ method: "/s/m" }));
   });
   await assert.rejects(echo.unary({}), isStatus(Code.Internal));
 });
@@ -725,7 +721,7 @@ test("misplaced frames and undecodable messages fail the stream", async () => {
     [Code.InvalidArgument, encodeFrame(FrameType.Status, new Uint8Array([0x0a, 0xff]))],
     [Code.InvalidArgument, encodeMessageFrame(new Uint8Array([0x0a, 0xff]))],
     [Code.Internal, encodeStatusFrame({ metadata: { "trevrpc-x": [] } })],
-    [Code.Internal, encodeRequestFrame({ service: "s", method: "m", version: 1 })],
+    [Code.Internal, encodeRequestFrame({ method: "/s/m" })],
   ];
   for (const [code, bytes] of frames) {
     const { echo } = setup(async (stream) => {
@@ -1010,6 +1006,45 @@ test("the whole Echo service works against a fake server", async () => {
     echo.unary({ failCode: Code.NotFound, failMessage: "missing" }),
     isStatus(Code.NotFound, "missing"),
   );
+});
+
+test("the client sends the full method path and the Echo fake server routes on it", async () => {
+  const unaryOf = (service) =>
+    createServiceClient(fakeTransport(echoHandler), service, root).unary({ message: "hi" });
+  const method = (name) => ({
+    unary: {
+      name,
+      kind: "unary",
+      inputType: "trevrpc.interop.v1.EchoRequest",
+      outputType: "trevrpc.interop.v1.EchoResponse",
+    },
+  });
+
+  const echoService = { fullName: "trevrpc.interop.v1.Echo", methods: method("Unary") };
+  assert.equal((await unaryOf(echoService)).message, "hi");
+
+  // A well-formed path without a handler is Unimplemented, for an unknown method or service.
+  const missingMethod = { fullName: "trevrpc.interop.v1.Echo", methods: method("Missing") };
+  await assert.rejects(
+    unaryOf(missingMethod),
+    isStatus(Code.Unimplemented, "unknown method /trevrpc.interop.v1.Echo/Missing"),
+  );
+  const missingService = { fullName: "trevrpc.interop.v1.Other", methods: method("Unary") };
+  await assert.rejects(unaryOf(missingService), isStatus(Code.Unimplemented));
+
+  // Anything that is not exactly /<service>/<method> is InvalidArgument.
+  for (const [fullName, name] of [
+    ["", "Unary"],
+    ["trevrpc.interop.v1.Echo", ""],
+    ["a/b", "Unary"],
+    ["trevrpc.interop.v1.Echo", "Un/ary"],
+  ]) {
+    await assert.rejects(
+      unaryOf({ fullName, methods: method(name) }),
+      isStatus(Code.InvalidArgument),
+      `${fullName}/${name}`,
+    );
+  }
 });
 
 // Call termination: how a call ends when the server answers before the upload is done.

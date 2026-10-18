@@ -12,8 +12,6 @@ const (
 	// TLS application protocol of QMux over TLS and the WebSocket subprotocol of
 	// QMux over WebSocket.
 	QMuxALPN = "qmux-02.trevrpc-1"
-	// wireVersion is the current TrevRPC wire protocol version.
-	wireVersion = uint32(1)
 
 	// maxMetadataEntries is the maximum number of metadata entries per message.
 	maxMetadataEntries = 64
@@ -50,29 +48,51 @@ const (
 	RPCKindBidirectionalStreaming RPCKind = 3
 )
 
-// wireRequest is the payload of a REQUEST frame. Field 3 was the request body
-// and is reserved: the request message travels in a MESSAGE frame.
+// wireRequest is the payload of a REQUEST frame. Fields 2 (the method name),
+// 3 (the request body) and 6 (the wire version) are reserved: the method is the
+// full path in field 1, the request message travels in a MESSAGE frame, and
+// transports fix the wire version while negotiating.
 type wireRequest struct {
-	Service      string   `protobuf:"bytes,1,opt,name=service,proto3" json:"service,omitempty"`
-	Method       string   `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	// Method is the method path "/package.Service/Method".
+	Method       string   `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
 	Metadata     Metadata `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 	Kind         RPCKind  `protobuf:"varint,5,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
-	Version      uint32   `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
 	TimeoutNanos uint64   `protobuf:"varint,7,opt,name=timeout_nanos,json=timeoutNanos,proto3" json:"timeout_nanos,omitempty"`
 	// Extensions lists the extension IDs the client supports (field 8). The
 	// registry is empty, so clients send none and servers ignore the field.
 	Extensions []uint64 `protobuf:"varint,8,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
 }
 
-// newWireRequest creates a unary RPC request with the current wire version.
-func newWireRequest(service, method string) *wireRequest {
+// newWireRequest creates a unary RPC request for the method path
+// "/package.Service/Method".
+func newWireRequest(method string) *wireRequest {
 	return &wireRequest{
-		Service:  service,
 		Method:   method,
 		Metadata: Metadata{},
 		Kind:     RPCKindUnary,
-		Version:  wireVersion,
 	}
+}
+
+// splitMethodPath splits a method path "/service/method" into its parts, which
+// are substrings of path. A path is well-formed when it has exactly two
+// slashes, the first at index 0, and both parts are non-empty.
+func splitMethodPath(path string) (service, method string, ok bool) {
+	if path == "" || path[0] != '/' {
+		return "", "", false
+	}
+	rest := path[1:]
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 || slash == len(rest)-1 || strings.IndexByte(rest[slash+1:], '/') >= 0 {
+		return "", "", false
+	}
+	return rest[:slash], rest[slash+1:], true
+}
+
+// serviceAndMethod returns the service and method parts of the request's
+// method path, or empty strings when the path is malformed.
+func (m *wireRequest) serviceAndMethod() (service, method string) {
+	service, method, _ = splitMethodPath(m.Method)
+	return service, method
 }
 
 // Reset clears the request for protobuf compatibility.
@@ -84,10 +104,10 @@ func (m *wireRequest) String() string { return fmt.Sprintf("%+v", *m) }
 // ProtoMessage marks wireRequest as a protobuf message.
 func (*wireRequest) ProtoMessage() {}
 
-// validateProtocol validates the request wire version and RPC kind.
+// validateProtocol validates the request method path and RPC kind.
 func (m *wireRequest) validateProtocol() error {
-	if m.Version != wireVersion {
-		return FailedPrecondition(fmt.Sprintf("unsupported TrevRPC wire version %d; expected %d", m.Version, wireVersion))
+	if _, _, ok := splitMethodPath(m.Method); !ok {
+		return InvalidArgument("malformed RPC method path; expected /<service>/<method>")
 	}
 
 	if !m.Kind.isValid() {

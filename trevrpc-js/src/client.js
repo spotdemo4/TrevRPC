@@ -11,8 +11,8 @@ export function createServiceClient(transport, service, root, options = {}) {
 
   for (const [jsName, method] of Object.entries(service.methods)) {
     const rpc = {
-      service: service.fullName,
-      method: method.name,
+      // The wire method path, computed once per method rather than per call.
+      path: `/${service.fullName}/${method.name}`,
       requestType: root.lookupType(method.inputType),
       responseType: root.lookupType(method.outputType),
     };
@@ -572,7 +572,7 @@ function deferred() {
 }
 
 function requestFields(rpc, kind) {
-  return { service: rpc.service, method: rpc.method, kind };
+  return { method: rpc.path, kind };
 }
 
 function validateResponseMetadata(metadata, what) {

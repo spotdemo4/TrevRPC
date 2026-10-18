@@ -9,13 +9,14 @@ import (
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 )
 
-// Names of the Greeter service and its methods.
+// Full method paths ("/package.Service/Method") of the Greeter service.
+//
+//nolint:staticcheck // mirrors the {Service}_{Method}_FullMethodName names protoc-gen-trevrpc-go generates
 const (
-	ServiceName           = "example.greeter.Greeter"
-	MethodSayHello        = "SayHello"
-	MethodLotsOfReplies   = "LotsOfReplies"
-	MethodLotsOfGreetings = "LotsOfGreetings"
-	MethodBidiHello       = "BidiHello"
+	Greeter_SayHello_FullMethodName        = "/example.greeter.Greeter/SayHello"
+	Greeter_LotsOfReplies_FullMethodName   = "/example.greeter.Greeter/LotsOfReplies"
+	Greeter_LotsOfGreetings_FullMethodName = "/example.greeter.Greeter/LotsOfGreetings"
+	Greeter_BidiHello_FullMethodName       = "/example.greeter.Greeter/BidiHello"
 )
 
 // HelloRequest is the request message of the Greeter methods.
@@ -84,28 +85,28 @@ func (c *GreeterClient) mergedCallOptions(overrides []trevrpc.CallOption) []trev
 
 // SayHello calls the SayHello method.
 func (c *GreeterClient) SayHello(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (*HelloReply, error) {
-	return trevrpc.Unary[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodSayHello, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+	return trevrpc.Unary[*HelloRequest, *HelloReply](ctx, c.transport, Greeter_SayHello_FullMethodName, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 // LotsOfReplies calls the LotsOfReplies method.
 func (c *GreeterClient) LotsOfReplies(ctx context.Context, request *HelloRequest, options ...trevrpc.CallOption) (trevrpc.ServerStreamingCall[*HelloReply], error) {
-	return trevrpc.ServerStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfReplies, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+	return trevrpc.ServerStreaming[*HelloRequest, *HelloReply](ctx, c.transport, Greeter_LotsOfReplies_FullMethodName, request, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 // LotsOfGreetings calls the LotsOfGreetings method.
 func (c *GreeterClient) LotsOfGreetings(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*HelloRequest, *HelloReply], error) {
-	return trevrpc.ClientStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodLotsOfGreetings, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+	return trevrpc.ClientStreaming[*HelloRequest, *HelloReply](ctx, c.transport, Greeter_LotsOfGreetings_FullMethodName, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 // BidiHello calls the BidiHello method.
 func (c *GreeterClient) BidiHello(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*HelloRequest, *HelloReply], error) {
-	return trevrpc.BidirectionalStreaming[*HelloRequest, *HelloReply](ctx, c.transport, ServiceName, MethodBidiHello, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
+	return trevrpc.BidirectionalStreaming[*HelloRequest, *HelloReply](ctx, c.transport, Greeter_BidiHello_FullMethodName, func() *HelloReply { return &HelloReply{} }, c.mergedCallOptions(options)...)
 }
 
 // RegisterGreeterServer registers implementation as the Greeter service on server.
 func RegisterGreeterServer(server *trevrpc.Server, implementation GreeterServer) {
-	trevrpc.RegisterUnary[*HelloRequest, *HelloReply](server, ServiceName, MethodSayHello, func() *HelloRequest { return &HelloRequest{} }, implementation.SayHello)
-	trevrpc.RegisterServerStreaming[*HelloRequest, *HelloReply](server, ServiceName, MethodLotsOfReplies, func() *HelloRequest { return &HelloRequest{} }, implementation.LotsOfReplies)
-	trevrpc.RegisterClientStreaming[*HelloRequest, *HelloReply](server, ServiceName, MethodLotsOfGreetings, func() *HelloRequest { return &HelloRequest{} }, implementation.LotsOfGreetings)
-	trevrpc.RegisterBidirectionalStreaming[*HelloRequest, *HelloReply](server, ServiceName, MethodBidiHello, func() *HelloRequest { return &HelloRequest{} }, implementation.BidiHello)
+	trevrpc.RegisterUnary[*HelloRequest, *HelloReply](server, Greeter_SayHello_FullMethodName, func() *HelloRequest { return &HelloRequest{} }, implementation.SayHello)
+	trevrpc.RegisterServerStreaming[*HelloRequest, *HelloReply](server, Greeter_LotsOfReplies_FullMethodName, func() *HelloRequest { return &HelloRequest{} }, implementation.LotsOfReplies)
+	trevrpc.RegisterClientStreaming[*HelloRequest, *HelloReply](server, Greeter_LotsOfGreetings_FullMethodName, func() *HelloRequest { return &HelloRequest{} }, implementation.LotsOfGreetings)
+	trevrpc.RegisterBidirectionalStreaming[*HelloRequest, *HelloReply](server, Greeter_BidiHello_FullMethodName, func() *HelloRequest { return &HelloRequest{} }, implementation.BidiHello)
 }

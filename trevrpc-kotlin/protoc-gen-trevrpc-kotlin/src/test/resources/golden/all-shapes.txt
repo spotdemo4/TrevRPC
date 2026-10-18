@@ -3,22 +3,21 @@ private val trevrpcCodec0: zip.trev.trevrpc.MessageCodec<example.generated.Hello
         decode = { body -> zip.trev.trevrpc.decodeProtobuf(body, example.generated.HelloRequest.getDescriptor(), example.generated.HelloRequest::parseFrom) },
 private val trevrpcCodec1: zip.trev.trevrpc.MessageCodec<example.generated.HelloReply> =
         decode = { body -> zip.trev.trevrpc.decodeProtobuf(body, example.generated.HelloReply.getDescriptor(), example.generated.HelloReply::parseFrom) },
-public const val GREETER_SERVICE_NAME: String = "hello.v1.Greeter"
-public const val GREETER_SAY_HELLO_METHOD_NAME: String = "SayHello"
-public const val GREETER_LOTS_OF_REPLIES_METHOD_NAME: String = "LotsOfReplies"
-public const val GREETER_LOTS_OF_GREETINGS_METHOD_NAME: String = "LotsOfGreetings"
-public const val GREETER_BIDI_HELLO_METHOD_NAME: String = "BidiHello"
+public const val GREETER_SAY_HELLO_PATH: String = "/hello.v1.Greeter/SayHello"
+public const val GREETER_LOTS_OF_REPLIES_PATH: String = "/hello.v1.Greeter/LotsOfReplies"
+public const val GREETER_LOTS_OF_GREETINGS_PATH: String = "/hello.v1.Greeter/LotsOfGreetings"
+public const val GREETER_BIDI_HELLO_PATH: String = "/hello.v1.Greeter/BidiHello"
 public class GreeterClient(
     public suspend fun sayHelloResponse(
     ): zip.trev.trevrpc.ResponseEnvelope<example.generated.HelloReply> =
-        client.unaryResponse(GREETER_SERVICE_NAME, GREETER_SAY_HELLO_METHOD_NAME, request, trevrpcCodec0, trevrpcCodec1, options)
+        client.unaryResponse(GREETER_SAY_HELLO_PATH, request, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun sayHello(
     public suspend fun lotsOfRepliesResponse(
-        client.serverStreaming(GREETER_SERVICE_NAME, GREETER_LOTS_OF_REPLIES_METHOD_NAME, request, trevrpcCodec0, trevrpcCodec1, options)
+        client.serverStreaming(GREETER_LOTS_OF_REPLIES_PATH, request, trevrpcCodec0, trevrpcCodec1, options)
     public fun lotsOfReplies(
     ): Flow<example.generated.HelloReply> =
     public suspend fun lotsOfGreetingsResponse(
-        client.clientStreaming(GREETER_SERVICE_NAME, GREETER_LOTS_OF_GREETINGS_METHOD_NAME, trevrpcCodec0, trevrpcCodec1, options)
+        client.clientStreaming(GREETER_LOTS_OF_GREETINGS_PATH, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun lotsOfGreetings(
     public suspend fun lotsOfGreetingsResponse(
         requests: Flow<example.generated.HelloRequest>,
@@ -26,7 +25,7 @@ public class GreeterClient(
     public suspend fun lotsOfGreetings(
         requests: Flow<example.generated.HelloRequest>,
     public suspend fun bidiHelloResponse(
-        client.bidirectionalStreaming(GREETER_SERVICE_NAME, GREETER_BIDI_HELLO_METHOD_NAME, trevrpcCodec0, trevrpcCodec1, options)
+        client.bidirectionalStreaming(GREETER_BIDI_HELLO_PATH, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun bidiHello(
     public fun bidiHello(
         requests: Flow<example.generated.HelloRequest>,

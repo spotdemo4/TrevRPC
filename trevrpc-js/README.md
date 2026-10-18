@@ -119,7 +119,9 @@ const channel = await connect(url, {
 
 `serverCertificateHashes` trusts a self-signed ECDSA certificate that is valid for at most 14 days by its SHA-256 hash, which is how development servers and the interop tests are reached. It applies to WebTransport only: the WebSocket fallback needs a certificate the browser trusts. `allowPooling`, `congestionControl` and `requireUnreliable` are passed to the `WebTransport` constructor.
 
-Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client.
+`connect()` always offers the WebTransport protocol `trevrpc-1` (wire version 1) through the `protocols` constructor option; it cannot be changed. If the server selects any other protocol, that connection attempt fails with `Code.FailedPrecondition` and the channel carries on as after any failed dial: the WebSocket fallback starts, or a reconnect is retried with backoff. An empty or missing selection means version 1, because older browsers cannot negotiate protocols and the Rust server cannot echo one.
+
+Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
 
 ### WebSocket fallback
 

@@ -58,8 +58,7 @@ func requestVector(name string, request *wireRequest) goldenVector {
 				t.Fatalf("frame type = %v, want REQUEST", got.Kind)
 			}
 			decoded := got.Request
-			if decoded.Service != request.Service || decoded.Method != request.Method || decoded.Kind != request.Kind ||
-				decoded.Version != request.Version || decoded.TimeoutNanos != request.TimeoutNanos ||
+			if decoded.Method != request.Method || decoded.Kind != request.Kind || decoded.TimeoutNanos != request.TimeoutNanos ||
 				!slices.Equal(decoded.Extensions, request.Extensions) || !metadataEqual(decoded.Metadata, request.Metadata) {
 				t.Fatalf("decoded request = %#v, want %#v", decoded, request)
 			}
@@ -70,12 +69,12 @@ func requestVector(name string, request *wireRequest) goldenVector {
 func TestWireGoldenVectors(t *testing.T) {
 	vectors := loadWireGoldenVectors(t)
 
-	withMetadata := newWireRequest("svc", "m")
+	withMetadata := newWireRequest("/svc/m")
 	withMetadata.Metadata["authorization"] = []byte("ok")
-	bidi := newWireRequest("svc", "m")
+	bidi := newWireRequest("/svc/m")
 	bidi.Kind = RPCKindBidirectionalStreaming
 	bidi.TimeoutNanos = 123456
-	extensions := newWireRequest("svc", "m")
+	extensions := newWireRequest("/svc/m")
 	extensions.Extensions = []uint64{1, 300}
 
 	statusVector := func(name string, status *Status) goldenVector {
@@ -130,7 +129,7 @@ func TestWireGoldenVectors(t *testing.T) {
 	}
 
 	tests := []goldenVector{
-		requestVector("request.unary", newWireRequest("svc", "m")),
+		requestVector("request.unary", newWireRequest("/svc/m")),
 		requestVector("request.bidi_timeout", bidi),
 		requestVector("request.metadata", withMetadata),
 		requestVector("request.extensions", extensions),

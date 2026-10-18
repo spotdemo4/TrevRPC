@@ -30,6 +30,9 @@ const (
 	testOrigin      = "https://app.example.test"
 )
 
+// testPath returns the method path of method in testServiceName.
+func testPath(method string) string { return "/" + testServiceName + "/" + method }
+
 // testPKI is a self-signed localhost certificate with matching client trust.
 type testPKI struct {
 	server *tls.Config
@@ -72,7 +75,7 @@ func newTestMessage() *testMessage { return &testMessage{} }
 
 // registerTestService registers one handler per RPC shape.
 func registerTestService(server *Server) {
-	RegisterUnary(server, testServiceName, "Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*Response[*testMessage], error) {
+	RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*Response[*testMessage], error) {
 		switch request.Value {
 		case "missing":
 			return nil, NotFound("nothing here")
@@ -87,7 +90,7 @@ func registerTestService(server *Server) {
 			Metadata: trailers,
 		}, nil
 	})
-	RegisterServerStreaming(server, testServiceName, "Count", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
+	RegisterServerStreaming(server, "/example.Greeter/Count", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		replies := make([]*testMessage, 0, 3)
 		for _, suffix := range []string{"1", "2", "3"} {
 			replies = append(replies, &testMessage{Value: request.Value + suffix})
@@ -96,11 +99,11 @@ func registerTestService(server *Server) {
 	})
 	// Gated sends its headers at once and its only message once the test
 	// opens the gate registered under the request value.
-	RegisterServerStreaming(server, testServiceName, "Gated", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
+	RegisterServerStreaming(server, "/example.Greeter/Gated", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		gate, _ := testGates.Load(request.Value)
 		return withTestHeaders(ctx, &gatedStream{ctx: ctx, gate: gate.(chan struct{})}), nil
 	})
-	RegisterClientStreaming(server, testServiceName, "Concat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
+	RegisterClientStreaming(server, "/example.Greeter/Concat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
 		var joined strings.Builder
 		for request, err := range Messages(requests) {
 			if err != nil {
@@ -112,10 +115,10 @@ func registerTestService(server *Server) {
 		return &Response[*testMessage]{Message: &testMessage{Value: joined.String()}, Headers: headers, Metadata: trailers}, nil
 	})
 	// FailFast fails a bidirectional call without reading any request message.
-	server.routeStreaming(testServiceName, "FailFast", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
+	server.routeStreaming("/example.Greeter/FailFast", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
 		return streamResponse{}, NewStatus(CodeAborted, "abort")
 	})
-	RegisterBidirectionalStreaming(server, testServiceName, "Chat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
+	RegisterBidirectionalStreaming(server, "/example.Greeter/Chat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
 		return withTestHeaders(ctx, &upperStream{requests: requests}), nil
 	})
 }
@@ -267,26 +270,26 @@ func exerciseRPCShapes(t *testing.T, transport Transport) {
 	defer cancel()
 
 	t.Run("unary", func(t *testing.T) {
-		reply, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "hello"}, newTestMessage, WithMetadata("suffix", []byte("!")))
+		reply, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "hello"}, newTestMessage, WithMetadata("suffix", []byte("!")))
 		if err != nil || reply.Value != "hello!" {
 			t.Fatalf("reply = %v, err = %v", reply, err)
 		}
 	})
 	t.Run("unary error", func(t *testing.T) {
-		_, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "missing"}, newTestMessage)
+		_, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "missing"}, newTestMessage)
 		if status := StatusFromError(err); status.Code != CodeNotFound || status.Message != "nothing here" {
 			t.Fatalf("status = %v", status)
 		}
 	})
 	t.Run("unary large", func(t *testing.T) {
 		large := strings.Repeat("x", 1<<20)
-		reply, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: large}, newTestMessage)
+		reply, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: large}, newTestMessage)
 		if err != nil || reply.Value != large {
 			t.Fatalf("large echo failed: err=%v", err)
 		}
 	})
 	t.Run("unknown method", func(t *testing.T) {
-		_, err := Unary(ctx, transport, testServiceName, "Nope", &testMessage{}, newTestMessage)
+		_, err := Unary(ctx, transport, "/example.Greeter/Nope", &testMessage{}, newTestMessage)
 		if status := StatusFromError(err); status.Code != CodeUnimplemented {
 			t.Fatalf("status = %v", status)
 		}
@@ -295,13 +298,13 @@ func exerciseRPCShapes(t *testing.T, transport Transport) {
 		exerciseResponseHeaders(ctx, t, transport)
 	})
 	t.Run("unary deadline", func(t *testing.T) {
-		_, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "slow"}, newTestMessage, WithTimeout(100*time.Millisecond))
+		_, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "slow"}, newTestMessage, WithTimeout(100*time.Millisecond))
 		if status := StatusFromError(err); status.Code != CodeDeadlineExceeded {
 			t.Fatalf("status = %v", status)
 		}
 	})
 	t.Run("server streaming", func(t *testing.T) {
-		stream, err := ServerStreaming(ctx, transport, testServiceName, "Count", &testMessage{Value: "n"}, newTestMessage)
+		stream, err := ServerStreaming(ctx, transport, "/example.Greeter/Count", &testMessage{Value: "n"}, newTestMessage)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -317,13 +320,13 @@ func exerciseRPCShapes(t *testing.T, transport Transport) {
 		}
 	})
 	t.Run("client streaming", func(t *testing.T) {
-		reply, err := runTestClientStreaming(ctx, transport, testServiceName, "Concat", []string{"a", "b", "c"})
+		reply, err := runTestClientStreaming(ctx, transport, "/example.Greeter/Concat", []string{"a", "b", "c"})
 		if err != nil || reply.Value != "abc" {
 			t.Fatalf("reply = %v, err = %v", reply, err)
 		}
 	})
 	t.Run("bidirectional streaming", func(t *testing.T) {
-		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "Chat", newTestMessage)
+		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/example.Greeter/Chat", newTestMessage)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -362,7 +365,7 @@ func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transp
 
 	t.Run("unary", func(t *testing.T) {
 		var headers, trailers Metadata
-		reply, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "hello"}, newTestMessage, want, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers))
+		reply, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "hello"}, newTestMessage, want, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers))
 		if err != nil || reply.Value != "hello" {
 			t.Fatalf("reply = %v, err = %v", reply, err)
 		}
@@ -370,7 +373,7 @@ func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transp
 		requireHeaders(t, "trailing metadata", trailers, testTrailerKey, "v")
 
 		headers, trailers = Metadata{"stale": nil}, Metadata{"stale": nil}
-		if _, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: "hello"}, newTestMessage, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers)); err != nil {
+		if _, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "hello"}, newTestMessage, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers)); err != nil {
 			t.Fatal(err)
 		}
 		if len(headers) != 0 || len(trailers) != 0 {
@@ -379,7 +382,7 @@ func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transp
 	})
 	t.Run("client streaming", func(t *testing.T) {
 		var headers, trailers Metadata
-		reply, err := runTestClientStreaming(ctx, transport, testServiceName, "Concat", []string{"a", "b"}, want, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers))
+		reply, err := runTestClientStreaming(ctx, transport, "/example.Greeter/Concat", []string{"a", "b"}, want, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers))
 		if err != nil || reply.Value != "ab" {
 			t.Fatalf("reply = %v, err = %v", reply, err)
 		}
@@ -387,7 +390,7 @@ func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transp
 		requireHeaders(t, "trailing metadata", trailers, testTrailerKey, "v")
 	})
 	t.Run("server streaming", func(t *testing.T) {
-		stream, err := ServerStreaming(ctx, transport, testServiceName, "Count", &testMessage{Value: "n"}, newTestMessage, want)
+		stream, err := ServerStreaming(ctx, transport, "/example.Greeter/Count", &testMessage{Value: "n"}, newTestMessage, want)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -416,7 +419,7 @@ func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transp
 		}
 	})
 	t.Run("server streaming without headers", func(t *testing.T) {
-		stream, err := ServerStreaming(ctx, transport, testServiceName, "Count", &testMessage{Value: "n"}, newTestMessage)
+		stream, err := ServerStreaming(ctx, transport, "/example.Greeter/Count", &testMessage{Value: "n"}, newTestMessage)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -432,7 +435,7 @@ func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transp
 		gate := make(chan struct{})
 		testGates.Store("gated", gate)
 		defer testGates.Delete("gated")
-		stream, err := ServerStreaming(ctx, transport, testServiceName, "Gated", &testMessage{Value: "gated"}, newTestMessage, want)
+		stream, err := ServerStreaming(ctx, transport, "/example.Greeter/Gated", &testMessage{Value: "gated"}, newTestMessage, want)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -450,7 +453,7 @@ func exerciseResponseHeaders(ctx context.Context, t *testing.T, transport Transp
 		}
 	})
 	t.Run("bidirectional streaming", func(t *testing.T) {
-		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, testServiceName, "Chat", newTestMessage, want)
+		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/example.Greeter/Chat", newTestMessage, want)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -549,7 +552,7 @@ func TestListenerCloseStopsServeAndDrainsConnections(t *testing.T) {
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- listener.Serve(context.Background()) }()
 	channel := dialNative(t, pki, listener)
-	if _, err := Unary(context.Background(), channel, testServiceName, "Echo", &testMessage{Value: "x"}, newTestMessage); err != nil {
+	if _, err := Unary(context.Background(), channel, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage); err != nil {
 		t.Fatal(err)
 	}
 
@@ -599,7 +602,7 @@ func TestListenerShutdownClosesEveryTransportPromptly(t *testing.T) {
 		"qmux":           newQMuxTestClient(t, pki, listener),
 		"qmux websocket": newWebSocketTestClient(t, pki, listener, ""),
 	} {
-		if _, err := Unary(context.Background(), transport, testServiceName, "Echo", &testMessage{Value: name}, newTestMessage); err != nil {
+		if _, err := Unary(context.Background(), transport, "/example.Greeter/Echo", &testMessage{Value: name}, newTestMessage); err != nil {
 			t.Fatalf("%s call: %v", name, err)
 		}
 	}
@@ -624,7 +627,7 @@ func TestShutdownCancelsInFlightHandlers(t *testing.T) {
 	handlerCancelled := make(chan struct{})
 	handlerStarted := make(chan struct{})
 	server := NewServer()
-	routeBytes(server, testServiceName, "Block", func(ctx context.Context, _ []byte) ([]byte, error) {
+	routeBytes(server, "/example.Greeter/Block", func(ctx context.Context, _ []byte) ([]byte, error) {
 		close(handlerStarted)
 		<-ctx.Done()
 		close(handlerCancelled)
@@ -641,7 +644,7 @@ func TestShutdownCancelsInFlightHandlers(t *testing.T) {
 
 	callDone := make(chan error, 1)
 	go func() {
-		_, err := Unary(context.Background(), channel, testServiceName, "Block", &testMessage{}, newTestMessage)
+		_, err := Unary(context.Background(), channel, "/example.Greeter/Block", &testMessage{}, newTestMessage)
 		callDone <- err
 	}()
 	<-handlerStarted
@@ -663,14 +666,14 @@ func TestConnectionLimitClosesExcessConnections(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, func(options *ServerOptions) { options.MaxConcurrentConnections = 1 })
 	first := dialNative(t, pki, listener)
-	if _, err := Unary(context.Background(), first, testServiceName, "Echo", &testMessage{Value: "x"}, newTestMessage); err != nil {
+	if _, err := Unary(context.Background(), first, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage); err != nil {
 		t.Fatal(err)
 	}
 
 	second := dialNative(t, pki, listener)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	if _, err := Unary(ctx, second, testServiceName, "Echo", &testMessage{Value: "x"}, newTestMessage); err == nil {
+	if _, err := Unary(ctx, second, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage); err == nil {
 		t.Fatal("call on a connection over the limit succeeded")
 	}
 }
@@ -688,7 +691,7 @@ func TestChannelReconnectsToRestartedServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeOnCleanup(t, channel)
-	if _, err := Unary(ctx, channel, testServiceName, "Echo", &testMessage{Value: "before"}, newTestMessage); err != nil {
+	if _, err := Unary(ctx, channel, "/example.Greeter/Echo", &testMessage{Value: "before"}, newTestMessage); err != nil {
 		t.Fatal(err)
 	}
 
@@ -718,7 +721,7 @@ func TestChannelReconnectsToRestartedServer(t *testing.T) {
 	if generation := channel.Generation(); generation != 2 {
 		t.Fatalf("generation = %d, want 2", generation)
 	}
-	reply, err := Unary(ctx, channel, testServiceName, "Echo", &testMessage{Value: "after"}, newTestMessage)
+	reply, err := Unary(ctx, channel, "/example.Greeter/Echo", &testMessage{Value: "after"}, newTestMessage)
 	if err != nil || reply.Value != "after" {
 		t.Fatalf("call after reconnect: %v, %v", reply, err)
 	}
@@ -851,6 +854,135 @@ func TestWebTransportAdmissionAndPath(t *testing.T) {
 	}
 }
 
+func TestWebTransportNegotiatesTheWireVersion(t *testing.T) {
+	pki := newTestPKI(t)
+	var diagnostics sync.Map
+	listener := startTestListenerWith(t, pki, nil, func(server *Server) {
+		registerTestService(server)
+		server.SetDiagnostics(func(event ServerDiagnostic) {
+			if event.Phase == ServerDiagnosticSessionAdmission {
+				diagnostics.Store(event.Message, event)
+			}
+		})
+	})
+
+	tests := []struct {
+		name         string
+		dial         webTransportTestDial
+		wantStatus   int // 0 means the session is established
+		wantSelected string
+	}{
+		{
+			name:         "offered",
+			dial:         webTransportTestDial{protocols: []string{"trevrpc-1"}},
+			wantSelected: "trevrpc-1",
+		},
+		{
+			name:         "offered after an unknown version",
+			dial:         webTransportTestDial{protocols: []string{"trevrpc-2", "trevrpc-1"}},
+			wantSelected: "trevrpc-1",
+		},
+		{
+			name:         "offered with parameters",
+			dial:         webTransportTestDial{protocols: []string{"trevrpc-1"}, available: `"trevrpc-2";q=1, "trevrpc-1";q=0.5`},
+			wantSelected: "trevrpc-1",
+		},
+		{
+			name: "no field means version 1",
+			dial: webTransportTestDial{},
+		},
+		{
+			name: "empty field is absent",
+			dial: webTransportTestDial{available: " "},
+		},
+		{
+			name: "malformed field is ignored",
+			dial: webTransportTestDial{available: `trevrpc-2`},
+		},
+		{
+			name: "field of the wrong type is ignored",
+			dial: webTransportTestDial{available: `("trevrpc-2")`},
+		},
+		{
+			name:       "only another version",
+			dial:       webTransportTestDial{protocols: []string{"trevrpc-2"}},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "only other protocols",
+			dial:       webTransportTestDial{protocols: []string{"chat", "trevrpc-10"}},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.dial.origin = testOrigin
+			response, session, err := dialWebTransportTest(pki, listener, tt.dial)
+			if session != nil {
+				defer func() { _ = session.CloseWithError(0, "test done") }()
+			}
+			if response != nil {
+				defer func() { _ = response.Body.Close() }()
+			}
+			if tt.wantStatus != 0 {
+				if err == nil || response == nil || response.StatusCode != tt.wantStatus {
+					t.Fatalf("dial: status = %v, err = %v, want status %d", response, err, tt.wantStatus)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			if got := session.SessionState().ApplicationProtocol; got != tt.wantSelected {
+				t.Fatalf("selected protocol = %q, want %q", got, tt.wantSelected)
+			}
+			// The session carries RPCs.
+			transport := newStreamClient(webTransportTestOpener{session}, DefaultMaxFrameSize)
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+			defer cancel()
+			reply, err := Unary(ctx, transport, testPath("Echo"), &testMessage{Value: "hi"}, newTestMessage)
+			if err != nil || reply.Value != "hi" {
+				t.Fatalf("Unary() = %v, %v", reply, err)
+			}
+		})
+	}
+
+	const wantMessage = `unsupported WebTransport protocol; offered "chat", "trevrpc-10"`
+	// Diagnostics are delivered asynchronously.
+	deadline := time.Now().Add(rpcTestTimeout)
+	for {
+		if _, ok := diagnostics.Load(wantMessage); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no session admission diagnostic %q", wantMessage)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestWebTransportProtocolMismatchSkipsAdmission(t *testing.T) {
+	pki := newTestPKI(t)
+	var admissions atomic.Int64
+	listener := startTestListener(t, pki, func(options *ServerOptions) {
+		options.WebTransportAdmission = func(AdmissionRequest) bool {
+			admissions.Add(1)
+			return true
+		}
+	})
+	response, session, err := dialWebTransportTest(pki, listener, webTransportTestDial{origin: testOrigin, protocols: []string{"trevrpc-2"}})
+	if session != nil {
+		_ = session.CloseWithError(0, "")
+	}
+	if response == nil || response.StatusCode != http.StatusBadRequest || err == nil {
+		t.Fatalf("dial: response = %v, err = %v, want 400", response, err)
+	}
+	_ = response.Body.Close()
+	if admissions.Load() != 0 {
+		t.Errorf("admission callbacks = %d, want 0 for a request the server cannot serve", admissions.Load())
+	}
+}
+
 // WebTransport SETTINGS codepoints from draft-ietf-webtrans-http3-14.
 const (
 	settingWTMaxSessions           = 0x14e9cd29
@@ -924,7 +1056,7 @@ func TestWebTransportSessionFlowControlReplenishesCredit(t *testing.T) {
 	// server's ~128 KiB and the client's 64 KiB session data windows.
 	value := strings.Repeat("x", 32*1024)
 	for i := range 16 {
-		reply, err := Unary(ctx, transport, testServiceName, "Echo", &testMessage{Value: value}, newTestMessage)
+		reply, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: value}, newTestMessage)
 		if err != nil || reply.Value != value {
 			t.Fatalf("call %d: err = %v", i, err)
 		}
@@ -974,7 +1106,7 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request := newWireRequest(testServiceName, "FailFast")
+			request := newWireRequest(testPath("FailFast"))
 			request.Kind = RPCKindBidirectionalStreaming
 			writeTestRequestFrame(t, stream, request)
 
@@ -1023,7 +1155,7 @@ func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := newWireRequest(testServiceName, "FailFast")
+	request := newWireRequest(testPath("FailFast"))
 	request.Kind = RPCKindBidirectionalStreaming
 	writeTestRequestFrame(t, stream, request)
 	readTestFrame(t, stream)

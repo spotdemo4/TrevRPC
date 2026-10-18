@@ -14,13 +14,14 @@ enum class RpcKind(
     }
 }
 
-/** REQUEST frame payload. The request message travels separately in MESSAGE frames. */
+/**
+ * REQUEST frame payload. The request message travels separately in MESSAGE frames. [method] is the
+ * method path `/package.Service/Method`. Frames carry no wire version: the transport fixes it.
+ */
 data class RpcRequest(
-    val service: String,
     val method: String,
     val metadata: Metadata = Metadata.EMPTY,
     val kindValue: Int = RpcKind.UNARY.value,
-    val version: UInt = WIRE_VERSION,
     val timeoutNanos: ULong = 0uL,
     val extensions: List<ULong> = emptyList(),
 ) {

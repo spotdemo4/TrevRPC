@@ -72,25 +72,25 @@ func TestClientEntryPointsTransmitEffectiveDeadline(t *testing.T) {
 		call func(context.Context, Transport, ...CallOption) error
 	}{
 		{name: "unary", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			_, err := Unary(ctx, transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
+			_, err := Unary(ctx, transport, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
 			return err
 		}},
 		{name: "server streaming", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			stream, err := ServerStreaming(ctx, transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
+			stream, err := ServerStreaming(ctx, transport, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...)
 			if err != nil {
 				return err
 			}
 			return stream.Close()
 		}},
 		{name: "client streaming", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, "service", "method", func() *testMessage { return &testMessage{} }, options...)
+			call, err := ClientStreaming[*testMessage, *testMessage](ctx, transport, "/service/method", func() *testMessage { return &testMessage{} }, options...)
 			if err != nil {
 				return err
 			}
 			return call.Close()
 		}},
 		{name: "bidirectional", call: func(ctx context.Context, transport Transport, options ...CallOption) error {
-			call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "service", "method", func() *testMessage { return &testMessage{} }, options...)
+			call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/service/method", func() *testMessage { return &testMessage{} }, options...)
 			if err != nil {
 				return err
 			}
@@ -148,8 +148,7 @@ func TestParentCancellationWithoutTimeoutOption(t *testing.T) {
 		_, err := Unary(
 			ctx,
 			transport,
-			"service",
-			"method",
+			"/service/method",
 			&testMessage{},
 			func() *testMessage { return &testMessage{} },
 		)
@@ -181,7 +180,7 @@ func TestClientMetadataOptionsOwnSnapshots(t *testing.T) {
 
 	transport := &mutatingClientTransport{responseBody: responseBody}
 	for range 2 {
-		if _, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...); err != nil {
+		if _, err := Unary(context.Background(), transport, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} }, options...); err != nil {
 			t.Fatalf("unary call failed: %v", err)
 		}
 	}
@@ -213,8 +212,7 @@ func TestPrepareClientRequestClonesCustomOptionMetadataForAsyncUse(t *testing.T)
 		_, err := Unary(
 			context.Background(),
 			transport,
-			"service",
-			"method",
+			"/service/method",
 			&testMessage{},
 			func() *testMessage { return &testMessage{} },
 			func(config *callConfig) { config.metadata = metadata },
@@ -244,7 +242,7 @@ func TestResponseMetadataIsCapturedForUnaryAndClientStreaming(t *testing.T) {
 	newMessage := func() *testMessage { return &testMessage{} }
 
 	var unaryMetadata Metadata
-	unary, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, newMessage, CaptureResponseMetadata(&unaryMetadata))
+	unary, err := Unary(context.Background(), transport, "/service/method", &testMessage{}, newMessage, CaptureResponseMetadata(&unaryMetadata))
 	if err != nil {
 		t.Fatalf("unary call: %v", err)
 	}
@@ -253,7 +251,7 @@ func TestResponseMetadataIsCapturedForUnaryAndClientStreaming(t *testing.T) {
 	}
 
 	var streamMetadata Metadata
-	call, err := ClientStreaming[*testMessage, *testMessage](context.Background(), transport, "service", "method", newMessage, CaptureResponseMetadata(&streamMetadata))
+	call, err := ClientStreaming[*testMessage, *testMessage](context.Background(), transport, "/service/method", newMessage, CaptureResponseMetadata(&streamMetadata))
 	if err != nil {
 		t.Fatalf("start client stream: %v", err)
 	}
@@ -272,7 +270,7 @@ func TestResponseMetadataIsCapturedForUnaryAndClientStreaming(t *testing.T) {
 func TestResponseMetadataIsNotCapturedOnFailure(t *testing.T) {
 	transport := &capturingClientTransport{status: Unavailable("down"), metadata: Metadata{"result": []byte("ok")}}
 	captured := Metadata{"sentinel": []byte("kept")}
-	_, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, CaptureResponseMetadata(&captured))
+	_, err := Unary(context.Background(), transport, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} }, CaptureResponseMetadata(&captured))
 	status := StatusFromError(err)
 	if status.Code != CodeUnavailable || string(status.Metadata["result"]) != "ok" {
 		t.Fatalf("failure status = %#v, want Unavailable carrying the response metadata", status)
@@ -292,7 +290,7 @@ func TestBidirectionalStreamingExposesTerminalMetadata(t *testing.T) {
 		metadata:     Metadata{"result": []byte("ok")},
 	}
 
-	bidi, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), transport, "service", "method", func() *testMessage { return &testMessage{} })
+	bidi, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), transport, "/service/method", func() *testMessage { return &testMessage{} })
 	if err != nil {
 		t.Fatalf("start bidi stream: %v", err)
 	}
@@ -884,7 +882,7 @@ func TestResponseHeadersAreCapturedForUnaryAndClientStreaming(t *testing.T) {
 	newMessage := func() *testMessage { return &testMessage{} }
 
 	var headers, trailers Metadata
-	if _, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, newMessage, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers)); err != nil {
+	if _, err := Unary(context.Background(), transport, "/service/method", &testMessage{}, newMessage, CaptureResponseHeaders(&headers), CaptureResponseMetadata(&trailers)); err != nil {
 		t.Fatalf("unary call: %v", err)
 	}
 	if string(headers["x-h"]) != "header" || len(headers) != 1 || string(trailers["result"]) != "trailer" || len(trailers) != 1 {
@@ -892,7 +890,7 @@ func TestResponseHeadersAreCapturedForUnaryAndClientStreaming(t *testing.T) {
 	}
 
 	var streamHeaders Metadata
-	call, err := ClientStreaming[*testMessage, *testMessage](context.Background(), transport, "service", "method", newMessage, CaptureResponseHeaders(&streamHeaders))
+	call, err := ClientStreaming[*testMessage, *testMessage](context.Background(), transport, "/service/method", newMessage, CaptureResponseHeaders(&streamHeaders))
 	if err != nil {
 		t.Fatalf("start client stream: %v", err)
 	}
@@ -907,14 +905,14 @@ func TestResponseHeadersAreCapturedForUnaryAndClientStreaming(t *testing.T) {
 	}
 
 	// Headers of server- and bidirectional-streaming calls come from Headers.
-	stream, err := ServerStreaming(context.Background(), transport, "service", "method", &testMessage{}, newMessage)
+	stream, err := ServerStreaming(context.Background(), transport, "/service/method", &testMessage{}, newMessage)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := stream.Headers(); err != nil || string(got["x-h"]) != "header" {
 		t.Fatalf("server-streaming Headers() = %v, %v", got, err)
 	}
-	bidi, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), transport, "service", "method", newMessage)
+	bidi, err := BidirectionalStreaming[*testMessage, *testMessage](context.Background(), transport, "/service/method", newMessage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -926,7 +924,7 @@ func TestResponseHeadersAreCapturedForUnaryAndClientStreaming(t *testing.T) {
 func TestResponseHeadersAreNotCapturedOnFailure(t *testing.T) {
 	transport := &capturingClientTransport{status: Unavailable("down"), headers: Metadata{"x-h": []byte("header")}}
 	captured := Metadata{"sentinel": []byte("kept")}
-	_, err := Unary(context.Background(), transport, "service", "method", &testMessage{}, func() *testMessage { return &testMessage{} }, CaptureResponseHeaders(&captured))
+	_, err := Unary(context.Background(), transport, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} }, CaptureResponseHeaders(&captured))
 	if StatusFromError(err).Code != CodeUnavailable {
 		t.Fatalf("Unary() = %v, want Unavailable", err)
 	}

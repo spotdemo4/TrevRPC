@@ -84,6 +84,18 @@ let envelope = client.say_hello_envelope(greeter::HelloRequest { name: "Alice".i
 let (reply, headers, trailers) = envelope.into_parts();
 ```
 
+### Method paths
+
+A call names its method by one path, `/package.Service/Method`. The generator emits the paths of each service as constants in a `<service>_paths` module (`greeter::greeter_paths::SAY_HELLO` is `"/example.greeter.Greeter/SayHello"`), and the generated clients and `register_*` functions use them. The lower-level API takes the path directly:
+
+```rust
+let reply: greeter::HelloReply =
+    trevrpc::client::unary(&channel, greeter::greeter_paths::SAY_HELLO, &request, options).await?;
+server.route(greeter::greeter_paths::SAY_HELLO, |body| async move { Ok(body) });
+```
+
+`Server::route*` panic when the path is not exactly `/<service>/<method>` with both parts non-empty. A request with a malformed path is rejected with `InvalidArgument`, and a well-formed path with no handler with `Unimplemented`. `RequestContext::service()`, `method()` and `full_method()` return the parts and the whole path.
+
 ## Server
 
 The complete, runnable version is [`examples/greeter_server.rs`](examples/greeter_server.rs).
@@ -147,7 +159,7 @@ server.set_options(
 );
 ```
 
-WebTransport policy: a session must use the shared path, then pass the authority and origin allowlists. With no allowlists, requests that carry an `Origin` header (every browser) are denied; requests without one are admitted. `with_webtransport_admission` installs a callback that replaces the allowlists (the path is still checked first). `with_http_admission` is the equivalent hook for HTTP/3 `POST`.
+WebTransport policy: a session must use the shared path, then pass the authority and origin allowlists. With no allowlists, requests that carry an `Origin` header (every browser) are denied; requests without one are admitted. `with_webtransport_admission` installs a callback that replaces the allowlists (the path is still checked first). `with_http_admission` is the equivalent hook for HTTP/3 `POST`. A CONNECT whose `WT-Available-Protocols` header offers WebTransport protocols but not `trevrpc-1` gets `400`; a missing, empty or malformed header means version 1. The server cannot send `WT-Protocol` back (see "WebTransport Protocol Selection" in the wiki's Current Limitations).
 
 `Server::serve_with_shutdown` drains in-flight RPCs for up to `ServerOptions::graceful_shutdown_timeout` before closing the endpoint.
 

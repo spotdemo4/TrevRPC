@@ -53,7 +53,7 @@ func serveTestStream(t *testing.T, server *Server, input []byte) (*countingRPCSt
 }
 
 func requestFor(method string, kind RPCKind) *wireRequest {
-	request := newWireRequest(testServiceName, method)
+	request := newWireRequest(testPath(method))
 	request.Kind = kind
 	return request
 }
@@ -131,11 +131,11 @@ func TestServerSkipsUnknownFramesEverywhere(t *testing.T) {
 func TestServerRejectsKnownFramesOutOfPlace(t *testing.T) {
 	var called atomic.Int64
 	server := newProtocolTestServer()
-	server.routeUnary(testServiceName, "Probe", func(context.Context, []byte) (*unaryReply, error) {
+	server.routeUnary("/example.Greeter/Probe", func(context.Context, []byte) (*unaryReply, error) {
 		called.Add(1)
 		return &unaryReply{message: rawMessage(nil)}, nil
 	})
-	server.routeStreaming(testServiceName, "Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
+	server.routeStreaming("/example.Greeter/Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
 		called.Add(1)
 		return rawResponse()
 	})
@@ -260,7 +260,7 @@ func TestServerDoesNotSendHeadersWithoutAny(t *testing.T) {
 	_, frames := serveTestStream(t, server, request)
 	requireReply(t, frames, "hi")
 
-	withHeaders := newWireRequest(testServiceName, "Echo")
+	withHeaders := newWireRequest(testPath("Echo"))
 	withHeaders.Metadata[testWantHeadersKey] = []byte("v")
 	_, frames = serveTestStream(t, server, testRequestBytes(t, withHeaders, encodedTestMessage(t, "hi")))
 	if len(frames) != 3 || frames[0].Kind != frameTypeHeaders || frames[1].Kind != frameTypeMessage || frames[2].Kind != frameTypeStatus {
@@ -274,7 +274,7 @@ func TestServerStreamingHeadersAreWrittenBeforeTheFirstMessageIsPulled(t *testin
 	server := NewServer()
 	release := make(chan struct{})
 	pulled := make(chan struct{})
-	RegisterServerStreaming(server, testServiceName, "Slow", newTestMessage, func(_ context.Context, _ *testMessage) (MessageStream[*testMessage], error) {
+	RegisterServerStreaming(server, "/example.Greeter/Slow", newTestMessage, func(_ context.Context, _ *testMessage) (MessageStream[*testMessage], error) {
 		return WithResponseHeaders(&notifyingStream{pulled: pulled, release: release}, Metadata{"x-h": []byte("1")}), nil
 	})
 	request := testRequestBytes(t, requestFor("Slow", RPCKindServerStreaming), "")
@@ -349,10 +349,10 @@ func (*notifyingStream) Close() error { return nil }
 
 func TestResponseHeadersAreValidated(t *testing.T) {
 	server := NewServer()
-	RegisterUnary(server, testServiceName, "Echo", newTestMessage, func(context.Context, *testMessage) (*Response[*testMessage], error) {
+	RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(context.Context, *testMessage) (*Response[*testMessage], error) {
 		return &Response[*testMessage]{Message: &testMessage{}, Headers: Metadata{"Bad Key": nil}}, nil
 	})
-	RegisterServerStreaming(server, testServiceName, "Count", newTestMessage, func(context.Context, *testMessage) (MessageStream[*testMessage], error) {
+	RegisterServerStreaming(server, "/example.Greeter/Count", newTestMessage, func(context.Context, *testMessage) (MessageStream[*testMessage], error) {
 		return WithResponseHeaders[*testMessage](newSliceStream[*testMessage](), Metadata{"trevrpc-reserved": nil}), nil
 	})
 	for _, test := range []struct {

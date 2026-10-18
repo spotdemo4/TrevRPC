@@ -29,6 +29,7 @@ pub mod server;
 mod server_transport;
 pub mod status;
 pub mod stream;
+mod structured_fields;
 mod sync;
 pub mod tcp;
 #[cfg(test)]

@@ -1,6 +1,5 @@
 package zip.trev.trevrpc
 
-const val WIRE_VERSION: UInt = 1u
 const val DEFAULT_MAX_FRAME_SIZE: Int = 4 * 1024 * 1024
 const val MAX_METADATA_ENTRIES: Int = 64
 const val MAX_METADATA_KEY_LENGTH: Int = 128

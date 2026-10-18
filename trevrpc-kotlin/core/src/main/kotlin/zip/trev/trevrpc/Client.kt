@@ -121,17 +121,15 @@ class Client(
     private val responseContext: CoroutineContext = Dispatchers.Default,
 ) {
     suspend fun <Req, Res> unary(
-        service: String,
-        method: String,
+        path: String,
         request: Req,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
-    ): Res = unaryResponse(service, method, request, requestCodec, responseCodec, options).message
+    ): Res = unaryResponse(path, request, requestCodec, responseCodec, options).message
 
     suspend fun <Req, Res> unaryResponse(
-        service: String,
-        method: String,
+        path: String,
         request: Req,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
@@ -140,7 +138,7 @@ class Client(
         // A unary call has no stream-idle bound, only the call deadline.
         val state =
             open(
-                request(service, method, RpcKind.UNARY, options),
+                request(path, RpcKind.UNARY, options),
                 requestCodec.encode(request),
                 responseCodec,
                 options,
@@ -151,8 +149,7 @@ class Client(
     }
 
     suspend fun <Req, Res> serverStreaming(
-        service: String,
-        method: String,
+        path: String,
         request: Req,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
@@ -160,7 +157,7 @@ class Client(
     ): ServerStreamingCall<Res> {
         val state =
             open(
-                request(service, method, RpcKind.SERVER_STREAMING, options),
+                request(path, RpcKind.SERVER_STREAMING, options),
                 requestCodec.encode(request),
                 responseCodec,
                 options,
@@ -170,24 +167,22 @@ class Client(
     }
 
     suspend fun <Req, Res> clientStreaming(
-        service: String,
-        method: String,
+        path: String,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): ClientStreamingCall<Req, Res> {
-        val state = open(request(service, method, RpcKind.CLIENT_STREAMING, options), null, responseCodec, options)
+        val state = open(request(path, RpcKind.CLIENT_STREAMING, options), null, responseCodec, options)
         return ClientStreamingCall(state.writer, requestCodec, state.reader)
     }
 
     suspend fun <Req, Res> bidirectionalStreaming(
-        service: String,
-        method: String,
+        path: String,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): BidirectionalStreamingCall<Req, Res> {
-        val state = open(request(service, method, RpcKind.BIDIRECTIONAL_STREAMING, options), null, responseCodec, options)
+        val state = open(request(path, RpcKind.BIDIRECTIONAL_STREAMING, options), null, responseCodec, options)
         return BidirectionalStreamingCall(state.writer, requestCodec, state.reader)
     }
 
@@ -710,14 +705,12 @@ internal suspend fun <T> ResponseReader<T>.receiveSingle(kind: String): Response
 }
 
 private fun request(
-    service: String,
-    method: String,
+    path: String,
     kind: RpcKind,
     options: CallOptions,
 ): RpcRequest =
     RpcRequest(
-        service = service,
-        method = method,
+        method = path,
         metadata = options.metadata,
         kindValue = kind.value,
         timeoutNanos = timeoutNanos(options.timeout),

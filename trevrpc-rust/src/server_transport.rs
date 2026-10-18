@@ -589,7 +589,7 @@ mod tests {
     fn request_frame(kind: RpcKind) -> Vec<u8> {
         encode_protobuf_frame(
             frame_type::REQUEST,
-            &RpcRequest::new("svc", "m").with_kind(kind),
+            &RpcRequest::new("/svc/m").with_kind(kind),
             DEFAULT_MAX_FRAME_SIZE,
         )
         .expect("request should encode")

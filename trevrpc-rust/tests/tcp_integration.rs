@@ -187,7 +187,7 @@ async fn connect_tls(
 
 /// The request frames of a unary `SayHello` call: REQUEST, then its one MESSAGE.
 fn unary_frame(name: &str) -> TestResult<Vec<u8>> {
-    let request = trevrpc::RpcRequest::new(greeter::GreeterClient::<()>::SERVICE, "SayHello");
+    let request = trevrpc::RpcRequest::new(greeter::greeter_paths::SAY_HELLO);
     let mut frames = trevrpc::framing::encode_protobuf_frame(
         trevrpc::framing::frame_type::REQUEST,
         &request,
