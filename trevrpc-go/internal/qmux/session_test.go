@@ -25,6 +25,13 @@ func testParameters() Parameters {
 // sessionPair opens a client and a server session over loopback TCP.
 func sessionPair(t *testing.T, client, server Config) (*Session, *Session) {
 	t.Helper()
+	clientConn, serverConn := tcpPair(t)
+	return openPair(t, clientConn, serverConn, client, server)
+}
+
+// tcpPair connects two loopback TCP connections.
+func tcpPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
 	var listenConfig net.ListenConfig
 	listener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
@@ -44,7 +51,7 @@ func sessionPair(t *testing.T, client, server Config) (*Session, *Session) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return openPair(t, clientConn, serverConn, client, server)
+	return clientConn, serverConn
 }
 
 func openPair(t *testing.T, clientConn, serverConn net.Conn, client, server Config) (*Session, *Session) {
@@ -433,4 +440,61 @@ func TestLargeWritesWithLargeRecordsComplete(t *testing.T) {
 	client, server := sessionPair(t, Config{Parameters: params}, Config{Parameters: params})
 	go echo(server)
 	roundTrip(t, client, bytes.Repeat([]byte("x"), 3<<20+17))
+}
+
+// A session that dies without a CONNECTION_CLOSE must end every operation that waits on it, with no
+// deadline to rescue them.
+func TestSessionLossFailsPendingOperations(t *testing.T) {
+	config := Config{Parameters: testParameters()}
+	config.Parameters.InitialMaxStreamsBidi = 1
+	clientConn, serverConn := tcpPair(t)
+	client, _ := openPair(t, clientConn, serverConn, config, config)
+
+	// The server never reads or writes, so these streams wait for it.
+	reading, err := client.OpenStreamSync(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := map[string]chan error{
+		"read":   make(chan error, 1),
+		"write":  make(chan error, 1),
+		"open":   make(chan error, 1),
+		"accept": make(chan error, 1),
+	}
+	go func() {
+		_, err := reading.Read(make([]byte, 1))
+		pending["read"] <- err
+	}()
+	go func() {
+		// More than the flow control window and the send buffer hold.
+		_, err := reading.Write(make([]byte, 64<<20))
+		pending["write"] <- err
+	}()
+	go func() {
+		_, err := client.OpenStreamSync(context.Background())
+		pending["open"] <- err
+	}()
+	go func() {
+		_, err := client.AcceptStream(context.Background())
+		pending["accept"] <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	_ = serverConn.Close()
+
+	for name, result := range pending {
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrConnectionLost) {
+				t.Errorf("%s failed with %v, want connection lost", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Errorf("%s is still waiting after the session died", name)
+		}
+	}
+	select {
+	case <-reading.Context().Done():
+	case <-time.After(time.Second):
+		t.Error("the stream context outlived the session")
+	}
 }

@@ -13,7 +13,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::http_admission::{admission_headers, validate_webtransport_admission};
 use crate::native;
-use crate::qmux_conn::{MAX_RECORD_SIZE, server_config};
+use crate::qmux_conn::{MAX_RECORD_SIZE, QmuxConnection, server_config};
 use crate::server::Server;
 
 /// The [`crate::QMUX_ALPN`] identifier as a WebSocket subprotocol.
@@ -48,7 +48,13 @@ pub async fn handle_connection<T>(
         .with_alpn(SUBPROTOCOL)
         .with_session_config(server_config(server.options()))
         .accept();
-    native::handle_connection(server, session, request_limit, shutdown).await;
+    native::handle_connection(
+        server,
+        QmuxConnection::from(session),
+        request_limit,
+        shutdown,
+    )
+    .await;
 }
 
 /// Admits a WebSocket upgrade like a `WebTransport` session: same path, same admission policy.

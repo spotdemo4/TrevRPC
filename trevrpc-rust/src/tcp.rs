@@ -8,7 +8,7 @@ use http::HeaderValue;
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 
-use crate::qmux_conn::{MAX_RECORD_SIZE, server_config};
+use crate::qmux_conn::{MAX_RECORD_SIZE, QmuxConnection, server_config};
 use crate::server::Server;
 use crate::{http2, native, websocket};
 
@@ -75,7 +75,13 @@ pub(crate) async fn handle_connection(
             let Ok(session) = qmux::Session::accept(transport, config).await else {
                 return;
             };
-            native::handle_connection(server, session, request_limit, shutdown).await;
+            native::handle_connection(
+                server,
+                QmuxConnection::from(session),
+                request_limit,
+                shutdown,
+            )
+            .await;
         }
         Some(H2_ALPN) if options.http_enabled() => {
             http2::handle_connection(

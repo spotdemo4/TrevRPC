@@ -10,15 +10,17 @@ use futures_util::StreamExt;
 use prost::Message;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Barrier, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use trevrpc::Status;
 use trevrpc::client::{
-    CallOptions, Channel, ChannelConfig, QmuxTransport, StreamingRpcTransport, TransportKind,
-    TransportPolicy,
+    CallOptions, Channel, ChannelConfig, QmuxTransport, RpcTransport, StreamingRpcTransport,
+    TransportKind, TransportPolicy,
 };
-use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissionRequest};
+use trevrpc::server::{
+    CancellationSource, RequestContext, Server, ServerOptions, WebTransportAdmissionRequest,
+};
 use trevrpc::tcp::TcpFallback;
+use trevrpc::{Code, RpcKind, Status};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
 #[allow(dead_code)]
@@ -119,6 +121,14 @@ impl RunningServer {
 }
 
 async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
+    spawn_server_with(options, |_| {}).await
+}
+
+/// Spawns a server with the greeter and whatever routes `configure` adds.
+async fn spawn_server_with(
+    options: ServerOptions,
+    configure: impl FnOnce(&mut Server),
+) -> TestResult<RunningServer> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
     let cert_der = CertificateDer::from(cert.cert);
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
@@ -129,6 +139,7 @@ async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
     let mut server = Server::new();
     server.set_options(options);
     greeter::register_greeter(&mut server, Greeter);
+    configure(&mut server);
     let endpoint = quinn::Endpoint::server(
         server.quic_config(tls.clone())?,
         SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -178,8 +189,16 @@ async fn connect_tls(
     server: &RunningServer,
     alpn: &[u8],
 ) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
-    let stream = TcpStream::connect(server.tcp).await?;
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls(&server.cert, alpn)?));
+    connect_tls_at(server.tcp, &server.cert, alpn).await
+}
+
+async fn connect_tls_at(
+    addr: SocketAddr,
+    cert: &CertificateDer<'static>,
+    alpn: &[u8],
+) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
+    let stream = TcpStream::connect(addr).await?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls(cert, alpn)?));
     Ok(connector
         .connect(ServerName::try_from("localhost")?, stream)
         .await?)
@@ -187,7 +206,16 @@ async fn connect_tls(
 
 /// The request frames of a unary `SayHello` call: REQUEST, then its one MESSAGE.
 fn unary_frame(name: &str) -> TestResult<Vec<u8>> {
-    let request = trevrpc::RpcRequest::new(greeter::greeter_paths::SAY_HELLO);
+    request_frames(
+        greeter::greeter_paths::SAY_HELLO,
+        trevrpc::RpcKind::Unary,
+        name,
+    )
+}
+
+/// The frames that start an RPC: REQUEST, then one MESSAGE carrying a `HelloRequest`.
+fn request_frames(path: &str, kind: trevrpc::RpcKind, name: &str) -> TestResult<Vec<u8>> {
+    let request = trevrpc::RpcRequest::new(path).with_kind(kind);
     let mut frames = trevrpc::framing::encode_protobuf_frame(
         trevrpc::framing::frame_type::REQUEST,
         &request,
@@ -400,9 +428,18 @@ async fn websocket_session(
     origin: &str,
     subprotocol: &str,
 ) -> TestResult<std::result::Result<qmux::Session, http::StatusCode>> {
-    let tls = connect_tls(server, b"http/1.1").await?;
-    let request = http::Request::get(format!("wss://localhost:{}/trevrpc", server.tcp.port()))
-        .header("Host", format!("localhost:{}", server.tcp.port()))
+    websocket_session_at(server.tcp, &server.cert, origin, subprotocol).await
+}
+
+async fn websocket_session_at(
+    addr: SocketAddr,
+    cert: &CertificateDer<'static>,
+    origin: &str,
+    subprotocol: &str,
+) -> TestResult<std::result::Result<qmux::Session, http::StatusCode>> {
+    let tls = connect_tls_at(addr, cert, b"http/1.1").await?;
+    let request = http::Request::get(format!("wss://localhost:{}/trevrpc", addr.port()))
+        .header("Host", format!("localhost:{}", addr.port()))
         .header("Origin", origin)
         .header("Sec-WebSocket-Protocol", subprotocol)
         .header(
@@ -543,5 +580,311 @@ async fn channel_can_use_tcp_only() -> TestResult {
         .await?;
     ensure_eq!(reply.message, "hello, tcp");
     channel.close();
+    server.stop().await
+}
+
+// A `QMux` session can die while calls are in flight. Every call must then fail, and the server
+// must cancel its handlers, without waiting for a deadline or an idle timeout.
+
+/// How long an in-flight call has to notice that its session died. None of these calls has a
+/// deadline, so a hang would otherwise last forever.
+const PROMPT: Duration = Duration::from_secs(1);
+
+const HANG_UNARY: &str = "/loss.Hang/Unary";
+const HANG_SERVER_STREAM: &str = "/loss.Hang/ServerStream";
+const HANG_BIDI: &str = "/loss.Hang/Bidi";
+const IDLE_BIDI: &str = "/loss.Hang/IdleBidi";
+const BARRIER: &str = "/loss.Hang/Barrier";
+const HANGING_ROUTES: usize = 4;
+
+/// What the server's hanging handlers report.
+struct HandlerEvents {
+    started: mpsc::UnboundedReceiver<&'static str>,
+    cancelled: mpsc::UnboundedReceiver<(&'static str, CancellationSource)>,
+}
+
+impl HandlerEvents {
+    async fn all_started(&mut self) -> TestResult {
+        for _ in 0..HANGING_ROUTES {
+            tokio::time::timeout(TEST_TIMEOUT, self.started.recv())
+                .await?
+                .ok_or("server dropped its handler events")?;
+        }
+        Ok(())
+    }
+
+    /// Waits for every hanging handler to see its call cancelled because the connection was lost.
+    async fn all_connection_lost(&mut self) -> TestResult {
+        let mut names = Vec::new();
+        for _ in 0..HANGING_ROUTES {
+            let (name, source) = tokio::time::timeout(PROMPT, self.cancelled.recv())
+                .await
+                .map_err(|_| format!("handlers cancelled so far: {names:?}"))?
+                .ok_or("server dropped its handler events")?;
+            ensure_eq!(source, CancellationSource::ConnectionLost, "{name}");
+            names.push(name);
+        }
+        Ok(())
+    }
+}
+
+/// Registers handlers that wait until their call is cancelled, a `BARRIER` route that completes
+/// once `HANGING_ROUTES` calls are in it at once, and returns what the hanging handlers report.
+fn register_hanging_routes(server: &mut Server) -> HandlerEvents {
+    let (started_tx, started) = mpsc::unbounded_channel();
+    let (cancelled_tx, cancelled) = mpsc::unbounded_channel();
+
+    // The server stops polling a handler once its call is cancelled, so a task reports that.
+    let watch = move |name: &'static str, context: RequestContext| {
+        let _ = started_tx.send(name);
+        let cancelled_tx = cancelled_tx.clone();
+        tokio::spawn(async move {
+            let source = context.cancelled_signal().await;
+            let _ = cancelled_tx.send((name, source));
+        });
+    };
+
+    let hang = watch.clone();
+    server.route_with_context(HANG_UNARY, move |context, _body| {
+        hang(HANG_UNARY, context);
+        std::future::pending()
+    });
+    for (path, kind) in [
+        (HANG_SERVER_STREAM, RpcKind::ServerStreaming),
+        (HANG_BIDI, RpcKind::BidirectionalStreaming),
+    ] {
+        let hang = watch.clone();
+        server.route_streaming_with_context(path, kind, move |context, _body, _requests| {
+            hang(path, context);
+            std::future::pending()
+        });
+    }
+    // This one has responded already: the server is writing its response, which never has more.
+    let idle = watch;
+    server.route_streaming_with_context(
+        IDLE_BIDI,
+        RpcKind::BidirectionalStreaming,
+        move |context, _body, _requests| {
+            idle(IDLE_BIDI, context);
+            let silence: trevrpc::BoxStream<Vec<u8>> = Box::pin(futures_util::stream::pending());
+            std::future::ready(Ok(silence))
+        },
+    );
+
+    let barrier = Arc::new(Barrier::new(HANGING_ROUTES));
+    server.route(BARRIER, move |_body| {
+        let barrier = barrier.clone();
+        async move {
+            barrier.wait().await;
+            Ok(Vec::new())
+        }
+    });
+
+    HandlerEvents { started, cancelled }
+}
+
+/// A TCP relay for one connection that can be cut abruptly, like a network failure.
+struct Relay {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl Relay {
+    async fn to(target: SocketAddr) -> TestResult<Self> {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut server) = TcpStream::connect(target).await else {
+                return;
+            };
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        });
+        Ok(Self { addr, task })
+    }
+
+    /// Drops both TCP connections.
+    async fn cut(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+fn hanging_options() -> ServerOptions {
+    // Few enough request slots that a pinned one is noticed.
+    test_options().with_max_concurrent_requests(Some(HANGING_ROUTES))
+}
+
+/// Asserts that a call without a deadline failed within `PROMPT` as `Unavailable`.
+async fn ensure_unavailable(name: &str, call: JoinHandle<trevrpc::Result<()>>) -> TestResult {
+    let result = tokio::time::timeout(PROMPT, call)
+        .await
+        .map_err(|_| format!("{name} is still waiting {PROMPT:?} after the session died"))??;
+    let error = result.err().ok_or_else(|| format!("{name} succeeded"))?;
+    let status = error.into_status();
+    ensure_eq!(
+        status.code(),
+        Code::Unavailable,
+        "{name}: {}",
+        status.message()
+    );
+    Ok(())
+}
+
+/// Checks that the server released the request slots of the lost calls: the barrier route only
+/// completes when `HANGING_ROUTES` calls are in it at once.
+async fn ensure_request_slots_released(server: &RunningServer) -> TestResult {
+    let transport = Arc::new(
+        QmuxTransport::connect(
+            server.tcp,
+            "localhost",
+            client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+        )
+        .await?,
+    );
+    let calls = (0..HANGING_ROUTES).map(|_| {
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            transport
+                .call(trevrpc::RpcRequest::new(BARRIER), Vec::new())
+                .await
+                .map(drop)
+        })
+    });
+    let results = tokio::time::timeout(PROMPT, futures_util::future::join_all(calls))
+        .await
+        .map_err(|_| "the server still holds the request slots of the lost calls")?;
+    for result in results {
+        result??;
+    }
+    transport.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn qmux_calls_fail_promptly_when_the_session_dies() -> TestResult {
+    let mut events = None;
+    let server = spawn_server_with(hanging_options(), |server| {
+        events = Some(register_hanging_routes(server));
+    })
+    .await?;
+    let mut events = events.ok_or("routes were not registered")?;
+    let relay = Relay::to(server.tcp).await?;
+    let transport = QmuxTransport::connect(
+        relay.addr,
+        "localhost",
+        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+    )
+    .await?;
+
+    let hello = greeter::HelloRequest {
+        name: "hang".to_owned(),
+    };
+    let unary = tokio::spawn({
+        let (transport, hello) = (transport.clone(), hello.clone());
+        async move {
+            trevrpc::client::unary::<_, _, greeter::HelloReply>(
+                &transport,
+                HANG_UNARY,
+                &hello,
+                CallOptions::default(),
+            )
+            .await
+            .map(drop)
+        }
+    });
+    let server_stream = tokio::spawn({
+        let (transport, hello) = (transport.clone(), hello.clone());
+        async move {
+            let mut replies = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+                &transport,
+                HANG_SERVER_STREAM,
+                &hello,
+                CallOptions::default(),
+            )
+            .await?;
+            match replies.next().await {
+                Some(Err(error)) => Err(error),
+                _ => Ok(()),
+            }
+        }
+    });
+    let bidi = |path: &'static str| {
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            let mut call = trevrpc::client::bidirectional_streaming::<
+                _,
+                greeter::HelloRequest,
+                greeter::HelloReply,
+            >(&transport, path, CallOptions::default())
+            .await?;
+            call.recv().await.map(drop)
+        })
+    };
+    let bidi_calls = [("bidi", bidi(HANG_BIDI)), ("idle bidi", bidi(IDLE_BIDI))];
+    events.all_started().await?;
+
+    relay.cut().await;
+
+    ensure_unavailable("unary", unary).await?;
+    ensure_unavailable("server-streaming read", server_stream).await?;
+    for (name, call) in bidi_calls {
+        ensure_unavailable(name, call).await?;
+    }
+    // The dead session also refuses new calls rather than waiting.
+    let new_call = tokio::time::timeout(
+        PROMPT,
+        transport.call(trevrpc::RpcRequest::new(HANG_UNARY), Vec::new()),
+    )
+    .await
+    .map_err(|_| "a call on the dead session is still waiting")?;
+    ensure_eq!(
+        new_call.err().map(|error| error.into_status().code()),
+        Some(Code::Unavailable)
+    );
+    // The handlers see the loss too, since the cut ended the server's session as well.
+    events.all_connection_lost().await?;
+    ensure_request_slots_released(&server).await?;
+    server.stop().await
+}
+
+#[tokio::test]
+async fn qmux_over_websocket_handlers_are_cancelled_when_the_client_connection_dies() -> TestResult
+{
+    let mut events = None;
+    let server = spawn_server_with(hanging_options(), |server| {
+        events = Some(register_hanging_routes(server));
+    })
+    .await?;
+    let mut events = events.ok_or("routes were not registered")?;
+    let relay = Relay::to(server.tcp).await?;
+    let session = websocket_session_at(relay.addr, &server.cert, ORIGIN, "qmux-02.trevrpc-1")
+        .await?
+        .map_err(|status| format!("WebSocket upgrade refused with {status}"))?;
+
+    // Each stream is left open for the client's request, as a real client's would be.
+    let mut streams = Vec::new();
+    for (path, kind) in [
+        (HANG_UNARY, RpcKind::Unary),
+        (HANG_SERVER_STREAM, RpcKind::ServerStreaming),
+        (HANG_BIDI, RpcKind::BidirectionalStreaming),
+        (IDLE_BIDI, RpcKind::BidirectionalStreaming),
+    ] {
+        let (mut send, recv) = session.open_bi().await?;
+        send.write_all(&request_frames(path, kind, "hang")?).await?;
+        if kind != RpcKind::BidirectionalStreaming {
+            send.finish()?;
+        }
+        streams.push((send, recv));
+    }
+    events.all_started().await?;
+
+    relay.cut().await;
+
+    events.all_connection_lost().await?;
+    ensure_request_slots_released(&server).await?;
+    drop(streams);
     server.stop().await
 }

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use web_transport_trait::Session as _;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
-use crate::qmux_conn::client_config;
+use crate::mux::MuxConnection as _;
+use crate::qmux_conn::{QmuxConnection, client_config};
 use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
 
 use bytes::Bytes;
@@ -25,7 +25,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The transport never reconnects. Most applications should use [`super::Channel`], which
 /// falls back to it when QUIC is unavailable.
 #[derive(Clone)]
-pub struct QmuxTransport(Arc<NativeTransport<qmux::Session>>);
+pub struct QmuxTransport(Arc<NativeTransport<QmuxConnection>>);
 
 impl QmuxTransport {
     /// Connects to the TCP listener of a `TrevRPC` server with the default maximum frame size.
@@ -90,7 +90,7 @@ impl QmuxTransport {
             .await
             .map_err(Error::transport)?;
         Ok(Self(Arc::new(NativeTransport {
-            connection: session,
+            connection: session.into(),
             max_frame_size,
         })))
     }
@@ -103,12 +103,12 @@ impl QmuxTransport {
 
     /// Resolves with the reason once the connection has ended.
     pub async fn closed(&self) -> Error {
-        Error::transport(self.0.connection.closed().await)
+        self.0.connection.connection_lost().await
     }
 
     /// Closes the connection.
     pub fn close(&self) {
-        self.0.connection.close(0, "client closed");
+        self.0.connection.close_connection(b"client closed");
     }
 }
 

@@ -323,6 +323,38 @@ test("aborting the writer resets a stream whose write is blocked on flow control
   session.close();
 });
 
+test("a connection that drops fails every pending read, write and stream open", async () => {
+  const server = fakeServer({
+    parameters: {
+      ...ServerParameters,
+      initialMaxStreamDataBidiRemote: 100,
+      initialMaxStreamsBidi: 1,
+    },
+    onFrame: (_socket, frame) => frame.data !== undefined,
+  });
+  const session = await openSession(server);
+  const stream = await session.createBidirectionalStream();
+  const settled = (promise) =>
+    promise.then(
+      () => "succeeded",
+      (error) => error.message,
+    );
+  const read = settled(stream.readable.getReader().read());
+  const write = settled(stream.writable.getWriter().write(new Uint8Array(1000)));
+  const open = settled(session.createBidirectionalStream());
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  server.sockets[0].close(1006);
+
+  for (const [name, result] of Object.entries({ read, write, open })) {
+    const outcome = await Promise.race([
+      result,
+      new Promise((resolve) => setTimeout(() => resolve("pending"), 500)),
+    ]);
+    assert.match(outcome, /WebSocket closed with code 1006/u, name);
+  }
+});
+
 test("a peer reset errors the readable and STOP_SENDING errors the writable", async () => {
   const server = fakeServer({
     onFrame(socket, frame) {

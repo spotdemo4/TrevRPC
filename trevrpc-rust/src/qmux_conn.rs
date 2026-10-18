@@ -1,7 +1,8 @@
 //! `QMux` (draft-ietf-quic-qmux-02) sessions from the `qmux` crate as multiplexed connections, so
 //! native `TrevRPC` runs over TLS and WebSocket unchanged.
 
-use std::future::pending;
+use std::future::{Future, pending};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -66,65 +67,142 @@ pub fn client_config(max_frame_size: usize) -> qmux::Config {
     config
 }
 
-impl MuxConnection for qmux::Session {
-    type SendStream = qmux::SendStream;
-    type RecvStream = qmux::RecvStream;
+/// A `QMux` session as a [`MuxConnection`].
+///
+/// `qmux` ends a stream's reads and writes when its session dies only as a side effect of how it
+/// tears the session down, and an operation can still wait for the stream's peer forever while a
+/// session handle is alive. Every wait on the session or one of its streams therefore also waits
+/// for the session to close, and fails with its close reason, so a dead session fails every call
+/// on it promptly. Operations that can finish at once never look at the session: the close is
+/// only polled once the operation itself has to wait.
+///
+/// Streams hold the connection, as QUIC streams do, so it stays open while any of them is in use.
+#[derive(Clone)]
+pub struct QmuxConnection(Arc<qmux::Session>);
 
-    async fn accept_stream(&self) -> Option<(qmux::SendStream, qmux::RecvStream)> {
-        self.accept_bi().await.ok()
-    }
-
-    async fn open_stream(&self) -> Result<(qmux::SendStream, qmux::RecvStream)> {
-        self.open_bi().await.map_err(Error::transport)
-    }
-
-    fn close_connection(&self, reason: &'static [u8]) {
-        self.close(0, &String::from_utf8_lossy(reason));
-    }
-
-    async fn connection_lost(&self) -> Error {
-        Error::transport(self.closed().await)
+impl From<qmux::Session> for QmuxConnection {
+    fn from(session: qmux::Session) -> Self {
+        Self(Arc::new(session))
     }
 }
 
-impl MuxSendStream for qmux::SendStream {
+impl QmuxConnection {
+    /// Resolves with the close reason once the session has ended.
+    async fn lost(&self) -> qmux::Error {
+        self.0.closed().await
+    }
+
+    /// Runs `operation` on a stream of this session, failing if the session ends first.
+    async fn until_lost<T>(
+        &self,
+        operation: impl Future<Output = std::result::Result<T, qmux::Error>>,
+    ) -> Result<T> {
+        tokio::select! {
+            biased;
+            result = operation => result.map_err(Error::transport),
+            error = self.lost() => Err(Error::transport(error)),
+        }
+    }
+}
+
+impl MuxConnection for QmuxConnection {
+    type SendStream = QmuxSendStream;
+    type RecvStream = QmuxRecvStream;
+
+    async fn accept_stream(&self) -> Option<(QmuxSendStream, QmuxRecvStream)> {
+        let (send, recv) = self.until_lost(self.0.accept_bi()).await.ok()?;
+        Some((
+            QmuxSendStream {
+                stream: send,
+                connection: self.clone(),
+            },
+            QmuxRecvStream {
+                stream: recv,
+                connection: self.clone(),
+            },
+        ))
+    }
+
+    async fn open_stream(&self) -> Result<(QmuxSendStream, QmuxRecvStream)> {
+        let (send, recv) = self.until_lost(self.0.open_bi()).await?;
+        Ok((
+            QmuxSendStream {
+                stream: send,
+                connection: self.clone(),
+            },
+            QmuxRecvStream {
+                stream: recv,
+                connection: self.clone(),
+            },
+        ))
+    }
+
+    fn close_connection(&self, reason: &'static [u8]) {
+        self.0.close(0, &String::from_utf8_lossy(reason));
+    }
+
+    async fn connection_lost(&self) -> Error {
+        Error::transport(self.lost().await)
+    }
+}
+
+/// The sending half of a stream of a [`QmuxConnection`].
+pub struct QmuxSendStream {
+    stream: qmux::SendStream,
+    connection: QmuxConnection,
+}
+
+impl MuxSendStream for QmuxSendStream {
     async fn peer_stopped(&mut self) -> Result<()> {
-        match self.closed().await {
-            Err(qmux::Error::StreamStop(_)) => Ok(()),
-            // Finished or reset locally: the peer can no longer stop the stream.
-            Ok(()) | Err(qmux::Error::StreamReset(_)) => pending().await,
-            Err(error) => Err(Error::transport(error)),
+        let stopped = async {
+            match self.stream.closed().await {
+                Err(qmux::Error::StreamStop(_)) => Ok(()),
+                // Finished or reset locally: the peer can no longer stop the stream.
+                Ok(()) | Err(qmux::Error::StreamReset(_)) => pending().await,
+                Err(error) => Err(Error::transport(error)),
+            }
+        };
+        tokio::select! {
+            biased;
+            stopped = stopped => stopped,
+            error = self.connection.lost() => Err(Error::transport(error)),
         }
     }
 
     fn reset_stream(&mut self, code: u32) {
-        self.reset(code);
+        self.stream.reset(code);
     }
 
     fn finish_stream(&mut self) -> Result<()> {
-        self.finish().map_err(Error::transport)
+        self.stream.finish().map_err(Error::transport)
     }
 }
 
-impl FrameWrite for qmux::SendStream {
+impl FrameWrite for QmuxSendStream {
     async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
         for chunk in chunks {
-            self.write_chunk(std::mem::take(chunk))
-                .await
-                .map_err(Error::transport)?;
+            self.connection
+                .until_lost(self.stream.write_chunk(std::mem::take(chunk)))
+                .await?;
         }
         Ok(())
     }
 }
 
-impl MuxRecvStream for qmux::RecvStream {
+/// The receiving half of a stream of a [`QmuxConnection`].
+pub struct QmuxRecvStream {
+    stream: qmux::RecvStream,
+    connection: QmuxConnection,
+}
+
+impl MuxRecvStream for QmuxRecvStream {
     fn stop_stream(&mut self, code: u32) {
-        self.stop(code);
+        self.stream.stop(code);
     }
 
     /// `RecvStream::closed` buffers data as it waits without consuming it, and is cancel-safe.
     async fn peer_reset(&mut self) -> Option<RequestTransportEvent> {
-        match self.closed().await {
+        match self.stream.closed().await {
             Err(qmux::Error::StreamReset(code)) => Some(RequestTransportEvent::PeerReset(
                 Status::cancelled(format!("request stream reset by peer with code {code}")),
             )),
@@ -135,8 +213,8 @@ impl MuxRecvStream for qmux::RecvStream {
     }
 }
 
-impl FrameRead for qmux::RecvStream {
+impl FrameRead for QmuxRecvStream {
     async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
-        self.read(bytes).await.map_err(Error::transport)
+        self.connection.until_lost(self.stream.read(bytes)).await
     }
 }
