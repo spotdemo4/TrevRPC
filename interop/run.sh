@@ -156,13 +156,13 @@ for server in "${servers[@]}"; do
     # Browsers run every scenario over WebTransport, over QMux over WebSocket,
     # and with a blocked UDP port, where they must fall back to WebSocket.
     if [[ ,$browser_lanes, == *,webtransport,* ]]; then
-      run_cell "$browser-to-$server_name" trevrpc-interop-browser \
+      run_cell "$browser-webtransport-to-$server_name" trevrpc-interop-browser \
         --browser "$browser" \
         --url "https://127.0.0.1:$webtransport/trevrpc" \
         --cert-hash "$cert_hash"
     fi
     if [[ ,$browser_lanes, == *,websocket,* ]]; then
-      run_cell "$browser-wss-to-$server_name" trevrpc-interop-browser \
+      run_cell "$browser-websocket-to-$server_name" trevrpc-interop-browser \
         --browser "$browser" \
         --url "https://127.0.0.1:$webtransport/trevrpc" \
         --ws-url "wss://127.0.0.1:$websocket/trevrpc" \

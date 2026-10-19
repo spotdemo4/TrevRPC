@@ -29,14 +29,15 @@ their own whether to expose WebTransport). Every Safari lane must pass against b
 | `X-to-S`                  | Go, Rust | QUIC                                                                                            |
 | `X-qmux-to-S`             | Go, Rust | QMux over TLS on the server's TCP port                                                          |
 | `X-fallback-to-S`         | Go, Rust | `auto`, with the QUIC address pointing at UDP port 24999, which nothing answers: must fall back |
-| `B-to-S`                  | Browser  | WebTransport                                                                                    |
-| `B-wss-to-S`              | Browser  | QMux over WebSocket (`wss://`)                                                                  |
+| `B-webtransport-to-S`     | Browser  | WebTransport                                                                                    |
+| `B-websocket-to-S`        | Browser  | QMux over WebSocket (`wss://`)                                                                  |
 | `B-fallback-to-S`         | Browser  | `auto`, with the WebTransport URL pointing at UDP port 24999: must fall back to WebSocket       |
 | `B-app-webtransport-to-S` | Browser  | WebTransport, from a page the server serves through its HTTP fallback (over HTTP/3 in Chromium) |
 | `B-app-websocket-to-S`    | Browser  | QMux over WebSocket, from a page the server serves through its HTTP fallback over HTTP/2        |
 
 `--browser-lanes webtransport,websocket,fallback,app-webtransport,app-websocket` selects
-which browser lanes run (default: all five). Each cell asserts the transport it actually used
+which browser lanes run (default: all five); each browser cell is named after its
+lane, `B-<lane>-to-S`. Each cell asserts the transport it actually used
 (`--expect-transport`), so a cell fails if it connects over the wrong
 transport.
 
