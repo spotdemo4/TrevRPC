@@ -2,11 +2,7 @@ name: safari
 
 # Runs the browser interop suite in Safari itself, driven through safaridriver,
 # on macOS. Playwright's WebKit is not used: its builds decide on their own
-# whether to expose WebTransport. Every Go lane must pass, and so must the Rust
-# QMux over WebSocket lanes. The Rust server's
-# h3-webtransport does not speak the WebTransport draft Safari uses
-# (hyperium/h3#347), so the Rust WebTransport lane is an allowed failure: it
-# keeps running so the failure stays visible, without failing the workflow.
+# whether to expose WebTransport. Every lane must pass against both servers.
 
 on:
   pull_request:
@@ -42,7 +38,6 @@ jobs:
     needs: build
     runs-on: macos-26
     timeout-minutes: 60
-    continue-on-error: ${{ matrix.allow-failure }}
     permissions:
       contents: read
       id-token: write
@@ -53,19 +48,15 @@ jobs:
           - server: go
             name: webtransport
             lanes: webtransport
-            allow-failure: false
           - server: go
             name: websocket
             lanes: websocket,fallback
-            allow-failure: false
           - server: rust
             name: websocket
             lanes: websocket,fallback
-            allow-failure: false
           - server: rust
             name: webtransport
             lanes: webtransport
-            allow-failure: true
     env:
       SERVER: ${{ matrix.server }}
       LANES: ${{ matrix.lanes }}

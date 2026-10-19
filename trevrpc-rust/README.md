@@ -159,7 +159,7 @@ server.set_options(
 );
 ```
 
-WebTransport policy: a session must use the shared path, then pass the authority and origin allowlists. With no allowlists, requests that carry an `Origin` header (every browser) are denied; requests without one are admitted. `with_webtransport_admission` installs a callback that replaces the allowlists (the path is still checked first). `with_http_admission` is the equivalent hook for HTTP/3 `POST`. A CONNECT whose `WT-Available-Protocols` header offers WebTransport protocols but not `trevrpc-1` gets `400`; a missing, empty or malformed header means version 1. The server cannot send `WT-Protocol` back (see "WebTransport Protocol Selection" in the wiki's Current Limitations).
+WebTransport policy: a session must use the shared path, then pass the authority and origin allowlists. With no allowlists, requests that carry an `Origin` header (every browser) are denied; requests without one are admitted. `with_webtransport_admission` installs a callback that replaces the allowlists (the path is still checked first). `with_http_admission` is the equivalent hook for HTTP/3 `POST`. A CONNECT whose `WT-Available-Protocols` header offers WebTransport protocols but not `trevrpc-1` gets `400`; when it offers `trevrpc-1`, the response selects it with `WT-Protocol`. A missing, empty or malformed header means version 1.
 
 `Server::serve_with_shutdown` drains in-flight RPCs for up to `ServerOptions::graceful_shutdown_timeout` before closing the endpoint.
 

@@ -30,11 +30,8 @@ QUIC is the primary transport. Every runtime also has a TCP fallback for network
 | [Kotlin](trevrpc-kotlin) (Android) | —                                                                                                | HTTP/3; fallback: HTTP/2 (Cronet's built-in TCP fallback) |
 
 Every client is tested against every server over every transport it speaks; see [interop](interop). The
-browser client is supported on Chromium, Firefox, and Safari with both servers. Safari works with the Rust
-server over the WebSocket fallback; only Rust's WebTransport is still affected on Safari, because `h3` does
-not yet speak the WebTransport draft Safari uses ([h3#347](https://github.com/hyperium/h3/issues/347)). The
-`safari` workflow keeps running that lane as an allowed failure so that it shows when upstream compatibility
-arrives.
+browser client is supported on Chromium, Firefox, and Safari with both servers, over WebTransport and the
+WebSocket fallback.
 
 The wire format is shared by every runtime and transport: HTTP/3-style frames (a QUIC varint type and
 length) carrying a REQUEST, raw protobuf MESSAGEs, optional response HEADERS, and a terminal STATUS, with

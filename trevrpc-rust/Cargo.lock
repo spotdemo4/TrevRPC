@@ -550,62 +550,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "h3"
-version = "0.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
-dependencies = [
- "bytes",
- "fastrand",
- "futures-util",
- "http",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "h3-datagram"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f"
-dependencies = [
- "bytes",
- "h3",
- "pin-project-lite",
-]
-
-[[package]]
-name = "h3-quinn"
-version = "0.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
-dependencies = [
- "bytes",
- "futures",
- "h3",
- "h3-datagram",
- "quinn",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "h3-webtransport"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d91a50fd582a5d67b1f756fba3cd9c66367ff4f23e1017c882f664d63b350a7"
-dependencies = [
- "bytes",
- "futures-util",
- "h3",
- "h3-datagram",
- "http",
- "pin-project-lite",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2022,6 +1966,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "trev-h3"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "686f9633ec96a4e7be56824323eba343e647dd83885aa4d781d724bc71293d11"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "trev-h3-datagram"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2161aebadfc15906fb40259ccd976f5e66d6c5f757e502be82722fbc788435d2"
+dependencies = [
+ "bytes",
+ "trev-h3",
+]
+
+[[package]]
+name = "trev-h3-quinn"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fffc0b19fe7fce83a6204760a74e408de18e0f23d74d1e5261f438269c2f9b92"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "quinn",
+ "trev-h3",
+ "trev-h3-datagram",
+]
+
+[[package]]
+name = "trev-h3-webtransport"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c802287c5d6f861d6a4e41a33308719e41b8d71418d45d822b2ec19e6a7ddb6"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http",
+ "pin-project-lite",
+ "tokio",
+ "tracing",
+ "trev-h3",
+ "trev-h3-datagram",
+]
+
+[[package]]
 name = "trevrpc"
 version = "1.0.0"
 dependencies = [
@@ -2031,9 +2028,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2",
- "h3",
- "h3-quinn",
- "h3-webtransport",
  "http",
  "prost",
  "qmux",
@@ -2043,6 +2037,9 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "trev-h3",
+ "trev-h3-quinn",
+ "trev-h3-webtransport",
  "url",
  "web-transport-quinn",
  "web-transport-trait",

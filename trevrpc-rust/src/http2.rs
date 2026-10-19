@@ -224,6 +224,10 @@ impl BodySource for H2Source {
         }
     }
 
+    /// HTTP/2 has no `STOP_SENDING`, and resetting the stream would also end the response, so
+    /// the body is released when it is dropped.
+    fn stop(&mut self) {}
+
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
         let _ = self.closed.wait_for(|closed| *closed).await;
         Some(RequestTransportEvent::ConnectionLost(Status::unavailable(

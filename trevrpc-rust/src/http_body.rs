@@ -36,6 +36,9 @@ pub trait BodySource: Send + 'static {
     /// Validates anything that follows the request body, such as HTTP trailers.
     fn validate_end(&mut self) -> impl Future<Output = Result<()>> + Send;
 
+    /// Asks the peer to stop sending the request body, if the transport can say so.
+    fn stop(&mut self);
+
     /// Resolves when the transport ends the request without consuming its data, or never if it
     /// cannot tell. It must be cancel-safe.
     fn transport_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
@@ -98,8 +101,7 @@ impl<S: BodySource> FrameRead for BodyReader<S> {
 
 impl<S: BodySource> RequestPumpReader for BodyReader<S> {
     fn stop_trevrpc(&mut self) {
-        // The HTTP libraries cannot stop a request body safely on its own (h3-quinn 0.0.10 can
-        // panic, see `H3-UPSTREAM-ISSUES.md`), so the bounded body is released when dropped.
+        self.source.stop();
     }
 
     async fn backpressure_event(&mut self) -> Option<RequestTransportEvent> {

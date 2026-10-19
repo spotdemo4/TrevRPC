@@ -183,6 +183,7 @@ impl Drop for RunningServer {
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type H3RecvStream = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
+type H3ClientSendStream = h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 
 #[derive(Clone)]
 struct Http3Transport {
@@ -1235,6 +1236,29 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
         .expect_err("HTTP/3 request stream should exceed message limit");
     ensure_eq!(error.into_status().code(), Code::ResourceExhausted);
 
+    let (mut send, body) = start_http3_probe(&transport).await?;
+    let recv = body.recv;
+    // h3 does not expose an independent request-reset waiter. The server must still contain
+    // the reset to this RPC and keep the connection usable without an unbounded detached
+    // observer.
+    send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+
+    let reply = client
+        .say_hello_with_options(
+            greeter::HelloRequest {
+                name: "after cancellation".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    ensure_eq!(reply.message, "hello, after cancellation");
+    drop(recv);
+    close_client(endpoint, connection).await?;
+    server.shutdown().await
+}
+
+/// Starts the cancellation probe over a raw HTTP/3 request and reads its first message.
+async fn start_http3_probe(transport: &Http3Transport) -> TestResult<(H3ClientSendStream, H3Body)> {
     let mut request = RpcRequest::new("/lifecycle.Probe/Watch")
         .with_kind(RpcKind::ServerStreaming)
         .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
@@ -1261,35 +1285,31 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
         recv,
         chunk: Bytes::new(),
     };
-    let Some(trevrpc::ResponseFrame::Headers(headers)) =
-        support::read_response_frame(&mut body).await?
-    else {
-        return Err("HTTP/3 response should begin with the response headers".into());
-    };
-    assert_response_shape_header(&headers, "server-streaming-probe");
-    let Some(trevrpc::ResponseFrame::Message(first)) =
-        support::read_response_frame(&mut body).await?
-    else {
-        return Err("HTTP/3 response should contain the first message".into());
-    };
-    ensure_eq!(greeter::HelloReply::decode(first)?.message, "ready");
-    let recv = body.recv;
-    // h3 0.0.8 does not expose an independent request-reset waiter, and
-    // h3-quinn 0.0.10 can panic if `stop_sending` races a pending body read.
-    // The server must still contain the reset to this RPC and keep the
-    // connection usable without an unbounded detached observer.
-    send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    expect_probe_ready(&mut body).await?;
+    Ok((send, body))
+}
 
-    let reply = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after cancellation".to_owned(),
-            },
-            authenticated_options(),
-        )
-        .await?;
-    ensure_eq!(reply.message, "hello, after cancellation");
-    drop(recv);
+#[tokio::test]
+async fn http3_stop_sending_reports_peer_reset_to_request_context() -> TestResult {
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(move |server| {
+        server.set_options(fast_server_options().with_http_enabled(true));
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+        register_cancellation_probe_route(server, source_tx);
+    })?;
+    let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
+    let (send, mut body) = start_http3_probe(&transport).await?;
+
+    // The handler is waiting to produce its next response, so no write is pending: only a
+    // STOP_SENDING notification can tell the server the client stopped reading.
+    body.recv
+        .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+
+    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+        .await?
+        .expect("HTTP/3 probe should report a cancellation source");
+    ensure_eq!(source, CancellationSource::PeerReset);
+    drop((send, body));
     close_client(endpoint, connection).await?;
     server.shutdown().await
 }
@@ -1307,8 +1327,12 @@ async fn webtransport_rejects_unexpected_path() -> TestResult {
     server.shutdown().await
 }
 
-/// Connects with the WebTransport protocols `protocols` offered and calls `SayHello`.
-async fn say_hello_over_webtransport_offering(protocols: &[&str]) -> TestResult {
+/// Connects with the WebTransport protocols `protocols` offered, checks the protocol the server
+/// selected, and calls `SayHello`.
+async fn say_hello_over_webtransport_offering(
+    protocols: &[&str],
+    selected: Option<&str>,
+) -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
@@ -1319,6 +1343,7 @@ async fn say_hello_over_webtransport_offering(protocols: &[&str]) -> TestResult 
         request = request.with_protocol(*protocol);
     }
     let session = client.connect(request).await?;
+    ensure_eq!(session.protocol(), selected);
     let greeter_client =
         greeter::GreeterClient::new(support::WebTransportRpc::new(session.clone()));
 
@@ -1373,17 +1398,17 @@ async fn webtransport_rejects_a_list_of_offers_without_trevrpc_1() -> TestResult
 
 #[tokio::test]
 async fn webtransport_accepts_an_offer_of_trevrpc_1() -> TestResult {
-    say_hello_over_webtransport_offering(&["trevrpc-1"]).await
+    say_hello_over_webtransport_offering(&["trevrpc-1"], Some("trevrpc-1")).await
 }
 
 #[tokio::test]
 async fn webtransport_accepts_an_offer_that_includes_trevrpc_1() -> TestResult {
-    say_hello_over_webtransport_offering(&["trevrpc-2", "trevrpc-1"]).await
+    say_hello_over_webtransport_offering(&["trevrpc-2", "trevrpc-1"], Some("trevrpc-1")).await
 }
 
 #[tokio::test]
 async fn webtransport_accepts_no_offer_as_version_1() -> TestResult {
-    say_hello_over_webtransport_offering(&[]).await
+    say_hello_over_webtransport_offering(&[], None).await
 }
 
 #[tokio::test]
@@ -1752,12 +1777,13 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload() -> TestResult {
-    let metrics = RecordingMetrics::default();
-    let observed_metrics = metrics.clone();
-    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
-    let server = spawn_greeter_server(move |server| {
+/// Serves `/lifecycle.LateFailure/Upload`, whose handler returns a pending response stream and
+/// signals `ready_tx`, under a limit of zero request messages.
+fn spawn_late_failure_server(
+    metrics: RecordingMetrics,
+    ready_tx: mpsc::UnboundedSender<()>,
+) -> TestResult<RunningServer> {
+    spawn_greeter_server(move |server| {
         server.set_options(
             fast_server_options()
                 .with_max_stream_messages(Some(0))
@@ -1781,7 +1807,15 @@ async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload(
                 }
             },
         );
-    })?;
+    })
+}
+
+#[tokio::test]
+async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+    let server = spawn_late_failure_server(metrics, ready_tx)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let request =
@@ -1805,6 +1839,35 @@ async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload(
     ensure_eq!(observed_metrics.codes(), vec![Code::ResourceExhausted]);
 
     close_client(endpoint, connection).await?;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_late_request_limit_failure_stops_upload() -> TestResult {
+    let metrics = RecordingMetrics::default();
+    let observed_metrics = metrics.clone();
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+    let server = spawn_late_failure_server(metrics, ready_tx)?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    let request =
+        RpcRequest::new("/lifecycle.LateFailure/Upload").with_kind(RpcKind::ClientStreaming);
+    support::write_request(&mut send, &request).await?;
+    tokio::time::timeout(TEST_TIMEOUT, ready_rx.recv())
+        .await?
+        .expect("handler should return its pending response stream");
+
+    support::write_message(&mut send, b"over limit").await?;
+    let status = support::read_lone_status(&mut recv).await?;
+    ensure_eq!(status.code(), Code::ResourceExhausted);
+    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    ensure_eq!(stopped, Some(1), "server should stop the rejected upload");
+    observed_metrics
+        .wait_for_code(Code::ResourceExhausted)
+        .await?;
+
+    drop((send, recv));
+    close_webtransport_client(client, session).await?;
     server.shutdown().await
 }
 
@@ -1979,6 +2042,61 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
 
     close_webtransport_client(client, session).await?;
     server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_stop_sending_reports_peer_reset_to_request_context() -> TestResult {
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(move |server| {
+        register_cancellation_probe_route(server, source_tx);
+    })?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    let request = RpcRequest::new("/lifecycle.Probe/Watch")
+        .with_kind(RpcKind::ServerStreaming)
+        .with_timeout_nanos(TEST_TIMEOUT.as_nanos().try_into()?);
+    support::write_request_and_message(&mut send, &request, &[]).await?;
+    expect_probe_ready(&mut recv).await?;
+
+    recv.stop(1)?;
+
+    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+        .await?
+        .expect("WebTransport probe should report a cancellation source");
+    ensure_eq!(source, CancellationSource::PeerReset);
+    drop((send, recv));
+    close_webtransport_client(client, session).await?;
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn webtransport_shutdown_closes_the_session() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+    let reply = greeter_client
+        .say_hello_with_options(
+            greeter::HelloRequest {
+                name: "before shutdown".to_owned(),
+            },
+            authenticated_options(),
+        )
+        .await?;
+    ensure_eq!(reply.message, "hello, before shutdown");
+
+    tokio::time::timeout(TEST_TIMEOUT, server.shutdown()).await??;
+    let error = tokio::time::timeout(TEST_TIMEOUT, session.closed()).await?;
+    let web_transport_quinn::SessionError::WebTransportError(
+        web_transport_quinn::WebTransportError::Closed(code, reason),
+    ) = error
+    else {
+        return Err(format!("session should end with a WebTransport close, got {error}").into());
+    };
+    ensure_eq!(code, 0);
+    ensure_eq!(reason, "server shutdown");
+    drop(client);
+    Ok(())
 }
 
 #[tokio::test]

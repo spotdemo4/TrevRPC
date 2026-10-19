@@ -1,12 +1,15 @@
 //! Server side of ordinary HTTP/3 (`POST /trevrpc`) and `WebTransport` (`/trevrpc`) over QUIC
 //! (ALPN `h3`).
 
+use std::future::pending;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use h3::ext::Protocol;
 use h3::quic::BidiStream as _;
-use http::{Method, Request, StatusCode, header};
+use h3_webtransport::server::AcceptedBi;
+use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
@@ -25,6 +28,11 @@ use crate::{Error, Result, Status};
 // RFC WebTransport reserves this error-code range for application protocol errors. Code 1 maps
 // to the first application code plus one; the division term is zero for this value.
 const CANCELLED_STREAM_CODE: u64 = 0x52e4_a40f_a8dc;
+
+/// How long a server close or drain of a `WebTransport` session waits for the client: to read
+/// the capsule, and after a close to close its side of the CONNECT stream. Closing the QUIC
+/// connection before that can lose the close.
+const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 type H3RequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 type H3SendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
@@ -72,16 +80,10 @@ pub async fn handle_connection(
                 let Ok(Some(request_resolver)) = accepted else {
                     break;
                 };
-                let resolve = async {
-                    if let Some(timeout) = server.options().initial_request_timeout() {
-                        tokio::time::timeout(timeout, request_resolver.resolve_request())
-                            .await
-                            .ok()
-                            .and_then(std::result::Result::ok)
-                    } else {
-                        request_resolver.resolve_request().await.ok()
-                    }
-                };
+                let resolve = within_initial_request_timeout(
+                    server.options().initial_request_timeout(),
+                    request_resolver.resolve_request(),
+                );
                 tokio::pin!(resolve);
                 let request_result = tokio::select! {
                     result = &mut resolve => result,
@@ -96,11 +98,19 @@ pub async fn handle_connection(
                     continue;
                 };
                 if is_webtransport_request(&request) {
-                    if let Some(status) = validate_webtransport_request(&server, &request) {
-                        reject_h3(stream, status).await;
-                        continue;
-                    }
-                    let accept = WebTransportSession::accept(request, stream, h3_connection);
+                    let response_headers = match validate_webtransport_request(&server, &request) {
+                        Ok(headers) => headers,
+                        Err(status) => {
+                            reject_h3(stream, status).await;
+                            continue;
+                        }
+                    };
+                    let accept = WebTransportSession::accept(
+                        request,
+                        stream,
+                        h3_connection,
+                        response_headers,
+                    );
                     tokio::pin!(accept);
                     let session = tokio::select! {
                         result = &mut accept => result.ok(),
@@ -209,11 +219,25 @@ async fn handle_http_request(
         request_limit,
         stream_permit,
         None,
-        H3Sink(send, connection.clone()),
+        H3Sink(send),
         H3Source(recv, connection),
         shutdown,
     )
     .await;
+}
+
+/// Resolves `future`, giving up after `timeout`. `None` means it failed or timed out.
+async fn within_initial_request_timeout<T, E>(
+    timeout: Option<Duration>,
+    future: impl Future<Output = std::result::Result<T, E>>,
+) -> Option<T> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, future)
+            .await
+            .ok()
+            .and_then(std::result::Result::ok),
+        None => future.await.ok(),
+    }
 }
 
 async fn reject_h3(mut stream: H3RequestStream, status: StatusCode) {
@@ -234,37 +258,58 @@ const WEBTRANSPORT_PROTOCOL: &str = "trevrpc-1";
 /// strings (draft-ietf-webtrans-http3).
 const WT_AVAILABLE_PROTOCOLS: &str = "wt-available-protocols";
 
-fn validate_webtransport_request(server: &Server, request: &Request<()>) -> Option<StatusCode> {
+/// The response header naming the protocol the server selected, an RFC 9651 string.
+const WT_PROTOCOL: &str = "wt-protocol";
+
+/// `WEBTRANSPORT_PROTOCOL` as an RFC 9651 string, the value of `WT-Protocol`.
+const WT_PROTOCOL_VALUE: &str = "\"trevrpc-1\"";
+
+/// Admits a `WebTransport` CONNECT, returning the headers to add to its response, or the status
+/// to reject it with.
+fn validate_webtransport_request(
+    server: &Server,
+    request: &Request<()>,
+) -> std::result::Result<HeaderMap, StatusCode> {
     let origin = request
         .headers()
         .get(header::ORIGIN)
         .and_then(|origin| origin.to_str().ok());
-    validate_webtransport_admission(
+    if let Some(status) = validate_webtransport_admission(
         server,
         request.uri().path(),
         request.uri().authority().map(http::uri::Authority::as_str),
         origin,
         request.uri().scheme_str() == Some("https"),
         &admission_headers(request.headers()),
-    )
-    .or_else(|| validate_webtransport_protocols(request.headers()))
+    ) {
+        return Err(status);
+    }
+    let mut headers = HeaderMap::new();
+    if select_webtransport_protocol(request.headers())? {
+        headers.insert(WT_PROTOCOL, HeaderValue::from_static(WT_PROTOCOL_VALUE));
+    }
+    Ok(headers)
 }
 
-/// Rejects a CONNECT that offers WebTransport protocols but not `trevrpc-1`.
+/// Decides whether the CONNECT's offer selects `trevrpc-1`: `Ok(true)` when the client offered
+/// it, so the response must name it in `WT-Protocol`, and `Ok(false)` when the client offered
+/// nothing. A CONNECT that offers protocols but not `trevrpc-1` is a bad request.
 ///
 /// A missing header means version 1, because older browsers cannot send it. A header that is not
 /// a list of strings is ignored, and so is an empty list, which RFC 9651 section 3.1 represents by
 /// not sending the field.
-///
-/// This server cannot answer with `WT-Protocol` to select `trevrpc-1`: `h3-webtransport` 0.1.2
-/// builds the CONNECT response itself, so its sessions carry no selected protocol, which clients
-/// treat as version 1. See "WebTransport Protocol Selection" in `wiki/Current-Limitations.md`.
-fn validate_webtransport_protocols(headers: &http::HeaderMap) -> Option<StatusCode> {
-    let offered = webtransport_offered_protocols(headers)?;
-    (!offered
+fn select_webtransport_protocol(headers: &HeaderMap) -> std::result::Result<bool, StatusCode> {
+    let Some(offered) = webtransport_offered_protocols(headers) else {
+        return Ok(false);
+    };
+    if offered
         .iter()
-        .any(|offered| offered == WEBTRANSPORT_PROTOCOL))
-    .then_some(StatusCode::BAD_REQUEST)
+        .any(|offered| offered == WEBTRANSPORT_PROTOCOL)
+    {
+        Ok(true)
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
 }
 
 /// Returns the protocols the CONNECT offers, or `None` when the header is missing, malformed, or
@@ -282,6 +327,7 @@ fn webtransport_offered_protocols(headers: &http::HeaderMap) -> Option<Vec<Strin
     crate::structured_fields::parse_string_list(&combined).filter(|offered| !offered.is_empty())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_webtransport_session(
     server: Server,
     session: WebTransportSession,
@@ -291,11 +337,14 @@ async fn handle_webtransport_session(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let session_id = session.session_id();
+    let initial_request_timeout = server.options().initial_request_timeout();
     let mut stream_tasks = JoinSet::new();
+    // Accepted streams whose first frame is still being read, to tell WebTransport streams from
+    // HTTP/3 requests without one slow stream holding up the others.
+    let mut resolving = JoinSet::new();
     // The session's datagrams are framed here, on the raw connection; see `SessionDatagrams`.
     // Nothing may call `session.datagram_reader()` or `session.datagram_sender()`: quinn's
-    // `read_datagram` has a single consumer, and `h3-datagram` 0.0.2 mis-encodes the quarter
-    // stream ID of outgoing datagrams (fixed by hyperium/h3#340, not released).
+    // `read_datagram` has a single consumer.
     let demux = SessionDatagrams::new(
         connection.clone(),
         h3::quic::StreamId::from(session_id).into_inner(),
@@ -307,6 +356,10 @@ async fn handle_webtransport_session(
             server.max_frame_size(),
         ))
     });
+    // A close from the client is only noticed while this is polled.
+    let closed = session.closed();
+    tokio::pin!(closed);
+    let mut terminated = false;
 
     loop {
         if *shutdown.borrow() {
@@ -315,16 +368,30 @@ async fn handle_webtransport_session(
         tokio::select! {
             accepted = session.accept_bi(), if !*shutdown.borrow() => {
                 match accepted {
-                    Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(id, stream)))
-                        if id == session_id =>
-                    {
+                    Ok(Some(resolver)) => {
+                        resolving.spawn(within_initial_request_timeout(
+                            initial_request_timeout,
+                            resolver.resolve(),
+                        ));
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let message = error.to_string();
+                        connection.close(0_u32.into(), message.as_bytes());
+                        break;
+                    }
+                }
+            }
+            Some(resolved) = resolving.join_next(), if !resolving.is_empty() => {
+                match resolved {
+                    Ok(Some(AcceptedBi::BidiStream(id, stream))) if id == session_id => {
                         let Some(stream_permit) = try_acquire_permit(stream_limit.as_ref()) else {
                             let server = server.clone();
                             let stream_connection = connection.clone();
                             let (send, recv) = stream.split();
                             stream_tasks.spawn(reject_rpc_stream(
                                 server,
-                                WebTransportSink(send, stream_connection.clone()),
+                                WebTransportSink(send),
                                 WebTransportSource(recv, stream_connection),
                             ));
                             continue;
@@ -341,17 +408,17 @@ async fn handle_webtransport_session(
                                 request_limit,
                                 stream_permit,
                                 stream_demux,
-                                WebTransportSink(send, stream_connection.clone()),
+                                WebTransportSink(send),
                                 WebTransportSource(recv, stream_connection),
                                 stream_shutdown,
                             )
                             .await;
                         });
                     }
-                    Ok(Some(h3_webtransport::server::AcceptedBi::BidiStream(_, mut stream))) => {
+                    Ok(Some(AcceptedBi::BidiStream(_, mut stream))) => {
                         h3::quic::SendStream::reset(&mut stream, CANCELLED_STREAM_CODE);
                     }
-                    Ok(Some(h3_webtransport::server::AcceptedBi::Request(request, stream))) => {
+                    Ok(Some(AcceptedBi::Request(request, stream))) => {
                         if is_webtransport_request(&request) {
                             stream_tasks.spawn(reject_h3(stream, StatusCode::CONFLICT));
                         } else {
@@ -367,13 +434,14 @@ async fn handle_webtransport_session(
                             );
                         }
                     }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let message = error.to_string();
-                        connection.close(0_u32.into(), message.as_bytes());
-                        break;
-                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "WebTransport stream resolution failed"),
                 }
+            }
+            _ = &mut closed => {
+                // The session's streams are reset with WT_SESSION_GONE as they are next used.
+                terminated = true;
+                break;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -385,15 +453,34 @@ async fn handle_webtransport_session(
             }
         }
     }
+    resolving.abort_all();
 
-    drain_tasks(
+    let shutting_down = *shutdown.borrow() && !terminated;
+    if shutting_down {
+        // Lets clients that support WebTransport.draining wind down before the close.
+        let _ = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, session.drain()).await;
+    }
+    let drained = drain_tasks(
         &mut stream_tasks,
         server.options().graceful_shutdown_timeout(),
     )
     .await;
+    if shutting_down {
+        let reason = if drained {
+            "server shutdown"
+        } else {
+            "server WebTransport stream drain timed out"
+        };
+        let close = async {
+            if session.close(0, reason).await.is_ok() {
+                let _ = (&mut closed).await;
+            }
+        };
+        let _ = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, close).await;
+    }
 }
 
-struct H3Sink(H3SendStream, quinn::Connection);
+struct H3Sink(H3SendStream);
 
 impl BodySink for H3Sink {
     async fn write(&mut self, chunk: &[u8]) -> Result<()> {
@@ -411,10 +498,22 @@ impl BodySink for H3Sink {
         self.0.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
     }
 
-    /// h3 cannot report a peer `STOP_SENDING` independently of body polling, so only the loss
-    /// of the whole connection is observed.
     async fn stopped(&mut self) -> Result<()> {
-        Err(Error::transport(self.1.closed().await))
+        stopped(self.0.stopped().await).await
+    }
+}
+
+/// Maps an h3 `stopped()` result to [`BodySink::stopped`]: `Ok(Some(_))` is the peer's
+/// `STOP_SENDING`, `Ok(None)` means the stream is closed and can no longer be stopped, and an
+/// error means the connection was lost.
+async fn stopped<C, E>(result: std::result::Result<Option<C>, E>) -> Result<()>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match result {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => pending().await,
+        Err(error) => Err(Error::transport(error)),
     }
 }
 
@@ -435,6 +534,10 @@ impl BodySource for H3Source {
         }
     }
 
+    fn stop(&mut self) {
+        self.0.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
         Some(RequestTransportEvent::connection_lost(
             self.1.closed().await,
@@ -442,7 +545,7 @@ impl BodySource for H3Source {
     }
 }
 
-struct WebTransportSink(WebTransportSendStream, quinn::Connection);
+struct WebTransportSink(WebTransportSendStream);
 
 impl BodySink for WebTransportSink {
     async fn write(&mut self, mut chunk: &[u8]) -> Result<()> {
@@ -472,7 +575,7 @@ impl BodySink for WebTransportSink {
     }
 
     async fn stopped(&mut self) -> Result<()> {
-        Err(Error::transport(self.1.closed().await))
+        stopped(self.0.stopped().await).await
     }
 }
 
@@ -489,6 +592,10 @@ impl BodySource for WebTransportSource {
 
     fn validate_end(&mut self) -> impl Future<Output = Result<()>> + Send {
         std::future::ready(Ok(()))
+    }
+
+    fn stop(&mut self) {
+        h3::quic::RecvStream::stop_sending(&mut self.0, CANCELLED_STREAM_CODE);
     }
 
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
@@ -528,7 +635,10 @@ mod tests {
         }
     }
 
-    use super::{WT_AVAILABLE_PROTOCOLS, validate_webtransport_protocols};
+    use super::{
+        WEBTRANSPORT_PROTOCOL, WT_AVAILABLE_PROTOCOLS, WT_PROTOCOL_VALUE,
+        select_webtransport_protocol,
+    };
 
     fn headers(lines: &[&str]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -542,19 +652,33 @@ mod tests {
     }
 
     fn check(lines: &[&str]) -> Option<StatusCode> {
-        validate_webtransport_protocols(&headers(lines))
+        select_webtransport_protocol(&headers(lines)).err()
+    }
+
+    fn selects(lines: &[&str]) -> bool {
+        select_webtransport_protocol(&headers(lines)) == Ok(true)
     }
 
     #[test]
     fn a_missing_header_means_version_1() {
         assert_eq!(check(&[]), None);
+        assert!(!selects(&[]));
     }
 
     #[test]
-    fn an_offer_that_includes_trevrpc_1_is_accepted() {
-        assert_eq!(check(&[r#""trevrpc-1""#]), None);
-        assert_eq!(check(&[r#""trevrpc-2", "trevrpc-1";v=2"#]), None);
-        assert_eq!(check(&[r#""trevrpc-2""#, r#""trevrpc-1""#]), None);
+    fn an_offer_that_includes_trevrpc_1_is_accepted_and_selected() {
+        for lines in [
+            &[r#""trevrpc-1""#][..],
+            &[r#""trevrpc-2", "trevrpc-1";v=2"#],
+            &[r#""trevrpc-2""#, r#""trevrpc-1""#],
+        ] {
+            assert!(selects(lines), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn the_wt_protocol_value_is_the_protocol_as_a_structured_string() {
+        assert_eq!(WT_PROTOCOL_VALUE, format!("\"{WEBTRANSPORT_PROTOCOL}\""));
     }
 
     #[test]
@@ -575,9 +699,10 @@ mod tests {
 
     #[test]
     fn an_empty_list_is_treated_as_an_absent_header() {
-        assert_eq!(check(&[""]), None);
-        assert_eq!(check(&["   "]), None);
-        assert_eq!(check(&["", "  "]), None);
+        for lines in [&[""][..], &["   "], &["", "  "]] {
+            assert_eq!(check(lines), None, "{lines:?}");
+            assert!(!selects(lines), "{lines:?}");
+        }
     }
 
     #[test]
@@ -590,6 +715,7 @@ mod tests {
             &[r#""trevrpc-2""other""#],
         ] {
             assert_eq!(check(lines), None, "{lines:?}");
+            assert!(!selects(lines), "{lines:?}");
         }
     }
 
@@ -601,6 +727,6 @@ mod tests {
             HeaderValue::from_bytes(b"\"trevrpc-2\xff\"").expect("opaque bytes are allowed"),
         );
 
-        assert_eq!(validate_webtransport_protocols(&headers), None);
+        assert_eq!(select_webtransport_protocol(&headers), Ok(false));
     }
 }

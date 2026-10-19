@@ -11,6 +11,24 @@ Research and source review were performed on 2026-08-12 against these exact publ
 
 The reproductions below omit routine TLS, certificate, endpoint, and h3 connection setup unless those details are relevant. Pseudocode is labeled where it is not a standalone compiling program.
 
+## Status with `trev-h3` 0.1.1
+
+TrevRPC now depends on `trev-h3`, `trev-h3-quinn`, `trev-h3-webtransport` and `trev-h3-datagram` 0.1.1, published from the [spotdemo4/h3](https://github.com/spotdemo4/h3) fork. The fork contains every fix merged upstream after `h3 0.0.8`, plus WebTransport draft negotiation, session close and drain, `WT-Protocol` response headers, and `stopped()` on send streams. The "TrevRPC impact and workaround" sections below describe the workarounds TrevRPC needed with the published hyperium crates.
+
+|   # | Status in `trev-h3` 0.1.1                                                                                                                                                                      |
+| --: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+|   1 | Fixed: `accept_bi()` returns a resolver ([#356](https://github.com/hyperium/h3/pull/356)). TrevRPC resolves each accepted stream in its own task, bounded by the initial request timeout.      |
+|   2 | Fixed: `WebTransportSession::close`, `drain`, `closed` and `draining`. TrevRPC drains and then closes its session at shutdown, and notices a close from the client.                            |
+|   3 | Fixed: `RequestStream::stopped()` and `stopped()` on WebTransport send streams. TrevRPC cancels a handler with `PeerReset` as soon as the client stops its response.                           |
+|   4 | Fixed ([#331](https://github.com/hyperium/h3/pull/331), then issue 11). TrevRPC now stops HTTP/3 and WebTransport request bodies with its cancellation code.                                   |
+|   5 | Fixed ([#357](https://github.com/hyperium/h3/pull/357)).                                                                                                                                       |
+|   6 | Still present.                                                                                                                                                                                 |
+|   7 | Still present; TrevRPC still polls the typed h3 traits directly.                                                                                                                               |
+|   8 | Still present; TrevRPC still validates the CONNECT before calling `accept()`.                                                                                                                  |
+|   9 | Still present; the fork always advertises one session, which matches TrevRPC's one-session-per-connection design.                                                                              |
+|  10 | Fixed ([#340](https://github.com/hyperium/h3/pull/340)). TrevRPC keeps framing session datagrams on the raw Quinn connection, which lets one demultiplexer serve native QUIC and WebTransport. |
+|  11 | Fixed in `trev-h3-quinn` 0.1.1; see below.                                                                                                                                                     |
+
 ## Summary
 
 |   # | Issue                                                                         | Confirmed in                        | Upstream report                                                                                             | Match                                                           |
@@ -579,6 +597,37 @@ TrevRPC sends and receives `WebTransport` datagrams itself on the raw Quinn conn
 ### Existing upstream issue
 
 Fixed by [hyperium/h3#340](https://github.com/hyperium/h3/pull/340), which no release includes yet. Switch back to `h3-datagram` once a release has the fix, if h3 then offers a way to share the connection's datagrams with the application.
+
+## 11. `h3-quinn::RecvStream::stop_sending()` is deferred while a read is outstanding
+
+**Owner:** `h3-quinn`
+
+**Confirmed in:** `trev-h3-quinn 0.1.0` (and upstream `master` with [#331](https://github.com/hyperium/h3/pull/331)); fixed in `trev-h3-quinn 0.1.1`
+
+### Actual behavior
+
+`poll_data()` moves the Quinn stream into a reusable read future. The #331 fix for issue 4 makes `stop_sending()` record the code in `pending_stop` while that future owns the stream, and applies it only when the read completes. h3's frame decoder usually leaves such a read outstanding after it returns data. If the peer sends nothing more, the read never completes and `STOP_SENDING` is never sent; the stream is stopped only with code 0 when it is dropped.
+
+### Expected behavior
+
+`stop_sending()` sends `STOP_SENDING` with the given code promptly, whether or not a read is outstanding, and the outstanding read then fails.
+
+### Minimal reproduction
+
+```rust
+// A server-streaming response; the client has read the first message.
+let mut recv = request_stream_recv_half; // after `recv_data()` returned a chunk
+recv.stop_sending(Code::H3_REQUEST_CANCELLED);
+// The server's `stopped()` never resolves; dropping `recv` sends STOP_SENDING(0).
+```
+
+### TrevRPC impact and workaround
+
+With `trev-h3-quinn` 0.1.0, TrevRPC's request pump called `stop_sending()` when it no longer needed a request body, but the stop usually took effect only when the stream was dropped, with code 0 instead of TrevRPC's cancellation code. `webtransport_late_request_limit_failure_stops_upload` and `http3_stop_sending_reports_peer_reset_to_request_context` in `tests/quinn_integration.rs` cover the fix on the server and h3's client.
+
+### Suggested upstream fix
+
+Keep the Quinn stream outside the read future, for example by reading with `quinn::RecvStream::poll_read_buf`, or have Quinn expose a pollable chunk read, so that `stop_sending()` can always reach the stream.
 
 ## Upstream issue relationship notes
 

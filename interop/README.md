@@ -4,24 +4,20 @@ Cross-runtime interoperability tests. Every server is exercised by every client
 over every transport that client speaks. QUIC is the primary transport; each
 client also has a TCP fallback for networks that block UDP.
 
-| Client                   | Primary transport | TCP fallback        | Servers                                |
-| ------------------------ | ----------------- | ------------------- | -------------------------------------- |
-| Go                       | native QUIC       | QMux over TLS       | Go, Rust                               |
-| Rust                     | native QUIC       | QMux over TLS       | Go, Rust                               |
-| JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust                               |
-| JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust                               |
-| Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust                               |
-| JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go; Rust WebTransport expected to fail |
+| Client                   | Primary transport | TCP fallback        | Servers  |
+| ------------------------ | ----------------- | ------------------- | -------- |
+| Go                       | native QUIC       | QMux over TLS       | Go, Rust |
+| Rust                     | native QUIC       | QMux over TLS       | Go, Rust |
+| JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust |
+| JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust |
+| Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust |
+| JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust |
 
 `run.sh` (packaged with its tools as `nix run .#trevrpc-interop`) drives the desktop matrix, which `nix flake check` runs on Linux for
 Chromium and Firefox. CI runs the Android client on an emulator because it needs
 KVM (once over HTTP/3 and once over HTTP/2 with QUIC disabled), and runs Safari
 on macOS through `safaridriver` (not Playwright's WebKit, whose builds decide on
-their own whether to expose WebTransport). Safari passes every lane against the Go server. Against the Rust
-server it passes the WebSocket and fallback lanes; Rust's `h3` does not yet
-speak the WebTransport draft Safari uses, so the Rust WebTransport lane is
-expected to fail. It is an allowed failure in the `safari` workflow, so it stays
-visible without failing the workflow.
+their own whether to expose WebTransport). Every Safari lane must pass against both servers.
 
 ## Cells
 

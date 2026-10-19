@@ -91,9 +91,8 @@ impl DatagramTransport for quinn::Connection {
 ///
 /// A `WebTransport` datagram is a QUIC DATAGRAM frame that starts with the session's quarter
 /// stream ID (RFC 9297). This crate adds and checks that prefix itself instead of using the h3
-/// crates' datagram support: `h3-datagram` 0.0.2 encodes the quarter stream ID of every outgoing
-/// datagram as 0, which only matches the first session of a connection by accident. The fix,
-/// hyperium/h3#340, is not released yet.
+/// crates' datagram support, so that one [`crate::datagram::Demux`] serves native QUIC and
+/// `WebTransport` alike and no h3 buffer sits between Quinn and a call.
 ///
 /// Quinn's `read_datagram` has a single consumer, so nothing else may read this connection's
 /// datagrams: the HTTP/3 and `WebTransport` code must never call the session's
