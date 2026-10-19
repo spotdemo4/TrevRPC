@@ -14,7 +14,7 @@ func TestServerQUICConfigDerivesLimitsFromServerOptions(t *testing.T) {
 	options.MaxFrameSize = 1024
 	options.MaxStreamBodySize = 4096
 	options.MaxConcurrentStreamsPerConnection = 10
-	options.StreamIdleTimeout = 20 * time.Second
+	options.ConnectionIdleTimeout = 20 * time.Second
 
 	config := serverQUICConfig(nil, options)
 
@@ -28,7 +28,7 @@ func TestServerQUICConfigDerivesLimitsFromServerOptions(t *testing.T) {
 		t.Fatalf("incoming bidirectional streams should include one rejection slot, got %d", config.MaxIncomingStreams)
 	}
 	if config.MaxIdleTimeout != 20*time.Second || config.KeepAlivePeriod != 10*time.Second {
-		t.Fatalf("idle defaults should derive from the stream idle timeout, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlivePeriod)
+		t.Fatalf("idle defaults should derive from the connection idle timeout, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlivePeriod)
 	}
 	if config.MaxIncomingUniStreams != -1 {
 		t.Fatalf("native-only listeners should refuse unidirectional streams, got %d", config.MaxIncomingUniStreams)
@@ -46,10 +46,23 @@ func TestServerQUICConfigDerivesLimitsFromServerOptions(t *testing.T) {
 		t.Fatalf("WebTransport needs unidirectional streams, datagrams and partial reset delivery: %+v", config)
 	}
 
-	options.StreamIdleTimeout = -time.Second
+	options.ConnectionIdleTimeout = 0
 	config = serverQUICConfig(nil, options)
 	if config.MaxIdleTimeout != 0 || config.KeepAlivePeriod != 0 {
-		t.Fatalf("non-positive stream idle timeout should leave QUIC idle defaults, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlivePeriod)
+		t.Fatalf("a disabled connection idle timeout should leave QUIC idle defaults, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlivePeriod)
+	}
+
+	// Without a stream body limit, the connection window is still bounded.
+	options.MaxStreamBodySize = -1
+	config = serverQUICConfig(nil, options)
+	if config.MaxConnectionReceiveWindow != 10*1040 {
+		t.Fatalf("connection window should be a frame per stream, got %d", config.MaxConnectionReceiveWindow)
+	}
+	options.MaxFrameSize = DefaultMaxFrameSize
+	options.MaxConcurrentStreamsPerConnection = 64
+	config = serverQUICConfig(nil, options)
+	if config.MaxConnectionReceiveWindow != defaultConnectionReceiveWindow {
+		t.Fatalf("connection window should stop at the default bound, got %d", config.MaxConnectionReceiveWindow)
 	}
 }
 

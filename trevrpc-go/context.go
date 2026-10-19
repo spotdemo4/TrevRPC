@@ -4,6 +4,13 @@ import "context"
 
 type handlerContextKey struct{}
 
+// callState is what a handler's context carries: the description of the
+// request and the response metadata the handler sets.
+type callState struct {
+	info     HandlerContext
+	response responseMetadata
+}
+
 // HandlerContext describes the request being handled. Handlers receive it
 // through HandlerContextFromContext and authorizers as an argument. Metadata
 // keys are lowercase.
@@ -24,8 +31,21 @@ type HandlerContext struct {
 
 // HandlerContextFromContext returns TrevRPC request information attached to ctx.
 func HandlerContextFromContext(ctx context.Context) (HandlerContext, bool) {
-	info, ok := ctx.Value(handlerContextKey{}).(HandlerContext)
-	return info, ok
+	state, ok := ctx.Value(handlerContextKey{}).(*callState)
+	if !ok {
+		return HandlerContext{}, false
+	}
+	return state.info, true
+}
+
+// responseMetadataFromContext returns the response metadata of the call ctx
+// belongs to, or nil outside a handler.
+func responseMetadataFromContext(ctx context.Context) *responseMetadata {
+	state, ok := ctx.Value(handlerContextKey{}).(*callState)
+	if !ok {
+		return nil
+	}
+	return &state.response
 }
 
 // RequestMetadataFromContext returns normalized request metadata attached to ctx.
@@ -55,7 +75,7 @@ func contextWithHandlerContext(ctx context.Context, request *wireRequest) contex
 		return ctx
 	}
 
-	return context.WithValue(ctx, handlerContextKey{}, newHandlerContext(request))
+	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request)})
 }
 
 func cloneMetadata(metadata Metadata) Metadata {

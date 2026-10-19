@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use trevrpc::client::{ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport};
 use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
-use trevrpc::{Metadata, ResponseEnvelope, ResponseFrame, RpcKind, RpcRequest, Status, Unreliable};
+use trevrpc::{Metadata, ResponseFrame, RpcKind, RpcRequest, Status, Unreliable};
 
 #[macro_use]
 mod support;
@@ -48,7 +48,7 @@ fn register_routes(server: &mut Server) {
         ),
         (ECHO_ALL_RELIABLE_RESPONSES, RouteOptions::new()),
     ] {
-        server.route_streaming_envelope_with_options(
+        server.route_streaming_with_options(
             path,
             RpcKind::BidirectionalStreaming,
             options,
@@ -59,21 +59,23 @@ fn register_routes(server: &mut Server) {
                 }
                 let trailers =
                     counted_trailers(messages.len(), context.datagram_requests_received());
-                Ok(ResponseEnvelope::new(trevrpc::stream::from_iter(messages))
-                    .with_metadata(trailers))
+                for (key, value) in trailers {
+                    context.set_response_metadata(&key, value)?;
+                }
+                Ok(trevrpc::stream::from_iter(messages))
             },
         );
     }
-    server.route_streaming_envelope_with_options(
+    server.route_streaming_with_options(
         ECHO_LIVE,
         RpcKind::BidirectionalStreaming,
         RouteOptions::new().with_unreliable(Unreliable::BOTH),
         |_context, _body, requests| async move {
             let echoes: trevrpc::BoxStream<Vec<u8>> = Box::pin(requests);
-            Ok(ResponseEnvelope::new(echoes))
+            Ok(echoes)
         },
     );
-    server.route_streaming_envelope_with_options(
+    server.route_streaming_with_options(
         HOLD,
         RpcKind::BidirectionalStreaming,
         RouteOptions::new().with_unreliable(Unreliable::BOTH),

@@ -165,7 +165,8 @@ fn short(message: &str) -> String {
 
 async fn unary(client: &Echo) -> Scenario {
     let response = client
-        .unary_with_options(message("hello"), options())
+        .unary(&message("hello"))
+        .options(|_| options())
         .await
         .map_err(rpc)?;
     expect_response(&response, "hello", 0)
@@ -174,7 +175,8 @@ async fn unary(client: &Echo) -> Scenario {
 async fn unary_metadata(client: &Echo) -> Scenario {
     let options = options().with_metadata("interop-suffix", b"!".to_vec());
     let response = client
-        .unary_with_options(message("hello"), options)
+        .unary(&message("hello"))
+        .options(|_| options)
         .await
         .map_err(rpc)?;
     expect_response(&response, "hello!", 0)
@@ -182,7 +184,8 @@ async fn unary_metadata(client: &Echo) -> Scenario {
 
 async fn unary_error(client: &Echo) -> Scenario {
     match client
-        .unary_with_options(failing(Code::NotFound, "missing"), options())
+        .unary(&failing(Code::NotFound, "missing"))
+        .options(|_| options())
         .await
     {
         Ok(_) => Err("expected NotFound, got a response".to_owned()),
@@ -193,7 +196,8 @@ async fn unary_error(client: &Echo) -> Scenario {
 async fn unary_large(client: &Echo) -> Scenario {
     let large = "x".repeat(1 << 20);
     let response = client
-        .unary_with_options(message(&large), options())
+        .unary(&message(&large))
+        .options(|_| options())
         .await
         .map_err(rpc)?;
     if response.message == large && response.index == 0 {
@@ -209,7 +213,8 @@ async fn unary_large(client: &Echo) -> Scenario {
 
 async fn client_stream(client: &Echo) -> Scenario {
     let call = client
-        .client_stream_with_options(options())
+        .client_stream()
+        .options(|_| options())
         .await
         .map_err(rpc)?;
     for part in ["a", "b", "c"] {
@@ -225,7 +230,8 @@ async fn server_stream(client: &Echo) -> Scenario {
         ..message("s")
     };
     let mut responses = client
-        .server_stream_with_options(request, options())
+        .server_stream(&request)
+        .options(|_| options())
         .await
         .map_err(rpc)?;
     for index in 0..3 {
@@ -251,7 +257,8 @@ async fn server_stream_error(client: &Echo) -> Scenario {
         ..message("s")
     };
     let mut responses = client
-        .server_stream_with_options(request, options())
+        .server_stream(&request)
+        .options(|_| options())
         .await
         .map_err(rpc)?;
     for index in 0..2 {
@@ -270,7 +277,7 @@ async fn server_stream_error(client: &Echo) -> Scenario {
 }
 
 async fn bidi(client: &Echo) -> Scenario {
-    let mut call = client.bidi_with_options(options()).await.map_err(rpc)?;
+    let mut call = client.bidi().options(|_| options()).await.map_err(rpc)?;
     for (index, part) in ["1", "2", "3"].into_iter().enumerate() {
         call.send(message(part)).await.map_err(rpc)?;
         let response = call
@@ -293,7 +300,7 @@ async fn bidi(client: &Echo) -> Scenario {
 }
 
 async fn bidi_error(client: &Echo) -> Scenario {
-    let mut call = client.bidi_with_options(options()).await.map_err(rpc)?;
+    let mut call = client.bidi().options(|_| options()).await.map_err(rpc)?;
     call.send(message("1")).await.map_err(rpc)?;
     let response = call
         .recv()
@@ -327,7 +334,9 @@ fn expect_metadata(actual: &Metadata, key: &str, what: &str) -> Scenario {
 
 async fn unary_headers(client: &Echo) -> Scenario {
     let response = client
-        .unary_envelope_with_options(message("hello"), header_options())
+        .unary(&message("hello"))
+        .options(|_| header_options())
+        .with_response()
         .await
         .map_err(rpc)?;
     expect_response(response.message(), "hello", 0)?;
@@ -341,7 +350,8 @@ async fn server_stream_headers(client: &Echo) -> Scenario {
         ..message("s")
     };
     let mut responses = client
-        .server_stream_with_options(request, header_options())
+        .server_stream(&request)
+        .options(|_| header_options())
         .await
         .map_err(rpc)?;
     // The headers precede the first message.
@@ -378,7 +388,8 @@ async fn unreliable(client: &UnreliableEcho, channel: &Channel) -> Scenario {
         .map(|connection| connection.stats().frame_rx.datagram);
 
     let (sender, mut responses) = client
-        .bidi_with_options(options())
+        .bidi()
+        .options(|_| options())
         .await
         .map_err(rpc)?
         .split();

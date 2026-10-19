@@ -75,7 +75,7 @@ func newTestMessage() *testMessage { return &testMessage{} }
 
 // registerTestService registers one handler per RPC shape.
 func registerTestService(server *Server) {
-	RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*Response[*testMessage], error) {
+	RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*testMessage, error) {
 		switch request.Value {
 		case "missing":
 			return nil, NotFound("nothing here")
@@ -83,27 +83,25 @@ func registerTestService(server *Server) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
-		headers, trailers := testHeaderMetadata(ctx)
-		return &Response[*testMessage]{
-			Message:  &testMessage{Value: request.Value + string(RequestMetadataFromContext(ctx)["suffix"])},
-			Headers:  headers,
-			Metadata: trailers,
-		}, nil
+		answerTestHeaders(ctx)
+		return &testMessage{Value: request.Value + string(RequestMetadataFromContext(ctx)["suffix"])}, nil
 	})
 	RegisterServerStreaming(server, "/example.Greeter/Count", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		replies := make([]*testMessage, 0, 3)
 		for _, suffix := range []string{"1", "2", "3"} {
 			replies = append(replies, &testMessage{Value: request.Value + suffix})
 		}
-		return withTestHeaders(ctx, newSliceStream(replies...)), nil
+		answerTestHeaders(ctx)
+		return newSliceStream(replies...), nil
 	})
 	// Gated sends its headers at once and its only message once the test
 	// opens the gate registered under the request value.
 	RegisterServerStreaming(server, "/example.Greeter/Gated", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		gate, _ := testGates.Load(request.Value)
-		return withTestHeaders(ctx, &gatedStream{ctx: ctx, gate: gate.(chan struct{})}), nil
+		answerTestHeaders(ctx)
+		return &gatedStream{ctx: ctx, gate: gate.(chan struct{})}, nil
 	})
-	RegisterClientStreaming(server, "/example.Greeter/Concat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
+	RegisterClientStreaming(server, "/example.Greeter/Concat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (*testMessage, error) {
 		var joined strings.Builder
 		for request, err := range Messages(requests) {
 			if err != nil {
@@ -111,15 +109,16 @@ func registerTestService(server *Server) {
 			}
 			joined.WriteString(request.Value)
 		}
-		headers, trailers := testHeaderMetadata(ctx)
-		return &Response[*testMessage]{Message: &testMessage{Value: joined.String()}, Headers: headers, Metadata: trailers}, nil
+		answerTestHeaders(ctx)
+		return &testMessage{Value: joined.String()}, nil
 	})
 	// FailFast fails a bidirectional call without reading any request message.
-	server.routeStreaming("/example.Greeter/FailFast", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
-		return streamResponse{}, NewStatus(CodeAborted, "abort")
+	server.routeStreaming("/example.Greeter/FailFast", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (encodedStream, error) {
+		return nil, NewStatus(CodeAborted, "abort")
 	})
 	RegisterBidirectionalStreaming(server, "/example.Greeter/Chat", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
-		return withTestHeaders(ctx, &upperStream{requests: requests}), nil
+		answerTestHeaders(ctx)
+		return &upperStream{requests: requests}, nil
 	})
 }
 
@@ -154,23 +153,19 @@ const (
 	testTrailerKey     = "x-trailer"
 )
 
-// testHeaderMetadata answers the want-headers request metadata with response
-// headers and trailing metadata carrying its value; both are empty without it.
-func testHeaderMetadata(ctx context.Context) (headers, trailers Metadata) {
+// answerTestHeaders answers the want-headers request metadata with a response
+// header and trailing metadata carrying its value.
+func answerTestHeaders(ctx context.Context) {
 	value, ok := RequestMetadataFromContext(ctx)[testWantHeadersKey]
 	if !ok {
-		return nil, nil
+		return
 	}
-	return Metadata{testHeaderKey: value}, Metadata{testTrailerKey: value}
-}
-
-// withTestHeaders adds the answer to want-headers to a response stream.
-func withTestHeaders(ctx context.Context, stream MessageStream[*testMessage]) MessageStream[*testMessage] {
-	headers, trailers := testHeaderMetadata(ctx)
-	if headers == nil {
-		return stream
+	if err := SetResponseHeader(ctx, testHeaderKey, value); err != nil {
+		panic(err)
 	}
-	return WithResponseHeaders(NewResponseStream(stream, trailers), headers)
+	if err := SetResponseMetadata(ctx, testTrailerKey, value); err != nil {
+		panic(err)
+	}
 }
 
 // upperStream answers every request with its upper-cased value.

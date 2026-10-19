@@ -77,8 +77,8 @@ Serve it from Go:
 ```go
 type greeterService struct{}
 
-func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
-	return &trevrpc.Response[*greeter.HelloReply]{Message: &greeter.HelloReply{Message: "hello, " + r.Name}}, nil
+func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*greeter.HelloReply, error) {
+	return &greeter.HelloReply{Message: "hello, " + r.Name}, nil
 }
 
 server := trevrpc.NewServer()

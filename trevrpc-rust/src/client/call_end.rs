@@ -12,8 +12,9 @@
 //! that is blocked, or that finds the upload stopped, needs the STATUS even when the caller is not
 //! reading and frames are queued ahead of it, so the task then keeps reading and buffers frames.
 //! It buffers at most the call's own response limits (`max_response_messages` and
-//! `max_response_stream_body_size`, with fallbacks when they are unset), which the response stream
-//! would enforce on the caller anyway, plus the two queued frames. While the upload merely
+//! `max_response_stream_body_size`), which the response stream would enforce on the caller anyway,
+//! or 4096 messages and 16 MiB when they are unset, as they are by default, plus the two queued
+//! frames. While the upload merely
 //! blocks, reaching that bound pauses reading again. Once the upload has stopped, reaching it
 //! ends the call for sends with `ResourceExhausted`, since the STATUS cannot be found; the
 //! response stream still delivers everything buffered.

@@ -93,32 +93,29 @@ fn the_option_is_read_from_descriptors_and_emitted_for_clients_and_servers() {
         ",
     ));
 
-    // Clients apply the marks on top of the caller's options.
+    // Clients make the schema's marks the call's default, which options can override.
     assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, options.with_unreliable(::trevrpc::Unreliable::BOTH)).await"
+        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone()).default_unreliable(::trevrpc::Unreliable::BOTH)"
     ), "{content}");
     assert!(content.contains(
-        "bidirectional_streaming_from_stream(&self.transport, telemetry_paths::TRACK, requests, options.with_unreliable(::trevrpc::Unreliable::BOTH)).await"
+        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone()).default_unreliable(::trevrpc::Unreliable::REQUESTS)"
     ));
     assert!(content.contains(
-        "client_streaming(&self.transport, telemetry_paths::UPLOAD, options.with_unreliable(::trevrpc::Unreliable::REQUESTS)).await"
+        "server_streaming(&self.transport, telemetry_paths::WATCH, request, self.default_options.clone()).default_unreliable(::trevrpc::Unreliable::RESPONSES)"
     ));
     assert!(content.contains(
-        "server_streaming(&self.transport, telemetry_paths::WATCH, &request, options.with_unreliable(::trevrpc::Unreliable::RESPONSES)).await"
-    ));
-    assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::RELIABLE, options).await"
+        "bidirectional_streaming(&self.transport, telemetry_paths::RELIABLE, self.default_options.clone())"
     ));
 
     // Servers register the marked routes with route options.
     assert!(content.contains(
-        "server.route_streaming_envelope_with_options(telemetry_paths::TRACK, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_unreliable(::trevrpc::Unreliable::BOTH), move |context,"
+        "server.route_streaming_with_options(telemetry_paths::TRACK, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_unreliable(::trevrpc::Unreliable::BOTH), move |context,"
     ));
     assert!(content.contains(
-        "server.route_streaming_envelope_with_options(telemetry_paths::UPLOAD, ::trevrpc::RpcKind::ClientStreaming, ::trevrpc::server::RouteOptions::new().with_unreliable(::trevrpc::Unreliable::REQUESTS), move |context,"
+        "server.route_streaming_with_options(telemetry_paths::UPLOAD, ::trevrpc::RpcKind::ClientStreaming, ::trevrpc::server::RouteOptions::new().with_unreliable(::trevrpc::Unreliable::REQUESTS), move |context,"
     ));
     assert!(content.contains(
-        "server.route_streaming_envelope_with_context(telemetry_paths::RELIABLE, ::trevrpc::RpcKind::BidirectionalStreaming, move |context,"
+        "server.route_streaming_with_context(telemetry_paths::RELIABLE, ::trevrpc::RpcKind::BidirectionalStreaming, move |context,"
     ));
 }
 

@@ -15,13 +15,13 @@ func serverQMuxConfig(options ServerOptions) qmux.Config {
 	streamWindow := frameReceiveWindow(options.MaxFrameSize)
 	return qmux.Config{
 		Parameters: qmux.Parameters{
-			MaxIdleTimeout:                 options.StreamIdleTimeout,
+			MaxIdleTimeout:                 options.ConnectionIdleTimeout,
 			InitialMaxData:                 connectionReceiveWindow(options, streamWindow),
 			InitialMaxStreamDataBidiRemote: streamWindow,
 			InitialMaxStreamsBidi:          uint64(serverStreamLimit(options)),
 			MaxRecordSize:                  qmuxMaxRecordSize,
 		},
-		KeepAlivePeriod: options.StreamIdleTimeout / 2,
+		KeepAlivePeriod: options.ConnectionIdleTimeout / 2,
 	}
 }
 

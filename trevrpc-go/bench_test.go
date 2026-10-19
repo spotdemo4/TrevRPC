@@ -178,8 +178,8 @@ const (
 //   - Sink counts the messages it receives.
 //   - Chat returns every message it receives.
 func registerBenchService(server *Server) {
-	RegisterUnary(server, "/bench.Echo/Unary", newTestMessage, func(_ context.Context, request *testMessage) (*Response[*testMessage], error) {
-		return &Response[*testMessage]{Message: request}, nil
+	RegisterUnary(server, "/bench.Echo/Unary", newTestMessage, func(_ context.Context, request *testMessage) (*testMessage, error) {
+		return request, nil
 	})
 	RegisterServerStreaming(server, "/bench.Echo/Repeat", newTestMessage, func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {
 		count, err := strconv.Atoi(string(RequestMetadataFromContext(ctx)[benchCountKey]))
@@ -188,7 +188,7 @@ func registerBenchService(server *Server) {
 		}
 		return &repeatStream{message: request, left: count}, nil
 	})
-	RegisterClientStreaming(server, "/bench.Echo/Sink", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (*Response[*testMessage], error) {
+	RegisterClientStreaming(server, "/bench.Echo/Sink", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (*testMessage, error) {
 		var count int
 		for _, err := range Messages(requests) {
 			if err != nil {
@@ -196,7 +196,7 @@ func registerBenchService(server *Server) {
 			}
 			count++
 		}
-		return &Response[*testMessage]{Message: &testMessage{Value: strconv.Itoa(count)}}, nil
+		return &testMessage{Value: strconv.Itoa(count)}, nil
 	})
 	RegisterBidirectionalStreaming(server, "/bench.Echo/Chat", newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
 		return echoStream{requests}, nil
@@ -251,11 +251,7 @@ var benchTransports = []benchTransport{
 func benchEndToEnd(b *testing.B, fn func(ctx context.Context, b *testing.B, transport Transport, payload string)) {
 	b.Helper()
 	pki := newTestPKI(b)
-	listener := startTestListenerWith(b, pki, func(options *ServerOptions) {
-		// A benchmark streams far more than the default per-stream limits allow.
-		options.MaxStreamMessages = -1
-		options.MaxStreamBodySize = -1
-	}, registerBenchService)
+	listener := startTestListenerWith(b, pki, nil, registerBenchService)
 	for _, tr := range benchTransports {
 		b.Run(tr.name, func(b *testing.B) {
 			runSizes(b, func(b *testing.B, size int) {

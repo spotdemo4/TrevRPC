@@ -32,31 +32,25 @@ pub trait Greeter: Send + Sync + 'static {
         &self,
         context: ::trevrpc::server::RequestContext,
         request: HelloRequest,
-    ) -> ::core::result::Result<::trevrpc::ResponseEnvelope<HelloReply>, ::trevrpc::Status>;
+    ) -> ::core::result::Result<HelloReply, ::trevrpc::Status>;
     /// Handles the `LotsOfReplies` RPC.
     async fn lots_of_replies(
         &self,
         context: ::trevrpc::server::RequestContext,
         request: HelloRequest,
-    ) -> ::core::result::Result<
-        ::trevrpc::ResponseEnvelope<::trevrpc::BoxStream<HelloReply>>,
-        ::trevrpc::Status,
-    >;
+    ) -> ::core::result::Result<::trevrpc::BoxStream<HelloReply>, ::trevrpc::Status>;
     /// Handles the `LotsOfGreetings` RPC.
     async fn lots_of_greetings(
         &self,
         context: ::trevrpc::server::RequestContext,
         requests: ::trevrpc::BoxStream<HelloRequest>,
-    ) -> ::core::result::Result<::trevrpc::ResponseEnvelope<HelloReply>, ::trevrpc::Status>;
+    ) -> ::core::result::Result<HelloReply, ::trevrpc::Status>;
     /// Handles the `BidiHello` RPC.
     async fn bidi_hello(
         &self,
         context: ::trevrpc::server::RequestContext,
         requests: ::trevrpc::BoxStream<HelloRequest>,
-    ) -> ::core::result::Result<
-        ::trevrpc::ResponseEnvelope<::trevrpc::BoxStream<HelloReply>>,
-        ::trevrpc::Status,
-    >;
+    ) -> ::core::result::Result<::trevrpc::BoxStream<HelloReply>, ::trevrpc::Status>;
 }
 
 #[derive(Clone)]
@@ -106,214 +100,74 @@ impl<T> GreeterClient<T> {
     }
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl<T> GreeterClient<T>
 where
     T: ::trevrpc::client::RpcTransport,
 {
-    /// Calls the `SayHello` RPC.
-    pub async fn say_hello(
+    /// Calls the `SayHello` RPC when the returned call is awaited.
+    pub fn say_hello(
         &self,
-        request: HelloRequest,
-    ) -> ::core::result::Result<HelloReply, ::trevrpc::Error> {
-        self.say_hello_with_options(request, self.default_options.clone())
-            .await
-    }
-
-    /// Calls the `SayHello` RPC with explicit call options.
-    pub async fn say_hello_with_options(
-        &self,
-        request: HelloRequest,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<HelloReply, ::trevrpc::Error> {
-        ::trevrpc::client::unary(&self.transport, greeter_paths::SAY_HELLO, &request, options).await
-    }
-
-    /// Calls the `SayHello` RPC and returns response metadata.
-    pub async fn say_hello_envelope(
-        &self,
-        request: HelloRequest,
-    ) -> ::core::result::Result<::trevrpc::ResponseEnvelope<HelloReply>, ::trevrpc::Error> {
-        self.say_hello_envelope_with_options(request, self.default_options.clone())
-            .await
-    }
-
-    /// Calls the `SayHello` RPC with explicit call options and returns response metadata.
-    pub async fn say_hello_envelope_with_options(
-        &self,
-        request: HelloRequest,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<::trevrpc::ResponseEnvelope<HelloReply>, ::trevrpc::Error> {
-        ::trevrpc::client::unary_envelope(
+        request: &HelloRequest,
+    ) -> ::trevrpc::client::Call<'_, T, ::trevrpc::client::call::Unary<HelloRequest, HelloReply>>
+    {
+        ::trevrpc::client::unary(
             &self.transport,
             greeter_paths::SAY_HELLO,
-            &request,
-            options,
+            request,
+            self.default_options.clone(),
         )
-        .await
     }
 }
 
-#[allow(clippy::missing_errors_doc)]
 impl<T> GreeterClient<T>
 where
     T: ::trevrpc::client::StreamingRpcTransport,
 {
-    /// Calls the `LotsOfReplies` RPC.
-    pub async fn lots_of_replies(
+    /// Calls the `LotsOfReplies` RPC when the returned call is awaited.
+    pub fn lots_of_replies(
         &self,
-        request: HelloRequest,
-    ) -> ::core::result::Result<::trevrpc::client::ResponseStream<HelloReply>, ::trevrpc::Error>
-    {
-        self.lots_of_replies_with_options(request, self.default_options.clone())
-            .await
-    }
-
-    /// Calls the `LotsOfReplies` RPC with explicit call options.
-    pub async fn lots_of_replies_with_options(
-        &self,
-        request: HelloRequest,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<::trevrpc::client::ResponseStream<HelloReply>, ::trevrpc::Error>
-    {
+        request: &HelloRequest,
+    ) -> ::trevrpc::client::Call<
+        '_,
+        T,
+        ::trevrpc::client::call::ServerStreaming<HelloRequest, HelloReply>,
+    > {
         ::trevrpc::client::server_streaming(
             &self.transport,
             greeter_paths::LOTS_OF_REPLIES,
-            &request,
-            options,
+            request,
+            self.default_options.clone(),
         )
-        .await
     }
 
-    /// Calls the `LotsOfGreetings` RPC.
-    pub async fn lots_of_greetings(
+    /// Calls the `LotsOfGreetings` RPC when the returned call is awaited.
+    pub fn lots_of_greetings(
         &self,
-    ) -> ::core::result::Result<
-        ::trevrpc::client::ClientStreamingCall<HelloRequest, HelloReply>,
-        ::trevrpc::Error,
-    > {
-        self.lots_of_greetings_with_options(self.default_options.clone())
-            .await
-    }
-
-    /// Calls the `LotsOfGreetings` RPC with explicit call options.
-    pub async fn lots_of_greetings_with_options(
-        &self,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<
-        ::trevrpc::client::ClientStreamingCall<HelloRequest, HelloReply>,
-        ::trevrpc::Error,
+    ) -> ::trevrpc::client::Call<
+        '_,
+        T,
+        ::trevrpc::client::call::ClientStreaming<HelloRequest, HelloReply>,
     > {
         ::trevrpc::client::client_streaming(
             &self.transport,
             greeter_paths::LOTS_OF_GREETINGS,
-            options,
-        )
-        .await
-    }
-
-    /// Calls the `LotsOfGreetings` RPC with a caller-provided request stream.
-    pub async fn lots_of_greetings_from_stream(
-        &self,
-        requests: ::trevrpc::BoxStream<HelloRequest>,
-    ) -> ::core::result::Result<HelloReply, ::trevrpc::Error> {
-        self.lots_of_greetings_from_stream_with_options(requests, self.default_options.clone())
-            .await
-    }
-
-    /// Calls the `LotsOfGreetings` RPC with a caller-provided request stream and explicit call options.
-    pub async fn lots_of_greetings_from_stream_with_options(
-        &self,
-        requests: ::trevrpc::BoxStream<HelloRequest>,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<HelloReply, ::trevrpc::Error> {
-        ::trevrpc::client::client_streaming_from_stream(
-            &self.transport,
-            greeter_paths::LOTS_OF_GREETINGS,
-            requests,
-            options,
-        )
-        .await
-    }
-
-    /// Calls the `LotsOfGreetings` RPC with a caller-provided request stream and preserves response metadata.
-    pub async fn lots_of_greetings_from_stream_envelope(
-        &self,
-        requests: ::trevrpc::BoxStream<HelloRequest>,
-    ) -> ::core::result::Result<::trevrpc::ResponseEnvelope<HelloReply>, ::trevrpc::Error> {
-        self.lots_of_greetings_from_stream_envelope_with_options(
-            requests,
             self.default_options.clone(),
         )
-        .await
     }
 
-    /// Calls the `LotsOfGreetings` RPC with a caller-provided request stream, explicit options, and response metadata.
-    pub async fn lots_of_greetings_from_stream_envelope_with_options(
+    /// Calls the `BidiHello` RPC when the returned call is awaited.
+    pub fn bidi_hello(
         &self,
-        requests: ::trevrpc::BoxStream<HelloRequest>,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<::trevrpc::ResponseEnvelope<HelloReply>, ::trevrpc::Error> {
-        ::trevrpc::client::client_streaming_from_stream_envelope(
-            &self.transport,
-            greeter_paths::LOTS_OF_GREETINGS,
-            requests,
-            options,
-        )
-        .await
-    }
-
-    /// Calls the `BidiHello` RPC.
-    pub async fn bidi_hello(
-        &self,
-    ) -> ::core::result::Result<
-        ::trevrpc::client::BidirectionalCall<HelloRequest, HelloReply>,
-        ::trevrpc::Error,
-    > {
-        self.bidi_hello_with_options(self.default_options.clone())
-            .await
-    }
-
-    /// Calls the `BidiHello` RPC with explicit call options.
-    pub async fn bidi_hello_with_options(
-        &self,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<
-        ::trevrpc::client::BidirectionalCall<HelloRequest, HelloReply>,
-        ::trevrpc::Error,
+    ) -> ::trevrpc::client::Call<
+        '_,
+        T,
+        ::trevrpc::client::call::BidirectionalStreaming<HelloRequest, HelloReply>,
     > {
         ::trevrpc::client::bidirectional_streaming(
             &self.transport,
             greeter_paths::BIDI_HELLO,
-            options,
+            self.default_options.clone(),
         )
-        .await
-    }
-
-    /// Calls the `BidiHello` RPC with a caller-provided request stream.
-    pub async fn bidi_hello_from_stream(
-        &self,
-        requests: ::trevrpc::BoxStream<HelloRequest>,
-    ) -> ::core::result::Result<::trevrpc::client::ResponseStream<HelloReply>, ::trevrpc::Error>
-    {
-        self.bidi_hello_from_stream_with_options(requests, self.default_options.clone())
-            .await
-    }
-
-    /// Calls the `BidiHello` RPC with a caller-provided request stream and explicit call options.
-    pub async fn bidi_hello_from_stream_with_options(
-        &self,
-        requests: ::trevrpc::BoxStream<HelloRequest>,
-        options: ::trevrpc::client::CallOptions,
-    ) -> ::core::result::Result<::trevrpc::client::ResponseStream<HelloReply>, ::trevrpc::Error>
-    {
-        ::trevrpc::client::bidirectional_streaming_from_stream(
-            &self.transport,
-            greeter_paths::BIDI_HELLO,
-            requests,
-            options,
-        )
-        .await
     }
 }
 
@@ -326,19 +180,19 @@ where
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_envelope_with_context(greeter_paths::SAY_HELLO, move |context, body| {
+        server.route_with_context(greeter_paths::SAY_HELLO, move |context, body| {
             let service = ::std::sync::Arc::clone(&service);
             async move {
                 let request = <HelloRequest as ::prost::Message>::decode(body.as_slice())?;
                 let response = service.say_hello(context, request).await?;
-                Ok(response.map(|response| ::prost::Message::encode_to_vec(&response)))
+                Ok(::prost::Message::encode_to_vec(&response))
             }
         });
     }
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_streaming_envelope_with_context(
+        server.route_streaming_with_context(
             greeter_paths::LOTS_OF_REPLIES,
             ::trevrpc::RpcKind::ServerStreaming,
             move |context, body, _request_stream| {
@@ -346,7 +200,7 @@ where
                 async move {
                     let request = <HelloRequest as ::prost::Message>::decode(body.as_slice())?;
                     let responses = service.lots_of_replies(context, request).await?;
-                    Ok(responses.map(::trevrpc::stream::encode))
+                    Ok(::trevrpc::stream::encode(responses))
                 }
             },
         );
@@ -354,7 +208,7 @@ where
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_streaming_envelope_with_context(
+        server.route_streaming_with_context(
             greeter_paths::LOTS_OF_GREETINGS,
             ::trevrpc::RpcKind::ClientStreaming,
             move |context, _body, request_stream| {
@@ -362,9 +216,9 @@ where
                 async move {
                     let requests = ::trevrpc::stream::decode::<HelloRequest>(request_stream);
                     let response = service.lots_of_greetings(context, requests).await?;
-                    Ok(response.map(|response| {
-                        ::trevrpc::stream::encode(::trevrpc::stream::from_iter([response]))
-                    }))
+                    Ok(::trevrpc::stream::encode(::trevrpc::stream::from_iter([
+                        response,
+                    ])))
                 }
             },
         );
@@ -372,7 +226,7 @@ where
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_streaming_envelope_with_context(
+        server.route_streaming_with_context(
             greeter_paths::BIDI_HELLO,
             ::trevrpc::RpcKind::BidirectionalStreaming,
             move |context, _body, request_stream| {
@@ -380,7 +234,7 @@ where
                 async move {
                     let requests = ::trevrpc::stream::decode::<HelloRequest>(request_stream);
                     let responses = service.bidi_hello(context, requests).await?;
-                    Ok(responses.map(::trevrpc::stream::encode))
+                    Ok(::trevrpc::stream::encode(responses))
                 }
             },
         );

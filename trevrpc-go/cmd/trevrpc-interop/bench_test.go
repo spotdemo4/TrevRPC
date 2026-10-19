@@ -203,9 +203,9 @@ func (r padRecorder) record(ctx context.Context) {
 	r.pads <- trevrpc.RequestMetadataFromContext(ctx)[benchPadKey]
 }
 
-func (r padRecorder) Unary(ctx context.Context, request *interoppb.EchoRequest) (*trevrpc.Response[*interoppb.EchoResponse], error) {
+func (r padRecorder) Unary(ctx context.Context, request *interoppb.EchoRequest) (*interoppb.EchoResponse, error) {
 	r.record(ctx)
-	return &trevrpc.Response[*interoppb.EchoResponse]{Message: &interoppb.EchoResponse{Message: request.Message}}, nil
+	return &interoppb.EchoResponse{Message: request.Message}, nil
 }
 
 func (r padRecorder) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {

@@ -42,25 +42,33 @@ fn response_headers() -> trevrpc::Metadata {
     trevrpc::Metadata::from([("x-header".to_owned(), b"h".to_vec())])
 }
 
+fn set_response_headers(context: &RequestContext) -> Result<(), Status> {
+    for (key, value) in response_headers() {
+        context.set_response_header(&key, value)?;
+    }
+    Ok(())
+}
+
 #[trevrpc::async_trait]
 impl greeter::Greeter for Greeter {
     async fn say_hello(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
-        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
+    ) -> Result<greeter::HelloReply, Status> {
+        set_response_headers(&context)?;
+        Ok(greeter::HelloReply {
             message: format!("hello, {}", request.name),
         })
-        .with_headers(response_headers()))
     }
 
     async fn lots_of_replies(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>, Status> {
-        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter([
+    ) -> Result<trevrpc::BoxStream<greeter::HelloReply>, Status> {
+        set_response_headers(&context)?;
+        Ok(trevrpc::stream::from_iter([
             greeter::HelloReply {
                 message: format!("hello, {}", request.name),
             },
@@ -68,35 +76,32 @@ impl greeter::Greeter for Greeter {
                 message: format!("goodbye, {}", request.name),
             },
         ]))
-        .with_headers(response_headers()))
     }
 
     async fn lots_of_greetings(
         &self,
         _context: RequestContext,
         mut requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
+    ) -> Result<greeter::HelloReply, Status> {
         let mut names = Vec::new();
         while let Some(request) = requests.next().await {
             names.push(request?.name);
         }
-        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
+        Ok(greeter::HelloReply {
             message: names.join(","),
-        }))
+        })
     }
 
     async fn bidi_hello(
         &self,
         _context: RequestContext,
         requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>, Status> {
-        Ok(trevrpc::ResponseEnvelope::new(Box::pin(requests.map(
-            |request| {
-                request.map(|request| greeter::HelloReply {
-                    message: format!("echo, {}", request.name),
-                })
-            },
-        ))))
+    ) -> Result<trevrpc::BoxStream<greeter::HelloReply>, Status> {
+        Ok(Box::pin(requests.map(|request| {
+            request.map(|request| greeter::HelloReply {
+                message: format!("echo, {}", request.name),
+            })
+        })))
     }
 }
 
@@ -258,15 +263,16 @@ async fn exercise_greeter<T: StreamingRpcTransport>(
     client: &greeter::GreeterClient<T>,
 ) -> TestResult {
     let reply = client
-        .say_hello_envelope(greeter::HelloRequest {
+        .say_hello(&greeter::HelloRequest {
             name: "unary".to_owned(),
         })
+        .with_response()
         .await?;
     assert_eq!(reply.message().message, "hello, unary");
     assert_eq!(reply.headers(), &response_headers());
 
     let mut replies = client
-        .lots_of_replies(greeter::HelloRequest {
+        .lots_of_replies(&greeter::HelloRequest {
             name: "stream".to_owned(),
         })
         .await?;
@@ -278,7 +284,8 @@ async fn exercise_greeter<T: StreamingRpcTransport>(
     assert_eq!(messages, ["hello, stream", "goodbye, stream"]);
 
     let call = client
-        .lots_of_greetings_with_options(CallOptions::default())
+        .lots_of_greetings()
+        .options(|_| CallOptions::default())
         .await?;
     for name in ["one", "two"] {
         call.send(greeter::HelloRequest {
@@ -289,7 +296,8 @@ async fn exercise_greeter<T: StreamingRpcTransport>(
     assert_eq!(call.close_and_recv().await?.message, "one,two");
 
     let mut call = client
-        .bidi_hello_with_options(CallOptions::default())
+        .bidi_hello()
+        .options(|_| CallOptions::default())
         .await?;
     for name in ["left", "right"] {
         call.send(greeter::HelloRequest {
@@ -321,7 +329,7 @@ async fn qmux_over_tls_round_trips_every_rpc_shape() -> TestResult {
     // Large messages cross many records and flow-control updates.
     let large = "x".repeat(1 << 20);
     let reply = client
-        .say_hello(greeter::HelloRequest {
+        .say_hello(&greeter::HelloRequest {
             name: large.clone(),
         })
         .await?;
@@ -341,7 +349,7 @@ async fn shutdown_closes_qmux_connections() -> TestResult {
     .await?;
     let client = greeter::GreeterClient::new(transport.clone());
     client
-        .say_hello(greeter::HelloRequest {
+        .say_hello(&greeter::HelloRequest {
             name: "before".to_owned(),
         })
         .await?;
@@ -509,7 +517,7 @@ async fn tcp_offers_only_enabled_protocols() -> TestResult {
     )
     .await?;
     let reply = greeter::GreeterClient::new(transport)
-        .say_hello(greeter::HelloRequest {
+        .say_hello(&greeter::HelloRequest {
             name: "native".to_owned(),
         })
         .await?;
@@ -576,7 +584,7 @@ async fn channel_can_use_tcp_only() -> TestResult {
     .await?;
     ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
     let reply = greeter::GreeterClient::new(channel.clone())
-        .say_hello(greeter::HelloRequest {
+        .say_hello(&greeter::HelloRequest {
             name: "tcp".to_owned(),
         })
         .await?;

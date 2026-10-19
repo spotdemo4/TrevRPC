@@ -51,9 +51,9 @@ func (*HelloReply) ProtoMessage() {}
 //
 //nolint:revive // mirrors the {Service}Server name protoc-gen-trevrpc-go generates
 type GreeterServer interface {
-	SayHello(context.Context, *HelloRequest) (*trevrpc.Response[*HelloReply], error)
+	SayHello(context.Context, *HelloRequest) (*HelloReply, error)
 	LotsOfReplies(context.Context, *HelloRequest) (trevrpc.MessageStream[*HelloReply], error)
-	LotsOfGreetings(context.Context, trevrpc.MessageStream[*HelloRequest]) (*trevrpc.Response[*HelloReply], error)
+	LotsOfGreetings(context.Context, trevrpc.MessageStream[*HelloRequest]) (*HelloReply, error)
 	BidiHello(context.Context, trevrpc.MessageStream[*HelloRequest]) (trevrpc.MessageStream[*HelloReply], error)
 }
 

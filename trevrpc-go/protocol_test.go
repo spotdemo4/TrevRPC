@@ -3,7 +3,6 @@ package trevrpc
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -131,11 +130,11 @@ func TestServerSkipsUnknownFramesEverywhere(t *testing.T) {
 func TestServerRejectsKnownFramesOutOfPlace(t *testing.T) {
 	var called atomic.Int64
 	server := newProtocolTestServer()
-	server.routeUnary("/example.Greeter/Probe", func(context.Context, []byte) (*unaryReply, error) {
+	server.routeUnary("/example.Greeter/Probe", func(context.Context, []byte) (encodedMessage, error) {
 		called.Add(1)
-		return &unaryReply{message: rawMessage(nil)}, nil
+		return rawMessage(nil), nil
 	})
-	server.routeStreaming("/example.Greeter/Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
+	server.routeStreaming("/example.Greeter/Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (encodedStream, error) {
 		called.Add(1)
 		return rawResponse()
 	})
@@ -274,8 +273,11 @@ func TestServerStreamingHeadersAreWrittenBeforeTheFirstMessageIsPulled(t *testin
 	server := NewServer()
 	release := make(chan struct{})
 	pulled := make(chan struct{})
-	RegisterServerStreaming(server, "/example.Greeter/Slow", newTestMessage, func(_ context.Context, _ *testMessage) (MessageStream[*testMessage], error) {
-		return WithResponseHeaders(&notifyingStream{pulled: pulled, release: release}, Metadata{"x-h": []byte("1")}), nil
+	RegisterServerStreaming(server, "/example.Greeter/Slow", newTestMessage, func(ctx context.Context, _ *testMessage) (MessageStream[*testMessage], error) {
+		if err := SetResponseHeader(ctx, "x-h", []byte("1")); err != nil {
+			return nil, err
+		}
+		return &notifyingStream{pulled: pulled, release: release}, nil
 	})
 	request := testRequestBytes(t, requestFor("Slow", RPCKindServerStreaming), "")
 	stream := &lockedRPCStream{reader: bytes.NewReader(request)}
@@ -346,59 +348,6 @@ func (s *notifyingStream) Recv() (*testMessage, error) {
 }
 
 func (*notifyingStream) Close() error { return nil }
-
-func TestResponseHeadersAreValidated(t *testing.T) {
-	server := NewServer()
-	RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(context.Context, *testMessage) (*Response[*testMessage], error) {
-		return &Response[*testMessage]{Message: &testMessage{}, Headers: Metadata{"Bad Key": nil}}, nil
-	})
-	RegisterServerStreaming(server, "/example.Greeter/Count", newTestMessage, func(context.Context, *testMessage) (MessageStream[*testMessage], error) {
-		return WithResponseHeaders[*testMessage](newSliceStream[*testMessage](), Metadata{"trevrpc-reserved": nil}), nil
-	})
-	for _, test := range []struct {
-		method string
-		kind   RPCKind
-	}{{"Echo", RPCKindUnary}, {"Count", RPCKindServerStreaming}} {
-		_, frames := serveTestStream(t, server, testRequestBytes(t, requestFor(test.method, test.kind), ""))
-		status := requireStatusFrame(t, frames, CodeInternal)
-		if status.Message != "internal server error" {
-			t.Fatalf("%s: invalid headers leaked detail: %q", test.method, status.Message)
-		}
-	}
-}
-
-func TestWithResponseHeadersComposesWithNewResponseStream(t *testing.T) {
-	headers := Metadata{"x-h": []byte("1")}
-	trailers := Metadata{"x-t": []byte("2")}
-	inner := newSliceStream(&testMessage{Value: "a"})
-
-	for name, stream := range map[string]MessageStream[*testMessage]{
-		"headers outside": WithResponseHeaders(NewResponseStream(inner, trailers), headers),
-		"headers inside":  NewResponseStream(WithResponseHeaders(newSliceStream(&testMessage{Value: "a"}), headers), trailers),
-	} {
-		t.Run(name, func(t *testing.T) {
-			response, err := newStreamResponse(stream)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(response.headers["x-h"]) != "1" || len(response.headers) != 1 {
-				t.Fatalf("headers = %v", response.headers)
-			}
-			if response.terminal == nil {
-				t.Fatal("the terminal status source was lost")
-			}
-			for range 2 {
-				if _, err := response.stream.Recv(); err != nil && !errors.Is(err, io.EOF) {
-					t.Fatal(err)
-				}
-			}
-			status, ok := response.terminal()
-			if !ok || string(status.Metadata["x-t"]) != "2" {
-				t.Fatalf("terminal status = %v, %t, want the trailing metadata", status, ok)
-			}
-		})
-	}
-}
 
 func TestServerIgnoresRequestExtensions(t *testing.T) {
 	server := newProtocolTestServer()

@@ -152,11 +152,11 @@ func TestHTTP2EnforcesTheStreamLimitPerConnection(t *testing.T) {
 	}, func(server *Server) {
 		registerTestService(server)
 		// Hold occupies the connection's only RPC slot until released.
-		RegisterUnary(server, "/example.Greeter/Hold", newTestMessage, func(ctx context.Context, _ *testMessage) (*Response[*testMessage], error) {
+		RegisterUnary(server, "/example.Greeter/Hold", newTestMessage, func(ctx context.Context, _ *testMessage) (*testMessage, error) {
 			entered <- struct{}{}
 			select {
 			case <-release:
-				return &Response[*testMessage]{Message: &testMessage{Value: "held"}}, nil
+				return &testMessage{Value: "held"}, nil
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}

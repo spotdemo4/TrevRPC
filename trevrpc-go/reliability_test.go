@@ -169,8 +169,8 @@ const uploadRejectionTimeout = 2 * time.Second
 func registerEarlyFinishService(server *Server) {
 	registerTestService(server)
 	for _, kind := range []RPCKind{RPCKindClientStreaming, RPCKindBidirectionalStreaming} {
-		server.routeStreaming(testPath(fmt.Sprintf("FailEarly%d", kind)), kind, func(context.Context, []byte, byteStream) (streamResponse, error) {
-			return streamResponse{}, NewStatus(CodeFailedPrecondition, "no uploads")
+		server.routeStreaming(testPath(fmt.Sprintf("FailEarly%d", kind)), kind, func(context.Context, []byte, byteStream) (encodedStream, error) {
+			return nil, NewStatus(CodeFailedPrecondition, "no uploads")
 		})
 	}
 }
@@ -284,7 +284,7 @@ func TestSendReportsEOFAfterServerFinishesCallSuccessfully(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, func(server *Server) {
 		registerTestService(server)
-		server.routeStreaming("/example.Greeter/Done", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
+		server.routeStreaming("/example.Greeter/Done", RPCKindBidirectionalStreaming, func(context.Context, []byte, byteStream) (encodedStream, error) {
 			return rawResponse()
 		})
 	})

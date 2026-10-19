@@ -11,7 +11,7 @@ use tower_http::services::ServeDir;
 use trevrpc::fallback::HttpFallback;
 use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissionRequest};
 use trevrpc::tcp::TcpFallback;
-use trevrpc::{BoxStream, Code, Error, Metadata, ResponseEnvelope, Status};
+use trevrpc::{BoxStream, Code, Error, Status};
 
 use crate::proto::{self, Echo, EchoRequest, EchoResponse, UnreliableEcho};
 use crate::{BoxError, Flags};
@@ -22,24 +22,17 @@ const TRAILER_METADATA_KEY: &str = "interop-trailer";
 
 struct EchoService;
 
-/// Wraps a response in an envelope that honors the `interop-header` request metadata.
+/// Answers the `interop-header` request metadata.
 ///
 /// When the request carries the key with value `v`, the response headers are
 /// `{interop-header: v}` and the `OK` status carries trailing metadata `{interop-trailer: v}`.
-/// Without it the envelope has neither.
-fn envelope<T>(context: &RequestContext, message: T) -> ResponseEnvelope<T> {
+/// Without it the response has neither.
+fn answer_header(context: &RequestContext) -> Result<(), Status> {
     let Some(value) = context.metadata().get(HEADER_METADATA_KEY) else {
-        return ResponseEnvelope::new(message);
+        return Ok(());
     };
-    ResponseEnvelope::new(message)
-        .with_headers(Metadata::from([(
-            HEADER_METADATA_KEY.to_owned(),
-            value.clone(),
-        )]))
-        .with_metadata(Metadata::from([(
-            TRAILER_METADATA_KEY.to_owned(),
-            value.clone(),
-        )]))
+    context.set_response_header(HEADER_METADATA_KEY, value.clone())?;
+    context.set_response_metadata(TRAILER_METADATA_KEY, value.clone())
 }
 
 /// The status a request asks to fail with, if any.
@@ -58,29 +51,27 @@ impl Echo for EchoService {
         &self,
         context: RequestContext,
         request: EchoRequest,
-    ) -> Result<ResponseEnvelope<EchoResponse>, Status> {
+    ) -> Result<EchoResponse, Status> {
         if let Some(status) = requested_failure(&request) {
             return Err(status);
         }
+        answer_header(&context)?;
         let suffix = context
             .metadata()
             .get(SUFFIX_METADATA_KEY)
             .map(|value| String::from_utf8_lossy(value).into_owned())
             .unwrap_or_default();
-        Ok(envelope(
-            &context,
-            EchoResponse {
-                message: request.message + &suffix,
-                index: 0,
-            },
-        ))
+        Ok(EchoResponse {
+            message: request.message + &suffix,
+            index: 0,
+        })
     }
 
     async fn client_stream(
         &self,
         context: RequestContext,
         mut requests: BoxStream<EchoRequest>,
-    ) -> Result<ResponseEnvelope<EchoResponse>, Status> {
+    ) -> Result<EchoResponse, Status> {
         let mut message = String::new();
         let mut count = 0_u32;
         while let Some(request) = requests.next().await {
@@ -91,20 +82,18 @@ impl Echo for EchoService {
             message.push_str(&request.message);
             count = count.saturating_add(1);
         }
-        Ok(envelope(
-            &context,
-            EchoResponse {
-                message,
-                index: count,
-            },
-        ))
+        answer_header(&context)?;
+        Ok(EchoResponse {
+            message,
+            index: count,
+        })
     }
 
     async fn server_stream(
         &self,
         context: RequestContext,
         request: EchoRequest,
-    ) -> Result<ResponseEnvelope<BoxStream<EchoResponse>>, Status> {
+    ) -> Result<BoxStream<EchoResponse>, Status> {
         let failure = requested_failure(&request);
         let EchoRequest { message, count, .. } = request;
         let responses = (0..count)
@@ -115,17 +104,15 @@ impl Echo for EchoService {
                 })
             })
             .chain(failure.map(|status| Err(Error::from(status))));
-        Ok(envelope(
-            &context,
-            Box::pin(futures_util::stream::iter(responses)),
-        ))
+        answer_header(&context)?;
+        Ok(Box::pin(futures_util::stream::iter(responses)))
     }
 
     async fn bidi(
         &self,
         context: RequestContext,
         requests: BoxStream<EchoRequest>,
-    ) -> Result<ResponseEnvelope<BoxStream<EchoResponse>>, Status> {
+    ) -> Result<BoxStream<EchoResponse>, Status> {
         // `(requests, next index, finished)`: a failing request ends the stream with its status.
         let responses = futures_util::stream::unfold(
             (requests, 0_u32, false),
@@ -148,7 +135,8 @@ impl Echo for EchoService {
                 }
             },
         );
-        Ok(envelope(&context, Box::pin(responses)))
+        answer_header(&context)?;
+        Ok(Box::pin(responses))
     }
 }
 
@@ -166,7 +154,7 @@ impl UnreliableEcho for UnreliableEchoService {
         &self,
         context: RequestContext,
         mut requests: BoxStream<EchoRequest>,
-    ) -> Result<ResponseEnvelope<BoxStream<EchoResponse>>, Status> {
+    ) -> Result<BoxStream<EchoResponse>, Status> {
         let mut received = 0_u64;
         // The requests that ask for responses, as `(message, count)`.
         let mut asked = Vec::new();
@@ -186,21 +174,13 @@ impl UnreliableEcho for UnreliableEchoService {
             })
         });
 
-        let responses: BoxStream<EchoResponse> = Box::pin(futures_util::stream::iter(responses));
-        let envelope = envelope(&context, responses);
-        let mut trailers = envelope.metadata().clone();
-        trailers.insert(
-            RECEIVED_METADATA_KEY.to_owned(),
-            received.to_string().into_bytes(),
-        );
-        trailers.insert(
-            DATAGRAMS_RECEIVED_METADATA_KEY.to_owned(),
-            context
-                .datagram_requests_received()
-                .to_string()
-                .into_bytes(),
-        );
-        Ok(envelope.with_metadata(trailers))
+        answer_header(&context)?;
+        context.set_response_metadata(RECEIVED_METADATA_KEY, received.to_string())?;
+        context.set_response_metadata(
+            DATAGRAMS_RECEIVED_METADATA_KEY,
+            context.datagram_requests_received().to_string(),
+        )?;
+        Ok(Box::pin(futures_util::stream::iter(responses)))
     }
 }
 
@@ -217,15 +197,12 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let key = PrivateKeyDer::from_pem_file(flags.require("key")?)?;
 
     // No `tracing` subscriber is installed, so the per-RPC logs are not emitted and cannot skew
-    // the load benchmarks. The stream message and size limits are lifted because `bench` keeps one
-    // bidi stream open for a whole run.
+    // the load benchmarks.
     // `--web-root` serves a directory, such as the browser interop page, through the HTTP
     // fallback on the same ports.
     let mut server = Server::new();
     server.set_options(
         ServerOptions::new()
-            .with_max_stream_messages(None)
-            .with_max_stream_body_size(None)
             .with_http_enabled(true)
             .with_webtransport_enabled(true)
             .with_webtransport_admission(Some(admit_webtransport))

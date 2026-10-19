@@ -25,7 +25,7 @@ use trevrpc::client::{
 };
 use trevrpc::server::{RequestContext, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
-use trevrpc::{BoxStream, ResponseEnvelope, RpcKind, Status};
+use trevrpc::{BoxStream, RpcKind, Status};
 
 #[allow(dead_code)]
 #[path = "../../examples/shared/greeter.rs"]
@@ -110,41 +110,41 @@ impl greeter::Greeter for BenchGreeter {
         &self,
         _context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> Result<ResponseEnvelope<greeter::HelloReply>, Status> {
-        Ok(ResponseEnvelope::new(reply(request.name)))
+    ) -> Result<greeter::HelloReply, Status> {
+        Ok(reply(request.name))
     }
 
     async fn lots_of_replies(
         &self,
         _context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> Result<ResponseEnvelope<BoxStream<greeter::HelloReply>>, Status> {
-        Ok(ResponseEnvelope::new(trevrpc::stream::from_iter(
+    ) -> Result<BoxStream<greeter::HelloReply>, Status> {
+        Ok(trevrpc::stream::from_iter(
             (0..MESSAGES).map(move |_| reply(request.name.clone())),
-        )))
+        ))
     }
 
     async fn lots_of_greetings(
         &self,
         _context: RequestContext,
         mut requests: BoxStream<greeter::HelloRequest>,
-    ) -> Result<ResponseEnvelope<greeter::HelloReply>, Status> {
+    ) -> Result<greeter::HelloReply, Status> {
         let mut count = 0_usize;
         while let Some(request) = requests.next().await {
             request?;
             count += 1;
         }
-        Ok(ResponseEnvelope::new(reply(count.to_string())))
+        Ok(reply(count.to_string()))
     }
 
     async fn bidi_hello(
         &self,
         _context: RequestContext,
         requests: BoxStream<greeter::HelloRequest>,
-    ) -> Result<ResponseEnvelope<BoxStream<greeter::HelloReply>>, Status> {
-        Ok(ResponseEnvelope::new(Box::pin(requests.map(|request| {
-            request.map(|request| reply(request.name))
-        }))))
+    ) -> Result<BoxStream<greeter::HelloReply>, Status> {
+        Ok(Box::pin(
+            requests.map(|request| request.map(|request| reply(request.name))),
+        ))
     }
 }
 
@@ -197,12 +197,8 @@ impl Fixture {
             .unwrap();
 
         let mut server = Server::new();
-        // Benchmarks keep one bidi stream open across thousands of iterations.
         server.set_options(
-            ServerOptions::new()
-                .with_max_stream_messages(None)
-                .with_max_stream_body_size(None)
-                .with_graceful_shutdown_timeout(Some(Duration::from_millis(200))),
+            ServerOptions::new().with_graceful_shutdown_timeout(Some(Duration::from_millis(200))),
         );
         match variant {
             Variant::Raw => register_raw(&mut server),
@@ -327,7 +323,8 @@ where
             }
             Self::Greeter { client, request } => {
                 let reply = client
-                    .say_hello_with_options(request.clone(), options())
+                    .say_hello(request)
+                    .options(|_| options())
                     .await
                     .unwrap();
                 assert_eq!(reply.message.len(), request.name.len());
@@ -355,7 +352,8 @@ where
             }
             Self::Greeter { client, request } => {
                 let mut responses = client
-                    .lots_of_replies_with_options(request.clone(), options())
+                    .lots_of_replies(request)
+                    .options(|_| options())
                     .await
                     .unwrap();
                 while let Some(response) = responses.next().await {
@@ -386,7 +384,8 @@ where
             }
             Self::Greeter { client, request } => {
                 let call = client
-                    .lots_of_greetings_with_options(options())
+                    .lots_of_greetings()
+                    .options(|_| options())
                     .await
                     .unwrap();
                 for _ in 0..MESSAGES {
@@ -413,7 +412,7 @@ where
                 request: request.clone(),
             },
             Self::Greeter { client, request } => Bidi::Greeter {
-                call: client.bidi_hello_with_options(options()).await.unwrap(),
+                call: client.bidi_hello().options(|_| options()).await.unwrap(),
                 request: request.clone(),
             },
         }

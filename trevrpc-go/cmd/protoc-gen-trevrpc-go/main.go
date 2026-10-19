@@ -369,7 +369,7 @@ func (g fileGenerator) serverResponseType(method *protogen.Method) string {
 	if method.Desc.IsStreamingServer() {
 		return g.runtime("MessageStream") + "[" + outputType + "]"
 	}
-	return "*" + g.runtime("Response") + "[" + outputType + "]"
+	return outputType
 }
 
 func (g fileGenerator) messageType(message *protogen.Message) string {

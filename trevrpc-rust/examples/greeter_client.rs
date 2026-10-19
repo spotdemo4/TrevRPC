@@ -30,19 +30,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = greeter::GreeterClient::new(channel.clone());
 
     let reply = client
-        .say_hello_with_options(greeter::HelloRequest { name: name.clone() }, call_options())
+        .say_hello(&greeter::HelloRequest { name: name.clone() })
+        .options(|_| call_options())
         .await?;
     println!("unary: {}", reply.message);
 
     let mut replies = client
-        .lots_of_replies_with_options(greeter::HelloRequest { name: name.clone() }, call_options())
+        .lots_of_replies(&greeter::HelloRequest { name: name.clone() })
+        .options(|_| call_options())
         .await?;
     while let Some(reply) = replies.next().await {
         println!("server-streaming: {}", reply?.message);
     }
 
     let greetings = client
-        .lots_of_greetings_with_options(call_options())
+        .lots_of_greetings()
+        .options(|_| call_options())
         .await?;
     for suffix in ["client stream 1", "client stream 2"] {
         greetings
@@ -54,7 +57,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let summary = greetings.close_and_recv().await?;
     println!("client-streaming: {}", summary.message);
 
-    let call = client.bidi_hello_with_options(call_options()).await?;
+    let call = client.bidi_hello().options(|_| call_options()).await?;
     let (sender, mut replies) = call.split();
     let send_name = name.clone();
     let send_task = tokio::spawn(async move {

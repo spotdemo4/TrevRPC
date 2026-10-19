@@ -117,12 +117,12 @@ fmt.Println(channel.Transport()) // trevrpc.TransportQUIC ("quic") or trevrpc.Tr
 ```go
 type greeterService struct{}
 
-func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
-	return &trevrpc.Response[*greeter.HelloReply]{Message: &greeter.HelloReply{Message: "hello, " + r.Name}}, nil
+func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*greeter.HelloReply, error) {
+	return &greeter.HelloReply{Message: "hello, " + r.Name}, nil
 }
 
 // LotsOfReplies and BidiHello return a trevrpc.MessageStream; LotsOfGreetings
-// returns a *trevrpc.Response like SayHello. See examples/greeter_server.
+// returns a *greeter.HelloReply like SayHello. See examples/greeter_server.
 
 server := trevrpc.NewServer()
 options := server.Options()
@@ -144,7 +144,7 @@ defer listener.Close()
 return listener.Serve(ctx) // returns nil after ctx is cancelled and handlers drain
 ```
 
-Unary and client-streaming handlers return a `*trevrpc.Response` whose `Headers` are sent ahead of the message and whose `Metadata` is trailing metadata, sent with the final status. Streaming handlers may wrap their stream with `trevrpc.WithResponseHeaders(stream, headers)`, which sends the headers as soon as the handler returns, before the first message is pulled, and with `trevrpc.NewResponseStream(stream, metadata)` to send trailing metadata. The two wrappers compose in either order.
+Handlers set response metadata through their context. `trevrpc.SetResponseHeader(ctx, key, value)` adds a response header, sent before the first response message as soon as the handler returns. `trevrpc.SetResponseMetadata(ctx, key, value)` adds trailing metadata, sent with the final OK status: when a unary or client-streaming handler returns, or when a streaming handler's response stream ends, so the stream may still set it before its `Recv` returns `io.EOF`. Keys are normalized with `trevrpc.NormalizeMetadataKey` and validated; setting a header after the handler has returned, or metadata after the final status, fails. A failed call sends the `Metadata` of its `*trevrpc.Status` instead.
 
 Generated code calls the generic functions `trevrpc.Unary`, `ServerStreaming`, `ClientStreaming` and `BidirectionalStreaming` on the client and `trevrpc.RegisterUnary`, `RegisterServerStreaming`, `RegisterClientStreaming` and `RegisterBidirectionalStreaming` on the server, and you can call them directly. Each identifies the method by its full path, `/package.Service/Method`, which generated code exposes as a constant such as `greeter.Greeter_SayHello_FullMethodName`:
 
@@ -154,7 +154,7 @@ reply, err := trevrpc.Unary(ctx, channel, "/example.greeter.Greeter/SayHello",
 
 trevrpc.RegisterUnary(server, "/example.greeter.Greeter/SayHello",
 	func() *greeter.HelloRequest { return &greeter.HelloRequest{} },
-	func(ctx context.Context, r *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) { /* ... */ })
+	func(ctx context.Context, r *greeter.HelloRequest) (*greeter.HelloReply, error) { /* ... */ })
 ```
 
 `Register*` panics if the path is not exactly `/<service>/<method>` with both parts non-empty. The server answers a request whose path is malformed with `InvalidArgument` and a well-formed path without a handler with `Unimplemented`. `HandlerContext` carries the `FullMethod` path and its `Service` and `Method` parts.

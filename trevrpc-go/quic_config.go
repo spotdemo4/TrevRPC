@@ -49,12 +49,12 @@ func serverQUICConfig(base *quic.Config, options ServerOptions) *quic.Config {
 		config.MaxIncomingStreams = maxStreams
 	}
 
-	if options.StreamIdleTimeout > 0 {
+	if options.ConnectionIdleTimeout > 0 {
 		if config.MaxIdleTimeout == 0 {
-			config.MaxIdleTimeout = options.StreamIdleTimeout
+			config.MaxIdleTimeout = options.ConnectionIdleTimeout
 		}
 		if config.KeepAlivePeriod == 0 {
-			config.KeepAlivePeriod = options.StreamIdleTimeout / 2
+			config.KeepAlivePeriod = options.ConnectionIdleTimeout / 2
 		}
 	}
 

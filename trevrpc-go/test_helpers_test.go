@@ -276,13 +276,13 @@ func rawStream(bodies ...string) encodedStream {
 }
 
 // rawResponse is a streaming handler response of messages with the given payloads.
-func rawResponse(bodies ...string) (streamResponse, error) {
-	return streamResponse{stream: rawStream(bodies...)}, nil
+func rawResponse(bodies ...string) (encodedStream, error) {
+	return rawStream(bodies...), nil
 }
 
 // respond is a streaming handler response over stream.
-func respond(stream encodedStream) (streamResponse, error) {
-	return streamResponse{stream: stream}, nil
+func respond(stream encodedStream) (encodedStream, error) {
+	return stream, nil
 }
 
 // testRequestBytes is the request side of a stream: a REQUEST frame and then a
@@ -574,18 +574,13 @@ func (uploadWaitingTransport) streamingCall(ctx context.Context, _ *wireRequest,
 // routeBytes registers a unary handler that works on raw request and response
 // payloads.
 func routeBytes(server *Server, method string, handler func(context.Context, []byte) ([]byte, error)) {
-	server.routeUnary(method, func(ctx context.Context, body []byte) (*unaryReply, error) {
+	server.routeUnary(method, func(ctx context.Context, body []byte) (encodedMessage, error) {
 		responseBody, err := handler(ctx, body)
 		if err != nil {
-			return nil, err
+			return encodedMessage{}, err
 		}
-		return &unaryReply{message: rawMessage(responseBody)}, nil
+		return rawMessage(responseBody), nil
 	})
-}
-
-// testResponse wraps message in a handler Response without metadata.
-func testResponse[T ProtoMessage](message T) *Response[T] {
-	return &Response[T]{Message: message}
 }
 
 // unaryResult is a unary response as the tests inspect it.
@@ -656,8 +651,8 @@ func (s *Server) handleStreamingWriter(ctx context.Context, request *wireRequest
 }
 
 // singleMessageResponse is a streaming handler response of one message.
-func singleMessageResponse[T ProtoMessage](message T) (streamResponse, error) {
-	return newStreamResponse(NewResponseStream(newSliceStream(message), nil))
+func singleMessageResponse[T ProtoMessage](message T) (encodedStream, error) {
+	return newEncodeStream(newSliceStream(message)), nil
 }
 
 // responseStreamFailureReason returns the stable reason for a response-stream failure.

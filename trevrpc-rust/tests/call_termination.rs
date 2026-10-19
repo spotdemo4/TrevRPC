@@ -47,49 +47,43 @@ impl greeter::Greeter for Greeter {
         &self,
         _context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
-        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
+    ) -> Result<greeter::HelloReply, Status> {
+        Ok(greeter::HelloReply {
             message: request.name,
-        }))
+        })
     }
 
     async fn lots_of_replies(
         &self,
         _context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>, Status> {
-        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter(
-            [greeter::HelloReply {
-                message: request.name,
-            }],
-        )))
+    ) -> Result<trevrpc::BoxStream<greeter::HelloReply>, Status> {
+        Ok(trevrpc::stream::from_iter([greeter::HelloReply {
+            message: request.name,
+        }]))
     }
 
     async fn lots_of_greetings(
         &self,
         _context: RequestContext,
         mut requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
+    ) -> Result<greeter::HelloReply, Status> {
         while let Some(request) = requests.next().await {
             request?;
         }
-        Ok(trevrpc::ResponseEnvelope::new(
-            greeter::HelloReply::default(),
-        ))
+        Ok(greeter::HelloReply::default())
     }
 
     async fn bidi_hello(
         &self,
         _context: RequestContext,
         requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>, Status> {
-        Ok(trevrpc::ResponseEnvelope::new(Box::pin(requests.map(
-            |request| {
-                request.map(|request| greeter::HelloReply {
-                    message: request.name,
-                })
-            },
-        ))))
+    ) -> Result<trevrpc::BoxStream<greeter::HelloReply>, Status> {
+        Ok(Box::pin(requests.map(|request| {
+            request.map(|request| greeter::HelloReply {
+                message: request.name,
+            })
+        })))
     }
 }
 
@@ -320,7 +314,7 @@ over_each_transport!(
             let transport = Arc::clone(&transport);
             async move {
                 let client = greeter::GreeterClient::new(transport);
-                client.say_hello(name(index)).await.map(drop)
+                client.say_hello(&name(index)).await.map(drop)
             }
         })
         .await
@@ -335,7 +329,7 @@ over_each_transport!(
             let transport = Arc::clone(&transport);
             async move {
                 let client = greeter::GreeterClient::new(transport);
-                let mut replies = client.lots_of_replies(name(index)).await?;
+                let mut replies = client.lots_of_replies(&name(index)).await?;
                 while let Some(reply) = replies.next().await {
                     reply?;
                 }
@@ -361,8 +355,8 @@ over_each_transport!(
             let transport = Arc::clone(&transport);
             async move {
                 let client = greeter::GreeterClient::new(transport);
-                client.say_hello(name(index)).await?;
-                let mut replies = client.lots_of_replies(name(index)).await?;
+                client.say_hello(&name(index)).await?;
+                let mut replies = client.lots_of_replies(&name(index)).await?;
                 while let Some(reply) = replies.next().await {
                     reply?;
                 }
@@ -389,7 +383,7 @@ over_each_transport!(
         // One call holds the only slot. The transport admits a spare stream, so the second
         // call reaches the server and is answered with a lone UNAVAILABLE status.
         let status = client
-            .say_hello(name(1))
+            .say_hello(&name(1))
             .await
             .err()
             .ok_or("the call above the limit should fail")?
@@ -445,7 +439,8 @@ over_each_transport!(
     |transport| async move {
         let client = greeter::GreeterClient::new(transport);
         let call = client
-            .lots_of_greetings_with_options(long_options())
+            .lots_of_greetings()
+            .options(|_| long_options())
             .await?;
         send_until_failure(|| call.send(large_message())).await?;
         let status = call
@@ -463,7 +458,7 @@ over_each_transport!(
     upload_options(),
     |transport| async move {
         let client = greeter::GreeterClient::new(transport);
-        let mut call = client.bidi_hello_with_options(long_options()).await?;
+        let mut call = client.bidi_hello().options(|_| long_options()).await?;
         send_until_failure(|| call.send(large_message())).await?;
         let status = loop {
             match call.recv().await {
@@ -525,7 +520,7 @@ over_each_transport!(
     upload_options(),
     |transport| async move {
         let client = greeter::GreeterClient::new(transport);
-        let call = client.bidi_hello_with_options(long_options()).await?;
+        let call = client.bidi_hello().options(|_| long_options()).await?;
         let (sender, mut replies) = call.split();
         let reader = tokio::spawn(async move {
             while let Some(reply) = replies.next().await {

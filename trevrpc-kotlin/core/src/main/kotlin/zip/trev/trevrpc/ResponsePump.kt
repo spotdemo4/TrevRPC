@@ -20,10 +20,10 @@ import kotlin.time.TimeMark
 internal const val PUMP_QUEUED_FRAMES = 2
 
 /** The message bound of the pump's read-ahead when the call sets no `maxResponseMessages`. */
-internal const val PUMP_FALLBACK_MAX_MESSAGES: Int = DEFAULT_MAX_STREAM_MESSAGES
+internal const val PUMP_FALLBACK_MAX_MESSAGES: Int = 4096
 
 /** The byte bound of the pump's read-ahead when the call sets no `maxResponseStreamBodySize`. */
-internal const val PUMP_FALLBACK_MAX_BYTES: Long = DEFAULT_MAX_STREAM_BODY_SIZE
+internal const val PUMP_FALLBACK_MAX_BYTES: Long = 16L * 1024 * 1024
 
 /**
  * How a call ended, as far as its request side is concerned. The response side records the end as

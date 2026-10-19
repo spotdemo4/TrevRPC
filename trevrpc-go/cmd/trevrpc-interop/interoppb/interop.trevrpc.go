@@ -18,9 +18,9 @@ const (
 // EchoServer handles the Echo service.
 type EchoServer interface {
 	// Unary handles the Unary RPC.
-	Unary(context.Context, *EchoRequest) (*trevrpc_go.Response[*EchoResponse], error)
+	Unary(context.Context, *EchoRequest) (*EchoResponse, error)
 	// ClientStream handles the ClientStream RPC.
-	ClientStream(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (*trevrpc_go.Response[*EchoResponse], error)
+	ClientStream(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (*EchoResponse, error)
 	// ServerStream handles the ServerStream RPC.
 	ServerStream(context.Context, *EchoRequest) (trevrpc_go.MessageStream[*EchoResponse], error)
 	// Bidi handles the Bidi RPC.

@@ -1,10 +1,16 @@
-use crate::Metadata;
+use std::sync::{Arc, Mutex};
 
-/// A successful response value together with its response headers and trailing metadata.
+use crate::sync::MutexExt as _;
+use crate::wire::{normalize_metadata_key, validate_metadata};
+use crate::{Metadata, Status};
+
+/// A successful response value together with its response headers and trailing metadata, as a
+/// client receives it.
 ///
 /// Headers travel in the HEADERS frame ahead of the first message, so streaming clients see them
 /// before any response arrives. Trailing metadata travels in the final STATUS frame and is
-/// visible only once the call completes.
+/// visible only once the call completes. Handlers do not return envelopes: they set response
+/// metadata through their [`RequestContext`](crate::server::RequestContext).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseEnvelope<T> {
     message: T,
@@ -73,5 +79,94 @@ impl<T> ResponseEnvelope<T> {
 impl<T> From<T> for ResponseEnvelope<T> {
     fn from(message: T) -> Self {
         Self::new(message)
+    }
+}
+
+/// The response headers and trailing metadata a handler sets through its request context, shared
+/// by every clone of the context.
+///
+/// The server takes the headers when the handler returns and the trailing metadata when the
+/// response ends; setting either afterwards fails.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResponseMetadata {
+    state: Arc<Mutex<ResponseMetadataState>>,
+}
+
+#[derive(Debug, Default)]
+struct ResponseMetadataState {
+    headers: Metadata,
+    metadata: Metadata,
+    headers_sent: bool,
+    metadata_sent: bool,
+}
+
+impl ResponseMetadataState {
+    fn set(
+        &mut self,
+        kind: ResponseMetadataKind,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<(), Status> {
+        let (target, sent, what) = match kind {
+            ResponseMetadataKind::Headers => {
+                (&mut self.headers, self.headers_sent, "response headers")
+            }
+            ResponseMetadataKind::Trailers => {
+                (&mut self.metadata, self.metadata_sent, "response metadata")
+            }
+        };
+        if sent {
+            return Err(Status::internal(format!("{what} already sent")));
+        }
+        let previous = target.insert(key.clone(), value);
+        if let Err(status) = validate_metadata(target) {
+            match previous {
+                Some(previous) => target.insert(key, previous),
+                None => target.remove(&key),
+            };
+            return Err(Status::internal(format!(
+                "invalid {what}: {}",
+                status.message()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Which of the two kinds of response metadata a value is set on.
+#[derive(Clone, Copy)]
+enum ResponseMetadataKind {
+    Headers,
+    Trailers,
+}
+
+impl ResponseMetadata {
+    pub(crate) fn set_header(&self, key: &str, value: Vec<u8>) -> Result<(), Status> {
+        self.set(ResponseMetadataKind::Headers, key, value)
+    }
+
+    pub(crate) fn set_metadata(&self, key: &str, value: Vec<u8>) -> Result<(), Status> {
+        self.set(ResponseMetadataKind::Trailers, key, value)
+    }
+
+    fn set(&self, kind: ResponseMetadataKind, key: &str, value: Vec<u8>) -> Result<(), Status> {
+        let key = normalize_metadata_key(key);
+        self.state.lock_unpoisoned().set(kind, key, value)
+    }
+
+    /// Returns the headers to send and makes later headers fail.
+    pub(crate) fn take_headers(&self) -> Metadata {
+        let mut state = self.state.lock_unpoisoned();
+        state.headers_sent = true;
+        std::mem::take(&mut state.headers)
+    }
+
+    /// Returns the trailing metadata to send with the final `OK` status and makes later response
+    /// metadata of either kind fail.
+    pub(crate) fn take_metadata(&self) -> Metadata {
+        let mut state = self.state.lock_unpoisoned();
+        state.headers_sent = true;
+        state.metadata_sent = true;
+        std::mem::take(&mut state.metadata)
     }
 }

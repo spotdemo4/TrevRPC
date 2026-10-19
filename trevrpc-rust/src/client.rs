@@ -22,6 +22,7 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+pub mod call;
 mod call_end;
 mod channel;
 mod native;
@@ -30,6 +31,7 @@ mod quic;
 mod race;
 mod upload;
 
+pub use call::{Call, bidirectional_streaming, client_streaming, server_streaming, unary};
 pub use channel::{
     Channel, ChannelConfig, ChannelEvent, ChannelPhase, ChannelState, ExponentialBackoff,
     ReconnectBackoff,
@@ -46,7 +48,9 @@ pub struct CallOptions {
     max_response_stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
     metadata: Metadata,
-    unreliable: Unreliable,
+    /// The directions marked unreliable, or `None` to leave them to the call; see
+    /// [`Call::default_unreliable`].
+    unreliable: Option<Unreliable>,
 }
 
 impl Default for CallOptions {
@@ -54,17 +58,19 @@ impl Default for CallOptions {
         Self {
             timeout: None,
             max_response_body_size: DEFAULT_MAX_FRAME_SIZE,
-            max_response_messages: Some(4096),
-            max_response_stream_body_size: Some(16 * 1024 * 1024),
-            stream_idle_timeout: Some(Duration::from_secs(30)),
+            max_response_messages: None,
+            max_response_stream_body_size: None,
+            stream_idle_timeout: None,
             metadata: Metadata::new(),
-            unreliable: Unreliable::NONE,
+            unreliable: None,
         }
     }
 }
 
 impl CallOptions {
-    /// Creates call options with the default timeout, size, stream, and metadata settings.
+    /// Creates call options with the defaults: no timeout, no metadata, a response message of at
+    /// most the default frame size, and no limit on the number, total size, or spacing of the
+    /// messages of a response stream.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -106,9 +112,10 @@ impl CallOptions {
         &self.metadata
     }
 
-    /// Returns the directions of the call marked unreliable.
+    /// Returns the directions marked unreliable, or `None` when the options leave them to the call
+    /// (see [`Call::default_unreliable`]).
     #[must_use]
-    pub const fn unreliable(&self) -> Unreliable {
+    pub const fn unreliable(&self) -> Option<Unreliable> {
         self.unreliable
     }
 
@@ -160,16 +167,18 @@ impl CallOptions {
         self
     }
 
-    /// Marks directions of a streaming call as [`Unreliable`], in addition to any marked already.
+    /// Marks the directions of a streaming call that are [`Unreliable`], replacing any marked
+    /// already and the call's default, which generated clients take from the schema (see
+    /// [`Call::default_unreliable`]). `Unreliable::NONE` keeps every message on the stream.
     ///
     /// When the connection that carries the call supports datagrams, the call gets a datagram
     /// flow, and the client sends its streamed requests as datagrams if `unreliable.requests` is
     /// set. The server decides on its own whether to send its responses as datagrams; the call
     /// receives them either way. Over transports without datagrams, and for a direction that does
-    /// not stream, the setting changes nothing. Generated clients apply the marks of the schema.
+    /// not stream, the setting changes nothing.
     #[must_use]
     pub const fn with_unreliable(mut self, unreliable: Unreliable) -> Self {
-        self.unreliable = self.unreliable.union(unreliable);
+        self.unreliable = Some(unreliable);
         self
     }
 
@@ -293,37 +302,16 @@ pub async fn collect_unary_response(
     response.finish().map_err(Error::from)
 }
 
-/// Calls a unary RPC and decodes the protobuf response.
-///
-/// `method` is the method path `/package.Service/Method`; generated code exposes it as a constant.
-pub async fn unary<T, Req, Res>(
+/// Makes a unary call whose encoded request message is `body` and returns the decoded response
+/// with the response headers and trailing metadata.
+async fn unary_response<T, Res>(
     transport: &T,
     method: &str,
-    request: &Req,
-    options: CallOptions,
-) -> Result<Res>
-where
-    T: RpcTransport + ?Sized,
-    Req: Message,
-    Res: Message + Default,
-{
-    Ok(unary_envelope(transport, method, request, options)
-        .await?
-        .into_parts()
-        .0)
-}
-
-/// Calls a unary RPC and returns the decoded response envelope, with the response headers and
-/// trailing metadata.
-pub async fn unary_envelope<T, Req, Res>(
-    transport: &T,
-    method: &str,
-    request: &Req,
+    body: Vec<u8>,
     options: CallOptions,
 ) -> Result<ResponseEnvelope<Res>>
 where
     T: RpcTransport + ?Sized,
-    Req: Message,
     Res: Message + Default,
 {
     let CallOptions {
@@ -341,7 +329,6 @@ where
     let rpc_request = RpcRequest::new(method)
         .with_metadata(metadata)
         .with_timeout_nanos(timeout_nanos);
-    let body = request.encode_to_vec();
     let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, transport.call(rpc_request, body))
             .await
@@ -366,30 +353,29 @@ where
         .with_metadata(metadata))
 }
 
-/// Calls a server-streaming RPC and returns a terminal-aware response stream.
-pub async fn server_streaming<T, Req, Res>(
+/// Starts a server-streaming call whose encoded request message is `request`.
+async fn start_server_streaming<T, Res>(
     transport: &T,
     method: &str,
-    request: &Req,
+    request: Vec<u8>,
     options: CallOptions,
 ) -> Result<ResponseStream<Res>>
 where
     T: StreamingRpcTransport + ?Sized,
-    Req: Message,
     Res: Message + Default + Send + 'static,
 {
     let prepared = prepare_streaming_request(method, RpcKind::ServerStreaming, options)?;
     open_response_stream(
         transport,
         prepared,
-        crate::stream::from_iter([request.encode_to_vec()]),
+        crate::stream::from_iter([request]),
         None,
     )
     .await
 }
 
-/// Starts a client-streaming RPC and returns a sendable call object.
-pub async fn client_streaming<T, Req, Res>(
+/// Starts a client-streaming call and returns its sendable call object.
+async fn start_client_streaming<T, Req, Res>(
     transport: &T,
     method: &str,
     options: CallOptions,
@@ -406,28 +392,9 @@ where
     Ok(ClientStreamingCall::new(sender, response))
 }
 
-/// Calls a client-streaming RPC with a caller-provided request stream.
-pub async fn client_streaming_from_stream<T, Req, Res>(
-    transport: &T,
-    method: &str,
-    requests: BoxStream<Req>,
-    options: CallOptions,
-) -> Result<Res>
-where
-    T: StreamingRpcTransport + ?Sized,
-    Req: Message + Send + 'static,
-    Res: Message + Default + Send + 'static,
-{
-    Ok(
-        client_streaming_from_stream_envelope(transport, method, requests, options)
-            .await?
-            .into_parts()
-            .0,
-    )
-}
-
-/// Calls a client-streaming RPC and preserves successful terminal metadata.
-pub async fn client_streaming_from_stream_envelope<T, Req, Res>(
+/// Makes a client-streaming call that sends `requests` and returns its response with the
+/// response headers and trailing metadata.
+async fn client_streaming_send_all<T, Req, Res>(
     transport: &T,
     method: &str,
     requests: BoxStream<Req>,
@@ -445,8 +412,8 @@ where
     read_unary_response_envelope_from_message_stream(&mut response).await
 }
 
-/// Starts a bidirectional-streaming RPC and returns a splittable call object.
-pub async fn bidirectional_streaming<T, Req, Res>(
+/// Starts a bidirectional-streaming call and returns its splittable call object.
+async fn start_bidirectional_streaming<T, Req, Res>(
     transport: &T,
     method: &str,
     options: CallOptions,
@@ -463,8 +430,8 @@ where
     Ok(BidirectionalCall::new(sender, response))
 }
 
-/// Starts a bidirectional-streaming RPC with a caller-provided request stream.
-pub async fn bidirectional_streaming_from_stream<T, Req, Res>(
+/// Starts a bidirectional-streaming call that sends `requests` and returns its response stream.
+async fn bidirectional_streaming_send_all<T, Req, Res>(
     transport: &T,
     method: &str,
     requests: BoxStream<Req>,
@@ -708,7 +675,9 @@ where
         read_unary_response_from_message_stream(&mut self.response).await
     }
 
-    pub async fn close_and_recv_envelope(mut self) -> Result<ResponseEnvelope<Res>> {
+    /// Closes the request stream and returns the response with the response headers and trailing
+    /// metadata.
+    pub async fn close_and_recv_with_response(mut self) -> Result<ResponseEnvelope<Res>> {
         self.close_send()?;
         read_unary_response_envelope_from_message_stream(&mut self.response).await
     }
@@ -803,6 +772,7 @@ fn prepare_streaming_request(
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
+    let unreliable = unreliable.unwrap_or_default();
 
     Ok(PreparedStreamingCall {
         request: RpcRequest::new(method)
@@ -1330,10 +1300,12 @@ mod tests {
         Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status,
     };
 
+    use std::future::IntoFuture as _;
+
     use super::{
         BidirectionalCall, CallOptions, ResponseStream, RpcTransport, StreamingRpcTransport,
-        bidirectional_streaming, bidirectional_streaming_from_stream, client_streaming_from_stream,
-        read_unary_response_from_stream, request_channel, server_streaming, unary,
+        bidirectional_streaming, client_streaming, read_unary_response_from_stream,
+        request_channel, server_streaming, unary,
     };
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -1674,14 +1646,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn client_streaming_deadline_drops_pending_upload() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let call = client_streaming_from_stream::<_, TestMessage, TestMessage>(
+        let call = client_streaming::<_, TestMessage, TestMessage>(
             &UploadWaitingTransport,
             "/example.Greeter/LotsOfGreetings",
-            Box::pin(DropTrackedPendingStream {
-                dropped: Arc::clone(&dropped),
-            }),
             CallOptions::new().with_timeout(Duration::from_millis(1)),
-        );
+        )
+        .send_all(Box::pin(DropTrackedPendingStream {
+            dropped: Arc::clone(&dropped),
+        }))
+        .into_future();
         tokio::pin!(call);
         assert!(
             futures_util::poll!(&mut call).is_pending(),
@@ -1744,19 +1717,19 @@ mod tests {
 
     #[tokio::test]
     async fn client_streaming_from_stream_sends_all_requests() {
-        let response = client_streaming_from_stream::<_, TestMessage, TestMessage>(
+        let response = client_streaming::<_, TestMessage, TestMessage>(
             &CollectingStreamingTransport,
             "/example.Greeter/LotsOfGreetings",
-            crate::stream::from_iter([
-                TestMessage {
-                    value: "one".to_owned(),
-                },
-                TestMessage {
-                    value: "two".to_owned(),
-                },
-            ]),
             CallOptions::new(),
         )
+        .send_all(crate::stream::from_iter([
+            TestMessage {
+                value: "one".to_owned(),
+            },
+            TestMessage {
+                value: "two".to_owned(),
+            },
+        ]))
         .await
         .expect("client-streaming call should succeed");
 
@@ -1767,27 +1740,27 @@ mod tests {
     async fn streaming_transport_capability_is_object_safe() {
         let concrete = CollectingStreamingTransport;
         let transport: &dyn StreamingRpcTransport = &concrete;
-        let response = client_streaming_from_stream::<_, TestMessage, TestMessage>(
+        let response = client_streaming::<_, TestMessage, TestMessage>(
             transport,
             "/example.Greeter/LotsOfGreetings",
-            crate::stream::from_iter([TestMessage {
-                value: "one".to_owned(),
-            }]),
             CallOptions::new(),
         )
+        .send_all(crate::stream::from_iter([TestMessage {
+            value: "one".to_owned(),
+        }]))
         .await
         .expect("trait-object transport should be callable");
         assert_eq!(response.value, "1");
 
         let transport: Arc<dyn StreamingRpcTransport> = Arc::new(CollectingStreamingTransport);
-        let response = client_streaming_from_stream::<_, TestMessage, TestMessage>(
+        let response = client_streaming::<_, TestMessage, TestMessage>(
             &transport,
             "/example.Greeter/LotsOfGreetings",
-            crate::stream::from_iter([TestMessage {
-                value: "two".to_owned(),
-            }]),
             CallOptions::new(),
         )
+        .send_all(crate::stream::from_iter([TestMessage {
+            value: "two".to_owned(),
+        }]))
         .await
         .expect("shared trait-object transport should be callable");
         assert_eq!(response.value, "1");
@@ -1795,19 +1768,19 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_streaming_from_stream_sends_all_requests() {
-        let mut response = bidirectional_streaming_from_stream::<_, TestMessage, TestMessage>(
+        let mut response = bidirectional_streaming::<_, TestMessage, TestMessage>(
             &CollectingStreamingTransport,
             "/example.Greeter/BidiHello",
-            crate::stream::from_iter([
-                TestMessage {
-                    value: "one".to_owned(),
-                },
-                TestMessage {
-                    value: "two".to_owned(),
-                },
-            ]),
             CallOptions::new(),
         )
+        .send_all(crate::stream::from_iter([
+            TestMessage {
+                value: "one".to_owned(),
+            },
+            TestMessage {
+                value: "two".to_owned(),
+            },
+        ]))
         .await
         .expect("bidi-streaming call should open");
 
@@ -2133,7 +2106,7 @@ mod tests {
             &header_map("x-a", b"1")
         );
         let envelope = call
-            .close_and_recv_envelope()
+            .close_and_recv_with_response()
             .await
             .expect("call should complete");
         assert_eq!(envelope.message().value, "done");
@@ -2153,12 +2126,13 @@ mod tests {
             .with_metadata(header_map("x-t", b"2")),
         };
 
-        let envelope = super::unary_envelope::<_, _, TestMessage>(
+        let envelope = unary::<_, _, TestMessage>(
             &transport,
             "/example.Greeter/SayHello",
             &TestMessage::default(),
             CallOptions::new(),
         )
+        .with_response()
         .await
         .expect("unary call should succeed");
 
@@ -2173,12 +2147,13 @@ mod tests {
             response: ResponseEnvelope::new(Bytes::new()).with_headers(header_map("Bad Key", b"1")),
         };
 
-        let error = super::unary_envelope::<_, _, TestMessage>(
+        let error = unary::<_, _, TestMessage>(
             &transport,
             "/example.Greeter/SayHello",
             &TestMessage::default(),
             CallOptions::new(),
         )
+        .with_response()
         .await
         .expect_err("invalid headers must be rejected");
 

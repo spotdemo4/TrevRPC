@@ -39,12 +39,8 @@ var (
 
 type greeterService struct{}
 
-func reply(message string) *trevrpc.Response[*greeter.HelloReply] {
-	return &trevrpc.Response[*greeter.HelloReply]{Message: &greeter.HelloReply{Message: message}}
-}
-
-func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
-	return reply("hello " + request.Name), nil
+func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest) (*greeter.HelloReply, error) {
+	return &greeter.HelloReply{Message: "hello " + request.Name}, nil
 }
 
 func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
@@ -81,7 +77,7 @@ func (s *fixedReplies) Close() error {
 	return nil
 }
 
-func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*trevrpc.Response[*greeter.HelloReply], error) {
+func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*greeter.HelloReply, error) {
 	var names []string
 	for request, err := range trevrpc.Messages(requests) {
 		if err != nil {
@@ -92,10 +88,10 @@ func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.Messag
 	}
 
 	if len(names) == 0 {
-		return reply("hello, nobody"), nil
+		return &greeter.HelloReply{Message: "hello, nobody"}, nil
 	}
 
-	return reply("hello, " + strings.Join(names, ", ")), nil
+	return &greeter.HelloReply{Message: "hello, " + strings.Join(names, ", ")}, nil
 }
 
 func (greeterService) BidiHello(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (trevrpc.MessageStream[*greeter.HelloReply], error) {

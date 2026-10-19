@@ -23,40 +23,35 @@ impl greeter::Greeter for GreeterService {
         &self,
         _context: trevrpc::server::RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, trevrpc::Status> {
-        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
+    ) -> core::result::Result<greeter::HelloReply, trevrpc::Status> {
+        Ok(greeter::HelloReply {
             message: format!("hello, {}", request.name),
-        }))
+        })
     }
 
     async fn lots_of_replies(
         &self,
         _context: trevrpc::server::RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<
-        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
-        trevrpc::Status,
-    > {
-        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter(
-            [
-                greeter::HelloReply {
-                    message: format!("hello, {}", request.name),
-                },
-                greeter::HelloReply {
-                    message: format!("hello again, {}", request.name),
-                },
-                greeter::HelloReply {
-                    message: format!("goodbye, {}", request.name),
-                },
-            ],
-        )))
+    ) -> core::result::Result<trevrpc::BoxStream<greeter::HelloReply>, trevrpc::Status> {
+        Ok(trevrpc::stream::from_iter([
+            greeter::HelloReply {
+                message: format!("hello, {}", request.name),
+            },
+            greeter::HelloReply {
+                message: format!("hello again, {}", request.name),
+            },
+            greeter::HelloReply {
+                message: format!("goodbye, {}", request.name),
+            },
+        ]))
     }
 
     async fn lots_of_greetings(
         &self,
         _context: trevrpc::server::RequestContext,
         mut requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, trevrpc::Status> {
+    ) -> core::result::Result<greeter::HelloReply, trevrpc::Status> {
         let mut names = Vec::new();
 
         while let Some(request) = requests.next().await {
@@ -69,27 +64,21 @@ impl greeter::Greeter for GreeterService {
             format!("hello, {}", names.join(", "))
         };
 
-        Ok(trevrpc::ResponseEnvelope::new(greeter::HelloReply {
-            message,
-        }))
+        Ok(greeter::HelloReply { message })
     }
 
     async fn bidi_hello(
         &self,
-        _context: trevrpc::server::RequestContext,
+        context: trevrpc::server::RequestContext,
         requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> core::result::Result<
-        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
-        trevrpc::Status,
-    > {
+    ) -> core::result::Result<trevrpc::BoxStream<greeter::HelloReply>, trevrpc::Status> {
         let replies: trevrpc::BoxStream<greeter::HelloReply> = Box::pin(requests.map(|request| {
             request.map(|request| greeter::HelloReply {
                 message: format!("stream hello, {}", request.name),
             })
         }));
-        let mut metadata = trevrpc::Metadata::new();
-        metadata.insert("x-trevrpc-example".to_owned(), b"complete".to_vec());
-        Ok(trevrpc::ResponseEnvelope::new(replies).with_metadata(metadata))
+        context.set_response_metadata("x-trevrpc-example", "complete")?;
+        Ok(replies)
     }
 }
 

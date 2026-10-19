@@ -890,19 +890,7 @@ fn validate_generated_method_names(service: &Service) -> Result<(), String> {
 }
 
 fn generated_client_method_names(method: &Method) -> Vec<String> {
-    let mut names = vec![method.name.clone(), format!("{}_with_options", method.name)];
-    if method.client_streaming {
-        names.push(format!("{}_from_stream", method.name));
-        names.push(format!("{}_from_stream_with_options", method.name));
-        if !method.server_streaming {
-            names.push(format!("{}_from_stream_envelope", method.name));
-            names.push(format!("{}_from_stream_envelope_with_options", method.name));
-        }
-    } else if !method.server_streaming {
-        names.push(format!("{}_envelope", method.name));
-        names.push(format!("{}_envelope_with_options", method.name));
-    }
-    names
+    vec![method.name.clone()]
 }
 
 fn semantic_rust_identifier(identifier: &str) -> &str {
@@ -1002,22 +990,22 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
         ));
         if method.client_streaming && method.server_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{runtime_path}::BoxStream<{}>>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::BoxStream<{}>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else if method.client_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else if method.server_streaming {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{runtime_path}::BoxStream<{}>>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::BoxStream<{}>, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         } else {
             buf.push_str(&format!(
-                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Status>;\n",
+                "    async fn {}(&self, context: {runtime_path}::server::RequestContext, request: {}) -> ::core::result::Result<{}, {runtime_path}::Status>;\n",
                 method.name, method.input_type, method.output_type
             ));
         }
@@ -1038,7 +1026,7 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
     ));
 
     buf.push_str(&format!(
-        "#[allow(clippy::missing_errors_doc)]\nimpl<T> {client_name}<T>\nwhere\n    T: {runtime_path}::client::RpcTransport,\n{{\n"
+        "impl<T> {client_name}<T>\nwhere\n    T: {runtime_path}::client::RpcTransport,\n{{\n"
     ));
 
     for method in service
@@ -1051,7 +1039,7 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
 
     buf.push_str("}\n\n");
     buf.push_str(&format!(
-        "#[allow(clippy::missing_errors_doc)]\nimpl<T> {client_name}<T>\nwhere\n    T: {runtime_path}::client::StreamingRpcTransport,\n{{\n"
+        "impl<T> {client_name}<T>\nwhere\n    T: {runtime_path}::client::StreamingRpcTransport,\n{{\n"
     ));
 
     for method in service
@@ -1065,120 +1053,50 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
     buf.push_str("}\n\n");
 }
 
+/// Emits the client method of `method`, which returns the call to make: awaiting it makes the
+/// call, and its builder methods change the call's options or shape first.
 fn generate_client_method(
     runtime_path: &str,
     service: &Service,
     method: &Method,
     buf: &mut String,
 ) {
-    let start = buf.len();
-    emit_client_method(runtime_path, service, method, buf);
-    if let Some(unreliable) = unreliable_expr(runtime_path, method) {
-        // Every call the client makes ends in its options; the schema marks come on top of any
-        // the caller set.
-        let emitted = buf.split_off(start);
-        buf.push_str(&emitted.replace(
-            ", options).await",
-            &format!(", options.with_unreliable({unreliable})).await"),
-        ));
-    }
-}
-
-fn emit_client_method(runtime_path: &str, service: &Service, method: &Method, buf: &mut String) {
     let path = path_const_expr(service, method);
+    // The schema's marks are the call's default, so the client's default options and the call's
+    // own options override them.
+    let marks = unreliable_expr(runtime_path, method)
+        .map(|unreliable| format!(".default_unreliable({unreliable})"))
+        .unwrap_or_default();
+    let (shape, constructor, request_param, request_arg) =
+        match (method.client_streaming, method.server_streaming) {
+            (true, true) => (
+                "BidirectionalStreaming",
+                "bidirectional_streaming",
+                String::new(),
+                "",
+            ),
+            (true, false) => ("ClientStreaming", "client_streaming", String::new(), ""),
+            (false, true) => (
+                "ServerStreaming",
+                "server_streaming",
+                format!(", request: &{}", method.input_type),
+                " request,",
+            ),
+            (false, false) => (
+                "Unary",
+                "unary",
+                format!(", request: &{}", method.input_type),
+                " request,",
+            ),
+        };
     buf.push_str(&format!(
-        "    /// Calls the `{}` RPC.\n{}",
+        "    /// Calls the `{}` RPC when the returned call is awaited.\n{}    pub fn {}(&self{request_param}) -> {runtime_path}::client::Call<'_, T, {runtime_path}::client::call::{shape}<{}, {}>> {{\n        {runtime_path}::client::{constructor}(&self.transport, {path},{request_arg} self.default_options.clone()){marks}\n    }}\n\n",
         method.proto_name,
-        unreliable_docs(method)
+        unreliable_docs(method),
+        method.name,
+        method.input_type,
+        method.output_type,
     ));
-    if method.client_streaming && method.server_streaming {
-        buf.push_str(&format!(
-            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::BidirectionalCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::BidirectionalCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, {path}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming_from_stream(&self.transport, {path}, requests, options).await\n    }}\n\n",
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type
-        ));
-    } else if method.client_streaming {
-        buf.push_str(&format!(
-            "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ClientStreamingCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming(&self.transport, {path}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming_from_stream(&self.transport, {path}, requests, options).await\n    }}\n\n",
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type
-        ));
-        buf.push_str(&format!(
-            "    /// Calls the `{}` RPC with a caller-provided request stream and preserves response metadata.\n    pub async fn {}_from_stream_envelope(&self, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        self.{}_from_stream_envelope_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream, explicit options, and response metadata.\n    pub async fn {}_from_stream_envelope_with_options(&self, requests: {runtime_path}::BoxStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::client_streaming_from_stream_envelope(&self.transport, {path}, requests, options).await\n    }}\n\n",
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type
-        ));
-    } else if method.server_streaming {
-        buf.push_str(&format!(
-            "    pub async fn {}(&self, request: {}) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        self.{}_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::server_streaming(&self.transport, {path}, &request, options).await\n    }}\n\n",
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type
-        ));
-    } else {
-        buf.push_str(&format!(
-            "    pub async fn {}(&self, request: {}) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        self.{}_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{}, {runtime_path}::Error> {{\n        {runtime_path}::client::unary(&self.transport, {path}, &request, options).await\n    }}\n\n    /// Calls the `{}` RPC and returns response metadata.\n    pub async fn {}_envelope(&self, request: {}) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        self.{}_envelope_with_options(request, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options and returns response metadata.\n    pub async fn {}_envelope_with_options(&self, request: {}, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::ResponseEnvelope<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::unary_envelope(&self.transport, {path}, &request, options).await\n    }}\n\n",
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type,
-            method.name,
-            method.proto_name,
-            method.name,
-            method.input_type,
-            method.output_type
-        ));
-    }
 }
 
 fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String) {
@@ -1206,14 +1124,14 @@ fn generate_registration_method(
     let start = buf.len();
     emit_registration_method(runtime_path, service, method, buf);
     if let Some(unreliable) = unreliable_expr(runtime_path, method) {
-        // Streaming routes register through `route_streaming_envelope_with_context`; the options
-        // variant takes the marks as one more argument before the handler.
+        // Streaming routes register through `route_streaming_with_context`; the options variant
+        // takes the marks as one more argument before the handler.
         let emitted = buf.split_off(start);
         buf.push_str(
             &emitted
                 .replace(
-                    "route_streaming_envelope_with_context(",
-                    "route_streaming_envelope_with_options(",
+                    "route_streaming_with_context(",
+                    "route_streaming_with_options(",
                 )
                 .replace(
                     ", move |context,",
@@ -1234,22 +1152,22 @@ fn emit_registration_method(
     let path = path_const_expr(service, method);
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_envelope_with_context({path}, {runtime_path}::RpcKind::BidirectionalStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(context, requests).await?;\n                Ok(responses.map({runtime_path}::stream::encode))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::BidirectionalStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let responses = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
             method.input_type, method.name
         ));
     } else if method.client_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_envelope_with_context({path}, {runtime_path}::RpcKind::ClientStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(context, requests).await?;\n                Ok(response.map(|response| {runtime_path}::stream::encode({runtime_path}::stream::from_iter([response]))))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::ClientStreaming, move |context, _body, request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let requests = {runtime_path}::stream::decode::<{}>(request_stream);\n                let response = service.{}(context, requests).await?;\n                Ok({runtime_path}::stream::encode({runtime_path}::stream::from_iter([response])))\n            }}\n        }});\n    }}\n",
             method.input_type, method.name
         ));
     } else if method.server_streaming {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_envelope_with_context({path}, {runtime_path}::RpcKind::ServerStreaming, move |context, body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(context, request).await?;\n                Ok(responses.map({runtime_path}::stream::encode))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_streaming_with_context({path}, {runtime_path}::RpcKind::ServerStreaming, move |context, body, _request_stream| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let responses = service.{}(context, request).await?;\n                Ok({runtime_path}::stream::encode(responses))\n            }}\n        }});\n    }}\n",
             method.input_type, method.name
         ));
     } else {
         buf.push_str(&format!(
-            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_envelope_with_context({path}, move |context, body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(context, request).await?;\n                Ok(response.map(|response| ::prost::Message::encode_to_vec(&response)))\n            }}\n        }});\n    }}\n",
+            "\n    {{\n        let service = ::std::sync::Arc::clone(&service);\n        server.route_with_context({path}, move |context, body| {{\n            let service = ::std::sync::Arc::clone(&service);\n            async move {{\n                let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n                let response = service.{}(context, request).await?;\n                Ok(::prost::Message::encode_to_vec(&response))\n            }}\n        }});\n    }}\n",
             method.input_type, method.name
         ));
     }
@@ -1427,12 +1345,20 @@ mod tests {
         assert!(generated.contains("pub mod greeter_paths {"));
         assert!(generated.contains("pub const SAY_HELLO: &str = \"/hello.v1.Greeter/SayHello\";"));
         assert!(generated.contains(
-            "::trevrpc::client::unary(&self.transport, greeter_paths::SAY_HELLO, &request, options)"
+            "::trevrpc::client::unary(&self.transport, greeter_paths::SAY_HELLO, request, self.default_options.clone())"
         ));
+        // One client method per RPC: the returned call carries the options and response variants.
         assert!(generated.contains(
-            "::trevrpc::client::unary_envelope(&self.transport, greeter_paths::SAY_HELLO, &request, options)"
+            "pub fn say_hello(&self, request: &HelloRequest) -> ::trevrpc::client::Call<'_, T, ::trevrpc::client::call::Unary<HelloRequest, HelloReply>>"
         ));
-        assert!(generated.contains("server.route_envelope_with_context(greeter_paths::SAY_HELLO,"));
+        for variant in ["_with_options", "_envelope", "_from_stream"] {
+            assert!(!generated.contains(variant), "generated {variant} variant");
+        }
+        assert!(generated.contains("server.route_with_context(greeter_paths::SAY_HELLO,"));
+        // Handlers return plain messages and set response metadata through their context.
+        assert!(generated.contains(
+            "request: HelloRequest) -> ::core::result::Result<HelloReply, ::trevrpc::Status>;"
+        ));
         assert!(!generated.contains("SERVICE"));
     }
 
@@ -1504,11 +1430,14 @@ mod tests {
         assert!(generated.contains("::trevrpc::client::server_streaming"));
         assert!(generated.contains("::trevrpc::client::client_streaming"));
         assert!(
-            generated.contains("::trevrpc::client::ClientStreamingCall<HelloRequest, HelloReply>")
+            generated
+                .contains("::trevrpc::client::call::ClientStreaming<HelloRequest, HelloReply>")
         );
         assert!(generated.contains("::trevrpc::client::bidirectional_streaming"));
         assert!(
-            generated.contains("::trevrpc::client::BidirectionalCall<HelloRequest, HelloReply>")
+            generated.contains(
+                "::trevrpc::client::call::BidirectionalStreaming<HelloRequest, HelloReply>"
+            )
         );
         assert!(generated.contains("server.route_streaming"));
         assert!(generated.contains("greeter_paths::LOTS_OF_REPLIES,"));
@@ -1589,7 +1518,7 @@ mod tests {
             .as_deref()
             .expect("plugin should generate service content");
         assert!(content.contains("request: ()"));
-        assert!(content.contains("ResponseEnvelope<()>"));
+        assert!(content.contains("-> ::core::result::Result<(), ::trevrpc::Status>;"));
         assert!(!content.contains("crate::google::protobuf::Empty"));
     }
 

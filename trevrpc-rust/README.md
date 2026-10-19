@@ -50,10 +50,10 @@ let channel = trevrpc::client::Channel::connect(endpoint, "127.0.0.1:50051".pars
 let client = greeter::GreeterClient::new(channel.clone());
 
 // Unary
-let reply = client.say_hello(greeter::HelloRequest { name: "TrevRPC".into() }).await?;
+let reply = client.say_hello(&greeter::HelloRequest { name: "TrevRPC".into() }).await?;
 
 // Server streaming
-let mut stream = client.lots_of_replies(greeter::HelloRequest { name: "TrevRPC".into() }).await?;
+let mut stream = client.lots_of_replies(&greeter::HelloRequest { name: "TrevRPC".into() }).await?;
 while let Some(reply) = stream.next().await { println!("{}", reply?.message); }
 
 // Client streaming
@@ -68,19 +68,29 @@ let (sender, mut responses) = call.split();
 sender.send(greeter::HelloRequest { name: "Alice".into() }).await?;
 sender.finish()?;
 while let Some(reply) = responses.next().await { println!("{}", reply?.message); }
+
+// Per-call options, and an existing stream of requests
+let reply = client
+    .say_hello(&greeter::HelloRequest { name: "TrevRPC".into() })
+    .timeout(std::time::Duration::from_secs(5))
+    .metadata("authorization", "Bearer token")
+    .await?;
+let reply = client.lots_of_greetings().send_all(trevrpc::stream::from_iter(requests)).await?;
 ```
+
+A client method returns a `trevrpc::client::Call`, and awaiting it makes the call. Its options start from the client's default call options (`GreeterClient::with_default_call_options`); `.timeout(d)`, `.metadata(key, value)` and `.options(|options| ...)` change them for that call only. `.with_response()` also returns the response headers and trailing metadata, and `.send_all(requests)` sends a stream of requests and finishes it.
 
 ### Response headers and trailing metadata
 
-A response carries two metadata maps. Headers are sent before the first response message, so a streaming call sees them without waiting for a message; trailing metadata arrives with the final status. `ResponseStream::headers()` (also on `BidirectionalCall` and `ClientStreamingCall`) resolves once the first response frame arrives, with empty headers if the server sent none, and never loses a message it read ahead. The envelope methods fill `headers()` and `metadata()` (the trailing metadata) once the call completes.
+A response carries two metadata maps. Headers are sent before the first response message, so a streaming call sees them without waiting for a message; trailing metadata arrives with the final status. `ResponseStream::headers()` (also on `BidirectionalCall` and `ClientStreamingCall`) resolves once the first response frame arrives, with empty headers if the server sent none, and never loses a message it read ahead. For unary and client-streaming calls, `.with_response()` (and `ClientStreamingCall::close_and_recv_with_response`) returns a `ResponseEnvelope` whose `headers()` and `metadata()` (the trailing metadata) are filled once the call completes.
 
 ```rust
-let mut replies = client.lots_of_replies(greeter::HelloRequest { name: "Alice".into() }).await?;
+let mut replies = client.lots_of_replies(&greeter::HelloRequest { name: "Alice".into() }).await?;
 let headers = replies.headers().await?;           // before the first message
 while let Some(reply) = replies.next().await { reply?; }
 let trailers = replies.terminal_metadata();       // after a clean end
 
-let envelope = client.say_hello_envelope(greeter::HelloRequest { name: "Alice".into() }).await?;
+let envelope = client.say_hello(&greeter::HelloRequest { name: "Alice".into() }).with_response().await?;
 let (reply, headers, trailers) = envelope.into_parts();
 ```
 
@@ -102,35 +112,35 @@ The complete, runnable version is [`examples/greeter_server.rs`](examples/greete
 
 ```rust
 use futures_util::StreamExt;
-use trevrpc::{BoxStream, ResponseEnvelope, Status, server::RequestContext};
+use trevrpc::{BoxStream, Status, server::RequestContext};
 
 struct GreeterService;
 
 #[trevrpc::async_trait]
 impl greeter::Greeter for GreeterService {
-    async fn say_hello(&self, _ctx: RequestContext, req: greeter::HelloRequest)
-        -> Result<ResponseEnvelope<greeter::HelloReply>, Status> {
-        Ok(ResponseEnvelope::new(greeter::HelloReply { message: format!("hello, {}", req.name) }))
+    async fn say_hello(&self, ctx: RequestContext, req: greeter::HelloRequest)
+        -> Result<greeter::HelloReply, Status> {
+        ctx.set_response_metadata("greeting-language", "en")?; // optional
+        Ok(greeter::HelloReply { message: format!("hello, {}", req.name) })
     }
     async fn lots_of_replies(&self, _ctx: RequestContext, req: greeter::HelloRequest)
-        -> Result<ResponseEnvelope<BoxStream<greeter::HelloReply>>, Status> {
-        Ok(ResponseEnvelope::new(trevrpc::stream::from_iter([
+        -> Result<BoxStream<greeter::HelloReply>, Status> {
+        Ok(trevrpc::stream::from_iter([
             greeter::HelloReply { message: format!("hello, {}", req.name) },
             greeter::HelloReply { message: format!("goodbye, {}", req.name) },
-        ])))
+        ]))
     }
     async fn lots_of_greetings(&self, _ctx: RequestContext, mut reqs: BoxStream<greeter::HelloRequest>)
-        -> Result<ResponseEnvelope<greeter::HelloReply>, Status> {
+        -> Result<greeter::HelloReply, Status> {
         let mut names = Vec::new();
         while let Some(r) = reqs.next().await { names.push(r?.name); }
-        Ok(ResponseEnvelope::new(greeter::HelloReply { message: names.join(", ") }))
+        Ok(greeter::HelloReply { message: names.join(", ") })
     }
     async fn bidi_hello(&self, _ctx: RequestContext, reqs: BoxStream<greeter::HelloRequest>)
-        -> Result<ResponseEnvelope<BoxStream<greeter::HelloReply>>, Status> {
-        let replies: BoxStream<greeter::HelloReply> = Box::pin(reqs.map(|r| {
+        -> Result<BoxStream<greeter::HelloReply>, Status> {
+        Ok(Box::pin(reqs.map(|r| {
             r.map(|r| greeter::HelloReply { message: format!("hello, {}", r.name) })
-        }));
-        Ok(ResponseEnvelope::new(replies))
+        })))
     }
 }
 
@@ -145,7 +155,7 @@ let endpoint = quinn::Endpoint::server(server.quic_config(tls)?, "[::]:50051".pa
 server.serve(endpoint).await?;
 ```
 
-Handlers attach response headers with `ResponseEnvelope::with_headers` and trailing metadata with `with_metadata`; both are validated like request metadata, and an invalid map fails the call with `Internal`. For streaming responses the headers go out as soon as the handler returns its envelope, before the first message is polled.
+Handlers set response metadata through their `RequestContext`. `context.set_response_header(key, value)` adds a response header, sent before the first response message as soon as the handler returns. `context.set_response_metadata(key, value)` adds trailing metadata, sent with the final `OK` status: when a unary or client-streaming handler returns, or when a streaming handler's response stream ends, so a clone of the context moved into the stream may still set it until then. Keys are lowercased and validated like request metadata; an invalid entry, a header set after the handler has returned, or metadata set after the final status, is an `Internal` status, ready for `?`. A failed call sends the metadata of its `Status` instead.
 
 Native QUIC is always served. HTTP/3 and WebTransport are opt-in through `ServerOptions`; the `h3` ALPN is negotiated only when at least one is enabled:
 
@@ -183,7 +193,7 @@ service Telemetry {
 
 Their messages then travel in QUIC datagrams where the connection has them (native QUIC, and WebTransport on the server) and may be lost or reordered, never duplicated or corrupted. A message that does not fit a datagram, or whose datagram cannot be sent, goes on the stream, and QMux, HTTP/2 and HTTP/3 request streams keep every message on the stream. `protoc-gen-trevrpc-rust` reads the option and fails on a direction that does not stream; generated clients and `register_*` functions apply it.
 
-The runtime options underneath are `trevrpc::Unreliable`, set on a client call with `CallOptions::with_unreliable` and on a server route with `RouteOptions::with_unreliable` and `Server::route_streaming_envelope_with_options`. A handler sees how many request messages arrived as datagrams with `RequestContext::datagram_requests_received`. The QUIC configurations from `Server::quic_config` and `ChannelConfig::quic_config` buffer at most 128 KiB of incoming datagrams per connection.
+The runtime options underneath are `trevrpc::Unreliable`, set on a client call with `CallOptions::with_unreliable` and on a server route with `RouteOptions::with_unreliable` and `Server::route_streaming_with_options`. A handler sees how many request messages arrived as datagrams with `RequestContext::datagram_requests_received`. The QUIC configurations from `Server::quic_config` and `ChannelConfig::quic_config` buffer at most 128 KiB of incoming datagrams per connection.
 
 ## TCP fallback
 

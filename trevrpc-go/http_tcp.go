@@ -36,7 +36,7 @@ func newHTTPTCPServer(l *Listener) *httpTCPServer {
 	h.server = &http.Server{
 		Handler:           http.HandlerFunc(h.handle),
 		ReadHeaderTimeout: l.handshakeTimeout,
-		IdleTimeout:       options.StreamIdleTimeout,
+		IdleTimeout:       options.ConnectionIdleTimeout,
 		BaseContext:       func(net.Listener) context.Context { return l.ctx },
 		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 			state := &httpConnState{streamLimit: newSemaphore(options.MaxConcurrentStreamsPerConnection), conn: conn}
@@ -54,7 +54,7 @@ func newHTTPTCPServer(l *Listener) *httpTCPServer {
 			MaxConcurrentStreams:          int(serverStreamLimit(options)),
 			MaxReceiveBufferPerStream:     clampInt32(streamWindow),
 			MaxReceiveBufferPerConnection: clampInt32(connectionReceiveWindow(options, streamWindow)),
-			SendPingTimeout:               options.StreamIdleTimeout,
+			SendPingTimeout:               options.ConnectionIdleTimeout,
 		},
 		ErrorLog: log.New(io.Discard, "", 0),
 	}

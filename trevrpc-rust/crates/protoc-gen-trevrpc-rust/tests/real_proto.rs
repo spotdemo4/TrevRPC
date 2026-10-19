@@ -42,12 +42,10 @@ fn generates_services_from_a_real_proto_descriptor() {
     assert!(content.contains("async fn lots_of_replies"));
     assert!(content.contains("async fn lots_of_greetings"));
     assert!(content.contains("async fn bidi_hello"));
-    assert!(content.contains("options: ::trevrpc::client::CallOptions"));
+    assert!(content.contains("::trevrpc::client::Call<'_, T,"));
     assert!(content.contains("::trevrpc::client::server_streaming"));
     assert!(content.contains("::trevrpc::client::client_streaming"));
-    assert!(content.contains("::trevrpc::client::client_streaming_from_stream"));
     assert!(content.contains("::trevrpc::client::bidirectional_streaming"));
-    assert!(content.contains("::trevrpc::client::bidirectional_streaming_from_stream"));
     assert!(content.contains("server.route_streaming"));
     assert!(content.contains("::trevrpc::RpcKind::ServerStreaming"));
     assert!(content.contains("::trevrpc::RpcKind::ClientStreaming"));
@@ -141,51 +139,90 @@ impl Greeter for Service {
         &self,
         _context: trevrpc::server::RequestContext,
         request: HelloRequest,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<HelloReply>, trevrpc::Status> {
-        Ok(trevrpc::ResponseEnvelope::new(HelloReply { message: request.name }))
+    ) -> core::result::Result<HelloReply, trevrpc::Status> {
+        Ok(HelloReply { message: request.name })
     }
 
     async fn lots_of_replies(
         &self,
         _context: trevrpc::server::RequestContext,
         request: HelloRequest,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<HelloReply>>, trevrpc::Status> {
-        Ok(trevrpc::ResponseEnvelope::new(trevrpc::stream::from_iter([HelloReply {
+    ) -> core::result::Result<trevrpc::BoxStream<HelloReply>, trevrpc::Status> {
+        Ok(trevrpc::stream::from_iter([HelloReply {
             message: request.name,
-        }])))
+        }]))
     }
 
     async fn lots_of_greetings(
         &self,
         _context: trevrpc::server::RequestContext,
         mut requests: trevrpc::BoxStream<HelloRequest>,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<HelloReply>, trevrpc::Status> {
+    ) -> core::result::Result<HelloReply, trevrpc::Status> {
         let mut names = Vec::new();
 
         while let Some(request) = requests.next().await {
             names.push(request?.name);
         }
 
-        Ok(trevrpc::ResponseEnvelope::new(HelloReply {
+        Ok(HelloReply {
             message: names.join(","),
-        }))
+        })
     }
 
     async fn bidi_hello(
         &self,
         _context: trevrpc::server::RequestContext,
         requests: trevrpc::BoxStream<HelloRequest>,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<trevrpc::BoxStream<HelloReply>>, trevrpc::Status> {
-        Ok(trevrpc::ResponseEnvelope::new(Box::pin(requests.map(|request| {
+    ) -> core::result::Result<trevrpc::BoxStream<HelloReply>, trevrpc::Status> {
+        Ok(Box::pin(requests.map(|request| {
             request.map(|request| HelloReply {
                 message: request.name,
             })
-        }))))
+        })))
     }
 }
 
 pub fn register(server: &mut trevrpc::server::Server) {
     register_greeter(server, Service);
+}
+
+fn require_send<F: Send>(future: F) -> F {
+    future
+}
+
+/// Makes every shape of call the generated client offers, which only has to compile.
+pub async fn call<T>(client: &GreeterClient<T>) -> trevrpc::Result<()>
+where
+    T: trevrpc::client::StreamingRpcTransport,
+{
+    use std::future::IntoFuture as _;
+
+    let request = HelloRequest {
+        name: "a".to_owned(),
+    };
+    let requests = || trevrpc::stream::from_iter([request.clone()]);
+    let _reply: HelloReply = require_send(
+        client
+            .say_hello(&request)
+            .timeout(std::time::Duration::from_secs(1))
+            .into_future(),
+    )
+    .await?;
+    let _envelope = client.say_hello(&request).with_response().await?;
+    let _replies = client.lots_of_replies(&request).metadata("k", "v").await?;
+    let _upload = client.lots_of_greetings().await?;
+    let _reply: HelloReply = client.lots_of_greetings().send_all(requests()).await?;
+    let _envelope = client
+        .lots_of_greetings()
+        .send_all(requests())
+        .with_response()
+        .await?;
+    let _call = client
+        .bidi_hello()
+        .options(|options| options.with_max_response_messages(Some(1)))
+        .await?;
+    let _replies = client.bidi_hello().send_all(requests()).await?;
+    Ok(())
 }
 "#,
     )?;

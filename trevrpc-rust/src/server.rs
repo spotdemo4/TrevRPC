@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use crate::datagram::DatagramCount;
 use crate::fallback::HttpFallback;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
+use crate::response::ResponseMetadata;
 use crate::sync::MutexExt as _;
 use crate::wire::{
     normalize_metadata_key, split_method_path, validate_metadata, validate_method_path,
@@ -21,12 +22,11 @@ use crate::{
     Status, Unreliable,
 };
 
-type UnaryHandlerFuture =
-    Pin<Box<dyn Future<Output = Result<ResponseEnvelope<Vec<u8>>>> + Send + 'static>>;
+type UnaryHandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
 type UnaryHandler =
     Arc<dyn Fn(RequestContext, Vec<u8>) -> UnaryHandlerFuture + Send + Sync + 'static>;
 type StreamingHandlerFuture =
-    Pin<Box<dyn Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static>>;
 type StreamingHandler = Arc<
     dyn Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> StreamingHandlerFuture + Send + Sync,
 >;
@@ -196,6 +196,8 @@ pub struct RequestContext {
     deadline: Option<Instant>,
     cancellation: CancellationToken,
     datagrams: DatagramCount,
+    /// The response metadata the handler sets, shared by every clone of the context.
+    response: ResponseMetadata,
 }
 
 impl RequestContext {
@@ -228,7 +230,46 @@ impl RequestContext {
             deadline,
             cancellation,
             datagrams,
+            response: ResponseMetadata::default(),
         }
+    }
+
+    /// Sets a response header of the call, sent in a HEADERS frame ahead of the first response
+    /// message as soon as the handler returns. A failed call sends no headers.
+    ///
+    /// The key is lowercased (see [`normalize_metadata_key`]). Clients read the headers from
+    /// `ResponseEnvelope::headers` or the `headers` of a response stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `INTERNAL` status when the key, or the headers with this entry, are invalid,
+    /// and once the headers have been sent.
+    pub fn set_response_header(
+        &self,
+        key: &str,
+        value: impl Into<Vec<u8>>,
+    ) -> std::result::Result<(), Status> {
+        self.response.set_header(key, value.into())
+    }
+
+    /// Sets trailing metadata of the call, sent with the final `OK` status: when a unary or
+    /// client-streaming handler returns, and when the response stream of a streaming handler ends,
+    /// so a clone of the context held by the stream may still set it until then. A failed call
+    /// sends the metadata of its [`Status`] instead.
+    ///
+    /// The key is lowercased (see [`normalize_metadata_key`]). Clients read the metadata from
+    /// `ResponseEnvelope::metadata` or the terminal status of a response stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `INTERNAL` status when the key, or the metadata with this entry, are invalid,
+    /// and once the final status has been sent.
+    pub fn set_response_metadata(
+        &self,
+        key: &str,
+        value: impl Into<Vec<u8>>,
+    ) -> std::result::Result<(), Status> {
+        self.response.set_metadata(key, value.into())
     }
 
     /// Returns the fully-qualified service name, such as `example.greeter.Greeter`.
@@ -364,6 +405,13 @@ pub struct HttpAdmissionRequest<'a> {
 
 pub type HttpAdmission = for<'a> fn(&HttpAdmissionRequest<'a>) -> bool;
 
+/// Server limits, timeouts, and the HTTP and browser session transports.
+///
+/// A stream has no message-count, cumulative-body, or idle limit by default, so long-lived and
+/// quiet streams work; set them with [`ServerOptions::with_max_stream_messages`],
+/// [`ServerOptions::with_max_stream_body_size`], and [`ServerOptions::with_stream_idle_timeout`].
+/// The connection idle timeout (30 s by default) closes a connection whose peer stopped answering
+/// and sends keep-alives at half of it, so quiet streams on a live connection are not affected.
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
     frame_size: usize,
@@ -375,6 +423,7 @@ pub struct ServerOptions {
     stream_messages: Option<usize>,
     stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
+    connection_idle_timeout: Option<Duration>,
     http_enabled: bool,
     http_path: String,
     http_admission: Option<HttpAdmission>,
@@ -394,9 +443,10 @@ impl Default for ServerOptions {
             requests: Some(1024),
             shutdown_timeout: Some(Duration::from_secs(30)),
             initial_request_timeout: Some(Duration::from_secs(10)),
-            stream_messages: Some(4096),
-            stream_body_size: Some(16 * 1024 * 1024),
-            stream_idle_timeout: Some(Duration::from_secs(30)),
+            stream_messages: None,
+            stream_body_size: None,
+            stream_idle_timeout: None,
+            connection_idle_timeout: Some(Duration::from_secs(30)),
             http_enabled: false,
             http_path: "/trevrpc".to_owned(),
             http_admission: None,
@@ -464,10 +514,17 @@ impl ServerOptions {
         self.stream_body_size
     }
 
-    /// Returns the maximum idle time allowed while waiting for the next stream message.
+    /// Returns the maximum time the request or response side of a stream may be quiet.
     #[must_use]
     pub const fn stream_idle_timeout(&self) -> Option<Duration> {
         self.stream_idle_timeout
+    }
+
+    /// Returns the time after which a connection whose peer stopped answering is closed. Keep-alives
+    /// are sent at half of it.
+    #[must_use]
+    pub const fn connection_idle_timeout(&self) -> Option<Duration> {
+        self.connection_idle_timeout
     }
 
     /// Returns whether ordinary HTTP/3 POST requests are accepted. Off by default.
@@ -601,24 +658,37 @@ impl ServerOptions {
         self
     }
 
-    /// Sets the maximum number of messages allowed on a stream.
+    /// Sets the maximum number of messages allowed on a stream (none by default).
     #[must_use]
     pub const fn with_max_stream_messages(mut self, max_stream_messages: Option<usize>) -> Self {
         self.stream_messages = max_stream_messages;
         self
     }
 
-    /// Sets the maximum total body bytes allowed on a stream.
+    /// Sets the maximum total body bytes allowed on a stream (none by default).
     #[must_use]
     pub const fn with_max_stream_body_size(mut self, max_stream_body_size: Option<usize>) -> Self {
         self.stream_body_size = max_stream_body_size;
         self
     }
 
-    /// Sets the maximum idle time allowed while waiting for the next stream message.
+    /// Sets the maximum time the request or response side of a stream may be quiet before the call
+    /// fails with `Unavailable` (none by default).
     #[must_use]
     pub const fn with_stream_idle_timeout(mut self, stream_idle_timeout: Option<Duration>) -> Self {
         self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    /// Sets the time after which a QUIC or `QMux` connection whose peer stopped answering is
+    /// closed (30 s by default); keep-alives are sent at half of it. `None` leaves the transports'
+    /// own defaults.
+    #[must_use]
+    pub const fn with_connection_idle_timeout(
+        mut self,
+        connection_idle_timeout: Option<Duration>,
+    ) -> Self {
+        self.connection_idle_timeout = connection_idle_timeout;
         self
     }
 
@@ -903,7 +973,8 @@ impl Server {
         self.route_with_context(path, move |_context, body| handler(body));
     }
 
-    /// Registers a unary route handler that receives request context.
+    /// Registers a unary route handler that receives request context, through which it may set
+    /// response headers and trailing metadata.
     ///
     /// # Panics
     ///
@@ -912,23 +983,6 @@ impl Server {
     where
         F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
-    {
-        self.route_envelope_with_context(path, move |context, body| {
-            let future = handler(context, body);
-            async move { future.await.map(ResponseEnvelope::new) }
-        });
-    }
-
-    /// Registers a unary route handler that can attach response headers and successful trailing
-    /// metadata.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `path` is not of the form `/<service>/<method>`.
-    pub fn route_envelope_with_context<F, Fut>(&mut self, path: impl Into<String>, handler: F)
-    where
-        F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ResponseEnvelope<Vec<u8>>>> + Send + 'static,
     {
         self.insert_route(
             path.into(),
@@ -953,7 +1007,8 @@ impl Server {
         });
     }
 
-    /// Registers a streaming route handler that receives request context.
+    /// Registers a streaming route handler that receives request context, through which it may set
+    /// response headers before it returns and trailing metadata until its response stream ends.
     ///
     /// # Panics
     ///
@@ -967,38 +1022,16 @@ impl Server {
         F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
-        self.route_streaming_envelope_with_context(path, kind, move |context, body, stream| {
-            let future = handler(context, body, stream);
-            async move { future.await.map(ResponseEnvelope::new) }
-        });
+        self.route_streaming_with_options(path, kind, RouteOptions::new(), handler);
     }
 
-    /// Registers a streaming route handler that can attach response headers, sent before the first
-    /// message, and terminal success metadata.
+    /// Registers a streaming route handler like [`Server::route_streaming_with_context`], with
+    /// route options such as which directions are [`Unreliable`].
     ///
     /// # Panics
     ///
     /// Panics when `path` is not of the form `/<service>/<method>`.
-    pub fn route_streaming_envelope_with_context<F, Fut>(
-        &mut self,
-        path: impl Into<String>,
-        kind: RpcKind,
-        handler: F,
-    ) where
-        F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static,
-    {
-        self.route_streaming_envelope_with_options(path, kind, RouteOptions::new(), handler);
-    }
-
-    /// Registers a streaming route handler like
-    /// [`Server::route_streaming_envelope_with_context`], with route options such as which
-    /// directions are [`Unreliable`].
-    ///
-    /// # Panics
-    ///
-    /// Panics when `path` is not of the form `/<service>/<method>`.
-    pub fn route_streaming_envelope_with_options<F, Fut>(
+    pub fn route_streaming_with_options<F, Fut>(
         &mut self,
         path: impl Into<String>,
         kind: RpcKind,
@@ -1006,7 +1039,7 @@ impl Server {
         handler: F,
     ) where
         F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static,
+        Fut: Future<Output = Result<BoxStream<Vec<u8>>>> + Send + 'static,
     {
         self.insert_route(
             path.into(),
@@ -1108,10 +1141,16 @@ impl Server {
             cancellation.clone(),
             DatagramCount::default(),
         );
+        let response_metadata = context.response.clone();
 
         let result = match invoke_unary_handler(handler, context, body) {
             Ok(future) => match run_handler_with_deadline(future, deadline, &cancellation).await {
-                Ok(Ok(response)) => validate_response_metadata(response),
+                Ok(Ok(message)) => {
+                    let headers = response_metadata.take_headers();
+                    Ok(ResponseEnvelope::new(message)
+                        .with_headers(headers)
+                        .with_metadata(response_metadata.take_metadata()))
+                }
                 Ok(Err(error)) => Err(error.into_status()),
                 Err(status) => Err(status),
             },
@@ -1220,6 +1259,7 @@ impl Server {
             cancellation.clone(),
             datagrams,
         );
+        let response_metadata = context.response.clone();
         let handler_result = match invoke_streaming_handler(handler, context, body, request_body) {
             Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,
             Err(status) => Err(status),
@@ -1229,23 +1269,12 @@ impl Server {
             Err(status) => {
                 self.finish_streaming_status(&path, request_body_len, started_at, status)
             }
-            Ok(Ok(response)) => {
-                let response = match validate_response_metadata(response) {
-                    Ok(response) => response,
-                    Err(status) => {
-                        return self.finish_streaming_status(
-                            &path,
-                            request_body_len,
-                            started_at,
-                            status,
-                        );
-                    }
-                };
-                let (response_body, headers, metadata) = response.into_parts();
+            Ok(Ok(response_body)) => {
+                let headers = response_metadata.take_headers();
                 server_response_stream(
                     response_body,
                     headers,
-                    metadata,
+                    response_metadata,
                     StreamingCompletion {
                         metrics: Arc::clone(&self.metrics),
                         path,
@@ -1492,16 +1521,6 @@ fn remaining_deadline(deadline: Option<Instant>) -> std::result::Result<Option<D
 
 fn status_stream(status: Status) -> BoxStream<ResponseFrame> {
     crate::stream::from_iter([ResponseFrame::Status(status)])
-}
-
-/// Rejects a successful response whose header or trailing metadata is invalid.
-fn validate_response_metadata<T>(
-    response: ResponseEnvelope<T>,
-) -> std::result::Result<ResponseEnvelope<T>, Status> {
-    validate_metadata(response.headers())
-        .and_then(|()| validate_metadata(response.metadata()))
-        .map_err(|_| Status::internal("invalid successful response metadata"))?;
-    Ok(response)
 }
 
 #[derive(Clone, Copy)]
@@ -1781,7 +1800,8 @@ struct ServerResponseStream {
     inner: BoxStream<Vec<u8>>,
     /// Response headers still to send. Empty headers are never sent.
     headers: Option<Metadata>,
-    metadata: Metadata,
+    /// Where the trailing metadata of the final `OK` status comes from.
+    metadata: ResponseMetadata,
     completion: StreamingCompletion,
     response_body_len: usize,
     limits: StreamLimits,
@@ -1794,7 +1814,7 @@ impl ServerResponseStream {
     fn new(
         inner: BoxStream<Vec<u8>>,
         headers: Metadata,
-        metadata: Metadata,
+        metadata: ResponseMetadata,
         completion: StreamingCompletion,
         limits: StreamLimits,
         cancellation: CancellationToken,
@@ -1823,7 +1843,7 @@ impl ServerResponseStream {
 fn server_response_stream(
     inner: BoxStream<Vec<u8>>,
     headers: Metadata,
-    metadata: Metadata,
+    metadata: ResponseMetadata,
     completion: StreamingCompletion,
     limits: StreamLimits,
     cancellation: CancellationToken,
@@ -1870,7 +1890,7 @@ fn server_response_stream(
                 Ok(None) => {
                     stream.finish(Code::Ok);
                     ResponseFrame::Status(
-                        Status::ok().with_metadata(std::mem::take(&mut stream.metadata)),
+                        Status::ok().with_metadata(stream.metadata.take_metadata()),
                     )
                 }
             };
@@ -1975,7 +1995,7 @@ mod tests {
 
     use crate::{Code, Error, ResponseFrame, RpcKind, RpcRequest, Status};
 
-    use crate::{Metadata, ResponseEnvelope};
+    use crate::Metadata;
 
     use super::{
         Authorizer, CancellationSource, CancellationToken, MetadataValueAuthorizer, Metrics,
@@ -2602,7 +2622,13 @@ mod tests {
             options.initial_request_timeout(),
             Some(Duration::from_secs(10))
         );
-        assert_eq!(options.max_stream_body_size(), Some(16 * 1024 * 1024));
+        assert_eq!(options.max_stream_messages(), None);
+        assert_eq!(options.max_stream_body_size(), None);
+        assert_eq!(options.stream_idle_timeout(), None);
+        assert_eq!(
+            options.connection_idle_timeout(),
+            Some(Duration::from_secs(30))
+        );
         {
             assert!(!options.http_enabled());
             assert!(!options.webtransport_enabled());
@@ -2939,15 +2965,12 @@ mod tests {
     #[tokio::test]
     async fn unary_handlers_receive_the_request_message_and_return_headers() {
         let mut server = Server::new();
-        server.route_envelope_with_context(
-            "/example.Greeter/SayHello",
-            |_context, body| async move {
-                assert_eq!(body, b"request");
-                Ok(ResponseEnvelope::new(b"reply".to_vec())
-                    .with_headers(headers_of("x-header", b"h"))
-                    .with_metadata(headers_of("x-trailer", b"t")))
-            },
-        );
+        server.route_with_context("/example.Greeter/SayHello", |context, body| async move {
+            assert_eq!(body, b"request");
+            context.set_response_header("X-Header", b"h".to_vec())?;
+            context.set_response_metadata("x-trailer", b"t".to_vec())?;
+            Ok(b"reply".to_vec())
+        });
 
         let response = server
             .handle_request(
@@ -2997,34 +3020,115 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_unary_header_or_trailing_metadata_is_internal() {
-        for envelope in [
-            ResponseEnvelope::new(Vec::new()).with_headers(headers_of("Bad Key", b"h")),
-            ResponseEnvelope::new(Vec::new()).with_metadata(headers_of("Bad Key", b"t")),
-        ] {
-            let mut server = Server::new();
-            server.route_envelope_with_context(
-                "/example.Greeter/SayHello",
-                move |_context, _body| {
-                    let envelope = envelope.clone();
-                    async move { Ok(envelope) }
-                },
-            );
+        let mut server = Server::new();
+        server.route_with_context("/example.Greeter/SayHello", |context, _body| async move {
+            for key in ["bad key", "trevrpc-reserved", ""] {
+                let header = context.set_response_header(key, Vec::new());
+                let trailer = context.set_response_metadata(key, Vec::new());
+                for result in [header, trailer] {
+                    assert_eq!(result.map_err(|status| status.code()), Err(Code::Internal));
+                }
+            }
+            context.set_response_header("bad key", Vec::new())?;
+            Ok(Vec::new())
+        });
 
-            let status = server
-                .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
-                .await
-                .expect_err("invalid metadata should fail the call");
+        let status = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect_err("invalid metadata should fail the call");
 
-            assert_eq!(status.code(), Code::Internal);
-        }
+        assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_sends_the_metadata_of_its_status() {
+        let mut server = Server::new();
+        server.route_with_context("/example.Greeter/SayHello", |context, _body| async move {
+            context.set_response_header("x-header", b"h".to_vec())?;
+            context.set_response_metadata("x-trailer", b"t".to_vec())?;
+            Err(Status::not_found("gone")
+                .with_metadata(headers_of("x-status", b"s"))
+                .into())
+        });
+
+        let status = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect_err("the handler failed");
+
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(status.metadata(), &headers_of("x-status", b"s"));
+    }
+
+    #[tokio::test]
+    async fn streaming_response_metadata_is_taken_when_it_is_sent() {
+        let late = Arc::new(Mutex::new(Vec::new()));
+        let mut server = Server::new();
+        let results = Arc::clone(&late);
+        server.route_streaming_with_context(
+            "/example.Greeter/Watch",
+            RpcKind::ServerStreaming,
+            move |context, _body, _requests| {
+                let results = Arc::clone(&results);
+                async move {
+                    context.set_response_header("x-header", b"h".to_vec())?;
+                    // The stream sets a header too late with its message, and trailing metadata
+                    // before and after it ends.
+                    let messages = futures_util::stream::unfold(0, move |step| {
+                        let context = context.clone();
+                        let results = Arc::clone(&results);
+                        async move {
+                            match step {
+                                0 => {
+                                    let late = context.set_response_header("x-late", Vec::new());
+                                    results
+                                        .lock()
+                                        .expect("lock should not be poisoned")
+                                        .push(late);
+                                    Some((Ok(b"one".to_vec()), 1))
+                                }
+                                1 => {
+                                    context
+                                        .set_response_metadata("x-trailer", b"t".to_vec())
+                                        .ok()?;
+                                    None
+                                }
+                                _ => None,
+                            }
+                        }
+                    });
+                    let messages: crate::BoxStream<Vec<u8>> = Box::pin(messages);
+                    Ok(messages)
+                }
+            },
+        );
+
+        let frames: Vec<_> = server
+            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .await
+            .map(|frame| frame.expect("frame should be ok"))
+            .collect()
+            .await;
+
+        assert_eq!(
+            frames,
+            [
+                ResponseFrame::Headers(headers_of("x-header", b"h")),
+                ResponseFrame::message(&b"one"[..]),
+                ResponseFrame::Status(Status::ok().with_metadata(headers_of("x-trailer", b"t"))),
+            ]
+        );
+        let late = std::mem::take(&mut *late.lock().expect("lock should not be poisoned"));
+        assert!(matches!(late.as_slice(), [Err(status)] if status.code() == Code::Internal));
     }
 
     fn headers_route(server: &mut Server, headers: Metadata, messages: crate::BoxStream<Vec<u8>>) {
         let messages = Arc::new(Mutex::new(Some(messages)));
-        server.route_streaming_envelope_with_context(
+        server.route_streaming_with_context(
             "/example.Greeter/Watch",
             RpcKind::ServerStreaming,
-            move |_context, _body, _requests| {
+            move |context, _body, _requests| {
                 let headers = headers.clone();
                 let messages = Arc::clone(&messages);
                 async move {
@@ -3033,9 +3137,11 @@ mod tests {
                         .expect("lock should not be poisoned")
                         .take()
                         .expect("route should be called once");
-                    Ok(ResponseEnvelope::new(messages)
-                        .with_headers(headers)
-                        .with_metadata(headers_of("x-trailer", b"t")))
+                    for (key, value) in headers {
+                        context.set_response_header(&key, value)?;
+                    }
+                    context.set_response_metadata("x-trailer", b"t".to_vec())?;
+                    Ok(messages)
                 }
             },
         );

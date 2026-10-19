@@ -55,39 +55,38 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 struct TestGreeter;
 
-fn successful_response<T>(shape: &str, response: T) -> trevrpc::ResponseEnvelope<T> {
-    let mut metadata = trevrpc::Metadata::new();
-    metadata.insert("x-rpc-shape".to_owned(), shape.as_bytes().to_vec());
-    let mut headers = trevrpc::Metadata::new();
-    headers.insert("x-rpc-header".to_owned(), shape.as_bytes().to_vec());
-    trevrpc::ResponseEnvelope::new(response)
-        .with_headers(headers)
-        .with_metadata(metadata)
+/// Answers with `response`, a response header and trailing metadata naming the RPC shape.
+fn successful_response<T>(
+    context: &RequestContext,
+    shape: &str,
+    response: T,
+) -> core::result::Result<T, Status> {
+    context.set_response_header("x-rpc-header", shape)?;
+    context.set_response_metadata("x-rpc-shape", shape)?;
+    Ok(response)
 }
 
 #[trevrpc::async_trait]
 impl greeter::Greeter for TestGreeter {
     async fn say_hello(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
-        Ok(successful_response(
+    ) -> core::result::Result<greeter::HelloReply, Status> {
+        successful_response(
+            &context,
             "unary",
             greeter::HelloReply {
                 message: format!("hello, {}", request.name),
             },
-        ))
+        )
     }
 
     async fn lots_of_replies(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         request: greeter::HelloRequest,
-    ) -> core::result::Result<
-        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
-        Status,
-    > {
+    ) -> core::result::Result<trevrpc::BoxStream<greeter::HelloReply>, Status> {
         if request.name == "cancel" {
             let replies: trevrpc::BoxStream<greeter::HelloReply> = Box::pin(
                 trevrpc::stream::from_iter([greeter::HelloReply {
@@ -95,10 +94,11 @@ impl greeter::Greeter for TestGreeter {
                 }])
                 .chain(futures_util::stream::pending()),
             );
-            return Ok(successful_response("server-streaming", replies));
+            return successful_response(&context, "server-streaming", replies);
         }
 
-        Ok(successful_response(
+        successful_response(
+            &context,
             "server-streaming",
             trevrpc::stream::from_iter([
                 greeter::HelloReply {
@@ -108,42 +108,40 @@ impl greeter::Greeter for TestGreeter {
                     message: format!("goodbye, {}", request.name),
                 },
             ]),
-        ))
+        )
     }
 
     async fn lots_of_greetings(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         mut requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> core::result::Result<trevrpc::ResponseEnvelope<greeter::HelloReply>, Status> {
+    ) -> core::result::Result<greeter::HelloReply, Status> {
         let mut names = Vec::new();
 
         while let Some(request) = requests.next().await {
             names.push(request?.name);
         }
 
-        Ok(successful_response(
+        successful_response(
+            &context,
             "client-streaming",
             greeter::HelloReply {
                 message: names.join(","),
             },
-        ))
+        )
     }
 
     async fn bidi_hello(
         &self,
-        _context: RequestContext,
+        context: RequestContext,
         requests: trevrpc::BoxStream<greeter::HelloRequest>,
-    ) -> core::result::Result<
-        trevrpc::ResponseEnvelope<trevrpc::BoxStream<greeter::HelloReply>>,
-        Status,
-    > {
+    ) -> core::result::Result<trevrpc::BoxStream<greeter::HelloReply>, Status> {
         let replies: trevrpc::BoxStream<greeter::HelloReply> = Box::pin(requests.map(|request| {
             request.map(|request| greeter::HelloReply {
                 message: format!("echo, {}", request.name),
             })
         }));
-        Ok(successful_response("bidirectional-streaming", replies))
+        successful_response(&context, "bidirectional-streaming", replies)
     }
 }
 
@@ -448,22 +446,18 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let reply = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "unary".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "unary".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(reply.message, "hello, unary");
 
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "server stream".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "server stream".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     let mut messages = Vec::new();
     while let Some(reply) = replies.next().await {
@@ -489,22 +483,19 @@ async fn quinn_preserves_success_metadata_for_every_rpc_shape() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let unary = client
-        .say_hello_envelope_with_options(
-            greeter::HelloRequest {
-                name: "metadata".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "metadata".to_owned(),
+        })
+        .options(|_| authenticated_options())
+        .with_response()
         .await?;
     assert_response_shape(unary.metadata(), "unary");
 
     let mut server_stream = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "metadata".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "metadata".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     while let Some(reply) = server_stream.next().await {
         reply?;
@@ -517,18 +508,20 @@ async fn quinn_preserves_success_metadata_for_every_rpc_shape() -> TestResult {
     );
 
     let client_stream = client
-        .lots_of_greetings_with_options(authenticated_options())
+        .lots_of_greetings()
+        .options(|_| authenticated_options())
         .await?;
     client_stream
         .send(greeter::HelloRequest {
             name: "metadata".to_owned(),
         })
         .await?;
-    let client_stream = client_stream.close_and_recv_envelope().await?;
+    let client_stream = client_stream.close_and_recv_with_response().await?;
     assert_response_shape(client_stream.metadata(), "client-streaming");
 
     let bidi = client
-        .bidi_hello_with_options(authenticated_options())
+        .bidi_hello()
+        .options(|_| authenticated_options())
         .await?;
     let (sender, mut responses) = bidi.split();
     let send_task = tokio::spawn(async move {
@@ -934,22 +927,18 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
     let (endpoint, connection, client) = connect_webtransport_client(&server).await?;
 
     let reply = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "unary".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "unary".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(reply.message, "hello, unary");
 
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "server stream".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "server stream".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     let mut messages = Vec::new();
     while let Some(reply) = replies.next().await {
@@ -976,22 +965,18 @@ async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let (endpoint, connection, client) = connect_http3_client(&server).await?;
 
     let reply = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "unary".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "unary".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(reply.message, "hello, unary");
 
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "server stream".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "server stream".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     let mut messages = Vec::new();
     while let Some(reply) = replies.next().await {
@@ -1127,12 +1112,10 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
     let quinn_client =
         greeter::GreeterClient::new(trevrpc::client::QuicTransport::new(connection.clone()));
     let quinn_reply = quinn_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "quinn".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "quinn".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(quinn_reply.message, "hello, quinn");
     close_client(endpoint, connection).await?;
@@ -1140,45 +1123,37 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
     let (webtransport_client, session, greeter_client) =
         connect_webtransport_client(&server).await?;
     let webtransport_reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "webtransport".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "webtransport".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(webtransport_reply.message, "hello, webtransport");
 
     let (http3_endpoint, http3_connection, http3_client) = connect_http3_client(&server).await?;
     let http3_reply = http3_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "http3".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "http3".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(http3_reply.message, "hello, http3");
 
     let webtransport_reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "webtransport interleaved".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "webtransport interleaved".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(
         webtransport_reply.message,
         "hello, webtransport interleaved"
     );
     let http3_reply = http3_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "http3 interleaved".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "http3 interleaved".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(http3_reply.message, "hello, http3 interleaved");
 
@@ -1202,20 +1177,16 @@ async fn h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> Tes
     let (http3_endpoint, http3_connection, http3_rpc) = connect_http3_client(&server).await?;
 
     let mut webtransport_replies = webtransport_rpc
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "cancel".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     let mut http3_replies = http3_rpc
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "cancel".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(
         webtransport_replies
@@ -1348,7 +1319,8 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
     let client = greeter::GreeterClient::new(transport.clone());
 
     let call = client
-        .lots_of_greetings_with_options(authenticated_options())
+        .lots_of_greetings()
+        .options(|_| authenticated_options())
         .await?;
     call.send(greeter::HelloRequest {
         name: "one".to_owned(),
@@ -1371,12 +1343,10 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
     send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
 
     let reply = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after cancellation".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after cancellation".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(reply.message, "hello, after cancellation");
     drop(recv);
@@ -1475,12 +1445,10 @@ async fn say_hello_over_webtransport_offering(
         greeter::GreeterClient::new(support::WebTransportRpc::new(session.clone()));
 
     let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "version".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "version".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
 
     ensure_eq!(reply.message, "hello, version");
@@ -1578,12 +1546,10 @@ async fn webtransport_allows_configured_browser_origin() -> TestResult {
     let greeter_client = greeter::GreeterClient::new(transport);
 
     let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "origin".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "origin".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
 
     ensure_eq!(reply.message, "hello, origin");
@@ -1619,12 +1585,10 @@ async fn webtransport_admission_receives_generic_request_headers() -> TestResult
     let session = client.connect(allowed).await?;
     let rpc = greeter::GreeterClient::new(support::WebTransportRpc::new(session.clone()));
     let reply = rpc
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "admitted".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "admitted".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(reply.message, "hello, admitted");
 
@@ -1660,12 +1624,10 @@ async fn quinn_auth_failures_return_status_errors() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let error = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "missing auth".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "missing auth".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await
         .expect_err("request without auth should fail");
 
@@ -1706,7 +1668,8 @@ async fn quinn_request_stream_limits_return_resource_exhausted() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let call = client
-        .lots_of_greetings_with_options(authenticated_options())
+        .lots_of_greetings()
+        .options(|_| authenticated_options())
         .await?;
     call.send(greeter::HelloRequest {
         name: "one".to_owned(),
@@ -1735,12 +1698,10 @@ async fn quinn_response_stream_limits_return_resource_exhausted() -> TestResult 
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "limited".to_owned(),
-            },
-            authenticated_options().with_max_response_messages(Some(1)),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "limited".to_owned(),
+        })
+        .options(|_| authenticated_options().with_max_response_messages(Some(1)))
         .await?;
     let first = replies
         .next()
@@ -1805,12 +1766,10 @@ async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResu
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
     let mut hanging = greeter_client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "cancel".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     let first = hanging
         .next()
@@ -2052,12 +2011,10 @@ async fn quinn_dropped_response_stream_cancels_server_work() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "cancel".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     let first = replies
         .next()
@@ -2155,12 +2112,10 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
     // Contain the reset to this RPC and preserve the session.
     send.reset(1)?;
     let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after cancellation".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after cancellation".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(reply.message, "hello, after cancellation");
     drop(recv);
@@ -2201,12 +2156,10 @@ async fn webtransport_shutdown_closes_the_session() -> TestResult {
     })?;
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
     let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "before shutdown".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "before shutdown".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     ensure_eq!(reply.message, "hello, before shutdown");
 
@@ -2259,12 +2212,10 @@ async fn quinn_server_streaming_deadline_while_response_pending() -> TestResult 
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "cancel".to_owned(),
-            },
-            short_authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        })
+        .options(|_| short_authenticated_options())
         .await?;
     let first = replies
         .next()
@@ -2291,12 +2242,10 @@ async fn webtransport_server_streaming_deadline_while_response_pending() -> Test
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
     let mut replies = greeter_client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "cancel".to_owned(),
-            },
-            short_authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        })
+        .options(|_| short_authenticated_options())
         .await?;
     let first = replies
         .next()
@@ -2325,7 +2274,9 @@ async fn quinn_client_streaming_deadline_while_upload_pending() -> TestResult {
     let requests: trevrpc::BoxStream<greeter::HelloRequest> =
         Box::pin(futures_util::stream::pending());
     let error = client
-        .lots_of_greetings_from_stream_with_options(requests, short_authenticated_options())
+        .lots_of_greetings()
+        .options(|_| short_authenticated_options())
+        .send_all(requests)
         .await
         .expect_err("pending upload should hit deadline");
     ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
@@ -2344,7 +2295,9 @@ async fn webtransport_client_streaming_deadline_while_upload_pending() -> TestRe
     let requests: trevrpc::BoxStream<greeter::HelloRequest> =
         Box::pin(futures_util::stream::pending());
     let error = greeter_client
-        .lots_of_greetings_from_stream_with_options(requests, short_authenticated_options())
+        .lots_of_greetings()
+        .options(|_| short_authenticated_options())
+        .send_all(requests)
         .await
         .expect_err("pending upload should hit deadline");
     ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
@@ -2361,7 +2314,8 @@ async fn quinn_bidi_deadline_while_response_pending() -> TestResult {
     let (endpoint, connection, client) = connect_client(&server).await?;
 
     let mut replies = client
-        .bidi_hello_with_options(short_authenticated_options())
+        .bidi_hello()
+        .options(|_| short_authenticated_options())
         .await?;
     let error = replies
         .recv()
@@ -2382,7 +2336,8 @@ async fn webtransport_bidi_deadline_while_response_pending() -> TestResult {
     let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
 
     let mut replies = greeter_client
-        .bidi_hello_with_options(short_authenticated_options())
+        .bidi_hello()
+        .options(|_| short_authenticated_options())
         .await?;
     let error = replies
         .recv()
@@ -2471,12 +2426,10 @@ async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult
     );
 
     let concurrent = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "concurrent".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "concurrent".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await?;
     ensure_eq!(concurrent.message, "hello, concurrent");
 
@@ -2622,12 +2575,10 @@ async fn quinn_unary_request_left_open_is_bounded_and_frees_the_stream_slot() ->
 
     // The unfinished request must not pin the connection's only stream slot.
     let reply = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "second".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "second".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await?;
     ensure_eq!(reply.message, "hello, second");
 
@@ -2854,12 +2805,10 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
     server.shutdown().await?;
 
     let error = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after shutdown".to_owned(),
-            },
-            CallOptions::new().with_timeout(Duration::from_millis(100)),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after shutdown".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(Duration::from_millis(100)))
         .await
         .expect_err("RPC on drained connection should fail");
     ensure_eq!(error.into_status().code(), Code::Unavailable);
@@ -2880,12 +2829,10 @@ async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
         .expect("client should observe WebTransport server shutdown");
 
     let error = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after shutdown".to_owned(),
-            },
-            CallOptions::new().with_timeout(Duration::from_millis(100)),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after shutdown".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(Duration::from_millis(100)))
         .await
         .expect_err("RPC on drained WebTransport session should fail");
     ensure!(matches!(
@@ -2909,12 +2856,10 @@ async fn http3_shutdown_closes_active_connections() -> TestResult {
         .expect("client should observe HTTP/3 server shutdown");
 
     let error = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after shutdown".to_owned(),
-            },
-            CallOptions::new().with_timeout(Duration::from_millis(100)),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after shutdown".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(Duration::from_millis(100)))
         .await
         .expect_err("RPC on drained HTTP/3 connection should fail");
     ensure!(matches!(
@@ -3027,12 +2972,10 @@ async fn quinn_local_close_maps_to_cancelled() -> TestResult {
     connection.close(0_u32.into(), b"client closed");
 
     let error = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after local close".to_owned(),
-            },
-            CallOptions::new().with_timeout(Duration::from_millis(100)),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after local close".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(Duration::from_millis(100)))
         .await
         .expect_err("RPC on locally closed connection should fail");
     ensure_eq!(error.into_status().code(), Code::Cancelled);
@@ -3316,12 +3259,10 @@ async fn quinn_large_partial_initial_body_does_not_hold_request_permit() -> Test
     send.write_all(&[1]).await?;
 
     let reply = client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after partial".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after partial".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await?;
     ensure_eq!(reply.message, "hello, after partial");
 
@@ -3348,12 +3289,10 @@ async fn webtransport_large_partial_initial_body_does_not_hold_request_permit() 
     send.write_all(&[1]).await?;
 
     let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after partial".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after partial".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await?;
     ensure_eq!(reply.message, "hello, after partial");
 
@@ -3402,12 +3341,10 @@ async fn webtransport_oversized_initial_frame_is_rejected_before_body() -> TestR
     );
 
     let reply = greeter_client
-        .say_hello_with_options(
-            greeter::HelloRequest {
-                name: "after oversized".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "after oversized".to_owned(),
+        })
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await?;
     ensure_eq!(reply.message, "hello, after oversized");
 
@@ -3428,10 +3365,8 @@ async fn quinn_handles_many_concurrent_unary_calls() -> TestResult {
         calls.spawn(async move {
             let name = format!("concurrent-{index}");
             let response = client
-                .say_hello_with_options(
-                    greeter::HelloRequest { name: name.clone() },
-                    authenticated_options(),
-                )
+                .say_hello(&greeter::HelloRequest { name: name.clone() })
+                .options(|_| authenticated_options())
                 .await?;
             Ok::<_, trevrpc::Error>((name, response.message))
         });
@@ -3506,20 +3441,16 @@ async fn run_mixed_call(
         0 => {
             let name = format!("load-unary-{index}");
             let response = client
-                .say_hello_with_options(
-                    greeter::HelloRequest { name: name.clone() },
-                    authenticated_options(),
-                )
+                .say_hello(&greeter::HelloRequest { name: name.clone() })
+                .options(|_| authenticated_options())
                 .await?;
             assert_eq!(response.message, format!("hello, {name}"));
         }
         1 => {
             let name = format!("load-server-stream-{index}");
             let mut responses = client
-                .lots_of_replies_with_options(
-                    greeter::HelloRequest { name: name.clone() },
-                    authenticated_options(),
-                )
+                .lots_of_replies(&greeter::HelloRequest { name: name.clone() })
+                .options(|_| authenticated_options())
                 .await?;
             let mut count = 0_usize;
             while let Some(response) = responses.next().await {
@@ -3567,12 +3498,10 @@ async fn hold_server_stream_open(
     client: &greeter::GreeterClient<trevrpc::client::QuicTransport>,
 ) -> TestResult<trevrpc::client::ResponseStream<greeter::HelloReply>> {
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "cancel".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "cancel".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     let first = replies
         .next()
@@ -3595,14 +3524,15 @@ fn register_cancellation_probe_route(
     server: &mut Server,
     source_tx: mpsc::UnboundedSender<CancellationSource>,
 ) {
-    server.route_streaming_envelope_with_context(
+    server.route_streaming_with_context(
         "/lifecycle.Probe/Watch",
         RpcKind::ServerStreaming,
         move |context, _body, _requests| {
             let source_tx = source_tx.clone();
             async move {
+                let probe = context.clone();
                 tokio::spawn(async move {
-                    let source = context.cancelled_signal().await;
+                    let source = probe.cancelled_signal().await;
                     let _ = source_tx.send(source);
                 });
                 let first = greeter::HelloReply {
@@ -3612,7 +3542,11 @@ fn register_cancellation_probe_route(
                 let stream: trevrpc::BoxStream<Vec<u8>> = Box::pin(
                     trevrpc::stream::from_iter([first]).chain(futures_util::stream::pending()),
                 );
-                Ok(successful_response("server-streaming-probe", stream))
+                Ok(successful_response(
+                    &context,
+                    "server-streaming-probe",
+                    stream,
+                )?)
             }
         },
     );
@@ -3928,12 +3862,11 @@ where
 {
     let reply = tokio::time::timeout(
         TEST_TIMEOUT,
-        client.say_hello_with_options(
-            greeter::HelloRequest {
+        client
+            .say_hello(&greeter::HelloRequest {
                 name: "readiness".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        ),
+            })
+            .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT)),
     )
     .await??;
     assert_eq!(reply.message, "hello, readiness");
@@ -3954,7 +3887,7 @@ async fn run_client_greetings<T>(
 where
     T: StreamingRpcTransport,
 {
-    let call = client.lots_of_greetings_with_options(options).await?;
+    let call = client.lots_of_greetings().options(|_| options).await?;
     for name in names {
         call.send(greeter::HelloRequest {
             name: (*name).to_owned(),
@@ -3972,7 +3905,7 @@ async fn run_bidi_greetings<T>(
 where
     T: StreamingRpcTransport,
 {
-    let mut call = client.bidi_hello_with_options(options).await?;
+    let mut call = client.bidi_hello().options(|_| options).await?;
     for name in names {
         call.send(greeter::HelloRequest {
             name: (*name).to_owned(),
@@ -4073,24 +4006,21 @@ where
     T: StreamingRpcTransport,
 {
     let unary = client
-        .say_hello_envelope_with_options(
-            greeter::HelloRequest {
-                name: "headers".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .say_hello(&greeter::HelloRequest {
+            name: "headers".to_owned(),
+        })
+        .options(|_| authenticated_options())
+        .with_response()
         .await?;
     assert_response_shape_header(unary.headers(), "unary");
     assert_response_shape(unary.metadata(), "unary");
 
     // Headers are available before any message is read, and the message is not lost.
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest {
-                name: "headers".to_owned(),
-            },
-            authenticated_options(),
-        )
+        .lots_of_replies(&greeter::HelloRequest {
+            name: "headers".to_owned(),
+        })
+        .options(|_| authenticated_options())
         .await?;
     assert_response_shape_header(replies.headers().await?, "server-streaming");
     ensure_eq!(
@@ -4108,7 +4038,8 @@ where
     );
 
     let mut upload = client
-        .lots_of_greetings_with_options(authenticated_options())
+        .lots_of_greetings()
+        .options(|_| authenticated_options())
         .await?;
     upload
         .send(greeter::HelloRequest {
@@ -4117,13 +4048,14 @@ where
         .await?;
     upload.close_send()?;
     assert_response_shape_header(upload.headers().await?, "client-streaming");
-    let upload = upload.close_and_recv_envelope().await?;
+    let upload = upload.close_and_recv_with_response().await?;
     assert_response_shape_header(upload.headers(), "client-streaming");
     assert_response_shape(upload.metadata(), "client-streaming");
 
     // The handler answers before the first request message, and so do its headers.
     let mut bidi = client
-        .bidi_hello_with_options(authenticated_options())
+        .bidi_hello()
+        .options(|_| authenticated_options())
         .await?;
     assert_response_shape_header(bidi.headers().await?, "bidirectional-streaming");
     bidi.send(greeter::HelloRequest {
@@ -4180,10 +4112,10 @@ async fn http3_response_headers_reach_every_rpc_shape() -> TestResult {
 
 /// A server-streaming route that sends its headers at once and its only message once released.
 fn register_gated_headers_route(server: &mut Server, gate: Arc<Notify>) {
-    server.route_streaming_envelope_with_context(
+    server.route_streaming_with_context(
         "/test.Headers/Gate",
         RpcKind::ServerStreaming,
-        move |_context, _body, _requests| {
+        move |context, _body, _requests| {
             let gate = Arc::clone(&gate);
             async move {
                 let late = greeter::HelloReply {
@@ -4195,7 +4127,7 @@ fn register_gated_headers_route(server: &mut Server, gate: Arc<Notify>) {
                         gate.notified().await;
                         Ok(late)
                     }));
-                Ok(successful_response("gated", messages))
+                Ok(successful_response(&context, "gated", messages)?)
             }
         },
     );
@@ -4536,10 +4468,9 @@ async fn quinn_client_skips_unknown_frames_everywhere_on_a_response() -> TestRes
     let client = greeter::GreeterClient::new(server.transport());
 
     let envelope = client
-        .say_hello_envelope_with_options(
-            greeter::HelloRequest::default(),
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest::default())
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
+        .with_response()
         .await?;
 
     ensure_eq!(envelope.message().message, "one");
@@ -4564,10 +4495,8 @@ async fn quinn_client_streaming_responses_skip_unknown_frames() -> TestResult {
     let client = greeter::GreeterClient::new(server.transport());
 
     let mut replies = client
-        .lots_of_replies_with_options(
-            greeter::HelloRequest::default(),
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .lots_of_replies(&greeter::HelloRequest::default())
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await?;
     ensure_eq!(replies.headers().await?, &single_header("x-h", b"1"));
     let mut messages = Vec::new();
@@ -4600,10 +4529,8 @@ async fn quinn_client_rejects_misplaced_response_headers() -> TestResult {
         let server = ScriptedServer::start(frame_bytes(&frames)?).await?;
         let client = greeter::GreeterClient::new(server.transport());
         let error = client
-            .say_hello_with_options(
-                greeter::HelloRequest::default(),
-                CallOptions::new().with_timeout(TEST_TIMEOUT),
-            )
+            .say_hello(&greeter::HelloRequest::default())
+            .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
             .await
             .expect_err(name);
         ensure_eq!(error.into_status().code(), Code::Internal, "unary {name}");
@@ -4613,10 +4540,8 @@ async fn quinn_client_rejects_misplaced_response_headers() -> TestResult {
         let server = ScriptedServer::start(frame_bytes(&frames)?).await?;
         let client = greeter::GreeterClient::new(server.transport());
         let mut replies = client
-            .lots_of_replies_with_options(
-                greeter::HelloRequest::default(),
-                CallOptions::new().with_timeout(TEST_TIMEOUT),
-            )
+            .lots_of_replies(&greeter::HelloRequest::default())
+            .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
             .await?;
         let mut failure = None;
         while let Some(reply) = replies.next().await {
@@ -4649,10 +4574,8 @@ async fn quinn_client_rejects_unary_responses_without_exactly_one_message() -> T
         let server = ScriptedServer::start(frame_bytes(&frames)?).await?;
         let client = greeter::GreeterClient::new(server.transport());
         let error = client
-            .say_hello_with_options(
-                greeter::HelloRequest::default(),
-                CallOptions::new().with_timeout(TEST_TIMEOUT),
-            )
+            .say_hello(&greeter::HelloRequest::default())
+            .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
             .await
             .expect_err(name);
         ensure_eq!(error.into_status().code(), Code::Internal, "{name}");
@@ -4674,10 +4597,8 @@ async fn quinn_client_rejects_oversized_response_frames_before_reading_them() ->
     let client = greeter::GreeterClient::new(server.transport());
 
     let error = client
-        .say_hello_with_options(
-            greeter::HelloRequest::default(),
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
+        .say_hello(&greeter::HelloRequest::default())
+        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
         .await
         .expect_err("an oversized frame should fail the call");
 

@@ -246,6 +246,13 @@ fn apply_transport_limits(config: &mut quinn::TransportConfig, options: &ServerO
     config.stream_receive_window(varint(limits.stream_receive_window));
     config.receive_window(varint(limits.connection_receive_window));
     config.datagram_receive_buffer_size(Some(crate::datagram::DATAGRAM_RECEIVE_BUFFER));
+    if let Some(idle) = options.connection_idle_timeout() {
+        // An idle timeout too large for QUIC leaves Quinn's default.
+        if let Ok(timeout) = quinn::IdleTimeout::try_from(idle) {
+            config.max_idle_timeout(Some(timeout));
+            config.keep_alive_interval(idle.checked_div(2));
+        }
+    }
     if let Some(max_streams) = limits.max_concurrent_bidi_streams {
         config.max_concurrent_bidi_streams(varint(max_streams));
     }
@@ -253,21 +260,27 @@ fn apply_transport_limits(config: &mut quinn::TransportConfig, options: &ServerO
     // `WebTransport` opens more, and the connection window bounds what native peers can buffer.
 }
 
+/// The connection receive window when the stream body limit sets no smaller one.
+const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+
+/// Bounds the data a peer may have in flight across the streams of one connection: a frame on
+/// every stream, at most [`DEFAULT_CONNECTION_RECEIVE_WINDOW`] or the stream body limit when that
+/// is smaller, and never less than one frame.
 fn connection_receive_window(options: &ServerOptions, stream_receive_window: u64) -> u64 {
-    let mut connection_receive_window = match options.max_concurrent_streams_per_connection() {
+    let every_stream = match options.max_concurrent_streams_per_connection() {
         Some(max_streams) if max_streams > 1 => {
             stream_receive_window.saturating_mul(saturating_usize_to_u64(max_streams))
         }
         _ => stream_receive_window,
     };
+    let bound =
+        options
+            .max_stream_body_size()
+            .map_or(DEFAULT_CONNECTION_RECEIVE_WINDOW, |max_body_size| {
+                DEFAULT_CONNECTION_RECEIVE_WINDOW.min(saturating_usize_to_u64(max_body_size))
+            });
 
-    if let Some(max_body_size) = options.max_stream_body_size() {
-        let stream_body_window = saturating_usize_to_u64(max_body_size);
-        connection_receive_window = connection_receive_window.min(stream_body_window);
-        connection_receive_window = connection_receive_window.max(stream_receive_window);
-    }
-
-    connection_receive_window
+    every_stream.min(bound).max(stream_receive_window)
 }
 
 /// Waits for `tasks` to finish, aborting them if `timeout` elapses first. Returns whether they all
@@ -353,6 +366,20 @@ mod tests {
                 max_concurrent_bidi_streams: Some(12),
             }
         );
+    }
+
+    #[test]
+    fn connection_window_stays_bounded_without_a_stream_body_limit() {
+        let small = ServerOptions::new()
+            .with_max_frame_size(1024)
+            .with_max_concurrent_streams_per_connection(Some(10));
+        assert_eq!(
+            transport_limits(&small).connection_receive_window,
+            10 * 1040
+        );
+
+        let defaults = transport_limits(&ServerOptions::new());
+        assert_eq!(defaults.connection_receive_window, 16 * 1024 * 1024);
     }
 
     #[test]

@@ -19,45 +19,17 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
-// unaryReply is a successful unary handler result: the encoded response
-// message with its response headers and trailing metadata.
-type unaryReply struct {
-	message  encodedMessage
-	headers  Metadata
-	trailers Metadata
-}
+// unaryHandler handles an encoded unary request message and returns the
+// encoded response message. Response headers and trailing metadata are set
+// through the context (see SetResponseHeader).
+type unaryHandler func(context.Context, []byte) (encodedMessage, error)
 
-// unaryHandler handles an encoded unary request message.
-type unaryHandler func(context.Context, []byte) (*unaryReply, error)
-
-// streamResponse is what a streaming handler produces: the encoded response
-// messages, the headers to send before the first one, and, for a
-// ResponseStream, the source of the terminal status.
-type streamResponse struct {
-	stream   encodedStream
-	headers  Metadata
-	terminal func() (*Status, bool)
-}
-
-// newStreamResponse prepares a handler's response stream for the server. It
-// closes stream and fails when the stream's response headers are invalid.
-func newStreamResponse[T ProtoMessage](stream MessageStream[T]) (streamResponse, error) {
-	headers := cloneMetadata(responseHeadersOf(stream))
-	if err := validateMetadata(headers); err != nil {
-		discardMessageStream(stream)
-		return streamResponse{}, Internal("handler returned invalid response headers: " + err.Error())
-	}
-	response := streamResponse{stream: newEncodeStream(stream), headers: headers}
-	if terminal, ok := stream.(ResponseStream[T]); ok {
-		response.terminal = terminal.TerminalStatus
-	}
-	return response, nil
-}
-
-// streamingHandler handles a streaming request. body is the request message of
-// a server-streaming call and nil otherwise; requests carries the message
-// stream of a client-streaming or bidirectional call.
-type streamingHandler func(context.Context, []byte, byteStream) (streamResponse, error)
+// streamingHandler handles a streaming request and returns the encoded
+// response messages. body is the request message of a server-streaming call
+// and nil otherwise; requests carries the message stream of a client-streaming
+// or bidirectional call. Response headers and trailing metadata are set
+// through the context (see SetResponseHeader).
+type streamingHandler func(context.Context, []byte, byteStream) (encodedStream, error)
 
 type route struct {
 	kind      RPCKind
@@ -100,6 +72,14 @@ type Server struct {
 // stream slot of its connection like an RPC, so a connection at
 // MaxConcurrentStreamsPerConnection answers it with 503, but admission does
 // not apply to it. Its context is cancelled when the listener shuts down.
+//
+// A stream has no message-count, cumulative-body or idle limit by default, so
+// long-lived and quiet streams work: MaxStreamMessages and MaxStreamBodySize
+// bound a stream when positive (0 or -1 for none), and StreamIdleTimeout ends a
+// stream whose request or response side is quiet for longer when positive.
+// ConnectionIdleTimeout (default 30 s) closes a connection the peer stopped
+// answering and sends keepalives at half of it, so quiet streams on a live
+// connection are not affected; DisableConnectionIdleTimeout turns it off.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -113,7 +93,8 @@ type ServerOptions struct {
 	MaxStreamMessages                 int
 	MaxStreamBodySize                 int
 	StreamIdleTimeout                 time.Duration
-	DisableStreamIdleTimeout          bool
+	ConnectionIdleTimeout             time.Duration
+	DisableConnectionIdleTimeout      bool
 	EnableHTTP                        bool
 	HTTPPath                          string
 	HTTPAdmission                     Admission
@@ -221,9 +202,9 @@ func DefaultServerOptions() ServerOptions {
 		MaxConcurrentAdmissionCallbacks:   64,
 		GracefulShutdownTimeout:           30 * time.Second,
 		InitialRequestTimeout:             10 * time.Second,
-		MaxStreamMessages:                 4096,
-		MaxStreamBodySize:                 16 * 1024 * 1024,
-		StreamIdleTimeout:                 30 * time.Second,
+		MaxStreamMessages:                 -1,
+		MaxStreamBodySize:                 -1,
+		ConnectionIdleTimeout:             30 * time.Second,
 		HTTPPath:                          DefaultHTTPPath,
 	}
 }
@@ -373,82 +354,86 @@ func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHa
 
 // RegisterUnary registers a unary handler for method, the full method path
 // "/package.Service/Method". It panics if method is not of that form. The
-// handler may attach response headers and trailing metadata through the
-// returned Response.
-func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (*Response[Res], error)) {
-	s.routeUnary(method, func(ctx context.Context, body []byte) (*unaryReply, error) {
+// handler may set response headers and trailing metadata with
+// SetResponseHeader and SetResponseMetadata.
+func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error)) {
+	s.routeUnary(method, func(ctx context.Context, body []byte) (encodedMessage, error) {
 		request, err := decodeRegisteredRequest(body, newRequest)
 		if err != nil {
-			return nil, err
+			return encodedMessage{}, err
 		}
 
 		response, err := handler(ctx, request)
 		if err != nil {
-			return nil, err
+			return encodedMessage{}, err
 		}
-		return encodeRegisteredResponse(response)
+		if isNilRegisteredValue(response) {
+			return encodedMessage{}, Internal("handler returned nil response message")
+		}
+		return encodeMessage(response)
 	})
 }
 
 // RegisterClientStreaming registers a client-streaming handler for method, the
 // full method path "/package.Service/Method". It panics if method is not of
-// that form. The handler may attach response headers and trailing metadata
-// through the returned Response. Request messages that arrive as datagrams are
-// delivered with the others; RouteUnreliable has no effect on a method whose
-// response is a single message.
-func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (*Response[Res], error), options ...RouteOption) {
-	s.routeStreaming(method, RPCKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
+// that form. The handler may set response headers and trailing metadata with
+// SetResponseHeader and SetResponseMetadata. Request messages that arrive as
+// datagrams are delivered with the others; RouteUnreliable has no effect on a
+// method whose response is a single message.
+func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (Res, error), options ...RouteOption) {
+	s.routeStreaming(method, RPCKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (encodedStream, error) {
 		response, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
-			return streamResponse{}, err
+			return nil, err
 		}
-		if err := validateRegisteredResponse(response); err != nil {
-			return streamResponse{}, err
+		if isNilRegisteredValue(response) {
+			return nil, Internal("handler returned nil response message")
 		}
-		return newStreamResponse(WithResponseHeaders(NewResponseStream(newSliceStream(response.Message), response.Metadata), response.Headers))
+		return newEncodeStream(newSliceStream(response)), nil
 	}, options...)
 }
 
 // RegisterServerStreaming registers a server-streaming handler for method, the
 // full method path "/package.Service/Method". It panics if method is not of
-// that form. If the returned stream implements ResponseStream (see NewResponseStream), its
-// trailing metadata is sent with the final status; WithResponseHeaders adds
-// response headers. RouteUnreliable lets the response messages travel as
+// that form. The handler may set response headers with SetResponseHeader
+// before it returns, and trailing metadata with SetResponseMetadata until the
+// returned stream ends. RouteUnreliable lets the response messages travel as
 // datagrams.
 func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (MessageStream[Res], error), options ...RouteOption) {
-	s.routeStreaming(method, RPCKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (streamResponse, error) {
+	s.routeStreaming(method, RPCKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (encodedStream, error) {
 		request, err := decodeRegisteredRequest(body, newRequest)
 		if err != nil {
-			return streamResponse{}, err
+			return nil, err
 		}
 
 		responses, err := handler(ctx, request)
 		if err != nil {
-			return streamResponse{}, err
+			return nil, err
 		}
 		if isNilRegisteredValue(responses) {
-			return streamResponse{}, Internal("handler returned nil response stream")
+			return nil, Internal("handler returned nil response stream")
 		}
-		return newStreamResponse(responses)
+		return newEncodeStream(responses), nil
 	}, options...)
 }
 
 // RegisterBidirectionalStreaming registers a bidirectional-streaming handler
 // for method, the full method path "/package.Service/Method". It panics if
-// method is not of that form. If the returned stream implements ResponseStream (see NewResponseStream), its
-// trailing metadata is sent with the final status; WithResponseHeaders adds
-// response headers. RouteUnreliable lets the response messages travel as
-// datagrams; request messages that arrive as datagrams are always accepted.
+// method is not of that form. The handler may set response headers with
+// SetResponseHeader before it returns, and trailing metadata with
+// SetResponseMetadata until the returned stream ends. RouteUnreliable lets the
+// response messages travel as datagrams; request messages that arrive as
+// datagrams are always accepted.
 func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (MessageStream[Res], error), options ...RouteOption) {
-	s.routeStreaming(method, RPCKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
+	s.routeStreaming(method, RPCKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (encodedStream, error) {
 		responses, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
-			return streamResponse{}, err
+			return nil, err
 		}
 		if isNilRegisteredValue(responses) {
-			return streamResponse{}, Internal("handler returned nil response stream")
+			return nil, Internal("handler returned nil response stream")
 		}
-		return newStreamResponse(responses)
+		return newEncodeStream(responses), nil
 	}, options...)
 }
 
@@ -463,33 +448,6 @@ func decodeRegisteredRequest[Req ProtoMessage](body []byte, newRequest func() Re
 		return zero, InvalidArgument("failed to decode request: " + err.Error())
 	}
 	return request, nil
-}
-
-func encodeRegisteredResponse[Res ProtoMessage](response *Response[Res]) (*unaryReply, error) {
-	if err := validateRegisteredResponse(response); err != nil {
-		return nil, err
-	}
-	message, err := encodeMessage(response.Message)
-	if err != nil {
-		return nil, err
-	}
-	return &unaryReply{message: message, headers: cloneMetadata(response.Headers), trailers: cloneMetadata(response.Metadata)}, nil
-}
-
-func validateRegisteredResponse[Res ProtoMessage](response *Response[Res]) error {
-	if response == nil {
-		return Internal("handler returned nil response")
-	}
-	if isNilRegisteredValue(response.Message) {
-		return Internal("handler returned nil response message")
-	}
-	if err := validateMetadata(response.Headers); err != nil {
-		return Internal("handler returned invalid response headers: " + err.Error())
-	}
-	if err := validateMetadata(response.Metadata); err != nil {
-		return Internal("handler returned invalid response metadata: " + err.Error())
-	}
-	return nil
 }
 
 func isNilRegisteredValue(value any) bool {
@@ -540,7 +498,8 @@ func canonicalServerOptions(options ServerOptions) ServerOptions {
 	canonical.MaxStreamBodySize = canonicalStreamLimit("MaxStreamBodySize", options.MaxStreamBodySize, defaults.MaxStreamBodySize)
 	canonical.GracefulShutdownTimeout = canonicalDuration("GracefulShutdownTimeout", options.GracefulShutdownTimeout, defaults.GracefulShutdownTimeout, options.DisableGracefulShutdownTimeout)
 	canonical.InitialRequestTimeout = canonicalDuration("InitialRequestTimeout", options.InitialRequestTimeout, defaults.InitialRequestTimeout, options.DisableInitialRequestTimeout)
-	canonical.StreamIdleTimeout = canonicalDuration("StreamIdleTimeout", options.StreamIdleTimeout, defaults.StreamIdleTimeout, options.DisableStreamIdleTimeout)
+	canonical.StreamIdleTimeout = canonicalDuration("StreamIdleTimeout", options.StreamIdleTimeout, defaults.StreamIdleTimeout, false)
+	canonical.ConnectionIdleTimeout = canonicalDuration("ConnectionIdleTimeout", options.ConnectionIdleTimeout, defaults.ConnectionIdleTimeout, options.DisableConnectionIdleTimeout)
 	if canonical.HTTPPath == "" {
 		canonical.HTTPPath = defaults.HTTPPath
 	}
@@ -986,34 +945,27 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 	if !ok || route.unary == nil {
 		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(Unimplemented(fmt.Sprintf("unknown RPC method %s", request.Method))), request)
 	}
-	reply, err := invokeUnaryHandler(ctx, route.unary, body, handlerNeedsDeadlineRace(ctx), lease)
+	message, err := invokeUnaryHandler(ctx, route.unary, body, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
 		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(err, ServerDiagnosticInternalError, request)), request)
 	}
-	return r.finishResponse(service, method, requestBodyLen, startedAt, r.unaryResponseFor(reply, request), request)
+	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message), request)
 }
 
 func failedUnaryResponse(status *Status) *unaryResponse {
 	return &unaryResponse{status: status}
 }
 
-// unaryResponseFor turns a handler's reply into the response to send.
-func (r *serverRuntime) unaryResponseFor(reply *unaryReply, request *wireRequest) *unaryResponse {
-	if reply == nil {
-		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: errors.New("handler returned nil response")})
-		return failedUnaryResponse(internalServerStatus())
-	}
-	for _, metadata := range []Metadata{reply.headers, reply.trailers} {
-		if err := validateMetadata(metadata); err != nil {
-			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})
-			return failedUnaryResponse(internalServerStatus())
-		}
-	}
+// successfulUnaryResponse is the response of a unary handler that returned
+// message, with the response metadata it set through ctx.
+func successfulUnaryResponse(ctx context.Context, message encodedMessage) *unaryResponse {
+	response := responseMetadataFromContext(ctx)
+	headers := response.takeHeaders()
 	return &unaryResponse{
-		headers:    reply.headers,
-		message:    reply.message,
+		headers:    headers,
+		message:    message,
 		hasMessage: true,
-		status:     OK().WithMetadata(reply.trailers),
+		status:     OK().WithMetadata(response.takeMetadata()),
 	}
 }
 
@@ -1023,23 +975,23 @@ func invokeUnaryHandler(
 	body []byte,
 	raceContext bool,
 	lease *requestExecutionLease,
-) (reply *unaryReply, err error) {
+) (message encodedMessage, err error) {
 	if !raceContext {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				reply = nil
+				message = encodedMessage{}
 				err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
 			}
 		}()
 		return handler(ctx, body)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, statusFromContextError(err)
+		return encodedMessage{}, statusFromContextError(err)
 	}
 
 	type unaryResult struct {
-		reply *unaryReply
-		err   error
+		message encodedMessage
+		err     error
 	}
 	result := make(chan unaryResult, 1)
 	execution := lease.retain(ServerDiagnosticHandlerPanic)
@@ -1050,19 +1002,19 @@ func invokeUnaryHandler(
 				result <- unaryResult{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
 			}
 		}()
-		reply, err := handler(ctx, body)
-		result <- unaryResult{reply: reply, err: err}
+		message, err := handler(ctx, body)
+		result <- unaryResult{message: message, err: err}
 	}()
 
 	select {
 	case result := <-result:
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, statusFromContextError(ctxErr)
+			return encodedMessage{}, statusFromContextError(ctxErr)
 		}
-		return result.reply, result.err
+		return result.message, result.err
 	case <-ctx.Done():
 		execution.detach()
-		return nil, statusFromContextError(ctx.Err())
+		return encodedMessage{}, statusFromContextError(ctx.Err())
 	}
 }
 
@@ -1100,32 +1052,26 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s: expected %d, got %d", request.Method, route.kind, request.rpcKind())), request)
 	}
 
-	response, err := invokeStreamingHandler(ctx, route.streaming, body, requestBody, handlerNeedsDeadlineRace(ctx), lease)
+	responses, err := invokeStreamingHandler(ctx, route.streaming, body, requestBody, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
 		cancel()
 		lease.release()
 		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request), request)
 	}
-	if response.stream == nil {
+	if responses == nil {
 		cancel()
 		lease.release()
 		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: service, Method: method, Kind: request.rpcKind(), Err: errors.New("handler returned nil response stream")})
 		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), request)
 	}
-	if err := validateMetadata(response.headers); err != nil {
-		discardMessageStream(response.stream)
-		cancel()
-		lease.release()
-		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: service, Method: method, Kind: request.rpcKind(), Err: err})
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), request)
-	}
-	response.stream = closeStreamOnContext(ctx, response.stream)
-	stream := &serverResponseStream{response: response, runtime: r, request: request, flow: responseFlow(request, route), lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
-	if isNonBlockingStream(response.stream) {
+	metadata := responseMetadataFromContext(ctx)
+	responses = closeStreamOnContext(ctx, responses)
+	stream := &serverResponseStream{responses: responses, headers: metadata.takeHeaders(), metadata: metadata, runtime: r, request: request, flow: responseFlow(request, route), lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
+	if isNonBlockingStream(responses) {
 		// Such a stream is read where it is written, and drained in batches.
-		stream.receiver = newStreamReceiver(ctx, response.stream, limits.idleTimeout, "response", lease)
+		stream.receiver = newStreamReceiver(ctx, responses, limits.idleTimeout, "response", lease)
 	} else {
-		stream.readAhead = newResponseReadAhead(ctx, response.stream, limits.idleTimeout, lease)
+		stream.readAhead = newResponseReadAhead(ctx, responses, limits.idleTimeout, lease)
 	}
 	return stream
 }
@@ -1140,8 +1086,8 @@ func responseFlow(request *wireRequest, route route) *datagramFlow {
 }
 
 type streamingHandlerResult struct {
-	response streamResponse
-	err      error
+	responses encodedStream
+	err       error
 }
 
 func invokeStreamingHandler(
@@ -1151,18 +1097,18 @@ func invokeStreamingHandler(
 	requestBody byteStream,
 	raceContext bool,
 	lease *requestExecutionLease,
-) (response streamResponse, err error) {
+) (responses encodedStream, err error) {
 	if !raceContext {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				response = streamResponse{}
+				responses = nil
 				err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
 			}
 		}()
 		return handler(ctx, body, requestBody)
 	}
 	if err := ctx.Err(); err != nil {
-		return streamResponse{}, statusFromContextError(err)
+		return nil, statusFromContextError(err)
 	}
 
 	result := make(chan streamingHandlerResult)
@@ -1176,27 +1122,27 @@ func invokeStreamingHandler(
 					result = streamingHandlerResult{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
 				}
 			}()
-			result.response, result.err = handler(ctx, body, requestBody)
+			result.responses, result.err = handler(ctx, body, requestBody)
 			return result
 		}()
 		select {
 		case result <- resultValue:
 		case <-abandoned:
-			discardMessageStream(resultValue.response.stream)
+			discardMessageStream(resultValue.responses)
 		}
 	}()
 
 	select {
 	case result := <-result:
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			discardMessageStream(result.response.stream)
-			return streamResponse{}, statusFromContextError(ctxErr)
+			discardMessageStream(result.responses)
+			return nil, statusFromContextError(ctxErr)
 		}
-		return result.response, result.err
+		return result.responses, result.err
 	case <-ctx.Done():
 		execution.detach()
 		close(abandoned)
-		return streamResponse{}, statusFromContextError(ctx.Err())
+		return nil, statusFromContextError(ctx.Err())
 	}
 }
 
@@ -1466,7 +1412,11 @@ func checkStreamLimits(direction string, limits streamLimits, messages, bodySize
 // read ahead by a goroutine (see responseReadAhead), and each write carries
 // all the messages that have queued by then.
 type serverResponseStream struct {
-	response        streamResponse
+	responses encodedStream
+	// headers go out before the first message, and metadata is where the
+	// trailing metadata of the final OK status comes from.
+	headers         Metadata
+	metadata        *responseMetadata
 	runtime         *serverRuntime
 	request         *wireRequest
 	lease           *requestExecutionLease
@@ -1527,9 +1477,9 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 		}
 		// A call that sends datagrams flushes HEADERS, empty ones included,
 		// before the first one.
-		if len(s.response.headers) > 0 || s.flow != nil {
+		if len(s.headers) > 0 || s.flow != nil {
 			var err error
-			if headers, err = appendHeadersFrame(nil, s.response.headers, maxFrameSize); err != nil {
+			if headers, err = appendHeadersFrame(nil, s.headers, maxFrameSize); err != nil {
 				return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
 			}
 			if s.readAhead != nil || s.flow != nil {
@@ -1651,7 +1601,7 @@ func (s *serverResponseStream) trevrpcNonBlockingStream() bool {
 }
 
 func (s *serverResponseStream) trevrpcContextCancelsRecv() bool {
-	return s.limits.idleTimeout <= 0 && streamContextCancelsRecv(s.response.stream)
+	return s.limits.idleTimeout <= 0 && streamContextCancelsRecv(s.responses)
 }
 
 func (s *serverResponseStream) Close() error {
@@ -1670,7 +1620,7 @@ func (s *serverResponseStream) finish(code Code) {
 		// deadline ended from one that ends here.
 		s.closeReceiver()
 		s.cancel()
-		discardMessageStream(s.response.stream)
+		discardMessageStream(s.responses)
 		s.runtime.recordFinished(RPCFinished{Service: s.service, Method: s.method, RequestBodyLen: s.requestBodyLen, ResponseBodyLen: s.responseBodyLen, Code: code, Elapsed: time.Since(s.startedAt)}, s.request)
 		s.lease.release()
 	})
@@ -1727,16 +1677,10 @@ func (s *serverResponseStream) acceptResponseMessage(message encodedMessage) *St
 	return nil
 }
 
+// terminalResponseStatus is the final OK status of a response stream that
+// ended, with the trailing metadata the handler set through its context.
 func (s *serverResponseStream) terminalResponseStatus() *Status {
-	if s.response.terminal == nil {
-		return OK()
-	}
-
-	status, present := s.response.terminal()
-	if !present || status == nil {
-		return s.runtime.wireStatus(Internal("response stream reached EOF without a terminal status"), ServerDiagnosticInternalError, s.request)
-	}
-	return s.runtime.wireStatus(status, ServerDiagnosticInternalError, s.request)
+	return OK().WithMetadata(s.metadata.takeMetadata())
 }
 
 func responseFrameBatchByteLimit(maxFrameSize int) int {

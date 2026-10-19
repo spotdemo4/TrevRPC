@@ -283,7 +283,8 @@ where
         match self.scenario {
             Scenario::Unary => {
                 self.client
-                    .unary_with_options(self.request.clone(), self.options.clone())
+                    .unary(&self.request)
+                    .options(|_| self.options.clone())
                     .await?;
                 Ok(Outcome::delivered(1))
             }
@@ -307,7 +308,8 @@ where
         };
         let mut responses = self
             .client
-            .server_stream_with_options(request, self.options.clone())
+            .server_stream(&request)
+            .options(|_| self.options.clone())
             .await?;
         let mut received = 0_usize;
         while let Some(response) = responses.next().await {
@@ -322,7 +324,8 @@ where
     async fn client_stream(&mut self) -> Result<Outcome, Error> {
         let call = self
             .client
-            .client_stream_with_options(self.options.clone())
+            .client_stream()
+            .options(|_| self.options.clone())
             .await?;
         for _ in 0..self.messages {
             call.send(self.request.clone()).await?;
@@ -343,7 +346,8 @@ where
 
         let (sender, mut responses) = self
             .unreliable
-            .bidi_with_options(self.options.clone())
+            .bidi()
+            .options(|_| self.options.clone())
             .await?
             .split();
         let wanted = u32::try_from(self.messages).unwrap_or(u32::MAX);
@@ -370,7 +374,8 @@ where
 
         let (sender, mut responses) = self
             .unreliable
-            .bidi_with_options(self.options.clone())
+            .bidi()
+            .options(|_| self.options.clone())
             .await?
             .split();
         for _ in 0..self.messages {
@@ -397,7 +402,7 @@ where
         let call = match &mut self.bidi {
             Some(call) => call,
             empty @ None => {
-                empty.insert(self.client.bidi_with_options(self.options.clone()).await?)
+                empty.insert(self.client.bidi().options(|_| self.options.clone()).await?)
             }
         };
         let sent = call.send(self.request.clone()).await;

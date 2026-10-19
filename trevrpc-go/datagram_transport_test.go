@@ -60,7 +60,6 @@ type datagramChatStream struct {
 	ctx      context.Context
 	requests MessageStream[*testMessage]
 	received int
-	terminal *Status
 }
 
 func (s *datagramChatStream) Recv() (*testMessage, error) {
@@ -70,10 +69,12 @@ func (s *datagramChatStream) Recv() (*testMessage, error) {
 		if info, ok := HandlerContextFromContext(s.ctx); ok {
 			datagrams = info.RequestDatagrams()
 		}
-		s.terminal = OK().WithMetadata(Metadata{
-			datagramsTrailer: []byte(strconv.FormatInt(datagrams, 10)),
-			receivedTrailer:  []byte(strconv.Itoa(s.received)),
-		})
+		if err := SetResponseMetadata(s.ctx, datagramsTrailer, []byte(strconv.FormatInt(datagrams, 10))); err != nil {
+			return nil, err
+		}
+		if err := SetResponseMetadata(s.ctx, receivedTrailer, []byte(strconv.Itoa(s.received))); err != nil {
+			return nil, err
+		}
 		return nil, io.EOF
 	}
 	if err != nil {
@@ -82,8 +83,6 @@ func (s *datagramChatStream) Recv() (*testMessage, error) {
 	s.received++
 	return &testMessage{Value: strings.ToUpper(request.Value)}, nil
 }
-
-func (s *datagramChatStream) TerminalStatus() (*Status, bool) { return s.terminal, s.terminal != nil }
 
 func (s *datagramChatStream) Close() error { return s.requests.Close() }
 

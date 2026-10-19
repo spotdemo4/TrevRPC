@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net"
 	"net/http"
 	"strconv"
@@ -61,18 +60,14 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 }
 
 // newServer binds a listener for the Echo and UnreliableEcho services. Every browser session is
-// admitted because browsers connect from arbitrary origins. Streams are not
-// limited in messages or bytes, because bench/README.md keeps one Bidi stream
-// open for a whole run. A non-empty webRoot is served through the HTTP fallback
-// on the same ports.
+// admitted because browsers connect from arbitrary origins. A non-empty webRoot
+// is served through the HTTP fallback on the same ports.
 func newServer(addr string, tlsConfig *tls.Config, webRoot string) (*trevrpc.Listener, error) {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(trevrpc.AdmissionRequest) bool { return true }
-	options.MaxStreamMessages = -1
-	options.MaxStreamBodySize = -1
 	if webRoot != "" {
 		options.HTTPFallback = http.FileServer(http.Dir(webRoot))
 	}
@@ -95,40 +90,31 @@ const headerKey = "interop-header"
 // trailerKey is the trailing metadata key of the answer to headerKey.
 const trailerKey = "interop-trailer"
 
-// headerMetadata returns the response headers and the trailing metadata that
-// answer the interop-header request metadata of ctx: both are empty without it.
-func headerMetadata(ctx context.Context) (headers, trailers trevrpc.Metadata) {
+// answerHeader sets the response header and the trailing metadata that answer
+// the interop-header request metadata of ctx, if any.
+func answerHeader(ctx context.Context) error {
 	value, ok := trevrpc.RequestMetadataFromContext(ctx)[headerKey]
 	if !ok {
-		return nil, nil
+		return nil
 	}
-	return trevrpc.Metadata{headerKey: value}, trevrpc.Metadata{trailerKey: value}
+	if err := trevrpc.SetResponseHeader(ctx, headerKey, value); err != nil {
+		return err
+	}
+	return trevrpc.SetResponseMetadata(ctx, trailerKey, value)
 }
 
-// withHeaders adds the response headers and trailing metadata that answer
-// interop-header to a response stream.
-func withHeaders(ctx context.Context, stream trevrpc.MessageStream[*interoppb.EchoResponse]) trevrpc.MessageStream[*interoppb.EchoResponse] {
-	headers, trailers := headerMetadata(ctx)
-	if headers == nil {
-		return stream
-	}
-	return trevrpc.WithResponseHeaders(trevrpc.NewResponseStream(stream, trailers), headers)
-}
-
-func (echoServer) Unary(ctx context.Context, request *interoppb.EchoRequest) (*trevrpc.Response[*interoppb.EchoResponse], error) {
+func (echoServer) Unary(ctx context.Context, request *interoppb.EchoRequest) (*interoppb.EchoResponse, error) {
 	if request.FailCode != 0 {
 		return nil, failure(request)
 	}
+	if err := answerHeader(ctx); err != nil {
+		return nil, err
+	}
 	suffix := trevrpc.RequestMetadataFromContext(ctx)["interop-suffix"]
-	headers, trailers := headerMetadata(ctx)
-	return &trevrpc.Response[*interoppb.EchoResponse]{
-		Message:  &interoppb.EchoResponse{Message: request.Message + string(suffix)},
-		Headers:  headers,
-		Metadata: trailers,
-	}, nil
+	return &interoppb.EchoResponse{Message: request.Message + string(suffix)}, nil
 }
 
-func (echoServer) ClientStream(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*trevrpc.Response[*interoppb.EchoResponse], error) {
+func (echoServer) ClientStream(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*interoppb.EchoResponse, error) {
 	var message strings.Builder
 	var count uint32
 	for request, err := range trevrpc.Messages(requests) {
@@ -141,16 +127,17 @@ func (echoServer) ClientStream(ctx context.Context, requests trevrpc.MessageStre
 		message.WriteString(request.Message)
 		count++
 	}
-	headers, trailers := headerMetadata(ctx)
-	return &trevrpc.Response[*interoppb.EchoResponse]{
-		Message:  &interoppb.EchoResponse{Message: message.String(), Index: count},
-		Headers:  headers,
-		Metadata: trailers,
-	}, nil
+	if err := answerHeader(ctx); err != nil {
+		return nil, err
+	}
+	return &interoppb.EchoResponse{Message: message.String(), Index: count}, nil
 }
 
 func (echoServer) ServerStream(ctx context.Context, request *interoppb.EchoRequest) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
-	return withHeaders(ctx, &countedEcho{request: request}), nil
+	if err := answerHeader(ctx); err != nil {
+		return nil, err
+	}
+	return &countedEcho{request: request}, nil
 }
 
 // countedEcho yields request.Count echoes and then ends with the requested status.
@@ -174,7 +161,10 @@ func (s *countedEcho) Recv() (*interoppb.EchoResponse, error) {
 func (*countedEcho) Close() error { return nil }
 
 func (echoServer) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
-	return withHeaders(ctx, &bidiEcho{requests: requests}), nil
+	if err := answerHeader(ctx); err != nil {
+		return nil, err
+	}
+	return &bidiEcho{requests: requests}, nil
 }
 
 // bidiEcho answers each request in order and ends when the requests end.
@@ -208,11 +198,10 @@ const (
 type unreliableEchoServer struct{}
 
 func (unreliableEchoServer) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
-	stream := &unreliableEcho{ctx: ctx, requests: requests}
-	if headers, _ := headerMetadata(ctx); headers != nil {
-		return trevrpc.WithResponseHeaders[*interoppb.EchoResponse](stream, headers), nil
+	if err := answerHeader(ctx); err != nil {
+		return nil, err
 	}
-	return stream, nil
+	return &unreliableEcho{ctx: ctx, requests: requests}, nil
 }
 
 // unreliableEcho answers each request with request.count echoes, in order, and
@@ -224,7 +213,6 @@ type unreliableEcho struct {
 	current  *interoppb.EchoRequest
 	sent     uint32
 	received int
-	terminal *trevrpc.Status
 }
 
 func (s *unreliableEcho) Recv() (*interoppb.EchoResponse, error) {
@@ -236,7 +224,9 @@ func (s *unreliableEcho) Recv() (*interoppb.EchoResponse, error) {
 		}
 		request, err := s.requests.Recv()
 		if errors.Is(err, io.EOF) {
-			s.terminal = trevrpc.OK().WithMetadata(s.trailers())
+			if err := s.setTrailers(); err != nil {
+				return nil, err
+			}
 			return nil, io.EOF
 		}
 		if err != nil {
@@ -247,24 +237,16 @@ func (s *unreliableEcho) Recv() (*interoppb.EchoResponse, error) {
 	}
 }
 
-// trailers returns the trailing metadata of a request stream that ended.
-func (s *unreliableEcho) trailers() trevrpc.Metadata {
+// setTrailers sets the trailing metadata of a request stream that ended.
+func (s *unreliableEcho) setTrailers() error {
 	var datagrams int64
 	if info, ok := trevrpc.HandlerContextFromContext(s.ctx); ok {
 		datagrams = info.RequestDatagrams()
 	}
-	trailers := trevrpc.Metadata{
-		receivedKey:          []byte(strconv.Itoa(s.received)),
-		datagramsReceivedKey: []byte(strconv.FormatInt(datagrams, 10)),
+	if err := trevrpc.SetResponseMetadata(s.ctx, receivedKey, []byte(strconv.Itoa(s.received))); err != nil {
+		return err
 	}
-	if _, answer := headerMetadata(s.ctx); answer != nil {
-		maps.Copy(trailers, answer)
-	}
-	return trailers
-}
-
-func (s *unreliableEcho) TerminalStatus() (*trevrpc.Status, bool) {
-	return s.terminal, s.terminal != nil
+	return trevrpc.SetResponseMetadata(s.ctx, datagramsReceivedKey, []byte(strconv.FormatInt(datagrams, 10)))
 }
 
 func (s *unreliableEcho) Close() error { return s.requests.Close() }

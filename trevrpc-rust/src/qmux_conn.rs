@@ -48,7 +48,7 @@ pub fn server_config(options: &ServerOptions) -> qmux::Config {
         .map_or(u64::MAX >> 4, |streams| {
             saturating_usize_to_u64(streams).saturating_add(1)
         });
-    config.max_idle_timeout = options.stream_idle_timeout().map_or(0, |timeout| {
+    config.max_idle_timeout = options.connection_idle_timeout().map_or(0, |timeout| {
         timeout.as_millis().try_into().unwrap_or(u64::MAX)
     });
     config

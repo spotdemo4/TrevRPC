@@ -32,9 +32,9 @@ func TestGenerateAllRPCShapes(t *testing.T) {
 	content := generated.GetContent()
 	for _, want := range []string{
 		"type GreeterServer interface",
-		"SayHello(context.Context, *HelloRequest)",
+		"SayHello(context.Context, *HelloRequest) (*HelloReply, error)",
 		"LotsOfReplies(context.Context, *HelloRequest)",
-		"LotsOfGreetings(context.Context",
+		"LotsOfGreetings(context.Context, trevrpc_go.MessageStream[*HelloRequest]) (*HelloReply, error)",
 		"BidiHello(context.Context",
 		"func NewGreeterClient",
 		"func (c *GreeterClient) mergedCallOptions",
@@ -63,6 +63,11 @@ func TestGenerateAllRPCShapes(t *testing.T) {
 		if strings.Contains(content, unwanted) {
 			t.Fatalf("generated content contains duplicate-shape variant %q:\n%s", unwanted, content)
 		}
+	}
+	// Handlers return plain messages and set response metadata through their
+	// context: there is no response wrapper.
+	if strings.Contains(content, ".Response[") {
+		t.Fatalf("generated a wrapped handler response:\n%s", content)
 	}
 	if strings.Contains(content, "func mergeTrevrpcCallOptions") {
 		t.Fatalf("generated a package-level option helper:\n%s", content)
@@ -127,7 +132,7 @@ type replyThenStatus struct {
 
 func (s *replyThenStatus) Recv() (*HelloReply, error) {
 	if s.answered {
-		return nil, io.EOF
+		return nil, s.status
 	}
 	if _, err := s.requests.Recv(); err != nil {
 		return nil, err
@@ -135,14 +140,19 @@ func (s *replyThenStatus) Recv() (*HelloReply, error) {
 	s.answered = true
 	return &HelloReply{Value: "bidi"}, nil
 }
-func (s *replyThenStatus) Close() error                             { return s.requests.Close() }
-func (s *replyThenStatus) TerminalStatus() (*trevrpc.Status, bool) { return s.status, true }
+func (s *replyThenStatus) Close() error { return s.requests.Close() }
 
-// oneReply yields a single reply.
-type oneReply struct{ sent bool }
+// oneReply yields a single reply and then sets the trailing metadata.
+type oneReply struct {
+	ctx  context.Context
+	sent bool
+}
 
 func (s *oneReply) Recv() (*HelloReply, error) {
 	if s.sent {
+		if err := trevrpc.SetResponseMetadata(s.ctx, "result", []byte("server-meta")); err != nil {
+			return nil, err
+		}
 		return nil, io.EOF
 	}
 	s.sent = true
@@ -150,19 +160,25 @@ func (s *oneReply) Recv() (*HelloReply, error) {
 }
 func (*oneReply) Close() error { return nil }
 
-func (service) SayHello(context.Context, *HelloRequest) (*trevrpc.Response[*HelloReply], error) {
-	return &trevrpc.Response[*HelloReply]{Message: &HelloReply{Value: "unary"}, Metadata: trevrpc.Metadata{"result": []byte("unary-meta")}}, nil
+func (service) SayHello(ctx context.Context, _ *HelloRequest) (*HelloReply, error) {
+	if err := trevrpc.SetResponseMetadata(ctx, "result", []byte("unary-meta")); err != nil {
+		return nil, err
+	}
+	return &HelloReply{Value: "unary"}, nil
 }
-func (service) LotsOfReplies(context.Context, *HelloRequest) (trevrpc.MessageStream[*HelloReply], error) {
-	return trevrpc.NewResponseStream[*HelloReply](&oneReply{}, trevrpc.Metadata{"result": []byte("server-meta")}), nil
+func (service) LotsOfReplies(ctx context.Context, _ *HelloRequest) (trevrpc.MessageStream[*HelloReply], error) {
+	return &oneReply{ctx: ctx}, nil
 }
-func (service) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*HelloRequest]) (*trevrpc.Response[*HelloReply], error) {
+func (service) LotsOfGreetings(ctx context.Context, requests trevrpc.MessageStream[*HelloRequest]) (*HelloReply, error) {
 	for _, err := range trevrpc.Messages(requests) {
 		if err != nil {
 			return nil, err
 		}
 	}
-	return &trevrpc.Response[*HelloReply]{Message: &HelloReply{Value: "client-stream"}, Metadata: trevrpc.Metadata{"result": []byte("client-meta")}}, nil
+	if err := trevrpc.SetResponseMetadata(ctx, "result", []byte("client-meta")); err != nil {
+		return nil, err
+	}
+	return &HelloReply{Value: "client-stream"}, nil
 }
 func (service) BidiHello(_ context.Context, requests trevrpc.MessageStream[*HelloRequest]) (trevrpc.MessageStream[*HelloReply], error) {
 	return &replyThenStatus{
@@ -683,7 +699,7 @@ func (service) Bidi(context.Context, trevrpc.MessageStream[*HelloRequest]) (trev
 	return nil, nil
 }
 
-func (service) Upload(context.Context, trevrpc.MessageStream[*HelloRequest]) (*trevrpc.Response[*HelloReply], error) {
+func (service) Upload(context.Context, trevrpc.MessageStream[*HelloRequest]) (*HelloReply, error) {
 	return nil, nil
 }
 

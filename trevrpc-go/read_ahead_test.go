@@ -123,8 +123,13 @@ func newAheadResponse(ctx context.Context, t *testing.T, stream encodedStream, h
 		configure(&options)
 	}
 	server.SetOptions(options)
-	server.routeStreaming("/example.Greeter/Download", RPCKindServerStreaming, func(context.Context, []byte, byteStream) (streamResponse, error) {
-		return streamResponse{stream: stream, headers: headers}, nil
+	server.routeStreaming("/example.Greeter/Download", RPCKindServerStreaming, func(ctx context.Context, _ []byte, _ byteStream) (encodedStream, error) {
+		for key, value := range headers {
+			if err := SetResponseHeader(ctx, key, value); err != nil {
+				return nil, err
+			}
+		}
+		return stream, nil
 	})
 	request := newWireRequest("/example.Greeter/Download")
 	request.Kind = RPCKindServerStreaming

@@ -186,7 +186,7 @@ class CallTerminationTest {
     fun `read ahead without a limit stops at a documented bound and close releases the pump`() =
         bounded {
             val stream = ScriptedStream()
-            repeat(DEFAULT_MAX_STREAM_MESSAGES + 500) { stream.incoming.send(message("m")) }
+            repeat(PUMP_FALLBACK_MAX_MESSAGES + 500) { stream.incoming.send(message("m")) }
             val call =
                 Client(OneStream(stream))
                     .bidirectionalStreaming<String, String>(
@@ -199,7 +199,7 @@ class CallTerminationTest {
             stream.awaitSend()
             delay(200.milliseconds)
             assertTrue(!blocked.isCompleted)
-            assertTrue(stream.receives.get() <= DEFAULT_MAX_STREAM_MESSAGES + 2, "read ${stream.receives.get()} frames")
+            assertTrue(stream.receives.get() <= PUMP_FALLBACK_MAX_MESSAGES + 2, "read ${stream.receives.get()} frames")
 
             call.close()
 

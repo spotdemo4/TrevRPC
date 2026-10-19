@@ -42,12 +42,17 @@ data class ResponseEnvelope<T>(
     val headers: Metadata = Metadata.EMPTY,
 )
 
+/**
+ * Options of one call. By default a call has no deadline and no metadata, and a response stream is
+ * bounded only by [maxResponseBodySize] per message: [maxResponseMessages],
+ * [maxResponseStreamBodySize], and [streamIdleTimeout] are off until set.
+ */
 data class CallOptions(
     val timeout: Duration? = null,
     val maxResponseBodySize: Int = DEFAULT_MAX_FRAME_SIZE,
-    val maxResponseMessages: Int? = DEFAULT_MAX_STREAM_MESSAGES,
-    val maxResponseStreamBodySize: Long? = DEFAULT_MAX_STREAM_BODY_SIZE,
-    val streamIdleTimeout: Duration? = 30.seconds,
+    val maxResponseMessages: Int? = null,
+    val maxResponseStreamBodySize: Long? = null,
+    val streamIdleTimeout: Duration? = null,
     val metadata: Metadata = Metadata.EMPTY,
 ) {
     init {
