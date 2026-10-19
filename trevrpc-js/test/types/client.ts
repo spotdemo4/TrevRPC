@@ -63,11 +63,17 @@ await stream.close(new Error("done"));
 const upload = await echo.clientStream();
 upload satisfies ClientStreamingCall<{ message?: string }, EchoResponse>;
 await upload.send({ message: "a" });
+await upload.sendAll([{ message: "b" }]);
 (await upload.closeAndRecv()) satisfies EchoResponse;
 
 const bidi = await echo.bidi({ signal: new AbortController().signal });
 bidi satisfies BidirectionalStreamingCall<{ message?: string }, EchoResponse>;
 await bidi.send({ message: "a" });
+await bidi.sendAll(
+  (async function* () {
+    yield { message: "b" };
+  })(),
+);
 (await bidi.recv()) satisfies EchoResponse | undefined;
 (await bidi.headers)["x"] satisfies Uint8Array;
 await bidi.closeSend();

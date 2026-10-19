@@ -130,6 +130,27 @@ class GeneratorTest {
     }
 
     @Test
+    fun `imports Flow only for files with streaming methods`() {
+        val streaming = generate(shapesRequest()).fileList.single().content
+        assertTrue("import kotlinx.coroutines.flow.Flow" in streaming, streaming)
+
+        val unaryOnly =
+            generate(
+                request(
+                    collisionFile(
+                        "api/unary.proto",
+                        ServiceDescriptorProto
+                            .newBuilder()
+                            .setName("Plain")
+                            .addMethod(method("Get", ".collision.Request", ".collision.Reply"))
+                            .build(),
+                    ),
+                ),
+            ).fileList.single().content
+        assertFalse("kotlinx.coroutines" in unaryOnly, unaryOnly)
+    }
+
+    @Test
     fun `allows a method whose name ends in Response next to the plain one`() {
         val file =
             collisionFile(

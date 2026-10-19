@@ -431,8 +431,11 @@ private fun generateFile(
             appendLine("package ${javaPackage(file).split('.').joinToString(".", transform = ::kotlinIdent)}")
         }
         appendLine()
-        appendLine("import kotlinx.coroutines.flow.Flow")
-        appendLine()
+        // Only streaming methods take or return a Flow.
+        if (services.any { service -> service.methods.any { it.clientStreaming || it.serverStreaming } }) {
+            appendLine("import kotlinx.coroutines.flow.Flow")
+            appendLine()
+        }
         codecs.values.forEach { type -> generateCodec(runtime, type, checkNotNull(codecNames[type.protoName])) }
         services.forEachIndexed { index, service ->
             if (index > 0) appendLine()

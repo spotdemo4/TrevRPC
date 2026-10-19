@@ -283,6 +283,35 @@ export class BidirectionalStreamingCall {
     }
   }
 
+  /**
+   * Sends every message of requests, an iterable or async iterable, then closes the request
+   * stream. If the server ends the call first, the rest is not sent and nothing is thrown: the
+   * response side reports the outcome. A send that fails otherwise rejects as send() does, and
+   * requests that throw cancel the call with that error and reject with it.
+   */
+  async sendAll(requests) {
+    let sendFailure;
+    try {
+      for await (const request of requests) {
+        try {
+          await this.send(request);
+        } catch (error) {
+          if (this.#terminal?.status !== undefined) {
+            return; // the server ended the call; the response side reports how
+          }
+          sendFailure = error;
+          throw error;
+        }
+      }
+    } catch (error) {
+      if (error !== sendFailure) {
+        await this.close(error);
+      }
+      throw error;
+    }
+    await this.closeSend();
+  }
+
   /** Receives the next response message, or undefined after the final OK status. */
   recv() {
     const next = this.#reads.then(() => this.#recv());
@@ -586,6 +615,11 @@ export class ClientStreamingCall {
   /** Sends one request message. */
   send(message) {
     return this.#call.send(message);
+  }
+
+  /** Sends every message of requests, then closes the request stream; see the bidirectional call. */
+  sendAll(requests) {
+    return this.#call.sendAll(requests);
   }
 
   /** Closes the request stream and returns the final response. */

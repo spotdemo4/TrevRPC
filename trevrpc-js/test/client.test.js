@@ -1131,6 +1131,65 @@ async function sendUntilRejected(call, limit = 500) {
 
 const largeDeadline = 60_000;
 
+test("sendAll sends every request and closes the request stream", async () => {
+  const { echo } = setup(echoHandler);
+  const upload = await echo.clientStream();
+  await upload.sendAll([{ message: "a" }, { message: "b" }, { message: "c" }]);
+  const reply = await upload.closeAndRecv();
+  assert.equal(reply.message, "abc");
+  assert.equal(reply.index, 3);
+
+  async function* requests() {
+    yield { message: "1" };
+    yield { message: "2" };
+  }
+  const call = await echo.bidi();
+  const sending = call.sendAll(requests());
+  const echoed = [];
+  for await (const response of call) {
+    echoed.push(response.message);
+  }
+  await sending;
+  assert.deepEqual(echoed, ["1", "2"]);
+  assert.equal((await call.status).code, Code.Ok);
+});
+
+test("sendAll stops quietly when the server ends the call first", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeStatus(Code.NotFound, "gone");
+  });
+  async function* endless() {
+    for (;;) {
+      yield { message: "x".repeat(64) };
+    }
+  }
+  const call = await echo.clientStream({ timeoutMs: largeDeadline });
+  await within(1000, call.sendAll(endless()), "sendAll");
+  await assert.rejects(call.closeAndRecv(), isStatus(Code.NotFound, "gone"));
+});
+
+test("sendAll cancels the call when the requests throw", async () => {
+  const release = deferred();
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await release.promise;
+  });
+  const failure = new Error("no more requests");
+  async function* failing() {
+    yield { message: "a" };
+    throw failure;
+  }
+  const call = await echo.bidi({ timeoutMs: largeDeadline });
+  try {
+    await assert.rejects(call.sendAll(failing()), (error) => error === failure);
+    await assert.rejects(within(1000, call.status), isStatus(Code.Cancelled));
+  } finally {
+    release.resolve();
+    await call.close();
+  }
+});
+
 test("a client-streaming upload fails with an early error status although the server never reads", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();

@@ -172,6 +172,13 @@ export interface ClientStreamingCall<TRequest, TResponse> {
    * Pending sends are rejected too when the call is cancelled or its deadline expires.
    */
   send(request: TRequest): Promise<void>;
+  /**
+   * Sends every message of `requests`, then closes the request stream. If the server ends the
+   * call first, the rest is not sent and the promise resolves; `closeAndRecv()` reports the
+   * outcome. A send that fails otherwise rejects as `send()` does, and requests that throw cancel
+   * the call and reject with what they threw.
+   */
+  sendAll(requests: Iterable<TRequest> | AsyncIterable<TRequest>): Promise<void>;
   /** Closes the request stream and returns the final response. */
   closeAndRecv(): Promise<TResponse>;
   /** Cancels the call unless it already finished. */
@@ -213,6 +220,13 @@ export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIt
    * Pending sends are rejected too when the call is cancelled or its deadline expires.
    */
   send(request: TRequest): Promise<void>;
+  /**
+   * Sends every message of `requests`, then closes the request stream. If the server ends the
+   * call first, the rest is not sent and the promise resolves; `recv()` and `status` report the
+   * outcome. A send that fails otherwise rejects as `send()` does, and requests that throw cancel
+   * the call and reject with what they threw.
+   */
+  sendAll(requests: Iterable<TRequest> | AsyncIterable<TRequest>): Promise<void>;
   /** Receives the next response message, or undefined after the final OK status. */
   recv(): Promise<TResponse | undefined>;
   /**

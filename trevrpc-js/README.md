@@ -65,6 +65,11 @@ await upload.send({ name: "Alice" });
 await upload.send({ name: "Bob" });
 const summary = await upload.closeAndRecv();
 
+// Client streaming from an iterable or async iterable
+const batch = await client.lotsOfGreetings();
+await batch.sendAll([{ name: "Alice" }, { name: "Bob" }]);
+const batchSummary = await batch.closeAndRecv();
+
 // Bidirectional streaming
 const chat = await client.bidiHello();
 await chat.send({ name: "Alice" });
@@ -104,6 +109,8 @@ call.
   - with the failure of the response stream, for instance `Code.Unavailable` for a lost connection, if the server stopped reading the request and the response then failed. A bare "stream closed" error from the transport is used only when the response gives no other explanation.
 
   `send()` calls that are blocked on backpressure fail the same way, and so do all sends of a call that is cancelled or whose deadline expires. A deadline or abort that fires after the final status arrived does not change the outcome, even if the server has not finished the response stream yet.
+
+  `sendAll(requests)` sends every message of an iterable or async iterable and then closes the request stream. When the server ends the call first it stops and resolves, so `closeAndRecv()`, `recv()`, or `status` report the server's outcome instead of an upload error. Requests that throw cancel the call.
 
 - To find the final status while the caller only sends, a client-streaming or bidirectional call reads the response ahead of `recv()` while its request side is open: at most 32 frames or 1 MiB (plus one frame of at most `maxFrameSize`) are held; beyond that reading pauses and flow control applies until `recv()` takes messages. Responses read ahead are delivered in order, including before an error that ended the stream.
 
