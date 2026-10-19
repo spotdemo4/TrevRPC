@@ -109,7 +109,7 @@
             ];
           };
 
-          # The Android interop harness and both servers, for the android workflow. The shell is
+          # The Android interop harness and both servers, for the android CI jobs. The shell is
           # only offered where the harness builds.
           android = pkgs.mkShell {
             packages = with self.packages.${system}; [
@@ -120,7 +120,7 @@
             meta.platforms = self.packages.${system}.trevrpc-kotlin.interopAndroid.meta.platforms;
           };
 
-          # The interop runner, both servers and the browser CLI, for the safari workflow.
+          # The interop runner, both servers and the browser CLI, for the safari CI jobs.
           safari = pkgs.mkShell {
             packages = with self.packages.${system}; [
               trevrpc-go

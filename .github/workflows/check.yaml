@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -34,3 +35,119 @@ jobs:
           --max-silent-time 300
           --timeout 1800
           --option log-lines 100
+
+  # The interop jobs below run after the check, which builds and caches everything their shells
+  # load: the servers, the browser runner and CLI, and the Android harness.
+
+  android:
+    name: android-${{ matrix.transport }}-to-${{ matrix.server }}
+    needs: check
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [go, rust]
+        # http2 runs with QUIC disabled, as on a network that blocks UDP.
+        transport: [http3, http2]
+    env:
+      SERVER: ${{ matrix.server }}
+      TRANSPORT: ${{ matrix.transport }}
+      WORK_DIR: /nix/trevrpc-android/work
+      CELL: android-${{ matrix.transport }}-to-${{ matrix.server }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          shell: android
+
+      - name: Prepare Android work directory
+        run: sudo install -d -o "$USER" -g "$(id -gn)" "$WORK_DIR"
+
+      - name: Allow KVM access
+        run: sudo chown "$USER" /dev/kvm
+
+      - name: Run Android interop
+        env:
+          OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
+        run: |
+          trevrpc-interop-android \
+            --server-command "trevrpc-interop-$SERVER server" \
+            --transport "$TRANSPORT" \
+            --output "$OUTPUT" \
+            --work-dir "$WORK_DIR"
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
+          if-no-files-found: ignore
+
+      - name: Clean Android work directory
+        if: ${{ always() }}
+        run: |
+          [[ $WORK_DIR == /nix/trevrpc-android/work ]]
+          sudo rm -rf -- "$WORK_DIR"
+
+  # Runs the browser interop suite in Safari itself, driven through safaridriver. Playwright's
+  # WebKit is not used: its builds decide on their own whether to expose WebTransport. Every lane
+  # must pass against both servers.
+  safari:
+    name: safari-${{ matrix.name }}-to-${{ matrix.server }}
+    needs: check
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: go
+            name: webtransport
+            lanes: webtransport
+          - server: go
+            name: websocket
+            lanes: websocket,fallback
+          - server: rust
+            name: websocket
+            lanes: websocket,fallback
+          - server: rust
+            name: webtransport
+            lanes: webtransport
+    env:
+      SERVER: ${{ matrix.server }}
+      LANES: ${{ matrix.lanes }}
+      CELL: safari-${{ matrix.name }}-to-${{ matrix.server }}
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
+        with:
+          shell: safari
+
+      - name: Enable safaridriver
+        run: sudo safaridriver --enable
+
+      - name: Run Safari interop
+        env:
+          OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
+        run: |
+          trevrpc-interop \
+            --out "$OUTPUT" \
+            --server "$SERVER=trevrpc-interop-$SERVER" \
+            --browser safari \
+            --browser-lanes "$LANES"
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.CELL }}
+          path: ${{ runner.temp }}/${{ env.CELL }}
+          if-no-files-found: ignore
