@@ -1,45 +1,23 @@
 {
   lib,
-  runCommand,
-  trevrpc-bench,
+  callPackage,
   trevrpc-bench-grpc,
   trevrpc-go,
   trevrpc-rust,
-  # Extra arguments for run.sh; the check passes a very short matrix.
-  extraArgs ? [ ],
 }:
-let
-  # run.sh parses `--option value`, not GNU `--option=value`.
-  args =
-    lib.cli.toCommandLineShell
-      (name: {
-        option = "--${name}";
-        sep = null;
-        explicitBool = false;
-      })
-      {
-        server = [
-          "go=${trevrpc-go}/bin/trevrpc-interop-go"
-          "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
-        ];
-        client = [
-          "go=${trevrpc-go}/bin/trevrpc-interop-go"
-          "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
-        ];
-        grpc = "${trevrpc-bench-grpc}/bin/trevrpc-bench-grpc";
-      };
-in
-{
-  inherit args;
-  # Keeps the load tool working; the timings it records are not meaningful.
-  check =
-    runCommand "trevrpc-bench-check"
-      {
-        nativeBuildInputs = [ trevrpc-bench ];
-        __darwinAllowLocalNetworking = true;
-      }
-      ''
-        export HOME=$TMPDIR
-        trevrpc-bench --out "$out" ${args} ${lib.escapeShellArgs extraArgs}
-      '';
+callPackage ../interop/runner.nix {
+  name = "trevrpc-bench";
+  script = "bench/run.py";
+  # Every server and client, plus the grpc-go baseline.
+  defaults = {
+    server = [
+      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
+    ];
+    client = [
+      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
+    ];
+    grpc = lib.getExe trevrpc-bench-grpc;
+  };
 }

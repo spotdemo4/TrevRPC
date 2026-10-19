@@ -13,15 +13,17 @@ client also has a TCP fallback for networks that block UDP.
 | Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust |
 | JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust |
 
-`run.sh` (packaged with its tools as `nix run .#trevrpc-interop`) drives the desktop matrix, which `nix flake check` runs on Linux for
-Chromium and Firefox. CI runs the Android client on an emulator because it needs
+`run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
+packaged Go and Rust servers and clients and, on Linux, Chromium and Firefox,
+unless the command line names any `--server`, `--client`, or `--browser`, which
+then replace all three. `nix flake check` runs that default matrix. CI runs the Android client on an emulator because it needs
 KVM (once over HTTP/3 and once over HTTP/2 with QUIC disabled), and runs Safari
 on macOS through `safaridriver` (not Playwright's WebKit, whose builds decide on
 their own whether to expose WebTransport). Every Safari lane must pass against both servers.
 
 ## Cells
 
-`run.sh` runs one cell per client, server, and transport (`X` is a native client,
+`run.py` runs one cell per client, server, and transport (`X` is a native client,
 `B` a browser, `S` a server):
 
 | Cell                      | Client   | Transport                                                                                       |
@@ -42,7 +44,7 @@ lane, `B-<lane>-to-S`. Each cell asserts the transport it actually used
 transport.
 
 The app lanes check that one port serves both a web application and TrevRPC.
-`run.sh` writes the interop page with `trevrpc-interop-browser --write-page`,
+`run.py` writes the interop page with `trevrpc-interop-browser --write-page`,
 starts each server with `--web-root` on that directory, and has the browser load
 the page from the server. The scenarios then run from the server's own origin, to
 its WebTransport or WebSocket endpoint.
@@ -134,7 +136,8 @@ have their own entry points but follow the same output contract.
   request, over HTTP/3, HTTP/2 and HTTP/1.1, through the HTTP fallback
   (`/` serves `index.html`).
 - Runs until stdin reaches EOF or it receives `SIGTERM`/`SIGINT`, then shuts
-  down gracefully and exits `0`.
+  down gracefully and exits `0`. `run.py` closes stdin after the server's cells
+  and fails the run unless the server exits `0` within 10 seconds.
 - Diagnostics go to stderr.
 
 ### Client
@@ -192,14 +195,14 @@ HTTP/2 mapping on its TCP port.
 
 ### Certificates
 
-`run.sh` generates one self-signed ECDSA P-256 certificate valid for 10 days
+`run.py` generates one self-signed ECDSA P-256 certificate valid for 10 days
 with SANs `DNS:localhost` and `IP:127.0.0.1`, `CA:FALSE` (rustls rejects a CA
 certificate as a server identity) and the `serverAuth` extended key usage (macOS
 requires it of TLS server certificates). It is both the server certificate and the
 client trust root. Browsers trust it through WebTransport
 `serverCertificateHashes`, which requires ECDSA and at most 14 days validity.
 The WSS lanes cannot pin a hash, so Chromium and Firefox ignore certificate
-errors instead. Safari cannot, so with `--browser safari` `run.sh` adds the
+errors instead. Safari cannot, so with `--browser safari` `run.py` adds the
 certificate to the macOS System keychain as a trusted root through `sudo` and
 removes it when the run ends. It never prompts: `sudo` must not need a password,
 as on CI runners, or must already be authenticated (`sudo -v`).

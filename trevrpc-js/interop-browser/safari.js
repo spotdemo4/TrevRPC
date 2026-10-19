@@ -1,7 +1,7 @@
 // Drives Safari through safaridriver over W3C WebDriver. Playwright's WebKit is not Safari: its
 // builds decide on their own whether to expose WebTransport, so only Safari itself shows what Safari
 // users get. Safari cannot be told to ignore certificate errors, so the interop certificate must be
-// trusted by the system (run.sh does this) and remote automation must be enabled once with
+// trusted by the system (run.py does this) and remote automation must be enabled once with
 // `sudo safaridriver --enable`.
 import { spawn } from "node:child_process";
 import { once } from "node:events";

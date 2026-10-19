@@ -3,18 +3,22 @@
 `bench/` measures end-to-end throughput and latency of every native client
 against every server over QUIC and QMux over TLS, plus a grpc-go baseline over
 HTTP/2. Per-function microbenchmarks live in each runtime (`go test -bench` in
-`trevrpc-go`, `cargo bench` in `trevrpc-rust`); see the wiki's Benchmarks page.
+`trevrpc-go`, `cargo bench` in `trevrpc-rust`), which `bench/micro.py`
+(`nix run .#trevrpc-bench-micro`) runs and compares across commits with
+benchstat; see the wiki's Benchmarks page.
 
 ```text
-nix run .#bench                      # every pair, default matrix
-nix run .#bench -- --scenarios unary,bidi --sizes 64,4096 --duration 10
-bench/run.sh --server NAME=CMD... --client NAME=CMD... [--grpc CMD]
+nix run .#trevrpc-bench              # every pair, default matrix
+nix run .#trevrpc-bench -- --scenarios unary,bidi --sizes 64,4096 --duration 10
+bench/run.py --server NAME=CMD... --client NAME=CMD... [--grpc CMD]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST]
              [--metadata-sizes LIST] [--duration SECONDS] [--warmup SECONDS]
              [--messages N] [--out DIR]
 ```
 
-`run.sh` starts each server once, then runs every client over every transport
+The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients
+and the grpc-go baseline unless the command line names any `--server`,
+`--client`, or `--grpc`, which then replace all three. `run.py` starts each server once, then runs every client over every transport
 for every combination of scenario, size, metadata size, and concurrency. It prints a summary
 table and writes one JSON object per run to `DIR/results.jsonl`; without
 `--out`, `DIR` is a new `trevrpc-bench.*` directory under `$TMPDIR`. A run fails

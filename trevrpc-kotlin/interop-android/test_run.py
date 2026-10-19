@@ -96,53 +96,45 @@ class ParseInstrumentationTest(unittest.TestCase):
         self.assertFalse(outcomes.passed)
 
 
-class ParsePortsTest(unittest.TestCase):
-    def test_accepts_the_readiness_line(self) -> None:
-        ports = run.parse_ports(
-            '{"native":4433,"http3":4434,"webtransport":4435,"http2":4436,"qmux":4436}'
-        )
-
-        self.assertEqual(4434, ports["http3"])
-        self.assertEqual(4436, ports["http2"])
-
-    def test_rejects_malformed_lines(self) -> None:
-        for line in [
-            "",
-            "ready",
-            "[]",
-            '{"native":1,"http3":0,"http2":1}',
-            '{"native":1,"webtransport":1,"http2":1}',
-            '{"native":1,"http3":1,"webtransport":1}',
-        ]:
-            with self.subTest(line=line), self.assertRaises(run.RunnerError):
-                _ = run.parse_ports(line)
+def fake_server(root: Path, ports: str) -> list[str]:
+    """Writes a server that logs its arguments, reports `ports`, and runs until stdin closes."""
+    server = root / "fake-server"
+    script = ["#!/bin/sh", 'echo "$@" >&2', f"echo '{ports}'", "cat >/dev/null"]
+    _ = server.write_text("\n".join(script) + "\n", encoding="utf-8")
+    server.chmod(server.stat().st_mode | stat.S_IXUSR)
+    return [str(server)]
 
 
 class StartServerTest(unittest.TestCase):
-    def test_appends_host_and_tls_flags_and_reads_ports(self) -> None:
+    def test_appends_tls_and_host_flags_and_reads_ports(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            server = root / "fake-server"
-            script = [
-                "#!/bin/sh",
-                'echo "$@" >&2',
-                'echo \'{"native":1,"http3":4434,"webtransport":1,"http2":1}\'',
-                "cat >/dev/null",
-            ]
-            _ = server.write_text("\n".join(script) + "\n", encoding="utf-8")
-            server.chmod(server.stat().st_mode | stat.S_IXUSR)
+            command = fake_server(root, '{"native":1,"http3":4434,"webtransport":1,"http2":4436}')
             certificates = run.Certificates(
                 root / "ca.pem", root / "server.pem", root / "server.key"
             )
 
-            process, ports = run.start_server(f"{server} server", certificates, "0.0.0.0", root)
-            run.shutdown_server(process)
+            server = run.start_server(command, certificates, "0.0.0.0", root)
+            problem = server.stop()
 
-            self.assertEqual(4434, ports["http3"])
+            self.assertIsNone(problem)
+            self.assertEqual(4434, server.port("http3"))
+            self.assertEqual(4436, server.port("http2"))
             self.assertEqual(
-                f"server --host 0.0.0.0 --cert {certificates.certificate} --key {certificates.key}",
-                (root / "server.stderr.log").read_text(encoding="utf-8").strip(),
+                f"server --cert {certificates.certificate} --key {certificates.key} --host 0.0.0.0",
+                server.log.read_text(encoding="utf-8").strip(),
             )
+
+    def test_requires_a_port_for_every_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = fake_server(root, '{"native":1,"http3":4434}')
+            certificates = run.Certificates(
+                root / "ca.pem", root / "server.pem", root / "server.key"
+            )
+
+            with self.assertRaisesRegex(run.RunnerError, "'http2'"):
+                _ = run.start_server(command, certificates, "0.0.0.0", root)
 
     def test_reports_a_server_that_exits_early(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -152,7 +144,7 @@ class StartServerTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(run.RunnerError, "exited with 3"):
-                _ = run.start_server("sh -c 'exit 3' --", certificates, "0.0.0.0", root)
+                _ = run.start_server(["sh", "-c", "exit 3", "--"], certificates, "0.0.0.0", root)
 
 
 class CertificatesTest(unittest.TestCase):

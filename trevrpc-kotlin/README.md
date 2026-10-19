@@ -128,13 +128,13 @@ If the call's own deadline passes while the client waits for the end of the stre
 ```shell
 nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go --command \
   trevrpc-interop-android \
-  --server-command "trevrpc-interop-go server" \
+  --server-command trevrpc-interop-go \
   --output out/interop --work-dir /var/tmp/interop
 ```
 
 `--transport http3` (the default) runs the scenarios over HTTP/3. `--transport http2` runs them with Cronet's QUIC disabled, as on a network that blocks UDP, to exercise the HTTP/2 mapping on the server's TCP listener. The GitHub `android` workflow runs both for each server.
 
-The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, appends `--host 0.0.0.0 --cert <pem> --key <pem>` to the server command, and prints `ok <name>` or `fail <name>: <reason>` per scenario. It exits 0 only if every scenario passed.
+The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, and runs the server command with `server --cert <pem> --key <pem> --host 0.0.0.0`. It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if every scenario passed and the server exited 0 once its stdin closed.
 
 ## Development
 

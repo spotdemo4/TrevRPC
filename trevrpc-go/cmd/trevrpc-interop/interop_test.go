@@ -28,7 +28,7 @@ var wantScenarios = []string{
 }
 
 // writeTestCertificate writes a localhost ECDSA P-256 certificate and key like
-// the one interop/run.sh generates.
+// the one interop/run.py generates.
 func writeTestCertificate(t *testing.T) (certFile, keyFile string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -66,7 +66,7 @@ func writeTestCertificate(t *testing.T) (certFile, keyFile string) {
 }
 
 // TestServerAndClientCommandsFollowTheContract drives both subcommands through
-// run, exactly as interop/run.sh does with the built binary.
+// run, exactly as interop/run.py does with the built binary.
 func TestServerAndClientCommandsFollowTheContract(t *testing.T) {
 	certFile, keyFile := writeTestCertificate(t)
 

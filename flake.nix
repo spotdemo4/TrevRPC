@@ -63,6 +63,7 @@
               gotools
               golangci-lint
               protobuf
+              benchstat
 
               # javascript
               nodejs_26
@@ -120,12 +121,11 @@
             meta.platforms = self.packages.${system}.trevrpc-kotlin.interopAndroid.meta.platforms;
           };
 
-          # The interop runner, both servers and the browser CLI, for the safari workflow.
+          # The interop runner and both servers, for the safari workflow.
           safari = pkgs.mkShell {
             packages = with self.packages.${system}; [
               trevrpc-go
               trevrpc-interop
-              trevrpc-js
               trevrpc-rust
             ];
           };
@@ -224,37 +224,6 @@
             '';
           };
 
-          # Load benchmarks: every client against every server, plus grpc-go; see bench/README.md.
-          bench = {
-            packages = [ self.packages.${system}.trevrpc-bench ];
-            script = ''
-              trevrpc-bench ${
-                (pkgs.callPackage ./bench {
-                  inherit (self.packages.${system})
-                    trevrpc-bench
-                    trevrpc-bench-grpc
-                    trevrpc-go
-                    trevrpc-rust
-                    ;
-                }).args
-              } "$@"
-            '';
-          };
-
-          # Go and Rust microbenchmarks, run from the checkout; compare runs with benchstat.
-          bench-micro = {
-            packages = with pkgs; [
-              go
-              cargo
-              rustc
-            ];
-            script = ''
-              go -C trevrpc-go test -run '^$' -bench . -count 5 ./... | tee "''${TMPDIR:-/tmp}/trevrpc-bench-go.txt"
-              (cd trevrpc-rust && cargo bench)
-              echo "Go results: ''${TMPDIR:-/tmp}/trevrpc-bench-go.txt (compare with: go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261009192801-be2c69fb417e old.txt new.txt)"
-            '';
-          };
-
           sync-playwright = {
             packages = [ pkgs.nodejs_26 ];
             script = ''
@@ -279,6 +248,7 @@
             wireGolden = ./testdata/wire-golden-vectors.txt;
             qmuxGolden = ./testdata/qmux-golden-vectors.txt;
             interopProto = ./interop/proto;
+            interopHarness = ./interop/harness.py;
             trevrpcProto = ./proto;
             licenseFile = ./LICENSE;
           in
@@ -302,6 +272,7 @@
             trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
               inherit
                 wireGolden
+                interopHarness
                 interopProto
                 trevrpcProto
                 licenseFile
@@ -315,8 +286,16 @@
                 licenseFile
                 ;
             };
-            trevrpc-interop = pkgs.callPackage ./interop/runner.nix { };
-            trevrpc-bench = pkgs.callPackage ./bench/runner.nix { };
+            # nix run .#trevrpc-interop: the interop matrix; see interop/README.md.
+            trevrpc-interop = pkgs.callPackage ./interop {
+              inherit (self.packages.${system}) trevrpc-go trevrpc-js trevrpc-rust;
+            };
+            # nix run .#trevrpc-bench: the load benchmarks; see bench/README.md.
+            trevrpc-bench = pkgs.callPackage ./bench {
+              inherit (self.packages.${system}) trevrpc-bench-grpc trevrpc-go trevrpc-rust;
+            };
+            # nix run .#trevrpc-bench-micro: the Go and Rust microbenchmarks, from the checkout.
+            trevrpc-bench-micro = pkgs.callPackage ./bench/micro.nix { };
             trevrpc-bench-grpc = pkgs.callPackage ./bench/grpc-go { inherit interopProto; };
           };
 
@@ -343,35 +322,14 @@
             trevrpc-kotlin
             trevrpc-rust
             trevrpc-bench-grpc
+            trevrpc-bench-micro
             ;
 
-          bench =
-            (pkgs.callPackage ./bench {
-              inherit (self.packages.${system})
-                trevrpc-bench
-                trevrpc-bench-grpc
-                trevrpc-go
-                trevrpc-rust
-                ;
-              extraArgs = [
-                "--duration"
-                "0.2"
-                "--warmup"
-                "0"
-                "--concurrency"
-                "1,4"
-                "--messages"
-                "10"
-              ];
-            }).check;
-
-          interop = pkgs.callPackage ./interop {
-            inherit (self.packages.${system})
-              trevrpc-go
-              trevrpc-interop
-              trevrpc-js
-              trevrpc-rust
-              ;
+          bench = pkgs.callPackage ./bench/check.nix {
+            inherit (self.packages.${system}) trevrpc-bench;
+          };
+          interop = pkgs.callPackage ./interop/check.nix {
+            inherit (self.packages.${system}) trevrpc-interop;
           };
           kotlin-interop-android = self.packages.${system}.trevrpc-kotlin.interopAndroid;
 

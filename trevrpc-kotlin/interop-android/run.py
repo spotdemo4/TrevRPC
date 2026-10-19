@@ -12,20 +12,28 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import re
-import selectors
-import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, cast
+from typing import cast
+
+# The shared harness; appended so it never shadows modules next to this script.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "interop"))
+
+from harness import (
+    Certificate,
+    RunnerError,
+    Server,
+    command_line,
+    run_checked,
+    stop_group,
+)
 
 EMULATOR_HOST = "10.0.2.2"
 EMULATOR_PORT = 5554
@@ -35,44 +43,11 @@ TEST_RUNNER = "androidx.test.runner.AndroidJUnitRunner"
 DEFAULT_SYSTEM_IMAGE = "system-images;android-33;google_apis;x86_64"
 CA_DIRECTORY = "/system/etc/security/cacerts"
 BOOT_TIMEOUT = 180
-SERVER_TIMEOUT = 30
 INSTRUMENTATION_TIMEOUT = 180
 MIN_FREE_BYTES = 6 * 1024**3
 
 
-class RunnerError(RuntimeError):
-    """An infrastructure failure that prevents scenario results from being produced."""
-
-
 # --- processes -------------------------------------------------------------------------------
-
-
-def run(
-    command: list[str],
-    *,
-    timeout: int = 60,
-    input_text: str | None = None,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Runs a command to completion and raises RunnerError unless it exits 0."""
-    try:
-        result = subprocess.run(
-            command,
-            input=input_text,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RunnerError(f"command timed out after {timeout}s: {shlex.join(command)}") from error
-    except OSError as error:
-        raise RunnerError(f"could not run {shlex.join(command)}: {error}") from error
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise RunnerError(f"command exited {result.returncode}: {shlex.join(command)}\n{detail}")
-    return result
 
 
 def probe(command: list[str]) -> str | None:
@@ -82,21 +57,6 @@ def probe(command: list[str]) -> str | None:
     except OSError, subprocess.TimeoutExpired:
         return None
     return result.stdout.strip() if result.returncode == 0 else None
-
-
-def stop(
-    process: subprocess.Popen[bytes] | subprocess.Popen[str] | None, timeout: int = 10
-) -> None:
-    """Terminates a process group, escalating to SIGKILL."""
-    if process is None or process.poll() is not None:
-        return
-    for signal_number in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(process.pid, signal_number)
-            _ = process.wait(timeout=timeout)
-            return
-        except OSError, subprocess.TimeoutExpired:
-            continue
 
 
 # --- certificates ----------------------------------------------------------------------------
@@ -130,7 +90,7 @@ def generate_certificates(
     ]
     _ = extensions.write_text("\n".join(lines) + "\n", encoding="utf-8")
     curve = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"]
-    _ = run(
+    _ = run_checked(
         [
             "openssl",
             "req",
@@ -150,7 +110,7 @@ def generate_certificates(
             "keyUsage=critical,keyCertSign,cRLSign",
         ]
     )
-    _ = run(
+    _ = run_checked(
         [
             "openssl",
             "req",
@@ -164,7 +124,7 @@ def generate_certificates(
             "/CN=localhost",
         ]
     )
-    _ = run(
+    _ = run_checked(
         [
             "openssl",
             "x509",
@@ -193,104 +153,25 @@ def generate_certificates(
 TRANSPORTS = ("http3", "http2")
 
 
-def parse_ports(line: str) -> dict[str, int]:
-    """Parses the server's readiness line, such as `{"native":N,"http3":N,"http2":N,...}`."""
+def start_server(command: list[str], certificates: Certificates, host: str, output: Path) -> Server:
+    """Starts the interop server on `host` and waits for it to report its ports."""
+    certificate = Certificate(certificates.certificate, certificates.key)
+    server = Server("interop", command, certificate, output, ["--host", host])
     try:
-        value = cast(object, json.loads(line))
-    except json.JSONDecodeError as error:
-        raise RunnerError(f"server readiness line is not JSON: {line!r}") from error
-    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
-    ports: dict[str, int] = {}
-    for name in ("native", *TRANSPORTS):
-        port = fields.get(name)
-        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-            raise RunnerError(f"server readiness line has no valid {name!r} port: {line!r}")
-        ports[name] = port
-    return ports
-
-
-def start_server(
-    command: str, certificates: Certificates, host: str, output: Path
-) -> tuple[subprocess.Popen[str], dict[str, int]]:
-    """Starts the interop server and waits for its readiness line."""
-    arguments = [
-        *shlex.split(command),
-        "--host",
-        host,
-        "--cert",
-        str(certificates.certificate),
-        "--key",
-        str(certificates.key),
-    ]
-    with (output / "server.stderr.log").open("w", encoding="utf-8") as stderr:
-        try:
-            process: subprocess.Popen[str] = subprocess.Popen(
-                arguments,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                text=True,
-                start_new_session=True,
-            )
-        except OSError as error:
-            raise RunnerError(f"could not start server {shlex.join(arguments)}: {error}") from error
-    # typeshed types text-mode pipes as IO[Any].
-    stdout = cast(IO[str], process.stdout)
-    selector = selectors.DefaultSelector()
-    _ = selector.register(stdout, selectors.EVENT_READ)
-    try:
-        if not selector.select(SERVER_TIMEOUT):
-            stop(process)
-            close_pipes(process)
-            raise RunnerError(
-                f"server did not print its ports within {SERVER_TIMEOUT}s; "
-                f"see {output / 'server.stderr.log'}"
-            )
-    finally:
-        selector.close()
-    line = stdout.readline().strip()
-    if not line:
-        _ = process.wait(timeout=SERVER_TIMEOUT)
-        close_pipes(process)
-        raise RunnerError(
-            f"server exited with {process.returncode} before printing its ports; "
-            f"see {output / 'server.stderr.log'}"
-        )
-    try:
-        return process, parse_ports(line)
+        for transport in TRANSPORTS:
+            _ = server.port(transport)
     except RunnerError:
-        stop(process)
-        close_pipes(process)
+        _ = server.stop()
         raise
-
-
-def close_pipes(process: subprocess.Popen[str]) -> None:
-    for pipe in (process.stdin, process.stdout):
-        if pipe is not None:
-            pipe.close()
-
-
-def shutdown_server(process: subprocess.Popen[str]) -> None:
-    """Asks the server to exit by closing stdin and requires a clean exit."""
-    assert process.stdin is not None
-    process.stdin.close()
-    try:
-        returncode = process.wait(timeout=SERVER_TIMEOUT)
-    except subprocess.TimeoutExpired as error:
-        raise RunnerError(
-            f"server did not exit after stdin closed within {SERVER_TIMEOUT}s"
-        ) from error
-    finally:
-        close_pipes(process)
-    if returncode != 0:
-        raise RunnerError(f"server exited with {returncode}")
+    return server
 
 
 # --- emulator --------------------------------------------------------------------------------
 
 
-def adb(*arguments: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    return run(["adb", "-s", SERIAL, *arguments], timeout=timeout)
+def adb(*arguments: str, timeout: int = 60) -> str:
+    """Runs an adb command against the emulator and returns its stdout."""
+    return run_checked(["adb", "-s", SERIAL, *arguments], timeout=timeout)
 
 
 def adb_probe(*arguments: str) -> str | None:
@@ -308,7 +189,7 @@ class Emulator:
         avd_home.mkdir(exist_ok=True)
         name = f"trevrpc-interop-{os.getpid()}"
         env = {**os.environ, "ANDROID_AVD_HOME": str(avd_home)}
-        _ = run(
+        _ = run_checked(
             [
                 "avdmanager",
                 "create",
@@ -390,9 +271,9 @@ class Emulator:
         The system partition is read-only until verity is disabled and the image is remounted,
         and the platform rereads the store only at boot, so this takes two reboots.
         """
-        subject_hash = run(
+        subject_hash = run_checked(
             ["openssl", "x509", "-subject_hash_old", "-noout", "-in", str(ca)]
-        ).stdout.split()[0]
+        ).split()[0]
         android_ca = work_dir / f"{subject_hash}.0"
         _ = shutil.copyfile(ca, android_ca)
         destination = f"{CA_DIRECTORY}/{android_ca.name}"
@@ -406,7 +287,7 @@ class Emulator:
         _ = adb("shell", "chown", "0:0", destination)
         _ = adb("shell", "restorecon", destination)
         self.reboot()
-        digest = adb("shell", "sha256sum", destination).stdout.split()
+        digest = adb("shell", "sha256sum", destination).split()
         expected = hashlib.sha256(android_ca.read_bytes()).hexdigest()
         if not digest or digest[0] != expected:
             raise RunnerError(f"installed CA digest is {digest[:1]}, expected {expected}")
@@ -414,7 +295,7 @@ class Emulator:
     def shutdown(self) -> None:
         if self.process.poll() is None:
             _ = adb_probe("emu", "kill")
-        stop(self.process, timeout=30)
+        stop_group(self.process, grace=30)
 
 
 # --- instrumentation -------------------------------------------------------------------------
@@ -534,7 +415,7 @@ def _decode(value: str | bytes | None) -> str:
 
 def collect_logcat(output: Path) -> None:
     try:
-        text = adb("logcat", "-d", "-v", "threadtime", timeout=30).stdout
+        text = adb("logcat", "-d", "-v", "threadtime", timeout=30)
     except RunnerError as error:
         text = f"logcat unavailable: {error}\n"
     _ = (output / "logcat.log").write_text(text, encoding="utf-8")
@@ -545,7 +426,7 @@ def collect_logcat(output: Path) -> None:
 
 @dataclass(frozen=True)
 class Options:
-    server_command: str
+    server_command: list[str]
     output: Path
     work_dir: Path
     app_apk: Path
@@ -561,8 +442,9 @@ def parse_args(argv: list[str]) -> Options:
     )
     _ = parser.add_argument(
         "--server-command",
+        type=command_line,
         required=True,
-        help="command that starts an interop server; --host, --cert and --key are appended",
+        help="interop executable; `server --cert --key --host` is appended",
     )
     _ = parser.add_argument(
         "--output", type=Path, required=True, help="directory for logs and diagnostics"
@@ -585,7 +467,7 @@ def parse_args(argv: list[str]) -> Options:
     )
     args = parser.parse_args(argv)
     return Options(
-        server_command=cast(str, args.server_command),
+        server_command=cast(list[str], args.server_command),
         output=cast(Path, args.output),
         work_dir=cast(Path, args.work_dir),
         app_apk=cast(Path, args.app_apk),
@@ -614,12 +496,10 @@ def execute(args: Options) -> Outcomes:
         )
 
     certificates = generate_certificates(args.work_dir / "certificates")
-    server: subprocess.Popen[str] | None = None
+    server: Server | None = None
     emulator: Emulator | None = None
     try:
-        server, ports = start_server(
-            args.server_command, certificates, args.server_host, args.output
-        )
+        server = start_server(args.server_command, certificates, args.server_host, args.output)
         emulator = Emulator(args.work_dir, args.output, args.system_image)
         emulator.wait_for_boot()
         emulator.install_ca(certificates.ca, args.work_dir)
@@ -632,14 +512,13 @@ def execute(args: Options) -> Outcomes:
         _ = adb("install", "-r", str(args.app_apk), timeout=90)
         _ = adb("install", "-r", str(args.test_apk), timeout=90)
         _ = adb("logcat", "-c")
-        outcomes = run_instrumentation(ports[args.transport], args.transport, args.output)
-        try:
-            shutdown_server(server)
-        except RunnerError as error:
-            outcomes.problems.append(str(error))
+        outcomes = run_instrumentation(server.port(args.transport), args.transport, args.output)
+        if (problem := server.stop()) is not None:
+            outcomes.problems.append(problem)
         return outcomes
     finally:
-        stop(server)
+        if server is not None:
+            _ = server.stop()
         if emulator is not None:
             if emulator.process.poll() is None:
                 collect_logcat(args.output)

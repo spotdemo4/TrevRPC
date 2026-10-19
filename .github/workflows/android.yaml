@@ -65,7 +65,7 @@ jobs:
           OUTPUT: ${{ runner.temp }}/${{ env.CELL }}
         run: |
           trevrpc-interop-android \
-            --server-command "trevrpc-interop-$SERVER server" \
+            --server-command "trevrpc-interop-$SERVER" \
             --transport "$TRANSPORT" \
             --output "$OUTPUT" \
             --work-dir "$WORK_DIR"

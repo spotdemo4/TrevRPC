@@ -1,44 +1,30 @@
 {
   lib,
   stdenv,
-  runCommand,
+  callPackage,
   trevrpc-go,
-  trevrpc-interop,
   trevrpc-js,
   trevrpc-rust,
 }:
-let
-  # playwright-driver only ships the browsers on Linux.
-  browsers = lib.optionals stdenv.hostPlatform.isLinux [
-    "chromium"
-    "firefox"
-  ];
-  # run.sh parses `--option value`, not GNU `--option=value`.
-  args =
-    lib.cli.toCommandLineShell
-      (name: {
-        option = "--${name}";
-        sep = null;
-        explicitBool = false;
-      })
-      {
-        server = [
-          "go=${trevrpc-go}/bin/trevrpc-interop-go"
-          "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
-        ];
-        client = [
-          "go=${trevrpc-go}/bin/trevrpc-interop-go"
-          "rust=${trevrpc-rust}/bin/trevrpc-interop-rust"
-        ];
-        browser = browsers;
-      };
-in
-runCommand "trevrpc-interop-check"
-  {
-    nativeBuildInputs = [ trevrpc-interop ] ++ lib.optional (browsers != [ ]) trevrpc-js;
-    __darwinAllowLocalNetworking = true;
-  }
-  ''
-    export HOME=$TMPDIR
-    trevrpc-interop --out "$out" ${args}
-  ''
+callPackage ./runner.nix {
+  name = "trevrpc-interop";
+  script = "interop/run.py";
+  # trevrpc-interop-browser drives the browsers.
+  runtimeInputs = [ trevrpc-js ];
+  # Every server and native client, and the browsers playwright-driver ships, which is only on
+  # Linux. Safari needs its certificate trusted through sudo, so it runs only when asked for.
+  defaults = {
+    server = [
+      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
+    ];
+    client = [
+      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
+    ];
+    browser = lib.optionals stdenv.hostPlatform.isLinux [
+      "chromium"
+      "firefox"
+    ];
+  };
+}

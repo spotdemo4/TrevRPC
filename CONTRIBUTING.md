@@ -88,11 +88,7 @@ ktlint "**/src/**/*.kt" "**/*.gradle.kts"
 with the cross-runtime [interop](interop) suite:
 
 ```sh
-nix shell .#trevrpc-go .#trevrpc-rust .#trevrpc-js nixpkgs#jq nixpkgs#openssl --command \
-  interop/run.sh \
-    --server go=trevrpc-interop-go --server rust=trevrpc-interop-rust \
-    --client go=trevrpc-interop-go --client rust=trevrpc-interop-rust \
-    --browser chromium --browser firefox
+nix run .#trevrpc-interop
 ```
 
 ### build

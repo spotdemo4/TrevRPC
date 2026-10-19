@@ -1,6 +1,7 @@
 {
   androidSdk,
   gradle_9,
+  interopHarness,
   interopProto,
   jdk25,
   lib,
@@ -23,6 +24,7 @@ stdenvNoCC.mkDerivation (final: {
     fileset = lib.fileset.unions [
       licenseFile
       wireGolden
+      interopHarness
       interopProto
       trevrpcProto
       ../.
@@ -84,6 +86,8 @@ stdenvNoCC.mkDerivation (final: {
     cp interop-android/build/outputs/apk/androidTest/debug/interop-android-debug-androidTest.apk \
       "$share/test.apk"
     cp interop-android/run.py "$share/run.py"
+    # run.py imports the shared harness from ../../interop, as in the checkout.
+    install -Dm644 ../interop/harness.py $out/share/interop/harness.py
     makeWrapper ${python3}/bin/python3 $out/bin/trevrpc-interop-android \
       --add-flags "-I $share/run.py" \
       --add-flags "--app-apk $share/app.apk" \

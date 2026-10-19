@@ -12,6 +12,7 @@
   openssl,
   runtimeShell,
   stdenvNoCC,
+  interopHarness,
   interopProto,
   trevrpcProto,
   wireGolden,
@@ -75,6 +76,7 @@ let
   # The emulator needs KVM and an x86_64 host; meta.platforms restricts it to x86_64-linux.
   interopAndroid = callPackage ./interop-android {
     inherit
+      interopHarness
       interopProto
       licenseFile
       trevrpcProto
@@ -96,6 +98,7 @@ stdenvNoCC.mkDerivation (final: {
     fileset = lib.fileset.unions [
       licenseFile
       wireGolden
+      interopHarness
       interopProto
       trevrpcProto
       ./.
