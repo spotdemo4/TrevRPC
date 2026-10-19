@@ -3,7 +3,7 @@
   stdenv,
   buildNpmPackage,
   importNpmLock,
-  nodejs_24,
+  nodejs_26,
   makeWrapper,
   oxlint,
   protobuf,
@@ -52,7 +52,7 @@ buildNpmPackage (final: {
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-js";
-  nodejs = nodejs_24;
+  nodejs = nodejs_26;
 
   npmConfigHook = importNpmLock.npmConfigHook;
   npmDeps = importNpmLock {
@@ -100,7 +100,7 @@ buildNpmPackage (final: {
     cp build/interop/page.js "$interop/build/interop/"
     cp -R "$TMPDIR/interop-node_modules" "$interop/node_modules"
     chmod -R u+w "$interop"
-    makeWrapper ${nodejs_24}/bin/node "$out/bin/trevrpc-interop-browser" \
+    makeWrapper ${nodejs_26}/bin/node "$out/bin/trevrpc-interop-browser" \
       --add-flags "$interop/interop-browser/cli.js" \
       --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}"
   '';
@@ -112,7 +112,7 @@ buildNpmPackage (final: {
     library="$out/lib/node_modules/@trevrpc/trevrpc-js"
 
     IFS= read -r installed_shebang < "$library/bin/protoc-gen-trevrpc-js.js"
-    test "$installed_shebang" = "#!${nodejs_24}/bin/node"
+    test "$installed_shebang" = "#!${nodejs_26}/bin/node"
     test -x "$out/bin/protoc-gen-trevrpc-js"
     test -x "$out/bin/trevrpc-interop-browser"
 
@@ -129,7 +129,7 @@ buildNpmPackage (final: {
 
     (
       cd "$out/lib"
-      ${nodejs_24}/bin/node --input-type=module -e '
+      ${nodejs_26}/bin/node --input-type=module -e '
         import assert from "node:assert/strict";
         const runtime = await import("@trevrpc/trevrpc-js");
         assert.deepEqual(Object.keys(runtime).sort(), [

@@ -65,7 +65,7 @@
               protobuf
 
               # javascript
-              nodejs_24
+              nodejs_26
               playwright-driver.browsers
               oxlint
               typescript
@@ -141,7 +141,7 @@
               # go
               go
               # javascript
-              nodejs_24
+              nodejs_26
               # kotlin
               jdk25
               gradle_9
@@ -159,7 +159,7 @@
               go
               fix-hash
               # javascript
-              nodejs_24
+              nodejs_26
               # kotlin
               jdk25
               gradle_9
@@ -174,7 +174,7 @@
               go
               govulncheck
               # javascript
-              nodejs_24
+              nodejs_26
               # kotlin
               osv-scanner
               # nix
@@ -256,7 +256,7 @@
           };
 
           sync-playwright = {
-            packages = [ pkgs.nodejs_24 ];
+            packages = [ pkgs.nodejs_26 ];
             script = ''
               export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
               npm install \
