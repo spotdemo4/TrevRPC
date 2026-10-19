@@ -47,6 +47,7 @@
               GOTOOLCHAIN = "local";
               RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
               PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+              FIXED_VERSION = "true";
             };
             packages = with pkgs; [
               # rust

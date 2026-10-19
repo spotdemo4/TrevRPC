@@ -38,5 +38,6 @@ jobs:
       - name: Bump
         run: bumper
         env:
+          FIXED_VERSION: true
           GITHUB_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           FORCE: ${{ inputs.force }}
