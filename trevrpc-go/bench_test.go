@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -301,6 +302,35 @@ func BenchmarkUnary(b *testing.B) {
 	})
 }
 
+// benchWorkers is how many calls BenchmarkUnaryParallel keeps in flight on
+// its one connection, which is the server's default stream limit.
+const benchWorkers = 64
+
+// BenchmarkUnaryParallel measures unary calls on one connection with
+// benchWorkers calls in flight, so it reports throughput under concurrency
+// rather than the latency of one call.
+func BenchmarkUnaryParallel(b *testing.B) {
+	benchEndToEnd(b, func(ctx context.Context, b *testing.B, transport Transport, payload string) {
+		request := &testMessage{Value: payload}
+		b.SetParallelism(benchWorkers / runtime.GOMAXPROCS(0))
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				reply, err := Unary(ctx, transport, "/bench.Echo/Unary", request, newTestMessage)
+				if err != nil {
+					b.Error(err)
+					return
+				}
+				if len(reply.Value) != len(payload) {
+					b.Errorf("reply length = %d, want %d", len(reply.Value), len(payload))
+					return
+				}
+			}
+		})
+		b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "ops/s")
+	})
+}
+
 // BenchmarkServerStream reports the time per streamed message.
 func BenchmarkServerStream(b *testing.B) {
 	benchEndToEnd(b, func(ctx context.Context, b *testing.B, transport Transport, payload string) {
@@ -393,5 +423,47 @@ func BenchmarkBidiPingPong(b *testing.B) {
 		if err := call.Close(); err != nil {
 			b.Fatal(err)
 		}
+	})
+}
+
+// BenchmarkBidiPingPongParallel measures ping-pong on one connection with
+// benchWorkers bidirectional calls in flight, each exchanging one message at
+// a time, so it reports the per-message cost of the server under concurrency.
+func BenchmarkBidiPingPongParallel(b *testing.B) {
+	benchEndToEnd(b, func(ctx context.Context, b *testing.B, transport Transport, payload string) {
+		request := &testMessage{Value: payload}
+		b.SetParallelism(benchWorkers / runtime.GOMAXPROCS(0))
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/bench.Echo/Chat", newTestMessage)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			defer func() { _ = call.Close() }()
+			for pb.Next() {
+				if err := call.Send(request); err != nil {
+					b.Error(err)
+					return
+				}
+				reply, err := call.Recv()
+				if err != nil {
+					b.Error(err)
+					return
+				}
+				if len(reply.Value) != len(payload) {
+					b.Errorf("reply length = %d, want %d", len(reply.Value), len(payload))
+					return
+				}
+			}
+			if err := call.CloseSend(); err != nil {
+				b.Error(err)
+				return
+			}
+			if _, err := call.Recv(); !errors.Is(err, io.EOF) {
+				b.Errorf("Recv after CloseSend error = %v, want EOF", err)
+			}
+		})
+		b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "msgs/s")
 	})
 }

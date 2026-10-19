@@ -371,7 +371,7 @@ func TestClientStreamingResponseDrainsBeforeCardinality(t *testing.T) {
 				func() {},
 			)
 
-			_, _, _, err := readSingleResponse[*testMessage](responses)
+			_, err := readSingleResponse[*testMessage](responses)
 			if reason, ok := responseStreamFailureReason(err); !ok || reason != test.reason {
 				t.Fatalf("failure reason = %q, %t, want %q: %v", reason, ok, test.reason, err)
 			}

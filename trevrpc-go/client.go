@@ -87,7 +87,7 @@ type callConfig struct {
 type CallOption func(*callConfig)
 
 func defaultCallConfig() callConfig {
-	return callConfig{maxResponseSize: DefaultMaxFrameSize, metadata: Metadata{}}
+	return callConfig{maxResponseSize: DefaultMaxFrameSize}
 }
 
 // WithTimeout bounds the RPC by timeout. The earlier of this and any deadline
@@ -167,14 +167,7 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 		return zero, err
 	}
 
-	message, headers, trailers, err := readSingleResponse(newResponseMessageStream(ctx, frames, newResponse, config, cancel))
-	if err != nil {
-		return zero, err
-	}
-
-	config.captureResponseHeaders(headers)
-	config.captureResponseMetadata(trailers)
-	return message, nil
+	return readSingleResponse(newResponseMessageStream(ctx, frames, newResponse, config, cancel))
 }
 
 // ServerStreaming calls the server-streaming RPC at method, the full method
@@ -213,7 +206,7 @@ func ClientStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 		return nil, err
 	}
 
-	return &clientStreamingCall[Req, Res]{requests: requests, responses: responses, cancel: cancel, config: config}, nil
+	return &clientStreamingCall[Req, Res]{requests: requests, responses: responses, cancel: cancel}, nil
 }
 
 // BidirectionalStreaming starts the bidirectional-streaming RPC at method, the
@@ -255,7 +248,6 @@ type clientStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {
 	requests  *messagePipe[Req]
 	responses *responseMessageStream[Res]
 	cancel    context.CancelFunc
-	config    callConfig
 }
 
 func (c *clientStreamingCall[Req, Res]) Send(request Req) error {
@@ -268,13 +260,7 @@ func (c *clientStreamingCall[Req, Res]) CloseAndRecv() (Res, error) {
 		return zero, err
 	}
 
-	message, headers, trailers, err := readSingleResponse(c.responses)
-	if err != nil {
-		return zero, err
-	}
-	c.config.captureResponseHeaders(headers)
-	c.config.captureResponseMetadata(trailers)
-	return message, nil
+	return readSingleResponse(c.responses)
 }
 
 func (c *clientStreamingCall[Req, Res]) Close() error {
@@ -320,18 +306,6 @@ func applyCallOptions(options []CallOption) callConfig {
 	return config
 }
 
-func (c callConfig) captureResponseHeaders(headers Metadata) {
-	if c.responseHeaders != nil {
-		*c.responseHeaders = cloneMetadata(headers)
-	}
-}
-
-func (c callConfig) captureResponseMetadata(metadata Metadata) {
-	if c.responseMetadata != nil {
-		*c.responseMetadata = cloneMetadata(metadata)
-	}
-}
-
 type clientDeadline struct {
 	at  time.Time
 	set bool
@@ -355,17 +329,21 @@ func resolveClientDeadline(ctx context.Context, config callConfig, now func() ti
 }
 
 func prepareClientRequest(method string, kind RPCKind, config callConfig, deadline clientDeadline, now func() time.Time) (*wireRequest, error) {
-	metadata := cloneMetadata(config.metadata)
+	// The request is sent asynchronously, so it gets its own copy.
+	var metadata Metadata
+	if len(config.metadata) > 0 {
+		metadata = cloneMetadata(config.metadata)
+	}
 	if err := validateMetadata(metadata); err != nil {
 		return nil, err
 	}
 
-	request := newWireRequest(method)
-	request.Kind = kind
-	request.Metadata = metadata
-	request.TimeoutNanos = deadlineTimeoutNanos(deadline, now)
-
-	return request, nil
+	return &wireRequest{
+		Method:       method,
+		Metadata:     metadata,
+		Kind:         kind,
+		TimeoutNanos: deadlineTimeoutNanos(deadline, now),
+	}, nil
 }
 
 func deadlineTimeoutNanos(deadline clientDeadline, now func() time.Time) uint64 {
@@ -383,7 +361,10 @@ func deadlineTimeoutNanos(deadline clientDeadline, now func() time.Time) uint64 
 
 func callContext(ctx context.Context, deadline clientDeadline) (context.Context, context.CancelFunc) {
 	if deadline.set {
-		return context.WithDeadline(ctx, deadline.at)
+		// A context that already ends at the deadline needs no timer of its own.
+		if parent, ok := ctx.Deadline(); !ok || !parent.Equal(deadline.at) {
+			return context.WithDeadline(ctx, deadline.at)
+		}
 	}
 
 	return context.WithCancel(ctx)
@@ -444,14 +425,14 @@ type responseMessageStream[T ProtoMessage] struct {
 	hasPending bool
 	pendingErr error
 
-	mu             sync.Mutex
-	headers        Metadata
-	headersClosed  bool // a frame arrived, so HEADERS may no longer
-	done           bool
-	closedLocally  bool
-	closeErr       error
-	closeErrRead   bool
-	terminalStatus *Status
+	mu            sync.Mutex
+	headers       Metadata
+	headersClosed bool // a frame arrived, so HEADERS may no longer
+	done          bool
+	closedLocally bool
+	closeErr      error
+	closeErrRead  bool
+	terminal      *Status
 }
 
 func newResponseMessageStream[T ProtoMessage](ctx context.Context, inner frameStream, newMessage func() T, config callConfig, cancel context.CancelFunc) *responseMessageStream[T] {
@@ -538,7 +519,7 @@ func (s *responseMessageStream[T]) finishWithStatus(status *Status) error {
 	switch {
 	case errors.Is(trailingErr, io.EOF):
 		s.mu.Lock()
-		s.terminalStatus = status
+		s.terminal = status
 		s.mu.Unlock()
 		cleanupErr = s.finish()
 	case s.ctx.Err() != nil:
@@ -546,7 +527,7 @@ func (s *responseMessageStream[T]) finishWithStatus(status *Status) error {
 		// the stream short. The server's status already decided the outcome,
 		// so report it rather than a protocol error.
 		s.mu.Lock()
-		s.terminalStatus = status
+		s.terminal = status
 		s.mu.Unlock()
 		s.abort()
 	default:
@@ -739,13 +720,20 @@ func (s *responseMessageStream[T]) readFrame() (responseFrame, error) {
 }
 
 func (s *responseMessageStream[T]) TerminalStatus() (*Status, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.terminalStatus == nil {
+	status := s.terminalStatus()
+	if status == nil {
 		return nil, false
 	}
 
-	return cloneStatus(s.terminalStatus), true
+	return cloneStatus(status), true
+}
+
+// terminalStatus returns the terminal status itself, which the caller must not
+// change or keep, or nil if the stream has none yet.
+func (s *responseMessageStream[T]) terminalStatus() *Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminal
 }
 
 func (s *responseMessageStream[T]) finish() error {
@@ -794,25 +782,27 @@ func (s *responseMessageStream[T]) Close() error {
 // recvClientFrame receives the next response frame, ending early with a
 // status when ctx is cancelled or its deadline passes.
 func recvClientFrame(ctx context.Context, stream frameStream) (responseFrame, error) {
-	return recvWithContext(ctx, stream, stream.Recv)
+	return recvWithContext(ctx, stream)
 }
 
-// recvWithContext runs recv on stream so that ctx cancellation and its deadline
-// interrupt it. Streams that support read deadlines or cancel reads on context
-// avoid the helper goroutine.
-func recvWithContext[T any](ctx context.Context, stream any, recv func() (T, error)) (T, error) {
+// recvWithContext receives from stream so that ctx cancellation and its
+// deadline interrupt it. Streams that support read deadlines or cancel reads
+// on context avoid the helper goroutine.
+func recvWithContext[T any](ctx context.Context, stream MessageStream[T]) (T, error) {
 	var zero T
 	if err := ctx.Err(); err != nil {
 		return zero, statusFromContextError(err)
 	}
 	deadline, hasDeadline := ctx.Deadline()
 	if deadlineStream, ok := stream.(readDeadlineStream); ok && (hasDeadline || streamContextCancelsRecv(stream)) {
-		if hasDeadline {
+		// A stream that cancels a pending read when ctx ends also covers the
+		// deadline, without a timer in the transport.
+		if hasDeadline && !streamContextCancelsRecv(stream) {
 			_ = deadlineStream.SetReadDeadline(deadline)
 			defer func() { _ = deadlineStream.SetReadDeadline(time.Time{}) }()
 		}
 
-		value, err := recv()
+		value, err := stream.Recv()
 		if err != nil {
 			if deadlineErr := readDeadlineError(ctx, hasDeadline, err); deadlineErr != nil {
 				return zero, deadlineErr
@@ -822,7 +812,7 @@ func recvWithContext[T any](ctx context.Context, stream any, recv func() (T, err
 		return value, err
 	}
 	if isNonBlockingStream(stream) || streamContextCancelsRecv(stream) {
-		value, err := recv()
+		value, err := stream.Recv()
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return zero, statusFromContextError(ctxErr)
@@ -839,7 +829,7 @@ func recvWithContext[T any](ctx context.Context, stream any, recv func() (T, err
 
 	results := make(chan recvResult, 1)
 	go func() {
-		value, err := recv()
+		value, err := stream.Recv()
 		results <- recvResult{value: value, err: err}
 	}()
 
@@ -868,10 +858,10 @@ func readDeadlineError(ctx context.Context, hasDeadline bool, err error) error {
 }
 
 // readSingleResponse drains the response of a unary or client-streaming call
-// and returns its only message with the response headers and trailing
-// metadata. The whole stream is read first so a server-reported failure takes
-// precedence over a cardinality error.
-func readSingleResponse[Res ProtoMessage](responses *responseMessageStream[Res]) (Res, Metadata, Metadata, error) {
+// and returns its only message. It stores the response headers and trailing
+// metadata where the call options asked for them. The whole stream is read
+// first so a server-reported failure takes precedence over a cardinality error.
+func readSingleResponse[Res ProtoMessage](responses *responseMessageStream[Res]) (Res, error) {
 	var first, zero Res
 	responseCount := 0
 	for {
@@ -884,25 +874,31 @@ func readSingleResponse[Res ProtoMessage](responses *responseMessageStream[Res])
 			continue
 		}
 		if !errors.Is(err, io.EOF) {
-			return zero, nil, nil, err
+			return zero, err
 		}
 		break
 	}
 
-	status, ok := responses.TerminalStatus()
-	if !ok || status == nil {
-		return zero, nil, nil, Internal("response stream ended before final status")
+	status := responses.terminalStatus()
+	if status == nil {
+		return zero, Internal("response stream ended before final status")
 	}
 	if responseCount != 1 {
-		return zero, nil, nil, newResponseStreamFailure(
+		return zero, newResponseStreamFailure(
 			"response_cardinality",
 			Internal(fmt.Sprintf("RPC returned %d response messages; expected exactly one", responseCount)),
 			nil,
 		)
 	}
-	headers, err := responses.Headers()
-	if err != nil {
-		return zero, nil, nil, err
+	if dst := responses.config.responseHeaders; dst != nil {
+		headers, err := responses.Headers()
+		if err != nil {
+			return zero, err
+		}
+		*dst = headers
 	}
-	return first, headers, status.Metadata, nil
+	if dst := responses.config.responseMetadata; dst != nil {
+		*dst = cloneMetadata(status.Metadata)
+	}
+	return first, nil
 }

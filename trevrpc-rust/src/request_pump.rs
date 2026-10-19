@@ -1,15 +1,14 @@
 use std::future::Future;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::framed::{self, FrameRead, RequestFrame};
 use crate::server::{CancellationSource, RequestBudget};
 use crate::transport_error::{self, TransportFailureKind};
 use crate::{BoxStream, Code, Error, Result, Status};
-
-pub const REQUEST_BODY_CHANNEL_CAPACITY: usize = 1;
+use crate::{latest, queue};
 
 /// How long, and how many bytes, the server keeps discarding the request side of a call it has
 /// already answered before giving up and stopping it.
@@ -198,7 +197,8 @@ impl<R: RequestPumpReader> Drop for PumpReaderGuard<R> {
 /// The task ends within `DISCARD_TIMEOUT`, and sooner when the connection closes, so it cannot
 /// outlive a shutdown by more than that.
 async fn discard_request<R: RequestPumpReader>(mut reader: R) {
-    let mut buffer = [0_u8; 4096];
+    // On the heap, so the spawned task does not carry the buffer in its state.
+    let mut buffer = vec![0_u8; 4096];
     let finished = tokio::time::timeout(DISCARD_TIMEOUT, async {
         let mut discarded = 0_usize;
         loop {
@@ -223,7 +223,7 @@ async fn discard_request<R: RequestPumpReader>(mut reader: R) {
 
 pub struct RequestPump {
     state: watch::Receiver<RequestPumpState>,
-    settle: watch::Sender<Option<RequestPumpSettle>>,
+    settle: latest::Sender<Option<RequestPumpSettle>>,
     task: Option<JoinHandle<RequestPumpOutcome>>,
 }
 
@@ -250,7 +250,7 @@ impl RequestPump {
     }
 
     pub(crate) async fn settle(mut self, reason: RequestPumpSettle) -> RequestPumpOutcome {
-        let _ = self.settle.send(Some(reason));
+        self.settle.send(Some(reason));
         let Some(task) = self.task.take() else {
             return RequestPumpOutcome::LocallyStopped;
         };
@@ -260,7 +260,7 @@ impl RequestPump {
 
 impl Drop for RequestPump {
     fn drop(&mut self) {
-        let _ = self.settle.send(Some(RequestPumpSettle::ResponseStopped));
+        self.settle.send(Some(RequestPumpSettle::ResponseStopped));
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -276,9 +276,9 @@ pub fn start_request_pump<R>(
 where
     R: RequestPumpReader,
 {
-    let (body_tx, body_rx) = mpsc::channel(REQUEST_BODY_CHANNEL_CAPACITY);
+    let (body_tx, body_rx) = queue::channel(queue::MESSAGES);
     let (state_tx, state_rx) = watch::channel(RequestPumpState::Receiving);
-    let (settle_tx, settle_rx) = watch::channel(None);
+    let (settle_tx, settle_rx) = latest::channel(None);
     let task = tokio::spawn(run_request_pump::<R>(
         reader,
         input_kind,
@@ -307,9 +307,9 @@ async fn run_request_pump<R>(
     input_kind: RequestInputKind,
     max_frame_size: usize,
     budget: RequestBudget,
-    body_tx: mpsc::Sender<Result<Vec<u8>>>,
+    body_tx: queue::Sender<Result<Vec<u8>>>,
     state_tx: watch::Sender<RequestPumpState>,
-    mut settle_rx: watch::Receiver<Option<RequestPumpSettle>>,
+    mut settle_rx: latest::Receiver<Option<RequestPumpSettle>>,
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
@@ -347,7 +347,7 @@ async fn run_unary_pump<R>(
     max_frame_size: usize,
     mut budget: RequestBudget,
     state_tx: &watch::Sender<RequestPumpState>,
-    settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
+    settle_rx: &mut latest::Receiver<Option<RequestPumpSettle>>,
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
@@ -390,9 +390,9 @@ async fn run_streaming_pump<R>(
     reader: &mut PumpReaderGuard<R>,
     max_frame_size: usize,
     mut budget: RequestBudget,
-    body_tx: &mpsc::Sender<Result<Vec<u8>>>,
+    body_tx: &queue::Sender<Result<Vec<u8>>>,
     state_tx: &watch::Sender<RequestPumpState>,
-    settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
+    settle_rx: &mut latest::Receiver<Option<RequestPumpSettle>>,
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
@@ -448,7 +448,6 @@ where
             biased;
             changed = settle_rx.changed() => {
                 let _ = changed;
-                drop(permit);
                 return settle_reader(reader, settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped));
             }
             frame = reader.reader().read_request_frame(max_frame_size, &mut budget) => frame,
@@ -460,10 +459,10 @@ where
                     let failure = RequestPumpFailure::Protocol(error.into_status());
                     return fail_and_wait(reader, failure, state_tx, settle_rx, Some(permit)).await;
                 }
-                permit.send(Ok(Vec::from(body)));
+                let size = body.len();
+                permit.send(Ok(Vec::from(body)), size);
             }
             Ok(Some(RequestFrame::Status(status))) => {
-                drop(permit);
                 let _ = state_tx.send(RequestPumpState::DrainingTerminalFin);
                 match drain_terminal::<R>(reader, max_frame_size, &mut budget, settle_rx).await {
                     Ok(RequestPumpOutcome::CleanFin) if status.is_ok() => {
@@ -495,7 +494,6 @@ where
                 }
             }
             Ok(None) => {
-                drop(permit);
                 if let Err(error) = reader.reader().validate_transport_end().await {
                     return fail_and_wait(reader, classify_error(error), state_tx, settle_rx, None)
                         .await;
@@ -524,7 +522,7 @@ async fn drain_terminal<R>(
     reader: &mut PumpReaderGuard<R>,
     max_frame_size: usize,
     budget: &mut RequestBudget,
-    settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
+    settle_rx: &mut latest::Receiver<Option<RequestPumpSettle>>,
 ) -> Result<RequestPumpOutcome>
 where
     R: RequestPumpReader,
@@ -561,8 +559,8 @@ async fn fail_and_wait<R>(
     reader: &mut PumpReaderGuard<R>,
     failure: RequestPumpFailure,
     state_tx: &watch::Sender<RequestPumpState>,
-    settle_rx: &mut watch::Receiver<Option<RequestPumpSettle>>,
-    permit: Option<mpsc::Permit<'_, Result<Vec<u8>>>>,
+    settle_rx: &mut latest::Receiver<Option<RequestPumpSettle>>,
+    permit: Option<queue::Permit<'_, Result<Vec<u8>>>>,
 ) -> RequestPumpOutcome
 where
     R: RequestPumpReader,
@@ -576,9 +574,9 @@ where
     };
     let _ = state_tx.send(RequestPumpState::Failed(failure.clone()));
     if let Some(permit) = permit {
-        permit.send(Err(Error::from(failure.status().clone())));
+        permit.send(Err(Error::from(failure.status().clone())), 0);
     }
-    let settled = *settle_rx.borrow_and_update();
+    let settled = settle_rx.borrow_and_update();
     if let Some(reason) = settled {
         if !matches!(failure, RequestPumpFailure::Protocol(_)) {
             reader.settled = true;
@@ -601,7 +599,7 @@ where
         if settle_rx.changed().await.is_err() {
             return settle_reader(reader, RequestPumpSettle::ResponseStopped);
         }
-        let settled = *settle_rx.borrow_and_update();
+        let settled = settle_rx.borrow_and_update();
         if let Some(reason) = settled {
             return settle_reader(reader, reason);
         }
@@ -671,6 +669,7 @@ mod tests {
         DEFAULT_MAX_FRAME_SIZE, encode_frame, encode_message_frame, encode_protobuf_frame,
         frame_type,
     };
+    use crate::queue;
     use crate::server::RequestBudget;
     use crate::{Code, Error, Result, RpcRequest, RpcStatus, Status};
 
@@ -827,7 +826,11 @@ mod tests {
     }
 
     fn test_io(end_error: Option<Status>) -> TestPumpIo {
-        let (writer, stream) = tokio::io::duplex(4096);
+        test_io_with_capacity(end_error, 4096)
+    }
+
+    fn test_io_with_capacity(end_error: Option<Status>, capacity: usize) -> TestPumpIo {
+        let (writer, stream) = tokio::io::duplex(capacity);
         let (events, event_rx) = mpsc::unbounded_channel();
         let stops = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
@@ -916,44 +919,54 @@ mod tests {
         RequestInputKind::Streaming
     }
 
+    /// The frames that fill a request body queue by count.
+    fn queue_filling_frames() -> Vec<u8> {
+        message(b"queued").repeat(queue::MESSAGES.values)
+    }
+
     #[tokio::test]
-    async fn request_pump_reserves_before_reading() {
+    async fn request_pump_reads_only_while_the_queue_has_room() {
         let mut io = test_io(None);
-        let first = message(b"first");
-        let second = message(b"second");
+        let queued = queue_filling_frames();
+        let extra = message(b"extra");
         io.writer
-            .write_all(&[first.clone(), second.clone()].concat())
+            .write_all(&[queued.clone(), extra.clone()].concat())
             .await
             .expect("frames should be written");
         let (mut body, pump) = start_request_pump(io.reader, streaming(), 1024);
 
-        wait_for(&io.reads, first.len()).await;
+        wait_for(&io.reads, queued.len()).await;
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(io.reads.load(Ordering::SeqCst), first.len());
-        assert_eq!(body.next().await.unwrap().unwrap(), b"first");
-        wait_for(&io.reads, first.len() + second.len()).await;
+        assert_eq!(io.reads.load(Ordering::SeqCst), queued.len());
+        assert_eq!(body.next().await.unwrap().unwrap(), b"queued");
+        wait_for(&io.reads, queued.len() + extra.len()).await;
 
         drop(pump);
     }
 
     #[tokio::test]
-    async fn request_pump_never_queues_more_than_one_body() {
-        let mut io = test_io(None);
-        let first = message(b"one");
-        let second = message(b"two");
+    async fn request_pump_queues_at_most_the_byte_limit_and_one_body() {
+        let body_len = queue::MESSAGES.bytes * 2 / 3;
+        let large = message(&vec![7; body_len]);
+        let mut io = test_io_with_capacity(None, 4 * large.len());
         io.writer
-            .write_all(&[first.clone(), second.clone()].concat())
+            .write_all(&[large.clone(), large.clone(), large.clone()].concat())
             .await
-            .unwrap();
-        let (mut body, pump) = start_request_pump(io.reader, streaming(), 1024);
+            .expect("frames should be written");
+        let (mut body, pump) = start_request_pump(io.reader, streaming(), usize::MAX);
 
-        wait_for(&io.reads, first.len()).await;
-        assert_eq!(io.reads.load(Ordering::SeqCst), first.len());
-        assert_eq!(body.next().await.unwrap().unwrap(), b"one");
-        wait_for(&io.reads, first.len() + second.len()).await;
-        assert_eq!(body.next().await.unwrap().unwrap(), b"two");
+        // The second body crosses the byte limit, so the third is not read.
+        wait_for(&io.reads, 2 * large.len()).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(io.reads.load(Ordering::SeqCst), 2 * large.len());
+        assert_eq!(body.next().await.unwrap().unwrap().len(), body_len);
+        wait_for(&io.reads, 3 * large.len()).await;
+        assert_eq!(body.next().await.unwrap().unwrap().len(), body_len);
+        assert_eq!(body.next().await.unwrap().unwrap().len(), body_len);
 
         drop(pump);
     }
@@ -961,10 +974,10 @@ mod tests {
     #[tokio::test]
     async fn request_reset_during_reserve_cancels_without_body_poll() {
         let mut io = test_io(None);
-        let first = message(b"queued");
-        io.writer.write_all(&first).await.unwrap();
+        let queued = queue_filling_frames();
+        io.writer.write_all(&queued).await.unwrap();
         let (mut body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
-        wait_for(&io.reads, first.len()).await;
+        wait_for(&io.reads, queued.len()).await;
         io.events
             .send(RequestTransportEvent::PeerReset(Status::cancelled("reset")))
             .unwrap();
@@ -985,10 +998,10 @@ mod tests {
     #[tokio::test]
     async fn connection_loss_during_reserve_is_observable() {
         let mut io = test_io(None);
-        let first = message(b"queued");
-        io.writer.write_all(&first).await.unwrap();
+        let queued = queue_filling_frames();
+        io.writer.write_all(&queued).await.unwrap();
         let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
-        wait_for(&io.reads, first.len()).await;
+        wait_for(&io.reads, queued.len()).await;
         io.events
             .send(RequestTransportEvent::ConnectionLost(Status::unavailable(
                 "connection lost",

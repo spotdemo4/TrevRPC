@@ -77,6 +77,8 @@ type Server struct {
 	metrics     Metrics
 	diagnostics ServerDiagnosticHandler
 	runtime     *serverRuntime
+	// frozen is runtime, once set, for lock-free reads on the request path.
+	frozen atomic.Pointer[serverRuntime]
 }
 
 // ServerOptions configures server limits, timeouts, and the HTTP and browser
@@ -467,18 +469,23 @@ func isNilRegisteredValue(value any) bool {
 }
 
 type serverRuntime struct {
-	options          ServerOptions
-	routes           map[string]route
-	authorizer       Authorizer
-	metrics          Metrics
-	requestLimit     semaphore
-	connectionLimit  semaphore
-	admissionLimit   semaphore
-	diagnostics      *serverDiagnosticDispatcher
-	active           atomic.Int64
-	detached         atomic.Int64
-	executionMu      sync.Mutex
-	executionChanged chan struct{}
+	options         ServerOptions
+	routes          map[string]route
+	authorizer      Authorizer
+	metrics         Metrics
+	requestLimit    semaphore
+	connectionLimit semaphore
+	admissionLimit  semaphore
+	diagnostics     *serverDiagnosticDispatcher
+	active          atomic.Int64
+	detached        atomic.Int64
+	// waiters counts the waitForExecutions calls in progress. While it is
+	// zero, starting and finishing an execution only counts it.
+	waiters atomic.Int32
+	// executionMu guards executionChangedCh, which is closed, and then reset,
+	// when an execution starts or finishes with a waiter present.
+	executionMu        sync.Mutex
+	executionChangedCh chan struct{}
 }
 
 func canonicalServerOptions(options ServerOptions) ServerOptions {
@@ -559,6 +566,9 @@ func (s *Server) freeze() *serverRuntime {
 	if s == nil {
 		panic("trevrpc: server is nil")
 	}
+	if runtime := s.frozen.Load(); runtime != nil {
+		return runtime
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.runtime != nil {
@@ -571,18 +581,18 @@ func (s *Server) freeze() *serverRuntime {
 		metrics = NoopMetrics{}
 	}
 	runtime := &serverRuntime{
-		options:          options,
-		routes:           routes,
-		authorizer:       s.authorizer,
-		metrics:          metrics,
-		requestLimit:     newSemaphore(options.MaxConcurrentRequests),
-		connectionLimit:  newSemaphore(options.MaxConcurrentConnections),
-		admissionLimit:   newSemaphore(options.MaxConcurrentAdmissionCallbacks),
-		executionChanged: make(chan struct{}),
+		options:         options,
+		routes:          routes,
+		authorizer:      s.authorizer,
+		metrics:         metrics,
+		requestLimit:    newSemaphore(options.MaxConcurrentRequests),
+		connectionLimit: newSemaphore(options.MaxConcurrentConnections),
+		admissionLimit:  newSemaphore(options.MaxConcurrentAdmissionCallbacks),
 	}
 	runtime.diagnostics = newServerDiagnosticDispatcher(s.diagnostics, runtime)
 	s.options = options
 	s.runtime = runtime
+	s.frozen.Store(runtime)
 	return runtime
 }
 
@@ -644,19 +654,22 @@ func (r *serverRuntime) emitDiagnostic(event ServerDiagnostic) {
 	}
 }
 
-func (r *serverRuntime) executionStarted() {
-	r.executionMu.Lock()
-	r.active.Add(1)
-	close(r.executionChanged)
-	r.executionChanged = make(chan struct{})
-	r.executionMu.Unlock()
-}
+func (r *serverRuntime) executionStarted() { r.executionChanged(1) }
 
-func (r *serverRuntime) executionFinished() {
+func (r *serverRuntime) executionFinished() { r.executionChanged(-1) }
+
+// executionChanged counts an execution that started or finished and wakes
+// the waitForExecutions calls.
+func (r *serverRuntime) executionChanged(delta int64) {
+	r.active.Add(delta)
+	if r.waiters.Load() == 0 {
+		return
+	}
 	r.executionMu.Lock()
-	r.active.Add(-1)
-	close(r.executionChanged)
-	r.executionChanged = make(chan struct{})
+	if r.executionChangedCh != nil {
+		close(r.executionChangedCh)
+		r.executionChangedCh = nil
+	}
 	r.executionMu.Unlock()
 }
 
@@ -669,13 +682,18 @@ func (r *serverRuntime) waitForExecutions(timeout time.Duration) bool {
 		defer timer.Stop()
 	}
 
+	r.waiters.Add(1)
+	defer r.waiters.Add(-1)
 	for {
 		r.executionMu.Lock()
 		if r.active.Load() == 0 {
 			r.executionMu.Unlock()
 			return true
 		}
-		changed := r.executionChanged
+		if r.executionChangedCh == nil {
+			r.executionChangedCh = make(chan struct{})
+		}
+		changed := r.executionChangedCh
 		r.executionMu.Unlock()
 
 		select {
@@ -718,9 +736,20 @@ func (l *requestExecutionLease) retain(phase ServerDiagnosticPhase) *executionRe
 	if l == nil {
 		return nil
 	}
+	return l.retainAs(&executionReference{}, phase)
+}
+
+// retainAs starts the execution that reference stands for. A reference that
+// has finished can start another, if nothing uses it any more.
+func (l *requestExecutionLease) retainAs(reference *executionReference, phase ServerDiagnosticPhase) *executionReference {
+	if l == nil {
+		return nil
+	}
 	l.refs.Add(1)
 	l.runtime.executionStarted()
-	return &executionReference{lease: l, phase: phase}
+	reference.lease, reference.phase = l, phase
+	reference.detached, reference.finished = false, false
+	return reference
 }
 
 type executionReference struct {
@@ -1054,7 +1083,14 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), request)
 	}
 	response.stream = closeStreamOnContext(ctx, response.stream)
-	return &serverResponseStream{response: response, runtime: r, request: request, lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
+	stream := &serverResponseStream{response: response, runtime: r, request: request, lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
+	if isNonBlockingStream(response.stream) {
+		// Such a stream is read where it is written, and drained in batches.
+		stream.receiver = newStreamReceiver(ctx, response.stream, limits.idleTimeout, "response", lease)
+	} else {
+		stream.readAhead = newResponseReadAhead(ctx, response.stream, limits.idleTimeout, lease)
+	}
+	return stream
 }
 
 type streamingHandlerResult struct {
@@ -1291,6 +1327,7 @@ type limitedByteStream struct {
 	request   *wireRequest
 	messages  int
 	bodySize  int
+	receiver  *streamReceiver[[]byte]
 	// mu guards done and stopCancelRead: Close may run on another goroutine
 	// than Recv, such as the one that closes the stream when ctx ends.
 	mu             sync.Mutex
@@ -1300,6 +1337,7 @@ type limitedByteStream struct {
 
 func limitByteStream(ctx context.Context, inner byteStream, limits streamLimits, direction string, lease *requestExecutionLease, request *wireRequest) byteStream {
 	stream := &limitedByteStream{inner: inner, ctx: ctx, limits: limits, direction: direction, lease: lease, request: request}
+	stream.receiver = newStreamReceiver(ctx, inner, limits.idleTimeout, direction, lease)
 	if cancellable, ok := inner.(contextCancelReadStream); ok {
 		stream.stopCancelRead = cancellable.trevrpcCancelReadOnContext(ctx)
 	}
@@ -1312,7 +1350,7 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 		return nil, io.EOF
 	}
 
-	body, err := recvByteWithTimeout(s.ctx, s.inner, s.limits.idleTimeout, s.direction, s.lease)
+	body, err := s.receiver.recv()
 	if err != nil {
 		s.finish()
 		return nil, err
@@ -1355,72 +1393,8 @@ func (s *limitedByteStream) finish() bool {
 	if stop != nil {
 		stop()
 	}
+	s.receiver.close()
 	return first
-}
-
-func recvByteWithTimeout[T any](ctx context.Context, stream MessageStream[T], idleTimeout time.Duration, direction string, lease *requestExecutionLease) (T, error) {
-	var zero T
-	if err := ctx.Err(); err != nil {
-		return zero, statusFromContextError(err)
-	}
-	if idleTimeout <= 0 && (isNonBlockingStream(stream) || streamContextCancelsRecv(stream)) {
-		body, err := recvByte(stream, direction)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return zero, statusFromContextError(ctxErr)
-		}
-		return body, err
-	}
-	type recvResult struct {
-		body T
-		err  error
-	}
-	phase := ServerDiagnosticRequestStreamPanic
-	if direction == "response" {
-		phase = ServerDiagnosticResponseStreamPanic
-	}
-	results := make(chan recvResult, 1)
-	execution := lease.retain(phase)
-	go func() {
-		defer execution.finish()
-		body, err := recvByte(stream, direction)
-		results <- recvResult{body: body, err: err}
-	}()
-
-	var idle <-chan time.Time
-	var timer *time.Timer
-	if idleTimeout > 0 {
-		timer = time.NewTimer(idleTimeout)
-		idle = timer.C
-		defer timer.Stop()
-	}
-	select {
-	case result := <-results:
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return zero, statusFromContextError(ctxErr)
-		}
-		return result.body, result.err
-	case <-ctx.Done():
-		cancelStreamRead(stream)
-		execution.detach()
-		return zero, statusFromContextError(ctx.Err())
-	case <-idle:
-		cancelStreamRead(stream)
-		execution.detach()
-		return zero, Unavailable(fmt.Sprintf("%s stream idle timeout", direction))
-	}
-}
-
-func recvByte[T any](stream MessageStream[T], direction string) (body T, err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			phase := ServerDiagnosticRequestStreamPanic
-			if direction == "response" {
-				phase = ServerDiagnosticResponseStreamPanic
-			}
-			err = &serverPanicError{phase: phase, recovered: recovered, stack: debug.Stack()}
-		}
-	}()
-	return stream.Recv()
 }
 
 func checkStreamLimits(direction string, limits streamLimits, messages, bodySize *int, itemLen int) error {
@@ -1441,6 +1415,10 @@ func checkStreamLimits(direction string, limits streamLimits, messages, bodySize
 // serverResponseStream writes the response of a streaming call: optional
 // HEADERS before the first message, MESSAGE frames pulled from the handler's
 // stream, and a terminal STATUS.
+//
+// A stream that never blocks is read where it is written. Any other stream is
+// read ahead by a goroutine (see responseReadAhead), and each write carries
+// all the messages that have queued by then.
 type serverResponseStream struct {
 	response        streamResponse
 	runtime         *serverRuntime
@@ -1459,7 +1437,14 @@ type serverResponseStream struct {
 	hasPending      bool
 	done            bool
 	cancel          context.CancelFunc
-	finishOnce      sync.Once
+	// receiver reads a stream that never blocks, and readAhead any other.
+	receiver  *streamReceiver[encodedMessage]
+	readAhead *responseReadAhead
+	// batch and buffer are reused by the writes: the messages of one, and
+	// the frames joined for it.
+	batch      []encodedMessage
+	buffer     []byte
+	finishOnce sync.Once
 }
 
 type responseStreamItem struct {
@@ -1467,10 +1452,15 @@ type responseStreamItem struct {
 	status  *Status
 }
 
+// maxRetainedWriteBuffer is the largest buffer a response keeps between
+// writes. A bigger one is rare, and not worth holding for the rest of the call.
+const maxRetainedWriteBuffer = 256 * 1024
+
 // writeNext writes the next frames of the response. HEADERS go out as soon as
 // the handler has returned, in a write of their own when pulling the first
-// message may block. A stream that never blocks has its messages written in
-// batches, and the terminal STATUS joins the last batch.
+// message may block. A write carries every message that is ready, up to the
+// batch limits and without waiting for more, and the terminal STATUS joins the
+// write of the last messages.
 func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, err
@@ -1479,74 +1469,125 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 		return true, nil
 	}
 
-	var frames []byte
-	var err error
+	var headers []byte
 	if !s.headersSent {
 		s.headersSent = true
+		if s.readAhead != nil {
+			// The handler starts on the first message while HEADERS go out.
+			s.readAhead.start()
+		}
 		if len(s.response.headers) > 0 {
-			if frames, err = appendHeadersFrame(frames, s.response.headers, maxFrameSize); err != nil {
-				return s.writeFinalFrames(writer, maxFrameSize, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
+			var err error
+			if headers, err = appendHeadersFrame(nil, s.response.headers, maxFrameSize); err != nil {
+				return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
 			}
-			if !s.trevrpcNonBlockingStream() {
-				if _, err := writer.Write(frames); err != nil {
+			if s.readAhead != nil {
+				if _, err := writer.Write(headers); err != nil {
 					return true, err
 				}
-				frames = nil
+				headers = nil
 			}
 		}
 	}
 
-	batchSize := 1
-	if s.trevrpcNonBlockingStream() {
-		batchSize = maxMessageFrameBatch
+	if s.batch == nil {
+		s.batch = make([]encodedMessage, 0, handlerReadAheadMessages)
 	}
+	batch := s.batch[:0]
+	defer func() { clear(batch); s.batch = batch[:0] }()
+	size := len(headers)
 	batchByteLimit := responseFrameBatchByteLimit(maxFrameSize)
-	for count := 0; count < batchSize; count++ {
-		if count > 0 {
+	var final *Status
+	for len(batch) < handlerReadAheadMessages {
+		if len(batch) > 0 && s.readAhead == nil {
+			// A stream read ahead checks the call where it hands out a message.
 			if err := ctx.Err(); err != nil {
 				break
 			}
 		}
 
-		item := s.readNextResponseItem()
+		// Only the first message is waited for. The others are the ones
+		// already there.
+		item, ok := s.readNextResponseItem(len(batch) == 0)
+		if !ok {
+			break
+		}
 		if item.status == nil {
-			if count > 0 && batchByteLimit > 0 && saturatingAdd(len(frames), len(item.message.frame)) > batchByteLimit {
+			if len(batch) > 0 && batchByteLimit > 0 && saturatingAdd(size, len(item.message.frame)) > batchByteLimit {
 				s.pending, s.hasPending = item.message, true
 				break
 			}
 			item.status = s.acceptResponseMessage(item.message)
 		}
 		if item.status != nil {
-			return s.writeFinalFrames(writer, maxFrameSize, frames, item.status, beforeStatus)
+			final = item.status
+			break
+		}
+		if item.message.size > maxFrameSize {
+			return true, &FrameTooLargeError{Len: item.message.size, Max: maxFrameSize}
 		}
 
-		if frames, err = appendEncodedMessage(frames, item.message, maxFrameSize); err != nil {
-			return true, err
-		}
+		batch = append(batch, item.message)
+		size = saturatingAdd(size, len(item.message.frame))
 	}
 
-	if len(frames) == 0 {
+	if final != nil {
+		return s.writeFinalFrames(writer, maxFrameSize, headers, batch, final, beforeStatus)
+	}
+	switch {
+	case len(batch) == 0 && len(headers) == 0:
 		return false, nil
+	case len(batch) == 1 && len(headers) == 0:
+		// A lone message is the write, without a copy.
+		_, err := writer.Write(batch[0].frame)
+		return false, err
 	}
-	_, err = writer.Write(frames)
-	return false, err
+	return false, s.writeJoined(writer, headers, batch, nil, maxFrameSize, nil)
 }
 
-// writeFinalFrames writes frames followed by the terminal STATUS and finishes
-// the response.
-func (s *serverResponseStream) writeFinalFrames(writer io.Writer, maxFrameSize int, frames []byte, status *Status, beforeStatus func()) (bool, error) {
+// writeFinalFrames writes headers and messages followed by the terminal STATUS
+// and finishes the response.
+func (s *serverResponseStream) writeFinalFrames(writer io.Writer, maxFrameSize int, headers []byte, messages []encodedMessage, status *Status, beforeStatus func()) (bool, error) {
 	s.finish(status.Code)
-	frames, err := appendStatusFrame(frames, status, maxFrameSize)
-	if err != nil {
-		return true, err
+	return true, s.writeJoined(writer, headers, messages, status, maxFrameSize, beforeStatus)
+}
+
+// writeJoined writes headers, messages and then status, if there is one, in
+// one write. beforeStatus is called just before the write when there is a
+// status.
+func (s *serverResponseStream) writeJoined(writer io.Writer, headers []byte, messages []encodedMessage, status *Status, maxFrameSize int, beforeStatus func()) error {
+	total := len(headers)
+	for _, message := range messages {
+		total = saturatingAdd(total, len(message.frame))
 	}
-	callBeforeStatus(beforeStatus)
-	_, err = writer.Write(frames)
-	return true, err
+	frames := s.buffer[:0]
+	if cap(frames) < total+frameTailSlack {
+		frames = make([]byte, 0, total+frameTailSlack)
+	}
+	frames = append(frames, headers...)
+	for _, message := range messages {
+		frames = append(frames, message.frame...)
+	}
+	if status != nil {
+		var err error
+		if frames, err = appendStatusFrame(frames, status, maxFrameSize); err != nil {
+			s.buffer = nil
+			return err
+		}
+		callBeforeStatus(beforeStatus)
+	}
+	_, err := writer.Write(frames)
+	if status == nil && cap(frames) <= maxRetainedWriteBuffer {
+		s.buffer = frames[:0]
+	} else {
+		// After the last write, or a very large one, nothing is kept.
+		s.buffer = nil
+	}
+	return err
 }
 
 func (s *serverResponseStream) trevrpcNonBlockingStream() bool {
-	return s.limits.idleTimeout <= 0 && isNonBlockingStream(s.response.stream)
+	return s.readAhead == nil
 }
 
 func (s *serverResponseStream) trevrpcContextCancelsRecv() bool {
@@ -1557,6 +1598,7 @@ func (s *serverResponseStream) Close() error {
 	if !s.done {
 		s.finish(CodeCancelled)
 	}
+	s.buffer = nil
 
 	return nil
 }
@@ -1564,6 +1606,9 @@ func (s *serverResponseStream) Close() error {
 func (s *serverResponseStream) finish(code Code) {
 	s.finishOnce.Do(func() {
 		s.done = true
+		// The receiver goes first, so it can tell a call the peer or a
+		// deadline ended from one that ends here.
+		s.closeReceiver()
 		s.cancel()
 		discardMessageStream(s.response.stream)
 		s.runtime.recordFinished(RPCFinished{Service: s.service, Method: s.method, RequestBodyLen: s.requestBodyLen, ResponseBodyLen: s.responseBodyLen, Code: code, Elapsed: time.Since(s.startedAt)}, s.request)
@@ -1571,23 +1616,47 @@ func (s *serverResponseStream) finish(code Code) {
 	})
 }
 
-func (s *serverResponseStream) readNextResponseItem() responseStreamItem {
+func (s *serverResponseStream) closeReceiver() {
+	if s.readAhead != nil {
+		s.readAhead.close()
+		return
+	}
+	s.receiver.close()
+}
+
+// readNextResponseItem returns the next message or the terminal status of the
+// response. If wait is not set it reports false instead of waiting for a
+// stream that has nothing ready.
+func (s *serverResponseStream) readNextResponseItem(wait bool) (responseStreamItem, bool) {
 	if s.hasPending {
 		message := s.pending
 		s.pending = encodedMessage{}
 		s.hasPending = false
-		return responseStreamItem{message: message}
+		return responseStreamItem{message: message}, true
 	}
 
-	message, err := recvByteWithTimeout(s.ctx, s.response.stream, s.limits.idleTimeout, "response", s.lease)
+	var message encodedMessage
+	var err error
+	if s.readAhead != nil {
+		item, ok, waitErr := s.readAhead.next(wait)
+		if waitErr != nil {
+			return responseStreamItem{status: s.runtime.wireStatus(waitErr, ServerDiagnosticInternalError, s.request)}, true
+		}
+		if !ok {
+			return responseStreamItem{}, false
+		}
+		message, err = item.message, item.err
+	} else {
+		message, err = s.receiver.recv()
+	}
 	if errors.Is(err, io.EOF) {
-		return responseStreamItem{status: s.terminalResponseStatus()}
+		return responseStreamItem{status: s.terminalResponseStatus()}, true
 	}
 	if err != nil {
-		return responseStreamItem{status: s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request)}
+		return responseStreamItem{status: s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request)}, true
 	}
 
-	return responseStreamItem{message: message}
+	return responseStreamItem{message: message}, true
 }
 
 func (s *serverResponseStream) acceptResponseMessage(message encodedMessage) *Status {

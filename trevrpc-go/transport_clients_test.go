@@ -40,9 +40,19 @@ func newHTTP3TestClient(t testing.TB, pki testPKI, listener *Listener) Transport
 // POST /trevrpc request over HTTP/2 on the TCP listener.
 func newHTTP2TestClient(t testing.TB, pki testPKI, listener *Listener) Transport {
 	t.Helper()
+	return newHTTP2TestClientWith(t, pki, listener, nil)
+}
+
+// newHTTP2TestClientWith is newHTTP2TestClient with configure applied to the
+// HTTP transport, when not nil.
+func newHTTP2TestClientWith(t testing.TB, pki testPKI, listener *Listener, configure func(*http.Transport)) Transport {
+	t.Helper()
 	protocols := new(http.Protocols)
 	protocols.SetHTTP2(true)
 	roundTripper := &http.Transport{TLSClientConfig: pki.client.Clone(), Protocols: protocols}
+	if configure != nil {
+		configure(roundTripper)
+	}
 	t.Cleanup(roundTripper.CloseIdleConnections)
 	opener := httpTestOpener{
 		roundTripper: roundTripper,
@@ -150,8 +160,20 @@ func (s *http3TestStream) Read(p []byte) (int, error) {
 	return s.response.Body.Read(p)
 }
 
-func (s *http3TestStream) Write(p []byte) (int, error) { return s.writer.Write(p) }
-func (s *http3TestStream) Close() error                { return s.writer.Close() }
+// Write writes request body bytes. A server that rejects the request with an
+// HTTP status can do so before the body is written, which closes the body;
+// the write then reports that status rather than the closed pipe.
+func (s *http3TestStream) Write(p []byte) (int, error) {
+	n, err := s.writer.Write(p)
+	if err != nil {
+		<-s.ready
+		if s.err != nil {
+			return n, s.err
+		}
+	}
+	return n, err
+}
+func (s *http3TestStream) Close() error { return s.writer.Close() }
 
 func (s *http3TestStream) SetReadDeadline(time.Time) error { return nil }
 

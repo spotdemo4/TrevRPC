@@ -1239,17 +1239,11 @@ impl Server {
 
     pub(crate) fn record_active_request_failure(
         &self,
-        request: &RpcRequest,
+        method: &str,
         request_body_len: usize,
         status: &Status,
     ) {
-        self.finish_streaming_response(
-            &request.method,
-            request_body_len,
-            Instant::now(),
-            0,
-            status.code(),
-        );
+        self.finish_streaming_response(method, request_body_len, Instant::now(), 0, status.code());
     }
 
     pub(crate) fn record_pre_handler_failure(&self, status: &Status) {

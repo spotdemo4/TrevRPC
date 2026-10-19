@@ -5,10 +5,10 @@ use std::future::{Future, pending};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
-use crate::framed::{FrameRead, FrameWrite};
+use crate::framed::{ChunkSource, Chunked, FrameWrite};
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::quic::saturating_usize_to_u64;
 use crate::request_pump::RequestTransportEvent;
@@ -116,10 +116,10 @@ impl MuxConnection for QmuxConnection {
                 stream: send,
                 connection: self.clone(),
             },
-            QmuxRecvStream {
+            Chunked::new(QmuxRecvSource {
                 stream: recv,
                 connection: self.clone(),
-            },
+            }),
         ))
     }
 
@@ -130,10 +130,10 @@ impl MuxConnection for QmuxConnection {
                 stream: send,
                 connection: self.clone(),
             },
-            QmuxRecvStream {
+            Chunked::new(QmuxRecvSource {
                 stream: recv,
                 connection: self.clone(),
-            },
+            }),
         ))
     }
 
@@ -178,31 +178,63 @@ impl MuxSendStream for QmuxSendStream {
     }
 }
 
+/// The size from which a chunk is written on its own, so it is never copied. `qmux` makes every
+/// chunk at least one STREAM frame with its own queue slot and flow-control claim, so smaller
+/// chunks, such as frame headers and short messages, are joined into one write first.
+const JOIN_LIMIT: usize = 16 * 1024;
+
+impl QmuxSendStream {
+    async fn write_chunk(&mut self, chunk: Bytes) -> Result<()> {
+        self.connection
+            .until_lost(self.stream.write_chunk(chunk))
+            .await
+    }
+}
+
 impl FrameWrite for QmuxSendStream {
     async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
+        if let [chunk] = chunks {
+            return self.write_chunk(std::mem::take(chunk)).await;
+        }
+        let mut joined = BytesMut::new();
         for chunk in chunks {
-            self.connection
-                .until_lost(self.stream.write_chunk(std::mem::take(chunk)))
-                .await?;
+            let chunk = std::mem::take(chunk);
+            if chunk.len() >= JOIN_LIMIT {
+                if !joined.is_empty() {
+                    self.write_chunk(joined.split().freeze()).await?;
+                }
+                self.write_chunk(chunk).await?;
+                continue;
+            }
+            if joined.len().saturating_add(chunk.len()) > JOIN_LIMIT {
+                self.write_chunk(joined.split().freeze()).await?;
+            }
+            joined.extend_from_slice(&chunk);
+        }
+        if !joined.is_empty() {
+            self.write_chunk(joined.freeze()).await?;
         }
         Ok(())
     }
 }
 
-/// The receiving half of a stream of a [`QmuxConnection`].
-pub struct QmuxRecvStream {
+/// The receiving half of a stream of a [`QmuxConnection`], read as frames.
+pub type QmuxRecvStream = Chunked<QmuxRecvSource>;
+
+/// The chunks of a stream of a [`QmuxConnection`].
+pub struct QmuxRecvSource {
     stream: qmux::RecvStream,
     connection: QmuxConnection,
 }
 
 impl MuxRecvStream for QmuxRecvStream {
     fn stop_stream(&mut self, code: u32) {
-        self.stream.stop(code);
+        self.source.stream.stop(code);
     }
 
     /// `RecvStream::closed` buffers data as it waits without consuming it, and is cancel-safe.
     async fn peer_reset(&mut self) -> Option<RequestTransportEvent> {
-        match self.stream.closed().await {
+        match self.source.stream.closed().await {
             Err(qmux::Error::StreamReset(code)) => Some(RequestTransportEvent::PeerReset(
                 Status::cancelled(format!("request stream reset by peer with code {code}")),
             )),
@@ -213,8 +245,14 @@ impl MuxRecvStream for QmuxRecvStream {
     }
 }
 
-impl FrameRead for QmuxRecvStream {
-    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+impl ChunkSource for QmuxRecvSource {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        self.connection
+            .until_lost(self.stream.read_chunk(usize::MAX))
+            .await
+    }
+
+    async fn read_into(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
         self.connection.until_lost(self.stream.read(bytes)).await
     }
 }

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,37 +142,61 @@ func TestHTTP1RequestsAreRefused(t *testing.T) {
 
 func TestHTTP2EnforcesTheStreamLimitPerConnection(t *testing.T) {
 	pki := newTestPKI(t)
-	listener := startTestListener(t, pki, func(options *ServerOptions) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHold := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHold)
+	listener := startTestListenerWith(t, pki, func(options *ServerOptions) {
 		options.MaxConcurrentStreamsPerConnection = 1
+	}, func(server *Server) {
+		registerTestService(server)
+		// Hold occupies the connection's only RPC slot until released.
+		RegisterUnary(server, "/example.Greeter/Hold", newTestMessage, func(ctx context.Context, _ *testMessage) (*Response[*testMessage], error) {
+			entered <- struct{}{}
+			select {
+			case <-release:
+				return &Response[*testMessage]{Message: &testMessage{Value: "held"}}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
 	})
-	transport := newHTTP2TestClient(t, pki, listener)
-	holdCtx, release := context.WithCancel(t.Context())
-	defer release()
-	// "slow" holds the connection's only RPC slot until cancelled. It is
-	// restarted whenever it loses the race for the slot.
-	held := make(chan struct{}, 1)
-	hold := func() {
-		go func() {
-			_, _ = Unary(holdCtx, transport, "/example.Greeter/Echo", &testMessage{Value: "slow"}, newTestMessage)
-			held <- struct{}{}
-		}()
+	// By default net/http opens another connection when one is at the
+	// server's stream limit, which would bypass the per-connection limit.
+	transport := newHTTP2TestClientWith(t, pki, listener, func(roundTripper *http.Transport) {
+		roundTripper.HTTP2 = &http.HTTP2Config{StrictMaxConcurrentRequests: true}
+	})
+
+	held := make(chan error, 1)
+	go func() {
+		_, err := Unary(t.Context(), transport, "/example.Greeter/Hold", &testMessage{}, newTestMessage)
+		held <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(rpcTestTimeout):
+		t.Fatal("held RPC did not reach its handler")
 	}
-	hold()
-	deadline := time.Now().Add(rpcTestTimeout)
-	for {
-		select {
-		case <-held:
-			hold()
-		default:
+
+	_, err := Unary(t.Context(), transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage)
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("RPC on a saturated connection = %v, want HTTP 503", err)
+	}
+
+	releaseHold()
+	select {
+	case err := <-held:
+		if err != nil {
+			t.Fatalf("held RPC = %v", err)
 		}
-		_, err := Unary(context.Background(), transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage)
-		if err != nil && strings.Contains(err.Error(), "503") {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("concurrent RPC on a saturated connection = %v, want HTTP 503", err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	case <-time.After(rpcTestTimeout):
+		t.Fatal("held RPC did not finish after release")
+	}
+	// The server frees the slot before it sends the held RPC's status, so the
+	// next RPC is admitted.
+	if _, err := Unary(t.Context(), transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage); err != nil {
+		t.Fatalf("RPC after the slot was freed = %v", err)
 	}
 }
 

@@ -1,4 +1,5 @@
 use std::io;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -8,6 +9,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
+use crate::queue;
 use crate::response_state::{ResponseEvent, ResponseState, ResponseStateFailure, UnaryResponse};
 use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
@@ -348,13 +350,7 @@ where
 {
     let prepared = prepare_streaming_request(method, RpcKind::ClientStreaming, options)?;
     let (sender, requests, call_end) = request_channel(prepared.deadline);
-    let response = open_response_stream(
-        transport,
-        prepared,
-        crate::stream::encode(requests),
-        Some(call_end),
-    )
-    .await?;
+    let response = open_response_stream(transport, prepared, requests, Some(call_end)).await?;
 
     Ok(ClientStreamingCall::new(sender, response))
 }
@@ -411,13 +407,7 @@ where
 {
     let prepared = prepare_streaming_request(method, RpcKind::BidirectionalStreaming, options)?;
     let (sender, requests, call_end) = request_channel(prepared.deadline);
-    let response = open_response_stream(
-        transport,
-        prepared,
-        crate::stream::encode(requests),
-        Some(call_end),
-    )
-    .await?;
+    let response = open_response_stream(transport, prepared, requests, Some(call_end)).await?;
 
     Ok(BidirectionalCall::new(sender, response))
 }
@@ -443,14 +433,14 @@ enum RequestControl {
     Cancel,
 }
 
-struct RequestMessageStream<T> {
-    receiver: mpsc::Receiver<T>,
+struct RequestMessageStream {
+    receiver: queue::Receiver<Vec<u8>>,
     control: mpsc::UnboundedReceiver<RequestControl>,
     cancelled: bool,
 }
 
-impl<T> Stream for RequestMessageStream<T> {
-    type Item = Result<T>;
+impl Stream for RequestMessageStream {
+    type Item = Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if !self.cancelled
@@ -471,15 +461,13 @@ impl<T> Stream for RequestMessageStream<T> {
     }
 }
 
-/// Creates the request half of a streaming call. The returned [`call_end::EndSender`] belongs to
-/// whoever reads the response; it lets sends fail with the call's terminal status.
+/// Creates the request half of a streaming call: the sender, and the stream of encoded messages
+/// the transport uploads. The returned [`call_end::EndSender`] belongs to whoever reads the
+/// response; it lets sends fail with the call's terminal status.
 fn request_channel<T>(
     deadline: Option<Instant>,
-) -> (RequestSender<T>, BoxStream<T>, call_end::EndSender)
-where
-    T: Send + 'static,
-{
-    let (sender, receiver) = mpsc::channel(1);
+) -> (RequestSender<T>, BoxStream<Vec<u8>>, call_end::EndSender) {
+    let (sender, receiver) = queue::channel(queue::MESSAGES);
     let (control, control_rx) = mpsc::unbounded_channel();
     let (call_end, call_end_watch) = call_end::channel(deadline);
     (
@@ -490,6 +478,7 @@ where
             }),
             control,
             finished: false,
+            _messages: PhantomData,
         },
         Box::pin(RequestMessageStream {
             receiver,
@@ -500,38 +489,42 @@ where
     )
 }
 
-struct RequestSenderState<T> {
-    sender: Mutex<Option<mpsc::Sender<T>>>,
+struct RequestSenderState {
+    sender: Mutex<Option<queue::Sender<Vec<u8>>>>,
     call_end: call_end::EndWatch,
 }
 
 /// The independently movable request half of a streaming call.
 pub struct RequestSender<T> {
-    state: Arc<RequestSenderState<T>>,
+    state: Arc<RequestSenderState>,
     control: mpsc::UnboundedSender<RequestControl>,
     finished: bool,
+    _messages: PhantomData<fn(T)>,
 }
 
 impl<T> RequestSender<T>
 where
-    T: Send + 'static,
+    T: Message + Send + 'static,
 {
     /// Sends one request message with bounded backpressure.
     ///
-    /// Fails once the server has ended the call, without waiting for a peer that no longer
-    /// reads: with the server's terminal status when it is not `OK`, and with `Cancelled` when
-    /// the server completed the call before the request stream finished. A send after
-    /// [`Self::finish`] or on a closed stream also fails with `Cancelled`. The status is known as
-    /// soon as the server sends it, unless the caller is not reading a response that has more
-    /// than a couple of messages queued ahead of it; sends then fail with `Cancelled` once the
-    /// upload stops.
+    /// The message is encoded when this is called and queued for upload; a few messages are
+    /// queued ahead of the upload, and the send waits while the queue is full. Fails once the
+    /// server has ended the call, without waiting for a peer that no longer reads: with the
+    /// server's terminal status when it is not `OK`, and with `Cancelled` when the server
+    /// completed the call before the request stream finished. A send after [`Self::finish`] or
+    /// on a closed stream also fails with `Cancelled`. The status is known as soon as the server
+    /// sends it, unless the caller is not reading a response that has more than a couple of
+    /// messages queued ahead of it; sends then fail with `Cancelled` once the upload stops.
     pub fn send(
         &self,
         request: T,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
-        send_request(Arc::clone(&self.state), request)
+        send_message(&self.state, request)
     }
+}
 
+impl<T> RequestSender<T> {
     /// Gracefully finishes the request stream after all accepted messages.
     pub fn finish(mut self) -> Result<()> {
         self.finish_in_place();
@@ -544,34 +537,69 @@ where
     }
 }
 
-async fn send_request<T>(state: Arc<RequestSenderState<T>>, request: T) -> Result<()>
-where
-    T: Send + 'static,
-{
-    let sender = state
-        .sender
-        .lock_unpoisoned()
-        .clone()
-        .ok_or_else(|| Error::from(Status::cancelled("request stream is closed")))?;
-    let mut call_end = state.call_end.clone();
-    if let Some(error) = call_end.error_if_ended() {
-        return Err(error);
+/// The outcome of trying to queue a message without waiting.
+enum Attempt {
+    Queued,
+    Ended(Error),
+    /// The upload stopped taking messages; the response says why.
+    Stopped,
+    /// The queue is full; the message is handed back with a sender to wait on.
+    Full(Vec<u8>, queue::Sender<Vec<u8>>),
+}
+
+impl RequestSenderState {
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the sender is borrowed from the lock for the whole attempt, which saves a clone per send"
+    )]
+    fn try_send(&self, body: Vec<u8>) -> Attempt {
+        let guard = self.sender.lock_unpoisoned();
+        let Some(sender) = guard.as_ref() else {
+            return Attempt::Ended(Error::from(Status::cancelled("request stream is closed")));
+        };
+        if let Some(error) = self.call_end.error_if_ended() {
+            return Attempt::Ended(error);
+        }
+        let size = body.len();
+        match sender.try_send(body, size) {
+            Ok(()) => Attempt::Queued,
+            Err(queue::TrySendError::Full(body)) => Attempt::Full(body, sender.clone()),
+            Err(queue::TrySendError::Closed(_)) => Attempt::Stopped,
+        }
     }
-    let request = match sender.try_send(request) {
-        Ok(()) => return Ok(()),
-        Err(mpsc::error::TrySendError::Full(request)) => request,
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+}
+
+/// Encodes `request` and sends it. The message is encoded, and dropped, before the returned future
+/// is first polled.
+fn send_message<T: Message>(
+    state: &Arc<RequestSenderState>,
+    request: T,
+) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
+    let body = request.encode_to_vec();
+    drop(request);
+    send_encoded(Arc::clone(state), body)
+}
+
+async fn send_encoded(state: Arc<RequestSenderState>, body: Vec<u8>) -> Result<()> {
+    let (body, sender) = match state.try_send(body) {
+        Attempt::Queued => return Ok(()),
+        Attempt::Ended(error) => return Err(error),
+        Attempt::Stopped => {
+            let mut call_end = state.call_end.clone();
             call_end.upload_stopped();
             return Err(call_end.ended().await);
         }
+        Attempt::Full(body, sender) => (body, sender),
     };
 
     // Waiting for room, the response side reads on to find a STATUS even if nobody reads it.
+    let mut call_end = state.call_end.clone();
     let _waiting = call_end.waiting_send();
+    let size = body.len();
     tokio::select! {
         biased;
         error = call_end.ended() => Err(error),
-        sent = sender.send(request) => if sent.is_ok() {
+        sent = sender.send(body, size) => if sent.is_ok() {
             Ok(())
         } else {
             // The upload stopped: the call has ended, and the response says how.
@@ -602,7 +630,7 @@ impl<Req, Res> ClientStreamingCall<Req, Res> {
 
 impl<Req, Res> ClientStreamingCall<Req, Res>
 where
-    Req: Send + 'static,
+    Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
     /// Sends one request message; see [`RequestSender::send`] for how it fails once the server
@@ -611,7 +639,7 @@ where
         &self,
         request: Req,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
-        send_request(Arc::clone(&self.sender.state), request)
+        send_message(&self.sender.state, request)
     }
 
     pub fn close_send(&mut self) -> Result<()> {
@@ -655,7 +683,7 @@ impl<Req, Res> BidirectionalCall<Req, Res> {
 
 impl<Req, Res> BidirectionalCall<Req, Res>
 where
-    Req: Send + 'static,
+    Req: Message + Send + 'static,
     Res: Message + Default + Send + 'static,
 {
     /// Sends one request message; see [`RequestSender::send`] for how it fails once the server
@@ -664,7 +692,7 @@ where
         &self,
         request: Req,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
-        send_request(Arc::clone(&self.sender.state), request)
+        send_message(&self.sender.state, request)
     }
 
     pub async fn recv(&mut self) -> Result<Option<Res>> {
@@ -1286,16 +1314,25 @@ mod tests {
     #[tokio::test]
     async fn request_sender_finish_gracefully_drains_accepted_messages() {
         let (sender, mut requests, _end) = request_channel(None);
-        sender.send(7_u8).await.expect("request should be accepted");
+        let message = TestMessage {
+            value: "accepted".to_owned(),
+        };
+        sender
+            .send(message.clone())
+            .await
+            .expect("request should be accepted");
         sender.finish().expect("request sender should finish");
 
-        assert_eq!(requests.next().await.transpose().unwrap(), Some(7));
+        assert_eq!(
+            requests.next().await.transpose().unwrap(),
+            Some(prost::Message::encode_to_vec(&message))
+        );
         assert!(requests.next().await.is_none());
     }
 
     #[tokio::test]
     async fn dropping_unfinished_request_sender_emits_cancellation() {
-        let (sender, mut requests, _end) = request_channel::<u8>(None);
+        let (sender, mut requests, _end) = request_channel::<TestMessage>(None);
         drop(sender);
 
         let error = requests
@@ -1309,8 +1346,8 @@ mod tests {
 
     #[tokio::test]
     async fn request_send_future_cannot_outlive_graceful_finish() {
-        let (sender, mut requests, _end) = request_channel::<u8>(None);
-        let send = sender.send(7);
+        let (sender, mut requests, _end) = request_channel::<TestMessage>(None);
+        let send = sender.send(TestMessage::default());
         sender.finish().expect("request sender should finish");
 
         assert!(

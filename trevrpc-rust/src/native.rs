@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
@@ -61,6 +62,10 @@ impl<C: MuxConnection> NativePumpReader<C> {
 impl<C: MuxConnection> FrameRead for NativePumpReader<C> {
     async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
         self.recv.read_frame_bytes(bytes).await
+    }
+
+    async fn read_payload_bytes(&mut self, len: usize) -> Result<Bytes> {
+        self.recv.read_payload_bytes(len).await
     }
 }
 

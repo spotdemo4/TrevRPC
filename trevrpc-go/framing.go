@@ -110,16 +110,29 @@ func decodePayload(payload []byte, message ProtoMessage) error {
 	return nil
 }
 
+// decodeRequest decodes the payload of a REQUEST frame into request, which
+// must be empty.
+func decodeRequest(payload []byte, request *wireRequest) error {
+	if request.decodeFast(payload) {
+		return nil
+	}
+	*request = wireRequest{}
+	return decodePayload(payload, request)
+}
+
 // decodeStatus decodes the payload of a STATUS frame.
 func decodeStatus(payload []byte) (*Status, error) {
 	if len(payload) == 0 {
 		return OK(), nil
 	}
 	var status wireStatus
-	if err := decodePayload(payload, &status); err != nil {
-		return nil, err
+	if !status.decodeFast(payload) {
+		status = wireStatus{}
+		if err := decodePayload(payload, &status); err != nil {
+			return nil, err
+		}
 	}
-	return statusFromWire(&status), nil
+	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata)}, nil
 }
 
 // decodeHeaders decodes the payload of a HEADERS frame into its metadata.
@@ -129,10 +142,13 @@ func decodeHeaders(payload []byte) (Metadata, error) {
 		return Metadata{}, nil
 	}
 	var headers wireHeaders
-	if err := decodePayload(payload, &headers); err != nil {
-		return nil, err
+	if !headers.decodeFast(payload) {
+		headers = wireHeaders{}
+		if err := decodePayload(payload, &headers); err != nil {
+			return nil, err
+		}
 	}
-	return cloneMetadata(headers.Metadata), nil
+	return ownedMetadata(headers.Metadata), nil
 }
 
 // encodedMessage is one message ready to send: a complete MESSAGE frame whose
@@ -177,11 +193,12 @@ func appendProtoFrame(dst []byte, typ frameType, message proto.Message, size int
 	start := len(dst)
 	dst = slices.Grow(dst, frameHeaderLen(typ, size)+size)
 	dst = appendFrameHeader(dst, typ, size)
-	dst, err := proto.MarshalOptions{UseCachedSize: true}.MarshalAppend(dst, message)
+	marshalled, err := proto.MarshalOptions{UseCachedSize: true}.MarshalAppend(dst, message)
 	if err != nil {
+		// MarshalAppend does not return a usable buffer on failure.
 		return dst[:start], err
 	}
-	return dst, nil
+	return marshalled, nil
 }
 
 // appendLimitedProtoFrame appends a frame carrying message, rejecting payloads
@@ -195,14 +212,41 @@ func appendLimitedProtoFrame(dst []byte, typ frameType, message ProtoMessage, ma
 	return appendProtoFrame(dst, typ, protoMessage, size)
 }
 
+// appendDirectFrameHeader checks the payload size against maxFrameSize and
+// appends the frame header, with room for the payload behind it.
+func appendDirectFrameHeader(dst []byte, typ frameType, size, maxFrameSize int) ([]byte, error) {
+	if size > maxFrameSize {
+		return dst, &FrameTooLargeError{Len: size, Max: maxFrameSize}
+	}
+	dst = slices.Grow(dst, frameHeaderLen(typ, size)+size)
+	return appendFrameHeader(dst, typ, size), nil
+}
+
 // appendRequestFrame appends a REQUEST frame.
 func appendRequestFrame(dst []byte, request *wireRequest, maxFrameSize int) ([]byte, error) {
-	return appendLimitedProtoFrame(dst, frameTypeRequest, request, maxFrameSize)
+	size, ok := request.payloadSize()
+	if !ok {
+		return appendLimitedProtoFrame(dst, frameTypeRequest, request, maxFrameSize)
+	}
+	dst, err := appendDirectFrameHeader(dst, frameTypeRequest, size, maxFrameSize)
+	if err != nil {
+		return dst, err
+	}
+	return request.appendPayload(dst), nil
 }
 
 // appendHeadersFrame appends a HEADERS frame carrying metadata.
 func appendHeadersFrame(dst []byte, metadata Metadata, maxFrameSize int) ([]byte, error) {
-	return appendLimitedProtoFrame(dst, frameTypeHeaders, &wireHeaders{Metadata: metadata}, maxFrameSize)
+	headers := wireHeaders{Metadata: metadata}
+	size, ok := headers.payloadSize()
+	if !ok {
+		return appendLimitedProtoFrame(dst, frameTypeHeaders, &headers, maxFrameSize)
+	}
+	dst, err := appendDirectFrameHeader(dst, frameTypeHeaders, size, maxFrameSize)
+	if err != nil {
+		return dst, err
+	}
+	return headers.appendPayload(dst), nil
 }
 
 // appendStatusFrame appends a STATUS frame. An OK status without message or
@@ -214,7 +258,16 @@ func appendStatusFrame(dst []byte, status *Status, maxFrameSize int) ([]byte, er
 	if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 {
 		return appendFrameHeader(dst, frameTypeStatus, 0), nil
 	}
-	return appendLimitedProtoFrame(dst, frameTypeStatus, status.wire(), maxFrameSize)
+	wire := wireStatus{Code: uint32(status.Code), Message: status.Message, Metadata: status.Metadata}
+	size, ok := wire.payloadSize()
+	if !ok {
+		return appendLimitedProtoFrame(dst, frameTypeStatus, &wire, maxFrameSize)
+	}
+	dst, err := appendDirectFrameHeader(dst, frameTypeStatus, size, maxFrameSize)
+	if err != nil {
+		return dst, err
+	}
+	return wire.appendPayload(dst), nil
 }
 
 // appendEncodedMessage appends a message frame produced by encodeMessage.
@@ -224,6 +277,11 @@ func appendEncodedMessage(dst []byte, message encodedMessage, maxFrameSize int) 
 	}
 	return append(dst, message.frame...), nil
 }
+
+// frameReadAhead is how many bytes a frameReader with readAhead set asks its
+// stream for at a time. Small frames, and the header of a larger one, then
+// cost one read of the stream instead of one per field.
+const frameReadAhead = 256
 
 // frameReader reads frames from one stream. Frames of unknown type are
 // skipped without being buffered.
@@ -239,6 +297,19 @@ type frameReader struct {
 	// is a single message is bounded by the frame size alone; a stream of
 	// messages is bounded cumulatively.
 	chargeMessages bool
+	// readAhead lets the reader take bytes beyond the frame it is reading from
+	// the stream. Until it is set the reader takes exactly what it needs,
+	// which leaves the rest of a request in the stream when the server
+	// rejects it.
+	readAhead bool
+
+	// ahead[start:end] holds bytes read from r but not consumed yet. err is
+	// the error r returned with them, reported once they are consumed.
+	ahead      [frameReadAhead]byte
+	start, end int
+	err        error
+	// header is the scratch space of readHeader.
+	header [16]byte
 }
 
 func newFrameReader(r io.Reader, maxFrameSize, maxBytes int) *frameReader {
@@ -266,7 +337,7 @@ func (fr *frameReader) next() (frame, error) {
 					return frame{}, err
 				}
 			}
-			payload, err := readPayload(fr.r, size)
+			payload, err := fr.readPayload(size)
 			if err != nil {
 				return frame{}, err
 			}
@@ -276,10 +347,7 @@ func (fr *frameReader) next() (frame, error) {
 		if err := fr.charge(headerLen + size); err != nil {
 			return frame{}, err
 		}
-		if _, err := io.CopyN(io.Discard, fr.r, int64(size)); err != nil {
-			if errors.Is(err, io.EOF) {
-				err = io.ErrUnexpectedEOF
-			}
+		if err := fr.discard(size); err != nil {
 			return frame{}, err
 		}
 	}
@@ -297,41 +365,86 @@ func (fr *frameReader) charge(n int) error {
 	return nil
 }
 
-// readHeader reads a frame header. A header is at least two bytes, so the first
-// read takes exactly two; a short type and length then cost one read.
-func (fr *frameReader) readHeader() (typ frameType, length uint64, headerLen int, err error) {
-	var buf [16]byte
-	if _, err := io.ReadFull(fr.r, buf[:2]); err != nil {
-		return 0, 0, 0, err
+// readFull fills p, like io.ReadFull: it fails with io.EOF if the stream
+// ended before the first byte, and io.ErrUnexpectedEOF after it.
+func (fr *frameReader) readFull(p []byte) error {
+	if !fr.readAhead && fr.start == fr.end && fr.err == nil {
+		_, err := io.ReadFull(fr.r, p)
+		return err
 	}
-	have := 2
-	fill := func(n int) error {
-		if n <= have {
-			return nil
+	read := 0
+	for read < len(p) {
+		if fr.start < fr.end {
+			n := copy(p[read:], fr.ahead[fr.start:fr.end])
+			fr.start += n
+			read += n
+			continue
 		}
-		if _, err := io.ReadFull(fr.r, buf[have:n]); err != nil {
-			if errors.Is(err, io.EOF) {
-				err = io.ErrUnexpectedEOF
-			}
-			return err
+		if fr.err == nil && (!fr.readAhead || len(p)-read >= len(fr.ahead)) {
+			// Nothing is gained by buffering what is read in full anyway.
+			n, err := io.ReadFull(fr.r, p[read:])
+			read += n
+			return unexpectedEOF(err, read)
 		}
-		have = n
+		if err := fr.err; err != nil {
+			fr.err = nil
+			return unexpectedEOF(err, read)
+		}
+		n, err := fr.r.Read(fr.ahead[:])
+		fr.start, fr.end, fr.err = 0, n, err
+	}
+	return nil
+}
+
+// unexpectedEOF reports an end of stream after read bytes as
+// io.ErrUnexpectedEOF if bytes of the unit being read came before it.
+func unexpectedEOF(err error, read int) error {
+	if err != nil && read > 0 && errors.Is(err, io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+// discard skips n bytes. A stream that ends first is io.ErrUnexpectedEOF.
+func (fr *frameReader) discard(n int) error {
+	buffered := min(fr.end-fr.start, n)
+	fr.start += buffered
+	n -= buffered
+	if n == 0 {
 		return nil
 	}
+	if fr.err != nil {
+		err := fr.err
+		fr.err = nil
+		return unexpectedEOF(err, 1)
+	}
+	if _, err := io.CopyN(io.Discard, fr.r, int64(n)); err != nil {
+		return unexpectedEOF(err, 1)
+	}
+	return nil
+}
 
+// readHeader reads a frame header: a type and a length, each a QUIC varint.
+func (fr *frameReader) readHeader() (typ frameType, length uint64, headerLen int, err error) {
+	// A header is at least two bytes, so the first read takes exactly two; a
+	// longer type or length costs one more.
+	buf := &fr.header
+	if err := fr.readFull(buf[:2]); err != nil {
+		return 0, 0, 0, err
+	}
 	typeLen := 1 << (buf[0] >> 6)
-	if err := fill(typeLen); err != nil {
+	if err := fr.fillHeader(buf, 2, typeLen); err != nil {
 		return 0, 0, 0, err
 	}
 	typeValue, _, err := quicvarint.Parse(buf[:typeLen])
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	if err := fill(typeLen + 1); err != nil {
+	if err := fr.fillHeader(buf, max(2, typeLen), typeLen+1); err != nil {
 		return 0, 0, 0, err
 	}
 	lengthLen := 1 << (buf[typeLen] >> 6)
-	if err := fill(typeLen + lengthLen); err != nil {
+	if err := fr.fillHeader(buf, max(2, typeLen+1), typeLen+lengthLen); err != nil {
 		return 0, 0, 0, err
 	}
 	length, _, err = quicvarint.Parse(buf[typeLen : typeLen+lengthLen])
@@ -341,23 +454,37 @@ func (fr *frameReader) readHeader() (typ frameType, length uint64, headerLen int
 	return frameType(typeValue), length, typeLen + lengthLen, nil
 }
 
+// fillHeader reads header bytes buf[have:want], if any are missing. The
+// stream may not end inside a header.
+func (fr *frameReader) fillHeader(buf *[16]byte, have, want int) error {
+	if want <= have {
+		return nil
+	}
+	if err := fr.readFull(buf[have:want]); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	return nil
+}
+
 // readPayloadChunk is the largest payload allocated before any of it has been
 // received. Larger payloads grow as data arrives, so a declared length alone
 // cannot make the receiver allocate it.
 const readPayloadChunk = 64 * 1024
 
 // readPayload reads exactly length payload bytes.
-func readPayload(r io.Reader, length int) ([]byte, error) {
+func (fr *frameReader) readPayload(length int) ([]byte, error) {
 	payload := make([]byte, min(length, readPayloadChunk))
 	for read := 0; ; {
-		n, err := io.ReadFull(r, payload[read:])
-		read += n
-		if err != nil {
+		if err := fr.readFull(payload[read:]); err != nil {
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
 			return nil, err
 		}
+		read = len(payload)
 		if read == length {
 			return payload, nil
 		}

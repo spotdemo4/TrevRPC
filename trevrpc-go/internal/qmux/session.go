@@ -524,7 +524,7 @@ func (s *Session) handleStreamLocked(f *frame) *TransportError {
 		stream.read = end
 		s.consumedLocked(uint64(len(f.data)))
 	} else {
-		stream.recvBuf = append(stream.recvBuf, f.data...)
+		stream.appendReceivedLocked(f.data)
 	}
 	stream.readNotify.notify()
 	stream.maybeRemoveLocked()

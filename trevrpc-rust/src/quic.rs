@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::framed::Chunked;
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::RequestTransportEvent;
 use crate::{Error, Result, Status};
@@ -33,14 +34,16 @@ pub fn negotiated_protocol(connection: &quinn::Connection) -> Option<Vec<u8>> {
 
 impl MuxConnection for quinn::Connection {
     type SendStream = quinn::SendStream;
-    type RecvStream = quinn::RecvStream;
+    type RecvStream = Chunked<quinn::RecvStream>;
 
-    async fn accept_stream(&self) -> Option<(quinn::SendStream, quinn::RecvStream)> {
-        self.accept_bi().await.ok()
+    async fn accept_stream(&self) -> Option<(quinn::SendStream, Chunked<quinn::RecvStream>)> {
+        let (send, recv) = self.accept_bi().await.ok()?;
+        Some((send, Chunked::new(recv)))
     }
 
-    async fn open_stream(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        self.open_bi().await.map_err(Error::transport)
+    async fn open_stream(&self) -> Result<(quinn::SendStream, Chunked<quinn::RecvStream>)> {
+        let (send, recv) = self.open_bi().await.map_err(Error::transport)?;
+        Ok((send, Chunked::new(recv)))
     }
 
     fn close_connection(&self, reason: &'static [u8]) {
@@ -69,9 +72,9 @@ impl MuxSendStream for quinn::SendStream {
 /// How often a backpressured request stream with unread buffered data is re-checked for a reset.
 const RESET_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
-impl MuxRecvStream for quinn::RecvStream {
+impl MuxRecvStream for Chunked<quinn::RecvStream> {
     fn stop_stream(&mut self, code: u32) {
-        let _ = self.stop(code.into());
+        let _ = self.source.stop(code.into());
     }
 
     /// Waits for the peer to reset the stream without consuming any of its data.
@@ -91,7 +94,7 @@ impl MuxRecvStream for quinn::RecvStream {
     /// this probe when it is. That case is re-checked on a timer instead.
     async fn peer_reset(&mut self) -> Option<RequestTransportEvent> {
         loop {
-            match self.read_chunk(0, true).await {
+            match self.source.read_chunk(0, true).await {
                 Ok(Some(_)) => tokio::time::sleep(RESET_PROBE_INTERVAL).await,
                 Err(quinn::ReadError::Reset(code)) => {
                     return Some(RequestTransportEvent::PeerReset(Status::cancelled(

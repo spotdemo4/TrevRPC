@@ -65,3 +65,19 @@ func cloneMetadata(metadata Metadata) Metadata {
 	}
 	return clone
 }
+
+// ownedMetadata turns metadata that was just decoded from a frame into the
+// metadata to hand out: it is never nil, and an empty value is nil, as
+// cloneMetadata makes it. The decoded values are private to the caller, so
+// unlike cloneMetadata it does not copy them.
+func ownedMetadata(metadata Metadata) Metadata {
+	if metadata == nil {
+		return Metadata{}
+	}
+	for key, value := range metadata {
+		if len(value) == 0 {
+			metadata[key] = nil
+		}
+	}
+	return metadata
+}

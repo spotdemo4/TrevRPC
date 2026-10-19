@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // clientStream is the stream surface the RPC client needs from a transport.
@@ -45,12 +47,19 @@ func (c *streamClient) call(
 	request *wireRequest,
 	message ProtoMessage,
 ) (frameStream, error) {
-	frames, err := appendRequestFrame(nil, request, c.maxFrameSize)
+	protoMessage := protoMessageV2(message)
+	messageSize := proto.Size(protoMessage)
+	requestSize, _ := request.payloadSize()
+	// The frames are built in one allocation.
+	frames := make([]byte, 0, frameHeaderSize+requestSize+frameHeaderLen(frameTypeMessage, messageSize)+messageSize)
+	frames, err := appendRequestFrame(frames, request, c.maxFrameSize)
 	if err != nil {
 		return nil, err
 	}
-	frames, err = appendLimitedProtoFrame(frames, frameTypeMessage, message, c.maxFrameSize)
-	if err != nil {
+	if messageSize > c.maxFrameSize {
+		return nil, &FrameTooLargeError{Len: messageSize, Max: c.maxFrameSize}
+	}
+	if frames, err = appendProtoFrame(frames, frameTypeMessage, protoMessage, messageSize); err != nil {
 		return nil, err
 	}
 
@@ -61,7 +70,7 @@ func (c *streamClient) call(
 	response := &transportResponseStream{
 		ctx:          ctx,
 		stream:       stream,
-		reader:       newFrameReader(stream, c.maxFrameSize, -1),
+		reader:       newResponseFrameReader(stream, c.maxFrameSize),
 		stopCancel:   cancelStreamOnContext(ctx, stream),
 		maxFrameSize: c.maxFrameSize,
 	}
@@ -103,7 +112,7 @@ func (c *streamClient) streamingCall(
 	response := &transportResponseStream{
 		ctx:          streamCtx,
 		stream:       stream,
-		reader:       newFrameReader(stream, c.maxFrameSize, -1),
+		reader:       newResponseFrameReader(stream, c.maxFrameSize),
 		writerDone:   writerDone,
 		cancelUpload: cancelUpload,
 		cancel:       cancel,
@@ -124,6 +133,13 @@ func (c *streamClient) streamingCall(
 	// reaches a caller that is only sending.
 	go response.pump()
 	return response, nil
+}
+
+// newResponseFrameReader returns the reader of the response frames of a call.
+func newResponseFrameReader(stream io.Reader, maxFrameSize int) *frameReader {
+	reader := newFrameReader(stream, maxFrameSize, -1)
+	reader.readAhead = true
+	return reader
 }
 
 // writeStreamingRequest uploads the request and then the messages of requests.
@@ -466,19 +482,13 @@ func cancelStreamOnContext(ctx context.Context, stream clientStream) func() {
 	})
 }
 
+// watchContextCancellation calls cancel, on a goroutine of its own, once ctx
+// is done. The returned function stops the watch. Waiting costs no goroutine.
 func watchContextCancellation(ctx context.Context, cancel func()) func() {
 	if ctx.Done() == nil {
 		return func() {}
 	}
 
-	done := make(chan struct{})
-	var closeOnce sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancel()
-		case <-done:
-		}
-	}()
-	return func() { closeOnce.Do(func() { close(done) }) }
+	stop := context.AfterFunc(ctx, cancel)
+	return func() { stop() }
 }

@@ -305,3 +305,23 @@ func waitUntil(changed <-chan struct{}, deadline time.Time) error {
 		return os.ErrDeadlineExceeded
 	}
 }
+
+// appendReceivedLocked queues received data for Read. When the buffer is full,
+// the unread data moves to the front if that frees at least half of it, and
+// otherwise to a buffer twice the size, so a reader that falls behind a writer
+// that sends in bursts costs a copy of the unread data per doubling, not per
+// burst. Only the unread data is ever copied.
+func (st *Stream) appendReceivedLocked(data []byte) {
+	if len(st.recvBuf)+len(data) > cap(st.recvBuf) {
+		unread := len(st.recvBuf) - st.recvHead
+		if unread+len(data) <= cap(st.recvBuf)/2 {
+			n := copy(st.recvBuf, st.recvBuf[st.recvHead:])
+			st.recvBuf, st.recvHead = st.recvBuf[:n], 0
+		} else {
+			grown := make([]byte, unread, max(2*cap(st.recvBuf), unread+len(data)))
+			copy(grown, st.recvBuf[st.recvHead:])
+			st.recvBuf, st.recvHead = grown, 0
+		}
+	}
+	st.recvBuf = append(st.recvBuf, data...)
+}

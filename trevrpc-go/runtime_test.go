@@ -1482,7 +1482,7 @@ func TestServerResponseBatchWriterSplitsOnByteCap(t *testing.T) {
 	}
 }
 
-func TestServerResponseBatchWriterFallsBackWithIdleTimeout(t *testing.T) {
+func TestServerResponseBatchWriterBatchesWithIdleTimeout(t *testing.T) {
 	server := NewServer()
 	options := DefaultServerOptions()
 	options.MaxStreamMessages = -1
@@ -1498,16 +1498,15 @@ func TestServerResponseBatchWriterFallsBackWithIdleTimeout(t *testing.T) {
 	defer discardMessageStream(response)
 	writer := &countingWriter{}
 
+	// A stream that never blocks cannot be idle, so the timeout does not
+	// keep its messages from sharing a write.
 	done, err := response.writeNext(context.Background(), writer, DefaultMaxFrameSize, nil)
-	if err != nil {
-		t.Fatalf("write first frame: %v", err)
-	}
-	if done {
-		t.Fatal("first message frame should not be terminal")
+	if err != nil || !done || writer.writeCount != 1 {
+		t.Fatalf("done = %t, err = %v after %d writes, want one write that ends the response", done, err, writer.writeCount)
 	}
 	frames := readTestFrames(t, writer.Bytes(), DefaultMaxFrameSize)
-	if len(frames) != 1 || frames[0].Kind != frameTypeMessage || !bytes.Equal(frames[0].Body, []byte("one")) {
-		t.Fatalf("idle timeout should fall back to one message per write, got %#v", frames)
+	if len(frames) != 3 || string(frames[0].Body) != "one" || string(frames[1].Body) != "two" || frames[2].Kind != frameTypeStatus {
+		t.Fatalf("expected both messages and the status, got %#v", frames)
 	}
 }
 
@@ -1861,7 +1860,9 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 		defer lease.release()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		defer cancel()
-		_, err := recvByteWithTimeout(ctx, contextResultStream[[]byte]{done: ctx.Done()}, time.Minute, "request", lease)
+		receiver := newStreamReceiver(ctx, contextResultStream[[]byte]{done: ctx.Done()}, time.Minute, "request", lease)
+		defer receiver.close()
+		_, err := receiver.recv()
 		if StatusFromError(err).Code != CodeDeadlineExceeded {
 			t.Fatalf("recv error = %v, want deadline exceeded", err)
 		}

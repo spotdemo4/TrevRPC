@@ -26,21 +26,107 @@ pub trait FrameWrite {
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
-pub trait FrameRead {
+pub trait FrameRead: Send + Sized {
     fn read_frame_bytes(
         &mut self,
         bytes: &mut [u8],
     ) -> impl std::future::Future<Output = Result<Option<usize>>> + Send;
+
+    /// Reads exactly `len` bytes, the payload of a frame. The stream ending first is an
+    /// unexpected end.
+    ///
+    /// A stream that holds the bytes already can hand them over without copying.
+    fn read_payload_bytes(
+        &mut self,
+        len: usize,
+    ) -> impl std::future::Future<Output = Result<Bytes>> + Send {
+        read_payload_copy(self, len)
+    }
+}
+
+/// Reads `len` bytes into a new buffer.
+async fn read_payload_copy<R: FrameRead>(recv: &mut R, len: usize) -> Result<Bytes> {
+    let mut payload = vec![0; len];
+    read_exact_body(recv, &mut payload).await?;
+    Ok(Bytes::from(payload))
+}
+
+/// A byte stream that delivers its bytes in chunks.
+pub trait ChunkSource: Send {
+    /// The next chunk, or `None` at the end of the stream.
+    fn next_chunk(&mut self) -> impl std::future::Future<Output = Result<Option<Bytes>>> + Send;
+
+    /// Reads into `bytes`, as [`FrameRead::read_frame_bytes`] does.
+    fn read_into(
+        &mut self,
+        bytes: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<Option<usize>>> + Send;
+}
+
+/// Reads at most this many bytes from the chunk buffer even when it is empty; larger reads go to
+/// the stream directly.
+const BUFFERED_READ_MAX: usize = 16;
+
+/// A [`ChunkSource`] read as frames.
+///
+/// A frame is a few header bytes and a payload. Reading each of them from the stream costs a
+/// round of locking and bookkeeping in the transport, which for small messages dominates reading
+/// them. This reader instead takes whole chunks from the stream and serves headers and payloads
+/// from the chunk, so one read of the stream serves as many frames as the chunk holds, and a
+/// payload inside the chunk is handed out without being copied.
+pub struct Chunked<S> {
+    pub(crate) source: S,
+    /// The part of the latest chunk that has not been read.
+    pending: Bytes,
+}
+
+impl<S> Chunked<S> {
+    pub const fn new(source: S) -> Self {
+        Self {
+            source,
+            pending: Bytes::new(),
+        }
+    }
+}
+
+impl<S: ChunkSource> FrameRead for Chunked<S> {
+    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+        if self.pending.is_empty() {
+            if bytes.len() > BUFFERED_READ_MAX {
+                return self.source.read_into(bytes).await;
+            }
+            match self.source.next_chunk().await? {
+                Some(chunk) => self.pending = chunk,
+                None => return Ok(None),
+            }
+        }
+        let len = bytes.len().min(self.pending.len());
+        let (head, _) = bytes.split_at_mut(len);
+        head.copy_from_slice(&self.pending.split_to(len));
+        Ok(Some(len))
+    }
+
+    async fn read_payload_bytes(&mut self, len: usize) -> Result<Bytes> {
+        if self.pending.len() >= len {
+            return Ok(self.pending.split_to(len));
+        }
+        read_payload_copy(self, len).await
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Writing
 // ---------------------------------------------------------------------------------------------
 
+/// The largest MESSAGE payload that is copied next to its header. Larger payloads are written
+/// as chunks of their own, so they are never copied.
+const COALESCE_MAX: usize = 2048;
+
 /// Accumulates frames as write chunks.
 ///
-/// Frame headers and protobuf payloads share one scratch allocation; MESSAGE payloads are chained
-/// as their own chunk, so they are never copied.
+/// Frame headers, protobuf payloads and small MESSAGE payloads share one scratch allocation: the
+/// transport then has one chunk to queue and packetize for a whole batch of small messages
+/// instead of two per message. Larger MESSAGE payloads are chained as their own chunk.
 pub struct FrameChunks {
     scratch: BytesMut,
     chunks: Vec<Bytes>,
@@ -48,11 +134,21 @@ pub struct FrameChunks {
 }
 
 impl FrameChunks {
-    pub fn new(max_frame_size: usize) -> Self {
+    /// Creates a writer whose scratch buffer holds `scratch` bytes without growing.
+    pub fn with_capacity(max_frame_size: usize, scratch: usize) -> Self {
         Self {
-            scratch: BytesMut::with_capacity(2 * MAX_FRAME_HEADER_LEN),
+            scratch: BytesMut::with_capacity(scratch),
             chunks: Vec::new(),
             max_frame_size,
+        }
+    }
+
+    /// The scratch bytes a MESSAGE frame with a payload of `len` bytes needs.
+    pub const fn scratch_len(len: usize) -> usize {
+        if len <= COALESCE_MAX {
+            len.saturating_add(MAX_FRAME_HEADER_LEN)
+        } else {
+            MAX_FRAME_HEADER_LEN
         }
     }
 
@@ -63,9 +159,7 @@ impl FrameChunks {
     }
 
     pub fn protobuf<M: Message>(&mut self, frame_type: u64, message: &M) -> Result<()> {
-        framing::put_protobuf_frame(&mut self.scratch, frame_type, message, self.max_frame_size)?;
-        self.seal_scratch();
-        Ok(())
+        framing::put_protobuf_frame(&mut self.scratch, frame_type, message, self.max_frame_size)
     }
 
     pub fn message(&mut self, body: Bytes) -> Result<()> {
@@ -75,8 +169,10 @@ impl FrameChunks {
             body.len(),
             self.max_frame_size,
         )?;
-        self.seal_scratch();
-        if !body.is_empty() {
+        if body.len() <= COALESCE_MAX {
+            self.scratch.extend_from_slice(&body);
+        } else {
+            self.seal_scratch();
             self.chunks.push(body);
         }
         Ok(())
@@ -99,9 +195,14 @@ impl FrameChunks {
     }
 
     pub async fn write<W: FrameWrite>(mut self, send: &mut W) -> Result<()> {
+        self.seal_scratch();
         send.write_frame_chunks(&mut self.chunks).await
     }
 }
+
+/// What a HEADERS or STATUS frame is expected to need in the scratch buffer. Larger frames grow
+/// it.
+const FRAME_ESTIMATE: usize = 64;
 
 /// Writes response frames, draining `frames`, with one write.
 pub async fn write_response_frames<W: FrameWrite>(
@@ -109,7 +210,13 @@ pub async fn write_response_frames<W: FrameWrite>(
     frames: &mut Vec<ResponseFrame>,
     max_frame_size: usize,
 ) -> Result<()> {
-    let mut chunks = FrameChunks::new(max_frame_size);
+    let scratch = frames.iter().fold(0_usize, |total, frame| {
+        total.saturating_add(match frame {
+            ResponseFrame::Message(body) => FrameChunks::scratch_len(body.len()),
+            ResponseFrame::Headers(_) | ResponseFrame::Status(_) => FRAME_ESTIMATE,
+        })
+    });
+    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
     for frame in frames.drain(..) {
         chunks.response_frame(frame)?;
     }
@@ -123,7 +230,11 @@ pub async fn write_request<W: FrameWrite>(
     messages: Vec<Bytes>,
     max_frame_size: usize,
 ) -> Result<()> {
-    let mut chunks = FrameChunks::new(max_frame_size);
+    let scratch = messages.iter().fold(
+        MAX_FRAME_HEADER_LEN.saturating_add(request.encoded_len()),
+        |total, message| total.saturating_add(FrameChunks::scratch_len(message.len())),
+    );
+    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
     chunks.protobuf(frame_type::REQUEST, request)?;
     for message in messages {
         chunks.message(message)?;
@@ -137,7 +248,10 @@ async fn write_message_frames<W: FrameWrite>(
     messages: &mut Vec<Bytes>,
     max_frame_size: usize,
 ) -> Result<()> {
-    let mut chunks = FrameChunks::new(max_frame_size);
+    let scratch = messages.iter().fold(0_usize, |total, message| {
+        total.saturating_add(FrameChunks::scratch_len(message.len()))
+    });
+    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
     for message in messages.drain(..) {
         chunks.message(message)?;
     }
@@ -275,14 +389,14 @@ pub async fn read_payload<R: FrameRead>(recv: &mut R, len: usize) -> Result<Byte
         return Ok(Bytes::new());
     }
 
-    let mut payload = vec![0; len];
-    read_exact_body(recv, &mut payload).await?;
-    Ok(Bytes::from(payload))
+    recv.read_payload_bytes(len).await
 }
 
 /// Discards a frame's payload without buffering it.
 async fn discard_payload<R: FrameRead>(recv: &mut R, len: usize) -> Result<()> {
-    let mut buffer = [0_u8; DISCARD_CHUNK];
+    // Unknown frames are rare, so the buffer lives on the heap: on the stack it would sit in every
+    // future that reads frames, which are copied whenever a task is spawned or moved.
+    let mut buffer = vec![0_u8; len.min(DISCARD_CHUNK)];
     let mut remaining = len;
     while remaining > 0 {
         let chunk = buffer
@@ -481,8 +595,16 @@ impl FrameWrite for quinn::SendStream {
     }
 }
 
-impl FrameRead for quinn::RecvStream {
-    async fn read_frame_bytes(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+impl ChunkSource for quinn::RecvStream {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        let chunk = self
+            .read_chunk(usize::MAX, true)
+            .await
+            .map_err(Error::transport)?;
+        Ok(chunk.map(|chunk| chunk.bytes))
+    }
+
+    async fn read_into(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
         self.read(bytes).await.map_err(Error::transport)
     }
 }
@@ -491,6 +613,7 @@ impl FrameRead for quinn::RecvStream {
 mod tests {
     use bytes::Bytes;
 
+    use super::Chunked;
     use super::{
         FrameChunks, RequestFrame, drain_fin_after_terminal_status, read_frame_header,
         read_request, read_request_end, read_request_frame, read_response_frame,
@@ -499,7 +622,7 @@ mod tests {
         DEFAULT_MAX_FRAME_SIZE, ResponseFrame, encode_frame, encode_message_frame,
         encode_protobuf_frame, frame_type,
     };
-    use crate::test_io::{Script, Sink};
+    use crate::test_io::{Chunks, Script, Sink};
     use crate::{Code, Metadata, RpcHeaders, RpcRequest, RpcStatus, Status};
 
     fn status_frame(status: Status) -> Vec<u8> {
@@ -555,9 +678,130 @@ mod tests {
         );
     }
 
+    fn message_frame(body: &[u8]) -> Vec<u8> {
+        encode_message_frame(body, DEFAULT_MAX_FRAME_SIZE).expect("message frame should encode")
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_serves_many_frames_from_one_chunk() {
+        let wire = [
+            message_frame(b"one"),
+            message_frame(&[7; 100]),
+            status_frame(Status::ok()),
+        ]
+        .concat();
+        let mut recv = Chunked::new(Chunks::new([Bytes::from(wire)]));
+
+        for expected in [
+            ResponseFrame::message(&b"one"[..]),
+            ResponseFrame::message(vec![7; 100]),
+            ResponseFrame::Status(Status::ok()),
+        ] {
+            assert_eq!(
+                read_response_frame(&mut recv, 1024).await.unwrap(),
+                Some(expected)
+            );
+        }
+        assert!(
+            read_response_frame(&mut recv, 1024)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // One read for the chunk, one that finds the end.
+        assert_eq!(recv.source.chunk_reads, 2);
+        assert_eq!(recv.source.direct_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_hands_out_a_payload_inside_the_chunk_without_copying() {
+        let wire = Bytes::from(message_frame(b"payload"));
+        let memory = wire.as_ptr_range();
+        let mut recv = Chunked::new(Chunks::new([wire]));
+
+        let Some(ResponseFrame::Message(body)) =
+            read_response_frame(&mut recv, 1024).await.unwrap()
+        else {
+            panic!("a message frame was written");
+        };
+
+        assert_eq!(&body[..], b"payload");
+        assert!(
+            memory.contains(&body.as_ptr()),
+            "the payload shares the chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_assembles_frames_that_span_chunks() {
+        let body = vec![9_u8; 300];
+        let wire = [message_frame(&body), message_frame(b"after")].concat();
+        // Split inside the header, inside the payload, and between frames.
+        let cuts = [1, 2, 150, 305];
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        for cut in cuts {
+            chunks.push(Bytes::copy_from_slice(&wire[start..cut]));
+            start = cut;
+        }
+        chunks.push(Bytes::copy_from_slice(&wire[start..]));
+        let mut recv = Chunked::new(Chunks::new(chunks));
+
+        assert_eq!(
+            read_response_frame(&mut recv, 1024).await.unwrap(),
+            Some(ResponseFrame::message(body))
+        );
+        assert_eq!(
+            read_response_frame(&mut recv, 1024).await.unwrap(),
+            Some(ResponseFrame::message(&b"after"[..]))
+        );
+        assert!(
+            read_response_frame(&mut recv, 1024)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            recv.source.direct_reads > 0,
+            "the payload tail is read directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_reader_reports_a_stream_that_ends_inside_a_frame() {
+        let mut wire = message_frame(&[1; 50]);
+        wire.truncate(20);
+        let mut recv = Chunked::new(Chunks::new([Bytes::from(wire)]));
+
+        let error = read_response_frame(&mut recv, 1024)
+            .await
+            .expect_err("a truncated frame must fail");
+
+        assert_eq!(error.into_status().code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn writer_chains_large_messages_and_joins_small_ones() {
+        let large = Bytes::from(vec![9_u8; super::COALESCE_MAX + 1]);
+        let mut chunks = FrameChunks::with_capacity(DEFAULT_MAX_FRAME_SIZE, 0);
+        chunks.message(Bytes::from_static(b"a")).unwrap();
+        chunks.message(Bytes::from_static(b"b")).unwrap();
+        chunks.message(large.clone()).unwrap();
+        chunks.message(Bytes::from_static(b"c")).unwrap();
+        chunks.seal_scratch();
+
+        // The small frames and the large frame's header, the large payload, the last frame.
+        assert_eq!(chunks.chunks.len(), 3);
+        assert_eq!(
+            chunks.chunks.get(1).map(|chunk| chunk.as_ptr()),
+            Some(large.as_ptr()),
+            "a large message is chained, not copied"
+        );
+    }
+
     #[test]
     fn writer_rejects_oversized_messages_before_writing() {
-        let mut chunks = FrameChunks::new(3);
+        let mut chunks = FrameChunks::with_capacity(3, 0);
         let error = chunks
             .message(Bytes::from_static(b"four"))
             .expect_err("oversized message must fail");

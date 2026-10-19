@@ -155,6 +155,8 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 	}
 	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
 	defer cancelRequest()
+	// The rest of a call that ends after its message is read in any case.
+	reader.readAhead = requestEndsAfterMessage(request.rpcKind())
 
 	var body []byte
 	if requestEndsAfterMessage(request.rpcKind()) {
@@ -187,6 +189,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 		lease.release()
 	} else {
 		reader.chargeMessages = true
+		reader.readAhead = true
 		requests := &rpcRequestStream{reader: reader}
 		if request.rpcKind() == RPCKindClientStreaming || request.rpcKind() == RPCKindBidirectionalStreaming {
 			upload = requests
@@ -253,8 +256,8 @@ func isTimeoutError(err error) bool {
 		return true
 	}
 
-	var netError net.Error
-	return errors.As(err, &netError) && netError.Timeout()
+	netError, ok := errors.AsType[net.Error](err)
+	return ok && netError.Timeout()
 }
 
 func waitForWaitGroup(group *sync.WaitGroup, timeout time.Duration, onTimeout func()) {
@@ -301,7 +304,7 @@ func readRequestFrame(ctx context.Context, options ServerOptions, startedAt time
 		err = InvalidArgument(fmt.Sprintf("request stream must start with REQUEST, not %s", first.typ))
 	}
 	if err == nil {
-		err = decodePayload(first.payload, request)
+		err = decodeRequest(first.payload, request)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr

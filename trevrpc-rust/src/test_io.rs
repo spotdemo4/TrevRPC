@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 
 use crate::Result;
-use crate::framed::{FrameRead, FrameWrite};
+use crate::framed::{ChunkSource, FrameRead, FrameWrite};
 
 /// A readable stream that serves its bytes in small reads and counts what it served.
 pub struct Script {
@@ -55,5 +55,45 @@ impl FrameWrite for Sink {
         self.0
             .push(chunks.iter().flat_map(|chunk| chunk.to_vec()).collect());
         Ok(())
+    }
+}
+
+/// A [`ChunkSource`] that serves fixed chunks and counts how it was read.
+pub struct Chunks {
+    queue: VecDeque<Bytes>,
+    /// Calls to `next_chunk`.
+    pub chunk_reads: usize,
+    /// Calls to `read_into`.
+    pub direct_reads: usize,
+}
+
+impl Chunks {
+    pub fn new(chunks: impl IntoIterator<Item = Bytes>) -> Self {
+        Self {
+            queue: chunks.into_iter().collect(),
+            chunk_reads: 0,
+            direct_reads: 0,
+        }
+    }
+}
+
+impl ChunkSource for Chunks {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        self.chunk_reads = self.chunk_reads.saturating_add(1);
+        Ok(self.queue.pop_front())
+    }
+
+    async fn read_into(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+        self.direct_reads = self.direct_reads.saturating_add(1);
+        let Some(chunk) = self.queue.front_mut() else {
+            return Ok(None);
+        };
+        let take = bytes.len().min(chunk.len());
+        let (head, _) = bytes.split_at_mut(take);
+        head.copy_from_slice(&chunk.split_to(take));
+        if chunk.is_empty() {
+            self.queue.pop_front();
+        }
+        Ok(Some(take))
     }
 }

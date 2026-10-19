@@ -40,7 +40,7 @@ type drainingStream struct {
 	drainLimit   int64
 
 	mu         sync.Mutex
-	idle       *sync.Cond // signalled when readers drops to zero
+	idle       *sync.Cond // signalled when readers drops to zero; set once a drain waits
 	readers    int
 	aborted    bool // handlers may no longer read
 	unblocked  bool // pending reads were interrupted; a drain may take over
@@ -50,12 +50,10 @@ type drainingStream struct {
 }
 
 func newDrainingStream(shutdown context.Context, rw io.ReadWriteCloser, setReadDeadline func(time.Time) error, stopReading func()) *drainingStream {
-	s := &drainingStream{
+	return &drainingStream{
 		rw: rw, setReadDeadline: setReadDeadline, stopReading: stopReading, shutdown: shutdown,
 		drainTimeout: requestDrainTimeout, drainLimit: requestDrainLimit,
 	}
-	s.idle = sync.NewCond(&s.mu)
-	return s
 }
 
 func (s *drainingStream) Read(data []byte) (int, error) {
@@ -77,7 +75,7 @@ func (s *drainingStream) Read(data []byte) (int, error) {
 			err = errRequestAborted
 		}
 	}
-	if s.readers == 0 {
+	if s.readers == 0 && s.idle != nil {
 		s.idle.Broadcast()
 	}
 	s.mu.Unlock()
@@ -145,6 +143,9 @@ func (s *drainingStream) drain() {
 	// Wait until the handler's reads, unblocked by the abort, have returned so
 	// the drain is the only reader.
 	s.mu.Lock()
+	if s.idle == nil {
+		s.idle = sync.NewCond(&s.mu)
+	}
 	for s.readers > 0 {
 		s.idle.Wait()
 	}

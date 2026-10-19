@@ -137,7 +137,7 @@ pub async fn handle_stream<W, R>(
         return;
     }
 
-    let request_for_failure = request.clone();
+    let method_for_failure = request.method.clone();
     let (_request_body, mut request_pump) = start_request_pump(
         recv,
         RequestInputKind::Unary,
@@ -148,7 +148,7 @@ pub async fn handle_stream<W, R>(
         biased;
         response = server.handle_request_with_cancellation(request, body, cancellation.clone()) => response,
         failure = request_pump.failure() => {
-            server.record_active_request_failure(&request_for_failure, request_body_len, failure.status());
+            server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
             if let Some(source) = failure.cancellation_source() {
                 cancellation.cancel(source);
             }
@@ -316,7 +316,7 @@ async fn handle_streaming_rpc<W, R>(
     } = incoming;
     let max_frame_size = server.max_frame_size();
     let request_body_len = body.len();
-    let request_for_failure = request.clone();
+    let method_for_failure = request.method.clone();
     let (request_body, mut request_pump) = start_request_pump(
         recv,
         RequestInputKind::for_rpc_kind(request.rpc_kind()),
@@ -332,7 +332,7 @@ async fn handle_streaming_rpc<W, R>(
             cancellation.clone(),
         ) => response,
         failure = request_pump.failure() => {
-            server.record_active_request_failure(&request_for_failure, request_body_len, failure.status());
+            server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
             if let Some(source) = failure.cancellation_source() {
                 cancellation.cancel(source);
             }
@@ -366,6 +366,10 @@ async fn handle_streaming_rpc<W, R>(
         }
     };
 
+    let mut batch = ResponseBatch {
+        frames: Vec::with_capacity(MESSAGE_FRAME_BATCH),
+        terminal: false,
+    };
     loop {
         let frame = tokio::select! {
             biased;
@@ -410,10 +414,7 @@ async fn handle_streaming_rpc<W, R>(
             break;
         };
 
-        let mut batch = ResponseBatch {
-            frames: Vec::with_capacity(MESSAGE_FRAME_BATCH),
-            terminal: false,
-        };
+        batch.terminal = false;
         push_response_frame(&mut batch, frame);
         // Frames that are ready now go out in the same write; a frame that is not ready never
         // delays the ones before it.
