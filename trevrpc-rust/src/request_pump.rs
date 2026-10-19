@@ -1,4 +1,5 @@
-use std::future::Future;
+use std::future::{Future, pending, poll_fn};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -105,6 +106,41 @@ impl RequestTransportEvent {
     /// The event for a QUIC connection that ended while a request was still in flight.
     pub(crate) fn connection_lost(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::ConnectionLost(Error::transport(error).into_status())
+    }
+
+    /// The event for a peer that reset the request stream with `code`.
+    pub(crate) fn peer_reset(code: impl std::fmt::Display) -> Self {
+        Self::PeerReset(Status::cancelled(format!(
+            "request stream reset by peer with code {code}"
+        )))
+    }
+}
+
+/// How often a reset probe that cannot be woken by a reset, because unread request data is
+/// buffered ahead of it, is retried.
+pub const RESET_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Waits for the peer to reset a request stream through a `received_reset`-style poll, which
+/// resolves with the reset code, with `None` once the stream can no longer be reset, or with an
+/// error when the connection is lost.
+///
+/// h3's poll stays pending without registering a wakeup while unread data is buffered, because
+/// Quinn's own `received_reset` leaves a stale waker (see `peer_reset` in `quic.rs`), so it is
+/// retried every [`RESET_PROBE_INTERVAL`]. It is cancel-safe whenever the poll is.
+pub async fn poll_peer_reset<E>(
+    mut poll: impl FnMut(&mut Context<'_>) -> Poll<std::result::Result<Option<u64>, E>>,
+) -> Option<RequestTransportEvent>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    loop {
+        match tokio::time::timeout(RESET_PROBE_INTERVAL, poll_fn(&mut poll)).await {
+            Err(_) => {}
+            Ok(Ok(Some(code))) => return Some(RequestTransportEvent::peer_reset(code)),
+            // The request ended or was stopped locally: the reads that follow report it.
+            Ok(Ok(None)) => return pending().await,
+            Ok(Err(error)) => return Some(RequestTransportEvent::connection_lost(error)),
+        }
     }
 }
 

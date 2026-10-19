@@ -55,9 +55,9 @@ bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 h2 = "0.4"
-h3 = { package = "trev-h3", version = "0.1.1" }
-h3-quinn = { package = "trev-h3-quinn", version = "0.1.1", features = ["datagram"] }
-h3-webtransport = { package = "trev-h3-webtransport", version = "0.1.1" }
+h3 = { package = "trev-h3", version = "0.2.1" }
+h3-quinn = { package = "trev-h3-quinn", version = "0.2.1", features = ["datagram"] }
+h3-webtransport = { package = "trev-h3-webtransport", version = "0.2.1" }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

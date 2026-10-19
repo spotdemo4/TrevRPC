@@ -665,55 +665,149 @@ async fn quinn_bidirectional_streaming_does_not_violate_quinn_recv_stream_contra
     Ok(())
 }
 
-/// The upload is entirely buffered by QUIC, FIN included, while the handler ignores the body, so
-/// the request pump waits on backpressure and then reads the whole request to EOF without ever
-/// blocking on the transport.
-#[tokio::test]
-async fn quinn_backpressured_upload_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+/// Registers `BackpressuredUpload`, a client-streaming route that waits before it reads its body,
+/// then answers with the number of messages it read.
+fn register_backpressured_upload_route(server: &mut Server) {
+    server.route_streaming(
+        support::greeter_path("BackpressuredUpload"),
+        RpcKind::ClientStreaming,
+        |_body, mut requests| async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut count = 0_usize;
+            while let Some(request) = requests.next().await {
+                request?;
+                count = count.saturating_add(1);
+            }
+            let reply = greeter::HelloReply {
+                message: count.to_string(),
+            }
+            .encode_to_vec();
+            let replies: trevrpc::BoxStream<Vec<u8>> =
+                Box::pin(trevrpc::stream::from_iter([reply]));
+            Ok(replies)
+        },
+    );
+}
+
+/// Uploads more than the request pump's queue holds while the handler waits, so the whole upload,
+/// FIN included, is buffered by QUIC while the pump waits on backpressure and watches for a
+/// reset. The pump then reads the whole request to EOF without blocking on the transport, which
+/// must leave no reader waker behind: Quinn asserts that when the stream is dropped.
+async fn backpressured_upload<T: StreamingRpcTransport>(transport: &T) -> TestResult {
     const MESSAGES: usize = 8;
 
-    task_panics::install();
-    let server = spawn_greeter_server(|server| {
-        server.route_streaming(
-            support::greeter_path("BackpressuredUpload"),
-            RpcKind::ClientStreaming,
-            |_body, mut requests| async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let mut count = 0_usize;
-                while let Some(request) = requests.next().await {
-                    request?;
-                    count += 1;
-                }
-                let reply = greeter::HelloReply {
-                    message: count.to_string(),
-                }
-                .encode_to_vec();
-                let replies: trevrpc::BoxStream<Vec<u8>> =
-                    Box::pin(trevrpc::stream::from_iter([reply]));
-                Ok(replies)
-            },
-        );
-    })?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::client::QuicTransport::new(connection.clone());
-
     let call = trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-        &transport,
+        transport,
         &support::greeter_path("BackpressuredUpload"),
         CallOptions::new().with_timeout(TEST_TIMEOUT),
     )
     .await?;
-    for index in 0..MESSAGES {
+    for _ in 0..MESSAGES {
         call.send(greeter::HelloRequest {
-            name: format!("message {index}"),
+            name: "x".repeat(IGNORED_UPLOAD_MESSAGE),
         })
         .await?;
     }
     let reply = call.close_and_recv().await?;
     ensure_eq!(reply.message, MESSAGES.to_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn quinn_backpressured_upload_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+    task_panics::install();
+    let server = spawn_greeter_server(register_backpressured_upload_route)?;
+    let (endpoint, connection, _client) = connect_client(&server).await?;
+    backpressured_upload(&trevrpc::client::QuicTransport::new(connection.clone())).await?;
 
     settle_detached_server_tasks().await;
     close_client(endpoint, connection).await?;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+#[tokio::test]
+async fn http3_backpressured_upload_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+    task_panics::install();
+    let server = spawn_greeter_server(|server| {
+        server.set_options(fast_server_options().with_http_enabled(true));
+        register_backpressured_upload_route(server);
+    })?;
+    let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
+    backpressured_upload(&transport).await?;
+
+    settle_detached_server_tasks().await;
+    close_client(endpoint, connection).await?;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+#[tokio::test]
+async fn webtransport_backpressured_upload_does_not_violate_quinn_recv_stream_contract()
+-> TestResult {
+    task_panics::install();
+    let server = spawn_greeter_server(register_backpressured_upload_route)?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+    backpressured_upload(&support::WebTransportRpc::new(session.clone())).await?;
+
+    settle_detached_server_tasks().await;
+    close_webtransport_client(client, session).await?;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+/// The HTTP/3 request pump notices a reset of a request body the handler is not reading, through
+/// h3's `received_reset`, whether or not unread data is buffered ahead of the reset.
+#[tokio::test]
+async fn http3_request_reset_cancels_handler_that_is_not_reading_the_body() -> TestResult {
+    task_panics::install();
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(|server| {
+        server.set_options(fast_server_options().with_http_enabled(true));
+        register_ignored_upload_route(server, &source_tx);
+    })?;
+    let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
+
+    for messages in IGNORED_UPLOAD_MESSAGES {
+        let stream = transport
+            .open(http::Method::POST, "/trevrpc", Some("application/trevrpc"))
+            .await?;
+        let (mut send, _recv) = stream.split();
+        send.send_data(ignored_upload_frames(messages)?).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        expect_peer_reset(&mut source_rx).await?;
+    }
+
+    settle_detached_server_tasks().await;
+    close_client(endpoint, connection).await?;
+    server.shutdown().await?;
+    assert_no_task_panics();
+    Ok(())
+}
+
+/// The WebTransport request pump notices a reset of a request body the handler is not reading,
+/// whether or not unread data is buffered ahead of the reset.
+#[tokio::test]
+async fn webtransport_request_reset_cancels_handler_that_is_not_reading_the_body() -> TestResult {
+    task_panics::install();
+    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
+    let server = spawn_greeter_server(|server| register_ignored_upload_route(server, &source_tx))?;
+    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
+
+    for messages in IGNORED_UPLOAD_MESSAGES {
+        let (mut send, _recv) = session.open_bi().await?;
+        support::write_raw(&mut send, &ignored_upload_frames(messages)?).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send.reset(1)?;
+        expect_peer_reset(&mut source_rx).await?;
+    }
+
+    settle_detached_server_tasks().await;
+    close_webtransport_client(client, session).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -746,49 +840,83 @@ async fn quinn_post_response_drain_does_not_violate_quinn_recv_stream_contract()
     Ok(())
 }
 
-/// A peer reset of the request stream cancels a handler that is not reading the body, whether or
-/// not unread request data is buffered behind the message the pump already queued.
+/// Registers `IgnoredUpload`, a client-streaming route whose handler holds its request body
+/// without reading it and reports the source of its cancellation to `source_tx`.
+fn register_ignored_upload_route(
+    server: &mut Server,
+    source_tx: &mpsc::UnboundedSender<CancellationSource>,
+) {
+    let source_tx = source_tx.clone();
+    server.route_streaming_with_context(
+        support::greeter_path("IgnoredUpload"),
+        RpcKind::ClientStreaming,
+        move |context, _body, requests| {
+            let source_tx = source_tx.clone();
+            async move {
+                // Hold the body without polling it: dropping it would stop the request.
+                tokio::spawn(async move {
+                    let _unread_requests = requests;
+                    let _ = source_tx.send(context.cancelled_signal().await);
+                });
+                let replies: trevrpc::BoxStream<Vec<u8>> =
+                    Box::pin(futures_util::stream::pending());
+                Ok(replies)
+            }
+        },
+    );
+}
+
+/// The size of each `IgnoredUpload` message. Two fill the request pump's 64 KiB queue, so the pump
+/// stops reading and waits for room, watching the transport instead.
+const IGNORED_UPLOAD_MESSAGE: usize = 48 * 1024;
+
+/// The upload sizes of the reset tests: just enough to fill the pump's queue, and more, so that
+/// unread data is buffered behind it.
+const IGNORED_UPLOAD_MESSAGES: [usize; 2] = [2, 6];
+
+/// The request frames of an `IgnoredUpload` call: REQUEST, then `messages` MESSAGE frames.
+fn ignored_upload_frames(messages: usize) -> TestResult<Bytes> {
+    let request =
+        RpcRequest::new(support::greeter_path("IgnoredUpload")).with_kind(RpcKind::ClientStreaming);
+    let mut frames = trevrpc::framing::encode_protobuf_frame(
+        trevrpc::framing::frame_type::REQUEST,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )?;
+    for _ in 0..messages {
+        frames.extend(trevrpc::framing::encode_message_frame(
+            &vec![0; IGNORED_UPLOAD_MESSAGE],
+            trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+        )?);
+    }
+    Ok(Bytes::from(frames))
+}
+
+async fn expect_peer_reset(
+    source_rx: &mut mpsc::UnboundedReceiver<CancellationSource>,
+) -> TestResult {
+    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
+        .await?
+        .ok_or("handler should report its cancellation source")?;
+    ensure_eq!(source, CancellationSource::PeerReset);
+    Ok(())
+}
+
+/// A peer reset of the request stream cancels a handler that is not reading the body, once the
+/// pump's queue is full, whether or not unread request data is buffered behind it.
 #[tokio::test]
 async fn quinn_request_reset_cancels_handler_that_is_not_reading_the_body() -> TestResult {
     task_panics::install();
     let (source_tx, mut source_rx) = mpsc::unbounded_channel();
-    let server = spawn_greeter_server(|server| {
-        let source_tx = source_tx.clone();
-        server.route_streaming_with_context(
-            support::greeter_path("IgnoredUpload"),
-            RpcKind::ClientStreaming,
-            move |context, _body, requests| {
-                let source_tx = source_tx.clone();
-                async move {
-                    // Hold the body without polling it: dropping it would stop the request.
-                    tokio::spawn(async move {
-                        let _unread_requests = requests;
-                        let _ = source_tx.send(context.cancelled_signal().await);
-                    });
-                    let replies: trevrpc::BoxStream<Vec<u8>> =
-                        Box::pin(futures_util::stream::pending());
-                    Ok(replies)
-                }
-            },
-        );
-    })?;
+    let server = spawn_greeter_server(|server| register_ignored_upload_route(server, &source_tx))?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
 
-    for buffered_messages in [1_usize, 4] {
+    for messages in IGNORED_UPLOAD_MESSAGES {
         let (mut send, _recv) = connection.open_bi().await?;
-        let request = RpcRequest::new(support::greeter_path("IgnoredUpload"))
-            .with_kind(RpcKind::ClientStreaming);
-        support::write_request(&mut send, &request).await?;
-        for _ in 0..buffered_messages {
-            support::write_message(&mut send, &[0; 16]).await?;
-        }
+        send.write_all(&ignored_upload_frames(messages)?).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         send.reset(1_u32.into())?;
-
-        let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-            .await?
-            .expect("handler should report its cancellation source");
-        ensure_eq!(source, CancellationSource::PeerReset);
+        expect_peer_reset(&mut source_rx).await?;
     }
 
     settle_detached_server_tasks().await;
@@ -1238,9 +1366,8 @@ async fn http3_enforces_stream_limits_and_survives_request_reset() -> TestResult
 
     let (mut send, body) = start_http3_probe(&transport).await?;
     let recv = body.recv;
-    // h3 does not expose an independent request-reset waiter. The server must still contain
-    // the reset to this RPC and keep the connection usable without an unbounded detached
-    // observer.
+    // The server must contain the reset to this RPC and keep the connection usable without an
+    // unbounded detached observer.
     send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
 
     let reply = client
@@ -2025,9 +2152,7 @@ async fn webtransport_request_reset_is_contained() -> TestResult {
     support::write_request_and_message(&mut send, &request, &[]).await?;
     expect_probe_ready(&mut recv).await?;
 
-    // The h3-WebTransport API has no independent reset observer for
-    // a request body read. Contain the reset to this RPC and preserve the
-    // session; prompt independent reset observation is not exposed by the current h3 stack.
+    // Contain the reset to this RPC and preserve the session.
     send.reset(1)?;
     let reply = greeter_client
         .say_hello_with_options(

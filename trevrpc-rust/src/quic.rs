@@ -1,15 +1,13 @@
 //! Quinn helpers shared by the native client and the server.
 
-use std::time::Duration;
-
 use bytes::Bytes;
 use futures_util::FutureExt as _;
 
 use crate::datagram::{DatagramTransport, Unsent};
 use crate::framed::Chunked;
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
-use crate::request_pump::RequestTransportEvent;
-use crate::{Error, Result, Status};
+use crate::request_pump::{RESET_PROBE_INTERVAL, RequestTransportEvent};
+use crate::{Error, Result};
 
 /// The longest `TrevRPC` frame header: a type and a length, each a QUIC variable-length integer
 /// of at most eight bytes.
@@ -165,9 +163,6 @@ impl MuxSendStream for quinn::SendStream {
     }
 }
 
-/// How often a backpressured request stream with unread buffered data is re-checked for a reset.
-const RESET_PROBE_INTERVAL: Duration = Duration::from_millis(250);
-
 impl MuxRecvStream for Chunked<quinn::RecvStream> {
     fn stop_stream(&mut self, code: u32) {
         let _ = self.source.stop(code.into());
@@ -193,12 +188,7 @@ impl MuxRecvStream for Chunked<quinn::RecvStream> {
             match self.source.read_chunk(0, true).await {
                 Ok(Some(_)) => tokio::time::sleep(RESET_PROBE_INTERVAL).await,
                 Err(quinn::ReadError::Reset(code)) => {
-                    return Some(RequestTransportEvent::PeerReset(Status::cancelled(
-                        format!(
-                            "request stream reset by peer with code {}",
-                            code.into_inner()
-                        ),
-                    )));
+                    return Some(RequestTransportEvent::peer_reset(code.into_inner()));
                 }
                 Err(
                     error @ (quinn::ReadError::ConnectionLost(_)

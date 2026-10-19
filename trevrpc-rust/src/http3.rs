@@ -6,10 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use h3::ext::Protocol;
 use h3::quic::BidiStream as _;
-use h3_webtransport::server::AcceptedBi;
-use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use h3_webtransport::server::{Accepted, AcceptedBi, is_webtransport_request};
+use http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
@@ -20,7 +19,7 @@ use crate::http_admission::{
     validate_webtransport_admission,
 };
 use crate::quic::SessionDatagrams;
-use crate::request_pump::RequestTransportEvent;
+use crate::request_pump::{RequestTransportEvent, poll_peer_reset};
 use crate::rpc_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_stream};
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
 use crate::server::Server;
@@ -54,12 +53,12 @@ pub async fn handle_connection(
 ) {
     let raw_connection = connection.clone();
     let mut builder = h3::server::builder();
+    // The connection advertises, and carries, at most one WebTransport session.
     if server.options().webtransport_enabled() {
         builder
             .enable_extended_connect(true)
             .enable_datagram(true)
-            .enable_webtransport(true)
-            .max_webtransport_sessions(1);
+            .enable_webtransport(true);
     }
     let h3_connection = builder.build(h3_quinn::Connection::new(connection)).await;
     let Ok(mut h3_connection) = h3_connection else {
@@ -113,23 +112,32 @@ pub async fn handle_connection(
                         response_headers,
                     );
                     tokio::pin!(accept);
-                    let session = tokio::select! {
+                    let accepted = tokio::select! {
                         result = &mut accept => result.ok(),
                         changed = shutdown.changed() => {
                             let _ = changed;
                             None
                         }
                     };
-                    if let Some(session) = session {
-                        handle_webtransport_session(
-                            server.clone(),
-                            session,
-                            request_limit,
-                            stream_limit,
-                            raw_connection.clone(),
-                            shutdown.clone(),
-                        )
-                        .await;
+                    match accepted {
+                        Some(Accepted::Session(session)) => {
+                            handle_webtransport_session(
+                                server.clone(),
+                                session,
+                                request_limit,
+                                stream_limit,
+                                raw_connection.clone(),
+                                shutdown.clone(),
+                            )
+                            .await;
+                        }
+                        // The request was checked above, so this does not happen; keep serving.
+                        Some(Accepted::NotWebTransport { stream, conn, .. }) => {
+                            h3_connection = conn;
+                            reject_h3(stream, StatusCode::BAD_REQUEST).await;
+                            continue;
+                        }
+                        None => {}
                     }
                     break;
                 }
@@ -263,11 +271,6 @@ async fn reject_h3(mut stream: H3RequestStream, status: StatusCode) {
     if stream.send_response(rejection_head(status)).await.is_ok() {
         let _ = stream.finish().await;
     }
-}
-
-fn is_webtransport_request(request: &Request<()>) -> bool {
-    request.method() == Method::CONNECT
-        && request.extensions().get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT)
 }
 
 /// The WebTransport protocol that names wire version 1.
@@ -437,21 +440,19 @@ async fn handle_webtransport_session(
                     Ok(Some(AcceptedBi::BidiStream(_, mut stream))) => {
                         h3::quic::SendStream::reset(&mut stream, CANCELLED_STREAM_CODE);
                     }
+                    // Ordinary requests on the session's connection are served as before it. The
+                    // resolver resets a CONNECT for another session with H3_REQUEST_REJECTED.
                     Ok(Some(AcceptedBi::Request(request, stream))) => {
-                        if is_webtransport_request(&request) {
-                            stream_tasks.spawn(reject_h3(stream, StatusCode::CONFLICT));
-                        } else {
-                            spawn_http_request(
-                                &server,
-                                request,
-                                stream,
-                                request_limit.as_ref(),
-                                stream_limit.as_ref(),
-                                shutdown.clone(),
-                                connection.clone(),
-                                &mut stream_tasks,
-                            );
-                        }
+                        spawn_http_request(
+                            &server,
+                            request,
+                            stream,
+                            request_limit.as_ref(),
+                            stream_limit.as_ref(),
+                            shutdown.clone(),
+                            connection.clone(),
+                            &mut stream_tasks,
+                        );
                     }
                     Ok(None) => {}
                     Err(error) => tracing::warn!(%error, "WebTransport stream resolution failed"),
@@ -565,9 +566,15 @@ impl BodySource for H3Source {
     }
 
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
-        Some(RequestTransportEvent::connection_lost(
-            self.1.closed().await,
-        ))
+        let Self(recv, connection) = self;
+        let reset = poll_peer_reset(|context| {
+            recv.poll_received_reset(context)
+                .map_ok(|code| code.map(u64::from))
+        });
+        tokio::select! {
+            event = reset => event,
+            error = connection.closed() => Some(RequestTransportEvent::connection_lost(error)),
+        }
     }
 }
 
@@ -626,9 +633,13 @@ impl BodySource for WebTransportSource {
     }
 
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
-        Some(RequestTransportEvent::connection_lost(
-            self.1.closed().await,
-        ))
+        let Self(recv, connection) = self;
+        let reset =
+            poll_peer_reset(|context| h3::quic::RecvStream::poll_received_reset(recv, context));
+        tokio::select! {
+            event = reset => event,
+            error = connection.closed() => Some(RequestTransportEvent::connection_lost(error)),
+        }
     }
 }
 

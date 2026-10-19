@@ -1045,32 +1045,45 @@ async fn http2_fallback_request(
     Ok((status, alt_svc, String::from_utf8(body)?))
 }
 
-/// Sends one HTTP/3 request on its own connection.
-async fn http3_request(
-    server: &RunningServer,
-    method: &str,
-    path: &str,
-    body: &str,
-) -> TestResult<FallbackReply> {
-    use bytes::Buf as _;
+type Http3Sender = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
+/// Opens an HTTP/3 connection to the server, able to carry a WebTransport session when
+/// `webtransport` is set. The endpoint must outlive the connection.
+async fn http3_sender(
+    server: &RunningServer,
+    webtransport: bool,
+) -> TestResult<(quinn::Endpoint, Http3Sender)> {
     let tls = client_tls(&server.cert, trevrpc::HTTP3_ALPN)?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
     )));
     let connection = endpoint.connect(server.udp, "localhost")?.await?;
-    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection)).await?;
+    let mut builder = h3::client::builder();
+    if webtransport {
+        builder
+            .enable_extended_connect(true)
+            .enable_datagram(true)
+            .enable_webtransport(true);
+    }
+    let (mut driver, sender) = builder.build(h3_quinn::Connection::new(connection)).await?;
     tokio::spawn(async move {
         let _ = driver.wait_idle().await;
     });
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://localhost:{}{path}", server.udp.port()))
-        .body(())?;
+    Ok((endpoint, sender))
+}
+
+/// Sends `request` with `body` and reads the whole response.
+async fn http3_exchange(
+    sender: &mut Http3Sender,
+    request: http::Request<()>,
+    body: Bytes,
+) -> TestResult<(http::Response<()>, Vec<u8>)> {
+    use bytes::Buf as _;
+
     let mut stream = sender.send_request(request).await?;
     if !body.is_empty() {
-        stream.send_data(Bytes::from(body.to_owned())).await?;
+        stream.send_data(body).await?;
     }
     stream.finish().await?;
     let response = tokio::time::timeout(TEST_TIMEOUT, stream.recv_response()).await??;
@@ -1078,10 +1091,27 @@ async fn http3_request(
     while let Some(mut chunk) = stream.recv_data().await? {
         bytes.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
     }
+    Ok((response, bytes))
+}
+
+/// Sends one HTTP/3 request on its own connection.
+async fn http3_request(
+    server: &RunningServer,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> TestResult<FallbackReply> {
+    let (_endpoint, mut sender) = http3_sender(server, false).await?;
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://localhost:{}{path}", server.udp.port()))
+        .body(())?;
+    let (response, body) =
+        http3_exchange(&mut sender, request, Bytes::from(body.to_owned())).await?;
     Ok((
         response.status(),
         alt_svc(response.headers()),
-        String::from_utf8(bytes)?,
+        String::from_utf8(body)?,
     ))
 }
 
@@ -1199,5 +1229,58 @@ async fn http_fallback_requests_hold_a_stream_slot() -> TestResult {
             .0,
         http::StatusCode::OK
     );
+    server.stop().await
+}
+
+#[tokio::test]
+async fn http3_serves_requests_alongside_a_webtransport_session() -> TestResult {
+    let fallback = EchoFallback::default();
+    let server = spawn_server(fallback_options(test_options(), &fallback)).await?;
+    let (_endpoint, mut sender) = http3_sender(&server, true).await?;
+    let port = server.udp.port();
+    let connect = || {
+        http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://localhost:{port}/trevrpc"))
+            .header(http::header::ORIGIN, ORIGIN)
+            .extension(h3::ext::Protocol::WEB_TRANSPORT)
+            .body(())
+    };
+    let mut session = sender.send_request(connect()?).await?;
+    let response = tokio::time::timeout(TEST_TIMEOUT, session.recv_response()).await??;
+    ensure_eq!(response.status(), http::StatusCode::OK);
+
+    // While the session runs, the connection still serves the fallback and HTTP RPCs.
+    let get = http::Request::get(format!("https://localhost:{port}/app/index.html")).body(())?;
+    let (response, body) = http3_exchange(&mut sender, get, Bytes::new()).await?;
+    ensure_eq!(response.status(), http::StatusCode::OK);
+    ensure_eq!(
+        String::from_utf8(body)?,
+        "fallback HTTP/3.0 GET /app/index.html\n"
+    );
+    let rpc = http::Request::post(format!("https://localhost:{port}/trevrpc"))
+        .header(http::header::CONTENT_TYPE, "application/trevrpc")
+        .body(())?;
+    let (response, reply) =
+        http3_exchange(&mut sender, rpc, Bytes::from(unary_frame("h3")?)).await?;
+    ensure_eq!(response.status(), http::StatusCode::OK);
+    ensure_eq!(decode_hello(&reply)?, "hello, h3");
+
+    // A connection carries one session, so another CONNECT is reset.
+    let mut second = sender.send_request(connect()?).await?;
+    match tokio::time::timeout(TEST_TIMEOUT, second.recv_response()).await? {
+        Ok(response) => {
+            return Err(format!("a second session was answered {}", response.status()).into());
+        }
+        Err(error) => ensure!(
+            matches!(
+                &error,
+                h3::error::StreamError::RemoteTerminate { code, .. }
+                    if *code == h3::error::Code::H3_REQUEST_REJECTED
+            ),
+            "a second session failed with {error}"
+        ),
+    }
+    drop(session);
     server.stop().await
 }

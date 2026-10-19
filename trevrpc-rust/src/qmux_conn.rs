@@ -15,7 +15,7 @@ use crate::quic::saturating_usize_to_u64;
 use crate::request_pump::RequestTransportEvent;
 use crate::serve::transport_limits;
 use crate::server::ServerOptions;
-use crate::{Error, Result, Status};
+use crate::{Error, Result};
 
 /// The application protocol inside [`crate::QMUX_ALPN`], as the `qmux` crate names it.
 const APPLICATION_PROTOCOL: &str = "trevrpc-1";
@@ -242,9 +242,7 @@ impl MuxRecvStream for QmuxRecvStream {
     /// `RecvStream::closed` buffers data as it waits without consuming it, and is cancel-safe.
     async fn peer_reset(&mut self) -> Option<RequestTransportEvent> {
         match self.source.stream.closed().await {
-            Err(qmux::Error::StreamReset(code)) => Some(RequestTransportEvent::PeerReset(
-                Status::cancelled(format!("request stream reset by peer with code {code}")),
-            )),
+            Err(qmux::Error::StreamReset(code)) => Some(RequestTransportEvent::peer_reset(code)),
             // The request ended cleanly or was stopped locally: the reads that follow report it.
             Ok(()) | Err(qmux::Error::StreamStop(_)) => pending().await,
             Err(error) => Some(RequestTransportEvent::connection_lost(error)),
