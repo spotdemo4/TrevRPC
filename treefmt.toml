@@ -20,10 +20,12 @@ options = ["--format"]
 includes = ["*.kt", "*.kts"]
 
 [formatter.buf]
-# buf format takes one input at a time.
-command = "sh"
-options = ["-c", "for file; do buf format --write \"$file\"; done", "buf-format"]
-includes = ["proto/**/*.proto"]
+command = "buf"
+options = ["format", "--write"]
+includes = ["*.proto"]
+# buf parses "#" in a path as input options
+excludes = ["**/trailing_hash#.proto"]
+no-positional-arg-support = true
 
 [formatter.ruff]
 command = "ruff"

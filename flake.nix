@@ -307,7 +307,14 @@
                 licenseFile
                 ;
             };
-            trevrpc-rust = pkgs.callPackage ./trevrpc-rust { inherit wireGolden interopProto trevrpcProto; };
+            trevrpc-rust = pkgs.callPackage ./trevrpc-rust {
+              inherit
+                wireGolden
+                interopProto
+                trevrpcProto
+                licenseFile
+                ;
+            };
             trevrpc-interop = pkgs.callPackage ./interop/runner.nix { };
             trevrpc-bench = pkgs.callPackage ./bench/runner.nix { };
             trevrpc-bench-grpc = pkgs.callPackage ./bench/grpc-go { inherit interopProto; };

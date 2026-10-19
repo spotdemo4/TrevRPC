@@ -5,6 +5,7 @@
     "jetbrains.kotlin-server",
     "TypeScriptTeam.native-preview",
     "jnoortheen.nix-ide",
+    "bufbuild.vscode-buf",
     "oxc.oxc-vscode",
     "redhat.vscode-yaml",
     "tombi-toml.tombi"

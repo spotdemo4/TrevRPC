@@ -2,9 +2,9 @@ syntax = "proto3";
 
 package generator.compat.single;
 
-option java_package = "generator.compat";
-option java_outer_classname = "SingleFileTypes";
 option java_multiple_files = false;
+option java_outer_classname = "SingleFileTypes";
+option java_package = "generator.compat";
 
 message snake_name {
   message _nested_Name {}

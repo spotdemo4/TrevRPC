@@ -1,7 +1,10 @@
 {
   "files.associations": {
     "renovate.json": "jsonc",
-    ".envrc*": "shellscript"
+    ".envrc*": "shellscript",
+    // bufbuild.vscode-buf claims these, and one is a Forgejo workflow
+    "buf.yaml": "yaml",
+    "buf.gen.yaml": "yaml"
   },
 
   "editor.semanticHighlighting.enabled": true,
@@ -79,6 +82,11 @@
 
   // redhat.vscode-yaml
   "yaml.format.enable": false,
+
+  // bufbuild.vscode-buf
+  "[proto]": {
+    "editor.defaultFormatter": "bufbuild.vscode-buf"
+  },
 
   // jnoortheen.nix-ide
   "nix.enableLanguageServer": true,

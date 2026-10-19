@@ -4,8 +4,8 @@ package generator.compat.unreliable;
 
 import "trevrpc/options.proto";
 
-option java_package = "generator.compat.unreliable";
 option java_multiple_files = true;
+option java_package = "generator.compat.unreliable";
 
 message Position {}
 

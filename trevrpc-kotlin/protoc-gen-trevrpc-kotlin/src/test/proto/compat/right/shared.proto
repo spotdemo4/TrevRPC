@@ -2,9 +2,9 @@ syntax = "proto3";
 
 package generator.compat.right;
 
-option java_package = "generator.compat.shared";
-option java_outer_classname = "RightSharedDescriptor";
 option java_multiple_files = true;
+option java_outer_classname = "RightSharedDescriptor";
+option java_package = "generator.compat.shared";
 
 message RightRequest {}
 message RightReply {}

@@ -6,7 +6,8 @@ rust-version = "1.95.0"
 description = "Buf/protoc plugin for TrevRPC service code generation"
 readme = "../../README.md"
 repository = "https://trev.zip/llc/TrevRPC"
-license-file = "../../LICENSE"
+license = "MIT"
+license-file = "../../../LICENSE"
 
 [lints]
 workspace = true

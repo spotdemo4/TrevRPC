@@ -6,7 +6,7 @@ import { mkdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { build as bundle } from "esbuild";
+import { rolldown } from "rolldown";
 
 const run = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -33,16 +33,18 @@ export async function buildInterop() {
     "unreliable.proto",
   ]);
 
-  await bundle({
-    absWorkingDir: packageRoot,
-    entryPoints: ["interop-browser/page.js"],
-    outfile: `${outDir}/page.js`,
-    bundle: true,
-    format: "esm",
+  const bundle = await rolldown({
+    cwd: packageRoot,
+    input: "interop-browser/page.js",
     platform: "browser",
-    target: "es2022",
-    logLevel: "warning",
+    transform: { target: "es2022" },
+    logLevel: "warn",
   });
+  try {
+    await bundle.write({ file: `${outDir}/page.js`, format: "esm" });
+  } finally {
+    await bundle.close();
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

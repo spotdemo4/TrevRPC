@@ -83,6 +83,11 @@
         { "language_server": { "name": "ruff" } }
       ]
     },
+    "Proto": {
+      "format_on_save": "on",
+      "language_servers": ["buf"],
+      "formatter": [{ "language_server": { "name": "buf" } }]
+    },
     "Nix": {
       "format_on_save": "on",
       "language_servers": ["nixd"],

@@ -5,6 +5,7 @@
   rustfmt,
   clippy,
   gnugrep,
+  licenseFile,
   wireGolden,
   interopProto,
   trevrpcProto,
@@ -19,6 +20,7 @@ mkRustPackage (final: {
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
+      licenseFile
       interopProto
       trevrpcProto
       wireGolden

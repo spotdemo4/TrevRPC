@@ -6,36 +6,27 @@
 .agents/
 .claude/
 .codex/
-.cache/
 
-# crash dumps
-core.*
-
-# nix
-/build/
-/result*
-/.direnv/
-
-# rust
-/target/
-/trevrpc-rust/target/
+# build
+build/
+dist/
+target/
 
 # go
 /trevrpc-go/bin/
 
 # javascript
 node_modules/
-/trevrpc-js/build/
 
 # kotlin
-/trevrpc-kotlin/.gradle/
-/trevrpc-kotlin/.kotlin/
-/trevrpc-kotlin/build/
-/trevrpc-kotlin/**/build/
-/trevrpc-kotlin/**/target/
+.gradle/
+.kotlin/
 
 # python
-/.venv
-/dist
-/.ruff_cache
-__pycache__
+.ruff_cache/
+.venv/
+__pycache__/
+
+# nix
+/result*
+/.direnv/
