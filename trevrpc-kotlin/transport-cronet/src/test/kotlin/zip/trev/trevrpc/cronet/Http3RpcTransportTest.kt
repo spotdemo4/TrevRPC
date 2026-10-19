@@ -518,7 +518,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .clientStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                        .openClientStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             val send = async { runCatching { call.send("a") } }
             runCurrent()
@@ -548,7 +548,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .bidirectionalStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                        .openBidirectionalStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             val send = async { runCatching { call.send("a") } }
             runCurrent()
@@ -574,7 +574,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .clientStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                        .openClientStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             val send = async { runCatching { call.send("a") } }
             runCurrent()
@@ -586,7 +586,7 @@ class Http3RpcTransportTest {
 
             assertTrue(send.isCompleted)
             assertEquals(Code.CANCELLED, (send.await().exceptionOrNull() as TrevRpcException).status.code)
-            assertEquals("early", call.receive().message)
+            assertEquals("early", call.receive())
         }
 
     @Test
@@ -597,7 +597,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .clientStreaming("/svc/m", strings, strings, CallOptions(timeout = 100.milliseconds))
+                        .openClientStreaming("/svc/m", strings, strings, CallOptions(timeout = 100.milliseconds))
                 }
             fake.headers(validHeaders())
             fake.deliverRead(messageFrame("reply".encodeToByteArray()) + statusFrame(Status.ok()))
@@ -605,7 +605,7 @@ class Http3RpcTransportTest {
             // The deadline is measured on the real clock.
             Thread.sleep(250)
 
-            assertEquals("reply", call.receive().message)
+            assertEquals("reply", call.receive())
         }
 
     @Test
@@ -616,7 +616,7 @@ class Http3RpcTransportTest {
             val call =
                 openCall(fake) {
                     Client(transport, coroutineContext)
-                        .bidirectionalStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                        .openBidirectionalStreaming("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
                 }
             fake.headers(validHeaders())
             fake.fail(IllegalStateException("connection reset"))

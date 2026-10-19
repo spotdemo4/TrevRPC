@@ -24,7 +24,7 @@ test("the generator emits a JavaScript client and its declarations, nothing else
   assert.match(js, /export class GreeterClient/);
   assert.match(js, /export function createGreeterClient/);
   assert.match(js, /sayHello\(request, options = \{\}\)/);
-  assert.match(js, /sayHelloWithResponse\(request, options = \{\}\)/);
+  assert.doesNotMatch(js, /WithResponse/);
   assert.match(js, /lotsOfReplies\(request, options = \{\}\)/);
   assert.match(js, /lotsOfGreetings\(options = \{\}\)/);
   assert.match(js, /bidiHello\(options = \{\}\)/);
@@ -41,7 +41,7 @@ test("generated declarations type every call shape", () => {
     types,
     /sayHello\(request: HelloRequest, options\?: CallOptions\): Promise<HelloReply>;/,
   );
-  assert.match(types, /sayHelloWithResponse\([\s\S]*Promise<UnaryResponse<HelloReply>>;/);
+  assert.doesNotMatch(types, /WithResponse|UnaryResponse/);
   assert.match(types, /lotsOfReplies\([\s\S]*Promise<ResponseStream<HelloReply>>;/);
   assert.match(
     types,
@@ -53,7 +53,7 @@ test("generated declarations type every call shape", () => {
   );
   assert.match(
     types,
-    /import type \{ BidirectionalStreamingCall, CallOptions, ClientStreamingCall, ResponseStream, RpcServiceDescriptor, Transport, UnaryResponse \} from "@trevrpc\/trevrpc-js";/,
+    /import type \{ BidirectionalStreamingCall, CallOptions, ClientStreamingCall, ResponseStream, RpcServiceDescriptor, Transport \} from "@trevrpc\/trevrpc-js";/,
   );
   assert.match(types, /import type \{ Root \} from "protobufjs";/);
 });
@@ -64,10 +64,7 @@ test("declarations import only the types they use", () => {
   assert.match(types, /import type \{ Long, Root \} from "protobufjs";/);
   assert.match(types, /count\?: number \| string \| Long;/);
   assert.match(types, /labels\?: Record<string, string>;/);
-  assert.match(
-    types,
-    /import type \{ CallOptions, RpcServiceDescriptor, Transport, UnaryResponse \} from/,
-  );
+  assert.match(types, /import type \{ CallOptions, RpcServiceDescriptor, Transport \} from/);
   assert.match(types, /getValues\(request: Values, options\?: CallOptions\): Promise<Values>;/);
 });
 

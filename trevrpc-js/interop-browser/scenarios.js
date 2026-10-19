@@ -100,13 +100,23 @@ const scenarios = {
   },
 
   async "unary-headers"(echo) {
-    const response = await echo.unaryWithResponse(
+    let headers;
+    let metadata;
+    const response = await echo.unary(
       { message: "hello" },
-      { metadata: { "interop-header": "h" } },
+      {
+        metadata: { "interop-header": "h" },
+        onResponseHeaders: (received) => {
+          headers = received;
+        },
+        onResponseMetadata: (received) => {
+          metadata = received;
+        },
+      },
     );
-    expectEcho(response.message, "hello", 0);
-    expectMetadata(response.headers, { "interop-header": "h" }, "headers");
-    expectMetadata(response.metadata, { "interop-trailer": "h" }, "trailing metadata");
+    expectEcho(response, "hello", 0);
+    expectMetadata(headers, { "interop-header": "h" }, "headers");
+    expectMetadata(metadata, { "interop-trailer": "h" }, "trailing metadata");
   },
 
   async "server-stream-headers"(echo) {

@@ -52,6 +52,17 @@ export interface CallOptions {
   metadata?: MetadataInput;
   /** Cancels the call. */
   signal?: AbortSignal;
+  /**
+   * Called with the response headers, empty when the server sent none, as soon as the first
+   * response frame arrives. A callback that throws fails the call.
+   */
+  onResponseHeaders?(headers: Metadata): void;
+  /**
+   * Called with the trailing metadata of the final status when the call succeeds, before its
+   * result is returned or its response stream ends. A failed call reports its metadata on the
+   * TrevRpcError instead. A callback that throws fails the call.
+   */
+  onResponseMetadata?(metadata: Metadata): void;
 }
 
 export interface TransportStream {
@@ -122,14 +133,6 @@ export interface RpcServiceDescriptor {
   methods: Record<string, RpcMethodDescriptor>;
 }
 
-export interface UnaryResponse<TResponse> {
-  readonly message: TResponse;
-  /** Response headers; empty when the server sent none. */
-  readonly headers: Metadata;
-  /** Trailing metadata from the final status. */
-  readonly metadata: Metadata;
-}
-
 /** The final status of a call that ended with OK. */
 export interface StreamStatus {
   readonly code: StatusCode;
@@ -171,8 +174,6 @@ export interface ClientStreamingCall<TRequest, TResponse> {
   send(request: TRequest): Promise<void>;
   /** Closes the request stream and returns the final response. */
   closeAndRecv(): Promise<TResponse>;
-  /** Closes the request stream and returns the final response with its headers and trailing metadata. */
-  closeAndRecvWithResponse(): Promise<UnaryResponse<TResponse>>;
   /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;
 }

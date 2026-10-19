@@ -8,11 +8,9 @@ private val trevrpcCodec2: custom.rpc.MessageCodec<example.`class`.ApiTypes.Resu
 public const val WHEN_WHEN_PATH: String = "/api.When/When"
 public const val WHEN_NESTED_PATH: String = "/api.When/Nested"
 public class WhenClient(
-    public suspend fun whenResponse(
-    ): custom.rpc.ResponseEnvelope<example.`class`.ApiTypes.Envelope.Result> =
-        client.unaryResponse(WHEN_WHEN_PATH, request, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun `when`(
-    public suspend fun nestedResponse(
-    ): custom.rpc.ResponseEnvelope<shared.`when`.Result> =
-        client.unaryResponse(WHEN_NESTED_PATH, request, trevrpcCodec2, trevrpcCodec0, options)
+        options: custom.rpc.CallOptions.() -> custom.rpc.CallOptions = { this },
+        client.unary(WHEN_WHEN_PATH, request, trevrpcCodec0, trevrpcCodec1, defaultCallOptions.options())
     public suspend fun nested(
+        options: custom.rpc.CallOptions.() -> custom.rpc.CallOptions = { this },
+        client.unary(WHEN_NESTED_PATH, request, trevrpcCodec2, trevrpcCodec0, defaultCallOptions.options())

@@ -1,10 +1,11 @@
 package zip.trev.trevrpc.interop
 
 import androidx.test.platform.app.InstrumentationRegistry
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.chromium.net.CronetEngine
@@ -100,8 +101,8 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             expectEcho(client.unary(request("hello")), "hello", 0)
         },
         "unary-metadata" to { (client) ->
-            val options = CallOptions(timeout = 10.seconds, metadata = Metadata.of("interop-suffix" to "!".encodeToByteArray()))
-            expectEcho(client.unary(request("hello"), options), "hello!", 0)
+            val response = client.unary(request("hello")) { copy(metadata = Metadata.of("interop-suffix" to "!".encodeToByteArray())) }
+            expectEcho(response, "hello!", 0)
         },
         "unary-error" to { (client) ->
             expectStatus(Code.NOT_FOUND, "missing") { client.unary(request("", failCode = 5, failMessage = "missing")) }
@@ -119,96 +120,95 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             responses.forEachIndexed { index, response -> expectEcho(response, "s", index) }
         },
         "server-stream-error" to { (client) ->
-            val call = client.serverStreamResponse(request("s", count = 2, failCode = 9, failMessage = "stop"))
-            try {
-                expectEcho(checkNotNull(call.receive()) { "stream ended before response 0" }, "s", 0)
-                expectEcho(checkNotNull(call.receive()) { "stream ended before response 1" }, "s", 1)
-                expectStatus(Code.FAILED_PRECONDITION, "stop") { call.receive() }
-            } finally {
-                call.close()
+            val received = mutableListOf<EchoResponse>()
+            expectStatus(Code.FAILED_PRECONDITION, "stop") {
+                client.serverStream(request("s", count = 2, failCode = 9, failMessage = "stop")).collect { received += it }
             }
+            expect(received.size == 2) { "expected 2 responses before the status, got ${received.size}" }
+            received.forEachIndexed { index, response -> expectEcho(response, "s", index) }
         },
         "bidi" to { (client) ->
-            val call = client.bidi()
-            try {
-                listOf("1", "2", "3").forEachIndexed { index, message ->
-                    call.send(request(message))
-                    expectEcho(checkNotNull(call.receive()) { "stream ended before echo $index" }, message, index)
-                }
-                call.closeSend()
-                expect(call.receive() == null) { "expected the stream to end with OK" }
-            } finally {
-                call.close()
+            // Each request is sent once the echo of the one before arrived.
+            val messages = listOf("1", "2", "3")
+            val requests = Channel<EchoRequest>(Channel.UNLIMITED)
+            requests.send(request(messages[0]))
+            var echoed = 0
+            client.bidi(requests.consumeAsFlow()).collect { response ->
+                expectEcho(response, messages[echoed], echoed)
+                echoed++
+                if (echoed < messages.size) requests.send(request(messages[echoed])) else requests.close()
             }
+            expect(echoed == messages.size) { "expected ${messages.size} echoes, got $echoed" }
         },
         "bidi-error" to { (client) ->
-            val call = client.bidi()
-            try {
-                call.send(request("1"))
-                expectEcho(checkNotNull(call.receive()) { "stream ended before echo 0" }, "1", 0)
-                try {
-                    call.send(request("", failCode = 10, failMessage = "abort"))
-                } catch (error: TrevRpcException) {
-                    // The server may end the call before this send returns; send then reports its status.
-                    expect(error.status.code == Code.ABORTED && error.status.message == "abort") {
-                        "expected send to fail with ABORTED \"abort\", got ${error.status}"
-                    }
+            val requests = Channel<EchoRequest>(Channel.UNLIMITED)
+            requests.send(request("1"))
+            var echoed = 0
+            expectStatus(Code.ABORTED, "abort") {
+                client.bidi(requests.consumeAsFlow()).collect { response ->
+                    expectEcho(response, "1", echoed)
+                    echoed++
+                    requests.send(request("", failCode = 10, failMessage = "abort"))
                 }
-                expectStatus(Code.ABORTED, "abort") { call.receive() }
-            } finally {
-                call.close()
             }
+            expect(echoed == 1) { "expected 1 echo before the status, got $echoed" }
         },
         "unary-headers" to { (client) ->
-            val response = client.unaryResponse(request("hello"), headerOptions())
-            expectEcho(response.message, "hello", 0)
+            val response = ResponseMetadata()
+            expectEcho(client.unary(request("hello")) { response.capture(withHeaderRequest()) }, "hello", 0)
             expectMetadata("headers", response.headers, "interop-header")
-            expectMetadata("trailing metadata", response.metadata, "interop-trailer")
+            expectMetadata("trailing metadata", response.trailers, "interop-trailer")
         },
         "server-stream-headers" to { (client) ->
-            val call = client.serverStreamResponse(request("s", count = 2), headerOptions())
-            try {
-                expectMetadata("headers", call.headers(), "interop-header")
-                expectEcho(checkNotNull(call.receive()) { "stream ended before response 0" }, "s", 0)
-                expectEcho(checkNotNull(call.receive()) { "stream ended before response 1" }, "s", 1)
-                expect(call.receive() == null) { "expected the stream to end with OK" }
-                expectMetadata("trailing metadata", call.responseMetadata, "interop-trailer")
-            } finally {
-                call.close()
+            val response = ResponseMetadata()
+            var index = 0
+            client.serverStream(request("s", count = 2)) { response.capture(withHeaderRequest()) }.collect { echo ->
+                // The headers arrive before the first message.
+                expectMetadata("headers", response.headers, "interop-header")
+                expectEcho(echo, "s", index++)
             }
+            expect(index == 2) { "expected 2 responses, got $index" }
+            expectMetadata("trailing metadata", response.trailers, "interop-trailer")
         },
         "unreliable" to { (_, client) ->
             // Cronet has no datagram API, so the schema's unreliable marking changes nothing: HTTP/3
             // and HTTP/2 deliver every message on the stream and the server sees no datagrams.
             val sent = (0 until 50).map { "$it" } + "x".repeat(4096)
-            val call = client.bidi()
-            try {
-                val received = mutableListOf<String>()
-                coroutineScope {
-                    val sender =
-                        launch {
-                            sent.forEach { call.send(request(it, count = 1)) }
-                            call.closeSend()
-                        }
-                    while (true) {
-                        val response = call.receive() ?: break
-                        expect(response.index == 0) { "expected response index 0, got ${response.index}" }
-                        received += response.message
+            val response = ResponseMetadata()
+            val received =
+                client
+                    .bidi(sent.map { request(it, count = 1) }.asFlow()) { response.capture(this) }
+                    .toList()
+                    .map { echo ->
+                        expect(echo.index == 0) { "expected response index 0, got ${echo.index}" }
+                        echo.message
                     }
-                    sender.join()
-                }
-                expect(received.toSet().size == received.size) { "a response was delivered more than once" }
-                expect(sent.containsAll(received)) { "a response was not one that was sent" }
-                expect(received.size == sent.size) { "expected ${sent.size} responses, got ${received.size}" }
-                expect(sent.last() in received) { "the 4096-byte echo is missing" }
-                val trailers = call.responseMetadata
-                expectCounter(trailers, "interop-received", sent.size.toString())
-                expectCounter(trailers, "interop-datagrams-received", "0")
-            } finally {
-                call.close()
-            }
+            expect(received.toSet().size == received.size) { "a response was delivered more than once" }
+            expect(sent.containsAll(received)) { "a response was not one that was sent" }
+            expect(received.size == sent.size) { "expected ${sent.size} responses, got ${received.size}" }
+            expect(sent.last() in received) { "the 4096-byte echo is missing" }
+            expectCounter(response.trailers, "interop-received", sent.size.toString())
+            expectCounter(response.trailers, "interop-datagrams-received", "0")
         },
     )
+
+/** The response headers and trailing metadata of one call, reported through its options. */
+private class ResponseMetadata {
+    @Volatile
+    private var headersOrNull: Metadata? = null
+
+    @Volatile
+    private var trailersOrNull: Metadata? = null
+
+    val headers: Metadata
+        get() = headersOrNull ?: throw AssertionError("no response headers were reported")
+
+    val trailers: Metadata
+        get() = trailersOrNull ?: throw AssertionError("no trailing metadata was reported")
+
+    fun capture(options: CallOptions): CallOptions =
+        options.copy(onResponseHeaders = { headersOrNull = it }, onResponseMetadata = { trailersOrNull = it })
+}
 
 private fun expectCounter(
     metadata: Metadata,
@@ -219,8 +219,7 @@ private fun expectCounter(
     expect(actual == expected) { "expected trailing metadata $key=$expected, got $actual" }
 }
 
-private fun headerOptions(): CallOptions =
-    CallOptions(timeout = 10.seconds, metadata = Metadata.of("interop-header" to "h".encodeToByteArray()))
+private fun CallOptions.withHeaderRequest(): CallOptions = copy(metadata = Metadata.of("interop-header" to "h".encodeToByteArray()))
 
 private fun expectMetadata(
     what: String,

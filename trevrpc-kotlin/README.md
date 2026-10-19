@@ -64,14 +64,11 @@ client.lotsOfReplies(req("TrevRPC")).collect { println(it.message) }
 // Client streaming
 val summary = client.lotsOfGreetings(flowOf(req("Alice"), req("Bob")))
 
-// Bidirectional streaming (Flow)
+// Bidirectional streaming
 client.bidiHello(flowOf(req("Alice"), req("Bob"))).collect { println(it.message) }
 
-// Bidi with explicit sends
-val bidi = client.bidiHello()
-bidi.send(req("Alice"))
-println(bidi.receive()?.message)
-bidi.closeSend()
+// Per-call options start from the client's defaults
+val quick = client.sayHello(req("TrevRPC")) { copy(timeout = 2.seconds) }
 
 // A successful close proves every call has settled; only then release the engine and executor.
 channel.close()
@@ -81,22 +78,23 @@ executor.shutdown()
 
 Requests use `Content-Type: application/trevrpc`, which names wire version 1; frames carry no version, so a server that does not serve it answers `415`. Every call names its method by one path (`/example.greeter.Greeter/SayHello`), which the generator emits as a `GREETER_SAY_HELLO_PATH` constant per method. Calling `Client` directly takes that path: `client.unary(GREETER_SAY_HELLO_PATH, request, requestCodec, responseCodec)`.
 
+A generated client has one function per RPC, in the shape of the RPC: a unary call is a `suspend` function that returns the response, a server-streaming call returns a `Flow` of responses, a client-streaming call takes a `Flow` of requests and returns the response, and a bidirectional call takes a `Flow` of requests and returns a `Flow` of responses. A flow makes its call when it is collected, and cancelling the collection cancels the call. The last parameter, `options`, changes the client's default `CallOptions` for one call, as in `client.sayHello(request) { copy(timeout = 2.seconds) }`. `Client` also has `openServerStreaming`, `openClientStreaming`, and `openBidirectionalStreaming`, which return call objects for sending and receiving one message at a time.
+
 Cronet decides between HTTP/3 and HTTP/2, so the wire format and the channel API are identical on both. Servers must keep their TCP port reachable for the fallback (Go uses the same port number for TCP and UDP). Their HTTP/2 responses carry an `Alt-Svc` header pointing at the UDP port, so Cronet can move to HTTP/3 when it is available.
 
 ### Headers and metadata
 
-A response has two metadata maps. Response headers arrive in an optional `HEADERS` frame before the first message; trailing metadata arrives with the terminal `STATUS` frame. Per-call `*Response` methods expose both. For unary and client-streaming calls the returned `ResponseEnvelope` carries `headers` (empty when the server sent none) and `metadata` (trailing). For streaming calls, `headers()` suspends until the first response frame arrives and never loses a message, and `responseMetadata` is the trailing metadata once the call has ended.
+A response has two metadata maps. Response headers arrive in an optional `HEADERS` frame before the first message; trailing metadata arrives with the terminal `STATUS` frame. A call reports them to the `onResponseHeaders` and `onResponseMetadata` callbacks of its `CallOptions`: the headers (empty when the server sent none) as soon as the first response frame arrives, and the trailing metadata when the call succeeds, before its result is returned or its flow completes. A failed call carries its metadata on the `TrevRpcException`. A callback that throws fails the call.
 
 ```kotlin
-val envelope = client.sayHelloResponse(req("TrevRPC"))
-println(envelope.headers["x-request-id"])   // response headers
-println(envelope.metadata["x-cost"])        // trailing metadata
-
-val call = client.lotsOfRepliesResponse(req("TrevRPC"))
-println(call.headers()["x-request-id"])     // before the first message
-while (true) println((call.receive() ?: break).message)
-println(call.responseMetadata["x-cost"])
-call.close()
+var headers = Metadata.EMPTY
+var trailers = Metadata.EMPTY
+val reply =
+    client.sayHello(req("TrevRPC")) {
+        copy(onResponseHeaders = { headers = it }, onResponseMetadata = { trailers = it })
+    }
+println(headers["x-request-id"])   // response headers
+println(trailers["x-cost"])        // trailing metadata
 ```
 
 Frames use HTTP/3's layout (QUIC variable-length integer type and length, then the payload), so `core` skips unknown frame types, including after `STATUS`. Request messages are written raw in `MESSAGE` frames, and unary and server-streaming calls send `REQUEST`, the one `MESSAGE`, and the end of the request stream in a single write. See the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format).
@@ -115,7 +113,7 @@ A server may end a call before it has read the whole request. Client-streaming a
 | Response limit exceeded                       | `Code.RESOURCE_EXHAUSTED`, which is also what `receive` reports                |
 | `closeSend()` or `close()` was called         | `Code.CANCELLED` ("request stream is closed")                                  |
 
-`closeSend` does nothing once the call has ended. To stop at the first sign that the server is done and let `receive` report the outcome, use `sendAll(flow)`: it sends every request, half-closes, and returns normally when the server ends the call early. The generated `Flow` methods use it, so they return the response (or throw the status) rather than a `CANCELLED` error from the upload.
+`closeSend` does nothing once the call has ended. To stop at the first sign that the server is done and let `receive` report the outcome, use `sendAll(flow)`: it sends every request, half-closes, and returns normally when the server ends the call early. The generated functions, which take a `Flow` of requests, use it, so they return the response (or throw the status) rather than a `CANCELLED` error from the upload.
 
 Finding the status can mean reading responses the caller has not asked for yet. While the request side is open, that read-ahead is bounded by the call's own response limits: `maxResponseMessages` and `maxResponseStreamBodySize` (4096 messages and 16 MiB when they are `null`, as they are by default), plus the frame that crosses a limit. A frame that crosses a limit you set ends the call with `RESOURCE_EXHAUSTED`, as it would for `receive`; with no limit set, reaching the bound pauses reading until you receive. After `closeSend` the read-ahead falls back to two frames and the transport's flow control paces the server. The reading coroutine stops at `STATUS` or when the call closes.
 

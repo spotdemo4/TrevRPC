@@ -40,7 +40,7 @@ class GeneratorTest {
         assertEquals("", response.error)
         assertEquals("api/greeter.trevrpc.kt", response.fileList.single().name)
         val content = response.fileList.single().content
-        assertFalse(Regex("fun \\w+(Envelope|Call)\\(").containsMatchIn(content))
+        assertFalse(Regex("fun \\w+(Envelope|Call|Response)\\(").containsMatchIn(content))
         assertEquals(golden("all-shapes.txt"), snapshot(content))
     }
 
@@ -98,7 +98,7 @@ class GeneratorTest {
 
         assertDeterministicCollision(
             request(file),
-            "fun collision.generated.NamesClient.fooBar(collision.generated.Request, zip.trev.trevrpc.CallOptions)",
+            "fun collision.generated.NamesClient.fooBar(collision.generated.Request, zip.trev.trevrpc.CallOptions.() -> zip.trev.trevrpc.CallOptions)",
             "collision.Names.Foo_Bar",
             "collision.Names.Foo__Bar",
         )
@@ -123,14 +123,14 @@ class GeneratorTest {
 
         assertDeterministicCollision(
             request(file),
-            "fun collision.generated.NamesClient.fooBar(zip.trev.trevrpc.CallOptions)",
+            "JVM method collision.generated.NamesClient.fooBar(kotlinx.coroutines.flow.Flow, kotlin.jvm.functions.Function1, Continuation)",
             "collision.Names.Foo_Bar",
             "collision.Names.Foo__Bar",
         )
     }
 
     @Test
-    fun `rejects Response suffix and JVM erased signature collisions`() {
+    fun `allows a method whose name ends in Response next to the plain one`() {
         val file =
             collisionFile(
                 "api/response.proto",
@@ -142,12 +142,12 @@ class GeneratorTest {
                     .build(),
             )
 
-        assertDeterministicCollision(
-            request(file),
-            "fun collision.generated.NamesClient.fooResponse(collision.generated.Request, zip.trev.trevrpc.CallOptions)",
-            "collision.Names.Foo",
-            "collision.Names.FooResponse",
-        )
+        val response = generate(request(file))
+
+        assertEquals("", response.error)
+        val content = response.fileList.single().content
+        assertTrue("public suspend fun foo(" in content, content)
+        assertTrue("public suspend fun fooResponse(" in content, content)
     }
 
     @Test
@@ -392,7 +392,7 @@ class GeneratorTest {
 
         assertDeterministicCollision(
             request(first, second),
-            "fun collision.generated.FooBarClient.call(collision.generated.Request, zip.trev.trevrpc.CallOptions)",
+            "fun collision.generated.FooBarClient.call(collision.generated.Request, zip.trev.trevrpc.CallOptions.() -> zip.trev.trevrpc.CallOptions)",
             "first.FooBar",
             "second.Foo_Bar",
         )
@@ -432,11 +432,11 @@ class GeneratorTest {
         assertEquals("", response.error)
         val content = response.fileList.single().content
         val docs = content.lines().filter { "unreliable (datagram messages)" in it }
-        // Upload has 4 public functions, Watch 2, Track 3; each gets one KDoc block.
-        assertEquals(9, docs.size, content)
-        assertEquals(4, docs.count { "requests unreliable" in it && "responses" !in it })
-        assertEquals(2, docs.count { "responses unreliable" in it && "requests" !in it })
-        assertEquals(3, docs.count { "requests and responses unreliable" in it })
+        // Upload, Watch and Track have one public function each, and each gets one KDoc block.
+        assertEquals(3, docs.size, content)
+        assertEquals(1, docs.count { "requests unreliable" in it && "responses" !in it })
+        assertEquals(1, docs.count { "responses unreliable" in it && "requests" !in it })
+        assertEquals(1, docs.count { "requests and responses unreliable" in it })
         assertTrue(content.contains("Cronet has no"), content)
         // The KDoc sits directly above its function and never above the unmarked methods.
         val lines = content.lines()
@@ -444,7 +444,7 @@ class GeneratorTest {
             if (line.startsWith("    public ") && " fun " in line) {
                 val documented = lines[index - 1] == "     */"
                 val name = Regex("fun (\\w+)\\(").find(line)?.groupValues?.get(1)
-                assertEquals(name !in setOf("plain", "plainResponse", "off", "offResponse"), documented, line)
+                assertEquals(name !in setOf("plain", "off"), documented, line)
             }
         }
     }
@@ -751,7 +751,7 @@ class GeneratorTest {
                 "Call(",
                 "Flow<",
                 "client.",
-                "ResponseEnvelope<",
+                "options: ",
             )
     }
 }
@@ -834,10 +834,8 @@ class GeneratedCodeCompilationTest {
             check(index > 0) { "missing $function in\n$generated" }
             return lines[index - 1] == "     */" && lines[index - 3].contains("Cronet has no")
         }
-        listOf("upload", "uploadResponse", "watch", "watchResponse", "track", "trackResponse").forEach {
-            assertTrue(documented(it), it)
-        }
-        listOf("lookup", "lookupResponse", "plain", "plainResponse").forEach { assertFalse(documented(it), it) }
+        listOf("upload", "watch", "track").forEach { assertTrue(documented(it), it) }
+        listOf("lookup", "plain").forEach { assertFalse(documented(it), it) }
         assertTrue(lines.any { "requests and responses unreliable" in it })
     }
 
@@ -988,12 +986,11 @@ class GeneratedCodeCompilationTest {
             package generator.compat.unreliable
 
             import kotlinx.coroutines.flow.Flow
-            import zip.trev.trevrpc.BidirectionalStreamingCall
 
             @Suppress("UNUSED_VARIABLE")
             private suspend fun typeCheck(client: TrackerClient, position: Position, positions: Flow<Position>) {
                 // Unreliable methods keep the ordinary client shapes.
-                val track: BidirectionalStreamingCall<Position, Position> = client.track()
+                val track: Flow<Position> = client.track(positions)
                 val watch: Flow<Position> = client.watch(position)
                 val upload: Position = client.upload(positions)
             }
@@ -1004,27 +1001,21 @@ class GeneratedCodeCompilationTest {
             package trevrpc.interop.v1
 
             import kotlinx.coroutines.flow.Flow
-            import zip.trev.trevrpc.BidirectionalStreamingCall
-            import zip.trev.trevrpc.ClientStreamingCall
-            import zip.trev.trevrpc.ResponseEnvelope
-            import zip.trev.trevrpc.ServerStreamingCall
+            import kotlin.time.Duration.Companion.seconds
+            import zip.trev.trevrpc.Metadata
 
             private typealias Request = Interop.EchoRequest
             private typealias Reply = Interop.EchoResponse
 
             @Suppress("UNUSED_VARIABLE")
             private suspend fun typeCheck(client: EchoClient, request: Request, requests: Flow<Request>) {
-                val unaryResponse: ResponseEnvelope<Reply> = client.unaryResponse(request)
+                var trailers: Metadata = Metadata.EMPTY
                 val unary: Reply = client.unary(request)
-                val serverResponse: ServerStreamingCall<Reply> = client.serverStreamResponse(request)
+                val configured: Reply =
+                    client.unary(request) { copy(timeout = 5.seconds, onResponseMetadata = { trailers = it }) }
                 val server: Flow<Reply> = client.serverStream(request)
-                val clientResponse: ClientStreamingCall<Request, Reply> = client.clientStreamResponse()
-                val clientAlias: ClientStreamingCall<Request, Reply> = client.clientStream()
-                val clientCollectedResponse: ResponseEnvelope<Reply> = client.clientStreamResponse(requests)
                 val clientCollected: Reply = client.clientStream(requests)
-                val bidiResponse: BidirectionalStreamingCall<Request, Reply> = client.bidiResponse()
-                val bidiAlias: BidirectionalStreamingCall<Request, Reply> = client.bidi()
-                val bidi: Flow<Reply> = client.bidi(requests)
+                val bidi: Flow<Reply> = client.bidi(requests) { copy(onResponseHeaders = {}) }
             }
             """.trimIndent()
 

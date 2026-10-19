@@ -26,6 +26,18 @@ function setup(handler, options) {
   return { transport, echo: new EchoClient(transport, options) };
 }
 
+/** Call options whose response callbacks record the headers and trailing metadata into seen. */
+function captureResponse(seen) {
+  return {
+    onResponseHeaders: (headers) => {
+      seen.headers = headers;
+    },
+    onResponseMetadata: (metadata) => {
+      seen.metadata = metadata;
+    },
+  };
+}
+
 const isStatus = (code, message) => (error) =>
   error instanceof TrevRpcError &&
   error.code === code &&
@@ -54,11 +66,15 @@ test("unary calls send the request header and decode the response", async () => 
     await stream.finish();
   });
 
-  const response = await echo.unaryWithResponse({ message: "hi" }, { metadata: { Trace: "abc" } });
-  assert.equal(response.message.message, "hello");
-  assert.equal(response.message.index, 3);
-  assert.deepEqual([...response.metadata.served], [1]);
-  assert.deepEqual([...response.headers.hdr], [2]);
+  const seen = {};
+  const response = await echo.unary(
+    { message: "hi" },
+    { metadata: { Trace: "abc" }, ...captureResponse(seen) },
+  );
+  assert.equal(response.message, "hello");
+  assert.equal(response.index, 3);
+  assert.deepEqual([...seen.metadata.served], [1]);
+  assert.deepEqual([...seen.headers.hdr], [2]);
   await transport.settled();
 });
 
@@ -80,10 +96,11 @@ test("unary calls return as soon as the response arrives", async () => {
   const { echo } = setup(async (stream) => {
     await reply(stream, { message: "early" });
   });
-  const response = await echo.unaryWithResponse({ message: "x" });
-  assert.equal(response.message.message, "early");
-  assert.deepEqual(response.headers, {});
-  assert.deepEqual(response.metadata, {});
+  const seen = {};
+  const response = await echo.unary({ message: "x" }, captureResponse(seen));
+  assert.equal(response.message, "early");
+  assert.deepEqual(seen.headers, {});
+  assert.deepEqual(seen.metadata, {});
 });
 
 test("invalid requests fail before a stream is opened", async () => {
@@ -356,18 +373,50 @@ test("a lone status fails a unary call before any message", async () => {
   await assert.rejects(echo.unary({}), isStatus(Code.Unimplemented, "no such method"));
 });
 
-test("unary response headers are returned next to the trailing metadata", async () => {
+test("unary response headers and trailing metadata reach the call's callbacks", async () => {
   const { echo } = setup(echoHandler);
-  const marked = await echo.unaryWithResponse(
+  const marked = {};
+  await echo.unary(
     { message: "hi" },
-    { metadata: { "interop-header": "h" } },
+    { metadata: { "interop-header": "h" }, ...captureResponse(marked) },
   );
   assert.deepEqual(metadataText(marked.headers), { "interop-header": "h" });
   assert.deepEqual(metadataText(marked.metadata), { "interop-trailer": "h" });
 
-  const plain = await echo.unaryWithResponse({ message: "hi" });
+  const plain = {};
+  await echo.unary({ message: "hi" }, captureResponse(plain));
   assert.deepEqual(plain.headers, {});
   assert.deepEqual(plain.metadata, {});
+});
+
+test("response callbacks of the client's options apply to every call", async () => {
+  const { transport } = setup(echoHandler);
+  const seen = {};
+  const echo = new EchoClient(transport, captureResponse(seen));
+  const stream = await echo.serverStream(
+    { message: "s", count: 1 },
+    { metadata: { "interop-header": "s" } },
+  );
+  for await (const response of stream) {
+    assert.equal(response.message, "s");
+  }
+  assert.deepEqual(metadataText(seen.headers), { "interop-header": "s" });
+  assert.deepEqual(metadataText(seen.metadata), { "interop-trailer": "s" });
+});
+
+test("a response callback that throws fails the call", async () => {
+  const { echo } = setup(echoHandler);
+  await assert.rejects(
+    echo.unary(
+      { message: "hi" },
+      {
+        onResponseMetadata() {
+          throw new Error("rejected by the callback");
+        },
+      },
+    ),
+    (error) => error instanceof TrevRpcError,
+  );
 });
 
 test("headers are visible before the first streamed message", async () => {
@@ -439,12 +488,15 @@ test("bidirectional and client-streaming calls expose headers too", async () => 
   assert.equal(await call.recv(), undefined);
   assert.deepEqual(metadataText((await call.status).metadata), { "interop-trailer": "b" });
 
-  const upload = await echo.clientStream({ metadata: { "interop-header": "c" } });
+  const seen = {};
+  const upload = await echo.clientStream({
+    metadata: { "interop-header": "c" },
+    ...captureResponse(seen),
+  });
   await upload.send({ message: "x" });
-  const response = await upload.closeAndRecvWithResponse();
-  assert.equal(response.message.message, "x");
-  assert.deepEqual(metadataText(response.headers), { "interop-header": "c" });
-  assert.deepEqual(metadataText(response.metadata), { "interop-trailer": "c" });
+  assert.equal((await upload.closeAndRecv()).message, "x");
+  assert.deepEqual(metadataText(seen.headers), { "interop-header": "c" });
+  assert.deepEqual(metadataText(seen.metadata), { "interop-trailer": "c" });
 });
 
 test("headers reject with the call error when the call ends first", async () => {
@@ -796,9 +848,9 @@ test("client streaming sends ordered messages and returns the single response", 
   const call = await echo.clientStream();
   await Promise.all([call.send({ message: "a" }), call.send({ message: "b" })]);
   await call.send({ message: "c" });
-  const response = await call.closeAndRecvWithResponse();
-  assert.equal(response.message.message, "abc");
-  assert.equal(response.message.index, 3);
+  const response = await call.closeAndRecv();
+  assert.equal(response.message, "abc");
+  assert.equal(response.index, 3);
   await transport.settled();
 });
 
@@ -1163,14 +1215,15 @@ test("a send after an early OK status reports that the call is already over", as
     await stream.writeMessage(EchoResponse, { message: "enough", index: 7 });
     await stream.writeStatus(Code.Ok, "done", { t: new Uint8Array([3]) });
   });
-  const call = await echo.clientStream({ timeoutMs: largeDeadline });
+  const seen = {};
+  const call = await echo.clientStream({ timeoutMs: largeDeadline, ...captureResponse(seen) });
   const error = await within(1000, sendUntilRejected(call), "sends");
   assert.ok(isStatus(Code.Cancelled)(error), String(error));
   assert.match(error.statusMessage, /server completed the call/u);
   // The outcome is the server's OK response; the failed send does not change it.
-  const response = await call.closeAndRecvWithResponse();
-  assert.equal(response.message.message, "enough");
-  assert.deepEqual([...response.metadata.t], [3]);
+  const response = await call.closeAndRecv();
+  assert.equal(response.message, "enough");
+  assert.deepEqual([...seen.metadata.t], [3]);
 });
 
 test("an early OK status ends a bidirectional upload without an error status", async () => {

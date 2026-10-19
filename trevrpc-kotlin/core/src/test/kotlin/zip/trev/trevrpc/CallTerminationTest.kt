@@ -38,7 +38,7 @@ class CallTerminationTest {
             val stream = ScriptedStream()
             val call =
                 Client(OneStream(stream))
-                    .clientStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                    .openClientStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
             val blocked = async { runCatching { call.send("a") } }
             stream.awaitSend()
 
@@ -67,7 +67,7 @@ class CallTerminationTest {
             stream.incoming.close()
             val call =
                 Client(OneStream(stream))
-                    .bidirectionalStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                    .openBidirectionalStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
 
             val error = runCatching { call.send("a") }.exceptionOrNull() as TrevRpcException
             assertEquals(Code.NOT_FOUND, error.status.code)
@@ -83,7 +83,7 @@ class CallTerminationTest {
             val stream = ScriptedStream()
             val call =
                 Client(OneStream(stream))
-                    .clientStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                    .openClientStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
             val blocked = async { runCatching { call.send("a") } }
             stream.awaitSend()
 
@@ -93,14 +93,14 @@ class CallTerminationTest {
 
             val error = blocked.await().exceptionOrNull() as TrevRpcException
             assertEquals(Code.CANCELLED, error.status.code)
-            assertEquals("early", call.receive().message)
+            assertEquals("early", call.receive())
         }
 
     @Test
     fun `an early OK status ends the sends of a bidi call and receive completes normally`() =
         bounded {
             val stream = ScriptedStream()
-            val call = Client(OneStream(stream)).bidirectionalStreaming<String, String>("/svc/m", strings, strings)
+            val call = Client(OneStream(stream)).openBidirectionalStreaming<String, String>("/svc/m", strings, strings)
             val blocked = async { runCatching { call.send("a") } }
             stream.awaitSend()
 
@@ -126,7 +126,7 @@ class CallTerminationTest {
                 }
             val call =
                 Client(OneStream(refusing))
-                    .clientStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                    .openClientStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
             val error = runCatching { call.send("a") }.exceptionOrNull() as TrevRpcException
             assertEquals(Code.UNAVAILABLE, error.status.code)
             assertEquals("connection lost", error.status.message)
@@ -135,7 +135,7 @@ class CallTerminationTest {
             val blockedStream = ScriptedStream()
             val blockedCall =
                 Client(OneStream(blockedStream))
-                    .bidirectionalStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
+                    .openBidirectionalStreaming<String, String>("/svc/m", strings, strings, CallOptions(timeout = 1.hours))
             val blocked = async { runCatching { blockedCall.send("a") } }
             blockedStream.awaitSend()
             blockedStream.incoming.close(TrevRpcException(Status.unavailable("reset by peer")))
@@ -154,7 +154,7 @@ class CallTerminationTest {
                 ScriptedStream().apply { sendBehavior = { throw TrevRpcException(Status.invalidArgument("bad message")) } }
             val call =
                 Client(OneStream(stream))
-                    .clientStreaming<String, String>("/svc/m", strings, strings, CallOptions(streamIdleTimeout = 200.milliseconds))
+                    .openClientStreaming<String, String>("/svc/m", strings, strings, CallOptions(streamIdleTimeout = 200.milliseconds))
             val error = runCatching { call.send("a") }.exceptionOrNull() as TrevRpcException
             assertEquals(Code.INVALID_ARGUMENT, error.status.code)
             assertEquals(1, stream.closes.get())
@@ -167,7 +167,7 @@ class CallTerminationTest {
             repeat(100) { stream.incoming.send(message("m$it")) }
             val call =
                 Client(OneStream(stream))
-                    .bidirectionalStreaming<String, String>(
+                    .openBidirectionalStreaming<String, String>(
                         "/svc/m",
                         strings,
                         strings,
@@ -189,7 +189,7 @@ class CallTerminationTest {
             repeat(PUMP_FALLBACK_MAX_MESSAGES + 500) { stream.incoming.send(message("m")) }
             val call =
                 Client(OneStream(stream))
-                    .bidirectionalStreaming<String, String>(
+                    .openBidirectionalStreaming<String, String>(
                         "/svc/m",
                         strings,
                         strings,
@@ -215,15 +215,15 @@ class CallTerminationTest {
             finished.incoming.send(message("r"))
             finished.incoming.send(status(Status.ok()))
             finished.incoming.close()
-            val call = Client(OneStream(finished)).clientStreaming<String, String>("/svc/m", strings, strings)
+            val call = Client(OneStream(finished)).openClientStreaming<String, String>("/svc/m", strings, strings)
             call.closeSend()
-            assertEquals("r", call.receive().message)
+            assertEquals("r", call.receive())
             assertEquals(1, finished.closes.get())
             // message, status, and the one read that proves the end of the stream.
             assertEquals(3, finished.receives.get())
 
             val pending = ScriptedStream()
-            val open = Client(OneStream(pending)).bidirectionalStreaming<String, String>("/svc/m", strings, strings)
+            val open = Client(OneStream(pending)).openBidirectionalStreaming<String, String>("/svc/m", strings, strings)
             pending.awaitReceive()
             open.close()
             pending.receiveCancelled.await()
@@ -234,7 +234,7 @@ class CallTerminationTest {
     fun `sendAll uploads every request and half-closes`() =
         bounded {
             val stream = ScriptedStream().apply { sendBehavior = {} }
-            val call = Client(OneStream(stream)).clientStreaming<String, String>("/svc/m", strings, strings)
+            val call = Client(OneStream(stream)).openClientStreaming<String, String>("/svc/m", strings, strings)
             call.sendAll(flowOf("a", "b", "c"))
             assertEquals(3, stream.sends.get())
             assertEquals(1, stream.finishes.get())
@@ -247,17 +247,17 @@ class CallTerminationTest {
     fun `sendAll stops quietly when the server ends the call and receive reports the outcome`() =
         bounded {
             val ok = ScriptedStream()
-            val okCall = Client(OneStream(ok)).clientStreaming<String, String>("/svc/m", strings, strings)
+            val okCall = Client(OneStream(ok)).openClientStreaming<String, String>("/svc/m", strings, strings)
             val okUpload = async { runCatching { okCall.sendAll(flow { while (true) emit("x") }) } }
             ok.awaitSend()
             ok.incoming.send(message("answer"))
             ok.incoming.send(status(Status.ok()))
             ok.incoming.close()
             assertTrue(okUpload.await().isSuccess)
-            assertEquals("answer", okCall.receive().message)
+            assertEquals("answer", okCall.receive())
 
             val failed = ScriptedStream()
-            val failedCall = Client(OneStream(failed)).bidirectionalStreaming<String, String>("/svc/m", strings, strings)
+            val failedCall = Client(OneStream(failed)).openBidirectionalStreaming<String, String>("/svc/m", strings, strings)
             val failedUpload = async { runCatching { failedCall.sendAll(flow { while (true) emit("x") }) } }
             failed.awaitSend()
             failed.incoming.send(message("before"))
@@ -273,7 +273,7 @@ class CallTerminationTest {
     fun `sendAll rethrows failures that do not come from the response`() =
         bounded {
             val stream = ScriptedStream().apply { sendBehavior = {} }
-            val call = Client(OneStream(stream)).clientStreaming<String, String>("/svc/m", strings, strings)
+            val call = Client(OneStream(stream)).openClientStreaming<String, String>("/svc/m", strings, strings)
             val error =
                 runCatching {
                     call.sendAll(
@@ -311,28 +311,28 @@ class CallTerminationTest {
 
             val streaming =
                 Client(hangingAfter(message("a"), status(Status.ok())))
-                    .serverStreaming("/svc/m", "request", strings, strings, options)
+                    .openServerStreaming("/svc/m", "request", strings, strings, options)
             assertEquals("a", streaming.receive())
             assertNull(streaming.receive())
             assertEquals(Code.OK, streaming.terminalStatus?.code)
 
             val unary =
                 Client(hangingAfter(message("a"), status(Status.ok())))
-                    .unaryResponse("/svc/m", "request", strings, strings, options)
-            assertEquals("a", unary.message)
+                    .unary("/svc/m", "request", strings, strings, options)
+            assertEquals("a", unary)
 
             val failed =
                 Client(hangingAfter(status(Status(Code.ABORTED, "stop"))))
-                    .serverStreaming("/svc/m", "request", strings, strings, options)
+                    .openServerStreaming("/svc/m", "request", strings, strings, options)
             val error = runCatching { failed.receive() }.exceptionOrNull() as TrevRpcException
             assertEquals(Code.ABORTED, error.status.code)
             assertEquals(Code.ABORTED, failed.terminalStatus?.code)
 
             val upload =
                 Client(hangingAfter(message("a"), status(Status.ok())))
-                    .clientStreaming<String, String>("/svc/m", strings, strings, options)
+                    .openClientStreaming<String, String>("/svc/m", strings, strings, options)
             upload.closeSend()
-            assertEquals("a", upload.receive().message)
+            assertEquals("a", upload.receive())
         }
 
     @Test
@@ -359,7 +359,7 @@ class CallTerminationTest {
                         }
                     },
                 )
-            val call = Client(transport).serverStreaming("/svc/m", "request", strings, strings)
+            val call = Client(transport).openServerStreaming("/svc/m", "request", strings, strings)
             val receiving = launch { call.receive() }
             waiting.await()
 

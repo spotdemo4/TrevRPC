@@ -8,25 +8,19 @@ public const val GREETER_LOTS_OF_REPLIES_PATH: String = "/hello.v1.Greeter/LotsO
 public const val GREETER_LOTS_OF_GREETINGS_PATH: String = "/hello.v1.Greeter/LotsOfGreetings"
 public const val GREETER_BIDI_HELLO_PATH: String = "/hello.v1.Greeter/BidiHello"
 public class GreeterClient(
-    public suspend fun sayHelloResponse(
-    ): zip.trev.trevrpc.ResponseEnvelope<example.generated.HelloReply> =
-        client.unaryResponse(GREETER_SAY_HELLO_PATH, request, trevrpcCodec0, trevrpcCodec1, options)
     public suspend fun sayHello(
-    public suspend fun lotsOfRepliesResponse(
-        client.serverStreaming(GREETER_LOTS_OF_REPLIES_PATH, request, trevrpcCodec0, trevrpcCodec1, options)
+        options: zip.trev.trevrpc.CallOptions.() -> zip.trev.trevrpc.CallOptions = { this },
+        client.unary(GREETER_SAY_HELLO_PATH, request, trevrpcCodec0, trevrpcCodec1, defaultCallOptions.options())
     public fun lotsOfReplies(
+        options: zip.trev.trevrpc.CallOptions.() -> zip.trev.trevrpc.CallOptions = { this },
     ): Flow<example.generated.HelloReply> =
-    public suspend fun lotsOfGreetingsResponse(
-        client.clientStreaming(GREETER_LOTS_OF_GREETINGS_PATH, trevrpcCodec0, trevrpcCodec1, options)
-    public suspend fun lotsOfGreetings(
-    public suspend fun lotsOfGreetingsResponse(
-        requests: Flow<example.generated.HelloRequest>,
-    ): zip.trev.trevrpc.ResponseEnvelope<example.generated.HelloReply> {
+        client.serverStreaming(GREETER_LOTS_OF_REPLIES_PATH, request, trevrpcCodec0, trevrpcCodec1, defaultCallOptions.options())
     public suspend fun lotsOfGreetings(
         requests: Flow<example.generated.HelloRequest>,
-    public suspend fun bidiHelloResponse(
-        client.bidirectionalStreaming(GREETER_BIDI_HELLO_PATH, trevrpcCodec0, trevrpcCodec1, options)
-    public suspend fun bidiHello(
+        options: zip.trev.trevrpc.CallOptions.() -> zip.trev.trevrpc.CallOptions = { this },
+        client.clientStreaming(GREETER_LOTS_OF_GREETINGS_PATH, requests, trevrpcCodec0, trevrpcCodec1, defaultCallOptions.options())
     public fun bidiHello(
         requests: Flow<example.generated.HelloRequest>,
+        options: zip.trev.trevrpc.CallOptions.() -> zip.trev.trevrpc.CallOptions = { this },
     ): Flow<example.generated.HelloReply> =
+        client.bidirectionalStreaming(GREETER_BIDI_HELLO_PATH, requests, trevrpcCodec0, trevrpcCodec1, defaultCallOptions.options())

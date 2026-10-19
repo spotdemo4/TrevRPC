@@ -79,12 +79,14 @@ channel.close();
 
 Every method takes `CallOptions` as its last argument; the same options can be given to the client constructor as defaults, and per-call `metadata` is merged over the defaults per key.
 
-| Option         | Meaning                                                                                       |
-| -------------- | --------------------------------------------------------------------------------------------- |
-| `timeoutMs`    | Deadline for the whole call, from the request to the final status. Also sent to the server.   |
-| `signal`       | `AbortSignal` that cancels the call.                                                          |
-| `metadata`     | Request metadata (`{ key: "value" }` or a `Map`); keys are lowercase, `trevrpc-` is reserved. |
-| `maxFrameSize` | Largest frame accepted or sent in bytes (default 4 MiB).                                      |
+| Option               | Meaning                                                                                       |
+| -------------------- | --------------------------------------------------------------------------------------------- |
+| `timeoutMs`          | Deadline for the whole call, from the request to the final status. Also sent to the server.   |
+| `signal`             | `AbortSignal` that cancels the call.                                                          |
+| `metadata`           | Request metadata (`{ key: "value" }` or a `Map`); keys are lowercase, `trevrpc-` is reserved. |
+| `maxFrameSize`       | Largest frame accepted or sent in bytes (default 4 MiB).                                      |
+| `onResponseHeaders`  | Called with the response headers.                                                             |
+| `onResponseMetadata` | Called with the trailing metadata of a successful call.                                       |
 
 The client enforces no other response limits: there is no cap on the number of streamed
 messages, their total size, or idle time between them. Use `timeoutMs` or `signal` to bound a
@@ -94,7 +96,7 @@ call.
 
 - Failed calls throw `TrevRpcError` with a `code` (`Code.NotFound`, ...), `statusMessage` and `metadata`. A deadline surfaces as `Code.DeadlineExceeded`, a cancelled call as `Code.Cancelled` (with the abort reason as `cause`), and a lost connection as `Code.Unavailable`.
 - Streaming responses end with the server's final status: iteration finishes after `OK` and throws the `TrevRpcError` otherwise. `stream.status` settles with the same outcome and carries trailing metadata. Leaving a `for await` loop early, or calling `close()`, cancels the call.
-- Response headers and trailing metadata are separate. `...WithResponse(request)` (unary) and `closeAndRecvWithResponse()` (client streaming) return `{ message, headers, metadata }`, where `headers` are the server's response headers (empty when it sent none) and `metadata` is the trailing metadata of the final status. Server-streaming and bidirectional calls have a `headers` promise that resolves as soon as the first response frame arrives, so headers are available before the first message, and rejects with the call's error if the call fails first. Reading `headers` is optional.
+- Response headers and trailing metadata are separate. Every call reports them to the `onResponseHeaders(headers)` and `onResponseMetadata(metadata)` callbacks of its options: the headers (empty when the server sent none) as soon as the first response frame arrives, and the trailing metadata of the final status when the call succeeds, before its result is returned or its stream ends. A failed call carries its metadata on the `TrevRpcError`, and a callback that throws fails the call. Server-streaming and bidirectional calls also have a `headers` promise that resolves as soon as the first response frame arrives, so headers are available before the first message, and rejects with the call's error if the call fails first.
 - Frames follow the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format): a type, a length and a payload, with messages sent as raw protobuf. The client skips frame types it does not know, and `maxFrameSize` limits every frame, unknown ones included.
 - The server's response decides the outcome of a call, and a call reports it as soon as the final status arrives. If the server ends a call before the upload is done (client-streaming and bidirectional calls), the upload is cancelled and `send()` rejects at once, without waiting for the server to stop reading and whether or not the caller receives:
   - with the server's `TrevRpcError` if its status is not OK, and the same error is the call's outcome (`closeAndRecv()`, `recv()`, `status`);

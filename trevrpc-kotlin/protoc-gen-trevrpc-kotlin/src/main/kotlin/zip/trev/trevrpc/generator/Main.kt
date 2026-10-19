@@ -325,99 +325,19 @@ private fun reserveMethodFamily(
     val renderedPackage = packageName.split('.').filter(String::isNotEmpty).joinToString(".", transform = ::kotlinIdent)
     val clientOwner = listOf(renderedPackage, kotlinIdent(service.clientName)).filter(String::isNotEmpty).joinToString(".")
     val callOptions = "$runtimePackage.CallOptions"
+    val configure = "$callOptions.() -> $callOptions"
     val flowType = "kotlinx.coroutines.flow.Flow"
+    val configureErased = "kotlin.jvm.functions.Function1"
 
-    val options = listOf(callOptions)
-    val requestAndOptions = listOf(method.input.kotlinType, callOptions)
-    val flowAndOptions = listOf("$flowType<${method.input.kotlinType}>", callOptions)
-    val erasedFlowAndOptions = listOf(flowType, callOptions)
-    when {
-        method.clientStreaming && method.serverStreaming -> {
-            reserveMember(reservations, clientOwner, method.suffixedName("Response"), options, options, true, true, symbol)
-            reserveMember(reservations, clientOwner, method.name, options, options, true, true, symbol)
-            reserveMember(
-                reservations,
-                clientOwner,
-                method.name,
-                flowAndOptions,
-                erasedFlowAndOptions,
-                isSuspend = false,
-                hasDefaultParameters = true,
-                symbol = symbol,
-            )
+    val (parameters, erased) =
+        if (method.clientStreaming) {
+            listOf("$flowType<${method.input.kotlinType}>", configure) to listOf(flowType, configureErased)
+        } else {
+            listOf(method.input.kotlinType, configure) to listOf(method.input.kotlinType, configureErased)
         }
-
-        method.clientStreaming -> {
-            reserveMember(reservations, clientOwner, method.suffixedName("Response"), options, options, true, true, symbol)
-            reserveMember(
-                reservations,
-                clientOwner,
-                method.suffixedName("Response"),
-                flowAndOptions,
-                erasedFlowAndOptions,
-                isSuspend = true,
-                hasDefaultParameters = true,
-                symbol = symbol,
-            )
-            reserveMember(reservations, clientOwner, method.name, options, options, true, true, symbol)
-            reserveMember(
-                reservations,
-                clientOwner,
-                method.name,
-                flowAndOptions,
-                erasedFlowAndOptions,
-                isSuspend = true,
-                hasDefaultParameters = true,
-                symbol = symbol,
-            )
-        }
-
-        method.serverStreaming -> {
-            reserveMember(
-                reservations,
-                clientOwner,
-                method.suffixedName("Response"),
-                requestAndOptions,
-                requestAndOptions,
-                isSuspend = true,
-                hasDefaultParameters = true,
-                symbol = symbol,
-            )
-            reserveMember(
-                reservations,
-                clientOwner,
-                method.name,
-                requestAndOptions,
-                requestAndOptions,
-                isSuspend = false,
-                hasDefaultParameters = true,
-                symbol = symbol,
-            )
-        }
-
-        else -> {
-            reserveMember(
-                reservations,
-                clientOwner,
-                method.suffixedName("Response"),
-                requestAndOptions,
-                requestAndOptions,
-                isSuspend = true,
-                hasDefaultParameters = true,
-                symbol = symbol,
-            )
-            reserveMember(
-                reservations,
-                clientOwner,
-                method.name,
-                requestAndOptions,
-                requestAndOptions,
-                isSuspend = true,
-                hasDefaultParameters = true,
-                symbol = symbol,
-            )
-        }
-    }
+    // Unary and client-streaming calls suspend for their response; the others return a flow.
+    val isSuspend = !method.serverStreaming
+    reserveMember(reservations, clientOwner, method.name, parameters, erased, isSuspend, true, symbol)
 }
 
 private fun reserveMember(
@@ -474,8 +394,6 @@ private data class Method(
     val kotlinName: String
         get() = kotlinIdent(name)
 
-    fun suffixedName(suffix: String): String = kotlinIdent(name + suffix)
-
     /** The wire method path `/package.Service/Method`. */
     fun path(service: Service): String = "/${service.fullProtoName}/$protoName"
 
@@ -513,10 +431,7 @@ private fun generateFile(
             appendLine("package ${javaPackage(file).split('.').joinToString(".", transform = ::kotlinIdent)}")
         }
         appendLine()
-        appendLine("import kotlinx.coroutines.coroutineScope")
         appendLine("import kotlinx.coroutines.flow.Flow")
-        appendLine("import kotlinx.coroutines.flow.flow")
-        appendLine("import kotlinx.coroutines.launch")
         appendLine()
         codecs.values.forEach { type -> generateCodec(runtime, type, checkNotNull(codecNames[type.protoName])) }
         services.forEachIndexed { index, service ->
@@ -661,107 +576,34 @@ private fun StringBuilder.generateClientMethod(
     val pathConstant = method.pathConstant(service)
     val inputCodec = checkNotNull(codecNames[method.input.protoName])
     val outputCodec = checkNotNull(codecNames[method.output.protoName])
+    val input = method.input.kotlinType
+    val output = method.output.kotlinType
+    val (signature, call) =
+        when {
+            method.clientStreaming && method.serverStreaming -> {
+                "public fun ${method.kotlinName}(\n        requests: Flow<$input>," to
+                    "): Flow<$output> =\n        client.bidirectionalStreaming($pathConstant, requests, $inputCodec, $outputCodec, defaultCallOptions.options())"
+            }
+
+            method.clientStreaming -> {
+                "public suspend fun ${method.kotlinName}(\n        requests: Flow<$input>," to
+                    "): $output =\n        client.clientStreaming($pathConstant, requests, $inputCodec, $outputCodec, defaultCallOptions.options())"
+            }
+
+            method.serverStreaming -> {
+                "public fun ${method.kotlinName}(\n        request: $input," to
+                    "): Flow<$output> =\n        client.serverStreaming($pathConstant, request, $inputCodec, $outputCodec, defaultCallOptions.options())"
+            }
+
+            else -> {
+                "public suspend fun ${method.kotlinName}(\n        request: $input," to
+                    "): $output =\n        client.unary($pathConstant, request, $inputCodec, $outputCodec, defaultCallOptions.options())"
+            }
+        }
     val start = length
-    when {
-        method.clientStreaming && method.serverStreaming -> {
-            appendLine("    public suspend fun ${method.suffixedName("Response")}(")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): $runtime.BidirectionalStreamingCall<${method.input.kotlinType}, ${method.output.kotlinType}> =")
-            appendLine("        client.bidirectionalStreaming($pathConstant, $inputCodec, $outputCodec, options)")
-            appendLine()
-            appendLine("    public suspend fun ${method.kotlinName}(")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): $runtime.BidirectionalStreamingCall<${method.input.kotlinType}, ${method.output.kotlinType}> =")
-            appendLine("        ${method.suffixedName("Response")}(options)")
-            appendLine()
-            appendLine("    public fun ${method.kotlinName}(")
-            appendLine("        requests: Flow<${method.input.kotlinType}>,")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): Flow<${method.output.kotlinType}> =")
-            appendLine("        flow {")
-            appendLine("            coroutineScope {")
-            appendLine("                val call = ${method.suffixedName("Response")}(options)")
-            appendLine("                val sender = launch { call.sendAll(requests) }")
-            appendLine("                try {")
-            appendLine("                    while (true) {")
-            appendLine("                        val response = call.receive() ?: break")
-            appendLine("                        emit(response)")
-            appendLine("                    }")
-            appendLine("                } finally {")
-            appendLine("                    sender.cancel()")
-            appendLine("                    call.close()")
-            appendLine("                }")
-            appendLine("            }")
-            appendLine("        }")
-        }
-
-        method.clientStreaming -> {
-            appendLine("    public suspend fun ${method.suffixedName("Response")}(")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): $runtime.ClientStreamingCall<${method.input.kotlinType}, ${method.output.kotlinType}> =")
-            appendLine("        client.clientStreaming($pathConstant, $inputCodec, $outputCodec, options)")
-            appendLine()
-            appendLine("    public suspend fun ${method.kotlinName}(")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): $runtime.ClientStreamingCall<${method.input.kotlinType}, ${method.output.kotlinType}> =")
-            appendLine("        ${method.suffixedName("Response")}(options)")
-            appendLine()
-            appendLine("    public suspend fun ${method.suffixedName("Response")}(")
-            appendLine("        requests: Flow<${method.input.kotlinType}>,")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): $runtime.ResponseEnvelope<${method.output.kotlinType}> {")
-            appendLine("        val call = ${method.suffixedName("Response")}(options)")
-            appendLine("        return try {")
-            appendLine("            call.sendAll(requests)")
-            appendLine("            call.receive()")
-            appendLine("        } finally {")
-            appendLine("            call.close()")
-            appendLine("        }")
-            appendLine("    }")
-            appendLine()
-            appendLine("    public suspend fun ${method.kotlinName}(")
-            appendLine("        requests: Flow<${method.input.kotlinType}>,")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): ${method.output.kotlinType} = ${method.suffixedName("Response")}(requests, options).message")
-        }
-
-        method.serverStreaming -> {
-            appendLine("    public suspend fun ${method.suffixedName("Response")}(")
-            appendLine("        request: ${method.input.kotlinType},")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): $runtime.ServerStreamingCall<${method.output.kotlinType}> =")
-            appendLine("        client.serverStreaming($pathConstant, request, $inputCodec, $outputCodec, options)")
-            appendLine()
-            appendLine("    public fun ${method.kotlinName}(")
-            appendLine("        request: ${method.input.kotlinType},")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): Flow<${method.output.kotlinType}> =")
-            appendLine("        flow {")
-            appendLine("            val call = ${method.suffixedName("Response")}(request, options)")
-            appendLine("            try {")
-            appendLine("                while (true) {")
-            appendLine("                    val response = call.receive() ?: break")
-            appendLine("                    emit(response)")
-            appendLine("                }")
-            appendLine("            } finally {")
-            appendLine("                call.close()")
-            appendLine("            }")
-            appendLine("        }")
-        }
-
-        else -> {
-            appendLine("    public suspend fun ${method.suffixedName("Response")}(")
-            appendLine("        request: ${method.input.kotlinType},")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): $runtime.ResponseEnvelope<${method.output.kotlinType}> =")
-            appendLine("        client.unaryResponse($pathConstant, request, $inputCodec, $outputCodec, options)")
-            appendLine()
-            appendLine("    public suspend fun ${method.kotlinName}(")
-            appendLine("        request: ${method.input.kotlinType},")
-            appendLine("        options: $runtime.CallOptions = defaultCallOptions,")
-            appendLine("    ): ${method.output.kotlinType} = ${method.suffixedName("Response")}(request, options).message")
-        }
-    }
+    appendLine("    $signature")
+    appendLine("        options: $runtime.CallOptions.() -> $runtime.CallOptions = { this },")
+    appendLine("    $call")
     if (method.unreliable.any) documentUnreliable(method, start)
     appendLine()
 }

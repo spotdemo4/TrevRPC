@@ -22,8 +22,6 @@ export function createServiceClient(transport, service, root, options = {}) {
     switch (method.kind) {
       case "unary":
         client[jsName] = async (request, override) =>
-          (await unaryCall(transport, rpc, request, resolve(override))).message;
-        client[`${jsName}WithResponse`] = (request, override) =>
           unaryCall(transport, rpc, request, resolve(override));
         break;
       case "serverStreaming":
@@ -45,11 +43,11 @@ export function createServiceClient(transport, service, root, options = {}) {
   return client;
 }
 
-/** Calls a unary RPC and returns the decoded response with its headers and trailing metadata. */
+/** Calls a unary RPC and returns the decoded response. */
 export async function unaryCall(transport, rpc, request, options) {
   const body = marshalMessage(rpc.requestType, request);
   const call = await Call.open(transport, requestFields(rpc, RpcKind.Unary), body, options);
-  const stream = new BidirectionalStreamingCall(call, rpc);
+  const stream = new BidirectionalStreamingCall(call, rpc, { options });
   // The response decides the outcome, so the request side finishes in the background.
   stream.closeSend().catch(() => {});
   return await receiveSingleResponse(stream, "unary");
@@ -65,7 +63,7 @@ export async function serverStreamingCall(transport, rpc, request, options) {
     options,
     rpc.datagrams,
   );
-  const stream = new BidirectionalStreamingCall(call, rpc);
+  const stream = new BidirectionalStreamingCall(call, rpc, { options });
   stream.closeSend().catch(() => {});
   return new ResponseStream(stream);
 }
@@ -80,7 +78,7 @@ export async function clientStreamingCall(transport, rpc, options) {
     rpc.datagrams,
   );
   return new ClientStreamingCall(
-    new BidirectionalStreamingCall(call, rpc, { streamsRequest: true }),
+    new BidirectionalStreamingCall(call, rpc, { streamsRequest: true, options }),
   );
 }
 
@@ -93,7 +91,7 @@ export async function bidirectionalStreamingCall(transport, rpc, options) {
     options,
     rpc.datagrams,
   );
-  return new BidirectionalStreamingCall(call, rpc, { streamsRequest: true });
+  return new BidirectionalStreamingCall(call, rpc, { streamsRequest: true, options });
 }
 
 /**
@@ -119,8 +117,8 @@ async function receiveSingleResponse(stream, kind) {
   if (count !== 1) {
     throw internal(`${kind} RPC returned no response message`);
   }
-  const status = await stream.status;
-  return { message, metadata: status.metadata, headers: await stream.headers };
+  await stream.status;
+  return message;
 }
 
 /**
@@ -164,6 +162,10 @@ const EarlyOk = "the server completed the call before the request stream ended";
  *
  * The final status settles the outcome as soon as it is read. Responses read before it are still
  * delivered in order, and the call's deadline and abort signal no longer apply to it.
+ *
+ * The call options' `onResponseHeaders` is called with the headers when the first response frame
+ * is read, and `onResponseMetadata` with the trailing metadata when the final status is OK. A
+ * callback that throws fails the call.
  */
 export class BidirectionalStreamingCall {
   #call;
@@ -202,6 +204,10 @@ export class BidirectionalStreamingCall {
   #resolveHeaders;
   #rejectHeaders;
   #headers;
+  #onResponseHeaders;
+  #onResponseMetadata;
+  /** Whether the headers were handed to onResponseHeaders. */
+  #headersReported = false;
 
   /** The final status, or the error that ended the call. */
   status = new Promise((resolve, reject) => {
@@ -209,10 +215,12 @@ export class BidirectionalStreamingCall {
     this.#rejectStatus = reject;
   });
 
-  constructor(call, rpc, { streamsRequest = false } = {}) {
+  constructor(call, rpc, { streamsRequest = false, options = {} } = {}) {
     this.#call = call;
     this.#rpc = rpc;
     this.#streamsRequest = streamsRequest;
+    this.#onResponseHeaders = options.onResponseHeaders;
+    this.#onResponseMetadata = options.onResponseMetadata;
     this.#flow = rpc.datagrams?.receive ? call.flow : undefined;
     this.status.catch(() => {});
     this.#headers = new Promise((resolve, reject) => {
@@ -407,6 +415,14 @@ export class BidirectionalStreamingCall {
 
   /** The final status arrived: it is the outcome, and it ends the upload. */
   #endWithStatus({ code, message, metadata }) {
+    if (code === Code.Ok && this.#onResponseMetadata !== undefined) {
+      try {
+        this.#onResponseMetadata(metadata);
+      } catch (error) {
+        this.#endWithError(error);
+        return;
+      }
+    }
     const error = code === Code.Ok ? undefined : statusError(code, message, metadata);
     this.#terminal = { status: { code, message, metadata }, error };
     this.#call.finish(error ?? cancelled(EarlyOk));
@@ -435,6 +451,15 @@ export class BidirectionalStreamingCall {
     this.#notify();
   }
 
+  /** Settles the headers on their first frame, and hands them to onResponseHeaders once. */
+  #settleHeaders(metadata) {
+    this.#resolveHeaders(metadata);
+    if (!this.#headersReported) {
+      this.#headersReported = true;
+      this.#onResponseHeaders?.(metadata);
+    }
+  }
+
   /**
    * Reads the next MESSAGE or STATUS event, consuming HEADERS on the way. Enforces the response
    * grammar `[HEADERS] MESSAGE* STATUS`.
@@ -456,19 +481,19 @@ export class BidirectionalStreamingCall {
           const headers = unmarshalMessage(RpcHeaders, frame.payload);
           validateResponseMetadata(headers.metadata, "headers");
           this.#sawHeaders = true;
-          this.#resolveHeaders(headers.metadata);
+          this.#settleHeaders(headers.metadata);
           this.#flow?.connect(this.#onDatagram);
           continue;
         }
         case FrameType.Message:
           this.#sawMessage = true;
-          this.#resolveHeaders({});
+          this.#settleHeaders({});
           this.#flow?.connect(this.#onDatagram);
           return frame;
         case FrameType.Status: {
           const status = unmarshalMessage(RpcStatus, frame.payload);
           validateResponseMetadata(status.metadata, "trailing metadata");
-          this.#resolveHeaders({});
+          this.#settleHeaders({});
           this.#flow?.connect(this.#onDatagram);
           return { type: FrameType.Status, status };
         }
@@ -565,11 +590,6 @@ export class ClientStreamingCall {
 
   /** Closes the request stream and returns the final response. */
   async closeAndRecv() {
-    return (await this.closeAndRecvWithResponse()).message;
-  }
-
-  /** Closes the request stream and returns the final response with its headers and trailing metadata. */
-  async closeAndRecvWithResponse() {
     this.#call.closeSend().catch(() => {});
     return await receiveSingleResponse(this.#call, "client-streaming");
   }

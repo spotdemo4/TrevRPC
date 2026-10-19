@@ -9,8 +9,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -33,19 +35,15 @@ class MessageCodec<T>(
 }
 
 /**
- * A single response message. [metadata] is the trailing metadata from the terminal status;
- * [headers] is the response header metadata, empty when the server sent no HEADERS frame.
- */
-data class ResponseEnvelope<T>(
-    val message: T,
-    val metadata: Metadata = Metadata.EMPTY,
-    val headers: Metadata = Metadata.EMPTY,
-)
-
-/**
  * Options of one call. By default a call has no deadline and no metadata, and a response stream is
  * bounded only by [maxResponseBodySize] per message: [maxResponseMessages],
  * [maxResponseStreamBodySize], and [streamIdleTimeout] are off until set.
+ *
+ * [onResponseHeaders] is called with the response headers, empty when the server sent none, as
+ * soon as the first response frame arrives. [onResponseMetadata] is called with the trailing
+ * metadata of the final status when the call succeeds, before its result is returned or its
+ * response flow completes; a failed call carries its metadata on the [TrevRpcException] instead.
+ * Both run in the coroutine that reads the response, and one that throws fails the call.
  */
 data class CallOptions(
     val timeout: Duration? = null,
@@ -54,6 +52,8 @@ data class CallOptions(
     val maxResponseStreamBodySize: Long? = null,
     val streamIdleTimeout: Duration? = null,
     val metadata: Metadata = Metadata.EMPTY,
+    val onResponseHeaders: ((Metadata) -> Unit)? = null,
+    val onResponseMetadata: ((Metadata) -> Unit)? = null,
 ) {
     init {
         require(timeout == null || (timeout.isFinite() && timeout.isPositive())) {
@@ -125,21 +125,14 @@ class Client(
     private val transport: RpcTransport,
     private val responseContext: CoroutineContext = Dispatchers.Default,
 ) {
+    /** Calls a unary RPC and returns its response. */
     suspend fun <Req, Res> unary(
         path: String,
         request: Req,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
-    ): Res = unaryResponse(path, request, requestCodec, responseCodec, options).message
-
-    suspend fun <Req, Res> unaryResponse(
-        path: String,
-        request: Req,
-        requestCodec: MessageCodec<Req>,
-        responseCodec: MessageCodec<Res>,
-        options: CallOptions = CallOptions(),
-    ): ResponseEnvelope<Res> {
+    ): Res {
         // A unary call has no stream-idle bound, only the call deadline.
         val state =
             open(
@@ -153,7 +146,77 @@ class Client(
         return state.reader.receiveSingle("unary")
     }
 
-    suspend fun <Req, Res> serverStreaming(
+    /**
+     * Calls a server-streaming RPC when the returned flow is collected, and emits its responses.
+     * Cancelling the collection cancels the call.
+     */
+    fun <Req, Res> serverStreaming(
+        path: String,
+        request: Req,
+        requestCodec: MessageCodec<Req>,
+        responseCodec: MessageCodec<Res>,
+        options: CallOptions = CallOptions(),
+    ): Flow<Res> =
+        flow {
+            val call = openServerStreaming(path, request, requestCodec, responseCodec, options)
+            try {
+                while (true) emit(call.receive() ?: break)
+            } finally {
+                call.close()
+            }
+        }
+
+    /**
+     * Calls a client-streaming RPC that sends every request of [requests], and returns its
+     * response. If the server ends the call before [requests] is exhausted, the rest is dropped and
+     * the server's outcome is returned or thrown.
+     */
+    suspend fun <Req, Res> clientStreaming(
+        path: String,
+        requests: Flow<Req>,
+        requestCodec: MessageCodec<Req>,
+        responseCodec: MessageCodec<Res>,
+        options: CallOptions = CallOptions(),
+    ): Res {
+        val call = openClientStreaming(path, requestCodec, responseCodec, options)
+        return try {
+            call.sendAll(requests)
+            call.receive()
+        } finally {
+            call.close()
+        }
+    }
+
+    /**
+     * Calls a bidirectional-streaming RPC when the returned flow is collected: it sends every
+     * request of [requests] while it emits the responses. Cancelling the collection cancels the
+     * call.
+     */
+    fun <Req, Res> bidirectionalStreaming(
+        path: String,
+        requests: Flow<Req>,
+        requestCodec: MessageCodec<Req>,
+        responseCodec: MessageCodec<Res>,
+        options: CallOptions = CallOptions(),
+    ): Flow<Res> =
+        flow {
+            coroutineScope {
+                val call = openBidirectionalStreaming(path, requestCodec, responseCodec, options)
+                val sender = launch { call.sendAll(requests) }
+                try {
+                    while (true) emit(call.receive() ?: break)
+                } finally {
+                    sender.cancel()
+                    call.close()
+                }
+            }
+        }
+
+    /**
+     * Opens a server-streaming call and returns it, for reading its responses, headers, and final
+     * status one at a time.
+     */
+    suspend fun <Req, Res> openServerStreaming(
         path: String,
         request: Req,
         requestCodec: MessageCodec<Req>,
@@ -171,7 +234,8 @@ class Client(
         return ServerStreamingCall(state.reader)
     }
 
-    suspend fun <Req, Res> clientStreaming(
+    /** Opens a client-streaming call and returns it, for sending its requests one at a time. */
+    suspend fun <Req, Res> openClientStreaming(
         path: String,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
@@ -181,7 +245,11 @@ class Client(
         return ClientStreamingCall(state.writer, requestCodec, state.reader)
     }
 
-    suspend fun <Req, Res> bidirectionalStreaming(
+    /**
+     * Opens a bidirectional-streaming call and returns it, for sending requests and receiving
+     * responses one at a time.
+     */
+    suspend fun <Req, Res> openBidirectionalStreaming(
         path: String,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
@@ -441,7 +509,8 @@ class ClientStreamingCall<Req, Res> internal constructor(
     /** Response header metadata; see [ServerStreamingCall.headers]. */
     suspend fun headers(): Metadata = reader.headers()
 
-    suspend fun receive(): ResponseEnvelope<Res> {
+    /** Half-closes the request side and returns the response. */
+    suspend fun receive(): Res {
         if (!received.compareAndSet(false, true)) {
             throw TrevRpcException(Status.failedPrecondition("client-streaming response was already received"))
         }
@@ -611,8 +680,10 @@ internal class ResponseReader<T>(
                 )
             }
             headersMetadata = frame.metadata
+            options.onResponseHeaders?.invoke(frame.metadata)
         } else if (headersMetadata == null) {
             headersMetadata = Metadata.EMPTY
+            options.onResponseHeaders?.invoke(Metadata.EMPTY)
         }
         return frame
     }
@@ -680,6 +751,7 @@ internal class ResponseReader<T>(
             )
         }
         if (closeError != null) throw closeError
+        options.onResponseMetadata?.invoke(status.metadata)
         terminalStatus = status
         return null
     }
@@ -689,7 +761,7 @@ internal class ResponseReader<T>(
  * Reads the single response message of a unary or client-streaming call, then the terminal status.
  * The stream is drained to its status first so a remote failure wins over a shape violation.
  */
-internal suspend fun <T> ResponseReader<T>.receiveSingle(kind: String): ResponseEnvelope<T> {
+internal suspend fun <T> ResponseReader<T>.receiveSingle(kind: String): T {
     var response: T? = null
     var multipleResponses = false
     while (true) {
@@ -706,7 +778,7 @@ internal suspend fun <T> ResponseReader<T>.receiveSingle(kind: String): Response
     if (multipleResponses) {
         throw TrevRpcException(Status.internal("$kind RPC returned more than one response message"))
     }
-    return ResponseEnvelope(response, responseMetadata, headersMetadata ?: Metadata.EMPTY)
+    return response
 }
 
 private fun request(

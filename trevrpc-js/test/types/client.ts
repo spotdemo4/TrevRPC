@@ -10,7 +10,6 @@ import {
   type ResponseStream,
   type StreamStatus,
   type Transport,
-  type UnaryResponse,
 } from "@trevrpc/trevrpc-js";
 
 import {
@@ -44,10 +43,13 @@ createServiceClient(channel, EchoService, root);
 
 const unary: EchoResponse = await echo.unary({ message: "hi", failCode: Code.NotFound });
 unary.message satisfies string | undefined;
-const withResponse = await echo.unaryWithResponse({ message: "hi" });
-withResponse satisfies UnaryResponse<EchoResponse>;
-withResponse.metadata["x"] satisfies Uint8Array;
-withResponse.headers["x"] satisfies Uint8Array;
+await echo.unary(
+  { message: "hi" },
+  {
+    onResponseHeaders: (headers) => headers["x"] satisfies Uint8Array | undefined,
+    onResponseMetadata: (metadata) => metadata["x"] satisfies Uint8Array | undefined,
+  },
+);
 
 const stream = await echo.serverStream({ count: 2 });
 stream satisfies ResponseStream<EchoResponse>;
@@ -62,7 +64,6 @@ const upload = await echo.clientStream();
 upload satisfies ClientStreamingCall<{ message?: string }, EchoResponse>;
 await upload.send({ message: "a" });
 (await upload.closeAndRecv()) satisfies EchoResponse;
-(await upload.closeAndRecvWithResponse()) satisfies UnaryResponse<EchoResponse>;
 
 const bidi = await echo.bidi({ signal: new AbortController().signal });
 bidi satisfies BidirectionalStreamingCall<{ message?: string }, EchoResponse>;
