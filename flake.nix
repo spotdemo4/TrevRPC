@@ -91,6 +91,9 @@
               nixd
               nixfmt
 
+              # protobuf
+              buf
+
               # util
               treefmt
               bumper
@@ -130,6 +133,8 @@
           release = pkgs.mkShell {
             packages = with pkgs; [
               flake-release
+              # protobuf
+              buf
               # rust
               rustc
               cargo
@@ -319,6 +324,7 @@
             oxfmt
             ktlint
             ruff
+            buf
           ];
         };
 
@@ -367,6 +373,20 @@
             packages = with pkgs; [ golangci-lint ];
             script = ''
               golangci-lint run ./...
+            '';
+          };
+
+          buf = {
+            root = ./proto;
+            filter = file: file.hasExt "proto" || file.hasExt "yaml" || file.hasExt "md";
+            packages = with pkgs; [
+              buf
+            ];
+            script = ''
+              export BUF_CACHE_DIR=$(mktemp -d)
+              buf lint
+              buf format --diff --exit-code
+              buf build -o /dev/null
             '';
           };
 

@@ -19,6 +19,12 @@ command = "ktlint"
 options = ["--format"]
 includes = ["*.kt", "*.kts"]
 
+[formatter.buf]
+# buf format takes one input at a time.
+command = "sh"
+options = ["-c", "for file; do buf format --write \"$file\"; done", "buf-format"]
+includes = ["proto/**/*.proto"]
+
 [formatter.ruff]
 command = "ruff"
 options = ["format"]

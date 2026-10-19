@@ -1,0 +1,16 @@
+# The TrevRPC schema options, published to the Buf Schema Registry as
+# buf.build/trevrpc/trevrpc by the buf workflow.
+version: v2
+modules:
+  - path: .
+    name: buf.build/trevrpc/trevrpc
+lint:
+  use:
+    - STANDARD
+  except:
+    # The package is `trevrpc` so schemas write `(trevrpc.method)`; a
+    # versioned package would change every option users write.
+    - PACKAGE_VERSION_SUFFIX
+breaking:
+  use:
+    - FILE

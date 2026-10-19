@@ -4,8 +4,9 @@
 // 	protoc        v7.36.2
 // source: trevrpc/options.proto
 
-// TrevRPC schema options. Put the directory containing this file's trevrpc/
-// directory on your protoc include path and import "trevrpc/options.proto".
+// TrevRPC schema options. Depend on buf.build/trevrpc/trevrpc, or put the
+// directory containing this file's trevrpc/ directory on your protoc include
+// path, and import "trevrpc/options.proto".
 
 package trevrpcpb
 
