@@ -1,7 +1,8 @@
-// Command trevrpc-bench-grpc is the grpc-go baseline for TrevRPC's load
-// benchmarks (see ../README.md). Its server subcommand serves the interop Echo
-// service over gRPC (HTTP/2 over TLS) and its bench subcommand is a load
-// client with the same flags and JSON output as the TrevRPC bench clients.
+// Command trevrpc-bench-baseline is the grpc-go and connect-go baseline for
+// TrevRPC's load benchmarks (see README.md). Its server subcommand serves the
+// interop Echo service over gRPC and over the Connect protocol (both HTTP/2
+// over TLS), and its bench subcommand is a load client with the same flags and
+// JSON output as the TrevRPC bench clients.
 package main
 
 import (
@@ -14,7 +15,7 @@ import (
 	"syscall"
 )
 
-const usage = "usage: trevrpc-bench-grpc server|bench [flags]"
+const usage = "usage: trevrpc-bench-baseline server|bench [flags]"
 
 func main() {
 	os.Exit(realMain())
@@ -24,7 +25,7 @@ func realMain() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "trevrpc-bench-grpc:", err)
+		fmt.Fprintln(os.Stderr, "trevrpc-bench-baseline:", err)
 		return 1
 	}
 	return 0

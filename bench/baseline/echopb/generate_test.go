@@ -11,21 +11,24 @@ import (
 )
 
 const (
-	goPackage = "trev.zip/llc/trevrpc/bench/grpc-go/echopb"
+	goPackage = "trev.zip/llc/trevrpc/bench/baseline/echopb"
 	protoEnv  = "TREVRPC_INTEROP_PROTO"
 )
 
 var update = flag.Bool("update", false, "rewrite the generated files from interop/proto/interop.proto")
 
-var generatedFiles = []string{"interop.pb.go", "interop_grpc.pb.go"}
+// generatedFiles are relative to this package; protoc-gen-connect-go writes
+// into an echopbconnect subpackage because its identifiers collide with
+// protoc-gen-go-grpc's.
+var generatedFiles = []string{"interop.pb.go", "interop_grpc.pb.go", "echopbconnect/interop.connect.go"}
 
 // protocVersionLine is the only line of generated code that depends on the
 // installed protoc binary; every other line is fixed by this module's versions.
 var protocVersionLine = regexp.MustCompile(`(?m)^// (?:- )?\s*protoc +v.*\n`)
 
 // TestGeneratedCodeMatchesProto regenerates the Echo bindings from the shared
-// interop/proto/interop.proto with protoc-gen-go and protoc-gen-go-grpc, and
-// fails when the committed files have drifted. Run
+// interop/proto/interop.proto with protoc-gen-go, protoc-gen-go-grpc, and
+// protoc-gen-connect-go, and fails when the committed files have drifted. Run
 // `go test ./echopb -update` to rewrite them.
 //
 // The proto directory defaults to the repository checkout and can be
@@ -48,15 +51,18 @@ func TestGeneratedCodeMatchesProto(t *testing.T) {
 	binDir := t.TempDir()
 	run(t, "go", "build", "-o", binDir,
 		"google.golang.org/protobuf/cmd/protoc-gen-go",
-		"google.golang.org/grpc/cmd/protoc-gen-go-grpc")
+		"google.golang.org/grpc/cmd/protoc-gen-go-grpc",
+		"connectrpc.com/connect/cmd/protoc-gen-connect-go")
 
 	outDir := t.TempDir()
 	run(t, protoc,
 		"--plugin=protoc-gen-go="+filepath.Join(binDir, "protoc-gen-go"),
 		"--plugin=protoc-gen-go-grpc="+filepath.Join(binDir, "protoc-gen-go-grpc"),
+		"--plugin=protoc-gen-connect-go="+filepath.Join(binDir, "protoc-gen-connect-go"),
 		"-I", protoDir,
 		"--go_out="+outDir, "--go_opt=paths=source_relative", "--go_opt=Minterop.proto="+goPackage,
 		"--go-grpc_out="+outDir, "--go-grpc_opt=paths=source_relative", "--go-grpc_opt=Minterop.proto="+goPackage,
+		"--connect-go_out="+outDir, "--connect-go_opt=paths=source_relative", "--connect-go_opt=Minterop.proto="+goPackage,
 		protoFile,
 	)
 
@@ -66,6 +72,9 @@ func TestGeneratedCodeMatchesProto(t *testing.T) {
 			t.Fatalf("protoc did not generate %s: %v", name, err)
 		}
 		if *update {
+			if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+				t.Fatal(err)
+			}
 			if err := os.WriteFile(name, generated, 0o644); err != nil {
 				t.Fatal(err)
 			}

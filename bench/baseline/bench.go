@@ -2,26 +2,16 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"slices"
 	"strings"
 	"sync"
 	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
-
-	"trev.zip/llc/trevrpc/bench/grpc-go/echopb"
 )
 
 const (
@@ -57,7 +47,7 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 	fs.StringVar(&tcpAddr, "tcp-addr", "", "accepted and ignored; present for flag compatibility")
 	fs.StringVar(&cfg.ca, "ca", "", "CA certificate PEM file")
 	fs.StringVar(&cfg.serverName, "server-name", "localhost", "TLS server name")
-	fs.StringVar(&cfg.transport, "transport", "grpc", "transport (only grpc)")
+	fs.StringVar(&cfg.transport, "transport", "grpc", "grpc|connect")
 	fs.StringVar(&cfg.scenario, "scenario", "", "unary|server-stream|client-stream|bidi")
 	fs.IntVar(&cfg.size, "size", 64, "EchoRequest.message length in bytes")
 	fs.IntVar(&cfg.concurrency, "concurrency", 1, "number of workers")
@@ -76,8 +66,8 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 	switch {
 	case cfg.addr == "" || cfg.ca == "":
 		return cfg, errors.New("bench needs --addr and --ca")
-	case cfg.transport != "grpc":
-		return cfg, fmt.Errorf("unsupported --transport %q (this binary only speaks grpc)", cfg.transport)
+	case !slices.Contains(transports, cfg.transport):
+		return cfg, fmt.Errorf("unsupported --transport %q (this binary speaks %s)", cfg.transport, strings.Join(transports, ", "))
 	case !slices.Contains(scenarios, cfg.scenario):
 		return cfg, fmt.Errorf("--scenario must be one of %s", strings.Join(scenarios, ", "))
 	case cfg.size < 0, cfg.concurrency < 1, cfg.messages < 1:
@@ -90,7 +80,10 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 	return cfg, nil
 }
 
-var scenarios = []string{"unary", "server-stream", "client-stream", "bidi"}
+var (
+	transports = []string{"grpc", "connect"}
+	scenarios  = []string{"unary", "server-stream", "client-stream", "bidi"}
+)
 
 // latencySummary is in microseconds.
 type latencySummary struct {
@@ -131,39 +124,21 @@ type workerResult struct {
 }
 
 // runBench connects, runs the warmup and the measured window, and summarizes.
-//
-// All workers share one grpc.ClientConn, which grpc-go multiplexes over a
-// single HTTP/2 connection with default settings (64 KiB initial flow-control
-// windows with dynamic BDP estimation, 32 KiB write buffers, no compression).
-// Those defaults cap throughput per stream on high-latency links but are
-// irrelevant on loopback; no tuning is applied so the numbers are stock gRPC.
+// All workers share one connection; see dial.
 func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 	var zero benchResult
-	creds, err := clientCredentials(cfg)
+	conn, err := dial(ctx, cfg)
 	if err != nil {
 		return zero, err
 	}
-	counter := &wireCounter{}
-	conn, err := grpc.NewClient("passthrough:///"+cfg.addr,
-		grpc.WithTransportCredentials(creds),
-		grpc.WithContextDialer(counter.dial))
-	if err != nil {
-		return zero, err
-	}
-	defer func() { _ = conn.Close() }()
-	if err := waitReady(ctx, conn); err != nil {
-		return zero, err
-	}
-	client := echopb.NewEchoClient(conn)
+	defer conn.close()
 
 	// runCtx bounds every call; the deadline is armed once the window is known.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	// Every call, and the Bidi stream a worker keeps open, derives from runCtx.
-	runCtx = withPadMetadata(runCtx, cfg.metadataSize)
 	workers := make([]worker, cfg.concurrency)
 	for i := range workers {
-		workers[i] = newWorker(runCtx, client, cfg)
+		workers[i] = newWorker(runCtx, conn.client, cfg)
 	}
 	defer func() {
 		for _, w := range workers {
@@ -182,53 +157,12 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 		wg.Go(func() { results[i] = runWorker(runCtx, w, measureStart, measureEnd) })
 	}
 
-	wireStart, wireEnd, ok := snapshotWire(ctx, counter, measureStart, measureEnd)
+	wireStart, wireEnd, ok := snapshotWire(ctx, conn.wire, measureStart, measureEnd)
 	wg.Wait()
 	if !ok {
 		return zero, ctx.Err()
 	}
 	return summarize(cfg, results, wireEnd-wireStart)
-}
-
-// withPadMetadata returns ctx with the bench-pad outgoing metadata entry of
-// size bytes, or ctx itself when size is 0. gRPC metadata values must be
-// printable ASCII, so the pad is made of 'x'.
-func withPadMetadata(ctx context.Context, size int) context.Context {
-	if size == 0 {
-		return ctx
-	}
-	return metadata.AppendToOutgoingContext(ctx, padKey, strings.Repeat("x", size))
-}
-
-func clientCredentials(cfg benchConfig) (credentials.TransportCredentials, error) {
-	pem, err := os.ReadFile(cfg.ca)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("%s contains no certificates", cfg.ca)
-	}
-	return credentials.NewTLS(&tls.Config{RootCAs: pool, ServerName: cfg.serverName}), nil
-}
-
-// waitReady connects and waits for the HTTP/2 connection to be established, so
-// connection setup is never part of a measurement.
-func waitReady(ctx context.Context, conn *grpc.ClientConn) error {
-	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
-	defer cancel()
-	conn.Connect()
-	for {
-		switch state := conn.GetState(); state {
-		case connectivity.Ready:
-			return nil
-		case connectivity.TransientFailure, connectivity.Shutdown:
-			return fmt.Errorf("connect to %s: %s", conn.Target(), state)
-		}
-		if !conn.WaitForStateChange(ctx, conn.GetState()) {
-			return fmt.Errorf("connect to %s: %w", conn.Target(), ctx.Err())
-		}
-	}
 }
 
 // snapshotWire returns the connection's byte total at the start and end of the
@@ -301,7 +235,7 @@ func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (bench
 	seconds := cfg.duration.Seconds()
 	res := benchResult{
 		Scenario:     cfg.scenario,
-		Transport:    "grpc",
+		Transport:    cfg.transport,
 		Size:         cfg.size,
 		MetadataSize: cfg.metadataSize,
 		Concurrency:  cfg.concurrency,

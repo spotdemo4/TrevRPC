@@ -196,8 +196,8 @@
             script = ''
               go -C trevrpc-go mod tidy
               fix-hash .#trevrpc-go
-              go -C bench/grpc-go mod tidy
-              fix-hash .#trevrpc-bench-grpc
+              go -C bench/baseline mod tidy
+              fix-hash .#trevrpc-bench-baseline
             '';
           };
 
@@ -293,11 +293,11 @@
             };
             # nix run .#trevrpc-bench: the load benchmarks; see bench/README.md.
             trevrpc-bench = pkgs.callPackage ./bench {
-              inherit (self.packages.${system}) trevrpc-bench-grpc trevrpc-go trevrpc-rust;
+              inherit (self.packages.${system}) trevrpc-bench-baseline trevrpc-go trevrpc-rust;
             };
             # nix run .#trevrpc-bench-micro: the Go and Rust microbenchmarks, from the checkout.
             trevrpc-bench-micro = pkgs.callPackage ./bench/micro.nix { };
-            trevrpc-bench-grpc = pkgs.callPackage ./bench/grpc-go { inherit interopProto; };
+            trevrpc-bench-baseline = pkgs.callPackage ./bench/baseline { inherit interopProto; };
           };
 
         # nix fmt
@@ -322,7 +322,7 @@
             trevrpc-js
             trevrpc-kotlin
             trevrpc-rust
-            trevrpc-bench-grpc
+            trevrpc-bench-baseline
             trevrpc-bench-micro
             ;
 

@@ -1,8 +1,9 @@
-module trev.zip/llc/trevrpc/bench/grpc-go
+module trev.zip/llc/trevrpc/bench/baseline
 
 go 1.26.0
 
 require (
+	connectrpc.com/connect v1.21.1
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 )
@@ -16,6 +17,7 @@ require (
 )
 
 tool (
+	connectrpc.com/connect/cmd/protoc-gen-connect-go
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc
 	google.golang.org/protobuf/cmd/protoc-gen-go
 )

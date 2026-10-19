@@ -2,15 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
 	"errors"
-	"flag"
-	"fmt"
 	"io"
-	"net"
-	"strconv"
 	"strings"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -18,105 +13,21 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"trev.zip/llc/trevrpc/bench/grpc-go/echopb"
+	"trev.zip/llc/trevrpc/bench/baseline/echopb"
 )
 
-const (
-	suffixKey  = "interop-suffix"
-	headerKey  = "interop-header"
-	trailerKey = "interop-trailer"
-
-	// shutdownGrace bounds how long a graceful stop waits for in-flight calls.
-	shutdownGrace = 5 * time.Second
-)
-
-type serverConfig struct {
-	cert, key string
-	host      string
-	port      int
-}
-
-func parseServerFlags(args []string) (serverConfig, error) {
-	var cfg serverConfig
-	fs := flag.NewFlagSet("server", flag.ContinueOnError)
-	fs.StringVar(&cfg.cert, "cert", "", "TLS certificate PEM file")
-	fs.StringVar(&cfg.key, "key", "", "TLS private key PEM file")
-	fs.StringVar(&cfg.host, "host", "127.0.0.1", "listen host")
-	fs.IntVar(&cfg.port, "port", 0, "listen port (0 picks a free port)")
-	if err := fs.Parse(args); err != nil {
-		return cfg, err
-	}
-	if fs.NArg() != 0 {
-		return cfg, fmt.Errorf("unexpected argument %q", fs.Arg(0))
-	}
-	if cfg.cert == "" || cfg.key == "" {
-		return cfg, errors.New("server needs --cert and --key")
-	}
-	if cfg.port < 0 || cfg.port > 65535 {
-		return cfg, fmt.Errorf("invalid --port %d", cfg.port)
-	}
-	return cfg, nil
-}
-
-// runServer serves Echo over gRPC with TLS until stdin reaches EOF or ctx is
-// done. Once the listener is accepting it prints exactly one JSON line,
-// {"grpc":<port>}, to stdout (which is unbuffered when it is os.Stdout). The server uses grpc-go's defaults (no tuning
-// options), so it is the stock gRPC baseline; in particular HTTP/2 flow control
-// uses the default initial windows of 64 KiB with grpc-go's dynamic BDP
-// estimation enabled, and the server never logs per RPC.
-func runServer(ctx context.Context, cfg serverConfig, stdin io.Reader, stdout io.Writer) error {
-	creds, err := credentials.NewServerTLSFromFile(cfg.cert, cfg.key)
-	if err != nil {
-		return fmt.Errorf("load certificate: %w", err)
-	}
-	var lc net.ListenConfig
-	lis, err := lc.Listen(ctx, "tcp", net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port)))
-	if err != nil {
-		return err
-	}
-	srv := grpc.NewServer(grpc.Creds(creds))
+// newGRPCServer returns a grpc-go server for Echo with grpc-go's defaults (no
+// tuning options), so it is the stock gRPC baseline; in particular HTTP/2 flow
+// control uses the default initial windows of 64 KiB with grpc-go's dynamic BDP
+// estimation enabled.
+func newGRPCServer(certificate tls.Certificate) *grpc.Server {
+	srv := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&certificate)))
 	echopb.RegisterEchoServer(srv, echoServer{})
-
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(lis) }()
-
-	port := lis.Addr().(*net.TCPAddr).Port
-	line, err := json.Marshal(map[string]int{"grpc": port})
-	if err != nil {
-		srv.Stop()
-		return err
-	}
-	if _, err := fmt.Fprintf(stdout, "%s\n", line); err != nil {
-		srv.Stop()
-		return err
-	}
-
-	stdinClosed := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, stdin)
-		close(stdinClosed)
-	}()
-	select {
-	case <-stdinClosed:
-	case <-ctx.Done():
-	case err := <-serveErr:
-		return err
-	}
-
-	stopped := make(chan struct{})
-	go func() {
-		srv.GracefulStop()
-		close(stopped)
-	}()
-	select {
-	case <-stopped:
-	case <-time.After(shutdownGrace):
-		srv.Stop()
-	}
-	return nil
+	return srv
 }
 
-// echoServer implements the interop Echo semantics from interop/README.md.
+// echoServer implements the interop Echo semantics from interop/README.md
+// with grpc-go.
 type echoServer struct {
 	echopb.UnimplementedEchoServer
 }

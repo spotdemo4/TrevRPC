@@ -9,10 +9,10 @@ import (
 // wireCounter totals the bytes a client's TCP connections send and receive.
 //
 // Wire bytes are measured with a net.Conn wrapper installed through
-// grpc.WithContextDialer, below the TLS layer that grpc-go adds on top of the
-// dialed connection. It therefore counts the TLS records on the TCP stream
-// (HTTP/2 frames, TLS record headers and authentication tags, handshake and
-// session tickets), the closest analogue of the UDP payload bytes the QUIC
+// grpc.WithContextDialer or http.Transport.DialContext, below the TLS layer
+// that grpc-go and net/http add on top of the dialed connection. It therefore
+// counts the TLS records on the TCP stream (HTTP/2 frames, TLS record headers
+// and authentication tags, handshake and session tickets), the closest analogue of the UDP payload bytes the QUIC
 // clients report: neither includes IP/TCP/UDP headers or ACK-only packets.
 // grpc-go's stats.Handler was not used because its WireLength covers only the
 // gRPC message payload and framing, not HTTP/2 or TLS overhead.
@@ -27,8 +27,13 @@ func (c *wireCounter) total() uint64 {
 
 // dial dials addr over TCP and counts the connection's traffic.
 func (c *wireCounter) dial(ctx context.Context, addr string) (net.Conn, error) {
+	return c.dialNetwork(ctx, "tcp", addr)
+}
+
+// dialNetwork is dial for any stream network, as http.Transport dials.
+func (c *wireCounter) dialNetwork(ctx context.Context, network, addr string) (net.Conn, error) {
 	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}

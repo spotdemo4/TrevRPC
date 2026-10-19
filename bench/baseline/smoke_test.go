@@ -17,6 +17,7 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -31,14 +32,15 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"trev.zip/llc/trevrpc/bench/grpc-go/echopb"
+	"trev.zip/llc/trevrpc/bench/baseline/echopb"
 )
 
 // testServer is a running `server` subcommand backed by an in-process listener.
 type testServer struct {
-	addr, ca string
-	stdin    *io.PipeWriter
-	done     chan error
+	addrs map[string]string // by transport
+	ca    string
+	stdin *io.PipeWriter
+	done  chan error
 }
 
 // writeCert writes a self-signed ECDSA localhost certificate and key.
@@ -94,10 +96,16 @@ func startServer(t *testing.T) *testServer {
 		t.Fatalf("read port line: %v", err)
 	}
 	var ports map[string]int
-	if err := json.Unmarshal(line, &ports); err != nil || len(ports) != 1 || ports["grpc"] == 0 {
-		t.Fatalf("port line %q is not {\"grpc\":<port>}: %v", line, err)
+	if err := json.Unmarshal(line, &ports); err != nil || len(ports) != len(transports) {
+		t.Fatalf("port line %q is not {\"grpc\":<port>,\"connect\":<port>}: %v", line, err)
 	}
-	srv.addr = net.JoinHostPort("127.0.0.1", strconv.Itoa(ports["grpc"]))
+	srv.addrs = make(map[string]string)
+	for _, transport := range transports {
+		if ports[transport] == 0 {
+			t.Fatalf("port line %q has no %s port", line, transport)
+		}
+		srv.addrs[transport] = net.JoinHostPort("127.0.0.1", strconv.Itoa(ports[transport]))
+	}
 	t.Cleanup(func() { srv.stop(t) })
 	return srv
 }
@@ -119,23 +127,26 @@ func (s *testServer) stop(t *testing.T) {
 
 func TestBenchScenarios(t *testing.T) {
 	srv := startServer(t)
-	for _, scenario := range scenarios {
-		for _, concurrency := range []int{1, 4} {
-			for _, metadataSize := range []int{0, 300} {
-				t.Run(scenario+"/c"+strconv.Itoa(concurrency)+"/md"+strconv.Itoa(metadataSize), func(t *testing.T) {
-					var out bytes.Buffer
-					args := []string{
-						"bench", "--addr", srv.addr, "--tcp-addr", "ignored:1", "--ca", srv.ca,
-						"--server-name", "localhost", "--transport", "grpc", "--scenario", scenario,
-						"--size", "100", "--metadata-size", strconv.Itoa(metadataSize),
-						"--concurrency", strconv.Itoa(concurrency),
-						"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
-					}
-					if err := run(t.Context(), args, nil, &out); err != nil {
-						t.Fatal(err)
-					}
-					checkResult(t, out.Bytes(), scenario, concurrency, metadataSize)
-				})
+	for _, transport := range transports {
+		for _, scenario := range scenarios {
+			for _, concurrency := range []int{1, 4} {
+				for _, metadataSize := range []int{0, 300} {
+					name := transport + "/" + scenario + "/c" + strconv.Itoa(concurrency) + "/md" + strconv.Itoa(metadataSize)
+					t.Run(name, func(t *testing.T) {
+						var out bytes.Buffer
+						args := []string{
+							"bench", "--addr", srv.addrs[transport], "--tcp-addr", "ignored:1", "--ca", srv.ca,
+							"--server-name", "localhost", "--transport", transport, "--scenario", scenario,
+							"--size", "100", "--metadata-size", strconv.Itoa(metadataSize),
+							"--concurrency", strconv.Itoa(concurrency),
+							"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
+						}
+						if err := run(t.Context(), args, nil, &out); err != nil {
+							t.Fatal(err)
+						}
+						checkResult(t, out.Bytes(), transport, scenario, concurrency, metadataSize)
+					})
+				}
 			}
 		}
 	}
@@ -149,10 +160,15 @@ type padCounter struct {
 	size                   int
 }
 
-func (c *padCounter) observe(ctx context.Context) {
-	c.calls.Add(1)
+// observeGRPC observes a grpc-go call's incoming metadata.
+func (c *padCounter) observeGRPC(ctx context.Context) {
 	md, _ := metadata.FromIncomingContext(ctx)
-	pad := md.Get(padKey)
+	c.observe(md.Get(padKey))
+}
+
+// observe observes the values of a call's bench-pad request metadata entries.
+func (c *padCounter) observe(pad []string) {
+	c.calls.Add(1)
 	if len(pad) == 0 {
 		return
 	}
@@ -163,12 +179,12 @@ func (c *padCounter) observe(ctx context.Context) {
 	}
 }
 
-// startPadCountingServer serves Echo over TLS with interceptors that observe
-// every unary call and stream.
-func startPadCountingServer(t *testing.T, counter *padCounter) *testServer {
+// startPadCountingServer serves Echo over TLS for transport, observing the
+// request metadata of every call.
+func startPadCountingServer(t *testing.T, transport string, counter *padCounter) (addr, ca string) {
 	t.Helper()
-	cert, key := writeCert(t)
-	creds, err := credentials.NewServerTLSFromFile(cert, key)
+	certPath, keyPath := writeCert(t)
+	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,53 +193,70 @@ func startPadCountingServer(t *testing.T, counter *padCounter) *testServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := grpc.NewServer(grpc.Creds(creds),
+	if transport == "connect" {
+		srv := newConnectServer(certificate)
+		echo := srv.Handler
+		srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			counter.observe(r.Header.Values(padKey))
+			echo.ServeHTTP(w, r)
+		})
+		go func() { _ = srv.ServeTLS(lis, "", "") }()
+		t.Cleanup(func() { _ = srv.Close() })
+		return lis.Addr().String(), certPath
+	}
+	srv := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&certificate)),
 		grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-			counter.observe(ctx)
+			counter.observeGRPC(ctx)
 			return handler(ctx, req)
 		}),
 		grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-			counter.observe(stream.Context())
+			counter.observeGRPC(stream.Context())
 			return handler(srv, stream)
 		}))
 	echopb.RegisterEchoServer(srv, echoServer{})
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
-	return &testServer{addr: lis.Addr().String(), ca: cert}
+	return lis.Addr().String(), certPath
 }
 
 // TestBenchMetadataSizeAddsOnePadEntryToEveryCall checks what the smoke test
 // cannot see: that every call carries exactly one bench-pad entry of the
 // asked size, and none without --metadata-size.
 func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
-	for _, scenario := range scenarios {
-		for _, size := range []int{0, 1, 4096} {
-			t.Run(scenario+"/md"+strconv.Itoa(size), func(t *testing.T) {
-				counter := &padCounter{size: size}
-				srv := startPadCountingServer(t, counter)
-				args := []string{
-					"bench", "--addr", srv.addr, "--ca", srv.ca, "--scenario", scenario,
-					"--size", "10", "--metadata-size", strconv.Itoa(size), "--concurrency", "2",
-					"--duration", "0.2", "--warmup", "0.05", "--messages", "3",
-				}
-				if err := run(t.Context(), args, nil, io.Discard); err != nil {
-					t.Fatal(err)
-				}
-				calls, padded := counter.calls.Load(), counter.padded.Load()
-				if calls == 0 {
-					t.Fatal("the server saw no calls")
-				}
-				switch {
-				case size == 0 && padded != 0:
-					t.Errorf("%d of %d calls carried %s, want none", padded, calls, padKey)
-				case size > 0 && padded != calls:
-					t.Errorf("%d of %d calls carried %s, want all", padded, calls, padKey)
-				}
-				if counter.entries.Load() != padded || counter.badPads.Load() != 0 {
-					t.Errorf("%d pad entries on %d calls, %d with the wrong value", counter.entries.Load(), padded, counter.badPads.Load())
-				}
-			})
+	for _, transport := range transports {
+		for _, scenario := range scenarios {
+			for _, size := range []int{0, 1, 4096} {
+				t.Run(transport+"/"+scenario+"/md"+strconv.Itoa(size), func(t *testing.T) {
+					testPadEntries(t, transport, scenario, size)
+				})
+			}
 		}
+	}
+}
+
+func testPadEntries(t *testing.T, transport, scenario string, size int) {
+	counter := &padCounter{size: size}
+	addr, ca := startPadCountingServer(t, transport, counter)
+	args := []string{
+		"bench", "--addr", addr, "--ca", ca, "--transport", transport, "--scenario", scenario,
+		"--size", "10", "--metadata-size", strconv.Itoa(size), "--concurrency", "2",
+		"--duration", "0.2", "--warmup", "0.05", "--messages", "3",
+	}
+	if err := run(t.Context(), args, nil, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	calls, padded := counter.calls.Load(), counter.padded.Load()
+	if calls == 0 {
+		t.Fatal("the server saw no calls")
+	}
+	switch {
+	case size == 0 && padded != 0:
+		t.Errorf("%d of %d calls carried %s, want none", padded, calls, padKey)
+	case size > 0 && padded != calls:
+		t.Errorf("%d of %d calls carried %s, want all", padded, calls, padKey)
+	}
+	if counter.entries.Load() != padded || counter.badPads.Load() != 0 {
+		t.Errorf("%d pad entries on %d calls, %d with the wrong value", counter.entries.Load(), padded, counter.badPads.Load())
 	}
 }
 
@@ -236,7 +269,7 @@ func TestBenchRejectsInvalidMetadataSizes(t *testing.T) {
 	}
 }
 
-func checkResult(t *testing.T, line []byte, scenario string, concurrency, metadataSize int) {
+func checkResult(t *testing.T, line []byte, transport, scenario string, concurrency, metadataSize int) {
 	t.Helper()
 	if bytes.Count(line, []byte("\n")) != 1 || !bytes.HasSuffix(line, []byte("\n")) {
 		t.Fatalf("want exactly one JSON line, got %q", line)
@@ -253,7 +286,7 @@ func checkResult(t *testing.T, line []byte, scenario string, concurrency, metada
 		}
 		return v
 	}
-	if r["scenario"] != scenario || r["transport"] != "grpc" {
+	if r["scenario"] != scenario || r["transport"] != transport {
 		t.Errorf("scenario/transport = %v/%v", r["scenario"], r["transport"])
 	}
 	if num("size") != 100 || int(num("concurrency")) != concurrency || num("duration_s") != 0.2 {
@@ -310,8 +343,9 @@ func TestServerExitsOnStdinEOF(t *testing.T) {
 	startServer(t).stop(t)
 }
 
-// TestEchoSemantics checks the interop Echo behavior from interop/README.md.
-func TestEchoSemantics(t *testing.T) {
+// TestGRPCEchoSemantics checks the interop Echo behavior from
+// interop/README.md over gRPC.
+func TestGRPCEchoSemantics(t *testing.T) {
 	srv := startServer(t)
 	pem, err := os.ReadFile(srv.ca)
 	if err != nil {
@@ -319,7 +353,7 @@ func TestEchoSemantics(t *testing.T) {
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(pem)
-	conn, err := grpc.NewClient(srv.addr, grpc.WithTransportCredentials(
+	conn, err := grpc.NewClient(srv.addrs["grpc"], grpc.WithTransportCredentials(
 		credentials.NewTLS(&tls.Config{RootCAs: pool, ServerName: "localhost"})))
 	if err != nil {
 		t.Fatal(err)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Runs every load-benchmark client against every server over every native transport, plus the
-grpc-go baseline; see README.md.
+grpc-go and connect-go baselines; see README.md.
 
-    run.py --server NAME=CMD... --client NAME=CMD... [--grpc CMD]
+    run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
            [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--concurrency LIST]
            [--duration SECONDS] [--warmup SECONDS] [--messages N] [--out DIR]
 """
@@ -42,6 +42,9 @@ SCENARIOS = (
     "unreliable-server-stream",
     "unreliable-client-stream",
 )
+# The baseline's transports, each served on the port of the same name. They have no datagram
+# messages, so they skip the unreliable-* scenarios.
+BASELINE_TRANSPORTS = ("grpc", "connect")
 # Room on top of warmup and duration for connecting and draining.
 DEADLINE_SLACK = 60
 COLUMNS = (
@@ -206,8 +209,7 @@ class Runner:
         concurrency."""
         m = self.matrix
         for scenario in m.scenarios:
-            # gRPC has no datagram messages to compare against.
-            if transport == "grpc" and scenario.startswith("unreliable-"):
+            if transport in BASELINE_TRANSPORTS and scenario.startswith("unreliable-"):
                 continue
             for size in m.sizes:
                 for metadata in m.metadata_sizes:
@@ -291,8 +293,9 @@ def seconds(value: str) -> float:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="trevrpc-bench",
-        description="Runs every load-benchmark client against every server, plus grpc-go. "
-        "Without --server, --client, or --grpc, the packaged runner uses the packaged ones.",
+        description="Runs every load-benchmark client against every server, plus the grpc-go and "
+        "connect-go baselines. Without --server, --client, or --baseline, the packaged runner "
+        "uses the packaged ones.",
     )
     _ = parser.add_argument(
         "--server", type=named_command, action="append", default=[], metavar="NAME=CMD"
@@ -300,7 +303,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument(
         "--client", type=named_command, action="append", default=[], metavar="NAME=CMD"
     )
-    _ = parser.add_argument("--grpc", type=command_line, metavar="CMD", help="the grpc-go baseline")
+    _ = parser.add_argument(
+        "--baseline", type=command_line, metavar="CMD", help="the grpc-go and connect-go baseline"
+    )
     _ = parser.add_argument("--scenarios", type=comma_list, default=list(SCENARIOS))
     _ = parser.add_argument("--sizes", type=int_list, default=[64])
     _ = parser.add_argument("--metadata-sizes", type=int_list, default=[0])
@@ -311,16 +316,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument(
         "--out", type=Path, help="where results go (default: a new trevrpc-bench.* in $TMPDIR)"
     )
-    args = parse_with_defaults(parser, argv, ("server", "client", "grpc"))
-    if (not args.server or not args.client) and args.grpc is None:
-        parser.error("need at least one --server and one --client, or --grpc")
+    args = parse_with_defaults(parser, argv, ("server", "client", "baseline"))
+    if (not args.server or not args.client) and args.baseline is None:
+        parser.error("need at least one --server and one --client, or --baseline")
     return args
 
 
 def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
     servers: list[NamedCommand] = args.server
     clients: list[NamedCommand] = args.client
-    grpc: list[str] | None = args.grpc
+    baseline: list[str] | None = args.baseline
     runner = Runner(
         Matrix(
             scenarios=args.scenarios,
@@ -352,11 +357,14 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
         finally:
             runner.stop(server)
 
-    if grpc is not None:
-        server = Server("grpc", grpc, certificate, out)
+    if baseline is not None:
+        server = Server("baseline", baseline, certificate, out)
         try:
-            address = f"127.0.0.1:{server.port('grpc')}"
-            runner.run_matrix("grpc", "grpc", grpc, "grpc", ["--addr", address, *tls])
+            for transport in BASELINE_TRANSPORTS:
+                address = f"127.0.0.1:{server.port(transport)}"
+                runner.run_matrix(
+                    transport, transport, baseline, transport, ["--addr", address, *tls]
+                )
         finally:
             runner.stop(server)
     return runner

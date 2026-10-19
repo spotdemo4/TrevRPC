@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	"trev.zip/llc/trevrpc/bench/grpc-go/echopb"
+	"trev.zip/llc/trevrpc/bench/baseline/echopb"
 )
 
 // worker runs one operation at a time on behalf of a single benchmark worker.
@@ -17,7 +17,7 @@ type worker interface {
 	close()
 }
 
-func newWorker(ctx context.Context, client echopb.EchoClient, cfg benchConfig) worker {
+func newWorker(ctx context.Context, client echoClient, cfg benchConfig) worker {
 	req := &echopb.EchoRequest{Message: strings.Repeat("x", cfg.size)}
 	switch cfg.scenario {
 	case "unary":
@@ -42,7 +42,7 @@ func checkSize(got, want int) error {
 }
 
 type unaryWorker struct {
-	client echopb.EchoClient
+	client echoClient
 	req    *echopb.EchoRequest
 }
 
@@ -57,7 +57,7 @@ func (w *unaryWorker) do(ctx context.Context) (int, error) {
 func (*unaryWorker) close() {}
 
 type serverStreamWorker struct {
-	client   echopb.EchoClient
+	client   echoClient
 	req      *echopb.EchoRequest
 	messages int
 }
@@ -90,7 +90,7 @@ func (w *serverStreamWorker) do(ctx context.Context) (int, error) {
 func (*serverStreamWorker) close() {}
 
 type clientStreamWorker struct {
-	client   echopb.EchoClient
+	client   echoClient
 	req      *echopb.EchoRequest
 	messages int
 }
@@ -128,15 +128,11 @@ func (*clientStreamWorker) close() {}
 // bidiWorker keeps one Bidi stream open for the whole run, reopening it only
 // after an error.
 type bidiWorker struct {
-	client echopb.EchoClient
+	client echoClient
 	req    *echopb.EchoRequest
 	parent context.Context
 
-	stream interface {
-		Send(*echopb.EchoRequest) error
-		Recv() (*echopb.EchoResponse, error)
-		CloseSend() error
-	}
+	stream bidiStream
 	cancel context.CancelFunc
 	next   uint32 // index the next echo must carry
 }

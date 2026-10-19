@@ -1,8 +1,8 @@
 # Load benchmarks
 
 `bench/` measures end-to-end throughput and latency of every native client
-against every server over QUIC and QMux over TLS, plus a grpc-go baseline over
-HTTP/2. Per-function microbenchmarks live in each runtime (`go test -bench` in
+against every server over QUIC and QMux over TLS, plus grpc-go and connect-go
+baselines over HTTP/2. Per-function microbenchmarks live in each runtime (`go test -bench` in
 `trevrpc-go`, `cargo bench` in `trevrpc-rust`), which `bench/micro.py`
 (`nix run .#trevrpc-bench-micro`) runs and compares across commits with
 benchstat; see the wiki's Benchmarks page.
@@ -10,15 +10,17 @@ benchstat; see the wiki's Benchmarks page.
 ```text
 nix run .#trevrpc-bench              # every pair, default matrix
 nix run .#trevrpc-bench -- --scenarios unary,bidi --sizes 64,4096 --duration 10
-bench/run.py --server NAME=CMD... --client NAME=CMD... [--grpc CMD]
+bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST]
              [--metadata-sizes LIST] [--duration SECONDS] [--warmup SECONDS]
              [--messages N] [--out DIR]
 ```
 
 The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients
-and the grpc-go baseline unless the command line names any `--server`,
-`--client`, or `--grpc`, which then replace all three. `run.py` starts each server once, then runs every client over every transport
+and the baselines unless the command line names any `--server`, `--client`, or
+`--baseline`, which then replace all three. The baseline runs its gRPC client
+against its gRPC server and its Connect client against its Connect server.
+`run.py` starts each server once, then runs every client over every transport
 for every combination of scenario, size, metadata size, and concurrency. It prints a summary
 table and writes one JSON object per run to `DIR/results.jsonl`; without
 `--out`, `DIR` is a new `trevrpc-bench.*` directory under `$TMPDIR`. A run fails
@@ -32,9 +34,11 @@ check runs a very short matrix only to keep the tool working.
 
 Servers are the interop executables' `server` subcommand (see
 [`interop/README.md`](../interop/README.md)) serving `trevrpc.interop.v1.Echo` and `trevrpc.interop.v1.UnreliableEcho`.
-The grpc-go baseline (`bench/grpc-go`) follows the same contract: it serves the
-same `Echo` service over gRPC (HTTP/2 over TLS), prints `{"grpc":<port>}` once
-it is accepting, and exits when its stdin reaches EOF.
+The baseline ([`bench/baseline`](baseline/README.md)) follows the same
+contract: it serves the same `Echo` service over gRPC with grpc-go and over the
+Connect protocol with connect-go (both HTTP/2 over TLS, on separate ports),
+prints `{"grpc":<port>,"connect":<port>}` once it is accepting, and exits when
+its stdin reaches EOF.
 
 Servers must not log per RPC while benchmarking, and must not cap the message
 count or cumulative size of a stream, since `bidi` workers keep one stream open
@@ -44,15 +48,16 @@ for the whole run.
 
 ```text
 <binary> bench --addr <host:port> [--tcp-addr <host:port>] --ca <cert.pem>
-               [--server-name localhost] --transport quic|tcp|grpc
+               [--server-name localhost] --transport quic|tcp|grpc|connect
                --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream
                [--size BYTES] [--concurrency N] [--duration SECONDS]
                [--warmup SECONDS] [--messages N] [--metadata-size BYTES]
 ```
 
 - `--transport quic` dials native QUIC at `--addr`. `--transport tcp` dials
-  QMux over TLS at `--tcp-addr`. `--transport grpc` is the grpc-go baseline at
-  `--addr`. Every worker shares one connection.
+  QMux over TLS at `--tcp-addr`. `--transport grpc` and `--transport connect`
+  are the baseline's gRPC and Connect clients at `--addr`. Every worker shares
+  one connection.
 - `--size` (default 64) is the length of `EchoRequest.message` in bytes.
 - `--concurrency` (default 1) is the number of workers, each with exactly one
   call or stream in flight.
@@ -60,8 +65,8 @@ for the whole run.
   start and finish inside the measured window count.
 - `--metadata-size` (default 0) adds one request metadata entry, `bench-pad`,
   with a value of that many bytes to every call, to measure the cost of
-  per-call metadata such as a bearer token. The gRPC baseline sends it as gRPC
-  metadata. With `0`, calls carry no metadata. The maximum is 8192, the
+  per-call metadata such as a bearer token. The baseline sends it as gRPC
+  metadata or as a Connect request header. With `0`, calls carry no metadata. The maximum is 8192, the
   TrevRPC per-value metadata limit.
 - `--messages` (default 100) is the number of messages per streaming call. The
   `client-stream` response is `messages × size` bytes, so that product must stay
@@ -76,7 +81,7 @@ for the whole run.
 | `unreliable-server-stream` | `UnreliableEcho.Bidi` sending `{message, count: messages}`, closing the send side, and reading every response until the status | responses delivered    |
 | `unreliable-client-stream` | `UnreliableEcho.Bidi` sending `messages` requests `{message, count: 0}`, closing the send side, and reading the status         | `interop-received`     |
 
-The `unreliable-*` scenarios measure [datagram messages](../wiki/Protocol-and-Wire-Format.md#datagram-messages): over `quic` the streamed messages travel as datagrams and may be lost, while over `tcp` they stay on the QMux stream. The gRPC baseline has no equivalent and does not run them.
+The `unreliable-*` scenarios measure [datagram messages](../wiki/Protocol-and-Wire-Format.md#datagram-messages): over `quic` the streamed messages travel as datagrams and may be lost, while over `tcp` they stay on the QMux stream. The baselines have no equivalent and do not run them.
 
 The client prints exactly one JSON line to stdout and exits 0, or exits
 non-zero if it could not connect or measure:
@@ -101,7 +106,7 @@ non-zero if it could not connect or measure:
 }
 ```
 
-- `transport` is `quic`, `qmux`, or `grpc`.
+- `transport` is `quic`, `qmux`, `grpc`, or `connect`.
 - `msgs` counts application messages: responses for `unary` and
   `server-stream`, requests for `client-stream`, round trips for `bidi`.
 - `bytes_per_sec` is `msgs_per_sec × size`.
