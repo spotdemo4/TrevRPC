@@ -101,7 +101,7 @@ stdenvNoCC.mkDerivation (final: {
 
   # The app's only tests are instrumented and need an emulator, and the parent package already runs
   # every host test, so the Gradle check is skipped. doCheck stays on so this is the same derivation
-  # as the flake check, and the CI interop jobs fetch the checked build from the cache.
+  # as the flake check, and the android workflow and the flake check share one cached build.
   doCheck = true;
   dontUseGradleCheck = true;
 
