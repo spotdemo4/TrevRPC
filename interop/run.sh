@@ -3,14 +3,19 @@
 # see README.md.
 #
 #   run.sh [--out DIR] --server NAME=CMD... [--client NAME=CMD...] [--browser NAME...]
-#          [--browser-lanes webtransport,websocket,fallback]
+#          [--browser-lanes webtransport,websocket,fallback,app-webtransport,app-websocket]
 #
 # Servers and native clients are interop executables taking the `server` and
 # `client` subcommands. Browsers run through `trevrpc-interop-browser`, by
-# default over every lane: WebTransport, QMux over WebSocket, and the fallback
-# from a blocked UDP port to WebSocket. Safari cannot ignore certificate errors,
-# so with `--browser safari` the generated certificate is trusted in the macOS
-# System keychain for the duration of the run, through non-interactive sudo.
+# default over every lane: WebTransport, QMux over WebSocket, the fallback
+# from a blocked UDP port to WebSocket, and the app lanes, where the server
+# itself serves the page through its HTTP fallback, as a web app's server
+# would, and the page calls it over WebTransport or WebSocket. The
+# app-webtransport lane loads the page over HTTP/3 where the browser can be
+# made to (Chromium), and app-websocket over HTTP/2, as on a network that
+# blocks UDP. Safari cannot ignore certificate errors, so with
+# `--browser safari` the generated certificate is trusted in the macOS System
+# keychain for the duration of the run, through non-interactive sudo.
 set -euo pipefail
 
 # shellcheck source-path=SCRIPTDIR source=lib.sh
@@ -19,7 +24,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 servers=()
 clients=()
 browsers=()
-browser_lanes="webtransport,websocket,fallback"
+browser_lanes="webtransport,websocket,fallback,app-webtransport,app-websocket"
 out=""
 while (($#)); do
   case "$1" in
@@ -99,9 +104,17 @@ for browser in "${browsers[@]}"; do
   fi
 done
 
+# With browsers, every server also serves the interop page from its HTTP
+# fallback, for the app lanes.
+server_args=()
+if ((${#browsers[@]})); then
+  trevrpc-interop-browser --write-page "$work/web"
+  server_args=(--web-root "$work/web")
+fi
+
 for server in "${servers[@]}"; do
   server_name=${server%%=*}
-  start_server "$server_name" "${server#*=}"
+  start_server "$server_name" "${server#*=}" "${server_args[@]}"
   ports=$out/server-$server_name.ports
   native=$(jq -r .native "$ports")
   webtransport=$(jq -r .webtransport "$ports")
@@ -125,7 +138,21 @@ for server in "${servers[@]}"; do
       --server-name localhost --transport auto --expect-transport qmux
   done
   websocket=$(jq -r .websocket "$ports")
+  # Over HTTP/2 the page comes from the server's TCP listener, over HTTP/3 from
+  # its UDP socket. Their ports differ for the Rust server.
+  page_h2=(--page-url "https://127.0.0.1:$(jq -r .http2 "$ports")/")
+  page_h3=(--page-url "https://127.0.0.1:$(jq -r .http3 "$ports")/")
   for browser in "${browsers[@]}"; do
+    # The app lanes assert the protocol the page arrived over, except in Safari,
+    # which cannot be steered either way. Firefox does not use HTTP/3 with an
+    # overridden certificate, so its app-webtransport lane loads over HTTP/2.
+    case $browser in
+      chromium) app_webtransport=("${page_h3[@]}" --page-protocol h3) ;;
+      firefox) app_webtransport=("${page_h2[@]}" --page-protocol h2) ;;
+      *) app_webtransport=("${page_h2[@]}") ;;
+    esac
+    app_websocket=("${page_h2[@]}")
+    [[ $browser == safari ]] || app_websocket+=(--page-protocol h2)
     # Browsers run every scenario over WebTransport, over QMux over WebSocket,
     # and with a blocked UDP port, where they must fall back to WebSocket.
     if [[ ,$browser_lanes, == *,webtransport,* ]]; then
@@ -147,6 +174,21 @@ for server in "${servers[@]}"; do
         --url "https://127.0.0.1:$unreachable_udp/trevrpc" \
         --ws-url "wss://127.0.0.1:$websocket/trevrpc" \
         --cert-hash "$cert_hash" --transport auto --expect-transport websocket
+    fi
+    if [[ ,$browser_lanes, == *,app-webtransport,* ]]; then
+      run_cell "$browser-app-webtransport-to-$server_name" trevrpc-interop-browser \
+        --browser "$browser" \
+        "${app_webtransport[@]}" --cert "$cert" --key "$key" \
+        --url "https://127.0.0.1:$webtransport/trevrpc" \
+        --cert-hash "$cert_hash" --expect-transport webtransport
+    fi
+    if [[ ,$browser_lanes, == *,app-websocket,* ]]; then
+      run_cell "$browser-app-websocket-to-$server_name" trevrpc-interop-browser \
+        --browser "$browser" \
+        "${app_websocket[@]}" --cert "$cert" --key "$key" \
+        --url "https://127.0.0.1:$webtransport/trevrpc" \
+        --ws-url "wss://127.0.0.1:$websocket/trevrpc" \
+        --cert-hash "$cert_hash" --transport websocket --expect-transport websocket
     fi
   done
 

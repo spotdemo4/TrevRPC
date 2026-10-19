@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -148,12 +150,17 @@ test("the page bundle is browser-only and reports to the CLI", async () => {
   const bundle = await readFile(pageBundle, "utf8");
   assert.match(bundle, /"\/input"/);
   assert.match(bundle, /"\/result"/);
+  // A page served by a TrevRPC server reports to the origin in its query, and can check the
+  // protocol it arrived over.
+  assert.match(bundle, /"report"/);
+  assert.match(bundle, /nextHopProtocol/);
   assert.doesNotMatch(bundle, /from\s*["']node:|require\(["']node:|process\.binding/);
   assert.equal(Code.Ok, 0);
 });
 
 test("the CLI validates its arguments before launching a browser", () => {
   const valid = ["--browser", "chromium", "--url", url, "--cert-hash", "ab".repeat(32)];
+  const page = ["--page-url", "https://127.0.0.1:4433/", "--cert", "cert.pem", "--key", "key.pem"];
   const arguments_ = (replace) => {
     const copy = [...valid];
     for (const [flag, value] of Object.entries(replace)) {
@@ -176,11 +183,35 @@ test("the CLI validates its arguments before launching a browser", () => {
     arguments_({ "--cert-hash": "abcd" }),
     arguments_({ "--cert-hash": null }),
     [...valid, "--unknown"],
+    [...valid, "--page-url", "https://127.0.0.1:4433/"],
+    [...valid, "--page-url", "/relative", "--cert", "cert.pem", "--key", "key.pem"],
+    [...valid, "--cert", "cert.pem", "--key", "key.pem"],
+    ["--write-page", "out", "--browser", "chromium"],
+    [...valid, "--page-protocol", "h3"],
+    [...valid, ...page, "--page-protocol", "h1"],
+    [...arguments_({ "--browser": "firefox" }), ...page, "--page-protocol", "h3"],
+    [...arguments_({ "--browser": "safari" }), ...page, "--page-protocol", "h2"],
   ]) {
     const result = spawnSync(process.execPath, [cli, ...bad], { encoding: "utf8" });
     assert.equal(result.status, 2, bad.join(" "));
     assert.match(result.stderr, /usage: trevrpc-interop-browser/);
     assert.equal(result.stdout, "");
+  }
+});
+
+test("the CLI writes the page for a server to serve", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "trevrpc-page-"));
+  try {
+    const result = spawnSync(process.execPath, [cli, "--write-page", dir], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    // The script path is relative, so the page loads from any directory of a web root.
+    assert.match(
+      await readFile(join(dir, "index.html"), "utf8"),
+      /<script type="module" src="page.js">/,
+    );
+    assert.deepEqual(await readFile(join(dir, "page.js")), await readFile(pageBundle));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

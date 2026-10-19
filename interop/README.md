@@ -24,19 +24,35 @@ their own whether to expose WebTransport). Every Safari lane must pass against b
 `run.sh` runs one cell per client, server, and transport (`X` is a native client,
 `B` a browser, `S` a server):
 
-| Cell              | Client   | Transport                                                                                       |
-| ----------------- | -------- | ----------------------------------------------------------------------------------------------- |
-| `X-to-S`          | Go, Rust | QUIC                                                                                            |
-| `X-qmux-to-S`     | Go, Rust | QMux over TLS on the server's TCP port                                                          |
-| `X-fallback-to-S` | Go, Rust | `auto`, with the QUIC address pointing at UDP port 24999, which nothing answers: must fall back |
-| `B-to-S`          | Browser  | WebTransport                                                                                    |
-| `B-wss-to-S`      | Browser  | QMux over WebSocket (`wss://`)                                                                  |
-| `B-fallback-to-S` | Browser  | `auto`, with the WebTransport URL pointing at UDP port 24999: must fall back to WebSocket       |
+| Cell                      | Client   | Transport                                                                                       |
+| ------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `X-to-S`                  | Go, Rust | QUIC                                                                                            |
+| `X-qmux-to-S`             | Go, Rust | QMux over TLS on the server's TCP port                                                          |
+| `X-fallback-to-S`         | Go, Rust | `auto`, with the QUIC address pointing at UDP port 24999, which nothing answers: must fall back |
+| `B-to-S`                  | Browser  | WebTransport                                                                                    |
+| `B-wss-to-S`              | Browser  | QMux over WebSocket (`wss://`)                                                                  |
+| `B-fallback-to-S`         | Browser  | `auto`, with the WebTransport URL pointing at UDP port 24999: must fall back to WebSocket       |
+| `B-app-webtransport-to-S` | Browser  | WebTransport, from a page the server serves through its HTTP fallback (over HTTP/3 in Chromium) |
+| `B-app-websocket-to-S`    | Browser  | QMux over WebSocket, from a page the server serves through its HTTP fallback over HTTP/2        |
 
-`--browser-lanes webtransport,websocket,fallback` selects which browser lanes
-run (default: all three). Each cell asserts the transport it actually used
+`--browser-lanes webtransport,websocket,fallback,app-webtransport,app-websocket` selects
+which browser lanes run (default: all five). Each cell asserts the transport it actually used
 (`--expect-transport`), so a cell fails if it connects over the wrong
 transport.
+
+The app lanes check that one port serves both a web application and TrevRPC.
+`run.sh` writes the interop page with `trevrpc-interop-browser --write-page`,
+starts each server with `--web-root` on that directory, and has the browser load
+the page from the server. The scenarios then run from the server's own origin, to
+its WebTransport or WebSocket endpoint.
+
+`B-app-webtransport-to-S` loads the page over HTTP/3 from the server's UDP port in
+Chromium, and `B-app-websocket-to-S` over HTTP/2 from its TCP port, as on a network that blocks
+UDP. Both assert the protocol (`--page-protocol`). Chromium uses HTTP/3 only when
+it trusts the certificate by its public key and is forced to use QUIC for the
+origin: it ignores `Alt-Svc` from a connection with certificate errors. Firefox
+does not use HTTP/3 with an overridden certificate, so both of its app lanes load
+over HTTP/2. Safari's app lanes do not assert a protocol.
 
 ## Service
 
@@ -100,6 +116,7 @@ have their own entry points but follow the same output contract.
 
 ```text
 <binary> server --cert <cert.pem> --key <key.pem> [--host 127.0.0.1] [--port 0]
+                [--web-root <dir>]
 ```
 
 - Serves `Echo` over native QUIC (ALPN `trevrpc/1`), ordinary HTTP/3
@@ -112,6 +129,9 @@ have their own entry points but follow the same output contract.
   `P` is the UDP port and `T` the TCP port. The ports within each group are
   equal when one socket serves several protocols. The Go server uses the same
   number for `P` and `T`; the Rust server may use different ones.
+- With `--web-root`, serves the files in that directory to every other HTTP
+  request, over HTTP/3, HTTP/2 and HTTP/1.1, through the HTTP fallback
+  (`/` serves `index.html`).
 - Runs until stdin reaches EOF or it receives `SIGTERM`/`SIGINT`, then shuts
   down gracefully and exits `0`.
 - Diagnostics go to stderr.
@@ -140,6 +160,9 @@ trevrpc-interop-browser --browser chromium|firefox|safari --url <https://host:po
                         --cert-hash <hex sha256> [--transport webtransport|websocket|auto]
                         [--ws-url <wss://host:port/trevrpc>]
                         [--expect-transport webtransport|websocket]
+                        [--page-url <https://host:port/> --cert <cert.pem> --key <key.pem>
+                         [--page-protocol h2|h3]]
+trevrpc-interop-browser --write-page <dir>
 ```
 
 It follows the same output contract. `--transport` defaults to `webtransport`;
@@ -148,6 +171,17 @@ fails the run unless the channel connected over that transport. Chromium and
 Firefox ignore certificate errors, because WSS cannot pin a certificate hash.
 Safari is driven through `safaridriver`, which needs `sudo safaridriver --enable`
 once, and cannot ignore certificate errors (see [Certificates](#certificates)).
+
+The CLI normally serves the page itself from a loopback origin. `--write-page`
+writes it to a directory (`index.html` and `page.js`) instead and exits.
+`--page-url` then opens it from a server that serves that directory. The page
+reports to the CLI at the origin in its `report` query parameter, and the CLI
+serves that origin over HTTPS with `--cert` and `--key`, and answers cross-origin
+requests from the page. HTTPS keeps an HTTPS page's reports from being blocked as
+mixed content. `--page-protocol` has the browser load the page over that HTTP
+version and fails every scenario unless the page and its script arrived over it
+(their `nextHopProtocol`). Chromium supports `h2` and `h3`, Firefox only `h2`, and
+Safari neither.
 
 ### Android client
 

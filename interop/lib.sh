@@ -21,14 +21,16 @@ generate_cert() {
     -keyout "$key" -out "$cert" 2>/dev/null
 }
 
-# start_server NAME COMMAND runs `COMMAND server --cert --key` and waits for the
-# JSON port line it prints, which lands in $out/server-NAME.ports.
+# start_server NAME COMMAND [ARG...] runs `COMMAND server --cert --key ARG...`
+# and waits for the JSON port line it prints, which lands in
+# $out/server-NAME.ports.
 start_server() {
   local name=$1 command=$2 ports=$out/server-$1.ports
+  shift 2
   mkfifo "$work/stdin-$name"
   # The server exits when its stdin reaches EOF, so hold the write end open.
   # shellcheck disable=SC2086 # server commands may carry arguments
-  $command server --cert "$cert" --key "$key" \
+  $command server --cert "$cert" --key "$key" "$@" \
     <"$work/stdin-$name" >"$ports" 2>"$out/server-$name.log" &
   server_pid=$!
   exec {server_stdin}>"$work/stdin-$name"

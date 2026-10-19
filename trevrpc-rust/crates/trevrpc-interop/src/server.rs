@@ -7,6 +7,8 @@ use futures_util::StreamExt;
 use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
+use tower_http::services::ServeDir;
+use trevrpc::fallback::HttpFallback;
 use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissionRequest};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, Metadata, ResponseEnvelope, Status};
@@ -217,6 +219,8 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     // No `tracing` subscriber is installed, so the per-RPC logs are not emitted and cannot skew
     // the load benchmarks. The stream message and size limits are lifted because `bench` keeps one
     // bidi stream open for a whole run.
+    // `--web-root` serves a directory, such as the browser interop page, through the HTTP
+    // fallback on the same ports.
     let mut server = Server::new();
     server.set_options(
         ServerOptions::new()
@@ -224,7 +228,12 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
             .with_max_stream_body_size(None)
             .with_http_enabled(true)
             .with_webtransport_enabled(true)
-            .with_webtransport_admission(Some(admit_webtransport)),
+            .with_webtransport_admission(Some(admit_webtransport))
+            .with_http_fallback(
+                flags
+                    .get("web-root")
+                    .map(|root| HttpFallback::new(ServeDir::new(root))),
+            ),
     );
     proto::register_echo(&mut server, EchoService);
     proto::register_unreliable_echo(&mut server, UnreliableEchoService);

@@ -57,6 +57,12 @@ jobs:
           - server: rust
             name: webtransport
             lanes: webtransport
+          - server: go
+            name: app
+            lanes: app-webtransport,app-websocket
+          - server: rust
+            name: app
+            lanes: app-webtransport,app-websocket
     env:
       SERVER: ${{ matrix.server }}
       LANES: ${{ matrix.lanes }}

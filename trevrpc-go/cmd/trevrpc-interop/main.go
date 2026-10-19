@@ -3,6 +3,7 @@
 // UnreliableEcho services.
 //
 //	trevrpc-interop server --cert cert.pem --key key.pem [--host 127.0.0.1] [--port 0]
+//	                       [--web-root dir]
 //	trevrpc-interop client --addr host:port --ca cert.pem [--server-name localhost]
 //	                       [--transport quic|tcp|auto] [--tcp-addr host:port]
 //	                       [--expect-transport quic|qmux]
@@ -47,6 +48,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		flags.StringVar(&config.keyFile, "key", "", "server private key PEM file")
 		flags.StringVar(&config.host, "host", "127.0.0.1", "listen host")
 		flags.StringVar(&config.port, "port", "0", "listen UDP port (0 picks a free port)")
+		flags.StringVar(&config.webRoot, "web-root", "", "directory served through the HTTP fallback, such as the browser interop page")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
