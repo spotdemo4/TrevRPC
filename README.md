@@ -16,32 +16,104 @@
 [![maven-central](https://img.shields.io/maven-central/v/zip.trev.trevrpc/core?strategy=highestVersion&logo=apachemaven&logoColor=%23bac2de&labelColor=%23313244&color=%237F52FF)](https://central.sonatype.com/search?namespace=zip.trev.trevrpc)
 [![crates.io](https://img.shields.io/crates/v/trevrpc?labelColor=%23313244&color=%23D34516)](https://crates.io/crates/trevrpc)
 
-Protobuf over QUIC, HTTP/3 & WebTransport, with TCP fallbacks (QMux, HTTP/2 & WebSocket), and Go, Rust, JavaScript, and Kotlin runtimes
+Protobuf RPC over QUIC, HTTP/3 & WebTransport, with TCP fallbacks, for Go, Rust, JavaScript, and Kotlin
 
-## Support
+TrevRPC is an RPC framework like gRPC, but built on QUIC instead of HTTP/2. Write a protobuf service, generate
+typed clients and servers, and call it from native apps, browsers, and Android. Each RPC gets its own QUIC
+stream, so a lost packet stalls only the call it belongs to, and methods marked unreliable can send their
+messages as QUIC datagrams.
 
-QUIC is the primary transport. Every runtime also has a TCP fallback for networks that block UDP and browsers without WebTransport.
+> [!WARNING]
+> TrevRPC is a very early work in progress with no stability guarantees. It speaks its own protocol and is not
+> wire-compatible with gRPC, gRPC-Web, or Connect. See [current limitations](https://trev.zip/llc/TrevRPC/wiki/Current-Limitations).
 
-| Runtime                            | Server                                                                                           | Client                                                    |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
-| [Go](trevrpc-go)                   | native QUIC, HTTP/3, and WebTransport; fallbacks: QMux over TLS, HTTP/2, and QMux over WebSocket | native QUIC; fallback: QMux over TLS                      |
-| [Rust](trevrpc-rust)               | native QUIC, HTTP/3, and WebTransport; fallbacks: QMux over TLS, HTTP/2, and QMux over WebSocket | native QUIC; fallback: QMux over TLS                      |
-| [JavaScript](trevrpc-js) (browser) | —                                                                                                | WebTransport; fallback: QMux over WebSocket               |
-| [Kotlin](trevrpc-kotlin) (Android) | —                                                                                                | HTTP/3; fallback: HTTP/2 (Cronet's built-in TCP fallback) |
+## features
 
-Every client is tested against every server over every transport it speaks; see [interop](interop). The
-browser client is supported on Chromium, Firefox, and Safari with both servers, over WebTransport and the
-WebSocket fallback.
+- unary, client-streaming, server-streaming, and bidirectional-streaming RPCs
+- per-call deadlines, request and response metadata, and canonical status codes
+- [unreliable methods](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages)
+  that send messages as QUIC datagrams, and fall back to the stream wherever datagrams are unavailable
+- one UDP port for native QUIC, HTTP/3, and WebTransport, and one TCP port for every fallback
+- reconnecting client channels that fall back to TCP when UDP is blocked; RPCs are never retried or replayed
+- server limits, authorization hooks, metrics, and graceful shutdown
+- a shared wire format pinned by golden vectors, and an [interop](interop) suite that tests every client
+  against every server over every transport it speaks
 
-The wire format is shared by every runtime and transport: HTTP/3-style frames (a QUIC varint type and
-length) carrying a REQUEST, raw protobuf MESSAGEs, optional response HEADERS, and a terminal STATUS, with
-unknown frame types skipped. It is pinned by
-[`testdata/wire-golden-vectors.txt`](testdata/wire-golden-vectors.txt). The QMux framing used by the TCP
-fallbacks is pinned by [`testdata/qmux-golden-vectors.txt`](testdata/qmux-golden-vectors.txt).
+## support
 
-Full documentation is available in the [TrevRPC wiki](https://trev.zip/llc/TrevRPC/wiki)
+Servers are written in Go or Rust. Clients prefer QUIC and fall back to TCP for networks that block UDP and
+browsers without WebTransport.
+
+| runtime                            | server                                                    | client       | client fallback                     |
+| ---------------------------------- | --------------------------------------------------------- | ------------ | ----------------------------------- |
+| [Go](trevrpc-go)                   | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
+| [Rust](trevrpc-rust)               | native QUIC, HTTP/3, WebTransport, and every TCP fallback | native QUIC  | QMux over TLS                       |
+| [JavaScript](trevrpc-js) (browser) | —                                                         | WebTransport | QMux over WebSocket                 |
+| [Kotlin](trevrpc-kotlin) (Android) | —                                                         | HTTP/3       | HTTP/2 (Cronet's built-in fallback) |
+
+The browser client is supported on Chromium, Firefox, and Safari with both servers. See
+[TCP fallback](https://trev.zip/llc/TrevRPC/wiki/TCP-Fallback) for how the fallbacks are served and chosen.
+
+## example
+
+Define a service:
+
+```proto
+syntax = "proto3";
+
+package example.greeter;
+
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+  rpc LotsOfReplies(HelloRequest) returns (stream HelloReply);
+}
+
+message HelloRequest { string name = 1; }
+message HelloReply { string message = 1; }
+```
+
+Serve it from Go:
+
+```go
+type greeterService struct{}
+
+func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*trevrpc.Response[*greeter.HelloReply], error) {
+	return &trevrpc.Response[*greeter.HelloReply]{Message: &greeter.HelloReply{Message: "hello, " + r.Name}}, nil
+}
+
+server := trevrpc.NewServer()
+greeter.RegisterGreeterServer(server, greeterService{})
+
+listener, err := trevrpc.Listen("0.0.0.0:50051", server, trevrpc.ListenOptions{
+	TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}},
+})
+if err != nil {
+	return err
+}
+defer listener.Close()
+return listener.Serve(ctx)
+```
+
+And call it:
+
+```go
+channel, err := trevrpc.Dial(ctx, "example.com:50051", trevrpc.DialOptions{TLSConfig: tlsConfig})
+if err != nil {
+	return err
+}
+defer channel.Close()
+
+client := greeter.NewGreeterClient(channel, trevrpc.WithTimeout(5*time.Second))
+reply, err := client.SayHello(ctx, &greeter.HelloRequest{Name: "TrevRPC"})
+```
+
+Runnable greeter servers and clients are in [`trevrpc-go/examples`](trevrpc-go/examples) and
+[`trevrpc-rust/examples`](trevrpc-rust/examples). [Getting started](https://trev.zip/llc/TrevRPC/wiki/Getting-Started)
+covers code generation and the JavaScript and Kotlin clients.
 
 ## using
+
+Each runtime has a library and a `protoc` plugin that generates code from your services.
 
 ### go
 
@@ -54,9 +126,12 @@ go install trev.zip/llc/trevrpc/trevrpc-go/cmd/protoc-gen-trevrpc-go@latest
 
 ```sh
 cargo add trevrpc
+cargo install --git https://trev.zip/llc/TrevRPC.git protoc-gen-trevrpc-rust
 ```
 
 ### javascript
+
+the package includes `protoc-gen-trevrpc-js`, which runs on Node.js:
 
 ```sh
 npm install @trevrpc/trevrpc-js
@@ -70,6 +145,9 @@ dependencies {
     implementation("zip.trev.trevrpc:transport-cronet:<version>")
 }
 ```
+
+`protoc-gen-trevrpc-kotlin` is available from [nix](#nix), or from a checkout with
+`./gradlew :protoc-gen-trevrpc-kotlin:installDist` in `trevrpc-kotlin/`
 
 ### nix
 
@@ -85,6 +163,23 @@ nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
 ### download
 
 https://trev.zip/llc/TrevRPC/releases
+
+## documentation
+
+the [wiki](https://trev.zip/llc/TrevRPC/wiki) has the full documentation:
+
+- [getting started](https://trev.zip/llc/TrevRPC/wiki/Getting-Started): define a service, generate code, and run
+  a server and client
+- runtime guides: [Go](https://trev.zip/llc/TrevRPC/wiki/Go-Guide),
+  [Rust](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide),
+  [JavaScript](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide), and
+  [Kotlin](https://trev.zip/llc/TrevRPC/wiki/Kotlin-Guide)
+- transports: [HTTP/3 and HTTP/2](https://trev.zip/llc/TrevRPC/wiki/HTTP3),
+  [WebTransport](https://trev.zip/llc/TrevRPC/wiki/WebTransport), and
+  [TCP fallback](https://trev.zip/llc/TrevRPC/wiki/TCP-Fallback)
+- [protocol and wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format)
+- [operations, limits, and security](https://trev.zip/llc/TrevRPC/wiki/Operations-Limits-and-Security)
+- [benchmarks](https://trev.zip/llc/TrevRPC/wiki/Benchmarks)
 
 ## contributing
 
