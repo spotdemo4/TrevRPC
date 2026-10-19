@@ -95,7 +95,11 @@ const scenarios = {
     const call = await echo.bidi();
     await call.send({ message: "1" });
     expectEcho(await call.recv(), "1", 0);
-    await call.send({ failCode: Code.Aborted, failMessage: "abort" });
+    // The server may end the call before this send settles; the send then rejects with the same
+    // status.
+    await call
+      .send({ failCode: Code.Aborted, failMessage: "abort" })
+      .catch((error) => expectStatus(Code.Aborted, "abort", () => Promise.reject(error)));
     await expectStatus(Code.Aborted, "abort", () => call.recv());
   },
 

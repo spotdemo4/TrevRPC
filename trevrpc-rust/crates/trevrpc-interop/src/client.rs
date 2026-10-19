@@ -308,9 +308,10 @@ async fn bidi_error(client: &Echo) -> Scenario {
         .map_err(rpc)?
         .ok_or("stream ended before the echo")?;
     expect_response(&response, "1", 0)?;
-    call.send(failing(Code::Aborted, "abort"))
-        .await
-        .map_err(rpc)?;
+    // The server may end the call before this send returns; the send then reports the same status.
+    if let Err(error) = call.send(failing(Code::Aborted, "abort")).await {
+        expect_status(error, Code::Aborted, "abort")?;
+    }
     match call.recv().await {
         Err(error) => expect_status(error, Code::Aborted, "abort"),
         Ok(Some(_)) => Err("unexpected response to the failing request".to_owned()),

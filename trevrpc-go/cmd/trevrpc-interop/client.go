@@ -267,8 +267,12 @@ var scenarios = []scenario{
 		if err := expectResponse(response, "1", 0); err != nil {
 			return err
 		}
+		// The server may end the call before this send returns; the send then
+		// reports the same status.
 		if err := call.Send(&interoppb.EchoRequest{FailCode: 10, FailMessage: "abort"}); err != nil {
-			return err
+			if err := expectStatus(err, trevrpc.CodeAborted, "abort"); err != nil {
+				return err
+			}
 		}
 		_, err = call.Recv()
 		return expectStatus(err, trevrpc.CodeAborted, "abort")
