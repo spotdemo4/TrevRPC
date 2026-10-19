@@ -7,14 +7,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderValue, Request, StatusCode};
+use http_body::Body as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use crate::fallback::{FallbackBody, HttpFallback, ResponseSink, multiplexed_head, write_body};
 use crate::http_admission::{rejection_head, rpc_response_head, validate_http_request};
-use crate::http_body::{BodySink, BodySource, handle_rpc_stream};
 use crate::request_pump::RequestTransportEvent;
+use crate::rpc_body::{BodySink, BodySource, handle_rpc_stream};
 use crate::serve::{drain_tasks, log_task_error, transport_limits};
 use crate::server::Server;
 use crate::server_transport::{Permit, try_acquire_permit};
@@ -123,6 +125,13 @@ async fn handle_request(
     closed: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 ) {
+    if let Some(fallback) = server.options().http_fallback()
+        && !server.options().claims_path(request.uri().path())
+    {
+        // The stream permit is held until the response ends.
+        serve_fallback(fallback, request, respond, alt_svc).await;
+        return;
+    }
     let (parts, body) = request.into_parts();
     let head = Request::from_parts(parts, ());
     if let Some(status) = validate_http_request(&server, &head) {
@@ -146,6 +155,25 @@ async fn handle_request(
     .await;
 }
 
+async fn serve_fallback(
+    fallback: &HttpFallback,
+    request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    alt_svc: Option<HeaderValue>,
+) {
+    let response = fallback
+        .call(request.map(FallbackBody::http2), alt_svc)
+        .await;
+    let (parts, body) = response.into_parts();
+    let end = body.is_end_stream();
+    let Ok(send) = respond.send_response(multiplexed_head(parts), end) else {
+        return;
+    };
+    if !end {
+        write_body(body, H2Sink(send)).await;
+    }
+}
+
 fn reject(mut respond: h2::server::SendResponse<Bytes>, status: StatusCode) {
     let _ = respond.send_response(rejection_head(status), true);
 }
@@ -153,7 +181,7 @@ fn reject(mut respond: h2::server::SendResponse<Bytes>, status: StatusCode) {
 struct H2Sink(h2::SendStream<Bytes>);
 
 impl BodySink for H2Sink {
-    async fn write(&mut self, mut chunk: &[u8]) -> Result<()> {
+    async fn write(&mut self, mut chunk: Bytes) -> Result<()> {
         while !chunk.is_empty() {
             self.0.reserve_capacity(chunk.len());
             let capacity = poll_fn(|context| self.0.poll_capacity(context))
@@ -164,13 +192,9 @@ impl BodySink for H2Sink {
             if len == 0 {
                 continue;
             }
-            let (head, rest) = chunk.split_at_checked(len).ok_or_else(|| {
-                Error::from(Status::internal("HTTP/2 send capacity exceeded chunk"))
-            })?;
             self.0
-                .send_data(Bytes::copy_from_slice(head), false)
+                .send_data(chunk.split_to(len), false)
                 .map_err(Error::transport)?;
-            chunk = rest;
         }
         Ok(())
     }
@@ -194,6 +218,15 @@ impl BodySink for H2Sink {
             .await
             .map(|_| ())
             .map_err(Error::transport)
+    }
+}
+
+impl ResponseSink for H2Sink {
+    fn send_trailers(
+        &mut self,
+        trailers: http::HeaderMap,
+    ) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(self.0.send_trailers(trailers).map_err(Error::transport))
     }
 }
 

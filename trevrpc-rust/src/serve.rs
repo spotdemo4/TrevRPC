@@ -28,8 +28,8 @@ impl Server {
     /// Builds the Quinn server configuration for an endpoint served by [`Server::serve`].
     ///
     /// The configuration advertises [`crate::ALPN`] for native `TrevRPC`, and [`crate::HTTP3_ALPN`]
-    /// only when [`ServerOptions::http_enabled`] or [`ServerOptions::webtransport_enabled`] is
-    /// set, replacing any ALPN list already on `tls`. It also sizes the QUIC stream and connection
+    /// only when [`ServerOptions::http_enabled`], [`ServerOptions::webtransport_enabled`] or
+    /// [`ServerOptions::http_fallback`] is set, replacing any ALPN list already on `tls`. It also sizes the QUIC stream and connection
     /// windows from the server's [`ServerOptions`], so call it after the options are final.
     ///
     /// Datagrams ([`crate::Unreliable`] methods) are not flow controlled, so the configuration
@@ -39,7 +39,7 @@ impl Server {
     /// it holds for calls whose request has not arrived yet.
     pub fn quic_config(&self, mut tls: quinn::rustls::ServerConfig) -> Result<quinn::ServerConfig> {
         tls.alpn_protocols = vec![crate::ALPN.to_vec()];
-        if self.options().http_enabled() || self.options().webtransport_enabled() {
+        if self.options().serves_http() {
             tls.alpn_protocols.push(crate::HTTP3_ALPN.to_vec());
         }
         let crypto =
@@ -54,7 +54,8 @@ impl Server {
     /// Serves `TrevRPC` on a Quinn endpoint until the endpoint stops accepting connections.
     ///
     /// Connections are dispatched on their negotiated ALPN: [`crate::ALPN`] runs native `TrevRPC`,
-    /// and [`crate::HTTP3_ALPN`] runs the enabled HTTP/3 `POST` RPCs and `WebTransport` sessions.
+    /// and [`crate::HTTP3_ALPN`] runs the enabled HTTP/3 `POST` RPCs and `WebTransport` sessions,
+    /// and the HTTP fallback.
     pub async fn serve(self, endpoint: quinn::Endpoint) -> Result<()> {
         self.serve_with_shutdown(endpoint, pending::<()>()).await
     }
@@ -73,7 +74,8 @@ impl Server {
     ///
     /// The TCP listener serves clients that cannot use UDP: `QMux` over TLS ([`crate::QMUX_ALPN`])
     /// always, HTTP/2 `POST` RPCs when HTTP is enabled, and `QMux` over WebSocket browser
-    /// sessions when `WebTransport` is enabled. Both share the connection and request limits.
+    /// sessions when `WebTransport` is enabled. HTTP/2 and HTTP/1.1 also serve the HTTP fallback,
+    /// when one is set. Both share the connection and request limits.
     pub async fn serve_with_tcp<S>(
         self,
         endpoint: quinn::Endpoint,
@@ -96,8 +98,8 @@ impl Server {
     where
         S: Future<Output = ()> + Send,
     {
-        // HTTP/2 responses advertise HTTP/3 on the endpoint's port.
-        let alt_svc = if self.options().http_enabled() {
+        // HTTP/2 RPC and HTTP fallback responses advertise HTTP/3 on the endpoint's port.
+        let alt_svc = if self.options().serves_http2() {
             endpoint.local_addr().ok().and_then(|addr| {
                 HeaderValue::try_from(format!("h3=\":{}\"; ma=86400", addr.port())).ok()
             })
@@ -142,9 +144,7 @@ impl Server {
                                 native::handle_connection(server, connection, request_limit, shutdown)
                                     .await;
                             }
-                            Some(crate::HTTP3_ALPN)
-                                if server.options().http_enabled()
-                                    || server.options().webtransport_enabled() =>
+                            Some(crate::HTTP3_ALPN) if server.options().serves_http() =>
                             {
                                 Box::pin(http3::handle_connection(
                                     server,

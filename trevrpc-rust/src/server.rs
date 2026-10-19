@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use tokio::sync::watch;
 
 use crate::datagram::DatagramCount;
+use crate::fallback::HttpFallback;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::sync::MutexExt as _;
 use crate::wire::{
@@ -381,6 +382,7 @@ pub struct ServerOptions {
     webtransport_allowed_authorities: Vec<String>,
     webtransport_allowed_origins: Vec<String>,
     webtransport_admission: Option<WebTransportAdmission>,
+    http_fallback: Option<HttpFallback>,
 }
 
 impl Default for ServerOptions {
@@ -402,6 +404,7 @@ impl Default for ServerOptions {
             webtransport_allowed_authorities: Vec::new(),
             webtransport_allowed_origins: Vec::new(),
             webtransport_admission: None,
+            http_fallback: None,
         }
     }
 }
@@ -514,6 +517,33 @@ impl ServerOptions {
         self.webtransport_admission
     }
 
+    /// Returns the service for the HTTP requests `TrevRPC` does not claim, if configured.
+    #[must_use]
+    pub const fn http_fallback(&self) -> Option<&HttpFallback> {
+        self.http_fallback.as_ref()
+    }
+
+    /// Returns whether the server speaks HTTP: HTTP/3 on the endpoint and HTTP/2 or HTTP/1.1 on
+    /// the TCP listener.
+    pub(crate) const fn serves_http(&self) -> bool {
+        self.http_enabled || self.webtransport_enabled || self.http_fallback.is_some()
+    }
+
+    /// Returns whether the TCP listener serves HTTP/2: RPCs, or the HTTP fallback.
+    pub(crate) const fn serves_http2(&self) -> bool {
+        self.http_enabled || self.http_fallback.is_some()
+    }
+
+    /// Returns whether the TCP listener serves HTTP/1.1: WebSocket sessions, or the HTTP fallback.
+    pub(crate) const fn serves_http1(&self) -> bool {
+        self.webtransport_enabled || self.http_fallback.is_some()
+    }
+
+    /// Returns whether `TrevRPC`, rather than the HTTP fallback, serves HTTP requests for `path`.
+    pub(crate) fn claims_path(&self, path: &str) -> bool {
+        (self.http_enabled || self.webtransport_enabled) && path == self.http_path
+    }
+
     /// Sets the maximum `TrevRPC` frame size in bytes.
     #[must_use]
     pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
@@ -594,8 +624,8 @@ impl ServerOptions {
 
     /// Enables or disables ordinary HTTP/3 `POST` RPCs (disabled by default).
     ///
-    /// The `h3` ALPN is advertised by [`Server::quic_config`] only when HTTP/3 or `WebTransport`
-    /// is enabled.
+    /// The `h3` ALPN is advertised by [`Server::quic_config`] only when HTTP/3, `WebTransport` or
+    /// an HTTP fallback is enabled.
     #[must_use]
     pub const fn with_http_enabled(mut self, http_enabled: bool) -> Self {
         self.http_enabled = http_enabled;
@@ -669,6 +699,25 @@ impl ServerOptions {
         webtransport_admission: Option<WebTransportAdmission>,
     ) -> Self {
         self.webtransport_admission = webtransport_admission;
+        self
+    }
+
+    /// Sets the service for every HTTP request `TrevRPC` does not claim, such as the static
+    /// content of a web application served from the same port.
+    ///
+    /// `TrevRPC` claims the HTTP path while HTTP RPCs or `WebTransport` are enabled; every other
+    /// path, over HTTP/3, HTTP/2 and HTTP/1.1, goes to the fallback. Setting one serves those
+    /// HTTP versions even when neither is enabled: [`Server::quic_config`] then advertises `h3`
+    /// and [`Server::tcp_tls_config`] advertises `h2` and `http/1.1`. HTTP/1.1 and HTTP/2
+    /// responses advertise HTTP/3 through `Alt-Svc` unless the service sets the header itself.
+    ///
+    /// A fallback request takes a stream slot of its connection like an RPC, so a connection at
+    /// [`ServerOptions::max_concurrent_streams_per_connection`] answers it with 503. It does not
+    /// count toward [`ServerOptions::max_concurrent_requests`], and admission does not apply to
+    /// it. In-flight requests are drained on shutdown like RPCs.
+    #[must_use]
+    pub fn with_http_fallback(mut self, http_fallback: Option<HttpFallback>) -> Self {
+        self.http_fallback = http_fallback;
         self
     }
 }

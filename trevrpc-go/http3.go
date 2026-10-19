@@ -73,6 +73,10 @@ func (l *Listener) closeHTTP3() {
 }
 
 func (l *Listener) handleHTTP3(w http.ResponseWriter, r *http.Request) {
+	if !l.runtime.options.claimsPath(r.URL.Path) {
+		l.serveFallback(w, r)
+		return
+	}
 	if r.Method == http.MethodConnect && l.wt != nil {
 		l.handleWebTransport(w, r)
 		return

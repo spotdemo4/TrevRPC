@@ -1,4 +1,5 @@
-//! The TCP listener: `QMux` over TLS, HTTP/2 and `QMux` over WebSocket.
+//! The TCP listener: `QMux` over TLS, HTTP/2 and `QMux` over WebSocket, and the HTTP fallback it
+//! shares with the HTTP/3 endpoint.
 
 use std::error::Error;
 use std::net::SocketAddr;
@@ -16,6 +17,7 @@ use trevrpc::client::{
     CallOptions, Channel, ChannelConfig, QmuxTransport, RpcTransport, StreamingRpcTransport,
     TransportKind, TransportPolicy,
 };
+use trevrpc::fallback::{FallbackBody, HttpFallback};
 use trevrpc::server::{
     CancellationSource, RequestContext, Server, ServerOptions, WebTransportAdmissionRequest,
 };
@@ -886,5 +888,316 @@ async fn qmux_over_websocket_handlers_are_cancelled_when_the_client_connection_d
     events.all_connection_lost().await?;
     ensure_request_slots_released(&server).await?;
     drop(streams);
+    server.stop().await
+}
+
+/// Answers with the request's HTTP version, method and path, then the request body. A request to
+/// `/hold` first signals `held` and waits for `release`.
+#[derive(Clone, Default)]
+struct EchoFallback {
+    held: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+type EchoFallbackFuture = std::pin::Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    http::Response<http_body_util::Full<Bytes>>,
+                    std::convert::Infallible,
+                >,
+            > + Send,
+    >,
+>;
+
+impl tower_service::Service<http::Request<FallbackBody>> for EchoFallback {
+    type Response = http::Response<http_body_util::Full<Bytes>>;
+    type Error = std::convert::Infallible;
+    type Future = EchoFallbackFuture;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<FallbackBody>) -> Self::Future {
+        let this = self.clone();
+        Box::pin(async move {
+            use http_body_util::BodyExt as _;
+            if request.uri().path() == "/hold" {
+                this.held.notify_one();
+                this.release.notified().await;
+            }
+            let mut reply = format!(
+                "fallback {:?} {} {}\n",
+                request.version(),
+                request.method(),
+                request.uri().path()
+            )
+            .into_bytes();
+            if let Ok(body) = request.into_body().collect().await {
+                reply.extend_from_slice(&body.to_bytes());
+            }
+            Ok(http::Response::new(http_body_util::Full::new(Bytes::from(
+                reply,
+            ))))
+        })
+    }
+}
+
+fn fallback_options(options: ServerOptions, fallback: &EchoFallback) -> ServerOptions {
+    options.with_http_fallback(Some(HttpFallback::new(fallback.clone())))
+}
+
+/// A response's status, its `Alt-Svc` header and its body.
+type FallbackReply = (http::StatusCode, Option<String>, String);
+
+fn alt_svc(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(http::header::ALT_SVC)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Sends one HTTP/1.1 request on its own connection.
+async fn http1_request(
+    server: &RunningServer,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> TestResult<FallbackReply> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut tls = connect_tls(server, b"http/1.1").await?;
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tls.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    tokio::time::timeout(TEST_TIMEOUT, tls.read_to_end(&mut response)).await??;
+    let response = String::from_utf8(response)?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("HTTP/1.1 response has no head")?;
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .ok_or("HTTP/1.1 response has no status line")?;
+    let alt_svc = lines.find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("alt-svc")
+            .then(|| value.trim().to_owned())
+    });
+    Ok((
+        http::StatusCode::from_bytes(status.as_bytes())?,
+        alt_svc,
+        body.to_owned(),
+    ))
+}
+
+async fn http2_sender(server: &RunningServer) -> TestResult<h2::client::SendRequest<Bytes>> {
+    let tls = connect_tls(server, b"h2").await?;
+    let (sender, connection) = h2::client::handshake(tls).await?;
+    tokio::spawn(connection);
+    Ok(sender)
+}
+
+async fn http2_request(
+    sender: &h2::client::SendRequest<Bytes>,
+    request: http::Request<()>,
+    body: Bytes,
+) -> TestResult<(http::StatusCode, Option<String>, Vec<u8>)> {
+    let mut sender = sender.clone().ready().await?;
+    let (response, mut send) = sender.send_request(request, body.is_empty())?;
+    if !body.is_empty() {
+        send.send_data(body, true)?;
+    }
+    let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+    let status = response.status();
+    let alt_svc = alt_svc(response.headers());
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((status, alt_svc, bytes))
+}
+
+async fn http2_fallback_request(
+    server: &RunningServer,
+    sender: &h2::client::SendRequest<Bytes>,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> TestResult<FallbackReply> {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://localhost:{}{path}", server.tcp.port()))
+        .body(())?;
+    let (status, alt_svc, body) =
+        http2_request(sender, request, Bytes::from(body.to_owned())).await?;
+    Ok((status, alt_svc, String::from_utf8(body)?))
+}
+
+/// Sends one HTTP/3 request on its own connection.
+async fn http3_request(
+    server: &RunningServer,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> TestResult<FallbackReply> {
+    use bytes::Buf as _;
+
+    let tls = client_tls(&server.cert, trevrpc::HTTP3_ALPN)?;
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+    )));
+    let connection = endpoint.connect(server.udp, "localhost")?.await?;
+    let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(connection)).await?;
+    tokio::spawn(async move {
+        let _ = driver.wait_idle().await;
+    });
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://localhost:{}{path}", server.udp.port()))
+        .body(())?;
+    let mut stream = sender.send_request(request).await?;
+    if !body.is_empty() {
+        stream.send_data(Bytes::from(body.to_owned())).await?;
+    }
+    stream.finish().await?;
+    let response = tokio::time::timeout(TEST_TIMEOUT, stream.recv_response()).await??;
+    let mut bytes = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await? {
+        bytes.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+    Ok((
+        response.status(),
+        alt_svc(response.headers()),
+        String::from_utf8(bytes)?,
+    ))
+}
+
+#[tokio::test]
+async fn http_fallback_serves_every_http_version_alongside_rpcs() -> TestResult {
+    let fallback = EchoFallback::default();
+    let server = spawn_server(fallback_options(test_options(), &fallback)).await?;
+    let advertised = Some(format!("h3=\":{}\"; ma=86400", server.udp.port()));
+    let sender = http2_sender(&server).await?;
+
+    ensure_eq!(
+        http1_request(&server, "GET", "/app/index.html", "").await?,
+        (
+            http::StatusCode::OK,
+            advertised.clone(),
+            "fallback HTTP/1.1 GET /app/index.html\n".to_owned()
+        )
+    );
+    ensure_eq!(
+        http2_fallback_request(&server, &sender, "POST", "/app/upload", "h2 body").await?,
+        (
+            http::StatusCode::OK,
+            advertised.clone(),
+            "fallback HTTP/2.0 POST /app/upload\nh2 body".to_owned()
+        )
+    );
+    ensure_eq!(
+        http3_request(&server, "POST", "/app/upload", "h3 body").await?,
+        (
+            http::StatusCode::OK,
+            None,
+            "fallback HTTP/3.0 POST /app/upload\nh3 body".to_owned()
+        )
+    );
+
+    // The `TrevRPC` path stays `TrevRPC`'s, on every HTTP version.
+    ensure_eq!(
+        http1_request(&server, "GET", "/trevrpc", "").await?.0,
+        http::StatusCode::HTTP_VERSION_NOT_SUPPORTED
+    );
+    ensure_eq!(
+        http2_fallback_request(&server, &sender, "GET", "/trevrpc", "")
+            .await?
+            .0,
+        http::StatusCode::METHOD_NOT_ALLOWED
+    );
+    ensure_eq!(
+        http3_request(&server, "GET", "/trevrpc", "").await?.0,
+        http::StatusCode::METHOD_NOT_ALLOWED
+    );
+
+    let rpc = http::Request::post(format!("https://localhost:{}/trevrpc", server.tcp.port()))
+        .header(http::header::CONTENT_TYPE, "application/trevrpc")
+        .body(())?;
+    let (status, _, reply) = http2_request(&sender, rpc, Bytes::from(unary_frame("h2")?)).await?;
+    ensure_eq!(status, http::StatusCode::OK);
+    ensure_eq!(decode_hello(&reply)?, "hello, h2");
+    server.stop().await
+}
+
+#[tokio::test]
+async fn http_fallback_alone_serves_every_http_version() -> TestResult {
+    let fallback = EchoFallback::default();
+    let server = spawn_server(fallback_options(ServerOptions::new(), &fallback)).await?;
+    // `TrevRPC` claims no HTTP path, so even its default path is the fallback's.
+    let expected = |version| format!("fallback {version} GET /trevrpc\n");
+    ensure_eq!(
+        http1_request(&server, "GET", "/trevrpc", "").await?.2,
+        expected("HTTP/1.1")
+    );
+    let sender = http2_sender(&server).await?;
+    ensure_eq!(
+        http2_fallback_request(&server, &sender, "GET", "/trevrpc", "")
+            .await?
+            .2,
+        expected("HTTP/2.0")
+    );
+    ensure_eq!(
+        http3_request(&server, "GET", "/trevrpc", "").await?.2,
+        expected("HTTP/3.0")
+    );
+    server.stop().await
+}
+
+#[tokio::test]
+async fn http_fallback_requests_hold_a_stream_slot() -> TestResult {
+    let fallback = EchoFallback::default();
+    let options = test_options().with_max_concurrent_streams_per_connection(Some(1));
+    let server = spawn_server(fallback_options(options, &fallback)).await?;
+    let sender = http2_sender(&server).await?;
+
+    let held = {
+        let sender = sender.clone();
+        let port = server.tcp.port();
+        tokio::spawn(async move {
+            let request = http::Request::get(format!("https://localhost:{port}/hold")).body(())?;
+            http2_request(&sender, request, Bytes::new()).await
+        })
+    };
+    tokio::time::timeout(TEST_TIMEOUT, fallback.held.notified()).await?;
+    ensure_eq!(
+        http2_fallback_request(&server, &sender, "GET", "/other", "")
+            .await?
+            .0,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    fallback.release.notify_one();
+    let (status, _, _) = tokio::time::timeout(TEST_TIMEOUT, held).await???;
+    ensure_eq!(status, http::StatusCode::OK);
+    // The held request released its slot when its response ended.
+    ensure_eq!(
+        http2_fallback_request(&server, &sender, "GET", "/other", "")
+            .await?
+            .0,
+        http::StatusCode::OK
+    );
     server.stop().await
 }

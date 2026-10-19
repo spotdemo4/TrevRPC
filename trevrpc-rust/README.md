@@ -161,6 +161,8 @@ server.set_options(
 
 WebTransport policy: a session must use the shared path, then pass the authority and origin allowlists. With no allowlists, requests that carry an `Origin` header (every browser) are denied; requests without one are admitted. `with_webtransport_admission` installs a callback that replaces the allowlists (the path is still checked first). `with_http_admission` is the equivalent hook for HTTP/3 `POST`. A CONNECT whose `WT-Available-Protocols` header offers WebTransport protocols but not `trevrpc-1` gets `400`; when it offers `trevrpc-1`, the response selects it with `WT-Protocol`. A missing, empty or malformed header means version 1.
 
+`with_http_fallback` serves every other HTTP request on the same endpoint and TCP listener, over HTTP/3, HTTP/2 and HTTP/1.1, with any `tower_service::Service`, such as the static content of the web application that calls the server (`HttpFallback::new(tower_http::services::ServeDir::new("dist"))`). `TrevRPC` keeps the HTTP path while HTTP or WebTransport is enabled; see [Serving Other HTTP Content](https://trev.zip/llc/TrevRPC/wiki/HTTP3#serving-other-http-content).
+
 `Server::serve_with_shutdown` drains in-flight RPCs for up to `ServerOptions::graceful_shutdown_timeout` before closing the endpoint.
 
 `http3_enabled`, `http3_path`, and `http3_admission` (and their `with_*` builders) were renamed `http_enabled`, `http_path`, and `http_admission`, and `Http3Admission`/`Http3AdmissionRequest` became `HttpAdmission`/`HttpAdmissionRequest`, because the HTTP mapping is now also served over HTTP/2.

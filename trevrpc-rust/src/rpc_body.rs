@@ -18,7 +18,7 @@ use crate::{ResponseFrame, Result};
 
 /// The send half of one HTTP request or `WebTransport` stream.
 pub trait BodySink: Send + 'static {
-    fn write(&mut self, chunk: &[u8]) -> impl Future<Output = Result<()>> + Send;
+    fn write(&mut self, chunk: Bytes) -> impl Future<Output = Result<()>> + Send;
 
     fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
 
@@ -53,7 +53,7 @@ struct BodyWriter<S> {
 impl<S: BodySink> FrameWrite for BodyWriter<S> {
     async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
         for chunk in chunks {
-            self.sink.write(chunk).await?;
+            self.sink.write(std::mem::take(chunk)).await?;
         }
         Ok(())
     }

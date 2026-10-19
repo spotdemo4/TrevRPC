@@ -165,6 +165,8 @@ Frames carry no wire version: each transport fixes it while negotiating (ALPN `t
 
 Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `WebTransportAdmission` admits them; HTTP requests (HTTP/3 and HTTP/2) are admitted unless `HTTPAdmission` denies them. `AdmissionRequest.Proto` reports the HTTP version (`HTTP/3.0`, `HTTP/2.0`, or `HTTP/1.1`) and `Method` is `POST`, `CONNECT` (WebTransport), or `GET` (WebSocket). Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
 
+`ServerOptions.HTTPFallback` serves every other HTTP request on the same sockets, over HTTP/3, HTTP/2 and HTTP/1.1, such as the static content of the web application that calls the server (`options.HTTPFallback = http.FileServerFS(dist)`). TrevRPC keeps `HTTPPath` while `EnableHTTP` or `EnableWebTransport` is set; see [Serving Other HTTP Content](https://trev.zip/llc/TrevRPC/wiki/HTTP3#serving-other-http-content).
+
 `Listen` binds TCP on the same host and port number as the UDP socket (with port 0 it retries until a port is free for both). `ListenOptions.TCPAddr` overrides the TCP address, `ListenOptions.DisableTCP` serves QUIC only, and `ListenOptions.TLSHandshakeTimeout` (default 10 s) bounds the TLS handshake. `Listener.TCPAddr()` returns the TCP address, or nil when TCP is disabled. The TCP listener shares the connection limit, request limit, and graceful shutdown with QUIC.
 
 `EnableHTTP3`, `HTTP3Path`, and `HTTP3Admission` were renamed `EnableHTTP`, `HTTPPath`, and `HTTPAdmission`, because the HTTP mapping is now also served over HTTP/2.

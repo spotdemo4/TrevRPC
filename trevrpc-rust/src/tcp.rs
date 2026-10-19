@@ -1,5 +1,7 @@
 //! The TCP listener that serves clients that cannot use UDP: `QMux` over TLS for native clients,
 //! HTTP/2 for HTTP clients, and `QMux` over WebSocket for browsers, dispatched on the TLS ALPN.
+//!
+//! HTTP/2 and HTTP/1.1 also carry the requests of the HTTP fallback.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +12,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::qmux_conn::{MAX_RECORD_SIZE, QmuxConnection, server_config};
 use crate::server::Server;
-use crate::{http2, native, websocket};
+use crate::{http1, http2, native};
 
 /// Bounds the TLS handshake of a TCP connection and the `QMux` handshake or HTTP request head
 /// that follows it.
@@ -32,17 +34,17 @@ impl Server {
     /// It advertises [`crate::QMUX_ALPN`] for native clients, `h2` when
     /// [`crate::server::ServerOptions::http_enabled`] is set, and `http/1.1` (WebSocket) when
     /// [`crate::server::ServerOptions::webtransport_enabled`] is set, replacing any ALPN list
-    /// already on `tls`.
+    /// already on `tls`. An [`crate::server::ServerOptions::http_fallback`] advertises both.
     #[must_use]
     pub fn tcp_tls_config(
         &self,
         mut tls: quinn::rustls::ServerConfig,
     ) -> Arc<quinn::rustls::ServerConfig> {
         tls.alpn_protocols = vec![crate::QMUX_ALPN.to_vec()];
-        if self.options().http_enabled() {
+        if self.options().serves_http2() {
             tls.alpn_protocols.push(H2_ALPN.to_vec());
         }
-        if self.options().webtransport_enabled() {
+        if self.options().serves_http1() {
             tls.alpn_protocols.push(HTTP1_ALPN.to_vec());
         }
         Arc::new(tls)
@@ -83,7 +85,7 @@ pub(crate) async fn handle_connection(
             )
             .await;
         }
-        Some(H2_ALPN) if options.http_enabled() => {
+        Some(H2_ALPN) if options.serves_http2() => {
             http2::handle_connection(
                 server,
                 stream,
@@ -94,15 +96,8 @@ pub(crate) async fn handle_connection(
             )
             .await;
         }
-        Some(HTTP1_ALPN) | None if options.webtransport_enabled() => {
-            websocket::handle_connection(
-                server,
-                stream,
-                HANDSHAKE_TIMEOUT,
-                request_limit,
-                shutdown,
-            )
-            .await;
+        Some(HTTP1_ALPN) | None if options.serves_http1() => {
+            http1::handle_connection(server, stream, alt_svc, request_limit, shutdown).await;
         }
         _ => {}
     }

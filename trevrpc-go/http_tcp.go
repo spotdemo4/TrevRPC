@@ -12,14 +12,15 @@ import (
 	"time"
 )
 
-// httpTCPServer serves HTTP/2 RPCs and WebSocket sessions on the TLS
-// connections of the TCP listener. Each connection is handed over after its
-// TLS handshake and stays tracked by the listener until it ends.
+// httpTCPServer serves HTTP/2 RPCs, WebSocket sessions and fallback requests
+// on the TLS connections of the TCP listener. Each connection is handed over
+// after its TLS handshake and stays tracked by the listener until it ends.
 type httpTCPServer struct {
 	listener *Listener
 	server   *http.Server
 	queue    *connQueue
-	// altSvc advertises HTTP/3 on the UDP socket to HTTP/2 clients.
+	// altSvc advertises HTTP/3 on the UDP socket to HTTP/2 and fallback
+	// clients.
 	altSvc       string
 	conns        sync.Map // net.Conn -> chan struct{} closed when the connection ends
 	shutdownOnce sync.Once
@@ -28,7 +29,7 @@ type httpTCPServer struct {
 func newHTTPTCPServer(l *Listener) *httpTCPServer {
 	options := l.runtime.options
 	h := &httpTCPServer{listener: l, queue: newConnQueue(l.tcp.Addr())}
-	if options.EnableHTTP {
+	if options.servesHTTP2() {
 		h.altSvc = fmt.Sprintf(`h3=":%d"; ma=86400`, l.udp.LocalAddr().(*net.UDPAddr).Port)
 	}
 	streamWindow := frameReceiveWindow(options.MaxFrameSize)
@@ -84,6 +85,11 @@ func (h *httpTCPServer) finished(conn net.Conn) {
 
 func (h *httpTCPServer) handle(w http.ResponseWriter, r *http.Request) {
 	l := h.listener
+	if !l.runtime.options.claimsPath(r.URL.Path) {
+		h.setAltSvc(w)
+		l.serveFallback(w, r)
+		return
+	}
 	if r.ProtoMajor == 1 {
 		if l.runtime.options.EnableWebTransport && isWebSocketUpgrade(r) {
 			l.handleWebSocket(w, r, h)
@@ -92,10 +98,16 @@ func (h *httpTCPServer) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "TrevRPC over HTTP requires HTTP/2 or HTTP/3", http.StatusHTTPVersionNotSupported)
 		return
 	}
+	h.setAltSvc(w)
+	l.handleHTTPRPC(w, r)
+}
+
+// setAltSvc advertises HTTP/3 on a response, when it is served. A handler can
+// still replace the header.
+func (h *httpTCPServer) setAltSvc(w http.ResponseWriter) {
 	if h.altSvc != "" {
 		w.Header().Set("Alt-Svc", h.altSvc)
 	}
-	l.handleHTTPRPC(w, r)
 }
 
 // shutdown stops serving: HTTP/2 clients receive GOAWAY, and idle

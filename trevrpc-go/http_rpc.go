@@ -48,11 +48,7 @@ func (l *Listener) handleHTTPRPC(w http.ResponseWriter, r *http.Request) {
 	if !runtime.admit(w, r, options.HTTPAdmission, true, "HTTP admission denied") {
 		return
 	}
-	var streamLimit semaphore
-	if state, ok := r.Context().Value(httpConnStateKey{}).(*httpConnState); ok {
-		streamLimit = state.streamLimit
-	}
-	slot, ok := acquireStreamSlot(streamLimit)
+	slot, ok := acquireHTTPStreamSlot(r)
 	if !ok {
 		http.Error(w, "too many concurrent RPCs on HTTP connection", http.StatusServiceUnavailable)
 		return
@@ -66,6 +62,16 @@ func (l *Listener) handleHTTPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	handleRPCStream(r.Context(), l.server, &httpBody{body: r.Body, writer: w, controller: controller}, slot)
+}
+
+// acquireHTTPStreamSlot takes a stream slot of the connection r arrived on.
+// It returns false when the connection is at its stream limit.
+func acquireHTTPStreamSlot(r *http.Request) (*streamSlot, bool) {
+	var streamLimit semaphore
+	if state, ok := r.Context().Value(httpConnStateKey{}).(*httpConnState); ok {
+		streamLimit = state.streamLimit
+	}
+	return acquireStreamSlot(streamLimit)
 }
 
 func isTrevRPCMediaType(values []string) bool {

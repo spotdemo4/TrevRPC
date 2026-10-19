@@ -91,6 +91,15 @@ type Server struct {
 // the TCP listener, HTTP/2. EnableWebTransport serves browser sessions at
 // HTTPPath: WebTransport over HTTP/3 and, on the TCP listener, QMux over
 // WebSocket. Native QUIC and QMux over TLS are always served.
+//
+// HTTPFallback serves every other HTTP request on the same sockets, over
+// HTTP/3, HTTP/2 and HTTP/1.1, such as the static content of a web
+// application. TrevRPC claims HTTPPath while EnableHTTP or EnableWebTransport
+// is set; every other path goes to HTTPFallback. Setting HTTPFallback serves
+// these HTTP versions even when neither is set. A fallback request takes a
+// stream slot of its connection like an RPC, so a connection at
+// MaxConcurrentStreamsPerConnection answers it with 503, but admission does
+// not apply to it. Its context is cancelled when the listener shuts down.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -110,6 +119,27 @@ type ServerOptions struct {
 	HTTPAdmission                     Admission
 	EnableWebTransport                bool
 	WebTransportAdmission             Admission
+	HTTPFallback                      http.Handler
+}
+
+// servesHTTP reports whether the listener serves HTTP: HTTP/3 on the UDP
+// socket and HTTP/2 or HTTP/1.1 on the TCP socket.
+func (o ServerOptions) servesHTTP() bool {
+	return o.EnableHTTP || o.EnableWebTransport || o.HTTPFallback != nil
+}
+
+// servesHTTP2 reports whether the TCP listener serves HTTP/2: RPCs, or
+// HTTPFallback.
+func (o ServerOptions) servesHTTP2() bool { return o.EnableHTTP || o.HTTPFallback != nil }
+
+// servesHTTP1 reports whether the TCP listener serves HTTP/1.1: WebSocket
+// sessions, or HTTPFallback.
+func (o ServerOptions) servesHTTP1() bool { return o.EnableWebTransport || o.HTTPFallback != nil }
+
+// claimsPath reports whether TrevRPC, rather than HTTPFallback, serves HTTP
+// requests for path.
+func (o ServerOptions) claimsPath(path string) bool {
+	return (o.EnableHTTP || o.EnableWebTransport) && path == o.HTTPPath
 }
 
 // AdmissionRequest describes an HTTP RPC request or a browser session request

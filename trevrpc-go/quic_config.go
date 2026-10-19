@@ -63,7 +63,7 @@ func serverQUICConfig(base *quic.Config, options ServerOptions) *quic.Config {
 	if options.EnableWebTransport {
 		config.EnableStreamResetPartialDelivery = true
 	}
-	if !options.EnableHTTP && !options.EnableWebTransport {
+	if !options.servesHTTP() {
 		// Only HTTP/3 needs the control and QPACK unidirectional streams.
 		config.MaxIncomingUniStreams = -1
 	}
@@ -119,7 +119,7 @@ func serverTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, erro
 	}
 	config := base.Clone()
 	config.NextProtos = []string{ALPN}
-	if options.EnableHTTP || options.EnableWebTransport {
+	if options.servesHTTP() {
 		config.NextProtos = append(config.NextProtos, http3.NextProtoH3)
 	}
 	return config, nil

@@ -45,7 +45,7 @@ func (l *Listener) listenTCP(addr string, options ListenOptions) (connSource, er
 	if l.handshakeTimeout <= 0 {
 		l.handshakeTimeout = defaultTLSHandshakeTimeout
 	}
-	if l.runtime.options.EnableHTTP || l.runtime.options.EnableWebTransport {
+	if l.runtime.options.servesHTTP() {
 		l.httpTCP = newHTTPTCPServer(l)
 	}
 
@@ -139,10 +139,10 @@ func serverTCPTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, e
 		return nil, err
 	}
 	config.NextProtos = []string{QMuxALPN}
-	if options.EnableHTTP {
+	if options.servesHTTP2() {
 		config.NextProtos = append(config.NextProtos, http2ALPN)
 	}
-	if options.EnableWebTransport {
+	if options.servesHTTP1() {
 		config.NextProtos = append(config.NextProtos, http1ALPN)
 	}
 	return config, nil

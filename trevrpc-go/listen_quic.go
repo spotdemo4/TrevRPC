@@ -30,7 +30,7 @@ func (l *Listener) listenQUIC(addr string, options ListenOptions) (connSource, e
 		return connSource{}, Unavailable("listen: " + err.Error())
 	}
 	l.udp, l.tr, l.quic = udp, tr, ql
-	if l.runtime.options.EnableHTTP || l.runtime.options.EnableWebTransport {
+	if l.runtime.options.servesHTTP() {
 		l.setupHTTP3()
 	}
 

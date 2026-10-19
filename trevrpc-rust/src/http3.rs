@@ -14,13 +14,14 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::datagram::Demux;
+use crate::fallback::{FallbackBody, HttpFallback, ResponseSink, multiplexed_head, write_body};
 use crate::http_admission::{
     admission_headers, rejection_head, rpc_response_head, validate_http_request,
     validate_webtransport_admission,
 };
-use crate::http_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_stream};
 use crate::quic::SessionDatagrams;
 use crate::request_pump::RequestTransportEvent;
+use crate::rpc_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_stream};
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
 use crate::server::Server;
 use crate::server_transport::{Permit, try_acquire_permit};
@@ -36,7 +37,7 @@ const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 type H3RequestStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 type H3SendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
-type H3RecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+pub type H3RecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
 type WebTransportSession =
     h3_webtransport::server::WebTransportSession<h3_quinn::Connection, Bytes>;
 type WebTransportSendStream =
@@ -204,6 +205,13 @@ async fn handle_http_request(
     connection: quinn::Connection,
     shutdown: watch::Receiver<bool>,
 ) {
+    if let Some(fallback) = server.options().http_fallback()
+        && !server.options().claims_path(request.uri().path())
+    {
+        // The stream permit is held until the response ends.
+        serve_fallback(fallback, request, stream).await;
+        return;
+    }
     if let Some(status) = validate_http_request(&server, &request) {
         stream_permit.release();
         reject_h3(stream, status).await;
@@ -224,6 +232,17 @@ async fn handle_http_request(
         shutdown,
     )
     .await;
+}
+
+async fn serve_fallback(fallback: &HttpFallback, request: Request<()>, stream: H3RequestStream) {
+    let (mut send, recv) = stream.split();
+    let response = fallback
+        .call(request.map(|()| FallbackBody::http3(recv)), None)
+        .await;
+    let (parts, body) = response.into_parts();
+    if send.send_response(multiplexed_head(parts)).await.is_ok() {
+        write_body(body, H3Sink(send)).await;
+    }
 }
 
 /// Resolves `future`, giving up after `timeout`. `None` means it failed or timed out.
@@ -483,11 +502,8 @@ async fn handle_webtransport_session(
 struct H3Sink(H3SendStream);
 
 impl BodySink for H3Sink {
-    async fn write(&mut self, chunk: &[u8]) -> Result<()> {
-        self.0
-            .send_data(Bytes::copy_from_slice(chunk))
-            .await
-            .map_err(Error::transport)
+    async fn write(&mut self, chunk: Bytes) -> Result<()> {
+        self.0.send_data(chunk).await.map_err(Error::transport)
     }
 
     async fn finish(&mut self) -> Result<()> {
@@ -500,6 +516,16 @@ impl BodySink for H3Sink {
 
     async fn stopped(&mut self) -> Result<()> {
         stopped(self.0.stopped().await).await
+    }
+}
+
+impl ResponseSink for H3Sink {
+    async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
+        self.0
+            .send_trailers(trailers)
+            .await
+            .map_err(Error::transport)?;
+        self.finish().await
     }
 }
 
@@ -548,7 +574,8 @@ impl BodySource for H3Source {
 struct WebTransportSink(WebTransportSendStream);
 
 impl BodySink for WebTransportSink {
-    async fn write(&mut self, mut chunk: &[u8]) -> Result<()> {
+    async fn write(&mut self, chunk: Bytes) -> Result<()> {
+        let mut chunk = &chunk[..];
         while !chunk.is_empty() {
             let written = std::future::poll_fn(|context| {
                 h3::quic::SendStreamUnframed::poll_send(&mut self.0, context, &mut chunk)
