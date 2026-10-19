@@ -7,7 +7,8 @@
 //!                             [--expect-transport quic|qmux]
 //! trevrpc-interop-rust bench --addr <host:port> [--tcp-addr <host:port>] --ca <pem>
 //!                            [--server-name localhost] --transport quic|tcp
-//!                            --scenario unary|server-stream|client-stream|bidi
+//!                            --scenario unary|server-stream|client-stream|bidi|
+//!                                       unreliable-server-stream|unreliable-client-stream
 //!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
 //!                            [--messages 100] [--metadata-size 0]
 //! ```

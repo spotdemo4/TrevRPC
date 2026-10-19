@@ -13,11 +13,20 @@
 #                   comma separated as <type>:<payload hex>; unknown and grease
 #                   frames are skipped and therefore absent
 #
+# Datagram entries (datagram.*) are not frames:
+#   <name>.flow      the flow ID as an unsigned integer in hex
+#   <name>.messages  the messages, comma separated (an empty value means none)
+#   <name>.datagram  the datagram payload a conforming sender writes for them:
+#                    flow ID (minimal QUIC varint) | MESSAGE frame per message
+#   <name>.received  a datagram payload a conforming receiver decodes to them;
+#                    each entry has either .datagram or .received
+#
 # Logical values:
 #   request.unary          RpcRequest{method:"/svc/m"}
 #   request.bidi_timeout   RpcRequest{method:"/svc/m", kind:3, timeout_nanos:123456}
 #   request.metadata       RpcRequest{method:"/svc/m", metadata:{"authorization":"ok"}}
 #   request.extensions     RpcRequest{method:"/svc/m", extensions:[1, 300]} (packed)
+#   request.datagram_flow  RpcRequest{method:"/svc/m", kind:3, datagram_flow:1}
 #   message.hi             MESSAGE "hi"
 #   message.empty          MESSAGE with an empty payload
 #   headers.metadata       RpcHeaders{metadata:{"x-a":"1"}}
@@ -42,6 +51,9 @@ request.metadata.frame = 011d0a062f7376632f6d22130a0d617574686f72697a6174696f6e1
 
 request.extensions.payload = 0a062f7376632f6d420301ac02
 request.extensions.frame = 010d0a062f7376632f6d420301ac02
+
+request.datagram_flow.payload = 0a062f7376632f6d28034801
+request.datagram_flow.frame = 010c0a062f7376632f6d28034801
 
 message.hi.payload = 6869
 message.hi.frame = 00026869
@@ -81,3 +93,23 @@ stream.server_stream.frames = 2:0a080a03782d61120131,0:6869,0:,3:0809120473746f7
 
 stream.unknown_frames.stream = 404003000102020a0a080a03782d61120131923456780000400268692101ff03c000000000000000ffffffffffffffff027a7a
 stream.unknown_frames.frames = 2:0a080a03782d61120131,0:6869,3:
+
+datagram.flow_1.flow = 01
+datagram.flow_1.messages = 6869
+datagram.flow_1.datagram = 0100026869
+
+datagram.flow_64.flow = 40
+datagram.flow_64.messages = 6869
+datagram.flow_64.datagram = 404000026869
+
+datagram.batch.flow = 07
+datagram.batch.messages = 6869,,7a
+datagram.batch.datagram = 0700026869000000017a
+
+datagram.skipped_frames.flow = 01
+datagram.skipped_frames.messages = 6869,
+datagram.skipped_frames.received = 0121000002686912010301000000400202ffff
+
+datagram.truncated.flow = 01
+datagram.truncated.messages =
+datagram.truncated.received = 0100026869000568

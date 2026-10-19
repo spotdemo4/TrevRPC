@@ -9,10 +9,12 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
 
+	"github.com/quic-go/quic-go/quicvarint"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -58,7 +60,7 @@ func requestVector(name string, request *wireRequest) goldenVector {
 				t.Fatalf("frame type = %v, want REQUEST", got.Kind)
 			}
 			decoded := got.Request
-			if decoded.Method != request.Method || decoded.Kind != request.Kind || decoded.TimeoutNanos != request.TimeoutNanos ||
+			if decoded.Method != request.Method || decoded.Kind != request.Kind || decoded.TimeoutNanos != request.TimeoutNanos || decoded.DatagramFlow != request.DatagramFlow ||
 				!slices.Equal(decoded.Extensions, request.Extensions) || !metadataEqual(decoded.Metadata, request.Metadata) {
 				t.Fatalf("decoded request = %#v, want %#v", decoded, request)
 			}
@@ -76,6 +78,9 @@ func TestWireGoldenVectors(t *testing.T) {
 	bidi.TimeoutNanos = 123456
 	extensions := newWireRequest("/svc/m")
 	extensions.Extensions = []uint64{1, 300}
+	datagramFlow := newWireRequest("/svc/m")
+	datagramFlow.Kind = RPCKindBidirectionalStreaming
+	datagramFlow.DatagramFlow = 1
 
 	statusVector := func(name string, status *Status) goldenVector {
 		return goldenVector{
@@ -133,6 +138,7 @@ func TestWireGoldenVectors(t *testing.T) {
 		requestVector("request.bidi_timeout", bidi),
 		requestVector("request.metadata", withMetadata),
 		requestVector("request.extensions", extensions),
+		requestVector("request.datagram_flow", datagramFlow),
 		messageVector("message.hi", "hi"),
 		messageVector("message.empty", ""),
 		headersVector("headers.metadata", &wireHeaders{Metadata: Metadata{"x-a": []byte("1")}}),
@@ -184,6 +190,100 @@ func TestWireGoldenVectors(t *testing.T) {
 			t.Fatalf("grease frame yielded %v, %v; want it skipped", next, err)
 		}
 	})
+}
+
+// TestWireGoldenDatagrams checks every datagram.* vector: the flow ID is a hex
+// integer and the messages are comma separated hex. An entry with a .datagram
+// is encoded from its messages, byte for byte, and decoded; one with a
+// .received is only decoded, to its messages (none for a datagram that is
+// dropped whole).
+func TestWireGoldenDatagrams(t *testing.T) {
+	entries := loadGoldenEntries(t)
+	vectors := map[string]bool{}
+	for name := range entries {
+		if vector, ok := strings.CutSuffix(name, ".flow"); ok && strings.HasPrefix(vector, "datagram.") {
+			vectors[vector] = true
+		}
+	}
+	if len(vectors) == 0 {
+		t.Fatal("no datagram golden vectors were found")
+	}
+	for vector := range vectors {
+		t.Run(vector, func(t *testing.T) {
+			flow, err := strconv.ParseUint(entries[vector+".flow"], 16, 64)
+			if err != nil {
+				t.Fatalf("%s.flow: %v", vector, err)
+			}
+			var want [][]byte
+			if value := entries[vector+".messages"]; value != "" {
+				for i, hexMessage := range strings.Split(value, ",") {
+					want = append(want, decodeGoldenHex(t, fmt.Sprintf("%s.messages[%d]", vector, i), hexMessage))
+				}
+			}
+
+			wire, encoded := entries[vector+".datagram"]
+			received, decodeOnly := entries[vector+".received"]
+			if encoded == decodeOnly {
+				t.Fatalf("%s must have exactly one of .datagram and .received", vector)
+			}
+			if decodeOnly {
+				wire = received
+			}
+			datagram := decodeGoldenHex(t, vector, wire)
+
+			if encoded {
+				if got := appendDatagram(nil, flow, want); !bytes.Equal(got, datagram) {
+					t.Errorf("appendDatagram(%d, %x) = %x, want %x", flow, want, got, datagram)
+				}
+				// The sender packs encoded MESSAGE frames; they match.
+				packed := quicvarint.Append(nil, flow)
+				for _, message := range want {
+					packed = append(packed, rawMessage(message).frame...)
+				}
+				if !bytes.Equal(packed, datagram) {
+					t.Errorf("packed frames = %x, want %x", packed, datagram)
+				}
+			}
+
+			gotFlow, frames, ok := parseDatagram(datagram)
+			if !ok || gotFlow != flow {
+				t.Fatalf("parseDatagram(%x) = %d, %v; want flow %d", datagram, gotFlow, ok, flow)
+			}
+			got, valid := datagramMessages(frames)
+			if !valid && len(want) != 0 {
+				t.Fatalf("datagramMessages(%x) dropped the datagram, want %x", frames, want)
+			}
+			if len(got) != len(want) {
+				t.Fatalf("decoded %x, want %x", got, want)
+			}
+			for i := range want {
+				if !bytes.Equal(got[i], want[i]) {
+					t.Fatalf("message %d = %x, want %x", i, got[i], want[i])
+				}
+			}
+		})
+	}
+
+	// A payload that is empty, cut inside the varint, or addressed to flow 0
+	// belongs to no call.
+	for _, malformed := range [][]byte{nil, {0x40}, {0x00, 0x00, 0x00}} {
+		if flow, frames, ok := parseDatagram(malformed); ok {
+			t.Errorf("parseDatagram(%x) = %d, %x, true; want it rejected", malformed, flow, frames)
+		}
+	}
+	// Frames that do not exactly fill the datagram drop it whole, whatever
+	// precedes the fault.
+	for _, frames := range [][]byte{
+		{0x00},            // a type with no length
+		{0x00, 0x40},      // a length cut inside its varint
+		{0x00, 0x02, 'a'}, // a length past the end
+		{0x00, 0x01, 'a', 0x00, 0x05, 'b'},
+		{0x1f, 0x01}, // a skipped type with a length past the end
+	} {
+		if messages, valid := datagramMessages(frames); valid {
+			t.Errorf("datagramMessages(%x) = %x, true; want the datagram dropped", frames, messages)
+		}
+	}
 }
 
 // TestWireGoldenStreams parses every shared byte stream with the real frame
@@ -304,7 +404,8 @@ func loadWireGoldenVectors(t *testing.T) map[string][]byte {
 
 	vectors := map[string][]byte{}
 	for name, value := range loadGoldenEntries(t) {
-		if strings.HasSuffix(name, ".frames") {
+		// Frame lists and the datagram entries have formats of their own.
+		if strings.HasSuffix(name, ".frames") || strings.HasPrefix(name, "datagram.") {
 			continue
 		}
 		vectors[name] = decodeGoldenHex(t, name, value)

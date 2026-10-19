@@ -6,10 +6,14 @@
 //! Clients speak native QUIC through [`client::Channel`]. A [`server::Server`] serves native QUIC
 //! (ALPN [`ALPN`]), ordinary HTTP/3 (`POST /trevrpc`), and `WebTransport` (`/trevrpc`) from one
 //! Quinn endpoint, dispatching on the negotiated ALPN.
+//!
+//! Streaming methods can mark their messages [`Unreliable`], so that they travel in QUIC
+//! datagrams where the connection has them.
 
 extern crate self as trevrpc;
 
 pub mod client;
+mod datagram;
 pub mod error;
 mod framed;
 pub mod framing;
@@ -50,6 +54,7 @@ pub const HTTP3_ALPN: &[u8] = b"h3";
 pub const QMUX_ALPN: &[u8] = b"qmux-02.trevrpc-1";
 
 pub use async_trait::async_trait;
+pub use datagram::Unreliable;
 pub use error::{Error, Result};
 pub use framing::ResponseFrame;
 pub use futures_core::Stream;

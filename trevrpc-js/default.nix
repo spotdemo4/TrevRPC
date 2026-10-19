@@ -12,6 +12,7 @@
   wireGolden,
   qmuxGolden,
   interopProto,
+  trevrpcProto,
 }:
 let
   jsPackage = builtins.fromJSON (builtins.readFile ./package.json);
@@ -37,14 +38,16 @@ buildNpmPackage (final: {
   pname = "trevrpc-js";
   inherit (jsPackage) version;
 
-  # The interop client is generated from the shared interop proto, and the wire and QMux tests
-  # read the shared golden vectors; both live outside this directory.
+  # The interop clients are generated from the shared interop protos, which import the TrevRPC
+  # schema options, and the wire and QMux tests read the shared golden vectors; all of them live
+  # outside this directory.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       wireGolden
       qmuxGolden
       interopProto
+      trevrpcProto
       ./.
     ];
   };
@@ -56,7 +59,8 @@ buildNpmPackage (final: {
     npmRoot = ./.;
   };
 
-  # Generates the Echo client with protoc and bundles the interop page into build/interop/.
+  # Generates the Echo and UnreliableEcho clients with protoc and bundles the interop page into
+  # build/interop/.
   npmBuildScript = "build";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
 
@@ -145,7 +149,7 @@ buildNpmPackage (final: {
         "$out/bin/trevrpc-interop-browser" --browser "$browser" \
           --url https://127.0.0.1:49999/trevrpc --cert-hash "$hash" > "$browser.out" || status=$?
         test "$status" -eq 1
-        test "$(grep -c '^fail ' "$browser.out")" -eq 11
+        test "$(grep -c '^fail ' "$browser.out")" -eq 12
         ! grep -q '^ok ' "$browser.out"
       done
     ''}

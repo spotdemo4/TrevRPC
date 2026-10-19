@@ -1,7 +1,7 @@
 //! Native QUIC call transport over one established Quinn connection.
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
-use crate::{BoxStream, ResponseEnvelope, ResponseFrame, Result, RpcRequest};
+use crate::{BoxStream, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Unreliable};
 
 use bytes::Bytes;
 
@@ -18,11 +18,8 @@ pub struct QuicTransport(NativeTransport<quinn::Connection>);
 impl QuicTransport {
     /// Creates a transport over an established connection with the default maximum frame size.
     #[must_use]
-    pub const fn new(connection: quinn::Connection) -> Self {
-        Self(NativeTransport {
-            connection,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-        })
+    pub fn new(connection: quinn::Connection) -> Self {
+        Self(NativeTransport::new(connection, DEFAULT_MAX_FRAME_SIZE))
     }
 
     /// Sets the maximum `TrevRPC` frame size in bytes.
@@ -60,5 +57,16 @@ impl StreamingRpcTransport for QuicTransport {
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>> {
         self.0.streaming_call(request, request_body).await
+    }
+
+    async fn streaming_call_unreliable(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        self.0
+            .streaming_call_unreliable(request, request_body, unreliable)
+            .await
     }
 }

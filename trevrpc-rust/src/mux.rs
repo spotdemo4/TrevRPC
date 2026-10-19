@@ -5,6 +5,7 @@
 
 use std::future::Future;
 
+use crate::datagram::DatagramTransport;
 use crate::framed::{FrameRead, FrameWrite};
 use crate::request_pump::RequestTransportEvent;
 use crate::{Error, Result};
@@ -16,6 +17,8 @@ pub const CANCELLED_STREAM_CODE: u32 = 1;
 pub trait MuxConnection: Clone + Send + Sync + 'static {
     type SendStream: MuxSendStream;
     type RecvStream: MuxRecvStream;
+    /// How the connection sends and receives datagrams, for connections that have them.
+    type Datagrams: DatagramTransport;
 
     /// Accepts the next peer-initiated bidirectional stream, or `None` once the connection ends.
     fn accept_stream(
@@ -32,6 +35,11 @@ pub trait MuxConnection: Clone + Send + Sync + 'static {
 
     /// Resolves with the reason once the connection has ended.
     fn connection_lost(&self) -> impl Future<Output = Error> + Send;
+
+    /// The connection's datagrams, or `None` when the transport has none (`QMux` does not).
+    ///
+    /// Whether the peer accepts them is known only to the returned transport.
+    fn datagrams(&self) -> Option<Self::Datagrams>;
 }
 
 /// The sending half of a multiplexed stream.

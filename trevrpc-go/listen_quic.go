@@ -68,17 +68,29 @@ func (l *Listener) serveQUICConn(conn *quic.Conn) {
 }
 
 func (l *Listener) serveNative(conn *quic.Conn) {
+	datagrams := l.newDatagramMux(conn, 0)
+	defer datagrams.close()
 	l.serveStreams(l.ctx, streamAcceptor{
 		accept: func(ctx context.Context) (rpcStream, context.Context, error) {
 			stream, err := conn.AcceptStream(ctx)
 			if err != nil {
 				return nil, nil, err
 			}
-			return newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }), stream.Context(), nil
+			draining := newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) })
+			draining.datagrams = datagrams
+			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = conn.CloseWithError(0, message) },
 		overloadMessage:     "too many concurrent streams on connection",
 		drainTimeoutMessage: "server stream drain timed out",
 		shutdownMessage:     "server drained connection",
 	})
+}
+
+// newDatagramMux returns the demultiplexer of the datagram messages of one
+// connection or session, whose transport adds overhead bytes to every
+// datagram. It remembers twice as many ended flows as the connection has
+// streams.
+func (l *Listener) newDatagramMux(conn datagramConn, overhead int) *datagramMux {
+	return newDatagramMux(conn, overhead, true, 2*l.runtime.options.MaxConcurrentStreamsPerConnection)
 }

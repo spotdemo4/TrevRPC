@@ -17,6 +17,9 @@ type HandlerContext struct {
 	FullMethod string
 	Kind       RPCKind
 	Metadata   Metadata
+
+	// flow is the call's datagram flow, nil without one.
+	flow *datagramFlow
 }
 
 // HandlerContextFromContext returns TrevRPC request information attached to ctx.
@@ -43,6 +46,7 @@ func newHandlerContext(request *wireRequest) HandlerContext {
 		FullMethod: request.Method,
 		Kind:       request.rpcKind(),
 		Metadata:   cloneMetadata(request.Metadata),
+		flow:       request.flow,
 	}
 }
 

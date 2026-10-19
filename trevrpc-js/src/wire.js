@@ -30,6 +30,7 @@ const wireRoot = protobuf.Root.fromJSON({
             kind: { type: "RpcKind", id: 5 },
             timeoutNanos: { type: "uint64", id: 7 },
             extensions: { rule: "repeated", type: "uint64", id: 8 },
+            datagramFlow: { type: "uint64", id: 9 },
           },
           // Fields 2 (method name), 3 (request body) and 6 (wire version) must never be reused.
           reserved: [

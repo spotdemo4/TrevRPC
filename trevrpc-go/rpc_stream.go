@@ -19,13 +19,25 @@ const maxMessageFrameBatch = 16
 // requests never blocks, header and the messages share batched writes;
 // otherwise header goes out first, because the server must see the request
 // before the caller has anything to send.
-func writeRequestFrames(ctx context.Context, writer io.Writer, header []byte, requests encodedStream, maxFrameSize int) error {
+//
+// A non-nil datagrams sends the messages that fit as datagrams instead, and
+// only the others as frames. Its header always goes out first, on its own,
+// because a datagram must not overtake the REQUEST by more than the network
+// reorders it.
+func writeRequestFrames(ctx context.Context, writer io.Writer, header []byte, requests encodedStream, datagrams *datagramSender, maxFrameSize int) error {
 	nonBlocking := isNonBlockingStream(requests)
-	if !nonBlocking && len(header) > 0 {
+	if (!nonBlocking || datagrams != nil) && len(header) > 0 {
 		if _, err := writer.Write(header); err != nil {
 			return err
 		}
 		header = nil
+	}
+
+	// A sender that sends datagrams takes the messages that are ready along
+	// with the one it waited for, so that they share datagrams.
+	var ready readyReceiver[encodedMessage]
+	if datagrams != nil && !nonBlocking {
+		ready, _ = requests.(readyReceiver[encodedMessage])
 	}
 
 	var batch [maxMessageFrameBatch]encodedMessage
@@ -48,10 +60,33 @@ func writeRequestFrames(ctx context.Context, writer io.Writer, header []byte, re
 			batch[count] = message
 			count++
 			if !nonBlocking {
+				for ready != nil && count < len(batch) {
+					next, ok, err := ready.recvReady()
+					if err != nil {
+						return err
+					}
+					if !ok {
+						break
+					}
+					if next.size > maxFrameSize {
+						return &FrameTooLargeError{Len: next.size, Max: maxFrameSize}
+					}
+					batch[count] = next
+					count++
+				}
 				break
 			}
 		}
 
+		if datagrams != nil && count > 0 {
+			// The REQUEST was written above. What does not travel as a
+			// datagram stays in the batch.
+			kept, err := datagrams.send(batch[:count])
+			if err != nil {
+				return err
+			}
+			count = len(kept)
+		}
 		if count > 0 || len(header) > 0 {
 			if err := writeMessageFrames(writer, header, batch[:count]); err != nil {
 				return err
@@ -153,6 +188,23 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
+	if request.DatagramFlow != 0 {
+		// A connection without datagrams ignores the flow.
+		if datagrams, ok := stream.(datagramStream); ok {
+			if mux := datagrams.trevrpcDatagrams(); mux != nil {
+				flow, err := mux.register(request.DatagramFlow, request.rpcKind().streamsRequests(), options.MaxFrameSize)
+				if err != nil {
+					status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
+					runtime.recordRequestFailure(startedAt, request, 0, status)
+					writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
+					return
+				}
+				// The flow ends with the call, whichever way it ends.
+				defer flow.release()
+				request.flow = flow
+			}
+		}
+	}
 	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
 	defer cancelRequest()
 	// The rest of a call that ends after its message is read in any case.
@@ -191,8 +243,16 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 		reader.chargeMessages = true
 		reader.readAhead = true
 		requests := &rpcRequestStream{reader: reader}
+		if request.flow != nil && request.flow.sink != nil {
+			requests.merge = newRequestMerge(request.flow)
+		}
 		if request.rpcKind() == RPCKindClientStreaming || request.rpcKind() == RPCKindBidirectionalStreaming {
 			upload = requests
+			if requests.merge != nil {
+				// Ends the goroutine that reads the request ahead of a call
+				// with a flow, however the call ends.
+				defer func() { _ = requests.Close() }()
+			}
 			if cancellable, ok := stream.(contextCancelReadStream); ok {
 				requests.cancelReadOnContext = cancellable.trevrpcCancelReadOnContext
 			}
@@ -417,6 +477,9 @@ type rpcRequestStream struct {
 	reader              *frameReader
 	cancelReadOnContext func(context.Context) func()
 	cancelRead          func()
+	// merge is set for a call that receives its request messages as datagrams
+	// as well; see requestMerge.
+	merge *requestMerge
 	// done and ended are atomic because Close may run on another goroutine
 	// than Recv, and the connection handler reads ended after the response.
 	done atomic.Bool
@@ -451,8 +514,16 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 	if s.done.Load() {
 		return nil, io.EOF
 	}
+	if s.merge != nil {
+		return s.recvMerged()
+	}
 
 	next, err := s.reader.next()
+	return s.receive(next, err)
+}
+
+// receive turns the frame the reader returned into the result of Recv.
+func (s *rpcRequestStream) receive(next frame, err error) ([]byte, error) {
 	if err != nil {
 		s.done.Store(true)
 		if errors.Is(err, io.EOF) {
@@ -485,7 +556,99 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 
 func (s *rpcRequestStream) Close() error {
 	s.done.Store(true)
+	if s.merge != nil {
+		s.merge.stopOnce.Do(func() { close(s.merge.stop) })
+	}
 	return nil
+}
+
+// requestMerge merges the request messages of a call that arrive as datagrams
+// with its stream frames. The stream is read by a goroutine of its own, so
+// that a pending Recv wakes on a datagram without waiting for the next frame.
+type requestMerge struct {
+	flow *datagramFlow
+	// items carries what the goroutine read; it is unbuffered, so the goroutine
+	// is at most one frame ahead of Recv. It is created, with the goroutine,
+	// by the first Recv.
+	items chan requestItem
+	// stop ends the goroutine; Close closes it.
+	stop     chan struct{}
+	stopOnce sync.Once
+	// terminal is the frame that ended the request, held back until the
+	// datagram messages queued before it were delivered.
+	terminal *requestItem
+}
+
+type requestItem struct {
+	frame frame
+	err   error
+}
+
+func newRequestMerge(flow *datagramFlow) *requestMerge {
+	return &requestMerge{flow: flow, stop: make(chan struct{})}
+}
+
+// readLoop reads the request frames. Once the request ended, the datagram
+// direction ends with it: later datagrams are dropped.
+func (m *requestMerge) readLoop(reader *frameReader) {
+	for {
+		next, err := reader.next()
+		terminal := err != nil || next.typ != frameTypeMessage
+		if terminal {
+			m.flow.endReceive()
+		}
+		select {
+		case m.items <- requestItem{frame: next, err: err}:
+		case <-m.stop:
+			return
+		}
+		if terminal {
+			return
+		}
+	}
+}
+
+// recvMerged returns the next request message, whether it came as a frame or
+// as a datagram, in the order they arrive. The messages queued when the
+// request ends are delivered before it ends. The call's message and byte
+// limits and idle timer apply to the result, as to any other.
+func (s *rpcRequestStream) recvMerged() ([]byte, error) {
+	m := s.merge
+	sink := m.flow.sink
+	if m.items == nil {
+		m.items = make(chan requestItem)
+		go m.readLoop(s.reader)
+	}
+	for {
+		if m.terminal != nil {
+			if message, ok := sink.pop(); ok {
+				m.flow.received.Add(1)
+				return message, nil
+			}
+			item := *m.terminal
+			m.terminal = nil
+			return s.receive(item.frame, item.err)
+		}
+		select {
+		case item := <-m.items:
+			switch {
+			case item.err == nil && item.frame.typ == frameTypeMessage:
+				return item.frame.payload, nil
+			case item.err != nil && !errors.Is(item.err, io.EOF):
+				// The stream failed: what is queued is not delivered.
+				return s.receive(item.frame, item.err)
+			}
+			m.terminal = &item
+		case <-sink.wake:
+			if message, ok := sink.pop(); ok {
+				m.flow.received.Add(1)
+				return message, nil
+			}
+		case <-m.stop:
+			s.done.Store(true)
+			return nil, io.EOF
+		}
+	}
 }
 
 func transportStatus(err error) error {

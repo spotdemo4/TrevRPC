@@ -126,10 +126,16 @@ func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) 
 		}
 		return nil, Unavailable("transport unavailable: " + err.Error())
 	}
+	client := newStreamClient(connOpener{conn}, c.maxFrameSize)
+	if conn.ConnectionState().SupportsDatagrams.Remote {
+		// Each connection, and so each reconnect, has its own flow IDs.
+		client.datagrams = newDatagramMux(conn, 0, false, 0)
+	}
 	return &streamGeneration{
 		kind:   TransportQUIC,
-		client: newStreamClient(connOpener{conn}, c.maxFrameSize),
+		client: client,
 		close: func() error {
+			client.datagrams.close()
 			err := conn.CloseWithError(0, "client closed")
 			if errors.Is(err, net.ErrClosed) {
 				return nil

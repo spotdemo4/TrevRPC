@@ -1,18 +1,26 @@
 // The Echo service of interop/README.md, served over fake streams. Behavior must match what the
 // Go and Rust interop servers do.
 import { root } from "../build/interop/gen/interop.trevrpc.js";
+import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
+import { marshalMessage } from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { parseMethodPath } from "./support.js";
 
 const EchoService = "trevrpc.interop.v1.Echo";
+const UnreliableEchoService = "trevrpc.interop.v1.UnreliableEcho";
+/** Responses up to this size are sent as datagrams when the call has a flow. */
+const MaxDatagramResponse = 1000;
 const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
 const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
 
-/** Serves Echo streams. Tests can replace the unary implementation to simulate a faulty server. */
+/**
+ * Serves Echo streams. Tests can replace the unary implementation to simulate a faulty server.
+ * The handler takes the stream and, for UnreliableEcho, the session whose `datagrams` it serves.
+ */
 export function createEchoHandler({ unary = echoUnary } = {}) {
-  return async (stream) => {
+  return async (stream, session) => {
     const request = await stream.readRequest();
-    await serve(stream, request, unary);
+    await serve(stream, request, unary, session);
   };
 }
 
@@ -20,7 +28,7 @@ export const echoHandler = createEchoHandler();
 
 const text = new TextDecoder();
 
-async function serve(stream, request, unary) {
+async function serve(stream, request, unary, session) {
   // The interop-header rule: echo the value as response header and, on success, as trailer.
   const marker = request.metadata["interop-header"];
   const trailers = marker === undefined ? {} : { "interop-trailer": new Uint8Array(marker) };
@@ -34,6 +42,13 @@ async function serve(stream, request, unary) {
   const path = parseMethodPath(request.method);
   if (path === null) {
     await stream.writeStatus(Code.InvalidArgument, `malformed method path "${request.method}"`);
+    await stream.finish();
+    await stream.stopSending();
+    return;
+  }
+
+  if (path.service === UnreliableEchoService && path.method === "Bidi") {
+    await unreliableBidi(stream, request, session);
     await stream.finish();
     await stream.stopSending();
     return;
@@ -103,4 +118,64 @@ async function bidi(stream, done) {
     await stream.writeMessage(EchoResponse, { message: request.message, index });
   }
   await done();
+}
+
+/**
+ * UnreliableEcho.Bidi as the interop README specifies. Requests arrive on the stream or, for a call
+ * with a datagram flow, as datagrams from the session; responses to small requests go out as
+ * datagrams on such a call, after HEADERS.
+ */
+async function unreliableBidi(stream, request, session) {
+  const flow = Number(request.datagramFlow);
+  const datagrams = flow === 0 ? undefined : session?.datagrams;
+  const counts = { received: 0, datagrams: 0 };
+  let work = Promise.resolve();
+
+  const handle = (message, viaDatagram) => {
+    counts.received += 1;
+    counts.datagrams += viaDatagram ? 1 : 0;
+    work = work.then(async () => {
+      const responses = Array.from({ length: message.count }, (_, index) => ({
+        message: message.message,
+        index,
+      }));
+      if (datagrams !== undefined && message.message.length <= MaxDatagramResponse) {
+        // One datagram holds all the responses to a request.
+        datagrams.push(
+          encodeDatagram(
+            flow,
+            responses.map((response) => marshalMessage(EchoResponse, response)),
+          ),
+        );
+        return;
+      }
+      for (const response of responses) {
+        await stream.writeMessage(EchoResponse, response);
+      }
+    });
+  };
+
+  await stream.writeHeaders();
+  const previousListener = datagrams?.onSend;
+  if (datagrams !== undefined) {
+    datagrams.onSend = (datagram) => {
+      const decoded = decodeDatagram(datagram);
+      if (decoded?.flow === flow) {
+        for (const message of decoded.messages) {
+          handle(EchoRequest.decode(message), true);
+        }
+      }
+    };
+  }
+  for (let message; (message = await stream.readMessage(EchoRequest)) !== null;) {
+    handle(message, false);
+  }
+  if (datagrams !== undefined) {
+    datagrams.onSend = previousListener;
+  }
+  await work;
+  await stream.writeStatus(Code.Ok, "", {
+    "interop-received": new TextEncoder().encode(String(counts.received)),
+    "interop-datagrams-received": new TextEncoder().encode(String(counts.datagrams)),
+  });
 }

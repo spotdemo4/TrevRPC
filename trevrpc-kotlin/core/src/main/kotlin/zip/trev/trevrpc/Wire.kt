@@ -24,6 +24,12 @@ data class RpcRequest(
     val kindValue: Int = RpcKind.UNARY.value,
     val timeoutNanos: ULong = 0uL,
     val extensions: List<ULong> = emptyList(),
+    /**
+     * The datagram flow ID the client allocated for the call, or zero for none. Cronet exposes no
+     * datagram API, so this client never sets it and its calls stay reliable on the stream. The
+     * field exists so the codec round-trips what other runtimes send.
+     */
+    val datagramFlow: ULong = 0uL,
 ) {
     val kind: RpcKind?
         get() = RpcKind.fromValue(kindValue)

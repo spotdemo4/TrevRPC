@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use tokio::sync::watch;
 
+use crate::datagram::DatagramCount;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::sync::MutexExt as _;
 use crate::wire::{
@@ -16,7 +17,7 @@ use crate::wire::{
 };
 use crate::{
     BoxStream, Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest,
-    Status,
+    Status, Unreliable,
 };
 
 type UnaryHandlerFuture =
@@ -37,7 +38,43 @@ enum Route {
     Streaming {
         kind: RpcKind,
         handler: StreamingHandler,
+        options: RouteOptions,
     },
+}
+
+/// Settings of a streaming route beyond its handler.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RouteOptions {
+    unreliable: Unreliable,
+}
+
+impl RouteOptions {
+    /// Creates route options with every setting at its default: reliable.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            unreliable: Unreliable::NONE,
+        }
+    }
+
+    /// Marks directions of the route as unreliable, in addition to any marked already.
+    ///
+    /// The server sends the messages of a streaming response as datagrams, when the client's
+    /// connection carries them and gave the call a datagram flow, only if `unreliable.responses`
+    /// is set here. It accepts request datagrams on any call with a flow, so `unreliable.requests`
+    /// changes nothing on the server. Flags for a direction the route's kind does not stream are
+    /// ignored.
+    #[must_use]
+    pub const fn with_unreliable(mut self, unreliable: Unreliable) -> Self {
+        self.unreliable = self.unreliable.union(unreliable);
+        self
+    }
+
+    /// Returns the directions marked unreliable.
+    #[must_use]
+    pub const fn unreliable(&self) -> Unreliable {
+        self.unreliable
+    }
 }
 
 #[derive(Clone)]
@@ -157,6 +194,7 @@ pub struct RequestContext {
     metadata: Metadata,
     deadline: Option<Instant>,
     cancellation: CancellationToken,
+    datagrams: DatagramCount,
 }
 
 impl RequestContext {
@@ -168,6 +206,7 @@ impl RequestContext {
             request.metadata.clone(),
             deadline,
             CancellationToken::new(),
+            DatagramCount::default(),
         )
     }
 
@@ -177,6 +216,7 @@ impl RequestContext {
         metadata: Metadata,
         deadline: Option<Instant>,
         cancellation: CancellationToken,
+        datagrams: DatagramCount,
     ) -> Self {
         let service_len = split_method_path(&path).map(|(service, _)| service.len());
         Self {
@@ -186,6 +226,7 @@ impl RequestContext {
             metadata,
             deadline,
             cancellation,
+            datagrams,
         }
     }
 
@@ -242,6 +283,14 @@ impl RequestContext {
     pub fn deadline_expired(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    /// Returns how many of the call's request messages have arrived as datagrams so far.
+    ///
+    /// Zero for every call without a datagram flow, such as over `QMux` or HTTP.
+    #[must_use]
+    pub fn datagram_requests_received(&self) -> u64 {
+        self.datagrams.get()
     }
 
     /// Returns the call's cloneable cancellation token.
@@ -890,6 +939,26 @@ impl Server {
         F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static,
     {
+        self.route_streaming_envelope_with_options(path, kind, RouteOptions::new(), handler);
+    }
+
+    /// Registers a streaming route handler like
+    /// [`Server::route_streaming_envelope_with_context`], with route options such as which
+    /// directions are [`Unreliable`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
+    pub fn route_streaming_envelope_with_options<F, Fut>(
+        &mut self,
+        path: impl Into<String>,
+        kind: RpcKind,
+        options: RouteOptions,
+        handler: F,
+    ) where
+        F: Fn(RequestContext, Vec<u8>, BoxStream<Vec<u8>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ResponseEnvelope<BoxStream<Vec<u8>>>>> + Send + 'static,
+    {
         self.insert_route(
             path.into(),
             Route::Streaming {
@@ -897,8 +966,18 @@ impl Server {
                 handler: Arc::new(move |context, body, stream| {
                     Box::pin(handler(context, body, stream))
                 }),
+                options,
             },
         );
+    }
+
+    /// Returns the directions the streaming route at `path` marks unreliable, or none when there
+    /// is no such route.
+    pub(crate) fn route_unreliable(&self, path: &str) -> Unreliable {
+        match self.routes.get(path) {
+            Some(Route::Streaming { kind, options, .. }) => options.unreliable().effective(*kind),
+            _ => Unreliable::NONE,
+        }
     }
 
     /// Inserts a route, replacing any earlier route for the same path.
@@ -978,6 +1057,7 @@ impl Server {
             metadata,
             deadline,
             cancellation.clone(),
+            DatagramCount::default(),
         );
 
         let result = match invoke_unary_handler(handler, context, body) {
@@ -1007,6 +1087,7 @@ impl Server {
             body,
             request_body,
             CancellationToken::new(),
+            DatagramCount::default(),
         )
         .await
     }
@@ -1018,6 +1099,7 @@ impl Server {
         body: Vec<u8>,
         request_body: BoxStream<Vec<u8>>,
         cancellation: CancellationToken,
+        datagrams: DatagramCount,
     ) -> BoxStream<ResponseFrame> {
         let started_at = Instant::now();
         let request_body_len = body.len();
@@ -1049,7 +1131,7 @@ impl Server {
         let request_body =
             limit_stream(request_body, stream_limits, "request", cancellation.clone());
 
-        let Some(Route::Streaming { kind, handler }) = self.routes.get(request.method.as_str())
+        let Some(Route::Streaming { kind, handler, .. }) = self.routes.get(request.method.as_str())
         else {
             let status =
                 Status::unimplemented(format!("unknown streaming RPC method {}", request.method));
@@ -1087,6 +1169,7 @@ impl Server {
             metadata,
             deadline,
             cancellation.clone(),
+            datagrams,
         );
         let handler_result = match invoke_streaming_handler(handler, context, body, request_body) {
             Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,

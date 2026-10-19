@@ -1,5 +1,6 @@
-// Generates the Echo client from the shared interop proto with protoc-gen-trevrpc-js and bundles
-// the browser page that runs the interop scenarios. Output goes to build/interop/.
+// Generates the Echo and UnreliableEcho clients from the shared interop protos with
+// protoc-gen-trevrpc-js and bundles the browser page that runs the interop scenarios. Output goes
+// to build/interop/.
 import { execFile } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,8 @@ import { build as bundle } from "esbuild";
 const run = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const protoDir = fileURLToPath(new URL("../../interop/proto", import.meta.url));
+// The shared schema options (trevrpc/options.proto) that unreliable.proto imports.
+const optionsProtoDir = fileURLToPath(new URL("../../proto", import.meta.url));
 const plugin = fileURLToPath(new URL("../bin/protoc-gen-trevrpc-js.js", import.meta.url));
 const outDir = fileURLToPath(new URL("../build/interop", import.meta.url));
 
@@ -25,7 +28,9 @@ export async function buildInterop() {
     `--plugin=protoc-gen-trevrpc-js=${plugin}`,
     `--trevrpc-js_out=runtime_import=${runtime},runtime_type_import=${runtime}:${genDir}`,
     `--proto_path=${protoDir}`,
+    `--proto_path=${optionsProtoDir}`,
     "interop.proto",
+    "unreliable.proto",
   ]);
 
   await bundle({

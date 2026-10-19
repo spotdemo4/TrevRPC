@@ -63,6 +63,9 @@ type route struct {
 	kind      RPCKind
 	unary     unaryHandler
 	streaming streamingHandler
+	// unreliable says which directions send their messages as datagrams on
+	// calls that have a flow.
+	unreliable Unreliable
 }
 
 // ErrServerFrozen is the panic value used when a server is mutated after first use.
@@ -327,7 +330,7 @@ func (s *Server) routeUnary(method string, handler unaryHandler) {
 }
 
 // routeStreaming registers a streaming route handler for a method path and RPC kind.
-func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHandler) {
+func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHandler, options ...RouteOption) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
@@ -335,7 +338,7 @@ func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHa
 		panic("trevrpc: streaming route requires a streaming RPC kind")
 	}
 	validateRoute(method, handler != nil)
-	s.routes[method] = route{kind: kind, streaming: handler}
+	s.routes[method] = route{kind: kind, streaming: handler, unreliable: applyRouteOptions(options).unreliable.effective(kind)}
 }
 
 // RegisterUnary registers a unary handler for method, the full method path
@@ -360,8 +363,10 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string,
 // RegisterClientStreaming registers a client-streaming handler for method, the
 // full method path "/package.Service/Method". It panics if method is not of
 // that form. The handler may attach response headers and trailing metadata
-// through the returned Response.
-func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (*Response[Res], error)) {
+// through the returned Response. Request messages that arrive as datagrams are
+// delivered with the others; RouteUnreliable has no effect on a method whose
+// response is a single message.
+func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (*Response[Res], error), options ...RouteOption) {
 	s.routeStreaming(method, RPCKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
 		response, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
@@ -371,15 +376,16 @@ func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 			return streamResponse{}, err
 		}
 		return newStreamResponse(WithResponseHeaders(NewResponseStream(newSliceStream(response.Message), response.Metadata), response.Headers))
-	})
+	}, options...)
 }
 
 // RegisterServerStreaming registers a server-streaming handler for method, the
 // full method path "/package.Service/Method". It panics if method is not of
 // that form. If the returned stream implements ResponseStream (see NewResponseStream), its
 // trailing metadata is sent with the final status; WithResponseHeaders adds
-// response headers.
-func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (MessageStream[Res], error)) {
+// response headers. RouteUnreliable lets the response messages travel as
+// datagrams.
+func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (MessageStream[Res], error), options ...RouteOption) {
 	s.routeStreaming(method, RPCKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (streamResponse, error) {
 		request, err := decodeRegisteredRequest(body, newRequest)
 		if err != nil {
@@ -394,15 +400,16 @@ func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 			return streamResponse{}, Internal("handler returned nil response stream")
 		}
 		return newStreamResponse(responses)
-	})
+	}, options...)
 }
 
 // RegisterBidirectionalStreaming registers a bidirectional-streaming handler
 // for method, the full method path "/package.Service/Method". It panics if
 // method is not of that form. If the returned stream implements ResponseStream (see NewResponseStream), its
 // trailing metadata is sent with the final status; WithResponseHeaders adds
-// response headers.
-func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (MessageStream[Res], error)) {
+// response headers. RouteUnreliable lets the response messages travel as
+// datagrams; request messages that arrive as datagrams are always accepted.
+func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (MessageStream[Res], error), options ...RouteOption) {
 	s.routeStreaming(method, RPCKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (streamResponse, error) {
 		responses, err := handler(ctx, newDecodeStream(requests, newRequest))
 		if err != nil {
@@ -412,7 +419,7 @@ func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Serve
 			return streamResponse{}, Internal("handler returned nil response stream")
 		}
 		return newStreamResponse(responses)
-	})
+	}, options...)
 }
 
 func decodeRegisteredRequest[Req ProtoMessage](body []byte, newRequest func() Req) (Req, error) {
@@ -1083,7 +1090,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), request)
 	}
 	response.stream = closeStreamOnContext(ctx, response.stream)
-	stream := &serverResponseStream{response: response, runtime: r, request: request, lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
+	stream := &serverResponseStream{response: response, runtime: r, request: request, flow: responseFlow(request, route), lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
 	if isNonBlockingStream(response.stream) {
 		// Such a stream is read where it is written, and drained in batches.
 		stream.receiver = newStreamReceiver(ctx, response.stream, limits.idleTimeout, "response", lease)
@@ -1091,6 +1098,15 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		stream.readAhead = newResponseReadAhead(ctx, response.stream, limits.idleTimeout, lease)
 	}
 	return stream
+}
+
+// responseFlow returns the flow the response messages of a call travel on as
+// datagrams, or nil if they stay on the stream.
+func responseFlow(request *wireRequest, route route) *datagramFlow {
+	if request.flow == nil || !route.unreliable.Responses {
+		return nil
+	}
+	return request.flow
 }
 
 type streamingHandlerResult struct {
@@ -1437,6 +1453,9 @@ type serverResponseStream struct {
 	hasPending      bool
 	done            bool
 	cancel          context.CancelFunc
+	// flow is the call's datagram flow when the route sends its responses as
+	// datagrams, and nil otherwise.
+	flow *datagramFlow
 	// receiver reads a stream that never blocks, and readAhead any other.
 	receiver  *streamReceiver[encodedMessage]
 	readAhead *responseReadAhead
@@ -1476,12 +1495,14 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 			// The handler starts on the first message while HEADERS go out.
 			s.readAhead.start()
 		}
-		if len(s.response.headers) > 0 {
+		// A call that sends datagrams flushes HEADERS, empty ones included,
+		// before the first one.
+		if len(s.response.headers) > 0 || s.flow != nil {
 			var err error
 			if headers, err = appendHeadersFrame(nil, s.response.headers, maxFrameSize); err != nil {
 				return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
 			}
-			if s.readAhead != nil {
+			if s.readAhead != nil || s.flow != nil {
 				if _, err := writer.Write(headers); err != nil {
 					return true, err
 				}
@@ -1529,6 +1550,15 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 
 		batch = append(batch, item.message)
 		size = saturatingAdd(size, len(item.message.frame))
+	}
+
+	if s.flow != nil && len(batch) > 0 {
+		// The messages that are ready go out as few datagrams as fit; those
+		// that do not travel as datagrams stay for the stream.
+		var err error
+		if batch, err = s.flow.sendBatch(s.ctx, batch); err != nil {
+			return true, err
+		}
 	}
 
 	if final != nil {

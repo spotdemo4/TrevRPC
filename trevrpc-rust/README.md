@@ -165,6 +165,24 @@ WebTransport policy: a session must use the shared path, then pass the authority
 
 `http3_enabled`, `http3_path`, and `http3_admission` (and their `with_*` builders) were renamed `http_enabled`, `http_path`, and `http_admission`, and `Http3Admission`/`Http3AdmissionRequest` became `HttpAdmission`/`HttpAdmissionRequest`, because the HTTP mapping is now also served over HTTP/2.
 
+## Unreliable messages
+
+A method can mark its streamed requests, its streamed responses, or both as unreliable with the `trevrpc.method` option from [`proto/trevrpc/options.proto`](../proto/trevrpc/options.proto), imported with the `proto/` directory on the include path:
+
+```proto
+import "trevrpc/options.proto";
+
+service Telemetry {
+  rpc Track(stream Position) returns (stream Position) {
+    option (trevrpc.method) = {unreliable_requests: true, unreliable_responses: true};
+  }
+}
+```
+
+Their messages then travel in QUIC datagrams where the connection has them (native QUIC, and WebTransport on the server) and may be lost or reordered, never duplicated or corrupted. A message that does not fit a datagram, or whose datagram cannot be sent, goes on the stream, and QMux, HTTP/2 and HTTP/3 request streams keep every message on the stream. `protoc-gen-trevrpc-rust` reads the option and fails on a direction that does not stream; generated clients and `register_*` functions apply it.
+
+The runtime options underneath are `trevrpc::Unreliable`, set on a client call with `CallOptions::with_unreliable` and on a server route with `RouteOptions::with_unreliable` and `Server::route_streaming_envelope_with_options`. A handler sees how many request messages arrived as datagrams with `RequestContext::datagram_requests_received`. The QUIC configurations from `Server::quic_config` and `ChannelConfig::quic_config` buffer at most 128 KiB of incoming datagrams per connection.
+
 ## TCP fallback
 
 TCP is opt-in. `Server::tcp_tls_config` builds the TLS configuration for a TCP listener, setting the ALPN list from the options (`qmux-02.trevrpc-1` always, `h2` when HTTP is enabled, `http/1.1` for the WebSocket upgrade when WebTransport is enabled). `Server::serve_with_tcp` then serves QUIC and TCP together, sharing the connection and request limits and graceful shutdown:
@@ -196,7 +214,7 @@ println!("{:?}", channel.transport()); // Some(TransportKind::Quic) or Some(Tran
 
 ## Interop
 
-`trevrpc-interop-rust server|client` is the Rust half of the cross-runtime interop suite in `interop/`. The `Echo` service is generated from `interop/proto/interop.proto`, the single copy of the contract.
+`trevrpc-interop-rust server|client` is the Rust half of the cross-runtime interop suite in `interop/`. The `Echo` and `UnreliableEcho` services are generated from `interop/proto/interop.proto` and `interop/proto/unreliable.proto`, the single copy of the contract.
 
 ## Development
 

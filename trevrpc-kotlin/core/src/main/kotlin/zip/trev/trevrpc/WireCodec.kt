@@ -13,6 +13,7 @@ object WireCodec {
                 int32(5, request.kindValue)
                 uint64(7, request.timeoutNanos)
                 packedUint64(8, request.extensions)
+                uint64(9, request.datagramFlow)
             }.toByteArray()
 
     fun decodeRequest(bytes: ByteArray): RpcRequest {
@@ -22,6 +23,7 @@ object WireCodec {
         var kind = 0
         var timeoutNanos = 0uL
         val extensions = mutableListOf<ULong>()
+        var datagramFlow = 0uL
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
@@ -30,10 +32,11 @@ object WireCodec {
                 5 -> kind = reader.int32(tag)
                 7 -> timeoutNanos = reader.uint64(tag)
                 8 -> reader.uint64Elements(tag, extensions)
+                9 -> datagramFlow = reader.uint64(tag)
                 else -> reader.skip(tag)
             }
         }
-        return RpcRequest(method, Metadata.fromWire(metadata), kind, timeoutNanos, extensions)
+        return RpcRequest(method, Metadata.fromWire(metadata), kind, timeoutNanos, extensions, datagramFlow)
     }
 
     fun encode(headers: RpcHeaders): ByteArray =

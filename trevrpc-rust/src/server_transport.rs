@@ -5,12 +5,16 @@ use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
+use crate::datagram::{DatagramCount, Demux, FlowSender, MergedRequests, ServerFlow};
 use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH};
 use crate::request_pump::{
     RequestInputKind, RequestPumpReader, RequestPumpSettle, start_request_pump,
 };
 use crate::server::{CancellationSource, CancellationToken, RequestBudget, Server};
-use crate::{Code, Error, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status};
+use crate::{
+    Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status,
+    varint,
+};
 
 /// Sends response frames without imposing a transport framing format.
 ///
@@ -38,6 +42,38 @@ pub struct IncomingRequest {
     pub(crate) body: Vec<u8>,
     /// What the rest of the request stream may still send.
     pub(crate) budget: RequestBudget,
+    /// The call's datagram flow, once [`open_flow`] has registered it.
+    pub(crate) flow: Option<ServerFlow>,
+}
+
+/// Registers the datagram flow that a streaming REQUEST asks for on the connection's `demux`,
+/// claiming the datagrams that overtook the REQUEST.
+///
+/// Calls without a flow, unary calls, and connections without datagrams (`demux` is `None`) get
+/// none. Fails with `InvalidArgument` when the flow is out of range or already live on the
+/// connection.
+pub fn open_flow(demux: Option<&Demux>, incoming: &mut IncomingRequest) -> Result<()> {
+    let request = &incoming.request;
+    let flow = request.datagram_flow;
+    let kind = request.rpc_kind();
+    let Some(demux) = demux else {
+        return Ok(());
+    };
+    if flow == 0 || kind == RpcKind::Unary {
+        return Ok(());
+    }
+    if flow > varint::MAX {
+        return Err(Error::from(Status::invalid_argument(
+            "datagram flow is out of range",
+        )));
+    }
+    let opened = demux.open_server_flow(flow, kind).map_err(|_| {
+        Error::from(Status::invalid_argument(format!(
+            "datagram flow {flow} is already in use on the connection"
+        )))
+    })?;
+    incoming.flow = Some(opened);
+    Ok(())
 }
 
 /// Reads the REQUEST frame and, for calls with a single request message, that message, bounded by
@@ -91,6 +127,7 @@ where
         request,
         body,
         budget,
+        flow: None,
     })
 }
 
@@ -115,6 +152,7 @@ pub async fn handle_stream<W, R>(
         request,
         body,
         budget,
+        flow,
     } = incoming;
     let request_body_len = body.len();
     let mut slots = StreamSlots::new(stream_permit);
@@ -132,6 +170,7 @@ pub async fn handle_stream<W, R>(
             request,
             body,
             budget,
+            flow,
         };
         handle_streaming_rpc(server, slots, send, recv, incoming, cancellation, shutdown).await;
         return;
@@ -232,6 +271,7 @@ pub async fn reject_stream<W, R>(
         request,
         body,
         budget,
+        flow: _,
     } = incoming;
     let status = Status::unavailable("too many concurrent streams on connection");
     server.record_rejected_request(&request, body.len(), &status);
@@ -313,6 +353,7 @@ async fn handle_streaming_rpc<W, R>(
         request,
         body,
         budget,
+        flow,
     } = incoming;
     let max_frame_size = server.max_frame_size();
     let request_body_len = body.len();
@@ -323,6 +364,27 @@ async fn handle_streaming_rpc<W, R>(
         max_frame_size,
         budget,
     );
+    // The flow is unregistered when the call ends, however it ends.
+    let (request_body, datagram_count, mut datagram_responses, _flow_guard) = match flow {
+        Some(flow) => {
+            let count = DatagramCount::new();
+            let request_body = match flow.requests {
+                Some(datagrams) => MergedRequests::boxed(
+                    request_body,
+                    datagrams,
+                    flow.guard.drain_handle(),
+                    count.clone(),
+                ),
+                None => request_body,
+            };
+            let responses = server
+                .route_unreliable(&request.method)
+                .responses
+                .then(|| ResponseDatagrams::new(flow.sender));
+            (request_body, count, responses, Some(flow.guard))
+        }
+        None => (request_body, DatagramCount::default(), None, None),
+    };
     let mut response = tokio::select! {
         biased;
         response = server.handle_streaming_request_with_cancellation(
@@ -330,6 +392,7 @@ async fn handle_streaming_rpc<W, R>(
             body,
             request_body,
             cancellation.clone(),
+            datagram_count,
         ) => response,
         failure = request_pump.failure() => {
             server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
@@ -429,7 +492,15 @@ async fn handle_streaming_rpc<W, R>(
             // The STATUS ends the call from the client's point of view.
             slots.release();
         }
-        if let Err(error) = send.write_frames(&mut batch.frames).await {
+        let written = match &mut datagram_responses {
+            Some(datagrams) => {
+                datagrams
+                    .write(&mut send, &mut batch.frames, &cancellation)
+                    .await
+            }
+            None => send.write_frames(&mut batch.frames).await,
+        };
+        if let Err(error) = written {
             cancel_from_transport_error(&cancellation, &error);
             let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
             return;
@@ -443,6 +514,87 @@ async fn handle_streaming_rpc<W, R>(
     let _ = request_pump
         .settle(RequestPumpSettle::ResponseCommitted)
         .await;
+}
+
+/// Sends a call's response messages as datagrams where they fit, and the rest on the stream.
+struct ResponseDatagrams {
+    sender: FlowSender,
+    /// The call's HEADERS frame has been handed to the transport.
+    headers_flushed: bool,
+    /// The call has sent a datagram.
+    sent_any: bool,
+}
+
+impl ResponseDatagrams {
+    const fn new(sender: FlowSender) -> Self {
+        Self {
+            sender,
+            headers_flushed: false,
+            sent_any: false,
+        }
+    }
+
+    /// Writes a batch of response frames, draining `frames`.
+    ///
+    /// HEADERS, even empty ones, are written and flushed before the call's first datagram.
+    /// The messages go out packed into datagrams, in order; those that cannot are written to the
+    /// stream with the batch's other frames, after the datagrams. The terminal STATUS is
+    /// written after every datagram of its batch, and nothing follows it.
+    async fn write<W: ResponseWriter>(
+        &mut self,
+        send: &mut W,
+        frames: &mut Vec<ResponseFrame>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let has_message = frames
+            .iter()
+            .any(|frame| matches!(frame, ResponseFrame::Message(_)));
+        if has_message && !self.headers_flushed {
+            let headers = if matches!(frames.first(), Some(ResponseFrame::Headers(_))) {
+                frames.remove(0)
+            } else {
+                ResponseFrame::Headers(Metadata::new())
+            };
+            send.write_frames(&mut vec![headers]).await?;
+        }
+        if has_message || matches!(frames.first(), Some(ResponseFrame::Headers(_))) {
+            self.headers_flushed = true;
+        }
+
+        // Only HEADERS and the terminal STATUS can accompany the messages of a batch, and they
+        // stay on the stream, after the messages that could not travel as datagrams.
+        let mut messages = Vec::with_capacity(frames.len());
+        let mut other = Vec::new();
+        for frame in frames.drain(..) {
+            match frame {
+                ResponseFrame::Message(body) => messages.push(body),
+                frame => other.push(frame),
+            }
+        }
+        let mut on_stream = Vec::new();
+        self.sent_any |= !messages.is_empty();
+        self.sender
+            .send_batch(&mut messages, &mut on_stream, async {
+                cancellation.cancelled().await;
+            })
+            .await;
+        if self.sent_any && other.iter().any(ResponseFrame::is_status) {
+            // The STATUS must not overtake the datagrams sent before it.
+            self.sender
+                .flushed(async {
+                    cancellation.cancelled().await;
+                })
+                .await;
+        }
+        let mut frames_on_stream: Vec<ResponseFrame> =
+            on_stream.into_iter().map(ResponseFrame::Message).collect();
+        frames_on_stream.append(&mut other);
+        if frames_on_stream.is_empty() {
+            Ok(())
+        } else {
+            send.write_frames(&mut frames_on_stream).await
+        }
+    }
 }
 
 /// Adds a frame to a batch; a failed response stream becomes the terminal STATUS.

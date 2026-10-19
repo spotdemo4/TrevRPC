@@ -144,7 +144,7 @@ fn preflight_known_wire<M: 'static>(body: &[u8]) -> Result<()> {
     // and 6 of `RpcRequest` are reserved and skipped like any unknown field.
     let (fields, metadata_field): (&[(u64, u64)], Option<u64>) =
         if TypeId::of::<M>() == TypeId::of::<RpcRequest>() {
-            (&[(1, 2), (4, 2), (5, 0), (7, 0)], Some(4))
+            (&[(1, 2), (4, 2), (5, 0), (7, 0), (9, 0)], Some(4))
         } else if TypeId::of::<M>() == TypeId::of::<RpcHeaders>() {
             (&[(1, 2)], Some(1))
         } else if TypeId::of::<M>() == TypeId::of::<RpcStatus>() {
@@ -371,6 +371,12 @@ mod tests {
     fn known_fields_with_the_wrong_wire_type_are_rejected() {
         // RpcRequest.method (field 1) as a varint.
         let status = decode_payload::<RpcRequest>(&[0x08, 0x01])
+            .expect_err("wrong wire type should fail")
+            .into_status();
+        assert_eq!(status.code(), Code::InvalidArgument);
+
+        // RpcRequest.datagram_flow (field 9) as bytes.
+        let status = decode_payload::<RpcRequest>(&[0x4a, 0x01, 0x01])
             .expect_err("wrong wire type should fail")
             .into_status();
         assert_eq!(status.code(), Code::InvalidArgument);

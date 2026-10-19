@@ -31,6 +31,9 @@ type streamOpener interface {
 type streamClient struct {
 	opener       streamOpener
 	maxFrameSize int
+	// datagrams carries the datagram flows of the calls, or is nil when the
+	// connection has none. It is set before the client is used.
+	datagrams *datagramMux
 }
 
 func newStreamClient(opener streamOpener, maxFrameSize int) *streamClient {
@@ -49,22 +52,27 @@ func (c *streamClient) call(
 ) (frameStream, error) {
 	protoMessage := protoMessageV2(message)
 	messageSize := proto.Size(protoMessage)
+	flow := c.openFlow(request)
 	requestSize, _ := request.payloadSize()
 	// The frames are built in one allocation.
 	frames := make([]byte, 0, frameHeaderSize+requestSize+frameHeaderLen(frameTypeMessage, messageSize)+messageSize)
 	frames, err := appendRequestFrame(frames, request, c.maxFrameSize)
 	if err != nil {
+		flow.release()
 		return nil, err
 	}
 	if messageSize > c.maxFrameSize {
+		flow.release()
 		return nil, &FrameTooLargeError{Len: messageSize, Max: c.maxFrameSize}
 	}
 	if frames, err = appendProtoFrame(frames, frameTypeMessage, protoMessage, messageSize); err != nil {
+		flow.release()
 		return nil, err
 	}
 
 	stream, err := c.opener.openStream(ctx)
 	if err != nil {
+		flow.release()
 		return nil, callStatus(ctx, err)
 	}
 	response := &transportResponseStream{
@@ -73,6 +81,7 @@ func (c *streamClient) call(
 		reader:       newResponseFrameReader(stream, c.maxFrameSize),
 		stopCancel:   cancelStreamOnContext(ctx, stream),
 		maxFrameSize: c.maxFrameSize,
+		flow:         flow,
 	}
 
 	if _, err := stream.Write(frames); err != nil {
@@ -84,7 +93,32 @@ func (c *streamClient) call(
 		response.finish(true)
 		return nil, callStatus(ctx, err)
 	}
+	if flow != nil {
+		// A call with a flow reads its response ahead, so that a pending Recv
+		// wakes on a datagram as well as on a frame.
+		response.startPump()
+	}
 	return response, nil
+}
+
+// openFlow gives the call a datagram flow if the connection has datagrams and
+// the call asks for them, and records its ID in request. The decision is made
+// here, inside the connection that carries the call. It returns nil for a call
+// without a flow.
+func (c *streamClient) openFlow(request *wireRequest) *datagramFlow {
+	if c.datagrams == nil {
+		return nil
+	}
+	kind := request.rpcKind()
+	if !request.unreliable.effective(kind).any() {
+		return nil
+	}
+	flow := c.datagrams.allocate(kind.streamsResponses(), c.maxFrameSize)
+	if flow == nil {
+		return nil
+	}
+	request.DatagramFlow = flow.id
+	return flow
 }
 
 func (c *streamClient) streamingCall(
@@ -92,8 +126,10 @@ func (c *streamClient) streamingCall(
 	request *wireRequest,
 	requests encodedStream,
 ) (frameStream, error) {
+	flow := c.openFlow(request)
 	header, err := appendRequestFrame(nil, request, c.maxFrameSize)
 	if err != nil {
+		flow.release()
 		return nil, err
 	}
 
@@ -102,6 +138,7 @@ func (c *streamClient) streamingCall(
 	if err != nil {
 		statusErr := callStatus(streamCtx, err)
 		cancel()
+		flow.release()
 		return nil, statusErr
 	}
 
@@ -122,12 +159,20 @@ func (c *streamClient) streamingCall(
 		drained:      make(chan struct{}, 1),
 		pumpStop:     make(chan struct{}),
 		outcome:      make(chan struct{}),
+		flow:         flow,
 	}
 	if aborter, ok := requests.(uploadAborter); ok {
 		response.abortUpload = aborter.abortUpload
 	}
+	var sender *datagramSender
+	if flow != nil {
+		response.sink = flow.sink
+		if request.unreliable.effective(request.rpcKind()).Requests {
+			sender = &datagramSender{flow: flow, ctx: uploadCtx}
+		}
+	}
 	go func() {
-		writerDone <- c.writeStreamingRequest(uploadCtx, stream, header, requests, response.outcome)
+		writerDone <- c.writeStreamingRequest(uploadCtx, stream, header, requests, sender, response.outcome)
 	}()
 	// The response is read while the upload runs, so that a terminal status
 	// reaches a caller that is only sending.
@@ -152,13 +197,14 @@ func (c *streamClient) writeStreamingRequest(
 	stream clientStream,
 	header []byte,
 	requests encodedStream,
+	sender *datagramSender,
 	outcome <-chan struct{},
 ) error {
 	requests = closeStreamOnContext(ctx, requests)
 	defer discardMessageStream(requests)
 
 	writer := &trackedWriter{writer: stream}
-	if err := writeRequestFrames(ctx, writer, header, requests, c.maxFrameSize); err != nil {
+	if err := writeRequestFrames(ctx, writer, header, requests, sender, c.maxFrameSize); err != nil {
 		stream.cancelWrite()
 		if writer.failed {
 			select {
@@ -253,9 +299,33 @@ type transportResponseStream struct {
 	outcomeReached sync.Once
 	// abortUpload reports why the upload ended to Send.
 	abortUpload func(error)
+
+	// flow is the call's datagram flow, nil without one. A call with a flow
+	// is pumped, and its sink, if any, holds the response messages that
+	// arrived as datagrams. The remaining fields belong to the consumer of
+	// nextFrame.
+	flow *datagramFlow
+	sink *datagramSink
+	// gateOpen is set once the first frame of the response was delivered:
+	// datagram messages follow HEADERS, never precede it.
+	gateOpen bool
+	// held is the terminal frame that waits for the datagram messages queued
+	// before it.
+	held *pumpedFrame
 }
 
 func (s *transportResponseStream) trevrpcContextCancelsRecv() bool { return true }
+
+// startPump makes the stream a pumped one, for a call whose response is read
+// ahead of Recv without a writer goroutine.
+func (s *transportResponseStream) startPump() {
+	s.sink = s.flow.sink
+	s.frames = make(chan pumpedFrame, responseReadAheadFrames)
+	s.drained = make(chan struct{}, 1)
+	s.pumpStop = make(chan struct{})
+	s.outcome = make(chan struct{})
+	go s.pump()
+}
 
 // SetReadDeadline sets the stream's read deadline. A pumped stream is read by
 // the pump alone, and the call context bounds it through cancellation.
@@ -293,12 +363,15 @@ func (s *transportResponseStream) pump() {
 		item := pumpedFrame{frame: next, err: err}
 		switch {
 		case err != nil:
+			// The response direction ended: late datagrams are dropped.
+			s.flow.endReceive()
 			if !errors.Is(err, io.EOF) {
 				s.endUpload(callStatus(s.ctx, err))
 			} else {
 				s.endUpload(nil)
 			}
 		case next.typ == frameTypeStatus:
+			s.flow.endReceive()
 			item.status, item.statusErr = decodeStatus(next.payload)
 			if item.statusErr == nil {
 				s.endUpload(uploadEndError(item.status))
@@ -347,6 +420,9 @@ func (s *transportResponseStream) nextFrame() (pumpedFrame, error) {
 		}
 		return item, nil
 	}
+	if s.sink != nil {
+		return s.nextMergedFrame()
+	}
 	select {
 	case item, ok := <-s.frames:
 		if !ok {
@@ -356,15 +432,73 @@ func (s *transportResponseStream) nextFrame() (pumpedFrame, error) {
 			}
 			return pumpedFrame{err: io.EOF}, nil
 		}
-		s.queued.Add(-int64(len(item.frame.payload)))
-		select {
-		case s.drained <- struct{}{}:
-		default:
-		}
+		s.takeFrame(item)
 		return item, nil
 	case <-s.ctx.Done():
 		return pumpedFrame{}, statusFromContextError(s.ctx.Err())
 	}
+}
+
+// takeFrame accounts for a frame the consumer took from the pump.
+func (s *transportResponseStream) takeFrame(item pumpedFrame) {
+	s.queued.Add(-int64(len(item.frame.payload)))
+	select {
+	case s.drained <- struct{}{}:
+	default:
+	}
+}
+
+// nextMergedFrame returns the next frame of a call that also receives its
+// response messages as datagrams: the pumped stream frames and the datagram
+// messages in the order they arrive. The messages wait until the first frame,
+// HEADERS if there is any, was delivered, and the messages queued when the
+// terminal frame arrives go before it. Messages that arrive after the stream
+// ended were dropped by the pump.
+func (s *transportResponseStream) nextMergedFrame() (pumpedFrame, error) {
+	for {
+		if s.held != nil {
+			if message, ok := s.sink.pop(); ok {
+				return datagramMessageFrame(message), nil
+			}
+			item := *s.held
+			s.held = nil
+			return item, nil
+		}
+		var wake <-chan struct{}
+		if s.gateOpen {
+			wake = s.sink.wake
+		}
+		select {
+		case item, ok := <-s.frames:
+			if !ok {
+				// The pump stopped without a final frame because the call ended.
+				if err := s.ctx.Err(); err != nil {
+					return pumpedFrame{}, statusFromContextError(err)
+				}
+				return pumpedFrame{err: io.EOF}, nil
+			}
+			s.takeFrame(item)
+			s.gateOpen = true
+			if item.err == nil && item.frame.typ != frameTypeStatus {
+				return item, nil
+			}
+			if item.err != nil && !errors.Is(item.err, io.EOF) {
+				// The stream failed: what is queued is not delivered.
+				return item, nil
+			}
+			s.held = &item
+		case <-wake:
+			if message, ok := s.sink.pop(); ok {
+				return datagramMessageFrame(message), nil
+			}
+		case <-s.ctx.Done():
+			return pumpedFrame{}, statusFromContextError(s.ctx.Err())
+		}
+	}
+}
+
+func datagramMessageFrame(message []byte) pumpedFrame {
+	return pumpedFrame{frame: frame{typ: frameTypeMessage, payload: message}}
 }
 
 // Recv returns the next known response frame. After the STATUS frame it keeps
@@ -451,6 +585,7 @@ func (s *transportResponseStream) finish(cancelRead bool) {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.flow.release()
 	if cancelRead {
 		s.stream.cancelRead()
 	}

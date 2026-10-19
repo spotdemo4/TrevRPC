@@ -67,6 +67,22 @@ export class Channel {
     return this.#session.createBidirectionalStream();
   }
 
+  /**
+   * Opens a bidirectional stream on the current session, together with that session's WebTransport
+   * `datagrams` object, or undefined if the session has none (QMux over WebSocket). Calls that may
+   * use datagrams open their stream here, so their datagram flow belongs to the session that
+   * carries them even if the channel reconnects meanwhile.
+   */
+  createBidirectionalStreamWithDatagrams() {
+    if (this.#state !== "ready") {
+      return Promise.reject(unavailable(`channel is ${this.#state}`));
+    }
+    const session = this.#session;
+    return session
+      .createBidirectionalStream()
+      .then((stream) => ({ stream, datagrams: session.datagrams }));
+  }
+
   /** Resolves once the channel is ready, immediately if it already is. */
   waitUntilReady() {
     if (this.#state === "ready") {

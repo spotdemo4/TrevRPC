@@ -10,11 +10,13 @@ use http::{Method, Request, StatusCode, header};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
+use crate::datagram::Demux;
 use crate::http_admission::{
     admission_headers, rejection_head, rpc_response_head, validate_http_request,
     validate_webtransport_admission,
 };
 use crate::http_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_stream};
+use crate::quic::SessionDatagrams;
 use crate::request_pump::RequestTransportEvent;
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
 use crate::server::Server;
@@ -206,6 +208,7 @@ async fn handle_http_request(
         server,
         request_limit,
         stream_permit,
+        None,
         H3Sink(send, connection.clone()),
         H3Source(recv, connection),
         shutdown,
@@ -289,6 +292,21 @@ async fn handle_webtransport_session(
 ) {
     let session_id = session.session_id();
     let mut stream_tasks = JoinSet::new();
+    // The session's datagrams are framed here, on the raw connection; see `SessionDatagrams`.
+    // Nothing may call `session.datagram_reader()` or `session.datagram_sender()`: quinn's
+    // `read_datagram` has a single consumer, and `h3-datagram` 0.0.2 mis-encodes the quarter
+    // stream ID of outgoing datagrams (fixed by hyperium/h3#340, not released).
+    let demux = SessionDatagrams::new(
+        connection.clone(),
+        h3::quic::StreamId::from(session_id).into_inner(),
+    )
+    .map(|datagrams| {
+        Arc::new(Demux::server(
+            datagrams,
+            server.options().max_concurrent_streams_per_connection(),
+            server.max_frame_size(),
+        ))
+    });
 
     loop {
         if *shutdown.borrow() {
@@ -315,12 +333,14 @@ async fn handle_webtransport_session(
                         let request_limit = request_limit.clone();
                         let stream_connection = connection.clone();
                         let stream_shutdown = shutdown.clone();
+                        let stream_demux = demux.clone();
                         stream_tasks.spawn(async move {
                             let (send, recv) = stream.split();
                             handle_rpc_stream(
                                 server,
                                 request_limit,
                                 stream_permit,
+                                stream_demux,
                                 WebTransportSink(send, stream_connection.clone()),
                                 WebTransportSource(recv, stream_connection),
                                 stream_shutdown,
@@ -481,6 +501,32 @@ impl BodySource for WebTransportSource {
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, HeaderValue, StatusCode};
+
+    /// Quinn's `read_datagram` has a single consumer, which is this crate's datagram reader
+    /// ([`crate::datagram::Demux`]). h3's own datagram handlers would compete with it for the
+    /// connection's datagrams, so no code here may ask a session for them.
+    #[test]
+    fn nothing_here_asks_h3_for_the_sessions_datagrams() {
+        let source = include_str!("http3.rs");
+        let forbidden = [
+            [".datagram", "_reader("].concat(),
+            [".datagram", "_sender("].concat(),
+            ["get_datagram", "_reader("].concat(),
+            ["get_datagram", "_sender("].concat(),
+        ];
+        for (number, line) in source.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for needle in &forbidden {
+                assert!(
+                    !line.contains(needle.as_str()),
+                    "http3.rs line {} uses h3's datagram handlers: {line}",
+                    number + 1
+                );
+            }
+        }
+    }
 
     use super::{WT_AVAILABLE_PROTOCOLS, validate_webtransport_protocols};
 

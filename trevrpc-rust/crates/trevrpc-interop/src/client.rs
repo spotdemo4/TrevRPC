@@ -1,6 +1,7 @@
 //! The `client` subcommand: runs every scenario in `interop/README.md` over native QUIC, `QMux`
 //! over TLS, or QUIC with the TCP fallback.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write as _;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use futures_util::future::BoxFuture;
 use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, TransportPolicy};
 use trevrpc::{Code, Error, Metadata};
 
-use crate::proto::{EchoClient, EchoRequest, EchoResponse};
+use crate::proto::{EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient};
 use crate::{BoxError, Flags, connect};
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -19,6 +20,7 @@ const SCENARIO_BACKSTOP: Duration = Duration::from_secs(15);
 
 type Scenario = Result<(), String>;
 type Echo = EchoClient<Channel>;
+type UnreliableEcho = UnreliableEchoClient<Channel>;
 
 /// Runs every scenario and returns whether all of them passed.
 pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
@@ -52,9 +54,10 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
         }
     }
     let client = EchoClient::new(channel.clone());
+    let unreliable = UnreliableEchoClient::new(channel.clone());
 
     let mut passed = true;
-    for (name, scenario) in scenarios(&client) {
+    for (name, scenario) in scenarios(&client, &unreliable, &channel) {
         passed &= report(name, scenario).await;
     }
 
@@ -79,7 +82,11 @@ async fn report(name: &str, scenario: impl Future<Output = Scenario>) -> bool {
 
 type Named<'a> = (&'static str, BoxFuture<'a, Scenario>);
 
-fn scenarios(client: &Echo) -> Vec<Named<'_>> {
+fn scenarios<'a>(
+    client: &'a Echo,
+    unreliable_client: &'a UnreliableEcho,
+    channel: &'a Channel,
+) -> Vec<Named<'a>> {
     vec![
         ("unary", Box::pin(unary(client))),
         ("unary-metadata", Box::pin(unary_metadata(client))),
@@ -94,6 +101,10 @@ fn scenarios(client: &Echo) -> Vec<Named<'_>> {
         (
             "server-stream-headers",
             Box::pin(server_stream_headers(client)),
+        ),
+        (
+            "unreliable",
+            Box::pin(unreliable(unreliable_client, channel)),
         ),
     ]
 }
@@ -353,4 +364,96 @@ async fn server_stream_headers(client: &Echo) -> Scenario {
         .terminal_metadata()
         .ok_or("the stream ended without a terminal status")?;
     expect_metadata(trailers, "interop-trailer", "trailing metadata")
+}
+
+/// The requests the `unreliable` scenario sends before the large one.
+const UNRELIABLE_REQUESTS: usize = 50;
+/// The size of the last request, too large for a datagram.
+const UNRELIABLE_LARGE: usize = 4096;
+
+async fn unreliable(client: &UnreliableEcho, channel: &Channel) -> Scenario {
+    let connection = channel.quic_connection();
+    let datagrams_before = connection
+        .as_ref()
+        .map(|connection| connection.stats().frame_rx.datagram);
+
+    let (sender, mut responses) = client
+        .bidi_with_options(options())
+        .await
+        .map_err(rpc)?
+        .split();
+    let mut sent: Vec<String> = (0..UNRELIABLE_REQUESTS)
+        .map(|index| index.to_string())
+        .collect();
+    sent.push("x".repeat(UNRELIABLE_LARGE));
+    for part in &sent {
+        let request = EchoRequest {
+            count: 1,
+            ..message(part)
+        };
+        sender.send(request).await.map_err(rpc)?;
+    }
+    sender.finish().map_err(rpc)?;
+
+    // Every response is one that was sent, at most once.
+    let mut unseen: HashSet<&str> = sent.iter().map(String::as_str).collect();
+    let mut delivered = 0_usize;
+    let mut large_echoed = false;
+    while let Some(response) = responses.next().await {
+        let response = response.map_err(rpc)?;
+        if !unseen.remove(response.message.as_str()) {
+            return Err(format!(
+                "response {:?} was not sent or arrived twice",
+                short(&response.message)
+            ));
+        }
+        large_echoed |= response.message.len() == UNRELIABLE_LARGE;
+        delivered = delivered.saturating_add(1);
+    }
+    if !large_echoed {
+        return Err("the 4096-byte echo is missing".to_owned());
+    }
+
+    let trailers = responses
+        .terminal_metadata()
+        .ok_or("the stream ended without a terminal status")?;
+    let received = counter(trailers, "interop-received")?;
+    let datagrams = counter(trailers, "interop-datagrams-received")?;
+    let total = sent.len();
+    if channel.transport() == Some(TransportKind::Qmux) {
+        // No datagrams: everything travels on the stream, reliably.
+        if delivered != total || received != total || datagrams != 0 {
+            return Err(format!(
+                "over QMux expected {total} responses, {total} requests received and 0 as datagrams, \
+                 got {delivered}, {received} and {datagrams}"
+            ));
+        }
+        return Ok(());
+    }
+
+    if !(1..=total).contains(&received) {
+        return Err(format!(
+            "interop-received was {received}, want between 1 and {total}"
+        ));
+    }
+    if datagrams == 0 {
+        return Err("no request arrived as a datagram".to_owned());
+    }
+    if let (Some(connection), Some(before)) = (connection, datagrams_before)
+        && connection.stats().frame_rx.datagram <= before
+    {
+        return Err("the connection received no DATAGRAM frame from the server".to_owned());
+    }
+    Ok(())
+}
+
+/// A decimal counter in trailing metadata.
+fn counter(metadata: &Metadata, key: &str) -> Result<usize, String> {
+    let value = metadata
+        .get(key)
+        .ok_or_else(|| format!("trailing metadata has no {key}"))?;
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("trailing metadata {key} is not a decimal number"))
 }

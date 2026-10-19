@@ -33,8 +33,8 @@ const Transports = ["webtransport", "websocket", "auto"];
 const LaunchTimeoutMs = 20_000;
 const SetupTimeoutMs = 30_000;
 const CloseTimeoutMs = 5_000;
-/** Nine scenarios of at most ten seconds each, plus connecting, with slack. */
-const RunTimeoutMs = 120_000;
+/** Twelve scenarios of at most ten seconds each, plus connecting, with slack. */
+const RunTimeoutMs = 180_000;
 const PageBundle = new URL("../build/interop/page.js", import.meta.url);
 const PageHtml =
   '<!doctype html><meta charset="utf-8"><title>trevrpc interop</title><script type="module" src="/page.js"></script>';

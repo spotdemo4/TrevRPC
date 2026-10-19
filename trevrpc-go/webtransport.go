@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 const (
@@ -54,13 +57,25 @@ func (l *Listener) handleWebTransport(w http.ResponseWriter, r *http.Request) {
 	}
 	runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticSessionUpgradeSuccess, Message: "accepted"})
 
+	// The session ID is the ID of the CONNECT stream. Every datagram of the
+	// session starts with its quarter, which counts against the datagram size.
+	// Asking for the stream hijacks the response, so this follows the upgrade.
+	var datagramOverhead int
+	if streamer, ok := w.(http3.HTTPStreamer); ok {
+		datagramOverhead = quicvarint.Len(uint64(streamer.HTTPStream().StreamID()) / 4)
+	}
+
+	datagrams := l.newDatagramMux(session, datagramOverhead)
+	defer datagrams.close()
 	l.serveStreams(l.ctx, streamAcceptor{
 		accept: func(ctx context.Context) (rpcStream, context.Context, error) {
 			stream, err := session.AcceptStream(ctx)
 			if err != nil {
 				return nil, nil, err
 			}
-			return newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) }), stream.Context(), nil
+			draining := newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) })
+			draining.datagrams = datagrams
+			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = session.CloseWithError(0, message) },
 		overloadMessage:     "too many concurrent streams on WebTransport session",

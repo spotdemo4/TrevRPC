@@ -44,6 +44,10 @@ class WireCodecTest {
                     requestEntry(
                         RpcRequest("/svc/m", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value, timeoutNanos = 123_456u),
                     ),
+                "request.datagram_flow" to
+                    requestEntry(
+                        RpcRequest("/svc/m", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value, datagramFlow = 1uL),
+                    ),
                 "request.metadata" to requestEntry(RpcRequest("/svc/m", metadata)),
                 "request.extensions" to requestEntry(RpcRequest("/svc/m", extensions = listOf(1uL, 300uL))),
                 "headers.metadata" to headersEntry(RpcHeaders(Metadata.of("x-a" to "1".encodeToByteArray()))),
@@ -72,6 +76,26 @@ class WireCodecTest {
         val greaseFrame = encodeFrame(0x40, grease)
         assertArrayEquals(vectors.getValue("grease.two_byte_type.frame"), greaseFrame)
         assertTrue(FrameDecoder().feed(greaseFrame).isEmpty())
+    }
+
+    @Test
+    fun `shared datagram vectors are the flow varint then one MESSAGE frame per message`() {
+        val vectors = goldenVectors()
+        val raw = rawVectors()
+        val names = vectors.keys.filter { it.endsWith(".datagram") }.map { it.removeSuffix(".datagram") }
+        assertTrue(names.size >= 3)
+        names.forEach { name ->
+            val flow = java.math.BigInteger(1, vectors.getValue("$name.flow")).toLong()
+            val messages = raw.getValue("$name.messages").let { if (it.isEmpty()) emptyList() else it.split(',') }
+            val expected =
+                messages.fold(QuicVarint.encode(flow)) { bytes, message ->
+                    bytes + encodeFrame(0, message.chunked(2).map { it.toInt(16).toByte() }.toByteArray())
+                }
+            assertArrayEquals(expected, vectors.getValue("$name.datagram"), "$name datagram")
+            // The Cronet client never opens a flow, but a request carrying one still round-trips.
+            val request = RpcRequest("/svc/m", datagramFlow = flow.toULong())
+            assertEquals(flow.toULong(), WireCodec.decodeRequest(WireCodec.encode(request)).datagramFlow)
+        }
     }
 
     @Test
@@ -277,9 +301,13 @@ class WireCodecTest {
                     }
             }
 
-    /** Hex values of `.payload`, `.frame` and `.stream` entries as bytes. `.frames` entries are not hex. */
+    /**
+     * Hex values of every entry as bytes except `.frames` and `.messages`, which are lists. The
+     * `datagram.*` entries (`.flow`, `.messages`, `.datagram`, `.received`) are not frames; no frame
+     * test reads them because they have no `.payload`.
+     */
     private fun goldenVectors(): Map<String, ByteArray> =
         rawVectors()
-            .filterKeys { !it.endsWith(".frames") }
+            .filterKeys { !it.endsWith(".frames") && !it.endsWith(".messages") }
             .mapValues { (_, value) -> value.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }
 }

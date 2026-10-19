@@ -13,6 +13,7 @@
   runtimeShell,
   stdenvNoCC,
   interopProto,
+  trevrpcProto,
   wireGolden,
 }:
 let
@@ -76,6 +77,7 @@ let
     inherit
       interopProto
       licenseFile
+      trevrpcProto
       wireGolden
       ;
     inherit androidSdk;
@@ -95,6 +97,7 @@ stdenvNoCC.mkDerivation (final: {
       licenseFile
       wireGolden
       interopProto
+      trevrpcProto
       ./.
     ];
   };

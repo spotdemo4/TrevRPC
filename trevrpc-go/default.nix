@@ -6,6 +6,7 @@
   wireGolden,
   qmuxGolden,
   interopProto,
+  trevrpcProto,
 }:
 let
   canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
@@ -15,13 +16,15 @@ mkGoModule (final: {
   version = "1.0.0";
 
   # The module itself plus the shared files its tests read: the wire and QMux
-  # golden vectors and the interop proto the generated interop bindings must match.
+  # golden vectors, and the interop and TrevRPC option protos the generated
+  # bindings must match.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       wireGolden
       qmuxGolden
       interopProto
+      trevrpcProto
       (lib.fileset.difference ./. ./default.nix)
     ];
   };
@@ -38,7 +41,7 @@ mkGoModule (final: {
   '';
 
   doCheck = canExecute;
-  # The interop bindings test regenerates code from interop.proto.
+  # The bindings tests regenerate code from the interop and option protos.
   nativeCheckInputs = [ protobuf ];
   checkPhase = ''
     runHook preCheck

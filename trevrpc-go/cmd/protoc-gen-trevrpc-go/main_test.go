@@ -9,8 +9,11 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
 	descriptor "google.golang.org/protobuf/types/descriptorpb"
 	plugin "google.golang.org/protobuf/types/pluginpb"
+
+	"trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb"
 )
 
 func TestGenerateAllRPCShapes(t *testing.T) {
@@ -543,4 +546,155 @@ func writeFile(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+// unreliableRequest returns a request with one method per shape, each marked
+// with the given options (nil for none), as protoc would send it: the options
+// travel as serialized bytes.
+func unreliableRequest(t *testing.T, goPackage string, methods ...unreliableMethod) *plugin.CodeGeneratorRequest {
+	t.Helper()
+	var descriptors []*descriptor.MethodDescriptorProto
+	for _, method := range methods {
+		method := &descriptor.MethodDescriptorProto{
+			Name: new(method.name), InputType: new(".hello.v1.HelloRequest"), OutputType: new(".hello.v1.HelloReply"),
+			ClientStreaming: new(method.clientStreaming), ServerStreaming: new(method.serverStreaming),
+			Options: method.options(t),
+		}
+		descriptors = append(descriptors, method)
+	}
+	request := &plugin.CodeGeneratorRequest{
+		FileToGenerate: []string{"hello/v1/greeter.proto"},
+		ProtoFile: []*descriptor.FileDescriptorProto{{
+			Name: new("hello/v1/greeter.proto"), Package: new("hello.v1"),
+			Options:     &descriptor.FileOptions{GoPackage: new(goPackage)},
+			MessageType: []*descriptor.DescriptorProto{{Name: new("HelloRequest")}, {Name: new("HelloReply")}},
+			Service:     []*descriptor.ServiceDescriptorProto{{Name: new("Greeter"), Method: descriptors}},
+		}},
+	}
+	// Round-trip the request, so the option is a serialized extension the
+	// plugin has to resolve, not a message already in memory.
+	encoded, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded := &plugin.CodeGeneratorRequest{}
+	if err := proto.Unmarshal(encoded, decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}
+
+type unreliableMethod struct {
+	name                             string
+	clientStreaming, serverStreaming bool
+	// requests and responses are the options; neither set means no option.
+	requests, responses bool
+}
+
+func (m unreliableMethod) options(t *testing.T) *descriptor.MethodOptions {
+	t.Helper()
+	if !m.requests && !m.responses {
+		return nil
+	}
+	options := &descriptor.MethodOptions{}
+	proto.SetExtension(options, trevrpcpb.E_Method, &trevrpcpb.MethodOptions{UnreliableRequests: m.requests, UnreliableResponses: m.responses})
+	return options
+}
+
+func TestGeneratorEmitsUnreliableOptions(t *testing.T) {
+	request := unreliableRequest(t, "example.test/hello/v1;hellov1",
+		unreliableMethod{name: "Plain", clientStreaming: true, serverStreaming: true},
+		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, requests: true, responses: true},
+		unreliableMethod{name: "Upload", clientStreaming: true, requests: true},
+		unreliableMethod{name: "Download", serverStreaming: true, responses: true},
+	)
+	response := generate(request)
+	if response.GetError() != "" {
+		t.Fatalf("generator returned error: %s", response.GetError())
+	}
+	content := response.File[0].GetContent()
+	for _, want := range []string{
+		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: true}))...)",
+		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: false}))...)",
+		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}))...)",
+		"implementation.Bidi, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: true}))",
+		"implementation.Upload, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: false}))",
+		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}))",
+		"c.mergedCallOptions(options)...)",
+		"implementation.Plain)",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("generated content missing %q:\n%s", want, content)
+		}
+	}
+	if got := strings.Count(content, "WithUnreliable("); got != 3 {
+		t.Errorf("generated %d WithUnreliable options, want 3 (unmarked methods get none):\n%s", got, content)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "greeter.trevrpc.go", content, parser.AllErrors); err != nil {
+		t.Fatalf("generated Go is not syntactically valid: %v\n%s", err, content)
+	}
+}
+
+func TestGeneratorRejectsUnreliableDirectionsThatDoNotStream(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		method unreliableMethod
+		want   string
+	}{
+		{"unary requests", unreliableMethod{name: "Call", requests: true}, "hello.v1.Greeter.Call: unreliable_requests requires a client-streaming or bidirectional method"},
+		{"unary responses", unreliableMethod{name: "Call", responses: true}, "hello.v1.Greeter.Call: unreliable_responses requires a server-streaming or bidirectional method"},
+		{"server-streaming requests", unreliableMethod{name: "Watch", serverStreaming: true, requests: true}, "hello.v1.Greeter.Watch: unreliable_requests requires a client-streaming or bidirectional method"},
+		{"client-streaming responses", unreliableMethod{name: "Upload", clientStreaming: true, responses: true}, "hello.v1.Greeter.Upload: unreliable_responses requires a server-streaming or bidirectional method"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			response := generate(unreliableRequest(t, "example.test/hello/v1;hellov1", tt.method))
+			if response.GetError() != tt.want {
+				t.Fatalf("error = %q, want %q", response.GetError(), tt.want)
+			}
+		})
+	}
+}
+
+func TestGeneratedUnreliableOptionsCompile(t *testing.T) {
+	runtimeRoot, root, relativeRoot, importPrefix := newInModuleFixture(t)
+	response := generate(unreliableRequest(t, importPrefix+"/hello/v1;hellov1",
+		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, requests: true, responses: true},
+		unreliableMethod{name: "Upload", clientStreaming: true, requests: true},
+		unreliableMethod{name: "Download", serverStreaming: true, responses: true},
+	))
+	if response.GetError() != "" {
+		t.Fatalf("generator returned error: %s", response.GetError())
+	}
+	packageDir := filepath.Join(root, "hello", "v1")
+	writeFile(t, filepath.Join(packageDir, "messages.go"), legacyMessages("hellov1", "HelloRequest", "HelloReply"))
+	writeFile(t, filepath.Join(root, response.File[0].GetName()), response.File[0].GetContent())
+	writeFile(t, filepath.Join(packageDir, "service_test.go"), `package hellov1
+
+import (
+	"context"
+	"testing"
+
+	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
+)
+
+type service struct{}
+
+func (service) Bidi(context.Context, trevrpc.MessageStream[*HelloRequest]) (trevrpc.MessageStream[*HelloReply], error) {
+	return nil, nil
+}
+
+func (service) Upload(context.Context, trevrpc.MessageStream[*HelloRequest]) (*trevrpc.Response[*HelloReply], error) {
+	return nil, nil
+}
+
+func (service) Download(context.Context, *HelloRequest) (trevrpc.MessageStream[*HelloReply], error) {
+	return nil, nil
+}
+
+func TestRegistersAndCreatesClient(t *testing.T) {
+	RegisterGreeterServer(trevrpc.NewServer(), service{})
+	_ = NewGreeterClient(nil)
+}
+`)
+	runFixtureTests(t, runtimeRoot, relativeRoot)
 }

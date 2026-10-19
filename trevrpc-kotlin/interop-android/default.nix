@@ -11,6 +11,7 @@
   python3,
   runtimeShell,
   stdenvNoCC,
+  trevrpcProto,
   wireGolden,
 }:
 stdenvNoCC.mkDerivation (final: {
@@ -23,6 +24,7 @@ stdenvNoCC.mkDerivation (final: {
       licenseFile
       wireGolden
       interopProto
+      trevrpcProto
       ../.
     ];
   };

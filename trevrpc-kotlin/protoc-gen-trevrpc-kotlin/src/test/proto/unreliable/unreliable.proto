@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package generator.compat.unreliable;
+
+import "trevrpc/options.proto";
+
+option java_package = "generator.compat.unreliable";
+option java_multiple_files = true;
+
+message Position {}
+
+service Tracker {
+  rpc Lookup(Position) returns (Position);
+  rpc Upload(stream Position) returns (Position) {
+    option (trevrpc.method) = {unreliable_requests: true};
+  }
+  rpc Watch(Position) returns (stream Position) {
+    option (trevrpc.method) = {unreliable_responses: true};
+  }
+  rpc Track(stream Position) returns (stream Position) {
+    option (trevrpc.method) = {
+      unreliable_requests: true
+      unreliable_responses: true
+    };
+  }
+  // Setting a flag to false, or setting nothing, is not unreliable.
+  rpc Plain(stream Position) returns (stream Position) {
+    option (trevrpc.method) = {unreliable_requests: false};
+  }
+}

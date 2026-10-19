@@ -233,12 +233,31 @@ impl<T> Receiver<T> {
         reason = "one consumer polls at a time: the queue keeps a single receiver waker"
     )]
     pub fn poll_recv(&mut self, cx: &Context<'_>) -> Poll<Option<T>> {
+        self.poll_pop(Some(cx))
+    }
+
+    /// Takes the oldest value if one is queued, without waiting.
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "one consumer takes values at a time, like `poll_recv`"
+    )]
+    pub fn try_recv(&mut self) -> Option<T> {
+        match self.poll_pop(None) {
+            Poll::Ready(value) => value,
+            Poll::Pending => None,
+        }
+    }
+
+    /// Takes the oldest value, remembering `cx`'s waker if there is none and senders remain.
+    fn poll_pop(&self, cx: Option<&Context<'_>>) -> Poll<Option<T>> {
         let mut state = self.shared.state.lock_unpoisoned();
         let Some((value, size)) = state.queue.pop_front() else {
             if state.senders == 0 {
                 return Poll::Ready(None);
             }
-            state.receiver_waker = Some(cx.waker().clone());
+            if let Some(cx) = cx {
+                state.receiver_waker = Some(cx.waker().clone());
+            }
             return Poll::Pending;
         };
         state.queued_bytes = state.queued_bytes.saturating_sub(size);
@@ -298,6 +317,24 @@ mod tests {
         assert_eq!(receiver.recv().await, Some(1));
         assert_eq!(receiver.recv().await, Some(2));
         assert_eq!(receiver.recv().await, None);
+    }
+
+    #[test]
+    fn try_recv_takes_queued_values_without_waiting_and_frees_room() {
+        let (sender, mut receiver) = channel(LIMITS);
+        assert_eq!(receiver.try_recv(), None);
+        for value in 0..3 {
+            sender.try_send(value, 1).unwrap();
+        }
+        assert_eq!(sender.try_send(3, 1), Err(TrySendError::Full(3)));
+
+        assert_eq!(receiver.try_recv(), Some(0));
+
+        sender.try_send(3, 1).unwrap();
+        assert_eq!(receiver.try_recv(), Some(1));
+        assert_eq!(receiver.try_recv(), Some(2));
+        assert_eq!(receiver.try_recv(), Some(3));
+        assert_eq!(receiver.try_recv(), None);
     }
 
     #[test]

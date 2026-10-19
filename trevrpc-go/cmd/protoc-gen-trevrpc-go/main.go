@@ -10,6 +10,8 @@ import (
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
 	plugin "google.golang.org/protobuf/types/pluginpb"
+
+	"trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb"
 )
 
 type pluginOptions struct {
@@ -157,6 +159,9 @@ func validateGeneratedNames(files []*protogen.File, options pluginOptions) error
 			if err := validateGeneratedMethodNames(service); err != nil {
 				return err
 			}
+			if err := validateMethodOptions(service); err != nil {
+				return err
+			}
 			for _, generatedName := range generatedServiceNames(service, options) {
 				if owner, exists := owners[generatedName]; exists && owner != service {
 					return fmt.Errorf("go package %s services %s and %s both require generated declaration %s", file.GoImportPath, owner.Desc.FullName(), service.Desc.FullName(), generatedName)
@@ -194,6 +199,38 @@ func validateGeneratedMethodNames(service *protogen.Service) error {
 		owners[method.GoName] = method
 	}
 	return nil
+}
+
+// methodOptions returns the trevrpc.method option of method, which is the zero
+// value when the method does not set it.
+func methodOptions(method *protogen.Method) *trevrpcpb.MethodOptions {
+	options, _ := proto.GetExtension(method.Desc.Options(), trevrpcpb.E_Method).(*trevrpcpb.MethodOptions)
+	return options
+}
+
+// validateMethodOptions rejects an unreliable direction of a method that does
+// not stream that direction.
+func validateMethodOptions(service *protogen.Service) error {
+	for _, method := range service.Methods {
+		options := methodOptions(method)
+		if options.GetUnreliableRequests() && !method.Desc.IsStreamingClient() {
+			return fmt.Errorf("%s: unreliable_requests requires a client-streaming or bidirectional method", method.Desc.FullName())
+		}
+		if options.GetUnreliableResponses() && !method.Desc.IsStreamingServer() {
+			return fmt.Errorf("%s: unreliable_responses requires a server-streaming or bidirectional method", method.Desc.FullName())
+		}
+	}
+	return nil
+}
+
+// unreliableLiteral returns the Go expression of the Unreliable value of
+// method, or "" when no direction is marked.
+func (g fileGenerator) unreliableLiteral(method *protogen.Method) string {
+	options := methodOptions(method)
+	if !options.GetUnreliableRequests() && !options.GetUnreliableResponses() {
+		return ""
+	}
+	return fmt.Sprintf("%s{Requests: %t, Responses: %t}", g.runtime("Unreliable"), options.GetUnreliableRequests(), options.GetUnreliableResponses())
 }
 
 func (g fileGenerator) generateService(service *protogen.Service) {
@@ -247,14 +284,18 @@ func (g fileGenerator) generateService(service *protogen.Service) {
 
 func (g fileGenerator) generateMergeOptions(clientName string) {
 	callOption := g.runtime("CallOption")
-	g.generated.P("func (c *", clientName, ") mergedCallOptions(overrides []", callOption, ") []", callOption, " {")
+	g.generated.P("// mergedCallOptions puts the options of the schema first, then those of the client, then the call's own.")
+	g.generated.P("func (c *", clientName, ") mergedCallOptions(overrides []", callOption, ", schema ...", callOption, ") []", callOption, " {")
+	g.generated.P("if len(schema) == 0 {")
 	g.generated.P("if len(c.options) == 0 {")
 	g.generated.P("return overrides")
 	g.generated.P("}")
 	g.generated.P("if len(overrides) == 0 {")
 	g.generated.P("return c.options")
 	g.generated.P("}")
-	g.generated.P("merged := make([]", callOption, ", 0, len(c.options)+len(overrides))")
+	g.generated.P("}")
+	g.generated.P("merged := make([]", callOption, ", 0, len(schema)+len(c.options)+len(overrides))")
+	g.generated.P("merged = append(merged, schema...)")
 	g.generated.P("merged = append(merged, c.options...)")
 	g.generated.P("merged = append(merged, overrides...)")
 	g.generated.P("return merged")
@@ -269,6 +310,9 @@ func (g fileGenerator) generateClientMethods(clientName, serviceName string, met
 	factory := g.messageFactory(method.Output)
 	options := "options ..." + g.runtime("CallOption")
 	merged := "c.mergedCallOptions(options)..."
+	if unreliable := g.unreliableLiteral(method); unreliable != "" {
+		merged = "c.mergedCallOptions(options, " + g.runtime("WithUnreliable") + "(" + unreliable + "))..."
+	}
 	methodName := method.GoName
 	callPrefix := "(ctx, c.transport, " + fullMethodConstName(serviceName, method) + ", "
 
@@ -306,7 +350,11 @@ func (g fileGenerator) generateServerRegistration(serviceName string, method *pr
 	default:
 		helper = g.runtime("RegisterUnary")
 	}
-	g.generated.P(helper, "[", inputType, ", ", outputType, "](server, ", fullMethodConstName(serviceName, method), ", ", factory, ", implementation.", method.GoName, ")")
+	route := ""
+	if unreliable := g.unreliableLiteral(method); unreliable != "" {
+		route = ", " + g.runtime("RouteUnreliable") + "(" + unreliable + ")"
+	}
+	g.generated.P(helper, "[", inputType, ", ", outputType, "](server, ", fullMethodConstName(serviceName, method), ", ", factory, ", implementation.", method.GoName, route, ")")
 }
 
 func (g fileGenerator) serverRequestType(method *protogen.Method) string {

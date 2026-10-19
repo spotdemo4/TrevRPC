@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package trevrpc.interop.v1;
+
+import "interop.proto";
+import "trevrpc/options.proto";
+
+// UnreliableEcho exercises datagram messages. It lives apart from Echo so the
+// gRPC baseline, which compiles only interop.proto, needs no TrevRPC options.
+// See interop/README.md for the exact server behavior.
+service UnreliableEcho {
+  rpc Bidi(stream EchoRequest) returns (stream EchoResponse) {
+    option (trevrpc.method) = {
+      unreliable_requests: true
+      unreliable_responses: true
+    };
+  }
+}

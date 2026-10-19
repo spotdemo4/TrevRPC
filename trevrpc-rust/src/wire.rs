@@ -131,6 +131,11 @@ pub struct RpcRequest {
     /// ignore the field.
     #[prost(uint64, repeated, tag = "8")]
     pub extensions: Vec<u64>,
+    /// The call's datagram flow ID, or zero when the call has none. A client sets it only on a
+    /// connection that carries datagrams, for a method with an unreliable streaming direction;
+    /// connections without datagrams ignore it. See [`crate::Unreliable`].
+    #[prost(uint64, tag = "9")]
+    pub datagram_flow: u64,
 }
 
 impl RpcRequest {
@@ -143,6 +148,7 @@ impl RpcRequest {
             kind: i32::from(RpcKind::Unary),
             timeout_nanos: 0,
             extensions: Vec::new(),
+            datagram_flow: 0,
         }
     }
 
@@ -180,6 +186,13 @@ impl RpcRequest {
         self
     }
 
+    /// Sets the datagram flow ID of the request; zero means the call has no flow.
+    #[must_use]
+    pub const fn with_datagram_flow(mut self, datagram_flow: u64) -> Self {
+        self.datagram_flow = datagram_flow;
+        self
+    }
+
     /// Replaces the request metadata.
     #[must_use]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
@@ -194,6 +207,20 @@ impl RpcKind {
     #[must_use]
     pub const fn has_single_request_message(self) -> bool {
         matches!(self, Self::Unary | Self::ServerStreaming)
+    }
+
+    /// Returns whether the client streams request messages: client-streaming and bidirectional
+    /// calls.
+    #[must_use]
+    pub const fn streams_requests(self) -> bool {
+        matches!(self, Self::ClientStreaming | Self::BidirectionalStreaming)
+    }
+
+    /// Returns whether the server streams response messages: server-streaming and bidirectional
+    /// calls.
+    #[must_use]
+    pub const fn streams_responses(self) -> bool {
+        matches!(self, Self::ServerStreaming | Self::BidirectionalStreaming)
     }
 }
 
@@ -406,6 +433,10 @@ mod tests {
                     )
                 });
                 let (name, value) = (name.trim(), value.trim());
+                // The datagram entries are not frames; `datagram::tests` checks them.
+                if name.starts_with("datagram.") {
+                    continue;
+                }
                 if name.ends_with(".frames") {
                     vectors.frames.insert(name.to_owned(), value.to_owned());
                 } else {
@@ -572,6 +603,16 @@ mod tests {
                 extensions: vec![1, 300],
                 ..request()
             },
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "request.datagram_flow",
+            frame_type::REQUEST,
+            &request()
+                .with_kind(RpcKind::BidirectionalStreaming)
+                .with_datagram_flow(1),
         )
         .await;
 

@@ -34,6 +34,9 @@ type drainingStream struct {
 	rw              io.ReadWriteCloser
 	setReadDeadline func(time.Time) error
 	stopReading     func()
+	// datagrams is the demultiplexer of the connection's datagram messages, nil
+	// for a connection without them.
+	datagrams *datagramMux
 	// shutdown ends a running drain early.
 	shutdown     context.Context
 	drainTimeout time.Duration
@@ -55,6 +58,8 @@ func newDrainingStream(shutdown context.Context, rw io.ReadWriteCloser, setReadD
 		drainTimeout: requestDrainTimeout, drainLimit: requestDrainLimit,
 	}
 }
+
+func (s *drainingStream) trevrpcDatagrams() *datagramMux { return s.datagrams }
 
 func (s *drainingStream) Read(data []byte) (int, error) {
 	s.mu.Lock()

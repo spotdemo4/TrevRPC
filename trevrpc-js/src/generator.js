@@ -89,6 +89,18 @@ message MethodDescriptorProto {
   optional string output_type = 3;
   optional bool client_streaming = 5 [default = false];
   optional bool server_streaming = 6 [default = false];
+  optional MethodOptions options = 4;
+}
+
+// Only the trevrpc.method extension is modelled; protobuf.js keeps every other extension out of
+// the decoded message. The numbers are those of proto/trevrpc/options.proto.
+message MethodOptions {
+  optional TrevrpcMethodOptions trevrpc_method = 58247;
+}
+
+message TrevrpcMethodOptions {
+  optional bool unreliable_requests = 1;
+  optional bool unreliable_responses = 2;
 }
 
 message FileOptions {
@@ -401,11 +413,13 @@ function serviceDescriptor(file, service) {
 
   for (const method of service.method ?? []) {
     const jsName = uniqueName(lowerCamelIdentifier(method.name), usedNames);
+    const kind = methodKind(method);
     methods[jsName] = {
       name: method.name,
-      kind: methodKind(method),
+      kind,
       inputType: stripLeadingDot(method.inputType),
       outputType: stripLeadingDot(method.outputType),
+      ...unreliableDirections(`${fullName}.${method.name}`, kind, method.options?.trevrpcMethod),
     };
   }
 
@@ -415,6 +429,31 @@ function serviceDescriptor(file, service) {
     exportName: `${pascalIdentifier(service.name)}Service`,
     methods,
   };
+}
+
+/**
+ * The `(trevrpc.method)` flags of a method as descriptor fields, only for the ones that are set.
+ * A flag on a direction that does not stream is an error.
+ */
+function unreliableDirections(methodName, kind, options) {
+  const directions = {};
+  if (options?.unreliableRequests) {
+    if (kind !== "clientStreaming" && kind !== "bidirectionalStreaming") {
+      throw new Error(
+        `${methodName}: unreliable_requests requires a client-streaming or bidirectional method`,
+      );
+    }
+    directions.unreliableRequests = true;
+  }
+  if (options?.unreliableResponses) {
+    if (kind !== "serverStreaming" && kind !== "bidirectionalStreaming") {
+      throw new Error(
+        `${methodName}: unreliable_responses requires a server-streaming or bidirectional method`,
+      );
+    }
+    directions.unreliableResponses = true;
+  }
+  return directions;
 }
 
 function declarationTypeNames(files) {

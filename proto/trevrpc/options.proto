@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+// TrevRPC schema options. Put the directory containing this file's trevrpc/
+// directory on your protoc include path and import "trevrpc/options.proto".
+package trevrpc;
+
+import "google/protobuf/descriptor.proto";
+
+option go_package = "trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb;trevrpcpb";
+option java_multiple_files = true;
+option java_outer_classname = "OptionsProto";
+option java_package = "zip.trev.trevrpc.options";
+
+// MethodOptions are TrevRPC's per-method settings, set with
+//
+//   rpc Track(stream Position) returns (stream Position) {
+//     option (trevrpc.method) = {unreliable_requests: true, unreliable_responses: true};
+//   }
+message MethodOptions {
+  // Request messages may travel as datagrams: they can be lost or reordered,
+  // but never duplicated or corrupted. Only client-streaming and bidirectional
+  // methods stream requests.
+  bool unreliable_requests = 1;
+  // Response messages may travel as datagrams. Only server-streaming and
+  // bidirectional methods stream responses.
+  bool unreliable_responses = 2;
+}
+
+extend google.protobuf.MethodOptions {
+  MethodOptions method = 58247;
+}

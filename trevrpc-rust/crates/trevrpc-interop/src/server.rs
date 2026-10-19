@@ -11,7 +11,7 @@ use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissi
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, Metadata, ResponseEnvelope, Status};
 
-use crate::proto::{self, Echo, EchoRequest, EchoResponse};
+use crate::proto::{self, Echo, EchoRequest, EchoResponse, UnreliableEcho};
 use crate::{BoxError, Flags};
 
 const SUFFIX_METADATA_KEY: &str = "interop-suffix";
@@ -150,6 +150,58 @@ impl Echo for EchoService {
     }
 }
 
+const RECEIVED_METADATA_KEY: &str = "interop-received";
+const DATAGRAMS_RECEIVED_METADATA_KEY: &str = "interop-datagrams-received";
+
+struct UnreliableEchoService;
+
+#[trevrpc::async_trait]
+impl UnreliableEcho for UnreliableEchoService {
+    /// Reads every request, then sends `count` responses for each in order. The trailing metadata
+    /// counts the requests, and how many of them arrived as datagrams, so it is only known once
+    /// the request stream has ended.
+    async fn bidi(
+        &self,
+        context: RequestContext,
+        mut requests: BoxStream<EchoRequest>,
+    ) -> Result<ResponseEnvelope<BoxStream<EchoResponse>>, Status> {
+        let mut received = 0_u64;
+        // The requests that ask for responses, as `(message, count)`.
+        let mut asked = Vec::new();
+        while let Some(request) = requests.next().await {
+            let EchoRequest { message, count, .. } = request?;
+            received = received.saturating_add(1);
+            if count > 0 {
+                asked.push((message, count));
+            }
+        }
+        let responses = asked.into_iter().flat_map(|(message, count)| {
+            (0..count).map(move |index| {
+                Ok(EchoResponse {
+                    message: message.clone(),
+                    index,
+                })
+            })
+        });
+
+        let responses: BoxStream<EchoResponse> = Box::pin(futures_util::stream::iter(responses));
+        let envelope = envelope(&context, responses);
+        let mut trailers = envelope.metadata().clone();
+        trailers.insert(
+            RECEIVED_METADATA_KEY.to_owned(),
+            received.to_string().into_bytes(),
+        );
+        trailers.insert(
+            DATAGRAMS_RECEIVED_METADATA_KEY.to_owned(),
+            context
+                .datagram_requests_received()
+                .to_string()
+                .into_bytes(),
+        );
+        Ok(envelope.with_metadata(trailers))
+    }
+}
+
 /// Browsers connect from arbitrary origins, so any session on the shared path is admitted.
 const fn admit_webtransport(_request: &WebTransportAdmissionRequest<'_>) -> bool {
     true
@@ -175,6 +227,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
             .with_webtransport_admission(Some(admit_webtransport)),
     );
     proto::register_echo(&mut server, EchoService);
+    proto::register_unreliable_echo(&mut server, UnreliableEchoService);
 
     let tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()

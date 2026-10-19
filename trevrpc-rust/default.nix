@@ -7,6 +7,7 @@
   gnugrep,
   wireGolden,
   interopProto,
+  trevrpcProto,
 }:
 let
   canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
@@ -19,6 +20,7 @@ mkRustPackage (final: {
     root = ../.;
     fileset = lib.fileset.unions [
       interopProto
+      trevrpcProto
       wireGolden
       ./.
     ];

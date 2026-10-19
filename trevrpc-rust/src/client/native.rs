@@ -1,11 +1,14 @@
 //! Native `TrevRPC` call transport over one established multiplexed connection: QUIC or `QMux`.
 
+use std::sync::{Arc, OnceLock};
+
 use bytes::Bytes;
 
+use crate::datagram::{ClientFlow, Demux, FlowSender, MergedResponses};
 use crate::framed;
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::response_state::UnaryResponse;
-use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest};
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Unreliable};
 
 use super::upload::UploadWriter;
 use super::{RpcTransport, StreamingRpcTransport};
@@ -16,6 +19,75 @@ use super::{RpcTransport, StreamingRpcTransport};
 pub struct NativeTransport<C> {
     pub(crate) connection: C,
     pub(crate) max_frame_size: usize,
+    /// The connection's datagram demultiplexer, created by the first call that needs it. It is
+    /// `None` for connections without datagrams.
+    datagrams: Arc<OnceLock<Option<Demux>>>,
+}
+
+impl<C: MuxConnection> NativeTransport<C> {
+    pub(crate) fn new(connection: C, max_frame_size: usize) -> Self {
+        Self {
+            connection,
+            max_frame_size,
+            datagrams: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn demux(&self) -> Option<&Demux> {
+        self.datagrams
+            .get_or_init(|| {
+                self.connection
+                    .datagrams()
+                    .map(|transport| Demux::client(transport, self.max_frame_size))
+            })
+            .as_ref()
+    }
+
+    /// Opens the call's stream, giving it a datagram flow first if it is unreliable and this
+    /// connection supports datagrams. The decision is made here, on the connection that carries
+    /// the call.
+    async fn open_call(
+        &self,
+        mut request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        let flow = if unreliable.any() {
+            self.demux()
+                .and_then(|demux| demux.open_client_flow(request.rpc_kind(), unreliable))
+        } else {
+            None
+        };
+        if let Some(flow) = &flow {
+            request.datagram_flow = flow.flow;
+        }
+
+        let (send, recv) = self.connection.open_stream().await?;
+        let max_frame_size = self.max_frame_size;
+        let (requests, responses) = match flow {
+            Some(ClientFlow {
+                requests,
+                responses,
+                guard,
+                ..
+            }) => (requests, Some((responses, guard))),
+            None => (None, None),
+        };
+        let upload = UploadWriter::spawn(async move {
+            write_streaming_request(send, request, request_body, max_frame_size, requests).await
+        });
+
+        let frames = response_stream(StreamingCall {
+            recv,
+            upload,
+            max_frame_size,
+            complete: false,
+        });
+        Ok(match responses {
+            Some((responses, guard)) => MergedResponses::boxed(frames, responses, guard),
+            None => frames,
+        })
+    }
 }
 
 #[crate::async_trait]
@@ -63,18 +135,17 @@ impl<C: MuxConnection> StreamingRpcTransport for NativeTransport<C> {
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>> {
-        let (send, recv) = self.connection.open_stream().await?;
-        let max_frame_size = self.max_frame_size;
-        let upload = UploadWriter::spawn(async move {
-            write_streaming_request(send, request, request_body, max_frame_size).await
-        });
+        self.open_call(request, request_body, Unreliable::NONE)
+            .await
+    }
 
-        Ok(response_stream(StreamingCall {
-            recv,
-            upload,
-            max_frame_size,
-            complete: false,
-        }))
+    async fn streaming_call_unreliable(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        self.open_call(request, request_body, unreliable).await
     }
 }
 
@@ -113,18 +184,33 @@ async fn write_streaming_request<S: MuxSendStream>(
     request: RpcRequest,
     mut request_body: BoxStream<Vec<u8>>,
     max_frame_size: usize,
+    datagrams: Option<FlowSender>,
 ) -> Result<()> {
     let mut upload = UploadStream {
         send,
         complete: false,
     };
-    framed::write_request_stream(
-        &mut upload.send,
-        &request,
-        &mut request_body,
-        max_frame_size,
-    )
-    .await?;
+    match &datagrams {
+        Some(datagrams) => {
+            framed::write_request_stream_datagrams(
+                &mut upload.send,
+                &request,
+                &mut request_body,
+                max_frame_size,
+                datagrams,
+            )
+            .await?;
+        }
+        None => {
+            framed::write_request_stream(
+                &mut upload.send,
+                &request,
+                &mut request_body,
+                max_frame_size,
+            )
+            .await?;
+        }
+    }
     upload.send.finish_stream()?;
     upload.complete = true;
     Ok(())

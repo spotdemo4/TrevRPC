@@ -31,6 +31,12 @@ impl Server {
     /// only when [`ServerOptions::http_enabled`] or [`ServerOptions::webtransport_enabled`] is
     /// set, replacing any ALPN list already on `tls`. It also sizes the QUIC stream and connection
     /// windows from the server's [`ServerOptions`], so call it after the options are final.
+    ///
+    /// Datagrams ([`crate::Unreliable`] methods) are not flow controlled, so the configuration
+    /// bounds what the transport buffers for the datagram reader of each connection: 128 KiB,
+    /// after which the oldest datagrams are dropped. A server therefore uses at most that much
+    /// memory per connection for datagrams waiting to be read, plus the 64 datagrams and 64 KiB
+    /// it holds for calls whose request has not arrived yet.
     pub fn quic_config(&self, mut tls: quinn::rustls::ServerConfig) -> Result<quinn::ServerConfig> {
         tls.alpn_protocols = vec![crate::ALPN.to_vec()];
         if self.options().http_enabled() || self.options().webtransport_enabled() {
@@ -239,6 +245,7 @@ fn apply_transport_limits(config: &mut quinn::TransportConfig, options: &ServerO
     let limits = transport_limits(options);
     config.stream_receive_window(varint(limits.stream_receive_window));
     config.receive_window(varint(limits.connection_receive_window));
+    config.datagram_receive_buffer_size(Some(crate::datagram::DATAGRAM_RECEIVE_BUFFER));
     if let Some(max_streams) = limits.max_concurrent_bidi_streams {
         config.max_concurrent_bidi_streams(varint(max_streams));
     }

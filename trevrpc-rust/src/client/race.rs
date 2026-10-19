@@ -11,7 +11,9 @@ use super::{QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
-use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
+use crate::{
+    BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
+};
 
 pub const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
 pub const DEFAULT_REPROBE_INTERVAL: Duration = Duration::from_mins(5);
@@ -93,6 +95,27 @@ impl StreamingRpcTransport for GenerationTransport {
         match self {
             Self::Quic(transport) => transport.streaming_call(request, request_body).await,
             Self::Qmux(transport) => transport.streaming_call(request, request_body).await,
+        }
+    }
+
+    async fn streaming_call_unreliable(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        // Whether the call gets a datagram flow is decided by the transport the race chose.
+        match self {
+            Self::Quic(transport) => {
+                transport
+                    .streaming_call_unreliable(request, request_body, unreliable)
+                    .await
+            }
+            Self::Qmux(transport) => {
+                transport
+                    .streaming_call_unreliable(request, request_body, unreliable)
+                    .await
+            }
         }
     }
 }

@@ -51,7 +51,7 @@ type benchConfig struct {
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
 	c.connectionConfig.register(flags, "transport: quic or tcp (QMux over TLS)")
-	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream or bidi")
+	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream or unreliable-client-stream")
 	flags.IntVar(&c.size, "size", 64, "length of EchoRequest.message in bytes")
 	flags.IntVar(&c.metadata, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	flags.IntVar(&c.concurrency, "concurrency", 1, "workers, each with one call or stream in flight")
@@ -104,20 +104,39 @@ type benchOperation interface {
 	close()
 }
 
+// lossyOperation is implemented by the operations whose messages may be lost.
+type lossyOperation interface {
+	// lost returns how many messages the last successful run sent but did not
+	// deliver. Loss is not an error.
+	lost() int
+}
+
+// benchClients are the clients of the services the scenarios call.
+type benchClients struct {
+	echo       *interoppb.EchoClient
+	unreliable *interoppb.UnreliableEchoClient
+}
+
 // benchScenarios builds the operation of one worker for each scenario of
 // bench/README.md.
-var benchScenarios = map[string]func(client *interoppb.EchoClient, config benchConfig) benchOperation{
-	"unary": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &unaryOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size)}
+var benchScenarios = map[string]func(clients benchClients, config benchConfig) benchOperation{
+	"unary": func(clients benchClients, config benchConfig) benchOperation {
+		return &unaryOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size)}
 	},
-	"server-stream": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &serverStreamOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
+	"server-stream": func(clients benchClients, config benchConfig) benchOperation {
+		return &serverStreamOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
 	},
-	"client-stream": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &clientStreamOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
+	"client-stream": func(clients benchClients, config benchConfig) benchOperation {
+		return &clientStreamOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
 	},
-	"bidi": func(client *interoppb.EchoClient, config benchConfig) benchOperation {
-		return &bidiOperation{client: client, options: config.callOptions(), message: strings.Repeat("x", config.size)}
+	"bidi": func(clients benchClients, config benchConfig) benchOperation {
+		return &bidiOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size)}
+	},
+	"unreliable-server-stream": func(clients benchClients, config benchConfig) benchOperation {
+		return &unreliableServerStreamOperation{client: clients.unreliable, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
+	},
+	"unreliable-client-stream": func(clients benchClients, config benchConfig) benchOperation {
+		return &unreliableClientStreamOperation{client: clients.unreliable, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
 	},
 }
 
@@ -207,6 +226,104 @@ func (o *clientStreamOperation) run(ctx context.Context) (int, error) {
 
 func (*clientStreamOperation) close() {}
 
+// unreliableServerStreamOperation sends one request that asks for count
+// responses on an UnreliableEcho.Bidi stream and reads the responses that
+// arrive until the status. The responses may travel as datagrams, and the
+// ones that do not arrive are lost.
+type unreliableServerStreamOperation struct {
+	client  *interoppb.UnreliableEchoClient
+	options []trevrpc.CallOption
+	message string
+	count   int
+	missing int
+}
+
+func (o *unreliableServerStreamOperation) run(ctx context.Context) (int, error) {
+	call, err := o.client.Bidi(ctx, o.options...)
+	if err != nil {
+		return 0, err
+	}
+	defer closeQuietly(call)
+	if err := call.Send(&interoppb.EchoRequest{Message: o.message, Count: uint32(o.count)}); err != nil {
+		return 0, err
+	}
+	if err := call.CloseSend(); err != nil {
+		return 0, err
+	}
+	received := 0
+	for {
+		response, err := call.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		if len(response.Message) != len(o.message) {
+			return 0, fmt.Errorf("response has %d bytes, want %d", len(response.Message), len(o.message))
+		}
+		received++
+	}
+	if received > o.count {
+		return 0, fmt.Errorf("received %d responses, want at most %d", received, o.count)
+	}
+	o.missing = o.count - received
+	return received, nil
+}
+
+func (o *unreliableServerStreamOperation) lost() int { return o.missing }
+
+func (*unreliableServerStreamOperation) close() {}
+
+// unreliableClientStreamOperation sends count requests that ask for no
+// response on an UnreliableEcho.Bidi stream, and reads from the status how
+// many of them the server received. The requests may travel as datagrams, and
+// the ones that do not arrive are lost.
+type unreliableClientStreamOperation struct {
+	client  *interoppb.UnreliableEchoClient
+	options []trevrpc.CallOption
+	message string
+	count   int
+	missing int
+}
+
+func (o *unreliableClientStreamOperation) run(ctx context.Context) (int, error) {
+	call, err := o.client.Bidi(ctx, o.options...)
+	if err != nil {
+		return 0, err
+	}
+	defer closeQuietly(call)
+	request := &interoppb.EchoRequest{Message: o.message}
+	for range o.count {
+		if err := call.Send(request); err != nil {
+			return 0, err
+		}
+	}
+	if err := call.CloseSend(); err != nil {
+		return 0, err
+	}
+	if err := expectEnd(call); err != nil {
+		return 0, err
+	}
+	status, ok := call.TerminalStatus()
+	if !ok {
+		return 0, errors.New("no terminal status after the end of the stream")
+	}
+	received, err := metadataCount(status.Metadata, receivedKey)
+	if err != nil {
+		return 0, err
+	}
+	if received > o.count {
+		return 0, fmt.Errorf("server received %d requests, want at most %d", received, o.count)
+	}
+	o.missing = o.count - received
+	return received, nil
+}
+
+func (o *unreliableClientStreamOperation) lost() int { return o.missing }
+
+func (*unreliableClientStreamOperation) close() {}
+
 // bidiOperation keeps one Bidi stream open across operations, opening it again
 // after a failure.
 type bidiOperation struct {
@@ -258,6 +375,7 @@ func (o *bidiOperation) close() {
 type benchWorker struct {
 	latencies []time.Duration
 	messages  uint64
+	lost      uint64
 	errors    uint64
 }
 
@@ -286,16 +404,22 @@ func (w *benchWorker) loop(ctx context.Context, operation benchOperation, start,
 		if !began.Before(start) && !finished.After(end) {
 			w.latencies = append(w.latencies, finished.Sub(began))
 			w.messages += uint64(messages)
+			if lossy, ok := operation.(lossyOperation); ok {
+				w.lost += uint64(lossy.lost())
+			}
 		}
 	}
 }
 
 // wireCounter is a qlog trace that sums the sizes of the QUIC packets a client
-// connection sends and receives. It is the only per-connection byte counter
-// quic-go exposes: Conn has no statistics API.
+// connection sends and receives, and counts the DATAGRAM frames it receives.
+// It is the only per-connection counter quic-go exposes: Conn has no
+// statistics API.
 type wireCounter struct {
 	sent     atomic.Uint64
 	received atomic.Uint64
+	// datagramFrames counts the DATAGRAM frames received.
+	datagramFrames atomic.Uint64
 }
 
 func (c *wireCounter) AddProducer() qlogwriter.Recorder { return c }
@@ -308,6 +432,11 @@ func (c *wireCounter) RecordEvent(event qlogwriter.Event) {
 		c.sent.Add(uint64(event.Raw.Length))
 	case qlog.PacketReceived:
 		c.received.Add(uint64(event.Raw.Length))
+		for _, frame := range event.Frames {
+			if _, ok := frame.Frame.(*qlog.DatagramFrame); ok {
+				c.datagramFrames.Add(1)
+			}
+		}
 	}
 }
 
@@ -343,6 +472,9 @@ type benchResult struct {
 	BytesPerSec     float64      `json:"bytes_per_sec"`
 	LatencyUS       benchLatency `json:"latency_us"`
 	WireBytesPerMsg *float64     `json:"wire_bytes_per_msg,omitempty"`
+	// Lost counts the messages sent but not delivered, which only the
+	// unreliable scenarios can have.
+	Lost uint64 `json:"lost"`
 }
 
 // runBench connects, runs the scenario for the warmup and the measured window
@@ -361,7 +493,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		return err
 	}
 	defer closeQuietly(channel)
-	client := interoppb.NewEchoClient(channel)
+	clients := benchClients{echo: interoppb.NewEchoClient(channel), unreliable: interoppb.NewUnreliableEchoClient(channel)}
 
 	warmup := time.Duration(config.warmup * float64(time.Second))
 	window := time.Duration(config.duration * float64(time.Second))
@@ -373,7 +505,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	workers := make([]benchWorker, config.concurrency)
 	var group sync.WaitGroup
 	for i := range workers {
-		operation := benchScenarios[config.scenario](client, config)
+		operation := benchScenarios[config.scenario](clients, config)
 		group.Go(func() { workers[i].loop(opCtx, operation, start, end) })
 	}
 	var wireBefore, wireAfter uint64
@@ -399,7 +531,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if wire != nil {
+	if wire != nil && result.Msgs > 0 {
 		perMsg := float64(wireAfter-wireBefore) / float64(result.Msgs)
 		result.WireBytesPerMsg = &perMsg
 	}
@@ -421,10 +553,11 @@ func sleepUntil(ctx context.Context, t time.Time) error {
 // summarize turns what the workers measured into the result line.
 func summarize(config benchConfig, transport trevrpc.TransportKind, window time.Duration, workers []benchWorker) (benchResult, error) {
 	var latencies []time.Duration
-	var messages, failures uint64
+	var messages, lost, failures uint64
 	for _, w := range workers {
 		latencies = append(latencies, w.latencies...)
 		messages += w.messages
+		lost += w.lost
 		failures += w.errors
 	}
 	if len(latencies) == 0 {
@@ -442,6 +575,7 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 		DurationS:    seconds,
 		Ops:          ops,
 		Msgs:         messages,
+		Lost:         lost,
 		Errors:       failures,
 		OpsPerSec:    float64(ops) / seconds,
 		MsgsPerSec:   float64(messages) / seconds,

@@ -15,7 +15,7 @@ use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
     BoxStream, Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest,
-    Status,
+    Status, Unreliable,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -46,6 +46,7 @@ pub struct CallOptions {
     max_response_stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
     metadata: Metadata,
+    unreliable: Unreliable,
 }
 
 impl Default for CallOptions {
@@ -57,6 +58,7 @@ impl Default for CallOptions {
             max_response_stream_body_size: Some(16 * 1024 * 1024),
             stream_idle_timeout: Some(Duration::from_secs(30)),
             metadata: Metadata::new(),
+            unreliable: Unreliable::NONE,
         }
     }
 }
@@ -102,6 +104,12 @@ impl CallOptions {
     #[must_use]
     pub const fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    /// Returns the directions of the call marked unreliable.
+    #[must_use]
+    pub const fn unreliable(&self) -> Unreliable {
+        self.unreliable
     }
 
     /// Sets the per-call timeout.
@@ -152,6 +160,19 @@ impl CallOptions {
         self
     }
 
+    /// Marks directions of a streaming call as [`Unreliable`], in addition to any marked already.
+    ///
+    /// When the connection that carries the call supports datagrams, the call gets a datagram
+    /// flow, and the client sends its streamed requests as datagrams if `unreliable.requests` is
+    /// set. The server decides on its own whether to send its responses as datagrams; the call
+    /// receives them either way. Over transports without datagrams, and for a direction that does
+    /// not stream, the setting changes nothing. Generated clients apply the marks of the schema.
+    #[must_use]
+    pub const fn with_unreliable(mut self, unreliable: Unreliable) -> Self {
+        self.unreliable = self.unreliable.union(unreliable);
+        self
+    }
+
     /// Adds request metadata after normalizing the metadata key.
     #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
@@ -195,6 +216,24 @@ pub trait StreamingRpcTransport: RpcTransport {
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>>;
+
+    /// Sends a streaming request like [`StreamingRpcTransport::streaming_call`], for a call
+    /// with directions marked `unreliable`.
+    ///
+    /// A transport whose connection carries datagrams gives the call a datagram flow
+    /// (`RpcRequest::datagram_flow`) and sends request messages as datagrams if
+    /// `unreliable.requests` is set. The decision belongs to the connection that carries the
+    /// call, not to the caller: a channel may reach a different connection after the call began.
+    /// The default implementation ignores `unreliable`, so every message stays on the stream.
+    async fn streaming_call_unreliable(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        let _ = unreliable;
+        self.streaming_call(request, request_body).await
+    }
 }
 
 #[crate::async_trait]
@@ -218,6 +257,17 @@ where
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>> {
         self.as_ref().streaming_call(request, request_body).await
+    }
+
+    async fn streaming_call_unreliable(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        self.as_ref()
+            .streaming_call_unreliable(request, request_body, unreliable)
+            .await
     }
 }
 
@@ -283,6 +333,7 @@ where
         max_response_stream_body_size: _,
         stream_idle_timeout: _,
         metadata,
+        unreliable: _,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
@@ -733,6 +784,7 @@ struct PreparedStreamingCall {
     max_response_messages: Option<usize>,
     max_response_stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
+    unreliable: Unreliable,
 }
 
 fn prepare_streaming_request(
@@ -747,6 +799,7 @@ fn prepare_streaming_request(
         max_response_stream_body_size,
         stream_idle_timeout,
         metadata,
+        unreliable,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
@@ -761,6 +814,7 @@ fn prepare_streaming_request(
         max_response_messages,
         max_response_stream_body_size,
         stream_idle_timeout,
+        unreliable,
     })
 }
 
@@ -779,18 +833,27 @@ async fn streaming_call_with_deadline<T>(
     transport: &T,
     request: RpcRequest,
     request_body: BoxStream<Vec<u8>>,
+    unreliable: Unreliable,
     deadline: Option<Instant>,
 ) -> Result<BoxStream<ResponseFrame>>
 where
     T: StreamingRpcTransport + ?Sized,
 {
-    match remaining_timeout(deadline)? {
-        Some(timeout) => {
-            tokio::time::timeout(timeout, transport.streaming_call(request, request_body))
+    // The common reliable call takes the transport's plain entry point.
+    let call = async {
+        if unreliable.any() {
+            transport
+                .streaming_call_unreliable(request, request_body, unreliable)
                 .await
-                .map_err(|_| Error::from(Status::deadline_exceeded("RPC deadline exceeded")))?
+        } else {
+            transport.streaming_call(request, request_body).await
         }
-        None => transport.streaming_call(request, request_body).await,
+    };
+    match remaining_timeout(deadline)? {
+        Some(timeout) => tokio::time::timeout(timeout, call)
+            .await
+            .map_err(|_| Error::from(Status::deadline_exceeded("RPC deadline exceeded")))?,
+        None => call.await,
     }
 }
 
@@ -811,8 +874,11 @@ where
         max_response_messages,
         max_response_stream_body_size,
         stream_idle_timeout,
+        unreliable,
     } = prepared;
-    let response = streaming_call_with_deadline(transport, request, request_body, deadline).await?;
+    let response =
+        streaming_call_with_deadline(transport, request, request_body, unreliable, deadline)
+            .await?;
     let response = match call_end {
         Some(call_end) => call_end::read_response(
             response,

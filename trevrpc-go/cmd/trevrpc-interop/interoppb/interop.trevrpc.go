@@ -38,14 +38,18 @@ func NewEchoClient(transport trevrpc_go.Transport, options ...trevrpc_go.CallOpt
 	return &EchoClient{transport: transport, options: options}
 }
 
-func (c *EchoClient) mergedCallOptions(overrides []trevrpc_go.CallOption) []trevrpc_go.CallOption {
-	if len(c.options) == 0 {
-		return overrides
+// mergedCallOptions puts the options of the schema first, then those of the client, then the call's own.
+func (c *EchoClient) mergedCallOptions(overrides []trevrpc_go.CallOption, schema ...trevrpc_go.CallOption) []trevrpc_go.CallOption {
+	if len(schema) == 0 {
+		if len(c.options) == 0 {
+			return overrides
+		}
+		if len(overrides) == 0 {
+			return c.options
+		}
 	}
-	if len(overrides) == 0 {
-		return c.options
-	}
-	merged := make([]trevrpc_go.CallOption, 0, len(c.options)+len(overrides))
+	merged := make([]trevrpc_go.CallOption, 0, len(schema)+len(c.options)+len(overrides))
+	merged = append(merged, schema...)
 	merged = append(merged, c.options...)
 	merged = append(merged, overrides...)
 	return merged

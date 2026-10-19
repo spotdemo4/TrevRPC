@@ -1,8 +1,10 @@
 package zip.trev.trevrpc.interop
 
 import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.chromium.net.CronetEngine
@@ -14,6 +16,7 @@ import org.junit.runners.Parameterized
 import trevrpc.interop.v1.EchoClient
 import trevrpc.interop.v1.Interop.EchoRequest
 import trevrpc.interop.v1.Interop.EchoResponse
+import trevrpc.interop.v1.UnreliableEchoClient
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.Code
 import zip.trev.trevrpc.Metadata
@@ -37,7 +40,10 @@ class EchoScenarioTest(
     @Test(timeout = 60_000)
     fun scenario() {
         val body = checkNotNull(SCENARIOS[name]) { "unknown scenario $name" }
-        runBlocking { withTimeout(30.seconds) { body(EchoClient(channel, CallOptions(timeout = 10.seconds))) } }
+        val options = CallOptions(timeout = 10.seconds)
+        runBlocking {
+            withTimeout(30.seconds) { body(Clients(EchoClient(channel, options), UnreliableEchoClient(channel, options))) }
+        }
     }
 
     companion object {
@@ -82,31 +88,37 @@ class EchoScenarioTest(
     }
 }
 
-private val SCENARIOS: Map<String, suspend (EchoClient) -> Unit> =
+/** The generated clients a scenario can call; scenarios destructure the ones they use. */
+private data class Clients(
+    val echo: EchoClient,
+    val unreliable: UnreliableEchoClient,
+)
+
+private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
     linkedMapOf(
-        "unary" to { client ->
+        "unary" to { (client) ->
             expectEcho(client.unary(request("hello")), "hello", 0)
         },
-        "unary-metadata" to { client ->
+        "unary-metadata" to { (client) ->
             val options = CallOptions(timeout = 10.seconds, metadata = Metadata.of("interop-suffix" to "!".encodeToByteArray()))
             expectEcho(client.unary(request("hello"), options), "hello!", 0)
         },
-        "unary-error" to { client ->
+        "unary-error" to { (client) ->
             expectStatus(Code.NOT_FOUND, "missing") { client.unary(request("", failCode = 5, failMessage = "missing")) }
         },
-        "unary-large" to { client ->
+        "unary-large" to { (client) ->
             val message = "x".repeat(1 shl 20)
             expectEcho(client.unary(request(message)), message, 0)
         },
-        "client-stream" to { client ->
+        "client-stream" to { (client) ->
             expectEcho(client.clientStream(flowOf(request("a"), request("b"), request("c"))), "abc", 3)
         },
-        "server-stream" to { client ->
+        "server-stream" to { (client) ->
             val responses = client.serverStream(request("s", count = 3)).toList()
             expect(responses.size == 3) { "expected 3 responses, got ${responses.size}" }
             responses.forEachIndexed { index, response -> expectEcho(response, "s", index) }
         },
-        "server-stream-error" to { client ->
+        "server-stream-error" to { (client) ->
             val call = client.serverStreamResponse(request("s", count = 2, failCode = 9, failMessage = "stop"))
             try {
                 expectEcho(checkNotNull(call.receive()) { "stream ended before response 0" }, "s", 0)
@@ -116,7 +128,7 @@ private val SCENARIOS: Map<String, suspend (EchoClient) -> Unit> =
                 call.close()
             }
         },
-        "bidi" to { client ->
+        "bidi" to { (client) ->
             val call = client.bidi()
             try {
                 listOf("1", "2", "3").forEachIndexed { index, message ->
@@ -129,7 +141,7 @@ private val SCENARIOS: Map<String, suspend (EchoClient) -> Unit> =
                 call.close()
             }
         },
-        "bidi-error" to { client ->
+        "bidi-error" to { (client) ->
             val call = client.bidi()
             try {
                 call.send(request("1"))
@@ -147,13 +159,13 @@ private val SCENARIOS: Map<String, suspend (EchoClient) -> Unit> =
                 call.close()
             }
         },
-        "unary-headers" to { client ->
+        "unary-headers" to { (client) ->
             val response = client.unaryResponse(request("hello"), headerOptions())
             expectEcho(response.message, "hello", 0)
             expectMetadata("headers", response.headers, "interop-header")
             expectMetadata("trailing metadata", response.metadata, "interop-trailer")
         },
-        "server-stream-headers" to { client ->
+        "server-stream-headers" to { (client) ->
             val call = client.serverStreamResponse(request("s", count = 2), headerOptions())
             try {
                 expectMetadata("headers", call.headers(), "interop-header")
@@ -165,7 +177,47 @@ private val SCENARIOS: Map<String, suspend (EchoClient) -> Unit> =
                 call.close()
             }
         },
+        "unreliable" to { (_, client) ->
+            // Cronet has no datagram API, so the schema's unreliable marking changes nothing: HTTP/3
+            // and HTTP/2 deliver every message on the stream and the server sees no datagrams.
+            val sent = (0 until 50).map { "$it" } + "x".repeat(4096)
+            val call = client.bidi()
+            try {
+                val received = mutableListOf<String>()
+                coroutineScope {
+                    val sender =
+                        launch {
+                            sent.forEach { call.send(request(it, count = 1)) }
+                            call.closeSend()
+                        }
+                    while (true) {
+                        val response = call.receive() ?: break
+                        expect(response.index == 0) { "expected response index 0, got ${response.index}" }
+                        received += response.message
+                    }
+                    sender.join()
+                }
+                expect(received.toSet().size == received.size) { "a response was delivered more than once" }
+                expect(sent.containsAll(received)) { "a response was not one that was sent" }
+                expect(received.size == sent.size) { "expected ${sent.size} responses, got ${received.size}" }
+                expect(sent.last() in received) { "the 4096-byte echo is missing" }
+                val trailers = call.responseMetadata
+                expectCounter(trailers, "interop-received", sent.size.toString())
+                expectCounter(trailers, "interop-datagrams-received", "0")
+            } finally {
+                call.close()
+            }
+        },
     )
+
+private fun expectCounter(
+    metadata: Metadata,
+    key: String,
+    expected: String,
+) {
+    val actual = metadata[key]?.decodeToString()
+    expect(actual == expected) { "expected trailing metadata $key=$expected, got $actual" }
+}
 
 private fun headerOptions(): CallOptions =
     CallOptions(timeout = 10.seconds, metadata = Metadata.of("interop-header" to "h".encodeToByteArray()))

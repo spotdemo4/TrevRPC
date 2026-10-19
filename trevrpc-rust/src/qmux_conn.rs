@@ -8,6 +8,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
+use crate::datagram::NoDatagrams;
 use crate::framed::{ChunkSource, Chunked, FrameWrite};
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::quic::saturating_usize_to_u64;
@@ -108,6 +109,7 @@ impl QmuxConnection {
 impl MuxConnection for QmuxConnection {
     type SendStream = QmuxSendStream;
     type RecvStream = QmuxRecvStream;
+    type Datagrams = NoDatagrams;
 
     async fn accept_stream(&self) -> Option<(QmuxSendStream, QmuxRecvStream)> {
         let (send, recv) = self.until_lost(self.0.accept_bi()).await.ok()?;
@@ -143,6 +145,11 @@ impl MuxConnection for QmuxConnection {
 
     async fn connection_lost(&self) -> Error {
         Error::transport(self.lost().await)
+    }
+
+    /// `QMux` is configured with `max_datagram_frame_size = 0`: it has no datagrams.
+    fn datagrams(&self) -> Option<NoDatagrams> {
+        None
     }
 }
 

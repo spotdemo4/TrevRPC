@@ -1,10 +1,14 @@
 package zip.trev.trevrpc.generator
 
+import com.google.protobuf.ByteString
+import com.google.protobuf.CodedOutputStream
 import com.google.protobuf.DescriptorProtos.DescriptorProto
 import com.google.protobuf.DescriptorProtos.FileDescriptorProto
 import com.google.protobuf.DescriptorProtos.FileOptions
 import com.google.protobuf.DescriptorProtos.MethodDescriptorProto
+import com.google.protobuf.DescriptorProtos.MethodOptions
 import com.google.protobuf.DescriptorProtos.ServiceDescriptorProto
+import com.google.protobuf.UnknownFieldSet
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorRequest
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorResponse
 import org.jetbrains.kotlin.cli.common.ExitCode
@@ -395,6 +399,126 @@ class GeneratorTest {
     }
 
     @Test
+    fun `documents methods the schema marks unreliable and leaves the others alone`() {
+        val file =
+            collisionFile(
+                "api/tracker.proto",
+                ServiceDescriptorProto
+                    .newBuilder()
+                    .setName("Tracker")
+                    .addMethod(method("Plain", ".collision.Request", ".collision.Reply").setClientStreaming(true))
+                    .addMethod(
+                        method("Upload", ".collision.Request", ".collision.Reply")
+                            .setClientStreaming(true)
+                            .setOptions(unreliableOptions(requests = true)),
+                    ).addMethod(
+                        method("Watch", ".collision.Request", ".collision.Reply")
+                            .setServerStreaming(true)
+                            .setOptions(unreliableOptions(responses = true)),
+                    ).addMethod(
+                        method("Track", ".collision.Request", ".collision.Reply")
+                            .setClientStreaming(true)
+                            .setServerStreaming(true)
+                            .setOptions(unreliableOptions(requests = true, responses = true)),
+                    ).addMethod(
+                        method("Off", ".collision.Request", ".collision.Reply")
+                            .setClientStreaming(true)
+                            .setOptions(unreliableOptions()),
+                    ).build(),
+            )
+
+        val response = generate(request(file))
+
+        assertEquals("", response.error)
+        val content = response.fileList.single().content
+        val docs = content.lines().filter { "unreliable (datagram messages)" in it }
+        // Upload has 4 public functions, Watch 2, Track 3; each gets one KDoc block.
+        assertEquals(9, docs.size, content)
+        assertEquals(4, docs.count { "requests unreliable" in it && "responses" !in it })
+        assertEquals(2, docs.count { "responses unreliable" in it && "requests" !in it })
+        assertEquals(3, docs.count { "requests and responses unreliable" in it })
+        assertTrue(content.contains("Cronet has no"), content)
+        // The KDoc sits directly above its function and never above the unmarked methods.
+        val lines = content.lines()
+        lines.forEachIndexed { index, line ->
+            if (line.startsWith("    public ") && " fun " in line) {
+                val documented = lines[index - 1] == "     */"
+                val name = Regex("fun (\\w+)\\(").find(line)?.groupValues?.get(1)
+                assertEquals(name !in setOf("plain", "plainResponse", "off", "offResponse"), documented, line)
+            }
+        }
+    }
+
+    @Test
+    fun `rejects unreliable flags on directions that do not stream`() {
+        fun failure(
+            options: MethodOptions,
+            configure: (MethodDescriptorProto.Builder) -> Unit,
+        ): String {
+            val response =
+                generate(
+                    request(
+                        collisionFile(
+                            "api/misuse.proto",
+                            ServiceDescriptorProto
+                                .newBuilder()
+                                .setName("Svc")
+                                .addMethod(
+                                    method("M", ".collision.Request", ".collision.Reply")
+                                        .also(configure)
+                                        .setOptions(options),
+                                ).build(),
+                        ),
+                    ),
+                )
+            assertTrue(response.fileList.isEmpty())
+            return response.error
+        }
+
+        val requests = unreliableOptions(requests = true)
+        val responses = unreliableOptions(responses = true)
+        val unaryError = "collision.Svc.M: unreliable_requests requires a client-streaming or bidirectional method"
+        val responsesError = "collision.Svc.M: unreliable_responses requires a server-streaming or bidirectional method"
+        assertEquals(unaryError, failure(requests) {})
+        assertEquals(unaryError, failure(requests) { it.setServerStreaming(true) })
+        assertEquals(responsesError, failure(responses) {})
+        assertEquals(responsesError, failure(responses) { it.setClientStreaming(true) })
+        assertEquals(unaryError, failure(unreliableOptions(requests = true, responses = true)) {})
+    }
+
+    @Test
+    fun `rejects a malformed trevrpc method option`() {
+        val malformed =
+            MethodOptions
+                .newBuilder()
+                .setUnknownFields(
+                    UnknownFieldSet
+                        .newBuilder()
+                        .addField(
+                            58247,
+                            UnknownFieldSet.Field
+                                .newBuilder()
+                                .addLengthDelimited(ByteString.copyFrom(byteArrayOf(0x08)))
+                                .build(),
+                        ).build(),
+                ).build()
+        val response =
+            generate(
+                request(
+                    collisionFile(
+                        "api/malformed.proto",
+                        ServiceDescriptorProto
+                            .newBuilder()
+                            .setName("Svc")
+                            .addMethod(method("M", ".collision.Request", ".collision.Reply").setOptions(malformed))
+                            .build(),
+                    ),
+                ),
+            )
+        assertTrue(response.error.contains("malformed (trevrpc.method) option"), response.error)
+    }
+
+    @Test
     fun `round trips the protoc plugin protocol`() {
         val input = shapesRequest().toByteArray()
         val output = ByteArrayOutputStream()
@@ -575,6 +699,31 @@ class GeneratorTest {
             .build()
     }
 
+    /** MethodOptions as protoc hands them to a plugin: `(trevrpc.method)` is an unknown length-delimited field 58247. */
+    private fun unreliableOptions(
+        requests: Boolean = false,
+        responses: Boolean = false,
+    ): MethodOptions {
+        val bytes = ByteArrayOutputStream()
+        val out = CodedOutputStream.newInstance(bytes)
+        if (requests) out.writeBool(1, true)
+        if (responses) out.writeBool(2, true)
+        out.flush()
+        return MethodOptions
+            .newBuilder()
+            .setUnknownFields(
+                UnknownFieldSet
+                    .newBuilder()
+                    .addField(
+                        58247,
+                        UnknownFieldSet.Field
+                            .newBuilder()
+                            .addLengthDelimited(ByteString.copyFrom(bytes.toByteArray()))
+                            .build(),
+                    ).build(),
+            ).build()
+    }
+
     private fun message(name: String): DescriptorProto = DescriptorProto.newBuilder().setName(name).build()
 
     private fun method(
@@ -664,11 +813,89 @@ class GeneratedCodeCompilationTest {
         assertFalse(leftFacade == rightFacade)
     }
 
+    @Test
+    fun `protoc generated unreliable client compiles and documents the Cronet fallback`(
+        @TempDir temp: Path,
+    ) {
+        val fixtureRoot = compatFixtureRoot("unreliable/unreliable.proto")
+        compileSchemas(
+            temp,
+            fixtureRoot,
+            listOf("unreliable/unreliable.proto", "trevrpc/options.proto"),
+            mapOf("UnreliableFixture.kt" to UNRELIABLE_FIXTURE),
+            extraProtoRoots = listOf(optionsProtoRoot()),
+        )
+
+        val generated = temp.resolve("kotlin/unreliable/unreliable.trevrpc.kt").readText()
+        val lines = generated.lines()
+
+        fun documented(function: String): Boolean {
+            val index = lines.indexOfFirst { it.startsWith("    public ") && it.contains("fun $function(") }
+            check(index > 0) { "missing $function in\n$generated" }
+            return lines[index - 1] == "     */" && lines[index - 3].contains("Cronet has no")
+        }
+        listOf("upload", "uploadResponse", "watch", "watchResponse", "track", "trackResponse").forEach {
+            assertTrue(documented(it), it)
+        }
+        listOf("lookup", "lookupResponse", "plain", "plainResponse").forEach { assertFalse(documented(it), it) }
+        assertTrue(lines.any { "requests and responses unreliable" in it })
+    }
+
+    @Test
+    fun `protoc rejects misused unreliable flags through the plugin with the shared error text`(
+        @TempDir temp: Path,
+    ) {
+        val root = temp.resolve("proto").createDirectories()
+        root.resolve("misuse.proto").toFile().writeText(
+            """
+            syntax = "proto3";
+            package bad.v1;
+            import "trevrpc/options.proto";
+            message M {}
+            service S {
+              rpc Get(M) returns (M) { option (trevrpc.method) = {unreliable_requests: true}; }
+            }
+            """.trimIndent(),
+        )
+        val plugin = Path.of(checkNotNull(System.getProperty("trevrpc.kotlin.plugin")))
+        val output = temp.resolve("out").createDirectories()
+        val process =
+            ProcessBuilder(
+                "protoc",
+                "--proto_path=$root",
+                "--proto_path=${optionsProtoRoot()}",
+                "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
+                "--trevrpc-kotlin_out=$output",
+                "misuse.proto",
+            ).redirectErrorStream(true).start()
+        val text = process.inputStream.bufferedReader().readText()
+        assertTrue(process.waitFor() != 0, text)
+        assertTrue(
+            text.contains("bad.v1.S.Get: unreliable_requests requires a client-streaming or bidirectional method"),
+            text,
+        )
+    }
+
+    private fun optionsProtoRoot(): Path {
+        val root = Path.of(checkNotNull(System.getProperty("trevrpc.options.proto.root")))
+        check(root.resolve("trevrpc/options.proto").isRegularFile()) { "trevrpc/options.proto not found under $root" }
+        return root
+    }
+
+    private fun compatFixtureRoot(marker: String): Path {
+        val fixturePath = "trevrpc-kotlin/protoc-gen-trevrpc-kotlin/src/test/proto"
+        return generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath(), Path::getParent)
+            .map { it.resolve(fixturePath) }
+            .firstOrNull { it.resolve(marker).isRegularFile() }
+            ?: error("generator fixtures not found from ${System.getProperty("user.dir")}")
+    }
+
     private fun compileSchemas(
         temp: Path,
         protoRoot: Path,
         protoFiles: List<String>,
         fixtures: Map<String, String>,
+        extraProtoRoots: List<Path> = emptyList(),
     ) {
         val javaSources = temp.resolve("java").createDirectories()
         val kotlinSources = temp.resolve("kotlin").createDirectories()
@@ -677,10 +904,12 @@ class GeneratedCodeCompilationTest {
             listOf(
                 "protoc",
                 "--proto_path=$protoRoot",
-                "--java_out=$javaSources",
-                "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
-                "--trevrpc-kotlin_out=$kotlinSources",
-            ) + protoFiles,
+            ) + extraProtoRoots.map { "--proto_path=$it" } +
+                listOf(
+                    "--java_out=$javaSources",
+                    "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
+                    "--trevrpc-kotlin_out=$kotlinSources",
+                ) + protoFiles,
             protoRoot,
         )
         fixtures.forEach { (name, content) -> kotlinSources.resolve(name).toFile().writeText(content) }
@@ -754,6 +983,22 @@ class GeneratedCodeCompilationTest {
     }
 
     private companion object {
+        val UNRELIABLE_FIXTURE =
+            """
+            package generator.compat.unreliable
+
+            import kotlinx.coroutines.flow.Flow
+            import zip.trev.trevrpc.BidirectionalStreamingCall
+
+            @Suppress("UNUSED_VARIABLE")
+            private suspend fun typeCheck(client: TrackerClient, position: Position, positions: Flow<Position>) {
+                // Unreliable methods keep the ordinary client shapes.
+                val track: BidirectionalStreamingCall<Position, Position> = client.track()
+                val watch: Flow<Position> = client.watch(position)
+                val upload: Position = client.upload(positions)
+            }
+            """.trimIndent()
+
         val COMPILE_FIXTURE =
             """
             package trevrpc.interop.v1

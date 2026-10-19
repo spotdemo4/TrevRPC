@@ -17,6 +17,8 @@ const (
 
 // clientQUICConfig returns the QUIC configuration for a client connection.
 // Servers never open streams toward clients, so incoming streams are disabled.
+// Datagrams are enabled so that calls can use them (see Unreliable); a call
+// sets a flow only when the server advertised them as well.
 func clientQUICConfig(base *quic.Config, maxFrameSize int) *quic.Config {
 	config := cloneQUICConfig(base)
 	window := frameReceiveWindow(maxFrameSize)
@@ -26,6 +28,7 @@ func clientQUICConfig(base *quic.Config, maxFrameSize int) *quic.Config {
 	capWindow(&config.MaxConnectionReceiveWindow, window)
 	config.MaxIncomingStreams = -1
 	config.MaxIncomingUniStreams = -1
+	config.EnableDatagrams = true
 	return hardenQUICConfig(config)
 }
 
@@ -55,8 +58,9 @@ func serverQUICConfig(base *quic.Config, options ServerOptions) *quic.Config {
 		}
 	}
 
+	// Native clients and WebTransport sessions send datagram messages.
+	config.EnableDatagrams = true
 	if options.EnableWebTransport {
-		config.EnableDatagrams = true
 		config.EnableStreamResetPartialDelivery = true
 	}
 	if !options.EnableHTTP && !options.EnableWebTransport {

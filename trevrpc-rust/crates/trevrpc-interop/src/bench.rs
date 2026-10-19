@@ -16,8 +16,11 @@ use trevrpc::client::{
 };
 use trevrpc::wire::MAX_METADATA_VALUE_LEN;
 
-use crate::proto::{EchoClient, EchoRequest, EchoResponse};
+use crate::proto::{EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient};
 use crate::{BoxError, Flags, connect};
+
+/// The trailing metadata key that counts the requests the server received.
+const RECEIVED_METADATA_KEY: &str = "interop-received";
 
 /// The request metadata key `--metadata-size` fills.
 const PAD_METADATA_KEY: &str = "bench-pad";
@@ -35,6 +38,10 @@ enum Scenario {
     ServerStream,
     ClientStream,
     Bidi,
+    /// One request asks for `messages` responses, which may travel as datagrams.
+    UnreliableServerStream,
+    /// `messages` requests, which may travel as datagrams, ask for nothing back.
+    UnreliableClientStream,
 }
 
 impl Scenario {
@@ -44,6 +51,8 @@ impl Scenario {
             "server-stream" => Ok(Self::ServerStream),
             "client-stream" => Ok(Self::ClientStream),
             "bidi" => Ok(Self::Bidi),
+            "unreliable-server-stream" => Ok(Self::UnreliableServerStream),
+            "unreliable-client-stream" => Ok(Self::UnreliableClientStream),
             other => Err(format!("unknown --scenario {other:?}").into()),
         }
     }
@@ -54,14 +63,32 @@ impl Scenario {
             Self::ServerStream => "server-stream",
             Self::ClientStream => "client-stream",
             Self::Bidi => "bidi",
+            Self::UnreliableServerStream => "unreliable-server-stream",
+            Self::UnreliableClientStream => "unreliable-client-stream",
         }
     }
+}
 
-    /// The application messages one operation moves.
-    const fn messages_per_op(self, messages: usize) -> usize {
-        match self {
-            Self::Unary | Self::Bidi => 1,
-            Self::ServerStream | Self::ClientStream => messages,
+/// What one operation moved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Outcome {
+    /// The application messages that were delivered.
+    messages: u64,
+    /// The messages that were sent but not delivered, for the unreliable scenarios.
+    lost: u64,
+}
+
+impl Outcome {
+    /// An operation that moved `messages` reliably.
+    const fn delivered(messages: u64) -> Self {
+        Self { messages, lost: 0 }
+    }
+
+    /// An operation that sent `sent` unreliable messages, `delivered` of which arrived.
+    const fn unreliable(sent: u64, delivered: u64) -> Self {
+        Self {
+            messages: delivered,
+            lost: sent.saturating_sub(delivered),
         }
     }
 }
@@ -228,6 +255,10 @@ impl Window {
 #[derive(Default)]
 struct WorkerResult {
     latencies: Vec<Duration>,
+    /// The messages the measured operations delivered.
+    messages: u64,
+    /// The messages the measured operations lost.
+    lost: u64,
     /// Failures by message, reported on stderr to explain a non-zero error count.
     errors: BTreeMap<String, u64>,
 }
@@ -235,6 +266,7 @@ struct WorkerResult {
 /// One load worker: a client and, for `bidi`, the stream it keeps open.
 struct Worker<T> {
     client: EchoClient<T>,
+    unreliable: UnreliableEchoClient<T>,
     scenario: Scenario,
     request: EchoRequest,
     options: CallOptions,
@@ -247,24 +279,26 @@ where
     T: StreamingRpcTransport + Clone,
 {
     /// Runs one operation of the scenario.
-    async fn operation(&mut self) -> Result<(), Error> {
+    async fn operation(&mut self) -> Result<Outcome, Error> {
         match self.scenario {
             Scenario::Unary => {
                 self.client
                     .unary_with_options(self.request.clone(), self.options.clone())
                     .await?;
+                Ok(Outcome::delivered(1))
             }
-            Scenario::ServerStream => self.server_stream().await?,
-            Scenario::ClientStream => self.client_stream().await?,
-            Scenario::Bidi => self.bidi().await?,
+            Scenario::ServerStream => self.server_stream().await,
+            Scenario::ClientStream => self.client_stream().await,
+            Scenario::Bidi => self.bidi().await,
+            Scenario::UnreliableServerStream => self.unreliable_server_stream().await,
+            Scenario::UnreliableClientStream => self.unreliable_client_stream().await,
         }
-        Ok(())
     }
 
     // `&mut self` because the bidi call makes `Worker` not `Sync`, and a shared reference held
     // across an await would make the spawned worker not `Send`.
     #[allow(clippy::needless_pass_by_ref_mut)]
-    async fn server_stream(&mut self) -> Result<(), Error> {
+    async fn server_stream(&mut self) -> Result<Outcome, Error> {
         use futures_util::StreamExt as _;
 
         let request = EchoRequest {
@@ -280,11 +314,12 @@ where
             response?;
             received = received.saturating_add(1);
         }
-        short_stream_check(received, self.messages)
+        short_stream_check(received, self.messages)?;
+        Ok(Outcome::delivered(count_of(received)))
     }
 
     #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
-    async fn client_stream(&mut self) -> Result<(), Error> {
+    async fn client_stream(&mut self) -> Result<Outcome, Error> {
         let call = self
             .client
             .client_stream_with_options(self.options.clone())
@@ -296,10 +331,69 @@ where
         short_stream_check(
             usize::try_from(response.index).unwrap_or(usize::MAX),
             self.messages,
-        )
+        )?;
+        Ok(Outcome::delivered(count_of(self.messages)))
     }
 
-    async fn bidi(&mut self) -> Result<(), Error> {
+    /// One request asks for `messages` responses; the operation ends with the status, and the
+    /// responses that did not arrive are lost.
+    #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
+    async fn unreliable_server_stream(&mut self) -> Result<Outcome, Error> {
+        use futures_util::StreamExt as _;
+
+        let (sender, mut responses) = self
+            .unreliable
+            .bidi_with_options(self.options.clone())
+            .await?
+            .split();
+        let wanted = u32::try_from(self.messages).unwrap_or(u32::MAX);
+        sender
+            .send(EchoRequest {
+                count: wanted,
+                ..self.request.clone()
+            })
+            .await?;
+        sender.finish()?;
+        let mut delivered = 0_u64;
+        while let Some(response) = responses.next().await {
+            response?;
+            delivered = delivered.saturating_add(1);
+        }
+        Ok(Outcome::unreliable(u64::from(wanted), delivered))
+    }
+
+    /// `messages` requests ask for no responses; the server counts the ones that arrived, and
+    /// the rest are lost.
+    #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
+    async fn unreliable_client_stream(&mut self) -> Result<Outcome, Error> {
+        use futures_util::StreamExt as _;
+
+        let (sender, mut responses) = self
+            .unreliable
+            .bidi_with_options(self.options.clone())
+            .await?
+            .split();
+        for _ in 0..self.messages {
+            sender.send(self.request.clone()).await?;
+        }
+        sender.finish()?;
+        while let Some(response) = responses.next().await {
+            response?;
+        }
+        let received = responses
+            .terminal_metadata()
+            .and_then(|metadata| metadata.get(RECEIVED_METADATA_KEY))
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| {
+                Error::from(trevrpc::Status::internal(format!(
+                    "the status has no {RECEIVED_METADATA_KEY} metadata"
+                )))
+            })?;
+        Ok(Outcome::unreliable(count_of(self.messages), received))
+    }
+
+    async fn bidi(&mut self) -> Result<Outcome, Error> {
         let call = match &mut self.bidi {
             Some(call) => call,
             empty @ None => {
@@ -319,8 +413,13 @@ where
             // A failed stream is gone; the next operation opens a fresh one.
             self.bidi = None;
         }
-        result
+        result.map(|()| Outcome::delivered(1))
     }
+}
+
+/// A message count as the 64-bit counter the report uses.
+fn count_of(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 fn short_stream_check(got: usize, want: usize) -> Result<(), Error> {
@@ -348,9 +447,11 @@ where
         let finished = Instant::now();
         let measured = started >= window.start;
         match outcome {
-            Ok(Ok(())) => {
+            Ok(Ok(moved)) => {
                 if measured && finished <= window.end {
                     result.latencies.push(finished.duration_since(started));
+                    result.messages = result.messages.saturating_add(moved.messages);
+                    result.lost = result.lost.saturating_add(moved.lost);
                 }
             }
             failed => {
@@ -397,6 +498,7 @@ where
             tokio::spawn(work(
                 Worker {
                     client: EchoClient::new(transport.clone()),
+                    unreliable: UnreliableEchoClient::new(transport.clone()),
                     scenario: params.scenario,
                     request: request.clone(),
                     options: params.call_options(),
@@ -460,6 +562,8 @@ struct Report {
     duration: f64,
     ops: u64,
     msgs: u64,
+    /// Messages sent but not delivered, for the unreliable scenarios.
+    lost: u64,
     errors: u64,
     /// Sorted ascending.
     latencies: Vec<Duration>,
@@ -481,6 +585,12 @@ impl Report {
                 eprintln!("bench:   {failures} x {message}");
             }
         }
+        let msgs = results
+            .iter()
+            .fold(0_u64, |total, result| total.saturating_add(result.messages));
+        let lost = results
+            .iter()
+            .fold(0_u64, |total, result| total.saturating_add(result.lost));
         let mut latencies: Vec<Duration> = results
             .into_iter()
             .flat_map(|result| result.latencies)
@@ -492,7 +602,6 @@ impl Report {
                 format!("no operation completed in the measured window ({errors} failed)").into(),
             );
         }
-        let per_op = u64::try_from(params.scenario.messages_per_op(params.messages))?;
         Ok(Self {
             scenario: params.scenario,
             transport,
@@ -501,7 +610,8 @@ impl Report {
             concurrency: params.concurrency,
             duration: params.duration.as_secs_f64(),
             ops,
-            msgs: ops.saturating_mul(per_op),
+            msgs,
+            lost,
             errors,
             latencies,
             wire_bytes,
@@ -525,14 +635,18 @@ impl Report {
     fn json(&self) -> String {
         let msgs = count(self.msgs);
         let msgs_per_sec = msgs / self.duration;
-        let wire = self.wire_bytes.map_or_else(String::new, |bytes| {
-            format!(r#","wire_bytes_per_msg":{:.1}"#, count(bytes) / msgs)
-        });
+        // Nothing delivered leaves no message to divide the wire bytes by.
+        let wire = self
+            .wire_bytes
+            .filter(|_| self.msgs > 0)
+            .map_or_else(String::new, |bytes| {
+                format!(r#","wire_bytes_per_msg":{:.1}"#, count(bytes) / msgs)
+            });
         format!(
             concat!(
                 r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"concurrency":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
-                r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{}}}"#,
+                r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{}}}"#,
             ),
             self.scenario.name(),
             self.transport,
@@ -551,6 +665,7 @@ impl Report {
             self.percentile(990),
             self.percentile(999),
             wire,
+            self.lost,
         )
     }
 }

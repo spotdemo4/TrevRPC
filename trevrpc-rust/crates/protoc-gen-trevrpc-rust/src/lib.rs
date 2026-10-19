@@ -15,6 +15,158 @@ use prost_types::{
     DescriptorProto, EnumDescriptorProto, FileDescriptorProto, MethodDescriptorProto,
 };
 
+/// The extension number of `(trevrpc.method)` in `google.protobuf.MethodOptions`; see
+/// `proto/trevrpc/options.proto`.
+const METHOD_OPTION_FIELD: u32 = 58247;
+
+/// The unreliable marks of the `(trevrpc.method)` option of one method.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MethodMarks {
+    unreliable_requests: bool,
+    unreliable_responses: bool,
+}
+
+/// A minimal mirror of `CodeGeneratorRequest` that keeps what `prost-types` drops.
+///
+/// `prost-types` decodes `google.protobuf.MethodOptions` without its extensions, so the
+/// `(trevrpc.method)` option is read from the same request bytes through this mirror, which only
+/// declares the path to it: `CodeGeneratorRequest.proto_file` (15) -> `FileDescriptorProto`
+/// (`name` 1, `service` 6) -> `ServiceDescriptorProto` (`name` 1, `method` 2) ->
+/// `MethodDescriptorProto` (`name` 1, `options` 4) -> `MethodOptions` (extension 58247) ->
+/// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2).
+mod mirror {
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct Request {
+        #[prost(message, repeated, tag = "15")]
+        pub proto_file: Vec<File>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct File {
+        #[prost(string, optional, tag = "1")]
+        pub name: Option<String>,
+        #[prost(message, repeated, tag = "6")]
+        pub service: Vec<Service>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct Service {
+        #[prost(string, optional, tag = "1")]
+        pub name: Option<String>,
+        #[prost(message, repeated, tag = "2")]
+        pub method: Vec<Method>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct Method {
+        #[prost(string, optional, tag = "1")]
+        pub name: Option<String>,
+        #[prost(message, optional, tag = "4")]
+        pub options: Option<MethodOptions>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct MethodOptions {
+        #[prost(message, optional, tag = "58247")]
+        pub trevrpc: Option<TrevrpcOptions>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct TrevrpcOptions {
+        #[prost(bool, tag = "1")]
+        pub unreliable_requests: bool,
+        #[prost(bool, tag = "2")]
+        pub unreliable_responses: bool,
+    }
+
+    /// A `FileDescriptorSet`, with its files left encoded.
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct DescriptorSet {
+        #[prost(bytes = "vec", repeated, tag = "1")]
+        pub file: Vec<Vec<u8>>,
+    }
+
+    /// A `CodeGeneratorRequest` assembled from encoded files.
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct EncodedRequest {
+        #[prost(string, repeated, tag = "1")]
+        pub file_to_generate: Vec<String>,
+        #[prost(string, optional, tag = "2")]
+        pub parameter: Option<String>,
+        #[prost(bytes = "vec", repeated, tag = "15")]
+        pub proto_file: Vec<Vec<u8>>,
+    }
+}
+
+/// The `(trevrpc.method)` marks of every method of a request, by file, service and method name.
+#[derive(Debug, Default)]
+struct MethodOptionIndex {
+    marks: HashMap<(String, String, String), MethodMarks>,
+}
+
+impl MethodOptionIndex {
+    /// Reads the marks from the encoded `CodeGeneratorRequest`.
+    fn from_request_bytes(request: &[u8]) -> Result<Self, prost::DecodeError> {
+        debug_assert_eq!(METHOD_OPTION_FIELD, 58247);
+        let request = mirror::Request::decode(request)?;
+        let mut marks = HashMap::new();
+        for file in request.proto_file {
+            let file_name = file.name.unwrap_or_default();
+            for service in file.service {
+                let service_name = service.name.unwrap_or_default();
+                for method in service.method {
+                    let Some(options) = method.options.and_then(|options| options.trevrpc) else {
+                        continue;
+                    };
+                    marks.insert(
+                        (
+                            file_name.clone(),
+                            service_name.clone(),
+                            method.name.unwrap_or_default(),
+                        ),
+                        MethodMarks {
+                            unreliable_requests: options.unreliable_requests,
+                            unreliable_responses: options.unreliable_responses,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(Self { marks })
+    }
+
+    fn get(&self, file: &str, service: &str, method: &str) -> MethodMarks {
+        self.marks
+            .get(&(file.to_owned(), service.to_owned(), method.to_owned()))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// Builds the encoded `CodeGeneratorRequest` for `files_to_generate` from an encoded
+/// `FileDescriptorSet`.
+///
+/// The set must list every file, imports included, as `protox::Compiler::encode_file_descriptor_set`
+/// does with imports enabled. Unlike converting through `prost_types::FileDescriptorSet`, this keeps the extension options
+/// of the descriptors, such as `(trevrpc.method)`. It is meant for build scripts and tests that
+/// run the generator without `protoc`.
+pub fn code_generator_request(
+    descriptor_set: &[u8],
+    files_to_generate: &[&str],
+    parameter: &str,
+) -> Result<Vec<u8>, prost::DecodeError> {
+    let set = mirror::DescriptorSet::decode(descriptor_set)?;
+    Ok(mirror::EncodedRequest {
+        file_to_generate: files_to_generate
+            .iter()
+            .map(|file| (*file).to_owned())
+            .collect(),
+        parameter: Some(parameter.to_owned()),
+        proto_file: set.file,
+    }
+    .encode_to_vec())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PluginOptions {
     runtime_path: String,
@@ -40,17 +192,22 @@ where
     R: Read,
     W: Write,
 {
-    let mut request = Vec::new();
-    reader.read_to_end(&mut request)?;
+    let mut request_bytes = Vec::new();
+    reader.read_to_end(&mut request_bytes)?;
 
-    let request = CodeGeneratorRequest::decode(request.as_slice()).map_err(|error| {
+    let request = CodeGeneratorRequest::decode(request_bytes.as_slice()).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("failed to decode CodeGeneratorRequest: {error}"),
         )
     })?;
 
-    let response = generate_plugin_response(&request);
+    let response = match MethodOptionIndex::from_request_bytes(&request_bytes) {
+        Ok(index) => generate_plugin_response_with(&request, &index),
+        Err(error) => generator_error(format!(
+            "failed to decode the method options of CodeGeneratorRequest: {error}"
+        )),
+    };
     let mut output = Vec::new();
     response.encode(&mut output).map_err(|error| {
         io::Error::new(
@@ -63,7 +220,16 @@ where
 }
 
 #[must_use]
+#[cfg(test)]
 fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResponse {
+    generate_plugin_response_with(request, &MethodOptionIndex::default())
+}
+
+#[must_use]
+fn generate_plugin_response_with(
+    request: &CodeGeneratorRequest,
+    method_options: &MethodOptionIndex,
+) -> CodeGeneratorResponse {
     let options = match parse_plugin_options(request.parameter.as_deref()) {
         Ok(options) => options,
         Err(error) => {
@@ -98,7 +264,14 @@ fn generate_plugin_response(request: &CodeGeneratorRequest) -> CodeGeneratorResp
         let package = file.package.clone().unwrap_or_default();
         let mut services = Vec::with_capacity(file.service.len());
         for service in &file.service {
-            match descriptor_service(file_name, &package, service, &type_index, &options) {
+            match descriptor_service(
+                file_name,
+                &package,
+                service,
+                &type_index,
+                &options,
+                method_options,
+            ) {
                 Ok(service) => services.push(service),
                 Err(error) => {
                     return CodeGeneratorResponse {
@@ -236,6 +409,7 @@ struct Method {
     output_type: String,
     client_streaming: bool,
     server_streaming: bool,
+    unreliable: MethodMarks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +721,7 @@ fn descriptor_service(
     service: &prost_types::ServiceDescriptorProto,
     type_index: &TypeIndex,
     options: &PluginOptions,
+    method_options: &MethodOptionIndex,
 ) -> Result<Service, String> {
     let proto_name = service.name.clone().unwrap_or_default();
 
@@ -554,7 +729,20 @@ fn descriptor_service(
         .method
         .iter()
         .map(|method| {
-            descriptor_method(file_name, package, &proto_name, method, type_index, options)
+            let marks = method_options.get(
+                file_name,
+                &proto_name,
+                method.name.as_deref().unwrap_or_default(),
+            );
+            descriptor_method(
+                file_name,
+                package,
+                &proto_name,
+                method,
+                marks,
+                type_index,
+                options,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -571,6 +759,7 @@ fn descriptor_method(
     package: &str,
     service_name: &str,
     method: &MethodDescriptorProto,
+    marks: MethodMarks,
     type_index: &TypeIndex,
     options: &PluginOptions,
 ) -> Result<Method, String> {
@@ -593,14 +782,41 @@ fn descriptor_method(
             )
         })?;
 
+    let client_streaming = method.client_streaming.unwrap_or_default();
+    let server_streaming = method.server_streaming.unwrap_or_default();
+    let full_name = format!(
+        "{}.{proto_name}",
+        qualified_service_name(package, service_name)
+    );
+    if marks.unreliable_requests && !client_streaming {
+        return Err(format!(
+            "{full_name}: unreliable_requests requires a client-streaming or bidirectional method"
+        ));
+    }
+    if marks.unreliable_responses && !server_streaming {
+        return Err(format!(
+            "{full_name}: unreliable_responses requires a server-streaming or bidirectional method"
+        ));
+    }
+
     Ok(Method {
         name: to_rust_method_name(&proto_name),
         proto_name,
         input_type,
         output_type,
-        client_streaming: method.client_streaming.unwrap_or_default(),
-        server_streaming: method.server_streaming.unwrap_or_default(),
+        client_streaming,
+        server_streaming,
+        unreliable: marks,
     })
+}
+
+/// The service name qualified by its package: `package.Service`, or `Service` without a package.
+fn qualified_service_name(package: &str, service: &str) -> String {
+    if package.is_empty() {
+        service.to_owned()
+    } else {
+        format!("{package}.{service}")
+    }
 }
 
 fn validate_generated_names(
@@ -693,6 +909,37 @@ fn semantic_rust_identifier(identifier: &str) -> &str {
     identifier.strip_prefix("r#").unwrap_or(identifier)
 }
 
+/// Returns the `Unreliable` constant for the directions a method marks, or `None` when it marks
+/// neither.
+fn unreliable_expr(runtime_path: &str, method: &Method) -> Option<String> {
+    let constant = match (
+        method.unreliable.unreliable_requests,
+        method.unreliable.unreliable_responses,
+    ) {
+        (false, false) => return None,
+        (true, false) => "REQUESTS",
+        (false, true) => "RESPONSES",
+        (true, true) => "BOTH",
+    };
+    Some(format!("{runtime_path}::Unreliable::{constant}"))
+}
+
+/// Returns the doc lines that say which directions of a method travel as datagrams when they can.
+fn unreliable_docs(method: &Method) -> String {
+    let directions = match (
+        method.unreliable.unreliable_requests,
+        method.unreliable.unreliable_responses,
+    ) {
+        (false, false) => return String::new(),
+        (true, false) => "request",
+        (false, true) => "response",
+        (true, true) => "request and response",
+    };
+    format!(
+        "    ///\n    /// The schema marks the {directions} messages of this method as unreliable: where the\n    /// connection has datagrams they may be lost or reordered, but never duplicated.\n"
+    )
+}
+
 fn generate_service(runtime_path: &str, service: &Service, buf: &mut String) {
     generate_paths(service, buf);
     generate_trait(runtime_path, service, buf);
@@ -749,8 +996,9 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
 
     for method in &service.methods {
         buf.push_str(&format!(
-            "    /// Handles the `{}` RPC.\n",
-            method.proto_name
+            "    /// Handles the `{}` RPC.\n{}",
+            method.proto_name,
+            unreliable_docs(method)
         ));
         if method.client_streaming && method.server_streaming {
             buf.push_str(&format!(
@@ -823,8 +1071,26 @@ fn generate_client_method(
     method: &Method,
     buf: &mut String,
 ) {
+    let start = buf.len();
+    emit_client_method(runtime_path, service, method, buf);
+    if let Some(unreliable) = unreliable_expr(runtime_path, method) {
+        // Every call the client makes ends in its options; the schema marks come on top of any
+        // the caller set.
+        let emitted = buf.split_off(start);
+        buf.push_str(&emitted.replace(
+            ", options).await",
+            &format!(", options.with_unreliable({unreliable})).await"),
+        ));
+    }
+}
+
+fn emit_client_method(runtime_path: &str, service: &Service, method: &Method, buf: &mut String) {
     let path = path_const_expr(service, method);
-    buf.push_str(&format!("    /// Calls the `{}` RPC.\n", method.proto_name));
+    buf.push_str(&format!(
+        "    /// Calls the `{}` RPC.\n{}",
+        method.proto_name,
+        unreliable_docs(method)
+    ));
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
             "    pub async fn {}(&self) -> ::core::result::Result<{runtime_path}::client::BidirectionalCall<{}, {}>, {runtime_path}::Error> {{\n        self.{}_with_options(self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with explicit call options.\n    pub async fn {}_with_options(&self, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::BidirectionalCall<{}, {}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming(&self.transport, {path}, options).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream.\n    pub async fn {}_from_stream(&self, requests: {runtime_path}::BoxStream<{}>) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        self.{}_from_stream_with_options(requests, self.default_options.clone()).await\n    }}\n\n    /// Calls the `{}` RPC with a caller-provided request stream and explicit call options.\n    pub async fn {}_from_stream_with_options(&self, requests: {runtime_path}::BoxStream<{}>, options: {runtime_path}::client::CallOptions) -> ::core::result::Result<{runtime_path}::client::ResponseStream<{}>, {runtime_path}::Error> {{\n        {runtime_path}::client::bidirectional_streaming_from_stream(&self.transport, {path}, requests, options).await\n    }}\n\n",
@@ -937,6 +1203,34 @@ fn generate_registration_method(
     method: &Method,
     buf: &mut String,
 ) {
+    let start = buf.len();
+    emit_registration_method(runtime_path, service, method, buf);
+    if let Some(unreliable) = unreliable_expr(runtime_path, method) {
+        // Streaming routes register through `route_streaming_envelope_with_context`; the options
+        // variant takes the marks as one more argument before the handler.
+        let emitted = buf.split_off(start);
+        buf.push_str(
+            &emitted
+                .replace(
+                    "route_streaming_envelope_with_context(",
+                    "route_streaming_envelope_with_options(",
+                )
+                .replace(
+                    ", move |context,",
+                    &format!(
+                        ", {runtime_path}::server::RouteOptions::new().with_unreliable({unreliable}), move |context,"
+                    ),
+                ),
+        );
+    }
+}
+
+fn emit_registration_method(
+    runtime_path: &str,
+    service: &Service,
+    method: &Method,
+    buf: &mut String,
+) {
     let path = path_const_expr(service, method);
     if method.client_streaming && method.server_streaming {
         buf.push_str(&format!(
@@ -962,11 +1256,7 @@ fn generate_registration_method(
 }
 
 fn service_path(service: &Service) -> String {
-    if service.package.is_empty() {
-        service.proto_name.clone()
-    } else {
-        format!("{}.{}", service.package, service.proto_name)
-    }
+    qualified_service_name(&service.package, &service.proto_name)
 }
 
 fn package_file_name(package: &str, suffix: &str) -> String {
@@ -1053,7 +1343,7 @@ mod tests {
         to_rust_method_name, to_snake_case,
     };
 
-    use super::Method;
+    use super::{Method, MethodMarks};
 
     #[test]
     fn builds_proto_service_paths() {
@@ -1100,6 +1390,7 @@ mod tests {
                 output_type: "HelloReply".to_owned(),
                 client_streaming: false,
                 server_streaming: false,
+                unreliable: MethodMarks::default(),
             }],
         };
         let mut generated = String::new();
@@ -1126,6 +1417,7 @@ mod tests {
                 output_type: "HelloReply".to_owned(),
                 client_streaming: false,
                 server_streaming: false,
+                unreliable: MethodMarks::default(),
             }],
         };
         let mut generated = String::new();
@@ -1157,6 +1449,7 @@ mod tests {
                 output_type: "HelloReply".to_owned(),
                 client_streaming: false,
                 server_streaming: false,
+                unreliable: MethodMarks::default(),
             }],
         };
         let mut generated = String::new();
@@ -1180,6 +1473,7 @@ mod tests {
                     output_type: "HelloReply".to_owned(),
                     client_streaming: false,
                     server_streaming: true,
+                    unreliable: MethodMarks::default(),
                 },
                 Method {
                     name: "lots_of_greetings".to_owned(),
@@ -1188,6 +1482,7 @@ mod tests {
                     output_type: "HelloReply".to_owned(),
                     client_streaming: true,
                     server_streaming: false,
+                    unreliable: MethodMarks::default(),
                 },
                 Method {
                     name: "bidi_hello".to_owned(),
@@ -1196,6 +1491,7 @@ mod tests {
                     output_type: "HelloReply".to_owned(),
                     client_streaming: true,
                     server_streaming: true,
+                    unreliable: MethodMarks::default(),
                 },
             ],
         };

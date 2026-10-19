@@ -194,3 +194,52 @@ export function chunked(bytes, size) {
   }
   return chunks;
 }
+
+/**
+ * The `datagrams` object of a fake WebTransport session. `push(bytes)` delivers a datagram to the
+ * client; datagrams the client writes are collected in `sent` and passed to `onSend`. `gate` holds
+ * back writes while it is a pending promise, and `failWrites` makes them fail.
+ */
+export function fakeDatagrams({ maxDatagramSize, outgoingHighWaterMark = 16 } = {}) {
+  let controller;
+  const datagrams = {
+    readable: new ReadableStream(
+      {
+        start(readableController) {
+          controller = readableController;
+        },
+      },
+      { highWaterMark: 1000 },
+    ),
+    sent: [],
+    writables: 0,
+    gate: /** @type {Promise<unknown> | undefined} */ (undefined),
+    onSend: undefined,
+    failWrites: false,
+    createWritable() {
+      datagrams.writables += 1;
+      return new WritableStream(
+        {
+          async write(chunk) {
+            if (datagrams.gate !== undefined) {
+              await datagrams.gate;
+            }
+            if (datagrams.failWrites) {
+              throw new Error("datagram write failed");
+            }
+            datagrams.sent.push(chunk);
+            datagrams.onSend?.(chunk);
+          },
+        },
+        { highWaterMark: outgoingHighWaterMark },
+      );
+    },
+    push(bytes) {
+      controller.enqueue(bytes);
+    },
+  };
+  if (maxDatagramSize !== undefined) {
+    datagrams.maxDatagramSize = maxDatagramSize;
+  }
+  return datagrams;
+}

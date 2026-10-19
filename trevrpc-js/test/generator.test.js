@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -165,6 +165,103 @@ test("protoc runs the plugin and its output works against the runtime", async ()
 
   const types = await readFile(new URL("interop.trevrpc.d.ts", output), "utf8");
   assert.match(types, /from "@trevrpc\/trevrpc-js";/);
+});
+
+test("the generator reads the trevrpc.method option into the method descriptors", () => {
+  const request = greeterRequest();
+  const [unary, serverStream, clientStream, bidi] = request.protoFile[0].service[0].method;
+  assert.equal(unary.name, "SayHello");
+  unary.options = { trevrpcMethod: {} };
+  serverStream.options = { trevrpcMethod: { unreliableResponses: true } };
+  clientStream.options = { trevrpcMethod: { unreliableRequests: true } };
+  bidi.options = { trevrpcMethod: { unreliableRequests: true, unreliableResponses: true } };
+
+  const js = fileContent(generate(request), "hello/v1/greeter.trevrpc.js");
+  const service = JSON.parse(
+    js.slice(js.indexOf("Object.freeze(") + 14, js.indexOf(");\n\n/** Client")),
+  );
+  const flags = Object.fromEntries(
+    Object.entries(service.methods).map(([name, method]) => [
+      name,
+      [method.unreliableRequests, method.unreliableResponses],
+    ]),
+  );
+  assert.deepEqual(flags, {
+    sayHello: [undefined, undefined],
+    lotsOfReplies: [undefined, true],
+    lotsOfGreetings: [true, undefined],
+    bidiHello: [true, true],
+  });
+});
+
+test("the option is rejected on a direction that does not stream", () => {
+  const requests = "unreliable_requests requires a client-streaming or bidirectional method";
+  const responses = "unreliable_responses requires a server-streaming or bidirectional method";
+  const cases = [
+    { name: "SayHello", kind: {}, flags: { unreliableRequests: true }, message: requests },
+    { name: "SayHello", kind: {}, flags: { unreliableResponses: true }, message: responses },
+    {
+      name: "LotsOfReplies",
+      kind: { serverStreaming: true },
+      flags: { unreliableRequests: true },
+      message: requests,
+    },
+    {
+      name: "LotsOfGreetings",
+      kind: { clientStreaming: true },
+      flags: { unreliableResponses: true },
+      message: responses,
+    },
+  ];
+  for (const { name, kind, flags, message } of cases) {
+    const request = greeterRequest();
+    request.protoFile[0].service[0].method = [
+      method(name, { ...kind, options: { trevrpcMethod: flags } }),
+    ];
+    assert.equal(generate(request).error, `hello.v1.Greeter.${name}: ${message}`, name);
+  }
+});
+
+test("protoc passes the trevrpc.method option through to the generated descriptor", async () => {
+  const output = new URL("build/test-generated-unreliable/", packageRoot);
+  await rm(output, { recursive: true, force: true });
+  await mkdir(output, { recursive: true });
+  const protoc = (...files) =>
+    run("protoc", [
+      `--plugin=protoc-gen-trevrpc-js=${fileURLToPath(new URL("bin/protoc-gen-trevrpc-js.js", packageRoot))}`,
+      `--trevrpc-js_out=${fileURLToPath(output)}`,
+      `--proto_path=${fileURLToPath(new URL("../interop/proto", packageRoot))}`,
+      `--proto_path=${fileURLToPath(new URL("../proto", packageRoot))}`,
+      `--proto_path=${fileURLToPath(output)}`,
+      ...files,
+    ]);
+
+  await protoc("unreliable.proto");
+  const generated = await import(
+    pathToFileURL(fileURLToPath(output) + "unreliable.trevrpc.js").href
+  );
+  const method = generated.UnreliableEchoService.methods.bidi;
+  assert.equal(method.kind, "bidirectionalStreaming");
+  assert.equal(method.unreliableRequests, true);
+  assert.equal(method.unreliableResponses, true);
+
+  // A misplaced flag fails protoc with the generator's message.
+  await writeFile(
+    new URL("misuse.proto", output),
+    `syntax = "proto3";
+package misuse.v1;
+import "trevrpc/options.proto";
+message M {}
+service S {
+  rpc Unary(M) returns (M) { option (trevrpc.method) = {unreliable_responses: true}; }
+}
+`,
+  );
+  await assert.rejects(protoc("misuse.proto"), (error) =>
+    error.stderr.includes(
+      "misuse.v1.S.Unary: unreliable_responses requires a server-streaming or bidirectional method",
+    ),
+  );
 });
 
 test("runGenerator reports errors in the plugin response", () => {

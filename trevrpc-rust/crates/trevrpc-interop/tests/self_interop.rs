@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_trevrpc-interop-rust");
-const SCENARIOS: [&str; 11] = [
+const SCENARIOS: [&str; 12] = [
     "unary",
     "unary-metadata",
     "unary-error",
@@ -21,6 +21,7 @@ const SCENARIOS: [&str; 11] = [
     "bidi-error",
     "unary-headers",
     "server-stream-headers",
+    "unreliable",
 ];
 
 /// A running `server` subcommand with its certificate.
@@ -140,10 +141,18 @@ fn number(json: &str, name: &str) -> f64 {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn bench_reports_every_scenario_over_both_transports() {
     let server = Server::start("bench");
     for (transport, name, metadata_size) in [("quic", "quic", "0"), ("tcp", "qmux", "1024")] {
-        for scenario in ["unary", "server-stream", "client-stream", "bidi"] {
+        for scenario in [
+            "unary",
+            "server-stream",
+            "client-stream",
+            "bidi",
+            "unreliable-server-stream",
+            "unreliable-client-stream",
+        ] {
             let output = server.run(
                 "bench",
                 &[
@@ -200,7 +209,16 @@ fn bench_reports_every_scenario_over_both_transports() {
             } else {
                 1.0
             };
-            assert_close(number(json, "msgs"), ops * per_op, 1e-9, json);
+            let lost = number(json, "lost");
+            if scenario.starts_with("unreliable") && transport == "quic" {
+                // Datagram messages may be lost, but each is either delivered or counted as lost.
+                assert_close(number(json, "msgs") + lost, ops * per_op, 1e-9, json);
+                assert!(number(json, "msgs") > 0.0, "{json}");
+            } else {
+                // Everything else is reliable, including unreliable methods over QMux.
+                assert_close(number(json, "msgs"), ops * per_op, 1e-9, json);
+                assert_close(lost, 0.0, 1e-9, json);
+            }
             let msgs_per_sec = number(json, "msgs_per_sec");
             assert!(msgs_per_sec > 0.0, "{json}");
             assert!(number(json, "ops_per_sec") > 0.0, "{json}");

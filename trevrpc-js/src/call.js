@@ -1,3 +1,4 @@
+import { datagramEndpoint, messageFrameSize } from "./datagram.js";
 import {
   DefaultMaxFrameSize,
   FrameReader,
@@ -123,27 +124,55 @@ export class Call {
   #pendingUploads = new Set();
   /** The transport error that made the request side fail on its own, or undefined. */
   #uploadFailure;
+  /** The call's datagram flow, or undefined if its messages all travel on the stream. */
+  #flow;
+  /** Whether request messages are sent as datagrams when they fit. */
+  #sendDatagrams = false;
+  /** Request messages of a call that uses datagrams, queued for the flush loop, in order. */
+  #unsent = [];
+  /** Settles when the flush loop has sent everything queued so far. */
+  #sendTail = Promise.resolve();
+  #flushing = false;
 
   /**
    * Opens a stream on the transport and sends the REQUEST frame. The request carries the
    * method path and kind; metadata and the wire timeout come from the options. The request
    * message of a unary or server-streaming call goes out in the same write.
+   *
+   * `datagrams` is `{ send, receive }` for a method that marks a direction unreliable: the call
+   * gets a datagram flow if the session that carries it has datagrams, which is only known once
+   * its stream is open, so the REQUEST is encoded after that. `send` makes it send request
+   * messages as datagrams, `receive` makes it accept response datagrams.
    */
-  static async open(transport, request, message, options) {
-    const header = encodeRequestFrame(
-      { ...request, metadata: options.metadata, ...timeoutField(options) },
-      message,
-      options.maxFrameSize,
-    );
+  static async open(transport, request, message, options, datagrams) {
+    const fields = { ...request, metadata: options.metadata, ...timeoutField(options) };
+    const header =
+      datagrams === undefined ? encodeRequestFrame(fields, message, options.maxFrameSize) : null;
     const scope = new CallScope(options);
+    let call;
     try {
-      const stream = await openStream(transport, scope.signal);
-      const call = new Call(stream, scope, options.maxFrameSize);
-      await call.#write(header);
+      const session = datagrams === undefined ? undefined : {};
+      const stream = await openStream(transport, scope.signal, session);
+      call = new Call(stream, scope, options.maxFrameSize);
+      await call.#write(header ?? call.#requestWithFlow(fields, message, session, datagrams));
       return call;
     } catch (error) {
+      if (call !== undefined) {
+        call.#releaseFlow();
+      }
       throw scope.abort(failureStatus(error));
     }
+  }
+
+  /** Opens the call's flow on its session, if it has datagrams, and encodes the REQUEST. */
+  #requestWithFlow(fields, message, session, { send, receive }) {
+    this.#flow = datagramEndpoint(session.datagrams)?.openFlow({ receive });
+    this.#sendDatagrams = this.#flow !== undefined && send;
+    return encodeRequestFrame(
+      this.#flow === undefined ? fields : { ...fields, datagramFlow: this.#flow.id },
+      message,
+      this.#maxFrameSize,
+    );
   }
 
   constructor(stream, scope, maxFrameSize) {
@@ -183,9 +212,21 @@ export class Call {
     return this.#uploadEnded === undefined && !this.#closeCompleted;
   }
 
+  /** The largest frame the call accepts and sends, in bytes. */
+  get maxFrameSize() {
+    return this.#maxFrameSize;
+  }
+
+  /** The call's datagram flow, or undefined if its messages all travel on the stream. */
+  get flow() {
+    return this.#flow;
+  }
+
   /**
    * Sends one streaming request message; writes are ordered and apply backpressure. Fails with
    * the error that ended the upload, if any, even while the transport itself is still blocked.
+   * On a call that sends datagrams the message goes out as one if it fits, and on the stream
+   * otherwise.
    */
   sendMessage(body) {
     if (this.#uploadEnded !== undefined) {
@@ -194,7 +235,73 @@ export class Call {
     if (this.#sendClosed) {
       return Promise.reject(failedPrecondition("request stream is closed"));
     }
+    if (this.#sendDatagrams) {
+      return this.#upload(
+        new Promise((resolve, reject) => {
+          this.#unsent.push({ body, resolve, reject });
+          if (!this.#flushing) {
+            this.#flushing = true;
+            // Messages sent in the same turn are packed together; nothing waits for a timer.
+            this.#sendTail = Promise.resolve().then(() => this.#flush());
+          }
+        }),
+      );
+    }
     return this.#write(encodeMessageFrame(body, this.#maxFrameSize));
+  }
+
+  /**
+   * Sends the queued request messages in order: as many as fit into one datagram go together, a
+   * message that cannot be a datagram goes on the stream, and so does every message of a datagram
+   * that failed to send. Messages queued while a datagram waits for send-buffer space join the
+   * next one.
+   */
+  async #flush() {
+    let inFlight = [];
+    try {
+      while (this.#unsent.length > 0) {
+        if (this.#uploadEnded !== undefined) {
+          throw this.#uploadEnded;
+        }
+        inFlight = this.#takeBatch();
+        if (inFlight.length === 0 || !(await this.#flow.send(inFlight.map(bodyOf), this.signal))) {
+          // Not a datagram: a head message that never fits, or a datagram that failed to send.
+          inFlight = inFlight.length > 0 ? inFlight : [this.#unsent.shift()];
+          for (const { body } of inFlight) {
+            await this.#writer.write(encodeMessageFrame(body, this.#maxFrameSize));
+          }
+        }
+        for (const item of inFlight) {
+          item.resolve();
+        }
+        inFlight = [];
+      }
+    } catch (error) {
+      for (const item of [...inFlight, ...this.#unsent.splice(0)]) {
+        item.reject(error);
+      }
+    } finally {
+      this.#flushing = false;
+    }
+  }
+
+  /**
+   * Removes the longest run of queued messages from the front that fits one datagram, at least
+   * one if the head fits alone; empty if the head can only go on the stream.
+   */
+  #takeBatch() {
+    let room = this.#flow.frameRoom;
+    let count = 0;
+    while (count < this.#unsent.length) {
+      const { body } = this.#unsent[count];
+      const size = messageFrameSize(body);
+      if (body.byteLength > this.#maxFrameSize || size > room) {
+        break;
+      }
+      room -= size;
+      count += 1;
+    }
+    return this.#unsent.splice(0, count);
   }
 
   /** Finishes the request stream gracefully. */
@@ -203,7 +310,11 @@ export class Call {
       return Promise.resolve();
     }
     this.#sendClosed = true;
-    return this.#upload(this.#writer.close()).then(() => {
+    // Datagram sends in flight go first, so the stream does not end before them.
+    const closing = this.#sendDatagrams
+      ? this.#sendTail.then(() => this.#writer.close())
+      : this.#writer.close();
+    return this.#upload(closing).then(() => {
       this.#closeCompleted = true;
     });
   }
@@ -224,6 +335,7 @@ export class Call {
    */
   finish(uploadError) {
     this.#scope.settle();
+    this.#releaseFlow();
     this.#endUpload(uploadError, cancelled("RPC completed"));
     this.#frames.expectEnd(this.#maxFrameSize).catch(() => this.#cancelReader().catch(() => {}));
   }
@@ -250,12 +362,12 @@ export class Call {
     return new Promise((resolve, reject) => {
       this.#pendingUploads.add(reject);
       operation.then(
-        () => {
+        (value) => {
           this.#pendingUploads.delete(reject);
           if (this.signal.aborted) {
             reject(this.signal.reason);
           } else {
-            resolve();
+            resolve(value);
           }
         },
         (error) => {
@@ -305,14 +417,25 @@ export class Call {
     return result;
   }
 
+  /** Ends the datagram flow, if any; every way a call ends gets here. */
+  #releaseFlow() {
+    this.#flow?.release();
+  }
+
   #teardown() {
+    this.#releaseFlow();
     const reason = this.signal.reason;
     this.#endUpload(reason);
     this.#cancelReader(reason).catch(() => {});
   }
 }
 
-function openStream(transport, signal) {
+/**
+ * Opens a bidirectional stream. A call that may use datagrams passes `session`, which receives the
+ * datagram object of the session that opened the stream, so the flow belongs to the connection
+ * that carries the call and not to one a reconnect swapped in later.
+ */
+function openStream(transport, signal, session) {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
       reject(signal.reason);
@@ -323,7 +446,7 @@ function openStream(transport, signal) {
 
     let opening;
     try {
-      opening = Promise.resolve(transport.createBidirectionalStream());
+      opening = Promise.resolve(startStream(transport, session));
     } catch (error) {
       opening = Promise.reject(error);
     }
@@ -344,6 +467,25 @@ function openStream(transport, signal) {
       },
     );
   });
+}
+
+function bodyOf(item) {
+  return item.body;
+}
+
+function startStream(transport, session) {
+  if (session === undefined) {
+    return transport.createBidirectionalStream();
+  }
+  if (typeof transport.createBidirectionalStreamWithDatagrams === "function") {
+    return transport.createBidirectionalStreamWithDatagrams().then(({ stream, datagrams }) => {
+      session.datagrams = datagrams;
+      return stream;
+    });
+  }
+  // A WebTransport session used directly: its datagrams belong to the stream opened right now.
+  session.datagrams = transport.datagrams;
+  return transport.createBidirectionalStream();
 }
 
 function throwIfAborted(signal) {

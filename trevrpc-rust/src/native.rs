@@ -6,13 +6,14 @@ use bytes::Bytes;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
+use crate::datagram::Demux;
 use crate::framed::{self, FrameRead};
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::serve::{drain_streams, log_task_error};
 use crate::server::Server;
 use crate::server_transport::{
-    self, IncomingRequest, Permit, ResponseWriter, reject_unreadable, try_acquire_permit,
+    self, IncomingRequest, Permit, ResponseWriter, open_flow, reject_unreadable, try_acquire_permit,
 };
 use crate::{ResponseFrame, Result};
 
@@ -101,6 +102,13 @@ pub async fn handle_connection<C: MuxConnection>(
         .max_concurrent_streams_per_connection()
         .map(|limit| Arc::new(Semaphore::new(limit)));
     let mut stream_tasks = JoinSet::new();
+    let demux = connection.datagrams().map(|transport| {
+        Arc::new(Demux::server(
+            transport,
+            server.options().max_concurrent_streams_per_connection(),
+            server.max_frame_size(),
+        ))
+    });
 
     loop {
         if *shutdown.borrow() {
@@ -129,6 +137,7 @@ pub async fn handle_connection<C: MuxConnection>(
                 stream_tasks.spawn(handle_stream(
                     server,
                     stream_connection,
+                    demux.clone(),
                     request_limit,
                     stream_permit,
                     send,
@@ -159,12 +168,13 @@ pub async fn handle_connection<C: MuxConnection>(
     }
 }
 
-/// Reads the initial request frame, replying with its failure status when it is unusable. The
-/// stream slot is released before that reply.
+/// Reads the initial request frame and opens its datagram flow on `demux`, replying with the
+/// failure status when either fails. The stream slot is released before that reply.
 async fn read_request<C: MuxConnection>(
     server: &Server,
     stream_permit: &mut Permit,
     connection: C,
+    demux: Option<&Demux>,
     send: C::SendStream,
     recv: C::RecvStream,
 ) -> Option<(
@@ -174,7 +184,10 @@ async fn read_request<C: MuxConnection>(
 )> {
     let max_frame_size = server.max_frame_size();
     let mut recv = NativePumpReader::new(recv, connection);
-    match server_transport::read_initial_request(server, &mut recv.recv).await {
+    let incoming = server_transport::read_initial_request(server, &mut recv.recv)
+        .await
+        .and_then(|mut incoming| open_flow(demux, &mut incoming).map(|()| incoming));
+    match incoming {
         Ok(incoming) => Some((
             NativeResponseWriter::new(send, max_frame_size),
             recv,
@@ -194,17 +207,26 @@ async fn read_request<C: MuxConnection>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream<C: MuxConnection>(
     server: Server,
     connection: C,
+    demux: Option<Arc<Demux>>,
     request_limit: Option<Arc<Semaphore>>,
     mut stream_permit: Permit,
     send: C::SendStream,
     recv: C::RecvStream,
     shutdown: watch::Receiver<bool>,
 ) {
-    if let Some((send, recv, incoming)) =
-        read_request(&server, &mut stream_permit, connection, send, recv).await
+    if let Some((send, recv, incoming)) = read_request(
+        &server,
+        &mut stream_permit,
+        connection,
+        demux.as_deref(),
+        send,
+        recv,
+    )
+    .await
     {
         server_transport::handle_stream(
             server,
@@ -227,7 +249,7 @@ async fn reject_stream<C: MuxConnection>(
 ) {
     let mut no_permit = Permit::none();
     if let Some((send, recv, incoming)) =
-        read_request(&server, &mut no_permit, connection, send, recv).await
+        read_request(&server, &mut no_permit, connection, None, send, recv).await
     {
         server_transport::reject_stream(server, send, recv, incoming).await;
     }

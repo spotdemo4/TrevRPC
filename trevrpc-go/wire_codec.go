@@ -21,6 +21,7 @@ const (
 	requestKindField       protowire.Number = 5
 	requestTimeoutField    protowire.Number = 7
 	requestExtensionsField protowire.Number = 8
+	requestDatagramField   protowire.Number = 9
 	headersMetadataField   protowire.Number = 1
 	headersExtensionsField protowire.Number = 2
 	statusCodeField        protowire.Number = 1
@@ -116,6 +117,9 @@ func (m *wireRequest) payloadSize() (int, bool) {
 	if m.TimeoutNanos != 0 {
 		size += protowire.SizeTag(requestTimeoutField) + protowire.SizeVarint(m.TimeoutNanos)
 	}
+	if m.DatagramFlow != 0 {
+		size += protowire.SizeTag(requestDatagramField) + protowire.SizeVarint(m.DatagramFlow)
+	}
 	return size + packedVarintsFieldSize(requestExtensionsField, m.Extensions), true
 }
 
@@ -135,7 +139,12 @@ func (m *wireRequest) appendPayload(b []byte) []byte {
 		b = protowire.AppendTag(b, requestTimeoutField, protowire.VarintType)
 		b = protowire.AppendVarint(b, m.TimeoutNanos)
 	}
-	return appendPackedVarints(b, requestExtensionsField, m.Extensions)
+	b = appendPackedVarints(b, requestExtensionsField, m.Extensions)
+	if m.DatagramFlow != 0 {
+		b = protowire.AppendTag(b, requestDatagramField, protowire.VarintType)
+		b = protowire.AppendVarint(b, m.DatagramFlow)
+	}
+	return b
 }
 
 func (m *wireHeaders) payloadSize() (int, bool) {
@@ -269,8 +278,15 @@ func (m *wireRequest) decodeFast(b []byte) bool {
 			}
 			m.TimeoutNanos = value
 			b = b[n:]
+		case num == requestDatagramField && typ == protowire.VarintType:
+			value, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return false
+			}
+			m.DatagramFlow = value
+			b = b[n:]
 		case num == requestMethodField || num == requestMetadataField || num == requestKindField ||
-			num == requestTimeoutField || num == requestExtensionsField:
+			num == requestTimeoutField || num == requestExtensionsField || num == requestDatagramField:
 			// A known field of an unexpected wire type, or the extension
 			// list: both are left to the reflective decoder.
 			return false

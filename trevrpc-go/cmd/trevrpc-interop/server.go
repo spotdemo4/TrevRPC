@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
+	"strconv"
 	"strings"
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
@@ -54,7 +57,7 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 	return listener.Serve(ctx)
 }
 
-// newServer binds a listener for the Echo service. Every browser session is
+// newServer binds a listener for the Echo and UnreliableEcho services. Every browser session is
 // admitted because browsers connect from arbitrary origins. Streams are not
 // limited in messages or bytes, because bench/README.md keeps one Bidi stream
 // open for a whole run.
@@ -68,6 +71,7 @@ func newServer(addr string, tlsConfig *tls.Config) (*trevrpc.Listener, error) {
 	options.MaxStreamBodySize = -1
 	server.SetOptions(options)
 	interoppb.RegisterEchoServer(server, echoServer{})
+	interoppb.RegisterUnreliableEchoServer(server, unreliableEchoServer{})
 	return trevrpc.Listen(addr, server, trevrpc.ListenOptions{TLSConfig: tlsConfig})
 }
 
@@ -186,3 +190,74 @@ func (s *bidiEcho) Recv() (*interoppb.EchoResponse, error) {
 }
 
 func (s *bidiEcho) Close() error { return s.requests.Close() }
+
+// Trailing metadata keys of UnreliableEcho.Bidi.
+const (
+	receivedKey          = "interop-received"
+	datagramsReceivedKey = "interop-datagrams-received"
+)
+
+// unreliableEchoServer implements UnreliableEcho in interop/README.md.
+type unreliableEchoServer struct{}
+
+func (unreliableEchoServer) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
+	stream := &unreliableEcho{ctx: ctx, requests: requests}
+	if headers, _ := headerMetadata(ctx); headers != nil {
+		return trevrpc.WithResponseHeaders[*interoppb.EchoResponse](stream, headers), nil
+	}
+	return stream, nil
+}
+
+// unreliableEcho answers each request with request.count echoes, in order, and
+// ends with the number of requests received, and how many of them arrived as
+// datagrams, in its trailing metadata.
+type unreliableEcho struct {
+	ctx      context.Context
+	requests trevrpc.MessageStream[*interoppb.EchoRequest]
+	current  *interoppb.EchoRequest
+	sent     uint32
+	received int
+	terminal *trevrpc.Status
+}
+
+func (s *unreliableEcho) Recv() (*interoppb.EchoResponse, error) {
+	for {
+		if s.current != nil && s.sent < s.current.Count {
+			response := &interoppb.EchoResponse{Message: s.current.Message, Index: s.sent}
+			s.sent++
+			return response, nil
+		}
+		request, err := s.requests.Recv()
+		if errors.Is(err, io.EOF) {
+			s.terminal = trevrpc.OK().WithMetadata(s.trailers())
+			return nil, io.EOF
+		}
+		if err != nil {
+			return nil, err
+		}
+		s.received++
+		s.current, s.sent = request, 0
+	}
+}
+
+// trailers returns the trailing metadata of a request stream that ended.
+func (s *unreliableEcho) trailers() trevrpc.Metadata {
+	var datagrams int64
+	if info, ok := trevrpc.HandlerContextFromContext(s.ctx); ok {
+		datagrams = info.RequestDatagrams()
+	}
+	trailers := trevrpc.Metadata{
+		receivedKey:          []byte(strconv.Itoa(s.received)),
+		datagramsReceivedKey: []byte(strconv.FormatInt(datagrams, 10)),
+	}
+	if _, answer := headerMetadata(s.ctx); answer != nil {
+		maps.Copy(trailers, answer)
+	}
+	return trailers
+}
+
+func (s *unreliableEcho) TerminalStatus() (*trevrpc.Status, bool) {
+	return s.terminal, s.terminal != nil
+}
+
+func (s *unreliableEcho) Close() error { return s.requests.Close() }

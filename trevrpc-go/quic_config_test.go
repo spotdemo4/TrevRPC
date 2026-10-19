@@ -33,8 +33,11 @@ func TestServerQUICConfigDerivesLimitsFromServerOptions(t *testing.T) {
 	if config.MaxIncomingUniStreams != -1 {
 		t.Fatalf("native-only listeners should refuse unidirectional streams, got %d", config.MaxIncomingUniStreams)
 	}
-	if config.Allow0RTT || config.EnableDatagrams {
-		t.Fatalf("unexpected 0-RTT or datagram support: %+v", config)
+	if config.Allow0RTT || !config.EnableDatagrams {
+		t.Fatalf("native listeners accept datagram messages and never 0-RTT: %+v", config)
+	}
+	if client := clientQUICConfig(nil, DefaultMaxFrameSize); !client.EnableDatagrams {
+		t.Fatalf("clients must enable datagrams: %+v", client)
 	}
 
 	options.EnableWebTransport = true

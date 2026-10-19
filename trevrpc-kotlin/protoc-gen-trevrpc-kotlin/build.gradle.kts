@@ -93,6 +93,12 @@ tasks.test {
             .asFile,
     )
     systemProperty(
+        "trevrpc.options.proto.root",
+        rootProject.layout.projectDirectory
+            .dir("../proto")
+            .asFile,
+    )
+    systemProperty(
         "trevrpc.kotlin.plugin",
         layout.buildDirectory
             .file("install/protoc-gen-trevrpc-kotlin/bin/protoc-gen-trevrpc-kotlin")

@@ -9,7 +9,7 @@ import { runScenarios } from "../interop-browser/scenarios.js";
 import { encodeMessageFrame } from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { createEchoHandler, echoHandler } from "./echo-server.js";
-import { fakeTransport } from "./support.js";
+import { fakeDatagrams, fakeTransport } from "./support.js";
 
 const cli = fileURLToPath(new URL("../interop-browser/cli.js", import.meta.url));
 const pageBundle = new URL("../build/interop/page.js", import.meta.url);
@@ -24,7 +24,8 @@ function withWebTransport(handler, body) {
       this.options = options;
       this.ready = Promise.resolve();
       this.closed = new Promise(() => {});
-      this.streams = fakeTransport(handler);
+      this.datagrams = fakeDatagrams();
+      this.streams = fakeTransport((stream) => handler(stream, this));
       sessions.push(this);
     }
 
@@ -91,6 +92,30 @@ test("scenarios fail individually when the server misbehaves", () =>
       }
     },
   ));
+
+test("the unreliable scenario needs datagrams on WebTransport", async () => {
+  class NoDatagramsWebTransport {
+    ready = Promise.resolve();
+    closed = new Promise(() => {});
+    streams = fakeTransport(echoHandler);
+    close() {}
+    createBidirectionalStream() {
+      return this.streams.createBidirectionalStream();
+    }
+  }
+  globalThis.WebTransport = NoDatagramsWebTransport;
+  try {
+    const results = await runScenarios({ url });
+    const failed = results.filter((result) => !result.ok);
+    assert.deepEqual(
+      failed.map((result) => result.name),
+      ["unreliable"],
+    );
+    assert.match(failed[0].reason, /the server received no request as a datagram/);
+  } finally {
+    delete globalThis.WebTransport;
+  }
+});
 
 test("a server that cannot be reached fails every scenario", async () => {
   const results = await runScenarios({ url });

@@ -1,4 +1,5 @@
 import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
+import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
 // only needs the web platform, so it runs unchanged in a browser bundle and under Node tests.
 import { Code, TrevRpcError, codeName, connect } from "../src/index.js";
@@ -6,6 +7,14 @@ import { ScenarioNames } from "./names.js";
 
 const DeadlineMs = 10_000;
 
+/** The `unreliable` scenario sends this many short requests, then one that cannot be a datagram. */
+const UnreliableShortRequests = 50;
+const UnreliableLargeSize = 4096;
+
+/**
+ * Scenarios take the Echo client and a context: `unreliable` is the UnreliableEcho client and
+ * `transport` the transport ("webtransport" or "websocket") the channel connected over.
+ */
 const scenarios = {
   async unary(echo) {
     expectEcho(await echo.unary({ message: "hello" }), "hello", 0);
@@ -118,6 +127,70 @@ const scenarios = {
     expect(status.code === Code.Ok, "stream did not end with OK");
     expectMetadata(status.metadata, { "interop-trailer": "h" }, "trailing metadata");
   },
+
+  async unreliable(_echo, { unreliable, transport }) {
+    const call = await unreliable.bidi();
+    const requests = Array.from({ length: UnreliableShortRequests }, (_, index) => String(index));
+    requests.push("x".repeat(UnreliableLargeSize));
+
+    // Responses are read while the requests go out, so they are not dropped for a full queue.
+    const reading = (async () => {
+      const received = [];
+      for await (const response of call) {
+        received.push(response.message);
+      }
+      return received;
+    })();
+    // A failed send is reported through the responses too; do not leave that rejection unhandled.
+    reading.catch(() => {});
+    for (const message of requests) {
+      await call.send({ message, count: 1 });
+    }
+    await call.closeSend();
+    const received = await reading;
+    const status = await call.status;
+    expect(status.code === Code.Ok, "stream did not end with OK");
+
+    const sent = new Set(requests);
+    const seen = new Set();
+    for (const message of received) {
+      expect(
+        sent.has(message),
+        `received a response that was never requested: ${summarize(message)}`,
+      );
+      expect(!seen.has(message), `received the response ${summarize(message)} twice`);
+      seen.add(message);
+    }
+    expect(seen.has(requests.at(-1)), "the large response is missing");
+
+    const metadata = Object.fromEntries(
+      ["interop-received", "interop-datagrams-received"].map((key) => [
+        key,
+        Number(new TextDecoder().decode(status.metadata[key] ?? new Uint8Array())),
+      ]),
+    );
+    const total = requests.length;
+    if (transport === "webtransport") {
+      expect(
+        metadata["interop-received"] >= 1 && metadata["interop-received"] <= total,
+        `interop-received ${metadata["interop-received"]}, want 1 to ${total}`,
+      );
+      expect(
+        metadata["interop-datagrams-received"] >= 1,
+        "the server received no request as a datagram",
+      );
+    } else {
+      expect(received.length === total, `received ${received.length} responses, want ${total}`);
+      expect(
+        metadata["interop-received"] === total,
+        `interop-received ${metadata["interop-received"]}, want ${total}`,
+      );
+      expect(
+        metadata["interop-datagrams-received"] === 0,
+        `interop-datagrams-received ${metadata["interop-datagrams-received"]}, want 0`,
+      );
+    }
+  },
 };
 
 /** The channel transports each interop lane allows. */
@@ -175,9 +248,15 @@ export async function runScenarios({
 
   try {
     const echo = new EchoClient(channel, { timeoutMs: DeadlineMs });
+    const context = {
+      unreliable: new UnreliableEchoClient(channel, { timeoutMs: DeadlineMs }),
+      get transport() {
+        return channel.transport;
+      },
+    };
     for (const name of ScenarioNames) {
       try {
-        await scenarios[name](echo);
+        await scenarios[name](echo, context);
         report(name);
       } catch (error) {
         report(name, error);
@@ -243,8 +322,12 @@ async function expectStatus(code, message, operation) {
 }
 
 function summary(message, index) {
+  return `(${summarize(message)}, ${index})`;
+}
+
+function summarize(message) {
   const text = String(message);
-  return `(${text.length > 16 ? `${text.slice(0, 16)}... [${text.length} chars]` : text}, ${index})`;
+  return text.length > 16 ? `${text.slice(0, 16)}... [${text.length} chars]` : text;
 }
 
 /** A single-line description of a failure. */

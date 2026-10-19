@@ -81,6 +81,7 @@ type callConfig struct {
 	metadata         Metadata
 	responseHeaders  *Metadata
 	responseMetadata *Metadata
+	unreliable       Unreliable
 }
 
 // CallOption customizes a single RPC call.
@@ -235,6 +236,11 @@ func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context,
 
 	ctx, cancel := callContext(ctx, deadline)
 	requests := newMessagePipe[Req](ctx)
+	if config.unreliable.effective(kind).Requests {
+		// Unreliable requests may share datagrams, which needs several of them
+		// ready at once; see writeRequestFrames.
+		requests = newBufferedMessagePipe[Req](ctx, maxMessageFrameBatch)
+	}
 	response, err := transport.streamingCall(ctx, rpcRequest, newEncodeStream(requests))
 	if err != nil {
 		cancel()
@@ -343,6 +349,7 @@ func prepareClientRequest(method string, kind RPCKind, config callConfig, deadli
 		Metadata:     metadata,
 		Kind:         kind,
 		TimeoutNanos: deadlineTimeoutNanos(deadline, now),
+		unreliable:   config.unreliable,
 	}, nil
 }
 

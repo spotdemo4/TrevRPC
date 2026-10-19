@@ -13,7 +13,9 @@ use super::{RpcTransport, StreamingRpcTransport};
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
-use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
+use crate::{
+    BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
+};
 
 const EVENT_CAPACITY: usize = 32;
 const CLOSE_REASON: &[u8] = b"channel closed";
@@ -198,6 +200,10 @@ impl ChannelConfig {
     /// The configuration advertises [`crate::ALPN`] and sizes the QUIC stream windows for this
     /// configuration's maximum frame size. Native clients never accept peer-initiated streams, so
     /// those limits are zero.
+    ///
+    /// The configuration also bounds the datagrams the transport buffers for the connection's
+    /// datagram reader, which datagram messages of [`crate::Unreliable`] methods bypass flow
+    /// control for: 128 KiB, after which the oldest datagrams are dropped.
     pub fn quic_config(&self, mut tls: quinn::rustls::ClientConfig) -> Result<quinn::ClientConfig> {
         tls.alpn_protocols = vec![crate::ALPN.to_vec()];
         let crypto =
@@ -207,6 +213,7 @@ impl ChannelConfig {
         let window = crate::quic::frame_receive_window(self.max_frame_size);
         transport.stream_receive_window(crate::quic::varint(window));
         transport.receive_window(crate::quic::varint(window));
+        transport.datagram_receive_buffer_size(Some(crate::datagram::DATAGRAM_RECEIVE_BUFFER));
         transport.max_concurrent_bidi_streams(0_u8.into());
         transport.max_concurrent_uni_streams(0_u8.into());
         config.transport_config(Arc::new(transport));
@@ -396,6 +403,19 @@ impl Channel {
         self.snapshot().ok().map(|transport| transport.kind())
     }
 
+    /// Returns the current QUIC connection, or `None` while not ready or when the channel is
+    /// connected over `QMux`.
+    ///
+    /// It is for diagnostics, such as [`quinn::Connection::stats`] to see how many DATAGRAM frames
+    /// a call used. Closing it ends the channel's generation like any lost connection.
+    #[must_use]
+    pub fn quic_connection(&self) -> Option<quinn::Connection> {
+        match self.snapshot().ok()? {
+            GenerationTransport::Quic(transport) => Some(transport.connection().clone()),
+            GenerationTransport::Qmux(_) => None,
+        }
+    }
+
     /// Returns whether a connection can currently be snapshotted for a new RPC.
     #[must_use]
     pub fn is_ready(&self) -> bool {
@@ -486,6 +506,17 @@ impl StreamingRpcTransport for Channel {
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>> {
         self.snapshot()?.streaming_call(request, request_body).await
+    }
+
+    async fn streaming_call_unreliable(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        self.snapshot()?
+            .streaming_call_unreliable(request, request_body, unreliable)
+            .await
     }
 }
 

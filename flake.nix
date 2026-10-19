@@ -274,13 +274,35 @@
             wireGolden = ./testdata/wire-golden-vectors.txt;
             qmuxGolden = ./testdata/qmux-golden-vectors.txt;
             interopProto = ./interop/proto;
+            trevrpcProto = ./proto;
             licenseFile = ./LICENSE;
           in
           {
-            trevrpc-go = pkgs.callPackage ./trevrpc-go { inherit wireGolden qmuxGolden interopProto; };
-            trevrpc-js = pkgs.callPackage ./trevrpc-js { inherit wireGolden qmuxGolden interopProto; };
-            trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin { inherit wireGolden interopProto licenseFile; };
-            trevrpc-rust = pkgs.callPackage ./trevrpc-rust { inherit wireGolden interopProto; };
+            trevrpc-go = pkgs.callPackage ./trevrpc-go {
+              inherit
+                wireGolden
+                qmuxGolden
+                interopProto
+                trevrpcProto
+                ;
+            };
+            trevrpc-js = pkgs.callPackage ./trevrpc-js {
+              inherit
+                wireGolden
+                qmuxGolden
+                interopProto
+                trevrpcProto
+                ;
+            };
+            trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
+              inherit
+                wireGolden
+                interopProto
+                trevrpcProto
+                licenseFile
+                ;
+            };
+            trevrpc-rust = pkgs.callPackage ./trevrpc-rust { inherit wireGolden interopProto trevrpcProto; };
             trevrpc-interop = pkgs.callPackage ./interop/runner.nix { };
             trevrpc-bench = pkgs.callPackage ./bench/runner.nix { };
             trevrpc-bench-grpc = pkgs.callPackage ./bench/grpc-go { inherit interopProto; };

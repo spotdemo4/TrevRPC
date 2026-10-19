@@ -90,6 +90,33 @@ func newMessagePipe[T any](ctx context.Context) *messagePipe[T] {
 	return &messagePipe[T]{ctx: ctx, messages: make(chan T), done: make(chan struct{})}
 }
 
+// newBufferedMessagePipe is newMessagePipe with room for buffer messages, so
+// that a sender can run ahead of the goroutine that writes them and the writer
+// finds several messages ready at once. Messages in the buffer when the pipe
+// is closed without an error are still yielded.
+func newBufferedMessagePipe[T any](ctx context.Context, buffer int) *messagePipe[T] {
+	pipe := newMessagePipe[T](ctx)
+	pipe.messages = make(chan T, buffer)
+	return pipe
+}
+
+// readyReceiver is implemented by the streams that can hand out a message that
+// is already there without waiting.
+type readyReceiver[T any] interface {
+	// recvReady returns the next message if one is ready.
+	recvReady() (T, bool, error)
+}
+
+func (s *messagePipe[T]) recvReady() (T, bool, error) {
+	select {
+	case message := <-s.messages:
+		return message, true, nil
+	default:
+		var zero T
+		return zero, false, nil
+	}
+}
+
 // Send adds one message to the stream.
 func (s *messagePipe[T]) Send(message T) error {
 	if err := s.uploadError(); err != nil {
@@ -119,6 +146,11 @@ func (s *messagePipe[T]) Recv() (T, error) {
 		var zero T
 		if err := s.closeError(); err != nil {
 			return zero, err
+		}
+		select {
+		case message := <-s.messages:
+			return message, nil
+		default:
 		}
 		return zero, io.EOF
 	case <-s.ctx.Done():
@@ -235,6 +267,19 @@ func (s *encodeStream[T]) Recv() (encodedMessage, error) {
 	return encodeMessage(message)
 }
 
+func (s *encodeStream[T]) recvReady() (encodedMessage, bool, error) {
+	ready, ok := s.inner.(readyReceiver[T])
+	if !ok {
+		return encodedMessage{}, false, nil
+	}
+	message, ok, err := ready.recvReady()
+	if !ok || err != nil {
+		return encodedMessage{}, false, err
+	}
+	encoded, err := encodeMessage(message)
+	return encoded, err == nil, err
+}
+
 func (s *encodeStream[T]) Close() error {
 	return closeMessageStream(s.inner)
 }
@@ -311,6 +356,14 @@ func (s *contextCloseStream[T]) trevrpcContextCancelsRecv() bool { return true }
 
 func (s *contextCloseStream[T]) Recv() (T, error) {
 	return s.inner.Recv()
+}
+
+func (s *contextCloseStream[T]) recvReady() (T, bool, error) {
+	if ready, ok := s.inner.(readyReceiver[T]); ok {
+		return ready.recvReady()
+	}
+	var zero T
+	return zero, false, nil
 }
 
 func (s *contextCloseStream[T]) Close() error {

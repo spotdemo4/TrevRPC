@@ -59,9 +59,36 @@ export interface TransportStream {
   writable: WritableStream<Uint8Array>;
 }
 
-/** Anything that opens a bidirectional byte stream per call, such as a Channel or WebTransport. */
+/**
+ * The datagram side of a WebTransport session (`WebTransport.datagrams`). TrevRPC needs only
+ * `readable`; sending also needs `createWritable()` (or the older `writable`), and
+ * `maxDatagramSize` bounds what is sent as a datagram (1100 bytes if it is missing).
+ */
+export interface DatagramTransport {
+  readonly readable: ReadableStream<Uint8Array>;
+  readonly maxDatagramSize?: number;
+  createWritable?(): WritableStream<Uint8Array>;
+  readonly writable?: WritableStream<Uint8Array>;
+}
+
+/**
+ * Anything that opens a bidirectional byte stream per call, such as a Channel or WebTransport.
+ * Calls to methods that mark a direction unreliable use the `datagrams` of the session that opens
+ * their stream, when it has them.
+ */
 export interface Transport {
   createBidirectionalStream(): Promise<TransportStream>;
+  /** Datagrams of the session that the next stream opens on; absent without datagrams. */
+  readonly datagrams?: DatagramTransport;
+  /**
+   * Like `createBidirectionalStream()`, but also returns the datagrams of the session that opened
+   * the stream. Transports whose session can change, such as a Channel, implement it so a call
+   * never mixes the stream of one session with the datagrams of another.
+   */
+  createBidirectionalStreamWithDatagrams?(): Promise<{
+    stream: TransportStream;
+    datagrams?: DatagramTransport;
+  }>;
 }
 
 export type RpcMethodKind =
@@ -75,6 +102,17 @@ export interface RpcMethodDescriptor {
   kind: RpcMethodKind;
   inputType: string;
   outputType: string;
+  /**
+   * The method marks its streamed request messages unreliable (`unreliable_requests` in the
+   * `trevrpc.method` option). They are sent as WebTransport datagrams when they fit and the
+   * session has datagrams, and may be lost or reordered; otherwise they travel on the stream.
+   */
+  unreliableRequests?: boolean;
+  /**
+   * The method marks its streamed response messages unreliable (`unreliable_responses`). The
+   * client accepts them as datagrams on any session that has them.
+   */
+  unreliableResponses?: boolean;
 }
 
 export interface RpcServiceDescriptor {
@@ -139,6 +177,14 @@ export interface ClientStreamingCall<TRequest, TResponse> {
   close(reason?: unknown): Promise<void>;
 }
 
+/**
+ * On a method that marks a direction unreliable (`RpcMethodDescriptor.unreliableRequests` or
+ * `unreliableResponses`), a call on a session with datagrams may send its request messages, and
+ * receive its response messages, as datagrams: they can be lost or reordered, never duplicated.
+ * Response datagrams are delivered after the response headers, merged with the stream's messages
+ * in arrival order, and dropped when the call's queue is full (32 messages or 1 MiB) or the call
+ * has ended. Without datagrams, such as over WebSocket, everything stays on the stream.
+ */
 export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIterable<TResponse> {
   /** Settles with the final status, or rejects with the error that ended the call. */
   readonly status: Promise<StreamStatus>;
@@ -276,6 +322,11 @@ export class Channel implements Transport {
   /** The transport of the current or last session. */
   readonly transport: TransportKind;
   createBidirectionalStream(): Promise<TransportStream>;
+  /** Opens a stream together with the datagrams of the session that carries it, if any. */
+  createBidirectionalStreamWithDatagrams(): Promise<{
+    stream: TransportStream;
+    datagrams?: DatagramTransport;
+  }>;
   /** Resolves once the channel is ready, immediately if it already is. */
   waitUntilReady(): Promise<void>;
   /** Stops reconnecting and closes the current session. */

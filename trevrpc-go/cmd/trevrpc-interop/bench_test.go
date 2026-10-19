@@ -64,7 +64,7 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 		{"quic", "quic", true},
 		{"tcp", "qmux", false},
 	} {
-		for _, scenario := range []string{"unary", "server-stream", "client-stream", "bidi"} {
+		for _, scenario := range []string{"unary", "server-stream", "client-stream", "bidi", "unreliable-server-stream", "unreliable-client-stream"} {
 			// A metadata size of 0 sends no metadata; the others send one entry
 			// of that many bytes, the largest being the limit.
 			for _, metadataSize := range []int{0, 300, benchMaxMetadataSize} {
@@ -126,13 +126,18 @@ func checkBenchLine(t *testing.T, output, scenario, transport string, size, meta
 	if number("duration_s") != 0.2 {
 		t.Errorf("duration_s = %v, want 0.2", got["duration_s"])
 	}
-	ops, msgs := number("ops"), number("msgs")
+	ops, msgs, lost := number("ops"), number("msgs"), number("lost")
 	perOp := 1.0
-	if scenario == "server-stream" || scenario == "client-stream" {
+	if strings.HasSuffix(scenario, "stream") {
 		perOp = float64(messages)
 	}
-	if ops < 1 || msgs != ops*perOp {
-		t.Errorf("ops, msgs = %v, %v, want msgs = %v per op", ops, msgs, perOp)
+	if strings.HasPrefix(scenario, "unreliable-") {
+		// Every message is either delivered or lost, and TCP loses none.
+		if ops < 1 || msgs+lost != ops*perOp || (transport == "qmux" && lost != 0) {
+			t.Errorf("ops, msgs, lost = %v, %v, %v, want msgs + lost = %v per op and no loss over QMux", ops, msgs, lost, perOp)
+		}
+	} else if ops < 1 || msgs != ops*perOp || lost != 0 {
+		t.Errorf("ops, msgs, lost = %v, %v, %v, want msgs = %v per op and no loss", ops, msgs, lost, perOp)
 	}
 	if number("errors") != 0 {
 		t.Errorf("errors = %v, want 0", got["errors"])
@@ -263,9 +268,9 @@ func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer closeQuietly(channel)
-		client := interoppb.NewEchoClient(channel)
+		clients := benchClients{echo: interoppb.NewEchoClient(channel), unreliable: interoppb.NewUnreliableEchoClient(channel)}
 		for _, scenario := range []string{"unary", "bidi"} {
-			operation := benchScenarios[scenario](client, config)
+			operation := benchScenarios[scenario](clients, config)
 			if _, err := operation.run(ctx); err != nil {
 				t.Fatalf("%s with metadata size %d: %v", scenario, size, err)
 			}

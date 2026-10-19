@@ -301,6 +301,43 @@ pub async fn write_request_stream<W: FrameWrite>(
     Ok(())
 }
 
+/// Writes a call's request half like [`write_request_stream`], sending each request message as a
+/// datagram when it fits.
+///
+/// The REQUEST frame is written alone and flushed first, as the first datagram may not precede it.
+/// A message that cannot travel as a datagram is written to the stream, after the datagrams of
+/// its batch.
+pub async fn write_request_stream_datagrams<W: FrameWrite>(
+    send: &mut W,
+    request: &RpcRequest,
+    request_body: &mut BoxStream<Vec<u8>>,
+    max_frame_size: usize,
+    datagrams: &crate::datagram::FlowSender,
+) -> Result<()> {
+    write_request(send, request, Vec::new(), max_frame_size).await?;
+
+    let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
+    let mut on_stream = Vec::new();
+    let mut done = false;
+    while !done {
+        let Some(body) = request_body.next().await.transpose()? else {
+            break;
+        };
+        batch.push(Bytes::from(body));
+        done = take_ready_messages(request_body, &mut batch)?;
+        // The upload is dropped to cancel the call, which also ends a send that waits.
+        datagrams
+            .send_batch(&mut batch, &mut on_stream, std::future::pending())
+            .await;
+        if !on_stream.is_empty() {
+            write_message_frames(send, &mut on_stream, max_frame_size).await?;
+        }
+    }
+    // The caller finishes the stream next, and its FIN must not overtake the datagrams.
+    datagrams.flushed(std::future::pending()).await;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reading
 // ---------------------------------------------------------------------------------------------

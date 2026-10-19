@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import {
   FrameReader,
   FrameType,
@@ -47,6 +48,11 @@ const goldenCases = {
     { ...request, metadata: { authorization: bytes("ok") } },
   ],
   "request.extensions": [FrameType.Request, RpcRequest, { ...request, extensions: [1, 300] }],
+  "request.datagram_flow": [
+    FrameType.Request,
+    RpcRequest,
+    { ...request, kind: RpcKind.BidirectionalStreaming, datagramFlow: 1 },
+  ],
   "message.hi": [FrameType.Message, undefined, bytes("hi")],
   "message.empty": [FrameType.Message, undefined, new Uint8Array(0)],
   "headers.metadata": [FrameType.Headers, RpcHeaders, { metadata: { "x-a": bytes("1") } }],
@@ -66,12 +72,29 @@ test("every golden vector has a documented logical value", async () => {
   const vectors = await readGoldenVectors();
   const names = new Set();
   const streams = new Set();
+  const datagrams = new Set();
   for (const key of vectors.keys()) {
     const [name, kind] = [key.slice(0, key.lastIndexOf(".")), key.slice(key.lastIndexOf(".") + 1)];
+    if (name.startsWith("datagram.")) {
+      datagrams.add(name);
+      assert.ok(
+        ["flow", "messages", "datagram", "received"].includes(kind),
+        `unknown entry ${key}`,
+      );
+      continue;
+    }
     (name.startsWith("stream.") ? streams : names).add(name);
     assert.ok(["payload", "frame", "stream", "frames"].includes(kind), `unknown entry ${key}`);
   }
   assert.deepEqual(names, new Set(Object.keys(goldenCases)));
+  assert.ok(datagrams.size > 0);
+  for (const name of datagrams) {
+    assert.ok(
+      ["flow", "messages"].every((kind) => vectors.has(`${name}.${kind}`)),
+      name,
+    );
+    assert.ok(vectors.has(`${name}.datagram`) !== vectors.has(`${name}.received`), name);
+  }
   for (const name of streams) {
     assert.ok(vectors.has(`${name}.stream`) && vectors.has(`${name}.frames`), name);
   }
@@ -113,6 +136,11 @@ test("golden payloads decode to their logical fields", async () => {
   assert.equal(timeout.kind, RpcKind.BidirectionalStreaming);
   assert.equal(Number(timeout.timeoutNanos), 123456);
 
+  const flow = decode("request.datagram_flow", RpcRequest);
+  assert.equal(flow.kind, RpcKind.BidirectionalStreaming);
+  assert.equal(Number(flow.datagramFlow), 1);
+  assert.equal(Number(decode("request.unary", RpcRequest).datagramFlow), 0);
+
   assert.equal(
     Buffer.from(decode("request.metadata", RpcRequest).metadata.authorization) + "",
     "ok",
@@ -125,6 +153,55 @@ test("golden payloads decode to their logical fields", async () => {
   assert.equal(status.message, "stop");
   assert.equal(Buffer.from(status.metadata["x-t"]) + "", "2");
   assert.equal(decode("status.ok", RpcStatus).code, Code.Ok);
+});
+
+test("datagram payloads match the golden vectors and decode back", async () => {
+  const vectors = await readGoldenVectors();
+  const names = [
+    ...new Set(
+      [...vectors.keys()]
+        .filter((key) => key.startsWith("datagram."))
+        .map((key) => key.slice(0, key.lastIndexOf("."))),
+    ),
+  ];
+  assert.ok(names.length >= 3);
+  for (const name of names) {
+    const flow = parseInt(vectors.get(`${name}.flow`), 16);
+    const value = vectors.get(`${name}.messages`);
+    const messages = value === "" ? [] : value.split(",");
+    const decode = (datagram) => {
+      const decoded = decodeDatagram(fromHex(datagram));
+      assert.equal(decoded.flow, flow, name);
+      return decoded.messages.map(hex);
+    };
+
+    if (vectors.has(`${name}.datagram`)) {
+      // What a sender writes: encoding the messages gives these bytes, which decode back.
+      const datagram = hex(encodeDatagram(flow, messages.map(fromHex)));
+      assert.equal(datagram, vectors.get(`${name}.datagram`), name);
+      assert.deepEqual(decode(datagram), messages, name);
+    } else {
+      // What a receiver accepts: decoding only.
+      assert.deepEqual(decode(vectors.get(`${name}.received`)), messages, name);
+    }
+  }
+});
+
+test("a datagram without a complete flow ID does not decode", () => {
+  assert.equal(decodeDatagram(new Uint8Array(0)), null);
+  assert.equal(decodeDatagram(new Uint8Array([0x40])), null);
+  assert.equal(decodeDatagram(new Uint8Array([0x80, 0, 0])), null);
+  assert.deepEqual(decodeDatagram(new Uint8Array([0x40, 0x01])), { flow: 1, messages: [] });
+});
+
+test("a datagram whose frames do not exactly fill it decodes to no messages", () => {
+  const messagesOf = (...bytes) => decodeDatagram(Uint8Array.from(bytes)).messages.map(hex);
+  assert.deepEqual(messagesOf(1, 0, 1, 0x61), ["61"]);
+  assert.deepEqual(messagesOf(1, 0, 1, 0x61, 0, 2, 0x62), []); // length past the end
+  assert.deepEqual(messagesOf(1, 0, 1, 0x61, 0), []); // frame without a length
+  assert.deepEqual(messagesOf(1, 0, 1, 0x61, 0x40), []); // truncated type varint
+  assert.deepEqual(messagesOf(1, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x10), []); // length beyond 2^53
+  assert.deepEqual(messagesOf(1, 5, 1, 0xff, 0, 1, 0x61), ["61"]); // other types are skipped
 });
 
 test("the frame reader yields the golden known frames from every chunking", async () => {
@@ -455,7 +532,7 @@ async function readGoldenVectors() {
     assert.ok(separator > 0, `invalid golden vector on line ${index + 1}`);
     const name = line.slice(0, separator).trim();
     const value = line.slice(separator + 1).trim();
-    if (!name.endsWith(".frames")) {
+    if (!name.endsWith(".frames") && !name.endsWith(".messages")) {
       assert.match(value, /^(?:[0-9a-f]{2})*$/u, `invalid golden vector on line ${index + 1}`);
     }
     vectors.set(name, value);

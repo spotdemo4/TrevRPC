@@ -15,6 +15,7 @@ export function createServiceClient(transport, service, root, options = {}) {
       path: `/${service.fullName}/${method.name}`,
       requestType: root.lookupType(method.inputType),
       responseType: root.lookupType(method.outputType),
+      datagrams: datagramUse(method),
     };
     const resolve = (override) => mergeCallOptions(defaults, override);
 
@@ -62,6 +63,7 @@ export async function serverStreamingCall(transport, rpc, request, options) {
     requestFields(rpc, RpcKind.ServerStreaming),
     body,
     options,
+    rpc.datagrams,
   );
   const stream = new BidirectionalStreamingCall(call, rpc);
   stream.closeSend().catch(() => {});
@@ -75,6 +77,7 @@ export async function clientStreamingCall(transport, rpc, options) {
     requestFields(rpc, RpcKind.ClientStreaming),
     undefined,
     options,
+    rpc.datagrams,
   );
   return new ClientStreamingCall(
     new BidirectionalStreamingCall(call, rpc, { streamsRequest: true }),
@@ -88,6 +91,7 @@ export async function bidirectionalStreamingCall(transport, rpc, options) {
     requestFields(rpc, RpcKind.BidirectionalStreaming),
     undefined,
     options,
+    rpc.datagrams,
   );
   return new BidirectionalStreamingCall(call, rpc, { streamsRequest: true });
 }
@@ -129,6 +133,21 @@ async function receiveSingleResponse(stream, kind) {
 const ReadAheadFrames = 32;
 const ReadAheadBytes = 1 << 20;
 
+/**
+ * How a method uses datagrams, or undefined if it does not: `send` for request messages, which
+ * needs a streaming request and `unreliableRequests`, and `receive` for response messages, which
+ * every call with a streaming response accepts. A method needs a flow if it marks either
+ * direction unreliable; the generator rejects marks on a direction that does not stream.
+ */
+function datagramUse({ kind, unreliableRequests, unreliableResponses }) {
+  const streamsRequest = kind === "clientStreaming" || kind === "bidirectionalStreaming";
+  const streamsResponse = kind === "serverStreaming" || kind === "bidirectionalStreaming";
+  if (!(unreliableRequests || unreliableResponses) || !(streamsRequest || streamsResponse)) {
+    return undefined;
+  }
+  return { send: Boolean(unreliableRequests) && streamsRequest, receive: streamsResponse };
+}
+
 const EarlyOk = "the server completed the call before the request stream ended";
 
 /**
@@ -166,6 +185,11 @@ export class BidirectionalStreamingCall {
   #failingInOrder = false;
   #outcomeSettled = false;
   #pumping = false;
+  /**
+   * The call's datagram flow when its responses may arrive as datagrams, else undefined. The flow
+   * connects once HEADERS (or the first frame that implies them) was read; until then it buffers.
+   */
+  #flow;
   /** Receivers waiting for a frame. */
   #demand = 0;
   #headersWanted = false;
@@ -189,6 +213,7 @@ export class BidirectionalStreamingCall {
     this.#call = call;
     this.#rpc = rpc;
     this.#streamsRequest = streamsRequest;
+    this.#flow = rpc.datagrams?.receive ? call.flow : undefined;
     this.status.catch(() => {});
     this.#headers = new Promise((resolve, reject) => {
       this.#resolveHeaders = resolve;
@@ -343,9 +368,10 @@ export class BidirectionalStreamingCall {
     if (this.#headersWanted && !this.#sawHeaders && !this.#sawMessage) {
       return true;
     }
+    // A call with a datagram flow always reads ahead, so datagrams are released after HEADERS
+    // even if nobody receives.
     return (
-      this.#streamsRequest &&
-      this.#call.uploadOpen &&
+      ((this.#streamsRequest && this.#call.uploadOpen) || this.#flow !== undefined) &&
       this.#queue.length < ReadAheadFrames &&
       this.#queuedBytes < ReadAheadBytes
     );
@@ -431,16 +457,19 @@ export class BidirectionalStreamingCall {
           validateResponseMetadata(headers.metadata, "headers");
           this.#sawHeaders = true;
           this.#resolveHeaders(headers.metadata);
+          this.#flow?.connect(this.#onDatagram);
           continue;
         }
         case FrameType.Message:
           this.#sawMessage = true;
           this.#resolveHeaders({});
+          this.#flow?.connect(this.#onDatagram);
           return frame;
         case FrameType.Status: {
           const status = unmarshalMessage(RpcStatus, frame.payload);
           validateResponseMetadata(status.metadata, "trailing metadata");
           this.#resolveHeaders({});
+          this.#flow?.connect(this.#onDatagram);
           return { type: FrameType.Status, status };
         }
         default:
@@ -448,6 +477,25 @@ export class BidirectionalStreamingCall {
       }
     }
   }
+
+  /**
+   * Queues a response message that arrived as a datagram, in arrival order with the stream's
+   * messages. It never blocks: a message is dropped when the call ended or its queue is full.
+   */
+  #onDatagram = (payload) => {
+    if (
+      this.#terminal !== undefined ||
+      this.#failure !== undefined ||
+      payload.byteLength > this.#call.maxFrameSize ||
+      this.#queue.length >= ReadAheadFrames ||
+      this.#queuedBytes + payload.byteLength > ReadAheadBytes
+    ) {
+      return;
+    }
+    this.#queue.push(payload);
+    this.#queuedBytes += payload.byteLength;
+    this.#notify();
+  };
 
   /** Ends the call out of order: receivers fail with `error` without draining the queue. */
   #settleFailure(error) {

@@ -13,7 +13,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../interop/lib.sh"
 servers=()
 clients=()
 grpc=""
-scenarios="unary,server-stream,client-stream,bidi"
+scenarios="unary,server-stream,client-stream,bidi,unreliable-server-stream,unreliable-client-stream"
 sizes="64"
 metadata_sizes="0"
 concurrency="1,64"
@@ -82,6 +82,8 @@ run_matrix() {
     previous=$arg
   done
   for scenario in "${scenario_list[@]}"; do
+    # gRPC has no datagram messages to compare against.
+    [[ $transport == grpc && $scenario == unreliable-* ]] && continue
     for size in "${size_list[@]}"; do
       for metadata in "${metadata_size_list[@]}"; do
         for workers in "${concurrency_list[@]}"; do
@@ -138,15 +140,16 @@ fi
 
 # One row per run, grouped by scenario so transports and runtimes line up.
 {
-  printf 'scenario\tsize\tmd\tconc\ttransport\tclient\tserver\tops/s\tmsgs/s\tMB/s\tp50us\tp99us\twire_B/msg\n'
+  printf 'scenario\tsize\tmd\tconc\ttransport\tclient\tserver\tops/s\tmsgs/s\tMB/s\tp50us\tp99us\twire_B/msg\tlost%%\n'
   jq -sr 'sort_by(.scenario, .size, .metadata_size, .concurrency, .transport, .client, .server)[]
     | [.scenario, .size, (.metadata_size // 0), .concurrency, .transport, .client, .server,
        (.ops_per_sec | floor), (.msgs_per_sec | floor),
        ((.bytes_per_sec / 1e6 * 100 | floor) / 100),
        (.latency_us.p50 | floor), (.latency_us.p99 | floor),
-       (if .wire_bytes_per_msg then (.wire_bytes_per_msg | floor) else "-" end)]
+       (if .wire_bytes_per_msg then (.wire_bytes_per_msg | floor) else "-" end),
+       (if (.lost // 0) > 0 then ((.lost / (.lost + .msgs) * 10000 | floor) / 100) else 0 end)]
     | @tsv' "$results"
-} | awk -F'\t' '{ for (i = 1; i <= NF; i++) printf "%-14s", $i; printf "\n" }' | tee "$out/summary.txt"
+} | awk -F'\t' '{ printf "%-26s", $1; for (i = 2; i <= NF; i++) printf "%-14s", $i; printf "\n" }' | tee "$out/summary.txt"
 
 if ((${#failures[@]})); then
   printf 'failed: %s\n' "${failures[@]}" >&2

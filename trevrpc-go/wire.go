@@ -61,6 +61,18 @@ type wireRequest struct {
 	// Extensions lists the extension IDs the client supports (field 8). The
 	// registry is empty, so clients send none and servers ignore the field.
 	Extensions []uint64 `protobuf:"varint,8,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
+	// DatagramFlow is the datagram flow ID of the call (field 9), or zero for
+	// a call without one.
+	DatagramFlow uint64 `protobuf:"varint,9,opt,name=datagram_flow,json=datagramFlow,proto3" json:"datagram_flow,omitempty"`
+
+	// The fields below are not on the wire.
+	//
+	// unreliable is what the client asks for; the connection generation that
+	// carries the call decides whether it gets a flow.
+	unreliable Unreliable
+	// flow is the server's registration of DatagramFlow on the connection, or
+	// nil for a call without datagrams.
+	flow *datagramFlow
 }
 
 // newWireRequest creates a unary RPC request for the method path

@@ -2,6 +2,10 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures_util::FutureExt as _;
+
+use crate::datagram::{DatagramTransport, Unsent};
 use crate::framed::Chunked;
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::RequestTransportEvent;
@@ -35,6 +39,7 @@ pub fn negotiated_protocol(connection: &quinn::Connection) -> Option<Vec<u8>> {
 impl MuxConnection for quinn::Connection {
     type SendStream = quinn::SendStream;
     type RecvStream = Chunked<quinn::RecvStream>;
+    type Datagrams = Self;
 
     async fn accept_stream(&self) -> Option<(quinn::SendStream, Chunked<quinn::RecvStream>)> {
         let (send, recv) = self.accept_bi().await.ok()?;
@@ -52,6 +57,98 @@ impl MuxConnection for quinn::Connection {
 
     async fn connection_lost(&self) -> Error {
         Error::transport(self.closed().await)
+    }
+
+    fn datagrams(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+/// Native QUIC datagrams: DATAGRAM frames whose payload is the whole datagram.
+impl DatagramTransport for quinn::Connection {
+    fn max_size(&self) -> Option<usize> {
+        self.max_datagram_size()
+    }
+
+    async fn send(&self, datagram: Bytes) -> std::result::Result<(), Unsent> {
+        self.send_datagram_wait(datagram).await.map_err(|_| Unsent)
+    }
+
+    async fn recv(&self) -> Option<Bytes> {
+        self.read_datagram().await.ok()
+    }
+
+    fn try_recv(&self) -> Option<Bytes> {
+        self.read_datagram().now_or_never()?.ok()
+    }
+
+    fn transmitted(&self) -> Option<u64> {
+        Some(self.stats().frame_tx.datagram)
+    }
+}
+
+/// The datagrams of one `WebTransport` session, framed by this crate on the raw QUIC connection.
+///
+/// A `WebTransport` datagram is a QUIC DATAGRAM frame that starts with the session's quarter
+/// stream ID (RFC 9297). This crate adds and checks that prefix itself instead of using the h3
+/// crates' datagram support: `h3-datagram` 0.0.2 encodes the quarter stream ID of every outgoing
+/// datagram as 0, which only matches the first session of a connection by accident. The fix,
+/// hyperium/h3#340, is not released yet.
+///
+/// Quinn's `read_datagram` has a single consumer, so nothing else may read this connection's
+/// datagrams: the HTTP/3 and `WebTransport` code must never call the session's
+/// `datagram_reader()` or `datagram_sender()`.
+pub struct SessionDatagrams {
+    connection: quinn::Connection,
+    /// The session's quarter stream ID as a variable-length integer.
+    prefix: Bytes,
+}
+
+impl SessionDatagrams {
+    /// The datagrams of the session whose CONNECT request is stream `session_id`.
+    pub fn new(connection: quinn::Connection, session_id: u64) -> Option<Self> {
+        Some(Self {
+            connection,
+            prefix: quarter_stream_id(session_id)?,
+        })
+    }
+}
+
+/// The quarter stream ID that starts the datagrams of the session whose CONNECT request is stream
+/// `session_id`: the stream ID divided by four, as a variable-length integer (RFC 9297,
+/// section 2.1).
+fn quarter_stream_id(session_id: u64) -> Option<Bytes> {
+    let mut prefix = bytes::BytesMut::with_capacity(crate::varint::MAX_LEN);
+    crate::varint::push(&mut prefix, session_id / 4).ok()?;
+    Some(prefix.freeze())
+}
+
+impl DatagramTransport for SessionDatagrams {
+    fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    fn max_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+
+    async fn send(&self, datagram: Bytes) -> std::result::Result<(), Unsent> {
+        self.connection
+            .send_datagram_wait(datagram)
+            .await
+            .map_err(|_| Unsent)
+    }
+
+    async fn recv(&self) -> Option<Bytes> {
+        self.connection.read_datagram().await.ok()
+    }
+
+    fn try_recv(&self) -> Option<Bytes> {
+        self.connection.read_datagram().now_or_never()?.ok()
+    }
+
+    fn transmitted(&self) -> Option<u64> {
+        Some(self.connection.stats().frame_tx.datagram)
     }
 }
 
@@ -118,5 +215,25 @@ impl MuxRecvStream for Chunked<quinn::RecvStream> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quarter_stream_id;
+
+    #[test]
+    fn a_session_prefix_is_its_stream_id_divided_by_four() {
+        assert_eq!(quarter_stream_id(0).as_deref(), Some(&[0x00][..]));
+        // The second request stream of a connection, and the first one that is not stream 0.
+        assert_eq!(quarter_stream_id(4).as_deref(), Some(&[0x01][..]));
+        assert_eq!(quarter_stream_id(8).as_deref(), Some(&[0x02][..]));
+        // Past six bits the integer takes two bytes.
+        assert_eq!(
+            quarter_stream_id(4 * 64).as_deref(),
+            Some(&[0x40, 0x40][..])
+        );
+        // Stream IDs are below 2^62, so their quarters always fit.
+        assert!(quarter_stream_id((1 << 62) - 4).is_some());
     }
 }

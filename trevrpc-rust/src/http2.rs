@@ -137,6 +137,8 @@ async fn handle_request(
         server,
         request_limit,
         stream_permit,
+        // HTTP/2 request streams have no datagrams.
+        None,
         H2Sink(send),
         H2Source { body, closed },
         shutdown,

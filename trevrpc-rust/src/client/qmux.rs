@@ -9,7 +9,9 @@ use tokio::net::TcpStream;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::mux::MuxConnection as _;
 use crate::qmux_conn::{QmuxConnection, client_config};
-use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
+use crate::{
+    BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
+};
 
 use bytes::Bytes;
 
@@ -89,10 +91,10 @@ impl QmuxTransport {
         let session = qmux::Session::connect(transport, client_config(max_frame_size))
             .await
             .map_err(Error::transport)?;
-        Ok(Self(Arc::new(NativeTransport {
-            connection: session.into(),
+        Ok(Self(Arc::new(NativeTransport::new(
+            session.into(),
             max_frame_size,
-        })))
+        ))))
     }
 
     /// Returns the maximum `TrevRPC` frame size in bytes.
@@ -127,5 +129,17 @@ impl StreamingRpcTransport for QmuxTransport {
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>> {
         self.0.streaming_call(request, request_body).await
+    }
+
+    async fn streaming_call_unreliable(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        unreliable: Unreliable,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        // `QMux` has no datagrams: the call keeps every message on its stream.
+        self.0
+            .streaming_call_unreliable(request, request_body, unreliable)
+            .await
     }
 }

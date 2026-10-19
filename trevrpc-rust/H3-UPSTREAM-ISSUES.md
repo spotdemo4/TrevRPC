@@ -7,6 +7,7 @@ Research and source review were performed on 2026-08-12 against these exact publ
 - `h3 0.0.8`
 - `h3-quinn 0.0.10`
 - `h3-webtransport 0.1.2`
+- `h3-datagram 0.0.2` (issue 10 only)
 
 The reproductions below omit routine TLS, certificate, endpoint, and h3 connection setup unless those details are relevant. Pseudocode is labeled where it is not a standalone compiling program.
 
@@ -23,6 +24,7 @@ The reproductions below omit routine TLS, certificate, endpoint, and h3 connecti
 |   7 | `AsyncWrite` reduces typed stream failures to `io::ErrorKind::Other`          | `h3 0.0.8`, `h3-webtransport 0.1.2` | [#55](https://github.com/hyperium/h3/issues/55)                                                             | Strong historical architectural match; closed                   |
 |   8 | Invalid WebTransport CONNECT returns `Ok(WebTransportSession)` after HTTP 400 | `h3-webtransport 0.1.2`             | [#293](https://github.com/hyperium/h3/issues/293)                                                           | Related validation-ownership discussion; no direct report found |
 |   9 | `max_webtransport_sessions` is advertised but not enforced                    | `h3 0.0.8`                          | [#71](https://github.com/hyperium/h3/issues/71), [#293](https://github.com/hyperium/h3/issues/293)          | Related umbrella issues; no direct report found                 |
+|  10 | `h3-datagram` encodes every outgoing quarter stream ID as `0`                 | `h3-datagram 0.0.2`                 | [#340](https://github.com/hyperium/h3/pull/340)                                                             | Exact; fixed upstream, not yet released                         |
 
 GitHub searches also checked the relevant API names and protocol terms, including `accept_bi`, `CloseWebTransportSession`, `STOP_SENDING`, `max_webtransport_sessions`, invalid CONNECT handling, and the h3-quinn stream methods. “No direct report found” means no issue specifically describing the behavior was found; it does not prove that no duplicate exists under different wording.
 
@@ -554,10 +556,35 @@ No direct issue was found. [#71](https://github.com/hyperium/h3/issues/71) and [
 
 Clarify whether the setting is declarative or enforced. Add active-session lifecycle hooks and admission enforcement, or rename the builder operation to make its settings-only behavior explicit. `h3-webtransport` should support multiple session drivers on one h3 connection if values greater than one are intended to be usable.
 
+## 10. `h3-datagram` encodes every outgoing quarter stream ID as `0`
+
+**Owner:** `h3-datagram`
+
+**Confirmed in:** `0.0.2`
+
+### Actual behavior
+
+`Datagram::encode()` writes the datagram's quarter stream ID into a scratch buffer but builds the `EncodedDatagram` with a separate, zeroed `stream_id` buffer and only the length of the real encoding. The bytes it emits for the quarter stream ID are therefore all zero for every datagram, whatever stream it belongs to.
+
+The first WebTransport session on an HTTP/3 connection happens to use stream 0, so its datagrams are correct by accident. A session on any other request stream sends datagrams that the peer attributes to stream 0.
+
+### Expected behavior
+
+The encoded datagram carries the stream ID divided by four (RFC 9297, section 2.1).
+
+### TrevRPC impact and workaround
+
+TrevRPC sends and receives `WebTransport` datagrams itself on the raw Quinn connection: it adds the session's quarter stream ID in `quic::SessionDatagrams` and drops incoming datagrams that start with another one. Nothing calls the session's `datagram_reader()` or `datagram_sender()`, which also keeps Quinn's single-consumer `read_datagram` free for TrevRPC's own reader; a test in `src/http3.rs` checks that.
+
+### Existing upstream issue
+
+Fixed by [hyperium/h3#340](https://github.com/hyperium/h3/pull/340), which no release includes yet. Switch back to `h3-datagram` once a release has the fix, if h3 then offers a way to share the connection's datagrams with the application.
+
 ## Upstream issue relationship notes
 
 ### Exact reports
 
+- [#340](https://github.com/hyperium/h3/pull/340) fixes the `h3-datagram 0.0.2` quarter stream ID encoding (issue 10); no release includes it yet.
 - [#330](https://github.com/hyperium/h3/issues/330) exactly reports the `h3-quinn 0.0.10` `stop_sending()` panic. [#331](https://github.com/hyperium/h3/pull/331) is the merged fix.
 
 ### Strong architectural match

@@ -7,10 +7,13 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut as _, Bytes};
 use tokio::sync::{Semaphore, watch};
 
+use crate::datagram::Demux;
 use crate::framed::{self, FrameRead, FrameWrite};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::server::Server;
-use crate::server_transport::{self, IncomingRequest, Permit, ResponseWriter, reject_unreadable};
+use crate::server_transport::{
+    self, IncomingRequest, Permit, ResponseWriter, open_flow, reject_unreadable,
+};
 use crate::{ResponseFrame, Result};
 
 /// The send half of one HTTP request or `WebTransport` stream.
@@ -108,11 +111,12 @@ impl<S: BodySource> RequestPumpReader for BodyReader<S> {
     }
 }
 
-/// Reads the initial request frame, replying with its failure status when it is unusable. The
-/// stream slot is released before that reply.
+/// Reads the initial request frame and opens its datagram flow on `demux`, replying with the
+/// failure status when either fails. The stream slot is released before that reply.
 async fn read_request<K, S>(
     server: &Server,
     stream_permit: &mut Permit,
+    demux: Option<&Demux>,
     sink: K,
     source: S,
 ) -> Option<(BodyWriter<K>, BodyReader<S>, IncomingRequest)>
@@ -128,7 +132,10 @@ where
         source,
         chunk: Bytes::new(),
     };
-    match server_transport::read_initial_request(server, &mut reader).await {
+    let incoming = server_transport::read_initial_request(server, &mut reader)
+        .await
+        .and_then(|mut incoming| open_flow(demux, &mut incoming).map(|()| incoming));
+    match incoming {
         Ok(incoming) => Some((writer, reader, incoming)),
         Err(error) => {
             reject_unreadable(server, stream_permit, writer, error).await;
@@ -138,10 +145,13 @@ where
 }
 
 /// Serves one RPC carried by a body, holding `stream_permit` until its STATUS is written.
+///
+/// `demux` carries the datagrams of the `WebTransport` session the body belongs to, if any.
 pub async fn handle_rpc_stream<K, S>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
     mut stream_permit: Permit,
+    demux: Option<Arc<Demux>>,
     sink: K,
     source: S,
     shutdown: watch::Receiver<bool>,
@@ -150,7 +160,7 @@ pub async fn handle_rpc_stream<K, S>(
     S: BodySource,
 {
     if let Some((writer, reader, incoming)) =
-        read_request(&server, &mut stream_permit, sink, source).await
+        read_request(&server, &mut stream_permit, demux.as_deref(), sink, source).await
     {
         server_transport::handle_stream(
             server,
@@ -172,7 +182,7 @@ where
     S: BodySource,
 {
     if let Some((writer, reader, incoming)) =
-        read_request(&server, &mut Permit::none(), sink, source).await
+        read_request(&server, &mut Permit::none(), None, sink, source).await
     {
         server_transport::reject_stream(server, writer, reader, incoming).await;
     }

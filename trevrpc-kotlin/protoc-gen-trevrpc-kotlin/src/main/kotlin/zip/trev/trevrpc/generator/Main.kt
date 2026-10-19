@@ -5,6 +5,8 @@ import com.google.protobuf.DescriptorProtos.EnumDescriptorProto
 import com.google.protobuf.DescriptorProtos.FileDescriptorProto
 import com.google.protobuf.DescriptorProtos.MethodDescriptorProto
 import com.google.protobuf.DescriptorProtos.ServiceDescriptorProto
+import com.google.protobuf.InvalidProtocolBufferException
+import com.google.protobuf.UnknownFieldSet
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorRequest
 import com.google.protobuf.compiler.PluginProtos.CodeGeneratorResponse
 import java.io.InputStream
@@ -15,6 +17,11 @@ import kotlin.system.exitProcess
 private const val DEFAULT_RUNTIME_PACKAGE = "zip.trev.trevrpc"
 private const val DEFAULT_FILE_SUFFIX = ".trevrpc.kt"
 private const val HEX_DIGITS = "0123456789abcdef"
+
+/** Extension number of `(trevrpc.method)` on `google.protobuf.MethodOptions`, from trevrpc/options.proto. */
+private const val METHOD_OPTION_FIELD = 58247
+private const val UNRELIABLE_REQUESTS_FIELD = 1
+private const val UNRELIABLE_RESPONSES_FIELD = 2
 
 public fun main() {
     try {
@@ -462,6 +469,7 @@ private data class Method(
     val output: TypeRef,
     val clientStreaming: Boolean,
     val serverStreaming: Boolean,
+    val unreliable: TrevRpcMethodOptions,
 ) {
     val kotlinName: String
         get() = kotlinIdent(name)
@@ -539,22 +547,35 @@ private fun describeService(
     types: TypeIndex,
 ): Service {
     val typeName = javaClassName(descriptor.name)
-    val methods = descriptor.methodList.map { method -> describeMethod(file, method, types) }
+    val fullProtoName = listOf(file.`package`, descriptor.name).filter(String::isNotEmpty).joinToString(".")
+    val methods = descriptor.methodList.map { method -> describeMethod(file, fullProtoName, method, types) }
     return Service(
         name = typeName,
         clientName = "${typeName}Client",
         constantPrefix = screamingSnake(descriptor.name),
-        fullProtoName = listOf(file.`package`, descriptor.name).filter(String::isNotEmpty).joinToString("."),
+        fullProtoName = fullProtoName,
         methods = methods,
     )
 }
 
 private fun describeMethod(
     file: FileDescriptorProto,
+    serviceName: String,
     descriptor: MethodDescriptorProto,
     types: TypeIndex,
-): Method =
-    Method(
+): Method {
+    val unreliable = readMethodOptions(descriptor)
+    if (unreliable.requests && !descriptor.clientStreaming) {
+        throw GeneratorException(
+            "$serviceName.${descriptor.name}: unreliable_requests requires a client-streaming or bidirectional method",
+        )
+    }
+    if (unreliable.responses && !descriptor.serverStreaming) {
+        throw GeneratorException(
+            "$serviceName.${descriptor.name}: unreliable_responses requires a server-streaming or bidirectional method",
+        )
+    }
+    return Method(
         name = lowerCamel(descriptor.name),
         constantName = screamingSnake(descriptor.name),
         protoName = descriptor.name,
@@ -562,7 +583,43 @@ private fun describeMethod(
         output = types.resolve(file, descriptor.outputType),
         clientStreaming = descriptor.clientStreaming,
         serverStreaming = descriptor.serverStreaming,
+        unreliable = unreliable,
     )
+}
+
+/** The `(trevrpc.method)` option of a method: which streamed directions the schema marks unreliable. */
+private data class TrevRpcMethodOptions(
+    val requests: Boolean = false,
+    val responses: Boolean = false,
+) {
+    val any: Boolean
+        get() = requests || responses
+}
+
+/**
+ * Reads `(trevrpc.method)` from the unknown fields of `MethodOptions`: the generator's descriptors
+ * carry no extension registry, so protoc's extension bytes stay as raw fields, and decoding the two
+ * bool fields by hand avoids shipping generated option classes. Repeated occurrences merge, as
+ * protobuf message fields do.
+ */
+private fun readMethodOptions(descriptor: MethodDescriptorProto): TrevRpcMethodOptions {
+    val field = descriptor.options.unknownFields.getField(METHOD_OPTION_FIELD)
+    var result = TrevRpcMethodOptions()
+    for (encoded in field.lengthDelimitedList) {
+        val fields =
+            try {
+                UnknownFieldSet.parseFrom(encoded)
+            } catch (error: InvalidProtocolBufferException) {
+                throw GeneratorException("${descriptor.name}: malformed (trevrpc.method) option: ${error.message}")
+            }
+        result =
+            TrevRpcMethodOptions(
+                requests = result.requests || fields.getField(UNRELIABLE_REQUESTS_FIELD).varintList.any { it != 0L },
+                responses = result.responses || fields.getField(UNRELIABLE_RESPONSES_FIELD).varintList.any { it != 0L },
+            )
+    }
+    return result
+}
 
 private fun StringBuilder.generateService(
     runtime: String,
@@ -604,6 +661,7 @@ private fun StringBuilder.generateClientMethod(
     val pathConstant = method.pathConstant(service)
     val inputCodec = checkNotNull(codecNames[method.input.protoName])
     val outputCodec = checkNotNull(codecNames[method.output.protoName])
+    val start = length
     when {
         method.clientStreaming && method.serverStreaming -> {
             appendLine("    public suspend fun ${method.suffixedName("Response")}(")
@@ -704,7 +762,36 @@ private fun StringBuilder.generateClientMethod(
             appendLine("    ): ${method.output.kotlinType} = ${method.suffixedName("Response")}(request, options).message")
         }
     }
+    if (method.unreliable.any) documentUnreliable(method, start)
     appendLine()
+}
+
+/**
+ * Inserts a KDoc block before each public function generated since [start]. The schema marks the
+ * method's messages unreliable, but Cronet exposes no datagram API, so every message travels
+ * reliably on the HTTP stream.
+ */
+private fun StringBuilder.documentUnreliable(
+    method: Method,
+    start: Int,
+) {
+    val directions =
+        listOfNotNull(
+            "requests".takeIf { method.unreliable.requests },
+            "responses".takeIf { method.unreliable.responses },
+        ).joinToString(" and ")
+    val generated = substring(start)
+    setLength(start)
+    for (line in generated.lineSequence()) {
+        if (line.startsWith("    public suspend fun ") || line.startsWith("    public fun ")) {
+            appendLine("    /**")
+            appendLine("     * The schema marks this method's $directions unreliable (datagram messages). Cronet has no")
+            appendLine("     * datagram API, so this client delivers every message reliably and in order on the stream.")
+            appendLine("     */")
+        }
+        append(line).append('\n')
+    }
+    setLength(length - 1)
 }
 
 private fun javaTypePrefix(file: FileDescriptorProto): List<String> {

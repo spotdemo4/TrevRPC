@@ -27,7 +27,7 @@ check runs a very short matrix only to keep the tool working.
 ## Server
 
 Servers are the interop executables' `server` subcommand (see
-[`interop/README.md`](../interop/README.md)) serving `trevrpc.interop.v1.Echo`.
+[`interop/README.md`](../interop/README.md)) serving `trevrpc.interop.v1.Echo` and `trevrpc.interop.v1.UnreliableEcho`.
 The grpc-go baseline (`bench/grpc-go`) follows the same contract: it serves the
 same `Echo` service over gRPC (HTTP/2 over TLS), prints `{"grpc":<port>}` once
 it is accepting, and exits when its stdin reaches EOF.
@@ -41,7 +41,7 @@ for the whole run.
 ```text
 <binary> bench --addr <host:port> [--tcp-addr <host:port>] --ca <cert.pem>
                [--server-name localhost] --transport quic|tcp|grpc
-               --scenario unary|server-stream|client-stream|bidi
+               --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream
                [--size BYTES] [--concurrency N] [--duration SECONDS]
                [--warmup SECONDS] [--messages N] [--metadata-size BYTES]
 ```
@@ -63,12 +63,16 @@ for the whole run.
   `client-stream` response is `messages × size` bytes, so that product must stay
   under the 4 MiB frame limit.
 
-| Scenario        | One operation                                                                                   | Messages per operation |
-| --------------- | ----------------------------------------------------------------------------------------------- | ---------------------- |
-| `unary`         | `Unary {message}`                                                                               | 1                      |
-| `server-stream` | `ServerStream {message, count: messages}`, reading every response                               | `messages`             |
-| `client-stream` | `ClientStream` sending `messages` requests, then reading the response (`messages × size` bytes) | `messages`             |
-| `bidi`          | One round trip on a `Bidi` stream that each worker keeps open: send `{message}`, read its echo  | 1                      |
+| Scenario                   | One operation                                                                                                                  | Messages per operation |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
+| `unary`                    | `Unary {message}`                                                                                                              | 1                      |
+| `server-stream`            | `ServerStream {message, count: messages}`, reading every response                                                              | `messages`             |
+| `client-stream`            | `ClientStream` sending `messages` requests, then reading the response (`messages × size` bytes)                                | `messages`             |
+| `bidi`                     | One round trip on a `Bidi` stream that each worker keeps open: send `{message}`, read its echo                                 | 1                      |
+| `unreliable-server-stream` | `UnreliableEcho.Bidi` sending `{message, count: messages}`, closing the send side, and reading every response until the status | responses delivered    |
+| `unreliable-client-stream` | `UnreliableEcho.Bidi` sending `messages` requests `{message, count: 0}`, closing the send side, and reading the status         | `interop-received`     |
+
+The `unreliable-*` scenarios measure [datagram messages](../wiki/Protocol-and-Wire-Format.md#datagram-messages): over `quic` the streamed messages travel as datagrams and may be lost, while over `tcp` they stay on the QMux stream. The gRPC baseline has no equivalent and does not run them.
 
 The client prints exactly one JSON line to stdout and exits 0, or exits
 non-zero if it could not connect or measure:
@@ -88,7 +92,8 @@ non-zero if it could not connect or measure:
   "msgs_per_sec": 16246.8,
   "bytes_per_sec": 1039795.2,
   "latency_us": { "p50": 58.1, "p90": 66.0, "p99": 101.3, "p999": 240.7 },
-  "wire_bytes_per_msg": 141.2
+  "wire_bytes_per_msg": 141.2,
+  "lost": 0
 }
 ```
 
@@ -101,3 +106,5 @@ non-zero if it could not connect or measure:
   during the measured window (UDP payload for QUIC), divided by `msgs`. It is
   omitted where the transport stack does not expose connection statistics.
 - `errors` counts failed operations. Workers carry on after an error.
+- `lost` counts messages sent but not delivered, for the `unreliable-*`
+  scenarios only (`0` elsewhere). Loss is not an error.
