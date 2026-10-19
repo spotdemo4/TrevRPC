@@ -3,7 +3,7 @@ name: buf
 on:
   push:
     branches: ["main"]
-    paths: ["proto/**"]
+    paths: ["proto/**", ".forgejo/workflows/buf.yaml"]
   workflow_dispatch:
 
 concurrency:
@@ -24,13 +24,17 @@ jobs:
         with:
           github_token: ${{ secrets.GH_TOKEN }}
           niks3_url: https://niks3.trev.zip
-          fetch_depth: 0
           shell: release
 
-      # Labels the commit with the branch and any tags on it, and links it to
-      # the source commit.
+      # Labels the commit with its branch and links it to the source commit.
+      # buf's --git-metadata would derive these, but it only knows GitHub,
+      # GitLab, and Bitbucket remotes.
       - name: Push to the Buf Schema Registry
         working-directory: proto
-        run: buf push --git-metadata --create --create-visibility public
+        run: >-
+          buf push --create --create-visibility public --create-default-label main
+          --label "$LABEL" --source-control-url "$SOURCE_URL"
         env:
           BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+          LABEL: ${{ github.ref_name }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
