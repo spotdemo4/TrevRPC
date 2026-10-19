@@ -6,6 +6,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,10 +157,16 @@ var bothUnreliable = WithUnreliable(Unreliable{Requests: true, Responses: true})
 // channel with a counter of the DATAGRAM frames it receives.
 func dialDatagramChannel(t *testing.T, pki testPKI, listener *Listener) (*Channel, *datagramFrameCounter) {
 	t.Helper()
+	return dialDatagramChannelWith(t, pki, listener, nil)
+}
+
+// dialDatagramChannelWith is dialDatagramChannel with a channel event hook.
+func dialDatagramChannelWith(t *testing.T, pki testPKI, listener *Listener, onEvent func(ChannelEvent)) (*Channel, *datagramFrameCounter) {
+	t.Helper()
 	counter := new(datagramFrameCounter)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, QUICConfig: counter.quicConfig(), Transport: TransportQUICOnly})
+	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, QUICConfig: counter.quicConfig(), Transport: TransportQUICOnly, OnEvent: onEvent})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -496,7 +503,22 @@ func TestDatagramMessagesCountTowardTheServersStreamLimits(t *testing.T) {
 func TestEachReconnectGetsFreshFlowIDs(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, registerDatagramService)
-	channel, _ := dialDatagramChannel(t, pki, listener)
+	// The reconnect is end to end (backoff, then a new handshake), so wait for
+	// its Ready event with the RPC timeout rather than polling briefly, and
+	// keep failed attempts to explain a timeout.
+	reconnected := make(chan struct{})
+	var failures []error
+	var failuresMu sync.Mutex
+	channel, _ := dialDatagramChannelWith(t, pki, listener, func(event ChannelEvent) {
+		switch {
+		case event.Type == ChannelEventReady && event.Generation == 2:
+			close(reconnected)
+		case event.Type == ChannelEventReconnectFailed:
+			failuresMu.Lock()
+			failures = append(failures, event.Err)
+			failuresMu.Unlock()
+		}
+	})
 
 	firstMux := func() *datagramMux {
 		generation, err := channel.currentGeneration()
@@ -514,7 +536,13 @@ func TestEachReconnectGetsFreshFlowIDs(t *testing.T) {
 
 	generation, _ := channel.currentGeneration()
 	_ = generation.Close()
-	eventually(t, "the channel to reconnect", func() bool { return channel.Ready() && channel.Generation() == 2 })
+	select {
+	case <-reconnected:
+	case <-time.After(rpcTestTimeout):
+		failuresMu.Lock()
+		defer failuresMu.Unlock()
+		t.Fatalf("timed out waiting for the channel to reconnect (state %v, failed attempts: %v)", channel.Snapshot(), failures)
+	}
 	chat(t, channel, numbered(1), bothUnreliable)
 	second := firstMux()
 	if second == first {
