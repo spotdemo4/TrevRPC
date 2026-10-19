@@ -114,7 +114,8 @@ type Session struct {
 	control        [][]byte
 	ready          []*Stream
 	pingSent       uint64
-	pingReceived   uint64
+	pingReceived   uint64 // the highest QX_PING request sequence, once receivedPing
+	receivedPing   bool
 	sendPing       bool
 	sendPingReply  bool
 	paramsReceived bool
@@ -406,10 +407,12 @@ func (s *Session) handleFrameLocked(f *frame) *TransportError {
 		s.handleConnectionCloseLocked(f)
 		return nil
 	case f.typ == s.version.PingType:
-		if f.sequence <= s.pingReceived {
+		// Sequence numbers must strictly increase but may start anywhere,
+		// including 0, which is where the qmux crate starts.
+		if s.receivedPing && f.sequence <= s.pingReceived {
 			return protocolError(ProtocolViolation, f.typ, "QX_PING sequence number %d is not increasing", f.sequence)
 		}
-		s.pingReceived = f.sequence
+		s.pingReceived, s.receivedPing = f.sequence, true
 		s.sendPingReply = true
 		s.wakeWriter()
 		return nil

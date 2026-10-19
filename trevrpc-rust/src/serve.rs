@@ -20,9 +20,30 @@ use crate::{http3, native, tcp};
 /// Pause after a TCP accept failure, such as running out of file descriptors.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Spare bidirectional stream slots above the per-connection RPC limit: one so an over-limit RPC
-/// can still receive a status, and one for the long-lived `WebTransport` CONNECT stream.
-const RESERVED_BIDI_STREAMS: u64 = 2;
+/// How many times the per-connection RPC limit a peer may open as QUIC, `WebTransport`, or `QMux`
+/// streams. These transports grant stream credit cumulatively and return a closed stream's credit
+/// only once its last data is acknowledged, about a round trip after the call ends, so a stream
+/// limit equal to the RPC limit would let a client with that many short calls in flight start only
+/// about half of them per round trip. The spare streams cost per-stream state only: the connection
+/// receive window still bounds buffered data, and the per-connection RPC limit still rejects an
+/// RPC beyond it with a status.
+const STREAM_CREDIT_FACTOR: u64 = 2;
+
+/// The largest stream count QUIC and `QMux` can express.
+const MAX_STREAM_COUNT: u64 = 1 << 60;
+
+/// The QUIC stream of the long-lived `WebTransport` CONNECT request, beyond the RPC streams.
+const WEBTRANSPORT_CONNECT_STREAMS: u64 = 1;
+
+/// How many bidirectional streams a peer may open on one `QMux` session, or as RPC streams on one
+/// QUIC connection, for a per-connection RPC limit of `max_streams` (`None` for no limit).
+pub fn stream_credit_limit(max_streams: Option<usize>) -> u64 {
+    max_streams.map_or(MAX_STREAM_COUNT, |max_streams| {
+        saturating_usize_to_u64(max_streams)
+            .saturating_mul(STREAM_CREDIT_FACTOR)
+            .min(MAX_STREAM_COUNT)
+    })
+}
 
 impl Server {
     /// Builds the Quinn server configuration for an endpoint served by [`Server::serve`].
@@ -235,7 +256,9 @@ pub fn transport_limits(options: &ServerOptions) -> TransportLimits {
         connection_receive_window: connection_receive_window(options, stream_receive_window),
         max_concurrent_bidi_streams: options.max_concurrent_streams_per_connection().map(
             |max_streams| {
-                saturating_usize_to_u64(max_streams).saturating_add(RESERVED_BIDI_STREAMS)
+                stream_credit_limit(Some(max_streams))
+                    .saturating_add(WEBTRANSPORT_CONNECT_STREAMS)
+                    .min(MAX_STREAM_COUNT)
             },
         ),
     }
@@ -349,7 +372,14 @@ pub fn log_task_error(result: Option<std::result::Result<(), JoinError>>, messag
 mod tests {
     use crate::server::ServerOptions;
 
-    use super::{TransportLimits, transport_limits};
+    use super::{TransportLimits, stream_credit_limit, transport_limits};
+
+    #[test]
+    fn stream_credit_covers_streams_whose_credit_is_still_returning() {
+        assert_eq!(stream_credit_limit(Some(10)), 20);
+        assert_eq!(stream_credit_limit(Some(usize::MAX)), 1 << 60);
+        assert_eq!(stream_credit_limit(None), 1 << 60);
+    }
 
     #[test]
     fn transport_limits_align_with_trevrpc_limits() {
@@ -363,7 +393,7 @@ mod tests {
             TransportLimits {
                 stream_receive_window: 1040,
                 connection_receive_window: 4096,
-                max_concurrent_bidi_streams: Some(12),
+                max_concurrent_bidi_streams: Some(21),
             }
         );
     }
@@ -393,6 +423,6 @@ mod tests {
 
         assert_eq!(limits.stream_receive_window, u64::MAX);
         assert_eq!(limits.connection_receive_window, u64::MAX);
-        assert_eq!(limits.max_concurrent_bidi_streams, Some(u64::MAX));
+        assert_eq!(limits.max_concurrent_bidi_streams, Some(1 << 60));
     }
 }

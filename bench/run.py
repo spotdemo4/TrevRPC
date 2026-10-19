@@ -4,7 +4,8 @@ grpc-go and connect-go baselines; see README.md.
 
     run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
            [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--concurrency LIST]
-           [--duration SECONDS] [--warmup SECONDS] [--messages N] [--out DIR]
+           [--duration SECONDS] [--warmup SECONDS] [--messages N] [--netem PROFILE...]
+           [--out DIR]
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,9 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-# The shared harness; appended so it never shadows modules next to this script.
+# Modules next to this script, which -I leaves off the path, then the shared harness; appended so
+# they never shadow the standard library.
+sys.path.append(str(Path(__file__).resolve().parent))
 sys.path.append(str(Path(__file__).resolve().parents[1] / "interop"))
 
+import netem
 from harness import (
     NamedCommand,
     RunnerError,
@@ -88,6 +94,7 @@ class Result:
     p50_us: float
     p99_us: float
     wire_bytes_per_msg: float | None
+    netem: str | None
     record: dict[str, object]
 
     def row(self) -> list[str]:
@@ -152,12 +159,15 @@ def number_field(container: dict[str, object], name: str, default: float | None 
     return float(value)
 
 
-def parse_result(client: str, server: str, line: str) -> Result:
-    """Parses a client's JSON result line, raising ValueError if it is not a valid result."""
+def parse_result(client: str, server: str, line: str, netem: str | None = None) -> Result:
+    """Parses a client's JSON result line, raising ValueError if it is not a valid result. The
+    record is tagged with the client, the server, and the netem profile, if any."""
     value = cast(object, json.loads(line))  # JSONDecodeError is a ValueError
     if not isinstance(value, dict):
         raise ValueError("not a JSON object")
     record: dict[str, object] = {"client": client, "server": server}
+    if netem is not None:
+        record["netem"] = netem
     record.update(cast(dict[str, object], value))
     latency = record.get("latency_us")
     if not isinstance(latency, dict):
@@ -184,6 +194,7 @@ def parse_result(client: str, server: str, line: str) -> Result:
             if record.get("wire_bytes_per_msg") is None
             else number_field(record, "wire_bytes_per_msg")
         ),
+        netem=netem,
         record=record,
     )
 
@@ -203,11 +214,18 @@ class Runner:
         self.failures = []
 
     def run_matrix(
-        self, client: str, server: str, command: list[str], transport: str, flags: list[str]
+        self,
+        client: str,
+        server: str,
+        command: list[str],
+        transport: str,
+        flags: list[str],
+        netem: str | None,
     ) -> None:
         """Runs `COMMAND bench FLAGS...` with every scenario, size, metadata size, and
-        concurrency."""
+        concurrency, over a link with the `netem` profile applied, if any."""
         m = self.matrix
+        profile = "" if netem is None else "-" + re.sub(r"[^A-Za-z0-9.]+", "_", netem)
         for scenario in m.scenarios:
             if transport in BASELINE_TRANSPORTS and scenario.startswith("unreliable-"):
                 continue
@@ -216,12 +234,13 @@ class Runner:
                     for workers in m.concurrency:
                         cell = (
                             f"{client}-{transport}-to-{server}-{scenario}-{size}"
-                            f"-md{metadata}-c{workers}"
+                            f"-md{metadata}-c{workers}{profile}"
                         )
                         self.run_one(
                             cell,
                             client,
                             server,
+                            netem,
                             [
                                 *command, "bench", *flags, "--transport", transport,
                                 "--scenario", scenario, "--size", str(size),
@@ -231,7 +250,9 @@ class Runner:
                             ],
                         )  # fmt: skip
 
-    def run_one(self, cell: str, client: str, server: str, command: list[str]) -> None:
+    def run_one(
+        self, cell: str, client: str, server: str, netem: str | None, command: list[str]
+    ) -> None:
         log = self.out / f"{cell}.log"
         with log.open("w", encoding="utf-8") as stderr:
             completed = run_with_deadline(
@@ -245,7 +266,7 @@ class Runner:
             self.fail(cell, f"exited {completed.returncode} (see {log})")
             return
         try:
-            result = parse_result(client, server, line)
+            result = parse_result(client, server, line, netem)
         except ValueError as error:
             self.fail(cell, f"printed an invalid result ({error}): {line}")
             return
@@ -266,7 +287,18 @@ class Runner:
 
 
 def summary(results: list[Result]) -> str:
-    """One row per run, grouped by scenario so transports and runtimes line up."""
+    """One table per netem profile, in the order they ran, with one row per run, grouped by
+    scenario so transports and runtimes line up."""
+    profiles: dict[str | None, list[Result]] = {}
+    for result in results:
+        profiles.setdefault(result.netem, []).append(result)
+    return "\n".join(
+        ("" if profile is None else f"netem {profile}\n") + table(group)
+        for profile, group in profiles.items()
+    )
+
+
+def table(results: list[Result]) -> str:
     rows = [list(COLUMNS), *(r.row() for r in sorted(results, key=Result.sort_key))]
     return "".join(
         f"{row[0]:<26}" + "".join(f"{column:<14}" for column in row[1:]) + "\n" for row in rows
@@ -314,6 +346,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument("--warmup", type=seconds, default=1.0)
     _ = parser.add_argument("--messages", type=int, default=100)
     _ = parser.add_argument(
+        "--netem",
+        type=netem.profile,
+        action="append",
+        default=[],
+        metavar="PROFILE",
+        help="run the matrix once per profile over a link emulated with these netem arguments, "
+        "such as 'delay 10ms loss 1%%', inside a network namespace (Linux)",
+    )
+    _ = parser.add_argument(
         "--out", type=Path, help="where results go (default: a new trevrpc-bench.* in $TMPDIR)"
     )
     args = parse_with_defaults(parser, argv, ("server", "client", "baseline"))
@@ -338,6 +379,9 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
         ),
         out,
     )
+    profiles: list[str | None] = [*args.netem] or [None]
+    if args.netem:
+        netem.configure(args.netem)
     certificate = generate_certificate(work)
     _ = (out / "results.jsonl").write_text("", encoding="utf-8")
     tls = ["--ca", str(certificate.cert), "--server-name", "localhost"]
@@ -351,27 +395,52 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
                 "quic": ["--addr", native, *tls],
                 "tcp": ["--addr", native, "--tcp-addr", qmux, *tls],
             }
-            for client in clients:
-                for transport, flags in transports.items():
-                    runner.run_matrix(client.name, spec.name, client.command, transport, flags)
+            for profile in profiles:
+                apply(profile)
+                for client in clients:
+                    for transport, flags in transports.items():
+                        runner.run_matrix(
+                            client.name, spec.name, client.command, transport, flags, profile
+                        )
         finally:
             runner.stop(server)
 
     if baseline is not None:
         server = Server("baseline", baseline, certificate, out)
         try:
-            for transport in BASELINE_TRANSPORTS:
-                address = f"127.0.0.1:{server.port(transport)}"
-                runner.run_matrix(
-                    transport, transport, baseline, transport, ["--addr", address, *tls]
-                )
+            for profile in profiles:
+                apply(profile)
+                for transport in BASELINE_TRANSPORTS:
+                    address = f"127.0.0.1:{server.port(transport)}"
+                    runner.run_matrix(
+                        transport,
+                        transport,
+                        baseline,
+                        transport,
+                        ["--addr", address, *tls],
+                        profile,
+                    )
         finally:
             runner.stop(server)
     return runner
 
 
+def apply(profile: str | None) -> None:
+    if profile is not None:
+        netem.apply(profile)
+
+
 def main(argv: list[str]) -> int:
+    # parse_args consumes the package wrapper's defaults from the environment, and a runner
+    # re-executed in a namespace needs them again.
+    environment = dict(os.environ)
     args = parse_args(argv)
+    if args.netem and not netem.inside_namespace():
+        try:
+            netem.enter_namespace(Path(__file__).resolve(), argv, environment)
+        except RunnerError as error:
+            print(f"trevrpc-bench: {error}", file=sys.stderr)
+            return 1
     # Results outlive the run, unlike the scratch directory.
     out: Path = args.out or Path(tempfile.mkdtemp(prefix="trevrpc-bench."))
     out.mkdir(parents=True, exist_ok=True)

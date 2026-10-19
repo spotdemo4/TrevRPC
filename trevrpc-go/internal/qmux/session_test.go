@@ -408,6 +408,68 @@ func TestStreamDataGapIsProtocolViolation(t *testing.T) {
 	}
 }
 
+// TestPingSequenceMayStartAtZero checks that the first QX_PING may carry
+// sequence number 0. Draft-02 only requires sequence numbers to strictly
+// increase, and the qmux crate that the Rust runtime uses starts at 0. A
+// repeated sequence number is still a violation.
+func TestPingSequenceMayStartAtZero(t *testing.T) {
+	conn, result := rawPeer(t, Config{Parameters: testParameters(), CloseTimeout: 50 * time.Millisecond})
+	var (
+		mu       sync.Mutex
+		received []byte
+	)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			mu.Lock()
+			received = append(received, buf[:n]...)
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+	if _, err := conn.Write(record(appendTransportParameters(nil, &Draft02, testParameters()))); err != nil {
+		t.Fatal(err)
+	}
+	opened := <-result
+	if opened.err != nil {
+		t.Fatal(opened.err)
+	}
+	session := opened.session
+
+	if _, err := conn.Write(record(appendPing(nil, Draft02.PingType, 0))); err != nil {
+		t.Fatal(err)
+	}
+	response := appendPing(nil, Draft02.PingResponseType, 0)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		echoed := bytes.Contains(received, response)
+		mu.Unlock()
+		if echoed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no QX_PING response to sequence 0; session ended with %v", context.Cause(session.Context()))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := session.Context().Err(); err != nil {
+		t.Fatalf("session ended after QX_PING 0: %v", context.Cause(session.Context()))
+	}
+
+	if _, err := conn.Write(record(appendPing(nil, Draft02.PingType, 0))); err != nil {
+		t.Fatal(err)
+	}
+	<-session.Context().Done()
+	var transportErr *TransportError
+	if err := context.Cause(session.Context()); !errors.As(err, &transportErr) || transportErr.ErrorCode != ProtocolViolation {
+		t.Fatalf("session ended with %v, want PROTOCOL_VIOLATION for a repeated sequence", err)
+	}
+}
+
 func TestStreamBeyondLimitIsStreamLimitError(t *testing.T) {
 	params := testParameters()
 	params.InitialMaxStreamsBidi = 2

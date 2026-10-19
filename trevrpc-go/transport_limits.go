@@ -1,5 +1,7 @@
 package trevrpc
 
+import "math"
+
 const (
 	// frameHeaderSize bounds a frame header: a type and a length, each a QUIC
 	// variable-length integer of at most 8 bytes.
@@ -40,11 +42,32 @@ func connectionReceiveWindow(options ServerOptions, streamWindow uint64) uint64 
 	return max(min(connectionWindow, bound), streamWindow)
 }
 
+// streamCreditFactor is how many times MaxConcurrentStreamsPerConnection a
+// peer may open as QUIC, WebTransport, or QMux streams. These transports grant
+// stream credit cumulatively and return a closed stream's credit only once its
+// last data is acknowledged, about a round trip after the call ends, so a
+// stream limit equal to the RPC limit would let a client with that many short
+// calls in flight start only about half of them per round trip. The spare
+// streams cost per-stream state only: the connection receive window still
+// bounds buffered data, and the per-connection RPC limit still rejects an RPC
+// beyond it with a status.
+const streamCreditFactor = 2
+
+// maxStreamCount is the largest stream count QUIC and QMux can express.
+const maxStreamCount = 1 << 60
+
 // serverStreamLimit is how many bidirectional streams a peer may open on one
-// connection or session. It keeps one extra stream available so over-limit
-// RPCs receive a TrevRPC status instead of blocking in flow control.
+// QUIC connection, WebTransport session, or QMux session.
 func serverStreamLimit(options ServerOptions) int64 {
-	return int64(options.MaxConcurrentStreamsPerConnection) + 1
+	limit := saturatingMulUint64(uint64(options.MaxConcurrentStreamsPerConnection), streamCreditFactor)
+	return int64(min(limit, maxStreamCount))
+}
+
+// http2StreamLimit is SETTINGS_MAX_CONCURRENT_STREAMS. HTTP/2 frees a stream
+// as soon as both ends finish it, so one spare stream is enough: it lets an
+// over-limit RPC receive a TrevRPC status instead of waiting for a stream.
+func http2StreamLimit(options ServerOptions) int {
+	return min(options.MaxConcurrentStreamsPerConnection, math.MaxUint32-1) + 1
 }
 
 func saturatingAddUint64(left, right uint64) uint64 {

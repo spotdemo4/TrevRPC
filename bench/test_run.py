@@ -27,6 +27,7 @@ class ParseResultTest(unittest.TestCase):
         result = run.parse_result("go", "rust", json.dumps(RESULT))
 
         self.assertEqual({"client": "go", "server": "rust", **RESULT}, result.record)
+        self.assertIsNone(result.netem)
         self.assertEqual(0, result.lost)
         self.assertIsNone(result.wire_bytes_per_msg)
 
@@ -62,6 +63,22 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0"], bidi[7:])
         self.assertEqual(["unary", "rust", "go"], [unary[0], unary[5], unary[6]])
         self.assertEqual(["80", "33.33"], unary[12:])
+
+    def test_groups_rows_by_netem_profile_in_run_order(self) -> None:
+        results = [
+            run.parse_result("go", "go", json.dumps(RESULT), "delay 10ms loss 1%"),
+            run.parse_result("go", "go", json.dumps(RESULT), "delay 10ms"),
+            run.parse_result("rust", "go", json.dumps(RESULT), "delay 10ms loss 1%"),
+        ]
+
+        lines = run.summary(results).splitlines()
+
+        self.assertEqual("netem delay 10ms loss 1%", lines[0])
+        self.assertTrue(lines[1].startswith("scenario"))
+        self.assertEqual(["go", "rust"], [line.split()[5] for line in lines[2:4]])
+        self.assertEqual(["", "netem delay 10ms"], lines[4:6])
+        self.assertEqual(8, len(lines))
+        self.assertEqual("delay 10ms", results[1].record["netem"])
 
     def test_plain_drops_a_trailing_zero(self) -> None:
         self.assertEqual("5", run.plain(5.0))

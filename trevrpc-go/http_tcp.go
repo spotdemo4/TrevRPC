@@ -51,7 +51,7 @@ func newHTTPTCPServer(l *Listener) *httpTCPServer {
 		// Extended CONNECT (RFC 8441) stays off, so browsers open WebSocket
 		// sessions over HTTP/1.1, the only binding served.
 		HTTP2: &http.HTTP2Config{
-			MaxConcurrentStreams:          int(serverStreamLimit(options)),
+			MaxConcurrentStreams:          http2StreamLimit(options),
 			MaxReceiveBufferPerStream:     clampInt32(streamWindow),
 			MaxReceiveBufferPerConnection: clampInt32(connectionReceiveWindow(options, streamWindow)),
 			SendPingTimeout:               options.ConnectionIdleTimeout,

@@ -1024,8 +1024,8 @@ func TestWebTransportAdvertisesSessionFlowControl(t *testing.T) {
 	if settings[settingWTMaxSessions] <= 1 {
 		t.Errorf("WT_MAX_SESSIONS = %d; Safari needs it, and above 1 it enables flow control", settings[settingWTMaxSessions])
 	}
-	if got := settings[settingWTInitialMaxStreamsBidi]; got != 11 {
-		t.Errorf("WT_INITIAL_MAX_STREAMS_BIDI = %d, want the per-connection limit plus a rejection slot", got)
+	if got := settings[settingWTInitialMaxStreamsBidi]; got != 20 {
+		t.Errorf("WT_INITIAL_MAX_STREAMS_BIDI = %d, want twice the per-connection limit", got)
 	}
 	if got, ok := settings[settingWTInitialMaxStreamsUni]; !ok || got != 0 {
 		t.Errorf("WT_INITIAL_MAX_STREAMS_UNI = %d (sent %t), want an explicit 0", got, ok)

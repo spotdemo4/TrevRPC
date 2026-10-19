@@ -24,8 +24,8 @@ func TestServerQUICConfigDerivesLimitsFromServerOptions(t *testing.T) {
 	if config.InitialConnectionReceiveWindow != 4096 || config.MaxConnectionReceiveWindow != 4096 {
 		t.Fatalf("connection receive window should match the bounded stream budget, got initial=%d max=%d", config.InitialConnectionReceiveWindow, config.MaxConnectionReceiveWindow)
 	}
-	if config.MaxIncomingStreams != 11 {
-		t.Fatalf("incoming bidirectional streams should include one rejection slot, got %d", config.MaxIncomingStreams)
+	if config.MaxIncomingStreams != 20 {
+		t.Fatalf("incoming bidirectional streams should be twice the per-connection limit, so returning credit never stalls calls, got %d", config.MaxIncomingStreams)
 	}
 	if config.MaxIdleTimeout != 20*time.Second || config.KeepAlivePeriod != 10*time.Second {
 		t.Fatalf("idle defaults should derive from the connection idle timeout, got idle=%s keepalive=%s", config.MaxIdleTimeout, config.KeepAlivePeriod)

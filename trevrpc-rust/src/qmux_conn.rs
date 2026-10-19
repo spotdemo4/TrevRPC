@@ -11,9 +11,8 @@ use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 use crate::datagram::NoDatagrams;
 use crate::framed::{ChunkSource, Chunked, FrameWrite};
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
-use crate::quic::saturating_usize_to_u64;
 use crate::request_pump::RequestTransportEvent;
-use crate::serve::transport_limits;
+use crate::serve::{stream_credit_limit, transport_limits};
 use crate::server::ServerOptions;
 use crate::{Error, Result};
 
@@ -42,12 +41,7 @@ pub fn server_config(options: &ServerOptions) -> qmux::Config {
     config.max_data = limits.connection_receive_window;
     config.max_stream_data_bidi_remote = limits.stream_receive_window;
     config.max_stream_data_bidi_local = 0;
-    // One spare stream lets an over-limit RPC still receive a status.
-    config.max_streams_bidi = options
-        .max_concurrent_streams_per_connection()
-        .map_or(u64::MAX >> 4, |streams| {
-            saturating_usize_to_u64(streams).saturating_add(1)
-        });
+    config.max_streams_bidi = stream_credit_limit(options.max_concurrent_streams_per_connection());
     config.max_idle_timeout = options.connection_idle_timeout().map_or(0, |timeout| {
         timeout.as_millis().try_into().unwrap_or(u64::MAX)
     });
@@ -259,5 +253,21 @@ impl ChunkSource for QmuxRecvSource {
 
     async fn read_into(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
         self.connection.until_lost(self.stream.read(bytes)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::ServerOptions;
+
+    use super::server_config;
+
+    #[test]
+    fn server_streams_match_the_quic_credit() {
+        let limited = ServerOptions::new().with_max_concurrent_streams_per_connection(Some(10));
+        assert_eq!(server_config(&limited).max_streams_bidi, 20);
+
+        let unlimited = ServerOptions::new().with_max_concurrent_streams_per_connection(None);
+        assert_eq!(server_config(&unlimited).max_streams_bidi, 1 << 60);
     }
 }

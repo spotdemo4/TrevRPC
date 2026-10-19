@@ -10,10 +10,11 @@ benchstat; see the wiki's Benchmarks page.
 ```text
 nix run .#trevrpc-bench              # every pair, default matrix
 nix run .#trevrpc-bench -- --scenarios unary,bidi --sizes 64,4096 --duration 10
+nix run .#trevrpc-bench -- --netem 'delay 10ms' --netem 'delay 10ms loss 1%'
 bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST]
              [--metadata-sizes LIST] [--duration SECONDS] [--warmup SECONDS]
-             [--messages N] [--out DIR]
+             [--messages N] [--netem PROFILE...] [--out DIR]
 ```
 
 The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients
@@ -29,6 +30,36 @@ when its client exits non-zero or reports errors.
 Timings depend on the machine and on whatever else is running; compare runs
 from the same machine only. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
+
+## Network emulation
+
+Loopback has no loss and almost no latency, so on its own it cannot show what
+QUIC is for. `--netem PROFILE` runs the whole benchmark inside new user and
+network namespaces (Linux only, without root) whose loopback link applies
+[netem](https://man7.org/linux/man-pages/man8/tc-netem.8.html) with
+`PROFILE`'s arguments, such as `delay 10ms loss 1%`. Given more than once, it
+runs the matrix once per profile against the same servers. The summary prints
+one table per profile, and each JSON record carries the profile as `netem`.
+
+- Every packet crosses the link once, in either direction, so `delay 10ms`
+  is a 20 ms round trip and `loss 1%` drops 1% of the packets each way.
+- The link has a 1500-byte MTU. A `tbf` qdisc in front of netem segments TCP
+  and UDP offload (TSO and GSO) super-packets into frames, as a NIC does, so
+  loss applies to each frame. Otherwise netem would drop up to 64 KB of TCP,
+  or a QUIC stack's whole batch of datagrams, as one packet. Segmenting caps
+  the link at roughly 8 Gbit/s.
+- netem's queue holds 1,000,000 packets, so delay alone never drops any. A
+  `limit` in the profile overrides it, which matters with `rate`: a queue
+  that deep in front of a slow rate adds seconds of delay.
+- Size streaming operations to the link. Only operations that finish inside
+  the measured window count, and with loss one connection carries far less:
+  at a 20 ms round trip and 1% loss, roughly 1 MB/s. The default 100
+  messages per call from 64 workers is 6.4 MB per round at 1 KiB, which
+  outlasts a 5 s window, so the run fails with no completed operations.
+  Lower `--messages` or raise `--duration`.
+- Under loss, the `unreliable-*` scenarios lose far more than the link drops.
+  Loss shrinks the congestion window, and a sender that blasts datagrams
+  faster than the window allows has the excess dropped by its QUIC stack.
 
 ## Server
 
