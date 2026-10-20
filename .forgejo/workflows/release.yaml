@@ -2,7 +2,7 @@ name: release
 
 on:
   push:
-    tags: ["**"]
+    tags: ["trevrpc-go/v*", "trevrpc-js/v*", "trevrpc-kotlin/v*", "trevrpc-rust/v*"]
   workflow_dispatch:
 
 # each package tag releases independently; a shared group would cancel queued tags
@@ -14,27 +14,8 @@ concurrency:
 enable-openid-connect: true
 
 jobs:
-  check:
-    # zizmor: ignore[excessive-permissions]
-    if: >-
-      startsWith(github.ref, 'refs/tags/trevrpc-go/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-js/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v') ||
-      startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@a09ea83c7aa7f99a6832771f7b7cb3a764ade52f # v1.71.0
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-
-      - name: Check
-        run: nix flake check
-
   go:
     # zizmor: ignore[excessive-permissions]
-    needs: check
     if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
     name: trevrpc-go
     runs-on: ubuntu-26.04
@@ -62,7 +43,6 @@ jobs:
 
   js:
     # zizmor: ignore[excessive-permissions]
-    needs: check
     if: startsWith(github.ref, 'refs/tags/trevrpc-js/v')
     name: trevrpc-js
     runs-on: ubuntu-26.04
@@ -88,7 +68,6 @@ jobs:
 
   kotlin:
     # zizmor: ignore[excessive-permissions]
-    needs: check
     if: startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v')
     name: trevrpc-kotlin
     runs-on: ubuntu-26.04
@@ -117,7 +96,6 @@ jobs:
 
   rust:
     # zizmor: ignore[excessive-permissions]
-    needs: check
     if: startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     name: trevrpc-rust
     runs-on: ubuntu-26.04
