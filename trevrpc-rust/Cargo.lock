@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "protoc-gen-trevrpc-rust"
-version = "0.1.11"
+version = "1.1.0"
 dependencies = [
  "heck",
  "prost",
@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-interop"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "futures-util",
  "prost",

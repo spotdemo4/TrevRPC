@@ -13,7 +13,7 @@ let
 in
 mkGoModule (final: {
   pname = "trevrpc-go";
-  version = "1.0.0";
+  version = "1.1.0";
 
   # The module itself plus the shared files its tests read: the wire and QMux
   # golden vectors, and the interop and TrevRPC option protos the generated
