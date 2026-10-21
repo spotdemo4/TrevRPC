@@ -2366,9 +2366,9 @@ dependencies = [
 
 [[package]]
 name = "web-transport-trait"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f1e801f997864ab0074afb1c7d3262df46d5d9ad9b78274c47694544db2dba7"
+checksum = "75a9b0cb06e01f7dae64fc1856eb87344310101a3b5387e1512b7d74da42ab5a"
 dependencies = [
  "bytes",
 ]
