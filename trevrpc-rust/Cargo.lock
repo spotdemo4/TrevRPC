@@ -854,9 +854,9 @@ dependencies = [
 
 [[package]]
 name = "kio"
-version = "0.5.9"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3033155c4fffcd86959a9ebdfbcadbed7ec4bfcc2fb545469778f791adf704eb"
+checksum = "88b9d7b486bef9fdee1330ed216e35e8a170f840d407ccb20b5eb194af3d01a5"
 dependencies = [
  "loom",
  "smallvec",
@@ -2345,9 +2345,9 @@ dependencies = [
 
 [[package]]
 name = "web-transport-quinn"
-version = "0.13.2"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "101ac58477fdd48961159b33c347f64f992cbc24d948f21e9cadc58bb03dc748"
+checksum = "251772dde5c7b78a532af0df7597259186456b683b46fc516745585684574a0e"
 dependencies = [
  "bytes",
  "futures",
