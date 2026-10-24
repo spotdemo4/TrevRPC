@@ -14,6 +14,7 @@ import org.junit.BeforeClass
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.Parameterized
+import trevrpc.interop.v1.CompressedEchoClient
 import trevrpc.interop.v1.EchoClient
 import trevrpc.interop.v1.Interop.EchoRequest
 import trevrpc.interop.v1.Interop.EchoResponse
@@ -46,7 +47,9 @@ class EchoScenarioTest(
         val body = checkNotNull(SCENARIOS[name]) { "unknown scenario $name" }
         val options = CallOptions(timeout = 10.seconds)
         runBlocking {
-            withTimeout(30.seconds) { body(Clients(EchoClient(channel, options), UnreliableEchoClient(channel, options))) }
+            withTimeout(30.seconds) {
+                body(Clients(EchoClient(channel, options), UnreliableEchoClient(channel, options), CompressedEchoClient(channel, options)))
+            }
         }
     }
 
@@ -116,7 +119,11 @@ private fun interopCompression(): Compression {
 private data class Clients(
     val echo: EchoClient,
     val unreliable: UnreliableEchoClient,
+    val compressed: CompressedEchoClient,
 )
+
+/** The i-th message of the compressed scenarios: like the documents the interop dictionary was trained on. */
+private fun compressedMessage(index: Int) = """{"service":"search","region":"us-east-1","status":404,"latency_ms":${100 + index}}"""
 
 private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
     linkedMapOf(
@@ -194,10 +201,8 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             expectMetadata("trailing metadata", response.trailers, "interop-trailer")
         },
         "compressed" to { (client) ->
-            // Messages like the documents the interop dictionary was trained on, so they compress.
-            fun message(index: Int) = """{"service":"search","region":"us-east-1","status":404,"latency_ms":${100 + index}}"""
-            for (index in 0 until 2) expectEcho(client.unary(request(message(index))), message(index), 0)
-            val sent = (0 until 3).map(::message)
+            for (index in 0 until 2) expectEcho(client.unary(request(compressedMessage(index))), compressedMessage(index), 0)
+            val sent = (0 until 3).map(::compressedMessage)
             val responses = client.bidi(sent.map { request(it) }.asFlow()).toList()
             expect(responses.size == sent.size) { "expected ${sent.size} responses, got ${responses.size}" }
             responses.forEachIndexed { index, response -> expectEcho(response, sent[index], index) }
@@ -221,6 +226,25 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             expect(sent.last() in received) { "the 4096-byte echo is missing" }
             expectCounter(response.trailers, "interop-received", sent.size.toString())
             expectCounter(response.trailers, "interop-datagrams-received", "0")
+        },
+        "compressed-stream" to { (_, _, client) ->
+            // Each request waits for the echo of the one before, so the server's HEADERS, which
+            // enable compressed requests, arrive before the third, when compression starts.
+            val messages = (0 until 8).map(::compressedMessage)
+            val requests = Channel<EchoRequest>(Channel.UNLIMITED)
+            requests.send(request(messages[0]))
+            val response = ResponseMetadata()
+            var echoed = 0
+            client.bidi(requests.consumeAsFlow()) { response.capture(this) }.collect { echo ->
+                expectEcho(echo, messages[echoed], echoed)
+                echoed++
+                if (echoed < messages.size) requests.send(request(messages[echoed])) else requests.close()
+            }
+            expect(echoed == messages.size) { "expected ${messages.size} echoes, got $echoed" }
+            val compressed = response.trailers["interop-stream-compressed-received"]?.decodeToString()?.toIntOrNull()
+            expect(compressed != null && compressed >= 1) {
+                "expected trailing metadata interop-stream-compressed-received of at least 1, got $compressed"
+            }
         },
     )
 

@@ -1,3 +1,4 @@
+import { CompressedEchoClient } from "../build/interop/gen/compressed.trevrpc.js";
 import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
 import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
@@ -13,6 +14,8 @@ const UnreliableShortRequests = 50;
 const UnreliableLargeSize = 4096;
 /** How many messages the `compressed` scenario streams. */
 const CompressedMessages = 3;
+/** How many messages the `compressed-stream` scenario echoes. */
+const CompressedStreamMessages = 8;
 /** The message types the interop dictionary compresses. */
 const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
 
@@ -41,8 +44,9 @@ function incompressible(n) {
 }
 
 /**
- * Scenarios take the Echo client and a context: `unreliable` is the UnreliableEcho client and
- * `transport` the transport ("webtransport" or "websocket") the channel connected over.
+ * Scenarios take the Echo client and a context: `unreliable` is the UnreliableEcho client,
+ * `compressed` the CompressedEcho client, and `transport` the transport ("webtransport" or
+ * "websocket") the channel connected over.
  */
 const scenarios = {
   async unary(echo) {
@@ -255,6 +259,24 @@ const scenarios = {
     );
     expect((await call.status).code === Code.Ok, "stream did not end with OK");
   },
+
+  // Each echo is awaited, so the server's HEADERS, which let the client compress its requests,
+  // arrive before the third request, when stream compression starts.
+  async "compressed-stream"(_echo, { compressed }) {
+    const call = await compressed.bidi();
+    for (let i = 0; i < CompressedStreamMessages; i += 1) {
+      await call.send({ message: compressedMessage(i) });
+      expectEcho(await call.recv(), compressedMessage(i), i);
+    }
+    await call.closeSend();
+    expect((await call.recv()) === undefined, "expected the stream to end after closeSend");
+    const status = await call.status;
+    expect(status.code === Code.Ok, "stream did not end with OK");
+    const received = Number(
+      new TextDecoder().decode(status.metadata["interop-stream-compressed-received"] ?? []),
+    );
+    expect(received >= 1, `interop-stream-compressed-received ${received}, want at least 1`);
+  },
 };
 
 /** The channel transports each interop lane allows. */
@@ -271,8 +293,9 @@ const LaneTransports = {
  *
  * transport is "webtransport" (the default), "websocket" (QMux over WebSocket at webSocketUrl),
  * or "auto" (WebTransport with the WebSocket fallback). expectTransport fails every scenario
- * unless the channel connected over that transport. dictionary, the interop dictionary in base64,
- * makes the channel compress Echo messages with it.
+ * unless the channel connected over that transport. The channel always has compression settings,
+ * so it stream-compresses where methods allow it; dictionary, the interop dictionary in base64,
+ * adds that dictionary for Echo messages.
  */
 export async function runScenarios({
   url,
@@ -293,11 +316,9 @@ export async function runScenarios({
 
   let channel;
   try {
-    const compression =
-      dictionary &&
-      (await createCompression({
-        dictionaries: [{ data: base64Bytes(dictionary), messages: EchoTypes }],
-      }));
+    const compression = await createCompression({
+      dictionaries: dictionary ? [{ data: base64Bytes(dictionary), messages: EchoTypes }] : [],
+    });
     channel = await connect(url, {
       compression,
       signal: AbortSignal.timeout(DeadlineMs),
@@ -322,6 +343,7 @@ export async function runScenarios({
     const echo = new EchoClient(channel, { timeoutMs: DeadlineMs });
     const context = {
       unreliable: new UnreliableEchoClient(channel, { timeoutMs: DeadlineMs }),
+      compressed: new CompressedEchoClient(channel, { timeoutMs: DeadlineMs }),
       get transport() {
         return channel.transport;
       },

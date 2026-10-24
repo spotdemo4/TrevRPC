@@ -137,6 +137,15 @@ export interface RpcMethodDescriptor {
    * client accepts them as datagrams on any session that has them.
    */
   unreliableResponses?: boolean;
+  /**
+   * The method's request messages may be stream-compressed (`compress_stream` in the
+   * `trevrpc.method` option, on a method that streams requests, whose request type has no field
+   * marked `debug_redact`). Calls on a transport with compression then compress them with one zstd
+   * context per call, once the server agrees.
+   */
+  compressStreamRequests?: boolean;
+  /** The method's response messages may be stream-compressed; see `compressStreamRequests`. */
+  compressStreamResponses?: boolean;
 }
 
 export interface RpcServiceDescriptor {
@@ -314,9 +323,15 @@ export interface ConnectOptions {
   /**
    * Compresses messages with the dictionaries these settings hold, from `createCompression()` in
    * `@trevrpc/trevrpc-js/zstd`. Dictionaries are negotiated with the server per session, so a
-   * message whose dictionary the server lacks travels uncompressed.
+   * message whose dictionary the server lacks travels uncompressed. Compression settings also
+   * enable stream compression on methods that allow it, even without dictionaries.
    */
   compression?: Compression;
+  /**
+   * The memory, in bytes, the stream compression contexts of this channel's calls may hold.
+   * Defaults to 64 MiB; 0 turns stream compression off. Calls beyond it compress per message.
+   */
+  streamCompressionMemory?: number;
   /** Cancels the initial connection attempt only. */
   signal?: AbortSignal;
   /** Receives channel state transitions. */

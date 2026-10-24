@@ -3,6 +3,8 @@ package zip.trev.trevrpc.generator
 import com.google.protobuf.ByteString
 import com.google.protobuf.CodedOutputStream
 import com.google.protobuf.DescriptorProtos.DescriptorProto
+import com.google.protobuf.DescriptorProtos.FieldDescriptorProto
+import com.google.protobuf.DescriptorProtos.FieldOptions
 import com.google.protobuf.DescriptorProtos.FileDescriptorProto
 import com.google.protobuf.DescriptorProtos.FileOptions
 import com.google.protobuf.DescriptorProtos.MethodDescriptorProto
@@ -508,6 +510,107 @@ class GeneratorTest {
     }
 
     @Test
+    fun `passes stream compression for streamed directions without redacted or unreliable messages`() {
+        fun field(
+            name: String,
+            number: Int,
+            type: String? = null,
+            redacted: Boolean = false,
+        ): FieldDescriptorProto =
+            FieldDescriptorProto
+                .newBuilder()
+                .setName(name)
+                .setNumber(number)
+                .setLabel(FieldDescriptorProto.Label.LABEL_OPTIONAL)
+                .apply {
+                    if (type ==
+                        null
+                    ) {
+                        setType(FieldDescriptorProto.Type.TYPE_STRING)
+                    } else {
+                        setType(FieldDescriptorProto.Type.TYPE_MESSAGE).setTypeName(type)
+                    }
+                    if (redacted) setOptions(FieldOptions.newBuilder().setDebugRedact(true))
+                }.build()
+
+        fun compressed(
+            name: String,
+            input: String,
+            output: String,
+            unreliableRequests: Boolean = false,
+        ) = method(name, input, output)
+            .setClientStreaming(true)
+            .setServerStreaming(true)
+            .setOptions(trevrpcOptions(requests = unreliableRequests, compressStream = true))
+
+        val file =
+            FileDescriptorProto
+                .newBuilder()
+                .setName("api/redact.proto")
+                .setPackage("redact")
+                .setOptions(javaOptions("redact.generated"))
+                .addMessageType(DescriptorProto.newBuilder().setName("Plain").addField(field("text", 1)))
+                .addMessageType(DescriptorProto.newBuilder().setName("Secret").addField(field("token", 1, redacted = true)))
+                .addMessageType(DescriptorProto.newBuilder().setName("Wrapper").addField(field("inner", 1, ".redact.Secret")))
+                // A recursive type without redacted fields still compresses.
+                .addMessageType(DescriptorProto.newBuilder().setName("Node").addField(field("next", 1, ".redact.Node")))
+                .addService(
+                    ServiceDescriptorProto
+                        .newBuilder()
+                        .setName("Svc")
+                        .addMethod(compressed("Both", ".redact.Plain", ".redact.Plain"))
+                        .addMethod(compressed("Up", ".redact.Plain", ".redact.Plain").setServerStreaming(false))
+                        .addMethod(compressed("Down", ".redact.Plain", ".redact.Plain").setClientStreaming(false))
+                        .addMethod(compressed("SecretUp", ".redact.Wrapper", ".redact.Plain"))
+                        .addMethod(compressed("Tree", ".redact.Node", ".redact.Node"))
+                        .addMethod(compressed("Datagrams", ".redact.Plain", ".redact.Plain", unreliableRequests = true))
+                        .addMethod(compressed("Hidden", ".redact.Secret", ".redact.Wrapper"))
+                        .addMethod(method("Off", ".redact.Plain", ".redact.Plain").setClientStreaming(true).setServerStreaming(true)),
+                ).build()
+
+        val response = generate(request(file))
+
+        assertEquals("", response.error)
+        val calls =
+            response.fileList
+                .single()
+                .content
+                .lines()
+                .filter { "client." in it }
+                .associate { line -> Regex("SVC_(\\w+)_PATH").find(line)!!.groupValues[1] to line }
+
+        fun streams(method: String): String? = Regex("CompressStream\\.(\\w+)\\)").find(calls.getValue(method))?.groupValues?.get(1)
+        assertEquals("BOTH", streams("BOTH"))
+        assertEquals("REQUESTS", streams("UP"))
+        assertEquals("RESPONSES", streams("DOWN"))
+        assertEquals("RESPONSES", streams("SECRET_UP"))
+        assertEquals("BOTH", streams("TREE"))
+        assertEquals("RESPONSES", streams("DATAGRAMS"))
+        assertEquals(null, streams("HIDDEN"))
+        assertEquals(null, streams("OFF"))
+    }
+
+    @Test
+    fun `rejects compress_stream on a unary method`() {
+        val response =
+            generate(
+                request(
+                    collisionFile(
+                        "api/unary.proto",
+                        ServiceDescriptorProto
+                            .newBuilder()
+                            .setName("Svc")
+                            .addMethod(
+                                method("M", ".collision.Request", ".collision.Reply").setOptions(trevrpcOptions(compressStream = true)),
+                            ).build(),
+                    ),
+                ),
+            )
+        assertTrue(response.fileList.isEmpty())
+        assertEquals("collision.Svc.M: compress_stream requires a streaming method", response.error)
+    }
+
+    @Test
     fun `rejects a malformed trevrpc method option`() {
         val malformed =
             MethodOptions
@@ -720,15 +823,22 @@ class GeneratorTest {
             .build()
     }
 
-    /** MethodOptions as protoc hands them to a plugin: `(trevrpc.method)` is an unknown length-delimited field 58247. */
     private fun unreliableOptions(
         requests: Boolean = false,
         responses: Boolean = false,
+    ): MethodOptions = trevrpcOptions(requests, responses)
+
+    /** MethodOptions as protoc hands them to a plugin: `(trevrpc.method)` is an unknown length-delimited field 58247. */
+    private fun trevrpcOptions(
+        requests: Boolean = false,
+        responses: Boolean = false,
+        compressStream: Boolean = false,
     ): MethodOptions {
         val bytes = ByteArrayOutputStream()
         val out = CodedOutputStream.newInstance(bytes)
         if (requests) out.writeBool(1, true)
         if (responses) out.writeBool(2, true)
+        if (compressStream) out.writeBool(3, true)
         out.flush()
         return MethodOptions
             .newBuilder()
@@ -857,8 +967,9 @@ class GeneratedCodeCompilationTest {
             return lines[index - 1] == "     */" && lines[index - 3].contains("Cronet has no")
         }
         listOf("upload", "watch", "track").forEach { assertTrue(documented(it), it) }
-        listOf("lookup", "plain").forEach { assertFalse(documented(it), it) }
+        listOf("lookup", "plain", "compressed").forEach { assertFalse(documented(it), it) }
         assertTrue(lines.any { "requests and responses unreliable" in it })
+        assertTrue(lines.any { "TRACKER_COMPRESSED_PATH" in it && "CompressStream.BOTH)" in it }, generated)
     }
 
     @Test
@@ -1015,6 +1126,7 @@ class GeneratedCodeCompilationTest {
                 val track: Flow<Position> = client.track(positions)
                 val watch: Flow<Position> = client.watch(position)
                 val upload: Position = client.upload(positions)
+                val compressed: Flow<Position> = client.compressed(positions)
             }
             """.trimIndent()
 

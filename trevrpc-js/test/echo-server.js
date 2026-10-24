@@ -3,12 +3,16 @@
 import { root } from "../build/interop/gen/interop.trevrpc.js";
 import { encodeMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
-import { marshalMessage } from "../src/framing.js";
+import { encodeHeadersFrame, encodeOutgoingFrame, marshalMessage } from "../src/framing.js";
 import { Code } from "../src/status.js";
-import { parseMethodPath } from "./support.js";
+import { createCompression } from "../src/zstd.js";
+import { ServerStreams, parseMethodPath } from "./support.js";
 
 const EchoService = "trevrpc.interop.v1.Echo";
 const UnreliableEchoService = "trevrpc.interop.v1.UnreliableEcho";
+const CompressedEchoService = "trevrpc.interop.v1.CompressedEcho";
+/** The server's stream compression; it holds no dictionaries. */
+const compression = await createCompression();
 /** Responses up to this size are sent as datagrams when the call has a flow. */
 const MaxDatagramResponse = 1000;
 const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
@@ -43,6 +47,13 @@ async function serve(stream, request, unary, session) {
   const path = parseMethodPath(request.method);
   if (path === null) {
     await stream.writeStatus(Code.InvalidArgument, `malformed method path "${request.method}"`);
+    await stream.finish();
+    await stream.stopSending();
+    return;
+  }
+
+  if (path.service === CompressedEchoService && path.method === "Bidi") {
+    await compressedBidi(stream, request);
     await stream.finish();
     await stream.stopSending();
     return;
@@ -119,6 +130,31 @@ async function bidi(stream, done) {
     await stream.writeMessage(EchoResponse, { message: request.message, index });
   }
   await done();
+}
+
+/**
+ * CompressedEcho.Bidi as the interop README specifies: Echo.Bidi with stream compression, whose
+ * OK status reports how many requests arrived stream-compressed.
+ */
+async function compressedBidi(stream, request) {
+  const streams = new ServerStreams(compression, request);
+  try {
+    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
+    for (let index = 0, frame; (frame = await stream.readFrame()) !== null; index += 1) {
+      const message = EchoRequest.decode(streams.receive(frame));
+      if (message.failCode !== 0) {
+        await stream.writeStatus(message.failCode, message.failMessage);
+        return;
+      }
+      const response = marshalMessage(EchoResponse, { message: message.message, index });
+      await stream.write(encodeOutgoingFrame(streams.encode(response)));
+    }
+    await stream.writeStatus(Code.Ok, "", {
+      "interop-stream-compressed-received": new TextEncoder().encode(String(streams.received)),
+    });
+  } finally {
+    streams.close();
+  }
 }
 
 /**

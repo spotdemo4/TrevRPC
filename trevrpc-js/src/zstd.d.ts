@@ -29,6 +29,7 @@ export interface CompressionOptions {
 /**
  * Creates compression settings for `connect()`. It loads libzstd as WebAssembly (about 85 KB
  * gzipped), digests the dictionaries, and rejects with a TypeError for an invalid dictionary, a
- * dictionary ID used twice, or a message type in two dictionaries.
+ * dictionary ID used twice, or a message type in two dictionaries. Settings without dictionaries
+ * enable stream compression alone.
  */
 export function createCompression(options?: CompressionOptions): Promise<Compression>;

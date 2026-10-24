@@ -117,12 +117,13 @@ internal class CallEnd {
 
 /**
  * The transport stream of one call with the state its two halves share. Both halves send and
- * receive through it, so the call's [compression] applies to every message: responses larger than
- * [maxMessageSize] are rejected before they are decompressed.
+ * receive through it, so the call's [compression] and [streams] apply to every message: responses
+ * larger than [maxMessageSize] are rejected before they are decompressed.
  */
 internal class CallStream(
     val stream: RpcClientStream,
     private val compression: CallCompression? = null,
+    private val streams: CallStreams? = null,
     private val maxMessageSize: Int = DEFAULT_MAX_FRAME_SIZE,
 ) {
     val end = CallEnd()
@@ -132,29 +133,57 @@ internal class CallStream(
 
     private val closed = AtomicBoolean(false)
 
-    /** Sends one request message, compressed when the call's negotiation allows it. */
+    /**
+     * Sends one request message: stream-compressed once the call's stream compression has started,
+     * otherwise compressed with a dictionary when the call's negotiation allows it.
+     */
     suspend fun send(body: ByteArray) {
+        streams?.compressRequest(body)?.let { payload ->
+            stream.send(payload, FrameType.ZSTD_STREAM_MESSAGE)
+            return
+        }
         val compressed = compression?.compressRequest(body)
         if (compressed == null) stream.send(body) else stream.send(compressed, FrameType.ZSTD_MESSAGE)
     }
 
     /**
-     * Receives the next response frame from the transport: HEADERS carry the server's answer to
-     * the call's dictionary query, and compressed messages are decompressed.
+     * Receives the next response frame from the transport: HEADERS carry the server's answers to
+     * the call's dictionary query and stream compression offer, and compressed messages are
+     * decompressed.
      */
     suspend fun receive(): ResponseFrame? =
         when (val frame = stream.receive()) {
-            is ResponseFrame.Headers -> frame.also { compression?.learn(it.dictionaries) }
-            is ResponseFrame.Message -> inflateResponse(frame, compression, maxMessageSize)
-            else -> frame
+            is ResponseFrame.Headers -> {
+                frame.also {
+                    compression?.learn(it.dictionaries)
+                    streams?.learn(it.streamCompression)
+                }
+            }
+
+            is ResponseFrame.Message -> {
+                if (frame.streamSize == null) {
+                    inflateResponse(frame, compression, maxMessageSize)
+                } else {
+                    streams?.inflate(frame, maxMessageSize)
+                        ?: throw TrevRpcException(Status.internal("stream-compressed message where stream compression is not enabled"))
+                }
+            }
+
+            else -> {
+                frame
+            }
         }
 
-    /** Closes the transport stream once, releasing the pump and failing blocked sends. */
+    /** Closes the transport stream once, releasing the pump, failing blocked sends, and freeing compression contexts. */
     suspend fun close(cause: Throwable? = null) {
         end.closed()
         if (!closed.compareAndSet(false, true)) return
-        pump?.cancel()
-        stream.close(cause)
+        try {
+            pump?.cancel()
+            stream.close(cause)
+        } finally {
+            streams?.close()
+        }
     }
 }
 

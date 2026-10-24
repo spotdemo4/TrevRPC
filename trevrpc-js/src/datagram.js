@@ -51,7 +51,8 @@ export function encodeDatagram(flow, messages) {
 /**
  * Decodes a datagram payload as `{ flow, messages }`, or null if it has no complete flow ID. The
  * messages are its MESSAGE and ZSTD_MESSAGE frames as `{ type, payload }`; every other frame is
- * skipped. A datagram whose frames do not exactly fill it decodes to no messages at all.
+ * skipped. A datagram whose frames do not exactly fill it, or that holds a ZSTD_STREAM_MESSAGE,
+ * which needs a stream's ordered delivery, decodes to no messages at all.
  */
 export function decodeDatagram(datagram) {
   const bytes = byteView(datagram);
@@ -69,6 +70,9 @@ export function decodeDatagram(datagram) {
     }
     const end = length.next + length.value;
     if (end > bytes.byteLength) {
+      return { flow: flow.value, messages: [] };
+    }
+    if (type.value === FrameType.ZstdStreamMessage) {
       return { flow: flow.value, messages: [] };
     }
     if (type.value === FrameType.Message || type.value === FrameType.ZstdMessage) {

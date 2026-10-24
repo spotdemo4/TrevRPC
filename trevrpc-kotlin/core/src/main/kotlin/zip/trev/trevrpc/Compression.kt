@@ -1,10 +1,15 @@
 package zip.trev.trevrpc
 
 /**
- * Compressed messages: messages that travel as zstd frames compressed with a dictionary both peers
- * hold. A channel configured with it asks the server on every call which of the call's dictionaries
- * it holds, since Cronet does not say which calls share a connection, so a message whose dictionary
- * the server lacks travels uncompressed.
+ * Compressed messages: messages that travel as zstd frames. A channel configured with it compresses
+ * in two ways, which combine:
+ *
+ * - With dictionaries both peers hold. The channel asks the server on every call which of the
+ *   call's dictionaries it holds, since Cronet does not say which calls share a connection, so a
+ *   message whose dictionary the server lacks travels uncompressed.
+ * - With stream compression on methods whose schema sets `compress_stream`: one zstd context per
+ *   streamed direction of a call, which needs no dictionaries, so an empty [dictionaries] list
+ *   enables only this.
  *
  * Compression calls zstd-jni, which the application adds: `com.github.luben:zstd-jni` as an `aar`
  * on Android, or as a JAR on the JVM. Constructing a [Compression] without it fails.
@@ -21,6 +26,11 @@ class Compression(
     private val byType: Map<String, ConfiguredDictionary>
 
     init {
+        try {
+            loadZstd()
+        } catch (error: LinkageError) {
+            throw IllegalStateException("compression needs zstd-jni (com.github.luben:zstd-jni)", error)
+        }
         val byId = mutableMapOf<UInt, ConfiguredDictionary>()
         val types = mutableMapOf<String, ConfiguredDictionary>()
         this.dictionaries.forEachIndexed { index, dictionary ->
@@ -116,6 +126,14 @@ internal class CallCompression(
 
     @Volatile
     private var requestConfirmed = false
+
+    /** The request type's dictionary once the server's answer confirmed it, or null. */
+    val confirmedRequest: ConfiguredDictionary?
+        get() = request?.takeIf { requestConfirmed }
+
+    /** The dictionary the call accepts on its responses, or null. */
+    val acceptedResponse: ConfiguredDictionary?
+        get() = response
 
     /** Records the server's answer from the call's HEADERS. */
     fun learn(answer: List<DictionaryInfo>) {

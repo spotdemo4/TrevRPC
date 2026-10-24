@@ -1,6 +1,6 @@
-// Generates the Echo and UnreliableEcho clients from the shared interop protos with
-// protoc-gen-trevrpc-js and bundles the browser page that runs the interop scenarios. Output goes
-// to build/interop/.
+// Generates the Echo, UnreliableEcho and CompressedEcho clients from the shared interop protos
+// with protoc-gen-trevrpc-js and bundles the browser page that runs the interop scenarios. Output
+// goes to build/interop/.
 import { execFile } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -31,6 +31,7 @@ export async function buildInterop() {
     `--proto_path=${optionsProtoDir}`,
     "interop.proto",
     "unreliable.proto",
+    "compressed.proto",
   ]);
 
   const bundle = await rolldown({

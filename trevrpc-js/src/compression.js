@@ -1,19 +1,20 @@
 // Compressed messages: ZSTD_MESSAGE frames, whose payload is a magicless zstd frame compressed with
-// a dictionary both peers hold (see the "Compressed Messages" section of the wire format). The
-// codec itself lives in the `@trevrpc/trevrpc-js/zstd` subpath, so the runtime never loads it
-// unless compression is configured; this module negotiates dictionaries per session, validates
-// payloads, and enforces limits before handing a payload to the codec.
+// a dictionary both peers hold, and the chunks of ZSTD_STREAM_MESSAGE frames (see the "Compressed
+// Messages" section of the wire format). The codec itself lives in the `@trevrpc/trevrpc-js/zstd`
+// subpath, so the runtime never loads it unless compression is configured; this module negotiates
+// dictionaries per session, validates payloads, and enforces limits before handing a payload to
+// the codec. Stream compression's per-call state is in stream-compression.js.
 import { byteView } from "./bytes.js";
 import { FrameType } from "./framing.js";
 import { internal, resourceExhausted } from "./status.js";
 
 /**
  * The compression configuration of a transport, or undefined without one. A Channel carries the
- * one from its connect options; a configuration without dictionaries compresses nothing.
+ * one from its connect options. A configuration without dictionaries still enables stream
+ * compression.
  */
 export function transportCompression(transport) {
-  const compression = transport.compression;
-  return compression?.query?.length > 0 ? compression : undefined;
+  return transport.compression ?? undefined;
 }
 
 const sessions = new WeakMap();
@@ -53,7 +54,8 @@ class SessionCompression {
   prepare(responseType) {
     const shared = this.#shared;
     const fields = {};
-    if (shared === undefined) {
+    const queried = shared === undefined && this.#compression.query.length > 0;
+    if (queried) {
       fields.dictionaryQuery = this.#compression.query;
     }
     // A call that queries may already accept the dictionary it asks about: the server compresses
@@ -63,7 +65,7 @@ class SessionCompression {
     if (accept) {
       fields.acceptDictionaries = [dictionary.id];
     }
-    return { fields, accept: accept ? dictionary : undefined, queried: shared === undefined };
+    return { fields, accept: accept ? dictionary : undefined, queried };
   }
 
   /**
@@ -93,8 +95,8 @@ class SessionCompression {
 
 /**
  * Encodes a marshalled message as an outgoing message, `{ type, payload, size }`: a ZSTD_MESSAGE
- * compressed with `dictionary` when that is shorter, and a MESSAGE otherwise, as without one. `size` is the message size, which
- * limits apply to.
+ * compressed with `dictionary` when that is shorter, and a MESSAGE otherwise, as without one.
+ * `size` is the message size, which limits apply to.
  */
 export function encodeMessage(body, dictionary) {
   const compressed = dictionary?.compress(body);
@@ -184,28 +186,13 @@ export function parseZstdHeader(payload) {
     throw invalid();
   }
   for (;;) {
-    if (bytes.byteLength - position < 3) {
+    const block = nextBlock(bytes, position);
+    if (block === undefined) {
       throw invalid();
     }
-    const header = bytes[position] | (bytes[position + 1] << 8) | (bytes[position + 2] << 16);
-    position += 3;
-    let size = header >>> 3;
-    switch ((header >>> 1) & 0x03) {
-      case 0: // Raw_Block
-      case 2: // Compressed_Block
-        break;
-      case 1: // RLE_Block
-        size = 1;
-        break;
-      default:
-        throw invalid();
-    }
-    if (bytes.byteLength - position < size) {
-      throw invalid();
-    }
-    position += size;
-    if ((header & 1) !== 0) {
-      break; // Last_Block
+    position = block.next;
+    if (block.last) {
+      break;
     }
   }
   if (checksum) {
@@ -215,6 +202,79 @@ export function parseZstdHeader(payload) {
     throw invalid();
   }
   return { dictionaryId, contentSize };
+}
+
+/**
+ * Validates `chunk`, the zstd data of a ZSTD_STREAM_MESSAGE, and returns
+ * `{ startsFrame, dictionaryId, endsFrame }`. `atFrameStart` says that no frame is open, so a
+ * non-empty chunk must start with a frame header: one without Single_Segment_flag,
+ * Frame_Content_Size_flag, Content_Checksum_flag or the reserved bit, whose window is at most
+ * 2^maxWindowLog. It then walks the block headers: a chunk is whole blocks, and a Last_Block ends
+ * both the chunk and the frame. An empty chunk is an empty message and changes nothing. Block
+ * contents are not checked; decompression does that.
+ */
+export function parseStreamChunk(chunk, atFrameStart, maxWindowLog) {
+  const bytes = byteView(chunk);
+  const invalid = () => internal("invalid ZSTD_STREAM_MESSAGE payload");
+  const result = { startsFrame: false, dictionaryId: 0, endsFrame: false };
+  if (bytes.byteLength === 0) {
+    return result;
+  }
+  let position = 0;
+  if (atFrameStart) {
+    const descriptor = bytes[0];
+    // Frame_Content_Size_flag (bits 7-6), Single_Segment_flag (bit 5), the reserved bit (bit 3) and
+    // Content_Checksum_flag (bit 2) must be unset.
+    if ((descriptor & 0xec) !== 0 || bytes.byteLength < 2) {
+      throw invalid();
+    }
+    const windowDescriptor = bytes[1];
+    const base = 2 ** (10 + (windowDescriptor >> 3));
+    if (base + (base / 8) * (windowDescriptor & 7) > 2 ** maxWindowLog) {
+      throw invalid();
+    }
+    const didSize = DidSizes[descriptor & 0x03];
+    position = 2 + didSize;
+    if (bytes.byteLength < position) {
+      throw invalid();
+    }
+    result.dictionaryId = readLittleEndian(bytes, 2, didSize);
+    result.startsFrame = true;
+  }
+  while (position < bytes.byteLength) {
+    const block = nextBlock(bytes, position);
+    if (block === undefined || (block.last && block.next !== bytes.byteLength)) {
+      throw invalid();
+    }
+    position = block.next;
+    result.endsFrame = block.last;
+  }
+  return result;
+}
+
+/**
+ * Walks the zstd block whose header starts at `position` and returns `{ next, last }`: where the
+ * next block starts and whether this one is the Last_Block. Returns undefined for a reserved block
+ * type or a block that does not fit. Block contents are not checked.
+ */
+function nextBlock(bytes, position) {
+  if (bytes.byteLength - position < 3) {
+    return undefined;
+  }
+  const header = bytes[position] | (bytes[position + 1] << 8) | (bytes[position + 2] << 16);
+  let size = header >>> 3;
+  switch ((header >>> 1) & 0x03) {
+    case 0: // Raw_Block
+    case 2: // Compressed_Block
+      break;
+    case 1: // RLE_Block
+      size = 1;
+      break;
+    default:
+      return undefined;
+  }
+  const next = position + 3 + size;
+  return next > bytes.byteLength ? undefined : { next, last: (header & 1) !== 0 };
 }
 
 /** Reads an unsigned little-endian integer of size bytes as a number. */

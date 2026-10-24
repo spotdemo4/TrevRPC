@@ -147,6 +147,8 @@ const channel = await connect(url, { compression });
 
 Generated clients pick each message's dictionary by its protobuf type. The channel asks each new session's server which dictionaries it holds, so a message whose dictionary the server lacks travels uncompressed, and request messages are compressed once the answer arrives. A transport other than a `Channel` compresses when it has a `compression` property with these settings.
 
+Compression settings also enable stream compression, even without dictionaries (`createCompression()`): streaming methods marked `option (trevrpc.method) = {compress_stream: true}` compress each streamed direction with one zstd context per call, from its third message, so later messages compress against earlier ones. The contexts of a channel's calls may hold up to `streamCompressionMemory` bytes (64 MiB by default; 0 turns stream compression off).
+
 ### WebSocket fallback
 
 `connect()` races two transports. WebTransport starts first; QMux over WebSocket (subprotocol `qmux-02.trevrpc-1`, served by Go and Rust on the server's TCP port) starts after `fallbackDelayMs` (default 300) or immediately if WebTransport fails or the browser has no `WebTransport` API. The first session to be ready wins and the other is closed. After the WebSocket wins, reconnects use it directly until `reprobeIntervalMs` (default 5 minutes) has passed since WebTransport was lost, then race again.

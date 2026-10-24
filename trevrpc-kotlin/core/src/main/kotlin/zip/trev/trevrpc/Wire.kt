@@ -34,6 +34,8 @@ data class RpcRequest(
     val acceptDictionaries: List<UInt> = emptyList(),
     /** The dictionaries the client asks the server about, with their fingerprints. */
     val dictionaryQuery: List<DictionaryInfo> = emptyList(),
+    /** The client's offer of stream compression: it decodes stream-compressed responses. */
+    val streamCompression: StreamCompression? = null,
 ) {
     val kind: RpcKind?
         get() = RpcKind.fromValue(kindValue)
@@ -45,6 +47,16 @@ data class RpcHeaders(
     val extensions: List<ULong> = emptyList(),
     /** The server's answer to the request's `dictionaryQuery`: the queried dictionaries it holds. */
     val dictionaries: List<DictionaryInfo> = emptyList(),
+    /** The server's answer to the request's `streamCompression`: it decodes stream-compressed requests. */
+    val streamCompression: StreamCompression? = null,
+)
+
+/**
+ * What a peer decodes in stream compression: zstd windows of at most 2^[maxWindowLog] bytes. A
+ * value below 10 enables nothing.
+ */
+data class StreamCompression(
+    val maxWindowLog: UInt,
 )
 
 /** A compression dictionary in negotiation fields: its Dictionary_ID and fingerprint. */
@@ -86,27 +98,31 @@ data class RpcStatus(
  */
 sealed interface ResponseFrame {
     /**
-     * Response headers. Absent headers are equivalent to empty ones. [dictionaries] is the server's
-     * answer to the call's dictionary query.
+     * Response headers. Absent headers are equivalent to empty ones. [dictionaries] and
+     * [streamCompression] are the server's answers to the call's dictionary query and stream
+     * compression offer.
      */
     class Headers(
         val metadata: Metadata = Metadata.EMPTY,
         val dictionaries: List<DictionaryInfo> = emptyList(),
+        val streamCompression: StreamCompression? = null,
     ) : ResponseFrame
 
     /**
-     * One application message. A message read from a ZSTD_MESSAGE frame is still compressed: [body]
-     * is the zstd payload and [compressed] is set until [Client] decompresses it.
+     * One application message. A message read from a ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE frame is
+     * still compressed: [body] is the zstd data and [compressed] is set until [Client] decompresses
+     * it. [streamSize] is the declared size of a ZSTD_STREAM_MESSAGE.
      */
     class Message internal constructor(
         val body: ByteArray,
         internal val zstd: ZstdHeader?,
+        internal val streamSize: Int? = null,
     ) : ResponseFrame {
         /** One raw protobuf-encoded message. */
         constructor(body: ByteArray) : this(body, null)
 
         val compressed: Boolean
-            get() = zstd != null
+            get() = zstd != null || streamSize != null
     }
 
     /** The terminal status, carrying trailing metadata. */

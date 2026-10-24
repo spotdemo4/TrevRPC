@@ -131,6 +131,8 @@ val channel = CronetRpcChannel.create(engine, "https://rpc.example.com", executo
 
 Generated codecs carry each message's protobuf type, which picks its dictionary. Cronet does not say which calls share a connection, so every call asks the server which of its dictionaries it holds. Responses are compressed from the first call on; a client-streaming or bidirectional call compresses its requests once the server's answer arrives in its headers, and unary and server-streaming requests are never compressed.
 
+Streaming methods marked `option (trevrpc.method) = {compress_stream: true}` also use stream compression: each streamed direction of a call compresses with one zstd context, so later messages compress against earlier ones, with no dictionary needed (`Compression(emptyList())` enables only this). Generated clients pass the method's `CompressStream` directions. Responses use it as soon as the server chooses to; requests from their third message once the server's headers answered. `CronetTransportOptions.streamCompressionMemory` (64 MiB by default, 0 turns it off) bounds the memory its contexts hold on the channel; a call beyond it falls back to per-message compression.
+
 ## Interop tests
 
 `interop-android` generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go or Rust server on the host. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:

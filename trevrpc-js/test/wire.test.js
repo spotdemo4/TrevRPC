@@ -210,7 +210,9 @@ test("a datagram whose frames do not exactly fill it decodes to no messages", ()
   assert.deepEqual(messagesOf(1, 0, 1, 0x61, 0), []); // frame without a length
   assert.deepEqual(messagesOf(1, 0, 1, 0x61, 0x40), []); // truncated type varint
   assert.deepEqual(messagesOf(1, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x10), []); // length beyond 2^53
-  assert.deepEqual(messagesOf(1, 5, 1, 0xff, 0, 1, 0x61), ["61"]); // other types are skipped
+  assert.deepEqual(messagesOf(1, 6, 1, 0xff, 0, 1, 0x61), ["61"]); // other types are skipped
+  // ZSTD_STREAM_MESSAGE needs a stream's ordered delivery, so it drops the whole datagram.
+  assert.deepEqual(messagesOf(1, 0, 1, 0x61, 5, 1, 0x00), []);
 });
 
 test("the frame reader yields the golden known frames from every chunking", async () => {
@@ -373,7 +375,7 @@ test("unknown frames are skipped wherever they appear", async () => {
     unknown(0x21), // grease before everything
     encodeMessageFrame(bytes("a")),
     unknown(0x40, 0),
-    unknown(5),
+    unknown(6),
     unknown(2 ** 40), // 8-byte type that still fits a number
     encodeFrame(2n ** 62n - 1n, new Uint8Array(2)), // largest type, a bigint
     encodeMessageFrame(bytes("b")),

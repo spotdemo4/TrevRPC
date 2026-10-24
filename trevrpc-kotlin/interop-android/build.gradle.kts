@@ -11,20 +11,20 @@ import org.gradle.process.ExecOperations
 import javax.inject.Inject
 
 /**
- * Generates the Echo and UnreliableEcho clients from the shared interop schemas with `protoc` from
+ * Generates the Echo, UnreliableEcho and CompressedEcho clients from the shared interop schemas with `protoc` from
  * `PATH`. The schemas are the single source of truth for every runtime, so this module references
  * them instead of keeping copies. The task is not cacheable because its output depends on the
  * `protoc` binary.
  *
- * `unreliable.proto` imports `trevrpc/options.proto`, which lives in its own include root, so that
- * file is compiled too: the generated Java for `unreliable.proto` refers to its descriptor class.
+ * `unreliable.proto` and `compressed.proto` import `trevrpc/options.proto`, which lives in its own
+ * include root, so that file is compiled too: their generated Java refers to its descriptor class.
  */
 abstract class GenerateInteropClient
     @Inject
     constructor(
         private val exec: ExecOperations,
     ) : DefaultTask() {
-        /** Directory holding `interop.proto` and `unreliable.proto`. */
+        /** Directory holding `interop.proto`, `unreliable.proto` and `compressed.proto`. */
         @get:InputDirectory
         @get:PathSensitive(PathSensitivity.RELATIVE)
         abstract val schemaRoot: DirectoryProperty
@@ -105,7 +105,7 @@ val generateInteropClient =
     tasks.register<GenerateInteropClient>("generateInteropClient") {
         schemaRoot.set(rootProject.layout.projectDirectory.dir("../interop/proto"))
         optionsRoot.set(rootProject.layout.projectDirectory.dir("../proto"))
-        schemas.set(listOf("interop.proto", "unreliable.proto"))
+        schemas.set(listOf("interop.proto", "unreliable.proto", "compressed.proto"))
         generatorInstall.set(project(":protoc-gen-trevrpc-kotlin").layout.buildDirectory.dir("install/protoc-gen-trevrpc-kotlin"))
         javaOutput.set(layout.buildDirectory.dir("generated/interop/java"))
         kotlinOutput.set(layout.buildDirectory.dir("generated/interop/kotlin"))

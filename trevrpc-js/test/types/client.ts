@@ -95,7 +95,12 @@ const compression = await createCompression({
   dictionaries: [{ data: new Uint8Array(), messages: ["trevrpc.interop.v1.EchoRequest"] }],
   level: 3,
 });
-const compressed = await connect("https://example.test/trevrpc", { compression });
+const compressed = await connect("https://example.test/trevrpc", {
+  compression,
+  streamCompressionMemory: 16 * 1024 * 1024,
+});
+// Settings without dictionaries enable stream compression alone.
+await connect("https://example.test/trevrpc", { compression: await createCompression() });
 compressed.compression satisfies typeof compression | undefined;
 // @ts-expect-error Compression settings come from createCompression().
 await connect("https://example.test/trevrpc", { compression: { query: [] } });

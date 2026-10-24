@@ -21,11 +21,13 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.Client
 import zip.trev.trevrpc.Code
+import zip.trev.trevrpc.DEFAULT_STREAM_COMPRESSION_MEMORY
 import zip.trev.trevrpc.Frame
 import zip.trev.trevrpc.FrameDecoder
 import zip.trev.trevrpc.FrameType
@@ -422,6 +424,46 @@ class Http3RpcTransportTest {
             readFake.deliverRead(encodeFrame(FrameType.ZSTD_MESSAGE, COMPRESSED_PAYLOAD))
             runCurrent()
             assertEquals(Code.RESOURCE_EXHAUSTED, (reading.receiveFailure() as TrevRpcException).status.code)
+        }
+
+    @Test
+    fun `stream-compressed messages travel as ZSTD_STREAM_MESSAGE frames and count at their declared size`() =
+        runTest {
+            val fake = FakeFactory()
+            val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
+            assertEquals(DEFAULT_STREAM_COMPRESSION_MEMORY, transport.streamCompressionBudget.bytes)
+            val stream = openStreaming(transport, fake)
+            val send = async { stream.send(STREAM_PAYLOAD, FrameType.ZSTD_STREAM_MESSAGE) }
+            runCurrent()
+            val written = FrameDecoder().feed(fake.onlyWrite().bytes).single()
+            assertEquals(FrameType.ZSTD_STREAM_MESSAGE, written.type)
+            assertArrayEquals(STREAM_PAYLOAD, written.payload)
+            fake.completeWrite()
+            send.await()
+            fake.headers(validHeaders())
+            fake.deliverRead(encodeFrame(FrameType.ZSTD_STREAM_MESSAGE, STREAM_PAYLOAD) + statusFrame(Status.ok()))
+            runCurrent()
+            val message = stream.receive() as ResponseFrame.Message
+            assertTrue(message.compressed)
+            // The body is the chunk after the message size, still compressed.
+            assertArrayEquals(STREAM_PAYLOAD.copyOfRange(2, STREAM_PAYLOAD.size), message.body)
+
+            // The payload fits a 64-byte frame, but the 71-byte message it declares does not.
+            val limited = CronetTransportOptions(maxFrameSize = 64)
+            val smallFake = FakeFactory()
+            val small =
+                openStreaming(Http3RpcTransport(smallFake, limited, coroutineContext, shutdownContext = coroutineContext), smallFake)
+            val error = runCatching { small.send(STREAM_PAYLOAD, FrameType.ZSTD_STREAM_MESSAGE) }.exceptionOrNull()
+            assertEquals(Code.RESOURCE_EXHAUSTED, (error as TrevRpcException).status.code)
+            val readFake = FakeFactory()
+            val reading =
+                openStreaming(Http3RpcTransport(readFake, limited, coroutineContext, shutdownContext = coroutineContext), readFake)
+            readFake.headers(validHeaders())
+            readFake.deliverRead(encodeFrame(FrameType.ZSTD_STREAM_MESSAGE, STREAM_PAYLOAD))
+            runCurrent()
+            assertEquals(Code.RESOURCE_EXHAUSTED, (reading.receiveFailure() as TrevRpcException).status.code)
+            assertEquals(0L, CronetTransportOptions(streamCompressionMemory = 0).streamCompressionMemory)
+            assertThrows(IllegalArgumentException::class.java) { CronetTransportOptions(streamCompressionMemory = -1) }
         }
 
     @Test
@@ -1312,6 +1354,9 @@ private fun messageFrame(body: ByteArray): ByteArray = encodeFrame(FrameType.MES
 /** `ok.small` of the compression golden vectors: a 71-byte message compressed into 23 bytes. */
 private val COMPRESSED_PAYLOAD =
     "2101478d0000203238397d047c00cac4a5bd2f4f413605".chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+/** `stream.plain.1` of the compression golden vectors: a 71-byte message in a 12-byte chunk. */
+private val STREAM_PAYLOAD = "40474c000010317d0100a2a00108".chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
 private fun headersFrame(metadata: Metadata = Metadata.EMPTY): ByteArray =
     encodeFrame(FrameType.HEADERS, WireCodec.encode(RpcHeaders(metadata)))

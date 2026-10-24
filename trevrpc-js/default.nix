@@ -66,8 +66,8 @@ buildNpmPackage (final: {
     npmRoot = ./.;
   };
 
-  # Embeds the libzstd module into src/zstd-wasm.js, generates the Echo and UnreliableEcho clients
-  # with protoc, and bundles the interop page into build/interop/.
+  # Embeds the libzstd module into src/zstd-wasm.js, generates the Echo, UnreliableEcho and
+  # CompressedEcho clients with protoc, and bundles the interop page into build/interop/.
   npmBuildScript = "build";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
   TREVRPC_ZSTD_WASM = "${zstdWasm}/libzstd.wasm";
@@ -163,7 +163,7 @@ buildNpmPackage (final: {
         "$out/bin/trevrpc-interop-browser" --browser "$browser" \
           --url https://127.0.0.1:49999/trevrpc --cert-hash "$hash" > "$browser.out" || status=$?
         test "$status" -eq 1
-        test "$(grep -c '^fail ' "$browser.out")" -eq 13
+        test "$(grep -c '^fail ' "$browser.out")" -eq 14
         ! grep -q '^ok ' "$browser.out"
       done
     ''}

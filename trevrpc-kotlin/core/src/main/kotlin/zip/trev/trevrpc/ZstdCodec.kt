@@ -1,24 +1,30 @@
 package zip.trev.trevrpc
 
+import com.github.luben.zstd.EndDirective
 import com.github.luben.zstd.Zstd
 import com.github.luben.zstd.ZstdCompressCtx
 import com.github.luben.zstd.ZstdDecompressCtx
 import com.github.luben.zstd.ZstdDictCompress
 import com.github.luben.zstd.ZstdDictDecompress
 import com.github.luben.zstd.ZstdException
+import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedQueue
 
-/**
- * A dictionary digested by zstd-jni for both directions. This is the only class that refers to
- * zstd-jni, which the application supplies, so a client that configures no [Compression] never
- * loads it. It is safe for concurrent use.
- */
+// This file is the only one that refers to zstd-jni, which the application supplies, so a client
+// that configures no [Compression] never loads it.
+
+/** Loads zstd-jni, or throws the [LinkageError] that says it is missing. */
+internal fun loadZstd() {
+    Zstd.compressBound(0)
+}
+
+/** A dictionary digested by zstd-jni for both directions. It is safe for concurrent use. */
 internal class ZstdCodec(
     dictionary: ByteArray,
     private val level: Int,
 ) {
-    private val compressDictionary = ZstdDictCompress(dictionary, level)
-    private val decompressDictionary = ZstdDictDecompress(dictionary)
+    internal val compressDictionary = ZstdDictCompress(dictionary, level)
+    internal val decompressDictionary = ZstdDictDecompress(dictionary)
 
     // Contexts are pooled: creating one per message costs about as much as compressing a small
     // message. The pools hold at most one context per concurrent use.
@@ -68,4 +74,90 @@ internal class ZstdCodec(
             .loadDict(compressDictionary)
 
     private fun newDecompressor(): ZstdDecompressCtx = ZstdDecompressCtx().setMagicless(true).loadDict(decompressDictionary)
+}
+
+/**
+ * The compressing context of one direction of a call in stream compression: every message is
+ * compressed against the earlier ones and flushed as one chunk. It starts from [dictionary] when
+ * there is one. One sender uses it at a time; [close] frees it.
+ */
+internal class ZstdStreamEncoder(
+    level: Int,
+    windowLog: Int,
+    dictionary: ZstdCodec?,
+) {
+    private val context =
+        ZstdCompressCtx()
+            .setLevel(level)
+            .setMagicless(true)
+            .setChecksum(false)
+            .setDictID(true)
+            .setContentSize(false)
+            .setWindowLog(windowLog)
+            .also { context -> dictionary?.let { context.loadDict(it.compressDictionary) } }
+
+    /** Compresses [message] into its chunk. An empty message is an empty chunk. */
+    fun compress(message: ByteArray): ByteArray {
+        val input = ByteBuffer.wrap(message)
+        // The bound leaves room for the frame header of the first chunk too.
+        var output = ByteBuffer.allocate(Zstd.compressBound(message.size.toLong()).toInt() + FRAME_HEADER_ROOM)
+        while (!context.compressByteBufferStream(output, input, EndDirective.FLUSH)) {
+            if (!output.hasRemaining()) {
+                output = ByteBuffer.allocate(output.capacity() * 2).put(output.array(), 0, output.position())
+            }
+        }
+        return output.array().copyOf(output.position())
+    }
+
+    fun close() = context.close()
+
+    private companion object {
+        const val FRAME_HEADER_ROOM = 32
+    }
+}
+
+/**
+ * The decompressing context of one direction of a call in stream compression. Each frame gets a
+ * fresh libzstd context holding only that frame's dictionary, so a frame never inherits the
+ * previous one's. One receiver uses it at a time; [close] frees it.
+ */
+internal class ZstdStreamDecoder {
+    private var context: ZstdDecompressCtx? = null
+
+    /** Starts a new frame, which uses [dictionary], or none. */
+    fun startFrame(dictionary: ZstdCodec?) {
+        context?.close()
+        context = ZstdDecompressCtx().setMagicless(true).also { context -> dictionary?.let { context.loadDict(it.decompressDictionary) } }
+    }
+
+    /**
+     * Decompresses a validated [chunk], or returns null unless it decompresses to exactly [size]
+     * bytes. libzstd holds back output that does not fit, so the output has room for one byte more,
+     * which a message longer than declared then fills.
+     */
+    fun decompress(
+        chunk: ByteArray,
+        size: Int,
+    ): ByteArray? {
+        if (chunk.isEmpty()) return if (size == 0) ByteArray(0) else null
+        val context = context ?: return null
+        val input = ByteBuffer.wrap(chunk)
+        val output = ByteBuffer.allocate(size + 1)
+        try {
+            while (input.hasRemaining()) {
+                val consumed = input.position()
+                val produced = output.position()
+                context.decompressByteBufferStream(output, input)
+                if (input.position() == consumed && output.position() == produced) return null
+            }
+        } catch (_: RuntimeException) {
+            return null
+        }
+        return if (output.position() == size) output.array().copyOf(size) else null
+    }
+
+    fun close() {
+        context?.close()
+        context = null
+    }
 }

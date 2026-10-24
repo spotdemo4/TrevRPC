@@ -23,6 +23,10 @@ service Tracker {
       unreliable_responses: true
     };
   }
+  // Stream compression applies to both streamed directions here.
+  rpc Compressed(stream Position) returns (stream Position) {
+    option (trevrpc.method) = {compress_stream: true};
+  }
   // Setting a flag to false, or setting nothing, is not unreliable.
   rpc Plain(stream Position) returns (stream Position) {
     option (trevrpc.method) = {unreliable_requests: false};

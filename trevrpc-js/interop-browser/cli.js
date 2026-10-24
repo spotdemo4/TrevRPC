@@ -54,7 +54,7 @@ const Transports = ["webtransport", "websocket", "auto"];
 const LaunchTimeoutMs = 20_000;
 const SetupTimeoutMs = 30_000;
 const CloseTimeoutMs = 5_000;
-/** Thirteen scenarios of at most ten seconds each, plus connecting, with slack. */
+/** Fourteen scenarios of at most ten seconds each, plus connecting, with slack. */
 const RunTimeoutMs = 180_000;
 const PageBundle = new URL("../build/interop/page.js", import.meta.url);
 // The script path is relative, so the page also works from a TrevRPC server's web root.

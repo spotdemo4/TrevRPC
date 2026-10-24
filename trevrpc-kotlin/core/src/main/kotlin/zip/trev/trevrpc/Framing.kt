@@ -7,8 +7,9 @@ object FrameType {
     const val HEADERS: Long = 2
     const val STATUS: Long = 3
     const val ZSTD_MESSAGE: Long = 4
+    const val ZSTD_STREAM_MESSAGE: Long = 5
 
-    fun isKnown(type: Long): Boolean = type in MESSAGE..ZSTD_MESSAGE
+    fun isKnown(type: Long): Boolean = type in MESSAGE..ZSTD_STREAM_MESSAGE
 }
 
 /** A known frame read from the wire. [type] is one of [FrameType]. */
@@ -31,19 +32,27 @@ fun encodeFrame(
 }
 
 /**
- * Encodes a MESSAGE or ZSTD_MESSAGE frame. A ZSTD_MESSAGE counts at the size of the message it
- * carries, so that size is limited by [maxFrameSize] too.
+ * Encodes a MESSAGE, ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE frame. A compressed message counts at the
+ * size of the message it carries, so that size is limited by [maxFrameSize] too.
  */
 fun encodeMessageFrame(
     type: Long,
     payload: ByteArray,
     maxFrameSize: Int = DEFAULT_MAX_FRAME_SIZE,
 ): ByteArray {
-    if (type == FrameType.ZSTD_MESSAGE) {
-        val header = requireNotNull(parseZstdHeader(payload)) { "invalid ZSTD_MESSAGE payload" }
-        checkFrameSize(header.contentSize, maxFrameSize)
-    } else {
-        require(type == FrameType.MESSAGE) { "frame type $type does not carry a message" }
+    when (type) {
+        FrameType.ZSTD_MESSAGE -> {
+            val header = requireNotNull(parseZstdHeader(payload)) { "invalid ZSTD_MESSAGE payload" }
+            checkFrameSize(header.contentSize, maxFrameSize)
+        }
+
+        FrameType.ZSTD_STREAM_MESSAGE -> {
+            checkFrameSize(QuicVarint.decode(payload), maxFrameSize)
+        }
+
+        else -> {
+            require(type == FrameType.MESSAGE) { "frame type $type does not carry a message" }
+        }
     }
     return encodeFrame(type, payload, maxFrameSize)
 }

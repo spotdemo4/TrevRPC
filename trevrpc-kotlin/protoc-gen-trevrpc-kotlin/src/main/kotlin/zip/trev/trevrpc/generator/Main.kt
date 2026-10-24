@@ -22,6 +22,7 @@ private const val HEX_DIGITS = "0123456789abcdef"
 private const val METHOD_OPTION_FIELD = 58247
 private const val UNRELIABLE_REQUESTS_FIELD = 1
 private const val UNRELIABLE_RESPONSES_FIELD = 2
+private const val COMPRESS_STREAM_FIELD = 3
 
 public fun main() {
     try {
@@ -123,6 +124,8 @@ private class TypeIndex(
     files: List<FileDescriptorProto>,
 ) {
     private val messages = mutableMapOf<String, TypeRef>()
+    private val descriptors = mutableMapOf<String, DescriptorProto>()
+    private val redacted = mutableMapOf<String, Boolean>()
 
     init {
         for (file in files) {
@@ -147,6 +150,29 @@ private class TypeIndex(
             ?: throw GeneratorException("unknown protobuf message type ${absoluteName.quote()}")
     }
 
+    /**
+     * Whether messages of [type] contain a field marked `debug_redact`, directly or in a message
+     * they contain, so that stream compression must leave them out. Recursive types are walked once.
+     */
+    fun hasRedactedField(type: TypeRef): Boolean = hasRedactedField(type.protoName, mutableSetOf())
+
+    private fun hasRedactedField(
+        protoName: String,
+        visiting: MutableSet<String>,
+    ): Boolean {
+        redacted[protoName]?.let { return it }
+        val message = descriptors[protoName] ?: return false
+        if (!visiting.add(protoName)) return false
+        val result =
+            message.fieldList.any { field ->
+                field.options.debugRedact || (field.typeName.isNotEmpty() && hasRedactedField(field.typeName, visiting))
+            }
+        visiting.remove(protoName)
+        // A type on a cycle is decided by its outermost visit; only that result is cached.
+        if (visiting.isEmpty() || result) redacted[protoName] = result
+        return result
+    }
+
     private fun indexMessage(
         protoPackage: String,
         protoParents: List<String>,
@@ -158,6 +184,7 @@ private class TypeIndex(
         val javaParts = javaParents + message.name
         val protoName = fullProtoName(protoPackage, protoParts)
         messages[protoName] = TypeRef(protoName, (javaPrefix + javaParts).joinToString(".", transform = ::kotlinIdent))
+        descriptors[protoName] = message
         for (nested in message.nestedTypeList) {
             indexMessage(protoPackage, protoParts, javaParts, javaPrefix, nested)
         }
@@ -390,6 +417,9 @@ private data class Method(
     val clientStreaming: Boolean,
     val serverStreaming: Boolean,
     val unreliable: TrevRpcMethodOptions,
+    /** The streamed directions that use stream compression. */
+    val compressRequests: Boolean,
+    val compressResponses: Boolean,
 ) {
     val kotlinName: String
         get() = kotlinIdent(name)
@@ -495,22 +525,37 @@ private fun describeMethod(
             "$serviceName.${descriptor.name}: unreliable_responses requires a server-streaming or bidirectional method",
         )
     }
+    if (unreliable.compressStream && !descriptor.clientStreaming && !descriptor.serverStreaming) {
+        throw GeneratorException("$serviceName.${descriptor.name}: compress_stream requires a streaming method")
+    }
+    val input = types.resolve(file, descriptor.inputType)
+    val output = types.resolve(file, descriptor.outputType)
+    // Stream compression leaves out directions that are unreliable (their messages are meant for
+    // datagrams, which never use the context) and types with redacted fields.
     return Method(
         name = lowerCamel(descriptor.name),
         constantName = screamingSnake(descriptor.name),
         protoName = descriptor.name,
-        input = types.resolve(file, descriptor.inputType),
-        output = types.resolve(file, descriptor.outputType),
+        input = input,
+        output = output,
         clientStreaming = descriptor.clientStreaming,
         serverStreaming = descriptor.serverStreaming,
         unreliable = unreliable,
+        compressRequests =
+            unreliable.compressStream && descriptor.clientStreaming && !unreliable.requests && !types.hasRedactedField(input),
+        compressResponses =
+            unreliable.compressStream && descriptor.serverStreaming && !unreliable.responses && !types.hasRedactedField(output),
     )
 }
 
-/** The `(trevrpc.method)` option of a method: which streamed directions the schema marks unreliable. */
+/**
+ * The `(trevrpc.method)` option of a method: which streamed directions the schema marks unreliable,
+ * and whether it allows stream compression.
+ */
 private data class TrevRpcMethodOptions(
     val requests: Boolean = false,
     val responses: Boolean = false,
+    val compressStream: Boolean = false,
 ) {
     val any: Boolean
         get() = requests || responses
@@ -518,7 +563,7 @@ private data class TrevRpcMethodOptions(
 
 /**
  * Reads `(trevrpc.method)` from the unknown fields of `MethodOptions`: the generator's descriptors
- * carry no extension registry, so protoc's extension bytes stay as raw fields, and decoding the two
+ * carry no extension registry, so protoc's extension bytes stay as raw fields, and decoding the
  * bool fields by hand avoids shipping generated option classes. Repeated occurrences merge, as
  * protobuf message fields do.
  */
@@ -536,6 +581,7 @@ private fun readMethodOptions(descriptor: MethodDescriptorProto): TrevRpcMethodO
             TrevRpcMethodOptions(
                 requests = result.requests || fields.getField(UNRELIABLE_REQUESTS_FIELD).varintList.any { it != 0L },
                 responses = result.responses || fields.getField(UNRELIABLE_RESPONSES_FIELD).varintList.any { it != 0L },
+                compressStream = result.compressStream || fields.getField(COMPRESS_STREAM_FIELD).varintList.any { it != 0L },
             )
     }
     return result
@@ -605,10 +651,18 @@ private fun StringBuilder.generateClientMethod(
                     "): $output =\n        client.unary($pathConstant, request, $inputCodec, $outputCodec, defaultCallOptions.options())"
             }
         }
+    val compressStream =
+        when {
+            method.compressRequests && method.compressResponses -> "BOTH"
+            method.compressRequests -> "REQUESTS"
+            method.compressResponses -> "RESPONSES"
+            else -> null
+        }
     val start = length
     appendLine("    $signature")
     appendLine("        options: $runtime.CallOptions.() -> $runtime.CallOptions = { this },")
-    appendLine("    $call")
+    // The method's stream compression goes after the options, as the runtime's last argument.
+    appendLine(if (compressStream == null) "    $call" else "    ${call.removeSuffix(")")}, $runtime.CompressStream.$compressStream)")
     if (method.unreliable.any) documentUnreliable(method, start)
     appendLine()
 }

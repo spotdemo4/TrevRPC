@@ -1,6 +1,7 @@
 import { QMuxWebSocketSession } from "./qmux/session.js";
 import { dialRace } from "./race.js";
 import { cancelled, failedPrecondition, statusFromTransportError, unavailable } from "./status.js";
+import { StreamBudget, StreamBudgetKey } from "./stream-compression.js";
 
 /**
  * The WebTransport protocol that names wire version 1, offered through the `protocols` constructor
@@ -41,12 +42,20 @@ export class Channel {
   /** Opens a channel and waits for its first session; use connect() instead. */
   static async connect(url, options = {}) {
     const dial = sessionDialer(url, options);
-    return new Channel(await dial(options.signal), dial, options);
+    // Checked before dialing, so an invalid option never leaves a session behind.
+    const streamBudget = new StreamBudget(options.streamCompressionMemory);
+    return new Channel(await dial(options.signal), dial, { ...options, streamBudget });
   }
 
-  constructor(dialed, dial, { compression, onStateChange } = {}) {
+  constructor(
+    dialed,
+    dial,
+    { compression, streamBudget = new StreamBudget(), onStateChange } = {},
+  ) {
     this.#dial = dial;
     this.#compression = compression;
+    // The memory budget of the stream compression contexts of this channel's calls.
+    this[StreamBudgetKey] = streamBudget;
     this.#onStateChange = onStateChange;
     this.#adopt(dialed);
   }

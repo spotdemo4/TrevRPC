@@ -8,6 +8,7 @@ import { datagramEndpoint, messageFrameSize } from "./datagram.js";
 import {
   DefaultMaxFrameSize,
   FrameReader,
+  FrameType,
   encodeOutgoingFrame,
   encodeRequestFrame,
 } from "./framing.js";
@@ -18,10 +19,12 @@ import {
   cancelled,
   deadlineExceeded,
   failedPrecondition,
+  internal,
   invalidArgument,
   statusError,
   statusFromTransportError,
 } from "./status.js";
+import { CallStreams, streamBudget } from "./stream-compression.js";
 
 /** Longest delay setTimeout can represent; it fires immediately beyond this. */
 const MaxTimerDelayMs = 2_147_483_647;
@@ -142,6 +145,8 @@ export class Call {
   #accept;
   /** Whether the REQUEST queried the server's dictionaries, so its HEADERS answer. */
   #queried = false;
+  /** The call's stream compression, or undefined if its method or transport has none. */
+  #streams;
   /** Request messages of a call that uses datagrams, queued for the flush loop, in order. */
   #unsent = [];
   /** Settles when the flush loop has sent everything queued so far. */
@@ -159,6 +164,8 @@ export class Call {
    * datagram flow if the session that carries it has datagrams. Both depend on that session, which
    * is only known once the stream is open, so then the REQUEST is encoded after that. `send` makes
    * the call send request messages as datagrams, `receive` makes it accept response datagrams.
+   * `rpc.compressStream` is `{ requests, responses }`, the directions the call may
+   * stream-compress when the transport has compression.
    */
   static async open(transport, request, message, options, rpc = {}) {
     const fields = { ...request, metadata: options.metadata, ...timeoutField(options) };
@@ -174,12 +181,12 @@ export class Call {
       const stream = await openStream(transport, scope.signal, session);
       call = new Call(stream, scope, options.maxFrameSize);
       await call.#write(
-        header ?? call.#requestOnSession(fields, message, session, compression, rpc),
+        header ?? call.#requestOnSession(fields, message, session, compression, transport, rpc),
       );
       return call;
     } catch (error) {
       if (call !== undefined) {
-        call.#releaseFlow();
+        call.#releaseSessionState();
       }
       throw scope.abort(failureStatus(error));
     }
@@ -189,7 +196,8 @@ export class Call {
    * Sets the call up on the session that carries it, negotiating compression and opening its
    * datagram flow as the method needs, and encodes the REQUEST.
    */
-  #requestOnSession(fields, message, session, compression, { types, datagrams }) {
+  #requestOnSession(fields, message, session, compression, transport, rpc) {
+    const { types, datagrams, compressStream } = rpc;
     const request = { ...fields };
     if (compression !== undefined) {
       this.#compression = sessionCompression(compression, session.key);
@@ -198,6 +206,14 @@ export class Call {
       Object.assign(request, negotiation.fields);
       this.#accept = negotiation.accept;
       this.#queried = negotiation.queried;
+      if (compressStream?.requests || compressStream?.responses) {
+        this.#streams = new CallStreams(compression, streamBudget(transport), compressStream, {
+          session: this.#compression,
+          requestType: types.request,
+          accept: negotiation.accept,
+        });
+        this.#streams.offer(request);
+      }
     }
     if (datagrams !== undefined) {
       this.#flow = datagramEndpoint(session.datagrams)?.openFlow({
@@ -217,32 +233,42 @@ export class Call {
   }
 
   /**
-   * Encodes a request message for sending, compressed when the session's shared set has the
-   * dictionary of the request type. The set is checked per message, so a request stream starts
-   * compressing as soon as the server's answer arrives.
+   * Encodes a request message for sending: through the call's stream context once that exists,
+   * and otherwise compressed when the session's shared set has the dictionary of the request type.
+   * Both are checked per message, so a request stream starts compressing as soon as the server's
+   * answer arrives.
    */
   #encode(body) {
-    const dictionary =
-      body.byteLength <= this.#maxFrameSize
-        ? this.#compression?.requestDictionary(this.#requestType)
-        : undefined;
-    return encodeMessage(body, dictionary);
+    if (body.byteLength > this.#maxFrameSize) {
+      return encodeMessage(body);
+    }
+    const dictionary = this.#compression?.requestDictionary(this.#requestType);
+    return this.#streams === undefined
+      ? encodeMessage(body, dictionary)
+      : this.#streams.encode(body, dictionary);
   }
 
   /**
-   * The message of a received MESSAGE or ZSTD_MESSAGE frame, `{ type, payload }`. A compressed
-   * message must use the dictionary the call accepts and fit `maxFrameSize`; it fails with
-   * Internal or ResourceExhausted otherwise.
+   * The message of a received MESSAGE, ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE frame,
+   * `{ type, payload }`. A compressed message must use what the call negotiated and fit
+   * `maxFrameSize`; it fails with Internal or ResourceExhausted otherwise.
    */
   receivedMessage(frame) {
+    if (frame.type === FrameType.ZstdStreamMessage) {
+      if (this.#streams === undefined) {
+        throw internal("stream-compressed message where stream compression is not enabled");
+      }
+      return this.#streams.receive(frame.payload, this.#maxFrameSize);
+    }
     return receivedMessage(frame, this.#accept, this.#maxFrameSize);
   }
 
-  /** Records the dictionaries of the response HEADERS, if the call asked for them. */
-  learnDictionaries(dictionaries) {
+  /** Records the server's answers in the response HEADERS to what the REQUEST asked. */
+  learnAnswers(headers) {
     if (this.#queried) {
-      this.#compression.learn(dictionaries);
+      this.#compression.learn(headers.dictionaries);
     }
+    this.#streams?.learn(headers.streamCompression);
   }
 
   constructor(stream, scope, maxFrameSize) {
@@ -409,7 +435,7 @@ export class Call {
    */
   finish(uploadError) {
     this.#scope.settle();
-    this.#releaseFlow();
+    this.#releaseSessionState();
     this.#endUpload(uploadError, cancelled("RPC completed"));
     this.#frames.expectEnd(this.#maxFrameSize).catch(() => this.#cancelReader().catch(() => {}));
   }
@@ -491,13 +517,17 @@ export class Call {
     return result;
   }
 
-  /** Ends the datagram flow, if any; every way a call ends gets here. */
-  #releaseFlow() {
+  /**
+   * Ends the datagram flow and frees the stream compression contexts, if any; every way a call
+   * ends gets here.
+   */
+  #releaseSessionState() {
     this.#flow?.release();
+    this.#streams?.close();
   }
 
   #teardown() {
-    this.#releaseFlow();
+    this.#releaseSessionState();
     const reason = this.signal.reason;
     this.#endUpload(reason);
     this.#cancelReader(reason).catch(() => {});

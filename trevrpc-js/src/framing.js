@@ -12,6 +12,7 @@ export const FrameType = Object.freeze({
   Headers: 2,
   Status: 3,
   ZstdMessage: 4,
+  ZstdStreamMessage: 5,
 });
 
 const KnownFrameTypes = new Set(Object.values(FrameType));

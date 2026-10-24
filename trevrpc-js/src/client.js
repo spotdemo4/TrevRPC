@@ -20,6 +20,7 @@ export function createServiceClient(transport, service, root, options = {}) {
       // Full protobuf names, which pick the compression dictionaries.
       types: { request: fullName(requestType), response: fullName(responseType) },
       datagrams: datagramUse(method),
+      compressStream: streamCompressionUse(method),
     };
     const resolve = (override) => mergeCallOptions(defaults, override);
 
@@ -148,6 +149,18 @@ function datagramUse({ kind, unreliableRequests, unreliableResponses }) {
     return undefined;
   }
   return { send: Boolean(unreliableRequests) && streamsRequest, receive: streamsResponse };
+}
+
+/**
+ * The directions a method may stream-compress, `{ requests, responses }`, or undefined for none:
+ * those its descriptor marks (the generator leaves out directions that do not stream and message
+ * types with redacted fields), except directions marked unreliable, whose messages mostly travel
+ * as datagrams.
+ */
+function streamCompressionUse({ compressStreamRequests, compressStreamResponses, ...method }) {
+  const requests = Boolean(compressStreamRequests) && !method.unreliableRequests;
+  const responses = Boolean(compressStreamResponses) && !method.unreliableResponses;
+  return requests || responses ? { requests, responses } : undefined;
 }
 
 const EarlyOk = "the server completed the call before the request stream ended";
@@ -495,7 +508,8 @@ export class BidirectionalStreamingCall {
 
   /**
    * Reads the next MESSAGE or STATUS event, consuming HEADERS on the way. Enforces the response
-   * grammar `[HEADERS] MESSAGE* STATUS`. A ZSTD_MESSAGE is a MESSAGE, decompressed.
+   * grammar `[HEADERS] MESSAGE* STATUS`. A ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE is a MESSAGE,
+   * decompressed.
    */
   async #readEvent() {
     for (;;) {
@@ -513,14 +527,15 @@ export class BidirectionalStreamingCall {
           }
           const headers = unmarshalMessage(RpcHeaders, frame.payload);
           validateResponseMetadata(headers.metadata, "headers");
-          this.#call.learnDictionaries(headers.dictionaries);
+          this.#call.learnAnswers(headers);
           this.#sawHeaders = true;
           this.#settleHeaders(headers.metadata);
           this.#flow?.connect(this.#onDatagram);
           continue;
         }
         case FrameType.Message:
-        case FrameType.ZstdMessage: {
+        case FrameType.ZstdMessage:
+        case FrameType.ZstdStreamMessage: {
           const payload = this.#call.receivedMessage(frame);
           this.#sawMessage = true;
           this.#settleHeaders({});

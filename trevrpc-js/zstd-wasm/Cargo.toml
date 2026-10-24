@@ -11,7 +11,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Compiles the bundled libzstd 1.5.7, with its malloc and string shims for wasm32-unknown-unknown.
-zstd-sys = { version = "2.1.2", default-features = false }
+# The experimental bindings add the memory estimates of streaming contexts.
+zstd-sys = { version = "2.1.2", default-features = false, features = ["experimental"] }
 
 [profile.release]
 opt-level = 3

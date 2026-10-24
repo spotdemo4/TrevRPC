@@ -219,6 +219,56 @@ test("the option is rejected on a direction that does not stream", () => {
   }
 });
 
+test("compress_stream applies to the streamed directions whose types have no redacted field", () => {
+  const request = greeterRequest();
+  const file = request.protoFile[0];
+  // Secret is redacted; Wrapper holds one two levels down; Loop refers to itself.
+  file.messageType.push(
+    { name: "Secret", field: [field("token", 1, 9, { options: { debugRedact: true } })] },
+    { name: "Middle", field: [field("secret", 1, 11, { typeName: ".hello.v1.Secret" })] },
+    { name: "Wrapper", field: [field("middle", 1, 11, { typeName: ".hello.v1.Middle" })] },
+    { name: "Loop", field: [field("next", 1, 11, { typeName: ".hello.v1.Loop" })] },
+  );
+  const compress = { trevrpcMethod: { compressStream: true } };
+  file.service[0].method = [
+    method("Plain", { clientStreaming: true, serverStreaming: true, options: compress }),
+    method("Server", { serverStreaming: true, options: compress }),
+    method("Client", { clientStreaming: true, options: compress }),
+    method("Redacted", {
+      clientStreaming: true,
+      serverStreaming: true,
+      inputType: ".hello.v1.Wrapper",
+      outputType: ".hello.v1.Loop",
+      options: compress,
+    }),
+    method("Unmarked", { clientStreaming: true, serverStreaming: true }),
+  ];
+
+  const js = fileContent(generate(request), "hello/v1/greeter.trevrpc.js");
+  const service = JSON.parse(
+    js.slice(js.indexOf("Object.freeze(") + 14, js.indexOf(");\n\n/** Client")),
+  );
+  const flags = Object.fromEntries(
+    Object.entries(service.methods).map(([name, method]) => [
+      name,
+      [method.compressStreamRequests, method.compressStreamResponses],
+    ]),
+  );
+  assert.deepEqual(flags, {
+    plain: [true, true],
+    server: [undefined, true],
+    client: [true, undefined],
+    redacted: [undefined, true],
+    unmarked: [undefined, undefined],
+  });
+
+  file.service[0].method = [method("SayHello", { options: compress })];
+  assert.equal(
+    generate(request).error,
+    "hello.v1.Greeter.SayHello: compress_stream requires a streaming method",
+  );
+});
+
 test("protoc passes the trevrpc.method option through to the generated descriptor", async () => {
   const output = new URL("build/test-generated-unreliable/", packageRoot);
   await rm(output, { recursive: true, force: true });
@@ -232,6 +282,14 @@ test("protoc passes the trevrpc.method option through to the generated descripto
       `--proto_path=${fileURLToPath(output)}`,
       ...files,
     ]);
+
+  await protoc("compressed.proto");
+  const compressed = await import(
+    pathToFileURL(fileURLToPath(output) + "compressed.trevrpc.js").href
+  );
+  const compressedBidi = compressed.CompressedEchoService.methods.bidi;
+  assert.equal(compressedBidi.compressStreamRequests, true);
+  assert.equal(compressedBidi.compressStreamResponses, true);
 
   await protoc("unreliable.proto");
   const generated = await import(

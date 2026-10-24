@@ -18,12 +18,14 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import zip.trev.trevrpc.Compression
 import zip.trev.trevrpc.DEFAULT_MAX_FRAME_SIZE
+import zip.trev.trevrpc.DEFAULT_STREAM_COMPRESSION_MEMORY
 import zip.trev.trevrpc.FrameDecoder
 import zip.trev.trevrpc.ResponseFrame
 import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.RpcClientStream
 import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.Status
+import zip.trev.trevrpc.StreamCompressionBudget
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
 import zip.trev.trevrpc.encodeMessageFrame
@@ -43,7 +45,9 @@ import kotlin.time.Duration.Companion.seconds
 internal const val TREV_RPC_CONTENT_TYPE = "application/trevrpc"
 
 /**
- * Cronet transport options. [compression] enables compressed messages on the channel's calls.
+ * Cronet transport options. [compression] enables compressed messages on the channel's calls, and
+ * [streamCompressionMemory] bounds the memory stream compression holds on the channel's calls (64
+ * MiB by default; 0 turns stream compression off).
  * [closeTimeout] strictly bounds TrevRPC's shutdown wait. Provider
  * cancellation and callback-executor submission run on detached daemon workers, and close never
  * waits for a provider call while holding a transport monitor. A non-cooperative borrowed
@@ -55,8 +59,10 @@ data class CronetTransportOptions(
     val maxFrameSize: Int = DEFAULT_MAX_FRAME_SIZE,
     val closeTimeout: Duration = 5.seconds,
     val compression: Compression? = null,
+    val streamCompressionMemory: Long = DEFAULT_STREAM_COMPRESSION_MEMORY,
 ) {
     init {
+        require(streamCompressionMemory >= 0) { "streamCompressionMemory must be non-negative" }
         require(readBufferSize > 0) { "readBufferSize must be positive" }
         require(responseChannelCapacity > 0) { "responseChannelCapacity must be positive" }
         require(maxFrameSize >= 0) { "maxFrameSize must be non-negative" }
@@ -143,6 +149,8 @@ internal class Http3RpcTransport(
 
     override val compression: Compression?
         get() = options.compression
+
+    override val streamCompressionBudget = StreamCompressionBudget(options.streamCompressionMemory)
 
     internal val activeExchangeCount: Int
         get() = exchanges.activeCount

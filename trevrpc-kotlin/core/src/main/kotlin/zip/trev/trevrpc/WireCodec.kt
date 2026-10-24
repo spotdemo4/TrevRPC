@@ -16,6 +16,7 @@ object WireCodec {
                 uint64(9, request.datagramFlow)
                 packedUint32(10, request.acceptDictionaries)
                 dictionaries(11, request.dictionaryQuery)
+                streamCompression(12, request.streamCompression)
             }.toByteArray()
 
     fun decodeRequest(bytes: ByteArray): RpcRequest {
@@ -28,6 +29,7 @@ object WireCodec {
         var datagramFlow = 0uL
         val acceptDictionaries = mutableListOf<UInt>()
         val dictionaryQuery = mutableListOf<DictionaryInfo>()
+        var streamCompression: StreamCompression? = null
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
@@ -39,6 +41,7 @@ object WireCodec {
                 9 -> datagramFlow = reader.uint64(tag)
                 10 -> reader.uint32Elements(tag, acceptDictionaries)
                 11 -> dictionaryQuery += reader.dictionaryInfo(tag)
+                12 -> streamCompression = reader.streamCompression(tag)
                 else -> reader.skip(tag)
             }
         }
@@ -51,6 +54,7 @@ object WireCodec {
             datagramFlow,
             acceptDictionaries,
             dictionaryQuery,
+            streamCompression,
         )
     }
 
@@ -60,6 +64,7 @@ object WireCodec {
                 metadata(1, headers.metadata)
                 packedUint64(2, headers.extensions)
                 dictionaries(3, headers.dictionaries)
+                streamCompression(4, headers.streamCompression)
             }.toByteArray()
 
     fun decodeHeaders(bytes: ByteArray): RpcHeaders {
@@ -67,16 +72,18 @@ object WireCodec {
         val metadata = linkedMapOf<String, ByteArray>()
         val extensions = mutableListOf<ULong>()
         val dictionaries = mutableListOf<DictionaryInfo>()
+        var streamCompression: StreamCompression? = null
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
                 1 -> reader.mapEntry(tag, metadata)
                 2 -> reader.uint64Elements(tag, extensions)
                 3 -> dictionaries += reader.dictionaryInfo(tag)
+                4 -> streamCompression = reader.streamCompression(tag)
                 else -> reader.skip(tag)
             }
         }
-        return RpcHeaders(Metadata.fromWire(metadata), extensions, dictionaries)
+        return RpcHeaders(Metadata.fromWire(metadata), extensions, dictionaries, streamCompression)
     }
 
     fun encode(status: RpcStatus): ByteArray =
@@ -108,7 +115,8 @@ object WireCodec {
      * Decodes one known frame read from a response stream exactly once. A REQUEST frame is a known
      * frame the response grammar does not allow, which is an `Internal` protocol error. A
      * ZSTD_MESSAGE is validated but stays compressed; the message it carries is limited by
-     * [maxFrameSize], like the frames of the stream.
+     * [maxFrameSize], like the frames of the stream. A ZSTD_STREAM_MESSAGE is checked only for its
+     * declared size here: the rest depends on the call's earlier messages.
      */
     fun decodeResponseFrame(
         frame: Frame,
@@ -123,8 +131,12 @@ object WireCodec {
                 ResponseFrame.Message(frame.payload, compressedResponseHeader(frame.payload, maxFrameSize))
             }
 
+            FrameType.ZSTD_STREAM_MESSAGE -> {
+                streamMessage(frame.payload, maxFrameSize)
+            }
+
             FrameType.HEADERS -> {
-                decodeHeaders(frame.payload).let { ResponseFrame.Headers(it.metadata, it.dictionaries) }
+                decodeHeaders(frame.payload).let { ResponseFrame.Headers(it.metadata, it.dictionaries, it.streamCompression) }
             }
 
             FrameType.STATUS -> {
@@ -135,6 +147,27 @@ object WireCodec {
                 throw TrevRpcException(Status.internal("response stream contained an unexpected frame type ${frame.type}"))
             }
         }
+}
+
+/**
+ * Splits a ZSTD_STREAM_MESSAGE payload into its declared size and its chunk, rejecting a size above
+ * [maxFrameSize] before anything is decompressed.
+ */
+private fun streamMessage(
+    payload: ByteArray,
+    maxFrameSize: Int,
+): ResponseFrame.Message {
+    val size =
+        try {
+            QuicVarint.decode(payload)
+        } catch (error: IllegalArgumentException) {
+            throw TrevRpcException(Status.internal("invalid ZSTD_STREAM_MESSAGE payload"), error)
+        }
+    if (size > maxFrameSize) {
+        throw TrevRpcException(Status.resourceExhausted("compressed message is $size bytes, maximum is $maxFrameSize"))
+    }
+    val chunk = payload.copyOfRange(QuicVarint.encodedLength(payload[0]), payload.size)
+    return ResponseFrame.Message(chunk, null, size.toInt())
 }
 
 private data class Tag(
@@ -206,6 +239,18 @@ private class Writer {
             varint(entry.size.toULong())
             output.write(entry)
         }
+    }
+
+    /** Writes a present `StreamCompression` message, even one whose fields are all zero. */
+    fun streamCompression(
+        field: Int,
+        value: StreamCompression?,
+    ) {
+        if (value == null) return
+        val entry = Writer().apply { uint32(1, value.maxWindowLog) }.toByteArray()
+        tag(field, 2)
+        varint(entry.size.toULong())
+        output.write(entry)
     }
 
     fun string(
@@ -341,6 +386,19 @@ private class Reader(
             }
         }
         return DictionaryInfo(id, fingerprint)
+    }
+
+    fun streamCompression(tag: Tag): StreamCompression {
+        val entry = Reader(bytes(tag))
+        var maxWindowLog = 0u
+        while (entry.hasRemaining) {
+            val entryTag = entry.tag()
+            when (entryTag.field) {
+                1 -> maxWindowLog = entry.uint32(entryTag)
+                else -> entry.skip(entryTag)
+            }
+        }
+        return StreamCompression(maxWindowLog)
     }
 
     fun bytes(tag: Tag): ByteArray {

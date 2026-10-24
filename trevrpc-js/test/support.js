@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
+import { encodeMessage, parseStreamChunk } from "../src/compression.js";
 import {
   FrameReader,
   FrameType,
@@ -14,6 +15,7 @@ import {
   unmarshalMessage,
 } from "../src/framing.js";
 import { Code } from "../src/status.js";
+import { readVarint, varintLength, writeVarint } from "../src/varint.js";
 import { RpcRequest } from "../src/wire.js";
 
 /**
@@ -273,4 +275,78 @@ export async function readGoldenVectors(file) {
     vectors.set(name, value);
   }
   return vectors;
+}
+
+/**
+ * The server side of stream compression, for fake servers, as the Go and Rust servers do it: it
+ * answers a REQUEST that offers stream compression, decodes stream-compressed requests, and
+ * stream-compresses responses from the third. `answer: false` leaves requests uncompressed, and
+ * `compressResponses: false` responses.
+ */
+export class ServerStreams {
+  /** How many requests arrived stream-compressed. */
+  received = 0;
+  #compression;
+  #offered;
+  #answer;
+  #compressResponses;
+  #sent = 0;
+  #encoder;
+  #decoder;
+  #inFrame = false;
+
+  constructor(compression, request, { answer = true, compressResponses = true } = {}) {
+    this.#compression = compression;
+    this.#offered = (request.streamCompression?.maxWindowLog ?? 0) >= 10;
+    this.#answer = this.#offered && answer;
+    this.#compressResponses = this.#offered && compressResponses;
+  }
+
+  /** The HEADERS fields of the answer, if any. */
+  get headers() {
+    return this.#answer ? { streamCompression: { maxWindowLog: 16 } } : {};
+  }
+
+  /** The message of a request frame `{ type, payload }`. */
+  receive({ type, payload }) {
+    if (type === FrameType.Message) {
+      return payload;
+    }
+    if (type !== FrameType.ZstdStreamMessage || !this.#answer) {
+      throw new Error(`unexpected request frame of type ${type}`);
+    }
+    const size = readVarint(payload, 0);
+    const chunk = payload.subarray(size.next);
+    const info = parseStreamChunk(chunk, !this.#inFrame, 16);
+    let frameDictionary;
+    if (info.startsFrame) {
+      frameDictionary =
+        info.dictionaryId === 0 ? null : this.#compression.dictionary(info.dictionaryId);
+    }
+    this.#decoder ??= this.#compression.streamDecoder(16);
+    const message = this.#decoder.decode(chunk, size.value, frameDictionary);
+    if (chunk.byteLength > 0) {
+      this.#inFrame = !info.endsFrame;
+    }
+    this.received += 1;
+    return message;
+  }
+
+  /** Encodes a response: per message for the first two, then through the call's context. */
+  encode(body) {
+    this.#sent += 1;
+    if (!this.#compressResponses || this.#sent < 3) {
+      return encodeMessage(body);
+    }
+    this.#encoder ??= this.#compression.streamEncoder(undefined, 16);
+    const chunk = this.#encoder.encode(body);
+    const payload = new Uint8Array(varintLength(body.byteLength) + chunk.byteLength);
+    payload.set(chunk, writeVarint(payload, 0, body.byteLength));
+    return { type: FrameType.ZstdStreamMessage, payload, size: body.byteLength };
+  }
+
+  close() {
+    this.#encoder?.close();
+    this.#decoder?.close();
+  }
 }
