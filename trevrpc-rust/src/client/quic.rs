@@ -1,12 +1,14 @@
 //! Native QUIC call transport over one established Quinn connection.
 
+use std::sync::Arc;
+
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
-use crate::{BoxStream, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Unreliable};
+use crate::{BoxStream, ResponseEnvelope, ResponseFrame, Result, RpcRequest};
 
 use bytes::Bytes;
 
 use super::native::NativeTransport;
-use super::{RpcTransport, StreamingRpcTransport};
+use super::{CallInfo, RpcTransport, StreamingRpcTransport};
 
 /// A native `TrevRPC` transport over one established Quinn connection.
 ///
@@ -29,6 +31,20 @@ impl QuicTransport {
         self
     }
 
+    /// Lets messages travel compressed with the dictionaries of `compression`; see
+    /// [`Compression`](crate::Compression). Fails when they are invalid.
+    pub fn with_compression(self, compression: &crate::Compression) -> Result<Self> {
+        Ok(self.with_compression_config(crate::compression::CompressionConfig::new(compression)?))
+    }
+
+    pub(crate) fn with_compression_config(
+        mut self,
+        config: Option<Arc<crate::compression::CompressionConfig>>,
+    ) -> Self {
+        self.0.set_compression(config);
+        self
+    }
+
     /// Returns the established connection.
     #[must_use]
     pub const fn connection(&self) -> &quinn::Connection {
@@ -47,6 +63,15 @@ impl RpcTransport for QuicTransport {
     async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
         self.0.call(request, body).await
     }
+
+    async fn call_with_info(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+        info: CallInfo,
+    ) -> Result<ResponseEnvelope<Bytes>> {
+        self.0.call_with_info(request, body, info).await
+    }
 }
 
 #[crate::async_trait]
@@ -59,14 +84,14 @@ impl StreamingRpcTransport for QuicTransport {
         self.0.streaming_call(request, request_body).await
     }
 
-    async fn streaming_call_unreliable(
+    async fn streaming_call_with_info(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
         self.0
-            .streaming_call_unreliable(request, request_body, unreliable)
+            .streaming_call_with_info(request, request_body, info)
             .await
     }
 }

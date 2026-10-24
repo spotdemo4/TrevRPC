@@ -8,7 +8,7 @@ use bytes::{Buf, BufMut as _, Bytes};
 use tokio::sync::{Semaphore, watch};
 
 use crate::datagram::Demux;
-use crate::framed::{self, FrameRead, FrameWrite};
+use crate::framed::{self, FrameRead, FrameWrite, ResponseCodec};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::server::Server;
 use crate::server_transport::{
@@ -48,6 +48,7 @@ pub trait BodySource: Send + 'static {
 struct BodyWriter<S> {
     sink: S,
     max_frame_size: usize,
+    codec: ResponseCodec,
 }
 
 impl<S: BodySink> FrameWrite for BodyWriter<S> {
@@ -62,7 +63,15 @@ impl<S: BodySink> FrameWrite for BodyWriter<S> {
 impl<S: BodySink> ResponseWriter for BodyWriter<S> {
     async fn write_frames(&mut self, frames: &mut Vec<ResponseFrame>) -> Result<()> {
         let max_frame_size = self.max_frame_size;
-        framed::write_response_frames(self, frames, max_frame_size).await
+        // The writer is the frames' destination too, so the codec is moved out meanwhile.
+        let mut codec = std::mem::take(&mut self.codec);
+        let written = framed::write_response_frames(self, frames, max_frame_size, &mut codec).await;
+        self.codec = codec;
+        written
+    }
+
+    fn set_codec(&mut self, codec: ResponseCodec) {
+        self.codec = codec;
     }
 
     async fn stopped(&mut self) -> Result<()> {
@@ -129,6 +138,7 @@ where
     let writer = BodyWriter {
         sink,
         max_frame_size: server.max_frame_size(),
+        codec: ResponseCodec::default(),
     };
     let mut reader = BodyReader {
         source,

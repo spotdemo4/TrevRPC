@@ -23,7 +23,7 @@ func FuzzFrameDecodeNeverPanics(f *testing.F) {
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		for _, decode := range []func([]byte) error{
 			func(payload []byte) error { return decodePayload(payload, &wireRequest{}) },
-			func(payload []byte) error { _, err := decodeHeaders(payload); return err },
+			func(payload []byte) error { _, _, err := decodeHeaders(payload); return err },
 			func(payload []byte) error { _, err := decodeStatus(payload); return err },
 		} {
 			err := decode(payload)
@@ -51,23 +51,27 @@ func FuzzFrameReaderNeverPanics(f *testing.F) {
 		{0x40, 0x40, 0x01, 0xff},
 		{0xc0, 0, 0, 0, 0, 0, 0, 0},
 		{0x00, 0xff},
+		{0x04, 0x01, 0x00},
 	} {
 		f.Add(seed)
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		reader := newFrameReader(bytes.NewReader(data), 64, -1)
+		// Without accepted dictionaries a ZSTD_MESSAGE frame is a decode error.
 		for range len(data) + 1 {
 			next, err := reader.next()
 			if err != nil {
 				if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-					if _, ok := errors.AsType[*FrameTooLargeError](err); !ok {
+					_, tooLarge := errors.AsType[*FrameTooLargeError](err)
+					_, undecodable := errors.AsType[*frameDecodeError](err)
+					if !tooLarge && !undecodable {
 						t.Fatalf("unexpected frame reader error %T: %v", err, err)
 					}
 				}
 				return
 			}
-			if !next.typ.known() || len(next.payload) > 64 {
+			if !next.typ.known() || next.typ == frameTypeZstdMessage || len(next.payload) > 64 {
 				t.Fatalf("frame reader returned %v with %d payload bytes", next.typ, len(next.payload))
 			}
 		}

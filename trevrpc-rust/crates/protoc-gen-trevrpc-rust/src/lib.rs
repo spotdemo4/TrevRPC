@@ -407,6 +407,10 @@ struct Method {
     proto_name: String,
     input_type: String,
     output_type: String,
+    /// The full protobuf names of the input and output types, which pick compression
+    /// dictionaries at runtime.
+    input_proto_type: String,
+    output_proto_type: String,
     client_streaming: bool,
     server_streaming: bool,
     unreliable: MethodMarks,
@@ -804,6 +808,8 @@ fn descriptor_method(
         proto_name,
         input_type,
         output_type,
+        input_proto_type: input_proto_type.trim_start_matches('.').to_owned(),
+        output_proto_type: output_proto_type.trim_start_matches('.').to_owned(),
         client_streaming,
         server_streaming,
         unreliable: marks,
@@ -1067,6 +1073,10 @@ fn generate_client_method(
     let marks = unreliable_expr(runtime_path, method)
         .map(|unreliable| format!(".default_unreliable({unreliable})"))
         .unwrap_or_default();
+    let marks = format!(
+        ".message_types({:?}, {:?}){marks}",
+        method.input_proto_type, method.output_proto_type
+    );
     let (shape, constructor, request_param, request_arg) =
         match (method.client_streaming, method.server_streaming) {
             (true, true) => (
@@ -1123,24 +1133,26 @@ fn generate_registration_method(
 ) {
     let start = buf.len();
     emit_registration_method(runtime_path, service, method, buf);
+    // Routes register through the options variants of `route_with_context` and
+    // `route_streaming_with_context`, which take the route's message types, and its unreliable
+    // marks, as one more argument before the handler.
+    let mut options = format!(
+        "{runtime_path}::server::RouteOptions::new().with_message_types({:?}, {:?})",
+        method.input_proto_type, method.output_proto_type
+    );
     if let Some(unreliable) = unreliable_expr(runtime_path, method) {
-        // Streaming routes register through `route_streaming_with_context`; the options variant
-        // takes the marks as one more argument before the handler.
-        let emitted = buf.split_off(start);
-        buf.push_str(
-            &emitted
-                .replace(
-                    "route_streaming_with_context(",
-                    "route_streaming_with_options(",
-                )
-                .replace(
-                    ", move |context,",
-                    &format!(
-                        ", {runtime_path}::server::RouteOptions::new().with_unreliable({unreliable}), move |context,"
-                    ),
-                ),
-        );
+        options.push_str(&format!(".with_unreliable({unreliable})"));
     }
+    let emitted = buf.split_off(start);
+    buf.push_str(
+        &emitted
+            .replace(
+                "route_streaming_with_context(",
+                "route_streaming_with_options(",
+            )
+            .replace("route_with_context(", "route_with_options(")
+            .replace(", move |context,", &format!(", {options}, move |context,")),
+    );
 }
 
 fn emit_registration_method(
@@ -1306,6 +1318,8 @@ mod tests {
                 proto_name: "SayHello".to_owned(),
                 input_type: "HelloRequest".to_owned(),
                 output_type: "HelloReply".to_owned(),
+                input_proto_type: "example.HelloRequest".to_owned(),
+                output_proto_type: "example.HelloReply".to_owned(),
                 client_streaming: false,
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
@@ -1333,6 +1347,8 @@ mod tests {
                 proto_name: "SayHello".to_owned(),
                 input_type: "HelloRequest".to_owned(),
                 output_type: "HelloReply".to_owned(),
+                input_proto_type: "example.HelloRequest".to_owned(),
+                output_proto_type: "example.HelloReply".to_owned(),
                 client_streaming: false,
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
@@ -1345,16 +1361,22 @@ mod tests {
         assert!(generated.contains("pub mod greeter_paths {"));
         assert!(generated.contains("pub const SAY_HELLO: &str = \"/hello.v1.Greeter/SayHello\";"));
         assert!(generated.contains(
-            "::trevrpc::client::unary(&self.transport, greeter_paths::SAY_HELLO, request, self.default_options.clone())"
+            "::trevrpc::client::unary(&self.transport, greeter_paths::SAY_HELLO, request, self.default_options.clone()).message_types(\"example.HelloRequest\", \"example.HelloReply\")"
         ));
         // One client method per RPC: the returned call carries the options and response variants.
         assert!(generated.contains(
             "pub fn say_hello(&self, request: &HelloRequest) -> ::trevrpc::client::Call<'_, T, ::trevrpc::client::call::Unary<HelloRequest, HelloReply>>"
         ));
         for variant in ["_with_options", "_envelope", "_from_stream"] {
-            assert!(!generated.contains(variant), "generated {variant} variant");
+            assert!(
+                !generated.contains(&format!("fn say_hello{variant}")),
+                "generated {variant} variant"
+            );
         }
-        assert!(generated.contains("server.route_with_context(greeter_paths::SAY_HELLO,"));
+        // Routes carry their message types, which pick compression dictionaries.
+        assert!(generated.contains(
+            "server.route_with_options(greeter_paths::SAY_HELLO, ::trevrpc::server::RouteOptions::new().with_message_types(\"example.HelloRequest\", \"example.HelloReply\"), move |context,"
+        ));
         // Handlers return plain messages and set response metadata through their context.
         assert!(generated.contains(
             "request: HelloRequest) -> ::core::result::Result<HelloReply, ::trevrpc::Status>;"
@@ -1373,6 +1395,8 @@ mod tests {
                 proto_name: "SayHello".to_owned(),
                 input_type: "HelloRequest".to_owned(),
                 output_type: "HelloReply".to_owned(),
+                input_proto_type: "example.HelloRequest".to_owned(),
+                output_proto_type: "example.HelloReply".to_owned(),
                 client_streaming: false,
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
@@ -1397,6 +1421,8 @@ mod tests {
                     proto_name: "LotsOfReplies".to_owned(),
                     input_type: "HelloRequest".to_owned(),
                     output_type: "HelloReply".to_owned(),
+                    input_proto_type: "example.HelloRequest".to_owned(),
+                    output_proto_type: "example.HelloReply".to_owned(),
                     client_streaming: false,
                     server_streaming: true,
                     unreliable: MethodMarks::default(),
@@ -1406,6 +1432,8 @@ mod tests {
                     proto_name: "LotsOfGreetings".to_owned(),
                     input_type: "HelloRequest".to_owned(),
                     output_type: "HelloReply".to_owned(),
+                    input_proto_type: "example.HelloRequest".to_owned(),
+                    output_proto_type: "example.HelloReply".to_owned(),
                     client_streaming: true,
                     server_streaming: false,
                     unreliable: MethodMarks::default(),
@@ -1415,6 +1443,8 @@ mod tests {
                     proto_name: "BidiHello".to_owned(),
                     input_type: "HelloRequest".to_owned(),
                     output_type: "HelloReply".to_owned(),
+                    input_proto_type: "example.HelloRequest".to_owned(),
+                    output_proto_type: "example.HelloReply".to_owned(),
                     client_streaming: true,
                     server_streaming: true,
                     unreliable: MethodMarks::default(),

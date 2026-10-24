@@ -248,6 +248,7 @@
           let
             wireGolden = ./testdata/wire-golden-vectors.txt;
             qmuxGolden = ./testdata/qmux-golden-vectors.txt;
+            zstdGolden = ./testdata/zstd-golden-vectors.txt;
             interopProto = ./interop/proto;
             interopHarness = ./interop/harness.py;
             trevrpcProto = ./proto;
@@ -258,6 +259,7 @@
               inherit
                 wireGolden
                 qmuxGolden
+                zstdGolden
                 interopProto
                 trevrpcProto
                 ;
@@ -282,6 +284,7 @@
             trevrpc-rust = pkgs.callPackage ./trevrpc-rust {
               inherit
                 wireGolden
+                zstdGolden
                 interopProto
                 trevrpcProto
                 licenseFile

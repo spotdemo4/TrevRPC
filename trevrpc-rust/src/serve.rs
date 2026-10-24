@@ -59,6 +59,7 @@ impl Server {
     /// memory per connection for datagrams waiting to be read, plus the 64 datagrams and 64 KiB
     /// it holds for calls whose request has not arrived yet.
     pub fn quic_config(&self, mut tls: quinn::rustls::ServerConfig) -> Result<quinn::ServerConfig> {
+        self.check_compression()?;
         tls.alpn_protocols = vec![crate::ALPN.to_vec()];
         if self.options().serves_http() {
             tls.alpn_protocols.push(crate::HTTP3_ALPN.to_vec());
@@ -73,6 +74,8 @@ impl Server {
     }
 
     /// Serves `TrevRPC` on a Quinn endpoint until the endpoint stops accepting connections.
+    ///
+    /// Fails at once when the configured [`Compression`](crate::Compression) is invalid.
     ///
     /// Connections are dispatched on their negotiated ALPN: [`crate::ALPN`] runs native `TrevRPC`,
     /// and [`crate::HTTP3_ALPN`] runs the enabled HTTP/3 `POST` RPCs and `WebTransport` sessions,
@@ -119,6 +122,7 @@ impl Server {
     where
         S: Future<Output = ()> + Send,
     {
+        self.check_compression()?;
         // HTTP/2 RPC and HTTP fallback responses advertise HTTP/3 on the endpoint's port.
         let alt_svc = if self.options().serves_http2() {
             endpoint.local_addr().ok().and_then(|addr| {

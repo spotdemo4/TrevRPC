@@ -7,6 +7,7 @@
   gnugrep,
   licenseFile,
   wireGolden,
+  zstdGolden,
   interopProto,
   trevrpcProto,
 }:
@@ -24,6 +25,7 @@ mkRustPackage (final: {
       interopProto
       trevrpcProto
       wireGolden
+      zstdGolden
       ./.
     ];
   };

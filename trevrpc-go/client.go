@@ -7,6 +7,9 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Transport carries RPCs for generated clients. *Channel implements it; the
@@ -159,6 +162,7 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 	if err != nil {
 		return zero, err
 	}
+	rpcRequest.responseType = messageTypeName[Res]()
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
 	defer cancel()
@@ -187,6 +191,7 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 	if err != nil {
 		return nil, err
 	}
+	rpcRequest.responseType = messageTypeName[Res]()
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
 	frames, err := transport.call(ctx, rpcRequest, request)
@@ -233,6 +238,7 @@ func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context,
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	rpcRequest.responseType = messageTypeName[Res]()
 
 	ctx, cancel := callContext(ctx, deadline)
 	requests := newMessagePipe[Req](ctx)
@@ -351,6 +357,16 @@ func prepareClientRequest(method string, kind RPCKind, config callConfig, deadli
 		TimeoutNanos: deadlineTimeoutNanos(deadline, now),
 		unreliable:   config.unreliable,
 	}, nil
+}
+
+// messageTypeName returns the full name of the protobuf message type T, or ""
+// for a type that is not a generated protobuf message.
+func messageTypeName[T ProtoMessage]() protoreflect.FullName {
+	var zero T
+	if message, ok := any(zero).(proto.Message); ok {
+		return message.ProtoReflect().Descriptor().FullName()
+	}
+	return ""
 }
 
 func deadlineTimeoutNanos(deadline clientDeadline, now func() time.Time) uint64 {

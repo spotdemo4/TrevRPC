@@ -32,6 +32,7 @@ use futures_util::FutureExt as _;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::compression::{Accept, Dict, inflate};
 use crate::sync::MutexExt as _;
 use crate::{BoxStream, ResponseFrame, Result, RpcKind, queue, varint};
 
@@ -238,8 +239,11 @@ impl<T: DatagramTransport> SendLink for T {
     }
 }
 
-/// The frame type of a MESSAGE frame; every other frame type in a datagram is skipped.
-const MESSAGE_FRAME: u64 = 0;
+/// The frame type of a MESSAGE frame.
+const MESSAGE_FRAME: u64 = crate::framing::frame_type::MESSAGE;
+/// The frame type of a `ZSTD_MESSAGE` frame. Every frame type in a datagram other than these two is
+/// skipped.
+const ZSTD_MESSAGE_FRAME: u64 = crate::framing::frame_type::ZSTD_MESSAGE;
 
 /// The bytes a MESSAGE frame with a payload of `payload_len` bytes occupies in a datagram.
 fn message_frame_len(payload_len: usize) -> usize {
@@ -253,10 +257,10 @@ fn saturating_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// Appends a MESSAGE frame carrying `message`.
-fn put_message_frame(datagram: &mut BytesMut, message: &[u8]) {
+/// Appends a MESSAGE or `ZSTD_MESSAGE` frame carrying `message`.
+fn put_message_frame(datagram: &mut BytesMut, frame_type: u64, message: &[u8]) {
     // A payload length always fits a variable-length integer.
-    let _ = varint::push(datagram, MESSAGE_FRAME);
+    let _ = varint::push(datagram, frame_type);
     let _ = varint::push(datagram, saturating_u64(message.len()));
     datagram.extend_from_slice(message);
 }
@@ -281,7 +285,8 @@ fn next_frame(buf: &[u8], offset: usize) -> Option<(u64, usize, usize)> {
     (end <= buf.len()).then_some((frame_type, start, end))
 }
 
-/// The messages of a datagram that [`decode`] has checked: its MESSAGE frames, in order.
+/// The messages of a datagram that [`decode`] has checked: its MESSAGE and `ZSTD_MESSAGE` frames,
+/// in order, as their frame type and payload.
 #[derive(Clone)]
 struct Messages {
     datagram: Bytes,
@@ -289,17 +294,32 @@ struct Messages {
 }
 
 impl Iterator for Messages {
-    type Item = Bytes;
+    type Item = (u64, Bytes);
 
-    fn next(&mut self) -> Option<Bytes> {
+    fn next(&mut self) -> Option<(u64, Bytes)> {
         loop {
             // The frames were checked to fill the datagram exactly.
             let (frame_type, start, end) = next_frame(&self.datagram, self.offset)?;
             self.offset = end;
-            if frame_type == MESSAGE_FRAME {
-                return Some(self.datagram.slice(start..end));
+            if frame_type == MESSAGE_FRAME || frame_type == ZSTD_MESSAGE_FRAME {
+                return Some((frame_type, self.datagram.slice(start..end)));
             }
         }
+    }
+}
+
+impl Messages {
+    /// The datagram's messages, compressed ones decompressed with the dictionaries `accept`
+    /// holds, or `None` when one is rejected, which drops the whole datagram.
+    fn inflate(self, accept: &Accept, max_frame_size: usize) -> Option<Vec<Bytes>> {
+        self.map(|(frame_type, payload)| {
+            if frame_type == ZSTD_MESSAGE_FRAME {
+                inflate(accept, &payload, max_frame_size).ok()
+            } else {
+                Some(payload)
+            }
+        })
+        .collect()
     }
 }
 
@@ -419,7 +439,7 @@ impl HeldDatagrams {
     }
 
     /// Takes the unexpired datagrams held for `flow`, oldest first.
-    fn claim(&mut self, flow: u64, now: Instant) -> Vec<Bytes> {
+    fn claim(&mut self, flow: u64, now: Instant) -> Vec<Messages> {
         self.expire(now);
         if !self.held.iter().any(|held| held.flow == flow) {
             return Vec::new();
@@ -429,7 +449,7 @@ impl HeldDatagrams {
         for held in self.held.drain(..) {
             if held.flow == flow {
                 self.bytes = self.bytes.saturating_sub(held.len());
-                claimed.extend(held.messages);
+                claimed.push(held.messages);
             } else {
                 kept.push_back(held);
             }
@@ -450,6 +470,8 @@ enum Role {
 /// A registered flow: where its datagram messages go, if its call receives any.
 struct Slot {
     sink: Option<queue::Sender<Bytes>>,
+    /// The dictionaries the call accepts on compressed messages.
+    accept: Accept,
 }
 
 struct State {
@@ -488,7 +510,9 @@ impl Shared {
 
         let mut state = self.state.lock_unpoisoned();
         if let Some(slot) = state.flows.get(&flow) {
-            if let Some(sink) = &slot.sink {
+            if let Some(sink) = &slot.sink
+                && let Some(messages) = messages.inflate(&slot.accept, self.max_frame_size)
+            {
                 for message in messages {
                     let size = message.len();
                     // A full queue or a finished direction drops the message.
@@ -635,6 +659,7 @@ impl Demux {
             header: flow_header(self.shared.link.prefix(), flow)?,
             max_frame_size: self.shared.max_frame_size,
             queued: Arc::clone(&self.shared.queued),
+            compress: None,
         })
     }
 
@@ -653,9 +678,15 @@ impl Demux {
     /// datagrams.
     ///
     /// Open the flow before writing the call's REQUEST, so no datagram of the server can arrive
-    /// before the flow exists.
+    /// before the flow exists. `accept` holds the dictionaries the call accepts on compressed
+    /// response messages.
     #[must_use]
-    pub fn open_client_flow(&self, kind: RpcKind, unreliable: Unreliable) -> Option<ClientFlow> {
+    pub(crate) fn open_client_flow(
+        &self,
+        kind: RpcKind,
+        unreliable: Unreliable,
+        accept: Accept,
+    ) -> Option<ClientFlow> {
         let unreliable = unreliable.effective(kind);
         if !unreliable.any() || !self.supported() {
             return None;
@@ -670,7 +701,7 @@ impl Demux {
             .state
             .lock_unpoisoned()
             .flows
-            .insert(flow, Slot { sink });
+            .insert(flow, Slot { sink, accept });
         self.ensure_reader();
         Some(ClientFlow {
             flow,
@@ -686,11 +717,13 @@ impl Demux {
     /// Registers the flow of a server call of `kind` and claims the datagrams that arrived
     /// before its REQUEST.
     ///
-    /// Fails when the flow is zero, too large, or already live on the connection.
-    pub fn open_server_flow(
+    /// Fails when the flow is zero, too large, or already live on the connection. `accept` holds
+    /// the dictionaries the server accepts on compressed request messages.
+    pub(crate) fn open_server_flow(
         &self,
         flow: u64,
         kind: RpcKind,
+        accept: &Accept,
     ) -> std::result::Result<ServerFlow, FlowInUse> {
         if flow == 0 || flow > varint::MAX {
             return Err(FlowInUse);
@@ -704,13 +737,22 @@ impl Demux {
             }
             state.ended.remove(flow);
             let held = state.held.claim(flow, Instant::now());
-            state.flows.insert(flow, Slot { sink: sink.clone() });
+            state.flows.insert(
+                flow,
+                Slot {
+                    sink: sink.clone(),
+                    accept: accept.clone(),
+                },
+            );
             held
         };
         if let Some(sink) = &sink {
-            for message in held {
-                let size = message.len();
-                let _ = sink.try_send(message, size);
+            let max_frame_size = self.shared.max_frame_size;
+            for messages in held {
+                for message in messages.inflate(accept, max_frame_size).unwrap_or_default() {
+                    let size = message.len();
+                    let _ = sink.try_send(message, size);
+                }
             }
         }
         self.ensure_reader();
@@ -800,9 +842,18 @@ pub struct FlowSender {
     max_frame_size: usize,
     /// Counts the datagrams queued on the connection; see [`FlowSender::flushed`].
     queued: Arc<AtomicU64>,
+    /// Compresses the messages, when set.
+    compress: Option<Arc<Dict>>,
 }
 
 impl FlowSender {
+    /// Makes the sender compress messages with `dict`, when set and when that makes them shorter.
+    #[must_use]
+    pub(crate) fn with_compression(mut self, dict: Option<Arc<Dict>>) -> Self {
+        self.compress = dict;
+        self
+    }
+
     /// Sends the messages in `batch`, draining it, as few datagrams as fit, in order; the messages
     /// that have to travel on the stream are pushed to `on_stream`, in order.
     ///
@@ -828,7 +879,17 @@ impl FlowSender {
         let mut datagram = BytesMut::new();
         let mut packed: Vec<Bytes> = Vec::new();
         for message in batch.drain(..) {
-            let frame = message_frame_len(message.len());
+            // The datagram carries the compressed frame; a message that goes on the stream after
+            // all goes uncompressed, and the stream's writer compresses it again.
+            let (frame_type, payload) = self
+                .compress
+                .as_ref()
+                .and_then(|dict| dict.compress(&message))
+                .map_or_else(
+                    || (MESSAGE_FRAME, message.clone()),
+                    |compressed| (ZSTD_MESSAGE_FRAME, compressed),
+                );
+            let frame = message_frame_len(payload.len());
             let max = max.filter(|max| {
                 message.len() <= self.max_frame_size
                     && self.header.len().saturating_add(frame) <= *max
@@ -851,7 +912,7 @@ impl FlowSender {
                 datagram.reserve(total.min(max));
                 datagram.extend_from_slice(&self.header);
             }
-            put_message_frame(&mut datagram, &message);
+            put_message_frame(&mut datagram, frame_type, &payload);
             packed.push(message);
         }
         if !packed.is_empty() {
@@ -1276,7 +1337,7 @@ mod tests {
         fn arrive_batch(&self, flow: u64, messages: &[&[u8]]) {
             let mut datagram = BytesMut::from(&flow_header(&self.0.prefix, flow).unwrap()[..]);
             for message in messages {
-                put_message_frame(&mut datagram, message);
+                put_message_frame(&mut datagram, MESSAGE_FRAME, message);
             }
             self.arrive(&datagram);
         }
@@ -1400,7 +1461,7 @@ mod tests {
                     // A sender writes exactly these bytes.
                     let mut encoded = BytesMut::from(&flow_header(&[], flow).unwrap()[..]);
                     for message in &messages {
-                        put_message_frame(&mut encoded, message);
+                        put_message_frame(&mut encoded, MESSAGE_FRAME, message);
                     }
                     assert_eq!(&encoded[..], hex(datagram).as_slice(), "{name}");
                     hex(datagram)
@@ -1413,7 +1474,9 @@ mod tests {
             let decoded = decode(Bytes::from(datagram), MAX_FRAME).map(|(decoded, messages)| {
                 (
                     decoded,
-                    messages.map(|message| message.to_vec()).collect::<Vec<_>>(),
+                    messages
+                        .map(|(_, message)| message.to_vec())
+                        .collect::<Vec<_>>(),
                 )
             });
             if name == "truncated" {
@@ -1433,8 +1496,12 @@ mod tests {
     }
 
     fn messages_of(datagram: &[u8], max_frame_size: usize) -> Option<(u64, Vec<Vec<u8>>)> {
-        decode(Bytes::copy_from_slice(datagram), max_frame_size)
-            .map(|(flow, messages)| (flow, messages.map(|message| message.to_vec()).collect()))
+        decode(Bytes::copy_from_slice(datagram), max_frame_size).map(|(flow, messages)| {
+            (
+                flow,
+                messages.map(|(_, message)| message.to_vec()).collect(),
+            )
+        })
     }
 
     #[test]
@@ -1487,7 +1554,8 @@ mod tests {
     async fn a_server_flow_receives_its_datagrams_and_drops_what_does_not_fit() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let (mut requests, _flow) = requests_of(demux.open_server_flow(5, BIDI).unwrap());
+        let (mut requests, _flow) =
+            requests_of(demux.open_server_flow(5, BIDI, &Accept::None).unwrap());
 
         for index in 0..QUEUE.values + 10 {
             fake.arrive_for(5, index.to_string().as_bytes());
@@ -1508,7 +1576,9 @@ mod tests {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
         // A server-streaming call has one request message: no queue for request datagrams.
-        let flow = demux.open_server_flow(5, RpcKind::ServerStreaming).unwrap();
+        let flow = demux
+            .open_server_flow(5, RpcKind::ServerStreaming, &Accept::None)
+            .unwrap();
         assert!(flow.requests.is_none());
 
         fake.arrive_for(5, b"ignored");
@@ -1529,13 +1599,14 @@ mod tests {
     async fn datagrams_that_overtake_their_request_are_held_and_claimed_in_order() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let _other = demux.open_server_flow(1, BIDI).unwrap();
+        let _other = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
         for message in [&b"a"[..], b"b", b"c"] {
             fake.arrive_for(9, message);
         }
         settle().await;
 
-        let (mut requests, _flow) = requests_of(demux.open_server_flow(9, BIDI).unwrap());
+        let (mut requests, _flow) =
+            requests_of(demux.open_server_flow(9, BIDI, &Accept::None).unwrap());
 
         assert_eq!(
             drain(&mut requests),
@@ -1547,7 +1618,7 @@ mod tests {
     async fn held_datagrams_expire() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let _other = demux.open_server_flow(1, BIDI).unwrap();
+        let _other = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
         fake.arrive_for(9, b"old");
         settle().await;
         tokio::time::sleep(
@@ -1560,7 +1631,8 @@ mod tests {
         settle().await;
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let (mut requests, _flow) = requests_of(demux.open_server_flow(9, BIDI).unwrap());
+        let (mut requests, _flow) =
+            requests_of(demux.open_server_flow(9, BIDI, &Accept::None).unwrap());
 
         // The first is past the 500 ms limit by now; the second is not.
         assert_eq!(drain(&mut requests), [b"young".to_vec()]);
@@ -1570,12 +1642,13 @@ mod tests {
     async fn the_holding_area_is_bounded_by_count_and_by_bytes() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let _other = demux.open_server_flow(1, BIDI).unwrap();
+        let _other = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
         for index in 0..MAX_HELD_DATAGRAMS + 20 {
             fake.arrive_for(2, &[u8::try_from(index).unwrap()]);
         }
         settle().await;
-        let (mut by_count, _flow) = requests_of(demux.open_server_flow(2, BIDI).unwrap());
+        let (mut by_count, _flow) =
+            requests_of(demux.open_server_flow(2, BIDI, &Accept::None).unwrap());
         // The queue takes them all; the area kept the first 64.
         assert_eq!(drain(&mut by_count).len(), MAX_HELD_DATAGRAMS);
 
@@ -1583,7 +1656,8 @@ mod tests {
         fake.arrive_for(3, &chunk);
         fake.arrive_for(3, &chunk);
         settle().await;
-        let (mut by_bytes, _flow) = requests_of(demux.open_server_flow(3, BIDI).unwrap());
+        let (mut by_bytes, _flow) =
+            requests_of(demux.open_server_flow(3, BIDI, &Accept::None).unwrap());
         assert_eq!(drain(&mut by_bytes).len(), 1);
     }
 
@@ -1591,7 +1665,7 @@ mod tests {
     async fn late_datagrams_of_ended_flows_are_dropped_and_do_not_fill_the_holding_area() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        drop(demux.open_server_flow(1, BIDI).unwrap());
+        drop(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         for _ in 0..MAX_HELD_DATAGRAMS * 2 {
             fake.arrive_for(1, b"late");
         }
@@ -1602,7 +1676,8 @@ mod tests {
             fake.arrive_for(2, b"early");
         }
         settle().await;
-        let (mut requests, _flow) = requests_of(demux.open_server_flow(2, BIDI).unwrap());
+        let (mut requests, _flow) =
+            requests_of(demux.open_server_flow(2, BIDI, &Accept::None).unwrap());
         assert_eq!(drain(&mut requests).len(), MAX_HELD_DATAGRAMS);
     }
 
@@ -1614,9 +1689,11 @@ mod tests {
         let capacity = (10 * ENDED_FLOWS_PER_STREAM).max(MIN_ENDED_FLOWS);
         let flows = u64::try_from(capacity).unwrap() + 5;
         for flow in 1..=flows {
-            drop(demux.open_server_flow(flow, BIDI).unwrap());
+            drop(demux.open_server_flow(flow, BIDI, &Accept::None).unwrap());
         }
-        let _live = demux.open_server_flow(flows + 1, BIDI).unwrap();
+        let _live = demux
+            .open_server_flow(flows + 1, BIDI, &Accept::None)
+            .unwrap();
 
         // The oldest five are forgotten and held like unknown flows; the rest are dropped.
         fake.arrive_for(1, b"forgotten");
@@ -1639,16 +1716,24 @@ mod tests {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
 
-        let first = demux.open_server_flow(4, BIDI).unwrap();
-        assert_eq!(demux.open_server_flow(4, BIDI).err(), Some(FlowInUse));
-        assert_eq!(demux.open_server_flow(0, BIDI).err(), Some(FlowInUse));
+        let first = demux.open_server_flow(4, BIDI, &Accept::None).unwrap();
         assert_eq!(
-            demux.open_server_flow(varint::MAX + 1, BIDI).err(),
+            demux.open_server_flow(4, BIDI, &Accept::None).err(),
+            Some(FlowInUse)
+        );
+        assert_eq!(
+            demux.open_server_flow(0, BIDI, &Accept::None).err(),
+            Some(FlowInUse)
+        );
+        assert_eq!(
+            demux
+                .open_server_flow(varint::MAX + 1, BIDI, &Accept::None)
+                .err(),
             Some(FlowInUse)
         );
 
         drop(first);
-        assert!(demux.open_server_flow(4, BIDI).is_ok());
+        assert!(demux.open_server_flow(4, BIDI, &Accept::None).is_ok());
     }
 
     /// Sends `messages` as one batch; returns those that went on the stream.
@@ -1668,7 +1753,7 @@ mod tests {
         // leave 95 bytes of message in a datagram of 100: past 63 bytes the length takes two bytes.
         let fake = Fake::new(&[0x2a], 100);
         let demux = server(&fake);
-        let flow = demux.open_server_flow(1, BIDI).unwrap();
+        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
 
         assert!(send_all(&flow.sender, &[&[7; 95]]).await.is_empty());
         assert_eq!(send_all(&flow.sender, &[&[7; 96]]).await, [vec![7; 96]]);
@@ -1694,7 +1779,7 @@ mod tests {
     async fn the_flow_sender_packs_ready_messages_into_as_few_datagrams_as_fit() {
         let fake = Fake::new(&[], 40);
         let demux = server(&fake);
-        let flow = demux.open_server_flow(1, BIDI).unwrap();
+        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
 
         // Flow (1) + frames of 2 + 10 bytes: three fit in a datagram of 40, the fourth does not.
         let messages: Vec<&[u8]> = vec![&[1; 10], &[2; 10], &[3; 10], &[4; 10], &[5; 10]];
@@ -1714,7 +1799,7 @@ mod tests {
     async fn flushed_waits_for_the_transport_to_write_the_queued_datagrams_but_not_for_long() {
         let fake = Fake::reporting(1200);
         let demux = server(&fake);
-        let flow = demux.open_server_flow(1, BIDI).unwrap();
+        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
         // Nothing queued yet: nothing to wait for.
         let started = std::time::Instant::now();
         flow.sender.flushed(std::future::pending()).await;
@@ -1753,7 +1838,7 @@ mod tests {
     async fn a_message_too_large_for_a_datagram_goes_on_the_stream_without_splitting_the_batch() {
         let fake = Fake::new(&[], 40);
         let demux = server(&fake);
-        let flow = demux.open_server_flow(1, BIDI).unwrap();
+        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
 
         let on_stream = send_all(&flow.sender, &[b"a", &[9; 60], b"b", &[8; 70], b"c"]).await;
 
@@ -1771,7 +1856,7 @@ mod tests {
     async fn a_refused_datagram_sends_all_of_its_messages_on_the_stream() {
         let fake = Fake::new(&[], 40);
         let demux = server(&fake);
-        let flow = demux.open_server_flow(1, BIDI).unwrap();
+        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
         fake.0.fail.store(true, Ordering::SeqCst);
 
         let messages: Vec<&[u8]> = vec![&[1; 10], &[2; 10], &[3; 10], &[4; 10]];
@@ -1788,7 +1873,7 @@ mod tests {
     async fn messages_over_the_maximum_frame_size_stay_off_datagrams() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::server(fake.clone(), None, 8);
-        let flow = demux.open_server_flow(1, BIDI).unwrap();
+        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
 
         let on_stream = send_all(&flow.sender, &[&[1; 8], &[2; 9]]).await;
 
@@ -1799,7 +1884,8 @@ mod tests {
     async fn a_datagram_with_several_messages_reaches_the_call_in_order() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let (mut requests, _flow) = requests_of(demux.open_server_flow(3, BIDI).unwrap());
+        let (mut requests, _flow) =
+            requests_of(demux.open_server_flow(3, BIDI, &Accept::None).unwrap());
 
         fake.arrive_batch(3, &[b"a", b"", b"c"]);
         settle().await;
@@ -1811,7 +1897,8 @@ mod tests {
     async fn a_malformed_datagram_delivers_nothing_and_is_not_held() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let (mut requests, _flow) = requests_of(demux.open_server_flow(3, BIDI).unwrap());
+        let (mut requests, _flow) =
+            requests_of(demux.open_server_flow(3, BIDI, &Accept::None).unwrap());
 
         // A good message followed by a truncated frame, for a live flow and for an unknown one.
         fake.arrive(&[0x03, 0x00, 0x01, b'a', 0x00, 0x09, b'b']);
@@ -1834,7 +1921,8 @@ mod tests {
     async fn the_datagrams_of_a_session_are_filtered_and_stripped_by_its_prefix() {
         let fake = Fake::new(&[0x2a], 1200);
         let demux = server(&fake);
-        let (mut requests, _flow) = requests_of(demux.open_server_flow(1, BIDI).unwrap());
+        let (mut requests, _flow) =
+            requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
 
         fake.arrive_for(1, b"mine");
         // Another session's datagram, and one without any prefix.
@@ -1849,7 +1937,7 @@ mod tests {
     async fn a_send_that_must_wait_ends_with_its_call_and_never_blocks_a_send_with_room() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let first = demux.open_server_flow(1, BIDI).unwrap();
+        let first = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
         fake.block_sends(true);
 
         // The send buffer is full: the send waits until the call is cancelled.
@@ -1880,8 +1968,12 @@ mod tests {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake, MAX_FRAME);
 
-        let first = demux.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
-        let second = demux.open_client_flow(BIDI, Unreliable::RESPONSES).unwrap();
+        let first = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
+        let second = demux
+            .open_client_flow(BIDI, Unreliable::RESPONSES, Accept::None)
+            .unwrap();
         assert_eq!((first.flow, second.flow), (1, 2));
         assert!(first.requests.is_some() && second.requests.is_none());
         assert!(first.responses.is_some());
@@ -1890,7 +1982,7 @@ mod tests {
         let reconnected = Demux::client(Fake::new(&[], 1200), MAX_FRAME);
         assert_eq!(
             reconnected
-                .open_client_flow(BIDI, Unreliable::BOTH)
+                .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
                 .unwrap()
                 .flow,
             1
@@ -1902,35 +1994,49 @@ mod tests {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake.clone(), MAX_FRAME);
 
-        assert!(demux.open_client_flow(BIDI, Unreliable::NONE).is_none());
         assert!(
             demux
-                .open_client_flow(RpcKind::Unary, Unreliable::BOTH)
+                .open_client_flow(BIDI, Unreliable::NONE, Accept::None)
+                .is_none()
+        );
+        assert!(
+            demux
+                .open_client_flow(RpcKind::Unary, Unreliable::BOTH, Accept::None)
                 .is_none()
         );
         // Requests do not stream in a server-streaming call, so there is nothing to mark.
         assert!(
             demux
-                .open_client_flow(RpcKind::ServerStreaming, Unreliable::REQUESTS)
+                .open_client_flow(RpcKind::ServerStreaming, Unreliable::REQUESTS, Accept::None)
                 .is_none()
         );
         assert!(
             demux
-                .open_client_flow(RpcKind::ServerStreaming, Unreliable::RESPONSES)
+                .open_client_flow(
+                    RpcKind::ServerStreaming,
+                    Unreliable::RESPONSES,
+                    Accept::None
+                )
                 .is_some()
         );
 
         // The peer does not accept datagrams.
         fake.0.max.store(0, Ordering::SeqCst);
         assert!(!demux.supported());
-        assert!(demux.open_client_flow(BIDI, Unreliable::BOTH).is_none());
+        assert!(
+            demux
+                .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+                .is_none()
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_client_does_not_hold_datagrams_for_unknown_flows() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake.clone(), MAX_FRAME);
-        let _flow = demux.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
+        let _flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
         fake.arrive_for(77, b"stray");
         settle().await;
 
@@ -1949,7 +2055,7 @@ mod tests {
     async fn the_reader_stops_with_the_demultiplexer() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let flow = demux.open_server_flow(1, BIDI).unwrap();
+        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
         settle().await;
         assert!(Arc::strong_count(&fake.0) > 1);
 
@@ -1972,7 +2078,9 @@ mod tests {
         assert!(refusing.reader.lock_unpoisoned().is_none());
         let client = Demux::client(Fake::new(&[], 1200), MAX_FRAME);
         assert!(client.reader.lock_unpoisoned().is_none());
-        let _flow = client.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
+        let _flow = client
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
         assert!(client.reader.lock_unpoisoned().is_some());
     }
 
@@ -1989,7 +2097,7 @@ mod tests {
     async fn requests_merge_stream_messages_and_datagram_messages_and_count_the_latter() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI).unwrap());
+        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
         let count = DatagramCount::new();
         let mut merged =
@@ -2020,7 +2128,7 @@ mod tests {
     async fn requests_deliver_the_datagrams_queued_before_the_end_then_drop_later_ones() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI).unwrap());
+        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
         let mut merged = MergedRequests::boxed(
             stream,
@@ -2052,7 +2160,7 @@ mod tests {
     async fn a_failed_request_stream_ends_the_merged_requests_at_once() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI).unwrap());
+        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
         let mut merged = MergedRequests::boxed(
             stream,
@@ -2076,7 +2184,7 @@ mod tests {
     async fn requests_deliver_datagrams_that_arrived_before_the_end_even_if_the_reader_lags() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
-        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI).unwrap());
+        let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
         let mut merged = MergedRequests::boxed(
             stream,
@@ -2104,7 +2212,9 @@ mod tests {
     async fn responses_deliver_datagrams_that_arrived_before_the_status_even_if_the_reader_lags() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake.clone(), MAX_FRAME);
-        let flow = demux.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
         let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
 
@@ -2143,7 +2253,9 @@ mod tests {
     async fn responses_deliver_datagram_messages_only_after_the_headers() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake.clone(), MAX_FRAME);
-        let flow = demux.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
         let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
 
@@ -2168,7 +2280,9 @@ mod tests {
     async fn responses_deliver_queued_datagram_messages_before_the_status() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake.clone(), MAX_FRAME);
-        let flow = demux.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
         let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
 
@@ -2202,7 +2316,9 @@ mod tests {
     async fn responses_without_headers_or_with_an_error_drop_queued_datagrams() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake.clone(), MAX_FRAME);
-        let flow = demux.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
         let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
 
@@ -2220,7 +2336,9 @@ mod tests {
     async fn the_response_stream_holds_the_flow_until_it_is_dropped() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake, MAX_FRAME);
-        let flow = demux.open_client_flow(BIDI, Unreliable::BOTH).unwrap();
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
         let id = flow.flow;
         let (_frames_tx, frames) = channel_stream::<ResponseFrame>();
         let merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
@@ -2237,7 +2355,7 @@ mod tests {
         let demux = Demux::client(fake.clone(), MAX_FRAME);
         // A client-streaming call has one response: only the requests are unreliable.
         let flow = demux
-            .open_client_flow(RpcKind::ClientStreaming, Unreliable::REQUESTS)
+            .open_client_flow(RpcKind::ClientStreaming, Unreliable::REQUESTS, Accept::None)
             .unwrap();
         assert!(flow.responses.is_none() && flow.requests.is_some());
         let id = flow.flow;

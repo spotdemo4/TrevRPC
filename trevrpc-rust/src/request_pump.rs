@@ -161,7 +161,13 @@ pub trait RequestPumpReader: FrameRead + Send + Sized + 'static {
         max_frame_size: usize,
         budget: &mut RequestBudget,
     ) -> impl Future<Output = Result<Option<RequestFrame>>> + Send {
-        framed::read_request_frame(self, max_frame_size, |len| budget.charge_skipped(len))
+        async move {
+            let accept = budget.accept.clone();
+            framed::read_request_frame(self, max_frame_size, &accept, |len| {
+                budget.charge_skipped(len)
+            })
+            .await
+        }
     }
 
     /// Reads to the end of the request stream, failing on any known frame with `unexpected`.

@@ -188,11 +188,14 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
+	// The server accepts every dictionary it holds on request messages.
+	request.compression = runtime.compression.negotiate(request)
+	reader.inflate = runtime.compression.lookupOrNil()
 	if request.DatagramFlow != 0 {
 		// A connection without datagrams ignores the flow.
 		if datagrams, ok := stream.(datagramStream); ok {
 			if mux := datagrams.trevrpcDatagrams(); mux != nil {
-				flow, err := mux.register(request.DatagramFlow, request.rpcKind().streamsRequests(), options.MaxFrameSize)
+				flow, err := mux.register(request.DatagramFlow, request.rpcKind().streamsRequests(), options.MaxFrameSize, runtime.compression.lookupOrNil())
 				if err != nil {
 					status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
 					runtime.recordRequestFailure(startedAt, request, 0, status)

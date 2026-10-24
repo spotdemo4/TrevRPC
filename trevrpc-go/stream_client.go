@@ -34,6 +34,9 @@ type streamClient struct {
 	// datagrams carries the datagram flows of the calls, or is nil when the
 	// connection has none. It is set before the client is used.
 	datagrams *datagramMux
+	// compression is the connection's compression state, or nil without
+	// dictionaries. It is set before the client is used.
+	compression *clientCompression
 }
 
 func newStreamClient(opener streamOpener, maxFrameSize int) *streamClient {
@@ -51,11 +54,25 @@ func (c *streamClient) call(
 	message ProtoMessage,
 ) (frameStream, error) {
 	protoMessage := protoMessageV2(message)
-	messageSize := proto.Size(protoMessage)
-	flow := c.openFlow(request)
+	accept, queried := c.compression.prepare(request)
+	// A message that may be compressed is encoded on its own; any other is
+	// marshalled straight behind the request.
+	var compressed encodedMessage
+	if compressor := c.compression.requestCompressor(); compressor.dictFor(protoMessage) != nil {
+		var err error
+		if compressed, err = compressor.encode(message); err != nil {
+			return nil, err
+		}
+	}
+	messageSize, messageFrameLen := compressed.size, len(compressed.frame)
+	if compressed.frame == nil {
+		messageSize = proto.Size(protoMessage)
+		messageFrameLen = frameHeaderLen(frameTypeMessage, messageSize) + messageSize
+	}
+	flow := c.openFlow(request, accept)
 	requestSize, _ := request.payloadSize()
 	// The frames are built in one allocation.
-	frames := make([]byte, 0, frameHeaderSize+requestSize+frameHeaderLen(frameTypeMessage, messageSize)+messageSize)
+	frames := make([]byte, 0, frameHeaderSize+requestSize+messageFrameLen)
 	frames, err := appendRequestFrame(frames, request, c.maxFrameSize)
 	if err != nil {
 		flow.release()
@@ -65,7 +82,9 @@ func (c *streamClient) call(
 		flow.release()
 		return nil, &FrameTooLargeError{Len: messageSize, Max: c.maxFrameSize}
 	}
-	if frames, err = appendProtoFrame(frames, frameTypeMessage, protoMessage, messageSize); err != nil {
+	if compressed.frame != nil {
+		frames = append(frames, compressed.frame...)
+	} else if frames, err = appendProtoFrame(frames, frameTypeMessage, protoMessage, messageSize); err != nil {
 		flow.release()
 		return nil, err
 	}
@@ -78,10 +97,12 @@ func (c *streamClient) call(
 	response := &transportResponseStream{
 		ctx:          ctx,
 		stream:       stream,
-		reader:       newResponseFrameReader(stream, c.maxFrameSize),
+		reader:       newResponseFrameReader(stream, c.maxFrameSize, accept),
 		stopCancel:   cancelStreamOnContext(ctx, stream),
 		maxFrameSize: c.maxFrameSize,
 		flow:         flow,
+		compression:  c.compression,
+		queried:      queried,
 	}
 
 	if _, err := stream.Write(frames); err != nil {
@@ -105,7 +126,7 @@ func (c *streamClient) call(
 // the call asks for them, and records its ID in request. The decision is made
 // here, inside the connection that carries the call. It returns nil for a call
 // without a flow.
-func (c *streamClient) openFlow(request *wireRequest) *datagramFlow {
+func (c *streamClient) openFlow(request *wireRequest, accept *dictSet) *datagramFlow {
 	if c.datagrams == nil {
 		return nil
 	}
@@ -113,7 +134,7 @@ func (c *streamClient) openFlow(request *wireRequest) *datagramFlow {
 	if !request.unreliable.effective(kind).any() {
 		return nil
 	}
-	flow := c.datagrams.allocate(kind.streamsResponses(), c.maxFrameSize)
+	flow := c.datagrams.allocate(kind.streamsResponses(), c.maxFrameSize, accept.lookupOrNil())
 	if flow == nil {
 		return nil
 	}
@@ -126,7 +147,11 @@ func (c *streamClient) streamingCall(
 	request *wireRequest,
 	requests encodedStream,
 ) (frameStream, error) {
-	flow := c.openFlow(request)
+	accept, queried := c.compression.prepare(request)
+	if setter, ok := requests.(compressorSetter); ok {
+		setter.setCompressor(c.compression.requestCompressor())
+	}
+	flow := c.openFlow(request, accept)
 	header, err := appendRequestFrame(nil, request, c.maxFrameSize)
 	if err != nil {
 		flow.release()
@@ -149,7 +174,7 @@ func (c *streamClient) streamingCall(
 	response := &transportResponseStream{
 		ctx:          streamCtx,
 		stream:       stream,
-		reader:       newResponseFrameReader(stream, c.maxFrameSize),
+		reader:       newResponseFrameReader(stream, c.maxFrameSize, accept),
 		writerDone:   writerDone,
 		cancelUpload: cancelUpload,
 		cancel:       cancel,
@@ -160,6 +185,8 @@ func (c *streamClient) streamingCall(
 		pumpStop:     make(chan struct{}),
 		outcome:      make(chan struct{}),
 		flow:         flow,
+		compression:  c.compression,
+		queried:      queried,
 	}
 	if aborter, ok := requests.(uploadAborter); ok {
 		response.abortUpload = aborter.abortUpload
@@ -180,10 +207,12 @@ func (c *streamClient) streamingCall(
 	return response, nil
 }
 
-// newResponseFrameReader returns the reader of the response frames of a call.
-func newResponseFrameReader(stream io.Reader, maxFrameSize int) *frameReader {
+// newResponseFrameReader returns the reader of the response frames of a call,
+// which accepts the dictionaries of accept on compressed messages.
+func newResponseFrameReader(stream io.Reader, maxFrameSize int, accept *dictSet) *frameReader {
 	reader := newFrameReader(stream, maxFrameSize, -1)
 	reader.readAhead = true
+	reader.inflate = accept.lookupOrNil()
 	return reader
 }
 
@@ -281,6 +310,11 @@ type transportResponseStream struct {
 	stopCancel   func()
 	maxFrameSize int
 	done         bool
+	// compression is the connection's compression state, and queried says
+	// the request asked the server for its dictionaries, so that the HEADERS
+	// of the response answer it.
+	compression *clientCompression
+	queried     bool
 
 	// The fields below are set for calls that stream their request.
 	//
@@ -530,9 +564,13 @@ func (s *transportResponseStream) Recv() (responseFrame, error) {
 	case frameTypeMessage:
 		return responseFrame{kind: frameTypeMessage, body: next.payload}, nil
 	case frameTypeHeaders:
-		headers, err := decodeHeaders(next.payload)
+		headers, dictionaries, err := decodeHeaders(next.payload)
 		if err != nil {
 			return responseFrame{}, err
+		}
+		if s.queried {
+			s.queried = false
+			s.compression.learn(dictionaries)
 		}
 		return responseFrame{kind: frameTypeHeaders, headers: headers}, nil
 	case frameTypeStatus:

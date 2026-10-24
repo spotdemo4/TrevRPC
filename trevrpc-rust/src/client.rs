@@ -51,6 +51,50 @@ pub struct CallOptions {
     /// The directions marked unreliable, or `None` to leave them to the call; see
     /// [`Call::default_unreliable`].
     unreliable: Option<Unreliable>,
+    /// The method's message types, which the call sets from [`Call::message_types`].
+    message_types: Option<MessageTypes>,
+}
+
+/// The full protobuf names of a method's request and response message types.
+///
+/// Generated code passes them with [`Call::message_types`] and
+/// [`RouteOptions::with_message_types`](crate::server::RouteOptions::with_message_types); they
+/// pick the dictionaries of [compressed messages](crate::Compression).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageTypes {
+    /// The request message type, such as `example.v1.HelloRequest`.
+    pub request: &'static str,
+    /// The response message type.
+    pub response: &'static str,
+}
+
+impl MessageTypes {
+    /// Names a method's request and response message types.
+    #[must_use]
+    pub const fn new(request: &'static str, response: &'static str) -> Self {
+        Self { request, response }
+    }
+}
+
+/// What the call layer knows about a call besides its request, for the transport that carries it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CallInfo {
+    /// The directions marked unreliable; see [`StreamingRpcTransport::streaming_call_with_info`].
+    pub unreliable: Unreliable,
+    /// The method's message types, when generated code passed them.
+    pub message_types: Option<MessageTypes>,
+}
+
+impl CallInfo {
+    /// Describes a call with these unreliable directions and message types.
+    #[must_use]
+    pub const fn new(unreliable: Unreliable, message_types: Option<MessageTypes>) -> Self {
+        Self {
+            unreliable,
+            message_types,
+        }
+    }
 }
 
 impl Default for CallOptions {
@@ -63,6 +107,7 @@ impl Default for CallOptions {
             stream_idle_timeout: None,
             metadata: Metadata::new(),
             unreliable: None,
+            message_types: None,
         }
     }
 }
@@ -206,6 +251,21 @@ pub trait RpcTransport: Send + Sync + 'static {
     /// A failed call, including a non-`OK` status from the server, is the error; the status keeps
     /// its trailing metadata.
     async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>>;
+
+    /// Sends a unary request like [`RpcTransport::call`], with what the call layer knows about
+    /// the call.
+    ///
+    /// A transport that compresses messages uses `info.message_types` to pick the dictionaries
+    /// of the call. The default implementation ignores `info`.
+    async fn call_with_info(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+        info: CallInfo,
+    ) -> Result<ResponseEnvelope<Bytes>> {
+        let _ = info;
+        self.call(request, body).await
+    }
 }
 
 /// A transport with explicit support for streaming RPCs.
@@ -226,21 +286,23 @@ pub trait StreamingRpcTransport: RpcTransport {
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>>;
 
-    /// Sends a streaming request like [`StreamingRpcTransport::streaming_call`], for a call
-    /// with directions marked `unreliable`.
+    /// Sends a streaming request like [`StreamingRpcTransport::streaming_call`], with what the
+    /// call layer knows about the call.
     ///
-    /// A transport whose connection carries datagrams gives the call a datagram flow
-    /// (`RpcRequest::datagram_flow`) and sends request messages as datagrams if
-    /// `unreliable.requests` is set. The decision belongs to the connection that carries the
-    /// call, not to the caller: a channel may reach a different connection after the call began.
-    /// The default implementation ignores `unreliable`, so every message stays on the stream.
-    async fn streaming_call_unreliable(
+    /// A transport whose connection carries datagrams gives a call with directions marked
+    /// unreliable in `info.unreliable` a datagram flow (`RpcRequest::datagram_flow`), and sends
+    /// request messages as datagrams if `unreliable.requests` is set. A transport that compresses
+    /// messages uses `info.message_types` to pick the dictionaries of the call. These decisions
+    /// belong to the connection that carries the call, not to the caller: a channel may reach a
+    /// different connection after the call began. The default implementation ignores `info`, so
+    /// every message stays on the stream, uncompressed.
+    async fn streaming_call_with_info(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
-        let _ = unreliable;
+        let _ = info;
         self.streaming_call(request, request_body).await
     }
 }
@@ -252,6 +314,15 @@ where
 {
     async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
         self.as_ref().call(request, body).await
+    }
+
+    async fn call_with_info(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+        info: CallInfo,
+    ) -> Result<ResponseEnvelope<Bytes>> {
+        self.as_ref().call_with_info(request, body, info).await
     }
 }
 
@@ -268,14 +339,14 @@ where
         self.as_ref().streaming_call(request, request_body).await
     }
 
-    async fn streaming_call_unreliable(
+    async fn streaming_call_with_info(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
         self.as_ref()
-            .streaming_call_unreliable(request, request_body, unreliable)
+            .streaming_call_with_info(request, request_body, info)
             .await
     }
 }
@@ -322,6 +393,7 @@ where
         stream_idle_timeout: _,
         metadata,
         unreliable: _,
+        message_types,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
@@ -329,12 +401,13 @@ where
     let rpc_request = RpcRequest::new(method)
         .with_metadata(metadata)
         .with_timeout_nanos(timeout_nanos);
+    let info = CallInfo::new(Unreliable::NONE, message_types);
     let response = if let Some(timeout) = timeout {
-        tokio::time::timeout(timeout, transport.call(rpc_request, body))
+        tokio::time::timeout(timeout, transport.call_with_info(rpc_request, body, info))
             .await
             .map_err(|_| Error::from(Status::deadline_exceeded("RPC deadline exceeded")))??
     } else {
-        transport.call(rpc_request, body).await?
+        transport.call_with_info(rpc_request, body, info).await?
     };
 
     validate_response_metadata(&response)?;
@@ -753,7 +826,7 @@ struct PreparedStreamingCall {
     max_response_messages: Option<usize>,
     max_response_stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
-    unreliable: Unreliable,
+    info: CallInfo,
 }
 
 fn prepare_streaming_request(
@@ -769,10 +842,11 @@ fn prepare_streaming_request(
         stream_idle_timeout,
         metadata,
         unreliable,
+        message_types,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
-    let unreliable = unreliable.unwrap_or_default();
+    let info = CallInfo::new(unreliable.unwrap_or_default(), message_types);
 
     Ok(PreparedStreamingCall {
         request: RpcRequest::new(method)
@@ -784,7 +858,7 @@ fn prepare_streaming_request(
         max_response_messages,
         max_response_stream_body_size,
         stream_idle_timeout,
-        unreliable,
+        info,
     })
 }
 
@@ -803,20 +877,21 @@ async fn streaming_call_with_deadline<T>(
     transport: &T,
     request: RpcRequest,
     request_body: BoxStream<Vec<u8>>,
-    unreliable: Unreliable,
+    info: CallInfo,
     deadline: Option<Instant>,
 ) -> Result<BoxStream<ResponseFrame>>
 where
     T: StreamingRpcTransport + ?Sized,
 {
-    // The common reliable call takes the transport's plain entry point.
+    // The common call without unreliable directions or message types takes the transport's
+    // plain entry point.
     let call = async {
-        if unreliable.any() {
-            transport
-                .streaming_call_unreliable(request, request_body, unreliable)
-                .await
-        } else {
+        if info == CallInfo::default() {
             transport.streaming_call(request, request_body).await
+        } else {
+            transport
+                .streaming_call_with_info(request, request_body, info)
+                .await
         }
     };
     match remaining_timeout(deadline)? {
@@ -844,11 +919,10 @@ where
         max_response_messages,
         max_response_stream_body_size,
         stream_idle_timeout,
-        unreliable,
+        info,
     } = prepared;
     let response =
-        streaming_call_with_deadline(transport, request, request_body, unreliable, deadline)
-            .await?;
+        streaming_call_with_deadline(transport, request, request_body, info, deadline).await?;
     let response = match call_end {
         Some(call_end) => call_end::read_response(
             response,

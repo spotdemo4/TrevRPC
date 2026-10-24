@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! trevrpc-interop-rust server --cert <pem> --key <pem> [--host 127.0.0.1] [--port 0]
-//!                             [--web-root <dir>]
+//!                             [--web-root <dir>] [--dictionary <file>]
 //! trevrpc-interop-rust client --addr <host:port> --ca <pem> [--server-name localhost]
 //!                             [--transport quic|tcp|auto] [--tcp-addr <host:port>]
-//!                             [--expect-transport quic|qmux]
+//!                             [--expect-transport quic|qmux] [--dictionary <file>]
 //! trevrpc-interop-rust bench --addr <host:port> [--tcp-addr <host:port>] --ca <pem>
 //!                            [--server-name localhost] --transport quic|tcp
 //!                            --scenario unary|server-stream|client-stream|bidi|
@@ -34,9 +34,11 @@ type BoxError = Box<dyn Error + Send + Sync>;
 async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let result = match args.next().as_deref() {
-        Some("server") => {
-            parse_flags(args, &["cert", "key", "host", "port", "web-root"]).map(Command::Server)
-        }
+        Some("server") => parse_flags(
+            args,
+            &["cert", "key", "host", "port", "web-root", "dictionary"],
+        )
+        .map(Command::Server),
         Some("client") => parse_flags(
             args,
             &[
@@ -46,6 +48,7 @@ async fn main() -> ExitCode {
                 "transport",
                 "tcp-addr",
                 "expect-transport",
+                "dictionary",
             ],
         )
         .map(Command::Client),

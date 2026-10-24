@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -19,12 +20,41 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"trev.zip/llc/trevrpc/trevrpc-go/internal/zstd"
 )
 
 var wantScenarios = []string{
 	"unary", "unary-metadata", "unary-error", "unary-large", "client-stream",
 	"server-stream", "server-stream-error", "bidi", "bidi-error",
-	"unary-headers", "server-stream-headers", "unreliable",
+	"unary-headers", "server-stream-headers", "unreliable", "compressed",
+}
+
+// writeTestDictionary writes the compression dictionary of the shared golden
+// vectors, as interop/run.py does, and returns its path.
+func writeTestDictionary(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile("../../../testdata/zstd-golden-vectors.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		value, ok := strings.CutPrefix(line, "dict.d1.dictionary = ")
+		if !ok {
+			continue
+		}
+		dictionary, err := hex.DecodeString(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "interop.dict")
+		if err := os.WriteFile(path, dictionary, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Fatal("no dictionary in the golden vectors")
+	return ""
 }
 
 // writeTestCertificate writes a localhost ECDSA P-256 certificate and key like
@@ -66,8 +96,19 @@ func writeTestCertificate(t *testing.T) (certFile, keyFile string) {
 }
 
 // TestServerAndClientCommandsFollowTheContract drives both subcommands through
-// run, exactly as interop/run.py does with the built binary.
+// run, exactly as interop/run.py does with the built binary: without
+// compression, and with a dictionary on both sides.
 func TestServerAndClientCommandsFollowTheContract(t *testing.T) {
+	t.Run("plain", func(t *testing.T) { exerciseContract(t, nil) })
+	t.Run("compressed", func(t *testing.T) {
+		if !zstd.Available {
+			t.Skip("compression needs cgo")
+		}
+		exerciseContract(t, []string{"--dictionary", writeTestDictionary(t)})
+	})
+}
+
+func exerciseContract(t *testing.T, extra []string) {
 	certFile, keyFile := writeTestCertificate(t)
 
 	stdinReader, stdinWriter := io.Pipe()
@@ -75,7 +116,7 @@ func TestServerAndClientCommandsFollowTheContract(t *testing.T) {
 	var stderr bytes.Buffer
 	exit := make(chan int, 1)
 	go func() {
-		exit <- run([]string{"server", "--cert", certFile, "--key", keyFile, "--port", "0"}, stdinReader, stdoutWriter, &stderr)
+		exit <- run(append([]string{"server", "--cert", certFile, "--key", keyFile, "--port", "0"}, extra...), stdinReader, stdoutWriter, &stderr)
 		_ = stdoutWriter.Close()
 	}()
 
@@ -92,7 +133,7 @@ func TestServerAndClientCommandsFollowTheContract(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	args := []string{"client", "--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)), "--ca", certFile}
+	args := append([]string{"client", "--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)), "--ca", certFile}, extra...)
 	if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("client exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
 	}

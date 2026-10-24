@@ -47,3 +47,20 @@ pub fn client_endpoint(
     endpoint.set_default_client_config(config.quic_config(tls)?);
     Ok(endpoint)
 }
+
+/// The message types the interop compression dictionary compresses.
+const MESSAGE_TYPES: [&str; 2] = [
+    "trevrpc.interop.v1.EchoRequest",
+    "trevrpc.interop.v1.EchoResponse",
+];
+
+/// The compression configured by `--dictionary`: its dictionary for the Echo messages, or none.
+pub fn compression(flags: &Flags) -> Result<trevrpc::Compression, BoxError> {
+    let mut compression = trevrpc::Compression::new();
+    if let Some(path) = flags.get("dictionary") {
+        compression = compression.with_dictionary(
+            trevrpc::Dictionary::new(std::fs::read(path)?).with_messages(MESSAGE_TYPES),
+        );
+    }
+    Ok(compression)
+}

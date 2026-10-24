@@ -9,13 +9,12 @@ use super::race::{
     DEFAULT_FALLBACK_DELAY, DEFAULT_REPROBE_INTERVAL, Dialer, GenerationTransport, TcpDialer,
     TransportKind, TransportPolicy,
 };
-use super::{RpcTransport, StreamingRpcTransport};
+use super::{CallInfo, RpcTransport, StreamingRpcTransport};
+use crate::compression::{Compression, CompressionConfig};
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
-use crate::{
-    BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
-};
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
 
 const EVENT_CAPACITY: usize = 32;
 const CLOSE_REASON: &[u8] = b"channel closed";
@@ -120,6 +119,7 @@ pub struct ChannelConfig {
     tcp: Option<TcpDialer>,
     fallback_delay: Duration,
     reprobe_interval: Duration,
+    compression: Compression,
 }
 
 impl ChannelConfig {
@@ -133,7 +133,17 @@ impl ChannelConfig {
             tcp: None,
             fallback_delay: DEFAULT_FALLBACK_DELAY,
             reprobe_interval: DEFAULT_REPROBE_INTERVAL,
+            compression: Compression::new(),
         }
+    }
+
+    /// Lets messages travel compressed with the dictionaries of `compression`; see
+    /// [`Compression`]. Each connection negotiates them afresh. Connecting fails when they are
+    /// invalid.
+    #[must_use]
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Enables `QMux` over TLS to the server's TCP listener, the fallback for networks that block
@@ -349,6 +359,7 @@ impl Channel {
             endpoint,
             remote_addr,
             server_name: server_name.into(),
+            compression: CompressionConfig::new(&config.compression)?,
             max_frame_size: config.max_frame_size,
             policy: config.policy,
             tcp: config.tcp.clone(),
@@ -496,6 +507,15 @@ impl RpcTransport for Channel {
     async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
         self.snapshot()?.call(request, body).await
     }
+
+    async fn call_with_info(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+        info: CallInfo,
+    ) -> Result<ResponseEnvelope<Bytes>> {
+        self.snapshot()?.call_with_info(request, body, info).await
+    }
 }
 
 #[crate::async_trait]
@@ -508,14 +528,14 @@ impl StreamingRpcTransport for Channel {
         self.snapshot()?.streaming_call(request, request_body).await
     }
 
-    async fn streaming_call_unreliable(
+    async fn streaming_call_with_info(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
         self.snapshot()?
-            .streaming_call_unreliable(request, request_body, unreliable)
+            .streaming_call_with_info(request, request_body, info)
             .await
     }
 }

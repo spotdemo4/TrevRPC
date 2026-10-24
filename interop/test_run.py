@@ -39,11 +39,14 @@ class CellsTest(unittest.TestCase):
     def test_native_cells_cover_quic_qmux_and_the_fallback(self) -> None:
         client = harness.NamedCommand("go", ["trevrpc-interop-go"])
 
-        cells = run.native_cells(client, FakeServer("rust"), self.certificate)
+        cells = run.native_cells(client, FakeServer("rust"), self.certificate, Path("d.dict"))
 
         self.assertEqual(
             ["go-to-rust", "go-qmux-to-rust", "go-fallback-to-rust"], [c.name for c in cells]
         )
+        # The QUIC and QMux lanes compress; the fallback lane does not.
+        self.assertEqual(["--dictionary", "d.dict"], cells[0].command[-2:])
+        self.assertEqual(["--dictionary", "d.dict"], cells[1].command[-2:])
         self.assertEqual(
             [
                 "trevrpc-interop-go", "client", "--addr", "127.0.0.1:24999",
@@ -53,6 +56,12 @@ class CellsTest(unittest.TestCase):
             ],
             cells[2].command,
         )  # fmt: skip
+
+    def test_the_dictionary_comes_from_the_golden_vectors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = run.write_dictionary(run.ZSTD_VECTORS, Path(directory))
+            # A zstd-format dictionary starts with its magic number.
+            self.assertEqual(bytes.fromhex("37a430ec"), path.read_bytes()[:4])
 
     def test_browser_cells_follow_the_selected_lanes_in_order(self) -> None:
         cells = run.browser_cells(

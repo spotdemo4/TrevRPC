@@ -48,6 +48,7 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 			if rng.IntN(4) == 0 {
 				request.Extensions = []uint64{rng.Uint64() >> rng.UintN(64), 1}
 			}
+			addRandomDictionaries(rng, request)
 			payload, _ = proto.Marshal(protoMessageV2(request))
 			if rng.IntN(3) == 0 && len(payload) > 0 {
 				payload = payload[:rng.IntN(len(payload))]
@@ -81,12 +82,12 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 
 		var wantHeaders wireHeaders
 		wantHeadersErr := unmarshalMessage(payload, &wantHeaders)
-		headers, err := decodeHeaders(payload)
+		headers, answer, err := decodeHeaders(payload)
 		if (err == nil) != (wantHeadersErr == nil) {
 			t.Fatalf("headers %x: err = %v, protobuf err = %v", payload, err, wantHeadersErr)
 		}
-		if err == nil && !metadataEqual(headers, cloneMetadata(wantHeaders.Metadata)) {
-			t.Fatalf("headers %x: got %v, want %v", payload, headers, wantHeaders.Metadata)
+		if err == nil && (!metadataEqual(headers, cloneMetadata(wantHeaders.Metadata)) || !dictionaryInfosEqual(answer, wantHeaders.Dictionaries)) {
+			t.Fatalf("headers %x: got %v %v, want %v %v", payload, headers, answer, wantHeaders.Metadata, wantHeaders.Dictionaries)
 		}
 	}
 
@@ -95,11 +96,15 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 		if rng.IntN(4) == 0 {
 			request.Extensions = []uint64{rng.Uint64() >> rng.UintN(64), 1}
 		}
+		addRandomDictionaries(rng, request)
 		checkEncoding(t, frameTypeRequest, func(dst []byte) ([]byte, error) { return appendRequestFrame(dst, request, DefaultMaxFrameSize) }, request, len(request.Metadata) > 1)
 
 		headers := &wireHeaders{Metadata: randomMetadata(rng)}
+		if rng.IntN(3) == 0 {
+			headers.Dictionaries = randomDictionaryInfos(rng)
+		}
 		checkEncoding(t, frameTypeHeaders, func(dst []byte) ([]byte, error) {
-			return appendHeadersFrame(dst, headers.Metadata, DefaultMaxFrameSize)
+			return appendHeadersFrame(dst, headers.Metadata, headers.Dictionaries, DefaultMaxFrameSize)
 		}, headers, len(headers.Metadata) > 1)
 
 		status := &Status{Code: Code(rng.IntN(20)), Message: string(prefix(randomWireBytes(rng), rng.IntN(5))), Metadata: randomMetadata(rng)}
@@ -144,7 +149,32 @@ func checkEncoding(t *testing.T, typ frameType, appendFrame func([]byte) ([]byte
 
 func wireRequestEqual(a, b *wireRequest) bool {
 	return a.Method == b.Method && a.Kind == b.Kind && a.TimeoutNanos == b.TimeoutNanos &&
-		slices.Equal(a.Extensions, b.Extensions) && metadataEqual(a.Metadata, b.Metadata)
+		slices.Equal(a.Extensions, b.Extensions) && metadataEqual(a.Metadata, b.Metadata) &&
+		slices.Equal(a.AcceptDictionaries, b.AcceptDictionaries) && dictionaryInfosEqual(a.DictionaryQuery, b.DictionaryQuery)
+}
+
+func dictionaryInfosEqual(a, b []*dictionaryInfo) bool {
+	return slices.EqualFunc(a, b, func(x, y *dictionaryInfo) bool {
+		return x.GetID() == y.GetID() && bytes.Equal(x.GetFingerprint(), y.GetFingerprint())
+	})
+}
+
+// addRandomDictionaries sometimes gives request negotiation fields.
+func addRandomDictionaries(rng *rand.Rand, request *wireRequest) {
+	if rng.IntN(3) == 0 {
+		request.AcceptDictionaries = []uint32{rng.Uint32() >> rng.UintN(32), 1}
+	}
+	if rng.IntN(4) == 0 {
+		request.DictionaryQuery = randomDictionaryInfos(rng)
+	}
+}
+
+func randomDictionaryInfos(rng *rand.Rand) []*dictionaryInfo {
+	infos := make([]*dictionaryInfo, 1+rng.IntN(3))
+	for i := range infos {
+		infos[i] = &dictionaryInfo{ID: rng.Uint32() >> rng.UintN(32), Fingerprint: prefix(randomWireBytes(rng), 8)}
+	}
+	return infos
 }
 
 func prefix(data []byte, n int) []byte { return data[:min(n, len(data))] }
@@ -156,7 +186,7 @@ func TestAppendFramesRejectInvalidUTF8(t *testing.T) {
 	if frame, err := appendStatusFrame(prefix, Internal("\xff"), DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("status frame = %x, err = %v", frame, err)
 	}
-	if frame, err := appendHeadersFrame(prefix, Metadata{"\xff": nil}, DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
+	if frame, err := appendHeadersFrame(prefix, Metadata{"\xff": nil}, nil, DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("headers frame = %x, err = %v", frame, err)
 	}
 	if frame, err := appendRequestFrame(prefix, newWireRequest("/svc/\xff"), DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {

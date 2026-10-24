@@ -100,6 +100,9 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 	if server == nil {
 		return nil, InvalidArgument("server is nil")
 	}
+	if err := server.compressionError(); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
 		server:  server,

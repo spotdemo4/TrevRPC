@@ -35,6 +35,7 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
         other => return Err(format!("unknown --transport {other:?}").into()),
     };
     let mut config = ChannelConfig::new()
+        .with_compression(connect::compression(flags)?)
         .with_transport_policy(policy)
         .with_tcp_fallback(tls.clone());
     if flags.get("tcp-addr").is_some() {
@@ -106,7 +107,50 @@ fn scenarios<'a>(
             "unreliable",
             Box::pin(unreliable(unreliable_client, channel)),
         ),
+        ("compressed", Box::pin(compressed(client))),
     ]
+}
+
+/// The `index`-th message of the `compressed` scenario: like the documents the interop dictionary
+/// was trained on, so it compresses.
+fn compressed_message(index: u32) -> String {
+    format!(
+        r#"{{"service":"search","region":"us-east-1","status":404,"latency_ms":{}}}"#,
+        index.saturating_add(100)
+    )
+}
+
+/// Echoes messages that compress, in unary calls and on a bidirectional stream. With a
+/// dictionary on both sides they travel as `ZSTD_MESSAGE` frames; without, as MESSAGE frames.
+async fn compressed(client: &Echo) -> Scenario {
+    for index in 0..2 {
+        let response = client
+            .unary(&message(&compressed_message(index)))
+            .options(|_| options())
+            .await
+            .map_err(rpc)?;
+        expect_response(&response, &compressed_message(index), 0)?;
+    }
+    let mut call = client.bidi().options(|_| options()).await.map_err(rpc)?;
+    for index in 0..3 {
+        call.send(message(&compressed_message(index)))
+            .await
+            .map_err(rpc)?;
+    }
+    call.close_send().map_err(rpc)?;
+    for index in 0..3 {
+        let response = call
+            .recv()
+            .await
+            .map_err(rpc)?
+            .ok_or("stream ended before the echo")?;
+        expect_response(&response, &compressed_message(index), index)?;
+    }
+    match call.recv().await {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err("unexpected response after the echoes".to_owned()),
+        Err(error) => Err(rpc(error)),
+    }
 }
 
 fn options() -> CallOptions {
@@ -382,6 +426,23 @@ const UNRELIABLE_REQUESTS: usize = 50;
 /// The size of the last request, too large for a datagram.
 const UNRELIABLE_LARGE: usize = 4096;
 
+/// `len` characters that zstd cannot shrink much: base64 digits drawn by a fixed xorshift
+/// generator. A message of them stays too large for a datagram even when compression is on.
+fn incompressible(len: usize) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            DIGITS
+                .get(usize::try_from(state % 64).unwrap_or_default())
+                .map_or('A', |&digit| char::from(digit))
+        })
+        .collect()
+}
+
 async fn unreliable(client: &UnreliableEcho, channel: &Channel) -> Scenario {
     let connection = channel.quic_connection();
     let datagrams_before = connection
@@ -397,7 +458,7 @@ async fn unreliable(client: &UnreliableEcho, channel: &Channel) -> Scenario {
     let mut sent: Vec<String> = (0..UNRELIABLE_REQUESTS)
         .map(|index| index.to_string())
         .collect();
-    sent.push("x".repeat(UNRELIABLE_LARGE));
+    sent.push(incompressible(UNRELIABLE_LARGE));
     for part in &sent {
         let request = EchoRequest {
             count: 1,

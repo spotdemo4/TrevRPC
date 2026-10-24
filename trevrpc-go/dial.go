@@ -38,6 +38,9 @@ type DialOptions struct {
 	ReprobeInterval time.Duration
 	// OnEvent receives channel lifecycle events asynchronously from a bounded queue.
 	OnEvent func(ChannelEvent)
+	// Compression lets messages travel compressed with the dictionaries it
+	// holds; see Compression. It needs cgo, and Dial fails when it is invalid.
+	Compression *Compression
 }
 
 // TransportPolicy selects the transports a Channel connects with.
@@ -88,16 +91,22 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 	if maxFrameSize <= 0 {
 		maxFrameSize = DefaultMaxFrameSize
 	}
+	compression, err := newCompressionConfig(options.Compression)
+	if err != nil {
+		return nil, err
+	}
 	quicConnector := &quicConnector{
 		addr:         addr,
 		tls:          clientTLSConfig(options.TLSConfig, host),
 		quic:         clientQUICConfig(options.QUICConfig, maxFrameSize),
 		maxFrameSize: maxFrameSize,
+		compression:  compression,
 	}
 	qmuxConnector := &qmuxConnector{
 		addr:         tcpAddr,
 		tls:          clientQMuxTLSConfig(options.TLSConfig, host),
 		maxFrameSize: maxFrameSize,
+		compression:  compression,
 	}
 	var connector channelConnector
 	switch options.Transport {
@@ -116,6 +125,7 @@ type quicConnector struct {
 	tls          *tls.Config
 	quic         *quic.Config
 	maxFrameSize int
+	compression  *compressionConfig
 }
 
 func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) {
@@ -127,6 +137,8 @@ func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) 
 		return nil, Unavailable("transport unavailable: " + err.Error())
 	}
 	client := newStreamClient(connOpener{conn}, c.maxFrameSize)
+	// Each connection negotiates its dictionaries afresh.
+	client.compression = newClientCompression(c.compression)
 	if conn.ConnectionState().SupportsDatagrams.Remote {
 		// Each connection, and so each reconnect, has its own flow IDs.
 		client.datagrams = newDatagramMux(conn, 0, false, 0)

@@ -95,32 +95,33 @@ fn the_option_is_read_from_descriptors_and_emitted_for_clients_and_servers() {
 
     // Clients make the schema's marks the call's default, which options can override.
     assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone()).default_unreliable(::trevrpc::Unreliable::BOTH)"
+        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::BOTH)"
     ), "{content}");
     assert!(content.contains(
-        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone()).default_unreliable(::trevrpc::Unreliable::REQUESTS)"
+        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::REQUESTS)"
     ));
     assert!(content.contains(
-        "server_streaming(&self.transport, telemetry_paths::WATCH, request, self.default_options.clone()).default_unreliable(::trevrpc::Unreliable::RESPONSES)"
+        "server_streaming(&self.transport, telemetry_paths::WATCH, request, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").default_unreliable(::trevrpc::Unreliable::RESPONSES)"
     ));
     assert!(content.contains(
-        "bidirectional_streaming(&self.transport, telemetry_paths::RELIABLE, self.default_options.clone())"
+        "bidirectional_streaming(&self.transport, telemetry_paths::RELIABLE, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\")\n"
     ));
 
-    // Servers register the marked routes with route options.
+    // Servers register every route with route options carrying its message types, and the
+    // marked routes with their marks.
     assert!(content.contains(
-        "server.route_streaming_with_options(telemetry_paths::TRACK, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_unreliable(::trevrpc::Unreliable::BOTH), move |context,"
+        "server.route_streaming_with_options(telemetry_paths::TRACK, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_unreliable(::trevrpc::Unreliable::BOTH), move |context,"
     ));
     assert!(content.contains(
-        "server.route_streaming_with_options(telemetry_paths::UPLOAD, ::trevrpc::RpcKind::ClientStreaming, ::trevrpc::server::RouteOptions::new().with_unreliable(::trevrpc::Unreliable::REQUESTS), move |context,"
+        "server.route_streaming_with_options(telemetry_paths::UPLOAD, ::trevrpc::RpcKind::ClientStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_unreliable(::trevrpc::Unreliable::REQUESTS), move |context,"
     ));
     assert!(content.contains(
-        "server.route_streaming_with_context(telemetry_paths::RELIABLE, ::trevrpc::RpcKind::BidirectionalStreaming, move |context,"
+        "server.route_streaming_with_options(telemetry_paths::RELIABLE, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\"), move |context,"
     ));
 }
 
 #[test]
-fn methods_without_the_option_generate_exactly_what_they_did_before() {
+fn methods_without_the_option_carry_no_unreliable_marks() {
     let marked = generated(&service(
         "rpc Track(stream Position) returns (stream Position) { option (trevrpc.method) = { unreliable_requests: true }; }",
     ));
@@ -131,7 +132,7 @@ fn methods_without_the_option_generate_exactly_what_they_did_before() {
     assert!(marked.contains("with_unreliable"));
     assert!(!plain.contains("with_unreliable"));
     assert!(!plain.contains("Unreliable"));
-    assert!(!plain.contains("RouteOptions"));
+    assert!(plain.contains("RouteOptions::new().with_message_types("));
 }
 
 #[test]

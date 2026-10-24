@@ -330,7 +330,7 @@ func TestQMuxNeverSetsAFlowAndKeepsMessagesOnTheStream(t *testing.T) {
 		t.Fatal("a QMux connection has a datagram demultiplexer")
 	}
 	request := &wireRequest{Method: datagramChatPath, Kind: RPCKindBidirectionalStreaming, unreliable: Unreliable{Requests: true, Responses: true}}
-	if flow := generation.(*streamGeneration).client.openFlow(request); flow != nil || request.DatagramFlow != 0 {
+	if flow := generation.(*streamGeneration).client.openFlow(request, nil); flow != nil || request.DatagramFlow != 0 {
 		t.Fatalf("QMux opened flow %v for the request", flow)
 	}
 }

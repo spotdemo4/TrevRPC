@@ -129,14 +129,14 @@ func parseDatagram(datagram []byte) (flow uint64, frames []byte, ok bool) {
 	return flow, datagram[n:], true
 }
 
-// walkDatagramFrames calls fn, if there is one, with the payload of every
-// MESSAGE frame of frames in order, and skips the frames of every other type,
-// known or not. Type and length varints need not be minimal. It reports false
+// walkDatagramFrames calls fn, if there is one, with the type and payload of
+// every MESSAGE and ZSTD_MESSAGE frame of frames in order, and skips the
+// frames of every other type, known or not. Type and length varints need not be minimal. It reports false
 // when the frames do not exactly fill their space, a truncated frame or a
 // length past the end, in which case the datagram is dropped whole; fn may
 // have been called for the frames before the fault, so callers that must not
 // deliver any message first walk with a nil fn.
-func walkDatagramFrames(frames []byte, fn func(message []byte)) bool {
+func walkDatagramFrames(frames []byte, fn func(typ frameType, payload []byte)) bool {
 	for len(frames) > 0 {
 		typ, n, err := quicvarint.Parse(frames)
 		if err != nil {
@@ -151,22 +151,26 @@ func walkDatagramFrames(frames []byte, fn func(message []byte)) bool {
 		if length > uint64(len(frames)) {
 			return false
 		}
-		if frameType(typ) == frameTypeMessage && fn != nil {
-			fn(frames[:length])
+		if t := frameType(typ); (t == frameTypeMessage || t == frameTypeZstdMessage) && fn != nil {
+			fn(t, frames[:length])
 		}
 		frames = frames[length:]
 	}
 	return true
 }
 
-// datagramMessages returns the messages of a datagram's frames, or false if
-// the datagram is dropped whole.
+// datagramMessages returns the payloads of a datagram's MESSAGE frames, or
+// false if the datagram is dropped whole.
 func datagramMessages(frames []byte) ([][]byte, bool) {
 	if !walkDatagramFrames(frames, nil) {
 		return nil, false
 	}
 	var messages [][]byte
-	walkDatagramFrames(frames, func(message []byte) { messages = append(messages, message) })
+	walkDatagramFrames(frames, func(typ frameType, message []byte) {
+		if typ == frameTypeMessage {
+			messages = append(messages, message)
+		}
+	})
 	return messages, true
 }
 
@@ -313,11 +317,11 @@ func errDatagramFlowInUse(id uint64) error {
 // allocate registers the next flow ID of a client. receives says that the call
 // receives a stream of messages on it, with messages up to maxMessage bytes.
 // It returns nil when the connection is gone.
-func (m *datagramMux) allocate(receives bool, maxMessage int) *datagramFlow {
+func (m *datagramMux) allocate(receives bool, maxMessage int, inflate dictionaryLookup) *datagramFlow {
 	if m.ctx.Err() != nil {
 		return nil
 	}
-	flow, err := m.register(m.nextFlow.Add(1), receives, maxMessage)
+	flow, err := m.register(m.nextFlow.Add(1), receives, maxMessage, inflate)
 	if err != nil {
 		return nil
 	}
@@ -325,11 +329,13 @@ func (m *datagramMux) allocate(receives bool, maxMessage int) *datagramFlow {
 }
 
 // register makes id the flow of a call. It fails if id is live on the
-// connection. Held datagrams of the flow are claimed.
-func (m *datagramMux) register(id uint64, receives bool, maxMessage int) (*datagramFlow, error) {
+// connection. Held datagrams of the flow are claimed. inflate holds the
+// dictionaries the call accepts on compressed messages, nil for none.
+func (m *datagramMux) register(id uint64, receives bool, maxMessage int, inflate dictionaryLookup) (*datagramFlow, error) {
 	flow := &datagramFlow{mux: m, id: id, reply: make(chan error, 1)}
 	if receives {
 		flow.sink = newDatagramSink(maxMessage)
+		flow.sink.inflate = inflate
 	}
 	m.mu.Lock()
 	if _, live := m.flows[id]; live {
@@ -551,6 +557,9 @@ func (s *flowSet) has(id uint64) bool {
 // call. Pushing never blocks: a full or closed sink drops the message.
 type datagramSink struct {
 	maxMessage int
+	// inflate holds the dictionaries the call accepts on compressed
+	// messages, nil for none. It is set before the sink is used.
+	inflate dictionaryLookup
 	// wake holds a token whenever messages may be queued.
 	wake chan struct{}
 
@@ -594,14 +603,45 @@ func (s *datagramSink) pushLocked(message []byte) bool {
 // with walkDatagramFrames. The datagram is queued as a whole with respect to
 // the end of the direction: when the stream ends meanwhile, either all of its
 // messages are queued before the end or none.
+//
+// Compressed messages are decompressed first, outside the lock, and one that
+// is rejected drops the whole datagram.
 func (s *datagramSink) pushFrames(frames []byte) {
+	compressed := false
+	walkDatagramFrames(frames, func(typ frameType, _ []byte) {
+		compressed = compressed || typ == frameTypeZstdMessage
+	})
+	var messages [][]byte
+	if compressed {
+		ok := true
+		walkDatagramFrames(frames, func(typ frameType, payload []byte) {
+			if !ok {
+				return
+			}
+			if typ == frameTypeZstdMessage {
+				var err error
+				if payload, err = inflateMessage(s.inflate, payload, s.maxMessage); err != nil {
+					ok = false
+					return
+				}
+			}
+			messages = append(messages, payload)
+		})
+		if !ok {
+			return
+		}
+	}
 	queued := false
 	s.mu.Lock()
-	walkDatagramFrames(frames, func(message []byte) {
-		if s.pushLocked(message) {
-			queued = true
+	if compressed {
+		for _, message := range messages {
+			queued = s.pushLocked(message) || queued
 		}
-	})
+	} else {
+		walkDatagramFrames(frames, func(_ frameType, message []byte) {
+			queued = s.pushLocked(message) || queued
+		})
+	}
 	s.mu.Unlock()
 	if queued {
 		notify(s.wake)

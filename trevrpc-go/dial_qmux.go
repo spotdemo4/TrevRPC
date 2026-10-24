@@ -19,6 +19,7 @@ type qmuxConnector struct {
 	addr         string
 	tls          *tls.Config
 	maxFrameSize int
+	compression  *compressionConfig
 	dialer       net.Dialer
 }
 
@@ -43,7 +44,7 @@ func (c *qmuxConnector) Connect(parent context.Context) (channelGeneration, erro
 		_ = conn.Close()
 		return nil, dialError(parent, err)
 	}
-	return newQMuxGeneration(session, c.maxFrameSize), nil
+	return newQMuxGeneration(session, c.maxFrameSize, c.compression), nil
 }
 
 // dialError reports a failed dial. Only the caller's context turns it into a
@@ -77,10 +78,12 @@ func clientQMuxTLSConfig(base *tls.Config, host string) *tls.Config {
 }
 
 // newQMuxGeneration is one QMux session owned by a Channel.
-func newQMuxGeneration(session *qmux.Session, maxFrameSize int) *streamGeneration {
+func newQMuxGeneration(session *qmux.Session, maxFrameSize int, compression *compressionConfig) *streamGeneration {
+	client := newStreamClient(qmuxOpener{session}, maxFrameSize)
+	client.compression = newClientCompression(compression)
 	return &streamGeneration{
 		kind:   TransportQMux,
-		client: newStreamClient(qmuxOpener{session}, maxFrameSize),
+		client: client,
 		close:  func() error { return session.CloseWithError(0, "client closed") },
 		done:   session.Context().Done(),
 		err:    func() error { return context.Cause(session.Context()) },

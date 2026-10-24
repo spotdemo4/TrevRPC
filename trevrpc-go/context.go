@@ -9,6 +9,8 @@ type handlerContextKey struct{}
 type callState struct {
 	info     HandlerContext
 	response responseMetadata
+	// compression is the call's negotiation result, nil without one.
+	compression *callCompression
 }
 
 // HandlerContext describes the request being handled. Handlers receive it
@@ -75,7 +77,7 @@ func contextWithHandlerContext(ctx context.Context, request *wireRequest) contex
 		return ctx
 	}
 
-	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request)})
+	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression})
 }
 
 func cloneMetadata(metadata Metadata) Metadata {

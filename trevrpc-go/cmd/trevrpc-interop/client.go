@@ -78,6 +78,25 @@ func (c *connectionConfig) dial(ctx context.Context, options trevrpc.DialOptions
 type clientConfig struct {
 	connectionConfig
 	expectTransport string
+	// dictionary is a compression dictionary file, if set.
+	dictionary string
+}
+
+// interopMessageTypes are the message types the interop compression
+// dictionary compresses.
+var interopMessageTypes = []string{"trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"}
+
+// interopCompression reads the dictionary file at path into a Compression
+// for the Echo messages, or returns nil for no path.
+func interopCompression(path string) (*trevrpc.Compression, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read dictionary: %w", err)
+	}
+	return &trevrpc.Compression{Dictionaries: []trevrpc.Dictionary{{Data: data, Messages: interopMessageTypes}}}, nil
 }
 
 var transportPolicies = map[string]trevrpc.TransportPolicy{
@@ -115,6 +134,11 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 		frames = new(wireCounter)
 		dialOptions.QUICConfig = frames.quicConfig()
 	}
+	compression, err := interopCompression(config.dictionary)
+	if err != nil {
+		return false, err
+	}
+	dialOptions.Compression = compression
 	channel, err := config.dial(ctx, dialOptions)
 	if err != nil {
 		return false, err
@@ -323,7 +347,55 @@ var scenarios = []scenario{
 		return expectMetadata("trailing metadata", status.Metadata, "interop-trailer", "h")
 	}},
 	{"unreliable", runUnreliable},
+	{"compressed", runCompressed},
 }
+
+// compressedMessage is the i-th message of the compressed scenario: like the
+// documents the interop dictionary was trained on, so it compresses.
+func compressedMessage(i int) string {
+	return fmt.Sprintf(`{"service":"search","region":"us-east-1","status":404,"latency_ms":%d}`, 100+i)
+}
+
+// runCompressed echoes messages that compress, in a unary call and on a
+// bidirectional stream. With a dictionary on both sides they travel as
+// ZSTD_MESSAGE frames; without, as MESSAGE frames.
+func runCompressed(ctx context.Context, env *scenarioEnv) error {
+	for i := range 2 {
+		response, err := env.echo.Unary(ctx, &interoppb.EchoRequest{Message: compressedMessage(i)})
+		if err != nil {
+			return err
+		}
+		if response.GetMessage() != compressedMessage(i) {
+			return fmt.Errorf("unary %d echoed %q", i, response.GetMessage())
+		}
+	}
+	stream, err := env.echo.Bidi(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(stream)
+	for i := range compressedMessages {
+		if err := stream.Send(&interoppb.EchoRequest{Message: compressedMessage(i)}); err != nil {
+			return fmt.Errorf("send %d: %w", i, err)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		return err
+	}
+	for i := range compressedMessages {
+		response, err := stream.Recv()
+		if err != nil {
+			return fmt.Errorf("receive %d: %w", i, err)
+		}
+		if response.GetMessage() != compressedMessage(i) || response.GetIndex() != uint32(i) {
+			return fmt.Errorf("response %d is (%q, %d)", i, response.GetMessage(), response.GetIndex())
+		}
+	}
+	return expectEnd(stream)
+}
+
+// compressedMessages is how many messages the compressed scenario streams.
+const compressedMessages = 3
 
 // Parameters of the unreliable scenario: the number of small requests, and
 // the size of the large one, which cannot travel as a datagram.
@@ -331,6 +403,22 @@ const (
 	unreliableRequests  = 50
 	unreliableLargeSize = 4096
 )
+
+// incompressible returns n characters that zstd cannot shrink much: base64
+// digits drawn by a fixed xorshift generator. A message of them stays too large
+// for a datagram even when compression is on.
+func incompressible(n int) string {
+	const digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	state := uint64(0x9e3779b97f4a7c15)
+	out := make([]byte, n)
+	for i := range out {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		out[i] = digits[state%64]
+	}
+	return string(out)
+}
 
 // runUnreliable is the unreliable scenario of interop/README.md.
 func runUnreliable(ctx context.Context, env *scenarioEnv) error {
@@ -342,7 +430,7 @@ func runUnreliable(ctx context.Context, env *scenarioEnv) error {
 
 	// Every message that was sent, and none was echoed yet.
 	pending := make(map[string]bool)
-	large := strings.Repeat("x", unreliableLargeSize)
+	large := incompressible(unreliableLargeSize)
 	messages := make([]string, 0, unreliableRequests+1)
 	for i := range unreliableRequests {
 		messages = append(messages, strconv.Itoa(i))

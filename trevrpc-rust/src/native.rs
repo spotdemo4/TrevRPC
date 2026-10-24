@@ -7,7 +7,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::datagram::Demux;
-use crate::framed::{self, FrameRead};
+use crate::framed::{self, FrameRead, ResponseCodec};
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::serve::{drain_streams, log_task_error};
@@ -20,20 +20,27 @@ use crate::{ResponseFrame, Result};
 struct NativeResponseWriter<S> {
     send: S,
     max_frame_size: usize,
+    codec: ResponseCodec,
 }
 
 impl<S: MuxSendStream> NativeResponseWriter<S> {
-    const fn new(send: S, max_frame_size: usize) -> Self {
+    fn new(send: S, max_frame_size: usize) -> Self {
         Self {
             send,
             max_frame_size,
+            codec: ResponseCodec::default(),
         }
     }
 }
 
 impl<S: MuxSendStream> ResponseWriter for NativeResponseWriter<S> {
     async fn write_frames(&mut self, frames: &mut Vec<ResponseFrame>) -> Result<()> {
-        framed::write_response_frames(&mut self.send, frames, self.max_frame_size).await
+        framed::write_response_frames(&mut self.send, frames, self.max_frame_size, &mut self.codec)
+            .await
+    }
+
+    fn set_codec(&mut self, codec: ResponseCodec) {
+        self.codec = codec;
     }
 
     async fn stopped(&mut self) -> Result<()> {

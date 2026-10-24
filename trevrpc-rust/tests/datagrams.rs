@@ -11,7 +11,9 @@ use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use trevrpc::client::{ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport};
+use trevrpc::client::{
+    CallInfo, ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport,
+};
 use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{Metadata, ResponseFrame, RpcKind, RpcRequest, Status, Unreliable};
@@ -193,7 +195,11 @@ async fn run_call<T: StreamingRpcTransport>(
 ) -> TestResult<Reply> {
     let request = RpcRequest::new(path).with_kind(RpcKind::BidirectionalStreaming);
     let mut frames = transport
-        .streaming_call_unreliable(request, trevrpc::stream::from_iter(requests), unreliable)
+        .streaming_call_with_info(
+            request,
+            trevrpc::stream::from_iter(requests),
+            CallInfo::new(unreliable, None),
+        )
         .await?;
     let mut messages = Vec::new();
     loop {
@@ -573,10 +579,10 @@ async fn request_datagrams_count_toward_the_message_limit() -> TestResult {
     // Ten messages, all small enough for datagrams.
     let request = RpcRequest::new(ECHO_ALL).with_kind(RpcKind::BidirectionalStreaming);
     let mut frames = transport
-        .streaming_call_unreliable(
+        .streaming_call_with_info(
             request,
             trevrpc::stream::from_iter(numbered(10)),
-            Unreliable::REQUESTS,
+            CallInfo::new(Unreliable::REQUESTS, None),
         )
         .await?;
     let status = loop {

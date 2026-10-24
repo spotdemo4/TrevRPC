@@ -182,9 +182,9 @@ func TestDatagramMuxDeliversToTheFlowsSink(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newClientMux(conn)
 	defer mux.close()
-	one := mux.allocate(true, 1024)
-	two := mux.allocate(true, 1024)
-	noReceive := mux.allocate(false, 1024)
+	one := mux.allocate(true, 1024, nil)
+	two := mux.allocate(true, 1024, nil)
+	noReceive := mux.allocate(false, 1024, nil)
 	if one.id != 1 || two.id != 2 || noReceive.id != 3 {
 		t.Fatalf("flow IDs = %d, %d, %d; want 1, 2, 3", one.id, two.id, noReceive.id)
 	}
@@ -215,8 +215,8 @@ func TestDatagramMuxFullReceiveQueueDropsInsteadOfBlocking(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newClientMux(conn)
 	defer mux.close()
-	slow := mux.allocate(true, 1024)
-	fast := mux.allocate(true, 1024)
+	slow := mux.allocate(true, 1024, nil)
+	fast := mux.allocate(true, 1024, nil)
 
 	// Far more datagrams than the sink queues, with nobody receiving.
 	for range 10 * datagramSinkMessages {
@@ -239,7 +239,7 @@ func TestDatagramMuxHoldsDatagramsThatOvertakeTheirRequest(t *testing.T) {
 	mux := newServerMux(conn)
 	defer mux.close()
 	// Start the reader without registering a flow of interest.
-	other, err := mux.register(99, true, 1024)
+	other, err := mux.register(99, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestDatagramMuxHoldsDatagramsThatOvertakeTheirRequest(t *testing.T) {
 	conn.deliver(5, "second")
 	eventually(t, "the datagrams to be held", func() bool { return mux.heldCount() == 3 })
 
-	flow, err := mux.register(5, true, 1024)
+	flow, err := mux.register(5, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestDatagramMuxHeldDatagramsExpire(t *testing.T) {
 	mux := newServerMux(conn)
 	defer mux.close()
 	mux.holdTime = 30 * time.Millisecond
-	anchor, err := mux.register(99, false, 1024)
+	anchor, err := mux.register(99, false, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestDatagramMuxHeldDatagramsExpire(t *testing.T) {
 	eventually(t, "the datagram to be held", func() bool { return mux.heldCount() == 1 })
 	eventually(t, "the datagram to expire", func() bool { return mux.heldCount() == 0 })
 
-	flow, err := mux.register(5, true, 1024)
+	flow, err := mux.register(5, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestDatagramMuxHoldingAreaIsBounded(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newServerMux(conn)
 	defer mux.close()
-	anchor, err := mux.register(1, false, 1024)
+	anchor, err := mux.register(1, false, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,7 @@ func TestDatagramMuxDropsLateDatagramsOfEndedFlowsAtOnce(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newServerMux(conn)
 	defer mux.close()
-	flow, err := mux.register(4, true, 1024)
+	flow, err := mux.register(4, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestDatagramMuxDropsLateDatagramsOfEndedFlowsAtOnce(t *testing.T) {
 
 	// The set of ended flows is bounded: the oldest is forgotten.
 	for id := uint64(10); id < 10+8; id++ {
-		ended, err := mux.register(id, false, 1024)
+		ended, err := mux.register(id, false, 1024, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -373,11 +373,11 @@ func TestDatagramMuxDropsLateDatagramsOfEndedFlowsAtOnce(t *testing.T) {
 func TestDatagramMuxRejectsALiveFlowAndAcceptsItAfterTheCallEnds(t *testing.T) {
 	mux := newServerMux(newFakeDatagramConn())
 	defer mux.close()
-	first, err := mux.register(3, true, 1024)
+	first, err := mux.register(3, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mux.register(3, true, 1024); StatusFromError(err).Code != CodeInvalidArgument {
+	if _, err := mux.register(3, true, 1024, nil); StatusFromError(err).Code != CodeInvalidArgument {
 		t.Fatalf("registering a live flow = %v, want InvalidArgument", err)
 	}
 	if mux.liveFlows() != 1 {
@@ -396,13 +396,13 @@ func TestDatagramMuxDropsDatagramsOfDirectionsThatDoNotStream(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newServerMux(conn)
 	defer mux.close()
-	flow, err := mux.register(2, false, 1024)
+	flow, err := mux.register(2, false, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer flow.release()
 	conn.deliver(2, "no sink")
-	sentinel, err := mux.register(3, true, 1024)
+	sentinel, err := mux.register(3, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +432,7 @@ func TestDatagramSendFallsBackToTheStreamWhenTooLarge(t *testing.T) {
 	}
 	mux := newDatagramMux(conn, 3, false, 0)
 	defer mux.close()
-	flow := mux.allocate(false, 1024)
+	flow := mux.allocate(false, 1024, nil)
 	ctx := context.Background()
 
 	// The first large message learns the limit from the send error.
@@ -469,7 +469,7 @@ func TestDatagramSendPacksReadyMessagesIntoAsFewDatagramsAsFit(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newClientMux(conn)
 	defer mux.close()
-	flow := mux.allocate(false, 1024)
+	flow := mux.allocate(false, 1024, nil)
 	// The first send teaches the mux that datagrams hold 100 bytes.
 	conn.sendFunc = func(payload []byte) error {
 		if len(payload) > 100 {
@@ -533,7 +533,7 @@ func TestDatagramSendFailureLeavesTheWholeDatagramForTheStream(t *testing.T) {
 	}
 	mux := newClientMux(conn)
 	defer mux.close()
-	flow := mux.allocate(false, 1024)
+	flow := mux.allocate(false, 1024, nil)
 	// 30 messages of 100 bytes need three datagrams of 11, 11 and 8; the second
 	// fails.
 	batch := make([]encodedMessage, 30)
@@ -568,7 +568,7 @@ func TestDatagramSendErrorsFallBackToTheStream(t *testing.T) {
 	conn.sendFunc = func([]byte) error { return errors.New("datagram support disabled") }
 	mux := newClientMux(conn)
 	defer mux.close()
-	flow := mux.allocate(false, 1024)
+	flow := mux.allocate(false, 1024, nil)
 	if sent, err := trySend(context.Background(), flow, 1); sent || err != nil {
 		t.Fatalf("send after a send error = %v, %v; want it left to the stream", sent, err)
 	}
@@ -587,8 +587,8 @@ func TestDatagramSendWaitHonoursCancellationAndBlocksNoOtherCall(t *testing.T) {
 	mux := newClientMux(conn)
 	defer mux.close()
 	defer close(release)
-	stuck := mux.allocate(false, 1024)
-	waiting := mux.allocate(false, 1024)
+	stuck := mux.allocate(false, 1024, nil)
+	waiting := mux.allocate(false, 1024, nil)
 
 	// The first send occupies the sender goroutine.
 	stuckCtx, cancelStuck := context.WithCancel(context.Background())
@@ -627,7 +627,7 @@ func TestDatagramSenderStopsWhenTheConnectionCloses(t *testing.T) {
 	conn := newFakeDatagramConn()
 	conn.sendFunc = func([]byte) error { return nil }
 	mux := newClientMux(conn)
-	flow := mux.allocate(false, 1024)
+	flow := mux.allocate(false, 1024, nil)
 	if sent, err := trySend(context.Background(), flow, 1); !sent || err != nil {
 		t.Fatalf("send = %v, %v", sent, err)
 	}
@@ -636,7 +636,7 @@ func TestDatagramSenderStopsWhenTheConnectionCloses(t *testing.T) {
 	if sent, err := trySend(context.Background(), flow, 1); sent || err != nil {
 		t.Fatalf("send on a closed mux = %v, %v; want it left to the stream", sent, err)
 	}
-	if mux.allocate(true, 1024) != nil {
+	if mux.allocate(true, 1024, nil) != nil {
 		t.Fatal("a closed mux allocated a flow")
 	}
 }
@@ -673,7 +673,7 @@ func TestRequestDatagramsFollowTheFlushedRequestAndOversizedMessagesStayOnTheStr
 	}
 	mux := newClientMux(conn)
 	defer mux.close()
-	flow := mux.allocate(false, 1024)
+	flow := mux.allocate(false, 1024, nil)
 
 	small, large := rawMessage([]byte("small")), rawMessage(bytes.Repeat([]byte("L"), 64))
 	header := []byte("REQUEST")
@@ -826,7 +826,7 @@ func newMergedRequests(t *testing.T, reader io.Reader) (*rpcRequestStream, *data
 	t.Helper()
 	mux := newServerMux(newFakeDatagramConn())
 	t.Cleanup(mux.close)
-	flow, err := mux.register(1, true, 1024)
+	flow, err := mux.register(1, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -993,8 +993,8 @@ func TestEndingTheDirectionTakesTheDatagramsTheReaderHasNotDispatchedYet(t *test
 	conn := &polledConn{fakeDatagramConn: *newFakeDatagramConn(), pending: make(chan []byte, 8)}
 	mux := newClientMux(conn)
 	defer mux.close()
-	flow := mux.allocate(true, 1024)
-	other := mux.allocate(true, 1024)
+	flow := mux.allocate(true, 1024, nil)
+	other := mux.allocate(true, 1024, nil)
 
 	// The datagrams reached the connection before the end of the stream, but
 	// the reader did not take them.
@@ -1017,14 +1017,14 @@ func TestEndingTheDirectionTakesTheDatagramsTheReaderHasNotDispatchedYet(t *test
 
 	var noReceive *datagramFlow
 	noReceive.endReceive()
-	mux.allocate(false, 1024).endReceive()
+	mux.allocate(false, 1024, nil).endReceive()
 }
 
 func TestMuxDeliversEveryMessageOfABatchedDatagramAndDropsMalformedOnesWhole(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newClientMux(conn)
 	defer mux.close()
-	flow := mux.allocate(true, 8)
+	flow := mux.allocate(true, 8, nil)
 
 	batch := appendDatagram(nil, flow.id, [][]byte{[]byte("one"), nil, []byte("three")})
 	// A truncated last frame drops the whole datagram, the messages before it
@@ -1057,7 +1057,7 @@ func TestHeldBatchedDatagramDeliversAllItsMessagesWhenClaimed(t *testing.T) {
 	conn := newFakeDatagramConn()
 	mux := newServerMux(conn)
 	defer mux.close()
-	anchor, err := mux.register(99, false, 1024)
+	anchor, err := mux.register(99, false, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,7 +1065,7 @@ func TestHeldBatchedDatagramDeliversAllItsMessagesWhenClaimed(t *testing.T) {
 
 	conn.incoming <- appendDatagram(nil, 5, [][]byte{[]byte("a"), []byte("b"), []byte("c")})
 	eventually(t, "the datagram to be held", func() bool { return mux.heldCount() == 1 })
-	flow, err := mux.register(5, true, 1024)
+	flow, err := mux.register(5, true, 1024, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

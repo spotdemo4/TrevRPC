@@ -1,6 +1,7 @@
 package trevrpc
 
 import (
+	"math"
 	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protowire"
@@ -22,8 +23,13 @@ const (
 	requestTimeoutField    protowire.Number = 7
 	requestExtensionsField protowire.Number = 8
 	requestDatagramField   protowire.Number = 9
+	requestAcceptField     protowire.Number = 10
+	requestQueryField      protowire.Number = 11
 	headersMetadataField   protowire.Number = 1
 	headersExtensionsField protowire.Number = 2
+	headersDictionaryField protowire.Number = 3
+	dictionaryIDField      protowire.Number = 1
+	dictionaryFingerField  protowire.Number = 2
 	statusCodeField        protowire.Number = 1
 	statusMessageField     protowire.Number = 2
 	statusMetadataField    protowire.Number = 3
@@ -101,6 +107,69 @@ func packedVarintsFieldSize(num protowire.Number, values []uint64) int {
 	return protowire.SizeTag(num) + protowire.SizeBytes(packedVarintsSize(values))
 }
 
+func packedUint32sSize(values []uint32) int {
+	size := 0
+	for _, value := range values {
+		size += protowire.SizeVarint(uint64(value))
+	}
+	return size
+}
+
+func appendPackedUint32s(b []byte, num protowire.Number, values []uint32) []byte {
+	if len(values) == 0 {
+		return b
+	}
+	b = protowire.AppendTag(b, num, protowire.BytesType)
+	b = protowire.AppendVarint(b, uint64(packedUint32sSize(values)))
+	for _, value := range values {
+		b = protowire.AppendVarint(b, uint64(value))
+	}
+	return b
+}
+
+func packedUint32sFieldSize(num protowire.Number, values []uint32) int {
+	if len(values) == 0 {
+		return 0
+	}
+	return protowire.SizeTag(num) + protowire.SizeBytes(packedUint32sSize(values))
+}
+
+// dictionaryInfoSize is the encoded size of a DictionaryInfo message.
+func dictionaryInfoSize(info *dictionaryInfo) int {
+	size := 0
+	if info.ID != 0 {
+		size += protowire.SizeTag(dictionaryIDField) + protowire.SizeVarint(uint64(info.ID))
+	}
+	if len(info.Fingerprint) > 0 {
+		size += protowire.SizeTag(dictionaryFingerField) + protowire.SizeBytes(len(info.Fingerprint))
+	}
+	return size
+}
+
+func dictionaryInfosFieldSize(num protowire.Number, infos []*dictionaryInfo) int {
+	size := 0
+	for _, info := range infos {
+		size += protowire.SizeTag(num) + protowire.SizeBytes(dictionaryInfoSize(info))
+	}
+	return size
+}
+
+func appendDictionaryInfos(b []byte, num protowire.Number, infos []*dictionaryInfo) []byte {
+	for _, info := range infos {
+		b = protowire.AppendTag(b, num, protowire.BytesType)
+		b = protowire.AppendVarint(b, uint64(dictionaryInfoSize(info)))
+		if info.ID != 0 {
+			b = protowire.AppendTag(b, dictionaryIDField, protowire.VarintType)
+			b = protowire.AppendVarint(b, uint64(info.ID))
+		}
+		if len(info.Fingerprint) > 0 {
+			b = protowire.AppendTag(b, dictionaryFingerField, protowire.BytesType)
+			b = protowire.AppendBytes(b, info.Fingerprint)
+		}
+	}
+	return b
+}
+
 // payloadSize returns the encoded size of the request, and false when the
 // codec does not handle it.
 func (m *wireRequest) payloadSize() (int, bool) {
@@ -120,6 +189,8 @@ func (m *wireRequest) payloadSize() (int, bool) {
 	if m.DatagramFlow != 0 {
 		size += protowire.SizeTag(requestDatagramField) + protowire.SizeVarint(m.DatagramFlow)
 	}
+	size += packedUint32sFieldSize(requestAcceptField, m.AcceptDictionaries)
+	size += dictionaryInfosFieldSize(requestQueryField, m.DictionaryQuery)
 	return size + packedVarintsFieldSize(requestExtensionsField, m.Extensions), true
 }
 
@@ -144,19 +215,22 @@ func (m *wireRequest) appendPayload(b []byte) []byte {
 		b = protowire.AppendTag(b, requestDatagramField, protowire.VarintType)
 		b = protowire.AppendVarint(b, m.DatagramFlow)
 	}
-	return b
+	b = appendPackedUint32s(b, requestAcceptField, m.AcceptDictionaries)
+	return appendDictionaryInfos(b, requestQueryField, m.DictionaryQuery)
 }
 
 func (m *wireHeaders) payloadSize() (int, bool) {
 	if !metadataValid(m.Metadata) {
 		return 0, false
 	}
-	return metadataFieldSize(headersMetadataField, m.Metadata) + packedVarintsFieldSize(headersExtensionsField, m.Extensions), true
+	return metadataFieldSize(headersMetadataField, m.Metadata) + packedVarintsFieldSize(headersExtensionsField, m.Extensions) +
+		dictionaryInfosFieldSize(headersDictionaryField, m.Dictionaries), true
 }
 
 func (m *wireHeaders) appendPayload(b []byte) []byte {
 	b = appendMetadataField(b, headersMetadataField, m.Metadata)
-	return appendPackedVarints(b, headersExtensionsField, m.Extensions)
+	b = appendPackedVarints(b, headersExtensionsField, m.Extensions)
+	return appendDictionaryInfos(b, headersDictionaryField, m.Dictionaries)
 }
 
 func (m *wireStatus) payloadSize() (int, bool) {
@@ -285,10 +359,26 @@ func (m *wireRequest) decodeFast(b []byte) bool {
 			}
 			m.DatagramFlow = value
 			b = b[n:]
+		case num == requestAcceptField && typ == protowire.BytesType:
+			data, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return false
+			}
+			for len(data) > 0 {
+				value, n := protowire.ConsumeVarint(data)
+				if n < 0 || value > math.MaxUint32 {
+					return false
+				}
+				m.AcceptDictionaries = append(m.AcceptDictionaries, uint32(value))
+				data = data[n:]
+			}
+			b = b[n:]
 		case num == requestMethodField || num == requestMetadataField || num == requestKindField ||
-			num == requestTimeoutField || num == requestExtensionsField || num == requestDatagramField:
-			// A known field of an unexpected wire type, or the extension
-			// list: both are left to the reflective decoder.
+			num == requestTimeoutField || num == requestExtensionsField || num == requestDatagramField ||
+			num == requestAcceptField || num == requestQueryField:
+			// A known field of an unexpected wire type, the extension list, an
+			// unpacked dictionary list or the dictionary query, which a client
+			// sends once per connection: all are left to the reflective decoder.
 			return false
 		default:
 			n, ok := skipField(num, typ, b)
@@ -320,7 +410,7 @@ func (m *wireHeaders) decodeFast(b []byte) bool {
 				return false
 			}
 			b = b[n:]
-		case num == headersMetadataField || num == headersExtensionsField:
+		case num == headersMetadataField || num == headersExtensionsField || num == headersDictionaryField:
 			return false
 		default:
 			n, ok := skipField(num, typ, b)

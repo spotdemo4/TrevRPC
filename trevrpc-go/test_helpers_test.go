@@ -359,7 +359,7 @@ func decodeTestFrame(next frame) (testFrame, error) {
 	case frameTypeMessage:
 		decoded.Body = next.payload
 	case frameTypeHeaders:
-		headers, err := decodeHeaders(next.payload)
+		headers, _, err := decodeHeaders(next.payload)
 		if err != nil {
 			return testFrame{}, err
 		}

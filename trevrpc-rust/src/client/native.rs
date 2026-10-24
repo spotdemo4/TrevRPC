@@ -4,14 +4,15 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 
+use crate::compression::{ClientCall, ClientCompression, CompressionConfig, Dict};
 use crate::datagram::{ClientFlow, Demux, FlowSender, MergedResponses};
-use crate::framed;
+use crate::framed::{self, ResponseReading};
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::response_state::UnaryResponse;
-use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Unreliable};
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest};
 
 use super::upload::UploadWriter;
-use super::{RpcTransport, StreamingRpcTransport};
+use super::{CallInfo, MessageTypes, RpcTransport, StreamingRpcTransport};
 
 /// A native `TrevRPC` transport over any multiplexed connection: one RPC per bidirectional
 /// stream.
@@ -22,6 +23,8 @@ pub struct NativeTransport<C> {
     /// The connection's datagram demultiplexer, created by the first call that needs it. It is
     /// `None` for connections without datagrams.
     datagrams: Arc<OnceLock<Option<Demux>>>,
+    /// The connection's compression state, `None` without dictionaries.
+    compression: Option<Arc<ClientCompression>>,
 }
 
 impl<C: MuxConnection> NativeTransport<C> {
@@ -30,7 +33,21 @@ impl<C: MuxConnection> NativeTransport<C> {
             connection,
             max_frame_size,
             datagrams: Arc::new(OnceLock::new()),
+            compression: None,
         }
+    }
+
+    /// Gives the connection the dictionaries of `config`, which it negotiates afresh.
+    pub(crate) fn set_compression(&mut self, config: Option<Arc<CompressionConfig>>) {
+        self.compression = config.map(ClientCompression::new);
+    }
+
+    /// Fills the negotiation fields of `request` for a call whose message types are `types`.
+    fn prepare(&self, request: &mut RpcRequest, types: Option<MessageTypes>) -> ClientCall {
+        self.compression
+            .as_ref()
+            .map(|compression| compression.prepare(request, types))
+            .unwrap_or_default()
     }
 
     fn demux(&self) -> Option<&Demux> {
@@ -50,11 +67,13 @@ impl<C: MuxConnection> NativeTransport<C> {
         &self,
         mut request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
-        let flow = if unreliable.any() {
-            self.demux()
-                .and_then(|demux| demux.open_client_flow(request.rpc_kind(), unreliable))
+        let call = self.prepare(&mut request, info.message_types);
+        let flow = if info.unreliable.any() {
+            self.demux().and_then(|demux| {
+                demux.open_client_flow(request.rpc_kind(), info.unreliable, call.accept.clone())
+            })
         } else {
             None
         };
@@ -70,17 +89,33 @@ impl<C: MuxConnection> NativeTransport<C> {
                 responses,
                 guard,
                 ..
-            }) => (requests, Some((responses, guard))),
+            }) => (
+                requests.map(|sender| sender.with_compression(call.requests.clone())),
+                Some((responses, guard)),
+            ),
             None => (None, None),
         };
+        let compress = call.requests.clone();
         let upload = UploadWriter::spawn(async move {
-            write_streaming_request(send, request, request_body, max_frame_size, requests).await
+            write_streaming_request(
+                send,
+                request,
+                request_body,
+                max_frame_size,
+                requests,
+                compress,
+            )
+            .await
         });
 
         let frames = response_stream(StreamingCall {
             recv,
             upload,
             max_frame_size,
+            reading: ResponseReading {
+                accept: call.accept,
+                learn: call.learn,
+            },
             complete: false,
         });
         Ok(match responses {
@@ -93,6 +128,17 @@ impl<C: MuxConnection> NativeTransport<C> {
 #[crate::async_trait]
 impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
     async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
+        self.call_with_info(request, body, CallInfo::default())
+            .await
+    }
+
+    async fn call_with_info(
+        &self,
+        mut request: RpcRequest,
+        body: Vec<u8>,
+        info: CallInfo,
+    ) -> Result<ResponseEnvelope<Bytes>> {
+        let negotiated = self.prepare(&mut request, info.message_types);
         let (send, recv) = self.connection.open_stream().await?;
         let mut call = UnaryCall {
             send,
@@ -105,13 +151,18 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
             &request,
             vec![Bytes::from(body)],
             self.max_frame_size,
+            negotiated.requests.as_ref(),
         )
         .await?;
         call.send.finish_stream()?;
 
+        let mut reading = ResponseReading {
+            accept: negotiated.accept,
+            learn: negotiated.learn,
+        };
         let mut response = UnaryResponse::default();
         while let Some(frame) =
-            framed::read_response_frame(&mut call.recv, self.max_frame_size).await?
+            framed::read_response_frame(&mut call.recv, self.max_frame_size, &mut reading).await?
         {
             if response.accept(frame).map_err(Error::from)? {
                 framed::drain_fin_after_terminal_status(
@@ -135,17 +186,17 @@ impl<C: MuxConnection> StreamingRpcTransport for NativeTransport<C> {
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
     ) -> Result<BoxStream<ResponseFrame>> {
-        self.open_call(request, request_body, Unreliable::NONE)
+        self.open_call(request, request_body, CallInfo::default())
             .await
     }
 
-    async fn streaming_call_unreliable(
+    async fn streaming_call_with_info(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
-        self.open_call(request, request_body, unreliable).await
+        self.open_call(request, request_body, info).await
     }
 }
 
@@ -185,6 +236,7 @@ async fn write_streaming_request<S: MuxSendStream>(
     mut request_body: BoxStream<Vec<u8>>,
     max_frame_size: usize,
     datagrams: Option<FlowSender>,
+    compress: Option<Arc<Dict>>,
 ) -> Result<()> {
     let mut upload = UploadStream {
         send,
@@ -198,6 +250,7 @@ async fn write_streaming_request<S: MuxSendStream>(
                 &mut request_body,
                 max_frame_size,
                 datagrams,
+                compress.as_ref(),
             )
             .await?;
         }
@@ -207,6 +260,7 @@ async fn write_streaming_request<S: MuxSendStream>(
                 &request,
                 &mut request_body,
                 max_frame_size,
+                compress.as_ref(),
             )
             .await?;
         }
@@ -221,6 +275,7 @@ struct StreamingCall<R: MuxRecvStream> {
     recv: R,
     upload: UploadWriter,
     max_frame_size: usize,
+    reading: ResponseReading,
     complete: bool,
 }
 
@@ -241,36 +296,39 @@ fn response_stream<R: MuxRecvStream>(call: StreamingCall<R>) -> BoxStream<Respon
         }
 
         let max_frame_size = call.max_frame_size;
-        let item = match framed::read_response_frame(&mut call.recv, max_frame_size).await {
-            Ok(Some(ResponseFrame::Status(status))) => {
-                let upload_result = call.upload.abort_and_settle().await;
-                let drain_result = framed::drain_fin_after_terminal_status(
-                    &mut call.recv,
-                    max_frame_size,
-                    "response stream",
-                )
-                .await;
-                call.complete = true;
+        let item =
+            match framed::read_response_frame(&mut call.recv, max_frame_size, &mut call.reading)
+                .await
+            {
+                Ok(Some(ResponseFrame::Status(status))) => {
+                    let upload_result = call.upload.abort_and_settle().await;
+                    let drain_result = framed::drain_fin_after_terminal_status(
+                        &mut call.recv,
+                        max_frame_size,
+                        "response stream",
+                    )
+                    .await;
+                    call.complete = true;
 
-                if let Err(error) = drain_result {
-                    Err(error)
-                } else if status.is_ok() {
-                    upload_result.map(|()| ResponseFrame::Status(status))
-                } else {
-                    Ok(ResponseFrame::Status(status))
+                    if let Err(error) = drain_result {
+                        Err(error)
+                    } else if status.is_ok() {
+                        upload_result.map(|()| ResponseFrame::Status(status))
+                    } else {
+                        Ok(ResponseFrame::Status(status))
+                    }
                 }
-            }
-            Ok(Some(frame)) => Ok(frame),
-            Ok(None) => {
-                let _ = call.upload.abort_and_settle().await;
-                return None;
-            }
-            Err(error) => {
-                let _ = call.upload.abort_and_settle().await;
-                call.complete = true;
-                Err(error)
-            }
-        };
+                Ok(Some(frame)) => Ok(frame),
+                Ok(None) => {
+                    let _ = call.upload.abort_and_settle().await;
+                    return None;
+                }
+                Err(error) => {
+                    let _ = call.upload.abort_and_settle().await;
+                    call.complete = true;
+                    Err(error)
+                }
+            };
 
         Some((item, call))
     }))

@@ -136,6 +136,24 @@ pub struct RpcRequest {
     /// connections without datagrams ignore it. See [`crate::Unreliable`].
     #[prost(uint64, tag = "9")]
     pub datagram_flow: u64,
+    /// The dictionaries the client accepts on the call's response messages; see
+    /// [`crate::Compression`].
+    #[prost(uint32, repeated, tag = "10")]
+    pub accept_dictionaries: Vec<u32>,
+    /// The dictionaries the client asks the server about, on calls until the connection has an
+    /// answer.
+    #[prost(message, repeated, tag = "11")]
+    pub dictionary_query: Vec<DictionaryInfo>,
+}
+
+/// A compression dictionary in the negotiation fields: its `Dictionary_ID` and its fingerprint,
+/// the first 8 bytes of its SHA-256 digest.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct DictionaryInfo {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub fingerprint: Vec<u8>,
 }
 
 impl RpcRequest {
@@ -149,6 +167,8 @@ impl RpcRequest {
             timeout_nanos: 0,
             extensions: Vec::new(),
             datagram_flow: 0,
+            accept_dictionaries: Vec::new(),
+            dictionary_query: Vec::new(),
         }
     }
 
@@ -232,6 +252,9 @@ pub struct RpcHeaders {
     /// Extensions the server accepts. The registry is empty, so receivers ignore the field.
     #[prost(uint64, repeated, tag = "2")]
     pub extensions: Vec<u64>,
+    /// The server's answer to the request's `dictionary_query`.
+    #[prost(message, repeated, tag = "3")]
+    pub dictionaries: Vec<DictionaryInfo>,
 }
 
 /// The STATUS frame payload: the terminal status and trailing metadata.
@@ -641,6 +664,7 @@ mod tests {
             &RpcHeaders {
                 metadata: metadata("x-a", b"1"),
                 extensions: Vec::new(),
+                dictionaries: Vec::new(),
             },
         )
         .await;
@@ -660,6 +684,7 @@ mod tests {
             &RpcHeaders {
                 metadata: Metadata::new(),
                 extensions: vec![1],
+                dictionaries: Vec::new(),
             },
         )
         .await;

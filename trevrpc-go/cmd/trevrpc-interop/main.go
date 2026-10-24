@@ -49,6 +49,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		flags.StringVar(&config.host, "host", "127.0.0.1", "listen host")
 		flags.StringVar(&config.port, "port", "0", "listen UDP port (0 picks a free port)")
 		flags.StringVar(&config.webRoot, "web-root", "", "directory served through the HTTP fallback, such as the browser interop page")
+		flags.StringVar(&config.dictionary, "dictionary", "", "zstd dictionary file for compressed messages")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
@@ -72,6 +73,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		var config clientConfig
 		config.register(flags, "transport policy: quic, tcp (QMux over TLS) or auto (QUIC with TCP fallback)")
 		flags.StringVar(&config.expectTransport, "expect-transport", "", "fail unless the channel connects over this transport (quic or qmux)")
+		flags.StringVar(&config.dictionary, "dictionary", "", "zstd dictionary file for compressed messages")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}

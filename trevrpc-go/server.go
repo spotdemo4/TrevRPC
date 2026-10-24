@@ -54,6 +54,10 @@ type Server struct {
 	runtime     *serverRuntime
 	// frozen is runtime, once set, for lock-free reads on the request path.
 	frozen atomic.Pointer[serverRuntime]
+	// compression is options.Compression digested by SetOptions, and
+	// compressionErr why it could not be; Listen reports that error.
+	compression    *compressionConfig
+	compressionErr error
 }
 
 // ServerOptions configures server limits, timeouts, and the HTTP and browser
@@ -80,6 +84,9 @@ type Server struct {
 // ConnectionIdleTimeout (default 30 s) closes a connection the peer stopped
 // answering and sends keepalives at half of it, so quiet streams on a live
 // connection are not affected; DisableConnectionIdleTimeout turns it off.
+//
+// Compression lets messages travel compressed with the dictionaries it
+// holds; see Compression. It needs cgo, and Listen fails when it is invalid.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -101,6 +108,7 @@ type ServerOptions struct {
 	EnableWebTransport                bool
 	WebTransportAdmission             Admission
 	HTTPFallback                      http.Handler
+	Compression                       *Compression
 }
 
 // servesHTTP reports whether the listener serves HTTP: HTTP/3 on the UDP
@@ -291,6 +299,7 @@ func (s *Server) SetOptions(options ServerOptions) {
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
 	s.options = canonicalServerOptions(options)
+	s.compression, s.compressionErr = newCompressionConfig(options.Compression)
 }
 
 // Options returns the canonical server options snapshot.
@@ -370,7 +379,7 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string,
 		if isNilRegisteredValue(response) {
 			return encodedMessage{}, Internal("handler returned nil response message")
 		}
-		return encodeMessage(response)
+		return responseCompressorFromContext(ctx).encode(response)
 	})
 }
 
@@ -389,7 +398,7 @@ func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 		if isNilRegisteredValue(response) {
 			return nil, Internal("handler returned nil response message")
 		}
-		return newEncodeStream(newSliceStream(response)), nil
+		return newCompressedEncodeStream(newSliceStream(response), responseCompressorFromContext(ctx)), nil
 	}, options...)
 }
 
@@ -413,7 +422,7 @@ func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 		if isNilRegisteredValue(responses) {
 			return nil, Internal("handler returned nil response stream")
 		}
-		return newEncodeStream(responses), nil
+		return newCompressedEncodeStream(responses, responseCompressorFromContext(ctx)), nil
 	}, options...)
 }
 
@@ -433,7 +442,7 @@ func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Serve
 		if isNilRegisteredValue(responses) {
 			return nil, Internal("handler returned nil response stream")
 		}
-		return newEncodeStream(responses), nil
+		return newCompressedEncodeStream(responses, responseCompressorFromContext(ctx)), nil
 	}, options...)
 }
 
@@ -481,6 +490,8 @@ type serverRuntime struct {
 	// when an execution starts or finishes with a waiter present.
 	executionMu        sync.Mutex
 	executionChangedCh chan struct{}
+	// compression holds the server's dictionaries, nil without any.
+	compression *compressionConfig
 }
 
 func canonicalServerOptions(options ServerOptions) ServerOptions {
@@ -552,6 +563,13 @@ func validateRoute(method string, hasHandler bool) {
 	}
 }
 
+// compressionError reports why the configured compression is invalid.
+func (s *Server) compressionError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compressionErr
+}
+
 func (s *Server) requireMutableLocked() {
 	if s.runtime != nil {
 		panic(ErrServerFrozen)
@@ -584,6 +602,7 @@ func (s *Server) freeze() *serverRuntime {
 		requestLimit:    newSemaphore(options.MaxConcurrentRequests),
 		connectionLimit: newSemaphore(options.MaxConcurrentConnections),
 		admissionLimit:  newSemaphore(options.MaxConcurrentAdmissionCallbacks),
+		compression:     s.compression,
 	}
 	runtime.diagnostics = newServerDiagnosticDispatcher(s.diagnostics, runtime)
 	s.options = options
@@ -884,10 +903,14 @@ func callBeforeStatus(beforeStatus func()) {
 // unaryResponse is the complete response of a unary call: optional HEADERS,
 // then a MESSAGE and an OK STATUS on success, or a lone failure STATUS.
 type unaryResponse struct {
-	headers    Metadata
-	message    encodedMessage
-	hasMessage bool
-	status     *Status
+	headers Metadata
+	// dictionaries answers a dictionary query; answered says there was one,
+	// which makes HEADERS go out even without metadata.
+	dictionaries []*dictionaryInfo
+	answered     bool
+	message      encodedMessage
+	hasMessage   bool
+	status       *Status
 }
 
 func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
@@ -896,7 +919,7 @@ func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFram
 	}
 	var frames []byte
 	var err error
-	if len(r.headers) == 0 && r.hasMessage {
+	if len(r.headers) == 0 && !r.answered && r.hasMessage {
 		// The message frame has room for the STATUS behind it.
 		if r.message.size > maxFrameSize {
 			return true, &FrameTooLargeError{Len: r.message.size, Max: maxFrameSize}
@@ -904,8 +927,8 @@ func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFram
 		frames = r.message.frame
 	} else {
 		frames = make([]byte, 0, len(r.message.frame)+frameTailSlack)
-		if len(r.headers) > 0 {
-			if frames, err = appendHeadersFrame(frames, r.headers, maxFrameSize); err != nil {
+		if len(r.headers) > 0 || r.answered {
+			if frames, err = appendHeadersFrame(frames, r.headers, r.dictionaries, maxFrameSize); err != nil {
 				return true, err
 			}
 		}
@@ -949,7 +972,7 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 	if err != nil {
 		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(err, ServerDiagnosticInternalError, request)), request)
 	}
-	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message), request)
+	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message, request.compression), request)
 }
 
 func failedUnaryResponse(status *Status) *unaryResponse {
@@ -958,15 +981,19 @@ func failedUnaryResponse(status *Status) *unaryResponse {
 
 // successfulUnaryResponse is the response of a unary handler that returned
 // message, with the response metadata it set through ctx.
-func successfulUnaryResponse(ctx context.Context, message encodedMessage) *unaryResponse {
+func successfulUnaryResponse(ctx context.Context, message encodedMessage, compression *callCompression) *unaryResponse {
 	response := responseMetadataFromContext(ctx)
 	headers := response.takeHeaders()
-	return &unaryResponse{
+	unary := &unaryResponse{
 		headers:    headers,
 		message:    message,
 		hasMessage: true,
 		status:     OK().WithMetadata(response.takeMetadata()),
 	}
+	if compression != nil && compression.answered {
+		unary.answered, unary.dictionaries = true, compression.answer
+	}
+	return unary
 }
 
 func invokeUnaryHandler(
@@ -1476,10 +1503,17 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 			s.readAhead.start()
 		}
 		// A call that sends datagrams flushes HEADERS, empty ones included,
-		// before the first one.
-		if len(s.headers) > 0 || s.flow != nil {
+		// before the first one. A call that queried gets its answer in
+		// HEADERS, which then go out even without metadata.
+		compression := s.request.compression
+		answered := compression != nil && compression.answered
+		if len(s.headers) > 0 || s.flow != nil || answered {
+			var dictionaries []*dictionaryInfo
+			if answered {
+				dictionaries = compression.answer
+			}
 			var err error
-			if headers, err = appendHeadersFrame(nil, s.headers, maxFrameSize); err != nil {
+			if headers, err = appendHeadersFrame(nil, s.headers, dictionaries, maxFrameSize); err != nil {
 				return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
 			}
 			if s.readAhead != nil || s.flow != nil {

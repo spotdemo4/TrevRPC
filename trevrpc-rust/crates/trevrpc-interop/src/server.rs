@@ -14,7 +14,7 @@ use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, Status};
 
 use crate::proto::{self, Echo, EchoRequest, EchoResponse, UnreliableEcho};
-use crate::{BoxError, Flags};
+use crate::{BoxError, Flags, connect};
 
 const SUFFIX_METADATA_KEY: &str = "interop-suffix";
 const HEADER_METADATA_KEY: &str = "interop-header";
@@ -203,6 +203,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let mut server = Server::new();
     server.set_options(
         ServerOptions::new()
+            .with_compression(connect::compression(flags)?)
             .with_http_enabled(true)
             .with_webtransport_enabled(true)
             .with_webtransport_admission(Some(admit_webtransport))

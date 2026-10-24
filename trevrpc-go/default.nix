@@ -5,6 +5,7 @@
   protobuf,
   wireGolden,
   qmuxGolden,
+  zstdGolden,
   interopProto,
   trevrpcProto,
 }:
@@ -15,21 +16,22 @@ mkGoModule (final: {
   pname = "trevrpc-go";
   version = "1.1.0";
 
-  # The module itself plus the shared files its tests read: the wire and QMux
-  # golden vectors, and the interop and TrevRPC option protos the generated
-  # bindings must match.
+  # The module itself plus the shared files its tests read: the wire, QMux and
+  # compression golden vectors, and the interop and TrevRPC option protos the
+  # generated bindings must match.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       wireGolden
       qmuxGolden
+      zstdGolden
       interopProto
       trevrpcProto
       (lib.fileset.difference ./. ./default.nix)
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-vTWWuN97ZTYQziHfnzpJjwvfSse1Dn3sYxBz4fq3Fok=";
+  vendorHash = "sha256-6M0gbE9HsHcXBx75SisSoFM9P3mlU62VFJS7i/nn3Hs=";
 
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
@@ -46,6 +48,8 @@ mkGoModule (final: {
   checkPhase = ''
     runHook preCheck
     export HOME=$(mktemp -d)
+    # Compression calls libzstd through cgo; without it its tests would skip.
+    test "$(go env CGO_ENABLED)" = 1
     go test ./...
     # One iteration each, so the benchmarks keep compiling and running.
     go test -run '^$' -bench . -benchtime 1x ./...

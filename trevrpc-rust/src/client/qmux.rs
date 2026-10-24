@@ -9,14 +9,12 @@ use tokio::net::TcpStream;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::mux::MuxConnection as _;
 use crate::qmux_conn::{QmuxConnection, client_config};
-use crate::{
-    BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
-};
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
 
 use bytes::Bytes;
 
 use super::native::NativeTransport;
-use super::{RpcTransport, StreamingRpcTransport};
+use super::{CallInfo, RpcTransport, StreamingRpcTransport};
 
 /// Bounds connecting, the TLS handshake and the `QMux` handshake, so a server that accepts TCP but
 /// never answers cannot stall a reconnect.
@@ -97,6 +95,17 @@ impl QmuxTransport {
         ))))
     }
 
+    /// Gives a transport that was just connected the dictionaries of `config`.
+    pub(crate) fn with_compression_config(
+        mut self,
+        config: Option<Arc<crate::compression::CompressionConfig>>,
+    ) -> Self {
+        if let Some(transport) = Arc::get_mut(&mut self.0) {
+            transport.set_compression(config);
+        }
+        self
+    }
+
     /// Returns the maximum `TrevRPC` frame size in bytes.
     #[must_use]
     pub fn max_frame_size(&self) -> usize {
@@ -119,6 +128,15 @@ impl RpcTransport for QmuxTransport {
     async fn call(&self, request: RpcRequest, body: Vec<u8>) -> Result<ResponseEnvelope<Bytes>> {
         self.0.call(request, body).await
     }
+
+    async fn call_with_info(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+        info: CallInfo,
+    ) -> Result<ResponseEnvelope<Bytes>> {
+        self.0.call_with_info(request, body, info).await
+    }
 }
 
 #[crate::async_trait]
@@ -131,15 +149,15 @@ impl StreamingRpcTransport for QmuxTransport {
         self.0.streaming_call(request, request_body).await
     }
 
-    async fn streaming_call_unreliable(
+    async fn streaming_call_with_info(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
         // `QMux` has no datagrams: the call keeps every message on its stream.
         self.0
-            .streaming_call_unreliable(request, request_body, unreliable)
+            .streaming_call_with_info(request, request_body, info)
             .await
     }
 }

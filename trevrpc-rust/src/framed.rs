@@ -5,10 +5,13 @@
 //! unknown type. The writer assembles whole batches of frames and writes them with one call.
 
 use std::io;
+use std::sync::Arc;
 
+use crate::compression::{Accept, ClientCompression, Dict, inflate};
 use crate::framing::{
     self, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_payload, frame_type, is_known_frame_type,
 };
+use crate::wire::DictionaryInfo;
 use crate::{BoxStream, Error, Result, RpcHeaders, RpcRequest, RpcStatus, Status, varint};
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt};
@@ -131,6 +134,10 @@ pub struct FrameChunks {
     scratch: BytesMut,
     chunks: Vec<Bytes>,
     max_frame_size: usize,
+    /// Compresses messages that it makes shorter, when set.
+    compress: Option<Arc<Dict>>,
+    /// The answer to a dictionary query that the next HEADERS frame carries.
+    answer: Option<Vec<DictionaryInfo>>,
 }
 
 impl FrameChunks {
@@ -140,7 +147,16 @@ impl FrameChunks {
             scratch: BytesMut::with_capacity(scratch),
             chunks: Vec::new(),
             max_frame_size,
+            compress: None,
+            answer: None,
         }
+    }
+
+    /// Makes the writer compress messages with `dict`, when set.
+    #[must_use]
+    pub fn with_compression(mut self, dict: Option<Arc<Dict>>) -> Self {
+        self.compress = dict;
+        self
     }
 
     /// The scratch bytes a MESSAGE frame with a payload of `len` bytes needs.
@@ -163,9 +179,19 @@ impl FrameChunks {
     }
 
     pub fn message(&mut self, body: Bytes) -> Result<()> {
+        // A message is checked against the frame size limit uncompressed, which limits the
+        // message the receiver decompresses.
+        framing::validate_payload_len(body.len(), self.max_frame_size)?;
+        let (frame_type, body) = self
+            .compress
+            .as_ref()
+            .and_then(|dict| dict.compress(&body))
+            .map_or((frame_type::MESSAGE, body), |compressed| {
+                (frame_type::ZSTD_MESSAGE, compressed)
+            });
         framing::put_frame_header(
             &mut self.scratch,
-            frame_type::MESSAGE,
+            frame_type,
             body.len(),
             self.max_frame_size,
         )?;
@@ -181,13 +207,14 @@ impl FrameChunks {
     pub fn response_frame(&mut self, frame: ResponseFrame) -> Result<()> {
         match frame {
             ResponseFrame::Message(body) => self.message(body),
-            ResponseFrame::Headers(metadata) => self.protobuf(
-                frame_type::HEADERS,
-                &RpcHeaders {
+            ResponseFrame::Headers(metadata) => {
+                let headers = RpcHeaders {
                     metadata,
                     extensions: Vec::new(),
-                },
-            ),
+                    dictionaries: self.answer.take().unwrap_or_default(),
+                };
+                self.protobuf(frame_type::HEADERS, &headers)
+            }
             ResponseFrame::Status(status) => {
                 self.protobuf(frame_type::STATUS, &RpcStatus::from(status))
             }
@@ -204,11 +231,21 @@ impl FrameChunks {
 /// it.
 const FRAME_ESTIMATE: usize = 64;
 
+/// How a server call writes its response frames.
+#[derive(Debug, Default)]
+pub struct ResponseCodec {
+    /// The dictionary the response messages are compressed with, if any.
+    pub(crate) compress: Option<Arc<Dict>>,
+    /// The answer to the request's dictionary query, which the call's HEADERS carry.
+    pub(crate) answer: Option<Vec<DictionaryInfo>>,
+}
+
 /// Writes response frames, draining `frames`, with one write.
 pub async fn write_response_frames<W: FrameWrite>(
     send: &mut W,
     frames: &mut Vec<ResponseFrame>,
     max_frame_size: usize,
+    codec: &mut ResponseCodec,
 ) -> Result<()> {
     let scratch = frames.iter().fold(0_usize, |total, frame| {
         total.saturating_add(match frame {
@@ -216,25 +253,35 @@ pub async fn write_response_frames<W: FrameWrite>(
             ResponseFrame::Headers(_) | ResponseFrame::Status(_) => FRAME_ESTIMATE,
         })
     });
-    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
+    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch)
+        .with_compression(codec.compress.clone());
+    if frames
+        .iter()
+        .any(|frame| matches!(frame, ResponseFrame::Headers(_)))
+    {
+        chunks.answer = codec.answer.take();
+    }
     for frame in frames.drain(..) {
         chunks.response_frame(frame)?;
     }
     chunks.write(send).await
 }
 
-/// Writes a REQUEST frame followed by `messages` with one write.
+/// Writes a REQUEST frame followed by `messages` with one write, compressing the messages with
+/// `compress` when set.
 pub async fn write_request<W: FrameWrite>(
     send: &mut W,
     request: &RpcRequest,
     messages: Vec<Bytes>,
     max_frame_size: usize,
+    compress: Option<&Arc<Dict>>,
 ) -> Result<()> {
     let scratch = messages.iter().fold(
         MAX_FRAME_HEADER_LEN.saturating_add(request.encoded_len()),
         |total, message| total.saturating_add(FrameChunks::scratch_len(message.len())),
     );
-    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
+    let mut chunks =
+        FrameChunks::with_capacity(max_frame_size, scratch).with_compression(compress.cloned());
     chunks.protobuf(frame_type::REQUEST, request)?;
     for message in messages {
         chunks.message(message)?;
@@ -242,16 +289,19 @@ pub async fn write_request<W: FrameWrite>(
     chunks.write(send).await
 }
 
-/// Writes `messages` as MESSAGE frames with one write, draining them.
+/// Writes `messages` as MESSAGE frames with one write, draining them, compressing them with
+/// `compress` when set.
 async fn write_message_frames<W: FrameWrite>(
     send: &mut W,
     messages: &mut Vec<Bytes>,
     max_frame_size: usize,
+    compress: Option<&Arc<Dict>>,
 ) -> Result<()> {
     let scratch = messages.iter().fold(0_usize, |total, message| {
         total.saturating_add(FrameChunks::scratch_len(message.len()))
     });
-    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
+    let mut chunks =
+        FrameChunks::with_capacity(max_frame_size, scratch).with_compression(compress.cloned());
     for message in messages.drain(..) {
         chunks.message(message)?;
     }
@@ -279,16 +329,25 @@ fn take_ready_messages(
 /// Writes a call's request half: the REQUEST frame, then every request message.
 ///
 /// The REQUEST frame and the messages that are already available (the one message of a unary or
-/// server-streaming call) share the first write.
+/// server-streaming call) share the first write. Messages are compressed with `compress` when
+/// set.
 pub async fn write_request_stream<W: FrameWrite>(
     send: &mut W,
     request: &RpcRequest,
     request_body: &mut BoxStream<Vec<u8>>,
     max_frame_size: usize,
+    compress: Option<&Arc<Dict>>,
 ) -> Result<()> {
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     let mut done = take_ready_messages(request_body, &mut batch)?;
-    write_request(send, request, std::mem::take(&mut batch), max_frame_size).await?;
+    write_request(
+        send,
+        request,
+        std::mem::take(&mut batch),
+        max_frame_size,
+        compress,
+    )
+    .await?;
 
     while !done {
         let Some(body) = request_body.next().await.transpose()? else {
@@ -296,7 +355,7 @@ pub async fn write_request_stream<W: FrameWrite>(
         };
         batch.push(Bytes::from(body));
         done = take_ready_messages(request_body, &mut batch)?;
-        write_message_frames(send, &mut batch, max_frame_size).await?;
+        write_message_frames(send, &mut batch, max_frame_size, compress).await?;
     }
     Ok(())
 }
@@ -313,8 +372,9 @@ pub async fn write_request_stream_datagrams<W: FrameWrite>(
     request_body: &mut BoxStream<Vec<u8>>,
     max_frame_size: usize,
     datagrams: &crate::datagram::FlowSender,
+    compress: Option<&Arc<Dict>>,
 ) -> Result<()> {
-    write_request(send, request, Vec::new(), max_frame_size).await?;
+    write_request(send, request, Vec::new(), max_frame_size, None).await?;
 
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     let mut on_stream = Vec::new();
@@ -330,7 +390,7 @@ pub async fn write_request_stream_datagrams<W: FrameWrite>(
             .send_batch(&mut batch, &mut on_stream, std::future::pending())
             .await;
         if !on_stream.is_empty() {
-            write_message_frames(send, &mut on_stream, max_frame_size).await?;
+            write_message_frames(send, &mut on_stream, max_frame_size, compress).await?;
         }
     }
     // The caller finishes the stream next, and its FIN must not overtake the datagrams.
@@ -447,14 +507,35 @@ async fn discard_payload<R: FrameRead>(recv: &mut R, len: usize) -> Result<()> {
     Ok(())
 }
 
-/// Decodes a frame received on a response stream.
+/// How a client call reads its response frames.
+#[derive(Debug, Default)]
+pub struct ResponseReading {
+    /// The dictionaries the call accepts on compressed messages.
+    pub(crate) accept: Accept,
+    /// The connection to teach the answer in the call's HEADERS, when the request queried.
+    pub(crate) learn: Option<Arc<ClientCompression>>,
+}
+
+/// Decodes a frame received on a response stream, decompressing a `ZSTD_MESSAGE` with the
+/// dictionaries `reading` accepts and learning the answer of its HEADERS.
 ///
 /// A REQUEST frame has no place on a response stream.
-pub fn decode_response_frame(frame_type: u64, payload: Bytes) -> Result<ResponseFrame> {
+pub fn decode_response_frame(
+    frame_type: u64,
+    payload: Bytes,
+    reading: &mut ResponseReading,
+    max_frame_size: usize,
+) -> Result<ResponseFrame> {
     match frame_type {
         frame_type::MESSAGE => Ok(ResponseFrame::Message(payload)),
+        frame_type::ZSTD_MESSAGE => inflate(&reading.accept, &payload, max_frame_size)
+            .map(ResponseFrame::Message)
+            .map_err(|rejected| rejected.into_error(Status::internal)),
         frame_type::HEADERS => {
             let headers = decode_payload::<RpcHeaders>(&payload)?;
+            if let Some(connection) = reading.learn.take() {
+                connection.learn(&headers.dictionaries);
+            }
             Ok(ResponseFrame::Headers(headers.metadata))
         }
         frame_type::STATUS => {
@@ -472,15 +553,17 @@ pub fn decode_response_frame(frame_type: u64, payload: Bytes) -> Result<Response
 pub async fn read_response_frame<R: FrameRead>(
     recv: &mut R,
     max_frame_size: usize,
+    reading: &mut ResponseReading,
 ) -> Result<Option<ResponseFrame>> {
     let Some(header) = next_known_header(recv, max_frame_size, &mut |_| Ok(())).await? else {
         return Ok(None);
     };
     if header.frame_type == frame_type::REQUEST {
-        return decode_response_frame(header.frame_type, Bytes::new()).map(Some);
+        return decode_response_frame(header.frame_type, Bytes::new(), reading, max_frame_size)
+            .map(Some);
     }
     let payload = read_payload(recv, header.payload_len).await?;
-    decode_response_frame(header.frame_type, payload).map(Some)
+    decode_response_frame(header.frame_type, payload, reading, max_frame_size).map(Some)
 }
 
 /// A frame that follows the REQUEST frame on a request stream.
@@ -516,10 +599,12 @@ where
 /// Reads the next frame after REQUEST on a request stream, skipping unknown frames, or `None` at
 /// a clean end of stream.
 ///
-/// A second REQUEST or a HEADERS frame is a protocol error, rejected before its payload is read.
+/// A second REQUEST or a HEADERS frame is a protocol error, rejected before its payload is read. A
+/// `ZSTD_MESSAGE` is decompressed with the dictionaries `accept` holds.
 pub async fn read_request_frame<R, F>(
     recv: &mut R,
     max_frame_size: usize,
+    accept: &Accept,
     mut on_skipped: F,
 ) -> Result<Option<RequestFrame>>
 where
@@ -533,6 +618,12 @@ where
         frame_type::MESSAGE => {
             let payload = read_payload(recv, header.payload_len).await?;
             Ok(Some(RequestFrame::Message(payload)))
+        }
+        frame_type::ZSTD_MESSAGE => {
+            let payload = read_payload(recv, header.payload_len).await?;
+            let message = inflate(accept, &payload, max_frame_size)
+                .map_err(|rejected| rejected.into_error(Status::invalid_argument))?;
+            Ok(Some(RequestFrame::Message(message)))
         }
         frame_type::STATUS => {
             let payload = read_payload(recv, header.payload_len).await?;
@@ -652,9 +743,10 @@ mod tests {
 
     use super::Chunked;
     use super::{
-        FrameChunks, RequestFrame, drain_fin_after_terminal_status, read_frame_header,
-        read_request, read_request_end, read_request_frame, read_response_frame,
+        FrameChunks, RequestFrame, ResponseCodec, ResponseReading, drain_fin_after_terminal_status,
+        read_frame_header, read_request, read_request_end, read_request_frame, read_response_frame,
     };
+    use crate::compression::Accept;
     use crate::framing::{
         DEFAULT_MAX_FRAME_SIZE, ResponseFrame, encode_frame, encode_message_frame,
         encode_protobuf_frame, frame_type,
@@ -687,9 +779,14 @@ mod tests {
             ResponseFrame::Status(Status::ok()),
         ];
         let mut sink = Sink::default();
-        super::write_response_frames(&mut sink, &mut frames, DEFAULT_MAX_FRAME_SIZE)
-            .await
-            .expect("frames should write");
+        super::write_response_frames(
+            &mut sink,
+            &mut frames,
+            DEFAULT_MAX_FRAME_SIZE,
+            &mut ResponseCodec::default(),
+        )
+        .await
+        .expect("frames should write");
 
         assert!(frames.is_empty());
         assert_eq!(sink.0.len(), 1, "one write per batch");
@@ -701,14 +798,14 @@ mod tests {
             ResponseFrame::Status(Status::ok()),
         ] {
             assert_eq!(
-                read_response_frame(&mut wire, 1024)
+                read_response_frame(&mut wire, 1024, &mut ResponseReading::default())
                     .await
                     .expect("frame should read"),
                 Some(expected)
             );
         }
         assert!(
-            read_response_frame(&mut wire, 1024)
+            read_response_frame(&mut wire, 1024, &mut ResponseReading::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -735,12 +832,14 @@ mod tests {
             ResponseFrame::Status(Status::ok()),
         ] {
             assert_eq!(
-                read_response_frame(&mut recv, 1024).await.unwrap(),
+                read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                    .await
+                    .unwrap(),
                 Some(expected)
             );
         }
         assert!(
-            read_response_frame(&mut recv, 1024)
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -757,7 +856,9 @@ mod tests {
         let mut recv = Chunked::new(Chunks::new([wire]));
 
         let Some(ResponseFrame::Message(body)) =
-            read_response_frame(&mut recv, 1024).await.unwrap()
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                .await
+                .unwrap()
         else {
             panic!("a message frame was written");
         };
@@ -785,15 +886,19 @@ mod tests {
         let mut recv = Chunked::new(Chunks::new(chunks));
 
         assert_eq!(
-            read_response_frame(&mut recv, 1024).await.unwrap(),
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                .await
+                .unwrap(),
             Some(ResponseFrame::message(body))
         );
         assert_eq!(
-            read_response_frame(&mut recv, 1024).await.unwrap(),
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                .await
+                .unwrap(),
             Some(ResponseFrame::message(&b"after"[..]))
         );
         assert!(
-            read_response_frame(&mut recv, 1024)
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -810,7 +915,7 @@ mod tests {
         wire.truncate(20);
         let mut recv = Chunked::new(Chunks::new([Bytes::from(wire)]));
 
-        let error = read_response_frame(&mut recv, 1024)
+        let error = read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
             .await
             .expect_err("a truncated frame must fail");
 
@@ -851,7 +956,7 @@ mod tests {
         let request = RpcRequest::new("/svc/m");
         let mut sink = Sink::default();
         let mut body = crate::stream::from_iter([b"hi".to_vec()]);
-        super::write_request_stream(&mut sink, &request, &mut body, DEFAULT_MAX_FRAME_SIZE)
+        super::write_request_stream(&mut sink, &request, &mut body, DEFAULT_MAX_FRAME_SIZE, None)
             .await
             .expect("request should write");
 
@@ -873,19 +978,25 @@ mod tests {
         .concat();
         let mut recv = Script::new(wire);
         assert_eq!(
-            read_response_frame(&mut recv, 1024).await.unwrap(),
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                .await
+                .unwrap(),
             Some(ResponseFrame::message(&b"hi"[..]))
         );
         assert_eq!(
-            read_response_frame(&mut recv, 1024).await.unwrap(),
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                .await
+                .unwrap(),
             Some(ResponseFrame::Headers(Metadata::new()))
         );
         assert_eq!(
-            read_response_frame(&mut recv, 1024).await.unwrap(),
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                .await
+                .unwrap(),
             Some(ResponseFrame::Status(Status::ok()))
         );
         assert!(
-            read_response_frame(&mut recv, 1024)
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
                 .await
                 .unwrap()
                 .is_none()
@@ -901,6 +1012,7 @@ mod tests {
                 &RpcHeaders {
                     metadata: Metadata::new(),
                     extensions: vec![1],
+                    dictionaries: Vec::new(),
                 },
                 1024,
             )
@@ -914,7 +1026,11 @@ mod tests {
         let mut recv = Script::new(wire);
 
         let mut frames = Vec::new();
-        while let Some(frame) = read_response_frame(&mut recv, 1024).await.unwrap() {
+        while let Some(frame) =
+            read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                .await
+                .unwrap()
+        {
             frames.push(frame);
         }
         assert_eq!(
@@ -953,7 +1069,9 @@ mod tests {
     async fn a_frame_exactly_at_the_limit_is_accepted() {
         let mut recv = Script::new(encode_message_frame(&[9; 16], 16).unwrap());
         assert_eq!(
-            read_response_frame(&mut recv, 16).await.unwrap(),
+            read_response_frame(&mut recv, 16, &mut ResponseReading::default())
+                .await
+                .unwrap(),
             Some(ResponseFrame::message(vec![9; 16]))
         );
     }
@@ -963,7 +1081,7 @@ mod tests {
         let whole = encode_message_frame(b"payload", 1024).unwrap();
         for cut in 1..whole.len() {
             let mut recv = Script::new(whole.get(..cut).unwrap().to_vec());
-            let error = read_response_frame(&mut recv, 1024)
+            let error = read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
                 .await
                 .expect_err("a truncated frame must fail");
             assert_eq!(
@@ -975,7 +1093,11 @@ mod tests {
         // A cut inside a multi-byte header.
         for wire in [&[0x40][..], &[0x00, 0x40], &[0x80, 0x00, 0x00, 0x21, 0x40]] {
             let mut recv = Script::new(wire.to_vec());
-            assert!(read_response_frame(&mut recv, 1024).await.is_err());
+            assert!(
+                read_response_frame(&mut recv, 1024, &mut ResponseReading::default())
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -986,7 +1108,7 @@ mod tests {
         wire.extend(encode_message_frame(b"m", 1024).unwrap());
         let mut recv = Script::new(wire);
         let mut skipped = Vec::new();
-        let frame = read_request_frame(&mut recv, 1024, |len| {
+        let frame = read_request_frame(&mut recv, 1024, &Accept::None, |len| {
             skipped.push(len);
             Ok(())
         })
@@ -1001,7 +1123,7 @@ mod tests {
     #[tokio::test]
     async fn skipped_frames_can_fail_the_read() {
         let mut recv = Script::new([grease(10), grease(10)].concat());
-        let error = read_request_frame(&mut recv, 1024, |_| {
+        let error = read_request_frame(&mut recv, 1024, &Accept::None, |_| {
             Err(Status::resource_exhausted("too much").into())
         })
         .await
@@ -1033,7 +1155,10 @@ mod tests {
 
         // Afterwards only MESSAGE and STATUS may follow.
         for wire in [&request, &headers] {
-            let error = read_request_frame(&mut Script::new(wire.clone()), 1024, |_| Ok(()))
+            let error =
+                read_request_frame(&mut Script::new(wire.clone()), 1024, &Accept::None, |_| {
+                    Ok(())
+                })
                 .await
                 .err()
                 .expect("REQUEST and HEADERS must be rejected");
@@ -1077,9 +1202,13 @@ mod tests {
     async fn request_frames_on_a_response_stream_are_internal_errors() {
         let wire =
             encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new("/s/m"), 1024).unwrap();
-        let error = read_response_frame(&mut Script::new(wire), 1024)
-            .await
-            .expect_err("REQUEST has no place on a response stream");
+        let error = read_response_frame(
+            &mut Script::new(wire),
+            1024,
+            &mut ResponseReading::default(),
+        )
+        .await
+        .expect_err("REQUEST has no place on a response stream");
         assert_eq!(error.into_status().code(), Code::Internal);
     }
 }

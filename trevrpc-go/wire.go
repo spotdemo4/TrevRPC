@@ -3,6 +3,8 @@ package trevrpc
 import (
 	"fmt"
 	"strings"
+
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 const (
@@ -64,6 +66,12 @@ type wireRequest struct {
 	// DatagramFlow is the datagram flow ID of the call (field 9), or zero for
 	// a call without one.
 	DatagramFlow uint64 `protobuf:"varint,9,opt,name=datagram_flow,json=datagramFlow,proto3" json:"datagram_flow,omitempty"`
+	// AcceptDictionaries lists the dictionaries the client accepts on the
+	// call's response messages (field 10).
+	AcceptDictionaries []uint32 `protobuf:"varint,10,rep,packed,name=accept_dictionaries,json=acceptDictionaries,proto3" json:"accept_dictionaries,omitempty"`
+	// DictionaryQuery asks the server which of these dictionaries it holds
+	// (field 11).
+	DictionaryQuery []*dictionaryInfo `protobuf:"bytes,11,rep,name=dictionary_query,json=dictionaryQuery,proto3" json:"dictionary_query,omitempty"`
 
 	// The fields below are not on the wire.
 	//
@@ -73,6 +81,11 @@ type wireRequest struct {
 	// flow is the server's registration of DatagramFlow on the connection, or
 	// nil for a call without datagrams.
 	flow *datagramFlow
+	// responseType is the full name of the response message type, which picks
+	// the dictionary the client accepts; empty when it is not known.
+	responseType protoreflect.FullName
+	// compression is the server's negotiation result for the call.
+	compression *callCompression
 }
 
 // newWireRequest creates a unary RPC request for the method path
@@ -154,6 +167,8 @@ type wireHeaders struct {
 	// Extensions lists the extension IDs the server accepts (field 2). The
 	// registry is empty, so servers send none and clients ignore the field.
 	Extensions []uint64 `protobuf:"varint,2,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
+	// Dictionaries answers the request's DictionaryQuery (field 3).
+	Dictionaries []*dictionaryInfo `protobuf:"bytes,3,rep,name=dictionaries,proto3" json:"dictionaries,omitempty"`
 }
 
 // Reset clears the headers for protobuf compatibility.
@@ -164,6 +179,23 @@ func (m *wireHeaders) String() string { return fmt.Sprintf("%+v", *m) }
 
 // ProtoMessage marks wireHeaders as a protobuf message.
 func (*wireHeaders) ProtoMessage() {}
+
+// dictionaryInfo identifies a compression dictionary in the negotiation
+// fields: its Dictionary_ID and its fingerprint, the first 8 bytes of its
+// SHA-256 digest.
+type dictionaryInfo struct {
+	ID          uint32 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Fingerprint []byte `protobuf:"bytes,2,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
+}
+
+// Reset clears the dictionary for protobuf compatibility.
+func (m *dictionaryInfo) Reset() { *m = dictionaryInfo{} }
+
+// String returns the dictionary as a debug string for protobuf compatibility.
+func (m *dictionaryInfo) String() string { return fmt.Sprintf("%+v", *m) }
+
+// ProtoMessage marks dictionaryInfo as a protobuf message.
+func (*dictionaryInfo) ProtoMessage() {}
 
 // wireStatus is the payload of a STATUS frame.
 type wireStatus struct {

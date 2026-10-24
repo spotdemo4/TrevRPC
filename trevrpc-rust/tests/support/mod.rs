@@ -307,6 +307,7 @@ pub async fn write_headers<S: RawSend>(send: &mut S, metadata: Metadata) -> Resu
         &RpcHeaders {
             metadata,
             extensions: Vec::new(),
+            dictionaries: Vec::new(),
         },
         DEFAULT_MAX_FRAME_SIZE,
     )?)

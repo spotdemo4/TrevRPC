@@ -22,8 +22,8 @@ use futures_core::Stream;
 use prost::Message;
 
 use super::{
-    BidirectionalCall, CallOptions, ClientStreamingCall, ResponseStream, RpcTransport,
-    StreamingRpcTransport,
+    BidirectionalCall, CallOptions, ClientStreamingCall, MessageTypes, ResponseStream,
+    RpcTransport, StreamingRpcTransport,
 };
 use crate::{BoxStream, ResponseEnvelope, Result, Unreliable};
 
@@ -38,6 +38,8 @@ pub struct Call<'a, T: ?Sized, S> {
     options: CallOptions,
     /// The directions marked unreliable when the options leave them to the call.
     default_unreliable: Unreliable,
+    /// The method's message types, from generated code.
+    message_types: Option<MessageTypes>,
     shape: S,
 }
 
@@ -56,6 +58,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
             method,
             options,
             default_unreliable: Unreliable::NONE,
+            message_types: None,
             shape,
         }
     }
@@ -66,6 +69,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
             method: self.method,
             options: self.options,
             default_unreliable: self.default_unreliable,
+            message_types: self.message_types,
             shape: reshape(self.shape),
         }
     }
@@ -75,6 +79,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
     fn into_parts(self) -> Parts<'a, T, S> {
         let mut options = self.options;
         options.unreliable.get_or_insert(self.default_unreliable);
+        options.message_types = self.message_types;
         Parts {
             transport: self.transport,
             method: self.method,
@@ -105,6 +110,13 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
     /// the client's default options and the call's own options override the schema.
     pub const fn default_unreliable(mut self, unreliable: Unreliable) -> Self {
         self.default_unreliable = unreliable;
+        self
+    }
+
+    /// Names the method's request and response message types, which pick the dictionaries of
+    /// [compressed messages](crate::Compression). Generated clients pass them.
+    pub const fn message_types(mut self, request: &'static str, response: &'static str) -> Self {
+        self.message_types = Some(MessageTypes::new(request, response));
         self
     }
 
@@ -470,7 +482,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{CallOptions, bidirectional_streaming, unary};
-    use crate::client::{RpcTransport, StreamingRpcTransport};
+    use crate::client::{CallInfo, MessageTypes, RpcTransport, StreamingRpcTransport};
     use crate::{
         BoxStream, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
     };
@@ -481,15 +493,15 @@ mod tests {
         value: String,
     }
 
-    /// Records the request and the unreliable directions of the last call, and ends every
-    /// streaming call at once with an `OK` status.
+    /// Records the request and the call information of the last call, and ends every streaming
+    /// call at once with an `OK` status.
     #[derive(Default)]
     struct Recorder {
-        last: Arc<Mutex<Option<(RpcRequest, Unreliable)>>>,
+        last: Arc<Mutex<Option<(RpcRequest, CallInfo)>>>,
     }
 
     impl Recorder {
-        fn last(&self) -> (RpcRequest, Unreliable) {
+        fn last(&self) -> (RpcRequest, CallInfo) {
             self.last
                 .lock()
                 .expect("lock should not be poisoned")
@@ -505,8 +517,17 @@ mod tests {
             request: RpcRequest,
             body: Vec<u8>,
         ) -> Result<ResponseEnvelope<Bytes>> {
-            *self.last.lock().expect("lock should not be poisoned") =
-                Some((request, Unreliable::NONE));
+            self.call_with_info(request, body, CallInfo::default())
+                .await
+        }
+
+        async fn call_with_info(
+            &self,
+            request: RpcRequest,
+            body: Vec<u8>,
+            info: CallInfo,
+        ) -> Result<ResponseEnvelope<Bytes>> {
+            *self.last.lock().expect("lock should not be poisoned") = Some((request, info));
             Ok(ResponseEnvelope::new(Bytes::from(body)))
         }
     }
@@ -518,17 +539,17 @@ mod tests {
             request: RpcRequest,
             request_body: BoxStream<Vec<u8>>,
         ) -> Result<BoxStream<ResponseFrame>> {
-            self.streaming_call_unreliable(request, request_body, Unreliable::NONE)
+            self.streaming_call_with_info(request, request_body, CallInfo::default())
                 .await
         }
 
-        async fn streaming_call_unreliable(
+        async fn streaming_call_with_info(
             &self,
             request: RpcRequest,
             _request_body: BoxStream<Vec<u8>>,
-            unreliable: Unreliable,
+            info: CallInfo,
         ) -> Result<BoxStream<ResponseFrame>> {
-            *self.last.lock().expect("lock should not be poisoned") = Some((request, unreliable));
+            *self.last.lock().expect("lock should not be poisoned") = Some((request, info));
             Ok(crate::stream::from_iter([ResponseFrame::Status(
                 Status::ok(),
             )]))
@@ -575,7 +596,39 @@ mod tests {
                     .default_unreliable(Unreliable::BOTH)
                     .await
                     .expect("the call should open");
-            assert_eq!(transport.last().1, expected);
+            assert_eq!(transport.last().1.unreliable, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn generated_message_types_reach_the_transport() {
+        let transport = Recorder::default();
+        let request = Echo {
+            value: "hi".to_owned(),
+        };
+        let _: Echo = unary(&transport, "/test.Echo/Say", &request, CallOptions::new())
+            .message_types("test.Echo", "test.Echo")
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.last().1.message_types,
+            Some(MessageTypes::new("test.Echo", "test.Echo"))
+        );
+
+        let _ = bidirectional_streaming::<_, Echo, Echo>(
+            &transport,
+            "/test.Echo/Chat",
+            CallOptions::new(),
+        )
+        .message_types("test.Echo", "test.Echo")
+        .default_unreliable(Unreliable::BOTH)
+        .await
+        .unwrap();
+        let (_, info) = transport.last();
+        assert_eq!(info.unreliable, Unreliable::BOTH);
+        assert_eq!(
+            info.message_types,
+            Some(MessageTypes::new("test.Echo", "test.Echo"))
+        );
     }
 }

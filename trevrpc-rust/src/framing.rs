@@ -26,12 +26,15 @@ pub mod frame_type {
     pub const HEADERS: u64 = 2;
     /// An `RpcStatus`.
     pub const STATUS: u64 = 3;
+    /// A message compressed with zstd and a dictionary; see [`crate::Compression`]. Readers
+    /// hand it on as a message.
+    pub const ZSTD_MESSAGE: u64 = 4;
 }
 
 /// Returns whether `frame_type` is defined by wire version 1.
 #[must_use]
 pub const fn is_known_frame_type(frame_type: u64) -> bool {
-    frame_type <= frame_type::STATUS
+    frame_type <= frame_type::ZSTD_MESSAGE
 }
 
 /// A frame of a response stream, the currency between the transports and the call layer.
@@ -138,27 +141,39 @@ pub const fn validate_payload_len(len: usize, max_frame_size: usize) -> Result<(
     Ok(())
 }
 
+/// The fields of a metadata map entry: key and value, both length-delimited.
+const METADATA_ENTRY: &[(u64, u64)] = &[(1, 2), (2, 2)];
+/// The fields of a `DictionaryInfo`: the ID, a varint, and the fingerprint.
+const DICTIONARY_INFO: &[(u64, u64)] = &[(1, 0), (2, 2)];
+
 fn preflight_known_wire<M: 'static>(body: &[u8]) -> Result<()> {
-    // Field 8 of `RpcRequest` and field 2 of `RpcHeaders` are repeated integers, which may be
-    // packed (length-delimited) or not, so they are not pinned to one wire type here. Fields 2, 3
-    // and 6 of `RpcRequest` are reserved and skipped like any unknown field.
-    let (fields, metadata_field): (&[(u64, u64)], Option<u64>) =
+    // Field 8 and 10 of `RpcRequest` and field 2 of `RpcHeaders` are repeated integers, which may
+    // be packed (length-delimited) or not, so they are not pinned to one wire type here. Fields 2,
+    // 3 and 6 of `RpcRequest` are reserved and skipped like any unknown field.
+    type Nested = &'static [(u64, &'static [(u64, u64)])];
+    let (fields, nested): (&[(u64, u64)], Nested) =
         if TypeId::of::<M>() == TypeId::of::<RpcRequest>() {
-            (&[(1, 2), (4, 2), (5, 0), (7, 0), (9, 0)], Some(4))
+            (
+                &[(1, 2), (4, 2), (5, 0), (7, 0), (9, 0), (11, 2)],
+                &[(4, METADATA_ENTRY), (11, DICTIONARY_INFO)],
+            )
         } else if TypeId::of::<M>() == TypeId::of::<RpcHeaders>() {
-            (&[(1, 2)], Some(1))
+            (
+                &[(1, 2), (3, 2)],
+                &[(1, METADATA_ENTRY), (3, DICTIONARY_INFO)],
+            )
         } else if TypeId::of::<M>() == TypeId::of::<RpcStatus>() {
-            (&[(1, 0), (2, 2), (3, 2)], Some(3))
+            (&[(1, 0), (2, 2), (3, 2)], &[(3, METADATA_ENTRY)])
         } else {
             return Ok(());
         };
-    preflight_wire_message(body, fields, metadata_field)
+    preflight_wire_message(body, fields, nested)
 }
 
 fn preflight_wire_message(
     data: &[u8],
     fields: &[(u64, u64)],
-    metadata_field: Option<u64>,
+    nested: &[(u64, &[(u64, u64)])],
 ) -> Result<()> {
     let mut offset = 0;
     while offset < data.len() {
@@ -175,9 +190,9 @@ fn preflight_wire_message(
                 "known protobuf field used the wrong wire type",
             ));
         }
-        if metadata_field == Some(field) {
+        if let Some((_, nested_fields)) = nested.iter().find(|(known, _)| *known == field) {
             let entry = consume_proto_bytes(data, &mut offset)?;
-            preflight_wire_message(entry, &[(1, 2), (2, 2)], None)?;
+            preflight_wire_message(entry, nested_fields, &[])?;
         } else {
             skip_proto_value(data, &mut offset, field, wire_type)?;
         }
@@ -337,10 +352,10 @@ mod tests {
 
     #[test]
     fn known_frame_types_are_exactly_the_defined_ones() {
-        for known in 0..=3 {
+        for known in 0..=4 {
             assert!(is_known_frame_type(known));
         }
-        for unknown in [4, 0x21, 0x40, 0x5f, u64::MAX] {
+        for unknown in [5, 0x21, 0x40, 0x5f, u64::MAX] {
             assert!(!is_known_frame_type(unknown));
         }
         // The grease types 0x1f * N + 0x21 are all unknown.

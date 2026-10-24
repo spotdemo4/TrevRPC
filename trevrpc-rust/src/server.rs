@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use tokio::sync::watch;
 
+use crate::client::MessageTypes;
+use crate::compression::{Accept, Compression, CompressionConfig};
 use crate::datagram::DatagramCount;
 use crate::fallback::HttpFallback;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
@@ -35,7 +37,10 @@ type RouteMap = HashMap<String, Route>;
 
 #[derive(Clone)]
 enum Route {
-    Unary(UnaryHandler),
+    Unary {
+        handler: UnaryHandler,
+        options: RouteOptions,
+    },
     Streaming {
         kind: RpcKind,
         handler: StreamingHandler,
@@ -43,19 +48,40 @@ enum Route {
     },
 }
 
-/// Settings of a streaming route beyond its handler.
+/// Settings of a route beyond its handler.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RouteOptions {
     unreliable: Unreliable,
+    message_types: Option<MessageTypes>,
 }
 
 impl RouteOptions {
-    /// Creates route options with every setting at its default: reliable.
+    /// Creates route options with every setting at its default: reliable, without message types.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             unreliable: Unreliable::NONE,
+            message_types: None,
         }
+    }
+
+    /// Names the route's request and response message types, which pick the dictionary of
+    /// [compressed](crate::Compression) response messages. Generated code passes them; a route
+    /// without them sends its responses uncompressed.
+    #[must_use]
+    pub const fn with_message_types(
+        mut self,
+        request: &'static str,
+        response: &'static str,
+    ) -> Self {
+        self.message_types = Some(MessageTypes::new(request, response));
+        self
+    }
+
+    /// Returns the route's message types, if they were named.
+    #[must_use]
+    pub const fn message_types(&self) -> Option<MessageTypes> {
+        self.message_types
     }
 
     /// Marks directions of the route as unreliable, in addition to any marked already.
@@ -84,6 +110,8 @@ pub struct Server {
     options: ServerOptions,
     authorizer: Option<Arc<dyn Authorizer>>,
     metrics: Arc<dyn Metrics>,
+    /// The digested dictionaries of `options`, or why they are invalid, which serving reports.
+    compression: std::result::Result<Option<Arc<CompressionConfig>>, Status>,
 }
 
 /// Identifies the first lifecycle event that cancelled an RPC.
@@ -432,6 +460,7 @@ pub struct ServerOptions {
     webtransport_allowed_origins: Vec<String>,
     webtransport_admission: Option<WebTransportAdmission>,
     http_fallback: Option<HttpFallback>,
+    compression: Compression,
 }
 
 impl Default for ServerOptions {
@@ -455,6 +484,7 @@ impl Default for ServerOptions {
             webtransport_allowed_origins: Vec::new(),
             webtransport_admission: None,
             http_fallback: None,
+            compression: Compression::new(),
         }
     }
 }
@@ -464,6 +494,20 @@ impl ServerOptions {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Lets messages travel compressed with the dictionaries of `compression`; see
+    /// [`Compression`]. Serving fails when they are invalid.
+    #[must_use]
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Returns the dictionaries for compressed messages.
+    #[must_use]
+    pub const fn compression(&self) -> &Compression {
+        &self.compression
     }
 
     /// Returns the maximum `TrevRPC` frame size in bytes.
@@ -901,6 +945,7 @@ impl Default for Server {
             options: ServerOptions::default(),
             authorizer: None,
             metrics: Arc::new(NoopMetrics),
+            compression: Ok(None),
         }
     }
 }
@@ -926,8 +971,23 @@ impl Server {
 
     /// Replaces all server options.
     pub fn set_options(&mut self, options: ServerOptions) -> &mut Self {
+        self.compression =
+            CompressionConfig::new(options.compression()).map_err(Error::into_status);
         self.options = options;
         self
+    }
+
+    /// The server's dictionaries, `None` without any.
+    pub(crate) fn compression(&self) -> Option<&Arc<CompressionConfig>> {
+        self.compression.as_ref().ok().and_then(Option::as_ref)
+    }
+
+    /// Fails when the configured compression is invalid; serving checks this first.
+    pub(crate) fn check_compression(&self) -> Result<()> {
+        self.compression
+            .as_ref()
+            .map(|_| ())
+            .map_err(|status| Error::from(status.clone()))
     }
 
     /// Installs an authorizer that runs before route lookup.
@@ -984,11 +1044,30 @@ impl Server {
         F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
+        self.route_with_options(path, RouteOptions::new(), handler);
+    }
+
+    /// Registers a unary route handler like [`Server::route_with_context`], with route options
+    /// such as its message types.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is not of the form `/<service>/<method>`.
+    pub fn route_with_options<F, Fut>(
+        &mut self,
+        path: impl Into<String>,
+        options: RouteOptions,
+        handler: F,
+    ) where
+        F: Fn(RequestContext, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+    {
         self.insert_route(
             path.into(),
-            Route::Unary(Arc::new(move |context, body| {
-                Box::pin(handler(context, body))
-            })),
+            Route::Unary {
+                handler: Arc::new(move |context, body| Box::pin(handler(context, body))),
+                options,
+            },
         );
     }
 
@@ -1062,6 +1141,15 @@ impl Server {
         }
     }
 
+    /// The message types of the route at `path`, if it named them.
+    pub(crate) fn route_message_types(&self, path: &str) -> Option<MessageTypes> {
+        match self.routes.get(path)? {
+            Route::Unary { options, .. } | Route::Streaming { options, .. } => {
+                options.message_types()
+            }
+        }
+    }
+
     /// Inserts a route, replacing any earlier route for the same path.
     #[allow(clippy::panic)] // A malformed path is a programming error found at startup.
     fn insert_route(&mut self, path: String, route: Route) {
@@ -1115,7 +1203,7 @@ impl Server {
             }
         };
 
-        let Some(Route::Unary(handler)) = self.routes.get(request.method.as_str()) else {
+        let Some(Route::Unary { handler, .. }) = self.routes.get(request.method.as_str()) else {
             return self.finish_response(
                 &request.method,
                 request_body_len,
@@ -1702,6 +1790,8 @@ pub struct RequestBudget {
     max_body_size: Option<usize>,
     messages: usize,
     body_size: usize,
+    /// The dictionaries compressed request messages may use.
+    pub(crate) accept: Accept,
 }
 
 impl RequestBudget {
@@ -1711,6 +1801,7 @@ impl RequestBudget {
             max_body_size,
             messages: 0,
             body_size: 0,
+            accept: Accept::None,
         }
     }
 

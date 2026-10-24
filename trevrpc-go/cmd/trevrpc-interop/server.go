@@ -23,6 +23,8 @@ type serverConfig struct {
 	port     string
 	// webRoot is a directory served through the HTTP fallback, if set.
 	webRoot string
+	// dictionary is a compression dictionary file, if set.
+	dictionary string
 }
 
 // listeningLine is the single JSON line printed once the server accepts
@@ -44,7 +46,11 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("load certificate: %w", err)
 	}
-	listener, err := newServer(net.JoinHostPort(config.host, config.port), &tls.Config{Certificates: []tls.Certificate{certificate}}, config.webRoot)
+	compression, err := interopCompression(config.dictionary)
+	if err != nil {
+		return err
+	}
+	listener, err := newServer(net.JoinHostPort(config.host, config.port), &tls.Config{Certificates: []tls.Certificate{certificate}}, config.webRoot, compression)
 	if err != nil {
 		return err
 	}
@@ -62,12 +68,13 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 // newServer binds a listener for the Echo and UnreliableEcho services. Every browser session is
 // admitted because browsers connect from arbitrary origins. A non-empty webRoot
 // is served through the HTTP fallback on the same ports.
-func newServer(addr string, tlsConfig *tls.Config, webRoot string) (*trevrpc.Listener, error) {
+func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *trevrpc.Compression) (*trevrpc.Listener, error) {
 	server := trevrpc.NewServer()
 	options := server.Options()
 	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(trevrpc.AdmissionRequest) bool { return true }
+	options.Compression = compression
 	if webRoot != "" {
 		options.HTTPFallback = http.FileServer(http.Dir(webRoot))
 	}

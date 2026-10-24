@@ -4409,6 +4409,7 @@ fn frame_bytes(frames: &[trevrpc::ResponseFrame]) -> TestResult<Vec<u8>> {
                 &trevrpc::RpcHeaders {
                     metadata: metadata.clone(),
                     extensions: Vec::new(),
+                    dictionaries: Vec::new(),
                 },
                 trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
             )?,

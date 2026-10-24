@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_trevrpc-interop-rust");
-const SCENARIOS: [&str; 12] = [
+const SCENARIOS: [&str; 13] = [
     "unary",
     "unary-metadata",
     "unary-error",
@@ -22,7 +22,25 @@ const SCENARIOS: [&str; 12] = [
     "unary-headers",
     "server-stream-headers",
     "unreliable",
+    "compressed",
 ];
+
+/// Writes the compression dictionary of the shared golden vectors into `dir`, as `interop/run.py`
+/// does, and returns its path.
+fn write_dictionary(dir: &std::path::Path) -> PathBuf {
+    let hex = include_str!("../../../../testdata/zstd-golden-vectors.txt")
+        .lines()
+        .find_map(|line| line.strip_prefix("dict.d1.dictionary = "))
+        .expect("the golden vectors have a dictionary");
+    let dictionary: Vec<u8> = hex
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    let path = dir.join("interop.dict");
+    std::fs::write(&path, dictionary).unwrap();
+    path
+}
 
 /// A running `server` subcommand with its certificate.
 struct Server {
@@ -36,6 +54,11 @@ struct Server {
 impl Server {
     /// Starts a server that runs until its stdin closes, which `finish` or a drop does.
     fn start(name: &str) -> Self {
+        Self::start_with(name, &[])
+    }
+
+    /// Starts a server like [`Server::start`] with `flags` added to its command line.
+    fn start_with(name: &str, flags: &[&std::ffi::OsStr]) -> Self {
         let dir =
             std::env::temp_dir().join(format!("trevrpc-interop-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -51,6 +74,7 @@ impl Server {
             .arg(&cert_path)
             .arg("--key")
             .arg(&key_path)
+            .args(flags)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -113,7 +137,28 @@ fn port(line: &str, name: &str) -> String {
 fn rust_client_passes_every_scenario_against_rust_server() {
     let server = Server::start("client");
     let client = server.run("client", &[]);
-    let report = String::from_utf8(client.stdout).unwrap();
+    assert_passed(&client);
+    server.finish();
+}
+
+#[test]
+fn every_scenario_passes_with_compression_on_both_sides() {
+    let dir = std::env::temp_dir().join(format!("trevrpc-interop-{}-dict", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dictionary = write_dictionary(&dir);
+    let server = Server::start_with(
+        "compressed",
+        &["--dictionary".as_ref(), dictionary.as_os_str()],
+    );
+    let client = server.run("client", &["--dictionary", dictionary.to_str().unwrap()]);
+    assert_passed(&client);
+    server.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Asserts that a client run passed every scenario.
+fn assert_passed(client: &Output) {
+    let report = String::from_utf8_lossy(&client.stdout);
     assert!(client.status.success(), "client failed:\n{report}");
     for scenario in SCENARIOS {
         assert!(
@@ -121,7 +166,6 @@ fn rust_client_passes_every_scenario_against_rust_server() {
             "scenario {scenario} did not pass:\n{report}"
         );
     }
-    server.finish();
 }
 
 fn assert_close(actual: f64, expected: f64, tolerance: f64, json: &str) {

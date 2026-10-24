@@ -7,13 +7,12 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
+use super::{CallInfo, QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
+use crate::compression::CompressionConfig;
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
-use crate::{
-    BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status, Unreliable,
-};
+use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
 
 pub const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
 pub const DEFAULT_REPROBE_INTERVAL: Duration = Duration::from_mins(5);
@@ -83,6 +82,18 @@ impl RpcTransport for GenerationTransport {
             Self::Qmux(transport) => transport.call(request, body).await,
         }
     }
+
+    async fn call_with_info(
+        &self,
+        request: RpcRequest,
+        body: Vec<u8>,
+        info: CallInfo,
+    ) -> Result<ResponseEnvelope<Bytes>> {
+        match self {
+            Self::Quic(transport) => transport.call_with_info(request, body, info).await,
+            Self::Qmux(transport) => transport.call_with_info(request, body, info).await,
+        }
+    }
 }
 
 #[crate::async_trait]
@@ -98,22 +109,23 @@ impl StreamingRpcTransport for GenerationTransport {
         }
     }
 
-    async fn streaming_call_unreliable(
+    async fn streaming_call_with_info(
         &self,
         request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
-        unreliable: Unreliable,
+        info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
-        // Whether the call gets a datagram flow is decided by the transport the race chose.
+        // Whether the call gets a datagram flow, and its dictionaries, is decided by the
+        // transport the race chose.
         match self {
             Self::Quic(transport) => {
                 transport
-                    .streaming_call_unreliable(request, request_body, unreliable)
+                    .streaming_call_with_info(request, request_body, info)
                     .await
             }
             Self::Qmux(transport) => {
                 transport
-                    .streaming_call_unreliable(request, request_body, unreliable)
+                    .streaming_call_with_info(request, request_body, info)
                     .await
             }
         }
@@ -133,6 +145,8 @@ pub struct Dialer {
     pub(crate) endpoint: quinn::Endpoint,
     pub(crate) remote_addr: SocketAddr,
     pub(crate) server_name: String,
+    /// The channel's dictionaries, which every connection negotiates afresh.
+    pub(crate) compression: Option<Arc<CompressionConfig>>,
     pub(crate) max_frame_size: usize,
     pub(crate) policy: TransportPolicy,
     pub(crate) tcp: Option<TcpDialer>,
@@ -210,7 +224,9 @@ impl Dialer {
             .await
             .map_err(Error::transport)?;
         Ok(GenerationTransport::Quic(
-            QuicTransport::new(connection).with_max_frame_size(self.max_frame_size),
+            QuicTransport::new(connection)
+                .with_max_frame_size(self.max_frame_size)
+                .with_compression_config(self.compression.clone()),
         ))
     }
 
@@ -222,7 +238,9 @@ impl Dialer {
             self.max_frame_size,
         )
         .await
-        .map(GenerationTransport::Qmux)
+        .map(|transport| {
+            GenerationTransport::Qmux(transport.with_compression_config(self.compression.clone()))
+        })
     }
 }
 

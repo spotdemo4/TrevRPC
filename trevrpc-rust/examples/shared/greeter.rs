@@ -116,6 +116,7 @@ where
             request,
             self.default_options.clone(),
         )
+        .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
 }
 
@@ -138,6 +139,7 @@ where
             request,
             self.default_options.clone(),
         )
+        .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
 
     /// Calls the `LotsOfGreetings` RPC when the returned call is awaited.
@@ -153,6 +155,7 @@ where
             greeter_paths::LOTS_OF_GREETINGS,
             self.default_options.clone(),
         )
+        .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
 
     /// Calls the `BidiHello` RPC when the returned call is awaited.
@@ -168,6 +171,7 @@ where
             greeter_paths::BIDI_HELLO,
             self.default_options.clone(),
         )
+        .message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
     }
 }
 
@@ -180,21 +184,28 @@ where
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_with_context(greeter_paths::SAY_HELLO, move |context, body| {
-            let service = ::std::sync::Arc::clone(&service);
-            async move {
-                let request = <HelloRequest as ::prost::Message>::decode(body.as_slice())?;
-                let response = service.say_hello(context, request).await?;
-                Ok(::prost::Message::encode_to_vec(&response))
-            }
-        });
+        server.route_with_options(
+            greeter_paths::SAY_HELLO,
+            ::trevrpc::server::RouteOptions::new()
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
+            move |context, body| {
+                let service = ::std::sync::Arc::clone(&service);
+                async move {
+                    let request = <HelloRequest as ::prost::Message>::decode(body.as_slice())?;
+                    let response = service.say_hello(context, request).await?;
+                    Ok(::prost::Message::encode_to_vec(&response))
+                }
+            },
+        );
     }
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_streaming_with_context(
+        server.route_streaming_with_options(
             greeter_paths::LOTS_OF_REPLIES,
             ::trevrpc::RpcKind::ServerStreaming,
+            ::trevrpc::server::RouteOptions::new()
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
             move |context, body, _request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
@@ -208,9 +219,11 @@ where
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_streaming_with_context(
+        server.route_streaming_with_options(
             greeter_paths::LOTS_OF_GREETINGS,
             ::trevrpc::RpcKind::ClientStreaming,
+            ::trevrpc::server::RouteOptions::new()
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
             move |context, _body, request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
@@ -226,9 +239,11 @@ where
 
     {
         let service = ::std::sync::Arc::clone(&service);
-        server.route_streaming_with_context(
+        server.route_streaming_with_options(
             greeter_paths::BIDI_HELLO,
             ::trevrpc::RpcKind::BidirectionalStreaming,
+            ::trevrpc::server::RouteOptions::new()
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
             move |context, _body, request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {

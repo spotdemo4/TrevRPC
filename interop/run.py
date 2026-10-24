@@ -47,6 +47,9 @@ CELL_TIMEOUT = 120
 # list of unsafe ports.
 UNREACHABLE_UDP = 24999
 SYSTEM_KEYCHAIN = "/Library/Keychains/System.keychain"
+# The shared compression golden vectors, next to the runner in the checkout and in the package.
+# Their dictionary is the one the native servers and clients compress Echo messages with.
+ZSTD_VECTORS = Path(__file__).resolve().parents[1] / "testdata" / "zstd-golden-vectors.txt"
 KEYCHAIN_TIMEOUT = 30
 
 
@@ -56,25 +59,45 @@ class Cell:
     command: list[str]
 
 
-def native_cells(client: NamedCommand, server: Server, certificate: Certificate) -> list[Cell]:
+def native_cells(
+    client: NamedCommand, server: Server, certificate: Certificate, dictionary: Path
+) -> list[Cell]:
     """Every scenario over QUIC, over QMux over TLS, and over QUIC with a blocked UDP port, where
-    the client must fall back to TCP."""
+    the client must fall back to TCP. The QUIC and QMux lanes compress with `dictionary`, which
+    every server holds; the fallback lane does not, so both kinds of client are covered."""
     native = server.port("native")
     qmux = server.port("qmux")
     tls = ["--ca", str(certificate.cert), "--server-name", "localhost"]
     lanes = [
-        ("", native, None, "quic", "quic"),
-        ("-qmux", native, qmux, "tcp", "qmux"),
-        ("-fallback", UNREACHABLE_UDP, qmux, "auto", "qmux"),
+        ("", native, None, "quic", "quic", True),
+        ("-qmux", native, qmux, "tcp", "qmux", True),
+        ("-fallback", UNREACHABLE_UDP, qmux, "auto", "qmux", False),
     ]
     cells: list[Cell] = []
-    for suffix, udp, tcp, transport, expected in lanes:
+    for suffix, udp, tcp, transport, expected, compressed in lanes:
         command = [*client.command, "client", "--addr", f"127.0.0.1:{udp}"]
         if tcp is not None:
             command += ["--tcp-addr", f"127.0.0.1:{tcp}"]
         command += [*tls, "--transport", transport, "--expect-transport", expected]
+        if compressed:
+            command += ["--dictionary", str(dictionary)]
         cells.append(Cell(f"{client.name}{suffix}-to-{server.name}", command))
     return cells
+
+
+def write_dictionary(vectors: Path, directory: Path) -> Path:
+    """Writes the dictionary of the compression golden vectors to DIRECTORY and returns its path."""
+    prefix = "dict.d1.dictionary = "
+    try:
+        lines = vectors.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RunnerError(f"could not read {vectors}: {error}") from error
+    for line in lines:
+        if line.startswith(prefix):
+            path = directory / "interop.dict"
+            _ = path.write_bytes(bytes.fromhex(line.removeprefix(prefix)))
+            return path
+    raise RunnerError(f"{vectors} has no {prefix.strip(' =')}")
 
 
 def browser_cells(
@@ -211,13 +234,14 @@ def execute(args: argparse.Namespace, work: Path) -> list[str]:
     out: Path = args.out or work / "out"
     out.mkdir(parents=True, exist_ok=True)
     certificate = generate_certificate(work)
+    dictionary = write_dictionary(ZSTD_VECTORS, work)
 
-    # With browsers, every server also serves the interop page from its HTTP fallback, for the
-    # app lanes.
-    server_arguments: list[str] = []
+    # Every server holds the compression dictionary. With browsers, every server also serves the
+    # interop page from its HTTP fallback, for the app lanes.
+    server_arguments: list[str] = ["--dictionary", str(dictionary)]
     if browsers:
         _ = run_checked([BROWSER, "--write-page", str(work / "web")])
-        server_arguments = ["--web-root", str(work / "web")]
+        server_arguments += ["--web-root", str(work / "web")]
 
     failures: list[str] = []
     keychain = Keychain(certificate)
@@ -228,7 +252,9 @@ def execute(args: argparse.Namespace, work: Path) -> list[str]:
             server = Server(spec.name, spec.command, certificate, out, server_arguments)
             try:
                 cells = [
-                    cell for client in clients for cell in native_cells(client, server, certificate)
+                    cell
+                    for client in clients
+                    for cell in native_cells(client, server, certificate, dictionary)
                 ]
                 cells += [
                     cell

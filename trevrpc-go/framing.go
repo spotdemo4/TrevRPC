@@ -57,10 +57,14 @@ const (
 	frameTypeRequest frameType = 1
 	frameTypeHeaders frameType = 2
 	frameTypeStatus  frameType = 3
+	// frameTypeZstdMessage carries a message compressed with zstd and a
+	// dictionary. Readers turn it into a MESSAGE frame, so nothing after them
+	// sees this type.
+	frameTypeZstdMessage frameType = 4
 )
 
 // known reports whether t is a frame type this runtime interprets.
-func (t frameType) known() bool { return t <= frameTypeStatus }
+func (t frameType) known() bool { return t <= frameTypeZstdMessage }
 
 func (t frameType) String() string {
 	switch t {
@@ -72,6 +76,8 @@ func (t frameType) String() string {
 		return "HEADERS"
 	case frameTypeStatus:
 		return "STATUS"
+	case frameTypeZstdMessage:
+		return "ZSTD_MESSAGE"
 	default:
 		return fmt.Sprintf("unknown frame type %#x", uint64(t))
 	}
@@ -135,27 +141,30 @@ func decodeStatus(payload []byte) (*Status, error) {
 	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata)}, nil
 }
 
-// decodeHeaders decodes the payload of a HEADERS frame into its metadata.
-// Extensions are decoded and dropped: the registry is empty.
-func decodeHeaders(payload []byte) (Metadata, error) {
+// decodeHeaders decodes the payload of a HEADERS frame into its metadata and
+// its answer to a dictionary query. Extensions are decoded and dropped: the
+// registry is empty.
+func decodeHeaders(payload []byte) (Metadata, []*dictionaryInfo, error) {
 	if len(payload) == 0 {
-		return Metadata{}, nil
+		return Metadata{}, nil, nil
 	}
 	var headers wireHeaders
 	if !headers.decodeFast(payload) {
 		headers = wireHeaders{}
 		if err := decodePayload(payload, &headers); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return ownedMetadata(headers.Metadata), nil
+	return ownedMetadata(headers.Metadata), headers.Dictionaries, nil
 }
 
 // encodedMessage is one message ready to send: a complete MESSAGE frame whose
-// payload was marshalled directly into the frame buffer.
+// payload was marshalled directly into the frame buffer, or a ZSTD_MESSAGE
+// frame carrying it compressed.
 type encodedMessage struct {
 	frame []byte
-	// size is the length of the payload within frame.
+	// size is the length of the message, which limits apply to. For a MESSAGE
+	// frame it is the length of the payload within frame.
 	size int
 }
 
@@ -166,7 +175,12 @@ const frameTailSlack = 8
 // encodeMessage marshals message into a MESSAGE frame. The frame size limit is
 // enforced where the frame is written.
 func encodeMessage(message ProtoMessage) (encodedMessage, error) {
-	protoMessage := protoMessageV2(message)
+	return encodeProtoMessage(protoMessageV2(message))
+}
+
+// encodeProtoMessage is encodeMessage for a message already converted with
+// protoMessageV2.
+func encodeProtoMessage(protoMessage proto.Message) (encodedMessage, error) {
 	size := proto.Size(protoMessage)
 	frame, err := appendProtoFrame(make([]byte, 0, frameHeaderLen(frameTypeMessage, size)+size+frameTailSlack), frameTypeMessage, protoMessage, size)
 	if err != nil {
@@ -235,9 +249,10 @@ func appendRequestFrame(dst []byte, request *wireRequest, maxFrameSize int) ([]b
 	return request.appendPayload(dst), nil
 }
 
-// appendHeadersFrame appends a HEADERS frame carrying metadata.
-func appendHeadersFrame(dst []byte, metadata Metadata, maxFrameSize int) ([]byte, error) {
-	headers := wireHeaders{Metadata: metadata}
+// appendHeadersFrame appends a HEADERS frame carrying metadata and, for a
+// call that queried, the answer.
+func appendHeadersFrame(dst []byte, metadata Metadata, dictionaries []*dictionaryInfo, maxFrameSize int) ([]byte, error) {
+	headers := wireHeaders{Metadata: metadata, Dictionaries: dictionaries}
 	size, ok := headers.payloadSize()
 	if !ok {
 		return appendLimitedProtoFrame(dst, frameTypeHeaders, &headers, maxFrameSize)
@@ -297,6 +312,9 @@ type frameReader struct {
 	// is a single message is bounded by the frame size alone; a stream of
 	// messages is bounded cumulatively.
 	chargeMessages bool
+	// inflate holds the dictionaries the reader accepts on ZSTD_MESSAGE
+	// frames, which it hands on as MESSAGE frames; nil accepts none.
+	inflate dictionaryLookup
 	// readAhead lets the reader take bytes beyond the frame it is reading from
 	// the stream. Until it is set the reader takes exactly what it needs,
 	// which leaves the rest of a request in the stream when the server
@@ -331,6 +349,9 @@ func (fr *frameReader) next() (frame, error) {
 		}
 		size := int(length)
 
+		if typ == frameTypeZstdMessage {
+			return fr.readCompressed(size)
+		}
 		if typ.known() {
 			if typ == frameTypeMessage && fr.chargeMessages {
 				if err := fr.charge(size); err != nil {
@@ -351,6 +372,31 @@ func (fr *frameReader) next() (frame, error) {
 			return frame{}, err
 		}
 	}
+}
+
+// readCompressed reads the payload of a ZSTD_MESSAGE frame and returns the
+// message it decompresses to as a MESSAGE frame. The decompressed size is
+// checked against the frame size limit, and charged like a MESSAGE payload,
+// before it is decompressed.
+func (fr *frameReader) readCompressed(size int) (frame, error) {
+	payload, err := fr.readPayload(size)
+	if err != nil {
+		return frame{}, err
+	}
+	header, dict, err := checkCompressed(fr.inflate, payload, fr.maxFrameSize)
+	if err != nil {
+		return frame{}, err
+	}
+	if fr.chargeMessages {
+		if err := fr.charge(int(header.ContentSize)); err != nil {
+			return frame{}, err
+		}
+	}
+	message, err := decompressChecked(dict, payload, header)
+	if err != nil {
+		return frame{}, err
+	}
+	return frame{typ: frameTypeMessage, payload: message}, nil
 }
 
 // charge accounts n bytes against the cumulative limit.

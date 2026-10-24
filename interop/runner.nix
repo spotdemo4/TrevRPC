@@ -29,6 +29,8 @@ stdenvNoCC.mkDerivation {
     fileset = lib.fileset.unions [
       (lib.fileset.fileFilter (file: file.hasExt "py") ./.)
       (lib.fileset.fileFilter (file: file.hasExt "py") ../bench)
+      # The interop runner takes its compression dictionary from these.
+      ../testdata/zstd-golden-vectors.txt
     ];
   };
 
@@ -46,12 +48,13 @@ stdenvNoCC.mkDerivation {
     runHook postCheck
   '';
 
-  # The runners find the harness at ../interop relative to themselves, as in the checkout.
+  # The runners find the harness at ../interop and the compression golden vectors at ../testdata
+  # relative to themselves, as in the checkout.
   installPhase = ''
     runHook preInstall
     share=$out/share/${name}
     mkdir -p $out/bin "$share"
-    cp --parents interop/*.py bench/*.py "$share/"
+    cp --parents interop/*.py bench/*.py testdata/zstd-golden-vectors.txt "$share/"
     makeWrapper ${python3}/bin/python3 $out/bin/${name} \
       --add-flags "-I $share/${script}" \
       --prefix PATH : ${lib.makeBinPath ([ openssl ] ++ runtimeInputs)} \
