@@ -74,6 +74,13 @@ impl RouteOptions {
     /// Lets the route's streamed messages be compressed with one zstd context per call in the
     /// directions `directions` sets; see [`CompressStream`]. Generated code passes the schema's
     /// `compress_stream`. Directions the route's kind does not stream are ignored.
+    ///
+    /// When the requests direction is set, the route streams requests and they are not marked
+    /// unreliable, every call sends HEADERS at dispatch, before the handler runs, carrying the
+    /// server's answer, so the client can start compressing while it streams. The handlers of
+    /// such a route cannot set response headers
+    /// ([`RequestContext::set_response_header`] reports them as already sent); they use trailing
+    /// metadata instead.
     #[must_use]
     pub const fn with_compress_stream(mut self, directions: CompressStream) -> Self {
         self.compress_stream = directions;
@@ -299,6 +306,11 @@ impl RequestContext {
 
     /// Sets a response header of the call, sent in a HEADERS frame ahead of the first response
     /// message as soon as the handler returns. A failed call sends no headers.
+    ///
+    /// Calls to a method whose streamed requests may be stream-compressed (see
+    /// [`RouteOptions::with_compress_stream`]) send their HEADERS at dispatch, before the handler
+    /// runs, so on them this always fails as already sent; use
+    /// [`set_response_metadata`](Self::set_response_metadata) instead.
     ///
     /// The key is lowercased (see [`normalize_metadata_key`]). Clients read the headers from
     /// `ResponseEnvelope::headers` or the `headers` of a response stream.
@@ -1207,6 +1219,13 @@ impl Server {
         }
     }
 
+    /// Whether calls to `path` send HEADERS at dispatch, before the handler runs: those whose
+    /// requests the server may stream-compress, so the client learns its answer while it still
+    /// streams them. Their handlers cannot set response headers.
+    pub(crate) fn sends_headers_at_dispatch(&self, path: &str) -> bool {
+        self.route_compress_stream(path).requests
+    }
+
     /// The directions of the streaming route at `path` that may use stream compression, or none
     /// when there is no such route.
     pub(crate) fn route_compress_stream(&self, path: &str) -> CompressStream {
@@ -1417,7 +1436,7 @@ impl Server {
             ..
         } = request;
         let path: Arc<str> = Arc::from(path);
-        let context = RequestContext::from_parts(
+        let mut context = RequestContext::from_parts(
             Arc::clone(&path),
             request_kind,
             metadata,
@@ -1425,6 +1444,9 @@ impl Server {
             cancellation.clone(),
             counts,
         );
+        if self.sends_headers_at_dispatch(&path) {
+            context.response = ResponseMetadata::with_headers_sent();
+        }
         let response_metadata = context.response.clone();
         let handler_result = match invoke_streaming_handler(handler, context, body, request_body) {
             Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,
@@ -3390,6 +3412,76 @@ mod tests {
 
         assert!(matches!(frames.first(), Some(ResponseFrame::Message(_))));
         assert_eq!(frames.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handlers_of_request_stream_compressed_routes_cannot_set_headers() {
+        let mut server = Server::new();
+        let options = super::RouteOptions::new();
+        let routes = [
+            (
+                "/example.Uploads/Compressed",
+                options.with_compress_stream(crate::CompressStream::REQUESTS),
+                true,
+            ),
+            ("/example.Uploads/Plain", options, false),
+            // Only the requests direction sends HEADERS at dispatch.
+            (
+                "/example.Uploads/Responses",
+                options.with_compress_stream(crate::CompressStream::RESPONSES),
+                false,
+            ),
+            // Unreliable requests are never stream-compressed.
+            (
+                "/example.Uploads/Unreliable",
+                options
+                    .with_compress_stream(crate::CompressStream::REQUESTS)
+                    .with_unreliable(crate::Unreliable::REQUESTS),
+                false,
+            ),
+        ];
+        for (path, options, _) in routes {
+            server.route_streaming_with_options(
+                path,
+                RpcKind::BidirectionalStreaming,
+                options,
+                |context, _body, _requests| async move {
+                    // Deterministic from the start of the handler.
+                    let set = context.set_response_header("x-header", b"h".to_vec());
+                    let outcome = match set {
+                        Ok(()) => "set".to_owned(),
+                        Err(status) => status.message().to_owned(),
+                    };
+                    context.set_response_metadata("x-outcome", outcome)?;
+                    Ok(crate::stream::empty())
+                },
+            );
+        }
+
+        for (path, _, sent) in routes {
+            let request = RpcRequest::new(path).with_kind(RpcKind::BidirectionalStreaming);
+            let frames: Vec<_> = server
+                .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+                .await
+                .map(|frame| frame.expect("frame should be ok"))
+                .collect()
+                .await;
+            let (outcome, expected_frames) = if sent {
+                (&b"response headers already sent"[..], 1)
+            } else {
+                (&b"set"[..], 2)
+            };
+            assert_eq!(frames.len(), expected_frames, "{path}: {frames:?}");
+            let Some(ResponseFrame::Status(status)) = frames.last() else {
+                panic!("{path}: no status");
+            };
+            assert!(status.is_ok(), "{path}: {status:?}");
+            assert_eq!(
+                status.metadata().get("x-outcome").map(Vec::as_slice),
+                Some(outcome),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]

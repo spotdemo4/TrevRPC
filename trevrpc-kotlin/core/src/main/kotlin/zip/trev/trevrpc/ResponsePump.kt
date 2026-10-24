@@ -125,8 +125,19 @@ internal class CallStream(
     private val compression: CallCompression? = null,
     private val streams: CallStreams? = null,
     private val maxMessageSize: Int = DEFAULT_MAX_FRAME_SIZE,
+    private val onHeaders: ((Metadata) -> Unit)? = null,
 ) {
     val end = CallEnd()
+
+    private val headersReported = AtomicBoolean(false)
+
+    /**
+     * Hands the response headers to the call's `onResponseHeaders`, once: from whichever reads them
+     * first, the pump while the call uploads or the caller.
+     */
+    fun reportHeaders(metadata: Metadata) {
+        if (headersReported.compareAndSet(false, true)) onHeaders?.invoke(metadata)
+    }
 
     /** Reads the response while the call uploads; null for calls that do not stream their request. */
     var pump: ResponsePump? = null
@@ -157,6 +168,7 @@ internal class CallStream(
                 frame.also {
                     compression?.learn(it.dictionaries)
                     streams?.learn(it.streamCompression)
+                    reportHeaders(it.metadata)
                 }
             }
 

@@ -49,6 +49,13 @@ type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	CloseAndRecv() (Res, error)
 	// Close releases call resources without waiting for a response.
 	Close() error
+	// Headers returns the response headers. It blocks until the first response
+	// frame (headers, the response, or the final status) arrives and returns
+	// empty metadata if the server sent no headers. It does not consume the
+	// response: CloseAndRecv still returns it. A server sends HEADERS at
+	// dispatch on methods whose requests may be stream-compressed, so there it
+	// returns while the requests are still being sent.
+	Headers() (Metadata, error)
 }
 
 // BidirectionalStreamingCall sends request messages and receives response messages.
@@ -280,6 +287,10 @@ func (c *clientStreamingCall[Req, Res]) CloseAndRecv() (Res, error) {
 func (c *clientStreamingCall[Req, Res]) Close() error {
 	c.cancel()
 	return errors.Join(c.requests.Close(), closeMessageStream(c.responses))
+}
+
+func (c *clientStreamingCall[Req, Res]) Headers() (Metadata, error) {
+	return c.responses.Headers()
 }
 
 type bidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] struct {

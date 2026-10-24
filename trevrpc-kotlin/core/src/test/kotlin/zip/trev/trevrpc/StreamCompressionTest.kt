@@ -1,5 +1,7 @@
 package zip.trev.trevrpc
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -127,6 +129,38 @@ class StreamCompressionTest {
             }
             call.close()
             assertNotNull(budget.reserve(budget.bytes), "every reservation is released when the call ends")
+        }
+
+    @Test
+    fun `a client-streaming call reports the answer's headers mid-upload, and compresses the requests after them`() =
+        runBlocking {
+            val transport = ScriptedTransport(Compression(emptyList()), StreamCompressionBudget())
+            val headers = CompletableDeferred<Metadata>()
+            val more = (0..2).map { vectors.getValue("stream.plain.$it.message") }
+            val upload =
+                flow {
+                    emit(compressible)
+                    // The server sends HEADERS at dispatch, before its only response.
+                    transport.respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
+                    headers.await()
+                    emit(compressible)
+                    more.forEach { emit(it) }
+                    transport.respond(ResponseFrame.Message(compressible), ResponseFrame.Status(Status.ok()))
+                }
+            val response =
+                Client(transport).clientStreaming(
+                    "/svc/m",
+                    upload,
+                    requests,
+                    responses,
+                    CallOptions(onResponseHeaders = { headers.complete(it) }),
+                    CompressStream.REQUESTS,
+                )
+            assertArrayEquals(compressible, response)
+            assertEquals(
+                listOf(FrameType.MESSAGE, FrameType.MESSAGE) + List(3) { FrameType.ZSTD_STREAM_MESSAGE },
+                transport.sent.map { it.first },
+            )
         }
 
     @Test

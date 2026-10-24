@@ -31,6 +31,10 @@ import (
 // messages. Stream compression calls libzstd and needs cgo; without cgo it is
 // off.
 //
+// A server sends HEADERS at dispatch, before the handler runs, on every call
+// to a route whose request messages may be stream-compressed, so handlers of
+// such routes cannot set response headers (see SetResponseHeader).
+//
 // Compressed sizes depend on earlier messages of the call, so do not mark a
 // method whose streams carry data an attacker can influence together with
 // secrets.
@@ -59,7 +63,9 @@ func WithStreamCompression(s StreamCompression) CallOption {
 
 // RouteStreamCompression lets the route's calls stream-compress the
 // directions s marks; see StreamCompression. Generated registration passes the
-// method's schema option.
+// method's schema option. With Requests, the route's calls send HEADERS at
+// dispatch and their handlers cannot set response headers (see
+// SetResponseHeader).
 func RouteStreamCompression(s StreamCompression) RouteOption {
 	return func(config *routeConfig) {
 		config.streamCompression = s
@@ -388,6 +394,15 @@ type serverStreams struct {
 	responses *streamCompressor
 }
 
+// streamCompressesRequests reports whether the route's request messages may
+// be stream-compressed. A direction marked unreliable is left out: its
+// messages may be datagrams, which cannot carry stream-compressed messages.
+// The calls of such a route send HEADERS at dispatch, so a client learns the
+// answer while it is still uploading.
+func (rt route) streamCompressesRequests() bool {
+	return rt.streamCompression.Requests && !rt.unreliable.Requests
+}
+
 // negotiateStreams answers the request's stream_compression, if it has one,
 // for the directions its route allows. It returns nil when nothing is
 // enabled. A direction marked unreliable is left out: its messages may be
@@ -401,7 +416,7 @@ func (r *serverRuntime) negotiateStreams(request *wireRequest) *serverStreams {
 		return nil
 	}
 	streams := &serverStreams{}
-	if route.streamCompression.Requests && !route.unreliable.Requests {
+	if route.streamCompressesRequests() {
 		if reservation := r.streams.reserve(r.streams.decoderCost); reservation != nil {
 			streams.answer = streamOffer()
 			streams.requests = newStreamInflater(r.compression.lookupOrNil(), reservation)

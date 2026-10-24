@@ -647,7 +647,29 @@ func (s *Server) handleStreamingWriter(ctx context.Context, request *wireRequest
 		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: len(body)}, request)
 		return runtime.finishStreamingStatus(service, method, len(body), startedAt, Unavailable("too many concurrent RPCs"), request)
 	}
-	return runtime.handleStreamingRequest(ctx, request, body, requestBody, lease)
+	var dispatched bytes.Buffer
+	response := runtime.handleStreamingRequest(ctx, request, body, requestBody, lease, &dispatched)
+	if dispatched.Len() == 0 {
+		return response
+	}
+	return &dispatchedResponse{responseWriter: response, headers: dispatched.Bytes()}
+}
+
+// dispatchedResponse is a response whose HEADERS went out at dispatch: they
+// lead its first write.
+type dispatchedResponse struct {
+	responseWriter
+	headers []byte
+}
+
+func (r *dispatchedResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
+	if r.headers != nil {
+		if _, err := writer.Write(r.headers); err != nil {
+			return true, err
+		}
+		r.headers = nil
+	}
+	return r.responseWriter.writeNext(ctx, writer, maxFrameSize, beforeStatus)
 }
 
 // singleMessageResponse is a streaming handler response of one message.

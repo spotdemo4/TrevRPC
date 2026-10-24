@@ -70,23 +70,11 @@ impl Echo for EchoService {
     async fn client_stream(
         &self,
         context: RequestContext,
-        mut requests: BoxStream<EchoRequest>,
+        requests: BoxStream<EchoRequest>,
     ) -> Result<EchoResponse, Status> {
-        let mut message = String::new();
-        let mut count = 0_u32;
-        while let Some(request) = requests.next().await {
-            let request = request?;
-            if let Some(status) = requested_failure(&request) {
-                return Err(status);
-            }
-            message.push_str(&request.message);
-            count = count.saturating_add(1);
-        }
+        let response = concatenate(requests).await?;
         answer_header(&context)?;
-        Ok(EchoResponse {
-            message,
-            index: count,
-        })
+        Ok(response)
     }
 
     async fn server_stream(
@@ -116,6 +104,25 @@ impl Echo for EchoService {
         answer_header(&context)?;
         Ok(Box::pin(echo_each(requests)))
     }
+}
+
+/// `Echo.ClientStream`: the requests' messages concatenated, with their count as the index, or
+/// the status of the first request that asks to fail.
+async fn concatenate(mut requests: BoxStream<EchoRequest>) -> Result<EchoResponse, Status> {
+    let mut message = String::new();
+    let mut count = 0_u32;
+    while let Some(request) = requests.next().await {
+        let request = request?;
+        if let Some(status) = requested_failure(&request) {
+            return Err(status);
+        }
+        message.push_str(&request.message);
+        count = count.saturating_add(1);
+    }
+    Ok(EchoResponse {
+        message,
+        index: count,
+    })
 }
 
 /// `Echo.Bidi`: echoes each request as it arrives, with its index, until one asks to fail.
@@ -153,13 +160,13 @@ struct CompressedEchoService;
 #[trevrpc::async_trait]
 impl CompressedEcho for CompressedEchoService {
     /// `Echo.Bidi`, whose trailing metadata counts the requests that arrived stream-compressed,
-    /// known once the request stream has ended.
+    /// known once the request stream has ended. Its HEADERS go out at dispatch, so it sets no
+    /// response headers.
     async fn bidi(
         &self,
         context: RequestContext,
         requests: BoxStream<EchoRequest>,
     ) -> Result<BoxStream<EchoResponse>, Status> {
-        answer_header(&context)?;
         let report = futures_util::stream::once(async move {
             context.set_response_metadata(
                 STREAM_COMPRESSED_RECEIVED_METADATA_KEY,
@@ -172,13 +179,19 @@ impl CompressedEcho for CompressedEchoService {
         Ok(Box::pin(echo_each(requests).chain(report)))
     }
 
-    /// `Echo.ClientStream`, for the load benchmarks.
+    /// `Echo.ClientStream`, whose trailing metadata counts the requests that arrived
+    /// stream-compressed, as `bidi` does.
     async fn client_stream(
         &self,
         context: RequestContext,
         requests: BoxStream<EchoRequest>,
     ) -> Result<EchoResponse, Status> {
-        Echo::client_stream(&EchoService, context, requests).await
+        let response = concatenate(requests).await?;
+        context.set_response_metadata(
+            STREAM_COMPRESSED_RECEIVED_METADATA_KEY,
+            context.stream_compressed_requests_received().to_string(),
+        )?;
+        Ok(response)
     }
 }
 

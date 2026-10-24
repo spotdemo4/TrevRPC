@@ -52,8 +52,11 @@ async function serve(stream, request, unary, session) {
     return;
   }
 
-  if (path.service === CompressedEchoService && path.method === "Bidi") {
-    await compressedBidi(stream, request);
+  if (path.service === CompressedEchoService) {
+    await (path.method === "ClientStream" ? compressedClientStream : compressedBidi)(
+      stream,
+      request,
+    );
     await stream.finish();
     await stream.stopSending();
     return;
@@ -149,6 +152,30 @@ async function compressedBidi(stream, request) {
       const response = marshalMessage(EchoResponse, { message: message.message, index });
       await stream.write(encodeOutgoingFrame(streams.encode(response)));
     }
+    await stream.writeStatus(Code.Ok, "", {
+      "interop-stream-compressed-received": new TextEncoder().encode(String(streams.received)),
+    });
+  } finally {
+    streams.close();
+  }
+}
+
+/**
+ * CompressedEcho.ClientStream as the interop README specifies: Echo.ClientStream with stream
+ * compression. HEADERS go out at dispatch, as servers send them on methods whose requests may be
+ * stream-compressed.
+ */
+async function compressedClientStream(stream, request) {
+  const streams = new ServerStreams(compression, request);
+  try {
+    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
+    let message = "";
+    let count = 0;
+    for (let frame; (frame = await stream.readFrame()) !== null; count += 1) {
+      message += EchoRequest.decode(streams.receive(frame)).message;
+    }
+    const response = marshalMessage(EchoResponse, { message, index: count });
+    await stream.write(encodeOutgoingFrame(streams.encode(response)));
     await stream.writeStatus(Code.Ok, "", {
       "interop-stream-compressed-received": new TextEncoder().encode(String(streams.received)),
     });

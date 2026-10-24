@@ -86,7 +86,8 @@ impl<T> From<T> for ResponseEnvelope<T> {
 /// by every clone of the context.
 ///
 /// The server takes the headers when the handler returns and the trailing metadata when the
-/// response ends; setting either afterwards fails.
+/// response ends; setting either afterwards fails. On calls that send HEADERS at dispatch the
+/// headers count as sent from the start.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResponseMetadata {
     state: Arc<Mutex<ResponseMetadataState>>,
@@ -141,6 +142,16 @@ enum ResponseMetadataKind {
 }
 
 impl ResponseMetadata {
+    /// Response metadata whose headers have already been sent, so setting them fails.
+    pub(crate) fn with_headers_sent() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ResponseMetadataState {
+                headers_sent: true,
+                ..ResponseMetadataState::default()
+            })),
+        }
+    }
+
     pub(crate) fn set_header(&self, key: &str, value: Vec<u8>) -> Result<(), Status> {
         self.set(ResponseMetadataKind::Headers, key, value)
     }

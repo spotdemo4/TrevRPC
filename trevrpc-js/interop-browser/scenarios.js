@@ -272,10 +272,29 @@ const scenarios = {
     expect((await call.recv()) === undefined, "expected the stream to end after closeSend");
     const status = await call.status;
     expect(status.code === Code.Ok, "stream did not end with OK");
-    const received = Number(
-      new TextDecoder().decode(status.metadata["interop-stream-compressed-received"] ?? []),
-    );
-    expect(received >= 1, `interop-stream-compressed-received ${received}, want at least 1`);
+    expectStreamCompressed(status.metadata, "bidi");
+
+    // The server sends HEADERS at dispatch on this method, and they carry its answer, so the
+    // requests after them compress although the only response comes at the end.
+    let headersArrived;
+    const headers = new Promise((resolve) => {
+      headersArrived = resolve;
+    });
+    let trailers;
+    const upload = await compressed.clientStream({
+      onResponseHeaders: headersArrived,
+      onResponseMetadata: (metadata) => {
+        trailers = metadata;
+      },
+    });
+    await upload.send({ message: compressedMessage(0) });
+    await headers;
+    for (let i = 1; i < CompressedStreamMessages; i += 1) {
+      await upload.send({ message: compressedMessage(i) });
+    }
+    const all = Array.from({ length: CompressedStreamMessages }, (_, i) => compressedMessage(i));
+    expectEcho(await upload.closeAndRecv(), all.join(""), CompressedStreamMessages);
+    expectStreamCompressed(trailers, "client-stream");
   },
 };
 
@@ -366,6 +385,14 @@ for (const name of ScenarioNames) {
   if (typeof scenarios[name] !== "function") {
     throw new Error(`missing interop scenario ${name}`);
   }
+}
+
+/** Checks that the server received at least one request of the call stream-compressed. */
+function expectStreamCompressed(metadata, what) {
+  const received = Number(
+    new TextDecoder().decode(metadata?.["interop-stream-compressed-received"] ?? new Uint8Array()),
+  );
+  expect(received >= 1, `${what}: interop-stream-compressed-received ${received}, want at least 1`);
 }
 
 function base64Bytes(text) {

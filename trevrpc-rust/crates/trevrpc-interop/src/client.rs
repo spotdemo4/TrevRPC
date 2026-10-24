@@ -125,7 +125,8 @@ const COMPRESSED_STREAM_MESSAGES: u32 = 8;
 
 /// Echoes messages that compress against each other on a `CompressedEcho` stream, awaiting each
 /// echo so the server's HEADERS, which enable compressed requests, arrive before the third
-/// message, where stream compression starts.
+/// message, where stream compression starts; then uploads such messages on a client-streaming
+/// call, waiting only for its HEADERS after the first.
 async fn compressed_stream(client: &CompressedEcho) -> Scenario {
     let (sender, mut responses) = client
         .bidi()
@@ -153,8 +154,37 @@ async fn compressed_stream(client: &CompressedEcho) -> Scenario {
     let trailers = responses
         .terminal_metadata()
         .ok_or("the stream ended without a terminal status")?;
-    let received = counter(trailers, "interop-stream-compressed-received")?;
-    if received == 0 {
+    expect_stream_compressed(trailers)?;
+
+    // The server sends the HEADERS of a client-streaming call at dispatch, so the client can wait
+    // for them after its first message and stream-compress from the third.
+    let mut upload = client
+        .client_stream()
+        .options(|_| options())
+        .await
+        .map_err(rpc)?;
+    upload
+        .send(message(&compressed_message(0)))
+        .await
+        .map_err(rpc)?;
+    upload.headers().await.map_err(rpc)?;
+    for index in 1..COMPRESSED_STREAM_MESSAGES {
+        upload
+            .send(message(&compressed_message(index)))
+            .await
+            .map_err(rpc)?;
+    }
+    let response = upload.close_and_recv_with_response().await.map_err(rpc)?;
+    let expected: String = (0..COMPRESSED_STREAM_MESSAGES)
+        .map(compressed_message)
+        .collect();
+    expect_response(response.message(), &expected, COMPRESSED_STREAM_MESSAGES)?;
+    expect_stream_compressed(response.metadata())
+}
+
+/// Checks that the trailing metadata reports requests that arrived stream-compressed.
+fn expect_stream_compressed(trailers: &Metadata) -> Scenario {
+    if counter(trailers, "interop-stream-compressed-received")? == 0 {
         return Err("no request arrived stream-compressed".to_owned());
     }
     Ok(())

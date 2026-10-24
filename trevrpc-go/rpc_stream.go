@@ -267,7 +267,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 				requests.cancelRead = cancellable.trevrpcCancelRead
 			}
 		}
-		response = runtime.handleStreamingRequest(requestCtx, request, body, requests, lease)
+		response = runtime.handleStreamingRequest(requestCtx, request, body, requests, lease, stream)
 	}
 	defer discardMessageStream(response)
 

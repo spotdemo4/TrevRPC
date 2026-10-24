@@ -34,6 +34,9 @@ const BIDI: &str = "/test.Compressed/Chat";
 /// how many requests arrived stream-compressed.
 const STREAM: &str = "/test.Compressed/Stream";
 const STREAM_COMPRESSED_KEY: &str = "stream-compressed";
+/// A client-streaming route that allows stream compression, answers with the concatenation of
+/// its requests, and reports, in its trailing metadata, how many arrived stream-compressed.
+const UPLOAD: &str = "/test.Compressed/Upload";
 /// The type the test dictionary compresses: its samples are the JSON documents [`sample`] writes.
 const MESSAGE_TYPE: &str = "test.Echo";
 
@@ -139,6 +142,24 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
             });
             let responses: trevrpc::BoxStream<Vec<u8>> = Box::pin(requests.chain(report));
             Ok(responses)
+        },
+    );
+    server.route_streaming_with_options(
+        UPLOAD,
+        RpcKind::ClientStreaming,
+        options.with_compress_stream(CompressStream::REQUESTS),
+        |context, _body, requests| async move {
+            let mut value = String::new();
+            let mut requests = requests;
+            while let Some(body) = requests.next().await {
+                value.push_str(&<Echo as prost::Message>::decode(body?.as_slice())?.value);
+            }
+            context.set_response_metadata(
+                STREAM_COMPRESSED_KEY,
+                context.stream_compressed_requests_received().to_string(),
+            )?;
+            let response = prost::Message::encode_to_vec(&Echo { value });
+            Ok(trevrpc::stream::from_iter([response]))
         },
     );
     let endpoint = quinn::Endpoint::server(
@@ -636,10 +657,15 @@ async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_t
         Some(&b"4"[..])
     );
 
-    // Without an offer the server answers nothing and rejects stream-compressed requests.
+    // Without an offer the server answers nothing, though it sends its HEADERS at dispatch, and
+    // rejects stream-compressed requests.
     let frames = raw_stream_call(&connection, &stream_request(false), &requests).await?;
-    ensure_eq!(types(&frames), [frame_type::STATUS]);
-    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[0].payload)?);
+    ensure_eq!(types(&frames), [frame_type::HEADERS, frame_type::STATUS]);
+    ensure_eq!(
+        decode_payload::<RpcHeaders>(&frames[0].payload)?,
+        RpcHeaders::default()
+    );
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[1].payload)?);
     ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
 
     // An invalid chunk fails the call.
@@ -671,15 +697,21 @@ async fn a_server_without_stream_compression_memory_neither_answers_nor_compress
         )?;
     }
     let frames = raw_stream_call(&connection, &stream_request(true), &requests).await?;
+    // The HEADERS at dispatch carry no answer.
     ensure_eq!(
         types(&frames),
         [
+            frame_type::HEADERS,
             frame_type::MESSAGE,
             frame_type::MESSAGE,
             frame_type::MESSAGE,
             frame_type::MESSAGE,
             frame_type::STATUS,
         ]
+    );
+    ensure_eq!(
+        decode_payload::<RpcHeaders>(&frames[0].payload)?,
+        RpcHeaders::default()
     );
     drop(connection);
     server.stop().await
@@ -720,4 +752,148 @@ async fn stream_compressed_calls_work_over_quic_and_qmux() -> TestResult {
         server.stop().await?;
     }
     Ok(())
+}
+
+/// Reads one varint from `recv`, a byte at a time.
+async fn read_varint(recv: &mut quinn::RecvStream) -> TestResult<u64> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0];
+        recv.read_exact(&mut byte).await?;
+        bytes.push(byte[0]);
+        if let Some((value, _)) = trevrpc::varint::decode(&bytes) {
+            return Ok(value);
+        }
+    }
+}
+
+/// Reads one frame from `recv`.
+async fn read_frame(recv: &mut quinn::RecvStream) -> TestResult<RawFrame> {
+    let frame_type = read_varint(recv).await?;
+    let mut payload = vec![0; usize::try_from(read_varint(recv).await?)?];
+    recv.read_exact(&mut payload).await?;
+    Ok(RawFrame {
+        frame_type,
+        payload,
+    })
+}
+
+#[tokio::test]
+async fn the_server_sends_headers_before_reading_a_request_message() -> TestResult {
+    let server = spawn_server(Compression::new()).await?;
+    let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
+    for offer in [true, false] {
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let mut request = RpcRequest::new(UPLOAD).with_kind(RpcKind::ClientStreaming);
+        if offer {
+            request.stream_compression =
+                Some(trevrpc::wire::StreamCompression { max_window_log: 16 });
+        }
+        send.write_all(&encode_protobuf_frame(
+            frame_type::REQUEST,
+            &request,
+            1 << 20,
+        )?)
+        .await?;
+        // No request message has been sent, and the request stream is still open.
+        let headers = tokio::time::timeout(TEST_TIMEOUT, read_frame(&mut recv)).await??;
+        ensure_eq!(headers.frame_type, frame_type::HEADERS);
+        let headers: RpcHeaders = decode_payload(&headers.payload)?;
+        ensure_eq!(
+            headers.stream_compression,
+            offer.then_some(trevrpc::wire::StreamCompression { max_window_log: 16 })
+        );
+
+        let mut messages = Vec::new();
+        for i in 0..2 {
+            push_frame(
+                &mut messages,
+                frame_type::MESSAGE,
+                &prost::Message::encode_to_vec(&sample(i)),
+            )?;
+        }
+        send.write_all(&messages).await?;
+        send.finish()?;
+        let rest = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+        let frames = parse_frames(&rest)?;
+        ensure_eq!(types(&frames), [frame_type::MESSAGE, frame_type::STATUS]);
+        let reply: Echo = decode_payload(&frames[0].payload)?;
+        ensure_eq!(
+            reply.value,
+            format!("{}{}", sample(0).value, sample(1).value)
+        );
+    }
+    drop(connection);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn client_streaming_uploads_are_stream_compressed_once_the_headers_arrive() -> TestResult {
+    let server = spawn_server(Compression::new()).await?;
+    for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
+        let (_endpoint, channel) = compressed_channel(&server, policy).await?;
+        // Waiting for the headers after the first message, and sending slowly without reading
+        // them, both learn the server's answer before the third message.
+        for wait_for_headers in [true, false] {
+            let mut upload = trevrpc::client::client_streaming::<_, Echo, Echo>(
+                &channel,
+                UPLOAD,
+                trevrpc::client::CallOptions::new(),
+            )
+            .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+            .compress_stream(CompressStream::REQUESTS)
+            .await?;
+            upload.send(sample(0)).await?;
+            if wait_for_headers {
+                let headers = tokio::time::timeout(TEST_TIMEOUT, upload.headers()).await??;
+                ensure!(headers.is_empty(), "{headers:?}");
+            } else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            for i in 1..8 {
+                upload.send(sample(i)).await?;
+            }
+            let response =
+                tokio::time::timeout(TEST_TIMEOUT, upload.close_and_recv_with_response()).await??;
+            let expected: String = (0..8).map(|i| sample(i).value).collect();
+            ensure_eq!(response.message().value, expected, "{policy:?}");
+            // Messages 3 to 8 travel in the stream's context: [MESSAGE, MESSAGE,
+            // ZSTD_STREAM_MESSAGE, ...].
+            ensure_eq!(
+                response
+                    .metadata()
+                    .get(STREAM_COMPRESSED_KEY)
+                    .map(Vec::as_slice),
+                Some(&b"6"[..]),
+                "{policy:?}, waiting for headers: {wait_for_headers}"
+            );
+        }
+
+        // A call that sends a stream reads the response while it uploads too.
+        let requests = futures_util::stream::iter(0..8).then(|i| async move {
+            if i == 1 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Ok(sample(i))
+        });
+        let response = trevrpc::client::client_streaming::<_, Echo, Echo>(
+            &channel,
+            UPLOAD,
+            trevrpc::client::CallOptions::new(),
+        )
+        .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+        .compress_stream(CompressStream::REQUESTS)
+        .send_all(requests)
+        .with_response();
+        let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+        ensure_eq!(
+            response
+                .metadata()
+                .get(STREAM_COMPRESSED_KEY)
+                .map(Vec::as_slice),
+            Some(&b"6"[..]),
+            "{policy:?}, sending a stream"
+        );
+    }
+    server.stop().await
 }

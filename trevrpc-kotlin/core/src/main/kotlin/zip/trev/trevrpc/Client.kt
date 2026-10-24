@@ -46,10 +46,11 @@ class MessageCodec<T>(
  * [maxResponseStreamBodySize], and [streamIdleTimeout] are off until set.
  *
  * [onResponseHeaders] is called with the response headers, empty when the server sent none, as
- * soon as the first response frame arrives. [onResponseMetadata] is called with the trailing
- * metadata of the final status when the call succeeds, before its result is returned or its
- * response flow completes; a failed call carries its metadata on the [TrevRpcException] instead.
- * Both run in the coroutine that reads the response, and one that throws fails the call.
+ * soon as the first response frame arrives, also while a streaming request is still uploading.
+ * [onResponseMetadata] is called with the trailing metadata of the final status when the call
+ * succeeds, before its result is returned or its response flow completes; a failed call carries
+ * its metadata on the [TrevRpcException] instead. Both run in the coroutine that reads the
+ * response, and one that throws fails the call.
  */
 data class CallOptions(
     val timeout: Duration? = null,
@@ -322,7 +323,7 @@ class Client(
                 streams?.close()
                 throw error
             }
-        val call = CallStream(stream, compression, streams, options.maxResponseBodySize)
+        val call = CallStream(stream, compression, streams, options.maxResponseBodySize, options.onResponseHeaders)
         // A call that streams its request needs to learn of the server's terminal status while it uploads.
         if (!finishSend) call.pump = ResponsePump(responseContext, call, deadline, options)
         return OpenedStream(
@@ -733,10 +734,10 @@ internal class ResponseReader<T>(
                 )
             }
             headersMetadata = frame.metadata
-            options.onResponseHeaders?.invoke(frame.metadata)
+            call.reportHeaders(frame.metadata)
         } else if (headersMetadata == null) {
             headersMetadata = Metadata.EMPTY
-            options.onResponseHeaders?.invoke(Metadata.EMPTY)
+            call.reportHeaders(Metadata.EMPTY)
         }
         return frame
     }

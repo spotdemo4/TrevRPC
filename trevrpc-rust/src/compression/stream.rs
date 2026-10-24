@@ -27,6 +27,11 @@ use crate::{Result, RpcKind, varint, wire};
 /// and [`RouteOptions::with_compress_stream`](crate::server::RouteOptions::with_compress_stream).
 /// A direction is set only if the method streams it and its message type has no field marked
 /// `debug_redact`.
+///
+/// A server sends HEADERS at dispatch, before the handler runs, on every call to a method whose
+/// requests it may stream-compress (`requests` is set, the method streams requests and they are
+/// not unreliable), so the client learns the answer while it still streams. Handlers of such
+/// methods cannot set response headers; the runtime reports them as already sent.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct CompressStream {
     /// The messages the client streams may be stream-compressed.

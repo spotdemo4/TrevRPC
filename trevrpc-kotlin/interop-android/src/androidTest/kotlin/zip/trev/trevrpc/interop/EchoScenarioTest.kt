@@ -1,9 +1,11 @@
 package zip.trev.trevrpc.interop
 
 import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.consumeAsFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -241,10 +243,24 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
                 if (echoed < messages.size) requests.send(request(messages[echoed])) else requests.close()
             }
             expect(echoed == messages.size) { "expected ${messages.size} echoes, got $echoed" }
-            val compressed = response.trailers["interop-stream-compressed-received"]?.decodeToString()?.toIntOrNull()
-            expect(compressed != null && compressed >= 1) {
-                "expected trailing metadata interop-stream-compressed-received of at least 1, got $compressed"
-            }
+            expectStreamCompressed("bidi", response.trailers)
+
+            // The server sends HEADERS at dispatch on this method, with its answer, so the requests
+            // after them compress although the only response comes at the end.
+            val headers = CompletableDeferred<Unit>()
+            val upload =
+                flow {
+                    emit(request(messages[0]))
+                    headers.await()
+                    messages.drop(1).forEach { emit(request(it)) }
+                }
+            val summary = ResponseMetadata()
+            val echo =
+                client.clientStream(upload) {
+                    summary.capture(this).copy(onResponseHeaders = { headers.complete(Unit) })
+                }
+            expectEcho(echo, messages.joinToString(""), messages.size)
+            expectStreamCompressed("client-stream", summary.trailers)
         },
     )
 
@@ -264,6 +280,17 @@ private class ResponseMetadata {
 
     fun capture(options: CallOptions): CallOptions =
         options.copy(onResponseHeaders = { headersOrNull = it }, onResponseMetadata = { trailersOrNull = it })
+}
+
+/** Checks that the server received at least one request of the call stream-compressed. */
+private fun expectStreamCompressed(
+    what: String,
+    trailers: Metadata,
+) {
+    val compressed = trailers["interop-stream-compressed-received"]?.decodeToString()?.toIntOrNull()
+    expect(compressed != null && compressed >= 1) {
+        "$what: expected trailing metadata interop-stream-compressed-received of at least 1, got $compressed"
+    }
 }
 
 private fun expectCounter(

@@ -406,9 +406,20 @@ const compressedStreamMessages = 8
 
 // runCompressedStream is the compressed-stream scenario: CompressedEcho.Bidi,
 // waiting for each echo so that the server's answer in HEADERS arrives before
-// the client starts stream-compressing. The server reports how many requests
-// arrived stream-compressed.
+// the client starts stream-compressing, then CompressedEcho.ClientStream,
+// waiting for the HEADERS the server sends at dispatch. The server reports how
+// many requests arrived stream-compressed.
 func runCompressedStream(ctx context.Context, env *scenarioEnv) error {
+	if err := runCompressedBidi(ctx, env); err != nil {
+		return fmt.Errorf("bidi: %w", err)
+	}
+	if err := runCompressedClientStream(ctx, env); err != nil {
+		return fmt.Errorf("client stream: %w", err)
+	}
+	return nil
+}
+
+func runCompressedBidi(ctx context.Context, env *scenarioEnv) error {
 	stream, err := env.compressed.Bidi(ctx)
 	if err != nil {
 		return err
@@ -436,7 +447,42 @@ func runCompressedStream(ctx context.Context, env *scenarioEnv) error {
 	if !ok {
 		return errors.New("no terminal status after the end of the stream")
 	}
-	compressed, err := metadataCount(status.Metadata, streamCompressedReceivedKey)
+	return expectStreamCompressed(status.Metadata)
+}
+
+func runCompressedClientStream(ctx context.Context, env *scenarioEnv) error {
+	var trailers trevrpc.Metadata
+	call, err := env.compressed.ClientStream(ctx, trevrpc.CaptureResponseMetadata(&trailers))
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(call)
+	var want strings.Builder
+	for i := range compressedStreamMessages {
+		if err := call.Send(&interoppb.EchoRequest{Message: compressedMessage(i)}); err != nil {
+			return fmt.Errorf("send %d: %w", i, err)
+		}
+		want.WriteString(compressedMessage(i))
+		if i == 0 {
+			if _, err := call.Headers(); err != nil {
+				return fmt.Errorf("headers: %w", err)
+			}
+		}
+	}
+	response, err := call.CloseAndRecv()
+	if err != nil {
+		return err
+	}
+	if err := expectResponse(response, want.String(), compressedStreamMessages); err != nil {
+		return err
+	}
+	return expectStreamCompressed(trailers)
+}
+
+// expectStreamCompressed checks that the server received at least one request
+// stream-compressed.
+func expectStreamCompressed(trailers trevrpc.Metadata) error {
+	compressed, err := metadataCount(trailers, streamCompressedReceivedKey)
 	if err != nil {
 		return err
 	}

@@ -259,17 +259,24 @@ func (s *unreliableEcho) setTrailers() error {
 
 func (s *unreliableEcho) Close() error { return s.requests.Close() }
 
-// streamCompressedReceivedKey is the trailing metadata key of
-// CompressedEcho.Bidi.
+// streamCompressedReceivedKey is the trailing metadata key of the streaming
+// methods of CompressedEcho.
 const streamCompressedReceivedKey = "interop-stream-compressed-received"
 
 // compressedEchoServer implements CompressedEcho in interop/README.md: Echo's
-// Bidi, reporting how many requests arrived stream-compressed, and Echo's
-// ClientStream.
+// Bidi and ClientStream, reporting how many requests arrived
+// stream-compressed.
 type compressedEchoServer struct{}
 
 func (compressedEchoServer) ClientStream(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*interoppb.EchoResponse, error) {
-	return echoServer{}.ClientStream(ctx, requests)
+	response, err := echoServer{}.ClientStream(ctx, requests)
+	if err != nil {
+		return nil, err
+	}
+	if err := setStreamCompressedReceived(ctx); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func (compressedEchoServer) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
@@ -290,11 +297,7 @@ type compressedEcho struct {
 func (s *compressedEcho) Recv() (*interoppb.EchoResponse, error) {
 	response, err := s.responses.Recv()
 	if errors.Is(err, io.EOF) {
-		var received int64
-		if info, ok := trevrpc.HandlerContextFromContext(s.ctx); ok {
-			received = info.StreamCompressedRequests()
-		}
-		if err := trevrpc.SetResponseMetadata(s.ctx, streamCompressedReceivedKey, []byte(strconv.FormatInt(received, 10))); err != nil {
+		if err := setStreamCompressedReceived(s.ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -302,3 +305,13 @@ func (s *compressedEcho) Recv() (*interoppb.EchoResponse, error) {
 }
 
 func (s *compressedEcho) Close() error { return s.responses.Close() }
+
+// setStreamCompressedReceived sets the count of the call's requests that
+// arrived stream-compressed in its trailing metadata.
+func setStreamCompressedReceived(ctx context.Context) error {
+	var received int64
+	if info, ok := trevrpc.HandlerContextFromContext(ctx); ok {
+		received = info.StreamCompressedRequests()
+	}
+	return trevrpc.SetResponseMetadata(ctx, streamCompressedReceivedKey, []byte(strconv.FormatInt(received, 10)))
+}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/quicvarint"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"trev.zip/llc/trevrpc/trevrpc-go/internal/zstd"
@@ -38,6 +39,22 @@ func registerStreamCompressionService(server *Server) {
 		}
 		return newSliceStream(responses...), nil
 	}, both)
+	RegisterClientStreaming(server, testPath("StreamUpload"), newStringValue, joinUpload, both)
+}
+
+// joinUpload answers with the concatenation of the requests, and records how
+// many arrived stream-compressed.
+func joinUpload(ctx context.Context, requests MessageStream[*wrapperspb.StringValue]) (*wrapperspb.StringValue, error) {
+	var joined strings.Builder
+	for message, err := range Messages(requests) {
+		if err != nil {
+			return nil, err
+		}
+		joined.WriteString(message.GetValue())
+	}
+	info, _ := HandlerContextFromContext(ctx)
+	streamCompressedRequests.Store(info.StreamCompressedRequests())
+	return wrapperspb.String(joined.String()), nil
 }
 
 // countingRequests echoes the requests of a call and records, at their end,
@@ -268,6 +285,33 @@ func exerciseStreamCalls(t *testing.T, transport Transport) {
 	if _, err := feed.Recv(); !errors.Is(err, io.EOF) {
 		t.Fatalf("end of feed: %v", err)
 	}
+
+	upload, err := ClientStreaming[*wrapperspb.StringValue](ctx, transport, testPath("StreamUpload"), newStringValue, WithStreamCompression(StreamCompression{Requests: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = upload.Close() }()
+	var want strings.Builder
+	for i := range streamTestMessages {
+		if err := upload.Send(compressionSample(i)); err != nil {
+			t.Fatal(err)
+		}
+		want.WriteString(compressionSample(i).GetValue())
+		if i == 0 {
+			// The server sends HEADERS at dispatch, so the answer arrives
+			// while the upload is running.
+			if _, err := upload.Headers(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	got, err := upload.CloseAndRecv()
+	if err != nil || got.GetValue() != want.String() {
+		t.Fatalf("upload = %q, %v", got.GetValue(), err)
+	}
+	if got := streamCompressedRequests.Load(); got != streamTestMessages-streamCompressionStart+1 {
+		t.Fatalf("server saw %d stream-compressed uploads, want %d", got, streamTestMessages-streamCompressionStart+1)
+	}
 }
 
 // streamedFrames is what a stream of streamTestMessages messages in one
@@ -280,14 +324,14 @@ func streamedFrames(first string) string {
 	return strings.Join(frames, " ")
 }
 
-// checkStreamFrames checks the frames of the two calls exerciseStreamCalls
+// checkStreamFrames checks the frames of the three calls exerciseStreamCalls
 // made.
 func checkStreamFrames(t *testing.T, mu *sync.Mutex, log *[]*recordedStream) {
 	t.Helper()
 	mu.Lock()
 	defer mu.Unlock()
-	if len(*log) != 2 {
-		t.Fatalf("%d streams, want 2", len(*log))
+	if len(*log) != 3 {
+		t.Fatalf("%d streams, want 3", len(*log))
 	}
 	sent, received := (*log)[0].frames(t)
 	if want := "[" + streamedFrames("REQUEST") + "]"; fmt.Sprint(sent) != want {
@@ -304,6 +348,13 @@ func checkStreamFrames(t *testing.T, mu *sync.Mutex, log *[]*recordedStream) {
 	// sends no HEADERS.
 	if want := "[" + strings.TrimPrefix(streamedFrames(""), " ") + " STATUS]"; fmt.Sprint(received) != want {
 		t.Fatalf("feed received %v, want %s", received, want)
+	}
+	sent, received = (*log)[2].frames(t)
+	if want := "[" + streamedFrames("REQUEST") + "]"; fmt.Sprint(sent) != want {
+		t.Fatalf("upload sent %v, want %s", sent, want)
+	}
+	if fmt.Sprint(received) != "[HEADERS MESSAGE STATUS]" {
+		t.Fatalf("upload received %v", received)
 	}
 }
 
@@ -403,8 +454,8 @@ func TestStreamCompressionStartsFromDictionaries(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(*log) != 3 {
-		t.Fatalf("%d streams, want 3", len(*log))
+	if len(*log) != 4 {
+		t.Fatalf("%d streams, want 4", len(*log))
 	}
 	sent := parseRawFrames(t, (*log)[1].sent.Bytes())
 	received := parseRawFrames(t, (*log)[1].received.Bytes())
@@ -570,5 +621,115 @@ func TestStreamCompressionIsOffWithoutCgo(t *testing.T) {
 	}
 	if newStreamBudget(0, defaultServerStreamCompressionMemory, nil) != nil {
 		t.Fatal("a budget without cgo")
+	}
+}
+
+// pipedRPCStream is an RPC stream the test writes the request side of while
+// the server runs, and whose output can be read meanwhile.
+type pipedRPCStream struct {
+	lockedRPCStream
+	pipe *io.PipeReader
+}
+
+func (s *pipedRPCStream) Read(data []byte) (int, error) { return s.pipe.Read(data) }
+
+func (s *pipedRPCStream) Close() error { return s.pipe.Close() }
+
+// TestHeadersAtDispatch checks that a call to a route whose requests may be
+// stream-compressed gets HEADERS before the handler runs, with the answer to
+// its offer, and that the handler then cannot set response headers; other
+// routes are unchanged.
+func TestHeadersAtDispatch(t *testing.T) {
+	server := NewServer()
+	headerErrs := make(chan error, 1)
+	upload := func(ctx context.Context, requests MessageStream[*wrapperspb.StringValue]) (*wrapperspb.StringValue, error) {
+		headerErrs <- SetResponseHeader(ctx, testHeaderKey, []byte("v"))
+		return joinUpload(ctx, requests)
+	}
+	requestsOnly := RouteStreamCompression(StreamCompression{Requests: true})
+	RegisterClientStreaming(server, testPath("Upload"), newStringValue, upload, requestsOnly)
+	RegisterClientStreaming(server, testPath("Plain"), newStringValue, upload)
+	RegisterClientStreaming(server, testPath("Unreliable"), newStringValue, upload, requestsOnly, RouteUnreliable(Unreliable{Requests: true}))
+	RegisterClientStreaming(server, testPath("ResponsesOnly"), newStringValue, upload, RouteStreamCompression(StreamCompression{Responses: true}))
+	for _, test := range []struct {
+		method     string
+		offer      bool
+		dispatched bool
+	}{
+		{"Upload", true, true},
+		{"Upload", false, true},
+		{"Plain", true, false},
+		{"Unreliable", true, false},
+		{"ResponsesOnly", true, false},
+	} {
+		t.Run(fmt.Sprintf("%s offer=%v", test.method, test.offer), func(t *testing.T) {
+			request := requestFor(test.method, RPCKindClientStreaming)
+			if test.offer {
+				request.StreamCompression = streamOffer()
+			}
+			frame, err := appendRequestFrame(nil, request, DefaultMaxFrameSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pipe, client := io.Pipe()
+			stream := &pipedRPCStream{pipe: pipe}
+			done := make(chan struct{})
+			go func() {
+				handleRPCStream(context.Background(), server, stream, nil)
+				close(done)
+			}()
+			if _, err := client.Write(frame); err != nil {
+				t.Fatal(err)
+			}
+
+			// The handler runs before any request message was sent.
+			headerErr := <-headerErrs
+			early := parseRawFrames(t, stream.snapshot())
+			if test.dispatched {
+				if !errors.Is(headerErr, ErrResponseHeadersSent) {
+					t.Fatalf("SetResponseHeader = %v, want ErrResponseHeadersSent", headerErr)
+				}
+				if len(early) != 1 || early[0].typ != frameTypeHeaders {
+					t.Fatalf("written before the requests: %v", early)
+				}
+				metadata, answer, err := decodeHeaders(early[0].payload)
+				if err != nil || len(metadata) != 0 {
+					t.Fatalf("HEADERS = %v, %v", metadata, err)
+				}
+				if answered := answer.stream != nil; answered != (test.offer && zstd.Available) {
+					t.Fatalf("HEADERS answer = %+v", answer.stream)
+				}
+			} else {
+				if headerErr != nil {
+					t.Fatalf("SetResponseHeader = %v", headerErr)
+				}
+				if len(early) != 0 {
+					t.Fatalf("written before the requests: %v", early)
+				}
+			}
+
+			for _, value := range []string{"a", "b"} {
+				body, err := proto.Marshal(wrapperspb.String(value))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := client.Write(rawMessage(body).frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = client.Close()
+			<-done
+			frames := readTestFrames(t, stream.snapshot(), DefaultMaxFrameSize)
+			if len(frames) != 3 || frames[0].Kind != frameTypeHeaders || frames[1].Kind != frameTypeMessage || frames[2].Kind != frameTypeStatus || CodeFromUint32(frames[2].Status) != CodeOK {
+				t.Fatalf("frames = %#v, want HEADERS, MESSAGE, STATUS(OK)", frames)
+			}
+			if test.dispatched {
+				if len(frames[0].Headers) != 0 {
+					t.Fatalf("headers = %v, want none", frames[0].Headers)
+				}
+			} else {
+				requireHeaders(t, "headers", frames[0].Headers, testHeaderKey, "v")
+			}
+		})
 	}
 }

@@ -21,7 +21,8 @@ var (
 	// context that does not belong to a call being handled.
 	ErrNoHandlerContext = errors.New("trevrpc: context does not belong to a handled call")
 	// ErrResponseHeadersSent is returned when a response header is set after
-	// the headers have gone out, once the handler has returned.
+	// the headers have gone out: once the handler has returned, or from the
+	// start on a route whose requests may be stream-compressed.
 	ErrResponseHeadersSent = errors.New("trevrpc: response headers already sent")
 	// ErrResponseMetadataSent is returned when trailing metadata is set after
 	// the final status has gone out.
@@ -34,6 +35,14 @@ var (
 // CaptureResponseHeaders or the Headers method of a response stream. The key
 // is normalized with NormalizeMetadataKey and the value is copied. A failed
 // call sends no headers.
+//
+// A route whose request messages may be stream-compressed (RouteStreamCompression
+// with Requests on a client-streaming or bidirectional method whose requests
+// are not Unreliable) sends HEADERS at dispatch, before the handler runs, so
+// that the client learns the answer while it is still uploading. Its handlers
+// cannot set response headers: SetResponseHeader returns
+// ErrResponseHeadersSent from the start, on every call. They send trailing
+// metadata with SetResponseMetadata instead.
 func SetResponseHeader(ctx context.Context, key string, value []byte) error {
 	response := responseMetadataFromContext(ctx)
 	if response == nil {

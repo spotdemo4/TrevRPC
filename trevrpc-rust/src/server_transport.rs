@@ -404,8 +404,21 @@ async fn handle_streaming_rpc<W, R>(
         compression,
         stream,
     } = incoming;
-    // A call that queried or offered gets its answers in HEADERS before its first message.
-    let mut answer_pending = compression.answer.is_some() || stream.answer.is_some();
+    // Calls whose requests may be stream-compressed get HEADERS, with the answers, at dispatch,
+    // before any request message is read, so the client learns the answer while it still
+    // streams; their handlers cannot set headers. Other calls that queried or offered get their
+    // answers in HEADERS before their first message.
+    let headers_at_dispatch = server.sends_headers_at_dispatch(&request.method);
+    if headers_at_dispatch
+        && let Err(error) = send
+            .write_frames(&mut vec![ResponseFrame::Headers(Metadata::new())])
+            .await
+    {
+        cancel_from_transport_error(&cancellation, &error);
+        return;
+    }
+    let mut answer_pending =
+        !headers_at_dispatch && (compression.answer.is_some() || stream.answer.is_some());
     let max_frame_size = server.max_frame_size();
     let request_body_len = body.len();
     let method_for_failure = request.method.clone();
@@ -429,7 +442,10 @@ async fn handle_streaming_rpc<W, R>(
                 None => request_body,
             };
             let responses = server.route_unreliable(&request.method).responses.then(|| {
-                ResponseDatagrams::new(flow.sender.with_compression(compression.responses.clone()))
+                ResponseDatagrams::new(
+                    flow.sender.with_compression(compression.responses.clone()),
+                    headers_at_dispatch,
+                )
             });
             (request_body, count, responses, Some(flow.guard))
         }
@@ -591,10 +607,11 @@ struct ResponseDatagrams {
 }
 
 impl ResponseDatagrams {
-    const fn new(sender: FlowSender) -> Self {
+    /// `headers_flushed` is whether the call's HEADERS have already been written.
+    const fn new(sender: FlowSender, headers_flushed: bool) -> Self {
         Self {
             sender,
-            headers_flushed: false,
+            headers_flushed,
             sent_any: false,
         }
     }
