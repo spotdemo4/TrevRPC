@@ -1,8 +1,8 @@
 // Stream compression: each direction of a call may compress its messages with one zstd context
 // that lasts as long as the call, sent as ZSTD_STREAM_MESSAGE frames (see the "Stream Compression"
 // section of the wire format). A client offers it in its REQUEST on methods that allow it, and
-// may compress its requests once the server's HEADERS answer. Contexts hold memory for the whole
-// call, so every channel has a budget for them.
+// may compress its requests once the server's HEADERS answer, or from the start when it offers
+// optimistically. Contexts hold memory for the whole call, so every channel has a budget for them.
 import { encodeMessage, parseStreamChunk } from "./compression.js";
 import { FrameType } from "./framing.js";
 import { internal, resourceExhausted } from "./status.js";
@@ -30,6 +30,11 @@ export class StreamBudget {
       throw new TypeError("streamCompressionMemory must be a non-negative integer number of bytes");
     }
     this.#available = bytes;
+  }
+
+  /** Whether `bytes` fit now. */
+  fits(bytes) {
+    return bytes <= this.#available;
   }
 
   /** Sets aside `bytes`, returning a function that gives them back, or undefined if they do not fit. */
@@ -103,20 +108,33 @@ export class CallStreams {
   }
 
   /**
-   * Sets the REQUEST's `streamCompression` offer. A call whose responses may be compressed first
-   * reserves their decompressing context, and offers nothing if that does not fit; a call that
-   * only compresses requests offers so the server can answer.
+   * Sets the REQUEST's `streamCompression` offer, and returns whether it is optimistic. A call
+   * whose responses may be compressed first reserves their decompressing context, and offers
+   * nothing if that does not fit; a call that only compresses requests offers so the server can
+   * answer. With `optimistic`, a call whose requests may be compressed offers optimistically if
+   * the budget has room for their compressing context now: its requests are enabled from the
+   * start, and the server accepts or refuses the call at dispatch.
    */
-  offer(fields) {
+  offer(fields, optimistic = false) {
     if (this.#responses) {
       const release = this.#budget.reserve(this.#compression.streamDecoderCost(StreamWindowLog));
       if (release === undefined) {
-        return;
+        return false;
       }
       this.#releases.push(release);
     }
     fields.streamCompression = { maxWindowLog: StreamWindowLog };
     this.#offered = true;
+    if (
+      optimistic &&
+      this.#requests &&
+      this.#budget.fits(this.#compression.streamEncoderCost(StreamWindowLog))
+    ) {
+      fields.streamCompression.optimistic = true;
+      this.#requestWindowLog = StreamWindowLog;
+      return true;
+    }
+    return false;
   }
 
   /** Records the server's answer from the response HEADERS. */
@@ -231,5 +249,54 @@ export class CallStreams {
     for (const release of this.#releases.splice(0)) {
       release();
     }
+  }
+}
+
+/** The most request bytes an optimistic call keeps for a replay. */
+export const MaxReplayBytes = 1 << 20;
+
+/**
+ * The requests an optimistic call has sent while the server has not yet accepted or refused it:
+ * the marshalled messages, before compression, so a refused call can be replayed. They are held
+ * within MaxReplayBytes and the channel's stream budget; a request that does not fit waits for
+ * the decision. `decided` settles with "accepted", "refused" or "ended".
+ */
+export class ReplayCopies {
+  #budget;
+  #bodies = [];
+  #bytes = 0;
+  #releases = [];
+  #resolve;
+  decided = new Promise((resolve) => {
+    this.#resolve = resolve;
+  });
+
+  constructor(budget) {
+    this.#budget = budget;
+  }
+
+  /** Keeps `body`, or returns false if it does not fit; the sender then waits for `decided`. */
+  keep(body) {
+    if (this.#bytes + body.byteLength > MaxReplayBytes) {
+      return false;
+    }
+    const release = this.#budget.reserve(body.byteLength);
+    if (release === undefined) {
+      return false;
+    }
+    this.#releases.push(release);
+    this.#bodies.push(body);
+    this.#bytes += body.byteLength;
+    return true;
+  }
+
+  /** Settles the decision, returns the memory, and returns the kept messages in order. */
+  settle(outcome) {
+    for (const release of this.#releases.splice(0)) {
+      release();
+    }
+    this.#bytes = 0;
+    this.#resolve(outcome);
+    return this.#bodies.splice(0);
   }
 }

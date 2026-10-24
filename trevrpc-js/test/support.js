@@ -81,6 +81,23 @@ export class ServerStream {
     return this.write(encodeStatusFrame({ code, message, metadata }));
   }
 
+  /**
+   * Refuses an optimistic call, as servers do when they cannot decode its stream-compressed
+   * requests: a lone STATUS, then the end of both directions.
+   */
+  async refuse() {
+    await this.write(
+      encodeStatusFrame({
+        code: Code.ResourceExhausted,
+        message: "stream compression unavailable",
+        metadata: {},
+        refusedStreamCompression: true,
+      }),
+    );
+    await this.finish();
+    await this.stopSending();
+  }
+
   write(bytes) {
     return this.writer.write(bytes);
   }
@@ -280,14 +297,16 @@ export async function readGoldenVectors(file) {
 /**
  * The server side of stream compression, for fake servers, as the Go and Rust servers do it: it
  * answers a REQUEST that offers stream compression, decodes stream-compressed requests, and
- * stream-compresses responses from the third. `answer: false` leaves requests uncompressed, and
- * `compressResponses: false` responses.
+ * stream-compresses responses from the third. `answer: false` leaves requests uncompressed, as a
+ * server out of budget or one whose route does not decode them, and then `refuses` says to refuse
+ * an optimistic call; `compressResponses: false` leaves responses uncompressed.
  */
 export class ServerStreams {
   /** How many requests arrived stream-compressed. */
   received = 0;
   #compression;
   #offered;
+  #optimistic;
   #answer;
   #compressResponses;
   #sent = 0;
@@ -298,8 +317,14 @@ export class ServerStreams {
   constructor(compression, request, { answer = true, compressResponses = true } = {}) {
     this.#compression = compression;
     this.#offered = (request.streamCompression?.maxWindowLog ?? 0) >= 10;
+    this.#optimistic = this.#offered && Boolean(request.streamCompression.optimistic);
     this.#answer = this.#offered && answer;
     this.#compressResponses = this.#offered && compressResponses;
+  }
+
+  /** Whether the call is optimistic and not answered, so the server must refuse it. */
+  get refuses() {
+    return this.#optimistic && !this.#answer;
   }
 
   /** The HEADERS fields of the answer, if any. */

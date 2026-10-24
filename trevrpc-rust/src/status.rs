@@ -78,6 +78,10 @@ pub struct Status {
     code: Code,
     message: String,
     metadata: Metadata,
+    /// Set only on the STATUS that refuses an optimistic call, which the runtime writes itself:
+    /// application code cannot set it, and a decoded STATUS never carries it, so a handler that
+    /// forwards another call's status can never make its client replay a call.
+    refused_stream_compression: bool,
 }
 
 impl Status {
@@ -88,6 +92,17 @@ impl Status {
             code,
             message: message.into(),
             metadata: Metadata::new(),
+            refused_stream_compression: false,
+        }
+    }
+
+    /// The STATUS that refuses an optimistic call: the server does not decode its
+    /// stream-compressed requests, and no application code ran.
+    pub(crate) fn refused_stream_compression() -> Self {
+        Self {
+            refused_stream_compression: true,
+            // No message, so the frame is the same few bytes on every server.
+            ..Self::resource_exhausted("")
         }
     }
 
@@ -201,6 +216,7 @@ impl From<Status> for RpcStatus {
             code: status.code.as_u32(),
             message: status.message,
             metadata: status.metadata,
+            refused_stream_compression: status.refused_stream_compression,
         }
     }
 }

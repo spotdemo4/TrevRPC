@@ -24,7 +24,7 @@ import {
   statusError,
   statusFromTransportError,
 } from "./status.js";
-import { CallStreams, streamBudget } from "./stream-compression.js";
+import { CallStreams, ReplayCopies, streamBudget } from "./stream-compression.js";
 
 /** Longest delay setTimeout can represent; it fires immediately beyond this. */
 const MaxTimerDelayMs = 2_147_483_647;
@@ -152,6 +152,23 @@ export class Call {
   /** Settles when the flush loop has sent everything queued so far. */
   #sendTail = Promise.resolve();
   #flushing = false;
+  /**
+   * What the call needs to open itself again, for the replay of a refused optimistic call:
+   * `{ transport, request, rpc, deadline }`, where `deadline` is the `performance.now()` time the
+   * call's timeout ends, or undefined.
+   */
+  #setup;
+  /**
+   * The requests an optimistic call has sent, kept until the server accepts or refuses it;
+   * undefined once it decided, and on calls that are not optimistic.
+   */
+  #copies;
+  /** Whether the call was optimistic, so its sends and close go through #ordered. */
+  #optimistic = false;
+  /** Settles once the previous send or close of an optimistic call has written, in call order. */
+  #ordered = Promise.resolve();
+  /** The replay of a refused optimistic call, once it started. */
+  #replaying;
 
   /**
    * Opens a stream on the transport and sends the REQUEST frame. The request carries the
@@ -180,6 +197,12 @@ export class Call {
       const session = perSession ? {} : undefined;
       const stream = await openStream(transport, scope.signal, session);
       call = new Call(stream, scope, options.maxFrameSize);
+      call.#setup = {
+        transport,
+        request: { ...request, metadata: options.metadata },
+        rpc,
+        deadline: options.timeoutMs == null ? undefined : performance.now() + options.timeoutMs,
+      };
       await call.#write(
         header ?? call.#requestOnSession(fields, message, session, compression, transport, rpc),
       );
@@ -194,27 +217,14 @@ export class Call {
 
   /**
    * Sets the call up on the session that carries it, negotiating compression and opening its
-   * datagram flow as the method needs, and encodes the REQUEST.
+   * datagram flow as the method needs, and encodes the REQUEST. A call whose requests may be
+   * stream-compressed offers optimistically while the session allows it, unless `replay` says this
+   * is the replay of a refused call or the call has a datagram flow, which a replay would need to
+   * open again.
    */
-  #requestOnSession(fields, message, session, compression, transport, rpc) {
+  #requestOnSession(fields, message, session, compression, transport, rpc, replay = false) {
     const { types, datagrams, compressStream } = rpc;
     const request = { ...fields };
-    if (compression !== undefined) {
-      this.#compression = sessionCompression(compression, session.key);
-      this.#requestType = types.request;
-      const negotiation = this.#compression.prepare(types.response);
-      Object.assign(request, negotiation.fields);
-      this.#accept = negotiation.accept;
-      this.#queried = negotiation.queried;
-      if (compressStream?.requests || compressStream?.responses) {
-        this.#streams = new CallStreams(compression, streamBudget(transport), compressStream, {
-          session: this.#compression,
-          requestType: types.request,
-          accept: negotiation.accept,
-        });
-        this.#streams.offer(request);
-      }
-    }
     if (datagrams !== undefined) {
       this.#flow = datagramEndpoint(session.datagrams)?.openFlow({
         receive: datagrams.receive,
@@ -223,6 +233,28 @@ export class Call {
       this.#sendDatagrams = this.#flow !== undefined && datagrams.send;
       if (this.#flow !== undefined) {
         request.datagramFlow = this.#flow.id;
+      }
+    }
+    if (compression !== undefined) {
+      this.#compression = sessionCompression(compression, session.key);
+      this.#requestType = types.request;
+      const negotiation = this.#compression.prepare(types.response);
+      Object.assign(request, negotiation.fields);
+      this.#accept = negotiation.accept;
+      this.#queried = negotiation.queried;
+      if (compressStream?.requests || compressStream?.responses) {
+        const budget = streamBudget(transport);
+        this.#streams = new CallStreams(compression, budget, compressStream, {
+          session: this.#compression,
+          requestType: types.request,
+          accept: negotiation.accept,
+        });
+        const optimistic =
+          !replay && this.#flow === undefined && this.#compression.optimisticStreams;
+        if (this.#streams.offer(request, optimistic)) {
+          this.#copies = new ReplayCopies(budget);
+          this.#optimistic = true;
+        }
       }
     }
     return encodeRequestFrame(
@@ -263,27 +295,80 @@ export class Call {
     return receivedMessage(frame, this.#accept, this.#maxFrameSize);
   }
 
-  /** Records the server's answers in the response HEADERS to what the REQUEST asked. */
+  /**
+   * Records the server's answers in the response HEADERS to what the REQUEST asked. HEADERS
+   * accept an optimistic call, and a `stream_compression` answer lets the session's calls be
+   * optimistic again after a refusal.
+   */
   learnAnswers(headers) {
     if (this.#queried) {
       this.#compression.learn(headers.dictionaries);
     }
     this.#streams?.learn(headers.streamCompression);
+    this.#settleCopies("accepted");
+    if ((headers.streamCompression?.maxWindowLog ?? 0) >= 10 && this.#compression !== undefined) {
+      this.#compression.optimisticStreams = true;
+    }
+  }
+
+  /** Whether a STATUS refusing the call's optimistic stream compression can still be replayed. */
+  get replayable() {
+    return this.#copies !== undefined;
+  }
+
+  /**
+   * Replays a call the server refused: opens a new stream for it with the same REQUEST, not
+   * optimistic and with the time left before its deadline, and sends the kept requests and, if the
+   * caller closed the request side, its end. Sends waiting meanwhile continue on the new stream.
+   * The session stops being optimistic until a call is answered. Resolves once the replay was
+   * written; the response is read from the new stream after that.
+   */
+  replay() {
+    const copies = this.#copies;
+    this.#copies = undefined;
+    this.#compression.optimisticStreams = false;
+    this.#replaying = this.#reopen(copies.settle("refused"));
+    this.#replaying.catch(() => {});
+    return this.#replaying;
+  }
+
+  async #reopen(bodies) {
+    const { transport, request, rpc, deadline } = this.#setup;
+    // The old stream's failures belong to the refused call, not to this one.
+    this.#writer.abort(cancelled("RPC replayed")).catch(() => {});
+    this.#cancelReader(cancelled("RPC replayed")).catch(() => {});
+    this.#releaseSessionState();
+    const session = {};
+    const stream = await openStream(transport, this.signal, session);
+    this.#attach(stream);
+    this.#uploadFailure = undefined;
+    const timeoutMs =
+      deadline === undefined ? undefined : Math.max(0, deadline - performance.now());
+    const fields = { ...request, ...timeoutField({ timeoutMs }) };
+    const compression = transportCompression(transport);
+    await this.#write(
+      this.#requestOnSession(fields, undefined, session, compression, transport, rpc, true),
+    );
+    for (const body of bodies) {
+      await this.#write(encodeOutgoingFrame(this.#encode(body), this.#maxFrameSize));
+    }
+    if (this.#sendClosed && this.#uploadEnded === undefined) {
+      await this.#upload(this.#writer.close());
+      this.#closeCompleted = true;
+    }
+  }
+
+  /** Ends an optimistic call's wait for the server's decision with `outcome`. */
+  #settleCopies(outcome) {
+    const copies = this.#copies;
+    this.#copies = undefined;
+    copies?.settle(outcome);
   }
 
   constructor(stream, scope, maxFrameSize) {
-    const reader = stream.readable.getReader();
     this.#scope = scope;
-    this.#writer = stream.writable.getWriter();
-    this.#cancelReader = (reason) => reader.cancel(reason);
-    this.#frames = new FrameReader(reader);
     this.#maxFrameSize = maxFrameSize;
-    // The transport errors the request side as soon as the server stops reading it.
-    this.#writer.closed.catch((error) => {
-      if (this.#uploadEnded === undefined) {
-        this.#uploadFailure ??= statusFromTransportError(error);
-      }
-    });
+    this.#attach(stream);
     scope.signal.addEventListener("abort", () => this.#teardown(), { once: true });
     if (scope.signal.aborted) {
       this.#teardown();
@@ -301,6 +386,21 @@ export class Call {
    */
   get uploadFailure() {
     return this.#uploadFailure;
+  }
+
+  /** Makes `stream` the one the call writes and reads. */
+  #attach(stream) {
+    const reader = stream.readable.getReader();
+    const writer = stream.writable.getWriter();
+    this.#writer = writer;
+    this.#cancelReader = (reason) => reader.cancel(reason);
+    this.#frames = new FrameReader(reader);
+    // The transport errors the request side as soon as the server stops reading it.
+    writer.closed.catch((error) => {
+      if (this.#writer === writer && this.#uploadEnded === undefined) {
+        this.#uploadFailure ??= statusFromTransportError(error);
+      }
+    });
   }
 
   /** Whether the request side can still be written: not ended, not closed. */
@@ -330,6 +430,9 @@ export class Call {
     }
     if (this.#sendClosed) {
       return Promise.reject(failedPrecondition("request stream is closed"));
+    }
+    if (this.#optimistic) {
+      return this.#inOrder((issued) => this.#sendOptimistic(body, issued));
     }
     const message = this.#encode(body);
     if (this.#sendDatagrams) {
@@ -404,12 +507,89 @@ export class Call {
     return this.#unsent.splice(0, count);
   }
 
+  /**
+   * Runs `operation(issued)` after the previous send or close of an optimistic call has written,
+   * so they reach the stream in call order even when one waits; `operation` calls `issued` once
+   * it has written.
+   */
+  #inOrder(operation) {
+    const previous = this.#ordered;
+    let issued;
+    this.#ordered = new Promise((resolve) => {
+      issued = resolve;
+    });
+    return previous.then(() => operation(issued)).finally(issued);
+  }
+
+  /**
+   * Sends a request of an optimistic call. Until the server decides, the request is kept for a
+   * replay; one that does not fit waits for the decision. A request written to a stream the
+   * server then refused does not fail: the replay sends it again.
+   */
+  async #sendOptimistic(body, issued) {
+    let copies;
+    for (;;) {
+      if (this.#uploadEnded !== undefined) {
+        throw this.#uploadEnded;
+      }
+      if (this.#replaying !== undefined) {
+        await this.#replaying;
+      }
+      if (this.#copies === undefined) {
+        break;
+      }
+      if (this.#copies.keep(body)) {
+        copies = this.#copies;
+        break;
+      }
+      await this.#copies.decided;
+    }
+    const writing = this.#write(encodeOutgoingFrame(this.#encode(body), this.#maxFrameSize));
+    issued();
+    await this.#survivingRefusal(writing, copies);
+  }
+
+  /**
+   * Waits for a write of an optimistic call. If it fails while the server's decision was pending
+   * and the server then refused the call, the replay covers it: this waits for the replay instead.
+   */
+  async #survivingRefusal(writing, copies) {
+    try {
+      return await writing;
+    } catch (error) {
+      if (copies !== undefined && (await copies.decided) === "refused") {
+        await this.#replaying;
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
   /** Finishes the request stream gracefully. */
   closeSend() {
     if (this.#sendClosed) {
       return Promise.resolve();
     }
     this.#sendClosed = true;
+    if (this.#optimistic) {
+      return this.#inOrder(async (issued) => {
+        if (this.#replaying !== undefined) {
+          // A replay in progress ends the new stream itself; after one, the stream is ended here.
+          issued();
+          await this.#replaying;
+          if (!this.#closeCompleted) {
+            await this.#upload(this.#writer.close());
+            this.#closeCompleted = true;
+          }
+          return;
+        }
+        const copies = this.#copies;
+        const closing = this.#upload(this.#writer.close());
+        issued();
+        await this.#survivingRefusal(closing, copies);
+        this.#closeCompleted = true;
+      });
+    }
     // Datagram sends in flight go first, so the stream does not end before them.
     const closing = this.#sendDatagrams
       ? this.#sendTail.then(() => this.#writer.close())
@@ -459,6 +639,7 @@ export class Call {
    * transport blocked on flow control does not act on an abort while the write is in flight.
    */
   #upload(operation) {
+    const writer = this.#writer;
     return new Promise((resolve, reject) => {
       this.#pendingUploads.add(reject);
       operation.then(
@@ -472,19 +653,25 @@ export class Call {
         },
         (error) => {
           this.#pendingUploads.delete(reject);
-          reject(this.#uploadError(error));
+          reject(this.#uploadError(error, writer));
         },
       );
     });
   }
 
-  /** Maps a failed request-side operation to the call's error. */
-  #uploadError(error) {
+  /**
+   * Maps a failed request-side operation on `writer` to the call's error. Only the stream the call
+   * still writes records the upload failure; a replayed call's old stream does not.
+   */
+  #uploadError(error, writer) {
     if (this.signal.aborted) {
       return this.signal.reason;
     }
     if (error === this.#uploadEnded) {
       return error;
+    }
+    if (writer !== this.#writer) {
+      return statusFromTransportError(error);
     }
     this.#uploadFailure ??= statusFromTransportError(error);
     return this.#uploadFailure;
@@ -524,6 +711,7 @@ export class Call {
   #releaseSessionState() {
     this.#flow?.release();
     this.#streams?.close();
+    this.#settleCopies("ended");
   }
 
   #teardown() {

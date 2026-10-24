@@ -1,4 +1,7 @@
-import { CompressedEchoClient } from "../build/interop/gen/compressed.trevrpc.js";
+import {
+  CompressedEchoClient,
+  RefusingEchoClient,
+} from "../build/interop/gen/compressed.trevrpc.js";
 import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
 import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
@@ -16,6 +19,8 @@ const UnreliableLargeSize = 4096;
 const CompressedMessages = 3;
 /** How many messages the `compressed-stream` scenario echoes. */
 const CompressedStreamMessages = 8;
+/** How many of them an optimistic call stream-compresses: the third and every later one. */
+const OptimisticCompressed = CompressedStreamMessages - 2;
 /** The message types the interop dictionary compresses. */
 const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
 
@@ -260,43 +265,82 @@ const scenarios = {
     expect((await call.status).code === Code.Ok, "stream did not end with OK");
   },
 
-  // Each echo is awaited, so the server's HEADERS, which let the client compress its requests,
-  // arrive before the third request, when stream compression starts.
+  // The client compresses its requests optimistically, from the third, without waiting for the
+  // server's answer.
   async "compressed-stream"(_echo, { compressed }) {
-    const call = await compressed.bidi();
-    for (let i = 0; i < CompressedStreamMessages; i += 1) {
-      await call.send({ message: compressedMessage(i) });
-      expectEcho(await call.recv(), compressedMessage(i), i);
-    }
-    await call.closeSend();
-    expect((await call.recv()) === undefined, "expected the stream to end after closeSend");
-    const status = await call.status;
-    expect(status.code === Code.Ok, "stream did not end with OK");
-    expectStreamCompressed(status.metadata, "bidi");
+    expectStreamCompressed(await compressedBidi(compressed), "bidi", OptimisticCompressed);
+    expectStreamCompressed(
+      await compressedUpload(compressed),
+      "client-stream",
+      OptimisticCompressed,
+    );
+  },
 
-    // The server sends HEADERS at dispatch on this method, and they carry its answer, so the
-    // requests after them compress although the only response comes at the end.
-    let headersArrived;
-    const headers = new Promise((resolve) => {
-      headersArrived = resolve;
-    });
-    let trailers;
-    const upload = await compressed.clientStream({
-      onResponseHeaders: headersArrived,
-      onResponseMetadata: (metadata) => {
-        trailers = metadata;
-      },
-    });
-    await upload.send({ message: compressedMessage(0) });
-    await headers;
-    for (let i = 1; i < CompressedStreamMessages; i += 1) {
-      await upload.send({ message: compressedMessage(i) });
+  // The server refuses the optimistic call to RefusingEcho and the client replays it. The next call
+  // is not optimistic, and compresses once the server's answer arrives; that answer makes the
+  // client optimistic again.
+  async "refused-stream"(_echo, { compressed, refusing }) {
+    const upload = await refusing.clientStream();
+    for (const message of compressedStreamMessages()) {
+      await upload.send({ message });
     }
-    const all = Array.from({ length: CompressedStreamMessages }, (_, i) => compressedMessage(i));
-    expectEcho(await upload.closeAndRecv(), all.join(""), CompressedStreamMessages);
-    expectStreamCompressed(trailers, "client-stream");
+    expectEcho(
+      await upload.closeAndRecv(),
+      compressedStreamMessages().join(""),
+      CompressedStreamMessages,
+    );
+    expectStreamCompressed(await compressedBidi(compressed), "bidi", 1);
+    expectStreamCompressed(
+      await compressedUpload(compressed),
+      "client-stream",
+      OptimisticCompressed,
+    );
   },
 };
+
+/** The messages of the `compressed-stream` scenario. */
+function compressedStreamMessages() {
+  return Array.from({ length: CompressedStreamMessages }, (_, i) => compressedMessage(i));
+}
+
+/**
+ * CompressedEcho.Bidi echoing the `compressed-stream` messages one at a time; returns its trailing
+ * metadata.
+ */
+async function compressedBidi(compressed) {
+  const call = await compressed.bidi();
+  for (const [i, message] of compressedStreamMessages().entries()) {
+    await call.send({ message });
+    expectEcho(await call.recv(), message, i);
+  }
+  await call.closeSend();
+  expect((await call.recv()) === undefined, "expected the stream to end after closeSend");
+  const status = await call.status;
+  expect(status.code === Code.Ok, "stream did not end with OK");
+  return status.metadata;
+}
+
+/**
+ * CompressedEcho.ClientStream sending the `compressed-stream` messages without waiting; returns
+ * its trailing metadata.
+ */
+async function compressedUpload(compressed) {
+  let trailers;
+  const upload = await compressed.clientStream({
+    onResponseMetadata: (metadata) => {
+      trailers = metadata;
+    },
+  });
+  for (const message of compressedStreamMessages()) {
+    await upload.send({ message });
+  }
+  expectEcho(
+    await upload.closeAndRecv(),
+    compressedStreamMessages().join(""),
+    CompressedStreamMessages,
+  );
+  return trailers;
+}
 
 /** The channel transports each interop lane allows. */
 const LaneTransports = {
@@ -363,6 +407,7 @@ export async function runScenarios({
     const context = {
       unreliable: new UnreliableEchoClient(channel, { timeoutMs: DeadlineMs }),
       compressed: new CompressedEchoClient(channel, { timeoutMs: DeadlineMs }),
+      refusing: new RefusingEchoClient(channel, { timeoutMs: DeadlineMs }),
       get transport() {
         return channel.transport;
       },
@@ -387,12 +432,15 @@ for (const name of ScenarioNames) {
   }
 }
 
-/** Checks that the server received at least one request of the call stream-compressed. */
-function expectStreamCompressed(metadata, what) {
+/** Checks that the server received at least `least` requests of the call stream-compressed. */
+function expectStreamCompressed(metadata, what, least) {
   const received = Number(
     new TextDecoder().decode(metadata?.["interop-stream-compressed-received"] ?? new Uint8Array()),
   );
-  expect(received >= 1, `${what}: interop-stream-compressed-received ${received}, want at least 1`);
+  expect(
+    received >= least,
+    `${what}: interop-stream-compressed-received ${received}, want at least ${least}`,
+  );
 }
 
 function base64Bytes(text) {

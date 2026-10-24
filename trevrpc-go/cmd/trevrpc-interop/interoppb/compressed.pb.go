@@ -28,6 +28,8 @@ const file_compressed_proto_rawDesc = "" +
 	"\x10compressed.proto\x12\x12trevrpc.interop.v1\x1a\rinterop.proto\x1a\x15trevrpc/options.proto2\xc4\x01\n" +
 	"\x0eCompressedEcho\x12U\n" +
 	"\x04Bidi\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x010\x01\x12[\n" +
+	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x012k\n" +
+	"\fRefusingEcho\x12[\n" +
 	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x01b\x06proto3"
 
 var file_compressed_proto_goTypes = []any{
@@ -37,10 +39,12 @@ var file_compressed_proto_goTypes = []any{
 var file_compressed_proto_depIdxs = []int32{
 	0, // 0: trevrpc.interop.v1.CompressedEcho.Bidi:input_type -> trevrpc.interop.v1.EchoRequest
 	0, // 1: trevrpc.interop.v1.CompressedEcho.ClientStream:input_type -> trevrpc.interop.v1.EchoRequest
-	1, // 2: trevrpc.interop.v1.CompressedEcho.Bidi:output_type -> trevrpc.interop.v1.EchoResponse
-	1, // 3: trevrpc.interop.v1.CompressedEcho.ClientStream:output_type -> trevrpc.interop.v1.EchoResponse
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
+	0, // 2: trevrpc.interop.v1.RefusingEcho.ClientStream:input_type -> trevrpc.interop.v1.EchoRequest
+	1, // 3: trevrpc.interop.v1.CompressedEcho.Bidi:output_type -> trevrpc.interop.v1.EchoResponse
+	1, // 4: trevrpc.interop.v1.CompressedEcho.ClientStream:output_type -> trevrpc.interop.v1.EchoResponse
+	1, // 5: trevrpc.interop.v1.RefusingEcho.ClientStream:output_type -> trevrpc.interop.v1.EchoResponse
+	3, // [3:6] is the sub-list for method output_type
+	0, // [0:3] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -60,7 +64,7 @@ func file_compressed_proto_init() {
 			NumEnums:      0,
 			NumMessages:   0,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_compressed_proto_goTypes,
 		DependencyIndexes: file_compressed_proto_depIdxs,

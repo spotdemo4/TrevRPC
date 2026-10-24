@@ -110,6 +110,7 @@ type scenarioEnv struct {
 	echo       *interoppb.EchoClient
 	unreliable *interoppb.UnreliableEchoClient
 	compressed *interoppb.CompressedEchoClient
+	refusing   *interoppb.RefusingEchoClient
 	// transport is the transport of the connection.
 	transport trevrpc.TransportKind
 	// datagramFrames reports how many QUIC DATAGRAM frames the connection has
@@ -152,6 +153,7 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 		echo:       interoppb.NewEchoClient(channel),
 		unreliable: interoppb.NewUnreliableEchoClient(channel),
 		compressed: interoppb.NewCompressedEchoClient(channel),
+		refusing:   interoppb.NewRefusingEchoClient(channel),
 		transport:  channel.Transport(),
 	}
 	if frames != nil {
@@ -351,6 +353,7 @@ var scenarios = []scenario{
 	{"unreliable", runUnreliable},
 	{"compressed", runCompressed},
 	{"compressed-stream", runCompressedStream},
+	{"refused-stream", runRefusedStream},
 }
 
 // compressedMessage is the i-th message of the compressed scenario: like the
@@ -404,22 +407,48 @@ const compressedMessages = 3
 // streams.
 const compressedStreamMessages = 8
 
+// optimisticStreamCompressed is how many of the compressed-stream messages a
+// server receives stream-compressed when the client compresses them
+// optimistically: the third and every later one.
+const optimisticStreamCompressed = compressedStreamMessages - 2
+
 // runCompressedStream is the compressed-stream scenario: CompressedEcho.Bidi,
-// waiting for each echo so that the server's answer in HEADERS arrives before
-// the client starts stream-compressing, then CompressedEcho.ClientStream,
-// waiting for the HEADERS the server sends at dispatch. The server reports how
-// many requests arrived stream-compressed.
+// waiting for each echo, then CompressedEcho.ClientStream, sending every
+// message at once. The client stream-compresses optimistically, without
+// waiting for the server's answer, and the server reports how many requests
+// arrived stream-compressed.
 func runCompressedStream(ctx context.Context, env *scenarioEnv) error {
-	if err := runCompressedBidi(ctx, env); err != nil {
+	if err := runCompressedBidi(ctx, env, optimisticStreamCompressed); err != nil {
 		return fmt.Errorf("bidi: %w", err)
 	}
-	if err := runCompressedClientStream(ctx, env); err != nil {
+	if err := runCompressedClientStream(ctx, env.compressed.ClientStream, optimisticStreamCompressed); err != nil {
 		return fmt.Errorf("client stream: %w", err)
 	}
 	return nil
 }
 
-func runCompressedBidi(ctx context.Context, env *scenarioEnv) error {
+// runRefusedStream is the refused-stream scenario: RefusingEcho.ClientStream,
+// which the server refuses and the client replays, then compressed-stream's
+// calls. The bidi call is not optimistic after the refusal and compresses
+// once the server's answer arrives; that answer makes the client-stream call
+// optimistic again.
+func runRefusedStream(ctx context.Context, env *scenarioEnv) error {
+	if err := runCompressedClientStream(ctx, env.refusing.ClientStream, 0); err != nil {
+		return fmt.Errorf("refused client stream: %w", err)
+	}
+	if err := runCompressedBidi(ctx, env, 1); err != nil {
+		return fmt.Errorf("bidi: %w", err)
+	}
+	if err := runCompressedClientStream(ctx, env.compressed.ClientStream, optimisticStreamCompressed); err != nil {
+		return fmt.Errorf("client stream: %w", err)
+	}
+	return nil
+}
+
+// runCompressedBidi echoes the compressed-stream messages one at a time and
+// expects the server to have received at least minCompressed of them
+// stream-compressed.
+func runCompressedBidi(ctx context.Context, env *scenarioEnv, minCompressed int) error {
 	stream, err := env.compressed.Bidi(ctx)
 	if err != nil {
 		return err
@@ -447,12 +476,20 @@ func runCompressedBidi(ctx context.Context, env *scenarioEnv) error {
 	if !ok {
 		return errors.New("no terminal status after the end of the stream")
 	}
-	return expectStreamCompressed(status.Metadata)
+	return expectStreamCompressed(status.Metadata, minCompressed)
 }
 
-func runCompressedClientStream(ctx context.Context, env *scenarioEnv) error {
+// runCompressedClientStream sends the compressed-stream messages at once on
+// the client-streaming method start opens, and expects their concatenation
+// echoed, each message received once. With minCompressed above zero, the
+// server must have received at least that many stream-compressed.
+func runCompressedClientStream(
+	ctx context.Context,
+	start func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error),
+	minCompressed int,
+) error {
 	var trailers trevrpc.Metadata
-	call, err := env.compressed.ClientStream(ctx, trevrpc.CaptureResponseMetadata(&trailers))
+	call, err := start(ctx, trevrpc.CaptureResponseMetadata(&trailers))
 	if err != nil {
 		return err
 	}
@@ -463,11 +500,6 @@ func runCompressedClientStream(ctx context.Context, env *scenarioEnv) error {
 			return fmt.Errorf("send %d: %w", i, err)
 		}
 		want.WriteString(compressedMessage(i))
-		if i == 0 {
-			if _, err := call.Headers(); err != nil {
-				return fmt.Errorf("headers: %w", err)
-			}
-		}
 	}
 	response, err := call.CloseAndRecv()
 	if err != nil {
@@ -476,18 +508,21 @@ func runCompressedClientStream(ctx context.Context, env *scenarioEnv) error {
 	if err := expectResponse(response, want.String(), compressedStreamMessages); err != nil {
 		return err
 	}
-	return expectStreamCompressed(trailers)
+	if minCompressed == 0 {
+		return nil
+	}
+	return expectStreamCompressed(trailers, minCompressed)
 }
 
-// expectStreamCompressed checks that the server received at least one request
-// stream-compressed.
-func expectStreamCompressed(trailers trevrpc.Metadata) error {
+// expectStreamCompressed checks that the server received at least
+// minCompressed requests stream-compressed.
+func expectStreamCompressed(trailers trevrpc.Metadata, minCompressed int) error {
 	compressed, err := metadataCount(trailers, streamCompressedReceivedKey)
 	if err != nil {
 		return err
 	}
-	if compressed < 1 {
-		return fmt.Errorf("%s = 0: no request arrived stream-compressed", streamCompressedReceivedKey)
+	if compressed < minCompressed {
+		return fmt.Errorf("%s = %d: expected at least %d requests to arrive stream-compressed", streamCompressedReceivedKey, compressed, minCompressed)
 	}
 	return nil
 }

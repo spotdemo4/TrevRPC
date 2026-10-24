@@ -242,7 +242,7 @@ impl<R: RequestPumpReader> Drop for PumpReaderGuard<R> {
 ///
 /// The task ends within `DISCARD_TIMEOUT`, and sooner when the connection closes, so it cannot
 /// outlive a shutdown by more than that.
-async fn discard_request<R: RequestPumpReader>(mut reader: R) {
+pub async fn discard_request<R: RequestPumpReader>(mut reader: R) {
     // On the heap, so the spawned task does not carry the buffer in its state.
     let mut buffer = vec![0_u8; 4096];
     let finished = tokio::time::timeout(DISCARD_TIMEOUT, async {

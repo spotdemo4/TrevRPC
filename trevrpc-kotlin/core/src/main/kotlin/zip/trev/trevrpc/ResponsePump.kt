@@ -4,12 +4,17 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.SelectClause0
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -117,17 +122,49 @@ internal class CallEnd {
 
 /**
  * The transport stream of one call with the state its two halves share. Both halves send and
- * receive through it, so the call's [compression] and [streams] apply to every message: responses
- * larger than [maxMessageSize] are rejected before they are decompressed.
+ * receive through it, so the call's [compression] and stream compression apply to every message:
+ * responses larger than [maxMessageSize] are rejected before they are decompressed.
+ *
+ * An optimistic call ([replay] set) keeps its requests until its first response frame. If that
+ * frame is the server's refusal, the call switches to a new stream that is not optimistic and
+ * resends them there, in order, before any later send; a write to the refused stream that fails
+ * meanwhile was resent, so it does not fail the send. The caller never sees the refused stream.
  */
 internal class CallStream(
-    val stream: RpcClientStream,
+    stream: RpcClientStream,
     private val compression: CallCompression? = null,
-    private val streams: CallStreams? = null,
+    streams: CallStreams? = null,
     private val maxMessageSize: Int = DEFAULT_MAX_FRAME_SIZE,
     private val onHeaders: ((Metadata) -> Unit)? = null,
+    private val replay: OptimisticReplay? = null,
 ) {
     val end = CallEnd()
+
+    /** The call's current transport stream: the replayed one after a refusal. */
+    @Volatile
+    var stream: RpcClientStream = stream
+        private set
+
+    @Volatile
+    private var streams: CallStreams? = streams
+
+    /** Orders sends and half-closes with a switch to the replayed stream. */
+    private val sendLock = Mutex()
+
+    /** Counts switches of [stream]; a write to an earlier stream that fails was resent. */
+    @Volatile
+    private var generation = 0
+
+    /** Guarded by [sendLock]: the caller half-closed, so the replayed stream is half-closed too. */
+    private var sendFinished = false
+
+    /** Completes once the replayed stream has its resent requests; until then sends wait. */
+    @Volatile
+    private var resent: CompletableDeferred<Unit>? = null
+    private var resendJob: Job? = null
+
+    /** Whether the first response frame has yet to arrive on an optimistic call. */
+    private var awaitingFirstFrame = replay != null
 
     private val headersReported = AtomicBoolean(false)
 
@@ -144,11 +181,76 @@ internal class CallStream(
 
     private val closed = AtomicBoolean(false)
 
+    private class Target(
+        val stream: RpcClientStream,
+        val streams: CallStreams?,
+        val generation: Int,
+    )
+
     /**
      * Sends one request message: stream-compressed once the call's stream compression has started,
-     * otherwise compressed with a dictionary when the call's negotiation allows it.
+     * otherwise compressed with a dictionary when the call's negotiation allows it. An optimistic
+     * call keeps a copy first, waiting for its first response frame when it has no room.
      */
     suspend fun send(body: ByteArray) {
+        val copies = replay?.copies
+        while (true) {
+            val target =
+                sendLock.withLock {
+                    if (resent?.isCompleted == false || (copies != null && !copies.tryKeep(body))) {
+                        null
+                    } else {
+                        Target(stream, streams, generation)
+                    }
+                }
+            if (target == null) {
+                resent?.takeUnless { it.isCompleted }?.join() ?: copies?.awaitSettled()
+                continue
+            }
+            onTarget(target) { write(target.stream, target.streams, body) }
+            return
+        }
+    }
+
+    /** Half-closes the request side, on the replayed stream if the call was refused. */
+    suspend fun finishSend() {
+        while (true) {
+            val target =
+                sendLock.withLock {
+                    if (resent?.isCompleted == false) {
+                        null
+                    } else {
+                        sendFinished = true
+                        Target(stream, streams, generation)
+                    }
+                }
+            if (target == null) {
+                resent?.join()
+                continue
+            }
+            onTarget(target) { target.stream.finishSend() }
+            return
+        }
+    }
+
+    /** Runs [operation] on [target]; a failure after the call switched streams was resent. */
+    private suspend fun onTarget(
+        target: Target,
+        operation: suspend () -> Unit,
+    ) {
+        try {
+            operation()
+        } catch (error: Throwable) {
+            if (error is CancellationException && !currentCoroutineContext().isActive) throw error
+            if (target.generation == generation || closed.get()) throw error
+        }
+    }
+
+    private suspend fun write(
+        stream: RpcClientStream,
+        streams: CallStreams?,
+        body: ByteArray,
+    ) {
         streams?.compressRequest(body)?.let { payload ->
             stream.send(payload, FrameType.ZSTD_STREAM_MESSAGE)
             return
@@ -160,10 +262,20 @@ internal class CallStream(
     /**
      * Receives the next response frame from the transport: HEADERS carry the server's answers to
      * the call's dictionary query and stream compression offer, and compressed messages are
-     * decompressed.
+     * decompressed. A refusal of an optimistic call is replaced by the replayed call's frames.
      */
-    suspend fun receive(): ResponseFrame? =
-        when (val frame = stream.receive()) {
+    suspend fun receive(): ResponseFrame? {
+        val frame = stream.receive()
+        val replay = replay
+        if (replay != null && awaitingFirstFrame) {
+            awaitingFirstFrame = false
+            if (frame is ResponseFrame.Status && frame.refusedStreamCompression) {
+                replay(replay)
+                return receive()
+            }
+            replay.copies.settle()
+        }
+        return when (frame) {
             is ResponseFrame.Headers -> {
                 frame.also {
                     compression?.learn(it.dictionaries)
@@ -185,6 +297,76 @@ internal class CallStream(
                 frame
             }
         }
+    }
+
+    /**
+     * Switches a refused call to a new stream that is not optimistic, and resends its requests
+     * there in a coroutine of its own, so the response is read meanwhile. Sends wait for the
+     * resend; the refused stream is closed.
+     */
+    private suspend fun replay(replay: OptimisticReplay) {
+        replay.budget.optimistic = false
+        val done = CompletableDeferred<Unit>()
+        sendLock.withLock {
+            if (closed.get()) throw TrevRpcException(Status.cancelled("request stream is closed"))
+            val copies = replay.copies.settle()
+            generation++
+            resent = done
+            val refused = stream
+            withContext(NonCancellable) {
+                runCatching { refused.close(null) }
+                streams?.close()
+            }
+            streams = null
+            val replayedStreams = replay.reopen()
+            val replayed =
+                try {
+                    callWithDeadline(replay.deadline, null) {
+                        replay.transport.openStream(replay.replayedRequest(replayedStreams))
+                    }
+                } catch (error: Throwable) {
+                    replayedStreams?.close()
+                    done.complete(Unit)
+                    throw error
+                }
+            stream = replayed
+            streams = replayedStreams
+            if (closed.get()) {
+                // The call closed while the replayed stream opened, and may have closed the refused one.
+                withContext(NonCancellable) {
+                    runCatching { replayed.close(null) }
+                    replayedStreams?.close()
+                }
+                done.complete(Unit)
+                throw TrevRpcException(Status.cancelled("request stream is closed"))
+            }
+            val finish = sendFinished
+            resendJob =
+                CoroutineScope(replay.context.minusKey(Job)).launch {
+                    try {
+                        for (copy in copies) write(replayed, replayedStreams, copy)
+                        if (finish) replayed.finishSend()
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        resendFailed(error)
+                    } finally {
+                        done.complete(Unit)
+                    }
+                }
+        }
+    }
+
+    /**
+     * A resend failed. Usually the response explains why (the server ended the call); if it does
+     * not soon, the failure ends the call.
+     */
+    private suspend fun resendFailed(error: Throwable) {
+        withTimeoutOrNull(EXPLANATION_TIMEOUT) { end.await() }
+        if (end.isEnded) return
+        end.failure(error)
+        close(error)
+    }
 
     /** Closes the transport stream once, releasing the pump, failing blocked sends, and freeing compression contexts. */
     suspend fun close(cause: Throwable? = null) {
@@ -192,8 +374,10 @@ internal class CallStream(
         if (!closed.compareAndSet(false, true)) return
         try {
             pump?.cancel()
+            resendJob?.cancel()
             stream.close(cause)
         } finally {
+            replay?.copies?.settle()
             streams?.close()
         }
     }

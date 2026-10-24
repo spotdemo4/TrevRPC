@@ -144,7 +144,7 @@ func decodeStatus(payload []byte) (*Status, error) {
 			return nil, err
 		}
 	}
-	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata)}, nil
+	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata), refusedStreamCompression: status.RefusedStreamCompression}, nil
 }
 
 // headersAnswer is what the HEADERS of a response answer: the dictionary
@@ -178,6 +178,9 @@ type encodedMessage struct {
 	// size is the length of the message, which limits apply to. For a MESSAGE
 	// frame it is the length of the payload within frame.
 	size int
+	// generation is the call of an optimistic upload the message was encoded
+	// for, zero for any other message; see optimisticUpload.
+	generation uint32
 }
 
 // frameTailSlack is the spare capacity encodeMessage leaves behind a frame, so
@@ -282,10 +285,10 @@ func appendStatusFrame(dst []byte, status *Status, maxFrameSize int) ([]byte, er
 	if status == nil {
 		status = OK()
 	}
-	if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 {
+	if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 && !status.refusedStreamCompression {
 		return appendFrameHeader(dst, frameTypeStatus, 0), nil
 	}
-	wire := wireStatus{Code: uint32(status.Code), Message: status.Message, Metadata: status.Metadata}
+	wire := wireStatus{Code: uint32(status.Code), Message: status.Message, Metadata: status.Metadata, RefusedStreamCompression: status.refusedStreamCompression}
 	size, ok := wire.payloadSize()
 	if !ok {
 		return appendLimitedProtoFrame(dst, frameTypeStatus, &wire, maxFrameSize)

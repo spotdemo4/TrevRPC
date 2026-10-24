@@ -31,6 +31,15 @@ import (
 // messages. Stream compression calls libzstd and needs cgo; without cgo it is
 // off.
 //
+// Clients stream-compress requests optimistically, without waiting for the
+// server's answer, except on calls with a datagram flow. A server that cannot
+// decode them on a call (a route without Requests, stream compression off, or
+// the budget spent) refuses the call once it is authorized, before the
+// handler runs, and the client replays it without stream compression,
+// transparently; the authorizer then runs again for the replay. After a
+// refusal, calls on that connection wait for the server's answer again until
+// one is answered.
+//
 // A server sends HEADERS at dispatch, before the handler runs, on every call
 // to a route whose request messages may be stream-compressed, so handlers of
 // such routes cannot set response headers (see SetResponseHeader).
@@ -236,6 +245,40 @@ func (c *streamCompressor) start(message proto.Message, windowLog int) {
 // and the message size varint.
 const streamFrameHeaderRoom = compressedFrameHeaderRoom + 8
 
+// encodeMarshalled is encode for a message already marshalled into payload,
+// which it does not keep.
+func (c *streamCompressor) encodeMarshalled(payload []byte, message proto.Message) (encodedMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sent++
+	if c.encoder == nil && !c.stopped && c.sent >= streamCompressionStart {
+		if windowLog := int(c.windowLog.Load()); windowLog > 0 {
+			c.start(message, windowLog)
+		}
+	}
+	if c.encoder == nil {
+		return encodePayload(payload, c.per.dictFor(message)), nil
+	}
+	return c.compressStream(payload)
+}
+
+// reset makes the direction start over for a new call that has already sent
+// sent messages per message: its context is freed and the direction is not
+// enabled until the new call's answer.
+func (c *streamCompressor) reset(sent int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.encoder != nil {
+		c.encoder.Close()
+		c.encoder = nil
+	}
+	c.reservation.release()
+	c.reservation = nil
+	c.windowLog.Store(0)
+	c.sent = sent
+	c.stopped = false
+}
+
 // encodeStream marshals message and compresses it with the context into a
 // ZSTD_STREAM_MESSAGE frame.
 func (c *streamCompressor) encodeStream(message ProtoMessage) (encodedMessage, error) {
@@ -250,6 +293,12 @@ func (c *streamCompressor) encodeStream(message ProtoMessage) (encodedMessage, e
 		return encodedMessage{}, err
 	}
 	*scratch = payload[:0]
+	return c.compressStream(payload)
+}
+
+// compressStream compresses payload with the context into a
+// ZSTD_STREAM_MESSAGE frame.
+func (c *streamCompressor) compressStream(payload []byte) (encodedMessage, error) {
 	buffer := make([]byte, streamFrameHeaderRoom, streamFrameHeaderRoom+zstd.CompressBound(len(payload))+32)
 	compressed, err := c.encoder.Encode(buffer, payload)
 	if err != nil {
@@ -407,20 +456,37 @@ func (rt route) streamCompressesRequests() bool {
 // for the directions its route allows. It returns nil when nothing is
 // enabled. A direction marked unreliable is left out: its messages may be
 // datagrams, which cannot carry stream-compressed messages.
-func (r *serverRuntime) negotiateStreams(request *wireRequest) *serverStreams {
-	if request.StreamCompression == nil || r.streams == nil {
-		return nil
+//
+// refused is set for an optimistic request to a route the server finds, whose
+// stream-compressed requests it does not decode on this call: the route does
+// not allow them, the window is too large, stream compression is off, or the
+// budget is spent. The call must then be refused before anything else runs
+// for it; see refuseOptimistic.
+func (r *serverRuntime) negotiateStreams(request *wireRequest) (streams *serverStreams, refused bool) {
+	offer := request.StreamCompression
+	if offer == nil {
+		return nil, false
 	}
 	route, ok := r.routes[request.Method]
 	if !ok || route.kind != request.rpcKind() {
-		return nil
+		// The call fails with the status of an unknown route or kind.
+		return nil, false
 	}
-	streams := &serverStreams{}
-	if route.streamCompressesRequests() {
+	if r.streams == nil {
+		return nil, offer.Optimistic
+	}
+	streams = &serverStreams{}
+	// An optimistic client compresses with up to its own window, which the
+	// decoder must then take.
+	window := !offer.Optimistic || (offer.MaxWindowLog >= zstd.MinStreamWindowLog && offer.MaxWindowLog <= zstd.StreamWindowLog)
+	if route.streamCompressesRequests() && window {
 		if reservation := r.streams.reserve(r.streams.decoderCost); reservation != nil {
 			streams.answer = streamOffer()
 			streams.requests = newStreamInflater(r.compression.lookupOrNil(), reservation)
 		}
+	}
+	if offer.Optimistic && streams.requests == nil {
+		return nil, true
 	}
 	if windowLog := senderWindowLog(request.StreamCompression); windowLog > 0 && route.streamCompression.Responses && !route.unreliable.Responses {
 		var per *messageCompressor
@@ -431,9 +497,18 @@ func (r *serverRuntime) negotiateStreams(request *wireRequest) *serverStreams {
 		streams.responses.enable(windowLog)
 	}
 	if streams.answer == nil && streams.responses == nil {
-		return nil
+		return nil, false
 	}
-	return streams
+	return streams, false
+}
+
+// refusedStreamCompression is the STATUS of an optimistic call the server
+// refused: ResourceExhausted, marked so that the client knows no application
+// code ran and replays the call without optimistic stream compression.
+func refusedStreamCompression() *Status {
+	status := ResourceExhausted("stream-compressed requests refused")
+	status.refusedStreamCompression = true
+	return status
 }
 
 // requestInflater returns the decompressor of the request messages; nil-safe.

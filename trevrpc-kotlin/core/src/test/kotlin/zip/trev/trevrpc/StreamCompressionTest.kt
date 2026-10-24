@@ -97,9 +97,11 @@ class StreamCompressionTest {
     }
 
     @Test
-    fun `a call offers, then compresses requests from the third message after the answer, and decompresses responses`() =
+    fun `a call that is not optimistic offers, then compresses requests from the third message after the answer`() =
         runBlocking {
             val budget = StreamCompressionBudget()
+            // As after a refusal: the call waits for the answer.
+            budget.optimistic = false
             val transport = ScriptedTransport(Compression(emptyList()), budget)
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
             assertEquals(StreamCompression(16u), transport.requests.single().streamCompression)
@@ -182,7 +184,7 @@ class StreamCompressionTest {
             val tight = StreamCompressionBudget(400_000)
             val transport = ScriptedTransport(Compression(emptyList()), tight)
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
-            assertEquals(StreamCompression(16u), transport.requests.single().streamCompression)
+            assertEquals(StreamCompression(16u, optimistic = true), transport.requests.single().streamCompression)
             transport.respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
             call.headers()
             repeat(4) { call.send(compressible) }
@@ -209,7 +211,7 @@ class StreamCompressionTest {
             // A client-streaming call offers so the server can answer, but a stream-compressed
             // response is still invalid: its response direction does not stream.
             val upload = Client(transport).openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
-            assertEquals(StreamCompression(16u), transport.requests.single().streamCompression)
+            assertEquals(StreamCompression(16u, optimistic = true), transport.requests.single().streamCompression)
             upload.close()
 
             val plain = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses)

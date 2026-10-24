@@ -17,3 +17,12 @@ service CompressedEcho {
     option (trevrpc.method) = {compress_stream: true};
   }
 }
+
+// RefusingEcho allows stream-compressed requests in the schema, but servers
+// register it by hand without them, as a server built from an older schema
+// would, so they refuse every optimistic call (see interop/README.md).
+service RefusingEcho {
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse) {
+    option (trevrpc.method) = {compress_stream: true};
+  }
+}

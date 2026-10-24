@@ -1,6 +1,8 @@
 package zip.trev.trevrpc
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
+import java.util.concurrent.CopyOnWriteArrayList
 
 /** The compression golden vectors, every value decoded from hex. */
 internal fun zstdVectors(): Map<String, ByteArray> =
@@ -50,11 +52,90 @@ internal class ScriptedTransport(
                 frames.close()
             }
 
-            override suspend fun receive(): ResponseFrame? = frames.receiveCatching().getOrNull()
+            /** A server ends the response stream after its STATUS, half-closed or not. */
+            private var ended = false
+
+            override suspend fun receive(): ResponseFrame? {
+                if (ended) return null
+                return frames.receiveCatching().getOrNull()?.also { ended = it is ResponseFrame.Status }
+            }
 
             override suspend fun close(cause: Throwable?) {
                 frames.close()
             }
+        }
+    }
+}
+
+/**
+ * A transport whose every stream records what the client sends and answers with frames scripted per
+ * stream, for calls that open more than one, such as a replayed optimistic call. Opening the
+ * stream at index [gatedFrom] or later waits for [gate].
+ */
+internal class MultiStreamTransport(
+    override val compression: Compression?,
+    override val streamCompressionBudget: StreamCompressionBudget? = null,
+    private val gatedFrom: Int = Int.MAX_VALUE,
+) : RpcTransport {
+    val gate = CompletableDeferred<Unit>()
+    val streams = CopyOnWriteArrayList<Stream>()
+
+    /** Receives each stream as it opens. */
+    val opened = Channel<Stream>(Channel.UNLIMITED)
+
+    inner class Stream(
+        val request: RpcRequest,
+    ) : RpcClientStream {
+        private val frames = Channel<ResponseFrame>(Channel.UNLIMITED)
+        private val sentFrames = CopyOnWriteArrayList<Pair<Long, ByteArray>>()
+
+        @Volatile
+        var finished = false
+            private set
+
+        @Volatile
+        var closed = false
+            private set
+
+        val sent: List<Pair<Long, ByteArray>>
+            get() = sentFrames.toList()
+
+        /** Queues response frames; the stream ends after a STATUS, as a server's does. */
+        fun respond(vararg response: ResponseFrame) =
+            response.forEach {
+                frames.trySend(it)
+                if (it is ResponseFrame.Status) frames.close()
+            }
+
+        override suspend fun send(
+            body: ByteArray,
+            frameType: Long,
+        ) {
+            if (closed) throw TrevRpcException(Status.cancelled("stream is closed"))
+            sentFrames += frameType to body.copyOf()
+        }
+
+        override suspend fun finishSend() {
+            finished = true
+        }
+
+        override suspend fun receive(): ResponseFrame? = frames.receiveCatching().getOrNull()
+
+        override suspend fun close(cause: Throwable?) {
+            closed = true
+            frames.close()
+        }
+    }
+
+    override suspend fun openStream(
+        request: RpcRequest,
+        firstMessage: ByteArray?,
+        finishSend: Boolean,
+    ): RpcClientStream {
+        if (streams.size >= gatedFrom) gate.await()
+        return Stream(request).also {
+            streams += it
+            opened.trySend(it)
         }
     }
 }

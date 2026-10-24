@@ -12,7 +12,8 @@ use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, Transp
 use trevrpc::{Code, Error, Metadata};
 
 use crate::proto::{
-    CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient,
+    CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, RefusingEchoClient,
+    UnreliableEchoClient,
 };
 use crate::{BoxError, Flags, connect};
 
@@ -24,6 +25,7 @@ type Scenario = Result<(), String>;
 type Echo = EchoClient<Channel>;
 type UnreliableEcho = UnreliableEchoClient<Channel>;
 type CompressedEcho = CompressedEchoClient<Channel>;
+type RefusingEcho = RefusingEchoClient<Channel>;
 
 /// Runs every scenario and returns whether all of them passed.
 pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
@@ -60,9 +62,10 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
     let client = EchoClient::new(channel.clone());
     let unreliable = UnreliableEchoClient::new(channel.clone());
     let compressed = CompressedEchoClient::new(channel.clone());
+    let refusing = RefusingEchoClient::new(channel.clone());
 
     let mut passed = true;
-    for (name, scenario) in scenarios(&client, &unreliable, &compressed, &channel) {
+    for (name, scenario) in scenarios(&client, &unreliable, &compressed, &refusing, &channel) {
         passed &= report(name, scenario).await;
     }
 
@@ -91,6 +94,7 @@ fn scenarios<'a>(
     client: &'a Echo,
     unreliable_client: &'a UnreliableEcho,
     compressed_client: &'a CompressedEcho,
+    refusing_client: &'a RefusingEcho,
     channel: &'a Channel,
 ) -> Vec<Named<'a>> {
     vec![
@@ -117,17 +121,62 @@ fn scenarios<'a>(
             "compressed-stream",
             Box::pin(compressed_stream(compressed_client)),
         ),
+        (
+            "refused-stream",
+            Box::pin(refused_stream(compressed_client, refusing_client)),
+        ),
     ]
 }
 
 /// How many messages the `compressed-stream` scenario echoes.
 const COMPRESSED_STREAM_MESSAGES: u32 = 8;
+/// Clients compress optimistically from the third message, so the server receives that many
+/// stream-compressed.
+const OPTIMISTIC_STREAM_COMPRESSED: usize = 6;
 
-/// Echoes messages that compress against each other on a `CompressedEcho` stream, awaiting each
-/// echo so the server's HEADERS, which enable compressed requests, arrive before the third
-/// message, where stream compression starts; then uploads such messages on a client-streaming
-/// call, waiting only for its HEADERS after the first.
+/// Echoes messages that compress against each other on a `CompressedEcho` stream, one at a time,
+/// then uploads them in one burst on a client-streaming call. Calls are optimistic, so both
+/// compress from the third message without waiting for the server's answer.
 async fn compressed_stream(client: &CompressedEcho) -> Scenario {
+    let trailers = compressed_bidi(client).await?;
+    expect_stream_compressed(&trailers, OPTIMISTIC_STREAM_COMPRESSED)?;
+    let trailers = compressed_upload(client).await?;
+    expect_stream_compressed(&trailers, OPTIMISTIC_STREAM_COMPRESSED)
+}
+
+/// Uploads to `RefusingEcho`, whose server refuses the optimistic call, so the client replays
+/// it; then echoes on `CompressedEcho`, not optimistic after the refusal, whose answer makes the
+/// client optimistic again for the upload that follows.
+async fn refused_stream(compressed: &CompressedEcho, refusing: &RefusingEcho) -> Scenario {
+    let response = refusing
+        .client_stream()
+        .options(|_| options())
+        .send_all(futures_util::stream::iter(
+            (0..COMPRESSED_STREAM_MESSAGES).map(|index| Ok(message(&compressed_message(index)))),
+        ))
+        .await
+        .map_err(rpc)?;
+    expect_response(
+        &response,
+        &all_compressed_messages(),
+        COMPRESSED_STREAM_MESSAGES,
+    )?;
+    let trailers = compressed_bidi(compressed).await?;
+    expect_stream_compressed(&trailers, 1)?;
+    let trailers = compressed_upload(compressed).await?;
+    expect_stream_compressed(&trailers, OPTIMISTIC_STREAM_COMPRESSED)
+}
+
+/// The `compressed-stream` messages, concatenated.
+fn all_compressed_messages() -> String {
+    (0..COMPRESSED_STREAM_MESSAGES)
+        .map(compressed_message)
+        .collect()
+}
+
+/// `CompressedEcho.Bidi` with the `compressed-stream` messages, awaiting each echo: returns the
+/// trailing metadata.
+async fn compressed_bidi(client: &CompressedEcho) -> Result<Metadata, String> {
     let (sender, mut responses) = client
         .bidi()
         .options(|_| options())
@@ -151,41 +200,43 @@ async fn compressed_stream(client: &CompressedEcho) -> Scenario {
         response.map_err(rpc)?;
         return Err("unexpected response after the echoes".to_owned());
     }
-    let trailers = responses
+    responses
         .terminal_metadata()
-        .ok_or("the stream ended without a terminal status")?;
-    expect_stream_compressed(trailers)?;
+        .cloned()
+        .ok_or_else(|| "the stream ended without a terminal status".to_owned())
+}
 
-    // The server sends the HEADERS of a client-streaming call at dispatch, so the client can wait
-    // for them after its first message and stream-compress from the third.
-    let mut upload = client
+/// `CompressedEcho.ClientStream` with the `compressed-stream` messages, sent without waiting:
+/// returns the trailing metadata.
+async fn compressed_upload(client: &CompressedEcho) -> Result<Metadata, String> {
+    let upload = client
         .client_stream()
         .options(|_| options())
         .await
         .map_err(rpc)?;
-    upload
-        .send(message(&compressed_message(0)))
-        .await
-        .map_err(rpc)?;
-    upload.headers().await.map_err(rpc)?;
-    for index in 1..COMPRESSED_STREAM_MESSAGES {
+    for index in 0..COMPRESSED_STREAM_MESSAGES {
         upload
             .send(message(&compressed_message(index)))
             .await
             .map_err(rpc)?;
     }
     let response = upload.close_and_recv_with_response().await.map_err(rpc)?;
-    let expected: String = (0..COMPRESSED_STREAM_MESSAGES)
-        .map(compressed_message)
-        .collect();
-    expect_response(response.message(), &expected, COMPRESSED_STREAM_MESSAGES)?;
-    expect_stream_compressed(response.metadata())
+    expect_response(
+        response.message(),
+        &all_compressed_messages(),
+        COMPRESSED_STREAM_MESSAGES,
+    )?;
+    Ok(response.metadata().clone())
 }
 
-/// Checks that the trailing metadata reports requests that arrived stream-compressed.
-fn expect_stream_compressed(trailers: &Metadata) -> Scenario {
-    if counter(trailers, "interop-stream-compressed-received")? == 0 {
-        return Err("no request arrived stream-compressed".to_owned());
+/// Checks that the trailing metadata reports at least `least` requests that arrived
+/// stream-compressed.
+fn expect_stream_compressed(trailers: &Metadata, least: usize) -> Scenario {
+    let received = counter(trailers, "interop-stream-compressed-received")?;
+    if received < least {
+        return Err(format!(
+            "{received} requests arrived stream-compressed, want at least {least}"
+        ));
     }
     Ok(())
 }

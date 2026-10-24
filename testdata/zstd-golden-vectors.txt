@@ -77,6 +77,10 @@
 #   request.stream_compression RpcRequest{method:"/svc/m",
 #                             stream_compression:{max_window_log:16}}
 #   headers.stream_compression RpcHeaders{stream_compression:{max_window_log:16}}
+#   request.optimistic_stream_compression RpcRequest{method:"/svc/m",
+#                             stream_compression:{max_window_log:16, optimistic:true}}
+#   status.refused_stream_compression RpcStatus{code:8 (ResourceExhausted),
+#                             refused_stream_compression:true}
 
 dict.d1.id = 1
 dict.d1.fingerprint = 084fd69b50b28542
@@ -172,3 +176,9 @@ request.stream_compression.frame = 010c0a062f7376632f6d62020810
 
 headers.stream_compression.payload = 22020810
 headers.stream_compression.frame = 020422020810
+
+request.optimistic_stream_compression.payload = 0a062f7376632f6d620408101001
+request.optimistic_stream_compression.frame = 010e0a062f7376632f6d620408101001
+
+status.refused_stream_compression.payload = 08082001
+status.refused_stream_compression.frame = 030408082001

@@ -1,11 +1,10 @@
 package zip.trev.trevrpc.interop
 
 import androidx.test.platform.app.InstrumentationRegistry
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.consumeAsFlow
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -20,6 +19,7 @@ import trevrpc.interop.v1.CompressedEchoClient
 import trevrpc.interop.v1.EchoClient
 import trevrpc.interop.v1.Interop.EchoRequest
 import trevrpc.interop.v1.Interop.EchoResponse
+import trevrpc.interop.v1.RefusingEchoClient
 import trevrpc.interop.v1.UnreliableEchoClient
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.Code
@@ -50,7 +50,14 @@ class EchoScenarioTest(
         val options = CallOptions(timeout = 10.seconds)
         runBlocking {
             withTimeout(30.seconds) {
-                body(Clients(EchoClient(channel, options), UnreliableEchoClient(channel, options), CompressedEchoClient(channel, options)))
+                body(
+                    Clients(
+                        EchoClient(channel, options),
+                        UnreliableEchoClient(channel, options),
+                        CompressedEchoClient(channel, options),
+                        RefusingEchoClient(channel, options),
+                    ),
+                )
             }
         }
     }
@@ -122,6 +129,7 @@ private data class Clients(
     val echo: EchoClient,
     val unreliable: UnreliableEchoClient,
     val compressed: CompressedEchoClient,
+    val refusing: RefusingEchoClient,
 )
 
 /** The i-th message of the compressed scenarios: like the documents the interop dictionary was trained on. */
@@ -230,37 +238,18 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             expectCounter(response.trailers, "interop-datagrams-received", "0")
         },
         "compressed-stream" to { (_, _, client) ->
-            // Each request waits for the echo of the one before, so the server's HEADERS, which
-            // enable compressed requests, arrive before the third, when compression starts.
-            val messages = (0 until 8).map(::compressedMessage)
-            val requests = Channel<EchoRequest>(Channel.UNLIMITED)
-            requests.send(request(messages[0]))
-            val response = ResponseMetadata()
-            var echoed = 0
-            client.bidi(requests.consumeAsFlow()) { response.capture(this) }.collect { echo ->
-                expectEcho(echo, messages[echoed], echoed)
-                echoed++
-                if (echoed < messages.size) requests.send(request(messages[echoed])) else requests.close()
-            }
-            expect(echoed == messages.size) { "expected ${messages.size} echoes, got $echoed" }
-            expectStreamCompressed("bidi", response.trailers)
-
-            // The server sends HEADERS at dispatch on this method, with its answer, so the requests
-            // after them compress although the only response comes at the end.
-            val headers = CompletableDeferred<Unit>()
-            val upload =
-                flow {
-                    emit(request(messages[0]))
-                    headers.await()
-                    messages.drop(1).forEach { emit(request(it)) }
-                }
-            val summary = ResponseMetadata()
-            val echo =
-                client.clientStream(upload) {
-                    summary.capture(this).copy(onResponseHeaders = { headers.complete(Unit) })
-                }
-            expectEcho(echo, messages.joinToString(""), messages.size)
-            expectStreamCompressed("client-stream", summary.trailers)
+            // Requests compress optimistically from the third message, without waiting for the answer.
+            expectStreamCompressed("bidi", compressedBidi(client), 6)
+            expectStreamCompressed("client-stream", upload { requests, options -> client.clientStream(requests) { options(this) } }, 6)
+        },
+        "refused-stream" to { (_, _, client, refusing) ->
+            // The server refuses the optimistic call and the client replays it, so each message
+            // arrives once.
+            upload { requests, options -> refusing.clientStream(requests) { options(this) } }
+            // After the refusal the bidi call waits for the answer, which the server's HEADERS at
+            // dispatch bring before its third message; that answer makes the client optimistic again.
+            expectStreamCompressed("bidi", compressedBidi(client), 1)
+            expectStreamCompressed("client-stream", upload { requests, options -> client.clientStream(requests) { options(this) } }, 6)
         },
     )
 
@@ -282,14 +271,47 @@ private class ResponseMetadata {
         options.copy(onResponseHeaders = { headersOrNull = it }, onResponseMetadata = { trailersOrNull = it })
 }
 
-/** Checks that the server received at least one request of the call stream-compressed. */
+/** The eight messages of the stream compression scenarios. */
+private val compressedMessages = (0 until 8).map(::compressedMessage)
+
+/**
+ * `CompressedEcho.Bidi` sending [compressedMessages], each after the echo of the one before; returns
+ * the trailing metadata.
+ */
+private suspend fun compressedBidi(client: CompressedEchoClient): Metadata {
+    val requests = Channel<EchoRequest>(Channel.UNLIMITED)
+    requests.send(request(compressedMessages[0]))
+    val response = ResponseMetadata()
+    var echoed = 0
+    client.bidi(requests.consumeAsFlow()) { response.capture(this) }.collect { echo ->
+        expectEcho(echo, compressedMessages[echoed], echoed)
+        echoed++
+        if (echoed < compressedMessages.size) requests.send(request(compressedMessages[echoed])) else requests.close()
+    }
+    expect(echoed == compressedMessages.size) { "expected ${compressedMessages.size} echoes, got $echoed" }
+    return response.trailers
+}
+
+/**
+ * A client-streaming echo of [compressedMessages], sent without waiting through [call], which gets
+ * the requests and the call options to apply; checks the echo and returns the trailing metadata.
+ */
+private suspend fun upload(call: suspend (Flow<EchoRequest>, (CallOptions) -> CallOptions) -> EchoResponse): Metadata {
+    val response = ResponseMetadata()
+    val echo = call(compressedMessages.map(::request).asFlow()) { response.capture(it) }
+    expectEcho(echo, compressedMessages.joinToString(""), compressedMessages.size)
+    return response.trailers
+}
+
+/** Checks that the server received at least [minimum] requests of the call stream-compressed. */
 private fun expectStreamCompressed(
     what: String,
     trailers: Metadata,
+    minimum: Int,
 ) {
     val compressed = trailers["interop-stream-compressed-received"]?.decodeToString()?.toIntOrNull()
-    expect(compressed != null && compressed >= 1) {
-        "$what: expected trailing metadata interop-stream-compressed-received of at least 1, got $compressed"
+    expect(compressed != null && compressed >= minimum) {
+        "$what: expected trailing metadata interop-stream-compressed-received of at least $minimum, got $compressed"
     }
 }
 

@@ -183,6 +183,10 @@ const EarlyOk = "the server completed the call before the request stream ended";
  * The call options' `onResponseHeaders` is called with the headers when the first response frame
  * is read, and `onResponseMetadata` with the trailing metadata when the final status is OK. A
  * callback that throws fails the call.
+ *
+ * A call that stream-compresses its requests optimistically and is refused by the server is
+ * replayed without that, transparently: the caller's sends and the response continue on the
+ * replay.
  */
 export class BidirectionalStreamingCall {
   #call;
@@ -544,6 +548,20 @@ export class BidirectionalStreamingCall {
         }
         case FrameType.Status: {
           const status = unmarshalMessage(RpcStatus, frame.payload);
+          if (
+            status.refusedStreamCompression &&
+            !this.#sawHeaders &&
+            !this.#sawMessage &&
+            this.#call.replayable
+          ) {
+            // The server refused the optimistic call before running anything for it: the call
+            // continues on a replay, and its response is read from there.
+            // A call with a datagram flow is never optimistic, but its replay, on a session
+            // that may differ after a reconnect, can get one.
+            await this.#call.replay();
+            this.#flow = this.#rpc.datagrams?.receive ? this.#call.flow : undefined;
+            continue;
+          }
           validateResponseMetadata(status.metadata, "trailing metadata");
           this.#settleHeaders({});
           this.#flow?.connect(this.#onDatagram);

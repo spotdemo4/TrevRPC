@@ -4,6 +4,7 @@
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -37,6 +38,10 @@ const STREAM_COMPRESSED_KEY: &str = "stream-compressed";
 /// A client-streaming route that allows stream compression, answers with the concatenation of
 /// its requests, and reports, in its trailing metadata, how many arrived stream-compressed.
 const UPLOAD: &str = "/test.Compressed/Upload";
+/// `UPLOAD` and `STREAM` registered without stream compression, as a server built from a schema
+/// without `compress_stream` would: the server refuses optimistic calls to them.
+const REFUSING_UPLOAD: &str = "/test.Compressed/RefusingUpload";
+const REFUSING_STREAM: &str = "/test.Compressed/RefusingStream";
 /// The type the test dictionary compresses: its samples are the JSON documents [`sample`] writes.
 const MESSAGE_TYPE: &str = "test.Echo";
 
@@ -85,6 +90,63 @@ struct RunningServer {
     cert: CertificateDer<'static>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<trevrpc::Result<()>>,
+    /// How many calls the authorizer saw, and how many reached a streaming handler.
+    authorized: Arc<AtomicUsize>,
+    handled: Arc<AtomicUsize>,
+}
+
+/// Request metadata that makes [`CountingAuthorizer`] reject the call.
+const DENY_KEY: &str = "deny";
+
+/// Counts the calls it sees, and rejects those with [`DENY_KEY`] metadata.
+struct CountingAuthorizer(Arc<AtomicUsize>);
+
+#[trevrpc::async_trait]
+impl trevrpc::server::Authorizer for CountingAuthorizer {
+    async fn authorize(&self, request: &RpcRequest) -> Result<(), trevrpc::Status> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        if request.metadata.contains_key(DENY_KEY) {
+            return Err(trevrpc::Status::unauthenticated("denied"));
+        }
+        Ok(())
+    }
+}
+
+/// The concatenated values of an upload's requests, with the count of those that arrived
+/// stream-compressed in the trailing metadata.
+async fn concatenate(
+    context: trevrpc::server::RequestContext,
+    mut requests: trevrpc::BoxStream<Vec<u8>>,
+) -> trevrpc::Result<trevrpc::BoxStream<Vec<u8>>> {
+    let mut value = String::new();
+    while let Some(body) = requests.next().await {
+        value.push_str(&<Echo as prost::Message>::decode(body?.as_slice())?.value);
+    }
+    context.set_response_metadata(
+        STREAM_COMPRESSED_KEY,
+        context.stream_compressed_requests_received().to_string(),
+    )?;
+    let response = prost::Message::encode_to_vec(&Echo { value });
+    Ok(trevrpc::stream::from_iter([response]))
+}
+
+/// Echoes each request, then reports how many arrived stream-compressed.
+fn echo_and_count(
+    context: trevrpc::server::RequestContext,
+    requests: trevrpc::BoxStream<Vec<u8>>,
+) -> trevrpc::BoxStream<Vec<u8>> {
+    let report = futures_util::stream::once(async move {
+        context.set_response_metadata(
+            STREAM_COMPRESSED_KEY,
+            context.stream_compressed_requests_received().to_string(),
+        )
+    })
+    .filter_map(|reported| async move {
+        reported
+            .err()
+            .map(|status| Err(trevrpc::Error::from(status)))
+    });
+    Box::pin(requests.chain(report))
 }
 
 impl RunningServer {
@@ -116,6 +178,9 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
     let (cert, tls) = self_signed()?;
     let mut server = Server::new();
     server.set_options(options);
+    let authorized = Arc::new(AtomicUsize::new(0));
+    let handled = Arc::new(AtomicUsize::new(0));
+    server.set_authorizer(CountingAuthorizer(Arc::clone(&authorized)));
     let options = RouteOptions::new().with_message_types(MESSAGE_TYPE, MESSAGE_TYPE);
     server.route_with_options(UNARY, options, |_context, body| async move { Ok(body) });
     server.route_streaming_with_options(
@@ -128,38 +193,32 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
         STREAM,
         RpcKind::BidirectionalStreaming,
         options.with_compress_stream(CompressStream::BOTH),
-        |context, _body, requests| async move {
-            let report = futures_util::stream::once(async move {
-                context.set_response_metadata(
-                    STREAM_COMPRESSED_KEY,
-                    context.stream_compressed_requests_received().to_string(),
-                )
-            })
-            .filter_map(|reported| async move {
-                reported
-                    .err()
-                    .map(|status| Err(trevrpc::Error::from(status)))
-            });
-            let responses: trevrpc::BoxStream<Vec<u8>> = Box::pin(requests.chain(report));
-            Ok(responses)
-        },
+        |context, _body, requests| async move { Ok(echo_and_count(context, requests)) },
     );
     server.route_streaming_with_options(
         UPLOAD,
         RpcKind::ClientStreaming,
         options.with_compress_stream(CompressStream::REQUESTS),
-        |context, _body, requests| async move {
-            let mut value = String::new();
-            let mut requests = requests;
-            while let Some(body) = requests.next().await {
-                value.push_str(&<Echo as prost::Message>::decode(body?.as_slice())?.value);
-            }
-            context.set_response_metadata(
-                STREAM_COMPRESSED_KEY,
-                context.stream_compressed_requests_received().to_string(),
-            )?;
-            let response = prost::Message::encode_to_vec(&Echo { value });
-            Ok(trevrpc::stream::from_iter([response]))
+        |context, _body, requests| concatenate(context, requests),
+    );
+    let count = Arc::clone(&handled);
+    server.route_streaming_with_options(
+        REFUSING_UPLOAD,
+        RpcKind::ClientStreaming,
+        options,
+        move |context, _body, requests| {
+            count.fetch_add(1, Ordering::SeqCst);
+            concatenate(context, requests)
+        },
+    );
+    let count = Arc::clone(&handled);
+    server.route_streaming_with_options(
+        REFUSING_STREAM,
+        RpcKind::BidirectionalStreaming,
+        options,
+        move |context, _body, requests| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(echo_and_count(context, requests)) }
         },
     );
     let endpoint = quinn::Endpoint::server(
@@ -183,6 +242,8 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
         cert,
         shutdown: Some(shutdown),
         task,
+        authorized,
+        handled,
     })
 }
 
@@ -600,10 +661,18 @@ async fn raw_stream_call(
     parse_frames(&response)
 }
 
+/// The stream compression offer of a client that decodes a 64 KiB window.
+const fn stream_offer(optimistic: bool) -> trevrpc::wire::StreamCompression {
+    trevrpc::wire::StreamCompression {
+        max_window_log: 16,
+        optimistic,
+    }
+}
+
 fn stream_request(offer: bool) -> RpcRequest {
     let mut request = RpcRequest::new(STREAM).with_kind(RpcKind::BidirectionalStreaming);
     if offer {
-        request.stream_compression = Some(trevrpc::wire::StreamCompression { max_window_log: 16 });
+        request.stream_compression = Some(stream_offer(false));
     }
     request
 }
@@ -638,10 +707,7 @@ async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_t
         ]
     );
     let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
-    ensure_eq!(
-        headers.stream_compression,
-        Some(trevrpc::wire::StreamCompression { max_window_log: 16 })
-    );
+    ensure_eq!(headers.stream_compression, Some(stream_offer(false)));
     ensure_eq!(&frames[1].payload, &messages[0]);
     ensure_eq!(&frames[2].payload, &messages[1]);
     let mut reader = StreamReader::new()?;
@@ -786,8 +852,7 @@ async fn the_server_sends_headers_before_reading_a_request_message() -> TestResu
         let (mut send, mut recv) = connection.open_bi().await?;
         let mut request = RpcRequest::new(UPLOAD).with_kind(RpcKind::ClientStreaming);
         if offer {
-            request.stream_compression =
-                Some(trevrpc::wire::StreamCompression { max_window_log: 16 });
+            request.stream_compression = Some(stream_offer(false));
         }
         send.write_all(&encode_protobuf_frame(
             frame_type::REQUEST,
@@ -801,7 +866,7 @@ async fn the_server_sends_headers_before_reading_a_request_message() -> TestResu
         let headers: RpcHeaders = decode_payload(&headers.payload)?;
         ensure_eq!(
             headers.stream_compression,
-            offer.then_some(trevrpc::wire::StreamCompression { max_window_log: 16 })
+            offer.then_some(stream_offer(false))
         );
 
         let mut messages = Vec::new();
@@ -828,12 +893,12 @@ async fn the_server_sends_headers_before_reading_a_request_message() -> TestResu
 }
 
 #[tokio::test]
-async fn client_streaming_uploads_are_stream_compressed_once_the_headers_arrive() -> TestResult {
+async fn client_streaming_uploads_are_stream_compressed_from_the_third_message() -> TestResult {
     let server = spawn_server(Compression::new()).await?;
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let (_endpoint, channel) = compressed_channel(&server, policy).await?;
-        // Waiting for the headers after the first message, and sending slowly without reading
-        // them, both learn the server's answer before the third message.
+        // Calls are optimistic, so a burst compresses without waiting for the server's answer,
+        // and waiting for the headers, sent at dispatch, changes nothing.
         for wait_for_headers in [true, false] {
             let mut upload = trevrpc::client::client_streaming::<_, Echo, Echo>(
                 &channel,
@@ -847,8 +912,6 @@ async fn client_streaming_uploads_are_stream_compressed_once_the_headers_arrive(
             if wait_for_headers {
                 let headers = tokio::time::timeout(TEST_TIMEOUT, upload.headers()).await??;
                 ensure!(headers.is_empty(), "{headers:?}");
-            } else {
-                tokio::time::sleep(Duration::from_millis(200)).await;
             }
             for i in 1..8 {
                 upload.send(sample(i)).await?;
@@ -869,7 +932,7 @@ async fn client_streaming_uploads_are_stream_compressed_once_the_headers_arrive(
             );
         }
 
-        // A call that sends a stream reads the response while it uploads too.
+        // A call that sends a stream, with a pause, compresses the same way.
         let requests = futures_util::stream::iter(0..8).then(|i| async move {
             if i == 1 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -896,4 +959,542 @@ async fn client_streaming_uploads_are_stream_compressed_once_the_headers_arrive(
         );
     }
     server.stop().await
+}
+
+/// Sends the REQUEST of an optimistic call and two request messages, ignoring a server that stops
+/// reading, and returns the response frames.
+async fn optimistic_raw_call(
+    connection: &quinn::Connection,
+    method: &str,
+    kind: RpcKind,
+    messages: &[u8],
+) -> TestResult<Vec<RawFrame>> {
+    optimistic_raw_call_with(
+        connection,
+        RpcRequest::new(method).with_kind(kind),
+        messages,
+    )
+    .await
+}
+
+async fn optimistic_raw_call_with(
+    connection: &quinn::Connection,
+    mut request: RpcRequest,
+    messages: &[u8],
+) -> TestResult<Vec<RawFrame>> {
+    request.stream_compression = Some(stream_offer(true));
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let mut bytes = encode_protobuf_frame(frame_type::REQUEST, &request, 1 << 20)?;
+    bytes.extend_from_slice(messages);
+    let _ = send.write_all(&bytes).await;
+    let _ = send.finish();
+    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    parse_frames(&response)
+}
+
+#[tokio::test]
+async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() -> TestResult {
+    let mut messages = Vec::new();
+    for i in 0..2 {
+        push_frame(
+            &mut messages,
+            frame_type::MESSAGE,
+            &prost::Message::encode_to_vec(&sample(i)),
+        )?;
+    }
+    let server = spawn_server(Compression::new()).await?;
+    let without_memory =
+        spawn_server_with(ServerOptions::new().with_stream_compression_memory(0)).await?;
+    // Routes that do not decode stream-compressed requests, and a server without the memory to.
+    for (server, method, kind) in [
+        (&server, REFUSING_UPLOAD, RpcKind::ClientStreaming),
+        (&server, REFUSING_STREAM, RpcKind::BidirectionalStreaming),
+        (&without_memory, UPLOAD, RpcKind::ClientStreaming),
+        (&without_memory, STREAM, RpcKind::BidirectionalStreaming),
+    ] {
+        let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
+        let frames = optimistic_raw_call(&connection, method, kind, &messages).await?;
+        // A lone STATUS: ResourceExhausted and refused_stream_compression, nothing else.
+        ensure_eq!(types(&frames), [frame_type::STATUS], "{method}");
+        ensure_eq!(
+            &frames[0].payload,
+            &vector("status.refused_stream_compression.payload")?,
+            "{method}"
+        );
+    }
+    // The authorizer ran for each, but no handler did.
+    ensure_eq!(server.authorized.load(Ordering::SeqCst), 2);
+    ensure_eq!(server.handled.load(Ordering::SeqCst), 0);
+    ensure_eq!(without_memory.authorized.load(Ordering::SeqCst), 2);
+
+    let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
+    // A caller the authorizer rejects gets its error, not a refusal, so it cannot probe methods.
+    let mut metadata = trevrpc::Metadata::new();
+    metadata.insert(DENY_KEY.to_owned(), b"1".to_vec());
+    for method in [REFUSING_UPLOAD, "/test.Compressed/Missing"] {
+        let request = RpcRequest::new(method)
+            .with_kind(RpcKind::ClientStreaming)
+            .with_metadata(metadata.clone());
+        let frames = optimistic_raw_call_with(&connection, request, &messages).await?;
+        ensure_eq!(types(&frames), [frame_type::STATUS], "{method}");
+        let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[0].payload)?);
+        ensure_eq!(status.code(), trevrpc::Code::Unauthenticated, "{method}");
+    }
+    ensure_eq!(server.handled.load(Ordering::SeqCst), 0);
+    // A call that fails for another reason gets that status instead.
+    let frames = optimistic_raw_call(
+        &connection,
+        "/test.Compressed/Missing",
+        RpcKind::ClientStreaming,
+        &messages,
+    )
+    .await?;
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(
+        &frames.last().ok_or("no frames")?.payload,
+    )?);
+    ensure_eq!(status.code(), trevrpc::Code::Unimplemented);
+    let frames = optimistic_raw_call(
+        &connection,
+        REFUSING_UPLOAD,
+        RpcKind::BidirectionalStreaming,
+        &messages,
+    )
+    .await?;
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(
+        &frames.last().ok_or("no frames")?.payload,
+    )?);
+    ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
+
+    // An accepted optimistic call gets the answer in the HEADERS at dispatch and may send
+    // stream-compressed requests from its first message.
+    let mut requests = Vec::new();
+    for i in 0..4 {
+        push_frame(
+            &mut requests,
+            frame_type::ZSTD_STREAM_MESSAGE,
+            &vector(&format!("stream.plain.{i}.payload"))?,
+        )?;
+    }
+    let frames = optimistic_raw_call(
+        &connection,
+        STREAM,
+        RpcKind::BidirectionalStreaming,
+        &requests,
+    )
+    .await?;
+    ensure_eq!(
+        frames.first().map(|frame| frame.frame_type),
+        Some(frame_type::HEADERS)
+    );
+    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
+    ensure_eq!(headers.stream_compression, Some(stream_offer(false)));
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(
+        &frames.last().ok_or("no frames")?.payload,
+    )?);
+    ensure!(status.is_ok(), "{status:?}");
+    ensure_eq!(
+        status
+            .metadata()
+            .get(STREAM_COMPRESSED_KEY)
+            .map(Vec::as_slice),
+        Some(&b"4"[..])
+    );
+    drop(connection);
+    without_memory.stop().await?;
+    server.stop().await
+}
+
+/// Echoes six messages one at a time on `STREAM`: the call is answered, so the connection's
+/// calls are optimistic again after a refusal.
+async fn ping_pong(channel: &trevrpc::client::Channel, method: &str) -> TestResult<Vec<u8>> {
+    let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo>(
+        channel,
+        method,
+        trevrpc::client::CallOptions::new(),
+    )
+    .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+    .compress_stream(CompressStream::BOTH)
+    .await?;
+    let (sender, mut replies) = chat.split();
+    for i in 0..6 {
+        sender.send(sample(i)).await?;
+        let reply = tokio::time::timeout(TEST_TIMEOUT, replies.next())
+            .await?
+            .ok_or("stream ended")??;
+        ensure_eq!(reply, sample(i));
+    }
+    sender.finish()?;
+    ensure!(replies.next().await.is_none());
+    Ok(replies
+        .terminal_metadata()
+        .and_then(|metadata| metadata.get(STREAM_COMPRESSED_KEY))
+        .ok_or("no stream-compressed count")?
+        .clone())
+}
+
+#[tokio::test]
+async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
+    let server = spawn_server(Compression::new()).await?;
+    let expected: String = (0..8).map(|i| sample(i).value).collect();
+    for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
+        let (_endpoint, channel) = compressed_channel(&server, policy).await?;
+        let upload = || {
+            trevrpc::client::client_streaming::<_, Echo, Echo>(
+                &channel,
+                REFUSING_UPLOAD,
+                trevrpc::client::CallOptions::new(),
+            )
+            .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+            .compress_stream(CompressStream::REQUESTS)
+        };
+
+        // A burst, sent and closed without waiting: refused after the send side closed.
+        let response = upload()
+            .send_all(futures_util::stream::iter((0..8).map(|i| Ok(sample(i)))))
+            .with_response();
+        let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+        ensure_eq!(response.message().value, expected, "{policy:?}");
+        ensure_eq!(
+            response
+                .metadata()
+                .get(STREAM_COMPRESSED_KEY)
+                .map(Vec::as_slice),
+            Some(&b"0"[..])
+        );
+        // The refusal stopped the connection's optimism; an answer resumes it.
+        ensure_eq!(ping_pong(&channel, STREAM).await?.as_slice(), b"4");
+
+        // Refused while the caller still sends.
+        let call = upload().await?;
+        call.send(sample(0)).await?;
+        call.send(sample(1)).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for i in 2..8 {
+            call.send(sample(i)).await?;
+        }
+        let response =
+            tokio::time::timeout(TEST_TIMEOUT, call.close_and_recv_with_response()).await??;
+        ensure_eq!(response.message().value, expected, "{policy:?}");
+        ensure_eq!(ping_pong(&channel, STREAM).await?.as_slice(), b"4");
+
+        // A bidirectional call, refused at its first message, echoes each message once.
+        ensure_eq!(ping_pong(&channel, REFUSING_STREAM).await?.as_slice(), b"0");
+    }
+    // The authorizer ran once per attempt, refused or replayed, and each handler once per call:
+    // per policy, three refused calls and their replays and two answered calls in between.
+    ensure_eq!(server.handled.load(Ordering::SeqCst), 6);
+    ensure_eq!(server.authorized.load(Ordering::SeqCst), 16);
+    server.stop().await
+}
+
+/// What a scripted server does with one call.
+#[derive(Clone, Copy)]
+enum Script {
+    /// Refuses the call after `after`.
+    Refuse { after: Duration },
+    /// Sends HEADERS after `headers_after`, with a stream compression answer if `answer`, then
+    /// answers with the concatenation of the requests.
+    Answer {
+        answer: bool,
+        headers_after: Duration,
+    },
+    /// Never answers, and reports whether the client stops the response.
+    Hang,
+}
+
+/// What one call of a scripted server received.
+struct ScriptedCall {
+    request: RpcRequest,
+    /// The request messages that arrived before the server answered or refused.
+    before: Vec<RawFrame>,
+    /// The client stopped the response of a [`Script::Hang`] call.
+    stopped: bool,
+}
+
+/// A server that answers its calls, in the order they arrive, as `script` says.
+fn scripted_server(
+    script: Vec<Script>,
+) -> TestResult<(
+    SocketAddr,
+    CertificateDer<'static>,
+    tokio::sync::mpsc::UnboundedReceiver<ScriptedCall>,
+)> {
+    let (cert, mut tls) = self_signed()?;
+    tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+    let config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
+    ));
+    let endpoint = quinn::Endpoint::server(config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    let addr = endpoint.local_addr()?;
+    let (calls, received) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let Some(incoming) = endpoint.accept().await else {
+            return;
+        };
+        let Ok(connection) = incoming.await else {
+            return;
+        };
+        for step in script {
+            let Ok((send, recv)) = connection.accept_bi().await else {
+                return;
+            };
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                if let Ok(call) = scripted_call(step, send, recv).await {
+                    let _ = calls.send(call);
+                }
+            });
+        }
+        // Keep the connection until the client is done with it.
+        connection.closed().await;
+    });
+    Ok((addr, cert, received))
+}
+
+async fn scripted_call(
+    step: Script,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> TestResult<ScriptedCall> {
+    let request: RpcRequest = decode_payload(&read_frame(&mut recv).await?.payload)?;
+    // A reader that hands over frames as they arrive, so none is lost to a timeout.
+    let (frames, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(frame) = read_frame(&mut recv).await {
+            if frames.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    let mut before = Vec::new();
+    let mut take_arrived = |before: &mut Vec<RawFrame>| {
+        while let Ok(frame) = arrived.try_recv() {
+            before.push(frame);
+        }
+    };
+    match step {
+        Script::Refuse { after } => {
+            tokio::time::sleep(after).await;
+            take_arrived(&mut before);
+            send.write_all(&vector("status.refused_stream_compression.frame")?)
+                .await?;
+            send.finish()?;
+            Ok(ScriptedCall {
+                request,
+                before,
+                stopped: false,
+            })
+        }
+        Script::Answer {
+            answer,
+            headers_after,
+        } => {
+            tokio::time::sleep(headers_after).await;
+            take_arrived(&mut before);
+            let headers = RpcHeaders {
+                stream_compression: answer.then_some(stream_offer(false)),
+                ..RpcHeaders::default()
+            };
+            send.write_all(&encode_protobuf_frame(
+                frame_type::HEADERS,
+                &headers,
+                1 << 20,
+            )?)
+            .await?;
+            let mut all: Vec<RawFrame> = before
+                .iter()
+                .map(|frame| RawFrame {
+                    frame_type: frame.frame_type,
+                    payload: frame.payload.clone(),
+                })
+                .collect();
+            while let Some(frame) = arrived.recv().await {
+                all.push(frame);
+            }
+            let mut reader = StreamReader::new()?;
+            let mut value = String::new();
+            for frame in &all {
+                let message = match frame.frame_type {
+                    frame_type::MESSAGE => frame.payload.clone(),
+                    frame_type::ZSTD_STREAM_MESSAGE => reader.read(&frame.payload)?,
+                    _ => continue,
+                };
+                value.push_str(&<Echo as prost::Message>::decode(message.as_slice())?.value);
+            }
+            let mut response =
+                encode_message_frame(&prost::Message::encode_to_vec(&Echo { value }), 8 << 20)?;
+            response.extend([u8::try_from(frame_type::STATUS)?, 0]);
+            send.write_all(&response).await?;
+            send.finish()?;
+            Ok(ScriptedCall {
+                request,
+                before,
+                stopped: false,
+            })
+        }
+        Script::Hang => {
+            let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped())
+                .await
+                .is_ok();
+            Ok(ScriptedCall {
+                request,
+                before,
+                stopped,
+            })
+        }
+    }
+}
+
+/// Uploads `count` samples in one burst on a client-streaming call that may stream-compress its
+/// requests, over `transport`.
+async fn burst(
+    transport: &QuicTransport,
+    count: u32,
+    options: trevrpc::client::CallOptions,
+) -> trevrpc::Result<Echo> {
+    trevrpc::client::client_streaming::<_, Echo, Echo>(transport, UPLOAD, options)
+        .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+        .compress_stream(CompressStream::REQUESTS)
+        .send_all(futures_util::stream::iter(
+            (0..count).map(|i| Ok(sample(i))),
+        ))
+        .await
+}
+
+#[tokio::test]
+async fn a_refused_call_is_replayed_with_the_rest_of_its_deadline() -> TestResult {
+    let (addr, cert, mut calls) = scripted_server(vec![
+        Script::Refuse {
+            after: Duration::from_millis(300),
+        },
+        Script::Answer {
+            answer: false,
+            headers_after: Duration::ZERO,
+        },
+    ])?;
+    let (_endpoint, connection) = quic_connection(addr, &cert).await?;
+    let transport = QuicTransport::new(connection);
+    let options = trevrpc::client::CallOptions::new().with_timeout(Duration::from_secs(5));
+    let response = tokio::time::timeout(TEST_TIMEOUT, burst(&transport, 8, options)).await??;
+    let expected: String = (0..8).map(|i| sample(i).value).collect();
+    ensure_eq!(response.value, expected);
+
+    let refused = calls.recv().await.ok_or("no first call")?;
+    let replayed = calls.recv().await.ok_or("no replay")?;
+    ensure_eq!(refused.request.stream_compression, Some(stream_offer(true)));
+    // The refused call compressed from its third message without waiting.
+    ensure_eq!(
+        types(&refused.before),
+        [frame_type::MESSAGE, frame_type::MESSAGE]
+            .into_iter()
+            .chain([frame_type::ZSTD_STREAM_MESSAGE; 6])
+            .collect::<Vec<_>>()
+    );
+    // The replay offers without being optimistic, with the time left.
+    ensure_eq!(
+        replayed.request.stream_compression,
+        Some(stream_offer(false))
+    );
+    ensure_eq!(replayed.request.metadata, refused.request.metadata);
+    let waited = u64::try_from(Duration::from_millis(300).as_nanos())?;
+    ensure!(
+        replayed.request.timeout_nanos > 0
+            && replayed.request.timeout_nanos <= refused.request.timeout_nanos - waited,
+        "{} after {}",
+        replayed.request.timeout_nanos,
+        refused.request.timeout_nanos
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_client_stops_being_optimistic_after_a_refusal_until_an_answer() -> TestResult {
+    let answer = |answer| Script::Answer {
+        answer,
+        headers_after: Duration::ZERO,
+    };
+    let (addr, cert, mut calls) = scripted_server(vec![
+        Script::Refuse {
+            after: Duration::ZERO,
+        },
+        // The replay, answered by a server that never decodes.
+        answer(false),
+        // Not optimistic, and answered.
+        answer(true),
+        // Optimistic again.
+        answer(true),
+    ])?;
+    let (_endpoint, connection) = quic_connection(addr, &cert).await?;
+    let transport = QuicTransport::new(connection);
+    let mut optimistic = Vec::new();
+    for _ in 0..3 {
+        tokio::time::timeout(
+            TEST_TIMEOUT,
+            burst(&transport, 4, trevrpc::client::CallOptions::new()),
+        )
+        .await??;
+    }
+    for _ in 0..4 {
+        let call = calls.recv().await.ok_or("missing call")?;
+        optimistic.push(
+            call.request
+                .stream_compression
+                .is_some_and(|offer| offer.optimistic),
+        );
+    }
+    ensure_eq!(optimistic, [true, false, false, true]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_optimistic_call_keeps_at_most_a_mebibyte_until_the_answer() -> TestResult {
+    let (addr, cert, mut calls) = scripted_server(vec![Script::Answer {
+        answer: true,
+        headers_after: Duration::from_millis(500),
+    }])?;
+    let (_endpoint, connection) = quic_connection(addr, &cert).await?;
+    let transport = QuicTransport::new(connection);
+    let large = |i: u32| Echo {
+        value: format!("{i:064}").repeat(1024),
+    };
+    let response = trevrpc::client::client_streaming::<_, Echo, Echo>(
+        &transport,
+        UPLOAD,
+        trevrpc::client::CallOptions::new(),
+    )
+    .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+    .compress_stream(CompressStream::REQUESTS)
+    .send_all(futures_util::stream::iter(
+        (0..40).map(move |i| Ok(large(i))),
+    ));
+    let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+    let expected: String = (0..40).map(|i| large(i).value).collect();
+    ensure_eq!(response.value.len(), expected.len());
+    ensure!(response.value == expected);
+    let call = calls.recv().await.ok_or("no call")?;
+    // 64 KiB messages: 15 fit in 1 MiB of copies, and the next waits for the answer.
+    ensure_eq!(call.before.len(), 15, "messages before the answer");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_a_replay_cancels_the_call() -> TestResult {
+    let (addr, cert, mut calls) = scripted_server(vec![
+        Script::Refuse {
+            after: Duration::ZERO,
+        },
+        Script::Hang,
+    ])?;
+    let (_endpoint, connection) = quic_connection(addr, &cert).await?;
+    let transport = QuicTransport::new(connection);
+    let options = trevrpc::client::CallOptions::new().with_timeout(Duration::from_millis(500));
+    let error = tokio::time::timeout(TEST_TIMEOUT, burst(&transport, 4, options))
+        .await?
+        .err()
+        .ok_or("the call should fail")?;
+    ensure_eq!(error.into_status().code(), trevrpc::Code::DeadlineExceeded);
+    let _refused = calls.recv().await.ok_or("no first call")?;
+    let replay = calls.recv().await.ok_or("no replay")?;
+    ensure!(replay.stopped, "the replay's response was not stopped");
+    Ok(())
 }

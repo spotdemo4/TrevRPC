@@ -5,7 +5,10 @@
 //! A method allows it in its schema (`compress_stream`), which generated code passes as
 //! [`CompressStream`]. The client offers it on each call and the server answers, per direction;
 //! senders start a direction's context from its third message, within a memory budget that every
-//! server and channel has, and receivers validate each chunk before decompressing it.
+//! server and channel has, and receivers validate each chunk before decompressing it. Clients
+//! compress requests optimistically, before the answer; a server that cannot decode them refuses
+//! the call once it is authorized, before its handler runs, and the client replays it (see
+//! `client::replay`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -32,6 +35,13 @@ use crate::{Result, RpcKind, varint, wire};
 /// requests it may stream-compress (`requests` is set, the method streams requests and they are
 /// not unreliable), so the client learns the answer while it still streams. Handlers of such
 /// methods cannot set response headers; the runtime reports them as already sent.
+///
+/// Clients compress such requests optimistically, without waiting for the answer, while their
+/// connection's server accepts them. A server that does not decode them on a call, for instance
+/// when its stream compression memory is spent, refuses the call after its authorizer but before
+/// its handler runs, and the client replays it without stream compression, transparently: it keeps
+/// up to 1 MiB of a call's requests, from the channel's stream compression memory, until the server
+/// answers. Authorizers run again for the replay, so they must be free of side effects.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct CompressStream {
     /// The messages the client streams may be stream-compressed.
@@ -104,6 +114,7 @@ pub const DEFAULT_CLIENT_MEMORY: usize = 64 << 20;
 pub const fn advertised() -> wire::StreamCompression {
     wire::StreamCompression {
         max_window_log: STREAM_WINDOW_LOG,
+        optimistic: false,
     }
 }
 
@@ -153,6 +164,15 @@ impl StreamBudget {
 pub struct Reservation {
     budget: Arc<StreamBudget>,
     cost: usize,
+}
+
+impl Reservation {
+    /// Takes over `other`, a reservation from the same budget, so both are given back together.
+    pub fn absorb(&mut self, other: Self) {
+        debug_assert!(Arc::ptr_eq(&self.budget, &other.budget));
+        self.cost = self.cost.saturating_add(other.cost);
+        std::mem::forget(other);
+    }
 }
 
 impl Drop for Reservation {
@@ -664,6 +684,10 @@ pub struct ServerStream {
 
 /// Answers the request's stream compression offer for the directions of the route that may use
 /// it, within `budget`. A request that does not offer gets nothing: its client cannot use it.
+///
+/// An optimistic request may stream-compress its requests from the start with its own window, so
+/// it gets them only if the server decodes that window; otherwise the server refuses the call
+/// (see [`refuses_optimistic`]).
 pub fn negotiate_stream(
     request: &crate::RpcRequest,
     directions: CompressStream,
@@ -683,7 +707,12 @@ pub fn negotiate_stream(
             CompressionConfig::level(config),
         ));
     }
+    // An optimistic client compresses with its own window, which may be too wide to decode.
+    let too_wide = request
+        .stream_compression
+        .is_some_and(|offer| offer.optimistic && offer.max_window_log > STREAM_WINDOW_LOG);
     if directions.requests
+        && !too_wide
         && let Some(reservation) = budget.reserve(server_decoder_cost(config))
     {
         stream.count = MessageCount::new();
@@ -697,6 +726,15 @@ pub fn negotiate_stream(
     stream
 }
 
+/// Whether the server refuses `request`: it is optimistic, but negotiation did not enable its
+/// stream-compressed requests (`stream`), so the server cannot decode what the client sends.
+pub fn refuses_optimistic(request: &crate::RpcRequest, stream: &ServerStream) -> bool {
+    request
+        .stream_compression
+        .is_some_and(|offer| offer.optimistic)
+        && stream.requests.is_none()
+}
+
 /// What stream compression negotiation decided for one client call.
 #[derive(Debug, Default)]
 pub struct ClientStream {
@@ -706,19 +744,24 @@ pub struct ClientStream {
     pub requests: Option<StreamSender>,
     /// What the server's answer enables.
     pub enable_requests: Option<Arc<StreamEnable>>,
+    /// The request is optimistic: its requests are enabled from the start, and the server
+    /// accepts or refuses the call at dispatch.
+    pub optimistic: bool,
 }
 
 /// Offers stream compression on `request` for the directions of the method that may use it,
 /// within `budget`. Responses are decoded with the dictionaries `accept` holds.
 ///
 /// An offer says the client decodes stream-compressed responses, so a call whose responses stream
-/// offers only if it can reserve their decompressing context.
+/// offers only if it can reserve their decompressing context. With `optimistic`, a call whose
+/// requests may be stream-compressed compresses them without waiting for the answer.
 pub fn offer_stream(
     request: &mut crate::RpcRequest,
     directions: CompressStream,
     budget: Option<&Arc<StreamBudget>>,
     accept: &Accept,
     level: i32,
+    optimistic: bool,
 ) -> ClientStream {
     let mut stream = ClientStream::default();
     let Some(budget) = budget.filter(|_| directions.any()) else {
@@ -735,8 +778,15 @@ pub fn offer_stream(
         stream.responses =
             Some(Inflater::new(accept.clone(), STREAM_WINDOW_LOG).with_reservation(reservation));
     }
+    let mut offer = advertised();
     if directions.requests {
-        let enable = Arc::new(StreamEnable::default());
+        stream.optimistic = optimistic;
+        offer.optimistic = optimistic;
+        let enable = if optimistic {
+            StreamEnable::enabled(STREAM_WINDOW_LOG)
+        } else {
+            Arc::new(StreamEnable::default())
+        };
         stream.requests = Some(StreamSender::new(
             Arc::clone(&enable),
             Arc::clone(budget),
@@ -744,7 +794,7 @@ pub fn offer_stream(
         ));
         stream.enable_requests = Some(enable);
     }
-    request.stream_compression = Some(advertised());
+    request.stream_compression = Some(offer);
     stream
 }
 
@@ -867,12 +917,41 @@ mod tests {
             .stream_compression,
             Some(advertised())
         );
+
+        request.stream_compression = Some(wire::StreamCompression {
+            optimistic: true,
+            ..advertised()
+        });
+        assert_eq!(
+            request.encode_to_vec(),
+            vectors["request.optimistic_stream_compression.payload"]
+        );
+        let refused = crate::RpcStatus::from(crate::Status::refused_stream_compression());
+        assert_eq!(
+            refused.encode_to_vec(),
+            vectors["status.refused_stream_compression.payload"]
+        );
+        let decoded = crate::framing::decode_payload::<crate::RpcStatus>(
+            &vectors["status.refused_stream_compression.payload"],
+        )
+        .unwrap();
+        assert_eq!(decoded.code, crate::Code::ResourceExhausted.as_u32());
+        assert!(decoded.refused_stream_compression);
+        // A decoded STATUS never carries the flag into a `Status`.
+        assert_eq!(
+            crate::Status::from(decoded),
+            crate::Status::resource_exhausted("")
+        );
     }
 
     #[test]
     fn windows_below_the_minimum_enable_nothing() {
-        let window =
-            |max_window_log| sending_window(Some(&wire::StreamCompression { max_window_log }));
+        let window = |max_window_log| {
+            sending_window(Some(&wire::StreamCompression {
+                max_window_log,
+                optimistic: false,
+            }))
+        };
         assert_eq!(window(9), None);
         assert_eq!(window(10), Some(10));
         assert_eq!(window(20), Some(STREAM_WINDOW_LOG));
@@ -996,6 +1075,81 @@ mod tests {
     }
 
     #[test]
+    fn servers_refuse_optimistic_requests_they_cannot_decode() {
+        let budget = StreamBudget::new(64 << 20);
+        let optimistic = |max_window_log| {
+            let mut request = RpcRequest::new("/svc/m");
+            request.stream_compression = Some(wire::StreamCompression {
+                max_window_log,
+                optimistic: true,
+            });
+            request
+        };
+        let accepted =
+            negotiate_stream(&optimistic(16), CompressStream::BOTH, budget.as_ref(), None);
+        assert_eq!(accepted.answer, Some(advertised()));
+        assert!(!refuses_optimistic(&optimistic(16), &accepted));
+
+        // A window wider than the server decodes, a route that does not decode requests, and a
+        // server without memory all refuse.
+        let wide = negotiate_stream(&optimistic(17), CompressStream::BOTH, budget.as_ref(), None);
+        assert!(refuses_optimistic(&optimistic(17), &wide));
+        let responses = negotiate_stream(
+            &optimistic(16),
+            CompressStream::RESPONSES,
+            budget.as_ref(),
+            None,
+        );
+        assert!(refuses_optimistic(&optimistic(16), &responses));
+        let disabled = negotiate_stream(&optimistic(16), CompressStream::BOTH, None, None);
+        assert!(refuses_optimistic(&optimistic(16), &disabled));
+
+        // Calls that are not optimistic are never refused.
+        let mut offer = RpcRequest::new("/svc/m");
+        offer.stream_compression = Some(advertised());
+        let plain = negotiate_stream(&offer, CompressStream::RESPONSES, budget.as_ref(), None);
+        assert!(!refuses_optimistic(&offer, &plain));
+    }
+
+    #[test]
+    fn optimistic_clients_enable_their_requests_from_the_start() {
+        let budget = StreamBudget::new(64 << 20);
+        let mut request = RpcRequest::new("/svc/m");
+        let stream = offer_stream(
+            &mut request,
+            CompressStream::REQUESTS,
+            budget.as_ref(),
+            &Accept::None,
+            1,
+            true,
+        );
+        assert!(stream.optimistic);
+        assert_eq!(
+            request.stream_compression,
+            Some(wire::StreamCompression {
+                optimistic: true,
+                ..advertised()
+            })
+        );
+        let mut encoder = MessageEncoder::new(None).with_stream(stream.requests);
+        let types: Vec<u64> = (0..4).map(|i| encoder.encode(message(i)).0).collect();
+        assert_eq!(types, [0, 0, 5, 5]);
+
+        // Only a call whose requests may be stream-compressed is optimistic.
+        let mut request = RpcRequest::new("/svc/m");
+        let stream = offer_stream(
+            &mut request,
+            CompressStream::RESPONSES,
+            budget.as_ref(),
+            &Accept::None,
+            1,
+            true,
+        );
+        assert!(!stream.optimistic);
+        assert_eq!(request.stream_compression, Some(advertised()));
+    }
+
+    #[test]
     fn clients_offer_only_what_they_can_decode() {
         let budget = StreamBudget::new(64 << 20);
         let mut request = RpcRequest::new("/svc/m");
@@ -1005,6 +1159,7 @@ mod tests {
             budget.as_ref(),
             &Accept::None,
             1,
+            false,
         );
         assert_eq!(request.stream_compression, Some(advertised()));
         assert!(stream.responses.is_some() && stream.requests.is_some());
@@ -1017,6 +1172,7 @@ mod tests {
             budget.as_ref(),
             &Accept::None,
             1,
+            false,
         );
         assert!(request.stream_compression.is_some() && stream.responses.is_none());
 
@@ -1029,6 +1185,7 @@ mod tests {
             spent.as_ref(),
             &Accept::None,
             1,
+            false,
         );
         assert!(request.stream_compression.is_none() && stream.requests.is_none());
 
@@ -1039,6 +1196,7 @@ mod tests {
             budget.as_ref(),
             &Accept::None,
             1,
+            false,
         );
         assert!(request.stream_compression.is_none());
     }
