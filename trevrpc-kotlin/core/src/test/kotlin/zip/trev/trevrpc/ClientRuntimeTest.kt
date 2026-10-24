@@ -424,7 +424,10 @@ class ClientRuntimeTest {
         runTest {
             val stream =
                 object : RpcClientStream {
-                    override suspend fun send(body: ByteArray) = Unit
+                    override suspend fun send(
+                        body: ByteArray,
+                        frameType: Long,
+                    ) = Unit
 
                     override suspend fun finishSend() = Unit
 
@@ -675,7 +678,10 @@ private class LoopbackTransport : RpcTransport {
         }
         val uploaded = mutableListOf<String>()
         return object : RpcClientStream {
-            override suspend fun send(body: ByteArray) {
+            override suspend fun send(
+                body: ByteArray,
+                frameType: Long,
+            ) {
                 if (kind == RpcKind.BIDIRECTIONAL_STREAMING) {
                     frames.send(message("echo:${body.decodeToString()}"))
                 } else {
@@ -743,7 +749,10 @@ private class SequenceStream(
     var sendOperation: suspend () -> Unit = {}
     var finishOperation: suspend () -> Unit = {}
 
-    override suspend fun send(body: ByteArray) = sendOperation()
+    override suspend fun send(
+        body: ByteArray,
+        frameType: Long,
+    ) = sendOperation()
 
     override suspend fun finishSend() = finishOperation()
 
@@ -767,7 +776,10 @@ private class RecordingClientStream(
     var closes = 0
         private set
 
-    override suspend fun send(body: ByteArray) {
+    override suspend fun send(
+        body: ByteArray,
+        frameType: Long,
+    ) {
         if (sendFinished) throw TrevRpcException(Status.cancelled("request stream is closed"))
         sent += body.copyOf()
     }

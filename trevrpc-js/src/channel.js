@@ -30,6 +30,7 @@ const DefaultReprobeIntervalMs = 5 * 60_000;
  */
 export class Channel {
   #dial;
+  #compression;
   #onStateChange;
   #session;
   #transport;
@@ -40,11 +41,12 @@ export class Channel {
   /** Opens a channel and waits for its first session; use connect() instead. */
   static async connect(url, options = {}) {
     const dial = sessionDialer(url, options);
-    return new Channel(await dial(options.signal), dial, options.onStateChange);
+    return new Channel(await dial(options.signal), dial, options);
   }
 
-  constructor(dialed, dial, onStateChange) {
+  constructor(dialed, dial, { compression, onStateChange } = {}) {
     this.#dial = dial;
+    this.#compression = compression;
     this.#onStateChange = onStateChange;
     this.#adopt(dialed);
   }
@@ -59,6 +61,11 @@ export class Channel {
     return this.#transport;
   }
 
+  /** The compression settings from the connect options, or undefined. */
+  get compression() {
+    return this.#compression;
+  }
+
   /** Opens a bidirectional stream on the current session. */
   createBidirectionalStream() {
     if (this.#state !== "ready") {
@@ -68,19 +75,18 @@ export class Channel {
   }
 
   /**
-   * Opens a bidirectional stream on the current session, together with that session's WebTransport
-   * `datagrams` object, or undefined if the session has none (QMux over WebSocket). Calls that may
-   * use datagrams open their stream here, so their datagram flow belongs to the session that
-   * carries them even if the channel reconnects meanwhile.
+   * Opens a bidirectional stream on the current session, together with that session: the
+   * WebTransport or QMux over WebSocket session, whose `datagrams` are undefined for QMux. Calls
+   * whose setup depends on their session (dictionary negotiation, datagram flows) open their stream
+   * here, so that setup belongs to the session that carries them even if the channel reconnects
+   * meanwhile.
    */
-  createBidirectionalStreamWithDatagrams() {
+  createBidirectionalStreamWithSession() {
     if (this.#state !== "ready") {
       return Promise.reject(unavailable(`channel is ${this.#state}`));
     }
     const session = this.#session;
-    return session
-      .createBidirectionalStream()
-      .then((stream) => ({ stream, datagrams: session.datagrams }));
+    return session.createBidirectionalStream().then((stream) => ({ stream, session }));
   }
 
   /** Resolves once the channel is ready, immediately if it already is. */

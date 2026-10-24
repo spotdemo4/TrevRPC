@@ -47,6 +47,8 @@
               GOTOOLCHAIN = "local";
               RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
               PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+              # The libzstd module that `npm run build` embeds for @trevrpc/trevrpc-js/zstd.
+              TREVRPC_ZSTD_WASM = "${self.packages.${system}.trevrpc-js.zstdWasm}/libzstd.wasm";
               FIXED_VERSION = "true";
             };
             packages = with pkgs; [
@@ -268,6 +270,7 @@
               inherit
                 wireGolden
                 qmuxGolden
+                zstdGolden
                 interopProto
                 trevrpcProto
                 ;
@@ -275,6 +278,7 @@
             trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
               inherit
                 wireGolden
+                zstdGolden
                 interopHarness
                 interopProto
                 trevrpcProto

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { connect } from "../src/channel.js";
@@ -21,20 +20,13 @@ import { decodeTransportParameters, writeTransportParameters } from "../src/qmux
 import { QMuxProtocol, QMuxWebSocketSession } from "../src/qmux/session.js";
 import { Code } from "../src/status.js";
 import { readVarint, writeVarint } from "../src/varint.js";
-
-const goldenPath = new URL("../../testdata/qmux-golden-vectors.txt", import.meta.url);
+import { readGoldenVectors } from "./support.js";
 
 async function goldenVectors() {
-  const vectors = new Map();
-  for (const line of (await readFile(goldenPath, "utf8")).split(/\r?\n/u)) {
-    const text = line.trim();
-    if (text === "" || text.startsWith("#")) {
-      continue;
-    }
-    const [name, value] = text.split("=").map((part) => part.trim());
-    vectors.set(name, Uint8Array.from(Buffer.from(value, "hex")));
-  }
-  return vectors;
+  const vectors = await readGoldenVectors("qmux-golden-vectors.txt");
+  return new Map(
+    [...vectors].map(([name, value]) => [name, Uint8Array.from(Buffer.from(value, "hex"))]),
+  );
 }
 
 function frames(write) {

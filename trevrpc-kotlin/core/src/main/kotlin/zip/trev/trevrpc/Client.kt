@@ -25,9 +25,15 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 
+/**
+ * Encodes and decodes the messages of one type. [messageType] is the full protobuf name of the
+ * type, such as `example.v1.Position`, which picks its [Dictionary]; generated codecs set it, and
+ * messages of a codec without one are never compressed.
+ */
 class MessageCodec<T>(
     val encode: (T) -> ByteArray,
     val decode: (ByteArray) -> T,
+    val messageType: String? = null,
 ) {
     companion object {
         val BYTE_ARRAY: MessageCodec<ByteArray> = MessageCodec(ByteArray::copyOf, ByteArray::copyOf)
@@ -73,6 +79,10 @@ data class CallOptions(
 }
 
 interface RpcTransport {
+    /** The compressed messages calls on this transport negotiate, or null for none. */
+    val compression: Compression?
+        get() = null
+
     /**
      * Opens one call stream and writes REQUEST. When [firstMessage] is present (unary and
      * server-streaming calls) it is written in the same write as REQUEST, and when [finishSend] is
@@ -94,13 +104,19 @@ interface RpcTransport {
  */
 interface RpcClientStream {
     /**
-     * Writes one MESSAGE frame. [Client] cancels a send in flight when the response ends the call,
-     * so implementations must stay cancellable. A transport that stops accepting writes because the
-     * server ended the call should fail with a [TrevRpcException]; [Client] reports the server's
-     * status or the response error instead when the response explains the failure, so a transport
-     * that cannot say why may fail with any exception.
+     * Writes one message frame: [body] is the message of a MESSAGE frame, or the payload of a
+     * ZSTD_MESSAGE frame when [frameType] says so (see [encodeMessageFrame]). [Client] sends
+     * ZSTD_MESSAGE frames only on a transport that has [RpcTransport.compression]. [Client] cancels
+     * a send in flight when the response ends the call, so implementations must stay cancellable.
+     * A transport that stops accepting writes because the server ended the call should fail with a
+     * [TrevRpcException]; [Client] reports the server's status or the response error instead when
+     * the response explains the failure, so a transport that cannot say why may fail with any
+     * exception.
      */
-    suspend fun send(body: ByteArray)
+    suspend fun send(
+        body: ByteArray,
+        frameType: Long = FrameType.MESSAGE,
+    )
 
     /** Half-closes the request side after prior sends. Repeated calls have no effect. */
     suspend fun finishSend()
@@ -136,7 +152,9 @@ class Client(
         // A unary call has no stream-idle bound, only the call deadline.
         val state =
             open(
-                request(path, RpcKind.UNARY, options),
+                path,
+                RpcKind.UNARY,
+                requestCodec,
                 requestCodec.encode(request),
                 responseCodec,
                 options,
@@ -225,7 +243,9 @@ class Client(
     ): ServerStreamingCall<Res> {
         val state =
             open(
-                request(path, RpcKind.SERVER_STREAMING, options),
+                path,
+                RpcKind.SERVER_STREAMING,
+                requestCodec,
                 requestCodec.encode(request),
                 responseCodec,
                 options,
@@ -241,7 +261,7 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): ClientStreamingCall<Req, Res> {
-        val state = open(request(path, RpcKind.CLIENT_STREAMING, options), null, responseCodec, options)
+        val state = open(path, RpcKind.CLIENT_STREAMING, requestCodec, null, responseCodec, options)
         return ClientStreamingCall(state.writer, requestCodec, state.reader)
     }
 
@@ -255,21 +275,25 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
     ): BidirectionalStreamingCall<Req, Res> {
-        val state = open(request(path, RpcKind.BIDIRECTIONAL_STREAMING, options), null, responseCodec, options)
+        val state = open(path, RpcKind.BIDIRECTIONAL_STREAMING, requestCodec, null, responseCodec, options)
         return BidirectionalStreamingCall(state.writer, requestCodec, state.reader)
     }
 
     private suspend fun <Res> open(
-        request: RpcRequest,
+        path: String,
+        kind: RpcKind,
+        requestCodec: MessageCodec<*>,
         firstMessage: ByteArray?,
         codec: MessageCodec<Res>,
         options: CallOptions,
         finishSend: Boolean = false,
         idleTimeout: Duration? = options.streamIdleTimeout,
     ): OpenedStream<Res> {
+        val compression = transport.compression?.call(requestCodec.messageType, codec.messageType, streamsRequest = !finishSend)
+        val request = request(path, kind, options, compression)
         val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
         val stream = callWithDeadline(deadline, null) { transport.openStream(request, firstMessage, finishSend) }
-        val call = CallStream(stream)
+        val call = CallStream(stream, compression, options.maxResponseBodySize)
         // A call that streams its request needs to learn of the server's terminal status while it uploads.
         if (!finishSend) call.pump = ResponsePump(responseContext, call, deadline, options)
         return OpenedStream(
@@ -322,7 +346,7 @@ internal class RequestWriter(
             throw TrevRpcException(Status.cancelled("request stream is closed"))
         }
         call.end.sendError()?.let { throw it }
-        write(reportEnd = true) { call.stream.send(body) }
+        write(reportEnd = true) { call.send(body) }
     }
 
     /**
@@ -656,7 +680,7 @@ internal class ResponseReader<T>(
         pump?.poll()?.let { return it.unwrap() }
         return callWithDeadline(deadline, idleTimeout) {
             val item = pump?.take()
-            if (item != null) item.unwrap() else call.stream.receive()
+            if (item != null) item.unwrap() else call.receive()
         }
     }
 
@@ -785,12 +809,15 @@ private fun request(
     path: String,
     kind: RpcKind,
     options: CallOptions,
+    compression: CallCompression?,
 ): RpcRequest =
     RpcRequest(
         method = path,
         metadata = options.metadata,
         kindValue = kind.value,
         timeoutNanos = timeoutNanos(options.timeout),
+        acceptDictionaries = compression?.accept.orEmpty(),
+        dictionaryQuery = compression?.query.orEmpty(),
     )
 
 private fun timeoutNanos(timeout: Duration?): ULong {

@@ -16,9 +16,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import zip.trev.trevrpc.Compression
 import zip.trev.trevrpc.DEFAULT_MAX_FRAME_SIZE
 import zip.trev.trevrpc.FrameDecoder
-import zip.trev.trevrpc.FrameType
 import zip.trev.trevrpc.ResponseFrame
 import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.RpcClientStream
@@ -26,7 +26,7 @@ import zip.trev.trevrpc.RpcRequest
 import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.WireCodec
-import zip.trev.trevrpc.encodeFrame
+import zip.trev.trevrpc.encodeMessageFrame
 import zip.trev.trevrpc.encodeRequestFrames
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
@@ -43,7 +43,8 @@ import kotlin.time.Duration.Companion.seconds
 internal const val TREV_RPC_CONTENT_TYPE = "application/trevrpc"
 
 /**
- * Cronet transport limits. [closeTimeout] strictly bounds TrevRPC's shutdown wait. Provider
+ * Cronet transport options. [compression] enables compressed messages on the channel's calls.
+ * [closeTimeout] strictly bounds TrevRPC's shutdown wait. Provider
  * cancellation and callback-executor submission run on detached daemon workers, and close never
  * waits for a provider call while holding a transport monitor. A non-cooperative borrowed
  * implementation therefore cannot hold the closing coroutine past this bound.
@@ -53,6 +54,7 @@ data class CronetTransportOptions(
     val responseChannelCapacity: Int = 8,
     val maxFrameSize: Int = DEFAULT_MAX_FRAME_SIZE,
     val closeTimeout: Duration = 5.seconds,
+    val compression: Compression? = null,
 ) {
     init {
         require(readBufferSize > 0) { "readBufferSize must be positive" }
@@ -139,6 +141,9 @@ internal class Http3RpcTransport(
     private val closeLock = Any()
     private var closeResult: CompletableDeferred<Result<Unit>>? = null
 
+    override val compression: Compression?
+        get() = options.compression
+
     internal val activeExchangeCount: Int
         get() = exchanges.activeCount
 
@@ -210,7 +215,10 @@ internal class Http3RpcTransport(
 private class StreamingTransportStream(
     private val exchange: Http3Exchange,
 ) : RpcClientStream {
-    override suspend fun send(body: ByteArray) = exchange.send(body)
+    override suspend fun send(
+        body: ByteArray,
+        frameType: Long,
+    ) = exchange.send(body, frameType)
 
     override suspend fun finishSend() = exchange.finishSend()
 
@@ -324,11 +332,14 @@ internal class Http3Exchange(
         ) { encodeRequestFrames(request, firstMessage, options.maxFrameSize) }
     }
 
-    suspend fun send(body: ByteArray) {
+    suspend fun send(
+        body: ByteArray,
+        frameType: Long,
+    ) {
         sendLock.withLock {
             checkSendOpen()
             writeDirect(false, "request write failed") {
-                encodeFrame(FrameType.MESSAGE, body, options.maxFrameSize)
+                encodeMessageFrame(frameType, body, options.maxFrameSize)
             }
         }
     }
@@ -569,7 +580,7 @@ internal class Http3Exchange(
                 var statusSeen = false
                 for (raw in decoder.feed(chunk.bytes)) {
                     // Each frame is decoded exactly once, here; the stream receives the result.
-                    val frame = WireCodec.decodeResponseFrame(raw)
+                    val frame = WireCodec.decodeResponseFrame(raw, options.maxFrameSize)
                     // Frames after STATUS in the same read are still forwarded so the reader can
                     // reject a known frame after the terminal status.
                     if (frame is ResponseFrame.Status && !statusSeen) {

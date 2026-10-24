@@ -20,10 +20,14 @@ kotlin {
 dependencies {
     api(libs.coroutines.core)
     api(libs.protobuf.java)
+    // Compression calls zstd-jni, which the application adds (an AAR on Android, a JAR on the JVM)
+    // only if it configures compression, so it stays off the published dependencies.
+    compileOnly(libs.zstd.jni)
 
     testImplementation(platform(libs.junit.bom))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation(libs.coroutines.test)
+    testImplementation(libs.zstd.jni)
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
@@ -33,4 +37,6 @@ sourceSets.test {
 
 tasks.test {
     useJUnitPlatform()
+    // zstd-jni loads its native library.
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
 }

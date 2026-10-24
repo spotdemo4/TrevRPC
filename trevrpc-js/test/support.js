@@ -1,6 +1,9 @@
 // Test doubles: an in-memory server for TrevRPC streams built on web streams, so the real client
 // code runs end to end without a network. Cancelling or aborting one side of a stream errors the
 // other side exactly like a QUIC reset would.
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+
 import {
   FrameReader,
   FrameType,
@@ -242,4 +245,32 @@ export function fakeDatagrams({ maxDatagramSize, outgoingHighWaterMark = 16 } = 
     datagrams.maxDatagramSize = maxDatagramSize;
   }
   return datagrams;
+}
+
+/**
+ * Reads a shared golden vector file from testdata/ as a map from vector name to its raw text.
+ * Values are hex, except `.frames` and `.messages` lists and decimal `.id`s.
+ */
+export async function readGoldenVectors(file) {
+  const vectors = new Map();
+  const text = await readFile(new URL(`../../testdata/${file}`, import.meta.url), "utf8");
+  for (const [index, rawLine] of text.split(/\r?\n/u).entries()) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) {
+      continue;
+    }
+    const separator = line.indexOf("=");
+    assert.ok(separator > 0, `invalid golden vector on line ${index + 1} of ${file}`);
+    const name = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (![".frames", ".messages", ".id"].some((suffix) => name.endsWith(suffix))) {
+      assert.match(
+        value,
+        /^(?:[0-9a-f]{2})*$/u,
+        `invalid golden vector on line ${index + 1} of ${file}`,
+      );
+    }
+    vectors.set(name, value);
+  }
+  return vectors;
 }

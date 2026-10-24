@@ -764,6 +764,7 @@ class GeneratorTest {
                 "package ",
                 "MessageCodec<",
                 "decodeProtobuf(",
+                "messageType = ",
                 "invalidArgument(",
                 "const val ",
                 "suspend fun ",

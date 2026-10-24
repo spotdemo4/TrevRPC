@@ -11,6 +11,7 @@ import {
   type StreamStatus,
   type Transport,
 } from "@trevrpc/trevrpc-js";
+import { createCompression } from "@trevrpc/trevrpc-js/zstd";
 
 import {
   EchoClient,
@@ -89,6 +90,15 @@ try {
 }
 
 channel.close({ closeCode: 0, reason: "done" });
+
+const compression = await createCompression({
+  dictionaries: [{ data: new Uint8Array(), messages: ["trevrpc.interop.v1.EchoRequest"] }],
+  level: 3,
+});
+const compressed = await connect("https://example.test/trevrpc", { compression });
+compressed.compression satisfies typeof compression | undefined;
+// @ts-expect-error Compression settings come from createCompression().
+await connect("https://example.test/trevrpc", { compression: { query: [] } });
 
 // @ts-expect-error The Channel constructor is internal; use connect().
 new Channel();

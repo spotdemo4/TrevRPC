@@ -97,3 +97,7 @@ jobs:
       - name: Run cargo audit
         working-directory: trevrpc-rust
         run: cargo-audit audit
+
+      - name: Run cargo audit on the JavaScript zstd module
+        working-directory: trevrpc-js/zstd-wasm
+        run: cargo-audit audit

@@ -16,6 +16,7 @@
   interopProto,
   trevrpcProto,
   wireGolden,
+  zstdGolden,
 }:
 let
   gradleWrapperLines = lib.splitString "\n" (
@@ -64,7 +65,7 @@ let
     (androidenv.composeAndroidPackages {
       platformVersions = [
         "33"
-        "36"
+        "37.0"
       ];
       buildToolsVersions = [ "37.0.0" ];
       includeEmulator = true;
@@ -81,6 +82,7 @@ let
       licenseFile
       trevrpcProto
       wireGolden
+      zstdGolden
       ;
     inherit androidSdk;
     gradle_9 = gradle9;
@@ -98,6 +100,7 @@ stdenvNoCC.mkDerivation (final: {
     fileset = lib.fileset.unions [
       licenseFile
       wireGolden
+      zstdGolden
       interopHarness
       interopProto
       trevrpcProto

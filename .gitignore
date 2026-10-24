@@ -17,6 +17,7 @@ target/
 
 # javascript
 node_modules/
+/trevrpc-js/src/zstd-wasm.js
 
 # kotlin
 .gradle/

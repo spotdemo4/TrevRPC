@@ -389,6 +389,42 @@ class Http3RpcTransportTest {
         }
 
     @Test
+    fun `compressed messages travel as ZSTD_MESSAGE frames and count at the size of their message`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext), fake)
+            val send = async { stream.send(COMPRESSED_PAYLOAD, FrameType.ZSTD_MESSAGE) }
+            runCurrent()
+            val written = FrameDecoder().feed(fake.onlyWrite().bytes).single()
+            assertEquals(FrameType.ZSTD_MESSAGE, written.type)
+            assertArrayEquals(COMPRESSED_PAYLOAD, written.payload)
+            fake.completeWrite()
+            send.await()
+            fake.headers(validHeaders())
+            fake.deliverRead(encodeFrame(FrameType.ZSTD_MESSAGE, COMPRESSED_PAYLOAD) + statusFrame(Status.ok()))
+            runCurrent()
+            val message = stream.receive() as ResponseFrame.Message
+            assertTrue(message.compressed)
+            assertArrayEquals(COMPRESSED_PAYLOAD, message.body)
+
+            // The payload fits a 64-byte frame, but the 71-byte message it carries does not.
+            val limited = CronetTransportOptions(maxFrameSize = 64)
+            val smallFake = FakeFactory()
+            val small =
+                openStreaming(Http3RpcTransport(smallFake, limited, coroutineContext, shutdownContext = coroutineContext), smallFake)
+            val error = runCatching { small.send(COMPRESSED_PAYLOAD, FrameType.ZSTD_MESSAGE) }.exceptionOrNull()
+            assertEquals(Code.RESOURCE_EXHAUSTED, (error as TrevRpcException).status.code)
+            val readFake = FakeFactory()
+            val reading =
+                openStreaming(Http3RpcTransport(readFake, limited, coroutineContext, shutdownContext = coroutineContext), readFake)
+            readFake.headers(validHeaders())
+            readFake.deliverRead(encodeFrame(FrameType.ZSTD_MESSAGE, COMPRESSED_PAYLOAD))
+            runCurrent()
+            assertEquals(Code.RESOURCE_EXHAUSTED, (reading.receiveFailure() as TrevRpcException).status.code)
+        }
+
+    @Test
     fun `a known frame after status in the same read is forwarded for the reader to reject`() =
         runTest {
             val fake = FakeFactory()
@@ -1272,6 +1308,10 @@ private fun decodeRequestFrame(bytes: ByteArray): RpcRequest {
 }
 
 private fun messageFrame(body: ByteArray): ByteArray = encodeFrame(FrameType.MESSAGE, body)
+
+/** `ok.small` of the compression golden vectors: a 71-byte message compressed into 23 bytes. */
+private val COMPRESSED_PAYLOAD =
+    "2101478d0000203238397d047c00cac4a5bd2f4f413605".chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
 private fun headersFrame(metadata: Metadata = Metadata.EMPTY): ByteArray =
     encodeFrame(FrameType.HEADERS, WireCodec.encode(RpcHeaders(metadata)))

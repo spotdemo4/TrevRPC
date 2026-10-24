@@ -293,7 +293,10 @@ class CallTerminationTest {
                 val reads = AtomicInteger()
                 return OneStream(
                     object : RpcClientStream {
-                        override suspend fun send(body: ByteArray) = Unit
+                        override suspend fun send(
+                            body: ByteArray,
+                            frameType: Long,
+                        ) = Unit
 
                         override suspend fun finishSend() = Unit
 
@@ -344,7 +347,10 @@ class CallTerminationTest {
             val transport =
                 OneStream(
                     object : RpcClientStream {
-                        override suspend fun send(body: ByteArray) = Unit
+                        override suspend fun send(
+                            body: ByteArray,
+                            frameType: Long,
+                        ) = Unit
 
                         override suspend fun finishSend() = Unit
 
@@ -406,7 +412,10 @@ private class ScriptedStream : RpcClientStream {
 
     suspend fun awaitReceive() = receiveStarted.await()
 
-    override suspend fun send(body: ByteArray) {
+    override suspend fun send(
+        body: ByteArray,
+        frameType: Long,
+    ) {
         sends.incrementAndGet()
         sendStarted.complete(Unit)
         sendBehavior()

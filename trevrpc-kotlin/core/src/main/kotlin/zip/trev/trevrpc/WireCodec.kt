@@ -14,6 +14,8 @@ object WireCodec {
                 uint64(7, request.timeoutNanos)
                 packedUint64(8, request.extensions)
                 uint64(9, request.datagramFlow)
+                packedUint32(10, request.acceptDictionaries)
+                dictionaries(11, request.dictionaryQuery)
             }.toByteArray()
 
     fun decodeRequest(bytes: ByteArray): RpcRequest {
@@ -24,6 +26,8 @@ object WireCodec {
         var timeoutNanos = 0uL
         val extensions = mutableListOf<ULong>()
         var datagramFlow = 0uL
+        val acceptDictionaries = mutableListOf<UInt>()
+        val dictionaryQuery = mutableListOf<DictionaryInfo>()
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
@@ -33,10 +37,21 @@ object WireCodec {
                 7 -> timeoutNanos = reader.uint64(tag)
                 8 -> reader.uint64Elements(tag, extensions)
                 9 -> datagramFlow = reader.uint64(tag)
+                10 -> reader.uint32Elements(tag, acceptDictionaries)
+                11 -> dictionaryQuery += reader.dictionaryInfo(tag)
                 else -> reader.skip(tag)
             }
         }
-        return RpcRequest(method, Metadata.fromWire(metadata), kind, timeoutNanos, extensions, datagramFlow)
+        return RpcRequest(
+            method,
+            Metadata.fromWire(metadata),
+            kind,
+            timeoutNanos,
+            extensions,
+            datagramFlow,
+            acceptDictionaries,
+            dictionaryQuery,
+        )
     }
 
     fun encode(headers: RpcHeaders): ByteArray =
@@ -44,21 +59,24 @@ object WireCodec {
             .apply {
                 metadata(1, headers.metadata)
                 packedUint64(2, headers.extensions)
+                dictionaries(3, headers.dictionaries)
             }.toByteArray()
 
     fun decodeHeaders(bytes: ByteArray): RpcHeaders {
         val reader = Reader(bytes)
         val metadata = linkedMapOf<String, ByteArray>()
         val extensions = mutableListOf<ULong>()
+        val dictionaries = mutableListOf<DictionaryInfo>()
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
                 1 -> reader.mapEntry(tag, metadata)
                 2 -> reader.uint64Elements(tag, extensions)
+                3 -> dictionaries += reader.dictionaryInfo(tag)
                 else -> reader.skip(tag)
             }
         }
-        return RpcHeaders(Metadata.fromWire(metadata), extensions)
+        return RpcHeaders(Metadata.fromWire(metadata), extensions, dictionaries)
     }
 
     fun encode(status: RpcStatus): ByteArray =
@@ -88,14 +106,34 @@ object WireCodec {
 
     /**
      * Decodes one known frame read from a response stream exactly once. A REQUEST frame is a known
-     * frame the response grammar does not allow, which is an `Internal` protocol error.
+     * frame the response grammar does not allow, which is an `Internal` protocol error. A
+     * ZSTD_MESSAGE is validated but stays compressed; the message it carries is limited by
+     * [maxFrameSize], like the frames of the stream.
      */
-    fun decodeResponseFrame(frame: Frame): ResponseFrame =
+    fun decodeResponseFrame(
+        frame: Frame,
+        maxFrameSize: Int = DEFAULT_MAX_FRAME_SIZE,
+    ): ResponseFrame =
         when (frame.type) {
-            FrameType.MESSAGE -> ResponseFrame.Message(frame.payload)
-            FrameType.HEADERS -> ResponseFrame.Headers(decodeHeaders(frame.payload).metadata)
-            FrameType.STATUS -> ResponseFrame.Status(decodeStatus(frame.payload).status)
-            else -> throw TrevRpcException(Status.internal("response stream contained an unexpected frame type ${frame.type}"))
+            FrameType.MESSAGE -> {
+                ResponseFrame.Message(frame.payload)
+            }
+
+            FrameType.ZSTD_MESSAGE -> {
+                ResponseFrame.Message(frame.payload, compressedResponseHeader(frame.payload, maxFrameSize))
+            }
+
+            FrameType.HEADERS -> {
+                decodeHeaders(frame.payload).let { ResponseFrame.Headers(it.metadata, it.dictionaries) }
+            }
+
+            FrameType.STATUS -> {
+                ResponseFrame.Status(decodeStatus(frame.payload).status)
+            }
+
+            else -> {
+                throw TrevRpcException(Status.internal("response stream contained an unexpected frame type ${frame.type}"))
+            }
         }
 }
 
@@ -146,6 +184,28 @@ private class Writer {
         tag(field, 2)
         varint(packed.size.toULong())
         output.write(packed)
+    }
+
+    fun packedUint32(
+        field: Int,
+        values: List<UInt>,
+    ) = packedUint64(field, values.map(UInt::toULong))
+
+    fun dictionaries(
+        field: Int,
+        dictionaries: List<DictionaryInfo>,
+    ) {
+        dictionaries.forEach { info ->
+            val entry =
+                Writer()
+                    .apply {
+                        uint32(1, info.id)
+                        bytes(2, info.fingerprint)
+                    }.toByteArray()
+            tag(field, 2)
+            varint(entry.size.toULong())
+            output.write(entry)
+        }
     }
 
     fun string(
@@ -253,6 +313,34 @@ private class Reader(
                 malformed("field ${tag.field} used wire type ${tag.wireType}, expected 0 or 2")
             }
         }
+    }
+
+    /** Reads a repeated uint32 element: either one unpacked varint or a packed run of them. */
+    fun uint32Elements(
+        tag: Tag,
+        target: MutableList<UInt>,
+    ) {
+        val values = mutableListOf<ULong>()
+        uint64Elements(tag, values)
+        values.forEach { value ->
+            if (value > UInt.MAX_VALUE.toULong()) malformed("protobuf uint32 exceeded 32 bits")
+            target += value.toUInt()
+        }
+    }
+
+    fun dictionaryInfo(tag: Tag): DictionaryInfo {
+        val entry = Reader(bytes(tag))
+        var id = 0u
+        var fingerprint = byteArrayOf()
+        while (entry.hasRemaining) {
+            val entryTag = entry.tag()
+            when (entryTag.field) {
+                1 -> id = entry.uint32(entryTag)
+                2 -> fingerprint = entry.bytes(entryTag)
+                else -> entry.skip(entryTag)
+            }
+        }
+        return DictionaryInfo(id, fingerprint)
     }
 
     fun bytes(tag: Tag): ByteArray {

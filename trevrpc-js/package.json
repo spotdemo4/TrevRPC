@@ -26,13 +26,17 @@
     ".": {
       "types": "./src/index.d.ts",
       "import": "./src/index.js"
+    },
+    "./zstd": {
+      "types": "./src/zstd.d.ts",
+      "import": "./src/zstd.js"
     }
   },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "build": "node interop-browser/build.js",
+    "build": "node zstd-wasm/embed.js && node interop-browser/build.js",
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",

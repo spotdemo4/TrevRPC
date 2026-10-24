@@ -1,8 +1,14 @@
+import {
+  encodeMessage,
+  receivedMessage,
+  sessionCompression,
+  transportCompression,
+} from "./compression.js";
 import { datagramEndpoint, messageFrameSize } from "./datagram.js";
 import {
   DefaultMaxFrameSize,
   FrameReader,
-  encodeMessageFrame,
+  encodeOutgoingFrame,
   encodeRequestFrame,
 } from "./framing.js";
 import { normalizeMetadata, validateMetadata } from "./metadata.js";
@@ -128,6 +134,14 @@ export class Call {
   #flow;
   /** Whether request messages are sent as datagrams when they fit. */
   #sendDatagrams = false;
+  /** The compression state of the session that carries the call, or undefined without one. */
+  #compression;
+  /** The full protobuf type name of the request messages. */
+  #requestType;
+  /** The dictionary the call accepts on its response messages, or undefined. */
+  #accept;
+  /** Whether the REQUEST queried the server's dictionaries, so its HEADERS answer. */
+  #queried = false;
   /** Request messages of a call that uses datagrams, queued for the flush loop, in order. */
   #unsent = [];
   /** Settles when the flush loop has sent everything queued so far. */
@@ -137,24 +151,31 @@ export class Call {
   /**
    * Opens a stream on the transport and sends the REQUEST frame. The request carries the
    * method path and kind; metadata and the wire timeout come from the options. The request
-   * message of a unary or server-streaming call goes out in the same write.
+   * message of a unary or server-streaming call, a marshalled body, goes out in the same write.
    *
-   * `datagrams` is `{ send, receive }` for a method that marks a direction unreliable: the call
-   * gets a datagram flow if the session that carries it has datagrams, which is only known once
-   * its stream is open, so the REQUEST is encoded after that. `send` makes it send request
-   * messages as datagrams, `receive` makes it accept response datagrams.
+   * `rpc` describes the method. `rpc.types` holds the full names of its request and response
+   * message types, which pick the dictionaries when the transport has compression. `rpc.datagrams`
+   * is `{ send, receive }` for a method that marks a direction unreliable: the call gets a
+   * datagram flow if the session that carries it has datagrams. Both depend on that session, which
+   * is only known once the stream is open, so then the REQUEST is encoded after that. `send` makes
+   * the call send request messages as datagrams, `receive` makes it accept response datagrams.
    */
-  static async open(transport, request, message, options, datagrams) {
+  static async open(transport, request, message, options, rpc = {}) {
     const fields = { ...request, metadata: options.metadata, ...timeoutField(options) };
-    const header =
-      datagrams === undefined ? encodeRequestFrame(fields, message, options.maxFrameSize) : null;
+    const compression = transportCompression(transport);
+    const perSession = rpc.datagrams !== undefined || compression !== undefined;
+    const header = perSession
+      ? null
+      : encodeRequestFrame(fields, outgoing(message), options.maxFrameSize);
     const scope = new CallScope(options);
     let call;
     try {
-      const session = datagrams === undefined ? undefined : {};
+      const session = perSession ? {} : undefined;
       const stream = await openStream(transport, scope.signal, session);
       call = new Call(stream, scope, options.maxFrameSize);
-      await call.#write(header ?? call.#requestWithFlow(fields, message, session, datagrams));
+      await call.#write(
+        header ?? call.#requestOnSession(fields, message, session, compression, rpc),
+      );
       return call;
     } catch (error) {
       if (call !== undefined) {
@@ -164,15 +185,64 @@ export class Call {
     }
   }
 
-  /** Opens the call's flow on its session, if it has datagrams, and encodes the REQUEST. */
-  #requestWithFlow(fields, message, session, { send, receive }) {
-    this.#flow = datagramEndpoint(session.datagrams)?.openFlow({ receive });
-    this.#sendDatagrams = this.#flow !== undefined && send;
+  /**
+   * Sets the call up on the session that carries it, negotiating compression and opening its
+   * datagram flow as the method needs, and encodes the REQUEST.
+   */
+  #requestOnSession(fields, message, session, compression, { types, datagrams }) {
+    const request = { ...fields };
+    if (compression !== undefined) {
+      this.#compression = sessionCompression(compression, session.key);
+      this.#requestType = types.request;
+      const negotiation = this.#compression.prepare(types.response);
+      Object.assign(request, negotiation.fields);
+      this.#accept = negotiation.accept;
+      this.#queried = negotiation.queried;
+    }
+    if (datagrams !== undefined) {
+      this.#flow = datagramEndpoint(session.datagrams)?.openFlow({
+        receive: datagrams.receive,
+        inflate: (frame) => this.receivedMessage(frame),
+      });
+      this.#sendDatagrams = this.#flow !== undefined && datagrams.send;
+      if (this.#flow !== undefined) {
+        request.datagramFlow = this.#flow.id;
+      }
+    }
     return encodeRequestFrame(
-      this.#flow === undefined ? fields : { ...fields, datagramFlow: this.#flow.id },
-      message,
+      request,
+      message === undefined ? undefined : this.#encode(message),
       this.#maxFrameSize,
     );
+  }
+
+  /**
+   * Encodes a request message for sending, compressed when the session's shared set has the
+   * dictionary of the request type. The set is checked per message, so a request stream starts
+   * compressing as soon as the server's answer arrives.
+   */
+  #encode(body) {
+    const dictionary =
+      body.byteLength <= this.#maxFrameSize
+        ? this.#compression?.requestDictionary(this.#requestType)
+        : undefined;
+    return encodeMessage(body, dictionary);
+  }
+
+  /**
+   * The message of a received MESSAGE or ZSTD_MESSAGE frame, `{ type, payload }`. A compressed
+   * message must use the dictionary the call accepts and fit `maxFrameSize`; it fails with
+   * Internal or ResourceExhausted otherwise.
+   */
+  receivedMessage(frame) {
+    return receivedMessage(frame, this.#accept, this.#maxFrameSize);
+  }
+
+  /** Records the dictionaries of the response HEADERS, if the call asked for them. */
+  learnDictionaries(dictionaries) {
+    if (this.#queried) {
+      this.#compression.learn(dictionaries);
+    }
   }
 
   constructor(stream, scope, maxFrameSize) {
@@ -235,10 +305,11 @@ export class Call {
     if (this.#sendClosed) {
       return Promise.reject(failedPrecondition("request stream is closed"));
     }
+    const message = this.#encode(body);
     if (this.#sendDatagrams) {
       return this.#upload(
         new Promise((resolve, reject) => {
-          this.#unsent.push({ body, resolve, reject });
+          this.#unsent.push({ message, resolve, reject });
           if (!this.#flushing) {
             this.#flushing = true;
             // Messages sent in the same turn are packed together; nothing waits for a timer.
@@ -247,7 +318,7 @@ export class Call {
         }),
       );
     }
-    return this.#write(encodeMessageFrame(body, this.#maxFrameSize));
+    return this.#write(encodeOutgoingFrame(message, this.#maxFrameSize));
   }
 
   /**
@@ -264,11 +335,14 @@ export class Call {
           throw this.#uploadEnded;
         }
         inFlight = this.#takeBatch();
-        if (inFlight.length === 0 || !(await this.#flow.send(inFlight.map(bodyOf), this.signal))) {
+        if (
+          inFlight.length === 0 ||
+          !(await this.#flow.send(inFlight.map(messageOf), this.signal))
+        ) {
           // Not a datagram: a head message that never fits, or a datagram that failed to send.
           inFlight = inFlight.length > 0 ? inFlight : [this.#unsent.shift()];
-          for (const { body } of inFlight) {
-            await this.#writer.write(encodeMessageFrame(body, this.#maxFrameSize));
+          for (const { message } of inFlight) {
+            await this.#writer.write(encodeOutgoingFrame(message, this.#maxFrameSize));
           }
         }
         for (const item of inFlight) {
@@ -293,9 +367,9 @@ export class Call {
     let room = this.#flow.frameRoom;
     let count = 0;
     while (count < this.#unsent.length) {
-      const { body } = this.#unsent[count];
-      const size = messageFrameSize(body);
-      if (body.byteLength > this.#maxFrameSize || size > room) {
+      const { message } = this.#unsent[count];
+      const size = messageFrameSize(message);
+      if (message.size > this.#maxFrameSize || size > room) {
         break;
       }
       room -= size;
@@ -431,9 +505,9 @@ export class Call {
 }
 
 /**
- * Opens a bidirectional stream. A call that may use datagrams passes `session`, which receives the
- * datagram object of the session that opened the stream, so the flow belongs to the connection
- * that carries the call and not to one a reconnect swapped in later.
+ * Opens a bidirectional stream. A call whose setup depends on its session passes `session`, which
+ * receives that session's `key` and `datagrams` object, so the compression state and datagram flow
+ * belong to the connection that carries the call and not to one a reconnect swapped in later.
  */
 function openStream(transport, signal, session) {
   return new Promise((resolve, reject) => {
@@ -469,21 +543,28 @@ function openStream(transport, signal, session) {
   });
 }
 
-function bodyOf(item) {
-  return item.body;
+function messageOf(item) {
+  return item.message;
+}
+
+/** A request message body as an uncompressed outgoing message, or undefined. */
+function outgoing(body) {
+  return body === undefined ? undefined : encodeMessage(body);
 }
 
 function startStream(transport, session) {
   if (session === undefined) {
     return transport.createBidirectionalStream();
   }
-  if (typeof transport.createBidirectionalStreamWithDatagrams === "function") {
-    return transport.createBidirectionalStreamWithDatagrams().then(({ stream, datagrams }) => {
-      session.datagrams = datagrams;
+  if (typeof transport.createBidirectionalStreamWithSession === "function") {
+    return transport.createBidirectionalStreamWithSession().then(({ stream, session: opened }) => {
+      session.key = opened;
+      session.datagrams = opened.datagrams;
       return stream;
     });
   }
-  // A WebTransport session used directly: its datagrams belong to the stream opened right now.
+  // A WebTransport session used directly: the stream opened right now belongs to it.
+  session.key = transport;
   session.datagrams = transport.datagrams;
   return transport.createBidirectionalStream();
 }

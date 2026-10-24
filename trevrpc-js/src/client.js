@@ -10,11 +10,15 @@ export function createServiceClient(transport, service, root, options = {}) {
   const client = {};
 
   for (const [jsName, method] of Object.entries(service.methods)) {
+    const requestType = root.lookupType(method.inputType);
+    const responseType = root.lookupType(method.outputType);
     const rpc = {
       // The wire method path, computed once per method rather than per call.
       path: `/${service.fullName}/${method.name}`,
-      requestType: root.lookupType(method.inputType),
-      responseType: root.lookupType(method.outputType),
+      requestType,
+      responseType,
+      // Full protobuf names, which pick the compression dictionaries.
+      types: { request: fullName(requestType), response: fullName(responseType) },
       datagrams: datagramUse(method),
     };
     const resolve = (override) => mergeCallOptions(defaults, override);
@@ -46,7 +50,7 @@ export function createServiceClient(transport, service, root, options = {}) {
 /** Calls a unary RPC and returns the decoded response. */
 export async function unaryCall(transport, rpc, request, options) {
   const body = marshalMessage(rpc.requestType, request);
-  const call = await Call.open(transport, requestFields(rpc, RpcKind.Unary), body, options);
+  const call = await Call.open(transport, requestFields(rpc, RpcKind.Unary), body, options, rpc);
   const stream = new BidirectionalStreamingCall(call, rpc, { options });
   // The response decides the outcome, so the request side finishes in the background.
   stream.closeSend().catch(() => {});
@@ -61,7 +65,7 @@ export async function serverStreamingCall(transport, rpc, request, options) {
     requestFields(rpc, RpcKind.ServerStreaming),
     body,
     options,
-    rpc.datagrams,
+    rpc,
   );
   const stream = new BidirectionalStreamingCall(call, rpc, { options });
   stream.closeSend().catch(() => {});
@@ -75,7 +79,7 @@ export async function clientStreamingCall(transport, rpc, options) {
     requestFields(rpc, RpcKind.ClientStreaming),
     undefined,
     options,
-    rpc.datagrams,
+    rpc,
   );
   return new ClientStreamingCall(
     new BidirectionalStreamingCall(call, rpc, { streamsRequest: true, options }),
@@ -89,7 +93,7 @@ export async function bidirectionalStreamingCall(transport, rpc, options) {
     requestFields(rpc, RpcKind.BidirectionalStreaming),
     undefined,
     options,
-    rpc.datagrams,
+    rpc,
   );
   return new BidirectionalStreamingCall(call, rpc, { streamsRequest: true, options });
 }
@@ -491,7 +495,7 @@ export class BidirectionalStreamingCall {
 
   /**
    * Reads the next MESSAGE or STATUS event, consuming HEADERS on the way. Enforces the response
-   * grammar `[HEADERS] MESSAGE* STATUS`.
+   * grammar `[HEADERS] MESSAGE* STATUS`. A ZSTD_MESSAGE is a MESSAGE, decompressed.
    */
   async #readEvent() {
     for (;;) {
@@ -509,16 +513,20 @@ export class BidirectionalStreamingCall {
           }
           const headers = unmarshalMessage(RpcHeaders, frame.payload);
           validateResponseMetadata(headers.metadata, "headers");
+          this.#call.learnDictionaries(headers.dictionaries);
           this.#sawHeaders = true;
           this.#settleHeaders(headers.metadata);
           this.#flow?.connect(this.#onDatagram);
           continue;
         }
         case FrameType.Message:
+        case FrameType.ZstdMessage: {
+          const payload = this.#call.receivedMessage(frame);
           this.#sawMessage = true;
           this.#settleHeaders({});
           this.#flow?.connect(this.#onDatagram);
-          return frame;
+          return { type: FrameType.Message, payload };
+        }
         case FrameType.Status: {
           const status = unmarshalMessage(RpcStatus, frame.payload);
           validateResponseMetadata(status.metadata, "trailing metadata");
@@ -675,6 +683,11 @@ function deferred() {
 
 function requestFields(rpc, kind) {
   return { method: rpc.path, kind };
+}
+
+/** The full name of a protobuf.js message type, without the leading dot. */
+function fullName(type) {
+  return type.fullName.replace(/^\./u, "");
 }
 
 function validateResponseMetadata(metadata, what) {

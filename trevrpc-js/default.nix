@@ -1,6 +1,7 @@
 {
   lib,
   stdenv,
+  callPackage,
   buildNpmPackage,
   importNpmLock,
   nodejs_26,
@@ -11,6 +12,7 @@
   playwright-driver,
   wireGolden,
   qmuxGolden,
+  zstdGolden,
   interopProto,
   trevrpcProto,
 }:
@@ -21,6 +23,8 @@ let
   playwrightVersion = packageLock.packages."node_modules/playwright".version;
   playwrightCoreVersion = packageLock.packages."node_modules/playwright-core".version;
   expectedPlaywrightVersion = playwright-driver.version;
+  # The libzstd WebAssembly module that the zstd entry point embeds.
+  zstdWasm = callPackage ./zstd-wasm { };
 in
 assert lib.assertMsg (playwrightManifestVersion == expectedPlaywrightVersion) ''
   trevrpc-js playwright manifest ${playwrightManifestVersion} must exactly match
@@ -39,16 +43,19 @@ buildNpmPackage (final: {
   inherit (jsPackage) version;
 
   # The interop clients are generated from the shared interop protos, which import the TrevRPC
-  # schema options, and the wire and QMux tests read the shared golden vectors; all of them live
-  # outside this directory.
+  # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
+  # of them live outside this directory. The wasm module is built on its own; only the script that
+  # embeds it is needed here.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       wireGolden
       qmuxGolden
+      zstdGolden
       interopProto
       trevrpcProto
-      ./.
+      (lib.fileset.difference ./. ./zstd-wasm)
+      ./zstd-wasm/embed.js
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-js";
@@ -59,10 +66,11 @@ buildNpmPackage (final: {
     npmRoot = ./.;
   };
 
-  # Generates the Echo and UnreliableEcho clients with protoc and bundles the interop page into
-  # build/interop/.
+  # Embeds the libzstd module into src/zstd-wasm.js, generates the Echo and UnreliableEcho clients
+  # with protoc, and bundles the interop page into build/interop/.
   npmBuildScript = "build";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+  TREVRPC_ZSTD_WASM = "${zstdWasm}/libzstd.wasm";
 
   nativeBuildInputs = [
     makeWrapper
@@ -124,8 +132,11 @@ buildNpmPackage (final: {
     tar -tzf "$TMPDIR/$tarball" | sort > tarball.list
     grep -qx 'package/src/index.js' tarball.list
     grep -qx 'package/src/index.d.ts' tarball.list
+    grep -qx 'package/src/zstd.js' tarball.list
+    grep -qx 'package/src/zstd.d.ts' tarball.list
+    grep -qx 'package/src/zstd-wasm.js' tarball.list
     grep -qx 'package/bin/protoc-gen-trevrpc-js.js' tarball.list
-    ! grep -E 'interop|test/|build/|native|node_modules' tarball.list
+    ! grep -E 'interop|test/|build/|native|node_modules|\.rs$|Cargo' tarball.list
 
     (
       cd "$out/lib"
@@ -136,6 +147,9 @@ buildNpmPackage (final: {
           "Channel", "Code", "TrevRpcError", "codeName", "connect", "createRoot",
           "createServiceClient", "protobuf",
         ]);
+        const zstd = await import("@trevrpc/trevrpc-js/zstd");
+        assert.deepEqual(Object.keys(zstd), ["createCompression"]);
+        assert.deepEqual((await zstd.createCompression()).query, []);
       '
     )
 
@@ -149,13 +163,15 @@ buildNpmPackage (final: {
         "$out/bin/trevrpc-interop-browser" --browser "$browser" \
           --url https://127.0.0.1:49999/trevrpc --cert-hash "$hash" > "$browser.out" || status=$?
         test "$status" -eq 1
-        test "$(grep -c '^fail ' "$browser.out")" -eq 12
+        test "$(grep -c '^fail ' "$browser.out")" -eq 13
         ! grep -q '^ok ' "$browser.out"
       done
     ''}
 
     runHook postInstallCheck
   '';
+
+  passthru = { inherit zstdWasm; };
 
   meta = {
     mainProgram = "protoc-gen-trevrpc-js";

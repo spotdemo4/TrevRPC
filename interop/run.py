@@ -37,6 +37,7 @@ from harness import (
     parse_with_defaults,
     run_checked,
     run_with_deadline,
+    write_vectors_dictionary,
 )
 
 BROWSER_LANES = ("webtransport", "websocket", "fallback", "app-webtransport", "app-websocket")
@@ -87,28 +88,25 @@ def native_cells(
 
 def write_dictionary(vectors: Path, directory: Path) -> Path:
     """Writes the dictionary of the compression golden vectors to DIRECTORY and returns its path."""
-    prefix = "dict.d1.dictionary = "
     try:
-        lines = vectors.read_text(encoding="utf-8").splitlines()
+        text = vectors.read_text(encoding="utf-8")
     except OSError as error:
         raise RunnerError(f"could not read {vectors}: {error}") from error
-    for line in lines:
-        if line.startswith(prefix):
-            path = directory / "interop.dict"
-            _ = path.write_bytes(bytes.fromhex(line.removeprefix(prefix)))
-            return path
-    raise RunnerError(f"{vectors} has no {prefix.strip(' =')}")
+    return write_vectors_dictionary(text, str(vectors), directory)
 
 
 def browser_cells(
-    browser: str, server: Server, certificate: Certificate, lanes: list[str]
+    browser: str, server: Server, certificate: Certificate, lanes: list[str], dictionary: Path
 ) -> list[Cell]:
     """Every scenario over the selected lanes: WebTransport, QMux over WebSocket, the fallback
-    from a blocked UDP port to WebSocket, and the app lanes, where the server serves the page."""
+    from a blocked UDP port to WebSocket, and the app lanes, where the server serves the page.
+    The webtransport, websocket and app-webtransport lanes compress with `dictionary`; the
+    others do not, so both kinds of browser client are covered."""
     cert_hash = hashlib.sha256(certificate.der()).hexdigest()
     webtransport = ["--url", f"https://127.0.0.1:{server.port('webtransport')}/trevrpc"]
     websocket = ["--ws-url", f"wss://127.0.0.1:{server.port('websocket')}/trevrpc"]
     pin = ["--cert-hash", cert_hash]
+    compress = ["--dictionary", str(dictionary)]
     over_websocket = ["--transport", "websocket", "--expect-transport", "websocket"]
     page_tls = ["--cert", str(certificate.cert), "--key", str(certificate.key)]
     # Over HTTP/2 the page comes from the server's TCP listener, over HTTP/3 from its UDP socket.
@@ -127,15 +125,15 @@ def browser_cells(
             app_webtransport = page_h2
     app_websocket = page_h2 if browser == "safari" else [*page_h2, "--page-protocol", "h2"]
     commands = {
-        "webtransport": [*webtransport, *pin],
-        "websocket": [*webtransport, *websocket, *pin, *over_websocket],
+        "webtransport": [*webtransport, *pin, *compress],
+        "websocket": [*webtransport, *websocket, *pin, *over_websocket, *compress],
         "fallback": [
             "--url", f"https://127.0.0.1:{UNREACHABLE_UDP}/trevrpc", *websocket, *pin,
             "--transport", "auto", "--expect-transport", "websocket",
         ],
         "app-webtransport": [
             *app_webtransport, *page_tls, *webtransport, *pin,
-            "--expect-transport", "webtransport",
+            "--expect-transport", "webtransport", *compress,
         ],
         "app-websocket": [
             *app_websocket, *page_tls, *webtransport, *websocket, *pin, *over_websocket,
@@ -259,7 +257,7 @@ def execute(args: argparse.Namespace, work: Path) -> list[str]:
                 cells += [
                     cell
                     for browser in browsers
-                    for cell in browser_cells(browser, server, certificate, lanes)
+                    for cell in browser_cells(browser, server, certificate, lanes, dictionary)
                 ]
                 failures += [cell.name for cell in cells if not run_cell(cell, out)]
             finally:

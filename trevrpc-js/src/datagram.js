@@ -4,6 +4,7 @@
 // DatagramFlow on the endpoint of the session that carries them. QMux over WebSocket has no
 // datagrams, so those calls never get a flow and everything stays on the stream.
 import { byteView } from "./bytes.js";
+import { FrameType } from "./framing.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
 
 /**
@@ -19,16 +20,17 @@ export const FallbackMaxDatagramSize = 1100;
 export const FlowQueueMessages = 32;
 export const FlowQueueBytes = 1 << 20;
 
-const MessageFrameType = 0;
-
-/** Encoded size of one message as a MESSAGE frame inside a datagram. */
-export function messageFrameSize(message) {
-  return 1 + varintLength(message.byteLength) + message.byteLength;
+/**
+ * Encoded size of one outgoing message (`{ type, payload }` from encodeMessage) as a MESSAGE or
+ * ZSTD_MESSAGE frame inside a datagram.
+ */
+export function messageFrameSize({ payload }) {
+  return 1 + varintLength(payload.byteLength) + payload.byteLength;
 }
 
 /**
- * Encodes a datagram payload: the flow ID as a QUIC varint, then one MESSAGE frame per message,
- * in order.
+ * Encodes a datagram payload: the flow ID as a QUIC varint, then the frame of each outgoing
+ * message, in order.
  */
 export function encodeDatagram(flow, messages) {
   let size = varintLength(flow);
@@ -37,19 +39,19 @@ export function encodeDatagram(flow, messages) {
   }
   const datagram = new Uint8Array(size);
   let offset = writeVarint(datagram, 0, flow);
-  for (const message of messages) {
-    datagram[offset] = MessageFrameType;
-    offset = writeVarint(datagram, offset + 1, message.byteLength);
-    datagram.set(message, offset);
-    offset += message.byteLength;
+  for (const { type, payload } of messages) {
+    datagram[offset] = type;
+    offset = writeVarint(datagram, offset + 1, payload.byteLength);
+    datagram.set(payload, offset);
+    offset += payload.byteLength;
   }
   return datagram;
 }
 
 /**
  * Decodes a datagram payload as `{ flow, messages }`, or null if it has no complete flow ID. The
- * messages are the payloads of its MESSAGE frames; every other frame is skipped. A datagram whose
- * frames do not exactly fill it decodes to no messages at all.
+ * messages are its MESSAGE and ZSTD_MESSAGE frames as `{ type, payload }`; every other frame is
+ * skipped. A datagram whose frames do not exactly fill it decodes to no messages at all.
  */
 export function decodeDatagram(datagram) {
   const bytes = byteView(datagram);
@@ -69,8 +71,8 @@ export function decodeDatagram(datagram) {
     if (end > bytes.byteLength) {
       return { flow: flow.value, messages: [] };
     }
-    if (type.value === MessageFrameType) {
-      messages.push(bytes.subarray(length.next, end));
+    if (type.value === FrameType.Message || type.value === FrameType.ZstdMessage) {
+      messages.push({ type: type.value, payload: bytes.subarray(length.next, end) });
     }
     offset = end;
   }
@@ -116,14 +118,15 @@ class DatagramEndpoint {
 
   /**
    * Allocates the next flow of this session. A flow that `receive`s is registered with the
-   * reader, so datagrams for its ID reach it. Returns undefined if the session cannot read
-   * datagrams.
+   * reader, so datagrams for its ID reach it; `inflate` maps each received `{ type, payload }`
+   * message to its payload, decompressed, and throws if it is invalid. Returns undefined if the
+   * session cannot read datagrams.
    */
-  openFlow({ receive }) {
+  openFlow({ receive, inflate }) {
     if (!this.#start()) {
       return undefined;
     }
-    const flow = new DatagramFlow(this, this.#nextFlow);
+    const flow = new DatagramFlow(this, this.#nextFlow, inflate);
     this.#nextFlow += 1;
     if (receive) {
       this.#flows.set(flow.id, flow);
@@ -207,11 +210,7 @@ class DatagramEndpoint {
         const datagram = decodeDatagram(value);
         const flow = datagram === null ? undefined : this.#flows.get(datagram.flow);
         // Unknown and ended flows drop the datagram, and so do malformed ones (no messages).
-        if (flow !== undefined) {
-          for (const message of datagram.messages) {
-            flow.deliver(message);
-          }
-        }
+        flow?.deliverAll(datagram.messages);
       }
     } catch {
       // A failed session ends its calls through their streams.
@@ -253,21 +252,39 @@ class DatagramEndpoint {
  */
 export class DatagramFlow {
   #endpoint;
+  #inflate;
   #handler;
   #buffered = [];
   #bufferedBytes = 0;
   #released = false;
 
-  constructor(endpoint, id) {
+  constructor(endpoint, id, inflate) {
     this.#endpoint = endpoint;
+    this.#inflate = inflate;
     this.id = id;
+  }
+
+  /**
+   * Delivers the messages of one received datagram, decompressed. A datagram with an invalid
+   * message is dropped whole.
+   */
+  deliverAll(messages) {
+    let payloads;
+    try {
+      payloads = messages.map(this.#inflate);
+    } catch {
+      return;
+    }
+    for (const payload of payloads) {
+      this.#deliver(payload);
+    }
   }
 
   /**
    * Delivers one received message. It must not block or throw. Without a handler it is buffered,
    * and dropped when the buffer is full.
    */
-  deliver(message) {
+  #deliver(message) {
     if (this.#handler !== undefined) {
       this.#handler(message);
     } else if (

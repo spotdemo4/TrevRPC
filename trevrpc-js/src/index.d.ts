@@ -82,6 +82,16 @@ export interface DatagramTransport {
   readonly writable?: WritableStream<Uint8Array>;
 }
 
+declare const compressionBrand: unique symbol;
+
+/**
+ * Compression settings, made by `createCompression()` from `@trevrpc/trevrpc-js/zstd`: the zstd
+ * dictionaries a channel holds and the message types each compresses. See `ConnectOptions`.
+ */
+export interface Compression {
+  readonly [compressionBrand]: true;
+}
+
 /**
  * Anything that opens a bidirectional byte stream per call, such as a Channel or WebTransport.
  * Calls to methods that mark a direction unreliable use the `datagrams` of the session that opens
@@ -91,14 +101,17 @@ export interface Transport {
   createBidirectionalStream(): Promise<TransportStream>;
   /** Datagrams of the session that the next stream opens on; absent without datagrams. */
   readonly datagrams?: DatagramTransport;
+  /** Compression settings for calls on this transport; absent without compression. */
+  readonly compression?: Compression;
   /**
-   * Like `createBidirectionalStream()`, but also returns the datagrams of the session that opened
-   * the stream. Transports whose session can change, such as a Channel, implement it so a call
-   * never mixes the stream of one session with the datagrams of another.
+   * Like `createBidirectionalStream()`, but also returns the session that opened the stream.
+   * Calls negotiate dictionaries and open datagram flows per session, so transports whose session
+   * can change, such as a Channel, implement it so a call never mixes the stream of one session
+   * with the state of another.
    */
-  createBidirectionalStreamWithDatagrams?(): Promise<{
+  createBidirectionalStreamWithSession?(): Promise<{
     stream: TransportStream;
-    datagrams?: DatagramTransport;
+    session: { readonly datagrams?: DatagramTransport };
   }>;
 }
 
@@ -298,6 +311,12 @@ export interface ConnectOptions {
    * `protocols: ["trevrpc-1"]`, the wire version, which cannot be changed.
    */
   WebTransport?: new (url: string | URL, options?: object) => WebTransportSessionLike;
+  /**
+   * Compresses messages with the dictionaries these settings hold, from `createCompression()` in
+   * `@trevrpc/trevrpc-js/zstd`. Dictionaries are negotiated with the server per session, so a
+   * message whose dictionary the server lacks travels uncompressed.
+   */
+  compression?: Compression;
   /** Cancels the initial connection attempt only. */
   signal?: AbortSignal;
   /** Receives channel state transitions. */
@@ -336,11 +355,13 @@ export class Channel implements Transport {
   readonly state: ChannelState;
   /** The transport of the current or last session. */
   readonly transport: TransportKind;
+  /** The compression settings from the connect options. */
+  readonly compression?: Compression;
   createBidirectionalStream(): Promise<TransportStream>;
-  /** Opens a stream together with the datagrams of the session that carries it, if any. */
-  createBidirectionalStreamWithDatagrams(): Promise<{
+  /** Opens a stream together with the session that carries it. */
+  createBidirectionalStreamWithSession(): Promise<{
     stream: TransportStream;
-    datagrams?: DatagramTransport;
+    session: { readonly datagrams?: DatagramTransport };
   }>;
   /** Resolves once the channel is ready, immediately if it already is. */
   waitUntilReady(): Promise<void>;

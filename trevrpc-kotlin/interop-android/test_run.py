@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+import zipfile
 from pathlib import Path
 
 import run
@@ -114,14 +115,16 @@ class StartServerTest(unittest.TestCase):
                 root / "ca.pem", root / "server.pem", root / "server.key"
             )
 
-            server = run.start_server(command, certificates, "0.0.0.0", root)
+            dictionary = root / "interop.dict"
+            server = run.start_server(command, certificates, "0.0.0.0", dictionary, root)
             problem = server.stop()
 
             self.assertIsNone(problem)
             self.assertEqual(4434, server.port("http3"))
             self.assertEqual(4436, server.port("http2"))
             self.assertEqual(
-                f"server --cert {certificates.certificate} --key {certificates.key} --host 0.0.0.0",
+                f"server --cert {certificates.certificate} --key {certificates.key} --host 0.0.0.0"
+                + f" --dictionary {dictionary}",
                 server.log.read_text(encoding="utf-8").strip(),
             )
 
@@ -134,7 +137,7 @@ class StartServerTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(run.RunnerError, "'http2'"):
-                _ = run.start_server(command, certificates, "0.0.0.0", root)
+                _ = run.start_server(command, certificates, "0.0.0.0", root / "interop.dict", root)
 
     def test_reports_a_server_that_exits_early(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -144,7 +147,39 @@ class StartServerTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(run.RunnerError, "exited with 3"):
-                _ = run.start_server(["sh", "-c", "exit 3", "--"], certificates, "0.0.0.0", root)
+                _ = run.start_server(
+                    ["sh", "-c", "exit 3", "--"],
+                    certificates,
+                    "0.0.0.0",
+                    root / "interop.dict",
+                    root,
+                )
+
+
+class ExtractDictionaryTest(unittest.TestCase):
+    def test_writes_the_dictionary_of_the_vectors_in_the_test_apk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            apk = root / "test.apk"
+            with zipfile.ZipFile(apk, "w") as archive:
+                archive.writestr(
+                    run.DICTIONARY_VECTORS,
+                    "# vectors\ndict.d1.id = 1\ndict.d1.dictionary = 37a430ec\n",
+                )
+
+            path = run.extract_dictionary(apk, root)
+
+            self.assertEqual(bytes.fromhex("37a430ec"), path.read_bytes())
+
+    def test_reports_an_apk_without_the_vectors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            apk = root / "test.apk"
+            with zipfile.ZipFile(apk, "w") as archive:
+                archive.writestr("other.txt", "")
+
+            with self.assertRaisesRegex(run.RunnerError, run.DICTIONARY_VECTORS):
+                _ = run.extract_dictionary(apk, root)
 
 
 class CertificatesTest(unittest.TestCase):

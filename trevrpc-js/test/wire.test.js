@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { encodeMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import {
   FrameReader,
@@ -9,6 +9,7 @@ import {
   encodeFrame,
   encodeHeadersFrame,
   encodeMessageFrame,
+  encodeOutgoingFrame,
   encodeRequestFrame,
   encodeStatusFrame,
   marshalMessage,
@@ -25,9 +26,7 @@ import {
 import { Code, TrevRpcError } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
 import { RpcHeaders, RpcKind, RpcRequest, RpcStatus, createRoot } from "../src/wire.js";
-import { chunked, concatBytes, hex, readerOf } from "./support.js";
-
-const goldenPath = new URL("../../testdata/wire-golden-vectors.txt", import.meta.url);
+import { chunked, concatBytes, hex, readGoldenVectors, readerOf } from "./support.js";
 
 const bytes = (text) => new TextEncoder().encode(text);
 const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));
@@ -69,7 +68,7 @@ const goldenCases = {
 };
 
 test("every golden vector has a documented logical value", async () => {
-  const vectors = await readGoldenVectors();
+  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   const names = new Set();
   const streams = new Set();
   const datagrams = new Set();
@@ -102,7 +101,7 @@ test("every golden vector has a documented logical value", async () => {
 });
 
 test("wire encodings match the shared golden vectors and decode back", async () => {
-  const vectors = await readGoldenVectors();
+  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   for (const [name, [type, messageType, fields]] of Object.entries(goldenCases)) {
     const payload = messageType === undefined ? fields : marshalMessage(messageType, fields);
     assert.equal(hex(payload), vectors.get(`${name}.payload`), `${name} payload`);
@@ -125,7 +124,7 @@ test("wire encodings match the shared golden vectors and decode back", async () 
 });
 
 test("golden payloads decode to their logical fields", async () => {
-  const vectors = await readGoldenVectors();
+  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   const decode = (name, type) => unmarshalMessage(type, fromHex(vectors.get(`${name}.payload`)));
 
   const withExtensions = decode("request.extensions", RpcRequest);
@@ -156,7 +155,7 @@ test("golden payloads decode to their logical fields", async () => {
 });
 
 test("datagram payloads match the golden vectors and decode back", async () => {
-  const vectors = await readGoldenVectors();
+  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   const names = [
     ...new Set(
       [...vectors.keys()]
@@ -172,12 +171,21 @@ test("datagram payloads match the golden vectors and decode back", async () => {
     const decode = (datagram) => {
       const decoded = decodeDatagram(fromHex(datagram));
       assert.equal(decoded.flow, flow, name);
-      return decoded.messages.map(hex);
+      assert.ok(
+        decoded.messages.every(({ type }) => type === FrameType.Message),
+        name,
+      );
+      return decoded.messages.map(({ payload }) => hex(payload));
     };
 
     if (vectors.has(`${name}.datagram`)) {
       // What a sender writes: encoding the messages gives these bytes, which decode back.
-      const datagram = hex(encodeDatagram(flow, messages.map(fromHex)));
+      const datagram = hex(
+        encodeDatagram(
+          flow,
+          messages.map((message) => encodeMessage(fromHex(message))),
+        ),
+      );
       assert.equal(datagram, vectors.get(`${name}.datagram`), name);
       assert.deepEqual(decode(datagram), messages, name);
     } else {
@@ -195,7 +203,8 @@ test("a datagram without a complete flow ID does not decode", () => {
 });
 
 test("a datagram whose frames do not exactly fill it decodes to no messages", () => {
-  const messagesOf = (...bytes) => decodeDatagram(Uint8Array.from(bytes)).messages.map(hex);
+  const messagesOf = (...bytes) =>
+    decodeDatagram(Uint8Array.from(bytes)).messages.map(({ payload }) => hex(payload));
   assert.deepEqual(messagesOf(1, 0, 1, 0x61), ["61"]);
   assert.deepEqual(messagesOf(1, 0, 1, 0x61, 0, 2, 0x62), []); // length past the end
   assert.deepEqual(messagesOf(1, 0, 1, 0x61, 0), []); // frame without a length
@@ -205,7 +214,7 @@ test("a datagram whose frames do not exactly fill it decodes to no messages", ()
 });
 
 test("the frame reader yields the golden known frames from every chunking", async () => {
-  const vectors = await readGoldenVectors();
+  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   const streams = [...vectors.keys()].filter((key) => key.endsWith(".stream"));
   assert.ok(streams.length > 0);
   for (const key of streams) {
@@ -224,11 +233,14 @@ test("the frame reader yields the golden known frames from every chunking", asyn
 
 test("request frames carry the request message in the same buffer", () => {
   const body = bytes("hi");
-  const both = encodeRequestFrame(request, body);
+  const both = encodeRequestFrame(request, encodeMessage(body));
   const requestOnly = encodeRequestFrame(request);
   assert.deepEqual(both, concatBytes([requestOnly, encodeMessageFrame(body)]));
   assert.equal(hex(requestOnly), "01080a062f7376632f6d");
-  assert.equal(hex(encodeRequestFrame(request, new Uint8Array(0))), `${hex(requestOnly)}0000`);
+  assert.equal(
+    hex(encodeRequestFrame(request, encodeMessage(new Uint8Array(0)))),
+    `${hex(requestOnly)}0000`,
+  );
 });
 
 test("the reserved request fields are ignored when decoding", () => {
@@ -241,7 +253,7 @@ test("the reserved request fields are ignored when decoding", () => {
 });
 
 test("status and headers encoders match the golden frames", async () => {
-  const vectors = await readGoldenVectors();
+  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   assert.equal(
     hex(encodeStatusFrame({ code: Code.Unavailable, message: "down" })),
     vectors.get("status.unavailable.frame"),
@@ -257,7 +269,12 @@ test("encoders enforce the frame size limit inclusively", () => {
   const exceeds = (error) => error instanceof TrevRpcError && error.code === Code.ResourceExhausted;
   assert.throws(() => encodeMessageFrame(new Uint8Array(17), 16), exceeds);
   assert.throws(() => encodeFrame(0x21, new Uint8Array(17), 16), exceeds);
-  assert.throws(() => encodeRequestFrame(request, new Uint8Array(17), 16), exceeds);
+  assert.throws(() => encodeRequestFrame(request, encodeMessage(new Uint8Array(17)), 16), exceeds);
+  // A compressed message counts at its message size, not its payload size.
+  const compressed = { type: FrameType.ZstdMessage, payload: new Uint8Array(8), size: 17 };
+  assert.throws(() => encodeOutgoingFrame(compressed, 16), exceeds);
+  assert.throws(() => encodeRequestFrame(request, compressed, 16), exceeds);
+  assert.equal(encodeOutgoingFrame({ ...compressed, size: 16 }, 16).byteLength, 10);
   assert.throws(() => encodeRequestFrame(request, undefined, 4), exceeds);
 });
 
@@ -356,7 +373,7 @@ test("unknown frames are skipped wherever they appear", async () => {
     unknown(0x21), // grease before everything
     encodeMessageFrame(bytes("a")),
     unknown(0x40, 0),
-    unknown(4),
+    unknown(5),
     unknown(2 ** 40), // 8-byte type that still fits a number
     encodeFrame(2n ** 62n - 1n, new Uint8Array(2)), // largest type, a bigint
     encodeMessageFrame(bytes("b")),
@@ -520,22 +537,3 @@ test("metadata validation limits are inclusive", () => {
   invalid({ "bad key": [] });
   invalid({ "trevrpc-reserved": [] });
 });
-
-async function readGoldenVectors() {
-  const vectors = new Map();
-  for (const [index, rawLine] of (await readFile(goldenPath, "utf8")).split(/\r?\n/u).entries()) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#")) {
-      continue;
-    }
-    const separator = line.indexOf("=");
-    assert.ok(separator > 0, `invalid golden vector on line ${index + 1}`);
-    const name = line.slice(0, separator).trim();
-    const value = line.slice(separator + 1).trim();
-    if (!name.endsWith(".frames") && !name.endsWith(".messages")) {
-      assert.match(value, /^(?:[0-9a-f]{2})*$/u, `invalid golden vector on line ${index + 1}`);
-    }
-    vectors.set(name, value);
-  }
-  return vectors;
-}

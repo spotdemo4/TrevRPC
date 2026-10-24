@@ -40,11 +40,12 @@ their own whether to expose WebTransport). Every Safari lane must pass against b
 Every server holds the interop compression dictionary: the `dict.d1` dictionary of
 [`testdata/zstd-golden-vectors.txt`](../testdata/zstd-golden-vectors.txt), which `run.py` writes to a
 file and passes as `--dictionary`, for the message types `trevrpc.interop.v1.EchoRequest` and
-`trevrpc.interop.v1.EchoResponse`. The native QUIC and QMux cells pass it to the client too, so
-their calls negotiate it and compress every message that shrinks (see
-[Compressed Messages](../wiki/Protocol-and-Wire-Format.md#compressed-messages)). The fallback
-cells, the browsers and the Android client hold no dictionary and get uncompressed messages from
-the same servers.
+`trevrpc.interop.v1.EchoResponse`. The native QUIC and QMux cells, the browser webtransport,
+websocket and app-webtransport cells, and the Android client pass it to the client too, so their
+calls negotiate it and compress every message that shrinks (see
+[Compressed Messages](../wiki/Protocol-and-Wire-Format.md#compressed-messages)). The native
+fallback cells and the browser fallback and app-websocket cells hold no dictionary and get
+uncompressed messages from the same servers.
 
 `--browser-lanes webtransport,websocket,fallback,app-webtransport,app-websocket` selects
 which browser lanes run (default: all five); each browser cell is named after its
@@ -117,11 +118,9 @@ Clients run these in order, each with a 10 second deadline.
 | `compressed` | `Unary` twice with messages like `{"service":"search","region":"us-east-1","status":404,"latency_ms":100}` (`latency_ms` 100, 101), then `Bidi` sending three such messages (100 … 102) without waiting, then closing the send side | each message echoed, the stream ones with index 0, 1, 2, then `OK`. With the interop dictionary on both sides the messages travel compressed |
 
 The 4096-character message of `unreliable` must not fit a datagram, so it must
-not compress below about 1200 bytes either: the Go and Rust clients, which
-compress, send 4096 base64 digits from a fixed xorshift generator, and the
-browser and Android clients, which do not, may send `"x"` × 4096. Only the Go
-and Rust clients run `compressed`; the browser and Android clients do not
-compress messages yet.
+not compress below about 1200 bytes either: the Go, Rust and browser clients
+send 4096 base64 digits from a fixed xorshift generator. The Android client,
+whose Cronet transport has no datagrams, may send `"x"` × 4096.
 
 Native clients running `unreliable` over `--transport quic` also check that
 their connection received QUIC DATAGRAM frames, which proves the
@@ -186,7 +185,7 @@ have their own entry points but follow the same output contract.
 trevrpc-interop-browser --browser chromium|firefox|safari --url <https://host:port/trevrpc>
                         --cert-hash <hex sha256> [--transport webtransport|websocket|auto]
                         [--ws-url <wss://host:port/trevrpc>]
-                        [--expect-transport webtransport|websocket]
+                        [--expect-transport webtransport|websocket] [--dictionary <file>]
                         [--page-url <https://host:port/> --cert <cert.pem> --key <key.pem>
                          [--page-protocol h2|h3]]
 trevrpc-interop-browser --write-page <dir>
@@ -194,7 +193,8 @@ trevrpc-interop-browser --write-page <dir>
 
 It follows the same output contract. `--transport` defaults to `webtransport`;
 `--ws-url` defaults to `--url` with the `wss:` scheme. `--expect-transport`
-fails the run unless the channel connected over that transport. Chromium and
+fails the run unless the channel connected over that transport. `--dictionary`
+makes the channel compress Echo messages with that zstd dictionary. Chromium and
 Firefox ignore certificate errors, because WSS cannot pin a certificate hash.
 Safari is driven through `safaridriver`, which needs `sudo safaridriver --enable`
 once, and cannot ignore certificate errors (see [Certificates](#certificates)).
@@ -214,7 +214,9 @@ Safari neither.
 
 `trevrpc-interop-android` accepts `--transport http3|http2` (default `http3`).
 `http2` runs with Cronet's QUIC disabled, so the scenarios use the server's
-HTTP/2 mapping on its TCP port.
+HTTP/2 mapping on its TCP port. Over either, the server holds the interop
+dictionary, which the runner reads from the test APK's golden vectors, and the
+instrumented test compresses with it.
 
 ### Certificates
 

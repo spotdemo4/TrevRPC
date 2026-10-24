@@ -1,0 +1,7 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+[env]
+# Keeps only the fast and dfast strategies (levels 1-4; higher levels fall back to them) and drops
+# libzstd's error strings, which halves the module: see bench/compression/README.md.
+CFLAGS_wasm32_unknown_unknown = "-O3 -DZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTOPT_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR -DZSTD_STRIP_ERROR_STRINGS"

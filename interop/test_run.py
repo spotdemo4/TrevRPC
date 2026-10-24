@@ -65,18 +65,35 @@ class CellsTest(unittest.TestCase):
 
     def test_browser_cells_follow_the_selected_lanes_in_order(self) -> None:
         cells = run.browser_cells(
-            "firefox", FakeServer("go"), self.certificate, ["app-websocket", "webtransport"]
+            "firefox",
+            FakeServer("go"),
+            self.certificate,
+            ["app-websocket", "webtransport"],
+            Path("d.dict"),
         )
 
         self.assertEqual(
             ["firefox-webtransport-to-go", "firefox-app-websocket-to-go"], [c.name for c in cells]
         )
 
+    def test_some_browser_lanes_compress_and_the_others_do_not(self) -> None:
+        cells = run.browser_cells(
+            "chromium", FakeServer("go"), self.certificate, list(run.BROWSER_LANES), Path("d.dict")
+        )
+
+        compressed = {
+            cell.name.removeprefix("chromium-").removesuffix("-to-go")
+            for cell in cells
+            if cell.command[-2:] == ["--dictionary", "d.dict"]
+        }
+        self.assertEqual({"webtransport", "websocket", "app-webtransport"}, compressed)
+        self.assertEqual(2, sum("--dictionary" not in cell.command for cell in cells))
+
     def test_app_lanes_pin_the_page_protocol_where_the_browser_can_be_steered(self) -> None:
         pages: dict[str, list[str]] = {}
         for browser in ("chromium", "firefox", "safari"):
             [cell] = run.browser_cells(
-                browser, FakeServer("go"), self.certificate, ["app-webtransport"]
+                browser, FakeServer("go"), self.certificate, ["app-webtransport"], Path("d.dict")
             )
             start = cell.command.index("--page-url")
             pages[browser] = cell.command[start + 1 : start + 4]

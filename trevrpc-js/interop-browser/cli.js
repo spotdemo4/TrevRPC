@@ -5,9 +5,12 @@
 //
 //   trevrpc-interop-browser --browser chromium|firefox|safari --url <url> --cert-hash <hex>
 //                           [--transport webtransport|websocket|auto] [--ws-url <url>]
-//                           [--expect-transport webtransport|websocket]
+//                           [--expect-transport webtransport|websocket] [--dictionary <file>]
 //                           [--page-url <url> --cert <pem> --key <pem> [--page-protocol h2|h3]]
 //   trevrpc-interop-browser --write-page <dir>
+//
+// --dictionary makes the channel compress Echo messages with that zstd dictionary, the one the
+// interop servers hold.
 //
 // --cert-hash is the SHA-256 of the server certificate's DER encoding in hex, trusted through
 // WebTransport serverCertificateHashes. WebSocket connections cannot pin a certificate hash, so the
@@ -44,14 +47,14 @@ import { openSafari } from "./safari.js";
 const Usage =
   "usage: trevrpc-interop-browser --browser chromium|firefox|safari --url <url> --cert-hash <hex>" +
   " [--transport webtransport|websocket|auto] [--ws-url <url>]" +
-  " [--expect-transport webtransport|websocket]" +
+  " [--expect-transport webtransport|websocket] [--dictionary <file>]" +
   " [--page-url <url> --cert <pem> --key <pem> [--page-protocol h2|h3]]\n" +
   "       trevrpc-interop-browser --write-page <dir>";
 const Transports = ["webtransport", "websocket", "auto"];
 const LaunchTimeoutMs = 20_000;
 const SetupTimeoutMs = 30_000;
 const CloseTimeoutMs = 5_000;
-/** Twelve scenarios of at most ten seconds each, plus connecting, with slack. */
+/** Thirteen scenarios of at most ten seconds each, plus connecting, with slack. */
 const RunTimeoutMs = 180_000;
 const PageBundle = new URL("../build/interop/page.js", import.meta.url);
 // The script path is relative, so the page also works from a TrevRPC server's web root.
@@ -101,9 +104,12 @@ async function main() {
     await writePage(args.writePage);
     return 0;
   }
-  const results = await runInBrowser(args).catch((error) =>
-    Object.fromEntries(ScenarioNames.map((name) => [name, failure(describe(error))])),
-  );
+  const { dictionaryFile, ...run } = args;
+  const results = await readDictionary(dictionaryFile)
+    .then((dictionary) => runInBrowser({ ...run, dictionary }))
+    .catch((error) =>
+      Object.fromEntries(ScenarioNames.map((name) => [name, failure(describe(error))])),
+    );
 
   let passed = true;
   for (const name of ScenarioNames) {
@@ -125,6 +131,7 @@ function parseArguments() {
         transport: { type: "string", default: "webtransport" },
         "ws-url": { type: "string" },
         "expect-transport": { type: "string" },
+        dictionary: { type: "string" },
         "page-url": { type: "string" },
         "page-protocol": { type: "string" },
         cert: { type: "string" },
@@ -185,12 +192,18 @@ function parseArguments() {
     transport: values.transport,
     webSocketUrl: values["ws-url"],
     expectTransport: values["expect-transport"],
+    dictionaryFile: values.dictionary,
   };
 }
 
 function usageError(message) {
   console.error(`trevrpc-interop-browser: ${message}\n${Usage}`);
   process.exit(2);
+}
+
+/** The dictionary in file, in base64 for the page, or undefined without one. */
+async function readDictionary(file) {
+  return file === undefined ? undefined : (await readFile(file)).toString("base64");
 }
 
 /** Writes the page to dir: index.html, and the page.js bundle it loads. */

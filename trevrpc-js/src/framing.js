@@ -11,6 +11,7 @@ export const FrameType = Object.freeze({
   Request: 1,
   Headers: 2,
   Status: 3,
+  ZstdMessage: 4,
 });
 
 const KnownFrameTypes = new Set(Object.values(FrameType));
@@ -55,8 +56,17 @@ export function encodeMessageFrame(body, maxFrameSize = DefaultMaxFrameSize) {
 }
 
 /**
- * Encodes a REQUEST frame, followed by a MESSAGE frame when message is given, in one buffer so
- * both go out in a single write.
+ * Encodes an outgoing message, `{ type, payload, size }` from encodeMessage, as its MESSAGE or
+ * ZSTD_MESSAGE frame. The message size counts against the limit, not just the payload's.
+ */
+export function encodeOutgoingFrame(message, maxFrameSize = DefaultMaxFrameSize) {
+  checkFrameLength(message.size, maxFrameSize);
+  return encodeFrame(message.type, message.payload, maxFrameSize);
+}
+
+/**
+ * Encodes a REQUEST frame, followed by the frame of message, an outgoing message from
+ * encodeMessage, when it is given, in one buffer so both go out in a single write.
  */
 export function encodeRequestFrame(request, message, maxFrameSize = DefaultMaxFrameSize) {
   const payload = marshalMessage(RpcRequest, request);
@@ -64,10 +74,10 @@ export function encodeRequestFrame(request, message, maxFrameSize = DefaultMaxFr
   if (message === undefined) {
     return encodeFrame(FrameType.Request, payload, maxFrameSize);
   }
-  checkFrameLength(message.byteLength, maxFrameSize);
+  checkFrameLength(message.size, maxFrameSize);
   const requestSize = frameSize(FrameType.Request, payload.byteLength);
-  const frame = new Uint8Array(requestSize + frameSize(FrameType.Message, message.byteLength));
-  writeFrame(frame, requestSize, FrameType.Message, message);
+  const frame = new Uint8Array(requestSize + frameSize(message.type, message.payload.byteLength));
+  writeFrame(frame, requestSize, message.type, message.payload);
   writeFrame(frame, 0, FrameType.Request, payload);
   return frame;
 }

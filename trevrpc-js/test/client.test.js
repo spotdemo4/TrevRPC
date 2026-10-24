@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
 import { createServiceClient } from "../src/client.js";
+import { encodeMessage } from "../src/compression.js";
 import {
   FrameType,
   encodeFrame,
@@ -332,7 +333,7 @@ test("unary and server-streaming calls send the request message with the REQUEST
         method: `/trevrpc.interop.v1.Echo/${method === "unary" ? "Unary" : "ServerStream"}`,
         kind,
       },
-      EchoRequest.encode({ message: "hi" }).finish(),
+      encodeMessage(EchoRequest.encode({ message: "hi" }).finish()),
     );
     assert.deepEqual(await first.promise, expected, method);
   }
@@ -1041,7 +1042,7 @@ test("createServiceClient rejects unknown method kinds", () => {
     methods: { odd: { name: "Unary", kind: "weird", inputType: "x", outputType: "y" } },
   };
   assert.throws(
-    () => createServiceClient({}, service, { lookupType: () => ({}) }),
+    () => createServiceClient({}, service, { lookupType: (name) => ({ fullName: `.${name}` }) }),
     isStatus(Code.Internal),
   );
 });

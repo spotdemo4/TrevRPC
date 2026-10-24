@@ -115,9 +115,15 @@ internal class CallEnd {
     }
 }
 
-/** The transport stream of one call with the state its two halves share. */
+/**
+ * The transport stream of one call with the state its two halves share. Both halves send and
+ * receive through it, so the call's [compression] applies to every message: responses larger than
+ * [maxMessageSize] are rejected before they are decompressed.
+ */
 internal class CallStream(
     val stream: RpcClientStream,
+    private val compression: CallCompression? = null,
+    private val maxMessageSize: Int = DEFAULT_MAX_FRAME_SIZE,
 ) {
     val end = CallEnd()
 
@@ -125,6 +131,23 @@ internal class CallStream(
     var pump: ResponsePump? = null
 
     private val closed = AtomicBoolean(false)
+
+    /** Sends one request message, compressed when the call's negotiation allows it. */
+    suspend fun send(body: ByteArray) {
+        val compressed = compression?.compressRequest(body)
+        if (compressed == null) stream.send(body) else stream.send(compressed, FrameType.ZSTD_MESSAGE)
+    }
+
+    /**
+     * Receives the next response frame from the transport: HEADERS carry the server's answer to
+     * the call's dictionary query, and compressed messages are decompressed.
+     */
+    suspend fun receive(): ResponseFrame? =
+        when (val frame = stream.receive()) {
+            is ResponseFrame.Headers -> frame.also { compression?.learn(it.dictionaries) }
+            is ResponseFrame.Message -> inflateResponse(frame, compression, maxMessageSize)
+            else -> frame
+        }
 
     /** Closes the transport stream once, releasing the pump and failing blocked sends. */
     suspend fun close(cause: Throwable? = null) {
@@ -262,7 +285,7 @@ internal class ResponsePump(
                 while (!hasRoom()) wake.receive()
                 val frame =
                     try {
-                        callWithDeadline(deadline, null) { call.stream.receive() }
+                        callWithDeadline(deadline, null) { call.receive() }
                     } catch (error: CancellationException) {
                         if (!currentCoroutineContext().isActive) throw error
                         finish(error)

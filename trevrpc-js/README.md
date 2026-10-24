@@ -132,6 +132,21 @@ const channel = await connect(url, {
 
 Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
 
+### Compression
+
+Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). The codec lives in a separate entry point, `@trevrpc/trevrpc-js/zstd`, which loads libzstd as WebAssembly (about 85 KB gzipped), so applications without compression never load it:
+
+```js
+import { createCompression } from "@trevrpc/trevrpc-js/zstd";
+
+const compression = await createCompression({
+  dictionaries: [{ data: dictionaryBytes, messages: ["example.greeter.HelloRequest"] }],
+});
+const channel = await connect(url, { compression });
+```
+
+Generated clients pick each message's dictionary by its protobuf type. The channel asks each new session's server which dictionaries it holds, so a message whose dictionary the server lacks travels uncompressed, and request messages are compressed once the answer arrives. A transport other than a `Channel` compresses when it has a `compression` property with these settings.
+
 ### WebSocket fallback
 
 `connect()` races two transports. WebTransport starts first; QMux over WebSocket (subprotocol `qmux-02.trevrpc-1`, served by Go and Rust on the server's TCP port) starts after `fallbackDelayMs` (default 300) or immediately if WebTransport fails or the browser has no `WebTransport` API. The first session to be ready wins and the other is closed. After the WebSocket wins, reconnects use it directly until `reprobeIntervalMs` (default 5 minutes) has passed since WebTransport was lost, then race again.

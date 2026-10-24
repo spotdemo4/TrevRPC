@@ -1,8 +1,10 @@
 package example.generated
 private val trevrpcCodec0: zip.trev.trevrpc.MessageCodec<example.generated.HelloRequest> =
         decode = { body -> zip.trev.trevrpc.decodeProtobuf(body, example.generated.HelloRequest.getDescriptor(), example.generated.HelloRequest::parseFrom) },
+        messageType = "hello.v1.HelloRequest",
 private val trevrpcCodec1: zip.trev.trevrpc.MessageCodec<example.generated.HelloReply> =
         decode = { body -> zip.trev.trevrpc.decodeProtobuf(body, example.generated.HelloReply.getDescriptor(), example.generated.HelloReply::parseFrom) },
+        messageType = "hello.v1.HelloReply",
 public const val GREETER_SAY_HELLO_PATH: String = "/hello.v1.Greeter/SayHello"
 public const val GREETER_LOTS_OF_REPLIES_PATH: String = "/hello.v1.Greeter/LotsOfReplies"
 public const val GREETER_LOTS_OF_GREETINGS_PATH: String = "/hello.v1.Greeter/LotsOfGreetings"

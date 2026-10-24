@@ -368,6 +368,13 @@
       "jar": "sha256-ySjWBmXGQV+xw5d1z5XPxE9/RYDPWrAbHDgOv/12iH8=",
       "pom": "sha256-SDllThaxcU509Rq8s3jYNWgUq49NUnPR3S8c6KOQrdw="
     },
+    "com/github/luben#zstd-jni/1.5.7-24": {
+      "jar": "sha256-efXmeM5DfwnVq1XfHG5/yM9qLrjnMFLzSxQ0ZAYvyws=",
+      "pom": "sha256-hsbUWqOskII1etBewyJu3JsKs2ufZhTo6+6tunLElq4="
+    },
+    "com/github/luben/zstd-jni/1.5.7-24/zstd-jni-1.5.7-24": {
+      "aar": "sha256-UhTX0DTTpjiMYNAjPbdWZdWREPfkY4EcUhwV83clMmM="
+    },
     "com/google/auto#auto-parent/6": {
       "pom": "sha256-BfdAxmSBZdsAz2GN1WwgDEcl41jm1U9YU+C+wVc06go="
     },

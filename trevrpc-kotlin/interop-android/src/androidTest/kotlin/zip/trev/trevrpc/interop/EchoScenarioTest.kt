@@ -20,10 +20,13 @@ import trevrpc.interop.v1.Interop.EchoResponse
 import trevrpc.interop.v1.UnreliableEchoClient
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.Code
+import zip.trev.trevrpc.Compression
+import zip.trev.trevrpc.Dictionary
 import zip.trev.trevrpc.Metadata
 import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.TrevRpcException
 import zip.trev.trevrpc.cronet.CronetRpcChannel
+import zip.trev.trevrpc.cronet.CronetTransportOptions
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -74,7 +77,13 @@ class EchoScenarioTest(
             }
             engine = builder.build()
             executor = Executors.newFixedThreadPool(2)
-            channel = CronetRpcChannel.create(engine, "https://$host:$port", executor)
+            channel =
+                CronetRpcChannel.create(
+                    engine,
+                    "https://$host:$port",
+                    executor,
+                    CronetTransportOptions(compression = interopCompression()),
+                )
         }
 
         @JvmStatic
@@ -87,6 +96,20 @@ class EchoScenarioTest(
             check(executor.awaitTermination(10, TimeUnit.SECONDS)) { "Cronet callback executor did not terminate" }
         }
     }
+}
+
+/**
+ * Compression with the interop dictionary, `dict.d1` of the compression golden vectors, which the
+ * runner hands the server too. It compresses the Echo messages.
+ */
+private fun interopCompression(): Compression {
+    val prefix = "dict.d1.dictionary = "
+    val vectors = checkNotNull(Clients::class.java.classLoader?.getResourceAsStream("zstd-golden-vectors.txt"))
+    val hex = vectors.bufferedReader().useLines { lines -> lines.first { it.startsWith(prefix) }.removePrefix(prefix) }
+    val dictionary = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    return Compression(
+        listOf(Dictionary(dictionary, listOf("trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"))),
+    )
 }
 
 /** The generated clients a scenario can call; scenarios destructure the ones they use. */
@@ -169,6 +192,15 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             }
             expect(index == 2) { "expected 2 responses, got $index" }
             expectMetadata("trailing metadata", response.trailers, "interop-trailer")
+        },
+        "compressed" to { (client) ->
+            // Messages like the documents the interop dictionary was trained on, so they compress.
+            fun message(index: Int) = """{"service":"search","region":"us-east-1","status":404,"latency_ms":${100 + index}}"""
+            for (index in 0 until 2) expectEcho(client.unary(request(message(index))), message(index), 0)
+            val sent = (0 until 3).map(::message)
+            val responses = client.bidi(sent.map { request(it) }.asFlow()).toList()
+            expect(responses.size == sent.size) { "expected ${sent.size} responses, got ${responses.size}" }
+            responses.forEachIndexed { index, response -> expectEcho(response, sent[index], index) }
         },
         "unreliable" to { (_, client) ->
             // Cronet has no datagram API, so the schema's unreliable marking changes nothing: HTTP/3

@@ -1,0 +1,24 @@
+[package]
+name = "trevrpc-zstd-wasm"
+version = "0.0.0"
+edition = "2024"
+description = "The libzstd WebAssembly module behind @trevrpc/trevrpc-js/zstd"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Compiles the bundled libzstd 1.5.7, with its malloc and string shims for wasm32-unknown-unknown.
+zstd-sys = { version = "2.1.2", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Built on its own, not as part of a workspace.
+[workspace]

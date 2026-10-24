@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +34,7 @@ from harness import (
     command_line,
     run_checked,
     stop_group,
+    write_vectors_dictionary,
 )
 
 EMULATOR_HOST = "10.0.2.2"
@@ -45,6 +47,8 @@ CA_DIRECTORY = "/system/etc/security/cacerts"
 BOOT_TIMEOUT = 180
 INSTRUMENTATION_TIMEOUT = 180
 MIN_FREE_BYTES = 6 * 1024**3
+# The test APK carries the compression golden vectors, whose dictionary it compresses with.
+DICTIONARY_VECTORS = "zstd-golden-vectors.txt"
 
 
 # --- processes -------------------------------------------------------------------------------
@@ -153,10 +157,27 @@ def generate_certificates(
 TRANSPORTS = ("http3", "http2")
 
 
-def start_server(command: list[str], certificates: Certificates, host: str, output: Path) -> Server:
-    """Starts the interop server on `host` and waits for it to report its ports."""
+def extract_dictionary(test_apk: Path, directory: Path) -> Path:
+    """Writes the dictionary the instrumented test compresses with to DIRECTORY and returns its
+    path, so the server holds the same one."""
+    try:
+        with zipfile.ZipFile(test_apk) as apk:
+            vectors = apk.read(DICTIONARY_VECTORS).decode("utf-8")
+    except (OSError, KeyError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+        raise RunnerError(
+            f"could not read {DICTIONARY_VECTORS} from {test_apk}: {error}"
+        ) from error
+    return write_vectors_dictionary(vectors, f"{DICTIONARY_VECTORS} in {test_apk}", directory)
+
+
+def start_server(
+    command: list[str], certificates: Certificates, host: str, dictionary: Path, output: Path
+) -> Server:
+    """Starts the interop server on `host`, holding the compression `dictionary`, and waits for it
+    to report its ports."""
     certificate = Certificate(certificates.certificate, certificates.key)
-    server = Server("interop", command, certificate, output, ["--host", host])
+    arguments = ["--host", host, "--dictionary", str(dictionary)]
+    server = Server("interop", command, certificate, output, arguments)
     try:
         for transport in TRANSPORTS:
             _ = server.port(transport)
@@ -444,7 +465,7 @@ def parse_args(argv: list[str]) -> Options:
         "--server-command",
         type=command_line,
         required=True,
-        help="interop executable; `server --cert --key --host` is appended",
+        help="interop executable; `server --cert --key --host --dictionary` is appended",
     )
     _ = parser.add_argument(
         "--output", type=Path, required=True, help="directory for logs and diagnostics"
@@ -496,10 +517,13 @@ def execute(args: Options) -> Outcomes:
         )
 
     certificates = generate_certificates(args.work_dir / "certificates")
+    dictionary = extract_dictionary(args.test_apk, args.work_dir)
     server: Server | None = None
     emulator: Emulator | None = None
     try:
-        server = start_server(args.server_command, certificates, args.server_host, args.output)
+        server = start_server(
+            args.server_command, certificates, args.server_host, dictionary, args.output
+        )
         emulator = Emulator(args.work_dir, args.output, args.system_image)
         emulator.wait_for_boot()
         emulator.install_ca(certificates.ca, args.work_dir)

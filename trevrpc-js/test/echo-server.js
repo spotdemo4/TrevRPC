@@ -1,6 +1,7 @@
 // The Echo service of interop/README.md, served over fake streams. Behavior must match what the
 // Go and Rust interop servers do.
 import { root } from "../build/interop/gen/interop.trevrpc.js";
+import { encodeMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import { marshalMessage } from "../src/framing.js";
 import { Code } from "../src/status.js";
@@ -144,7 +145,7 @@ async function unreliableBidi(stream, request, session) {
         datagrams.push(
           encodeDatagram(
             flow,
-            responses.map((response) => marshalMessage(EchoResponse, response)),
+            responses.map((response) => encodeMessage(marshalMessage(EchoResponse, response))),
           ),
         );
         return;
@@ -161,8 +162,8 @@ async function unreliableBidi(stream, request, session) {
     datagrams.onSend = (datagram) => {
       const decoded = decodeDatagram(datagram);
       if (decoded?.flow === flow) {
-        for (const message of decoded.messages) {
-          handle(EchoRequest.decode(message), true);
+        for (const { payload } of decoded.messages) {
+          handle(EchoRequest.decode(payload), true);
         }
       }
     };

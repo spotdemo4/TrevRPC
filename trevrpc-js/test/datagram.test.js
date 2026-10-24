@@ -4,6 +4,7 @@ import test from "node:test";
 import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
 import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
 import { Channel } from "../src/channel.js";
+import { encodeMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import { FrameType, marshalMessage, unmarshalMessage } from "../src/framing.js";
 import { Code } from "../src/status.js";
@@ -19,7 +20,7 @@ const ownFlow = (request) => Number(request.datagramFlow);
 const responseDatagram = (flow, ...messages) =>
   encodeDatagram(
     flow,
-    messages.map((message) => marshalMessage(EchoResponse, { message, index: 0 })),
+    messages.map((message) => encodeMessage(marshalMessage(EchoResponse, { message, index: 0 }))),
   );
 
 /** The request messages carried by a datagram the client sent, and its flow. */
@@ -27,7 +28,7 @@ function decodeRequestDatagram(datagram) {
   const { flow, messages } = decodeDatagram(datagram);
   return {
     flow,
-    messages: messages.map((message) => unmarshalMessage(EchoRequest, message).message),
+    messages: messages.map(({ payload }) => unmarshalMessage(EchoRequest, payload).message),
   };
 }
 
@@ -527,7 +528,9 @@ test("a datagram that is not a valid message fails the call like a stream messag
     datagrams,
     serving([], async (stream, request) => {
       await stream.writeHeaders();
-      datagrams.push(encodeDatagram(ownFlow(request), [new Uint8Array([0x0a, 0x05, 0x61])]));
+      datagrams.push(
+        encodeDatagram(ownFlow(request), [encodeMessage(new Uint8Array([0x0a, 0x05, 0x61]))]),
+      );
     }),
   );
   const call = await new UnreliableEchoClient(transport).bidi();

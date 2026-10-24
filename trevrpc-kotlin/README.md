@@ -119,6 +119,18 @@ Finding the status can mean reading responses the caller has not asked for yet. 
 
 If the call's own deadline passes while the client waits for the end of the stream after `STATUS`, the server's status still decides the outcome. Cancelling the caller's coroutine at that point propagates the cancellation, and `terminalStatus` holds the server's status.
 
+### Compression
+
+Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). Compression calls [zstd-jni](https://github.com/luben/zstd-jni), which `core` compiles against but does not ship, so the application adds it: `com.github.luben:zstd-jni:1.5.7-24@aar` on Android (its AAR needs `compileSdk` 37), or the plain JAR on the JVM. Configure it on the channel:
+
+```kotlin
+val compression =
+    Compression(listOf(Dictionary(context.assets.open("metrics.dict").readBytes(), listOf("example.v1.MetricSample"))))
+val channel = CronetRpcChannel.create(engine, "https://rpc.example.com", executor, CronetTransportOptions(compression = compression))
+```
+
+Generated codecs carry each message's protobuf type, which picks its dictionary. Cronet does not say which calls share a connection, so every call asks the server which of its dictionaries it holds. Responses are compressed from the first call on; a client-streaming or bidirectional call compresses its requests once the server's answer arrives in its headers, and unary and server-streaming requests are never compressed.
+
 ## Interop tests
 
 `interop-android` generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go or Rust server on the host. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:

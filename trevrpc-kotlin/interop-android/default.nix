@@ -14,6 +14,7 @@
   stdenvNoCC,
   trevrpcProto,
   wireGolden,
+  zstdGolden,
 }:
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin-interop-android";
@@ -24,6 +25,7 @@ stdenvNoCC.mkDerivation (final: {
     fileset = lib.fileset.unions [
       licenseFile
       wireGolden
+      zstdGolden
       interopHarness
       interopProto
       trevrpcProto

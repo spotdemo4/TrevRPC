@@ -30,6 +30,10 @@ data class RpcRequest(
      * field exists so the codec round-trips what other runtimes send.
      */
     val datagramFlow: ULong = 0uL,
+    /** The dictionaries the client accepts on this call's response messages. */
+    val acceptDictionaries: List<UInt> = emptyList(),
+    /** The dictionaries the client asks the server about, with their fingerprints. */
+    val dictionaryQuery: List<DictionaryInfo> = emptyList(),
 ) {
     val kind: RpcKind?
         get() = RpcKind.fromValue(kindValue)
@@ -39,7 +43,28 @@ data class RpcRequest(
 data class RpcHeaders(
     val metadata: Metadata = Metadata.EMPTY,
     val extensions: List<ULong> = emptyList(),
+    /** The server's answer to the request's `dictionaryQuery`: the queried dictionaries it holds. */
+    val dictionaries: List<DictionaryInfo> = emptyList(),
 )
+
+/** A compression dictionary in negotiation fields: its Dictionary_ID and fingerprint. */
+class DictionaryInfo(
+    val id: UInt,
+    fingerprint: ByteArray,
+) {
+    private val fingerprintBytes = fingerprint.copyOf()
+
+    /** The first 8 bytes of the SHA-256 digest of the dictionary. */
+    val fingerprint: ByteArray
+        get() = fingerprintBytes.copyOf()
+
+    override fun equals(other: Any?): Boolean =
+        other is DictionaryInfo && id == other.id && fingerprintBytes.contentEquals(other.fingerprintBytes)
+
+    override fun hashCode(): Int = 31 * id.hashCode() + fingerprintBytes.contentHashCode()
+
+    override fun toString(): String = "DictionaryInfo(id=$id, fingerprint=${fingerprintBytes.joinToString("") { "%02x".format(it) }})"
+}
 
 /** STATUS frame payload. */
 data class RpcStatus(
@@ -60,15 +85,29 @@ data class RpcStatus(
  * dropped because the client negotiates none.
  */
 sealed interface ResponseFrame {
-    /** Response headers. Absent headers are equivalent to empty ones. */
+    /**
+     * Response headers. Absent headers are equivalent to empty ones. [dictionaries] is the server's
+     * answer to the call's dictionary query.
+     */
     class Headers(
         val metadata: Metadata = Metadata.EMPTY,
+        val dictionaries: List<DictionaryInfo> = emptyList(),
     ) : ResponseFrame
 
-    /** One raw protobuf-encoded application message. */
-    class Message(
+    /**
+     * One application message. A message read from a ZSTD_MESSAGE frame is still compressed: [body]
+     * is the zstd payload and [compressed] is set until [Client] decompresses it.
+     */
+    class Message internal constructor(
         val body: ByteArray,
-    ) : ResponseFrame
+        internal val zstd: ZstdHeader?,
+    ) : ResponseFrame {
+        /** One raw protobuf-encoded message. */
+        constructor(body: ByteArray) : this(body, null)
+
+        val compressed: Boolean
+            get() = zstd != null
+    }
 
     /** The terminal status, carrying trailing metadata. */
     class Status(

@@ -12,4 +12,5 @@ export const ScenarioNames = Object.freeze([
   "unary-headers",
   "server-stream-headers",
   "unreliable",
+  "compressed",
 ]);

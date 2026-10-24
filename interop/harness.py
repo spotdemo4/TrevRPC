@@ -171,6 +171,24 @@ def run_checked(
     return result.stdout
 
 
+# --- compression -----------------------------------------------------------------------------
+
+# The golden vector holding the interop dictionary, which every interop server and compressing
+# client holds for the Echo messages.
+DICTIONARY_ENTRY = "dict.d1.dictionary = "
+
+
+def write_vectors_dictionary(vectors: str, origin: str, directory: Path) -> Path:
+    """Writes the interop dictionary from the text of the compression golden vectors, read from
+    ORIGIN, to DIRECTORY and returns its path."""
+    for line in vectors.splitlines():
+        if line.startswith(DICTIONARY_ENTRY):
+            path = directory / "interop.dict"
+            _ = path.write_bytes(bytes.fromhex(line.removeprefix(DICTIONARY_ENTRY)))
+            return path
+    raise RunnerError(f"{origin} has no {DICTIONARY_ENTRY.strip(' =')}")
+
+
 # --- certificates ----------------------------------------------------------------------------
 
 

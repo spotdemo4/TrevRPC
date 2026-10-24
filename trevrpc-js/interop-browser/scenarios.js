@@ -3,6 +3,7 @@ import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
 // only needs the web platform, so it runs unchanged in a browser bundle and under Node tests.
 import { Code, TrevRpcError, codeName, connect } from "../src/index.js";
+import { createCompression } from "../src/zstd.js";
 import { ScenarioNames } from "./names.js";
 
 const DeadlineMs = 10_000;
@@ -10,6 +11,34 @@ const DeadlineMs = 10_000;
 /** The `unreliable` scenario sends this many short requests, then one that cannot be a datagram. */
 const UnreliableShortRequests = 50;
 const UnreliableLargeSize = 4096;
+/** How many messages the `compressed` scenario streams. */
+const CompressedMessages = 3;
+/** The message types the interop dictionary compresses. */
+const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
+
+/** The i-th message of the `compressed` scenario: like the dictionary's training data. */
+function compressedMessage(i) {
+  return `{"service":"search","region":"us-east-1","status":404,"latency_ms":${100 + i}}`;
+}
+
+/**
+ * Returns n characters that zstd cannot shrink much: base64 digits drawn by the fixed xorshift
+ * generator the native clients use. A message of them stays too large for a datagram even when
+ * compression is on.
+ */
+function incompressible(n) {
+  const digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const mask = (1n << 64n) - 1n;
+  let state = 0x9e3779b97f4a7c15n;
+  let out = "";
+  for (let i = 0; i < n; i += 1) {
+    state ^= (state << 13n) & mask;
+    state ^= state >> 7n;
+    state ^= (state << 17n) & mask;
+    out += digits[Number(state % 64n)];
+  }
+  return out;
+}
 
 /**
  * Scenarios take the Echo client and a context: `unreliable` is the UnreliableEcho client and
@@ -145,7 +174,7 @@ const scenarios = {
   async unreliable(_echo, { unreliable, transport }) {
     const call = await unreliable.bidi();
     const requests = Array.from({ length: UnreliableShortRequests }, (_, index) => String(index));
-    requests.push("x".repeat(UnreliableLargeSize));
+    requests.push(incompressible(UnreliableLargeSize));
 
     // Responses are read while the requests go out, so they are not dropped for a full queue.
     const reading = (async () => {
@@ -205,6 +234,27 @@ const scenarios = {
       );
     }
   },
+
+  // With the dictionary on both sides these travel as ZSTD_MESSAGE frames; without, as MESSAGE.
+  async compressed(echo) {
+    for (let i = 0; i < 2; i += 1) {
+      expectEcho(await echo.unary({ message: compressedMessage(i) }), compressedMessage(i), 0);
+    }
+    const call = await echo.bidi();
+    for (let i = 0; i < CompressedMessages; i += 1) {
+      await call.send({ message: compressedMessage(i) });
+    }
+    await call.closeSend();
+    const received = [];
+    for await (const response of call) {
+      received.push(response);
+    }
+    expectEchoes(
+      received,
+      Array.from({ length: CompressedMessages }, (_, i) => [compressedMessage(i), i]),
+    );
+    expect((await call.status).code === Code.Ok, "stream did not end with OK");
+  },
 };
 
 /** The channel transports each interop lane allows. */
@@ -221,7 +271,8 @@ const LaneTransports = {
  *
  * transport is "webtransport" (the default), "websocket" (QMux over WebSocket at webSocketUrl),
  * or "auto" (WebTransport with the WebSocket fallback). expectTransport fails every scenario
- * unless the channel connected over that transport.
+ * unless the channel connected over that transport. dictionary, the interop dictionary in base64,
+ * makes the channel compress Echo messages with it.
  */
 export async function runScenarios({
   url,
@@ -229,6 +280,7 @@ export async function runScenarios({
   transport = "webtransport",
   webSocketUrl,
   expectTransport,
+  dictionary,
   onResult = () => {},
 }) {
   const results = [];
@@ -241,7 +293,13 @@ export async function runScenarios({
 
   let channel;
   try {
+    const compression =
+      dictionary &&
+      (await createCompression({
+        dictionaries: [{ data: base64Bytes(dictionary), messages: EchoTypes }],
+      }));
     channel = await connect(url, {
+      compression,
       signal: AbortSignal.timeout(DeadlineMs),
       transports: LaneTransports[transport],
       webSocketUrl,
@@ -286,6 +344,10 @@ for (const name of ScenarioNames) {
   if (typeof scenarios[name] !== "function") {
     throw new Error(`missing interop scenario ${name}`);
   }
+}
+
+function base64Bytes(text) {
+  return Uint8Array.from(atob(text), (character) => character.charCodeAt(0));
 }
 
 function expect(condition, message) {

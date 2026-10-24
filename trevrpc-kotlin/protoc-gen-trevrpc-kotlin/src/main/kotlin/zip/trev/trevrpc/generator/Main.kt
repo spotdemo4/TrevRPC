@@ -455,6 +455,8 @@ private fun StringBuilder.generateCodec(
     appendLine(
         "        decode = { body -> $runtime.decodeProtobuf(body, ${type.kotlinType}.getDescriptor(), ${type.kotlinType}::parseFrom) },",
     )
+    // The full protobuf name picks the type's compression dictionary.
+    appendLine("        messageType = ${type.protoName.removePrefix(".").quote()},")
     appendLine("    )")
     appendLine()
 }
