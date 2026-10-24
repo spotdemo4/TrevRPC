@@ -180,7 +180,7 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
             &request,
             Bytes::from(body),
             self.max_frame_size,
-            negotiated.requests.as_ref(),
+            negotiated.requests.get().as_ref(),
         )
         .await?;
         call.send.finish_stream()?;

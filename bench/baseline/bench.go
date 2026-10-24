@@ -34,6 +34,7 @@ type benchConfig struct {
 	size, concurrency, messages               int
 	metadataSize                              int
 	duration, warmup                          time.Duration
+	payload, compression                      string
 }
 
 func parseBenchFlags(args []string) (benchConfig, error) {
@@ -55,6 +56,8 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 	fs.Float64Var(&warmup, "warmup", 1, "warmup seconds")
 	fs.IntVar(&cfg.messages, "messages", 100, "messages per streaming call")
 	fs.IntVar(&cfg.metadataSize, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
+	fs.StringVar(&cfg.payload, "payload", "repeat", "EchoRequest.message: repeat (x repeated) or records (a new log-records message per request)")
+	fs.StringVar(&cfg.compression, "compression", "none", "none, gzip or zstd")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -76,6 +79,12 @@ func parseBenchFlags(args []string) (benchConfig, error) {
 		return cfg, fmt.Errorf("--metadata-size must be between 0 and %d", maxMetadataSize)
 	case cfg.duration <= 0, cfg.warmup < 0:
 		return cfg, errors.New("--duration must be > 0 and --warmup >= 0")
+	case cfg.payload != "repeat" && cfg.payload != "records":
+		return cfg, fmt.Errorf("--payload must be repeat or records, not %q", cfg.payload)
+	case !slices.Contains(compressions, cfg.compression):
+		return cfg, fmt.Errorf("--compression must be one of %s", strings.Join(compressions, ", "))
+	case cfg.compression != "none" && !slices.Contains(compressedScenarios, cfg.scenario):
+		return cfg, fmt.Errorf("--compression %s does not run the %s scenario", cfg.compression, cfg.scenario)
 	}
 	return cfg, nil
 }
@@ -109,6 +118,8 @@ type benchResult struct {
 	BytesPerSec     float64        `json:"bytes_per_sec"`
 	LatencyUS       latencySummary `json:"latency_us"`
 	WireBytesPerMsg *float64       `json:"wire_bytes_per_msg,omitempty"`
+	Payload         string         `json:"payload"`
+	Compression     string         `json:"compression"`
 }
 
 func (r benchResult) write(w io.Writer) error {
@@ -138,7 +149,7 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 	defer cancel()
 	workers := make([]worker, cfg.concurrency)
 	for i := range workers {
-		workers[i] = newWorker(runCtx, conn.client, cfg)
+		workers[i] = newWorker(runCtx, conn.client, cfg, newBenchPayload(cfg.payload, cfg.size, i))
 	}
 	defer func() {
 		for _, w := range workers {
@@ -239,6 +250,8 @@ func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (bench
 		Size:         cfg.size,
 		MetadataSize: cfg.metadataSize,
 		Concurrency:  cfg.concurrency,
+		Payload:      cfg.payload,
+		Compression:  cfg.compression,
 		DurationS:    seconds,
 		Ops:          uint64(len(latencies)),
 		Msgs:         msgs,

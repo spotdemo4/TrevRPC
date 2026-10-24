@@ -15,12 +15,14 @@ import (
 )
 
 // newConnectServer returns a net/http server for Echo with connect-go's and
-// net/http's defaults. Served with TLS, it negotiates HTTP/2 with ALPN, which
-// Connect needs for bidirectional streams. Its handlers also accept gRPC and
-// gRPC-Web, though the bench client only speaks the Connect protocol.
+// net/http's defaults, plus zstd. Served with TLS, it negotiates HTTP/2 with
+// ALPN, which Connect needs for bidirectional streams. Its handlers also accept
+// gRPC and gRPC-Web, though the bench client only speaks the Connect protocol.
+// They accept gzip (built in) and zstd requests, and compress responses with an
+// encoding the client accepts.
 func newConnectServer(certificate tls.Certificate) *http.Server {
 	mux := http.NewServeMux()
-	mux.Handle(echopbconnect.NewEchoHandler(connectEcho{}))
+	mux.Handle(echopbconnect.NewEchoHandler(connectEcho{}, connectZstdAtFastest))
 	return &http.Server{
 		Handler:   mux,
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}},

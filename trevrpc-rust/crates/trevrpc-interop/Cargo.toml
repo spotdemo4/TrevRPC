@@ -40,3 +40,4 @@ protox = "0.10.0"
 
 [dev-dependencies]
 rcgen = "0.14"
+ring = "0.17"

@@ -1,6 +1,6 @@
 // Command trevrpc-interop is the Go entry point of the cross-runtime interop
-// suite described in interop/README.md. It serves or calls the Echo and
-// UnreliableEcho services.
+// suite described in interop/README.md. It serves or calls the Echo,
+// UnreliableEcho and CompressedEcho services.
 //
 //	trevrpc-interop server --cert cert.pem --key key.pem [--host 127.0.0.1] [--port 0]
 //	                       [--web-root dir]
@@ -12,7 +12,9 @@
 //	                       --scenario unary|server-stream|client-stream|bidi|
 //	                                  unreliable-server-stream|unreliable-client-stream
 //	                       [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
-//	                       [--messages 100]
+//	                       [--messages 100] [--payload repeat|records]
+//	                       [--compression none|dictionary|stream|stream-dictionary]
+//	                       [--dictionary file]
 //
 // bench is the load client described in bench/README.md.
 package main

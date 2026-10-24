@@ -10,7 +10,6 @@ import (
 	"io"
 	"math"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +46,9 @@ type benchConfig struct {
 	messages    int
 	duration    float64
 	warmup      float64
+	payload     string
+	compression string
+	dictionary  string
 }
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
@@ -58,6 +60,29 @@ func (c *benchConfig) register(flags *flag.FlagSet) {
 	flags.IntVar(&c.messages, "messages", 100, "messages per streaming call")
 	flags.Float64Var(&c.duration, "duration", 5, "measured seconds")
 	flags.Float64Var(&c.warmup, "warmup", 1, "seconds run before measuring")
+	flags.StringVar(&c.payload, "payload", "repeat", "EchoRequest.message: repeat (x repeated) or records (a new log-records message per request)")
+	flags.StringVar(&c.compression, "compression", "none", "none, dictionary, stream or stream-dictionary")
+	flags.StringVar(&c.dictionary, "dictionary", "", "zstd dictionary file for the dictionary and stream-dictionary compression modes")
+}
+
+// benchCompressions are the --compression modes and the scenarios each runs.
+// The stream modes call CompressedEcho, whose streaming methods allow stream
+// compression; stream compression never applies to unary calls.
+var benchCompressions = map[string][]string{
+	"none":              nil, // every scenario
+	"dictionary":        {"unary", "client-stream", "bidi"},
+	"stream":            {"client-stream", "bidi"},
+	"stream-dictionary": {"client-stream", "bidi"},
+}
+
+// usesDictionary reports whether the compression mode needs --dictionary.
+func (c *benchConfig) usesDictionary() bool {
+	return c.compression == "dictionary" || c.compression == "stream-dictionary"
+}
+
+// streamCompressed reports whether the compression mode calls CompressedEcho.
+func (c *benchConfig) streamCompressed() bool {
+	return c.compression == "stream" || c.compression == "stream-dictionary"
 }
 
 func (c *benchConfig) validate() error {
@@ -66,6 +91,17 @@ func (c *benchConfig) validate() error {
 	}
 	if _, ok := benchScenarios[c.scenario]; !ok {
 		return fmt.Errorf("bench: unknown --scenario %q", c.scenario)
+	}
+	scenarios, ok := benchCompressions[c.compression]
+	switch {
+	case !ok:
+		return fmt.Errorf("bench: unknown --compression %q", c.compression)
+	case scenarios != nil && !slices.Contains(scenarios, c.scenario):
+		return fmt.Errorf("bench: --compression %s does not run the %s scenario", c.compression, c.scenario)
+	case c.usesDictionary() != (c.dictionary != ""):
+		return fmt.Errorf("bench: --compression %s and --dictionary go together", c.compression)
+	case c.payload != "repeat" && c.payload != "records":
+		return fmt.Errorf("bench: unknown --payload %q", c.payload)
 	}
 	switch {
 	case c.size < 0:
@@ -115,44 +151,70 @@ type lossyOperation interface {
 type benchClients struct {
 	echo       *interoppb.EchoClient
 	unreliable *interoppb.UnreliableEchoClient
+	compressed *interoppb.CompressedEchoClient
+}
+
+// The streaming calls of Echo and CompressedEcho, which have the same
+// messages.
+type (
+	openClientStream func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error)
+	openBidi         func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error)
+)
+
+// clientStream returns the ClientStream call the compression mode uses.
+func (c benchClients) clientStream(config benchConfig) openClientStream {
+	if config.streamCompressed() {
+		return c.compressed.ClientStream
+	}
+	return c.echo.ClientStream
+}
+
+// bidi returns the Bidi call the compression mode uses.
+func (c benchClients) bidi(config benchConfig) openBidi {
+	if config.streamCompressed() {
+		return c.compressed.Bidi
+	}
+	return c.echo.Bidi
 }
 
 // benchScenarios builds the operation of one worker for each scenario of
-// bench/README.md.
-var benchScenarios = map[string]func(clients benchClients, config benchConfig) benchOperation{
-	"unary": func(clients benchClients, config benchConfig) benchOperation {
-		return &unaryOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size)}
+// bench/README.md. payload supplies the worker's request messages, all of
+// --size bytes.
+var benchScenarios = map[string]func(clients benchClients, config benchConfig, payload benchPayload) benchOperation{
+	"unary": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
+		return &unaryOperation{client: clients.echo, options: config.callOptions(), payload: payload}
 	},
-	"server-stream": func(clients benchClients, config benchConfig) benchOperation {
-		return &serverStreamOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
+	"server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
+		return &serverStreamOperation{client: clients.echo, options: config.callOptions(), payload: payload, count: config.messages}
 	},
-	"client-stream": func(clients benchClients, config benchConfig) benchOperation {
-		return &clientStreamOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
+	"client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
+		return &clientStreamOperation{open: clients.clientStream(config), options: config.callOptions(), payload: payload, count: config.messages}
 	},
-	"bidi": func(clients benchClients, config benchConfig) benchOperation {
-		return &bidiOperation{client: clients.echo, options: config.callOptions(), message: strings.Repeat("x", config.size)}
+	"bidi": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
+		return &bidiOperation{open: clients.bidi(config), options: config.callOptions(), payload: payload}
 	},
-	"unreliable-server-stream": func(clients benchClients, config benchConfig) benchOperation {
-		return &unreliableServerStreamOperation{client: clients.unreliable, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
+	"unreliable-server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
+		return &unreliableServerStreamOperation{client: clients.unreliable, options: config.callOptions(), message: payload.next(), count: config.messages}
 	},
-	"unreliable-client-stream": func(clients benchClients, config benchConfig) benchOperation {
-		return &unreliableClientStreamOperation{client: clients.unreliable, options: config.callOptions(), message: strings.Repeat("x", config.size), count: config.messages}
+	"unreliable-client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
+		return &unreliableClientStreamOperation{client: clients.unreliable, options: config.callOptions(), message: payload.next(), count: config.messages}
 	},
 }
 
 type unaryOperation struct {
 	client  *interoppb.EchoClient
 	options []trevrpc.CallOption
-	message string
+	payload benchPayload
 }
 
 func (o *unaryOperation) run(ctx context.Context) (int, error) {
-	response, err := o.client.Unary(ctx, &interoppb.EchoRequest{Message: o.message}, o.options...)
+	message := o.payload.next()
+	response, err := o.client.Unary(ctx, &interoppb.EchoRequest{Message: message}, o.options...)
 	if err != nil {
 		return 0, err
 	}
-	if len(response.Message) != len(o.message) {
-		return 0, fmt.Errorf("response has %d bytes, want %d", len(response.Message), len(o.message))
+	if len(response.Message) != len(message) {
+		return 0, fmt.Errorf("response has %d bytes, want %d", len(response.Message), len(message))
 	}
 	return 1, nil
 }
@@ -162,12 +224,13 @@ func (*unaryOperation) close() {}
 type serverStreamOperation struct {
 	client  *interoppb.EchoClient
 	options []trevrpc.CallOption
-	message string
+	payload benchPayload
 	count   int
 }
 
 func (o *serverStreamOperation) run(ctx context.Context) (int, error) {
-	stream, err := o.client.ServerStream(ctx, &interoppb.EchoRequest{Message: o.message, Count: uint32(o.count)}, o.options...)
+	message := o.payload.next()
+	stream, err := o.client.ServerStream(ctx, &interoppb.EchoRequest{Message: message, Count: uint32(o.count)}, o.options...)
 	if err != nil {
 		return 0, err
 	}
@@ -181,8 +244,8 @@ func (o *serverStreamOperation) run(ctx context.Context) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if len(response.Message) != len(o.message) {
-			return 0, fmt.Errorf("response has %d bytes, want %d", len(response.Message), len(o.message))
+		if len(response.Message) != len(message) {
+			return 0, fmt.Errorf("response has %d bytes, want %d", len(response.Message), len(message))
 		}
 		received++
 	}
@@ -195,21 +258,23 @@ func (o *serverStreamOperation) run(ctx context.Context) (int, error) {
 func (*serverStreamOperation) close() {}
 
 type clientStreamOperation struct {
-	client  *interoppb.EchoClient
+	open    openClientStream
 	options []trevrpc.CallOption
-	message string
+	payload benchPayload
 	count   int
 }
 
 func (o *clientStreamOperation) run(ctx context.Context) (int, error) {
-	call, err := o.client.ClientStream(ctx, o.options...)
+	call, err := o.open(ctx, o.options...)
 	if err != nil {
 		return 0, err
 	}
 	defer closeQuietly(call)
-	request := &interoppb.EchoRequest{Message: o.message}
+	sent := 0
 	for range o.count {
-		if err := call.Send(request); err != nil {
+		message := o.payload.next()
+		sent += len(message)
+		if err := call.Send(&interoppb.EchoRequest{Message: message}); err != nil {
 			return 0, err
 		}
 	}
@@ -217,9 +282,9 @@ func (o *clientStreamOperation) run(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if int(response.Index) != o.count || len(response.Message) != o.count*len(o.message) {
+	if int(response.Index) != o.count || len(response.Message) != sent {
 		return 0, fmt.Errorf("response covers %d messages and %d bytes, want %d and %d",
-			response.Index, len(response.Message), o.count, o.count*len(o.message))
+			response.Index, len(response.Message), o.count, sent)
 	}
 	return o.count, nil
 }
@@ -327,15 +392,15 @@ func (*unreliableClientStreamOperation) close() {}
 // bidiOperation keeps one Bidi stream open across operations, opening it again
 // after a failure.
 type bidiOperation struct {
-	client  *interoppb.EchoClient
+	open    openBidi
 	options []trevrpc.CallOption
-	message string
+	payload benchPayload
 	call    trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse]
 }
 
 func (o *bidiOperation) run(ctx context.Context) (int, error) {
 	if o.call == nil {
-		call, err := o.client.Bidi(ctx, o.options...)
+		call, err := o.open(ctx, o.options...)
 		if err != nil {
 			return 0, err
 		}
@@ -349,15 +414,16 @@ func (o *bidiOperation) run(ctx context.Context) (int, error) {
 }
 
 func (o *bidiOperation) roundTrip() error {
-	if err := o.call.Send(&interoppb.EchoRequest{Message: o.message}); err != nil {
+	message := o.payload.next()
+	if err := o.call.Send(&interoppb.EchoRequest{Message: message}); err != nil {
 		return err
 	}
 	response, err := o.call.Recv()
 	if err != nil {
 		return err
 	}
-	if len(response.Message) != len(o.message) {
-		return fmt.Errorf("response has %d bytes, want %d", len(response.Message), len(o.message))
+	if len(response.Message) != len(message) {
+		return fmt.Errorf("response has %d bytes, want %d", len(response.Message), len(message))
 	}
 	return nil
 }
@@ -474,7 +540,9 @@ type benchResult struct {
 	WireBytesPerMsg *float64     `json:"wire_bytes_per_msg,omitempty"`
 	// Lost counts the messages sent but not delivered, which only the
 	// unreliable scenarios can have.
-	Lost uint64 `json:"lost"`
+	Lost        uint64 `json:"lost"`
+	Payload     string `json:"payload"`
+	Compression string `json:"compression"`
 }
 
 // runBench connects, runs the scenario for the warmup and the measured window
@@ -488,12 +556,23 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		wire = new(wireCounter)
 		dialOptions.QUICConfig = wire.quicConfig()
 	}
+	if config.usesDictionary() {
+		compression, err := interopCompression(config.dictionary)
+		if err != nil {
+			return err
+		}
+		dialOptions.Compression = compression
+	}
 	channel, err := config.dial(ctx, dialOptions)
 	if err != nil {
 		return err
 	}
 	defer closeQuietly(channel)
-	clients := benchClients{echo: interoppb.NewEchoClient(channel), unreliable: interoppb.NewUnreliableEchoClient(channel)}
+	clients := benchClients{
+		echo:       interoppb.NewEchoClient(channel),
+		unreliable: interoppb.NewUnreliableEchoClient(channel),
+		compressed: interoppb.NewCompressedEchoClient(channel),
+	}
 
 	warmup := time.Duration(config.warmup * float64(time.Second))
 	window := time.Duration(config.duration * float64(time.Second))
@@ -505,7 +584,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	workers := make([]benchWorker, config.concurrency)
 	var group sync.WaitGroup
 	for i := range workers {
-		operation := benchScenarios[config.scenario](clients, config)
+		operation := benchScenarios[config.scenario](clients, config, newBenchPayload(config.payload, config.size, i))
 		group.Go(func() { workers[i].loop(opCtx, operation, start, end) })
 	}
 	var wireBefore, wireAfter uint64
@@ -576,6 +655,8 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 		Ops:          ops,
 		Msgs:         messages,
 		Lost:         lost,
+		Payload:      config.payload,
+		Compression:  config.compression,
 		Errors:       failures,
 		OpsPerSec:    float64(ops) / seconds,
 		MsgsPerSec:   float64(messages) / seconds,

@@ -65,9 +65,9 @@ func dial(ctx context.Context, cfg benchConfig) (connection, error) {
 	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	if cfg.transport == "connect" {
-		return dialConnect(ctx, cfg.addr, tlsConfig, pad)
+		return dialConnect(ctx, cfg.addr, tlsConfig, pad, connectClientOptions(cfg.compression))
 	}
-	return dialGRPC(ctx, cfg.addr, tlsConfig, pad)
+	return dialGRPC(ctx, cfg.addr, tlsConfig, pad, grpcCallOptions(cfg.compression))
 }
 
 func clientTLS(cfg benchConfig) (*tls.Config, error) {
@@ -84,10 +84,11 @@ func clientTLS(cfg benchConfig) (*tls.Config, error) {
 
 // dialGRPC returns a grpc.ClientConn, which grpc-go multiplexes over a single
 // HTTP/2 connection with default settings (64 KiB initial flow-control windows
-// with dynamic BDP estimation, 32 KiB write buffers, no compression). Those
-// defaults cap throughput per stream on high-latency links but are irrelevant
-// on loopback; no tuning is applied so the numbers are stock gRPC.
-func dialGRPC(ctx context.Context, addr string, tlsConfig *tls.Config, pad string) (connection, error) {
+// with dynamic BDP estimation, 32 KiB write buffers). Those defaults cap
+// throughput per stream on high-latency links but are irrelevant on loopback;
+// no tuning is applied so the numbers are stock gRPC. Every call carries
+// options, which select its compression.
+func dialGRPC(ctx context.Context, addr string, tlsConfig *tls.Config, pad string, options []grpc.CallOption) (connection, error) {
 	counter := &wireCounter{}
 	conn, err := grpc.NewClient("passthrough:///"+addr,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
@@ -99,7 +100,7 @@ func dialGRPC(ctx context.Context, addr string, tlsConfig *tls.Config, pad strin
 		_ = conn.Close()
 		return connection{}, err
 	}
-	client := grpcClient{client: echopb.NewEchoClient(conn)}
+	client := grpcClient{client: echopb.NewEchoClient(conn), options: options}
 	if pad != "" {
 		client.md = metadata.Pairs(padKey, pad)
 	}
@@ -124,8 +125,9 @@ func waitReady(ctx context.Context, conn *grpc.ClientConn) error {
 
 // grpcClient adapts the generated grpc-go client.
 type grpcClient struct {
-	client echopb.EchoClient
-	md     metadata.MD // the bench-pad entry, or nil without --metadata-size
+	client  echopb.EchoClient
+	md      metadata.MD // the bench-pad entry, or nil without --metadata-size
+	options []grpc.CallOption
 }
 
 func (c grpcClient) outgoing(ctx context.Context) context.Context {
@@ -136,30 +138,31 @@ func (c grpcClient) outgoing(ctx context.Context) context.Context {
 }
 
 func (c grpcClient) Unary(ctx context.Context, req *echopb.EchoRequest) (*echopb.EchoResponse, error) {
-	return c.client.Unary(c.outgoing(ctx), req)
+	return c.client.Unary(c.outgoing(ctx), req, c.options...)
 }
 
 func (c grpcClient) ServerStream(ctx context.Context, req *echopb.EchoRequest) (responseStream, error) {
-	return c.client.ServerStream(c.outgoing(ctx), req)
+	return c.client.ServerStream(c.outgoing(ctx), req, c.options...)
 }
 
 func (c grpcClient) ClientStream(ctx context.Context) (requestStream, error) {
-	return c.client.ClientStream(c.outgoing(ctx))
+	return c.client.ClientStream(c.outgoing(ctx), c.options...)
 }
 
 func (c grpcClient) Bidi(ctx context.Context) (bidiStream, error) {
-	return c.client.Bidi(c.outgoing(ctx))
+	return c.client.Bidi(c.outgoing(ctx), c.options...)
 }
 
 // dialConnect returns a connect-go client speaking the Connect protocol with
 // its default binary Protobuf codec over one HTTP/2 connection from net/http.
 // The defaults are kept except for two deviations that make it comparable with
-// the gRPC baseline: compression is off (connect-go otherwise gzips every
-// response, since its client accepts gzip and handlers compress messages of any
-// size), and the transport waits for a free stream rather than opening a
-// second connection once the server's stream limit (250 in net/http) is
-// reached, so that every worker shares one connection.
-func dialConnect(ctx context.Context, addr string, tlsConfig *tls.Config, pad string) (connection, error) {
+// the gRPC baseline: options select the compression, off unless a mode asks for
+// it (connect-go otherwise gzips every response, since its client accepts gzip
+// and handlers compress messages of any size), and the transport waits for a
+// free stream rather than opening a second connection once the server's stream
+// limit (250 in net/http) is reached, so that every worker shares one
+// connection.
+func dialConnect(ctx context.Context, addr string, tlsConfig *tls.Config, pad string, options []connect.ClientOption) (connection, error) {
 	counter := &wireCounter{}
 	var protocols http.Protocols
 	protocols.SetHTTP2(true)
@@ -170,9 +173,8 @@ func dialConnect(ctx context.Context, addr string, tlsConfig *tls.Config, pad st
 		HTTP2:           &http.HTTP2Config{StrictMaxConcurrentRequests: true},
 	}
 	client := connectClient{
-		client: echopbconnect.NewEchoClient(&http.Client{Transport: transport}, "https://"+addr,
-			connect.WithAcceptCompression("gzip", nil, nil)),
-		pad: pad,
+		client: echopbconnect.NewEchoClient(&http.Client{Transport: transport}, "https://"+addr, options...),
+		pad:    pad,
 	}
 	// One call establishes the connection the workers will share.
 	if _, err := client.Unary(ctx, &echopb.EchoRequest{}); err != nil {

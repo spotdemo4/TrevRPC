@@ -330,6 +330,9 @@ func checkResult(t *testing.T, line []byte, transport, scenario string, concurre
 	if wire := num("wire_bytes_per_msg"); wire < 100 {
 		t.Errorf("wire_bytes_per_msg = %v, want at least the 100 payload bytes", wire)
 	}
+	if r["payload"] != "repeat" || r["compression"] != "none" {
+		t.Errorf("payload, compression = %v, %v, want repeat, none", r["payload"], r["compression"])
+	}
 }
 
 func TestBenchRejectsOtherTransports(t *testing.T) {
@@ -458,4 +461,57 @@ func TestGRPCEchoSemantics(t *testing.T) {
 			t.Fatalf("err = %v, want EOF", err)
 		}
 	})
+}
+
+// TestBenchCompressionShrinksBothDirections runs bidi round trips of records
+// messages in every compression mode. Compressing only the requests would
+// leave more than 60% of the uncompressed bytes, so a smaller share shows that
+// the server compresses its responses with the request's encoding too.
+func TestBenchCompressionShrinksBothDirections(t *testing.T) {
+	srv := startServer(t)
+	for _, transport := range transports {
+		wire := make(map[string]float64)
+		for _, compression := range compressions {
+			var out bytes.Buffer
+			args := []string{
+				"bench", "--addr", srv.addrs[transport], "--ca", srv.ca, "--transport", transport,
+				"--scenario", "bidi", "--size", "1024", "--duration", "0.2", "--warmup", "0.05",
+				"--payload", "records", "--compression", compression,
+			}
+			if err := run(t.Context(), args, nil, &out); err != nil {
+				t.Fatalf("%s %s: %v", transport, compression, err)
+			}
+			var result struct {
+				Payload, Compression string
+				WireBytesPerMsg      float64 `json:"wire_bytes_per_msg"`
+				Errors               float64
+			}
+			if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Payload != "records" || result.Compression != compression || result.Errors != 0 {
+				t.Errorf("%s %s: result %s", transport, compression, out.String())
+			}
+			wire[compression] = result.WireBytesPerMsg
+		}
+		for _, compression := range []string{"gzip", "zstd"} {
+			if wire[compression] > 0.6*wire["none"] {
+				t.Errorf("%s %s carried %.0f bytes per round trip, more than 60%% of none's %.0f", transport, compression, wire[compression], wire["none"])
+			}
+		}
+	}
+}
+
+func TestBenchRejectsInvalidPayloadsAndCompressions(t *testing.T) {
+	for _, extra := range [][]string{
+		{"--scenario", "unary", "--payload", "bogus"},
+		{"--scenario", "unary", "--compression", "brotli"},
+		{"--scenario", "unary", "--compression", "stream"},
+		{"--scenario", "server-stream", "--compression", "gzip"},
+	} {
+		args := append([]string{"bench", "--addr", "x:1", "--ca", "ca.pem"}, extra...)
+		if err := run(t.Context(), args, nil, io.Discard); err == nil {
+			t.Errorf("%v: want an error", extra)
+		}
+	}
 }

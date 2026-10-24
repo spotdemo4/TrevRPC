@@ -4,6 +4,7 @@
   callPackage,
   iproute2,
   util-linux,
+  zstd,
   trevrpc-bench-baseline,
   trevrpc-go,
   trevrpc-rust,
@@ -11,9 +12,13 @@
 callPackage ../interop/runner.nix {
   name = "trevrpc-bench";
   script = "bench/run.py";
-  # --netem runs the benchmark in network namespaces, which only Linux has: unshare creates them
-  # and ip and tc shape their loopback link.
-  runtimeInputs = lib.optionals stdenv.hostPlatform.isLinux [
+  # zstd trains the dictionary of the dictionary compression modes. --netem runs the benchmark
+  # in network namespaces, which only Linux has: unshare creates them and ip and tc shape their
+  # loopback link.
+  runtimeInputs = [
+    zstd
+  ]
+  ++ lib.optionals stdenv.hostPlatform.isLinux [
     iproute2
     util-linux
   ];

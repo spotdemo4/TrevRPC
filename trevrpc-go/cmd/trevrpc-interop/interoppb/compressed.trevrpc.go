@@ -9,13 +9,16 @@ import (
 
 // Full method paths ("/package.Service/Method") of the CompressedEcho service.
 const (
-	CompressedEcho_Bidi_FullMethodName = "/trevrpc.interop.v1.CompressedEcho/Bidi"
+	CompressedEcho_Bidi_FullMethodName         = "/trevrpc.interop.v1.CompressedEcho/Bidi"
+	CompressedEcho_ClientStream_FullMethodName = "/trevrpc.interop.v1.CompressedEcho/ClientStream"
 )
 
 // CompressedEchoServer handles the CompressedEcho service.
 type CompressedEchoServer interface {
 	// Bidi handles the Bidi RPC.
 	Bidi(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (trevrpc_go.MessageStream[*EchoResponse], error)
+	// ClientStream handles the ClientStream RPC.
+	ClientStream(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (*EchoResponse, error)
 }
 
 // CompressedEchoClient calls the CompressedEcho service.
@@ -51,7 +54,13 @@ func (c *CompressedEchoClient) Bidi(ctx context.Context, options ...trevrpc_go.C
 	return trevrpc_go.BidirectionalStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, CompressedEcho_Bidi_FullMethodName, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}))...)
 }
 
+// ClientStream calls the ClientStream RPC.
+func (c *CompressedEchoClient) ClientStream(ctx context.Context, options ...trevrpc_go.CallOption) (trevrpc_go.ClientStreamingCall[*EchoRequest, *EchoResponse], error) {
+	return trevrpc_go.ClientStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, CompressedEcho_ClientStream_FullMethodName, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}))...)
+}
+
 // RegisterCompressedEchoServer registers handlers for the CompressedEcho service.
 func RegisterCompressedEchoServer(server *trevrpc_go.Server, implementation CompressedEchoServer) {
 	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}))
+	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}))
 }

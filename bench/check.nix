@@ -11,5 +11,8 @@ runCommand "trevrpc-bench-check"
   }
   ''
     export HOME=$TMPDIR
-    trevrpc-bench --out "$out" --duration 0.2 --warmup 0 --concurrency 1,4 --messages 10
+    trevrpc-bench --out "$out/plain" --duration 0.2 --warmup 0 --concurrency 1,4 --messages 10
+    trevrpc-bench --out "$out/compression" --duration 0.2 --warmup 0 --concurrency 1 --messages 10 \
+      --scenarios unary,client-stream,bidi --payload records \
+      --compressions none,gzip,zstd,dictionary,stream,stream-dictionary
   ''

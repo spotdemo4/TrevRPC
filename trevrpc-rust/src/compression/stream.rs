@@ -15,7 +15,7 @@ use bytes::Bytes;
 use zstd_safe::zstd_sys::ZSTD_EndDirective;
 use zstd_safe::{CCtx, CParameter, DCtx, DParameter, FrameFormat, InBuffer, OutBuffer};
 
-use super::{Accept, CompressionConfig, Dict, Rejected, zstd_error};
+use super::{Accept, CallDict, CompressionConfig, Dict, Rejected, zstd_error};
 use crate::datagram::MessageCount;
 use crate::sync::MutexExt;
 use crate::{Result, RpcKind, varint, wire};
@@ -375,14 +375,17 @@ impl StreamSender {
 pub struct MessageEncoder {
     /// The dictionary per-message frames are compressed with, which also starts the stream
     /// compression context.
-    dict: Option<Arc<Dict>>,
+    dict: CallDict,
     stream: Option<StreamSender>,
 }
 
 impl MessageEncoder {
-    /// Compresses per message with `dict`, when set.
-    pub const fn new(dict: Option<Arc<Dict>>) -> Self {
-        Self { dict, stream: None }
+    /// Compresses per message with `dict`, once it has one.
+    pub(crate) fn new(dict: impl Into<CallDict>) -> Self {
+        Self {
+            dict: dict.into(),
+            stream: None,
+        }
     }
 
     /// Lets the direction use stream compression, when `stream` is set.
@@ -397,15 +400,15 @@ impl MessageEncoder {
     /// MESSAGE.
     pub fn encode(&mut self, body: Bytes) -> (u64, Bytes) {
         use crate::framing::frame_type;
+        let dict = self.dict.get();
         if let Some(payload) = self
             .stream
             .as_mut()
-            .and_then(|stream| stream.encode(&body, self.dict.as_deref()))
+            .and_then(|stream| stream.encode(&body, dict.as_deref()))
         {
             return (frame_type::ZSTD_STREAM_MESSAGE, payload);
         }
-        self.dict
-            .as_ref()
+        dict.as_ref()
             .and_then(|dict| dict.compress(&body))
             .map_or((frame_type::MESSAGE, body), |compressed| {
                 (frame_type::ZSTD_MESSAGE, compressed)

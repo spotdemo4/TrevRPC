@@ -16,7 +16,10 @@ use trevrpc::client::{
 };
 use trevrpc::wire::MAX_METADATA_VALUE_LEN;
 
-use crate::proto::{EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient};
+use crate::proto::{
+    CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient,
+};
+use crate::records::{Records, WORKER_SEED};
 use crate::{BoxError, Flags, connect};
 
 /// The trailing metadata key that counts the requests the server received.
@@ -69,6 +72,92 @@ impl Scenario {
     }
 }
 
+/// What `EchoRequest.message` holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Payload {
+    /// `size` times the letter `x`, the same in every request.
+    Repeat,
+    /// A new `records` message for every request.
+    Records,
+}
+
+impl Payload {
+    fn parse(name: &str) -> Result<Self, BoxError> {
+        match name {
+            "repeat" => Ok(Self::Repeat),
+            "records" => Ok(Self::Records),
+            other => Err(format!("unknown --payload {other:?}, want repeat or records").into()),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Repeat => "repeat",
+            Self::Records => "records",
+        }
+    }
+}
+
+/// How messages are compressed; see the "Compression" section of `bench/README.md`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompressionMode {
+    None,
+    /// Each message on its own, with the `--dictionary` dictionary.
+    Dictionary,
+    /// Each streamed direction with one context, through `CompressedEcho`.
+    Stream,
+    /// Stream compression starting from the `--dictionary` dictionary.
+    StreamDictionary,
+}
+
+impl CompressionMode {
+    fn parse(name: &str) -> Result<Self, BoxError> {
+        match name {
+            "none" => Ok(Self::None),
+            "dictionary" => Ok(Self::Dictionary),
+            "stream" => Ok(Self::Stream),
+            "stream-dictionary" => Ok(Self::StreamDictionary),
+            other => Err(format!(
+                "unknown --compression {other:?}, want none, dictionary, stream or stream-dictionary"
+            )
+            .into()),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Dictionary => "dictionary",
+            Self::Stream => "stream",
+            Self::StreamDictionary => "stream-dictionary",
+        }
+    }
+
+    const fn uses_dictionary(self) -> bool {
+        matches!(self, Self::Dictionary | Self::StreamDictionary)
+    }
+
+    /// Whether the calls go to `CompressedEcho`, whose methods allow stream compression.
+    const fn streams(self) -> bool {
+        matches!(self, Self::Stream | Self::StreamDictionary)
+    }
+
+    /// Whether the mode runs `scenario`: stream compression applies to streams only, and no mode
+    /// runs `server-stream`, whose responses repeat one message, or the datagram scenarios.
+    const fn runs(self, scenario: Scenario) -> bool {
+        match self {
+            Self::None => true,
+            Self::Dictionary => matches!(
+                scenario,
+                Scenario::Unary | Scenario::ClientStream | Scenario::Bidi
+            ),
+            Self::Stream | Self::StreamDictionary => {
+                matches!(scenario, Scenario::ClientStream | Scenario::Bidi)
+            }
+        }
+    }
+}
+
 /// What one operation moved.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Outcome {
@@ -102,11 +191,29 @@ struct Params {
     duration: Duration,
     warmup: Duration,
     messages: usize,
+    payload: Payload,
+    compression: CompressionMode,
 }
 
 impl Params {
     fn parse(flags: &Flags) -> Result<Self, BoxError> {
         let scenario = Scenario::parse(flags.require("scenario")?)?;
+        let payload = Payload::parse(flags.get("payload").unwrap_or("repeat"))?;
+        let compression = CompressionMode::parse(flags.get("compression").unwrap_or("none"))?;
+        if !compression.runs(scenario) {
+            return Err(format!(
+                "--compression {} does not run --scenario {}",
+                compression.name(),
+                scenario.name()
+            )
+            .into());
+        }
+        if compression.uses_dictionary() != flags.get("dictionary").is_some() {
+            return Err(
+                "--dictionary is required by, and only used with, --compression dictionary and stream-dictionary"
+                    .into(),
+            );
+        }
         let size = number(flags, "size", 64)?;
         let metadata_size = number(flags, "metadata-size", 0)?;
         if metadata_size > MAX_METADATA_VALUE_LEN {
@@ -132,6 +239,8 @@ impl Params {
             duration,
             warmup: seconds(flags, "warmup", 1.0)?,
             messages,
+            payload,
+            compression,
         })
     }
 }
@@ -182,9 +291,11 @@ enum Link {
 }
 
 impl Link {
+    /// Connects over `--transport` with the `--dictionary` compression, if any.
     async fn connect(flags: &Flags) -> Result<Self, BoxError> {
         let tls = connect::tls_config(flags)?;
         let server_name = connect::server_name(flags);
+        let compression = connect::compression(flags)?;
         match flags.get("transport").unwrap_or("quic") {
             "quic" => {
                 let addr = connect::resolve(flags, "addr").await?;
@@ -192,13 +303,15 @@ impl Link {
                 let connection = endpoint.connect(addr, server_name)?.await?;
                 Ok(Self::Quic {
                     endpoint,
-                    transport: QuicTransport::new(connection),
+                    transport: QuicTransport::new(connection).with_compression(&compression)?,
                 })
             }
             "tcp" => {
                 let addr = connect::resolve(flags, "tcp-addr").await?;
                 Ok(Self::Qmux(
-                    QmuxTransport::connect(addr, server_name, tls).await?,
+                    QmuxTransport::connect(addr, server_name, tls)
+                        .await?
+                        .with_compression(&compression)?,
                 ))
             }
             other => Err(format!("unknown --transport {other:?}, want quic or tcp").into()),
@@ -263,12 +376,44 @@ struct WorkerResult {
     errors: BTreeMap<String, u64>,
 }
 
-/// One load worker: a client and, for `bidi`, the stream it keeps open.
+/// Where a worker's request messages come from.
+enum Messages {
+    /// The same message every time.
+    Repeat(String),
+    /// A new `records` message of `size` bytes every time.
+    Records { records: Records, size: usize },
+}
+
+impl Messages {
+    fn new(payload: Payload, size: usize, worker: usize) -> Self {
+        match payload {
+            Payload::Repeat => Self::Repeat("x".repeat(size)),
+            Payload::Records => Self::Records {
+                records: Records::new(
+                    WORKER_SEED.wrapping_add(u64::try_from(worker).unwrap_or(u64::MAX)),
+                ),
+                size,
+            },
+        }
+    }
+
+    fn next(&mut self) -> String {
+        match self {
+            Self::Repeat(message) => message.clone(),
+            Self::Records { records, size } => records.message(*size),
+        }
+    }
+}
+
+/// One load worker: its clients and, for `bidi`, the stream it keeps open.
 struct Worker<T> {
     client: EchoClient<T>,
     unreliable: UnreliableEchoClient<T>,
+    /// The `CompressedEcho` client, which the stream compression modes call instead of `client`.
+    compressed: CompressedEchoClient<T>,
+    streams: bool,
     scenario: Scenario,
-    request: EchoRequest,
+    messages_source: Messages,
     options: CallOptions,
     messages: usize,
     bidi: Option<BidirectionalCall<EchoRequest, EchoResponse>>,
@@ -278,12 +423,21 @@ impl<T> Worker<T>
 where
     T: StreamingRpcTransport + Clone,
 {
+    /// The next request: a new message, with nothing else set.
+    fn request(&mut self) -> EchoRequest {
+        EchoRequest {
+            message: self.messages_source.next(),
+            ..EchoRequest::default()
+        }
+    }
+
     /// Runs one operation of the scenario.
     async fn operation(&mut self) -> Result<Outcome, Error> {
         match self.scenario {
             Scenario::Unary => {
+                let request = self.request();
                 self.client
-                    .unary(&self.request)
+                    .unary(&request)
                     .options(|_| self.options.clone())
                     .await?;
                 Ok(Outcome::delivered(1))
@@ -304,7 +458,7 @@ where
 
         let request = EchoRequest {
             count: u32::try_from(self.messages).unwrap_or(u32::MAX),
-            ..self.request.clone()
+            ..self.request()
         };
         let mut responses = self
             .client
@@ -322,13 +476,16 @@ where
 
     #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
     async fn client_stream(&mut self) -> Result<Outcome, Error> {
-        let call = self
-            .client
-            .client_stream()
-            .options(|_| self.options.clone())
-            .await?;
+        let call = if self.streams {
+            self.compressed.client_stream()
+        } else {
+            self.client.client_stream()
+        }
+        .options(|_| self.options.clone())
+        .await?;
         for _ in 0..self.messages {
-            call.send(self.request.clone()).await?;
+            let request = self.request();
+            call.send(request).await?;
         }
         let response = call.close_and_recv().await?;
         short_stream_check(
@@ -354,7 +511,7 @@ where
         sender
             .send(EchoRequest {
                 count: wanted,
-                ..self.request.clone()
+                ..self.request()
             })
             .await?;
         sender.finish()?;
@@ -379,7 +536,8 @@ where
             .await?
             .split();
         for _ in 0..self.messages {
-            sender.send(self.request.clone()).await?;
+            let request = self.request();
+            sender.send(request).await?;
         }
         sender.finish()?;
         while let Some(response) = responses.next().await {
@@ -399,13 +557,19 @@ where
     }
 
     async fn bidi(&mut self) -> Result<Outcome, Error> {
+        let request = self.request();
         let call = match &mut self.bidi {
             Some(call) => call,
             empty @ None => {
-                empty.insert(self.client.bidi().options(|_| self.options.clone()).await?)
+                let call = if self.streams {
+                    self.compressed.bidi()
+                } else {
+                    self.client.bidi()
+                };
+                empty.insert(call.options(|_| self.options.clone()).await?)
             }
         };
-        let sent = call.send(self.request.clone()).await;
+        let sent = call.send(request).await;
         let result = match sent {
             Ok(()) => call.recv().await.and_then(|response| {
                 response.map(drop).ok_or_else(|| {
@@ -485,10 +649,6 @@ async fn measure<T>(
 where
     T: StreamingRpcTransport + Clone,
 {
-    let request = EchoRequest {
-        message: "x".repeat(params.size),
-        ..EchoRequest::default()
-    };
     let start = Instant::now()
         .checked_add(params.warmup)
         .ok_or("--warmup is too long")?;
@@ -499,13 +659,15 @@ where
             .ok_or("--duration is too long")?,
     };
     let workers: Vec<_> = (0..params.concurrency)
-        .map(|_| {
+        .map(|index| {
             tokio::spawn(work(
                 Worker {
                     client: EchoClient::new(transport.clone()),
                     unreliable: UnreliableEchoClient::new(transport.clone()),
+                    compressed: CompressedEchoClient::new(transport.clone()),
+                    streams: params.compression.streams(),
                     scenario: params.scenario,
-                    request: request.clone(),
+                    messages_source: Messages::new(params.payload, params.size, index),
                     options: params.call_options(),
                     messages: params.messages,
                     bidi: None,
@@ -560,6 +722,8 @@ fn error_breakdown(results: &[WorkerResult]) -> Vec<(&str, u64)> {
 
 struct Report {
     scenario: Scenario,
+    payload: Payload,
+    compression: CompressionMode,
     transport: &'static str,
     size: usize,
     metadata_size: usize,
@@ -609,6 +773,8 @@ impl Report {
         }
         Ok(Self {
             scenario: params.scenario,
+            payload: params.payload,
+            compression: params.compression,
             transport,
             size: params.size,
             metadata_size: params.metadata_size,
@@ -651,7 +817,8 @@ impl Report {
             concat!(
                 r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"concurrency":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
-                r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{}}}"#,
+                r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{},"#,
+                r#""payload":"{}","compression":"{}"}}"#,
             ),
             self.scenario.name(),
             self.transport,
@@ -671,6 +838,8 @@ impl Report {
             self.percentile(999),
             wire,
             self.lost,
+            self.payload.name(),
+            self.compression.name(),
         )
     }
 }

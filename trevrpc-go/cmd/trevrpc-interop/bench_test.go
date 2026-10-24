@@ -18,9 +18,9 @@ import (
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-interop/interoppb"
 )
 
-// startBenchServer runs the server subcommand in-process and returns the
-// certificate file and the server's listening line.
-func startBenchServer(t *testing.T) (certFile string, ports listeningLine) {
+// startBenchServer runs the server subcommand in-process, with extra flags,
+// and returns the certificate file and the server's listening line.
+func startBenchServer(t *testing.T, extra ...string) (certFile string, ports listeningLine) {
 	t.Helper()
 	certFile, keyFile := writeTestCertificate(t)
 	stdinReader, stdinWriter := io.Pipe()
@@ -28,7 +28,7 @@ func startBenchServer(t *testing.T) (certFile string, ports listeningLine) {
 	var stderr bytes.Buffer
 	exit := make(chan int, 1)
 	go func() {
-		exit <- run([]string{"server", "--cert", certFile, "--key", keyFile}, stdinReader, stdoutWriter, &stderr)
+		exit <- run(append([]string{"server", "--cert", certFile, "--key", keyFile}, extra...), stdinReader, stdoutWriter, &stderr)
 		_ = stdoutWriter.Close()
 	}()
 	t.Cleanup(func() {
@@ -90,14 +90,17 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 					if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
 						t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
 					}
-					checkBenchLine(t, stdout.String(), scenario, tc.wantTransport, size, metadataSize, messages, tc.wantWire)
+					checkBenchLine(t, stdout.String(), scenario, tc.wantTransport, size, metadataSize, messages, tc.wantWire, false)
+					checkBenchModes(t, stdout.String(), "repeat", "none")
 				})
 			}
 		}
 	}
 }
 
-func checkBenchLine(t *testing.T, output, scenario, transport string, size, metadataSize, messages int, wantWire bool) {
+// checkBenchLine checks a result line against the contract. A compressed run
+// may carry fewer wire bytes than its payload.
+func checkBenchLine(t *testing.T, output, scenario, transport string, size, metadataSize, messages int, wantWire, compressed bool) {
 	t.Helper()
 	if strings.Count(output, "\n") != 1 {
 		t.Fatalf("stdout = %q, want exactly one line", output)
@@ -168,8 +171,71 @@ func checkBenchLine(t *testing.T, output, scenario, transport string, size, meta
 		t.Fatalf("wire_bytes_per_msg present = %v, want %v", hasWire, wantWire)
 	}
 	if hasWire {
-		if value, ok := wire.(float64); !ok || value < float64(size) {
+		if value, ok := wire.(float64); !ok || value <= 0 || (!compressed && value < float64(size)) {
 			t.Errorf("wire_bytes_per_msg = %v, want at least the %d payload bytes", wire, size)
+		}
+	}
+}
+
+// checkBenchModes checks the payload and compression fields of a result line.
+func checkBenchModes(t *testing.T, output, payload, compression string) {
+	t.Helper()
+	var got struct{ Payload, Compression string }
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("stdout %q is not JSON: %v", output, err)
+	}
+	if got.Payload != payload || got.Compression != compression {
+		t.Errorf("payload, compression = %q, %q, want %q, %q", got.Payload, got.Compression, payload, compression)
+	}
+}
+
+// TestBenchCompressionModesShrinkTheRecordsPayload runs bidi round trips of
+// records messages over QUIC in every compression mode, against a server that
+// holds the dictionary, and checks that each mode carries fewer bytes than
+// none.
+func TestBenchCompressionModesShrinkTheRecordsPayload(t *testing.T) {
+	dictionary := writeTestDictionary(t)
+	certFile, ports := startBenchServer(t, "--dictionary", dictionary)
+	const size = 1024
+	wire := make(map[string]float64)
+	for _, compression := range []string{"none", "dictionary", "stream", "stream-dictionary"} {
+		for _, scenario := range []string{"client-stream", "bidi"} {
+			var stdout, stderr bytes.Buffer
+			args := []string{
+				"bench",
+				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+				"--ca", certFile,
+				"--scenario", scenario,
+				"--size", strconv.Itoa(size),
+				"--messages", "5",
+				"--concurrency", "2",
+				"--duration", "0.2",
+				"--warmup", "0.1",
+				"--payload", "records",
+				"--compression", compression,
+			}
+			if compression == "dictionary" || compression == "stream-dictionary" {
+				args = append(args, "--dictionary", dictionary)
+			}
+			if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+				t.Fatalf("%s %s: exit code = %d\nstdout:\n%s\nstderr:\n%s", compression, scenario, code, stdout.String(), stderr.String())
+			}
+			checkBenchLine(t, stdout.String(), scenario, "quic", size, 0, 5, true, compression != "none")
+			checkBenchModes(t, stdout.String(), "records", compression)
+			if scenario == "bidi" {
+				var result struct {
+					WireBytesPerMsg float64 `json:"wire_bytes_per_msg"`
+				}
+				if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+					t.Fatal(err)
+				}
+				wire[compression] = result.WireBytesPerMsg
+			}
+		}
+	}
+	for _, compression := range []string{"dictionary", "stream", "stream-dictionary"} {
+		if wire[compression] >= wire["none"] {
+			t.Errorf("%s carried %.0f bytes per round trip, no fewer than none's %.0f", compression, wire[compression], wire["none"])
 		}
 	}
 }
@@ -184,6 +250,13 @@ func TestBenchCommandLineErrors(t *testing.T) {
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--duration", "0"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", "-1"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", strconv.Itoa(benchMaxMetadataSize + 1)},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--payload", "bogus"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--compression", "gzip"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--compression", "stream"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "server-stream", "--compression", "dictionary", "--dictionary", "d"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unreliable-client-stream", "--compression", "stream"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "bidi", "--compression", "dictionary"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "bidi", "--dictionary", "d"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 {
@@ -270,7 +343,7 @@ func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 		defer closeQuietly(channel)
 		clients := benchClients{echo: interoppb.NewEchoClient(channel), unreliable: interoppb.NewUnreliableEchoClient(channel)}
 		for _, scenario := range []string{"unary", "bidi"} {
-			operation := benchScenarios[scenario](clients, config)
+			operation := benchScenarios[scenario](clients, config, newBenchPayload("repeat", config.size, 0))
 			if _, err := operation.run(ctx); err != nil {
 				t.Fatalf("%s with metadata size %d: %v", scenario, size, err)
 			}

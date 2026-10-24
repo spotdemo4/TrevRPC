@@ -19,7 +19,9 @@ import (
 // newGRPCServer returns a grpc-go server for Echo with grpc-go's defaults (no
 // tuning options), so it is the stock gRPC baseline; in particular HTTP/2 flow
 // control uses the default initial windows of 64 KiB with grpc-go's dynamic BDP
-// estimation enabled.
+// estimation enabled. It decompresses gzip and zstd requests, whose
+// compressors compression.go registers, and compresses each response with the
+// encoding of its request, as grpc-go does by default.
 func newGRPCServer(certificate tls.Certificate) *grpc.Server {
 	srv := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&certificate)))
 	echopb.RegisterEchoServer(srv, echoServer{})

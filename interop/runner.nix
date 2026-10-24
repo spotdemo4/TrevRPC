@@ -5,6 +5,7 @@
   openssl,
   python3,
   stdenvNoCC,
+  zstd,
   # The executable's name and the runner it starts, relative to the repository root.
   name,
   script,
@@ -34,10 +35,12 @@ stdenvNoCC.mkDerivation {
     ];
   };
 
+  # The bench tests train the benchmark dictionary with zstd.
   nativeBuildInputs = [
     makeWrapper
     openssl
     python3
+    zstd
   ];
 
   doCheck = true;

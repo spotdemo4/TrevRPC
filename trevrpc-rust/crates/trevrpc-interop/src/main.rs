@@ -11,7 +11,9 @@
 //!                            --scenario unary|server-stream|client-stream|bidi|
 //!                                       unreliable-server-stream|unreliable-client-stream
 //!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
-//!                            [--messages 100] [--metadata-size 0]
+//!                            [--messages 100] [--metadata-size 0] [--payload repeat|records]
+//!                            [--compression none|dictionary|stream|stream-dictionary]
+//!                            [--dictionary <file>]
 //! ```
 //!
 //! The `bench` subcommand follows `bench/README.md`.
@@ -22,6 +24,7 @@ mod bench;
 mod client;
 mod connect;
 mod proto;
+mod records;
 mod server;
 
 use std::collections::HashMap;
@@ -67,6 +70,9 @@ async fn main() -> ExitCode {
                 "warmup",
                 "messages",
                 "metadata-size",
+                "payload",
+                "compression",
+                "dictionary",
             ],
         )
         .map(Command::Bench),

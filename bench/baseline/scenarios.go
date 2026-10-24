@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
 	"trev.zip/llc/trevrpc/bench/baseline/echopb"
 )
@@ -17,18 +16,18 @@ type worker interface {
 	close()
 }
 
-func newWorker(ctx context.Context, client echoClient, cfg benchConfig) worker {
-	req := &echopb.EchoRequest{Message: strings.Repeat("x", cfg.size)}
+// newWorker returns the worker of the scenario. payload supplies its request
+// messages, a new one for every request.
+func newWorker(ctx context.Context, client echoClient, cfg benchConfig, payload benchPayload) worker {
 	switch cfg.scenario {
 	case "unary":
-		return &unaryWorker{client: client, req: req}
+		return &unaryWorker{client: client, payload: payload}
 	case "server-stream":
-		req.Count = uint32(cfg.messages)
-		return &serverStreamWorker{client: client, req: req, messages: cfg.messages}
+		return &serverStreamWorker{client: client, payload: payload, messages: cfg.messages}
 	case "client-stream":
-		return &clientStreamWorker{client: client, req: req, messages: cfg.messages}
+		return &clientStreamWorker{client: client, payload: payload, messages: cfg.messages}
 	default:
-		w := &bidiWorker{client: client, req: req, parent: ctx}
+		w := &bidiWorker{client: client, payload: payload, parent: ctx}
 		_ = w.open() // an error here surfaces on the first do, which reopens
 		return w
 	}
@@ -42,28 +41,30 @@ func checkSize(got, want int) error {
 }
 
 type unaryWorker struct {
-	client echoClient
-	req    *echopb.EchoRequest
+	client  echoClient
+	payload benchPayload
 }
 
 func (w *unaryWorker) do(ctx context.Context) (int, error) {
-	resp, err := w.client.Unary(ctx, w.req)
+	req := &echopb.EchoRequest{Message: w.payload.next()}
+	resp, err := w.client.Unary(ctx, req)
 	if err != nil {
 		return 0, err
 	}
-	return 1, checkSize(len(resp.GetMessage()), len(w.req.GetMessage()))
+	return 1, checkSize(len(resp.GetMessage()), len(req.GetMessage()))
 }
 
 func (*unaryWorker) close() {}
 
 type serverStreamWorker struct {
 	client   echoClient
-	req      *echopb.EchoRequest
+	payload  benchPayload
 	messages int
 }
 
 func (w *serverStreamWorker) do(ctx context.Context) (int, error) {
-	stream, err := w.client.ServerStream(ctx, w.req)
+	req := &echopb.EchoRequest{Message: w.payload.next(), Count: uint32(w.messages)}
+	stream, err := w.client.ServerStream(ctx, req)
 	if err != nil {
 		return 0, err
 	}
@@ -76,7 +77,7 @@ func (w *serverStreamWorker) do(ctx context.Context) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if err := checkSize(len(resp.GetMessage()), len(w.req.GetMessage())); err != nil {
+		if err := checkSize(len(resp.GetMessage()), len(req.GetMessage())); err != nil {
 			return 0, err
 		}
 		received++
@@ -91,7 +92,7 @@ func (*serverStreamWorker) close() {}
 
 type clientStreamWorker struct {
 	client   echoClient
-	req      *echopb.EchoRequest
+	payload  benchPayload
 	messages int
 }
 
@@ -100,8 +101,11 @@ func (w *clientStreamWorker) do(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	sent := 0
 	for range w.messages {
-		if err := stream.Send(w.req); err != nil {
+		req := &echopb.EchoRequest{Message: w.payload.next()}
+		sent += len(req.GetMessage())
+		if err := stream.Send(req); err != nil {
 			// Send reports io.EOF when the stream has ended; the status is
 			// available from the receive side.
 			if _, rerr := stream.CloseAndRecv(); rerr != nil {
@@ -114,7 +118,7 @@ func (w *clientStreamWorker) do(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := checkSize(len(resp.GetMessage()), w.messages*len(w.req.GetMessage())); err != nil {
+	if err := checkSize(len(resp.GetMessage()), sent); err != nil {
 		return 0, err
 	}
 	if int(resp.GetIndex()) != w.messages {
@@ -128,9 +132,9 @@ func (*clientStreamWorker) close() {}
 // bidiWorker keeps one Bidi stream open for the whole run, reopening it only
 // after an error.
 type bidiWorker struct {
-	client echoClient
-	req    *echopb.EchoRequest
-	parent context.Context
+	client  echoClient
+	payload benchPayload
+	parent  context.Context
 
 	stream bidiStream
 	cancel context.CancelFunc
@@ -161,13 +165,14 @@ func (w *bidiWorker) do(context.Context) (int, error) {
 			return 0, err
 		}
 	}
-	if err := w.stream.Send(w.req); err != nil {
+	req := &echopb.EchoRequest{Message: w.payload.next()}
+	if err := w.stream.Send(req); err != nil {
 		w.reset()
 		return 0, err
 	}
 	resp, err := w.stream.Recv()
 	if err == nil {
-		err = checkSize(len(resp.GetMessage()), len(w.req.GetMessage()))
+		err = checkSize(len(resp.GetMessage()), len(req.GetMessage()))
 	}
 	if err == nil && resp.GetIndex() != w.next {
 		err = fmt.Errorf("echo index %d, want %d", resp.GetIndex(), w.next)

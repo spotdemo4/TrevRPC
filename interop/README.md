@@ -91,13 +91,14 @@ needs no TrevRPC options. Both files import from the include roots
 | `UnreliableEcho.Bidi` | For each request, send `count` responses `{message: request.message, index: i}` for `i` in `0..count`, either as the request arrives or after request EOF. At request EOF end with `OK` and trailing metadata `interop-received` (the number of requests received) and `interop-datagrams-received` (how many of them arrived as datagrams), both as decimal strings. |
 
 [`proto/compressed.proto`](proto/compressed.proto) defines
-`trevrpc.interop.v1.CompressedEcho`, whose one method allows
+`trevrpc.interop.v1.CompressedEcho`, whose methods allow
 [stream compression](../wiki/Protocol-and-Wire-Format.md#stream-compression)
 (`compress_stream`), in a separate file for the same reason.
 
-| Method                | Behavior                                                                                                                                                                          |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CompressedEcho.Bidi` | As `Echo.Bidi`, and its `OK` status carries trailing metadata `interop-stream-compressed-received`: how many requests arrived as ZSTD_STREAM_MESSAGE frames, as a decimal string. |
+| Method                        | Behavior                                                                                                                                                                          |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CompressedEcho.Bidi`         | As `Echo.Bidi`, and its `OK` status carries trailing metadata `interop-stream-compressed-received`: how many requests arrived as ZSTD_STREAM_MESSAGE frames, as a decimal string. |
+| `CompressedEcho.ClientStream` | As `Echo.ClientStream`. The load benchmarks use it; no interop scenario does.                                                                                                     |
 
 Every method also handles headers: when request metadata key `interop-header`
 is present with value `v`, the server sends response headers

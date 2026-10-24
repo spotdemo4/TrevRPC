@@ -32,7 +32,7 @@ use futures_util::FutureExt as _;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::compression::{Accept, Dict, inflate};
+use crate::compression::{Accept, CallDict, inflate};
 use crate::sync::MutexExt as _;
 use crate::{BoxStream, ResponseFrame, Result, RpcKind, queue, varint};
 
@@ -662,7 +662,7 @@ impl Demux {
             header: flow_header(self.shared.link.prefix(), flow)?,
             max_frame_size: self.shared.max_frame_size,
             queued: Arc::clone(&self.shared.queued),
-            compress: None,
+            compress: CallDict::None,
         })
     }
 
@@ -845,15 +845,16 @@ pub struct FlowSender {
     max_frame_size: usize,
     /// Counts the datagrams queued on the connection; see [`FlowSender::flushed`].
     queued: Arc<AtomicU64>,
-    /// Compresses the messages, when set.
-    compress: Option<Arc<Dict>>,
+    /// Compresses the messages, once it has a dictionary.
+    compress: CallDict,
 }
 
 impl FlowSender {
-    /// Makes the sender compress messages with `dict`, when set and when that makes them shorter.
+    /// Makes the sender compress messages with `dict`, once it has one and when that makes them
+    /// shorter.
     #[must_use]
-    pub(crate) fn with_compression(mut self, dict: Option<Arc<Dict>>) -> Self {
-        self.compress = dict;
+    pub(crate) fn with_compression(mut self, dict: impl Into<CallDict>) -> Self {
+        self.compress = dict.into();
         self
     }
 
@@ -886,7 +887,7 @@ impl FlowSender {
             // all goes uncompressed, and the stream's writer compresses it again.
             let (frame_type, payload) = self
                 .compress
-                .as_ref()
+                .get()
                 .and_then(|dict| dict.compress(&message))
                 .map_or_else(
                     || (MESSAGE_FRAME, message.clone()),

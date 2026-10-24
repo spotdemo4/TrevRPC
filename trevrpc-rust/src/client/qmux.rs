@@ -95,6 +95,13 @@ impl QmuxTransport {
         ))))
     }
 
+    /// Lets messages travel compressed with the dictionaries of `compression`; see
+    /// [`Compression`](crate::Compression). Fails when they are invalid. Call it on a transport
+    /// that was just connected, before it is cloned.
+    pub fn with_compression(self, compression: &crate::Compression) -> Result<Self> {
+        Ok(self.with_compression_config(crate::compression::CompressionConfig::new(compression)?))
+    }
+
     /// Gives a transport that was just connected the dictionaries of `config`.
     pub(crate) fn with_compression_config(
         mut self,

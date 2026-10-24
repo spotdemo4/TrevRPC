@@ -4,11 +4,14 @@ go 1.26.0
 
 require (
 	connectrpc.com/connect v1.21.1
+	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/connect-compress/v2 v2.1.1
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 )
 
 require (
+	github.com/minio/minlz v1.0.1 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect

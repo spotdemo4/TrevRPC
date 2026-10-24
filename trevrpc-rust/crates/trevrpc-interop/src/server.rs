@@ -171,6 +171,15 @@ impl CompressedEcho for CompressedEchoService {
         });
         Ok(Box::pin(echo_each(requests).chain(report)))
     }
+
+    /// `Echo.ClientStream`, for the load benchmarks.
+    async fn client_stream(
+        &self,
+        context: RequestContext,
+        requests: BoxStream<EchoRequest>,
+    ) -> Result<EchoResponse, Status> {
+        Echo::client_stream(&EchoService, context, requests).await
+    }
 }
 
 const RECEIVED_METADATA_KEY: &str = "interop-received";

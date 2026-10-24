@@ -4,6 +4,7 @@ grpc-go and connect-go baselines; see README.md.
 
     run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
            [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--concurrency LIST]
+           [--payload repeat|records] [--compressions LIST]
            [--duration SECONDS] [--warmup SECONDS] [--messages N] [--netem PROFILE...]
            [--out DIR]
 """
@@ -28,6 +29,7 @@ sys.path.append(str(Path(__file__).resolve().parent))
 sys.path.append(str(Path(__file__).resolve().parents[1] / "interop"))
 
 import netem
+import payload
 from harness import (
     NamedCommand,
     RunnerError,
@@ -51,10 +53,26 @@ SCENARIOS = (
 # The baseline's transports, each served on the port of the same name. They have no datagram
 # messages, so they skip the unreliable-* scenarios.
 BASELINE_TRANSPORTS = ("grpc", "connect")
+# The TrevRPC transports, as the clients' --transport names them.
+NATIVE_TRANSPORTS = ("quic", "tcp")
+PAYLOADS = ("repeat", "records")
+# Each compression mode, with the transports that have it; see README.md.
+COMPRESSIONS = {
+    "none": (*NATIVE_TRANSPORTS, *BASELINE_TRANSPORTS),
+    "gzip": BASELINE_TRANSPORTS,
+    "zstd": BASELINE_TRANSPORTS,
+    "dictionary": NATIVE_TRANSPORTS,
+    "stream": NATIVE_TRANSPORTS,
+    "stream-dictionary": NATIVE_TRANSPORTS,
+}
+# The modes that compress with the trained dictionary.
+DICTIONARY_COMPRESSIONS = ("dictionary", "stream-dictionary")
+# The scenarios that compression modes other than none run: every message differs in them.
+COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
 # Room on top of warmup and duration for connecting and draining.
 DEADLINE_SLACK = 60
 COLUMNS = (
-    "scenario", "size", "md", "conc", "transport", "client", "server",
+    "scenario", "size", "md", "conc", "transport", "compression", "client", "server",
     "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%",
 )  # fmt: skip
 
@@ -68,6 +86,10 @@ class Matrix:
     duration: float
     warmup: float
     messages: int
+    payload: str = "repeat"
+    compressions: tuple[str, ...] = ("none",)
+    # The trained dictionary, when a mode needs it.
+    dictionary: Path | None = None
 
     @property
     def deadline(self) -> int:
@@ -82,6 +104,7 @@ class Result:
     server: str
     scenario: str
     transport: str
+    compression: str
     size: int
     metadata_size: int
     concurrency: int
@@ -105,6 +128,7 @@ class Result:
             str(self.metadata_size),
             str(self.concurrency),
             self.transport,
+            self.compression,
             self.client,
             self.server,
             str(math.floor(self.ops_per_sec)),
@@ -116,13 +140,14 @@ class Result:
             hundredths(lost),
         ]
 
-    def sort_key(self) -> tuple[str, int, int, int, str, str, str]:
+    def sort_key(self) -> tuple[str, int, int, int, str, str, str, str]:
         return (
             self.scenario,
             self.size,
             self.metadata_size,
             self.concurrency,
             self.transport,
+            self.compression,
             self.client,
             self.server,
         )
@@ -138,8 +163,8 @@ def hundredths(value: float) -> str:
     return plain(math.floor(value * 100) / 100)
 
 
-def text_field(container: dict[str, object], name: str) -> str:
-    value = container.get(name)
+def text_field(container: dict[str, object], name: str, default: str | None = None) -> str:
+    value = container.get(name, default)
     if not isinstance(value, str):
         raise ValueError(f"no valid {name!r}")
     return value
@@ -178,6 +203,7 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         server=server,
         scenario=text_field(record, "scenario"),
         transport=text_field(record, "transport"),
+        compression=text_field(record, "compression", "none"),
         size=int_field(record, "size"),
         metadata_size=int_field(record, "metadata_size", 0),
         concurrency=int_field(record, "concurrency"),
@@ -197,6 +223,40 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         netem=netem,
         record=record,
     )
+
+
+def runs(compression: str, transport: str, scenario: str) -> bool:
+    """Whether a cell runs: its transport has the compression mode, and the scenario shows
+    something real with it (see README.md)."""
+    if transport not in COMPRESSIONS[compression]:
+        return False
+    if transport in BASELINE_TRANSPORTS and scenario.startswith("unreliable-"):
+        return False
+    if compression == "none":
+        return True
+    if scenario not in COMPRESSED_SCENARIOS:
+        return False
+    return not (compression.startswith("stream") and scenario == "unary")
+
+
+def train_dictionary(directory: Path) -> Path:
+    """Trains the benchmark's dictionary from payload.py's samples with `zstd --train` in
+    DIRECTORY and returns its path. The same samples always give the same dictionary."""
+    samples = directory / "samples"
+    samples.mkdir()
+    for index, sample in enumerate(payload.training_samples()):
+        _ = (samples / f"{index:04}").write_bytes(sample)
+    dictionary = directory / "records.dict"
+    command = ["zstd", "-q", "-f", "--train", "-r", str(samples), "-o", str(dictionary)]
+    try:
+        _ = subprocess.run(
+            [*command, "--maxdict=8192", "--dictID=2"], check=True, capture_output=True
+        )
+    except FileNotFoundError as error:
+        raise RunnerError("the dictionary modes need the zstd command to train it") from error
+    except subprocess.CalledProcessError as error:
+        raise RunnerError(f"zstd --train failed: {error.stderr.decode().strip()}") from error
+    return dictionary
 
 
 class Runner:
@@ -222,33 +282,40 @@ class Runner:
         flags: list[str],
         netem: str | None,
     ) -> None:
-        """Runs `COMMAND bench FLAGS...` with every scenario, size, metadata size, and
-        concurrency, over a link with the `netem` profile applied, if any."""
+        """Runs `COMMAND bench FLAGS...` with every scenario, compression mode, size, metadata
+        size, and concurrency that runs on the transport, over a link with the `netem` profile
+        applied, if any."""
         m = self.matrix
         profile = "" if netem is None else "-" + re.sub(r"[^A-Za-z0-9.]+", "_", netem)
         for scenario in m.scenarios:
-            if transport in BASELINE_TRANSPORTS and scenario.startswith("unreliable-"):
-                continue
-            for size in m.sizes:
-                for metadata in m.metadata_sizes:
-                    for workers in m.concurrency:
-                        cell = (
-                            f"{client}-{transport}-to-{server}-{scenario}-{size}"
-                            f"-md{metadata}-c{workers}{profile}"
-                        )
-                        self.run_one(
-                            cell,
-                            client,
-                            server,
-                            netem,
-                            [
-                                *command, "bench", *flags, "--transport", transport,
-                                "--scenario", scenario, "--size", str(size),
-                                "--metadata-size", str(metadata), "--concurrency", str(workers),
-                                "--duration", plain(m.duration), "--warmup", plain(m.warmup),
-                                "--messages", str(m.messages),
-                            ],
-                        )  # fmt: skip
+            for compression in m.compressions:
+                if not runs(compression, transport, scenario):
+                    continue
+                mode = ["--payload", m.payload, "--compression", compression]
+                if compression in DICTIONARY_COMPRESSIONS and m.dictionary is not None:
+                    mode += ["--dictionary", str(m.dictionary)]
+                suffix = "" if compression == "none" else f"-{compression}"
+                for size in m.sizes:
+                    for metadata in m.metadata_sizes:
+                        for workers in m.concurrency:
+                            cell = (
+                                f"{client}-{transport}-to-{server}-{scenario}{suffix}-{size}"
+                                f"-md{metadata}-c{workers}{profile}"
+                            )
+                            self.run_one(
+                                cell,
+                                client,
+                                server,
+                                netem,
+                                [
+                                    *command, "bench", *flags, "--transport", transport,
+                                    "--scenario", scenario, "--size", str(size),
+                                    "--metadata-size", str(metadata),
+                                    "--concurrency", str(workers),
+                                    "--duration", plain(m.duration), "--warmup", plain(m.warmup),
+                                    "--messages", str(m.messages), *mode,
+                                ],
+                            )  # fmt: skip
 
     def run_one(
         self, cell: str, client: str, server: str, netem: str | None, command: list[str]
@@ -346,6 +413,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument("--warmup", type=seconds, default=1.0)
     _ = parser.add_argument("--messages", type=int, default=100)
     _ = parser.add_argument(
+        "--payload",
+        choices=PAYLOADS,
+        default="repeat",
+        help="what each request message holds: the letter x repeated, or realistic records",
+    )
+    _ = parser.add_argument(
+        "--compressions",
+        type=comma_list,
+        default=["none"],
+        metavar="LIST",
+        help=f"compression modes to run, from {', '.join(COMPRESSIONS)}",
+    )
+    _ = parser.add_argument(
         "--netem",
         type=netem.profile,
         action="append",
@@ -360,6 +440,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parse_with_defaults(parser, argv, ("server", "client", "baseline"))
     if (not args.server or not args.client) and args.baseline is None:
         parser.error("need at least one --server and one --client, or --baseline")
+    if unknown := set(args.compressions) - set(COMPRESSIONS):
+        parser.error(f"unknown compression modes: {', '.join(sorted(unknown))}")
+    if args.payload == "repeat" and set(args.compressions) != {"none"}:
+        parser.error("compression modes other than none need --payload records")
     return args
 
 
@@ -367,6 +451,13 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
     servers: list[NamedCommand] = args.server
     clients: list[NamedCommand] = args.client
     baseline: list[str] | None = args.baseline
+    compressions: tuple[str, ...] = tuple(args.compressions)
+    # Servers hold the trained dictionary only when a mode uses it, so zstd is needed only then.
+    dictionary = (
+        train_dictionary(work)
+        if servers and set(compressions) & set(DICTIONARY_COMPRESSIONS)
+        else None
+    )
     runner = Runner(
         Matrix(
             scenarios=args.scenarios,
@@ -376,6 +467,9 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
             duration=args.duration,
             warmup=args.warmup,
             messages=args.messages,
+            payload=args.payload,
+            compressions=compressions,
+            dictionary=dictionary,
         ),
         out,
     )
@@ -386,8 +480,9 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
     _ = (out / "results.jsonl").write_text("", encoding="utf-8")
     tls = ["--ca", str(certificate.cert), "--server-name", "localhost"]
 
+    server_arguments = [] if dictionary is None else ["--dictionary", str(dictionary)]
     for spec in servers:
-        server = Server(spec.name, spec.command, certificate, out)
+        server = Server(spec.name, spec.command, certificate, out, server_arguments)
         try:
             native = f"127.0.0.1:{server.port('native')}"
             qmux = f"127.0.0.1:{server.port('qmux')}"

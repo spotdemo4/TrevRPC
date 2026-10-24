@@ -2203,6 +2203,7 @@ dependencies = [
  "protox",
  "quinn",
  "rcgen",
+ "ring",
  "tokio",
  "tower-http",
  "trevrpc",

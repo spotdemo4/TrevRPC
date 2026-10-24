@@ -264,8 +264,13 @@ func (s *unreliableEcho) Close() error { return s.requests.Close() }
 const streamCompressedReceivedKey = "interop-stream-compressed-received"
 
 // compressedEchoServer implements CompressedEcho in interop/README.md: Echo's
-// Bidi, reporting how many requests arrived stream-compressed.
+// Bidi, reporting how many requests arrived stream-compressed, and Echo's
+// ClientStream.
 type compressedEchoServer struct{}
+
+func (compressedEchoServer) ClientStream(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*interoppb.EchoResponse, error) {
+	return echoServer{}.ClientStream(ctx, requests)
+}
 
 func (compressedEchoServer) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
 	responses, err := echoServer{}.Bidi(ctx, requests)

@@ -519,13 +519,52 @@ pub(crate) struct ClientCompression {
     shared: OnceLock<Vec<Arc<Dict>>>,
 }
 
+/// The dictionary one direction of a call compresses its messages with, which may only become
+/// known during the call.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum CallDict {
+    /// No dictionary.
+    #[default]
+    None,
+    /// This dictionary, from the start of the call.
+    Known(Arc<Dict>),
+    /// The request type's dictionary of a call that started before its connection had the
+    /// server's answer: it applies as soon as the answer arrives and confirms it, so a request
+    /// stream starts compressing mid-call.
+    Pending {
+        connection: Arc<ClientCompression>,
+        dict: Arc<Dict>,
+    },
+}
+
+impl CallDict {
+    /// The dictionary to compress with now, if any.
+    pub(crate) fn get(&self) -> Option<Arc<Dict>> {
+        match self {
+            Self::None => None,
+            Self::Known(dict) => Some(Arc::clone(dict)),
+            Self::Pending { connection, dict } => connection
+                .shared
+                .get()
+                .filter(|set| set.contains(dict))
+                .map(|_| Arc::clone(dict)),
+        }
+    }
+}
+
+impl From<Option<Arc<Dict>>> for CallDict {
+    fn from(dict: Option<Arc<Dict>>) -> Self {
+        dict.map_or(Self::None, Self::Known)
+    }
+}
+
 /// What negotiation decided for one client call.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ClientCall {
     /// The dictionaries the call accepts on its response messages.
     pub(crate) accept: Accept,
-    /// The dictionary request messages are compressed with, if any.
-    pub(crate) requests: Option<Arc<Dict>>,
+    /// The dictionary request messages are compressed with.
+    pub(crate) requests: CallDict,
     /// The connection to teach the answer in the call's HEADERS, when the request queried.
     pub(crate) learn: Option<Arc<ClientCompression>>,
 }
@@ -561,12 +600,16 @@ impl ClientCompression {
             request.accept_dictionaries = vec![dict.id];
             call.accept = Accept::One(Arc::clone(dict));
         }
-        call.requests = shared.and_then(|set| {
-            self.config
-                .dict_for_type(types.map(|types| types.request))
-                .filter(|dict| set.contains(dict))
-                .cloned()
-        });
+        if let Some(dict) = self.config.dict_for_type(types.map(|types| types.request)) {
+            call.requests = match shared {
+                Some(set) if set.contains(dict) => CallDict::Known(Arc::clone(dict)),
+                Some(_) => CallDict::None,
+                None => CallDict::Pending {
+                    connection: Arc::clone(self),
+                    dict: Arc::clone(dict),
+                },
+            };
+        }
         call
     }
 
@@ -766,10 +809,10 @@ mod tests {
 
         // The first call queries and accepts dictionary 1 unconfirmed.
         let mut request = RpcRequest::new("/svc/m");
-        let call = client.prepare(&mut request, types);
+        let first = client.prepare(&mut request, types);
         assert_eq!(request.accept_dictionaries, [1]);
         assert_eq!(request.dictionary_query.len(), 1);
-        assert!(call.requests.is_none() && call.learn.is_some());
+        assert!(first.requests.get().is_none() && first.learn.is_some());
 
         let server = negotiate(Some(&config), &request, Some("google.protobuf.StringValue"));
         assert_eq!(server.answer.as_deref(), Some(&config.query[..]));
@@ -786,13 +829,15 @@ mod tests {
         assert_eq!(refused.answer.as_deref(), Some(&[][..]));
         assert!(refused.responses.is_none());
 
-        // Once the answer is in, calls stop querying and compress requests.
+        // Once the answer is in, calls stop querying and compress requests, and so does the
+        // call that queried, from then on.
         client.learn(server.answer.as_deref().unwrap());
+        assert!(first.requests.get().is_some());
         let mut next = RpcRequest::new("/svc/m");
         let call = client.prepare(&mut next, types);
         assert!(next.dictionary_query.is_empty() && call.learn.is_none());
         assert_eq!(next.accept_dictionaries, [1]);
-        assert!(call.requests.is_some());
+        assert!(matches!(call.requests, CallDict::Known(_)));
     }
 
     #[test]
@@ -807,6 +852,6 @@ mod tests {
         ));
         let call = client.prepare(&mut request, types);
         assert!(request.dictionary_query.is_empty() && request.accept_dictionaries.is_empty());
-        assert!(matches!(call.accept, Accept::None) && call.requests.is_none());
+        assert!(matches!(call.accept, Accept::None) && matches!(call.requests, CallDict::None));
     }
 }

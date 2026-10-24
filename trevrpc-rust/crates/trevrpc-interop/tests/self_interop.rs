@@ -355,10 +355,118 @@ fn bench_rejects_unusable_flags() {
         &["--scenario", "unary", "--metadata-size", "lots"],
         // One byte over the 8 KiB metadata value limit.
         &["--scenario", "unary", "--metadata-size", "8193"],
+        &["--scenario", "unary", "--payload", "zeros"],
+        &["--scenario", "unary", "--compression", "gzip"],
+        // Stream compression never applies to unary calls, and no compression runs on
+        // server-stream or the datagram scenarios.
+        &["--scenario", "unary", "--compression", "stream"],
+        &["--scenario", "server-stream", "--compression", "stream"],
+        &[
+            "--scenario",
+            "unreliable-client-stream",
+            "--compression",
+            "stream",
+        ],
+        // The dictionary modes need --dictionary, and only they take it.
+        &["--scenario", "bidi", "--compression", "dictionary"],
+        &["--scenario", "bidi", "--dictionary", "none.dict"],
     ] {
         let output = server.run("bench", flags);
         assert!(!output.status.success(), "{flags:?} should fail");
         assert!(output.stdout.is_empty(), "{flags:?} printed to stdout");
     }
     server.finish();
+}
+
+/// Runs `bench` with `flags` and the records payload, and returns its JSON line.
+fn bench_json(server: &Server, flags: &[&str]) -> String {
+    let mut args = vec![
+        "--payload",
+        "records",
+        "--size",
+        "512",
+        "--concurrency",
+        "2",
+        "--duration",
+        "0.3",
+        "--warmup",
+        "0.05",
+        "--messages",
+        "5",
+    ];
+    args.extend_from_slice(flags);
+    let output = server.run("bench", &args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{flags:?} failed: {stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json = stdout.lines().next().expect("one JSON line").to_owned();
+    assert_close(number(&json, "errors"), 0.0, 1e-9, &json);
+    assert!(number(&json, "ops") > 0.0, "{json}");
+    json
+}
+
+#[test]
+fn bench_runs_every_compression_mode_with_the_records_payload() {
+    let dir = std::env::temp_dir().join(format!("trevrpc-bench-dict-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dictionary = write_dictionary(&dir);
+    let server = Server::start_with(
+        "bench-compression",
+        &["--dictionary".as_ref(), dictionary.as_os_str()],
+    );
+    let dictionary = dictionary.to_str().unwrap();
+    for transport in ["quic", "tcp"] {
+        for (compression, scenarios) in [
+            ("none", &["unary", "client-stream", "bidi"][..]),
+            ("dictionary", &["unary", "client-stream", "bidi"]),
+            ("stream", &["client-stream", "bidi"]),
+            ("stream-dictionary", &["client-stream", "bidi"]),
+        ] {
+            for scenario in scenarios {
+                let mut flags = vec![
+                    "--transport",
+                    transport,
+                    "--scenario",
+                    scenario,
+                    "--compression",
+                    compression,
+                ];
+                if compression.ends_with("dictionary") {
+                    flags.extend(["--dictionary", dictionary]);
+                }
+                let json = bench_json(&server, &flags);
+                assert!(json.contains(r#""payload":"records""#), "{json}");
+                assert!(
+                    json.contains(&format!(r#""compression":"{compression}""#)),
+                    "{json}"
+                );
+            }
+        }
+    }
+
+    // Each records message differs, but their keys and values repeat, which a stream context
+    // learns: it carries far fewer bytes than the plain messages.
+    let wire = |compression: &str| {
+        number(
+            &bench_json(
+                &server,
+                &[
+                    "--transport",
+                    "quic",
+                    "--scenario",
+                    "bidi",
+                    "--compression",
+                    compression,
+                ],
+            ),
+            "wire_bytes_per_msg",
+        )
+    };
+    let (plain, stream) = (wire("none"), wire("stream"));
+    assert!(
+        stream < plain * 0.6,
+        "wire bytes per round trip: {plain} plain, {stream} stream-compressed"
+    );
+    server.finish();
+    let _ = std::fs::remove_dir_all(&dir);
 }
