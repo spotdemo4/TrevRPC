@@ -247,12 +247,6 @@ where
 }
 
 /// Defines `$name::quic` and `$name::qmux`, which run the same scenario over each transport.
-///
-/// The `QMux` test runs on a single thread: `qmux` 0.6.3 sends its `MAX_STREAMS` updates after
-/// computing them without holding a lock, so two streams closing on different threads can send
-/// them out of order, and the peer then ends the session with a flow control error
-/// (<https://github.com/moq-dev/web-transport/issues/439>). That is independent of what these
-/// tests check.
 macro_rules! over_each_transport {
     ($name:ident, $options:expr, $scenario:expr) => {
         mod $name {
@@ -263,7 +257,7 @@ macro_rules! over_each_transport {
                 run(Wire::Quic, $options, $scenario).await
             }
 
-            #[tokio::test(flavor = "current_thread")]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn qmux() -> TestResult {
                 run(Wire::Qmux, $options, $scenario).await
             }
