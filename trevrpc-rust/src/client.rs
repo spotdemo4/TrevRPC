@@ -29,6 +29,7 @@ mod native;
 mod qmux;
 mod quic;
 mod race;
+pub(crate) mod replay;
 mod upload;
 
 pub use call::{Call, bidirectional_streaming, client_streaming, server_streaming, unary};

@@ -92,6 +92,7 @@ object WireCodec {
                 uint32(1, status.statusValue)
                 string(2, status.message)
                 metadata(3, status.metadata)
+                bool(4, status.refusedStreamCompression)
             }.toByteArray()
 
     fun decodeStatus(bytes: ByteArray): RpcStatus {
@@ -99,16 +100,18 @@ object WireCodec {
         var code = 0u
         var message = ""
         val metadata = linkedMapOf<String, ByteArray>()
+        var refusedStreamCompression = false
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
                 1 -> code = reader.uint32(tag)
                 2 -> message = reader.string(tag, "status message")
                 3 -> reader.mapEntry(tag, metadata)
+                4 -> refusedStreamCompression = reader.bool(tag)
                 else -> reader.skip(tag)
             }
         }
-        return RpcStatus(code, message, Metadata.fromWire(metadata))
+        return RpcStatus(code, message, Metadata.fromWire(metadata), refusedStreamCompression)
     }
 
     /**
@@ -140,7 +143,7 @@ object WireCodec {
             }
 
             FrameType.STATUS -> {
-                ResponseFrame.Status(decodeStatus(frame.payload).status)
+                decodeStatus(frame.payload).let { ResponseFrame.Status(it.status, it.refusedStreamCompression) }
             }
 
             else -> {
@@ -185,6 +188,16 @@ private class Writer {
         if (value != 0u) {
             tag(field, 0)
             varint(value.toULong())
+        }
+    }
+
+    fun bool(
+        field: Int,
+        value: Boolean,
+    ) {
+        if (value) {
+            tag(field, 0)
+            varint(1u)
         }
     }
 
@@ -247,7 +260,12 @@ private class Writer {
         value: StreamCompression?,
     ) {
         if (value == null) return
-        val entry = Writer().apply { uint32(1, value.maxWindowLog) }.toByteArray()
+        val entry =
+            Writer()
+                .apply {
+                    uint32(1, value.maxWindowLog)
+                    bool(2, value.optimistic)
+                }.toByteArray()
         tag(field, 2)
         varint(entry.size.toULong())
         output.write(entry)
@@ -339,6 +357,11 @@ private class Reader(
         return varint()
     }
 
+    fun bool(tag: Tag): Boolean {
+        requireWireType(tag, 0)
+        return varint() != 0uL
+    }
+
     /** Reads a repeated uint64 element: either one unpacked varint or a packed run of them. */
     fun uint64Elements(
         tag: Tag,
@@ -391,14 +414,16 @@ private class Reader(
     fun streamCompression(tag: Tag): StreamCompression {
         val entry = Reader(bytes(tag))
         var maxWindowLog = 0u
+        var optimistic = false
         while (entry.hasRemaining) {
             val entryTag = entry.tag()
             when (entryTag.field) {
                 1 -> maxWindowLog = entry.uint32(entryTag)
+                2 -> optimistic = entry.bool(entryTag)
                 else -> entry.skip(entryTag)
             }
         }
-        return StreamCompression(maxWindowLog)
+        return StreamCompression(maxWindowLog, optimistic)
     }
 
     fun bytes(tag: Tag): ByteArray {

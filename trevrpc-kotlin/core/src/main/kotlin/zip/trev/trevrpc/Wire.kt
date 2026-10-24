@@ -34,7 +34,10 @@ data class RpcRequest(
     val acceptDictionaries: List<UInt> = emptyList(),
     /** The dictionaries the client asks the server about, with their fingerprints. */
     val dictionaryQuery: List<DictionaryInfo> = emptyList(),
-    /** The client's offer of stream compression: it decodes stream-compressed responses. */
+    /**
+     * The client's offer of stream compression: it decodes stream-compressed responses, and with
+     * [StreamCompression.optimistic] it compresses requests without waiting for the answer.
+     */
     val streamCompression: StreamCompression? = null,
 ) {
     val kind: RpcKind?
@@ -53,10 +56,13 @@ data class RpcHeaders(
 
 /**
  * What a peer decodes in stream compression: zstd windows of at most 2^[maxWindowLog] bytes. A
- * value below 10 enables nothing.
+ * value below 10 enables nothing. [optimistic], in a REQUEST only, says the client sends
+ * stream-compressed requests from the start of the call, without waiting for the server's answer;
+ * the server accepts the call or refuses it before any application code runs.
  */
 data class StreamCompression(
     val maxWindowLog: UInt,
+    val optimistic: Boolean = false,
 )
 
 /** A compression dictionary in negotiation fields: its Dictionary_ID and fingerprint. */
@@ -78,11 +84,15 @@ class DictionaryInfo(
     override fun toString(): String = "DictionaryInfo(id=$id, fingerprint=${fingerprintBytes.joinToString("") { "%02x".format(it) }})"
 }
 
-/** STATUS frame payload. */
+/**
+ * STATUS frame payload. [refusedStreamCompression] is set on the lone STATUS of an optimistic call
+ * the server refused before any application code ran, which the client replays.
+ */
 data class RpcStatus(
     val statusValue: UInt = Code.OK.value,
     val message: String = "",
     val metadata: Metadata = Metadata.EMPTY,
+    val refusedStreamCompression: Boolean = false,
 ) {
     val status: Status
         get() = Status(Code.fromValue(statusValue), message, metadata)
@@ -125,8 +135,12 @@ sealed interface ResponseFrame {
             get() = zstd != null || streamSize != null
     }
 
-    /** The terminal status, carrying trailing metadata. */
+    /**
+     * The terminal status, carrying trailing metadata. [refusedStreamCompression] marks a server's
+     * refusal of an optimistic call, which [Client] replays instead of reporting.
+     */
     class Status(
         val status: zip.trev.trevrpc.Status,
+        val refusedStreamCompression: Boolean = false,
     ) : ResponseFrame
 }

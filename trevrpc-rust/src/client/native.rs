@@ -1,8 +1,11 @@
 //! Native `TrevRPC` call transport over one established multiplexed connection: QUIC or `QMux`.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use bytes::Bytes;
+use futures_util::StreamExt as _;
+use futures_util::future::BoxFuture;
 
 use crate::compression::{
     ClientCall, ClientCompression, CompressionConfig, DEFAULT_CLIENT_MEMORY, MessageEncoder,
@@ -14,8 +17,10 @@ use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStr
 use crate::response_state::UnaryResponse;
 use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest};
 
+use super::replay::{Optimism, Replay};
 use super::upload::UploadWriter;
 use super::{CallInfo, MessageTypes, RpcTransport, StreamingRpcTransport};
+use crate::Status;
 
 /// A native `TrevRPC` transport over any multiplexed connection: one RPC per bidirectional
 /// stream.
@@ -32,7 +37,14 @@ pub struct NativeTransport<C> {
     level: i32,
     /// The memory stream compression may hold, `None` when it is disabled.
     stream_budget: Option<Arc<StreamBudget>>,
+    /// Whether calls on this connection stream-compress their requests optimistically.
+    optimism: Arc<Optimism>,
 }
+
+/// Opens the replay of a refused optimistic call with the requests to send on it.
+type Retry = Box<
+    dyn FnOnce(BoxStream<Vec<u8>>) -> BoxFuture<'static, Result<BoxStream<ResponseFrame>>> + Send,
+>;
 
 impl<C: MuxConnection> NativeTransport<C> {
     pub(crate) fn new(connection: C, max_frame_size: usize) -> Self {
@@ -43,6 +55,7 @@ impl<C: MuxConnection> NativeTransport<C> {
             compression: None,
             level: CompressionConfig::level(None),
             stream_budget: StreamBudget::new(DEFAULT_CLIENT_MEMORY),
+            optimism: Arc::new(Optimism::default()),
         }
     }
 
@@ -76,14 +89,70 @@ impl<C: MuxConnection> NativeTransport<C> {
             .as_ref()
     }
 
+    /// Opens a streaming call. A call whose requests may be stream-compressed is optimistic while
+    /// the connection is: it compresses them without waiting for the server's answer, and is
+    /// replayed without stream compression if the server refuses it.
+    ///
+    /// Calls with a datagram flow are never optimistic, since a replay would need a second flow.
+    async fn open_call(
+        &self,
+        request: RpcRequest,
+        request_body: BoxStream<Vec<u8>>,
+        info: CallInfo,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        let directions = info
+            .compress_stream
+            .effective(request.rpc_kind())
+            .without_unreliable(info.unreliable);
+        let budget = self
+            .stream_budget
+            .as_ref()
+            .filter(|_| directions.requests && !info.unreliable.any() && self.optimism.get());
+        let Some(budget) = budget else {
+            return self.open_stream(request, request_body, info, None).await;
+        };
+        let (replay, requests) = Replay::new(request_body, Arc::clone(budget));
+        let transport = self.clone();
+        let original = request.clone();
+        let started = Instant::now();
+        let retry: Retry = Box::new(move |requests| {
+            Box::pin(async move { transport.replay(original, requests, info, started).await })
+        });
+        self.open_stream(request, requests, info, Some((replay, retry)))
+            .await
+    }
+
+    /// Opens the replay of a refused optimistic call, not optimistic, with the time left of the
+    /// original deadline.
+    async fn replay(
+        &self,
+        mut request: RpcRequest,
+        requests: BoxStream<Vec<u8>>,
+        info: CallInfo,
+        started: Instant,
+    ) -> Result<BoxStream<ResponseFrame>> {
+        if request.timeout_nanos != 0 {
+            let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            request.timeout_nanos = request.timeout_nanos.saturating_sub(elapsed);
+            if request.timeout_nanos == 0 {
+                let status = Status::deadline_exceeded("deadline exceeded before the replay");
+                return Ok(Box::pin(futures_util::stream::once(async move {
+                    Ok(ResponseFrame::Status(status))
+                })));
+            }
+        }
+        self.open_stream(request, requests, info, None).await
+    }
+
     /// Opens the call's stream, giving it a datagram flow first if it is unreliable and this
     /// connection supports datagrams. The decision is made here, on the connection that carries
-    /// the call.
-    async fn open_call(
+    /// the call. `optimistic` is the replay of an optimistic call and how to open it again.
+    async fn open_stream(
         &self,
         mut request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
         info: CallInfo,
+        optimistic: Option<(Replay, Retry)>,
     ) -> Result<BoxStream<ResponseFrame>> {
         let call = self.prepare(&mut request, info.message_types);
         let directions = info
@@ -96,7 +165,17 @@ impl<C: MuxConnection> NativeTransport<C> {
             self.stream_budget.as_ref(),
             &call.accept,
             self.level,
+            optimistic.is_some(),
         );
+        // A call that could not offer is not optimistic after all: it keeps no copies.
+        let (replay, retry) = match optimistic {
+            Some((replay, retry)) if stream.optimistic => (Some(replay), Some(retry)),
+            Some((replay, _)) => {
+                replay.settle();
+                (None, None)
+            }
+            None => (None, None),
+        };
         let flow = if info.unreliable.any() {
             self.demux().and_then(|demux| {
                 demux.open_client_flow(request.rpc_kind(), info.unreliable, call.accept.clone())
@@ -144,8 +223,12 @@ impl<C: MuxConnection> NativeTransport<C> {
                 learn: call.learn,
                 stream: stream.responses,
                 enable_requests: stream.enable_requests,
+                replay,
+                refused: None,
+                optimism: directions.requests.then(|| Arc::clone(&self.optimism)),
             },
             complete: false,
+            retry,
         });
         Ok(match responses {
             Some((responses, guard)) => MergedResponses::boxed(frames, responses, guard),
@@ -307,6 +390,16 @@ struct StreamingCall<R: MuxRecvStream> {
     max_frame_size: usize,
     reading: ResponseReading,
     complete: bool,
+    /// How to replay the call if the server refuses it, for an optimistic call.
+    retry: Option<Retry>,
+}
+
+/// Where a streaming response stands.
+enum Response<R: MuxRecvStream> {
+    Call(StreamingCall<R>),
+    /// The server refused the optimistic call; its replay answers instead.
+    Replayed(BoxStream<ResponseFrame>),
+    Done,
 }
 
 impl<R: MuxRecvStream> Drop for StreamingCall<R> {
@@ -320,46 +413,77 @@ impl<R: MuxRecvStream> Drop for StreamingCall<R> {
 /// Drives the logical lifecycle of a streaming response: upload settlement, terminal-status
 /// precedence, and the clean end of the response stream.
 fn response_stream<R: MuxRecvStream>(call: StreamingCall<R>) -> BoxStream<ResponseFrame> {
-    Box::pin(futures_util::stream::unfold(call, |mut call| async move {
-        if call.complete {
+    Box::pin(futures_util::stream::unfold(
+        Response::Call(call),
+        |state| async move {
+            match state {
+                Response::Call(call) => next_response(call).await,
+                Response::Replayed(mut frames) => {
+                    let item = frames.next().await?;
+                    Some((item, Response::Replayed(frames)))
+                }
+                Response::Done => None,
+            }
+        },
+    ))
+}
+
+async fn next_response<R: MuxRecvStream>(
+    mut call: StreamingCall<R>,
+) -> Option<(Result<ResponseFrame>, Response<R>)> {
+    if call.complete {
+        return None;
+    }
+
+    let max_frame_size = call.max_frame_size;
+    let item = match framed::read_response_frame(&mut call.recv, max_frame_size, &mut call.reading)
+        .await
+    {
+        Ok(Some(ResponseFrame::Status(status))) => {
+            if let Some(replay) = call.reading.refused.take()
+                && let Some(retry) = call.retry.take()
+            {
+                // Nothing of the call reached application code: replay it, with the
+                // requests sent so far and then the rest.
+                let _ = call.upload.abort_and_settle().await;
+                let requests = replay.refuse();
+                drop(call);
+                return match retry(requests).await {
+                    Ok(mut frames) => {
+                        let item = frames.next().await?;
+                        Some((item, Response::Replayed(frames)))
+                    }
+                    Err(error) => Some((Err(error), Response::Done)),
+                };
+            }
+            let upload_result = call.upload.abort_and_settle().await;
+            let drain_result = framed::drain_fin_after_terminal_status(
+                &mut call.recv,
+                max_frame_size,
+                "response stream",
+            )
+            .await;
+            call.complete = true;
+
+            if let Err(error) = drain_result {
+                Err(error)
+            } else if status.is_ok() {
+                upload_result.map(|()| ResponseFrame::Status(status))
+            } else {
+                Ok(ResponseFrame::Status(status))
+            }
+        }
+        Ok(Some(frame)) => Ok(frame),
+        Ok(None) => {
+            let _ = call.upload.abort_and_settle().await;
             return None;
         }
+        Err(error) => {
+            let _ = call.upload.abort_and_settle().await;
+            call.complete = true;
+            Err(error)
+        }
+    };
 
-        let max_frame_size = call.max_frame_size;
-        let item =
-            match framed::read_response_frame(&mut call.recv, max_frame_size, &mut call.reading)
-                .await
-            {
-                Ok(Some(ResponseFrame::Status(status))) => {
-                    let upload_result = call.upload.abort_and_settle().await;
-                    let drain_result = framed::drain_fin_after_terminal_status(
-                        &mut call.recv,
-                        max_frame_size,
-                        "response stream",
-                    )
-                    .await;
-                    call.complete = true;
-
-                    if let Err(error) = drain_result {
-                        Err(error)
-                    } else if status.is_ok() {
-                        upload_result.map(|()| ResponseFrame::Status(status))
-                    } else {
-                        Ok(ResponseFrame::Status(status))
-                    }
-                }
-                Ok(Some(frame)) => Ok(frame),
-                Ok(None) => {
-                    let _ = call.upload.abort_and_settle().await;
-                    return None;
-                }
-                Err(error) => {
-                    let _ = call.upload.abort_and_settle().await;
-                    call.complete = true;
-                    Err(error)
-                }
-            };
-
-        Some((item, call))
-    }))
+    Some((item, Response::Call(call)))
 }

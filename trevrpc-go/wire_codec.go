@@ -31,11 +31,13 @@ const (
 	headersDictionaryField protowire.Number = 3
 	headersStreamField     protowire.Number = 4
 	streamWindowField      protowire.Number = 1
+	streamOptimisticField  protowire.Number = 2
 	dictionaryIDField      protowire.Number = 1
 	dictionaryFingerField  protowire.Number = 2
 	statusCodeField        protowire.Number = 1
 	statusMessageField     protowire.Number = 2
 	statusMetadataField    protowire.Number = 3
+	statusRefusedField     protowire.Number = 4
 	mapEntryKeyField       protowire.Number = 1
 	mapEntryValueField     protowire.Number = 2
 )
@@ -176,10 +178,14 @@ func appendDictionaryInfos(b []byte, num protowire.Number, infos []*dictionaryIn
 // streamCompressionInfoSize is the encoded size of a StreamCompression
 // message.
 func streamCompressionInfoSize(info *streamCompressionInfo) int {
-	if info.MaxWindowLog == 0 {
-		return 0
+	size := 0
+	if info.MaxWindowLog != 0 {
+		size += protowire.SizeTag(streamWindowField) + protowire.SizeVarint(uint64(info.MaxWindowLog))
 	}
-	return protowire.SizeTag(streamWindowField) + protowire.SizeVarint(uint64(info.MaxWindowLog))
+	if info.Optimistic {
+		size += protowire.SizeTag(streamOptimisticField) + 1
+	}
+	return size
 }
 
 func streamCompressionFieldSize(num protowire.Number, info *streamCompressionInfo) int {
@@ -198,6 +204,10 @@ func appendStreamCompression(b []byte, num protowire.Number, info *streamCompres
 	if info.MaxWindowLog != 0 {
 		b = protowire.AppendTag(b, streamWindowField, protowire.VarintType)
 		b = protowire.AppendVarint(b, uint64(info.MaxWindowLog))
+	}
+	if info.Optimistic {
+		b = protowire.AppendTag(b, streamOptimisticField, protowire.VarintType)
+		b = protowire.AppendVarint(b, 1)
 	}
 	return b
 }
@@ -220,7 +230,14 @@ func consumeStreamCompression(data []byte) (*streamCompressionInfo, bool) {
 			}
 			info.MaxWindowLog = uint32(value)
 			data = data[n:]
-		case num == streamWindowField:
+		case num == streamOptimisticField && typ == protowire.VarintType:
+			value, n := protowire.ConsumeVarint(data)
+			if n < 0 {
+				return nil, false
+			}
+			info.Optimistic = protowire.DecodeBool(value)
+			data = data[n:]
+		case num == streamWindowField || num == streamOptimisticField:
 			return nil, false
 		default:
 			n, ok := skipField(num, typ, data)
@@ -310,6 +327,9 @@ func (m *wireStatus) payloadSize() (int, bool) {
 	if m.Message != "" {
 		size += protowire.SizeTag(statusMessageField) + protowire.SizeBytes(len(m.Message))
 	}
+	if m.RefusedStreamCompression {
+		size += protowire.SizeTag(statusRefusedField) + 1
+	}
 	return size, true
 }
 
@@ -322,7 +342,12 @@ func (m *wireStatus) appendPayload(b []byte) []byte {
 		b = protowire.AppendTag(b, statusMessageField, protowire.BytesType)
 		b = protowire.AppendString(b, m.Message)
 	}
-	return appendMetadataField(b, statusMetadataField, m.Metadata)
+	b = appendMetadataField(b, statusMetadataField, m.Metadata)
+	if m.RefusedStreamCompression {
+		b = protowire.AppendTag(b, statusRefusedField, protowire.VarintType)
+		b = protowire.AppendVarint(b, 1)
+	}
+	return b
 }
 
 // --- Decoding ---
@@ -542,7 +567,14 @@ func (m *wireStatus) decodeFast(b []byte) bool {
 				return false
 			}
 			b = b[n:]
-		case num == statusCodeField || num == statusMessageField || num == statusMetadataField:
+		case num == statusRefusedField && typ == protowire.VarintType:
+			value, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return false
+			}
+			m.RefusedStreamCompression = protowire.DecodeBool(value)
+			b = b[n:]
+		case num == statusCodeField || num == statusMessageField || num == statusMetadataField || num == statusRefusedField:
 			return false
 		default:
 			n, ok := skipField(num, typ, b)

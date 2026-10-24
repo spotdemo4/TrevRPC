@@ -163,7 +163,7 @@ buildNpmPackage (final: {
         "$out/bin/trevrpc-interop-browser" --browser "$browser" \
           --url https://127.0.0.1:49999/trevrpc --cert-hash "$hash" > "$browser.out" || status=$?
         test "$status" -eq 1
-        test "$(grep -c '^fail ' "$browser.out")" -eq 14
+        test "$(grep -c '^fail ' "$browser.out")" -eq 15
         ! grep -q '^ok ' "$browser.out"
       done
     ''}

@@ -247,6 +247,9 @@ type encodeStream[T ProtoMessage] struct {
 	// stream, when set, stream-compresses the messages and falls back to its
 	// own per-message compressor; see streamCompressor.
 	stream *streamCompressor
+	// upload, when set, encodes the messages of an optimistic call instead;
+	// see optimisticUpload.
+	upload *optimisticUpload
 }
 
 // newEncodeStream wraps a protobuf message stream and yields messages encoded
@@ -273,16 +276,25 @@ func (s *encodeStream[T]) setCompressors(compressor *messageCompressor, stream *
 	s.compressor, s.stream = compressor, stream
 }
 
+// setUpload implements compressorSetter.
+func (s *encodeStream[T]) setUpload(upload *optimisticUpload) {
+	s.upload = upload
+}
+
 // compressorSetter is implemented by the encoded streams of client requests,
 // whose compressors the connection that carries the call provides: the
 // per-message one, and the call's stream compressor, either of which may be
-// nil.
+// nil, or the optimistic upload that encodes with them.
 type compressorSetter interface {
 	setCompressors(*messageCompressor, *streamCompressor)
+	setUpload(*optimisticUpload)
 }
 
 // encode encodes message as the stream's compressors decide.
 func (s *encodeStream[T]) encode(message T) (encodedMessage, error) {
+	if s.upload != nil {
+		return s.upload.encode(message)
+	}
 	if s.stream != nil {
 		return s.stream.encode(message)
 	}

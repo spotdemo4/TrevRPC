@@ -64,3 +64,52 @@ func RegisterCompressedEchoServer(server *trevrpc_go.Server, implementation Comp
 	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}))
 	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}))
 }
+
+// Full method paths ("/package.Service/Method") of the RefusingEcho service.
+const (
+	RefusingEcho_ClientStream_FullMethodName = "/trevrpc.interop.v1.RefusingEcho/ClientStream"
+)
+
+// RefusingEchoServer handles the RefusingEcho service.
+type RefusingEchoServer interface {
+	// ClientStream handles the ClientStream RPC.
+	ClientStream(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (*EchoResponse, error)
+}
+
+// RefusingEchoClient calls the RefusingEcho service.
+type RefusingEchoClient struct {
+	transport trevrpc_go.Transport
+	options   []trevrpc_go.CallOption
+}
+
+// NewRefusingEchoClient creates a client for the RefusingEcho service.
+func NewRefusingEchoClient(transport trevrpc_go.Transport, options ...trevrpc_go.CallOption) *RefusingEchoClient {
+	return &RefusingEchoClient{transport: transport, options: options}
+}
+
+// mergedCallOptions puts the options of the schema first, then those of the client, then the call's own.
+func (c *RefusingEchoClient) mergedCallOptions(overrides []trevrpc_go.CallOption, schema ...trevrpc_go.CallOption) []trevrpc_go.CallOption {
+	if len(schema) == 0 {
+		if len(c.options) == 0 {
+			return overrides
+		}
+		if len(overrides) == 0 {
+			return c.options
+		}
+	}
+	merged := make([]trevrpc_go.CallOption, 0, len(schema)+len(c.options)+len(overrides))
+	merged = append(merged, schema...)
+	merged = append(merged, c.options...)
+	merged = append(merged, overrides...)
+	return merged
+}
+
+// ClientStream calls the ClientStream RPC.
+func (c *RefusingEchoClient) ClientStream(ctx context.Context, options ...trevrpc_go.CallOption) (trevrpc_go.ClientStreamingCall[*EchoRequest, *EchoResponse], error) {
+	return trevrpc_go.ClientStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, RefusingEcho_ClientStream_FullMethodName, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}))...)
+}
+
+// RegisterRefusingEchoServer registers handlers for the RefusingEcho service.
+func RegisterRefusingEchoServer(server *trevrpc_go.Server, implementation RefusingEchoServer) {
+	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, RefusingEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}))
+}

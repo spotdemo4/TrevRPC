@@ -208,9 +208,12 @@ func (m *dictionaryInfo) String() string { return fmt.Sprintf("%+v", *m) }
 func (*dictionaryInfo) ProtoMessage() {}
 
 // streamCompressionInfo describes what a peer decodes in stream compression:
-// the largest zstd window, as a base-2 logarithm.
+// the largest zstd window, as a base-2 logarithm. In a REQUEST, Optimistic
+// says the client stream-compresses its requests without waiting for the
+// server's answer, which the server then gives or refuses at dispatch.
 type streamCompressionInfo struct {
 	MaxWindowLog uint32 `protobuf:"varint,1,opt,name=max_window_log,json=maxWindowLog,proto3" json:"max_window_log,omitempty"`
+	Optimistic   bool   `protobuf:"varint,2,opt,name=optimistic,proto3" json:"optimistic,omitempty"`
 }
 
 // Reset clears the info for protobuf compatibility.
@@ -227,6 +230,9 @@ type wireStatus struct {
 	Code     uint32   `protobuf:"varint,1,opt,name=code,proto3" json:"code,omitempty"`
 	Message  string   `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
 	Metadata Metadata `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	// RefusedStreamCompression says the server refused an optimistic call
+	// before any application code ran (field 4), so the client may replay it.
+	RefusedStreamCompression bool `protobuf:"varint,4,opt,name=refused_stream_compression,json=refusedStreamCompression,proto3" json:"refused_stream_compression,omitempty"`
 }
 
 // Reset clears the status for protobuf compatibility.

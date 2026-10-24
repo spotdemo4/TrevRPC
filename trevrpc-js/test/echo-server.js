@@ -11,6 +11,7 @@ import { ServerStreams, parseMethodPath } from "./support.js";
 const EchoService = "trevrpc.interop.v1.Echo";
 const UnreliableEchoService = "trevrpc.interop.v1.UnreliableEcho";
 const CompressedEchoService = "trevrpc.interop.v1.CompressedEcho";
+const RefusingEchoService = "trevrpc.interop.v1.RefusingEcho";
 /** The server's stream compression; it holds no dictionaries. */
 const compression = await createCompression();
 /** Responses up to this size are sent as datagrams when the call has a flow. */
@@ -53,10 +54,28 @@ async function serve(stream, request, unary, session) {
   }
 
   if (path.service === CompressedEchoService) {
+    const streams = new ServerStreams(compression, request);
+    if (streams.refuses) {
+      await stream.refuse();
+      return;
+    }
     await (path.method === "ClientStream" ? compressedClientStream : compressedBidi)(
       stream,
-      request,
+      streams,
     );
+    await stream.finish();
+    await stream.stopSending();
+    return;
+  }
+
+  // RefusingEcho is registered without stream compression, as by a server built from a schema
+  // without compress_stream: it never answers, so it refuses every optimistic call.
+  if (path.service === RefusingEchoService && path.method === "ClientStream") {
+    if (request.streamCompression?.optimistic) {
+      await stream.refuse();
+      return;
+    }
+    await clientStream(stream, done);
     await stream.finish();
     await stream.stopSending();
     return;
@@ -139,8 +158,7 @@ async function bidi(stream, done) {
  * CompressedEcho.Bidi as the interop README specifies: Echo.Bidi with stream compression, whose
  * OK status reports how many requests arrived stream-compressed.
  */
-async function compressedBidi(stream, request) {
-  const streams = new ServerStreams(compression, request);
+async function compressedBidi(stream, streams) {
   try {
     await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
     for (let index = 0, frame; (frame = await stream.readFrame()) !== null; index += 1) {
@@ -165,8 +183,7 @@ async function compressedBidi(stream, request) {
  * compression. HEADERS go out at dispatch, as servers send them on methods whose requests may be
  * stream-compressed.
  */
-async function compressedClientStream(stream, request) {
-  const streams = new ServerStreams(compression, request);
+async function compressedClientStream(stream, streams) {
   try {
     await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
     let message = "";

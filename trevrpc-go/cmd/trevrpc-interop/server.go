@@ -82,6 +82,10 @@ func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *
 	interoppb.RegisterEchoServer(server, echoServer{})
 	interoppb.RegisterUnreliableEchoServer(server, unreliableEchoServer{})
 	interoppb.RegisterCompressedEchoServer(server, compressedEchoServer{})
+	// RefusingEcho is registered by hand, without the stream compression its
+	// schema allows, as a server built from a schema without it would be.
+	trevrpc.RegisterClientStreaming(server, interoppb.RefusingEcho_ClientStream_FullMethodName,
+		func() *interoppb.EchoRequest { return &interoppb.EchoRequest{} }, echoServer{}.ClientStream)
 	return trevrpc.Listen(addr, server, trevrpc.ListenOptions{TLSConfig: tlsConfig})
 }
 

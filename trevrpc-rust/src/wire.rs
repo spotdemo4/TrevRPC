@@ -165,6 +165,10 @@ pub struct DictionaryInfo {
 pub struct StreamCompression {
     #[prost(uint32, tag = "1")]
     pub max_window_log: u32,
+    /// REQUEST only: the client stream-compresses its requests without waiting for the server's
+    /// answer, which accepts or refuses the call at dispatch.
+    #[prost(bool, tag = "2")]
+    pub optimistic: bool,
 }
 
 impl RpcRequest {
@@ -282,6 +286,10 @@ pub struct RpcStatus {
     pub message: String,
     #[prost(map = "string, bytes", tag = "3")]
     pub metadata: Metadata,
+    /// The server refused an optimistic call before any application code ran, so the client may
+    /// replay it without stream compression. Meaningless on any other STATUS.
+    #[prost(bool, tag = "4")]
+    pub refused_stream_compression: bool,
 }
 
 #[cfg(test)]

@@ -11,7 +11,9 @@ use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, ResponseCodec};
 use crate::request_pump::{
     RequestInputKind, RequestPumpReader, RequestPumpSettle, start_request_pump,
 };
-use crate::server::{CancellationSource, CancellationToken, RequestBudget, RequestCounts, Server};
+use crate::server::{
+    Admitted, CancellationSource, CancellationToken, RequestBudget, RequestCounts, Server,
+};
 use crate::{
     Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status,
     varint,
@@ -51,8 +53,11 @@ pub struct IncomingRequest {
     pub(crate) flow: Option<ServerFlow>,
     /// What negotiation decided about compressed messages.
     pub(crate) compression: ServerCall,
-    /// What negotiation decided about stream compression.
+    /// What negotiation decided about stream compression, once [`handle_stream`] has authorized
+    /// the call.
     pub(crate) stream: ServerStream,
+    /// Set once [`handle_stream`] has validated and authorized a streaming call.
+    pub(crate) admitted: Option<Admitted>,
 }
 
 /// Registers the datagram flow that a streaming REQUEST asks for on the connection's `demux`,
@@ -123,13 +128,6 @@ where
             .route_message_types(&request.method)
             .map(|types| types.response),
     );
-    let mut stream = compression::negotiate_stream(
-        &request,
-        server.route_compress_stream(&request.method),
-        server.stream_budget(),
-        server.compression(),
-    );
-    budget.stream = stream.requests.take();
     let body = if request.rpc_kind().has_single_request_message() {
         let accept = budget.accept.clone();
         // The single request message is never stream-compressed.
@@ -159,7 +157,8 @@ where
         budget,
         flow: None,
         compression,
-        stream,
+        stream: ServerStream::default(),
+        admitted: None,
     })
 }
 
@@ -168,6 +167,7 @@ where
 /// `stream_permit` is the connection's stream slot. It and the server-wide request slot are
 /// released before the call's terminal STATUS is written or its stream is reset, never after, so
 /// a client that sees the call end can start the next one without finding the slot still taken.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_stream<W, R>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
@@ -183,11 +183,42 @@ pub async fn handle_stream<W, R>(
     let IncomingRequest {
         request,
         body,
-        budget,
+        mut budget,
         flow,
         compression,
-        mut stream,
+        stream: _,
+        admitted: _,
     } = incoming;
+    let cancellation = CancellationToken::new();
+    // A streaming call is validated and authorized first, so callers the authorizer rejects can
+    // neither probe its methods nor make it reserve stream compression memory. Unary calls never
+    // use stream compression, and their handlers authorize them as before.
+    let admitted = if request.rpc_kind() == RpcKind::Unary {
+        None
+    } else {
+        match server.admit(&request, &cancellation).await {
+            Ok(admitted) => Some(admitted),
+            Err(status) => {
+                drop(stream_permit);
+                server.record_rejected_request(&request, body.len(), &status);
+                reject_with_status(&server, &mut send, &mut recv, &request, budget, status).await;
+                return;
+            }
+        }
+    };
+    let mut stream = compression::negotiate_stream(
+        &request,
+        server.route_compress_stream(&request.method),
+        server.stream_budget(),
+        server.compression(),
+    );
+    if server.refuses_optimistic(&request, &stream) {
+        drop(stream_permit);
+        refuse(&server, &mut send, &request, body.len()).await;
+        tokio::spawn(crate::request_pump::discard_request(recv));
+        return;
+    }
+    budget.stream = stream.requests.take();
     let answered = compression.answer.is_some() || stream.answer.is_some();
     send.set_codec(ResponseCodec {
         encoder: MessageEncoder::new(compression.responses.clone())
@@ -205,8 +236,7 @@ pub async fn handle_stream<W, R>(
         return;
     }
 
-    let cancellation = CancellationToken::new();
-    if request.rpc_kind() != RpcKind::Unary {
+    if admitted.is_some() {
         let incoming = IncomingRequest {
             request,
             body,
@@ -214,6 +244,7 @@ pub async fn handle_stream<W, R>(
             flow,
             compression,
             stream,
+            admitted,
         };
         handle_streaming_rpc(server, slots, send, recv, incoming, cancellation, shutdown).await;
         return;
@@ -319,10 +350,30 @@ pub async fn reject_stream<W, R>(
         flow: _,
         compression: _,
         stream: _,
+        admitted: _,
     } = incoming;
     let status = Status::unavailable("too many concurrent streams on connection");
     server.record_rejected_request(&request, body.len(), &status);
     reject_with_status(&server, &mut send, &mut recv, &request, budget, status).await;
+}
+
+/// Refuses an optimistic call whose stream-compressed requests the server does not decode, with a
+/// lone STATUS, after authorizing it but before anything else runs for it: the client replays it
+/// without stream compression. The caller then discards the request stream rather than stopping
+/// it, since Firefox fails the unread response, STATUS included, when the request side is stopped.
+async fn refuse<W>(server: &Server, send: &mut W, request: &RpcRequest, len: usize)
+where
+    W: ResponseWriter,
+{
+    let status = Status::refused_stream_compression();
+    server.record_rejected_request(request, len, &status);
+    if send
+        .write_frames(&mut vec![ResponseFrame::Status(status)])
+        .await
+        .is_ok()
+    {
+        let _ = send.finish().await;
+    }
 }
 
 /// Answers a request with a lone STATUS, then lets a request that is not left open finish.
@@ -403,6 +454,7 @@ async fn handle_streaming_rpc<W, R>(
         flow,
         compression,
         stream,
+        admitted,
     } = incoming;
     // Calls whose requests may be stream-compressed get HEADERS, with the answers, at dispatch,
     // before any request message is read, so the client learns the answer while it still
@@ -457,6 +509,7 @@ async fn handle_streaming_rpc<W, R>(
             request,
             body,
             request_body,
+            admitted,
             cancellation.clone(),
             RequestCounts {
                 datagrams: datagram_count,

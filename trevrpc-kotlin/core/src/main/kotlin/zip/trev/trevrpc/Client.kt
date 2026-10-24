@@ -310,10 +310,9 @@ class Client(
     ): OpenedStream<Res> {
         val configured = transport.compression
         val compression = configured?.call(requestCodec.messageType, codec.messageType, streamsRequest = !finishSend)
-        val streams =
-            configured?.let {
-                CallStreams.open(it, transport.streamCompressionBudget, compressStream.effective(kind), compression)
-            }
+        val budget = transport.streamCompressionBudget
+        val directions = compressStream.effective(kind)
+        val streams = configured?.let { CallStreams.open(it, budget, directions, compression) }
         val request = request(path, kind, options, compression, streams)
         val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
         val stream =
@@ -323,7 +322,16 @@ class Client(
                 streams?.close()
                 throw error
             }
-        val call = CallStream(stream, compression, streams, options.maxResponseBodySize, options.onResponseHeaders)
+        // An optimistic call replays itself, without optimism, if the server refuses it.
+        val replay =
+            if (configured != null && budget != null && streams?.optimistic == true) {
+                OptimisticReplay(transport, request, deadline, responseContext, budget) {
+                    CallStreams.open(configured, budget, directions, compression, optimistic = false)
+                }
+            } else {
+                null
+            }
+        val call = CallStream(stream, compression, streams, options.maxResponseBodySize, options.onResponseHeaders, replay)
         // A call that streams its request needs to learn of the server's terminal status while it uploads.
         if (!finishSend) call.pump = ResponsePump(responseContext, call, deadline, options)
         return OpenedStream(
@@ -342,7 +350,7 @@ private data class OpenedStream<T>(
 private class CallEnded : Exception()
 
 /** How long a failed write waits for the response to explain it. */
-private val EXPLANATION_TIMEOUT = 5.seconds
+internal val EXPLANATION_TIMEOUT = 5.seconds
 
 /**
  * Writes the request of a call. A write races the end of the call: when the response ends it (the
@@ -404,7 +412,7 @@ internal class RequestWriter(
         try {
             // Half-closing a call that already ended has nothing left to do; the outcome is
             // reported by receive.
-            if (!call.end.isEnded) write(reportEnd = false) { call.stream.finishSend() }
+            if (!call.end.isEnded) write(reportEnd = false) { call.finishSend() }
         } finally {
             call.pump?.uploadClosed()
         }

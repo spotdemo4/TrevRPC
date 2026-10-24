@@ -230,7 +230,10 @@ func DefaultServerOptions() ServerOptions {
 }
 
 // Authorizer authorizes a request after metadata and protocol validation. The
-// request body is not available to it.
+// request body is not available to it. A call the server refuses for
+// optimistic stream compression is replayed by the client and authorized
+// again (see StreamCompression), so authorizers must not have side effects
+// that a second authorization of the same call would repeat.
 type Authorizer interface {
 	// Authorize returns nil when the request is authorized. A returned *Status
 	// is sent to the caller; any other error becomes Internal.
@@ -1088,6 +1091,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	}
 
 	limits := streamLimitsFromOptions(r.options)
+	requests := requestBody
 	requestBody = limitByteStream(ctx, requestBody, limits, "request", lease, request)
 	route, ok := r.routes[request.Method]
 	if !ok || route.streaming == nil {
@@ -1099,6 +1103,22 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		cancel()
 		lease.release()
 		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s: expected %d, got %d", request.Method, route.kind, request.rpcKind())), request)
+	}
+	// Stream compression is negotiated once the call is authorized and
+	// routed, so that an unauthorized caller can neither probe routes nor
+	// hold the server's memory. An optimistic call the server cannot decode
+	// is refused here, before the handler runs, with none of its request
+	// messages read, so that the client can replay it.
+	streams, refused := r.negotiateStreams(request)
+	if refused {
+		cancel()
+		lease.release()
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, refusedStreamCompression(), request)
+	}
+	request.streams = streams
+	setCallStreams(ctx, streams)
+	if stream, ok := requests.(*rpcRequestStream); ok {
+		stream.reader.stream = streams.requestInflater()
 	}
 
 	metadata := responseMetadataFromContext(ctx)

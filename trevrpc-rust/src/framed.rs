@@ -7,6 +7,7 @@
 use std::io;
 use std::sync::Arc;
 
+use crate::client::replay::{Optimism, Replay};
 use crate::compression::{
     Accept, ClientCompression, Dict, Inflater, MessageEncoder, StreamEnable, inflate,
 };
@@ -525,6 +526,12 @@ pub struct ResponseReading {
     /// The request direction to enable when the call's HEADERS answer the stream compression
     /// offer.
     pub(crate) enable_requests: Option<Arc<StreamEnable>>,
+    /// The requests of an optimistic call, until its HEADERS or STATUS decide it.
+    pub(crate) replay: Option<Replay>,
+    /// Set when the server refused the optimistic call, which the client then replays.
+    pub(crate) refused: Option<Replay>,
+    /// The connection to tell when HEADERS answer a stream compression offer.
+    pub(crate) optimism: Option<Arc<Optimism>>,
 }
 
 /// Decodes a frame received on a response stream, decompressing a `ZSTD_MESSAGE` with the
@@ -558,10 +565,29 @@ pub fn decode_response_frame(
             if let Some(requests) = reading.enable_requests.take() {
                 requests.enable(headers.stream_compression.as_ref());
             }
+            if let Some(replay) = reading.replay.take() {
+                replay.settle();
+            }
+            if headers.stream_compression.is_some()
+                && let Some(optimism) = &reading.optimism
+            {
+                optimism.answered();
+            }
             Ok(ResponseFrame::Headers(headers.metadata))
         }
         frame_type::STATUS => {
             let status = decode_payload::<RpcStatus>(&payload)?;
+            // Only a STATUS before any HEADERS of an optimistic call can refuse it.
+            if let Some(replay) = reading.replay.take() {
+                if status.refused_stream_compression {
+                    if let Some(optimism) = &reading.optimism {
+                        optimism.refused();
+                    }
+                    reading.refused = Some(replay);
+                } else {
+                    replay.settle();
+                }
+            }
             Ok(ResponseFrame::Status(Status::from(status)))
         }
         _ => Err(Error::from(Status::internal(

@@ -40,6 +40,10 @@ type streamClient struct {
 	// streams is the channel's stream compression budget, nil when stream
 	// compression is off. It is set before the client is used.
 	streams *streamBudget
+	// pessimistic is set while calls on the connection do not stream-compress
+	// their requests optimistically: from a refusal until a call's HEADERS
+	// answer stream compression again.
+	pessimistic atomic.Bool
 }
 
 func newStreamClient(opener streamOpener, maxFrameSize int) *streamClient {
@@ -160,10 +164,20 @@ func (c *streamClient) streamingCall(
 ) (frameStream, error) {
 	accept, queried := c.compression.prepare(request)
 	streams := c.prepareStreams(request, accept)
-	if setter, ok := requests.(compressorSetter); ok {
+	setter, _ := requests.(compressorSetter)
+	if setter != nil {
 		setter.setCompressors(c.compression.requestCompressor(), streams.requestCompressor())
 	}
 	flow := c.openFlow(request, accept)
+	// A call that may stream-compress its requests starts without waiting for
+	// the server's answer, unless the server of this connection refused that
+	// since it last answered. A call with a datagram flow waits: a replay
+	// would have to move its flow to the new call.
+	optimistic := setter != nil && streams.requestCompressor() != nil && flow == nil && !c.pessimistic.Load()
+	if optimistic {
+		request.StreamCompression.Optimistic = true
+		streams.requests.enable(int(request.StreamCompression.MaxWindowLog))
+	}
 	header, err := appendRequestFrame(nil, request, c.maxFrameSize)
 	if err != nil {
 		flow.release()
@@ -181,6 +195,18 @@ func (c *streamClient) streamingCall(
 		return nil, statusErr
 	}
 
+	// The requests of an optimistic call go through its upload, which may
+	// replace the stream.
+	var sink requestSink = stream
+	var upload *optimisticUpload
+	stopCancel := cancelStreamOnContext
+	if optimistic {
+		upload = newOptimisticUpload(streamCtx, c, stream, request, accept, streams.requests)
+		setter.setUpload(upload)
+		sink = upload
+		stopCancel = func(ctx context.Context, _ clientStream) func() { return watchContextCancellation(ctx, upload.cancel) }
+	}
+
 	// The upload has a context of its own, so it can be stopped when the
 	// response ends while the response stream stays readable.
 	uploadCtx, cancelUpload := context.WithCancel(streamCtx)
@@ -192,7 +218,7 @@ func (c *streamClient) streamingCall(
 		writerDone:   writerDone,
 		cancelUpload: cancelUpload,
 		cancel:       cancel,
-		stopCancel:   cancelStreamOnContext(streamCtx, stream),
+		stopCancel:   stopCancel(streamCtx, stream),
 		maxFrameSize: c.maxFrameSize,
 		frames:       make(chan pumpedFrame, responseReadAheadFrames),
 		drained:      make(chan struct{}, 1),
@@ -202,6 +228,8 @@ func (c *streamClient) streamingCall(
 		compression:  c.compression,
 		queried:      queried,
 		streams:      streams,
+		optimistic:   upload,
+		pessimistic:  &c.pessimistic,
 	}
 	if aborter, ok := requests.(uploadAborter); ok {
 		response.abortUpload = aborter.abortUpload
@@ -214,7 +242,7 @@ func (c *streamClient) streamingCall(
 		}
 	}
 	go func() {
-		err := c.writeStreamingRequest(uploadCtx, stream, header, requests, sender, response.outcome)
+		err := c.writeStreamingRequest(uploadCtx, sink, header, requests, sender, response.outcome)
 		// The writer was the only user of the request compressor.
 		streams.requestCompressor().close()
 		writerDone <- err
@@ -243,7 +271,7 @@ func newResponseFrameReader(stream io.Reader, maxFrameSize int, accept *dictSet,
 // the failure, and Send reports it instead of a closed pipe.
 func (c *streamClient) writeStreamingRequest(
 	ctx context.Context,
-	stream clientStream,
+	stream requestSink,
 	header []byte,
 	requests encodedStream,
 	sender *datagramSender,
@@ -282,6 +310,14 @@ func (w *trackedWriter) Write(data []byte) (int, error) {
 		w.failed = true
 	}
 	return n, err
+}
+
+func (w *trackedWriter) writeMessageFrames(header []byte, messages []encodedMessage) error {
+	err := writeMessageFrames(w.writer, header, messages)
+	if err != nil {
+		w.failed = true
+	}
+	return err
 }
 
 // callStatus maps a transport failure observed during a call to a status. A
@@ -338,6 +374,11 @@ type transportResponseStream struct {
 	// streams is the call's stream compression, nil without it. HEADERS
 	// enable its request direction.
 	streams *clientStreams
+	// optimistic is the upload of a call that stream-compresses its requests
+	// optimistically, nil otherwise; it may replace stream. pessimistic is
+	// the connection's streamClient.pessimistic.
+	optimistic  *optimisticUpload
+	pessimistic *atomic.Bool
 
 	// The fields below are set for calls that stream their request.
 	//
@@ -417,6 +458,19 @@ func (s *transportResponseStream) pump() {
 			}
 		}
 		next, err := s.reader.next()
+		if upload := s.optimistic; upload != nil && upload.undecided() {
+			if err == nil && isRefusal(next) {
+				// The server ran nothing for the call: it is replayed, and
+				// the refusal is not delivered.
+				if err = s.replayRefused(upload); err == nil {
+					continue
+				}
+				next = frame{}
+			} else {
+				upload.decide(false)
+				upload.settle()
+			}
+		}
 		item := pumpedFrame{frame: next, err: err}
 		switch {
 		case err == nil && next.typ == frameTypeHeaders && s.streams.requestCompressor() != nil:
@@ -424,6 +478,10 @@ func (s *transportResponseStream) pump() {
 			// soon as it arrives, not when Recv gets to it.
 			if _, answer, err := decodeHeaders(next.payload); err == nil {
 				s.streams.learn(answer.stream)
+				if answer.stream != nil {
+					// The server decodes again: later calls are optimistic.
+					s.pessimistic.Store(false)
+				}
 			}
 		case err != nil:
 			// The response direction ended: late datagrams are dropped.
@@ -452,6 +510,29 @@ func (s *transportResponseStream) pump() {
 			return
 		}
 	}
+}
+
+// replayRefused replays an optimistic call the server refused, and reads the
+// response of the new call from then on. Calls on the connection stop being
+// optimistic until a server answer.
+func (s *transportResponseStream) replayRefused(upload *optimisticUpload) error {
+	upload.decide(true)
+	s.pessimistic.Store(true)
+	stream, err := upload.replay()
+	if err != nil {
+		return err
+	}
+	s.reader = newResponseFrameReader(stream, s.maxFrameSize, upload.accept, s.streams.responseInflater())
+	return nil
+}
+
+// currentStream returns the stream the call uses, which a replay may have
+// replaced.
+func (s *transportResponseStream) currentStream() clientStream {
+	if s.optimistic != nil {
+		return s.optimistic.stream()
+	}
+	return s.stream
 }
 
 // uploadEndError is the error Send reports once the server ended the call
@@ -628,7 +709,7 @@ func (s *transportResponseStream) Recv() (responseFrame, error) {
 func (s *transportResponseStream) stopUpload() {
 	if s.cancelUpload != nil {
 		s.cancelUpload()
-		s.stream.cancelWrite()
+		s.currentStream().cancelWrite()
 	}
 }
 
@@ -653,9 +734,12 @@ func (s *transportResponseStream) finish(cancelRead bool) {
 		s.cancel()
 	}
 	s.flow.release()
+	if s.optimistic != nil {
+		s.optimistic.end()
+	}
 	s.streams.close()
 	if cancelRead {
-		s.stream.cancelRead()
+		s.currentStream().cancelRead()
 	}
 }
 

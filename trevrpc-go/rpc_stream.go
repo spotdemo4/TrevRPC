@@ -100,9 +100,24 @@ func writeRequestFrames(ctx context.Context, writer io.Writer, header []byte, re
 	}
 }
 
-// writeMessageFrames writes header and messages in one Write, without copying
-// when that is only one message.
+// messageFramesWriter is a writer that decides itself how header and messages
+// are written; see optimisticUpload.
+type messageFramesWriter interface {
+	writeMessageFrames(header []byte, messages []encodedMessage) error
+}
+
+// writeMessageFrames writes header and messages, through writer's own
+// writeMessageFrames if it has one.
 func writeMessageFrames(writer io.Writer, header []byte, messages []encodedMessage) error {
+	if framesWriter, ok := writer.(messageFramesWriter); ok {
+		return framesWriter.writeMessageFrames(header, messages)
+	}
+	return writeFrames(writer, header, messages)
+}
+
+// writeFrames writes header and messages in one Write, without copying when
+// that is only one message.
+func writeFrames(writer io.Writer, header []byte, messages []encodedMessage) error {
 	if len(header) == 0 && len(messages) == 1 {
 		_, err := writer.Write(messages[0].frame)
 		return err
@@ -191,10 +206,9 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 	// The server accepts every dictionary it holds on request messages.
 	request.compression = runtime.compression.negotiate(request)
 	reader.inflate = runtime.compression.lookupOrNil()
-	request.streams = runtime.negotiateStreams(request)
-	// Stream compression ends with the call, whichever way it ends.
-	defer request.streams.close()
-	reader.stream = request.streams.requestInflater()
+	// Stream compression, negotiated once the call is authorized and routed,
+	// ends with the call, whichever way it ends.
+	defer func() { request.streams.close() }()
 	if request.DatagramFlow != 0 {
 		// A connection without datagrams ignores the flow.
 		if datagrams, ok := stream.(datagramStream); ok {

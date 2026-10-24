@@ -45,6 +45,11 @@ type Status struct {
 	Code     Code
 	Message  string
 	Metadata Metadata
+
+	// refusedStreamCompression marks the STATUS of a server that refused an
+	// optimistic call before any application code ran; see
+	// wireStatus.RefusedStreamCompression.
+	refusedStreamCompression bool
 }
 
 // NewStatus creates a status from a code and message.
@@ -123,7 +128,7 @@ func (s *Status) IsOK() bool {
 
 // wire returns the STATUS frame payload for s.
 func (s *Status) wire() *wireStatus {
-	return &wireStatus{Code: uint32(s.Code), Message: s.Message, Metadata: s.Metadata}
+	return &wireStatus{Code: uint32(s.Code), Message: s.Message, Metadata: s.Metadata, RefusedStreamCompression: s.refusedStreamCompression}
 }
 
 // statusFromWire builds a status from a STATUS frame payload.

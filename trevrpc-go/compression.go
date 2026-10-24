@@ -273,6 +273,17 @@ const maxRetainedMarshalScratch = 64 * 1024
 // its frame header: the type and the longest length varint.
 const compressedFrameHeaderRoom = 1 + 8
 
+// encodePayload frames the marshalled message payload: compressed with dict,
+// if it is not nil and that is shorter, and as a MESSAGE otherwise.
+func encodePayload(payload []byte, dict *compressionDict) encodedMessage {
+	if dict != nil {
+		return compressPayload(payload, dict.Dict)
+	}
+	frame := make([]byte, 0, frameHeaderLen(frameTypeMessage, len(payload))+len(payload)+frameTailSlack)
+	frame = appendFrameHeader(frame, frameTypeMessage, len(payload))
+	return encodedMessage{frame: append(frame, payload...), size: len(payload)}
+}
+
 // compressPayload frames payload as a ZSTD_MESSAGE compressed with dict when
 // that is shorter, and as a MESSAGE otherwise.
 func compressPayload(payload []byte, dict *zstd.Dict) encodedMessage {
@@ -283,9 +294,7 @@ func compressPayload(payload []byte, dict *zstd.Dict) encodedMessage {
 		appendFrameHeader(compressed[start:start], frameTypeZstdMessage, n)
 		return encodedMessage{frame: compressed[start:], size: len(payload)}
 	}
-	frame := make([]byte, 0, frameHeaderLen(frameTypeMessage, len(payload))+len(payload)+frameTailSlack)
-	frame = appendFrameHeader(frame, frameTypeMessage, len(payload))
-	return encodedMessage{frame: append(frame, payload...), size: len(payload)}
+	return encodePayload(payload, nil)
 }
 
 // clientCompression is the compression state of one client connection.

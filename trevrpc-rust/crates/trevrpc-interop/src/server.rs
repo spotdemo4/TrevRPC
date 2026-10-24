@@ -9,9 +9,11 @@ use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
 use tower_http::services::ServeDir;
 use trevrpc::fallback::HttpFallback;
-use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissionRequest};
+use trevrpc::server::{
+    RequestContext, RouteOptions, Server, ServerOptions, WebTransportAdmissionRequest,
+};
 use trevrpc::tcp::TcpFallback;
-use trevrpc::{BoxStream, Code, Error, Status};
+use trevrpc::{BoxStream, Code, Error, RpcKind, Status};
 
 use crate::proto::{self, CompressedEcho, Echo, EchoRequest, EchoResponse, UnreliableEcho};
 use crate::{BoxError, Flags, connect};
@@ -195,6 +197,26 @@ impl CompressedEcho for CompressedEchoService {
     }
 }
 
+/// Registers `RefusingEcho.ClientStream` as `Echo.ClientStream`, by hand and without stream
+/// compression, as a server built from a schema without `compress_stream` would: the server
+/// refuses every optimistic call to it, and clients replay them.
+fn register_refusing_echo(server: &mut Server) {
+    server.route_streaming_with_options(
+        proto::refusing_echo_paths::CLIENT_STREAM,
+        RpcKind::ClientStreaming,
+        RouteOptions::new().with_message_types(
+            "trevrpc.interop.v1.EchoRequest",
+            "trevrpc.interop.v1.EchoResponse",
+        ),
+        |_context, _body, requests| async move {
+            let response = concatenate(trevrpc::stream::decode::<EchoRequest>(requests)).await?;
+            Ok(trevrpc::stream::encode(trevrpc::stream::from_iter([
+                response,
+            ])))
+        },
+    );
+}
+
 const RECEIVED_METADATA_KEY: &str = "interop-received";
 const DATAGRAMS_RECEIVED_METADATA_KEY: &str = "interop-datagrams-received";
 
@@ -271,6 +293,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     proto::register_echo(&mut server, EchoService);
     proto::register_unreliable_echo(&mut server, UnreliableEchoService);
     proto::register_compressed_echo(&mut server, CompressedEchoService);
+    register_refusing_echo(&mut server);
 
     let tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()

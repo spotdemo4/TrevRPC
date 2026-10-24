@@ -52,6 +52,7 @@ const wireRoot = protobuf.Root.fromJSON({
         StreamCompression: {
           fields: {
             maxWindowLog: { type: "uint32", id: 1 },
+            optimistic: { type: "bool", id: 2 },
           },
         },
         DictionaryInfo: {
@@ -65,6 +66,7 @@ const wireRoot = protobuf.Root.fromJSON({
             code: { type: "uint32", id: 1 },
             message: { type: "string", id: 2 },
             metadata: { keyType: "string", type: "bytes", id: 3 },
+            refusedStreamCompression: { type: "bool", id: 4 },
           },
         },
       },

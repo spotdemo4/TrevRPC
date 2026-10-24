@@ -11,8 +11,8 @@ use tokio::sync::watch;
 
 use crate::client::MessageTypes;
 use crate::compression::{
-    Accept, CompressStream, Compression, CompressionConfig, DEFAULT_SERVER_MEMORY, Inflater,
-    StreamBudget,
+    self, Accept, CompressStream, Compression, CompressionConfig, DEFAULT_SERVER_MEMORY, Inflater,
+    ServerStream, StreamBudget,
 };
 use crate::datagram::MessageCount;
 use crate::fallback::HttpFallback;
@@ -1226,6 +1226,18 @@ impl Server {
         self.route_compress_stream(path).requests
     }
 
+    /// Whether the server refuses `request`, which [`Server::admit`] authorized: it is
+    /// optimistic, but `stream`, what negotiation decided, does not decode its stream-compressed
+    /// requests. A request for an unknown method, or of the wrong kind, gets that status instead,
+    /// as without `optimistic`.
+    pub(crate) fn refuses_optimistic(&self, request: &RpcRequest, stream: &ServerStream) -> bool {
+        compression::refuses_optimistic(request, stream)
+            && matches!(
+                self.routes.get(request.method.as_str()),
+                Some(Route::Streaming { kind, .. }) if *kind == request.rpc_kind()
+            )
+    }
+
     /// The directions of the streaming route at `path` that may use stream compression, or none
     /// when there is no such route.
     pub(crate) fn route_compress_stream(&self, path: &str) -> CompressStream {
@@ -1288,8 +1300,8 @@ impl Server {
             "rpc started"
         );
 
-        let deadline = match self.prepare_request(&request, &cancellation).await {
-            Ok(deadline) => deadline,
+        let deadline = match self.admit(&request, &cancellation).await {
+            Ok(Admitted { deadline }) => deadline,
             Err(status) => {
                 return self.finish_response(
                     &request.method,
@@ -1359,18 +1371,22 @@ impl Server {
             request,
             body,
             request_body,
+            None,
             CancellationToken::new(),
             RequestCounts::default(),
         )
         .await
     }
 
+    /// `admitted` is set for a call that [`Server::admit`] already validated and authorized;
+    /// otherwise that happens here.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn handle_streaming_request_with_cancellation(
         &self,
         request: RpcRequest,
         body: Vec<u8>,
         request_body: BoxStream<Vec<u8>>,
+        admitted: Option<Admitted>,
         cancellation: CancellationToken,
         counts: RequestCounts,
     ) -> BoxStream<ResponseFrame> {
@@ -1389,8 +1405,12 @@ impl Server {
             "streaming rpc started"
         );
 
-        let deadline = match self.prepare_request(&request, &cancellation).await {
-            Ok(deadline) => deadline,
+        let admission = match admitted {
+            Some(admitted) => Ok(admitted),
+            None => self.admit(&request, &cancellation).await,
+        };
+        let deadline = match admission {
+            Ok(Admitted { deadline }) => deadline,
             Err(status) => {
                 return self.finish_streaming_status(
                     &request.method,
@@ -1480,11 +1500,12 @@ impl Server {
         }
     }
 
-    async fn prepare_request(
+    /// Validates `request` and runs the authorizer.
+    pub(crate) async fn admit(
         &self,
         request: &RpcRequest,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<Option<Instant>, Status> {
+    ) -> std::result::Result<Admitted, Status> {
         validate_metadata(&request.metadata)?;
         request.validate_protocol()?;
         let deadline = request_deadline(request)?;
@@ -1501,7 +1522,7 @@ impl Server {
             }
         }
 
-        Ok(deadline)
+        Ok(Admitted { deadline })
     }
 
     fn finish_response(
@@ -1600,6 +1621,13 @@ impl Server {
         record_rpc_started(self.metrics.as_ref(), "", 0);
         self.finish_streaming_response("", 0, started_at, 0, status.code());
     }
+}
+
+/// A call that [`Server::admit`] validated and authorized.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Admitted {
+    /// The call's deadline, from its timeout.
+    pub(crate) deadline: Option<Instant>,
 }
 
 async fn with_deadline<T, F>(future: F, deadline: Option<Instant>) -> std::result::Result<T, Status>

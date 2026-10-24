@@ -22,8 +22,8 @@ mod stream;
 
 pub use stream::CompressStream;
 pub(crate) use stream::{
-    DEFAULT_CLIENT_MEMORY, DEFAULT_SERVER_MEMORY, Inflater, MessageEncoder, ServerStream,
-    StreamBudget, StreamEnable, negotiate_stream, offer_stream,
+    DEFAULT_CLIENT_MEMORY, DEFAULT_SERVER_MEMORY, Inflater, MessageEncoder, Reservation,
+    ServerStream, StreamBudget, StreamEnable, negotiate_stream, offer_stream, refuses_optimistic,
 };
 
 /// The dictionaries a peer holds, for compressed messages.

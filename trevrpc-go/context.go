@@ -85,6 +85,15 @@ func contextWithHandlerContext(ctx context.Context, request *wireRequest) contex
 	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression, streams: request.streams})
 }
 
+// setCallStreams records the call's stream compression, negotiated once the
+// call is authorized and routed, in the handler context ctx carries.
+func setCallStreams(ctx context.Context, streams *serverStreams) {
+	if state, ok := ctx.Value(handlerContextKey{}).(*callState); ok {
+		state.streams = streams
+		state.info.streams = streams
+	}
+}
+
 func cloneMetadata(metadata Metadata) Metadata {
 	if len(metadata) == 0 {
 		return Metadata{}

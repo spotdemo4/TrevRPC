@@ -291,19 +291,14 @@ func exerciseStreamCalls(t *testing.T, transport Transport) {
 		t.Fatal(err)
 	}
 	defer func() { _ = upload.Close() }()
+	// The upload compresses optimistically: it sends every request at once
+	// without waiting for the server's answer.
 	var want strings.Builder
 	for i := range streamTestMessages {
 		if err := upload.Send(compressionSample(i)); err != nil {
 			t.Fatal(err)
 		}
 		want.WriteString(compressionSample(i).GetValue())
-		if i == 0 {
-			// The server sends HEADERS at dispatch, so the answer arrives
-			// while the upload is running.
-			if _, err := upload.Headers(); err != nil {
-				t.Fatal(err)
-			}
-		}
 	}
 	got, err := upload.CloseAndRecv()
 	if err != nil || got.GetValue() != want.String() {
@@ -557,24 +552,33 @@ func TestNegotiateStreamsFollowsTheRoute(t *testing.T) {
 		RouteStreamCompression(StreamCompression{Requests: true, Responses: true}), RouteUnreliable(Unreliable{Requests: true, Responses: true}))
 	RegisterBidirectionalStreaming(server, testPath("Plain"), newStringValue, echo)
 	runtime := server.freeze()
+	optimistic := &streamCompressionInfo{MaxWindowLog: zstd.StreamWindowLog, Optimistic: true}
 	for _, test := range []struct {
-		method              string
-		offer               *streamCompressionInfo
-		answers, compresses bool
+		method                       string
+		offer                        *streamCompressionInfo
+		answers, compresses, refuses bool
 	}{
-		{"Both", streamOffer(), true, true},
-		{"Both", nil, false, false},
-		{"Both", &streamCompressionInfo{MaxWindowLog: 9}, true, false},
-		{"Requests", streamOffer(), true, false},
-		{"Unreliable", streamOffer(), false, false},
-		{"Plain", streamOffer(), false, false},
-		{"Missing", streamOffer(), false, false},
+		{"Both", streamOffer(), true, true, false},
+		{"Both", nil, false, false, false},
+		{"Both", &streamCompressionInfo{MaxWindowLog: 9}, true, false, false},
+		{"Requests", streamOffer(), true, false, false},
+		{"Unreliable", streamOffer(), false, false, false},
+		{"Plain", streamOffer(), false, false, false},
+		{"Missing", streamOffer(), false, false, false},
+		// An optimistic call is answered or refused, never left waiting.
+		{"Both", optimistic, true, true, false},
+		{"Requests", optimistic, true, false, false},
+		{"Both", &streamCompressionInfo{MaxWindowLog: zstd.StreamWindowLog + 1, Optimistic: true}, false, false, true},
+		{"Unreliable", optimistic, false, false, true},
+		{"Plain", optimistic, false, false, true},
+		// An unknown route fails as one.
+		{"Missing", optimistic, false, false, false},
 	} {
 		request := requestFor(test.method, RPCKindBidirectionalStreaming)
 		request.StreamCompression = test.offer
-		streams := runtime.negotiateStreams(request)
-		if (streams.requestInflater() != nil) != test.answers || (streams != nil && (streams.answer != nil) != test.answers) || (streams.responseCompressor() != nil) != test.compresses {
-			t.Errorf("%s with %+v: %+v", test.method, test.offer, streams)
+		streams, refused := runtime.negotiateStreams(request)
+		if (streams.requestInflater() != nil) != test.answers || (streams != nil && (streams.answer != nil) != test.answers) || (streams.responseCompressor() != nil) != test.compresses || refused != test.refuses {
+			t.Errorf("%s with %+v: %+v, refused %v", test.method, test.offer, streams, refused)
 		}
 		streams.close()
 	}

@@ -44,9 +44,11 @@ type DialOptions struct {
 	// StreamCompressionMemory bounds the memory, in bytes, of the zstd
 	// contexts that stream compression holds for the channel's calls (see
 	// StreamCompression): about 350 KiB for a direction the client decodes and
-	// 585 KiB for one it compresses. Calls beyond it are compressed per
-	// message. Zero means 64 MiB, and a negative value turns stream
-	// compression off.
+	// 585 KiB for one it compresses. It also holds the requests an optimistic
+	// call keeps until the server accepts it, up to 1 MiB per call; a send
+	// without room waits for the server's answer. Calls beyond it are
+	// compressed per message. Zero means 64 MiB, and a negative value turns
+	// stream compression off.
 	StreamCompressionMemory int64
 }
 
