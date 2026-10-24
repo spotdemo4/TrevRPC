@@ -41,6 +41,13 @@ type DialOptions struct {
 	// Compression lets messages travel compressed with the dictionaries it
 	// holds; see Compression. It needs cgo, and Dial fails when it is invalid.
 	Compression *Compression
+	// StreamCompressionMemory bounds the memory, in bytes, of the zstd
+	// contexts that stream compression holds for the channel's calls (see
+	// StreamCompression): about 350 KiB for a direction the client decodes and
+	// 585 KiB for one it compresses. Calls beyond it are compressed per
+	// message. Zero means 64 MiB, and a negative value turns stream
+	// compression off.
+	StreamCompressionMemory int64
 }
 
 // TransportPolicy selects the transports a Channel connects with.
@@ -95,18 +102,22 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 	if err != nil {
 		return nil, err
 	}
+	// The budget is the channel's, shared by its connections.
+	streams := newStreamBudget(options.StreamCompressionMemory, defaultClientStreamCompressionMemory, compression)
 	quicConnector := &quicConnector{
 		addr:         addr,
 		tls:          clientTLSConfig(options.TLSConfig, host),
 		quic:         clientQUICConfig(options.QUICConfig, maxFrameSize),
 		maxFrameSize: maxFrameSize,
 		compression:  compression,
+		streams:      streams,
 	}
 	qmuxConnector := &qmuxConnector{
 		addr:         tcpAddr,
 		tls:          clientQMuxTLSConfig(options.TLSConfig, host),
 		maxFrameSize: maxFrameSize,
 		compression:  compression,
+		streams:      streams,
 	}
 	var connector channelConnector
 	switch options.Transport {
@@ -126,6 +137,7 @@ type quicConnector struct {
 	quic         *quic.Config
 	maxFrameSize int
 	compression  *compressionConfig
+	streams      *streamBudget
 }
 
 func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) {
@@ -139,6 +151,7 @@ func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) 
 	client := newStreamClient(connOpener{conn}, c.maxFrameSize)
 	// Each connection negotiates its dictionaries afresh.
 	client.compression = newClientCompression(c.compression)
+	client.streams = c.streams
 	if conn.ConnectionState().SupportsDatagrams.Remote {
 		// Each connection, and so each reconnect, has its own flow IDs.
 		client.datagrams = newDatagramMux(conn, 0, false, 0)

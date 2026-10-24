@@ -7,11 +7,13 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::compression::{Accept, ClientCompression, Dict, inflate};
+use crate::compression::{
+    Accept, ClientCompression, Dict, Inflater, MessageEncoder, StreamEnable, inflate,
+};
 use crate::framing::{
     self, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_payload, frame_type, is_known_frame_type,
 };
-use crate::wire::DictionaryInfo;
+use crate::wire::{DictionaryInfo, StreamCompression};
 use crate::{BoxStream, Error, Result, RpcHeaders, RpcRequest, RpcStatus, Status, varint};
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt};
@@ -134,10 +136,10 @@ pub struct FrameChunks {
     scratch: BytesMut,
     chunks: Vec<Bytes>,
     max_frame_size: usize,
-    /// Compresses messages that it makes shorter, when set.
-    compress: Option<Arc<Dict>>,
     /// The answer to a dictionary query that the next HEADERS frame carries.
     answer: Option<Vec<DictionaryInfo>>,
+    /// The answer to a stream compression offer that the next HEADERS frame carries.
+    stream_answer: Option<StreamCompression>,
 }
 
 impl FrameChunks {
@@ -147,16 +149,9 @@ impl FrameChunks {
             scratch: BytesMut::with_capacity(scratch),
             chunks: Vec::new(),
             max_frame_size,
-            compress: None,
             answer: None,
+            stream_answer: None,
         }
-    }
-
-    /// Makes the writer compress messages with `dict`, when set.
-    #[must_use]
-    pub fn with_compression(mut self, dict: Option<Arc<Dict>>) -> Self {
-        self.compress = dict;
-        self
     }
 
     /// The scratch bytes a MESSAGE frame with a payload of `len` bytes needs.
@@ -178,17 +173,12 @@ impl FrameChunks {
         framing::put_protobuf_frame(&mut self.scratch, frame_type, message, self.max_frame_size)
     }
 
-    pub fn message(&mut self, body: Bytes) -> Result<()> {
+    /// Adds a message frame, which `encoder` compresses as its direction may.
+    pub fn message(&mut self, body: Bytes, encoder: &mut MessageEncoder) -> Result<()> {
         // A message is checked against the frame size limit uncompressed, which limits the
         // message the receiver decompresses.
         framing::validate_payload_len(body.len(), self.max_frame_size)?;
-        let (frame_type, body) = self
-            .compress
-            .as_ref()
-            .and_then(|dict| dict.compress(&body))
-            .map_or((frame_type::MESSAGE, body), |compressed| {
-                (frame_type::ZSTD_MESSAGE, compressed)
-            });
+        let (frame_type, body) = encoder.encode(body);
         framing::put_frame_header(
             &mut self.scratch,
             frame_type,
@@ -204,14 +194,19 @@ impl FrameChunks {
         Ok(())
     }
 
-    pub fn response_frame(&mut self, frame: ResponseFrame) -> Result<()> {
+    pub fn response_frame(
+        &mut self,
+        frame: ResponseFrame,
+        encoder: &mut MessageEncoder,
+    ) -> Result<()> {
         match frame {
-            ResponseFrame::Message(body) => self.message(body),
+            ResponseFrame::Message(body) => self.message(body, encoder),
             ResponseFrame::Headers(metadata) => {
                 let headers = RpcHeaders {
                     metadata,
                     extensions: Vec::new(),
                     dictionaries: self.answer.take().unwrap_or_default(),
+                    stream_compression: self.stream_answer.take(),
                 };
                 self.protobuf(frame_type::HEADERS, &headers)
             }
@@ -234,10 +229,12 @@ const FRAME_ESTIMATE: usize = 64;
 /// How a server call writes its response frames.
 #[derive(Debug, Default)]
 pub struct ResponseCodec {
-    /// The dictionary the response messages are compressed with, if any.
-    pub(crate) compress: Option<Arc<Dict>>,
+    /// How the response messages are compressed.
+    pub(crate) encoder: MessageEncoder,
     /// The answer to the request's dictionary query, which the call's HEADERS carry.
     pub(crate) answer: Option<Vec<DictionaryInfo>>,
+    /// The answer to the request's stream compression offer, which the call's HEADERS carry.
+    pub(crate) stream_answer: Option<StreamCompression>,
 }
 
 /// Writes response frames, draining `frames`, with one write.
@@ -253,57 +250,67 @@ pub async fn write_response_frames<W: FrameWrite>(
             ResponseFrame::Headers(_) | ResponseFrame::Status(_) => FRAME_ESTIMATE,
         })
     });
-    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch)
-        .with_compression(codec.compress.clone());
+    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
     if frames
         .iter()
         .any(|frame| matches!(frame, ResponseFrame::Headers(_)))
     {
         chunks.answer = codec.answer.take();
+        chunks.stream_answer = codec.stream_answer.take();
     }
     for frame in frames.drain(..) {
-        chunks.response_frame(frame)?;
+        chunks.response_frame(frame, &mut codec.encoder)?;
     }
     chunks.write(send).await
 }
 
-/// Writes a REQUEST frame followed by `messages` with one write, compressing the messages with
-/// `compress` when set.
+/// Writes a REQUEST frame followed by `messages` with one write, the messages encoded by
+/// `encoder`.
 pub async fn write_request<W: FrameWrite>(
     send: &mut W,
     request: &RpcRequest,
     messages: Vec<Bytes>,
     max_frame_size: usize,
-    compress: Option<&Arc<Dict>>,
+    encoder: &mut MessageEncoder,
 ) -> Result<()> {
     let scratch = messages.iter().fold(
         MAX_FRAME_HEADER_LEN.saturating_add(request.encoded_len()),
         |total, message| total.saturating_add(FrameChunks::scratch_len(message.len())),
     );
-    let mut chunks =
-        FrameChunks::with_capacity(max_frame_size, scratch).with_compression(compress.cloned());
+    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
     chunks.protobuf(frame_type::REQUEST, request)?;
     for message in messages {
-        chunks.message(message)?;
+        chunks.message(message, encoder)?;
     }
     chunks.write(send).await
 }
 
-/// Writes `messages` as MESSAGE frames with one write, draining them, compressing them with
-/// `compress` when set.
+/// Writes a REQUEST frame and the one request message of a unary call with one write,
+/// compressing the message with `compress` when set.
+pub async fn write_unary_request<W: FrameWrite>(
+    send: &mut W,
+    request: &RpcRequest,
+    message: Bytes,
+    max_frame_size: usize,
+    compress: Option<&Arc<Dict>>,
+) -> Result<()> {
+    let mut encoder = MessageEncoder::new(compress.cloned());
+    write_request(send, request, vec![message], max_frame_size, &mut encoder).await
+}
+
+/// Writes `messages` as message frames with one write, draining them, encoded by `encoder`.
 async fn write_message_frames<W: FrameWrite>(
     send: &mut W,
     messages: &mut Vec<Bytes>,
     max_frame_size: usize,
-    compress: Option<&Arc<Dict>>,
+    encoder: &mut MessageEncoder,
 ) -> Result<()> {
     let scratch = messages.iter().fold(0_usize, |total, message| {
         total.saturating_add(FrameChunks::scratch_len(message.len()))
     });
-    let mut chunks =
-        FrameChunks::with_capacity(max_frame_size, scratch).with_compression(compress.cloned());
+    let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
     for message in messages.drain(..) {
-        chunks.message(message)?;
+        chunks.message(message, encoder)?;
     }
     chunks.write(send).await
 }
@@ -329,14 +336,13 @@ fn take_ready_messages(
 /// Writes a call's request half: the REQUEST frame, then every request message.
 ///
 /// The REQUEST frame and the messages that are already available (the one message of a unary or
-/// server-streaming call) share the first write. Messages are compressed with `compress` when
-/// set.
+/// server-streaming call) share the first write. Messages are encoded by `encoder`.
 pub async fn write_request_stream<W: FrameWrite>(
     send: &mut W,
     request: &RpcRequest,
     request_body: &mut BoxStream<Vec<u8>>,
     max_frame_size: usize,
-    compress: Option<&Arc<Dict>>,
+    encoder: &mut MessageEncoder,
 ) -> Result<()> {
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     let mut done = take_ready_messages(request_body, &mut batch)?;
@@ -345,7 +351,7 @@ pub async fn write_request_stream<W: FrameWrite>(
         request,
         std::mem::take(&mut batch),
         max_frame_size,
-        compress,
+        encoder,
     )
     .await?;
 
@@ -355,7 +361,7 @@ pub async fn write_request_stream<W: FrameWrite>(
         };
         batch.push(Bytes::from(body));
         done = take_ready_messages(request_body, &mut batch)?;
-        write_message_frames(send, &mut batch, max_frame_size, compress).await?;
+        write_message_frames(send, &mut batch, max_frame_size, encoder).await?;
     }
     Ok(())
 }
@@ -372,9 +378,9 @@ pub async fn write_request_stream_datagrams<W: FrameWrite>(
     request_body: &mut BoxStream<Vec<u8>>,
     max_frame_size: usize,
     datagrams: &crate::datagram::FlowSender,
-    compress: Option<&Arc<Dict>>,
+    encoder: &mut MessageEncoder,
 ) -> Result<()> {
-    write_request(send, request, Vec::new(), max_frame_size, None).await?;
+    write_request(send, request, Vec::new(), max_frame_size, encoder).await?;
 
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     let mut on_stream = Vec::new();
@@ -390,7 +396,7 @@ pub async fn write_request_stream_datagrams<W: FrameWrite>(
             .send_batch(&mut batch, &mut on_stream, std::future::pending())
             .await;
         if !on_stream.is_empty() {
-            write_message_frames(send, &mut on_stream, max_frame_size, compress).await?;
+            write_message_frames(send, &mut on_stream, max_frame_size, encoder).await?;
         }
     }
     // The caller finishes the stream next, and its FIN must not overtake the datagrams.
@@ -514,10 +520,16 @@ pub struct ResponseReading {
     pub(crate) accept: Accept,
     /// The connection to teach the answer in the call's HEADERS, when the request queried.
     pub(crate) learn: Option<Arc<ClientCompression>>,
+    /// The decompressing state of stream-compressed responses, when the request offered them.
+    pub(crate) stream: Option<Inflater>,
+    /// The request direction to enable when the call's HEADERS answer the stream compression
+    /// offer.
+    pub(crate) enable_requests: Option<Arc<StreamEnable>>,
 }
 
 /// Decodes a frame received on a response stream, decompressing a `ZSTD_MESSAGE` with the
-/// dictionaries `reading` accepts and learning the answer of its HEADERS.
+/// dictionaries `reading` accepts and a `ZSTD_STREAM_MESSAGE` with its stream state, and learning
+/// the answers of its HEADERS.
 ///
 /// A REQUEST frame has no place on a response stream.
 pub fn decode_response_frame(
@@ -531,10 +543,20 @@ pub fn decode_response_frame(
         frame_type::ZSTD_MESSAGE => inflate(&reading.accept, &payload, max_frame_size)
             .map(ResponseFrame::Message)
             .map_err(|rejected| rejected.into_error(Status::internal)),
+        frame_type::ZSTD_STREAM_MESSAGE => reading
+            .stream
+            .as_mut()
+            .ok_or_else(|| Error::from(Status::internal(NOT_STREAM_COMPRESSED)))?
+            .decode(&payload, max_frame_size)
+            .map(ResponseFrame::Message)
+            .map_err(|rejected| rejected.into_error(Status::internal)),
         frame_type::HEADERS => {
             let headers = decode_payload::<RpcHeaders>(&payload)?;
             if let Some(connection) = reading.learn.take() {
                 connection.learn(&headers.dictionaries);
+            }
+            if let Some(requests) = reading.enable_requests.take() {
+                requests.enable(headers.stream_compression.as_ref());
             }
             Ok(ResponseFrame::Headers(headers.metadata))
         }
@@ -565,6 +587,10 @@ pub async fn read_response_frame<R: FrameRead>(
     let payload = read_payload(recv, header.payload_len).await?;
     decode_response_frame(header.frame_type, payload, reading, max_frame_size).map(Some)
 }
+
+/// A `ZSTD_STREAM_MESSAGE` in a direction whose receiver did not enable stream compression.
+const NOT_STREAM_COMPRESSED: &str =
+    "stream-compressed message where stream compression is not enabled";
 
 /// A frame that follows the REQUEST frame on a request stream.
 pub enum RequestFrame {
@@ -600,11 +626,13 @@ where
 /// a clean end of stream.
 ///
 /// A second REQUEST or a HEADERS frame is a protocol error, rejected before its payload is read. A
-/// `ZSTD_MESSAGE` is decompressed with the dictionaries `accept` holds.
+/// `ZSTD_MESSAGE` is decompressed with the dictionaries `accept` holds, and a
+/// `ZSTD_STREAM_MESSAGE` with `stream`, the direction's state when the server enabled it.
 pub async fn read_request_frame<R, F>(
     recv: &mut R,
     max_frame_size: usize,
     accept: &Accept,
+    stream: Option<&mut Inflater>,
     mut on_skipped: F,
 ) -> Result<Option<RequestFrame>>
 where
@@ -622,6 +650,16 @@ where
         frame_type::ZSTD_MESSAGE => {
             let payload = read_payload(recv, header.payload_len).await?;
             let message = inflate(accept, &payload, max_frame_size)
+                .map_err(|rejected| rejected.into_error(Status::invalid_argument))?;
+            Ok(Some(RequestFrame::Message(message)))
+        }
+        frame_type::ZSTD_STREAM_MESSAGE => {
+            let Some(stream) = stream else {
+                return Err(Error::from(Status::invalid_argument(NOT_STREAM_COMPRESSED)));
+            };
+            let payload = read_payload(recv, header.payload_len).await?;
+            let message = stream
+                .decode(&payload, max_frame_size)
                 .map_err(|rejected| rejected.into_error(Status::invalid_argument))?;
             Ok(Some(RequestFrame::Message(message)))
         }
@@ -746,7 +784,7 @@ mod tests {
         FrameChunks, RequestFrame, ResponseCodec, ResponseReading, drain_fin_after_terminal_status,
         read_frame_header, read_request, read_request_end, read_request_frame, read_response_frame,
     };
-    use crate::compression::Accept;
+    use crate::compression::{Accept, MessageEncoder};
     use crate::framing::{
         DEFAULT_MAX_FRAME_SIZE, ResponseFrame, encode_frame, encode_message_frame,
         encode_protobuf_frame, frame_type,
@@ -926,10 +964,18 @@ mod tests {
     fn writer_chains_large_messages_and_joins_small_ones() {
         let large = Bytes::from(vec![9_u8; super::COALESCE_MAX + 1]);
         let mut chunks = FrameChunks::with_capacity(DEFAULT_MAX_FRAME_SIZE, 0);
-        chunks.message(Bytes::from_static(b"a")).unwrap();
-        chunks.message(Bytes::from_static(b"b")).unwrap();
-        chunks.message(large.clone()).unwrap();
-        chunks.message(Bytes::from_static(b"c")).unwrap();
+        chunks
+            .message(Bytes::from_static(b"a"), &mut MessageEncoder::default())
+            .unwrap();
+        chunks
+            .message(Bytes::from_static(b"b"), &mut MessageEncoder::default())
+            .unwrap();
+        chunks
+            .message(large.clone(), &mut MessageEncoder::default())
+            .unwrap();
+        chunks
+            .message(Bytes::from_static(b"c"), &mut MessageEncoder::default())
+            .unwrap();
         chunks.seal_scratch();
 
         // The small frames and the large frame's header, the large payload, the last frame.
@@ -945,7 +991,7 @@ mod tests {
     fn writer_rejects_oversized_messages_before_writing() {
         let mut chunks = FrameChunks::with_capacity(3, 0);
         let error = chunks
-            .message(Bytes::from_static(b"four"))
+            .message(Bytes::from_static(b"four"), &mut MessageEncoder::default())
             .expect_err("oversized message must fail");
         assert_eq!(error.into_status().code(), Code::ResourceExhausted);
         assert!(chunks.chunks.is_empty() && chunks.scratch.is_empty());
@@ -956,9 +1002,15 @@ mod tests {
         let request = RpcRequest::new("/svc/m");
         let mut sink = Sink::default();
         let mut body = crate::stream::from_iter([b"hi".to_vec()]);
-        super::write_request_stream(&mut sink, &request, &mut body, DEFAULT_MAX_FRAME_SIZE, None)
-            .await
-            .expect("request should write");
+        super::write_request_stream(
+            &mut sink,
+            &request,
+            &mut body,
+            DEFAULT_MAX_FRAME_SIZE,
+            &mut MessageEncoder::default(),
+        )
+        .await
+        .expect("request should write");
 
         assert_eq!(sink.0.len(), 1);
         let mut expected =
@@ -1013,6 +1065,7 @@ mod tests {
                     metadata: Metadata::new(),
                     extensions: vec![1],
                     dictionaries: Vec::new(),
+                    stream_compression: None,
                 },
                 1024,
             )
@@ -1108,7 +1161,7 @@ mod tests {
         wire.extend(encode_message_frame(b"m", 1024).unwrap());
         let mut recv = Script::new(wire);
         let mut skipped = Vec::new();
-        let frame = read_request_frame(&mut recv, 1024, &Accept::None, |len| {
+        let frame = read_request_frame(&mut recv, 1024, &Accept::None, None, |len| {
             skipped.push(len);
             Ok(())
         })
@@ -1123,7 +1176,7 @@ mod tests {
     #[tokio::test]
     async fn skipped_frames_can_fail_the_read() {
         let mut recv = Script::new([grease(10), grease(10)].concat());
-        let error = read_request_frame(&mut recv, 1024, &Accept::None, |_| {
+        let error = read_request_frame(&mut recv, 1024, &Accept::None, None, |_| {
             Err(Status::resource_exhausted("too much").into())
         })
         .await
@@ -1155,13 +1208,16 @@ mod tests {
 
         // Afterwards only MESSAGE and STATUS may follow.
         for wire in [&request, &headers] {
-            let error =
-                read_request_frame(&mut Script::new(wire.clone()), 1024, &Accept::None, |_| {
-                    Ok(())
-                })
-                .await
-                .err()
-                .expect("REQUEST and HEADERS must be rejected");
+            let error = read_request_frame(
+                &mut Script::new(wire.clone()),
+                1024,
+                &Accept::None,
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .err()
+            .expect("REQUEST and HEADERS must be rejected");
             assert_eq!(error.into_status().code(), Code::InvalidArgument);
         }
     }

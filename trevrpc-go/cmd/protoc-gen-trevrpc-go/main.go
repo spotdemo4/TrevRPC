@@ -9,6 +9,8 @@ import (
 
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 	plugin "google.golang.org/protobuf/types/pluginpb"
 
 	"trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb"
@@ -209,10 +211,13 @@ func methodOptions(method *protogen.Method) *trevrpcpb.MethodOptions {
 }
 
 // validateMethodOptions rejects an unreliable direction of a method that does
-// not stream that direction.
+// not stream that direction, and stream compression on a unary method.
 func validateMethodOptions(service *protogen.Service) error {
 	for _, method := range service.Methods {
 		options := methodOptions(method)
+		if options.GetCompressStream() && !method.Desc.IsStreamingClient() && !method.Desc.IsStreamingServer() {
+			return fmt.Errorf("%s: compress_stream requires a streaming method", method.Desc.FullName())
+		}
 		if options.GetUnreliableRequests() && !method.Desc.IsStreamingClient() {
 			return fmt.Errorf("%s: unreliable_requests requires a client-streaming or bidirectional method", method.Desc.FullName())
 		}
@@ -231,6 +236,75 @@ func (g fileGenerator) unreliableLiteral(method *protogen.Method) string {
 		return ""
 	}
 	return fmt.Sprintf("%s{Requests: %t, Responses: %t}", g.runtime("Unreliable"), options.GetUnreliableRequests(), options.GetUnreliableResponses())
+}
+
+// streamCompressionLiteral returns the Go expression of the StreamCompression
+// value of method, or "" when no direction may be stream-compressed.
+func (g fileGenerator) streamCompressionLiteral(method *protogen.Method) string {
+	requests, responses := streamCompressionDirections(method)
+	if !requests && !responses {
+		return ""
+	}
+	return fmt.Sprintf("%s{Requests: %t, Responses: %t}", g.runtime("StreamCompression"), requests, responses)
+}
+
+// streamCompressionDirections returns the directions of method that its
+// compress_stream option lets be stream-compressed: those that stream and
+// whose message type has no field marked debug_redact.
+func streamCompressionDirections(method *protogen.Method) (requests, responses bool) {
+	if !methodOptions(method).GetCompressStream() {
+		return false, false
+	}
+	requests = method.Desc.IsStreamingClient() && !hasRedactedField(method.Input.Desc, map[protoreflect.FullName]bool{})
+	responses = method.Desc.IsStreamingServer() && !hasRedactedField(method.Output.Desc, map[protoreflect.FullName]bool{})
+	return requests, responses
+}
+
+// hasRedactedField reports whether message has a field marked debug_redact,
+// directly or in a message type it contains. seen holds the types already
+// looked at, so recursive types end.
+func hasRedactedField(message protoreflect.MessageDescriptor, seen map[protoreflect.FullName]bool) bool {
+	if seen[message.FullName()] {
+		return false
+	}
+	seen[message.FullName()] = true
+	fields := message.Fields()
+	for i := range fields.Len() {
+		field := fields.Get(i)
+		if options, ok := field.Options().(*descriptorpb.FieldOptions); ok && options.GetDebugRedact() {
+			return true
+		}
+		if nested := field.Message(); nested != nil && hasRedactedField(nested, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaCallOptions returns the call options the schema sets on method, as Go
+// expressions.
+func (g fileGenerator) schemaCallOptions(method *protogen.Method) []string {
+	var options []string
+	if unreliable := g.unreliableLiteral(method); unreliable != "" {
+		options = append(options, g.runtime("WithUnreliable")+"("+unreliable+")")
+	}
+	if streams := g.streamCompressionLiteral(method); streams != "" {
+		options = append(options, g.runtime("WithStreamCompression")+"("+streams+")")
+	}
+	return options
+}
+
+// schemaRouteOptions returns the route options the schema sets on method, as
+// Go expressions.
+func (g fileGenerator) schemaRouteOptions(method *protogen.Method) []string {
+	var options []string
+	if unreliable := g.unreliableLiteral(method); unreliable != "" {
+		options = append(options, g.runtime("RouteUnreliable")+"("+unreliable+")")
+	}
+	if streams := g.streamCompressionLiteral(method); streams != "" {
+		options = append(options, g.runtime("RouteStreamCompression")+"("+streams+")")
+	}
+	return options
 }
 
 func (g fileGenerator) generateService(service *protogen.Service) {
@@ -310,8 +384,8 @@ func (g fileGenerator) generateClientMethods(clientName, serviceName string, met
 	factory := g.messageFactory(method.Output)
 	options := "options ..." + g.runtime("CallOption")
 	merged := "c.mergedCallOptions(options)..."
-	if unreliable := g.unreliableLiteral(method); unreliable != "" {
-		merged = "c.mergedCallOptions(options, " + g.runtime("WithUnreliable") + "(" + unreliable + "))..."
+	if schema := g.schemaCallOptions(method); len(schema) > 0 {
+		merged = "c.mergedCallOptions(options, " + strings.Join(schema, ", ") + ")..."
 	}
 	methodName := method.GoName
 	callPrefix := "(ctx, c.transport, " + fullMethodConstName(serviceName, method) + ", "
@@ -351,8 +425,8 @@ func (g fileGenerator) generateServerRegistration(serviceName string, method *pr
 		helper = g.runtime("RegisterUnary")
 	}
 	route := ""
-	if unreliable := g.unreliableLiteral(method); unreliable != "" {
-		route = ", " + g.runtime("RouteUnreliable") + "(" + unreliable + ")"
+	if schema := g.schemaRouteOptions(method); len(schema) > 0 {
+		route = ", " + strings.Join(schema, ", ")
 	}
 	g.generated.P(helper, "[", inputType, ", ", outputType, "](server, ", fullMethodConstName(serviceName, method), ", ", factory, ", implementation.", method.GoName, route, ")")
 }

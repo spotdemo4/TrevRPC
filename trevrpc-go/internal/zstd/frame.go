@@ -82,24 +82,12 @@ func ParseHeader(payload []byte) (Header, error) {
 		return Header{}, ErrInvalid
 	}
 	for {
-		if len(payload)-pos < 3 {
+		next, last, ok := nextBlock(payload, pos)
+		if !ok {
 			return Header{}, ErrInvalid
 		}
-		bh := uint32(payload[pos]) | uint32(payload[pos+1])<<8 | uint32(payload[pos+2])<<16
-		pos += 3
-		size := int(bh >> 3)
-		switch (bh >> 1) & 0x03 {
-		case 0, 2: // Raw_Block, Compressed_Block
-		case 1: // RLE_Block
-			size = 1
-		default:
-			return Header{}, ErrInvalid
-		}
-		if len(payload)-pos < size {
-			return Header{}, ErrInvalid
-		}
-		pos += size
-		if bh&1 != 0 { // Last_Block
+		pos = next
+		if last {
 			break
 		}
 	}
@@ -110,6 +98,97 @@ func ParseHeader(payload []byte) (Header, error) {
 		return Header{}, ErrInvalid
 	}
 	return h, nil
+}
+
+// nextBlock walks the block whose header starts at pos and returns where the
+// next block starts and whether this one is the Last_Block. It reports false
+// for a reserved block type or a block that does not fit in data. Block
+// contents are not checked.
+func nextBlock(data []byte, pos int) (next int, last bool, ok bool) {
+	if len(data)-pos < 3 {
+		return 0, false, false
+	}
+	bh := uint32(data[pos]) | uint32(data[pos+1])<<8 | uint32(data[pos+2])<<16
+	pos += 3
+	size := int(bh >> 3)
+	switch (bh >> 1) & 0x03 {
+	case 0, 2: // Raw_Block, Compressed_Block
+	case 1: // RLE_Block
+		size = 1
+	default:
+		return 0, false, false
+	}
+	if len(data)-pos < size {
+		return 0, false, false
+	}
+	return pos + size, bh&1 != 0, true
+}
+
+// StreamWindowLog is the window, as a base-2 logarithm, that TrevRPC's stream
+// compression contexts use and that its receivers decode. A peer advertising
+// less than MinStreamWindowLog enables nothing.
+const (
+	StreamWindowLog    = 16
+	MinStreamWindowLog = 10
+)
+
+// StreamChunk is what a receiver learns from validating the zstd data of a
+// ZSTD_STREAM_MESSAGE.
+type StreamChunk struct {
+	// StartsFrame reports that the chunk begins with a frame header, and
+	// DictID is that frame's Dictionary_ID, zero for none.
+	StartsFrame bool
+	DictID      uint32
+	// EndsFrame reports that the chunk's last block ends the frame, so the
+	// next chunk starts a new one.
+	EndsFrame bool
+}
+
+// ParseStreamChunk validates chunk, the zstd data of a ZSTD_STREAM_MESSAGE
+// (see the "Stream Compression" section of the wire format). atFrameStart
+// says that no frame is open, so a non-empty chunk must start with a frame
+// header: one without Single_Segment_flag, Frame_Content_Size_flag,
+// Content_Checksum_flag or the reserved bit, whose window is at most
+// 2^maxWindowLog. It then walks the block headers: a chunk is whole blocks,
+// and a Last_Block ends it. An empty chunk is an empty message and changes
+// nothing. Block contents are not checked; decompression does that.
+func ParseStreamChunk(chunk []byte, atFrameStart bool, maxWindowLog int) (StreamChunk, error) {
+	var result StreamChunk
+	if len(chunk) == 0 {
+		return result, nil
+	}
+	pos := 0
+	if atFrameStart {
+		fhd := chunk[0]
+		// Frame_Content_Size_flag (bits 7-6), Single_Segment_flag (bit 5), the
+		// reserved bit (bit 3) and Content_Checksum_flag (bit 2) must be unset.
+		if fhd&0xEC != 0 || len(chunk) < 2 {
+			return StreamChunk{}, ErrInvalid
+		}
+		wd := chunk[1]
+		base := uint64(1) << (10 + uint64(wd>>3))
+		if base+base/8*uint64(wd&7) > uint64(1)<<maxWindowLog {
+			return StreamChunk{}, ErrInvalid
+		}
+		didSize := [4]int{0, 1, 2, 4}[fhd&0x03]
+		pos = 2 + didSize
+		if len(chunk) < pos {
+			return StreamChunk{}, ErrInvalid
+		}
+		for i := range didSize {
+			result.DictID |= uint32(chunk[2+i]) << (8 * i)
+		}
+		result.StartsFrame = true
+	}
+	for pos < len(chunk) {
+		next, last, ok := nextBlock(chunk, pos)
+		if !ok || (last && next != len(chunk)) {
+			return StreamChunk{}, ErrInvalid
+		}
+		pos = next
+		result.EndsFrame = last
+	}
+	return result, nil
 }
 
 // Fingerprint returns a dictionary's fingerprint: the first 8 bytes of its

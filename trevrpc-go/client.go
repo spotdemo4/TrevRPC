@@ -85,6 +85,8 @@ type callConfig struct {
 	responseHeaders  *Metadata
 	responseMetadata *Metadata
 	unreliable       Unreliable
+	// streamCompression is what the call may stream-compress.
+	streamCompression StreamCompression
 }
 
 // CallOption customizes a single RPC call.
@@ -356,6 +358,8 @@ func prepareClientRequest(method string, kind RPCKind, config callConfig, deadli
 		Kind:         kind,
 		TimeoutNanos: deadlineTimeoutNanos(deadline, now),
 		unreliable:   config.unreliable,
+		// The kind decides which directions stream.
+		streamCompression: config.streamCompression.effective(kind),
 	}, nil
 }
 

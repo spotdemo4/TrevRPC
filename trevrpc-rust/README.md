@@ -195,6 +195,13 @@ Their messages then travel in QUIC datagrams where the connection has them (nati
 
 The runtime options underneath are `trevrpc::Unreliable`, set on a client call with `CallOptions::with_unreliable` and on a server route with `RouteOptions::with_unreliable` and `Server::route_streaming_with_options`. A handler sees how many request messages arrived as datagrams with `RequestContext::datagram_requests_received`. The QUIC configurations from `Server::quic_config` and `ChannelConfig::quic_config` buffer at most 128 KiB of incoming datagrams per connection.
 
+## Compression
+
+Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in two ways that combine:
+
+- **Dictionaries:** `ChannelConfig::with_compression` and `ServerOptions::with_compression` take a `Compression` holding dictionaries trained with `zstd --train`, each with the protobuf message types it compresses. Generated code passes each method's message types, which pick the dictionaries.
+- **Stream compression:** a streaming method marked `option (trevrpc.method) = {compress_stream: true}` compresses each streamed direction with one zstd context per call, from its third message, with nothing to configure. `ServerOptions::with_stream_compression_memory` (256 MiB by default) and `ChannelConfig::with_stream_compression_memory` (64 MiB) bound the memory those contexts hold; 0 turns it off.
+
 ## TCP fallback
 
 TCP is opt-in. `Server::tcp_tls_config` builds the TLS configuration for a TCP listener, setting the ALPN list from the options (`qmux-02.trevrpc-1` always, `h2` when HTTP is enabled, `http/1.1` for the WebSocket upgrade when WebTransport is enabled). `Server::serve_with_tcp` then serves QUIC and TCP together, sharing the connection and request limits and graceful shutdown:

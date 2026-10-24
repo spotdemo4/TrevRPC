@@ -183,3 +183,54 @@ fn false_flags_are_not_marks() {
     ));
     assert!(!content.contains("Unreliable"));
 }
+
+#[test]
+fn compress_stream_is_emitted_for_the_directions_that_stream_without_redacted_fields() {
+    let content = generated(
+        r#"syntax = "proto3";
+package demo.v1;
+import "trevrpc/options.proto";
+message Position { int32 x = 1; }
+message Secret { string token = 1 [debug_redact = true]; }
+message Holder { repeated Secret secrets = 1; }
+service Telemetry {
+    rpc Track(stream Position) returns (stream Position) { option (trevrpc.method) = { compress_stream: true }; }
+    rpc Upload(stream Position) returns (Position) { option (trevrpc.method) = { compress_stream: true }; }
+    rpc Leak(stream Position) returns (stream Holder) { option (trevrpc.method) = { compress_stream: true }; }
+    rpc Hidden(Secret) returns (stream Secret) { option (trevrpc.method) = { compress_stream: true }; }
+}
+"#,
+    );
+
+    assert!(content.contains(
+        "bidirectional_streaming(&self.transport, telemetry_paths::TRACK, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress_stream(::trevrpc::CompressStream::BOTH)"
+    ), "{content}");
+    assert!(content.contains(
+        "client_streaming(&self.transport, telemetry_paths::UPLOAD, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress_stream(::trevrpc::CompressStream::REQUESTS)"
+    ));
+    // A message type that holds a redacted field, even in a nested message, is never compressed
+    // this way, so its direction is left out.
+    assert!(content.contains(
+        "bidirectional_streaming(&self.transport, telemetry_paths::LEAK, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Holder\").compress_stream(::trevrpc::CompressStream::REQUESTS)"
+    ));
+    assert!(content.contains(
+        "server_streaming(&self.transport, telemetry_paths::HIDDEN, request, self.default_options.clone()).message_types(\"demo.v1.Secret\", \"demo.v1.Secret\")\n"
+    ));
+    assert!(content.contains(
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress_stream(::trevrpc::CompressStream::BOTH), move |context,"
+    ));
+    assert!(content.contains(
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Holder\").with_compress_stream(::trevrpc::CompressStream::REQUESTS), move |context,"
+    ));
+}
+
+#[test]
+fn compress_stream_needs_a_streaming_method() {
+    let response = generate(&service(
+        "rpc Call(Position) returns (Position) { option (trevrpc.method) = { compress_stream: true }; }",
+    ));
+    assert_eq!(
+        response.error.as_deref(),
+        Some("demo.v1.Telemetry.Call: compress_stream requires a streaming method")
+    );
+}

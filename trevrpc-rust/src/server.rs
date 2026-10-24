@@ -10,8 +10,11 @@ use futures_util::StreamExt;
 use tokio::sync::watch;
 
 use crate::client::MessageTypes;
-use crate::compression::{Accept, Compression, CompressionConfig};
-use crate::datagram::DatagramCount;
+use crate::compression::{
+    Accept, CompressStream, Compression, CompressionConfig, DEFAULT_SERVER_MEMORY, Inflater,
+    StreamBudget,
+};
+use crate::datagram::MessageCount;
 use crate::fallback::HttpFallback;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::response::ResponseMetadata;
@@ -53,16 +56,34 @@ enum Route {
 pub struct RouteOptions {
     unreliable: Unreliable,
     message_types: Option<MessageTypes>,
+    compress_stream: CompressStream,
 }
 
 impl RouteOptions {
-    /// Creates route options with every setting at its default: reliable, without message types.
+    /// Creates route options with every setting at its default: reliable, without message types
+    /// or stream compression.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             unreliable: Unreliable::NONE,
             message_types: None,
+            compress_stream: CompressStream::NONE,
         }
+    }
+
+    /// Lets the route's streamed messages be compressed with one zstd context per call in the
+    /// directions `directions` sets; see [`CompressStream`]. Generated code passes the schema's
+    /// `compress_stream`. Directions the route's kind does not stream are ignored.
+    #[must_use]
+    pub const fn with_compress_stream(mut self, directions: CompressStream) -> Self {
+        self.compress_stream = directions;
+        self
+    }
+
+    /// Returns the directions that may use stream compression.
+    #[must_use]
+    pub const fn compress_stream(&self) -> CompressStream {
+        self.compress_stream
     }
 
     /// Names the route's request and response message types, which pick the dictionary of
@@ -112,6 +133,17 @@ pub struct Server {
     metrics: Arc<dyn Metrics>,
     /// The digested dictionaries of `options`, or why they are invalid, which serving reports.
     compression: std::result::Result<Option<Arc<CompressionConfig>>, Status>,
+    /// The memory stream compression contexts may hold, `None` when it is disabled.
+    stream_budget: Option<Arc<StreamBudget>>,
+}
+
+/// The counters of a call's request messages that its handler context reports.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestCounts {
+    /// The request messages that arrived as datagrams.
+    pub(crate) datagrams: MessageCount,
+    /// The request messages that arrived stream-compressed.
+    pub(crate) stream_compressed: MessageCount,
 }
 
 /// Identifies the first lifecycle event that cancelled an RPC.
@@ -223,7 +255,9 @@ pub struct RequestContext {
     metadata: Metadata,
     deadline: Option<Instant>,
     cancellation: CancellationToken,
-    datagrams: DatagramCount,
+    datagrams: MessageCount,
+    /// Counts the request messages that arrived stream-compressed.
+    stream_compressed: MessageCount,
     /// The response metadata the handler sets, shared by every clone of the context.
     response: ResponseMetadata,
 }
@@ -237,7 +271,7 @@ impl RequestContext {
             request.metadata.clone(),
             deadline,
             CancellationToken::new(),
-            DatagramCount::default(),
+            RequestCounts::default(),
         )
     }
 
@@ -247,7 +281,7 @@ impl RequestContext {
         metadata: Metadata,
         deadline: Option<Instant>,
         cancellation: CancellationToken,
-        datagrams: DatagramCount,
+        counts: RequestCounts,
     ) -> Self {
         let service_len = split_method_path(&path).map(|(service, _)| service.len());
         Self {
@@ -257,7 +291,8 @@ impl RequestContext {
             metadata,
             deadline,
             cancellation,
-            datagrams,
+            datagrams: counts.datagrams,
+            stream_compressed: counts.stream_compressed,
             response: ResponseMetadata::default(),
         }
     }
@@ -363,6 +398,13 @@ impl RequestContext {
         self.datagrams.get()
     }
 
+    /// Returns how many of the call's request messages have arrived stream-compressed
+    /// (`ZSTD_STREAM_MESSAGE`) so far; see [`CompressStream`].
+    #[must_use]
+    pub fn stream_compressed_requests_received(&self) -> u64 {
+        self.stream_compressed.get()
+    }
+
     /// Returns the call's cloneable cancellation token.
     #[must_use]
     pub const fn cancellation(&self) -> &CancellationToken {
@@ -461,6 +503,7 @@ pub struct ServerOptions {
     webtransport_admission: Option<WebTransportAdmission>,
     http_fallback: Option<HttpFallback>,
     compression: Compression,
+    stream_compression_memory: usize,
 }
 
 impl Default for ServerOptions {
@@ -485,6 +528,7 @@ impl Default for ServerOptions {
             webtransport_admission: None,
             http_fallback: None,
             compression: Compression::new(),
+            stream_compression_memory: DEFAULT_SERVER_MEMORY,
         }
     }
 }
@@ -508,6 +552,21 @@ impl ServerOptions {
     #[must_use]
     pub const fn compression(&self) -> &Compression {
         &self.compression
+    }
+
+    /// Sets how much memory the zstd contexts of stream compression ([`CompressStream`]) may hold
+    /// at once, in bytes. Calls that would exceed it fall back to per-message compression. The
+    /// default is 256 MiB; zero disables stream compression.
+    #[must_use]
+    pub const fn with_stream_compression_memory(mut self, bytes: usize) -> Self {
+        self.stream_compression_memory = bytes;
+        self
+    }
+
+    /// Returns how much memory stream compression may hold, in bytes.
+    #[must_use]
+    pub const fn stream_compression_memory(&self) -> usize {
+        self.stream_compression_memory
     }
 
     /// Returns the maximum `TrevRPC` frame size in bytes.
@@ -946,6 +1005,7 @@ impl Default for Server {
             authorizer: None,
             metrics: Arc::new(NoopMetrics),
             compression: Ok(None),
+            stream_budget: StreamBudget::new(DEFAULT_SERVER_MEMORY),
         }
     }
 }
@@ -973,6 +1033,7 @@ impl Server {
     pub fn set_options(&mut self, options: ServerOptions) -> &mut Self {
         self.compression =
             CompressionConfig::new(options.compression()).map_err(Error::into_status);
+        self.stream_budget = StreamBudget::new(options.stream_compression_memory());
         self.options = options;
         self
     }
@@ -980,6 +1041,11 @@ impl Server {
     /// The server's dictionaries, `None` without any.
     pub(crate) fn compression(&self) -> Option<&Arc<CompressionConfig>> {
         self.compression.as_ref().ok().and_then(Option::as_ref)
+    }
+
+    /// The memory stream compression may hold, `None` when it is disabled.
+    pub(crate) const fn stream_budget(&self) -> Option<&Arc<StreamBudget>> {
+        self.stream_budget.as_ref()
     }
 
     /// Fails when the configured compression is invalid; serving checks this first.
@@ -1141,6 +1207,18 @@ impl Server {
         }
     }
 
+    /// The directions of the streaming route at `path` that may use stream compression, or none
+    /// when there is no such route.
+    pub(crate) fn route_compress_stream(&self, path: &str) -> CompressStream {
+        match self.routes.get(path) {
+            Some(Route::Streaming { kind, options, .. }) => options
+                .compress_stream()
+                .effective(*kind)
+                .without_unreliable(options.unreliable()),
+            _ => CompressStream::NONE,
+        }
+    }
+
     /// The message types of the route at `path`, if it named them.
     pub(crate) fn route_message_types(&self, path: &str) -> Option<MessageTypes> {
         match self.routes.get(path)? {
@@ -1227,7 +1305,7 @@ impl Server {
             metadata,
             deadline,
             cancellation.clone(),
-            DatagramCount::default(),
+            RequestCounts::default(),
         );
         let response_metadata = context.response.clone();
 
@@ -1263,7 +1341,7 @@ impl Server {
             body,
             request_body,
             CancellationToken::new(),
-            DatagramCount::default(),
+            RequestCounts::default(),
         )
         .await
     }
@@ -1275,7 +1353,7 @@ impl Server {
         body: Vec<u8>,
         request_body: BoxStream<Vec<u8>>,
         cancellation: CancellationToken,
-        datagrams: DatagramCount,
+        counts: RequestCounts,
     ) -> BoxStream<ResponseFrame> {
         let started_at = Instant::now();
         let request_body_len = body.len();
@@ -1345,7 +1423,7 @@ impl Server {
             metadata,
             deadline,
             cancellation.clone(),
-            datagrams,
+            counts,
         );
         let response_metadata = context.response.clone();
         let handler_result = match invoke_streaming_handler(handler, context, body, request_body) {
@@ -1784,7 +1862,7 @@ pub(crate) fn check_stream_body_limit(
 /// Frames of unknown type count toward the byte total, so they cannot hold a stream open for free.
 /// The single message of a unary or server-streaming call is bounded by the frame size instead
 /// and is not charged.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RequestBudget {
     max_messages: Option<usize>,
     max_body_size: Option<usize>,
@@ -1792,6 +1870,9 @@ pub struct RequestBudget {
     body_size: usize,
     /// The dictionaries compressed request messages may use.
     pub(crate) accept: Accept,
+    /// The decompressing state of stream-compressed request messages, when the server enabled
+    /// them.
+    pub(crate) stream: Option<Inflater>,
 }
 
 impl RequestBudget {
@@ -1802,6 +1883,7 @@ impl RequestBudget {
             messages: 0,
             body_size: 0,
             accept: Accept::None,
+            stream: None,
         }
     }
 

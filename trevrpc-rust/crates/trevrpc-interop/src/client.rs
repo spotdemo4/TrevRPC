@@ -11,7 +11,9 @@ use futures_util::future::BoxFuture;
 use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, TransportPolicy};
 use trevrpc::{Code, Error, Metadata};
 
-use crate::proto::{EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient};
+use crate::proto::{
+    CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient,
+};
 use crate::{BoxError, Flags, connect};
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -21,6 +23,7 @@ const SCENARIO_BACKSTOP: Duration = Duration::from_secs(15);
 type Scenario = Result<(), String>;
 type Echo = EchoClient<Channel>;
 type UnreliableEcho = UnreliableEchoClient<Channel>;
+type CompressedEcho = CompressedEchoClient<Channel>;
 
 /// Runs every scenario and returns whether all of them passed.
 pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
@@ -56,9 +59,10 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
     }
     let client = EchoClient::new(channel.clone());
     let unreliable = UnreliableEchoClient::new(channel.clone());
+    let compressed = CompressedEchoClient::new(channel.clone());
 
     let mut passed = true;
-    for (name, scenario) in scenarios(&client, &unreliable, &channel) {
+    for (name, scenario) in scenarios(&client, &unreliable, &compressed, &channel) {
         passed &= report(name, scenario).await;
     }
 
@@ -86,6 +90,7 @@ type Named<'a> = (&'static str, BoxFuture<'a, Scenario>);
 fn scenarios<'a>(
     client: &'a Echo,
     unreliable_client: &'a UnreliableEcho,
+    compressed_client: &'a CompressedEcho,
     channel: &'a Channel,
 ) -> Vec<Named<'a>> {
     vec![
@@ -108,7 +113,51 @@ fn scenarios<'a>(
             Box::pin(unreliable(unreliable_client, channel)),
         ),
         ("compressed", Box::pin(compressed(client))),
+        (
+            "compressed-stream",
+            Box::pin(compressed_stream(compressed_client)),
+        ),
     ]
+}
+
+/// How many messages the `compressed-stream` scenario echoes.
+const COMPRESSED_STREAM_MESSAGES: u32 = 8;
+
+/// Echoes messages that compress against each other on a `CompressedEcho` stream, awaiting each
+/// echo so the server's HEADERS, which enable compressed requests, arrive before the third
+/// message, where stream compression starts.
+async fn compressed_stream(client: &CompressedEcho) -> Scenario {
+    let (sender, mut responses) = client
+        .bidi()
+        .options(|_| options())
+        .await
+        .map_err(rpc)?
+        .split();
+    for index in 0..COMPRESSED_STREAM_MESSAGES {
+        sender
+            .send(message(&compressed_message(index)))
+            .await
+            .map_err(rpc)?;
+        let response = responses
+            .next()
+            .await
+            .ok_or("stream ended before the echo")?
+            .map_err(rpc)?;
+        expect_response(&response, &compressed_message(index), index)?;
+    }
+    sender.finish().map_err(rpc)?;
+    if let Some(response) = responses.next().await {
+        response.map_err(rpc)?;
+        return Err("unexpected response after the echoes".to_owned());
+    }
+    let trailers = responses
+        .terminal_metadata()
+        .ok_or("the stream ended without a terminal status")?;
+    let received = counter(trailers, "interop-stream-compressed-received")?;
+    if received == 0 {
+        return Err("no request arrived stream-compressed".to_owned());
+    }
+    Ok(())
 }
 
 /// The `index`-th message of the `compressed` scenario: like the documents the interop dictionary

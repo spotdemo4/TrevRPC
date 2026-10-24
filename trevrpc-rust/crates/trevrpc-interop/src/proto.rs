@@ -1,4 +1,5 @@
-//! Messages and the `Echo` and `UnreliableEcho` services generated from `interop/proto`.
+//! Messages and the `Echo`, `UnreliableEcho` and `CompressedEcho` services generated from
+//! `interop/proto`.
 
 #![allow(dead_code, clippy::pedantic)]
 

@@ -38,6 +38,8 @@ type route struct {
 	// unreliable says which directions send their messages as datagrams on
 	// calls that have a flow.
 	unreliable Unreliable
+	// streamCompression says which directions may be stream-compressed.
+	streamCompression StreamCompression
 }
 
 // ErrServerFrozen is the panic value used when a server is mutated after first use.
@@ -58,6 +60,9 @@ type Server struct {
 	// compressionErr why it could not be; Listen reports that error.
 	compression    *compressionConfig
 	compressionErr error
+	// streams is the stream compression budget SetOptions made, nil when it
+	// is off.
+	streams *streamBudget
 }
 
 // ServerOptions configures server limits, timeouts, and the HTTP and browser
@@ -87,6 +92,12 @@ type Server struct {
 //
 // Compression lets messages travel compressed with the dictionaries it
 // holds; see Compression. It needs cgo, and Listen fails when it is invalid.
+//
+// StreamCompressionMemory bounds the memory, in bytes, of the zstd contexts
+// that stream compression holds for the server's calls (see
+// StreamCompression): about 350 KiB for a direction the server decodes and
+// 585 KiB for one it compresses. Calls beyond it are compressed per message.
+// Zero means 256 MiB, and a negative value turns stream compression off.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -109,6 +120,7 @@ type ServerOptions struct {
 	WebTransportAdmission             Admission
 	HTTPFallback                      http.Handler
 	Compression                       *Compression
+	StreamCompressionMemory           int64
 }
 
 // servesHTTP reports whether the listener serves HTTP: HTTP/3 on the UDP
@@ -290,6 +302,7 @@ func NewServer() *Server {
 		routes:  map[string]route{},
 		options: DefaultServerOptions(),
 		metrics: NoopMetrics{},
+		streams: newStreamBudget(0, defaultServerStreamCompressionMemory, nil),
 	}
 }
 
@@ -300,6 +313,7 @@ func (s *Server) SetOptions(options ServerOptions) {
 	s.requireMutableLocked()
 	s.options = canonicalServerOptions(options)
 	s.compression, s.compressionErr = newCompressionConfig(options.Compression)
+	s.streams = newStreamBudget(options.StreamCompressionMemory, defaultServerStreamCompressionMemory, s.compression)
 }
 
 // Options returns the canonical server options snapshot.
@@ -358,7 +372,8 @@ func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHa
 		panic("trevrpc: streaming route requires a streaming RPC kind")
 	}
 	validateRoute(method, handler != nil)
-	s.routes[method] = route{kind: kind, streaming: handler, unreliable: applyRouteOptions(options).unreliable.effective(kind)}
+	config := applyRouteOptions(options)
+	s.routes[method] = route{kind: kind, streaming: handler, unreliable: config.unreliable.effective(kind), streamCompression: config.streamCompression.effective(kind)}
 }
 
 // RegisterUnary registers a unary handler for method, the full method path
@@ -422,7 +437,7 @@ func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 		if isNilRegisteredValue(responses) {
 			return nil, Internal("handler returned nil response stream")
 		}
-		return newCompressedEncodeStream(responses, responseCompressorFromContext(ctx)), nil
+		return newResponseEncodeStream(ctx, responses), nil
 	}, options...)
 }
 
@@ -442,7 +457,7 @@ func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Serve
 		if isNilRegisteredValue(responses) {
 			return nil, Internal("handler returned nil response stream")
 		}
-		return newCompressedEncodeStream(responses, responseCompressorFromContext(ctx)), nil
+		return newResponseEncodeStream(ctx, responses), nil
 	}, options...)
 }
 
@@ -492,6 +507,8 @@ type serverRuntime struct {
 	executionChangedCh chan struct{}
 	// compression holds the server's dictionaries, nil without any.
 	compression *compressionConfig
+	// streams is the stream compression budget, nil when it is off.
+	streams *streamBudget
 }
 
 func canonicalServerOptions(options ServerOptions) ServerOptions {
@@ -603,6 +620,7 @@ func (s *Server) freeze() *serverRuntime {
 		connectionLimit: newSemaphore(options.MaxConcurrentConnections),
 		admissionLimit:  newSemaphore(options.MaxConcurrentAdmissionCallbacks),
 		compression:     s.compression,
+		streams:         s.streams,
 	}
 	runtime.diagnostics = newServerDiagnosticDispatcher(s.diagnostics, runtime)
 	s.options = options
@@ -928,7 +946,7 @@ func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFram
 	} else {
 		frames = make([]byte, 0, len(r.message.frame)+frameTailSlack)
 		if len(r.headers) > 0 || r.answered {
-			if frames, err = appendHeadersFrame(frames, r.headers, r.dictionaries, maxFrameSize); err != nil {
+			if frames, err = appendHeadersFrame(frames, r.headers, headersAnswer{dictionaries: r.dictionaries}, maxFrameSize); err != nil {
 				return true, err
 			}
 		}
@@ -1503,17 +1521,20 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 			s.readAhead.start()
 		}
 		// A call that sends datagrams flushes HEADERS, empty ones included,
-		// before the first one. A call that queried gets its answer in
-		// HEADERS, which then go out even without metadata.
-		compression := s.request.compression
-		answered := compression != nil && compression.answered
+		// before the first one. A call that queried, or that enables
+		// stream-compressed requests, gets its answer in HEADERS, which then go
+		// out even without metadata.
+		var answer headersAnswer
+		if compression := s.request.compression; compression != nil && compression.answered {
+			answer.dictionaries = compression.answer
+		}
+		if streams := s.request.streams; streams != nil {
+			answer.stream = streams.answer
+		}
+		answered := s.request.compression != nil && s.request.compression.answered || answer.stream != nil
 		if len(s.headers) > 0 || s.flow != nil || answered {
-			var dictionaries []*dictionaryInfo
-			if answered {
-				dictionaries = compression.answer
-			}
 			var err error
-			if headers, err = appendHeadersFrame(nil, s.headers, dictionaries, maxFrameSize); err != nil {
+			if headers, err = appendHeadersFrame(nil, s.headers, answer, maxFrameSize); err != nil {
 				return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
 			}
 			if s.readAhead != nil || s.flow != nil {

@@ -171,6 +171,13 @@ Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `Web
 
 `EnableHTTP3`, `HTTP3Path`, and `HTTP3Admission` were renamed `EnableHTTP`, `HTTPPath`, and `HTTPAdmission`, because the HTTP mapping is now also served over HTTP/2.
 
+## Compression
+
+Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in two ways that combine. Both call libzstd through cgo, and are off in binaries built without it.
+
+- **Dictionaries:** `DialOptions.Compression` and `ServerOptions.Compression` take dictionaries trained with `zstd --train`, each with the protobuf message types it compresses.
+- **Stream compression:** a streaming method marked `option (trevrpc.method) = {compress_stream: true}` compresses each streamed direction with one zstd context per call, from its third message, with nothing to configure. `ServerOptions.StreamCompressionMemory` (256 MiB by default) and `DialOptions.StreamCompressionMemory` (64 MiB) bound the memory those contexts hold; a negative value turns it off.
+
 ## Interop
 
 `cmd/trevrpc-interop` (installed as `trevrpc-interop-go`) implements the `server` and `client` subcommands of the cross-runtime [interop suite](../interop/README.md). Its Echo bindings in `cmd/trevrpc-interop/interoppb` are generated from `interop/proto/interop.proto`; `go test ./cmd/trevrpc-interop/interoppb` fails when they drift, and `-update` rewrites them.

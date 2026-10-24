@@ -37,6 +37,9 @@ type streamClient struct {
 	// compression is the connection's compression state, or nil without
 	// dictionaries. It is set before the client is used.
 	compression *clientCompression
+	// streams is the channel's stream compression budget, nil when stream
+	// compression is off. It is set before the client is used.
+	streams *streamBudget
 }
 
 func newStreamClient(opener streamOpener, maxFrameSize int) *streamClient {
@@ -55,12 +58,15 @@ func (c *streamClient) call(
 ) (frameStream, error) {
 	protoMessage := protoMessageV2(message)
 	accept, queried := c.compression.prepare(request)
+	// A server-streaming call may stream-compress its responses.
+	streams := c.prepareStreams(request, accept)
 	// A message that may be compressed is encoded on its own; any other is
 	// marshalled straight behind the request.
 	var compressed encodedMessage
 	if compressor := c.compression.requestCompressor(); compressor.dictFor(protoMessage) != nil {
 		var err error
 		if compressed, err = compressor.encode(message); err != nil {
+			streams.close()
 			return nil, err
 		}
 	}
@@ -76,33 +82,38 @@ func (c *streamClient) call(
 	frames, err := appendRequestFrame(frames, request, c.maxFrameSize)
 	if err != nil {
 		flow.release()
+		streams.close()
 		return nil, err
 	}
 	if messageSize > c.maxFrameSize {
 		flow.release()
+		streams.close()
 		return nil, &FrameTooLargeError{Len: messageSize, Max: c.maxFrameSize}
 	}
 	if compressed.frame != nil {
 		frames = append(frames, compressed.frame...)
 	} else if frames, err = appendProtoFrame(frames, frameTypeMessage, protoMessage, messageSize); err != nil {
 		flow.release()
+		streams.close()
 		return nil, err
 	}
 
 	stream, err := c.opener.openStream(ctx)
 	if err != nil {
 		flow.release()
+		streams.close()
 		return nil, callStatus(ctx, err)
 	}
 	response := &transportResponseStream{
 		ctx:          ctx,
 		stream:       stream,
-		reader:       newResponseFrameReader(stream, c.maxFrameSize, accept),
+		reader:       newResponseFrameReader(stream, c.maxFrameSize, accept, streams.responseInflater()),
 		stopCancel:   cancelStreamOnContext(ctx, stream),
 		maxFrameSize: c.maxFrameSize,
 		flow:         flow,
 		compression:  c.compression,
 		queried:      queried,
+		streams:      streams,
 	}
 
 	if _, err := stream.Write(frames); err != nil {
@@ -148,13 +159,15 @@ func (c *streamClient) streamingCall(
 	requests encodedStream,
 ) (frameStream, error) {
 	accept, queried := c.compression.prepare(request)
+	streams := c.prepareStreams(request, accept)
 	if setter, ok := requests.(compressorSetter); ok {
-		setter.setCompressor(c.compression.requestCompressor())
+		setter.setCompressors(c.compression.requestCompressor(), streams.requestCompressor())
 	}
 	flow := c.openFlow(request, accept)
 	header, err := appendRequestFrame(nil, request, c.maxFrameSize)
 	if err != nil {
 		flow.release()
+		streams.close()
 		return nil, err
 	}
 
@@ -164,6 +177,7 @@ func (c *streamClient) streamingCall(
 		statusErr := callStatus(streamCtx, err)
 		cancel()
 		flow.release()
+		streams.close()
 		return nil, statusErr
 	}
 
@@ -174,7 +188,7 @@ func (c *streamClient) streamingCall(
 	response := &transportResponseStream{
 		ctx:          streamCtx,
 		stream:       stream,
-		reader:       newResponseFrameReader(stream, c.maxFrameSize, accept),
+		reader:       newResponseFrameReader(stream, c.maxFrameSize, accept, streams.responseInflater()),
 		writerDone:   writerDone,
 		cancelUpload: cancelUpload,
 		cancel:       cancel,
@@ -187,6 +201,7 @@ func (c *streamClient) streamingCall(
 		flow:         flow,
 		compression:  c.compression,
 		queried:      queried,
+		streams:      streams,
 	}
 	if aborter, ok := requests.(uploadAborter); ok {
 		response.abortUpload = aborter.abortUpload
@@ -199,7 +214,10 @@ func (c *streamClient) streamingCall(
 		}
 	}
 	go func() {
-		writerDone <- c.writeStreamingRequest(uploadCtx, stream, header, requests, sender, response.outcome)
+		err := c.writeStreamingRequest(uploadCtx, stream, header, requests, sender, response.outcome)
+		// The writer was the only user of the request compressor.
+		streams.requestCompressor().close()
+		writerDone <- err
 	}()
 	// The response is read while the upload runs, so that a terminal status
 	// reaches a caller that is only sending.
@@ -208,11 +226,13 @@ func (c *streamClient) streamingCall(
 }
 
 // newResponseFrameReader returns the reader of the response frames of a call,
-// which accepts the dictionaries of accept on compressed messages.
-func newResponseFrameReader(stream io.Reader, maxFrameSize int, accept *dictSet) *frameReader {
+// which accepts the dictionaries of accept on compressed messages and
+// decompresses stream-compressed ones with inflater, if the call enabled them.
+func newResponseFrameReader(stream io.Reader, maxFrameSize int, accept *dictSet, inflater *streamInflater) *frameReader {
 	reader := newFrameReader(stream, maxFrameSize, -1)
 	reader.readAhead = true
 	reader.inflate = accept.lookupOrNil()
+	reader.stream = inflater
 	return reader
 }
 
@@ -315,6 +335,9 @@ type transportResponseStream struct {
 	// of the response answer it.
 	compression *clientCompression
 	queried     bool
+	// streams is the call's stream compression, nil without it. HEADERS
+	// enable its request direction.
+	streams *clientStreams
 
 	// The fields below are set for calls that stream their request.
 	//
@@ -396,6 +419,12 @@ func (s *transportResponseStream) pump() {
 		next, err := s.reader.next()
 		item := pumpedFrame{frame: next, err: err}
 		switch {
+		case err == nil && next.typ == frameTypeHeaders && s.streams.requestCompressor() != nil:
+			// The answer enables compressed requests, so it is read here, as
+			// soon as it arrives, not when Recv gets to it.
+			if _, answer, err := decodeHeaders(next.payload); err == nil {
+				s.streams.learn(answer.stream)
+			}
 		case err != nil:
 			// The response direction ended: late datagrams are dropped.
 			s.flow.endReceive()
@@ -564,13 +593,13 @@ func (s *transportResponseStream) Recv() (responseFrame, error) {
 	case frameTypeMessage:
 		return responseFrame{kind: frameTypeMessage, body: next.payload}, nil
 	case frameTypeHeaders:
-		headers, dictionaries, err := decodeHeaders(next.payload)
+		headers, answer, err := decodeHeaders(next.payload)
 		if err != nil {
 			return responseFrame{}, err
 		}
 		if s.queried {
 			s.queried = false
-			s.compression.learn(dictionaries)
+			s.compression.learn(answer.dictionaries)
 		}
 		return responseFrame{kind: frameTypeHeaders, headers: headers}, nil
 	case frameTypeStatus:
@@ -624,6 +653,7 @@ func (s *transportResponseStream) finish(cancelRead bool) {
 		s.cancel()
 	}
 	s.flow.release()
+	s.streams.close()
 	if cancelRead {
 		s.stream.cancelRead()
 	}

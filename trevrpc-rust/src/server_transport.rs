@@ -5,13 +5,13 @@ use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
-use crate::compression::{self, Accept, ServerCall};
-use crate::datagram::{DatagramCount, Demux, FlowSender, MergedRequests, ServerFlow};
+use crate::compression::{self, Accept, MessageEncoder, ServerCall, ServerStream};
+use crate::datagram::{Demux, FlowSender, MergedRequests, MessageCount, ServerFlow};
 use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, ResponseCodec};
 use crate::request_pump::{
     RequestInputKind, RequestPumpReader, RequestPumpSettle, start_request_pump,
 };
-use crate::server::{CancellationSource, CancellationToken, RequestBudget, Server};
+use crate::server::{CancellationSource, CancellationToken, RequestBudget, RequestCounts, Server};
 use crate::{
     Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status,
     varint,
@@ -34,8 +34,8 @@ pub trait ResponseWriter: Send + 'static {
 
     fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
 
-    /// Sets how the call's frames are written: the dictionary its messages are compressed with
-    /// and the answer its HEADERS carry.
+    /// Sets how the call's frames are written: how its messages are compressed and the answers
+    /// its HEADERS carry.
     fn set_codec(&mut self, codec: ResponseCodec);
 }
 
@@ -51,6 +51,8 @@ pub struct IncomingRequest {
     pub(crate) flow: Option<ServerFlow>,
     /// What negotiation decided about compressed messages.
     pub(crate) compression: ServerCall,
+    /// What negotiation decided about stream compression.
+    pub(crate) stream: ServerStream,
 }
 
 /// Registers the datagram flow that a streaming REQUEST asks for on the connection's `demux`,
@@ -121,9 +123,17 @@ where
             .route_message_types(&request.method)
             .map(|types| types.response),
     );
+    let mut stream = compression::negotiate_stream(
+        &request,
+        server.route_compress_stream(&request.method),
+        server.stream_budget(),
+        server.compression(),
+    );
+    budget.stream = stream.requests.take();
     let body = if request.rpc_kind().has_single_request_message() {
         let accept = budget.accept.clone();
-        let frame = framed::read_request_frame(recv, max_frame_size, &accept, |len| {
+        // The single request message is never stream-compressed.
+        let frame = framed::read_request_frame(recv, max_frame_size, &accept, None, |len| {
             budget.charge_skipped(len)
         })
         .await?;
@@ -149,6 +159,7 @@ where
         budget,
         flow: None,
         compression,
+        stream,
     })
 }
 
@@ -175,11 +186,14 @@ pub async fn handle_stream<W, R>(
         budget,
         flow,
         compression,
+        mut stream,
     } = incoming;
-    let answered = compression.answer.is_some();
+    let answered = compression.answer.is_some() || stream.answer.is_some();
     send.set_codec(ResponseCodec {
-        compress: compression.responses.clone(),
+        encoder: MessageEncoder::new(compression.responses.clone())
+            .with_stream(stream.responses.take()),
         answer: compression.answer.clone(),
+        stream_answer: stream.answer,
     });
     let request_body_len = body.len();
     let mut slots = StreamSlots::new(stream_permit);
@@ -199,6 +213,7 @@ pub async fn handle_stream<W, R>(
             budget,
             flow,
             compression,
+            stream,
         };
         handle_streaming_rpc(server, slots, send, recv, incoming, cancellation, shutdown).await;
         return;
@@ -303,6 +318,7 @@ pub async fn reject_stream<W, R>(
         budget,
         flow: _,
         compression: _,
+        stream: _,
     } = incoming;
     let status = Status::unavailable("too many concurrent streams on connection");
     server.record_rejected_request(&request, body.len(), &status);
@@ -386,9 +402,10 @@ async fn handle_streaming_rpc<W, R>(
         budget,
         flow,
         compression,
+        stream,
     } = incoming;
-    // A call that queried gets its answer in HEADERS before its first message.
-    let mut answer_pending = compression.answer.is_some();
+    // A call that queried or offered gets its answers in HEADERS before its first message.
+    let mut answer_pending = compression.answer.is_some() || stream.answer.is_some();
     let max_frame_size = server.max_frame_size();
     let request_body_len = body.len();
     let method_for_failure = request.method.clone();
@@ -401,7 +418,7 @@ async fn handle_streaming_rpc<W, R>(
     // The flow is unregistered when the call ends, however it ends.
     let (request_body, datagram_count, mut datagram_responses, _flow_guard) = match flow {
         Some(flow) => {
-            let count = DatagramCount::new();
+            let count = MessageCount::new();
             let request_body = match flow.requests {
                 Some(datagrams) => MergedRequests::boxed(
                     request_body,
@@ -416,7 +433,7 @@ async fn handle_streaming_rpc<W, R>(
             });
             (request_body, count, responses, Some(flow.guard))
         }
-        None => (request_body, DatagramCount::default(), None, None),
+        None => (request_body, MessageCount::default(), None, None),
     };
     let mut response = tokio::select! {
         biased;
@@ -425,7 +442,10 @@ async fn handle_streaming_rpc<W, R>(
             body,
             request_body,
             cancellation.clone(),
-            datagram_count,
+            RequestCounts {
+                datagrams: datagram_count,
+                stream_compressed: stream.count,
+            },
         ) => response,
         failure = request_pump.failure() => {
             server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());

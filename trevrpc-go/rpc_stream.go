@@ -191,6 +191,10 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 	// The server accepts every dictionary it holds on request messages.
 	request.compression = runtime.compression.negotiate(request)
 	reader.inflate = runtime.compression.lookupOrNil()
+	request.streams = runtime.negotiateStreams(request)
+	// Stream compression ends with the call, whichever way it ends.
+	defer request.streams.close()
+	reader.stream = request.streams.requestInflater()
 	if request.DatagramFlow != 0 {
 		// A connection without datagrams ignores the flow.
 		if datagrams, ok := stream.(datagramStream); ok {

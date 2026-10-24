@@ -25,6 +25,14 @@ message MethodOptions {
   // Response messages may travel as datagrams. Only server-streaming and
   // bidirectional methods stream responses.
   bool unreliable_responses = 2;
+  // Streamed messages may be compressed with one zstd context per direction
+  // of a call, so later messages compress against earlier ones
+  // (ZSTD_STREAM_MESSAGE). Only methods that stream requests or responses
+  // can set it. Message types containing a field marked debug_redact are
+  // never compressed this way. Do not set it on a method whose streams carry
+  // data an attacker can influence together with secrets: compressed sizes
+  // can reveal the secrets.
+  bool compress_stream = 3;
 }
 
 extend google.protobuf.MethodOptions {

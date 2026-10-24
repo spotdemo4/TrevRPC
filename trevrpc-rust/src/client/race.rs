@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{CallInfo, QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
-use crate::compression::CompressionConfig;
+use crate::compression::{CompressionConfig, StreamBudget};
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
@@ -147,6 +147,8 @@ pub struct Dialer {
     pub(crate) server_name: String,
     /// The channel's dictionaries, which every connection negotiates afresh.
     pub(crate) compression: Option<Arc<CompressionConfig>>,
+    /// The memory the channel's stream compression may hold, shared by every connection.
+    pub(crate) stream_budget: Option<Arc<StreamBudget>>,
     pub(crate) max_frame_size: usize,
     pub(crate) policy: TransportPolicy,
     pub(crate) tcp: Option<TcpDialer>,
@@ -226,7 +228,8 @@ impl Dialer {
         Ok(GenerationTransport::Quic(
             QuicTransport::new(connection)
                 .with_max_frame_size(self.max_frame_size)
-                .with_compression_config(self.compression.clone()),
+                .with_compression_config(self.compression.clone())
+                .with_stream_budget(self.stream_budget.clone()),
         ))
     }
 
@@ -239,7 +242,11 @@ impl Dialer {
         )
         .await
         .map(|transport| {
-            GenerationTransport::Qmux(transport.with_compression_config(self.compression.clone()))
+            GenerationTransport::Qmux(
+                transport
+                    .with_compression_config(self.compression.clone())
+                    .with_stream_budget(self.stream_budget.clone()),
+            )
         })
     }
 }

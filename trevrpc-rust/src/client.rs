@@ -14,8 +14,8 @@ use crate::response_state::{ResponseEvent, ResponseState, ResponseStateFailure, 
 use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
-    BoxStream, Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest,
-    Status, Unreliable,
+    BoxStream, Code, CompressStream, Error, Metadata, ResponseEnvelope, ResponseFrame, Result,
+    RpcKind, RpcRequest, Status, Unreliable,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -53,6 +53,9 @@ pub struct CallOptions {
     unreliable: Option<Unreliable>,
     /// The method's message types, which the call sets from [`Call::message_types`].
     message_types: Option<MessageTypes>,
+    /// The directions that may use stream compression, which the call sets from
+    /// [`Call::compress_stream`].
+    compress_stream: CompressStream,
 }
 
 /// The full protobuf names of a method's request and response message types.
@@ -84,6 +87,8 @@ pub struct CallInfo {
     pub unreliable: Unreliable,
     /// The method's message types, when generated code passed them.
     pub message_types: Option<MessageTypes>,
+    /// The directions that may use stream compression; see [`CompressStream`].
+    pub compress_stream: CompressStream,
 }
 
 impl CallInfo {
@@ -93,7 +98,15 @@ impl CallInfo {
         Self {
             unreliable,
             message_types,
+            compress_stream: CompressStream::NONE,
         }
+    }
+
+    /// Lets the directions `directions` sets use stream compression.
+    #[must_use]
+    pub const fn with_compress_stream(mut self, directions: CompressStream) -> Self {
+        self.compress_stream = directions;
+        self
     }
 }
 
@@ -108,6 +121,7 @@ impl Default for CallOptions {
             metadata: Metadata::new(),
             unreliable: None,
             message_types: None,
+            compress_stream: CompressStream::NONE,
         }
     }
 }
@@ -394,6 +408,7 @@ where
         metadata,
         unreliable: _,
         message_types,
+        compress_stream: _,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
@@ -843,10 +858,12 @@ fn prepare_streaming_request(
         metadata,
         unreliable,
         message_types,
+        compress_stream,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
-    let info = CallInfo::new(unreliable.unwrap_or_default(), message_types);
+    let info = CallInfo::new(unreliable.unwrap_or_default(), message_types)
+        .with_compress_stream(compress_stream);
 
     Ok(PreparedStreamingCall {
         request: RpcRequest::new(method)

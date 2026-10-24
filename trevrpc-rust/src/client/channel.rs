@@ -10,7 +10,7 @@ use super::race::{
     TransportKind, TransportPolicy,
 };
 use super::{CallInfo, RpcTransport, StreamingRpcTransport};
-use crate::compression::{Compression, CompressionConfig};
+use crate::compression::{Compression, CompressionConfig, DEFAULT_CLIENT_MEMORY, StreamBudget};
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
@@ -120,6 +120,7 @@ pub struct ChannelConfig {
     fallback_delay: Duration,
     reprobe_interval: Duration,
     compression: Compression,
+    stream_compression_memory: usize,
 }
 
 impl ChannelConfig {
@@ -134,6 +135,7 @@ impl ChannelConfig {
             fallback_delay: DEFAULT_FALLBACK_DELAY,
             reprobe_interval: DEFAULT_REPROBE_INTERVAL,
             compression: Compression::new(),
+            stream_compression_memory: DEFAULT_CLIENT_MEMORY,
         }
     }
 
@@ -144,6 +146,21 @@ impl ChannelConfig {
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
+    }
+
+    /// Sets how much memory the zstd contexts of stream compression ([`crate::CompressStream`])
+    /// may hold at once across the channel's calls, in bytes. Calls that would exceed it fall
+    /// back to per-message compression. The default is 64 MiB; zero disables stream compression.
+    #[must_use]
+    pub const fn with_stream_compression_memory(mut self, bytes: usize) -> Self {
+        self.stream_compression_memory = bytes;
+        self
+    }
+
+    /// Returns how much memory stream compression may hold, in bytes.
+    #[must_use]
+    pub const fn stream_compression_memory(&self) -> usize {
+        self.stream_compression_memory
     }
 
     /// Enables `QMux` over TLS to the server's TCP listener, the fallback for networks that block
@@ -360,6 +377,7 @@ impl Channel {
             remote_addr,
             server_name: server_name.into(),
             compression: CompressionConfig::new(&config.compression)?,
+            stream_budget: StreamBudget::new(config.stream_compression_memory),
             max_frame_size: config.max_frame_size,
             policy: config.policy,
             tcp: config.tcp.clone(),

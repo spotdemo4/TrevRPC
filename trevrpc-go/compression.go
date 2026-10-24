@@ -55,6 +55,8 @@ type compressionDict struct {
 
 // compressionConfig is a validated Compression.
 type compressionConfig struct {
+	// level is the zstd level of outgoing messages.
+	level  int
 	byID   map[uint32]*compressionDict
 	byType map[protoreflect.FullName]*compressionDict
 	// query lists every dictionary, as a client's dictionary_query.
@@ -75,6 +77,7 @@ func newCompressionConfig(options *Compression) (*compressionConfig, error) {
 		level = 1
 	}
 	config := &compressionConfig{
+		level:  level,
 		byID:   make(map[uint32]*compressionDict, len(options.Dictionaries)),
 		byType: make(map[protoreflect.FullName]*compressionDict),
 	}
@@ -408,6 +411,16 @@ func responseCompressorFromContext(ctx contextValuer) *messageCompressor {
 		return nil
 	}
 	return state.compression.responses
+}
+
+// responseStreamsFromContext returns the stream compression of the call ctx
+// belongs to, or nil.
+func responseStreamsFromContext(ctx contextValuer) *serverStreams {
+	state, ok := ctx.Value(handlerContextKey{}).(*callState)
+	if !ok {
+		return nil
+	}
+	return state.streams
 }
 
 // contextValuer is the part of context.Context responseCompressorFromContext

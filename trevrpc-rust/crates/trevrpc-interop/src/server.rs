@@ -13,7 +13,7 @@ use trevrpc::server::{RequestContext, Server, ServerOptions, WebTransportAdmissi
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, Status};
 
-use crate::proto::{self, Echo, EchoRequest, EchoResponse, UnreliableEcho};
+use crate::proto::{self, CompressedEcho, Echo, EchoRequest, EchoResponse, UnreliableEcho};
 use crate::{BoxError, Flags, connect};
 
 const SUFFIX_METADATA_KEY: &str = "interop-suffix";
@@ -113,30 +113,63 @@ impl Echo for EchoService {
         context: RequestContext,
         requests: BoxStream<EchoRequest>,
     ) -> Result<BoxStream<EchoResponse>, Status> {
-        // `(requests, next index, finished)`: a failing request ends the stream with its status.
-        let responses = futures_util::stream::unfold(
-            (requests, 0_u32, false),
-            |(mut requests, index, finished)| async move {
-                if finished {
-                    return None;
-                }
-                match requests.next().await? {
-                    Err(error) => Some((Err(error), (requests, index, true))),
-                    Ok(request) => match requested_failure(&request) {
-                        Some(status) => Some((Err(Error::from(status)), (requests, index, true))),
-                        None => Some((
-                            Ok(EchoResponse {
-                                message: request.message,
-                                index,
-                            }),
-                            (requests, index.saturating_add(1), false),
-                        )),
-                    },
-                }
-            },
-        );
         answer_header(&context)?;
-        Ok(Box::pin(responses))
+        Ok(Box::pin(echo_each(requests)))
+    }
+}
+
+/// `Echo.Bidi`: echoes each request as it arrives, with its index, until one asks to fail.
+fn echo_each(
+    requests: BoxStream<EchoRequest>,
+) -> impl futures_util::Stream<Item = Result<EchoResponse, Error>> + Send {
+    // `(requests, next index, finished)`: a failing request ends the stream with its status.
+    futures_util::stream::unfold(
+        (requests, 0_u32, false),
+        |(mut requests, index, finished)| async move {
+            if finished {
+                return None;
+            }
+            match requests.next().await? {
+                Err(error) => Some((Err(error), (requests, index, true))),
+                Ok(request) => match requested_failure(&request) {
+                    Some(status) => Some((Err(Error::from(status)), (requests, index, true))),
+                    None => Some((
+                        Ok(EchoResponse {
+                            message: request.message,
+                            index,
+                        }),
+                        (requests, index.saturating_add(1), false),
+                    )),
+                },
+            }
+        },
+    )
+}
+
+const STREAM_COMPRESSED_RECEIVED_METADATA_KEY: &str = "interop-stream-compressed-received";
+
+struct CompressedEchoService;
+
+#[trevrpc::async_trait]
+impl CompressedEcho for CompressedEchoService {
+    /// `Echo.Bidi`, whose trailing metadata counts the requests that arrived stream-compressed,
+    /// known once the request stream has ended.
+    async fn bidi(
+        &self,
+        context: RequestContext,
+        requests: BoxStream<EchoRequest>,
+    ) -> Result<BoxStream<EchoResponse>, Status> {
+        answer_header(&context)?;
+        let report = futures_util::stream::once(async move {
+            context.set_response_metadata(
+                STREAM_COMPRESSED_RECEIVED_METADATA_KEY,
+                context.stream_compressed_requests_received().to_string(),
+            )
+        })
+        .filter_map(|reported| async move {
+            reported.err().map(|status| Err(Error::from(status)))
+        });
+        Ok(Box::pin(echo_each(requests).chain(report)))
     }
 }
 
@@ -215,6 +248,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     );
     proto::register_echo(&mut server, EchoService);
     proto::register_unreliable_echo(&mut server, UnreliableEchoService);
+    proto::register_compressed_echo(&mut server, CompressedEchoService);
 
     let tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()

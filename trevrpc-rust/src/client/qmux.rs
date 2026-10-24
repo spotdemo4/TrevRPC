@@ -106,6 +106,17 @@ impl QmuxTransport {
         self
     }
 
+    /// Makes a transport that was just connected hold stream compression memory from `budget`.
+    pub(crate) fn with_stream_budget(
+        mut self,
+        budget: Option<Arc<crate::compression::StreamBudget>>,
+    ) -> Self {
+        if let Some(transport) = Arc::get_mut(&mut self.0) {
+            transport.set_stream_budget(budget);
+        }
+        self
+    }
+
     /// Returns the maximum `TrevRPC` frame size in bytes.
     #[must_use]
     pub fn max_frame_size(&self) -> usize {

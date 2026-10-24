@@ -72,6 +72,9 @@ type wireRequest struct {
 	// DictionaryQuery asks the server which of these dictionaries it holds
 	// (field 11).
 	DictionaryQuery []*dictionaryInfo `protobuf:"bytes,11,rep,name=dictionary_query,json=dictionaryQuery,proto3" json:"dictionary_query,omitempty"`
+	// StreamCompression says the client decodes stream-compressed responses
+	// (field 12).
+	StreamCompression *streamCompressionInfo `protobuf:"bytes,12,opt,name=stream_compression,json=streamCompression,proto3" json:"stream_compression,omitempty"`
 
 	// The fields below are not on the wire.
 	//
@@ -86,6 +89,10 @@ type wireRequest struct {
 	responseType protoreflect.FullName
 	// compression is the server's negotiation result for the call.
 	compression *callCompression
+	// streamCompression is the directions the client may stream-compress.
+	streamCompression StreamCompression
+	// streams is the server's stream compression of the call, nil without.
+	streams *serverStreams
 }
 
 // newWireRequest creates a unary RPC request for the method path
@@ -169,6 +176,9 @@ type wireHeaders struct {
 	Extensions []uint64 `protobuf:"varint,2,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
 	// Dictionaries answers the request's DictionaryQuery (field 3).
 	Dictionaries []*dictionaryInfo `protobuf:"bytes,3,rep,name=dictionaries,proto3" json:"dictionaries,omitempty"`
+	// StreamCompression says the server decodes stream-compressed requests
+	// (field 4).
+	StreamCompression *streamCompressionInfo `protobuf:"bytes,4,opt,name=stream_compression,json=streamCompression,proto3" json:"stream_compression,omitempty"`
 }
 
 // Reset clears the headers for protobuf compatibility.
@@ -196,6 +206,21 @@ func (m *dictionaryInfo) String() string { return fmt.Sprintf("%+v", *m) }
 
 // ProtoMessage marks dictionaryInfo as a protobuf message.
 func (*dictionaryInfo) ProtoMessage() {}
+
+// streamCompressionInfo describes what a peer decodes in stream compression:
+// the largest zstd window, as a base-2 logarithm.
+type streamCompressionInfo struct {
+	MaxWindowLog uint32 `protobuf:"varint,1,opt,name=max_window_log,json=maxWindowLog,proto3" json:"max_window_log,omitempty"`
+}
+
+// Reset clears the info for protobuf compatibility.
+func (m *streamCompressionInfo) Reset() { *m = streamCompressionInfo{} }
+
+// String returns the info as a debug string for protobuf compatibility.
+func (m *streamCompressionInfo) String() string { return fmt.Sprintf("%+v", *m) }
+
+// ProtoMessage marks streamCompressionInfo as a protobuf message.
+func (*streamCompressionInfo) ProtoMessage() {}
 
 // wireStatus is the payload of a STATUS frame.
 type wireStatus struct {

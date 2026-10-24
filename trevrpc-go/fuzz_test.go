@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/quic-go/quic-go/quicvarint"
+
+	"trev.zip/llc/trevrpc/trevrpc-go/internal/zstd"
 )
 
 func FuzzFrameDecodeNeverPanics(f *testing.F) {
@@ -52,12 +54,20 @@ func FuzzFrameReaderNeverPanics(f *testing.F) {
 		{0xc0, 0, 0, 0, 0, 0, 0, 0},
 		{0x00, 0xff},
 		{0x04, 0x01, 0x00},
+		{0x05, 0x01, 0x00},
+		// A stream-compressed "hi" (see the stream vectors), then a second chunk.
+		{0x05, 0x0a, 0x02, 0x00, 0x30, 0x10, 0x00, 0x00, 'h', 'i', 0x05, 0x04},
 	} {
 		f.Add(seed)
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		reader := newFrameReader(bytes.NewReader(data), 64, -1)
+		// Odd inputs enable stream compression, so random chunks reach libzstd.
+		if len(data) > 0 && data[len(data)-1]&1 == 1 && zstd.Available {
+			reader.stream = newStreamInflater(nil, nil)
+			defer reader.stream.close()
+		}
 		// Without accepted dictionaries a ZSTD_MESSAGE frame is a decode error.
 		for range len(data) + 1 {
 			next, err := reader.next()
@@ -71,7 +81,7 @@ func FuzzFrameReaderNeverPanics(f *testing.F) {
 				}
 				return
 			}
-			if !next.typ.known() || next.typ == frameTypeZstdMessage || len(next.payload) > 64 {
+			if !next.typ.known() || next.typ == frameTypeZstdMessage || next.typ == frameTypeZstdStreamMessage || len(next.payload) > 64 {
 				t.Fatalf("frame reader returned %v with %d payload bytes", next.typ, len(next.payload))
 			}
 		}

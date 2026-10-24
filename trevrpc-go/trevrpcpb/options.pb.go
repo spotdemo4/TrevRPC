@@ -40,8 +40,16 @@ type MethodOptions struct {
 	// Response messages may travel as datagrams. Only server-streaming and
 	// bidirectional methods stream responses.
 	UnreliableResponses bool `protobuf:"varint,2,opt,name=unreliable_responses,json=unreliableResponses,proto3" json:"unreliable_responses,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Streamed messages may be compressed with one zstd context per direction
+	// of a call, so later messages compress against earlier ones
+	// (ZSTD_STREAM_MESSAGE). Only methods that stream requests or responses
+	// can set it. Message types containing a field marked debug_redact are
+	// never compressed this way. Do not set it on a method whose streams carry
+	// data an attacker can influence together with secrets: compressed sizes
+	// can reveal the secrets.
+	CompressStream bool `protobuf:"varint,3,opt,name=compress_stream,json=compressStream,proto3" json:"compress_stream,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *MethodOptions) Reset() {
@@ -88,6 +96,13 @@ func (x *MethodOptions) GetUnreliableResponses() bool {
 	return false
 }
 
+func (x *MethodOptions) GetCompressStream() bool {
+	if x != nil {
+		return x.CompressStream
+	}
+	return false
+}
+
 var file_trevrpc_options_proto_extTypes = []protoimpl.ExtensionInfo{
 	{
 		ExtendedType:  (*descriptorpb.MethodOptions)(nil),
@@ -109,10 +124,11 @@ var File_trevrpc_options_proto protoreflect.FileDescriptor
 
 const file_trevrpc_options_proto_rawDesc = "" +
 	"\n" +
-	"\x15trevrpc/options.proto\x12\atrevrpc\x1a google/protobuf/descriptor.proto\"s\n" +
+	"\x15trevrpc/options.proto\x12\atrevrpc\x1a google/protobuf/descriptor.proto\"\x9c\x01\n" +
 	"\rMethodOptions\x12/\n" +
 	"\x13unreliable_requests\x18\x01 \x01(\bR\x12unreliableRequests\x121\n" +
-	"\x14unreliable_responses\x18\x02 \x01(\bR\x13unreliableResponses:P\n" +
+	"\x14unreliable_responses\x18\x02 \x01(\bR\x13unreliableResponses\x12'\n" +
+	"\x0fcompress_stream\x18\x03 \x01(\bR\x0ecompressStream:P\n" +
 	"\x06method\x12\x1e.google.protobuf.MethodOptions\x18\x87\xc7\x03 \x01(\v2\x16.trevrpc.MethodOptionsR\x06methodB_\n" +
 	"\x18zip.trev.trevrpc.optionsB\fOptionsProtoP\x01Z3trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb;trevrpcpbb\x06proto3"
 

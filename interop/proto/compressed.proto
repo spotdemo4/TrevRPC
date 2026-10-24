@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package trevrpc.interop.v1;
+
+import "interop.proto";
+import "trevrpc/options.proto";
+
+// CompressedEcho is Echo's Bidi with stream compression allowed (see
+// interop/README.md). It is a separate file for the same reason as
+// unreliable.proto: the gRPC baseline compiles only interop.proto.
+service CompressedEcho {
+  rpc Bidi(stream EchoRequest) returns (stream EchoResponse) {
+    option (trevrpc.method) = {compress_stream: true};
+  }
+}

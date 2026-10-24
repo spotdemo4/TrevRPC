@@ -571,8 +571,12 @@ func unreliableRequest(t *testing.T, goPackage string, methods ...unreliableMeth
 	t.Helper()
 	var descriptors []*descriptor.MethodDescriptorProto
 	for _, method := range methods {
+		input := ".hello.v1.HelloRequest"
+		if method.input != "" {
+			input = ".hello.v1." + method.input
+		}
 		method := &descriptor.MethodDescriptorProto{
-			Name: new(method.name), InputType: new(".hello.v1.HelloRequest"), OutputType: new(".hello.v1.HelloReply"),
+			Name: new(method.name), InputType: new(input), OutputType: new(".hello.v1.HelloReply"),
 			ClientStreaming: new(method.clientStreaming), ServerStreaming: new(method.serverStreaming),
 			Options: method.options(t),
 		}
@@ -582,9 +586,27 @@ func unreliableRequest(t *testing.T, goPackage string, methods ...unreliableMeth
 		FileToGenerate: []string{"hello/v1/greeter.proto"},
 		ProtoFile: []*descriptor.FileDescriptorProto{{
 			Name: new("hello/v1/greeter.proto"), Package: new("hello.v1"),
-			Options:     &descriptor.FileOptions{GoPackage: new(goPackage)},
-			MessageType: []*descriptor.DescriptorProto{{Name: new("HelloRequest")}, {Name: new("HelloReply")}},
-			Service:     []*descriptor.ServiceDescriptorProto{{Name: new("Greeter"), Method: descriptors}},
+			Options: &descriptor.FileOptions{GoPackage: new(goPackage)},
+			MessageType: []*descriptor.DescriptorProto{{Name: new("HelloRequest")}, {Name: new("HelloReply")}, {
+				// Secret holds a redacted field one message down, in Inner.
+				Name: new("Secret"),
+				Field: []*descriptor.FieldDescriptorProto{{
+					Name: new("inner"), Number: new(int32(1)), Label: descriptor.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+					Type: descriptor.FieldDescriptorProto_TYPE_MESSAGE.Enum(), TypeName: new(".hello.v1.Inner"), JsonName: new("inner"),
+				}},
+			}, {
+				Name: new("Inner"),
+				Field: []*descriptor.FieldDescriptorProto{{
+					Name: new("token"), Number: new(int32(1)), Label: descriptor.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+					Type: descriptor.FieldDescriptorProto_TYPE_STRING.Enum(), JsonName: new("token"),
+					Options: &descriptor.FieldOptions{DebugRedact: new(true)},
+				}, {
+					// A recursive field, which the redaction check must not loop on.
+					Name: new("next"), Number: new(int32(2)), Label: descriptor.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+					Type: descriptor.FieldDescriptorProto_TYPE_MESSAGE.Enum(), TypeName: new(".hello.v1.Inner"), JsonName: new("next"),
+				}},
+			}},
+			Service: []*descriptor.ServiceDescriptorProto{{Name: new("Greeter"), Method: descriptors}},
 		}},
 	}
 	// Round-trip the request, so the option is a serialized extension the
@@ -603,18 +625,62 @@ func unreliableRequest(t *testing.T, goPackage string, methods ...unreliableMeth
 type unreliableMethod struct {
 	name                             string
 	clientStreaming, serverStreaming bool
-	// requests and responses are the options; neither set means no option.
-	requests, responses bool
+	// requests, responses and compress are the options; none set means no
+	// option.
+	requests, responses, compress bool
+	// input is the request message type, HelloRequest when empty.
+	input string
 }
 
 func (m unreliableMethod) options(t *testing.T) *descriptor.MethodOptions {
 	t.Helper()
-	if !m.requests && !m.responses {
+	if !m.requests && !m.responses && !m.compress {
 		return nil
 	}
 	options := &descriptor.MethodOptions{}
-	proto.SetExtension(options, trevrpcpb.E_Method, &trevrpcpb.MethodOptions{UnreliableRequests: m.requests, UnreliableResponses: m.responses})
+	proto.SetExtension(options, trevrpcpb.E_Method, &trevrpcpb.MethodOptions{UnreliableRequests: m.requests, UnreliableResponses: m.responses, CompressStream: m.compress})
 	return options
+}
+
+func TestGeneratorEmitsStreamCompressionOptions(t *testing.T) {
+	request := unreliableRequest(t, "example.test/hello/v1;hellov1",
+		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, compress: true},
+		unreliableMethod{name: "Upload", clientStreaming: true, compress: true},
+		unreliableMethod{name: "Download", serverStreaming: true, compress: true, responses: true},
+		unreliableMethod{name: "Leaky", clientStreaming: true, serverStreaming: true, compress: true, input: "Secret"},
+		unreliableMethod{name: "SecretUpload", clientStreaming: true, compress: true, input: "Secret"},
+	)
+	response := generate(request)
+	if response.GetError() != "" {
+		t.Fatalf("generator returned error: %s", response.GetError())
+	}
+	content := response.File[0].GetContent()
+	for _, want := range []string{
+		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}))...)",
+		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}))...)",
+		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))...)",
+		// A request type with a redacted field keeps its direction out.
+		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))...)",
+		"implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}))",
+		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))",
+		"implementation.Leaky, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))",
+		// Nothing is left for a client-streaming method of a redacted type.
+		"implementation.SecretUpload)",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("generated content missing %q:\n%s", want, content)
+		}
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "greeter.trevrpc.go", content, parser.AllErrors); err != nil {
+		t.Fatalf("generated Go is not syntactically valid: %v\n%s", err, content)
+	}
+}
+
+func TestGeneratorRejectsStreamCompressionOnUnaryMethods(t *testing.T) {
+	response := generate(unreliableRequest(t, "example.test/hello/v1;hellov1", unreliableMethod{name: "Call", compress: true}))
+	if want := "hello.v1.Greeter.Call: compress_stream requires a streaming method"; response.GetError() != want {
+		t.Fatalf("error = %q, want %q", response.GetError(), want)
+	}
 }
 
 func TestGeneratorEmitsUnreliableOptions(t *testing.T) {
@@ -674,9 +740,9 @@ func TestGeneratorRejectsUnreliableDirectionsThatDoNotStream(t *testing.T) {
 func TestGeneratedUnreliableOptionsCompile(t *testing.T) {
 	runtimeRoot, root, relativeRoot, importPrefix := newInModuleFixture(t)
 	response := generate(unreliableRequest(t, importPrefix+"/hello/v1;hellov1",
-		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, requests: true, responses: true},
+		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, requests: true, responses: true, compress: true},
 		unreliableMethod{name: "Upload", clientStreaming: true, requests: true},
-		unreliableMethod{name: "Download", serverStreaming: true, responses: true},
+		unreliableMethod{name: "Download", serverStreaming: true, responses: true, compress: true},
 	))
 	if response.GetError() != "" {
 		t.Fatalf("generator returned error: %s", response.GetError())

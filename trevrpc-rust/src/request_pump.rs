@@ -163,10 +163,14 @@ pub trait RequestPumpReader: FrameRead + Send + Sized + 'static {
     ) -> impl Future<Output = Result<Option<RequestFrame>>> + Send {
         async move {
             let accept = budget.accept.clone();
-            framed::read_request_frame(self, max_frame_size, &accept, |len| {
-                budget.charge_skipped(len)
-            })
-            .await
+            let mut stream = budget.stream.take();
+            let frame =
+                framed::read_request_frame(self, max_frame_size, &accept, stream.as_mut(), |len| {
+                    budget.charge_skipped(len)
+                })
+                .await;
+            budget.stream = stream;
+            frame
         }
     }
 

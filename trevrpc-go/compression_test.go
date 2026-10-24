@@ -126,11 +126,12 @@ func TestCompressionNegotiationGoldenVectors(t *testing.T) {
 		}
 	}
 
-	frame, err = appendHeadersFrame(nil, nil, []*dictionaryInfo{{ID: 1, Fingerprint: fingerprint}}, DefaultMaxFrameSize)
+	frame, err = appendHeadersFrame(nil, nil, headersAnswer{dictionaries: []*dictionaryInfo{{ID: 1, Fingerprint: fingerprint}}}, DefaultMaxFrameSize)
 	if err != nil || !bytes.Equal(frame, vectors["headers.dictionaries.frame"]) {
 		t.Fatalf("HEADERS frame = %x, %v; want %x", frame, err, vectors["headers.dictionaries.frame"])
 	}
-	_, answer, err := decodeHeaders(vectors["headers.dictionaries.payload"])
+	_, decoded, err := decodeHeaders(vectors["headers.dictionaries.payload"])
+	answer := decoded.dictionaries
 	if err != nil || len(answer) != 1 || answer[0].ID != 1 || !bytes.Equal(answer[0].Fingerprint, fingerprint) {
 		t.Fatalf("decoded answer %+v, %v", answer, err)
 	}
@@ -314,7 +315,8 @@ func TestServerAnswersQueryAndCompressesResponses(t *testing.T) {
 	if len(frames) != 3 || frames[0].typ != frameTypeHeaders || frames[1].typ != frameTypeZstdMessage || frames[2].typ != frameTypeStatus {
 		t.Fatalf("frames = %v, want HEADERS ZSTD_MESSAGE STATUS", frames)
 	}
-	_, answer, err := decodeHeaders(frames[0].payload)
+	_, decoded, err := decodeHeaders(frames[0].payload)
+	answer := decoded.dictionaries
 	if err != nil || len(answer) != 1 || !d1.matches(answer[0]) {
 		t.Fatalf("answer = %+v, %v", answer, err)
 	}
@@ -340,7 +342,7 @@ func TestServerRefusesUnconfirmedDictionary(t *testing.T) {
 	if len(frames) != 3 || frames[0].typ != frameTypeHeaders || frames[1].typ != frameTypeMessage {
 		t.Fatalf("frames = %v, want HEADERS MESSAGE STATUS", frames)
 	}
-	if _, answer, err := decodeHeaders(frames[0].payload); err != nil || len(answer) != 0 {
+	if _, answer, err := decodeHeaders(frames[0].payload); err != nil || len(answer.dictionaries) != 0 {
 		t.Fatalf("answer = %+v, %v; want none", answer, err)
 	}
 }

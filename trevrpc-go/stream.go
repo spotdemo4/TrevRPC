@@ -244,6 +244,9 @@ type encodeStream[T ProtoMessage] struct {
 	inner MessageStream[T]
 	// compressor compresses the messages, or is nil.
 	compressor *messageCompressor
+	// stream, when set, stream-compresses the messages and falls back to its
+	// own per-message compressor; see streamCompressor.
+	stream *streamCompressor
 }
 
 // newEncodeStream wraps a protobuf message stream and yields messages encoded
@@ -258,15 +261,32 @@ func newCompressedEncodeStream[T ProtoMessage](inner MessageStream[T], compresso
 	return &encodeStream[T]{inner: inner, compressor: compressor}
 }
 
-// setCompressor implements compressorSetter.
-func (s *encodeStream[T]) setCompressor(compressor *messageCompressor) {
-	s.compressor = compressor
+// newResponseEncodeStream is newEncodeStream for the streamed response
+// messages of the handler whose context is ctx, compressed as the call
+// negotiated.
+func newResponseEncodeStream[T ProtoMessage](ctx contextValuer, inner MessageStream[T]) encodedStream {
+	return &encodeStream[T]{inner: inner, compressor: responseCompressorFromContext(ctx), stream: responseStreamsFromContext(ctx).responseCompressor()}
+}
+
+// setCompressors implements compressorSetter.
+func (s *encodeStream[T]) setCompressors(compressor *messageCompressor, stream *streamCompressor) {
+	s.compressor, s.stream = compressor, stream
 }
 
 // compressorSetter is implemented by the encoded streams of client requests,
-// whose compressor the connection that carries the call provides.
+// whose compressors the connection that carries the call provides: the
+// per-message one, and the call's stream compressor, either of which may be
+// nil.
 type compressorSetter interface {
-	setCompressor(*messageCompressor)
+	setCompressors(*messageCompressor, *streamCompressor)
+}
+
+// encode encodes message as the stream's compressors decide.
+func (s *encodeStream[T]) encode(message T) (encodedMessage, error) {
+	if s.stream != nil {
+		return s.stream.encode(message)
+	}
+	return s.compressor.encode(message)
 }
 
 func (s *encodeStream[T]) trevrpcNonBlockingStream() bool {
@@ -283,7 +303,7 @@ func (s *encodeStream[T]) Recv() (encodedMessage, error) {
 		return encodedMessage{}, err
 	}
 
-	return s.compressor.encode(message)
+	return s.encode(message)
 }
 
 func (s *encodeStream[T]) recvReady() (encodedMessage, bool, error) {
@@ -295,7 +315,7 @@ func (s *encodeStream[T]) recvReady() (encodedMessage, bool, error) {
 	if !ok || err != nil {
 		return encodedMessage{}, false, err
 	}
-	encoded, err := s.compressor.encode(message)
+	encoded, err := s.encode(message)
 	return encoded, err == nil, err
 }
 

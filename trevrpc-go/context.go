@@ -11,6 +11,8 @@ type callState struct {
 	response responseMetadata
 	// compression is the call's negotiation result, nil without one.
 	compression *callCompression
+	// streams is the call's stream compression, nil without it.
+	streams *serverStreams
 }
 
 // HandlerContext describes the request being handled. Handlers receive it
@@ -29,6 +31,8 @@ type HandlerContext struct {
 
 	// flow is the call's datagram flow, nil without one.
 	flow *datagramFlow
+	// streams is the call's stream compression, nil without it.
+	streams *serverStreams
 }
 
 // HandlerContextFromContext returns TrevRPC request information attached to ctx.
@@ -69,6 +73,7 @@ func newHandlerContext(request *wireRequest) HandlerContext {
 		Kind:       request.rpcKind(),
 		Metadata:   cloneMetadata(request.Metadata),
 		flow:       request.flow,
+		streams:    request.streams,
 	}
 }
 
@@ -77,7 +82,7 @@ func contextWithHandlerContext(ctx context.Context, request *wireRequest) contex
 		return ctx
 	}
 
-	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression})
+	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression, streams: request.streams})
 }
 
 func cloneMetadata(metadata Metadata) Metadata {
@@ -106,4 +111,15 @@ func ownedMetadata(metadata Metadata) Metadata {
 		}
 	}
 	return metadata
+}
+
+// StreamCompressedRequests returns how many of the request messages of this
+// call have arrived stream-compressed so far (see StreamCompression), which is
+// zero when the call did not enable it. It is meant for observing stream
+// compression.
+func (c HandlerContext) StreamCompressedRequests() int64 {
+	if inflater := c.streams.requestInflater(); inflater != nil {
+		return inflater.received.Load()
+	}
+	return 0
 }

@@ -1,5 +1,5 @@
 //! Compressed messages end to end: the frames a Rust server and a Rust client put on the wire,
-//! and compressed calls over QUIC and `QMux` over TLS.
+//! and compressed calls over QUIC and `QMux` over TLS, per message and with stream compression.
 
 use std::error::Error;
 use std::net::SocketAddr;
@@ -18,7 +18,9 @@ use trevrpc::framing::{decode_payload, encode_message_frame, encode_protobuf_fra
 use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::wire::DictionaryInfo;
-use trevrpc::{Compression, Dictionary, RpcHeaders, RpcKind, RpcRequest, RpcStatus};
+use trevrpc::{
+    CompressStream, Compression, Dictionary, RpcHeaders, RpcKind, RpcRequest, RpcStatus,
+};
 
 #[macro_use]
 mod support;
@@ -28,6 +30,10 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UNARY: &str = "/test.Compressed/Echo";
 const BIDI: &str = "/test.Compressed/Chat";
+/// A bidirectional route that allows stream compression and reports, in its trailing metadata,
+/// how many requests arrived stream-compressed.
+const STREAM: &str = "/test.Compressed/Stream";
+const STREAM_COMPRESSED_KEY: &str = "stream-compressed";
 /// The type the test dictionary compresses: its samples are the JSON documents [`sample`] writes.
 const MESSAGE_TYPE: &str = "test.Echo";
 
@@ -100,9 +106,13 @@ fn self_signed() -> TestResult<(CertificateDer<'static>, quinn::rustls::ServerCo
 
 /// Serves an echo service whose routes name their message types, over QUIC and TCP.
 async fn spawn_server(compression: Compression) -> TestResult<RunningServer> {
+    spawn_server_with(ServerOptions::new().with_compression(compression)).await
+}
+
+async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> {
     let (cert, tls) = self_signed()?;
     let mut server = Server::new();
-    server.set_options(ServerOptions::new().with_compression(compression));
+    server.set_options(options);
     let options = RouteOptions::new().with_message_types(MESSAGE_TYPE, MESSAGE_TYPE);
     server.route_with_options(UNARY, options, |_context, body| async move { Ok(body) });
     server.route_streaming_with_options(
@@ -110,6 +120,26 @@ async fn spawn_server(compression: Compression) -> TestResult<RunningServer> {
         RpcKind::BidirectionalStreaming,
         options,
         |_context, _body, requests| async move { Ok(requests) },
+    );
+    server.route_streaming_with_options(
+        STREAM,
+        RpcKind::BidirectionalStreaming,
+        options.with_compress_stream(CompressStream::BOTH),
+        |context, _body, requests| async move {
+            let report = futures_util::stream::once(async move {
+                context.set_response_metadata(
+                    STREAM_COMPRESSED_KEY,
+                    context.stream_compressed_requests_received().to_string(),
+                )
+            })
+            .filter_map(|reported| async move {
+                reported
+                    .err()
+                    .map(|status| Err(trevrpc::Error::from(status)))
+            });
+            let responses: trevrpc::BoxStream<Vec<u8>> = Box::pin(requests.chain(report));
+            Ok(responses)
+        },
     );
     let endpoint = quinn::Endpoint::server(
         server.quic_config(tls.clone())?,
@@ -490,5 +520,204 @@ async fn the_client_queries_then_compresses_its_requests() -> TestResult {
             frame_type::ZSTD_MESSAGE
         ]
     );
+    Ok(())
+}
+
+/// Decodes the `ZSTD_STREAM_MESSAGE` payloads of one direction, in order, with libzstd.
+struct StreamReader(zstd_safe::DCtx<'static>);
+
+impl StreamReader {
+    fn new() -> TestResult<Self> {
+        use zstd_safe::{DCtx, DParameter, FrameFormat};
+        let mut context = DCtx::create();
+        context
+            .set_parameter(DParameter::Format(FrameFormat::Magicless))
+            .map_err(|code| zstd_safe::get_error_name(code).to_owned())?;
+        Ok(Self(context))
+    }
+
+    fn read(&mut self, payload: &[u8]) -> TestResult<Vec<u8>> {
+        let (size, size_len) = trevrpc::varint::decode(payload).ok_or("no message size")?;
+        let chunk = payload.get(size_len..).ok_or("no chunk")?;
+        let mut message = Vec::with_capacity(usize::try_from(size)?.saturating_add(1));
+        let mut input = zstd_safe::InBuffer::around(chunk);
+        while input.pos() < chunk.len() {
+            let start = message.len();
+            let mut output = zstd_safe::OutBuffer::around_pos(&mut message, start);
+            self.0
+                .decompress_stream(&mut output, &mut input)
+                .map_err(|code| zstd_safe::get_error_name(code).to_owned())?;
+        }
+        ensure_eq!(u64::try_from(message.len())?, size);
+        Ok(message)
+    }
+}
+
+/// Appends a frame of `frame_type` carrying `payload`.
+fn push_frame(bytes: &mut Vec<u8>, frame_type: u64, payload: &[u8]) -> TestResult {
+    bytes.extend(trevrpc::framing::encode_frame(
+        frame_type,
+        payload,
+        1 << 20,
+    )?);
+    Ok(())
+}
+
+/// Sends a bidirectional `STREAM` call with `request` and `messages` already framed, and returns
+/// the response frames.
+async fn raw_stream_call(
+    connection: &quinn::Connection,
+    request: &RpcRequest,
+    messages: &[u8],
+) -> TestResult<Vec<RawFrame>> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let mut bytes = encode_protobuf_frame(frame_type::REQUEST, request, 1 << 20)?;
+    bytes.extend_from_slice(messages);
+    send.write_all(&bytes).await?;
+    send.finish()?;
+    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    parse_frames(&response)
+}
+
+fn stream_request(offer: bool) -> RpcRequest {
+    let mut request = RpcRequest::new(STREAM).with_kind(RpcKind::BidirectionalStreaming);
+    if offer {
+        request.stream_compression = Some(trevrpc::wire::StreamCompression { max_window_log: 16 });
+    }
+    request
+}
+
+#[tokio::test]
+async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_third_response()
+-> TestResult {
+    let server = spawn_server(Compression::new()).await?;
+    let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
+
+    // The golden stream, sent stream-compressed from its first message.
+    let mut requests = Vec::new();
+    let mut messages = Vec::new();
+    for i in 0..4 {
+        push_frame(
+            &mut requests,
+            frame_type::ZSTD_STREAM_MESSAGE,
+            &vector(&format!("stream.plain.{i}.payload"))?,
+        )?;
+        messages.push(vector(&format!("stream.plain.{i}.message"))?);
+    }
+    let frames = raw_stream_call(&connection, &stream_request(true), &requests).await?;
+    ensure_eq!(
+        types(&frames),
+        [
+            frame_type::HEADERS,
+            frame_type::MESSAGE,
+            frame_type::MESSAGE,
+            frame_type::ZSTD_STREAM_MESSAGE,
+            frame_type::ZSTD_STREAM_MESSAGE,
+            frame_type::STATUS,
+        ]
+    );
+    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
+    ensure_eq!(
+        headers.stream_compression,
+        Some(trevrpc::wire::StreamCompression { max_window_log: 16 })
+    );
+    ensure_eq!(&frames[1].payload, &messages[0]);
+    ensure_eq!(&frames[2].payload, &messages[1]);
+    let mut reader = StreamReader::new()?;
+    ensure_eq!(reader.read(&frames[3].payload)?, messages[2]);
+    ensure_eq!(reader.read(&frames[4].payload)?, messages[3]);
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[5].payload)?);
+    ensure!(status.is_ok(), "{status:?}");
+    ensure_eq!(
+        status
+            .metadata()
+            .get(STREAM_COMPRESSED_KEY)
+            .map(Vec::as_slice),
+        Some(&b"4"[..])
+    );
+
+    // Without an offer the server answers nothing and rejects stream-compressed requests.
+    let frames = raw_stream_call(&connection, &stream_request(false), &requests).await?;
+    ensure_eq!(types(&frames), [frame_type::STATUS]);
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[0].payload)?);
+    ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
+
+    // An invalid chunk fails the call.
+    let mut bad = Vec::new();
+    push_frame(
+        &mut bad,
+        frame_type::ZSTD_STREAM_MESSAGE,
+        &vector("stream_bad.trailing_bytes.payload")?,
+    )?;
+    let frames = raw_stream_call(&connection, &stream_request(true), &bad).await?;
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(
+        &frames.last().ok_or("no frames")?.payload,
+    )?);
+    ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
+    drop(connection);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn a_server_without_stream_compression_memory_neither_answers_nor_compresses() -> TestResult {
+    let server = spawn_server_with(ServerOptions::new().with_stream_compression_memory(0)).await?;
+    let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
+    let mut requests = Vec::new();
+    for i in 0..4 {
+        push_frame(
+            &mut requests,
+            frame_type::MESSAGE,
+            &prost::Message::encode_to_vec(&sample(i)),
+        )?;
+    }
+    let frames = raw_stream_call(&connection, &stream_request(true), &requests).await?;
+    ensure_eq!(
+        types(&frames),
+        [
+            frame_type::MESSAGE,
+            frame_type::MESSAGE,
+            frame_type::MESSAGE,
+            frame_type::MESSAGE,
+            frame_type::STATUS,
+        ]
+    );
+    drop(connection);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn stream_compressed_calls_work_over_quic_and_qmux() -> TestResult {
+    for compression in [Compression::new(), compression()?] {
+        let server = spawn_server(compression.clone()).await?;
+        for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
+            let (_endpoint, channel) = compressed_channel(&server, policy).await?;
+            let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo>(
+                &channel,
+                STREAM,
+                trevrpc::client::CallOptions::new(),
+            )
+            .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+            .compress_stream(CompressStream::BOTH)
+            .await?;
+            let (sender, mut replies) = chat.split();
+            // Each echo arrives before the next send, so the server's answer is in before the
+            // third request, where stream compression starts.
+            for i in 0..6 {
+                sender.send(sample(i)).await?;
+                let reply = tokio::time::timeout(TEST_TIMEOUT, replies.next())
+                    .await?
+                    .ok_or("stream ended")??;
+                ensure!(reply == sample(i), "{policy:?}: {reply:?}");
+            }
+            sender.finish()?;
+            ensure!(replies.next().await.is_none());
+            let compressed = replies
+                .terminal_metadata()
+                .and_then(|metadata| metadata.get(STREAM_COMPRESSED_KEY))
+                .ok_or("no stream-compressed count")?;
+            ensure_eq!(compressed.as_slice(), b"4", "{policy:?}");
+        }
+        server.stop().await?;
+    }
     Ok(())
 }

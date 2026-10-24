@@ -144,6 +144,10 @@ pub struct RpcRequest {
     /// answer.
     #[prost(message, repeated, tag = "11")]
     pub dictionary_query: Vec<DictionaryInfo>,
+    /// Set by a client that implements stream compression, on calls to methods that allow it: it
+    /// decodes stream-compressed responses up to this window. See [`crate::CompressStream`].
+    #[prost(message, optional, tag = "12")]
+    pub stream_compression: Option<StreamCompression>,
 }
 
 /// A compression dictionary in the negotiation fields: its `Dictionary_ID` and its fingerprint,
@@ -154,6 +158,13 @@ pub struct DictionaryInfo {
     pub id: u32,
     #[prost(bytes = "vec", tag = "2")]
     pub fingerprint: Vec<u8>,
+}
+
+/// What a peer decodes in stream compression: the largest zstd window, as a base-2 logarithm.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct StreamCompression {
+    #[prost(uint32, tag = "1")]
+    pub max_window_log: u32,
 }
 
 impl RpcRequest {
@@ -169,6 +180,7 @@ impl RpcRequest {
             datagram_flow: 0,
             accept_dictionaries: Vec::new(),
             dictionary_query: Vec::new(),
+            stream_compression: None,
         }
     }
 
@@ -255,6 +267,10 @@ pub struct RpcHeaders {
     /// The server's answer to the request's `dictionary_query`.
     #[prost(message, repeated, tag = "3")]
     pub dictionaries: Vec<DictionaryInfo>,
+    /// The server's answer to the request's `stream_compression`: it decodes stream-compressed
+    /// requests up to this window.
+    #[prost(message, optional, tag = "4")]
+    pub stream_compression: Option<StreamCompression>,
 }
 
 /// The STATUS frame payload: the terminal status and trailing metadata.
@@ -665,6 +681,7 @@ mod tests {
                 metadata: metadata("x-a", b"1"),
                 extensions: Vec::new(),
                 dictionaries: Vec::new(),
+                stream_compression: None,
             },
         )
         .await;
@@ -685,6 +702,7 @@ mod tests {
                 metadata: Metadata::new(),
                 extensions: vec![1],
                 dictionaries: Vec::new(),
+                stream_compression: None,
             },
         )
         .await;

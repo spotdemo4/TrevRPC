@@ -81,6 +81,7 @@ func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *
 	server.SetOptions(options)
 	interoppb.RegisterEchoServer(server, echoServer{})
 	interoppb.RegisterUnreliableEchoServer(server, unreliableEchoServer{})
+	interoppb.RegisterCompressedEchoServer(server, compressedEchoServer{})
 	return trevrpc.Listen(addr, server, trevrpc.ListenOptions{TLSConfig: tlsConfig})
 }
 
@@ -257,3 +258,42 @@ func (s *unreliableEcho) setTrailers() error {
 }
 
 func (s *unreliableEcho) Close() error { return s.requests.Close() }
+
+// streamCompressedReceivedKey is the trailing metadata key of
+// CompressedEcho.Bidi.
+const streamCompressedReceivedKey = "interop-stream-compressed-received"
+
+// compressedEchoServer implements CompressedEcho in interop/README.md: Echo's
+// Bidi, reporting how many requests arrived stream-compressed.
+type compressedEchoServer struct{}
+
+func (compressedEchoServer) Bidi(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (trevrpc.MessageStream[*interoppb.EchoResponse], error) {
+	responses, err := echoServer{}.Bidi(ctx, requests)
+	if err != nil {
+		return nil, err
+	}
+	return &compressedEcho{ctx: ctx, responses: responses}, nil
+}
+
+// compressedEcho is an Echo.Bidi response stream that sets the count of
+// stream-compressed requests in its trailing metadata when the requests end.
+type compressedEcho struct {
+	ctx       context.Context
+	responses trevrpc.MessageStream[*interoppb.EchoResponse]
+}
+
+func (s *compressedEcho) Recv() (*interoppb.EchoResponse, error) {
+	response, err := s.responses.Recv()
+	if errors.Is(err, io.EOF) {
+		var received int64
+		if info, ok := trevrpc.HandlerContextFromContext(s.ctx); ok {
+			received = info.StreamCompressedRequests()
+		}
+		if err := trevrpc.SetResponseMetadata(s.ctx, streamCompressedReceivedKey, []byte(strconv.FormatInt(received, 10))); err != nil {
+			return nil, err
+		}
+	}
+	return response, err
+}
+
+func (s *compressedEcho) Close() error { return s.responses.Close() }

@@ -45,6 +45,14 @@ impl QuicTransport {
         self
     }
 
+    pub(crate) fn with_stream_budget(
+        mut self,
+        budget: Option<Arc<crate::compression::StreamBudget>>,
+    ) -> Self {
+        self.0.set_stream_budget(budget);
+        self
+    }
+
     /// Returns the established connection.
     #[must_use]
     pub const fn connection(&self) -> &quinn::Connection {

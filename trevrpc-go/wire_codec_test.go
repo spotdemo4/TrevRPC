@@ -86,7 +86,8 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 		if (err == nil) != (wantHeadersErr == nil) {
 			t.Fatalf("headers %x: err = %v, protobuf err = %v", payload, err, wantHeadersErr)
 		}
-		if err == nil && (!metadataEqual(headers, cloneMetadata(wantHeaders.Metadata)) || !dictionaryInfosEqual(answer, wantHeaders.Dictionaries)) {
+		if err == nil && (!metadataEqual(headers, cloneMetadata(wantHeaders.Metadata)) || !dictionaryInfosEqual(answer.dictionaries, wantHeaders.Dictionaries) ||
+			!streamCompressionInfoEqual(answer.stream, wantHeaders.StreamCompression)) {
 			t.Fatalf("headers %x: got %v %v, want %v %v", payload, headers, answer, wantHeaders.Metadata, wantHeaders.Dictionaries)
 		}
 	}
@@ -103,8 +104,9 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 		if rng.IntN(3) == 0 {
 			headers.Dictionaries = randomDictionaryInfos(rng)
 		}
+		headers.StreamCompression = randomStreamCompression(rng)
 		checkEncoding(t, frameTypeHeaders, func(dst []byte) ([]byte, error) {
-			return appendHeadersFrame(dst, headers.Metadata, headers.Dictionaries, DefaultMaxFrameSize)
+			return appendHeadersFrame(dst, headers.Metadata, headersAnswer{dictionaries: headers.Dictionaries, stream: headers.StreamCompression}, DefaultMaxFrameSize)
 		}, headers, len(headers.Metadata) > 1)
 
 		status := &Status{Code: Code(rng.IntN(20)), Message: string(prefix(randomWireBytes(rng), rng.IntN(5))), Metadata: randomMetadata(rng)}
@@ -150,7 +152,8 @@ func checkEncoding(t *testing.T, typ frameType, appendFrame func([]byte) ([]byte
 func wireRequestEqual(a, b *wireRequest) bool {
 	return a.Method == b.Method && a.Kind == b.Kind && a.TimeoutNanos == b.TimeoutNanos &&
 		slices.Equal(a.Extensions, b.Extensions) && metadataEqual(a.Metadata, b.Metadata) &&
-		slices.Equal(a.AcceptDictionaries, b.AcceptDictionaries) && dictionaryInfosEqual(a.DictionaryQuery, b.DictionaryQuery)
+		slices.Equal(a.AcceptDictionaries, b.AcceptDictionaries) && dictionaryInfosEqual(a.DictionaryQuery, b.DictionaryQuery) &&
+		streamCompressionInfoEqual(a.StreamCompression, b.StreamCompression)
 }
 
 func dictionaryInfosEqual(a, b []*dictionaryInfo) bool {
@@ -166,6 +169,20 @@ func addRandomDictionaries(rng *rand.Rand, request *wireRequest) {
 	}
 	if rng.IntN(4) == 0 {
 		request.DictionaryQuery = randomDictionaryInfos(rng)
+	}
+	request.StreamCompression = randomStreamCompression(rng)
+}
+
+// randomStreamCompression returns a stream_compression field, sometimes with
+// an unusual window and sometimes none.
+func randomStreamCompression(rng *rand.Rand) *streamCompressionInfo {
+	switch rng.IntN(4) {
+	case 0:
+		return nil
+	case 1:
+		return &streamCompressionInfo{}
+	default:
+		return &streamCompressionInfo{MaxWindowLog: rng.Uint32() >> rng.UintN(32)}
 	}
 }
 
@@ -186,10 +203,14 @@ func TestAppendFramesRejectInvalidUTF8(t *testing.T) {
 	if frame, err := appendStatusFrame(prefix, Internal("\xff"), DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("status frame = %x, err = %v", frame, err)
 	}
-	if frame, err := appendHeadersFrame(prefix, Metadata{"\xff": nil}, nil, DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
+	if frame, err := appendHeadersFrame(prefix, Metadata{"\xff": nil}, headersAnswer{}, DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("headers frame = %x, err = %v", frame, err)
 	}
 	if frame, err := appendRequestFrame(prefix, newWireRequest("/svc/\xff"), DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("request frame = %x, err = %v", frame, err)
 	}
+}
+
+func streamCompressionInfoEqual(a, b *streamCompressionInfo) bool {
+	return (a == nil) == (b == nil) && (a == nil || a.MaxWindowLog == b.MaxWindowLog)
 }

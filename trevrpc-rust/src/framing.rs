@@ -29,12 +29,15 @@ pub mod frame_type {
     /// A message compressed with zstd and a dictionary; see [`crate::Compression`]. Readers
     /// hand it on as a message.
     pub const ZSTD_MESSAGE: u64 = 4;
+    /// A message compressed with the zstd context of its direction of the call; see
+    /// [`crate::CompressStream`]. Readers hand it on as a message.
+    pub const ZSTD_STREAM_MESSAGE: u64 = 5;
 }
 
 /// Returns whether `frame_type` is defined by wire version 1.
 #[must_use]
 pub const fn is_known_frame_type(frame_type: u64) -> bool {
-    frame_type <= frame_type::ZSTD_MESSAGE
+    frame_type <= frame_type::ZSTD_STREAM_MESSAGE
 }
 
 /// A frame of a response stream, the currency between the transports and the call layer.
@@ -145,6 +148,8 @@ pub const fn validate_payload_len(len: usize, max_frame_size: usize) -> Result<(
 const METADATA_ENTRY: &[(u64, u64)] = &[(1, 2), (2, 2)];
 /// The fields of a `DictionaryInfo`: the ID, a varint, and the fingerprint.
 const DICTIONARY_INFO: &[(u64, u64)] = &[(1, 0), (2, 2)];
+/// The field of a `StreamCompression`: the window, a varint.
+const STREAM_COMPRESSION: &[(u64, u64)] = &[(1, 0)];
 
 fn preflight_known_wire<M: 'static>(body: &[u8]) -> Result<()> {
     // Field 8 and 10 of `RpcRequest` and field 2 of `RpcHeaders` are repeated integers, which may
@@ -154,13 +159,21 @@ fn preflight_known_wire<M: 'static>(body: &[u8]) -> Result<()> {
     let (fields, nested): (&[(u64, u64)], Nested) =
         if TypeId::of::<M>() == TypeId::of::<RpcRequest>() {
             (
-                &[(1, 2), (4, 2), (5, 0), (7, 0), (9, 0), (11, 2)],
-                &[(4, METADATA_ENTRY), (11, DICTIONARY_INFO)],
+                &[(1, 2), (4, 2), (5, 0), (7, 0), (9, 0), (11, 2), (12, 2)],
+                &[
+                    (4, METADATA_ENTRY),
+                    (11, DICTIONARY_INFO),
+                    (12, STREAM_COMPRESSION),
+                ],
             )
         } else if TypeId::of::<M>() == TypeId::of::<RpcHeaders>() {
             (
-                &[(1, 2), (3, 2)],
-                &[(1, METADATA_ENTRY), (3, DICTIONARY_INFO)],
+                &[(1, 2), (3, 2), (4, 2)],
+                &[
+                    (1, METADATA_ENTRY),
+                    (3, DICTIONARY_INFO),
+                    (4, STREAM_COMPRESSION),
+                ],
             )
         } else if TypeId::of::<M>() == TypeId::of::<RpcStatus>() {
             (&[(1, 0), (2, 2), (3, 2)], &[(3, METADATA_ENTRY)])
@@ -352,10 +365,10 @@ mod tests {
 
     #[test]
     fn known_frame_types_are_exactly_the_defined_ones() {
-        for known in 0..=4 {
+        for known in 0..=5 {
             assert!(is_known_frame_type(known));
         }
-        for unknown in [5, 0x21, 0x40, 0x5f, u64::MAX] {
+        for unknown in [6, 0x21, 0x40, 0x5f, u64::MAX] {
             assert!(!is_known_frame_type(unknown));
         }
         // The grease types 0x1f * N + 0x21 are all unknown.

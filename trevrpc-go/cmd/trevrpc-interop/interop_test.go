@@ -27,7 +27,7 @@ import (
 var wantScenarios = []string{
 	"unary", "unary-metadata", "unary-error", "unary-large", "client-stream",
 	"server-stream", "server-stream-error", "bidi", "bidi-error",
-	"unary-headers", "server-stream-headers", "unreliable", "compressed",
+	"unary-headers", "server-stream-headers", "unreliable", "compressed", "compressed-stream",
 }
 
 // writeTestDictionary writes the compression dictionary of the shared golden

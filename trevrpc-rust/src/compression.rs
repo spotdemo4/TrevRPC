@@ -18,6 +18,14 @@ use crate::sync::MutexExt;
 use crate::wire::DictionaryInfo;
 use crate::{Error, Result, RpcRequest, Status};
 
+mod stream;
+
+pub use stream::CompressStream;
+pub(crate) use stream::{
+    DEFAULT_CLIENT_MEMORY, DEFAULT_SERVER_MEMORY, Inflater, MessageEncoder, ServerStream,
+    StreamBudget, StreamEnable, negotiate_stream, offer_stream,
+};
+
 /// The dictionaries a peer holds, for compressed messages.
 ///
 /// Messages travel as zstd frames compressed with a dictionary both peers hold. Dictionaries are
@@ -177,6 +185,11 @@ impl Dict {
         Ok(dict)
     }
 
+    /// The dictionary itself, which stream compression contexts load.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     fn new_compressor(&self) -> Result<CCtx<'static>> {
         let mut context = CCtx::create();
         for parameter in [
@@ -256,6 +269,8 @@ pub(crate) struct CompressionConfig {
     by_type: HashMap<String, Arc<Dict>>,
     /// Every dictionary, as a client's `dictionary_query`.
     query: Vec<DictionaryInfo>,
+    /// The zstd level of outgoing messages.
+    level: i32,
 }
 
 impl CompressionConfig {
@@ -273,6 +288,7 @@ impl CompressionConfig {
             by_id: HashMap::new(),
             by_type: HashMap::new(),
             query: Vec::new(),
+            level,
         };
         for dictionary in &compression.dictionaries {
             let dict = Arc::new(Dict::new(dictionary.data.clone(), level)?);
@@ -307,6 +323,12 @@ impl CompressionConfig {
 
     fn dict(&self, id: u32) -> Option<&Arc<Dict>> {
         self.by_id.get(&id)
+    }
+
+    /// The zstd level of outgoing messages under `config`: its level, or 1 without one, since
+    /// stream compression needs no dictionaries.
+    pub(crate) fn level(config: Option<&Arc<Self>>) -> i32 {
+        config.map_or(1, |config| config.level)
     }
 
     fn dict_for_type(&self, name: Option<&str>) -> Option<&Arc<Dict>> {
@@ -610,7 +632,7 @@ mod tests {
     use super::*;
 
     /// The entries of `testdata/zstd-golden-vectors.txt`, hex-decoded.
-    fn vectors() -> HashMap<String, Vec<u8>> {
+    pub(super) fn vectors() -> HashMap<String, Vec<u8>> {
         include_str!("../../testdata/zstd-golden-vectors.txt")
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -635,7 +657,7 @@ mod tests {
         )
     }
 
-    fn config() -> Arc<CompressionConfig> {
+    pub(super) fn config() -> Arc<CompressionConfig> {
         CompressionConfig::new(&test_compression())
             .unwrap()
             .unwrap()

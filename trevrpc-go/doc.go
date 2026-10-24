@@ -9,4 +9,10 @@
 // with [WithUnreliable] and [RouteUnreliable]; see [Unreliable]. Those
 // messages then travel as QUIC or WebTransport datagrams, and may be lost or
 // reordered.
+//
+// Messages can be compressed with zstd: per message with dictionaries both
+// peers hold ([Compression]), and on long streams with one context per
+// direction of a call, which a method allows in its schema or with
+// [WithStreamCompression] and [RouteStreamCompression]; see
+// [StreamCompression].
 package trevrpc

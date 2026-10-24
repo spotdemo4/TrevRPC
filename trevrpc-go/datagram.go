@@ -73,7 +73,8 @@ func WithUnreliable(u Unreliable) CallOption {
 
 // routeConfig holds the resolved options of one registered route.
 type routeConfig struct {
-	unreliable Unreliable
+	unreliable        Unreliable
+	streamCompression StreamCompression
 }
 
 // RouteOption customizes a route registered with Register*.
@@ -131,11 +132,13 @@ func parseDatagram(datagram []byte) (flow uint64, frames []byte, ok bool) {
 
 // walkDatagramFrames calls fn, if there is one, with the type and payload of
 // every MESSAGE and ZSTD_MESSAGE frame of frames in order, and skips the
-// frames of every other type, known or not. Type and length varints need not be minimal. It reports false
-// when the frames do not exactly fill their space, a truncated frame or a
-// length past the end, in which case the datagram is dropped whole; fn may
-// have been called for the frames before the fault, so callers that must not
-// deliver any message first walk with a nil fn.
+// frames of every other type, known or not. Type and length varints need not
+// be minimal. It reports false when the frames do not exactly fill their
+// space, a truncated frame or a length past the end, or when they hold a
+// ZSTD_STREAM_MESSAGE, which needs the order of a stream; the datagram is
+// then dropped whole. fn may have been called for the frames before the
+// fault, so callers that must not deliver any message first walk with a nil
+// fn.
 func walkDatagramFrames(frames []byte, fn func(typ frameType, payload []byte)) bool {
 	for len(frames) > 0 {
 		typ, n, err := quicvarint.Parse(frames)
@@ -148,7 +151,7 @@ func walkDatagramFrames(frames []byte, fn func(typ frameType, payload []byte)) b
 			return false
 		}
 		frames = frames[n:]
-		if length > uint64(len(frames)) {
+		if length > uint64(len(frames)) || frameType(typ) == frameTypeZstdStreamMessage {
 			return false
 		}
 		if t := frameType(typ); (t == frameTypeMessage || t == frameTypeZstdMessage) && fn != nil {

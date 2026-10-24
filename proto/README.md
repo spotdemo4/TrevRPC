@@ -2,7 +2,7 @@
 
 Options for [TrevRPC](https://trev.zip/llc/TrevRPC), a protobuf RPC framework over QUIC, HTTP/3, and WebTransport.
 
-`trevrpc/options.proto` defines `(trevrpc.method)`, which marks the streamed requests or responses of a method as unreliable so they may travel as QUIC or WebTransport datagrams (see [Datagram Messages](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages)):
+`trevrpc/options.proto` defines `(trevrpc.method)`. It marks the streamed requests or responses of a method as unreliable, so they may travel as QUIC or WebTransport datagrams (see [Datagram Messages](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages)), and lets a streaming method compress its messages with one zstd context per call (`compress_stream`; see [Stream Compression](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#stream-compression)):
 
 ```proto
 import "trevrpc/options.proto";
@@ -10,6 +10,9 @@ import "trevrpc/options.proto";
 service Telemetry {
   rpc Track(stream Position) returns (stream Position) {
     option (trevrpc.method) = {unreliable_requests: true, unreliable_responses: true};
+  }
+  rpc Subscribe(SubscribeRequest) returns (stream MetricSample) {
+    option (trevrpc.method) = {compress_stream: true};
   }
 }
 ```

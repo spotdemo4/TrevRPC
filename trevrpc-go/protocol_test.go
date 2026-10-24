@@ -30,7 +30,7 @@ func statusBytes(t testing.TB, status *Status) []byte {
 // headersBytes is a HEADERS frame.
 func headersBytes(t testing.TB, metadata Metadata) []byte {
 	t.Helper()
-	frame, err := appendHeadersFrame(nil, metadata, nil, DefaultMaxFrameSize)
+	frame, err := appendHeadersFrame(nil, metadata, headersAnswer{}, DefaultMaxFrameSize)
 	if err != nil {
 		t.Fatal(err)
 	}

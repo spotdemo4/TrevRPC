@@ -326,8 +326,9 @@ impl Messages {
 /// Splits a datagram, with its transport prefix already removed, into its flow ID and messages.
 ///
 /// Returns `None`, dropping the datagram whole, when it does not start with a flow ID, when the
-/// flow is zero (which means no flow), when its frames do not exactly fill it, or when a message
-/// is larger than `max_frame_size`. Frames that are not MESSAGE frames are skipped.
+/// flow is zero (which means no flow), when its frames do not exactly fill it, when a message
+/// is larger than `max_frame_size`, or when it holds a `ZSTD_STREAM_MESSAGE`, which needs the
+/// ordered delivery of a stream. Other frames that are not messages are skipped.
 fn decode(datagram: Bytes, max_frame_size: usize) -> Option<(u64, Messages)> {
     let (flow, flow_len) = varint::decode(&datagram)?;
     if flow == 0 {
@@ -336,7 +337,9 @@ fn decode(datagram: Bytes, max_frame_size: usize) -> Option<(u64, Messages)> {
     let mut offset = flow_len;
     while offset < datagram.len() {
         let (frame_type, start, end) = next_frame(&datagram, offset)?;
-        if frame_type == MESSAGE_FRAME && end.saturating_sub(start) > max_frame_size {
+        if (frame_type == MESSAGE_FRAME && end.saturating_sub(start) > max_frame_size)
+            || frame_type == crate::framing::frame_type::ZSTD_STREAM_MESSAGE
+        {
             return None;
         }
         offset = end;
@@ -988,16 +991,16 @@ impl FlowSender {
 
 /// How many request messages of a call arrived as datagrams.
 #[derive(Clone, Debug, Default)]
-pub struct DatagramCount(Option<Arc<AtomicU64>>);
+pub struct MessageCount(Option<Arc<AtomicU64>>);
 
-impl DatagramCount {
+impl MessageCount {
     /// A counter that starts at zero and shares its count with its clones.
     #[must_use]
     pub fn new() -> Self {
         Self(Some(Arc::new(AtomicU64::new(0))))
     }
 
-    fn add(&self) {
+    pub(crate) fn add(&self) {
         if let Some(count) = &self.0 {
             count.fetch_add(1, Ordering::Relaxed);
         }
@@ -1021,7 +1024,7 @@ pub struct MergedRequests {
     requests: BoxStream<Vec<u8>>,
     datagrams: Option<queue::Receiver<Bytes>>,
     drain: DrainHandle,
-    count: DatagramCount,
+    count: MessageCount,
     requests_done: bool,
     /// Alternates which source is polled first, so neither starves the other.
     datagrams_first: bool,
@@ -1035,7 +1038,7 @@ impl MergedRequests {
         requests: BoxStream<Vec<u8>>,
         datagrams: queue::Receiver<Bytes>,
         drain: DrainHandle,
-        count: DatagramCount,
+        count: MessageCount,
     ) -> BoxStream<Vec<u8>> {
         Box::pin(Self {
             requests,
@@ -1518,6 +1521,9 @@ mod tests {
         // A message over the maximum frame size drops the whole datagram, even after good ones.
         assert!(messages_of(&[0x01, 0x00, 0x01, b'x', 0x00, 0x03, 1, 2, 3], 2).is_none());
         assert!(messages_of(&[0x01, 0x00, 0x03, 1, 2, 3], 3).is_some());
+        // A ZSTD_STREAM_MESSAGE needs a stream's order, so it drops the datagram, good messages
+        // and all.
+        assert!(messages_of(&[0x01, 0x00, 0x01, b'x', 0x05, 0x01, 0x00], MAX_FRAME).is_none());
     }
 
     #[test]
@@ -2099,7 +2105,7 @@ mod tests {
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
-        let count = DatagramCount::new();
+        let count = MessageCount::new();
         let mut merged =
             MergedRequests::boxed(stream, requests, flow.guard.drain_handle(), count.clone());
 
@@ -2134,7 +2140,7 @@ mod tests {
             stream,
             requests,
             flow.guard.drain_handle(),
-            DatagramCount::new(),
+            MessageCount::new(),
         );
 
         fake.arrive_for(1, b"queued");
@@ -2166,7 +2172,7 @@ mod tests {
             stream,
             requests,
             flow.guard.drain_handle(),
-            DatagramCount::new(),
+            MessageCount::new(),
         );
 
         stream_tx
@@ -2190,7 +2196,7 @@ mod tests {
             stream,
             requests,
             flow.guard.drain_handle(),
-            DatagramCount::new(),
+            MessageCount::new(),
         );
 
         // The datagrams and the end of the stream arrive together, and nothing yields to the

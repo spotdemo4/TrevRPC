@@ -109,6 +109,7 @@ var transportPolicies = map[string]trevrpc.TransportPolicy{
 type scenarioEnv struct {
 	echo       *interoppb.EchoClient
 	unreliable *interoppb.UnreliableEchoClient
+	compressed *interoppb.CompressedEchoClient
 	// transport is the transport of the connection.
 	transport trevrpc.TransportKind
 	// datagramFrames reports how many QUIC DATAGRAM frames the connection has
@@ -150,6 +151,7 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 	env := &scenarioEnv{
 		echo:       interoppb.NewEchoClient(channel),
 		unreliable: interoppb.NewUnreliableEchoClient(channel),
+		compressed: interoppb.NewCompressedEchoClient(channel),
 		transport:  channel.Transport(),
 	}
 	if frames != nil {
@@ -348,6 +350,7 @@ var scenarios = []scenario{
 	}},
 	{"unreliable", runUnreliable},
 	{"compressed", runCompressed},
+	{"compressed-stream", runCompressedStream},
 }
 
 // compressedMessage is the i-th message of the compressed scenario: like the
@@ -396,6 +399,52 @@ func runCompressed(ctx context.Context, env *scenarioEnv) error {
 
 // compressedMessages is how many messages the compressed scenario streams.
 const compressedMessages = 3
+
+// compressedStreamMessages is how many messages the compressed-stream scenario
+// streams.
+const compressedStreamMessages = 8
+
+// runCompressedStream is the compressed-stream scenario: CompressedEcho.Bidi,
+// waiting for each echo so that the server's answer in HEADERS arrives before
+// the client starts stream-compressing. The server reports how many requests
+// arrived stream-compressed.
+func runCompressedStream(ctx context.Context, env *scenarioEnv) error {
+	stream, err := env.compressed.Bidi(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(stream)
+	for i := range compressedStreamMessages {
+		if err := stream.Send(&interoppb.EchoRequest{Message: compressedMessage(i)}); err != nil {
+			return fmt.Errorf("send %d: %w", i, err)
+		}
+		response, err := stream.Recv()
+		if err != nil {
+			return fmt.Errorf("receive %d: %w", i, err)
+		}
+		if err := expectResponse(response, compressedMessage(i), uint32(i)); err != nil {
+			return fmt.Errorf("response %d: %w", i, err)
+		}
+	}
+	if err := stream.CloseSend(); err != nil {
+		return err
+	}
+	if err := expectEnd(stream); err != nil {
+		return err
+	}
+	status, ok := stream.TerminalStatus()
+	if !ok {
+		return errors.New("no terminal status after the end of the stream")
+	}
+	compressed, err := metadataCount(status.Metadata, streamCompressedReceivedKey)
+	if err != nil {
+		return err
+	}
+	if compressed < 1 {
+		return fmt.Errorf("%s = 0: no request arrived stream-compressed", streamCompressedReceivedKey)
+	}
+	return nil
+}
 
 // Parameters of the unreliable scenario: the number of small requests, and
 // the size of the large one, which cannot travel as a datagram.

@@ -19,11 +19,20 @@ use prost_types::{
 /// `proto/trevrpc/options.proto`.
 const METHOD_OPTION_FIELD: u32 = 58247;
 
-/// The unreliable marks of the `(trevrpc.method)` option of one method.
+/// The marks of the `(trevrpc.method)` option of one method.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MethodMarks {
     unreliable_requests: bool,
     unreliable_responses: bool,
+    compress_stream: bool,
+}
+
+/// The directions of a method that may use stream compression: those it streams, when the schema
+/// sets `compress_stream` and the direction's message type has no field marked `debug_redact`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompressedDirections {
+    requests: bool,
+    responses: bool,
 }
 
 /// A minimal mirror of `CodeGeneratorRequest` that keeps what `prost-types` drops.
@@ -33,7 +42,10 @@ struct MethodMarks {
 /// declares the path to it: `CodeGeneratorRequest.proto_file` (15) -> `FileDescriptorProto`
 /// (`name` 1, `service` 6) -> `ServiceDescriptorProto` (`name` 1, `method` 2) ->
 /// `MethodDescriptorProto` (`name` 1, `options` 4) -> `MethodOptions` (extension 58247) ->
-/// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2).
+/// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2, `compress_stream`
+/// 3). It also reads `FieldOptions.debug_redact` (16), which `prost-types` does not know, through
+/// `FileDescriptorProto.message_type` (4) -> `DescriptorProto` (`name` 1, `field` 2,
+/// `nested_type` 3) -> `FieldDescriptorProto` (`type_name` 6, `options` 8).
 mod mirror {
     #[derive(Clone, PartialEq, Eq, prost::Message)]
     pub struct Request {
@@ -45,8 +57,36 @@ mod mirror {
     pub struct File {
         #[prost(string, optional, tag = "1")]
         pub name: Option<String>,
+        #[prost(string, optional, tag = "2")]
+        pub package: Option<String>,
+        #[prost(message, repeated, tag = "4")]
+        pub message_type: Vec<MessageType>,
         #[prost(message, repeated, tag = "6")]
         pub service: Vec<Service>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct MessageType {
+        #[prost(string, optional, tag = "1")]
+        pub name: Option<String>,
+        #[prost(message, repeated, tag = "2")]
+        pub field: Vec<Field>,
+        #[prost(message, repeated, tag = "3")]
+        pub nested_type: Vec<Self>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct Field {
+        #[prost(string, optional, tag = "6")]
+        pub type_name: Option<String>,
+        #[prost(message, optional, tag = "8")]
+        pub options: Option<FieldOptions>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct FieldOptions {
+        #[prost(bool, tag = "16")]
+        pub debug_redact: bool,
     }
 
     #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -77,6 +117,8 @@ mod mirror {
         pub unreliable_requests: bool,
         #[prost(bool, tag = "2")]
         pub unreliable_responses: bool,
+        #[prost(bool, tag = "3")]
+        pub compress_stream: bool,
     }
 
     /// A `FileDescriptorSet`, with its files left encoded.
@@ -98,10 +140,14 @@ mod mirror {
     }
 }
 
-/// The `(trevrpc.method)` marks of every method of a request, by file, service and method name.
+/// The `(trevrpc.method)` marks of every method of a request, by file, service and method name,
+/// and the message types that hold a field marked `debug_redact`.
 #[derive(Debug, Default)]
 struct MethodOptionIndex {
     marks: HashMap<(String, String, String), MethodMarks>,
+    /// Full names, without a leading dot, of the messages that hold a redacted field, directly or
+    /// in a nested message field.
+    redacted: HashSet<String>,
 }
 
 impl MethodOptionIndex {
@@ -110,6 +156,15 @@ impl MethodOptionIndex {
         debug_assert_eq!(METHOD_OPTION_FIELD, 58247);
         let request = mirror::Request::decode(request)?;
         let mut marks = HashMap::new();
+        let mut messages = HashMap::new();
+        for file in &request.proto_file {
+            index_messages(
+                file.package.as_deref().unwrap_or_default(),
+                &file.message_type,
+                &mut messages,
+            );
+        }
+        let redacted = redacted_messages(&messages);
         for file in request.proto_file {
             let file_name = file.name.unwrap_or_default();
             for service in file.service {
@@ -127,12 +182,18 @@ impl MethodOptionIndex {
                         MethodMarks {
                             unreliable_requests: options.unreliable_requests,
                             unreliable_responses: options.unreliable_responses,
+                            compress_stream: options.compress_stream,
                         },
                     );
                 }
             }
         }
-        Ok(Self { marks })
+        Ok(Self { marks, redacted })
+    }
+
+    /// Whether the message `full_name` (with or without a leading dot) holds a redacted field.
+    fn is_redacted(&self, full_name: &str) -> bool {
+        self.redacted.contains(full_name.trim_start_matches('.'))
     }
 
     fn get(&self, file: &str, service: &str, method: &str) -> MethodMarks {
@@ -140,6 +201,77 @@ impl MethodOptionIndex {
             .get(&(file.to_owned(), service.to_owned(), method.to_owned()))
             .copied()
             .unwrap_or_default()
+    }
+}
+
+/// What one message type says about redaction: whether one of its own fields is marked
+/// `debug_redact`, and the message types of its fields.
+#[derive(Debug, Default)]
+struct MessageFields {
+    redacted: bool,
+    field_types: Vec<String>,
+}
+
+/// Indexes `messages` of the scope `scope` (a package, or an enclosing message's full name) and
+/// their nested messages, by full name without a leading dot.
+fn index_messages(
+    scope: &str,
+    messages: &[mirror::MessageType],
+    index: &mut HashMap<String, MessageFields>,
+) {
+    for message in messages {
+        let name = message.name.as_deref().unwrap_or_default();
+        let full_name = if scope.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{scope}.{name}")
+        };
+        index_messages(&full_name, &message.nested_type, index);
+        index.insert(
+            full_name,
+            MessageFields {
+                redacted: message.field.iter().any(|field| {
+                    field
+                        .options
+                        .as_ref()
+                        .is_some_and(|options| options.debug_redact)
+                }),
+                field_types: message
+                    .field
+                    .iter()
+                    .filter_map(|field| field.type_name.as_deref())
+                    .map(|name| name.trim_start_matches('.').to_owned())
+                    .collect(),
+            },
+        );
+    }
+}
+
+/// The messages that hold a redacted field directly or through message fields, however deep.
+fn redacted_messages(messages: &HashMap<String, MessageFields>) -> HashSet<String> {
+    let mut redacted: HashSet<String> = messages
+        .iter()
+        .filter(|(_, fields)| fields.redacted)
+        .map(|(name, _)| name.clone())
+        .collect();
+    // Spread to the messages that hold a redacted one until nothing changes; recursive types end
+    // the loop because the set only grows.
+    loop {
+        let more: Vec<String> = messages
+            .iter()
+            .filter(|(name, fields)| {
+                !redacted.contains(*name)
+                    && fields
+                        .field_types
+                        .iter()
+                        .any(|field| redacted.contains(field))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if more.is_empty() {
+            return redacted;
+        }
+        redacted.extend(more);
     }
 }
 
@@ -414,6 +546,7 @@ struct Method {
     client_streaming: bool,
     server_streaming: bool,
     unreliable: MethodMarks,
+    compressed: CompressedDirections,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,6 +880,15 @@ fn descriptor_service(
                 type_index,
                 options,
             )
+            .map(|mut generated| {
+                generated.compressed = CompressedDirections {
+                    requests: generated.compressed.requests
+                        && !method_options.is_redacted(&generated.input_proto_type),
+                    responses: generated.compressed.responses
+                        && !method_options.is_redacted(&generated.output_proto_type),
+                };
+                generated
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -802,6 +944,11 @@ fn descriptor_method(
             "{full_name}: unreliable_responses requires a server-streaming or bidirectional method"
         ));
     }
+    if marks.compress_stream && !client_streaming && !server_streaming {
+        return Err(format!(
+            "{full_name}: compress_stream requires a streaming method"
+        ));
+    }
 
     Ok(Method {
         name: to_rust_method_name(&proto_name),
@@ -813,6 +960,10 @@ fn descriptor_method(
         client_streaming,
         server_streaming,
         unreliable: marks,
+        compressed: CompressedDirections {
+            requests: marks.compress_stream && client_streaming,
+            responses: marks.compress_stream && server_streaming,
+        },
     })
 }
 
@@ -916,6 +1067,18 @@ fn unreliable_expr(runtime_path: &str, method: &Method) -> Option<String> {
         (true, true) => "BOTH",
     };
     Some(format!("{runtime_path}::Unreliable::{constant}"))
+}
+
+/// Returns the `CompressStream` constant for the directions of a method that may use stream
+/// compression, or `None` when neither may.
+fn compress_stream_expr(runtime_path: &str, method: &Method) -> Option<String> {
+    let constant = match (method.compressed.requests, method.compressed.responses) {
+        (false, false) => return None,
+        (true, false) => "REQUESTS",
+        (false, true) => "RESPONSES",
+        (true, true) => "BOTH",
+    };
+    Some(format!("{runtime_path}::CompressStream::{constant}"))
 }
 
 /// Returns the doc lines that say which directions of a method travel as datagrams when they can.
@@ -1073,8 +1236,11 @@ fn generate_client_method(
     let marks = unreliable_expr(runtime_path, method)
         .map(|unreliable| format!(".default_unreliable({unreliable})"))
         .unwrap_or_default();
+    let compress = compress_stream_expr(runtime_path, method)
+        .map(|directions| format!(".compress_stream({directions})"))
+        .unwrap_or_default();
     let marks = format!(
-        ".message_types({:?}, {:?}){marks}",
+        ".message_types({:?}, {:?}){marks}{compress}",
         method.input_proto_type, method.output_proto_type
     );
     let (shape, constructor, request_param, request_arg) =
@@ -1142,6 +1308,9 @@ fn generate_registration_method(
     );
     if let Some(unreliable) = unreliable_expr(runtime_path, method) {
         options.push_str(&format!(".with_unreliable({unreliable})"));
+    }
+    if let Some(directions) = compress_stream_expr(runtime_path, method) {
+        options.push_str(&format!(".with_compress_stream({directions})"));
     }
     let emitted = buf.split_off(start);
     buf.push_str(
@@ -1273,7 +1442,7 @@ mod tests {
         to_rust_method_name, to_snake_case,
     };
 
-    use super::{Method, MethodMarks};
+    use super::{CompressedDirections, Method, MethodMarks};
 
     #[test]
     fn builds_proto_service_paths() {
@@ -1323,6 +1492,7 @@ mod tests {
                 client_streaming: false,
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
+                compressed: CompressedDirections::default(),
             }],
         };
         let mut generated = String::new();
@@ -1352,6 +1522,7 @@ mod tests {
                 client_streaming: false,
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
+                compressed: CompressedDirections::default(),
             }],
         };
         let mut generated = String::new();
@@ -1400,6 +1571,7 @@ mod tests {
                 client_streaming: false,
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
+                compressed: CompressedDirections::default(),
             }],
         };
         let mut generated = String::new();
@@ -1426,6 +1598,7 @@ mod tests {
                     client_streaming: false,
                     server_streaming: true,
                     unreliable: MethodMarks::default(),
+                    compressed: CompressedDirections::default(),
                 },
                 Method {
                     name: "lots_of_greetings".to_owned(),
@@ -1437,6 +1610,7 @@ mod tests {
                     client_streaming: true,
                     server_streaming: false,
                     unreliable: MethodMarks::default(),
+                    compressed: CompressedDirections::default(),
                 },
                 Method {
                     name: "bidi_hello".to_owned(),
@@ -1448,6 +1622,7 @@ mod tests {
                     client_streaming: true,
                     server_streaming: true,
                     unreliable: MethodMarks::default(),
+                    compressed: CompressedDirections::default(),
                 },
             ],
         };

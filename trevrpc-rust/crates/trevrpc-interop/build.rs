@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use prost::Message;
 use prost_types::compiler::CodeGeneratorResponse;
 
-/// The interop services, shared by every runtime. `interop.proto` has the reliable `Echo` and
-/// `unreliable.proto` the `UnreliableEcho` service with datagram messages.
+/// The interop services, shared by every runtime. `interop.proto` has the reliable `Echo`,
+/// `unreliable.proto` the `UnreliableEcho` service with datagram messages, and `compressed.proto`
+/// the `CompressedEcho` service with stream compression.
 const INTEROP_PROTO_DIR: &str = "../../../interop/proto";
-const INTEROP_PROTOS: [&str; 2] = ["interop.proto", "unreliable.proto"];
-/// The directory holding `trevrpc/options.proto`, which `unreliable.proto` imports.
+const INTEROP_PROTOS: [&str; 3] = ["interop.proto", "unreliable.proto", "compressed.proto"];
+/// The directory holding `trevrpc/options.proto`, which the other files import.
 const TREVRPC_PROTO_DIR: &str = "../../../proto";
 const OPTIONS_PROTO: &str = "trevrpc/options.proto";
 const GENERATED_SERVICE: &str = "trevrpc.interop.v1.trevrpc.rs";

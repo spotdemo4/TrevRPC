@@ -4,7 +4,10 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 
-use crate::compression::{ClientCall, ClientCompression, CompressionConfig, Dict};
+use crate::compression::{
+    ClientCall, ClientCompression, CompressionConfig, DEFAULT_CLIENT_MEMORY, MessageEncoder,
+    StreamBudget, offer_stream,
+};
 use crate::datagram::{ClientFlow, Demux, FlowSender, MergedResponses};
 use crate::framed::{self, ResponseReading};
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
@@ -25,6 +28,10 @@ pub struct NativeTransport<C> {
     datagrams: Arc<OnceLock<Option<Demux>>>,
     /// The connection's compression state, `None` without dictionaries.
     compression: Option<Arc<ClientCompression>>,
+    /// The zstd level of outgoing messages.
+    level: i32,
+    /// The memory stream compression may hold, `None` when it is disabled.
+    stream_budget: Option<Arc<StreamBudget>>,
 }
 
 impl<C: MuxConnection> NativeTransport<C> {
@@ -34,12 +41,21 @@ impl<C: MuxConnection> NativeTransport<C> {
             max_frame_size,
             datagrams: Arc::new(OnceLock::new()),
             compression: None,
+            level: CompressionConfig::level(None),
+            stream_budget: StreamBudget::new(DEFAULT_CLIENT_MEMORY),
         }
     }
 
     /// Gives the connection the dictionaries of `config`, which it negotiates afresh.
     pub(crate) fn set_compression(&mut self, config: Option<Arc<CompressionConfig>>) {
+        self.level = CompressionConfig::level(config.as_ref());
         self.compression = config.map(ClientCompression::new);
+    }
+
+    /// Makes stream compression hold memory from `budget`, which channels share between their
+    /// connections; `None` disables it.
+    pub(crate) fn set_stream_budget(&mut self, budget: Option<Arc<StreamBudget>>) {
+        self.stream_budget = budget;
     }
 
     /// Fills the negotiation fields of `request` for a call whose message types are `types`.
@@ -70,6 +86,17 @@ impl<C: MuxConnection> NativeTransport<C> {
         info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
         let call = self.prepare(&mut request, info.message_types);
+        let directions = info
+            .compress_stream
+            .effective(request.rpc_kind())
+            .without_unreliable(info.unreliable);
+        let stream = offer_stream(
+            &mut request,
+            directions,
+            self.stream_budget.as_ref(),
+            &call.accept,
+            self.level,
+        );
         let flow = if info.unreliable.any() {
             self.demux().and_then(|demux| {
                 demux.open_client_flow(request.rpc_kind(), info.unreliable, call.accept.clone())
@@ -95,7 +122,7 @@ impl<C: MuxConnection> NativeTransport<C> {
             ),
             None => (None, None),
         };
-        let compress = call.requests.clone();
+        let encoder = MessageEncoder::new(call.requests.clone()).with_stream(stream.requests);
         let upload = UploadWriter::spawn(async move {
             write_streaming_request(
                 send,
@@ -103,7 +130,7 @@ impl<C: MuxConnection> NativeTransport<C> {
                 request_body,
                 max_frame_size,
                 requests,
-                compress,
+                encoder,
             )
             .await
         });
@@ -115,6 +142,8 @@ impl<C: MuxConnection> NativeTransport<C> {
             reading: ResponseReading {
                 accept: call.accept,
                 learn: call.learn,
+                stream: stream.responses,
+                enable_requests: stream.enable_requests,
             },
             complete: false,
         });
@@ -146,10 +175,10 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
             complete: false,
         };
 
-        framed::write_request(
+        framed::write_unary_request(
             &mut call.send,
             &request,
-            vec![Bytes::from(body)],
+            Bytes::from(body),
             self.max_frame_size,
             negotiated.requests.as_ref(),
         )
@@ -159,6 +188,7 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
         let mut reading = ResponseReading {
             accept: negotiated.accept,
             learn: negotiated.learn,
+            ..ResponseReading::default()
         };
         let mut response = UnaryResponse::default();
         while let Some(frame) =
@@ -236,7 +266,7 @@ async fn write_streaming_request<S: MuxSendStream>(
     mut request_body: BoxStream<Vec<u8>>,
     max_frame_size: usize,
     datagrams: Option<FlowSender>,
-    compress: Option<Arc<Dict>>,
+    mut encoder: MessageEncoder,
 ) -> Result<()> {
     let mut upload = UploadStream {
         send,
@@ -250,7 +280,7 @@ async fn write_streaming_request<S: MuxSendStream>(
                 &mut request_body,
                 max_frame_size,
                 datagrams,
-                compress.as_ref(),
+                &mut encoder,
             )
             .await?;
         }
@@ -260,7 +290,7 @@ async fn write_streaming_request<S: MuxSendStream>(
                 &request,
                 &mut request_body,
                 max_frame_size,
-                compress.as_ref(),
+                &mut encoder,
             )
             .await?;
         }

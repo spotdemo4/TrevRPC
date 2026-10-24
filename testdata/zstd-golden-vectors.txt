@@ -1,9 +1,10 @@
-# TrevRPC compressed message golden vectors: ZSTD_MESSAGE payloads and the
-# dictionary negotiation fields. Runtimes that implement compression consume
+# TrevRPC compressed message golden vectors: ZSTD_MESSAGE and
+# ZSTD_STREAM_MESSAGE payloads and the negotiation fields. Runtimes that implement compression consume
 # this file in addition to wire-golden-vectors.txt.
 #
-# The payloads were written by libzstd 1.5.7 at level 1. They lock decoding
-# only: other encoders may write different, equally valid payloads.
+# The payloads were written by libzstd 1.5.7 at level 1, streams with a 64 KiB
+# window. They lock decoding only: other encoders may write different, equally
+# valid payloads.
 #
 # Entry kinds (values are lowercase hex; an empty value means zero bytes):
 #   dict.<name>.id           the Dictionary_ID as an unsigned integer in hex
@@ -16,6 +17,19 @@
 #                            reject as invalid
 #   too_large.<name>.payload a payload declaring more than 4 MiB, which a
 #                            receiver with the default max frame size must
+#                            reject as too large without decompressing it
+#   stream.<name>.<i>.payload
+#                            the i-th ZSTD_STREAM_MESSAGE payload of one
+#                            direction of a call, which a receiver that
+#                            advertised max_window_log 16 and holds dict.d1
+#                            decodes, in order, with a fresh context
+#   stream.<name>.<i>.message the message payload i decodes to
+#   stream_bad.<name>.payload the first ZSTD_STREAM_MESSAGE payload of a
+#                            direction, which such a receiver must reject
+#                            as invalid
+#   stream_too_large.<name>.payload
+#                            a first payload declaring more than 4 MiB, which
+#                            a receiver with the default max frame size must
 #                            reject as too large without decompressing it
 #   <name>.payload / .frame  as in wire-golden-vectors.txt
 #
@@ -40,6 +54,29 @@
 #   request.dictionaries      RpcRequest{method:"/svc/m", accept_dictionaries:[1, 300]
 #                             (packed), dictionary_query:[{id:1, fingerprint:dict.d1}]}
 #   headers.dictionaries      RpcHeaders{dictionaries:[{id:1, fingerprint:dict.d1}]}
+#   stream.plain              four messages in one 64 KiB-window stream without
+#                             a dictionary: three that compress against each
+#                             other, then a 40-byte incompressible one in a
+#                             raw block
+#   stream.seeded             the first three, in a stream seeded with dict.d1
+#   stream.reset              two messages; the first chunk ends the frame, so
+#                             the second starts a new one
+#   stream.empty              a message, then an empty one (an empty chunk)
+#   stream_bad.window_too_large   a 128 KiB window
+#   stream_bad.checksum_flag      Content_Checksum_flag set
+#   stream_bad.content_size       a single-segment frame with Frame_Content_Size
+#   stream_bad.magic_number       a standard frame, with the Magic_Number
+#   stream_bad.unknown_dictionary stream.seeded.0 naming dictionary 2 (not held)
+#   stream_bad.size_mismatch      stream.plain.0 declaring one byte less
+#   stream_bad.truncated          stream.plain.0 without its last byte
+#   stream_bad.trailing_bytes     stream.plain.0 followed by one zero byte, the
+#                                 start of a block that never arrives
+#   stream_bad.missing_frame_header stream.plain.1 as a direction's first payload
+#   stream_too_large.zeros    4 MiB + 1 zero bytes
+#   zstd_stream_message.first a ZSTD_STREAM_MESSAGE frame carrying stream.plain.0
+#   request.stream_compression RpcRequest{method:"/svc/m",
+#                             stream_compression:{max_window_log:16}}
+#   headers.stream_compression RpcHeaders{stream_compression:{max_window_log:16}}
 
 dict.d1.id = 1
 dict.d1.fingerprint = 084fd69b50b28542
@@ -80,3 +117,58 @@ request.dictionaries.frame = 011b0a062f7376632f6d520301ac025a0c08011208084fd69b5
 
 headers.dictionaries.payload = 1a0c08011208084fd69b50b28542
 headers.dictionaries.frame = 020e1a0c08011208084fd69b50b28542
+
+stream.plain.0.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130307d
+stream.plain.0.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+stream.plain.1.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130317d
+stream.plain.1.payload = 40474c000010317d0100a2a00108
+stream.plain.2.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130327d
+stream.plain.2.payload = 40474c0000187b327d0100810221
+stream.plain.3.message = 079e35cc63fa9128bf56ed841bb249e0770ea53cd36a01982fc65df48b22b950e77e15ac43da7108
+stream.plain.3.payload = 28400100079e35cc63fa9128bf56ed841bb249e0770ea53cd36a01982fc65df48b22b950e77e15ac43da7108
+
+stream.seeded.0.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130307d
+stream.seeded.0.payload = 40470130018c0000203130307d047c00cac4a5bd2f4f413605
+stream.seeded.1.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130317d
+stream.seeded.1.payload = 4047640000187b317d020c56c201c00fae
+stream.seeded.2.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130327d
+stream.seeded.2.payload = 40474c0000187b327d0100810221
+
+stream.reset.0.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130307d
+stream.reset.0.payload = 404700000d020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+stream.reset.1.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130317d
+stream.reset.1.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c55c931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+
+stream.empty.0.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130307d
+stream.empty.0.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+stream.empty.1.message =
+stream.empty.1.payload = 00
+
+stream_bad.window_too_large.payload = 404700380c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+
+stream_bad.checksum_flag.payload = 404704300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+
+stream_bad.content_size.payload = 404720470d020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+
+stream_bad.magic_number.payload = 404728b52ffd00300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+
+stream_bad.unknown_dictionary.payload = 40470130028c0000203130307d047c00cac4a5bd2f4f413605
+
+stream_bad.size_mismatch.payload = 404600300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+
+stream_bad.truncated.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d04
+
+stream_bad.trailing_bytes.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d040000
+
+stream_bad.missing_frame_header.payload = 40474c000010317d0100a2a00108
+
+stream_too_large.zeros.payload = 8040000100305400001000000100fb7f1d600102000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080002000800020008000200080008000000
+
+zstd_stream_message.first.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+zstd_stream_message.first.frame = 054048404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
+
+request.stream_compression.payload = 0a062f7376632f6d62020810
+request.stream_compression.frame = 010c0a062f7376632f6d62020810
+
+headers.stream_compression.payload = 22020810
+headers.stream_compression.frame = 020422020810

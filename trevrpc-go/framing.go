@@ -61,10 +61,14 @@ const (
 	// dictionary. Readers turn it into a MESSAGE frame, so nothing after them
 	// sees this type.
 	frameTypeZstdMessage frameType = 4
+	// frameTypeZstdStreamMessage carries a message compressed with the zstd
+	// context of its direction of the call. Readers turn it into a MESSAGE
+	// frame too.
+	frameTypeZstdStreamMessage frameType = 5
 )
 
 // known reports whether t is a frame type this runtime interprets.
-func (t frameType) known() bool { return t <= frameTypeZstdMessage }
+func (t frameType) known() bool { return t <= frameTypeZstdStreamMessage }
 
 func (t frameType) String() string {
 	switch t {
@@ -78,6 +82,8 @@ func (t frameType) String() string {
 		return "STATUS"
 	case frameTypeZstdMessage:
 		return "ZSTD_MESSAGE"
+	case frameTypeZstdStreamMessage:
+		return "ZSTD_STREAM_MESSAGE"
 	default:
 		return fmt.Sprintf("unknown frame type %#x", uint64(t))
 	}
@@ -141,21 +147,27 @@ func decodeStatus(payload []byte) (*Status, error) {
 	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata)}, nil
 }
 
+// headersAnswer is what the HEADERS of a response answer: the dictionary
+// query, and whether the server decodes stream-compressed requests.
+type headersAnswer struct {
+	dictionaries []*dictionaryInfo
+	stream       *streamCompressionInfo
+}
+
 // decodeHeaders decodes the payload of a HEADERS frame into its metadata and
-// its answer to a dictionary query. Extensions are decoded and dropped: the
-// registry is empty.
-func decodeHeaders(payload []byte) (Metadata, []*dictionaryInfo, error) {
+// its answers. Extensions are decoded and dropped: the registry is empty.
+func decodeHeaders(payload []byte) (Metadata, headersAnswer, error) {
 	if len(payload) == 0 {
-		return Metadata{}, nil, nil
+		return Metadata{}, headersAnswer{}, nil
 	}
 	var headers wireHeaders
 	if !headers.decodeFast(payload) {
 		headers = wireHeaders{}
 		if err := decodePayload(payload, &headers); err != nil {
-			return nil, nil, err
+			return nil, headersAnswer{}, err
 		}
 	}
-	return ownedMetadata(headers.Metadata), headers.Dictionaries, nil
+	return ownedMetadata(headers.Metadata), headersAnswer{dictionaries: headers.Dictionaries, stream: headers.StreamCompression}, nil
 }
 
 // encodedMessage is one message ready to send: a complete MESSAGE frame whose
@@ -249,10 +261,10 @@ func appendRequestFrame(dst []byte, request *wireRequest, maxFrameSize int) ([]b
 	return request.appendPayload(dst), nil
 }
 
-// appendHeadersFrame appends a HEADERS frame carrying metadata and, for a
-// call that queried, the answer.
-func appendHeadersFrame(dst []byte, metadata Metadata, dictionaries []*dictionaryInfo, maxFrameSize int) ([]byte, error) {
-	headers := wireHeaders{Metadata: metadata, Dictionaries: dictionaries}
+// appendHeadersFrame appends a HEADERS frame carrying metadata and the
+// answers to the request.
+func appendHeadersFrame(dst []byte, metadata Metadata, answer headersAnswer, maxFrameSize int) ([]byte, error) {
+	headers := wireHeaders{Metadata: metadata, Dictionaries: answer.dictionaries, StreamCompression: answer.stream}
 	size, ok := headers.payloadSize()
 	if !ok {
 		return appendLimitedProtoFrame(dst, frameTypeHeaders, &headers, maxFrameSize)
@@ -315,6 +327,10 @@ type frameReader struct {
 	// inflate holds the dictionaries the reader accepts on ZSTD_MESSAGE
 	// frames, which it hands on as MESSAGE frames; nil accepts none.
 	inflate dictionaryLookup
+	// stream decompresses the ZSTD_STREAM_MESSAGE frames of a direction that
+	// enabled stream compression, which the reader hands on as MESSAGE
+	// frames; nil rejects them.
+	stream *streamInflater
 	// readAhead lets the reader take bytes beyond the frame it is reading from
 	// the stream. Until it is set the reader takes exactly what it needs,
 	// which leaves the rest of a request in the stream when the server
@@ -351,6 +367,9 @@ func (fr *frameReader) next() (frame, error) {
 
 		if typ == frameTypeZstdMessage {
 			return fr.readCompressed(size)
+		}
+		if typ == frameTypeZstdStreamMessage {
+			return fr.readStreamCompressed(size)
 		}
 		if typ.known() {
 			if typ == frameTypeMessage && fr.chargeMessages {
@@ -393,6 +412,29 @@ func (fr *frameReader) readCompressed(size int) (frame, error) {
 		}
 	}
 	message, err := decompressChecked(dict, payload, header)
+	if err != nil {
+		return frame{}, err
+	}
+	return frame{typ: frameTypeMessage, payload: message}, nil
+}
+
+// readStreamCompressed reads the payload of a ZSTD_STREAM_MESSAGE frame and
+// returns the message it decompresses to as a MESSAGE frame, checked and
+// charged like readCompressed's.
+func (fr *frameReader) readStreamCompressed(size int) (frame, error) {
+	if fr.stream == nil {
+		return frame{}, &frameDecodeError{Err: errUnenabledStreamCompression}
+	}
+	payload, err := fr.readPayload(size)
+	if err != nil {
+		return frame{}, err
+	}
+	message, err := fr.stream.inflate(payload, fr.maxFrameSize, func(n int) error {
+		if fr.chargeMessages {
+			return fr.charge(n)
+		}
+		return nil
+	})
 	if err != nil {
 		return frame{}, err
 	}
