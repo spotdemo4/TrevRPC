@@ -254,9 +254,9 @@ pub unsafe extern "C" fn zs_stream_encoder_new(
     }
 }
 
-/// Compresses one message through a stream compressing context and flushes it, writing the chunk
-/// to `dst`. Returns the chunk size, or -1 if it failed or `cap` was too small; the context cannot
-/// be used after a failure.
+/// Compresses one message through a stream compressing context and flushes it, or ends the frame
+/// when `end` is nonzero, writing the chunk to `dst`. Returns the chunk size, or -1 if it failed
+/// or `cap` was too small; the context cannot be used after a failure.
 ///
 /// # Safety
 ///
@@ -269,7 +269,13 @@ pub unsafe extern "C" fn zs_stream_compress(
     cap: usize,
     src: *const u8,
     len: usize,
+    end: u32,
 ) -> isize {
+    let directive = if end == 0 {
+        ZSTD_EndDirective::ZSTD_e_flush
+    } else {
+        ZSTD_EndDirective::ZSTD_e_end
+    };
     let mut input = ZSTD_inBuffer {
         src: src.cast::<c_void>(),
         size: len,
@@ -282,14 +288,8 @@ pub unsafe extern "C" fn zs_stream_compress(
     };
     loop {
         // SAFETY: the caller passes a live context and valid buffers.
-        let left = unsafe {
-            ZSTD_compressStream2(
-                cctx,
-                &raw mut output,
-                &raw mut input,
-                ZSTD_EndDirective::ZSTD_e_flush,
-            )
-        };
+        let left =
+            unsafe { ZSTD_compressStream2(cctx, &raw mut output, &raw mut input, directive) };
         // SAFETY: a pure function of its argument.
         if unsafe { ZSTD_isError(left) } != 0 {
             return -1;

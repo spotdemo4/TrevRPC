@@ -96,12 +96,21 @@ internal class ZstdStreamEncoder(
             .setWindowLog(windowLog)
             .also { context -> dictionary?.let { context.loadDict(it.compressDictionary) } }
 
-    /** Compresses [message] into its chunk. An empty message is an empty chunk. */
+    /** The bytes of the messages in the current frame. */
+    private var inFrame = 0
+
+    /**
+     * Compresses [message] into its chunk, ending the frame once it holds [FRAME_LIMIT] bytes. An
+     * empty message is an empty chunk, and never ends a frame.
+     */
     fun compress(message: ByteArray): ByteArray {
+        val end = inFrame + message.size >= FRAME_LIMIT
+        inFrame = if (end) 0 else inFrame + message.size
+        val directive = if (end) EndDirective.END else EndDirective.FLUSH
         val input = ByteBuffer.wrap(message)
         // The bound leaves room for the frame header of the first chunk too.
         var output = ByteBuffer.allocate(Zstd.compressBound(message.size.toLong()).toInt() + FRAME_HEADER_ROOM)
-        while (!context.compressByteBufferStream(output, input, EndDirective.FLUSH)) {
+        while (!context.compressByteBufferStream(output, input, directive)) {
             if (!output.hasRemaining()) {
                 output = ByteBuffer.allocate(output.capacity() * 2).put(output.array(), 0, output.position())
             }
@@ -111,8 +120,17 @@ internal class ZstdStreamEncoder(
 
     fun close() = context.close()
 
-    private companion object {
+    internal companion object {
         const val FRAME_HEADER_ROOM = 32
+
+        /**
+         * How many bytes of messages a frame takes before the encoder ends it and starts the next.
+         * libzstd's streaming buffer wraps once a 64 KiB window has filled, and from then on
+         * matches its history in two pieces, which costs a quarter more CPU per message. Ending the
+         * frame first keeps the history in one piece and makes messages less than 1% larger, since
+         * the next frame starts afresh (or from the dictionary again).
+         */
+        const val FRAME_LIMIT = 60 shl 10
     }
 }
 

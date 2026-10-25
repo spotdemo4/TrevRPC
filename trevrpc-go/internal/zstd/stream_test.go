@@ -183,6 +183,57 @@ func TestStreamRoundTripAcrossBlocks(t *testing.T) {
 	}
 }
 
+func TestStreamEncoderEndsFramesBeforeTheWindowWraps(t *testing.T) {
+	v := loadVectors(t)
+	d1 := newD1(t, v)
+	for _, dict := range []*Dict{nil, d1} {
+		encoder, err := NewStreamEncoder(dict, 1, StreamWindowLog)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payloads, messages [][]byte
+		inFrame, frames := false, 0
+		total := 0
+		for i := range 200 {
+			message := bytes.Repeat(fmt.Appendf(nil, "record %d with some text;", i), 50)[:1000]
+			payload := appendStreamPayload(t, encoder, message)
+			messages, payloads = append(messages, message), append(payloads, payload)
+			_, chunk := splitStreamPayload(t, payload)
+			info, err := ParseStreamChunk(chunk, !inFrame, StreamWindowLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.StartsFrame {
+				frames++
+				if dict != nil && info.DictID != dict.ID {
+					t.Fatalf("frame %d starts from dictionary %d, want %d", frames, info.DictID, dict.ID)
+				}
+			}
+			total += len(message)
+			if wantEnd := total >= frameLimit; info.EndsFrame != wantEnd {
+				t.Fatalf("message %d ends frame = %v, want %v", i, info.EndsFrame, wantEnd)
+			}
+			if info.EndsFrame {
+				total = 0
+			}
+			inFrame = !info.EndsFrame
+		}
+		encoder.Close()
+		if want := 200*1000/frameLimit + 1; frames != want {
+			t.Fatalf("%d frames, want %d", frames, want)
+		}
+		got, err := decodeSequence(t, d1, payloads)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range messages {
+			if !bytes.Equal(got[i], messages[i]) {
+				t.Fatalf("message %d does not round-trip", i)
+			}
+		}
+	}
+}
+
 func TestStreamContextsFailAfterClose(t *testing.T) {
 	encoder, err := NewStreamEncoder(nil, 1, StreamWindowLog)
 	if err != nil {

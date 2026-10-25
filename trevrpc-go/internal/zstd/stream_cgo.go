@@ -89,7 +89,16 @@ const (
 	cParamWindowLog = 101 // ZSTD_c_windowLog
 	dParamWindowMax = 100 // ZSTD_d_windowLogMax
 	endFlush        = 1   // ZSTD_e_flush
+	endFrame        = 2   // ZSTD_e_end
 )
+
+// frameLimit is how many bytes of messages a frame takes before the encoder
+// ends it and starts the next. libzstd's streaming buffer wraps once a 64 KiB
+// window has filled, and from then on matches its history in two pieces,
+// which costs a quarter more CPU per message. Ending the frame first keeps the
+// history in one piece and makes messages less than 1% larger, since the next
+// frame starts afresh (or from the dictionary again).
+const frameLimit = 60 << 10
 
 // errClosed reports a stream context used after Close.
 var errClosed = errors.New("zstd: stream context is closed")
@@ -117,12 +126,14 @@ func freeCCtx(p unsafe.Pointer) { C.ZSTD_freeCCtx(p) }
 func freeDCtx(p unsafe.Pointer) { C.ZSTD_freeDCtx(p) }
 
 // StreamEncoder compresses the messages of one direction of a call into
-// ZSTD_STREAM_MESSAGE chunks: one magicless frame without checksum or content
-// size, flushed after every message. It is used by one goroutine at a time,
+// ZSTD_STREAM_MESSAGE chunks: magicless frames without checksum or content
+// size, flushed after every message and ended every frameLimit bytes. It is used by one goroutine at a time,
 // and Close may be called from any.
 type StreamEncoder struct {
 	ctx  *streamContext
 	dict *Dict
+	// inFrame counts the bytes of the messages in the current frame.
+	inFrame int
 }
 
 // NewStreamEncoder creates an encoder at level with a window of
@@ -163,13 +174,21 @@ func (e *StreamEncoder) Encode(dst, src []byte) ([]byte, error) {
 	if e.ctx.p == nil {
 		return dst, errClosed
 	}
+	// An empty message never ends a frame, so it stays an empty chunk.
+	end := endFlush
+	if e.inFrame+len(src) >= frameLimit {
+		end = endFrame
+		e.inFrame = 0
+	} else {
+		e.inFrame += len(src)
+	}
 	// Room for the message and the frame header that may precede it.
 	dst = slices.Grow(dst, CompressBound(len(src))+32)
 	for {
 		out := dst[len(dst):cap(dst)]
 		var written, consumed C.size_t
 		left := C.trevrpc_compress_stream(e.ctx.p, unsafe.Pointer(unsafe.SliceData(out)), C.size_t(len(out)), &written,
-			unsafe.Pointer(unsafe.SliceData(src)), C.size_t(len(src)), &consumed, endFlush)
+			unsafe.Pointer(unsafe.SliceData(src)), C.size_t(len(src)), &consumed, C.int(end))
 		if C.ZSTD_isError(left) != 0 {
 			return dst, errors.New("zstd: compression failed")
 		}

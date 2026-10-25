@@ -97,6 +97,35 @@ class StreamCompressionTest {
     }
 
     @Test
+    fun `the encoder ends a frame every 60 KiB and starts the next from its dictionary`() {
+        for (seed in listOf(null, ConfiguredDictionary(dictionary, 1).codec)) {
+            val encoder = ZstdStreamEncoder(1, STREAM_WINDOW_LOG, seed)
+            val streams = responseStreams()
+            var atFrameStart = true
+            var frames = 0
+            var inFrame = 0
+            for (i in 0 until 200) {
+                val message = "record $i with some text;".repeat(50).take(1000).toByteArray()
+                val chunk = encoder.compress(message)
+                val info = checkNotNull(parseZstdStreamChunk(chunk, atFrameStart))
+                if (info.startsFrame) {
+                    frames++
+                    assertEquals(if (seed == null) 0u else 1u, info.dictionaryId, "frame $frames")
+                }
+                inFrame += message.size
+                assertEquals(inFrame >= ZstdStreamEncoder.FRAME_LIMIT, info.endsFrame, "message $i")
+                if (info.endsFrame) inFrame = 0
+                atFrameStart = info.endsFrame
+                val payload = QuicVarint.encode(message.size.toLong()) + chunk
+                assertArrayEquals(message, streams.inflate(streamMessage(payload), DEFAULT_MAX_FRAME_SIZE).body, "message $i")
+            }
+            assertEquals(200 * 1000 / ZstdStreamEncoder.FRAME_LIMIT + 1, frames)
+            encoder.close()
+            streams.close()
+        }
+    }
+
+    @Test
     fun `a call that is not optimistic offers, then compresses requests from the third message after the answer`() =
         runBlocking {
             val budget = StreamCompressionBudget()

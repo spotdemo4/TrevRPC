@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { CompressedEchoClient, root } from "../build/interop/gen/compressed.trevrpc.js";
 import { createServiceClient } from "../src/client.js";
+import { parseStreamChunk } from "../src/compression.js";
 import {
   DefaultMaxFrameSize,
   FrameType,
@@ -126,6 +127,43 @@ test("the stream encoder writes the golden payloads", () => {
       assert.equal(hex(written), hex(payload), `${group}.${index}`);
     }
     encoder.close();
+  }
+});
+
+test("the stream encoder ends a frame every 60 KiB, starting the next from its dictionary", () => {
+  const limit = 60 << 10;
+  for (const start of [undefined, dictionary]) {
+    const encoder = withDictionary.streamEncoder(start, 16);
+    const decoder = withDictionary.streamDecoder(16);
+    let atFrameStart = true;
+    let frames = 0;
+    let inFrame = 0;
+    for (let i = 0; i < 200; i++) {
+      const body = new TextEncoder().encode(
+        `record ${i} with some text;`.repeat(50).slice(0, 1000),
+      );
+      const chunk = encoder.encode(body);
+      const info = parseStreamChunk(chunk, atFrameStart, 16);
+      if (info.startsFrame) {
+        frames++;
+        assert.equal(info.dictionaryId, start === undefined ? 0 : 1, `frame ${frames}`);
+      }
+      inFrame += body.byteLength;
+      assert.equal(info.endsFrame, inFrame >= limit, `message ${i}`);
+      if (info.endsFrame) {
+        inFrame = 0;
+      }
+      atFrameStart = info.endsFrame;
+      const frameDictionary = info.dictionaryId === 0 ? undefined : dictionary;
+      assert.deepEqual(
+        decoder.decode(chunk, body.byteLength, frameDictionary),
+        body,
+        `message ${i}`,
+      );
+    }
+    assert.equal(frames, Math.floor((200 * 1000) / limit) + 1);
+    encoder.close();
+    decoder.close();
   }
 });
 
