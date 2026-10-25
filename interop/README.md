@@ -21,6 +21,12 @@ KVM (once over HTTP/3 and once over HTTP/2 with QUIC disabled), and runs Safari
 on macOS through `safaridriver` (not Playwright's WebKit, whose builds decide on
 their own whether to expose WebTransport). Every Safari lane must pass against both servers.
 
+Each cell's output is printed as it finishes and kept in `CELL.log` under
+`--out`. A run that fails ends with a summary of every failed cell and the lines
+that explain it (its `fail` lines, browser errors, timeouts, or whatever a
+crashing client printed), so the reason survives logs cut to their last lines,
+as CI and Nix print them.
+
 ## Cells
 
 `run.py` runs one cell per client, server, and transport (`X` is a native client,

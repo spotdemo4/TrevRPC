@@ -146,17 +146,51 @@ def browser_cells(
     ]
 
 
-def run_cell(cell: Cell, out: Path) -> bool:
-    """Runs one cell, logging to OUT/CELL.log, and prints the log."""
+# How many lines of a failed cell's log the final summary repeats.
+FAILURE_LINES = 20
+
+
+@dataclass(frozen=True)
+class Failure:
+    """A failed cell, or a server that did not stop cleanly, with the lines that say why."""
+
+    name: str
+    details: list[str]
+
+
+def failure_details(log: str, limit: int = FAILURE_LINES) -> list[str]:
+    """The last `limit` lines of a failed cell's log that are not passing scenarios: its `fail`
+    lines, browser errors, timeouts, and anything a crashing client printed."""
+    lines = [line for line in log.splitlines() if line.strip() and not line.startswith("ok ")]
+    return lines[-limit:]
+
+
+def summary(failures: list[Failure]) -> str:
+    """The closing report of failed cells and why each failed. It comes last, so it survives a
+    log truncated to its final lines, as CI and Nix print them."""
+    lines: list[str] = []
+    for failure in failures:
+        lines.append(f"failed: {failure.name}")
+        lines += [f"    {detail}" for detail in failure.details]
+    return "\n".join(lines)
+
+
+def run_cell(cell: Cell, out: Path) -> Failure | None:
+    """Runs one cell, logging to OUT/CELL.log, prints the log, and returns why it failed, if
+    it did."""
     print(f"== {cell.name}", flush=True)
     log = out / f"{cell.name}.log"
     with log.open("w", encoding="utf-8") as output:
         result = run_with_deadline(cell.command, CELL_TIMEOUT, stdout=output, stderr=output)
         if result.returncode is None:
             print(f"timed out after {CELL_TIMEOUT}s", file=output)
-    _ = sys.stdout.write(log.read_text(encoding="utf-8", errors="replace"))
+    text = log.read_text(encoding="utf-8", errors="replace")
+    _ = sys.stdout.write(text)
     _ = sys.stdout.flush()
-    return result.returncode == 0
+    if result.returncode == 0:
+        return None
+    details = failure_details(text) or [f"exited {result.returncode} without output"]
+    return Failure(cell.name, details)
 
 
 class Keychain:
@@ -223,8 +257,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
-def execute(args: argparse.Namespace, work: Path) -> list[str]:
-    """Runs every cell and returns the names of the failed ones."""
+def execute(args: argparse.Namespace, work: Path) -> list[Failure]:
+    """Runs every cell and returns the failed ones."""
     servers: list[NamedCommand] = args.server
     clients: list[NamedCommand] = args.client
     browsers: list[str] = args.browser
@@ -241,7 +275,7 @@ def execute(args: argparse.Namespace, work: Path) -> list[str]:
         _ = run_checked([BROWSER, "--write-page", str(work / "web")])
         server_arguments += ["--web-root", str(work / "web")]
 
-    failures: list[str] = []
+    failures: list[Failure] = []
     keychain = Keychain(certificate)
     try:
         if "safari" in browsers:
@@ -259,11 +293,11 @@ def execute(args: argparse.Namespace, work: Path) -> list[str]:
                     for browser in browsers
                     for cell in browser_cells(browser, server, certificate, lanes, dictionary)
                 ]
-                failures += [cell.name for cell in cells if not run_cell(cell, out)]
+                failures += [failure for cell in cells if (failure := run_cell(cell, out))]
             finally:
                 if (problem := server.stop()) is not None:
                     print(problem, file=sys.stderr)
-                    failures.append(f"server-{spec.name}")
+                    failures.append(Failure(f"server-{spec.name}", [problem]))
     finally:
         keychain.untrust()
     return failures
@@ -278,7 +312,7 @@ def main(argv: list[str]) -> int:
             print(f"trevrpc-interop: {error}", file=sys.stderr)
             return 1
     if failures:
-        print("\n".join(f"failed: {name}" for name in failures), file=sys.stderr)
+        print(summary(failures), file=sys.stderr)
         return 1
     print("all interop cells passed")
     return 0
