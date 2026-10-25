@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import {
+  CompressedEchoClient,
+  root as compressedRoot,
+} from "../build/interop/gen/compressed.trevrpc.js";
 import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
 import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
-import { encodeMessage, inflateMessage } from "../src/compression.js";
+import {
+  PlainMinSize,
+  encodeMessage,
+  inflateMessage,
+  sessionCompression,
+} from "../src/compression.js";
 import { encodeDatagram } from "../src/datagram.js";
 import {
   DefaultMaxFrameSize,
@@ -21,6 +30,7 @@ import { fakeDatagrams, fakeTransport, hex, readGoldenVectors, turn } from "./su
 const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
 const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
 const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
+const PlainMessage = compressedRoot.lookupType("trevrpc.interop.v1.PlainMessage");
 
 const vectors = await readGoldenVectors("zstd-golden-vectors.txt");
 const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));
@@ -29,7 +39,14 @@ const fingerprint = fromHex(vectors.get("dict.d1.fingerprint"));
 const compression = await createCompression({
   dictionaries: [{ data: dictionaryData, messages: EchoTypes }],
 });
+const plainOnly = createCompression();
 const dictionary = compression.dictionary(1);
+const plain = compression.plain;
+
+/** What a call that accepts `dictionaries` on its responses accepts, by ID. */
+const accepting = (...dictionaries) => new Map(dictionaries.map((d) => [d.id, d]));
+/** The 315-byte JSON record of the plain.records vector, which compresses without a dictionary. */
+const record = Buffer.from(vectors.get("plain.records.message"), "hex").toString();
 
 /** The i-th message of the interop `compressed` scenario, which the dictionary compresses. */
 const compressible = (i) =>
@@ -40,10 +57,16 @@ const isStatus = (code) => (error) => error instanceof TrevRpcError && error.cod
 test("a dictionary is identified by its ID and fingerprint", () => {
   assert.equal(dictionary.id, Number(vectors.get("dict.d1.id")));
   assert.equal(hex(dictionary.fingerprint), hex(fingerprint));
+  // The query ends with compression without a dictionary: ID 0, without a fingerprint.
   assert.deepEqual(
-    compression.query.map(({ id, fingerprint: print }) => [id, hex(print)]),
-    [[1, hex(fingerprint)]],
+    compression.query.map(({ id, fingerprint: print }) => [id, print && hex(print)]),
+    [
+      [1, hex(fingerprint)],
+      [undefined, undefined],
+    ],
   );
+  assert.equal(compression.dictionary(0), plain);
+  assert.equal(plain.id, 0);
   assert.equal(compression.dictionaryFor(EchoTypes[0]), dictionary);
   assert.equal(compression.dictionaryFor("trevrpc.interop.v1.Other"), undefined);
 });
@@ -55,32 +78,56 @@ test("golden payloads decompress, and invalid ones are rejected", () => {
       .map((key) => key.slice(0, -".payload".length));
   assert.ok(names("ok.").length >= 5);
   for (const name of names("ok.")) {
-    const message = inflateMessage(dictionary, fromHex(vectors.get(`${name}.payload`)), 4096);
+    const message = inflateMessage(
+      accepting(dictionary),
+      fromHex(vectors.get(`${name}.payload`)),
+      4096,
+    );
     assert.equal(hex(message), vectors.get(`${name}.message`), name);
   }
   assert.ok(names("bad.").length >= 9);
   for (const name of names("bad.")) {
+    // Rejected by a receiver holding only dict.d1, and by one that also decodes messages without
+    // a dictionary: bad.no_dictionary_id was compressed with dict.d1.
+    for (const accept of [accepting(dictionary), accepting(dictionary, plain)]) {
+      assert.throws(
+        () => inflateMessage(accept, fromHex(vectors.get(`${name}.payload`)), 4096),
+        isStatus(Code.Internal),
+        name,
+      );
+    }
+  }
+  // A message without a dictionary decodes where ID 0 is accepted, and only there.
+  assert.ok(names("plain.").length >= 1);
+  for (const name of names("plain.")) {
+    const payload = fromHex(vectors.get(`${name}.payload`));
+    assert.equal(
+      hex(inflateMessage(accepting(plain), payload, 4096)),
+      vectors.get(`${name}.message`),
+      name,
+    );
     assert.throws(
-      () => inflateMessage(dictionary, fromHex(vectors.get(`${name}.payload`)), 4096),
+      () => inflateMessage(accepting(dictionary), payload, 4096),
       isStatus(Code.Internal),
       name,
     );
   }
   const huge = fromHex(vectors.get("too_large.zeros.payload"));
   assert.throws(
-    () => inflateMessage(dictionary, huge, DefaultMaxFrameSize),
+    () => inflateMessage(accepting(dictionary), huge, DefaultMaxFrameSize),
     isStatus(Code.ResourceExhausted),
   );
   // The limit is inclusive.
   const small = fromHex(vectors.get("ok.small.payload"));
   const size = fromHex(vectors.get("ok.small.message")).byteLength;
-  assert.equal(inflateMessage(dictionary, small, size).byteLength, size);
+  assert.equal(inflateMessage(accepting(dictionary), small, size).byteLength, size);
   assert.throws(
-    () => inflateMessage(dictionary, small, size - 1),
+    () => inflateMessage(accepting(dictionary), small, size - 1),
     isStatus(Code.ResourceExhausted),
   );
   // Nothing is accepted without a dictionary.
   assert.throws(() => inflateMessage(undefined, small, 4096), isStatus(Code.Internal));
+  assert.throws(() => inflateMessage(new Map(), small, 4096), isStatus(Code.Internal));
 });
 
 test("compressing writes the golden frame, and only when it is shorter", () => {
@@ -98,7 +145,25 @@ test("compressing writes the golden frame, and only when it is shorter", () => {
   assert.deepEqual(encodeMessage(new Uint8Array(0), dictionary).type, FrameType.Message);
 });
 
-test("the negotiation fields match the golden vectors", () => {
+test("compressing without a dictionary starts at 256 bytes, and decodes back", () => {
+  const big = new TextEncoder().encode(record);
+  const compressed = encodeMessage(big, plain);
+  assert.equal(compressed.type, FrameType.ZstdMessage);
+  assert.ok(compressed.payload.byteLength < big.byteLength);
+  assert.equal(compressed.size, big.byteLength);
+  // No Dictionary_ID in the frame header (Dictionary_ID_flag, the low two bits, unset).
+  assert.equal(compressed.payload[0] & 0x03, 0);
+  assert.equal(hex(inflateMessage(accepting(plain), compressed.payload, 4096)), hex(big));
+  // Just under the threshold, a message that would shrink stays a MESSAGE.
+  const short = new TextEncoder().encode("a".repeat(PlainMinSize - 1));
+  assert.equal(encodeMessage(short, plain).type, FrameType.Message);
+  assert.equal(
+    encodeMessage(new TextEncoder().encode("a".repeat(PlainMinSize)), plain).type,
+    FrameType.ZstdMessage,
+  );
+});
+
+test("the negotiation fields match the golden vectors", async () => {
   const request = {
     method: "/svc/m",
     acceptDictionaries: [1, 300],
@@ -125,6 +190,17 @@ test("the negotiation fields match the golden vectors", () => {
     hex(encodeHeadersFrame({ dictionaries: [{ id: 1, fingerprint }] })),
     vectors.get("headers.dictionaries.frame"),
   );
+
+  // A client that offers only compression without a dictionary, on a method that allows it.
+  const withoutDictionaries = await plainOnly;
+  const prepared = sessionCompression(withoutDictionaries, {}).prepare("svc.Response", true);
+  assert.equal(
+    hex(marshalMessage(RpcRequest, { method: "/svc/m", ...prepared.fields })),
+    vectors.get("request.plain.payload"),
+  );
+  const answer = unmarshalMessage(RpcHeaders, fromHex(vectors.get("headers.plain.payload")));
+  assert.equal(answer.dictionaries.length, 1);
+  assert.equal(answer.dictionaries[0].id, 0);
 });
 
 test("createCompression rejects invalid settings", async () => {
@@ -151,8 +227,8 @@ test("createCompression rejects invalid settings", async () => {
   );
   await rejects({ dictionaries: [{ data: dictionaryData, messages: [".a.B"] }] }, /invalid/);
   await rejects({ dictionaries: [], level: 1.5 }, /level must be an integer/);
-  // No dictionaries compress nothing, and need no codec.
-  assert.deepEqual((await createCompression()).query, []);
+  // Without dictionaries, the query asks about compression without a dictionary only.
+  assert.deepEqual((await createCompression()).query, [{}]);
 });
 
 /**
@@ -181,7 +257,7 @@ function compressingEcho(calls, { confirm = true } = {}) {
       call.requestFrames.push(frame.type);
       const payload =
         frame.type === FrameType.ZstdMessage
-          ? inflateMessage(dictionary, frame.payload, DefaultMaxFrameSize)
+          ? inflateMessage(accepting(dictionary), frame.payload, DefaultMaxFrameSize)
           : frame.payload;
       const { message } = EchoRequest.decode(payload);
       const response = encodeMessage(
@@ -207,7 +283,7 @@ test("a session queries once, then compresses requests and accepts compressed re
   const echo = new EchoClient(compressedTransport(compressingEcho(calls)));
 
   assert.equal((await echo.unary({ message: compressible(0) })).message, compressible(0));
-  assert.equal(calls[0].request.dictionaryQuery.length, 1);
+  assert.equal(calls[0].request.dictionaryQuery.length, 2);
   assert.equal(hex(calls[0].request.dictionaryQuery[0].fingerprint), hex(fingerprint));
   assert.deepEqual(calls[0].request.acceptDictionaries, [1]);
   // The first request goes out before the answer, so it is not compressed.
@@ -263,7 +339,7 @@ test("each session negotiates on its own", async () => {
   }
   assert.deepEqual(
     calls.map((call) => call.request.dictionaryQuery.length),
-    [1, 1],
+    [2, 2],
   );
 });
 
@@ -287,7 +363,7 @@ test("a lone STATUS leaves the query unanswered, so the next call asks again", a
   await echo.unary({ message: "b" });
   assert.deepEqual(
     calls.map((call) => call.request.dictionaryQuery.length),
-    [1, 1],
+    [2, 2],
   );
 });
 
@@ -362,4 +438,98 @@ test("compressed response datagrams are decompressed, and an invalid one drops i
     received.push(message);
   }
   assert.deepEqual(received, [compressible(0), "end"]);
+});
+
+/**
+ * A CompressedEcho.Plain server that decodes messages without a dictionary: it answers the query
+ * for ID 0 in HEADERS, decompresses requests, and compresses responses without a dictionary when
+ * the call accepts that. `decodes: false` makes it a server without the feature, which answers
+ * nothing. Every call is recorded as `{ request, requestFrames, responseFrames }`.
+ */
+function plainEcho(calls, { decodes = true } = {}) {
+  return async (stream) => {
+    const request = await stream.readRequest();
+    const call = { request, requestFrames: [], responseFrames: [] };
+    calls.push(call);
+    const queried = (request.dictionaryQuery ?? []).some(({ id }) => id === 0);
+    if ((request.dictionaryQuery ?? []).length > 0) {
+      await stream.write(
+        encodeHeadersFrame({ metadata: {}, dictionaries: decodes && queried ? [{}] : [] }),
+      );
+    }
+    const accepted = decodes && (request.acceptDictionaries ?? []).includes(0);
+    const frame = await stream.readFrame();
+    call.requestFrames.push(frame.type);
+    const payload =
+      frame.type === FrameType.ZstdMessage
+        ? inflateMessage(accepting(plain), frame.payload, DefaultMaxFrameSize)
+        : frame.payload;
+    const response = encodeMessage(
+      marshalMessage(PlainMessage, PlainMessage.decode(payload)),
+      accepted ? plain : undefined,
+    );
+    call.responseFrames.push(response.type);
+    await stream.write(encodeOutgoingFrame(response));
+    await stream.writeStatus();
+    await stream.finish();
+  };
+}
+
+test("large messages travel compressed without a dictionary once the server decodes them", async () => {
+  const calls = [];
+  const transport = fakeTransport(plainEcho(calls));
+  transport.compression = await plainOnly;
+  const echo = new CompressedEchoClient(transport);
+  const text = record + record;
+
+  assert.equal((await echo.plain({ text })).text, text);
+  assert.deepEqual(calls[0].request.acceptDictionaries, [0]);
+  assert.equal(calls[0].request.dictionaryQuery.length, 1);
+  // The first request goes out before the answer; the response is compressed at once.
+  assert.deepEqual(calls[0].requestFrames, [FrameType.Message]);
+  assert.deepEqual(calls[0].responseFrames, [FrameType.ZstdMessage]);
+
+  assert.equal((await echo.plain({ text })).text, text);
+  assert.deepEqual(calls[1].request.dictionaryQuery, []);
+  assert.deepEqual(calls[1].requestFrames, [FrameType.ZstdMessage]);
+  assert.deepEqual(calls[1].responseFrames, [FrameType.ZstdMessage]);
+
+  // Small messages stay MESSAGE frames.
+  assert.equal((await echo.plain({ text: "short" })).text, "short");
+  assert.deepEqual(calls[2].requestFrames, [FrameType.Message]);
+  assert.deepEqual(calls[2].responseFrames, [FrameType.Message]);
+
+  // Methods without compress neither offer nor compress it.
+  const echoCalls = [];
+  const plainTransport = fakeTransport(compressingEcho(echoCalls, { confirm: false }));
+  plainTransport.compression = await plainOnly;
+  await new EchoClient(plainTransport).unary({ message: record });
+  assert.deepEqual(echoCalls[0].request.acceptDictionaries, []);
+});
+
+test("a server that does not answer ID 0 keeps receiving MESSAGE frames", async () => {
+  const calls = [];
+  const transport = fakeTransport(plainEcho(calls, { decodes: false }));
+  transport.compression = await plainOnly;
+  const echo = new CompressedEchoClient(transport);
+  const text = record + record;
+  await echo.plain({ text });
+  await echo.plain({ text });
+  assert.deepEqual(
+    calls.flatMap((call) => [...call.requestFrames, ...call.responseFrames]),
+    [FrameType.Message, FrameType.Message, FrameType.Message, FrameType.Message],
+  );
+});
+
+test("a dictionary for the message type wins over compression without one", () => {
+  const session = sessionCompression(compression, {});
+  // Before the answer, nothing compresses requests.
+  assert.equal(session.requestCompressor(EchoTypes[0], true), undefined);
+  session.learn([{ id: 1, fingerprint }, {}]);
+  assert.equal(session.requestCompressor(EchoTypes[0], true), dictionary);
+  assert.equal(session.requestCompressor("svc.Other", true), plain);
+  assert.equal(session.requestCompressor("svc.Other", false), undefined);
+  // A call on a method that allows it accepts both on its responses.
+  assert.deepEqual([...session.prepare(EchoTypes[1], true).accept.keys()], [1, 0]);
+  assert.deepEqual([...session.prepare(EchoTypes[1]).accept.keys()], [1]);
 });

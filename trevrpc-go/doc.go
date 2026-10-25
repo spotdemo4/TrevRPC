@@ -11,8 +11,10 @@
 // reordered.
 //
 // Messages can be compressed with zstd: per message with dictionaries both
-// peers hold ([Compression]), and on long streams with one context per
-// direction of a call, which a method allows in its schema or with
-// [WithStreamCompression] and [RouteStreamCompression]; see
+// peers hold ([Compression]), per message without a dictionary, which a method
+// allows in its schema or with [WithPlainCompression] and
+// [RoutePlainCompression] (see [PlainCompression]), and on long streams with
+// one context per direction of a call, which a method allows in its schema or
+// with [WithStreamCompression] and [RouteStreamCompression]; see
 // [StreamCompression].
 package trevrpc

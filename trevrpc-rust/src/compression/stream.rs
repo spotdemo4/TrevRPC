@@ -247,7 +247,7 @@ pub fn decoder_cost(dict: Option<&Arc<Dict>>) -> usize {
 pub fn server_decoder_cost(config: Option<&Arc<CompressionConfig>>) -> usize {
     config
         .into_iter()
-        .flat_map(|config| config.by_id.values())
+        .flat_map(|config| config.stream_dictionaries())
         .map(|dict| decoder_cost(Some(dict)))
         .fold(decoder_cost(None), usize::max)
 }
@@ -463,10 +463,13 @@ impl MessageEncoder {
     pub fn encode(&mut self, body: Bytes) -> (u64, Bytes) {
         use crate::framing::frame_type;
         let dict = self.dict.get();
+        // The stream context starts from the dictionary, if the direction has one; compression
+        // without a dictionary starts it from nothing.
+        let seed = dict.as_deref().filter(|dict| !dict.is_plain());
         if let Some(payload) = self
             .stream
             .as_mut()
-            .and_then(|stream| stream.encode(&body, dict.as_deref()))
+            .and_then(|stream| stream.encode(&body, seed))
         {
             return (frame_type::ZSTD_STREAM_MESSAGE, payload);
         }
@@ -805,9 +808,10 @@ pub fn offer_stream(
         return stream;
     };
     if directions.responses {
+        // A response frame starts from the call's dictionary, never from compression without one.
         let dict = match accept {
-            Accept::One(dict) => Some(dict),
-            Accept::None | Accept::All(_) => None,
+            Accept::One(dict) if !dict.is_plain() => Some(dict),
+            Accept::One(_) | Accept::None | Accept::All(..) => None,
         };
         let Some(reservation) = budget.reserve(decoder_cost(dict)) else {
             return stream;
@@ -845,7 +849,7 @@ mod tests {
     use crate::{RpcHeaders, RpcRequest};
 
     fn inflater() -> Inflater {
-        Inflater::new(Accept::All(config()), STREAM_WINDOW_LOG)
+        Inflater::new(Accept::server(Some(&config())), STREAM_WINDOW_LOG)
     }
 
     /// The payloads and messages of the golden sequence `name`, in order.
@@ -1031,6 +1035,34 @@ mod tests {
             0,
             "the default counter counts nothing"
         );
+    }
+
+    #[test]
+    fn compression_without_a_dictionary_covers_the_messages_before_the_stream_context() {
+        let plain = CompressionConfig::plain_only();
+        let dict = Arc::clone(plain.dict(0).unwrap());
+        let budget = StreamBudget::new(64 << 20).unwrap();
+        let mut encoder = MessageEncoder::new(Some(Arc::clone(&dict))).with_stream(Some(
+            StreamSender::new(StreamEnable::enabled(STREAM_WINDOW_LOG), budget, 1),
+        ));
+        let mut receiver = Inflater::new(Accept::One(dict), STREAM_WINDOW_LOG);
+        let long = |i: usize| Bytes::from(message(i).repeat(5));
+        let mut types = Vec::new();
+        for i in 0..4 {
+            let (frame_type, payload) = encoder.encode(long(i));
+            if frame_type == frame_type::ZSTD_STREAM_MESSAGE {
+                // The context starts from nothing, not from a "dictionary" with ID 0.
+                let chunk = &payload[varint::decode(&payload).unwrap().1..];
+                let parsed = parse_stream_chunk(chunk, i == 2, STREAM_WINDOW_LOG).unwrap();
+                assert_eq!(parsed.dict_id, 0);
+                assert_eq!(receiver.decode(&payload, 1 << 20).unwrap(), long(i));
+            }
+            types.push(frame_type);
+        }
+        assert_eq!(types, [4, 4, 5, 5].map(|frame_type: u64| frame_type));
+        // Short messages stay MESSAGE frames before the context starts.
+        let mut short = MessageEncoder::new(Some(Arc::clone(plain.dict(0).unwrap())));
+        assert_eq!(short.encode(message(0)).0, frame_type::MESSAGE);
     }
 
     #[test]

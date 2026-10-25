@@ -15,6 +15,10 @@
 #   ok.<name>.message        the message it decompresses to
 #   bad.<name>.payload       a payload a receiver holding only dict.d1 must
 #                            reject as invalid
+#   plain.<name>.payload     a ZSTD_MESSAGE payload without a dictionary,
+#                            which a receiver accepting ID 0 must accept and
+#                            one accepting only dict.d1 must reject
+#   plain.<name>.message     the message it decompresses to
 #   too_large.<name>.payload a payload declaring more than 4 MiB, which a
 #                            receiver with the default max frame size must
 #                            reject as too large without decompressing it
@@ -41,7 +45,9 @@
 #   ok.multi_segment          a 1500-byte message in a multi-segment frame
 #                             (window descriptor, 2-byte content size)
 #   bad.unknown_dictionary    compressed with dictionary 300 (not held)
-#   bad.no_dictionary_id      no Dictionary_ID
+#   bad.no_dictionary_id      ok.small without its Dictionary_ID: compressed
+#                             with dict.d1, so decompressing it without a
+#                             dictionary fails even where ID 0 is accepted
 #   bad.no_content_size       no Frame_Content_Size
 #   bad.trailing_bytes        ok.small followed by one zero byte
 #   bad.trailing_frame        ok.small followed by ok.empty
@@ -49,11 +55,17 @@
 #   bad.checksum              ok.checksum with a wrong checksum
 #   bad.truncated             ok.small without its last two bytes
 #   bad.content_size_mismatch ok.small declaring one byte less than it holds
+#   plain.records             a 315-byte JSON record without a dictionary
+#                             (single segment, 2-byte content size)
 #   too_large.zeros           4 MiB + 1 zero bytes
 #   zstd_message.small        a ZSTD_MESSAGE frame carrying ok.small
 #   request.dictionaries      RpcRequest{method:"/svc/m", accept_dictionaries:[1, 300]
 #                             (packed), dictionary_query:[{id:1, fingerprint:dict.d1}]}
 #   headers.dictionaries      RpcHeaders{dictionaries:[{id:1, fingerprint:dict.d1}]}
+#   request.plain             RpcRequest{method:"/svc/m", accept_dictionaries:[0]
+#                             (packed), dictionary_query:[{}]}: compression
+#                             without a dictionary, offered and queried
+#   headers.plain             RpcHeaders{dictionaries:[{}]}: the answer
 #   stream.plain              four messages in one 64 KiB-window stream without
 #                             a dictionary: three that compress against each
 #                             other, then a 40-byte incompressible one in a
@@ -113,6 +125,9 @@ bad.content_size_mismatch.payload = 2101468d0000203238397d047c00cac4a5bd2f4f4136
 
 too_large.zeros.payload = 814801010040004c000008000100fcff3910020200100002001000020010000200100002001000020010000200100002001000020010000200100002001000020010000200100002001000020010000200100002001000020010000200100002001000020010000200100002001000020010000200100002001000020010000200100002001000020010000200100009000000
 
+plain.records.payload = 603b005d0500e28a221f5049ac035168bf4991d10c932c05b047dc6466d05208e397b093c799999933cfc0b396b110d52c2492648905cb1441cf5ac62a2c0c785e5fbb3eba4a4915f0f9c5fd2090e77e915999a6c185692398f5e9ba84e70dab11e150cef17c6b068f0094caf301814161b4d93b4a09c9736cd67c745534332d383ecf34ce40f7e84d59a6fcbc2ace59e51f020b00436c82990d007dc033ae0c0868f1954dccb4385bff8d461b93a28528
+plain.records.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3230302c226c6174656e63795f6d73223a3131382c2270617468223a222f76312f736561726368222c227175657279223a22776972656c657373206865616470686f6e6573222c22726573756c7473223a5b7b226964223a22702d31303031222c227469746c65223a22576972656c657373206865616470686f6e6573222c227072696365223a35392e39397d2c7b226964223a22702d31303032222c227469746c65223a22576972656c6573732065617262756473222c227072696365223a33392e39397d2c7b226964223a22702d31303033222c227469746c65223a22576972656c657373206865616470686f6e65732070726f222c227072696365223a3132392e39397d5d7d
+
 zstd_message.small.payload = 2101478d0000203238397d047c00cac4a5bd2f4f413605
 zstd_message.small.frame = 04172101478d0000203238397d047c00cac4a5bd2f4f413605
 
@@ -121,6 +136,12 @@ request.dictionaries.frame = 011b0a062f7376632f6d520301ac025a0c08011208084fd69b5
 
 headers.dictionaries.payload = 1a0c08011208084fd69b50b28542
 headers.dictionaries.frame = 020e1a0c08011208084fd69b50b28542
+
+request.plain.payload = 0a062f7376632f6d5201005a00
+request.plain.frame = 010d0a062f7376632f6d5201005a00
+
+headers.plain.payload = 1a00
+headers.plain.frame = 02021a00
 
 stream.plain.0.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130307d
 stream.plain.0.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400

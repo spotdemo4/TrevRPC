@@ -150,13 +150,17 @@ class Client(
     private val transport: RpcTransport,
     private val responseContext: CoroutineContext = Dispatchers.Default,
 ) {
-    /** Calls a unary RPC and returns its response. */
+    /**
+     * Calls a unary RPC and returns its response. [compressMessages] is the method's compression
+     * without a dictionary, which generated clients pass.
+     */
     suspend fun <Req, Res> unary(
         path: String,
         request: Req,
         requestCodec: MessageCodec<Req>,
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): Res {
         // A unary call has no stream-idle bound, only the call deadline.
         val state =
@@ -169,6 +173,7 @@ class Client(
                 options,
                 finishSend = true,
                 idleTimeout = null,
+                compressMessages = compressMessages,
             )
         return state.reader.receiveSingle("unary")
     }
@@ -176,7 +181,8 @@ class Client(
     /**
      * Calls a server-streaming RPC when the returned flow is collected, and emits its responses.
      * Cancelling the collection cancels the call. [compressStream] is the method's stream
-     * compression, which generated clients pass.
+     * compression and [compressMessages] its compression without a dictionary, which generated
+     * clients pass.
      */
     fun <Req, Res> serverStreaming(
         path: String,
@@ -185,9 +191,10 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
         compressStream: CompressStream = CompressStream.NONE,
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): Flow<Res> =
         flow {
-            val call = openServerStreaming(path, request, requestCodec, responseCodec, options, compressStream)
+            val call = openServerStreaming(path, request, requestCodec, responseCodec, options, compressStream, compressMessages)
             try {
                 while (true) emit(call.receive() ?: break)
             } finally {
@@ -207,8 +214,9 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
         compressStream: CompressStream = CompressStream.NONE,
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): Res {
-        val call = openClientStreaming(path, requestCodec, responseCodec, options, compressStream)
+        val call = openClientStreaming(path, requestCodec, responseCodec, options, compressStream, compressMessages)
         return try {
             call.sendAll(requests)
             call.receive()
@@ -229,10 +237,11 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
         compressStream: CompressStream = CompressStream.NONE,
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): Flow<Res> =
         flow {
             coroutineScope {
-                val call = openBidirectionalStreaming(path, requestCodec, responseCodec, options, compressStream)
+                val call = openBidirectionalStreaming(path, requestCodec, responseCodec, options, compressStream, compressMessages)
                 val sender = launch { call.sendAll(requests) }
                 try {
                     while (true) emit(call.receive() ?: break)
@@ -254,6 +263,7 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
         compressStream: CompressStream = CompressStream.NONE,
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): ServerStreamingCall<Res> {
         val state =
             open(
@@ -265,6 +275,7 @@ class Client(
                 options,
                 finishSend = true,
                 compressStream = compressStream,
+                compressMessages = compressMessages,
             )
         return ServerStreamingCall(state.reader)
     }
@@ -276,8 +287,19 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
         compressStream: CompressStream = CompressStream.NONE,
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): ClientStreamingCall<Req, Res> {
-        val state = open(path, RpcKind.CLIENT_STREAMING, requestCodec, null, responseCodec, options, compressStream = compressStream)
+        val state =
+            open(
+                path,
+                RpcKind.CLIENT_STREAMING,
+                requestCodec,
+                null,
+                responseCodec,
+                options,
+                compressStream = compressStream,
+                compressMessages = compressMessages,
+            )
         return ClientStreamingCall(state.writer, requestCodec, state.reader)
     }
 
@@ -291,9 +313,19 @@ class Client(
         responseCodec: MessageCodec<Res>,
         options: CallOptions = CallOptions(),
         compressStream: CompressStream = CompressStream.NONE,
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): BidirectionalStreamingCall<Req, Res> {
         val state =
-            open(path, RpcKind.BIDIRECTIONAL_STREAMING, requestCodec, null, responseCodec, options, compressStream = compressStream)
+            open(
+                path,
+                RpcKind.BIDIRECTIONAL_STREAMING,
+                requestCodec,
+                null,
+                responseCodec,
+                options,
+                compressStream = compressStream,
+                compressMessages = compressMessages,
+            )
         return BidirectionalStreamingCall(state.writer, requestCodec, state.reader)
     }
 
@@ -307,9 +339,10 @@ class Client(
         finishSend: Boolean = false,
         idleTimeout: Duration? = options.streamIdleTimeout,
         compressStream: CompressStream = CompressStream.NONE,
+        compressMessages: CompressMessages = CompressMessages.NONE,
     ): OpenedStream<Res> {
         val configured = transport.compression
-        val compression = configured?.call(requestCodec.messageType, codec.messageType, streamsRequest = !finishSend)
+        val compression = configured?.call(requestCodec.messageType, codec.messageType, streamsRequest = !finishSend, compressMessages)
         val budget = transport.streamCompressionBudget
         val directions = compressStream.effective(kind)
         val streams = configured?.let { CallStreams.open(it, budget, directions, compression) }

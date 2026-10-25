@@ -579,7 +579,7 @@ class GeneratorTest {
                 .filter { "client." in it }
                 .associate { line -> Regex("SVC_(\\w+)_PATH").find(line)!!.groupValues[1] to line }
 
-        fun streams(method: String): String? = Regex("CompressStream\\.(\\w+)\\)").find(calls.getValue(method))?.groupValues?.get(1)
+        fun streams(method: String): String? = Regex("CompressStream\\.(\\w+)[,)]").find(calls.getValue(method))?.groupValues?.get(1)
         assertEquals("BOTH", streams("BOTH"))
         assertEquals("REQUESTS", streams("UP"))
         assertEquals("RESPONSES", streams("DOWN"))
@@ -588,6 +588,61 @@ class GeneratorTest {
         assertEquals("RESPONSES", streams("DATAGRAMS"))
         assertEquals(null, streams("HIDDEN"))
         assertEquals(null, streams("OFF"))
+    }
+
+    @Test
+    fun `passes compression without a dictionary for compress and compress_stream methods without redacted messages`() {
+        val redacted =
+            FieldDescriptorProto
+                .newBuilder()
+                .setName("token")
+                .setNumber(1)
+                .setLabel(FieldDescriptorProto.Label.LABEL_OPTIONAL)
+                .setType(FieldDescriptorProto.Type.TYPE_STRING)
+                .setOptions(FieldOptions.newBuilder().setDebugRedact(true))
+        val file =
+            FileDescriptorProto
+                .newBuilder()
+                .setName("api/plain.proto")
+                .setPackage("plain")
+                .setOptions(javaOptions("plain.generated"))
+                .addMessageType(DescriptorProto.newBuilder().setName("Report"))
+                .addMessageType(DescriptorProto.newBuilder().setName("Secret").addField(redacted))
+                .addService(
+                    ServiceDescriptorProto
+                        .newBuilder()
+                        .setName("Svc")
+                        .addMethod(method("Get", ".plain.Report", ".plain.Report").setOptions(trevrpcOptions(compress = true)))
+                        .addMethod(method("Login", ".plain.Secret", ".plain.Report").setOptions(trevrpcOptions(compress = true)))
+                        .addMethod(
+                            method("Stream", ".plain.Report", ".plain.Report")
+                                .setServerStreaming(true)
+                                .setOptions(trevrpcOptions(compressStream = true)),
+                        ).addMethod(method("Off", ".plain.Report", ".plain.Report")),
+                ).build()
+
+        val response = generate(request(file))
+
+        assertEquals("", response.error)
+        val calls =
+            response.fileList
+                .single()
+                .content
+                .lines()
+                .filter { "client." in it }
+                .associate { line -> Regex("SVC_(\\w+)_PATH").find(line)!!.groupValues[1] to line }
+
+        fun plain(method: String): String? =
+            Regex("compressMessages = zip\\.trev\\.trevrpc\\.CompressMessages\\.(\\w+)\\)")
+                .find(calls.getValue(method))
+                ?.groupValues
+                ?.get(1)
+        assertEquals("BOTH", plain("GET"))
+        assertEquals("RESPONSES", plain("LOGIN"))
+        // compress_stream implies compress, for the messages outside the stream context.
+        assertEquals("BOTH", plain("STREAM"))
+        assertTrue("CompressStream.RESPONSES, compressMessages" in calls.getValue("STREAM"), calls.getValue("STREAM"))
+        assertEquals(null, plain("OFF"))
     }
 
     @Test
@@ -833,12 +888,14 @@ class GeneratorTest {
         requests: Boolean = false,
         responses: Boolean = false,
         compressStream: Boolean = false,
+        compress: Boolean = false,
     ): MethodOptions {
         val bytes = ByteArrayOutputStream()
         val out = CodedOutputStream.newInstance(bytes)
         if (requests) out.writeBool(1, true)
         if (responses) out.writeBool(2, true)
         if (compressStream) out.writeBool(3, true)
+        if (compress) out.writeBool(4, true)
         out.flush()
         return MethodOptions
             .newBuilder()
@@ -969,7 +1026,12 @@ class GeneratedCodeCompilationTest {
         listOf("upload", "watch", "track").forEach { assertTrue(documented(it), it) }
         listOf("lookup", "plain", "compressed").forEach { assertFalse(documented(it), it) }
         assertTrue(lines.any { "requests and responses unreliable" in it })
-        assertTrue(lines.any { "TRACKER_COMPRESSED_PATH" in it && "CompressStream.BOTH)" in it }, generated)
+        assertTrue(
+            lines.any {
+                "TRACKER_COMPRESSED_PATH" in it && "CompressStream.BOTH, compressMessages = zip.trev.trevrpc.CompressMessages.BOTH)" in it
+            },
+            generated,
+        )
     }
 
     @Test

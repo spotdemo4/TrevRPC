@@ -15,4 +15,5 @@ export const ScenarioNames = Object.freeze([
   "compressed",
   "compressed-stream",
   "refused-stream",
+  "compressed-plain",
 ]);

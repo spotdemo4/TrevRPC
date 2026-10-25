@@ -99,7 +99,9 @@ impl QmuxTransport {
     /// [`Compression`](crate::Compression). Fails when they are invalid. Call it on a transport
     /// that was just connected, before it is cloned.
     pub fn with_compression(self, compression: &crate::Compression) -> Result<Self> {
-        Ok(self.with_compression_config(crate::compression::CompressionConfig::new(compression)?))
+        Ok(self.with_compression_config(
+            crate::compression::CompressionConfig::new(compression).map(Some)?,
+        ))
     }
 
     /// Gives a transport that was just connected the dictionaries of `config`.

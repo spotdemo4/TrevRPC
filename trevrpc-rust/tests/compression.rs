@@ -20,7 +20,8 @@ use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::wire::DictionaryInfo;
 use trevrpc::{
-    CompressStream, Compression, Dictionary, RpcHeaders, RpcKind, RpcRequest, RpcStatus,
+    CompressMessages, CompressStream, Compression, Dictionary, RpcHeaders, RpcKind, RpcRequest,
+    RpcStatus,
 };
 
 #[macro_use]
@@ -42,6 +43,12 @@ const UPLOAD: &str = "/test.Compressed/Upload";
 /// without `compress_stream` would: the server refuses optimistic calls to them.
 const REFUSING_UPLOAD: &str = "/test.Compressed/RefusingUpload";
 const REFUSING_STREAM: &str = "/test.Compressed/RefusingStream";
+/// A unary route whose messages may be compressed without a dictionary, as the schema's
+/// `compress` asks; its type has none. It reports in its trailing metadata, under
+/// [`PLAIN_COMPRESSED_KEY`], how many requests arrived so.
+const PLAIN: &str = "/test.Compressed/Plain";
+const PLAIN_TYPE: &str = "test.Plain";
+const PLAIN_COMPRESSED_KEY: &str = "plain-compressed";
 /// The type the test dictionary compresses: its samples are the JSON documents [`sample`] writes.
 const MESSAGE_TYPE: &str = "test.Echo";
 
@@ -57,6 +64,13 @@ fn sample(i: u32) -> Echo {
             r#"{{"service":"search","region":"us-east-1","status":404,"latency_ms":{}}}"#,
             100_u32.saturating_add(i)
         ),
+    }
+}
+
+/// A message long enough to be compressed without a dictionary.
+fn long_sample(i: u32) -> Echo {
+    Echo {
+        value: sample(i).value.repeat(8),
     }
 }
 
@@ -181,6 +195,19 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
     let authorized = Arc::new(AtomicUsize::new(0));
     let handled = Arc::new(AtomicUsize::new(0));
     server.set_authorizer(CountingAuthorizer(Arc::clone(&authorized)));
+    server.route_with_options(
+        PLAIN,
+        RouteOptions::new()
+            .with_message_types(PLAIN_TYPE, PLAIN_TYPE)
+            .with_compress(CompressMessages::BOTH),
+        |context, body| async move {
+            context.set_response_metadata(
+                PLAIN_COMPRESSED_KEY,
+                context.plain_compressed_requests_received().to_string(),
+            )?;
+            Ok(body)
+        },
+    );
     let options = RouteOptions::new().with_message_types(MESSAGE_TYPE, MESSAGE_TYPE);
     server.route_with_options(UNARY, options, |_context, body| async move { Ok(body) });
     server.route_streaming_with_options(
@@ -567,7 +594,11 @@ async fn the_client_queries_then_compresses_its_requests() -> TestResult {
     let first = received.recv().await.unwrap();
     ensure_eq!(types(&first), [frame_type::REQUEST, frame_type::MESSAGE]);
     let request: RpcRequest = decode_payload(&first[0].payload)?;
-    ensure_eq!(request.dictionary_query, [dictionary_info()?]);
+    // The query includes compression without a dictionary, as ID 0.
+    ensure_eq!(
+        request.dictionary_query,
+        [dictionary_info()?, DictionaryInfo::default()]
+    );
     ensure_eq!(request.accept_dictionaries, [1]);
 
     call(1).await?;
@@ -1497,4 +1528,116 @@ async fn cancelling_a_replay_cancels_the_call() -> TestResult {
     let replay = calls.recv().await.ok_or("no replay")?;
     ensure!(replay.stopped, "the replay's response was not stopped");
     Ok(())
+}
+
+/// Decompresses a `ZSTD_MESSAGE` payload compressed without a dictionary.
+fn decompress_plain(payload: &[u8]) -> TestResult<Vec<u8>> {
+    let mut context = zstd_safe::DCtx::create();
+    context
+        .set_parameter(zstd_safe::DParameter::Format(
+            zstd_safe::FrameFormat::Magicless,
+        ))
+        .map_err(|code| zstd_safe::get_error_name(code).to_owned())?;
+    let mut message = Vec::with_capacity(1 << 16);
+    context
+        .decompress(&mut message, payload)
+        .map_err(|code| zstd_safe::get_error_name(code).to_owned())?;
+    Ok(message)
+}
+
+#[tokio::test]
+async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_it() -> TestResult {
+    // The server holds no dictionaries: compression without one needs none.
+    let server = spawn_server_with(ServerOptions::new()).await?;
+    let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
+    let message = prost::Message::encode_to_vec(&long_sample(0));
+
+    // A client that offers it, as the golden vector request.plain does, gets the answer and a
+    // compressed response; a short one would travel as a MESSAGE.
+    let mut request = RpcRequest::new(PLAIN);
+    request.dictionary_query = vec![DictionaryInfo::default()];
+    request.accept_dictionaries = vec![0];
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let mut bytes = encode_protobuf_frame(frame_type::REQUEST, &request, 1 << 20)?;
+    bytes.extend(encode_message_frame(&message, 1 << 20)?);
+    send.write_all(&bytes).await?;
+    send.finish()?;
+    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let frames = parse_frames(&response)?;
+    ensure_eq!(
+        types(&frames),
+        [
+            frame_type::HEADERS,
+            frame_type::ZSTD_MESSAGE,
+            frame_type::STATUS
+        ]
+    );
+    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
+    ensure_eq!(headers.dictionaries, [DictionaryInfo::default()]);
+    ensure_eq!(decompress_plain(&frames[1].payload)?, message);
+
+    // A plain request is accepted and counted, even on a route that does not compress.
+    let (mut send, mut recv) = connection.open_bi().await?;
+    let mut bytes = encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new(PLAIN), 1 << 20)?;
+    push_frame(
+        &mut bytes,
+        frame_type::ZSTD_MESSAGE,
+        &vector("plain.records.payload")?,
+    )?;
+    send.write_all(&bytes).await?;
+    send.finish()?;
+    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let frames = parse_frames(&response)?;
+    ensure_eq!(types(&frames), [frame_type::MESSAGE, frame_type::STATUS]);
+    ensure_eq!(frames[0].payload, vector("plain.records.message")?);
+    let status: RpcStatus = decode_payload(&frames[1].payload)?;
+    ensure_eq!(
+        status.metadata.get(PLAIN_COMPRESSED_KEY).map(Vec::as_slice),
+        Some(&b"1"[..]),
+        "{status:?}"
+    );
+
+    // Channels offer it without any configuration: requests compress from the second call, once
+    // the first call's answer arrived, over QUIC and QMux alike.
+    for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
+        let mut tls = client_tls(&server.cert)?;
+        tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+        let config = ChannelConfig::new()
+            .with_tcp_fallback(client_tls(&server.cert)?)
+            .with_tcp_addr(server.tcp)
+            .with_transport_policy(policy);
+        let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        endpoint.set_default_client_config(config.quic_config(client_tls(&server.cert)?)?);
+        let channel = trevrpc::client::Channel::connect_with_config(
+            endpoint.clone(),
+            server.udp,
+            "localhost",
+            config,
+        )
+        .await?;
+        let mut counts = Vec::new();
+        for i in 0..2 {
+            let reply = trevrpc::client::unary::<_, Echo, Echo>(
+                &channel,
+                PLAIN,
+                &long_sample(i),
+                trevrpc::client::CallOptions::new(),
+            )
+            .message_types(PLAIN_TYPE, PLAIN_TYPE)
+            .compress(CompressMessages::BOTH)
+            .with_response()
+            .await?;
+            ensure!(*reply.message() == long_sample(i), "{policy:?}");
+            counts.push(reply.metadata().get(PLAIN_COMPRESSED_KEY).cloned());
+        }
+        ensure_eq!(
+            counts,
+            [Some(b"0".to_vec()), Some(b"1".to_vec())],
+            "{policy:?}"
+        );
+        channel.close();
+    }
+
+    drop(connection);
+    server.stop().await
 }

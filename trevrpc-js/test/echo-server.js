@@ -1,9 +1,15 @@
 // The Echo service of interop/README.md, served over fake streams. Behavior must match what the
 // Go and Rust interop servers do.
+import { root as compressedRoot } from "../build/interop/gen/compressed.trevrpc.js";
 import { root } from "../build/interop/gen/interop.trevrpc.js";
-import { encodeMessage } from "../src/compression.js";
+import { encodeMessage, inflateMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
-import { encodeHeadersFrame, encodeOutgoingFrame, marshalMessage } from "../src/framing.js";
+import {
+  FrameType,
+  encodeHeadersFrame,
+  encodeOutgoingFrame,
+  marshalMessage,
+} from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { createCompression } from "../src/zstd.js";
 import { ServerStreams, parseMethodPath } from "./support.js";
@@ -18,6 +24,7 @@ const compression = await createCompression();
 const MaxDatagramResponse = 1000;
 const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
 const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
+const PlainMessage = compressedRoot.lookupType("trevrpc.interop.v1.PlainMessage");
 
 /**
  * Serves Echo streams. Tests can replace the unary implementation to simulate a faulty server.
@@ -34,12 +41,30 @@ export const echoHandler = createEchoHandler();
 
 const text = new TextDecoder();
 
+/**
+ * The HEADERS fields answering the call's dictionary query: this server holds no dictionaries but
+ * decodes messages without one, so it confirms ID 0 when asked, as real servers do in every
+ * HEADERS that follows a query.
+ */
+function queryAnswer(request) {
+  const query = request.dictionaryQuery ?? [];
+  if (query.length === 0) {
+    return {};
+  }
+  return { dictionaries: query.some(({ id }) => id === 0) ? [{}] : [] };
+}
+
 async function serve(stream, request, unary, session) {
   // The interop-header rule: echo the value as response header and, on success, as trailer.
   const marker = request.metadata["interop-header"];
   const trailers = marker === undefined ? {} : { "interop-trailer": new Uint8Array(marker) };
   if (marker !== undefined) {
-    await stream.writeHeaders({ "interop-header": new Uint8Array(marker) });
+    await stream.write(
+      encodeHeadersFrame({
+        metadata: { "interop-header": new Uint8Array(marker) },
+        ...queryAnswer(request),
+      }),
+    );
   }
   const done = (code = Code.Ok, message = "") =>
     stream.writeStatus(code, message, code === Code.Ok ? trailers : {});
@@ -48,6 +73,13 @@ async function serve(stream, request, unary, session) {
   const path = parseMethodPath(request.method);
   if (path === null) {
     await stream.writeStatus(Code.InvalidArgument, `malformed method path "${request.method}"`);
+    await stream.finish();
+    await stream.stopSending();
+    return;
+  }
+
+  if (path.service === CompressedEchoService && path.method === "Plain") {
+    await compressedPlain(stream, request);
     await stream.finish();
     await stream.stopSending();
     return;
@@ -62,6 +94,7 @@ async function serve(stream, request, unary, session) {
     await (path.method === "ClientStream" ? compressedClientStream : compressedBidi)(
       stream,
       streams,
+      queryAnswer(request),
     );
     await stream.finish();
     await stream.stopSending();
@@ -158,9 +191,9 @@ async function bidi(stream, done) {
  * CompressedEcho.Bidi as the interop README specifies: Echo.Bidi with stream compression, whose
  * OK status reports how many requests arrived stream-compressed.
  */
-async function compressedBidi(stream, streams) {
+async function compressedBidi(stream, streams, answer) {
   try {
-    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
+    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers, ...answer }));
     for (let index = 0, frame; (frame = await stream.readFrame()) !== null; index += 1) {
       const message = EchoRequest.decode(streams.receive(frame));
       if (message.failCode !== 0) {
@@ -179,13 +212,38 @@ async function compressedBidi(stream, streams) {
 }
 
 /**
+ * CompressedEcho.Plain as the interop README specifies: it echoes the text, decodes messages
+ * without a dictionary (answering the query for ID 0), compresses the response so where the call
+ * accepts it, and reports whether the request arrived compressed.
+ */
+async function compressedPlain(stream, request) {
+  const answer = queryAnswer(request);
+  if (answer.dictionaries !== undefined) {
+    await stream.write(encodeHeadersFrame({ metadata: {}, ...answer }));
+  }
+  const frame = await stream.readFrame();
+  const plain = new Map([[0, compression.plain]]);
+  const compressed = frame.type === FrameType.ZstdMessage;
+  const payload = compressed ? inflateMessage(plain, frame.payload, 1 << 22) : frame.payload;
+  const { text: echoed } = PlainMessage.decode(payload);
+  const accepted = (request.acceptDictionaries ?? []).includes(0);
+  const response = marshalMessage(PlainMessage, { text: echoed });
+  await stream.write(
+    encodeOutgoingFrame(encodeMessage(response, accepted ? compression.plain : undefined)),
+  );
+  await stream.writeStatus(Code.Ok, "", {
+    "interop-plain-compressed-received": new TextEncoder().encode(compressed ? "1" : "0"),
+  });
+}
+
+/**
  * CompressedEcho.ClientStream as the interop README specifies: Echo.ClientStream with stream
  * compression. HEADERS go out at dispatch, as servers send them on methods whose requests may be
  * stream-compressed.
  */
-async function compressedClientStream(stream, streams) {
+async function compressedClientStream(stream, streams, answer) {
   try {
-    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
+    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers, ...answer }));
     let message = "";
     let count = 0;
     for (let frame; (frame = await stream.readFrame()) !== null; count += 1) {
@@ -236,7 +294,7 @@ async function unreliableBidi(stream, request, session) {
     });
   };
 
-  await stream.writeHeaders();
+  await stream.write(encodeHeadersFrame({ metadata: {}, ...queryAnswer(request) }));
   const previousListener = datagrams?.onSend;
   if (datagrams !== undefined) {
     datagrams.onSend = (datagram) => {

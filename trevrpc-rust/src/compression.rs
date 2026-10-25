@@ -1,5 +1,5 @@
 //! Compressed messages: `ZSTD_MESSAGE` frames, which carry a message compressed with zstd and a
-//! dictionary both peers hold.
+//! dictionary both peers hold, or without a dictionary on methods that allow it.
 //!
 //! Dictionaries are configured with [`Compression`] on a channel
 //! ([`ChannelConfig::with_compression`](crate::client::ChannelConfig::with_compression)) and a
@@ -7,6 +7,9 @@
 //! and negotiated per connection, so a message whose dictionary the peer lacks travels
 //! uncompressed. A dictionary compresses the protobuf message types it names; generated code tells
 //! the runtime each method's types.
+//!
+//! Compression without a dictionary ([`CompressMessages`]) is negotiated the same way, as the
+//! dictionary with ID 0, which every configuration holds: its "dictionary" is empty.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use bytes::Bytes;
 use zstd_safe::{CCtx, CParameter, DCtx, DParameter, FrameFormat};
 
+use crate::datagram::MessageCount;
 use crate::sync::MutexExt;
 use crate::wire::DictionaryInfo;
 use crate::{Error, Result, RpcRequest, Status};
@@ -99,12 +103,65 @@ impl Dictionary {
     }
 }
 
+/// The directions of a method whose messages may be compressed without a dictionary, from the
+/// `compress` field of the `trevrpc.method` schema option (which `compress_stream` implies).
+///
+/// Generated code passes them with [`Call::compress`](crate::client::Call::compress) and
+/// [`RouteOptions::with_compress`](crate::server::RouteOptions::with_compress). A direction is set
+/// only if its message type has no field marked `debug_redact`. Its messages of
+/// [`PLAIN_MIN_SIZE`] bytes or more travel as `ZSTD_MESSAGE` frames without a `Dictionary_ID` when
+/// no dictionary applies to their type, the peer decodes them, and compressing makes them shorter.
+/// A stream-compressed direction keeps its context from the third message.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct CompressMessages {
+    /// The client's request messages.
+    pub requests: bool,
+    /// The server's response messages.
+    pub responses: bool,
+}
+
+impl CompressMessages {
+    /// Neither direction.
+    pub const NONE: Self = Self {
+        requests: false,
+        responses: false,
+    };
+    /// The client's requests.
+    pub const REQUESTS: Self = Self {
+        requests: true,
+        responses: false,
+    };
+    /// The server's responses.
+    pub const RESPONSES: Self = Self {
+        requests: false,
+        responses: true,
+    };
+    /// Both directions.
+    pub const BOTH: Self = Self {
+        requests: true,
+        responses: true,
+    };
+
+    /// Returns whether either direction is set.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.requests || self.responses
+    }
+}
+
+/// The smallest message compressed without a dictionary: a lone smaller message rarely shrinks.
+pub const PLAIN_MIN_SIZE: usize = 256;
+
+/// The dictionary ID that stands for compression without a dictionary in the negotiation.
+const PLAIN_ID: u32 = 0;
+
 /// The magic number that opens every zstd-format dictionary (RFC 8878, section 5).
 const DICTIONARY_MAGIC: u32 = 0xEC30_A437;
 /// Contexts a dictionary keeps for reuse; more are created under load and then dropped.
 const MAX_POOLED_CONTEXTS: usize = 64;
 
-/// A digested dictionary, safe to share between calls.
+/// A digested dictionary, safe to share between calls; with ID 0 and no data, the "dictionary" of
+/// compression without one.
 pub(crate) struct Dict {
     pub(crate) id: u32,
     pub(crate) info: DictionaryInfo,
@@ -177,12 +234,38 @@ impl Dict {
             compressors: Mutex::new(Vec::new()),
             decompressors: Mutex::new(Vec::new()),
         };
-        // Digesting it once proves libzstd accepts it, and leaves a context of each kind ready.
-        let compressor = dict.new_compressor()?;
-        let decompressor = dict.new_decompressor()?;
-        dict.compressors.lock_unpoisoned().push(compressor);
-        dict.decompressors.lock_unpoisoned().push(decompressor);
-        Ok(dict)
+        dict.warm()
+    }
+
+    /// Compression without a dictionary, at `level`. Its contexts are created as messages need
+    /// them, since there is nothing to digest.
+    const fn plain(level: i32) -> Self {
+        Self {
+            id: PLAIN_ID,
+            info: DictionaryInfo {
+                id: PLAIN_ID,
+                fingerprint: Vec::new(),
+            },
+            data: Vec::new(),
+            level,
+            compressors: Mutex::new(Vec::new()),
+            decompressors: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Digesting the dictionary once proves libzstd accepts it, and leaves a context of each kind
+    /// ready.
+    fn warm(self) -> Result<Self> {
+        let compressor = self.new_compressor()?;
+        let decompressor = self.new_decompressor()?;
+        self.compressors.lock_unpoisoned().push(compressor);
+        self.decompressors.lock_unpoisoned().push(decompressor);
+        Ok(self)
+    }
+
+    /// Whether this is compression without a dictionary.
+    pub(crate) const fn is_plain(&self) -> bool {
+        self.id == PLAIN_ID
     }
 
     /// The dictionary itself, which stream compression contexts load.
@@ -202,7 +285,9 @@ impl Dict {
             context.set_parameter(parameter).map_err(zstd_error)?;
         }
         // The dictionary is digested once per context and used for every frame after.
-        context.load_dictionary(&self.data).map_err(zstd_error)?;
+        if !self.is_plain() {
+            context.load_dictionary(&self.data).map_err(zstd_error)?;
+        }
         Ok(context)
     }
 
@@ -211,13 +296,19 @@ impl Dict {
         context
             .set_parameter(DParameter::Format(FrameFormat::Magicless))
             .map_err(zstd_error)?;
-        context.load_dictionary(&self.data).map_err(zstd_error)?;
+        if !self.is_plain() {
+            context.load_dictionary(&self.data).map_err(zstd_error)?;
+        }
         Ok(context)
     }
 
     /// Compresses `message` into a `ZSTD_MESSAGE` payload, or returns `None` when that would not be
-    /// shorter than the message, which then travels uncompressed.
+    /// shorter than the message, which then travels uncompressed. Without a dictionary, messages
+    /// under [`PLAIN_MIN_SIZE`] are not tried.
     pub(crate) fn compress(&self, message: &[u8]) -> Option<Bytes> {
+        if self.is_plain() && message.len() < PLAIN_MIN_SIZE {
+            return None;
+        }
         let pooled = self.compressors.lock_unpoisoned().pop();
         let mut context = match pooled {
             Some(context) => context,
@@ -262,34 +353,30 @@ impl Dict {
     }
 }
 
-/// A validated [`Compression`].
+/// A validated [`Compression`]. Every configuration holds compression without a dictionary, as
+/// the dictionary with ID 0.
 #[derive(Debug)]
 pub(crate) struct CompressionConfig {
     by_id: HashMap<u32, Arc<Dict>>,
     by_type: HashMap<String, Arc<Dict>>,
-    /// Every dictionary, as a client's `dictionary_query`.
+    /// Compression without a dictionary.
+    plain: Arc<Dict>,
+    /// Every dictionary, compression without one last, as a client's `dictionary_query`.
     query: Vec<DictionaryInfo>,
     /// The zstd level of outgoing messages.
     level: i32,
 }
 
 impl CompressionConfig {
-    /// Validates and digests `compression`; `None` when it has no dictionaries.
-    pub(crate) fn new(compression: &Compression) -> Result<Option<Arc<Self>>> {
-        if compression.dictionaries.is_empty() {
-            return Ok(None);
-        }
+    /// Validates and digests `compression`.
+    pub(crate) fn new(compression: &Compression) -> Result<Arc<Self>> {
         let level = if compression.level == 0 {
             1
         } else {
             compression.level
         };
-        let mut config = Self {
-            by_id: HashMap::new(),
-            by_type: HashMap::new(),
-            query: Vec::new(),
-            level,
-        };
+        let mut config = Self::without_dictionaries(level);
+        config.query.clear();
         for dictionary in &compression.dictionaries {
             let dict = Arc::new(Dict::new(dictionary.data.clone(), level)?);
             if config.by_id.contains_key(&dict.id) {
@@ -318,7 +405,33 @@ impl CompressionConfig {
             }
             config.by_id.insert(dict.id, dict);
         }
-        Ok(Some(Arc::new(config)))
+        config.query.push(config.plain.info.clone());
+        Ok(Arc::new(config))
+    }
+
+    /// A configuration that holds compression without a dictionary only, at `level`.
+    fn without_dictionaries(level: i32) -> Self {
+        let plain = Arc::new(Dict::plain(level));
+        Self {
+            by_id: HashMap::from([(PLAIN_ID, Arc::clone(&plain))]),
+            by_type: HashMap::new(),
+            query: vec![plain.info.clone()],
+            plain,
+            level,
+        }
+    }
+
+    /// The configuration of a peer that configured no dictionaries: compression without one only,
+    /// at level 1. Shared, since every such peer's is the same.
+    pub(crate) fn plain_only() -> Arc<Self> {
+        static PLAIN: OnceLock<Arc<CompressionConfig>> = OnceLock::new();
+        Arc::clone(PLAIN.get_or_init(|| Arc::new(Self::without_dictionaries(1))))
+    }
+
+    /// The dictionaries peers may start a stream compression frame from: every one but
+    /// compression without a dictionary, which starts from nothing.
+    pub(crate) fn stream_dictionaries(&self) -> impl Iterator<Item = &Arc<Dict>> {
+        self.by_id.values().filter(|dict| !dict.is_plain())
     }
 
     fn dict(&self, id: u32) -> Option<&Arc<Dict>> {
@@ -333,6 +446,21 @@ impl CompressionConfig {
 
     fn dict_for_type(&self, name: Option<&str>) -> Option<&Arc<Dict>> {
         self.by_type.get(name?)
+    }
+
+    /// The per-message dictionary of a direction whose messages are of type `name`: the type's
+    /// dictionary if `usable` allows it, or else, where `plain` allows it and `usable` too,
+    /// compression without a dictionary. A peer that does not hold the type's dictionary can thus
+    /// still receive the direction's messages compressed.
+    fn dict_for(
+        &self,
+        name: Option<&str>,
+        plain: bool,
+        usable: impl Fn(&Arc<Dict>) -> bool,
+    ) -> Option<&Arc<Dict>> {
+        self.dict_for_type(name)
+            .filter(|dict| usable(dict))
+            .or_else(|| plain.then_some(&self.plain).filter(|dict| usable(dict)))
     }
 
     fn matches(&self, info: &DictionaryInfo) -> Option<&Arc<Dict>> {
@@ -360,21 +488,31 @@ pub(crate) enum Accept {
     None,
     /// The one dictionary a client listed for the call.
     One(Arc<Dict>),
-    /// Every dictionary a server holds.
-    All(Arc<CompressionConfig>),
+    /// Every dictionary a server holds, compression without one included, counting the messages
+    /// that arrive without a dictionary.
+    All(Arc<CompressionConfig>, MessageCount),
 }
 
 impl Accept {
-    /// What a server accepts: every dictionary it holds.
+    /// What a server accepts: every dictionary it holds, and compression without one.
     pub(crate) fn server(config: Option<&Arc<CompressionConfig>>) -> Self {
-        config.map_or(Self::None, |config| Self::All(Arc::clone(config)))
+        let config = config.map_or_else(CompressionConfig::plain_only, Arc::clone);
+        Self::All(config, MessageCount::new())
     }
 
     fn lookup(&self, id: u32) -> Option<&Arc<Dict>> {
         match self {
             Self::None => None,
             Self::One(dict) => (dict.id == id).then_some(dict),
-            Self::All(config) => config.dict(id),
+            Self::All(config, _) => config.dict(id),
+        }
+    }
+
+    /// Counts the messages a server receives compressed without a dictionary.
+    pub(crate) fn plain_count(&self) -> MessageCount {
+        match self {
+            Self::All(_, count) => count.clone(),
+            Self::None | Self::One(_) => MessageCount::default(),
         }
     }
 }
@@ -393,8 +531,8 @@ fn little_endian(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buffer))
 }
 
-/// Validates that `payload` is exactly one magicless zstd frame with a non-zero `Dictionary_ID`
-/// and a `Frame_Content_Size`, and returns both.
+/// Validates that `payload` is exactly one magicless zstd frame with a `Frame_Content_Size`, and
+/// returns it with the frame's `Dictionary_ID`, zero when it has none.
 ///
 /// It walks the block headers to find the frame's end, so trailing bytes, including a second
 /// frame, are rejected. Block contents are not checked; decompression does that.
@@ -419,7 +557,7 @@ pub(crate) fn parse_header(payload: &[u8]) -> Option<Header> {
         (2, _) => 4,
         _ => 8,
     };
-    if dict_id_len == 0 || content_size_len == 0 {
+    if content_size_len == 0 {
         return None;
     }
     if !single_segment {
@@ -433,9 +571,6 @@ pub(crate) fn parse_header(payload: &[u8]) -> Option<Header> {
     let mut content_size = little_endian(content_size)?;
     if content_size_len == 2 {
         content_size = content_size.checked_add(256)?;
-    }
-    if dict_id == 0 {
-        return None;
     }
     loop {
         let (block_header, after) = rest.split_at_checked(3)?;
@@ -503,12 +638,22 @@ pub(crate) fn inflate(
         return Err(Rejected::TooLarge { len, max: max_size });
     }
     let dict = accept.lookup(header.dict_id).ok_or_else(|| {
-        Rejected::Invalid(format!(
-            "compressed message uses dictionary {}, which is not accepted",
-            header.dict_id
-        ))
+        Rejected::Invalid(if header.dict_id == PLAIN_ID {
+            "compressed message without a dictionary, which is not accepted".to_owned()
+        } else {
+            format!(
+                "compressed message uses dictionary {}, which is not accepted",
+                header.dict_id
+            )
+        })
     })?;
-    dict.decompress(payload, header).map_err(Rejected::Invalid)
+    let message = dict
+        .decompress(payload, header)
+        .map_err(Rejected::Invalid)?;
+    if dict.is_plain() {
+        accept.plain_count().add();
+    }
+    Ok(message)
 }
 
 /// The compression state of one client connection.
@@ -577,14 +722,16 @@ impl ClientCompression {
         })
     }
 
-    /// Fills the negotiation fields of `request` for a call whose message types are `types`.
+    /// Fills the negotiation fields of `request` for a call whose message types are `types`, and
+    /// whose directions `plain` sets may be compressed without a dictionary.
     pub(crate) fn prepare(
         self: &Arc<Self>,
         request: &mut RpcRequest,
         types: Option<crate::client::MessageTypes>,
+        plain: CompressMessages,
     ) -> ClientCall {
         let shared = self.shared.get();
-        let usable = |dict: &&Arc<Dict>| shared.is_none_or(|set| set.contains(dict));
+        let usable = |dict: &Arc<Dict>| shared.is_none_or(|set| set.contains(dict));
         let mut call = ClientCall::default();
         if shared.is_none() {
             request.dictionary_query.clone_from(&self.config.query);
@@ -592,15 +739,17 @@ impl ClientCompression {
         }
         // A call that queries may already accept the dictionary it asks about: the server
         // compresses with it only if its answer confirms it.
-        if let Some(dict) = self
-            .config
-            .dict_for_type(types.map(|types| types.response))
-            .filter(usable)
+        if let Some(dict) =
+            self.config
+                .dict_for(types.map(|types| types.response), plain.responses, usable)
         {
             request.accept_dictionaries = vec![dict.id];
             call.accept = Accept::One(Arc::clone(dict));
         }
-        if let Some(dict) = self.config.dict_for_type(types.map(|types| types.request)) {
+        if let Some(dict) =
+            self.config
+                .dict_for(types.map(|types| types.request), plain.requests, usable)
+        {
             call.requests = match shared {
                 Some(set) if set.contains(dict) => CallDict::Known(Arc::clone(dict)),
                 Some(_) => CallDict::None,
@@ -639,18 +788,21 @@ pub(crate) struct ServerCall {
 }
 
 /// Answers the request's query, if it has one, and picks the dictionary of the response messages:
-/// the one for `response_type`, if the client accepts it. A server without compression still
-/// answers, so clients stop asking.
+/// the one for `response_type`, or compression without a dictionary where `plain` allows it, if
+/// the client accepts it. A server without dictionaries still answers, so clients stop asking, and
+/// confirms compression without a dictionary.
 pub(crate) fn negotiate(
     config: Option<&Arc<CompressionConfig>>,
     request: &RpcRequest,
     response_type: Option<&str>,
+    plain: CompressMessages,
 ) -> ServerCall {
+    let config = config.map_or_else(CompressionConfig::plain_only, Arc::clone);
     let mut call = ServerCall::default();
     if !request.dictionary_query.is_empty() {
         let mut answer: Vec<DictionaryInfo> = Vec::new();
         for info in &request.dictionary_query {
-            if let Some(dict) = config.and_then(|config| config.matches(info))
+            if let Some(dict) = config.matches(info)
                 && !answer.contains(&dict.info)
             {
                 answer.push(dict.info.clone());
@@ -659,12 +811,12 @@ pub(crate) fn negotiate(
         call.answer = Some(answer);
     }
     call.responses = config
-        .and_then(|config| config.dict_for_type(response_type))
-        .filter(|dict| request.accept_dictionaries.contains(&dict.id))
-        .filter(|dict| {
-            call.answer
-                .as_ref()
-                .is_none_or(|answer| answer.contains(&dict.info))
+        .dict_for(response_type, plain.responses, |dict| {
+            request.accept_dictionaries.contains(&dict.id)
+                && call
+                    .answer
+                    .as_ref()
+                    .is_none_or(|answer| answer.contains(&dict.info))
         })
         .cloned();
     call
@@ -701,10 +853,10 @@ mod tests {
     }
 
     pub(super) fn config() -> Arc<CompressionConfig> {
-        CompressionConfig::new(&test_compression())
-            .unwrap()
-            .unwrap()
+        CompressionConfig::new(&test_compression()).unwrap()
     }
+
+    const STRING_VALUE: &str = "google.protobuf.StringValue";
 
     #[test]
     fn the_dictionary_vector_has_its_id_and_fingerprint() {
@@ -718,7 +870,7 @@ mod tests {
     #[test]
     fn receivers_follow_the_golden_vectors() {
         let vectors = vectors();
-        let accept = Accept::All(config());
+        let accept = Accept::server(Some(&config()));
         let max = crate::framing::DEFAULT_MAX_FRAME_SIZE;
         for (key, payload) in &vectors {
             let Some(name) = key.strip_suffix(".payload") else {
@@ -732,6 +884,21 @@ mod tests {
                     message.as_ref(),
                     vectors[&format!("{name}.message")],
                     "{case}"
+                );
+            } else if let Some(case) = name.strip_prefix("plain.") {
+                let message = inflate(&accept, payload, max).unwrap_or_else(|error| {
+                    panic!("{case}: {error:?}");
+                });
+                assert_eq!(
+                    message.as_ref(),
+                    vectors[&format!("{name}.message")],
+                    "{case}"
+                );
+                // A receiver accepting only dict.d1 rejects it.
+                let only_d1 = Accept::One(Arc::clone(config().dict(1).unwrap()));
+                assert!(
+                    matches!(inflate(&only_d1, payload, max), Err(Rejected::Invalid(_))),
+                    "{name} was accepted without ID 0"
                 );
             } else if name.starts_with("bad.") {
                 assert!(
@@ -749,6 +916,8 @@ mod tests {
             }
         }
         assert!(inflate(&Accept::None, &vectors["ok.small.payload"], max).is_err());
+        // Servers count what arrives without a dictionary.
+        assert_eq!(accept.plain_count().get(), 1);
     }
 
     #[test]
@@ -791,42 +960,45 @@ mod tests {
         ] {
             assert!(CompressionConfig::new(&compression).is_err());
         }
-        assert!(
-            CompressionConfig::new(&Compression::new())
-                .unwrap()
-                .is_none()
-        );
+        // Without dictionaries, a configuration holds compression without one only.
+        let plain = CompressionConfig::new(&Compression::new()).unwrap();
+        assert_eq!(plain.query, [DictionaryInfo::default()]);
     }
 
     #[test]
     fn negotiation_answers_queries_and_confirms_dictionaries() {
         let config = config();
-        let types = Some(crate::client::MessageTypes::new(
-            "google.protobuf.StringValue",
-            "google.protobuf.StringValue",
-        ));
+        let types = Some(crate::client::MessageTypes::new(STRING_VALUE, STRING_VALUE));
         let client = ClientCompression::new(Arc::clone(&config));
 
-        // The first call queries and accepts dictionary 1 unconfirmed.
+        // The first call queries, compression without a dictionary included, and accepts
+        // dictionary 1 unconfirmed.
         let mut request = RpcRequest::new("/svc/m");
-        let first = client.prepare(&mut request, types);
+        let first = client.prepare(&mut request, types, CompressMessages::NONE);
         assert_eq!(request.accept_dictionaries, [1]);
-        assert_eq!(request.dictionary_query.len(), 1);
+        assert_eq!(request.dictionary_query.len(), 2);
         assert!(first.requests.get().is_none() && first.learn.is_some());
 
-        let server = negotiate(Some(&config), &request, Some("google.protobuf.StringValue"));
+        let none = CompressMessages::NONE;
+        let server = negotiate(Some(&config), &request, Some(STRING_VALUE), none);
         assert_eq!(server.answer.as_deref(), Some(&config.query[..]));
         assert!(server.responses.is_some());
-        // A server without compression answers too, with nothing.
-        let none = negotiate(None, &request, Some("google.protobuf.StringValue"));
-        assert_eq!(none.answer.as_deref(), Some(&[][..]));
-        assert!(none.responses.is_none());
+        // A server without dictionaries answers too, with compression without one only.
+        let plain = negotiate(None, &request, Some(STRING_VALUE), none);
+        assert_eq!(
+            plain.answer.as_deref(),
+            Some(&[DictionaryInfo::default()][..])
+        );
+        assert!(plain.responses.is_none());
 
         // A wrong fingerprint is not confirmed, so the server does not compress with it.
         let mut wrong = request.clone();
         wrong.dictionary_query[0].fingerprint = b"12345678".to_vec();
-        let refused = negotiate(Some(&config), &wrong, Some("google.protobuf.StringValue"));
-        assert_eq!(refused.answer.as_deref(), Some(&[][..]));
+        let refused = negotiate(Some(&config), &wrong, Some(STRING_VALUE), none);
+        assert_eq!(
+            refused.answer.as_deref(),
+            Some(&[DictionaryInfo::default()][..])
+        );
         assert!(refused.responses.is_none());
 
         // Once the answer is in, calls stop querying and compress requests, and so does the
@@ -834,7 +1006,7 @@ mod tests {
         client.learn(server.answer.as_deref().unwrap());
         assert!(first.requests.get().is_some());
         let mut next = RpcRequest::new("/svc/m");
-        let call = client.prepare(&mut next, types);
+        let call = client.prepare(&mut next, types, CompressMessages::NONE);
         assert!(next.dictionary_query.is_empty() && call.learn.is_none());
         assert_eq!(next.accept_dictionaries, [1]);
         assert!(matches!(call.requests, CallDict::Known(_)));
@@ -850,8 +1022,156 @@ mod tests {
             "a.B",
             "google.protobuf.StringValue",
         ));
-        let call = client.prepare(&mut request, types);
+        let call = client.prepare(&mut request, types, CompressMessages::BOTH);
         assert!(request.dictionary_query.is_empty() && request.accept_dictionaries.is_empty());
         assert!(matches!(call.accept, Accept::None) && matches!(call.requests, CallDict::None));
+    }
+
+    /// A message of `len` bytes that compresses well on its own.
+    fn compressible(len: usize) -> Vec<u8> {
+        br#"{"service":"search","region":"us-east-1","status":404,"latency_ms":100}"#
+            .iter()
+            .copied()
+            .cycle()
+            .take(len)
+            .collect()
+    }
+
+    #[test]
+    fn the_plain_negotiation_fields_match_the_golden_vectors() {
+        use prost::Message as _;
+        let vectors = vectors();
+        // A client without dictionaries, on a method that allows compression without one.
+        let client = ClientCompression::new(CompressionConfig::plain_only());
+        let mut request = RpcRequest::new("/svc/m");
+        let types = Some(crate::client::MessageTypes::new("a.Request", "a.Response"));
+        let call = client.prepare(&mut request, types, CompressMessages::BOTH);
+        assert_eq!(request.encode_to_vec(), vectors["request.plain.payload"]);
+        assert!(matches!(&call.accept, Accept::One(dict) if dict.is_plain()));
+
+        let server = negotiate(None, &request, Some("a.Response"), CompressMessages::BOTH);
+        let headers = crate::RpcHeaders {
+            dictionaries: server.answer.clone().unwrap(),
+            ..crate::RpcHeaders::default()
+        };
+        assert_eq!(headers.encode_to_vec(), vectors["headers.plain.payload"]);
+        assert!(
+            server
+                .responses
+                .as_ref()
+                .is_some_and(|dict| dict.is_plain())
+        );
+
+        // Requests compress once the answer confirms it, the call that queried included.
+        assert!(call.requests.get().is_none());
+        client.learn(&headers.dictionaries);
+        assert!(call.requests.get().is_some_and(|dict| dict.is_plain()));
+    }
+
+    #[test]
+    fn plain_compression_needs_the_method_the_peer_and_no_dictionary() {
+        let config = config();
+        let client = ClientCompression::new(Arc::clone(&config));
+        client.learn(&config.query);
+        let other = Some(crate::client::MessageTypes::new("a.Request", "a.Response"));
+        let dictionary = Some(crate::client::MessageTypes::new(STRING_VALUE, STRING_VALUE));
+
+        // A method that does not allow it lists nothing for types without a dictionary.
+        let mut request = RpcRequest::new("/svc/m");
+        let call = client.prepare(&mut request, other, CompressMessages::NONE);
+        assert!(request.accept_dictionaries.is_empty() && call.requests.get().is_none());
+
+        // A type's dictionary wins over compression without one.
+        let mut request = RpcRequest::new("/svc/m");
+        let call = client.prepare(&mut request, dictionary, CompressMessages::BOTH);
+        assert_eq!(request.accept_dictionaries, [1]);
+        assert_eq!(call.requests.get().map(|dict| dict.id), Some(1));
+        let server = negotiate(
+            Some(&config),
+            &request,
+            Some(STRING_VALUE),
+            CompressMessages::BOTH,
+        );
+        assert_eq!(server.responses.map(|dict| dict.id), Some(1));
+
+        // Without one, each direction the method allows lists ID 0.
+        let mut request = RpcRequest::new("/svc/m");
+        let call = client.prepare(&mut request, other, CompressMessages::RESPONSES);
+        assert_eq!(request.accept_dictionaries, [0]);
+        assert!(call.requests.get().is_none());
+        // The server compresses responses only where its route allows it too.
+        let allowed = negotiate(
+            Some(&config),
+            &request,
+            Some("a.Response"),
+            CompressMessages::BOTH,
+        );
+        assert!(allowed.responses.is_some_and(|dict| dict.is_plain()));
+        let route = negotiate(
+            Some(&config),
+            &request,
+            Some("a.Response"),
+            CompressMessages::NONE,
+        );
+        assert!(route.responses.is_none());
+        // Nor without the client's ID 0.
+        let unlisted = negotiate(
+            Some(&config),
+            &RpcRequest::new("/svc/m"),
+            Some("a.Response"),
+            CompressMessages::BOTH,
+        );
+        assert!(unlisted.responses.is_none());
+
+        // A server that did not confirm ID 0, as one without the feature, gets no such requests.
+        let old = ClientCompression::new(Arc::clone(&config));
+        old.learn(&config.query[..1]);
+        let mut request = RpcRequest::new("/svc/m");
+        let call = old.prepare(&mut request, other, CompressMessages::BOTH);
+        assert!(call.requests.get().is_none());
+
+        // A server that confirmed only ID 0 lacks the type's dictionary, so both directions fall
+        // back to compression without one.
+        let without = ClientCompression::new(Arc::clone(&config));
+        without.learn(&config.query[1..]);
+        let mut request = RpcRequest::new("/svc/m");
+        let call = without.prepare(&mut request, dictionary, CompressMessages::BOTH);
+        assert_eq!(request.accept_dictionaries, [0]);
+        assert!(call.requests.get().is_some_and(|dict| dict.is_plain()));
+        let server = negotiate(
+            Some(&CompressionConfig::plain_only()),
+            &request,
+            Some(STRING_VALUE),
+            CompressMessages::BOTH,
+        );
+        assert!(server.responses.is_some_and(|dict| dict.is_plain()));
+    }
+
+    #[test]
+    fn plain_messages_compress_from_256_bytes_when_they_shrink() {
+        let plain = CompressionConfig::plain_only();
+        let dict = plain.dict(0).unwrap();
+        assert!(dict.compress(&compressible(PLAIN_MIN_SIZE - 1)).is_none());
+        let message = compressible(PLAIN_MIN_SIZE);
+        let payload = dict.compress(&message).unwrap();
+        let header = parse_header(&payload).unwrap();
+        assert_eq!(header.dict_id, 0);
+        // No Dictionary_ID field, no checksum.
+        assert_eq!(payload.first().unwrap() & 0x07, 0);
+        assert_eq!(
+            inflate(&Accept::One(Arc::clone(dict)), &payload, 1 << 20)
+                .unwrap()
+                .as_ref(),
+            message
+        );
+        // Incompressible messages go uncompressed.
+        let noise: Vec<u8> = (0..32_u32)
+            .flat_map(|i| {
+                ring::digest::digest(&ring::digest::SHA256, &i.to_le_bytes())
+                    .as_ref()
+                    .to_vec()
+            })
+            .collect();
+        assert!(dict.compress(&noise).is_none());
     }
 }

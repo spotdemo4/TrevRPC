@@ -1,6 +1,6 @@
 // Compressed messages: ZSTD_MESSAGE frames, whose payload is a magicless zstd frame compressed with
-// a dictionary both peers hold, and the chunks of ZSTD_STREAM_MESSAGE frames (see the "Compressed
-// Messages" section of the wire format). The codec itself lives in the `@trevrpc/trevrpc-js/zstd`
+// a dictionary both peers hold or, on methods that allow it, without one, and the chunks of
+// ZSTD_STREAM_MESSAGE frames (see the "Compressed Messages" section of the wire format). The codec itself lives in the `@trevrpc/trevrpc-js/zstd`
 // subpath, so the runtime never loads it unless compression is configured; this module negotiates
 // dictionaries per session, validates payloads, and enforces limits before handing a payload to
 // the codec. Stream compression's per-call state is in stream-compression.js.
@@ -16,6 +16,12 @@ import { internal, resourceExhausted } from "./status.js";
 export function transportCompression(transport) {
   return transport.compression ?? undefined;
 }
+
+/**
+ * The smallest message compressed without a dictionary: a smaller one rarely has anything to
+ * compress against within itself.
+ */
+export const PlainMinSize = 256;
 
 const sessions = new WeakMap();
 
@@ -53,24 +59,32 @@ class SessionCompression {
 
   /**
    * The negotiation of one call whose response messages have type `responseType`: the REQUEST
-   * fields it sets, the dictionary it accepts on its responses (or undefined), and whether it
-   * queries the server.
+   * fields it sets, what it accepts on its responses (a Map from dictionary ID to dictionary, 0
+   * for compression without one, which `plainResponses` allows), and whether it queries the
+   * server.
    */
-  prepare(responseType) {
+  prepare(responseType, plainResponses = false) {
     const shared = this.#shared;
     const fields = {};
-    const queried = shared === undefined && this.#compression.query.length > 0;
+    const queried = shared === undefined;
     if (queried) {
       fields.dictionaryQuery = this.#compression.query;
     }
     // A call that queries may already accept the dictionary it asks about: the server compresses
-    // with it only if its answer confirms it.
+    // with it only if its answer confirms it. Compression without a dictionary needs no
+    // confirmation: a server that does not decode it does not send it either.
+    const accept = new Map();
     const dictionary = this.#compression.dictionaryFor(responseType);
-    const accept = dictionary !== undefined && (shared === undefined || shared.has(dictionary));
-    if (accept) {
-      fields.acceptDictionaries = [dictionary.id];
+    if (dictionary !== undefined && (shared === undefined || shared.has(dictionary))) {
+      accept.set(dictionary.id, dictionary);
     }
-    return { fields, accept: accept ? dictionary : undefined, queried };
+    if (plainResponses) {
+      accept.set(0, this.#compression.plain);
+    }
+    if (accept.size > 0) {
+      fields.acceptDictionaries = [...accept.keys()];
+    }
+    return { fields, accept, queried };
   }
 
   /**
@@ -82,7 +96,8 @@ class SessionCompression {
       return;
     }
     const shared = new Set();
-    for (const { id, fingerprint } of answer) {
+    for (const { id = 0, fingerprint } of answer) {
+      // ID 0, which an entry without fields decodes to, is compression without a dictionary.
       const dictionary = this.#compression.dictionary(id);
       if (dictionary !== undefined && sameBytes(dictionary.fingerprint, byteView(fingerprint))) {
         shared.add(dictionary);
@@ -96,15 +111,32 @@ class SessionCompression {
     const dictionary = this.#compression.dictionaryFor(requestType);
     return dictionary !== undefined && this.#shared?.has(dictionary) ? dictionary : undefined;
   }
+
+  /**
+   * What request messages of type `requestType` are compressed with now: their dictionary, or,
+   * with `plain`, `Compression.plain` once the server has confirmed it decodes compression
+   * without a dictionary; undefined for neither.
+   */
+  requestCompressor(requestType, plain) {
+    const dictionary = this.requestDictionary(requestType);
+    if (dictionary !== undefined || !plain) {
+      return dictionary;
+    }
+    const compressor = this.#compression.plain;
+    return this.#shared?.has(compressor) ? compressor : undefined;
+  }
 }
 
 /**
  * Encodes a marshalled message as an outgoing message, `{ type, payload, size }`: a ZSTD_MESSAGE
  * compressed with `dictionary` when that is shorter, and a MESSAGE otherwise, as without one.
- * `size` is the message size, which limits apply to.
+ * Compression without a dictionary (ID 0) applies from PlainMinSize. `size` is the message size,
+ * which limits apply to.
  */
 export function encodeMessage(body, dictionary) {
-  const compressed = dictionary?.compress(body);
+  const worth =
+    dictionary !== undefined && (dictionary.id !== 0 || body.byteLength >= PlainMinSize);
+  const compressed = worth ? dictionary.compress(body) : undefined;
   return compressed !== undefined && compressed.byteLength < body.byteLength
     ? { type: FrameType.ZstdMessage, payload: compressed, size: body.byteLength }
     : { type: FrameType.Message, payload: body, size: body.byteLength };
@@ -112,19 +144,20 @@ export function encodeMessage(body, dictionary) {
 
 /**
  * The message of a received MESSAGE or ZSTD_MESSAGE frame, `{ type, payload }`, decompressed with
- * `accept` (see inflateMessage).
+ * what `accept` holds (see inflateMessage).
  */
 export function receivedMessage({ type, payload }, accept, maxSize) {
   return type === FrameType.ZstdMessage ? inflateMessage(accept, payload, maxSize) : payload;
 }
 
 /**
- * Decompresses the payload of a ZSTD_MESSAGE frame received on a response. `accept` is the
- * dictionary the call accepts, or undefined. A message above maxSize is ResourceExhausted, found
- * before decompressing; every other fault is Internal.
+ * Decompresses the payload of a ZSTD_MESSAGE frame received on a response. `accept` maps the
+ * dictionary IDs the call accepts to their dictionaries, 0 for compression without one, or is
+ * undefined for none. A message above maxSize is ResourceExhausted, found before decompressing;
+ * every other fault is Internal.
  */
 export function inflateMessage(accept, payload, maxSize) {
-  if (accept === undefined) {
+  if (accept === undefined || accept.size === 0) {
     throw internal("compressed message where no dictionary is accepted");
   }
   const header = parseZstdHeader(payload);
@@ -133,14 +166,17 @@ export function inflateMessage(accept, payload, maxSize) {
       `compressed message of ${header.contentSize} bytes exceeds maximum ${maxSize}`,
     );
   }
-  if (header.dictionaryId !== accept.id) {
+  const dictionary = accept.get(header.dictionaryId);
+  if (dictionary === undefined) {
     throw internal(
-      `compressed message uses dictionary ${header.dictionaryId}, which is not accepted`,
+      header.dictionaryId === 0
+        ? "compressed message without a dictionary, which is not accepted"
+        : `compressed message uses dictionary ${header.dictionaryId}, which is not accepted`,
     );
   }
   let message;
   try {
-    message = accept.decompress(payload, header.contentSize);
+    message = dictionary.decompress(payload, header.contentSize);
   } catch {
     // Caught below as a failure; the codec's own error says nothing more.
   }
@@ -154,8 +190,9 @@ const FcsSizes = [0, 2, 4, 8];
 const DidSizes = [0, 1, 2, 4];
 
 /**
- * Validates that payload is exactly one magicless zstd frame with a non-zero Dictionary_ID and a
- * Frame_Content_Size, and returns both as `{ dictionaryId, contentSize }`. It walks the block
+ * Validates that payload is exactly one magicless zstd frame with a Frame_Content_Size, and
+ * returns its Dictionary_ID (0 if absent or zero: compressed without a dictionary) and content
+ * size as `{ dictionaryId, contentSize }`. It walks the block
  * headers to find the frame's end, so trailing bytes, a second frame included, are rejected. Block
  * contents are not checked; decompression does that. A content size beyond 2^53 is approximate,
  * which only matters for limits it exceeds anyway.
@@ -173,7 +210,7 @@ export function parseZstdHeader(payload) {
   const didSize = DidSizes[descriptor & 0x03];
   const fcsSize = fcsFlag === 0 && singleSegment ? 1 : FcsSizes[fcsFlag];
   // The reserved bit must be unset.
-  if ((descriptor & 0x08) !== 0 || didSize === 0 || fcsSize === 0) {
+  if ((descriptor & 0x08) !== 0 || fcsSize === 0) {
     throw invalid();
   }
   let position = singleSegment ? 1 : 2; // after the Window_Descriptor, if present
@@ -187,9 +224,6 @@ export function parseZstdHeader(payload) {
     contentSize += 256;
   }
   position += fcsSize;
-  if (dictionaryId === 0) {
-    throw invalid();
-  }
   for (;;) {
     const block = nextBlock(bytes, position);
     if (block === undefined) {

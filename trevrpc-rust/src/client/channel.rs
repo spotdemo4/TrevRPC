@@ -436,7 +436,7 @@ impl Channel {
             endpoint,
             remote_addr,
             server_name: server_name.into(),
-            compression: CompressionConfig::new(&config.compression)?,
+            compression: Some(CompressionConfig::new(&config.compression)?),
             stream_budget: StreamBudget::new(config.stream_compression_memory),
             max_frame_size: config.max_frame_size,
             policy: config.policy,

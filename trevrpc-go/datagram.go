@@ -75,6 +75,7 @@ func WithUnreliable(u Unreliable) CallOption {
 type routeConfig struct {
 	unreliable        Unreliable
 	streamCompression StreamCompression
+	plainCompression  PlainCompression
 }
 
 // RouteOption customizes a route registered with Register*.

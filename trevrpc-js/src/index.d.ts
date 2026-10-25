@@ -146,6 +146,15 @@ export interface RpcMethodDescriptor {
   compressStreamRequests?: boolean;
   /** The method's response messages may be stream-compressed; see `compressStreamRequests`. */
   compressStreamResponses?: boolean;
+  /**
+   * The method's request messages may be compressed without a dictionary: one at a time, from 256
+   * bytes, where no dictionary applies to their type and the server decodes it. The generator
+   * sets it for `compress` and `compress_stream`, except for message types with a field marked
+   * `debug_redact`.
+   */
+  compressRequests?: boolean;
+  /** The method's response messages may be compressed without a dictionary; see `compressRequests`. */
+  compressResponses?: boolean;
 }
 
 export interface RpcServiceDescriptor {

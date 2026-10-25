@@ -40,6 +40,9 @@ type route struct {
 	unreliable Unreliable
 	// streamCompression says which directions may be stream-compressed.
 	streamCompression StreamCompression
+	// plainCompression says which directions may be compressed without a
+	// dictionary.
+	plainCompression PlainCompression
 }
 
 // ErrServerFrozen is the panic value used when a server is mutated after first use.
@@ -358,12 +361,13 @@ func (s *Server) SetDiagnostics(handler ServerDiagnosticHandler) {
 }
 
 // routeUnary registers a unary route handler for a method path.
-func (s *Server) routeUnary(method string, handler unaryHandler) {
+func (s *Server) routeUnary(method string, handler unaryHandler, options ...RouteOption) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
 	validateRoute(method, handler != nil)
-	s.routes[method] = route{kind: RPCKindUnary, unary: handler}
+	config := applyRouteOptions(options)
+	s.routes[method] = route{kind: RPCKindUnary, unary: handler, plainCompression: config.plainCompression}
 }
 
 // routeStreaming registers a streaming route handler for a method path and RPC kind.
@@ -376,14 +380,22 @@ func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHa
 	}
 	validateRoute(method, handler != nil)
 	config := applyRouteOptions(options)
-	s.routes[method] = route{kind: kind, streaming: handler, unreliable: config.unreliable.effective(kind), streamCompression: config.streamCompression.effective(kind)}
+	s.routes[method] = route{
+		kind:              kind,
+		streaming:         handler,
+		unreliable:        config.unreliable.effective(kind),
+		streamCompression: config.streamCompression.effective(kind),
+		plainCompression:  config.plainCompression,
+	}
 }
 
 // RegisterUnary registers a unary handler for method, the full method path
 // "/package.Service/Method". It panics if method is not of that form. The
 // handler may set response headers and trailing metadata with
-// SetResponseHeader and SetResponseMetadata.
-func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error)) {
+// SetResponseHeader and SetResponseMetadata. Generated registration passes the
+// method's schema options as RouteOptions; RoutePlainCompression is the only
+// one that applies to a unary route.
+func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error), options ...RouteOption) {
 	s.routeUnary(method, func(ctx context.Context, body []byte) (encodedMessage, error) {
 		request, err := decodeRegisteredRequest(body, newRequest)
 		if err != nil {
@@ -398,7 +410,7 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string,
 			return encodedMessage{}, Internal("handler returned nil response message")
 		}
 		return responseCompressorFromContext(ctx).encode(response)
-	})
+	}, options...)
 }
 
 // RegisterClientStreaming registers a client-streaming handler for method, the

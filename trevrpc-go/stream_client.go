@@ -67,7 +67,7 @@ func (c *streamClient) call(
 	// A message that may be compressed is encoded on its own; any other is
 	// marshalled straight behind the request.
 	var compressed encodedMessage
-	if compressor := c.compression.requestCompressor(); compressor.dictFor(protoMessage) != nil {
+	if compressor := c.compression.requestCompressor(request.plainCompression.Requests); compressor.compressorFor(protoMessage) != nil {
 		var err error
 		if compressed, err = compressor.encode(message); err != nil {
 			streams.close()
@@ -166,7 +166,7 @@ func (c *streamClient) streamingCall(
 	streams := c.prepareStreams(request, accept)
 	setter, _ := requests.(compressorSetter)
 	if setter != nil {
-		setter.setCompressors(c.compression.requestCompressor(), streams.requestCompressor())
+		setter.setCompressors(c.compression.requestCompressor(request.plainCompression.Requests), streams.requestCompressor())
 	}
 	flow := c.openFlow(request, accept)
 	// A call that may stream-compress its requests starts without waiting for

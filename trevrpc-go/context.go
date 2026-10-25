@@ -1,6 +1,9 @@
 package trevrpc
 
-import "context"
+import (
+	"context"
+	"sync/atomic"
+)
 
 type handlerContextKey struct{}
 
@@ -33,6 +36,9 @@ type HandlerContext struct {
 	flow *datagramFlow
 	// streams is the call's stream compression, nil without it.
 	streams *serverStreams
+	// plainRequests counts the request messages that arrived compressed
+	// without a dictionary, nil on a server without compression.
+	plainRequests *atomic.Int64
 }
 
 // HandlerContextFromContext returns TrevRPC request information attached to ctx.
@@ -67,13 +73,14 @@ func RequestMetadataFromContext(ctx context.Context) Metadata {
 func newHandlerContext(request *wireRequest) HandlerContext {
 	service, method := request.serviceAndMethod()
 	return HandlerContext{
-		Service:    service,
-		Method:     method,
-		FullMethod: request.Method,
-		Kind:       request.rpcKind(),
-		Metadata:   cloneMetadata(request.Metadata),
-		flow:       request.flow,
-		streams:    request.streams,
+		Service:       service,
+		Method:        method,
+		FullMethod:    request.Method,
+		Kind:          request.rpcKind(),
+		Metadata:      cloneMetadata(request.Metadata),
+		flow:          request.flow,
+		streams:       request.streams,
+		plainRequests: request.plainRequests,
 	}
 }
 
@@ -131,4 +138,14 @@ func (c HandlerContext) StreamCompressedRequests() int64 {
 		return inflater.received.Load()
 	}
 	return 0
+}
+
+// PlainCompressedRequests returns how many of the request messages of this
+// call have arrived compressed without a dictionary so far (see
+// PlainCompression). It is meant for observing that compression.
+func (c HandlerContext) PlainCompressedRequests() int64 {
+	if c.plainRequests == nil {
+		return 0
+	}
+	return c.plainRequests.Load()
 }

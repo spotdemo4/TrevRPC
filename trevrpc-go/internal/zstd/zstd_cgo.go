@@ -23,6 +23,7 @@ size_t ZSTD_DCtx_setParameter(void* dctx, int param, int value);
 void* ZSTD_createDDict(const void* dict, size_t dictSize);
 size_t ZSTD_freeDDict(void* ddict);
 size_t ZSTD_decompress_usingDDict(void* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize, const void* ddict);
+size_t ZSTD_decompressDCtx(void* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize);
 */
 import "C"
 
@@ -49,12 +50,17 @@ const (
 // Available reports whether this binary can compress and decompress.
 const Available = true
 
-// Dict is a dictionary digested for both directions. It is safe for concurrent
-// use and frees its libzstd state when garbage collected.
+// Dict is a dictionary digested for both directions, or, from NewPlain, the
+// absence of one. It is safe for concurrent use and frees its libzstd state
+// when garbage collected.
 type Dict struct {
 	ID          uint32
 	Fingerprint [8]byte
 	handles     *dictHandles
+	// plain holds the compression contexts of a Dict without a dictionary,
+	// which carry its level; nil for a dictionary, whose level is in its
+	// handles.
+	plain *sync.Pool
 }
 
 type dictHandles struct{ cdict, ddict unsafe.Pointer }
@@ -77,6 +83,16 @@ func NewDict(data []byte, level int) (*Dict, error) {
 	return d, nil
 }
 
+// NewPlain returns the Dict of messages compressed at level without a
+// dictionary: its frames carry no Dictionary_ID, and its ID is zero.
+func NewPlain(level int) *Dict {
+	return &Dict{plain: &sync.Pool{New: func() any {
+		c := newCCtx()
+		C.ZSTD_CCtx_setParameter(c.p, cParamLevel, C.int(level))
+		return c
+	}}}
+}
+
 func (h *dictHandles) free() {
 	if h.cdict != nil {
 		C.ZSTD_freeCDict(h.cdict)
@@ -92,7 +108,12 @@ type cctx struct{ p unsafe.Pointer }
 
 type dctx struct{ p unsafe.Pointer }
 
-var cctxPool = sync.Pool{New: func() any {
+// cctxPool holds the contexts of dictionaries, which take their level from the
+// dictionary they reference.
+var cctxPool = sync.Pool{New: func() any { return newCCtx() }}
+
+// newCCtx creates a context that writes ZSTD_MESSAGE payloads.
+func newCCtx() *cctx {
 	c := &cctx{p: C.ZSTD_createCCtx()}
 	C.ZSTD_CCtx_setParameter(c.p, cParamChecksum, 0)
 	C.ZSTD_CCtx_setParameter(c.p, cParamDictID, 1)
@@ -100,7 +121,7 @@ var cctxPool = sync.Pool{New: func() any {
 	C.ZSTD_CCtx_setParameter(c.p, cParamFormat, formatMagicless)
 	runtime.AddCleanup(c, func(p unsafe.Pointer) { C.ZSTD_freeCCtx(p) }, c.p)
 	return c
-}}
+}
 
 var dctxPool = sync.Pool{New: func() any {
 	d := &dctx{p: C.ZSTD_createDCtx()}
@@ -114,9 +135,13 @@ func (d *Dict) Compress(dst, src []byte) ([]byte, error) {
 	bound := CompressBound(len(src))
 	dst = slices.Grow(dst, bound)
 	out := dst[len(dst) : len(dst)+bound]
-	c := cctxPool.Get().(*cctx)
-	defer cctxPool.Put(c)
-	if C.ZSTD_isError(C.ZSTD_CCtx_refCDict(c.p, d.handles.cdict)) != 0 {
+	pool := d.plain
+	if pool == nil {
+		pool = &cctxPool
+	}
+	c := pool.Get().(*cctx)
+	defer pool.Put(c)
+	if d.handles != nil && C.ZSTD_isError(C.ZSTD_CCtx_refCDict(c.p, d.handles.cdict)) != 0 {
 		return dst, errors.New("zstd: cannot reference dictionary")
 	}
 	n := C.ZSTD_compress2(c.p, unsafe.Pointer(unsafe.SliceData(out)), C.size_t(len(out)),
@@ -137,8 +162,13 @@ func (d *Dict) Decompress(dst, payload []byte, h Header) ([]byte, error) {
 	out := dst[len(dst) : len(dst)+size]
 	x := dctxPool.Get().(*dctx)
 	defer dctxPool.Put(x)
-	n := C.ZSTD_decompress_usingDDict(x.p, unsafe.Pointer(unsafe.SliceData(out)), C.size_t(size),
-		unsafe.Pointer(unsafe.SliceData(payload)), C.size_t(len(payload)), d.handles.ddict)
+	dstPtr, srcPtr := unsafe.Pointer(unsafe.SliceData(out)), unsafe.Pointer(unsafe.SliceData(payload))
+	var n C.size_t
+	if d.handles == nil {
+		n = C.ZSTD_decompressDCtx(x.p, dstPtr, C.size_t(size), srcPtr, C.size_t(len(payload)))
+	} else {
+		n = C.ZSTD_decompress_usingDDict(x.p, dstPtr, C.size_t(size), srcPtr, C.size_t(len(payload)), d.handles.ddict)
+	}
 	runtime.KeepAlive(d)
 	if C.ZSTD_isError(n) != 0 || int(n) != size {
 		return dst, ErrInvalid

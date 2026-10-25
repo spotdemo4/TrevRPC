@@ -28,7 +28,23 @@ var wantScenarios = []string{
 	"unary", "unary-metadata", "unary-error", "unary-large", "client-stream",
 	"server-stream", "server-stream-error", "bidi", "bidi-error",
 	"unary-headers", "server-stream-headers", "unreliable", "compressed", "compressed-stream",
-	"refused-stream",
+	"refused-stream", "compressed-plain",
+}
+
+func TestPlainRecordIsTheGoldenVector(t *testing.T) {
+	data, err := os.ReadFile("../../../testdata/zstd-golden-vectors.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "plain.records.message = "); ok {
+			if want, err := hex.DecodeString(value); err != nil || string(want) != plainRecord {
+				t.Fatalf("plainRecord = %q, want %q (%v)", plainRecord, want, err)
+			}
+			return
+		}
+	}
+	t.Fatal("no plain.records.message in the golden vectors")
 }
 
 // writeTestDictionary writes the compression dictionary of the shared golden

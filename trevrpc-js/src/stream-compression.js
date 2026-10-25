@@ -72,8 +72,8 @@ export function streamBudget(transport) {
 /**
  * The stream compression of one call on the client. `directions` is `{ requests, responses }`:
  * the directions the method allows it on. `session` picks dictionaries for request contexts, and
- * `accept` is the dictionary the call accepts on its responses, which response frames may start
- * from.
+ * `accept` maps the dictionary IDs the call accepts on its responses to their dictionaries, which
+ * response frames may start from.
  */
 export class CallStreams {
   #compression;
@@ -217,12 +217,12 @@ export class CallStreams {
     if (info.startsFrame) {
       frameDictionary = null;
       if (info.dictionaryId !== 0) {
-        if (info.dictionaryId !== this.#accept?.id) {
+        frameDictionary = this.#accept?.get(info.dictionaryId);
+        if (frameDictionary === undefined) {
           throw internal(
             `stream-compressed message uses dictionary ${info.dictionaryId}, which is not accepted`,
           );
         }
-        frameDictionary = this.#accept;
       }
     }
     let message;

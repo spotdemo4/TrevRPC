@@ -18,13 +18,16 @@ internal fun loadZstd() {
     Zstd.compressBound(0)
 }
 
-/** A dictionary digested by zstd-jni for both directions. It is safe for concurrent use. */
+/**
+ * Per-message zstd for both directions, with a [dictionary] digested by zstd-jni, or without one
+ * when it is null. It is safe for concurrent use.
+ */
 internal class ZstdCodec(
-    dictionary: ByteArray,
+    dictionary: ByteArray?,
     private val level: Int,
 ) {
-    internal val compressDictionary = ZstdDictCompress(dictionary, level)
-    internal val decompressDictionary = ZstdDictDecompress(dictionary)
+    internal val compressDictionary = dictionary?.let { ZstdDictCompress(it, level) }
+    internal val decompressDictionary = dictionary?.let { ZstdDictDecompress(it) }
 
     // Contexts are pooled: creating one per message costs about as much as compressing a small
     // message. The pools hold at most one context per concurrent use.
@@ -71,9 +74,10 @@ internal class ZstdCodec(
             .setChecksum(false)
             .setDictID(true)
             .setContentSize(true)
-            .loadDict(compressDictionary)
+            .also { context -> compressDictionary?.let(context::loadDict) }
 
-    private fun newDecompressor(): ZstdDecompressCtx = ZstdDecompressCtx().setMagicless(true).loadDict(decompressDictionary)
+    private fun newDecompressor(): ZstdDecompressCtx =
+        ZstdDecompressCtx().setMagicless(true).also { context -> decompressDictionary?.let(context::loadDict) }
 }
 
 /**
@@ -94,7 +98,7 @@ internal class ZstdStreamEncoder(
             .setDictID(true)
             .setContentSize(false)
             .setWindowLog(windowLog)
-            .also { context -> dictionary?.let { context.loadDict(it.compressDictionary) } }
+            .also { context -> dictionary?.compressDictionary?.let(context::loadDict) }
 
     /** The bytes of the messages in the current frame. */
     private var inFrame = 0
@@ -145,7 +149,7 @@ internal class ZstdStreamDecoder {
     /** Starts a new frame, which uses [dictionary], or none. */
     fun startFrame(dictionary: ZstdCodec?) {
         context?.close()
-        context = ZstdDecompressCtx().setMagicless(true).also { context -> dictionary?.let { context.loadDict(it.decompressDictionary) } }
+        context = ZstdDecompressCtx().setMagicless(true).also { context -> dictionary?.decompressDictionary?.let(context::loadDict) }
     }
 
     /**

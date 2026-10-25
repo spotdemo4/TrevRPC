@@ -6,7 +6,8 @@ import "interop.proto";
 import "trevrpc/options.proto";
 
 // CompressedEcho is Echo's Bidi and ClientStream with stream compression
-// allowed (see interop/README.md). It is a separate file for the same reason as
+// allowed, and Plain with compression without a dictionary (see
+// interop/README.md). It is a separate file for the same reason as
 // unreliable.proto: the gRPC baseline compiles only interop.proto.
 service CompressedEcho {
   rpc Bidi(stream EchoRequest) returns (stream EchoResponse) {
@@ -16,6 +17,16 @@ service CompressedEcho {
   rpc ClientStream(stream EchoRequest) returns (EchoResponse) {
     option (trevrpc.method) = {compress_stream: true};
   }
+  // Echoes text, compressed without a dictionary where both sides allow it.
+  rpc Plain(PlainMessage) returns (PlainMessage) {
+    option (trevrpc.method) = {compress: true};
+  }
+}
+
+// PlainMessage is not among the interop dictionary's message types, so it
+// compresses without a dictionary.
+message PlainMessage {
+  string text = 1;
 }
 
 // RefusingEcho allows stream-compressed requests in the schema, but servers

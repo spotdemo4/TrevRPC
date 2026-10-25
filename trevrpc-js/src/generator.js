@@ -103,6 +103,7 @@ message TrevrpcMethodOptions {
   optional bool unreliable_requests = 1;
   optional bool unreliable_responses = 2;
   optional bool compress_stream = 3;
+  optional bool compress = 4;
 }
 
 message FieldOptions {
@@ -435,6 +436,7 @@ function serviceDescriptor(file, service, redacted) {
         { inputType, outputType },
         redacted,
       ),
+      ...plainCompressionDirections(options, { inputType, outputType }, redacted),
     };
   }
 
@@ -501,6 +503,25 @@ function streamCompressionDirections(
     !redacted.has(outputType)
   ) {
     directions.compressStreamResponses = true;
+  }
+  return directions;
+}
+
+/**
+ * The directions whose messages compress without a dictionary, as descriptor fields: both, for a
+ * method that sets `compress` or `compress_stream`, except a message type with a field marked
+ * `debug_redact`.
+ */
+function plainCompressionDirections(options, { inputType, outputType }, redacted) {
+  if (!options?.compress && !options?.compressStream) {
+    return {};
+  }
+  const directions = {};
+  if (!redacted.has(inputType)) {
+    directions.compressRequests = true;
+  }
+  if (!redacted.has(outputType)) {
+    directions.compressResponses = true;
   }
   return directions;
 }

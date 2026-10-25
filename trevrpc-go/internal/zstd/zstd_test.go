@@ -122,6 +122,21 @@ func TestGoldenVectors(t *testing.T) {
 			t.Errorf("%s: got %v, want too large", name, err)
 		}
 	}
+	// Messages without a dictionary decode only where no dictionary is
+	// wanted, and a frame compressed with one does not decode without it.
+	plain := NewPlain(1)
+	for _, name := range names(v, "plain.", ".payload") {
+		got, err := decode(plain, v[name+".payload"], maxMessage)
+		if err != nil || !bytes.Equal(got, v[name+".message"]) {
+			t.Errorf("%s without a dictionary: got %x, %v; want %x", name, got, err, v[name+".message"])
+		}
+		if got, err := decode(dict, v[name+".payload"], maxMessage); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s with dict.d1 only: got %x, %v; want ErrInvalid", name, got, err)
+		}
+	}
+	if got, err := decode(plain, v["bad.no_dictionary_id.payload"], maxMessage); !errors.Is(err, ErrInvalid) {
+		t.Errorf("bad.no_dictionary_id without a dictionary: got %x, %v; want ErrInvalid", got, err)
+	}
 }
 
 func TestRoundTrip(t *testing.T) {
@@ -133,30 +148,39 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, msg := range [][]byte{nil, v["ok.small.message"], v["ok.multi_segment.message"], v["ok.raw_block.message"]} {
-		prefix := []byte("prefix")
-		payload, err := dict.Compress(bytes.Clone(prefix), msg)
-		if err != nil {
-			t.Fatal(err)
+	for _, dict := range []*Dict{dict, NewPlain(1)} {
+		for _, msg := range [][]byte{nil, v["ok.small.message"], v["ok.multi_segment.message"], v["ok.raw_block.message"]} {
+			roundTrip(t, dict, msg)
 		}
-		if !bytes.HasPrefix(payload, prefix) {
-			t.Fatal("Compress did not append")
-		}
-		payload = payload[len(prefix):]
-		h, err := ParseHeader(payload)
-		if err != nil {
-			t.Fatalf("ParseHeader(%x): %v", payload, err)
-		}
-		if h.DictID != dict.ID || h.ContentSize != uint64(len(msg)) {
-			t.Fatalf("header %+v for a %d-byte message", h, len(msg))
-		}
-		if payload[0]&0x04 != 0 {
-			t.Fatal("payload has a checksum")
-		}
-		got, err := dict.Decompress([]byte("x"), payload, h)
-		if err != nil || !bytes.Equal(got[1:], msg) {
-			t.Fatalf("Decompress = %x, %v", got, err)
-		}
+	}
+}
+
+// roundTrip checks that dict compresses msg into a payload that parses and
+// decompresses back to it.
+func roundTrip(t *testing.T, dict *Dict, msg []byte) {
+	t.Helper()
+	prefix := []byte("prefix")
+	payload, err := dict.Compress(bytes.Clone(prefix), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(payload, prefix) {
+		t.Fatal("Compress did not append")
+	}
+	payload = payload[len(prefix):]
+	h, err := ParseHeader(payload)
+	if err != nil {
+		t.Fatalf("ParseHeader(%x): %v", payload, err)
+	}
+	if h.DictID != dict.ID || h.ContentSize != uint64(len(msg)) {
+		t.Fatalf("header %+v for a %d-byte message", h, len(msg))
+	}
+	if payload[0]&0x04 != 0 {
+		t.Fatal("payload has a checksum")
+	}
+	got, err := dict.Decompress([]byte("x"), payload, h)
+	if err != nil || !bytes.Equal(got[1:], msg) {
+		t.Fatalf("Decompress = %x, %v", got, err)
 	}
 }
 
@@ -167,11 +191,10 @@ func FuzzParseHeader(f *testing.F) {
 			f.Add(b)
 		}
 	}
-	f.Fuzz(func(t *testing.T, payload []byte) {
-		h, err := ParseHeader(payload)
-		if err == nil && h.DictID == 0 {
-			t.Fatal("accepted Dictionary_ID 0")
-		}
+	f.Fuzz(func(_ *testing.T, payload []byte) {
+		// A frame without a Dictionary_ID is valid; the receiver decides
+		// whether it accepts one.
+		_, _ = ParseHeader(payload)
 	})
 }
 

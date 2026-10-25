@@ -8,7 +8,7 @@ use prost_types::compiler::CodeGeneratorResponse;
 
 /// The interop services, shared by every runtime. `interop.proto` has the reliable `Echo`,
 /// `unreliable.proto` the `UnreliableEcho` service with datagram messages, and `compressed.proto`
-/// the `CompressedEcho` service with stream compression.
+/// the `CompressedEcho` service with stream compression and compression without a dictionary.
 const INTEROP_PROTO_DIR: &str = "../../../interop/proto";
 const INTEROP_PROTOS: [&str; 3] = ["interop.proto", "unreliable.proto", "compressed.proto"];
 /// The directory holding `trevrpc/options.proto`, which the other files import.

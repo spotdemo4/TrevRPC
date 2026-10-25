@@ -11,8 +11,8 @@ use tokio::sync::watch;
 
 use crate::client::MessageTypes;
 use crate::compression::{
-    self, Accept, CompressStream, Compression, CompressionConfig, DEFAULT_SERVER_MEMORY, Inflater,
-    ServerStream, StreamBudget,
+    self, Accept, CompressMessages, CompressStream, Compression, CompressionConfig,
+    DEFAULT_SERVER_MEMORY, Inflater, ServerStream, StreamBudget,
 };
 use crate::datagram::MessageCount;
 use crate::fallback::HttpFallback;
@@ -57,6 +57,7 @@ pub struct RouteOptions {
     unreliable: Unreliable,
     message_types: Option<MessageTypes>,
     compress_stream: CompressStream,
+    compress: CompressMessages,
 }
 
 impl RouteOptions {
@@ -68,7 +69,24 @@ impl RouteOptions {
             unreliable: Unreliable::NONE,
             message_types: None,
             compress_stream: CompressStream::NONE,
+            compress: CompressMessages::NONE,
         }
+    }
+
+    /// Lets the route's messages be compressed without a dictionary in the directions
+    /// `directions` sets; see [`CompressMessages`]. Generated code passes the schema's `compress`
+    /// (or `compress_stream`). Requests compressed so are accepted on every route whatever this
+    /// says; it decides which responses may be.
+    #[must_use]
+    pub const fn with_compress(mut self, directions: CompressMessages) -> Self {
+        self.compress = directions;
+        self
+    }
+
+    /// Returns the directions that may be compressed without a dictionary.
+    #[must_use]
+    pub const fn compress(&self) -> CompressMessages {
+        self.compress
     }
 
     /// Lets the route's streamed messages be compressed with one zstd context per call in the
@@ -151,6 +169,8 @@ pub(crate) struct RequestCounts {
     pub(crate) datagrams: MessageCount,
     /// The request messages that arrived stream-compressed.
     pub(crate) stream_compressed: MessageCount,
+    /// The request messages that arrived compressed without a dictionary.
+    pub(crate) plain_compressed: MessageCount,
 }
 
 /// Identifies the first lifecycle event that cancelled an RPC.
@@ -265,6 +285,8 @@ pub struct RequestContext {
     datagrams: MessageCount,
     /// Counts the request messages that arrived stream-compressed.
     stream_compressed: MessageCount,
+    /// Counts the request messages that arrived compressed without a dictionary.
+    plain_compressed: MessageCount,
     /// The response metadata the handler sets, shared by every clone of the context.
     response: ResponseMetadata,
 }
@@ -300,6 +322,7 @@ impl RequestContext {
             cancellation,
             datagrams: counts.datagrams,
             stream_compressed: counts.stream_compressed,
+            plain_compressed: counts.plain_compressed,
             response: ResponseMetadata::default(),
         }
     }
@@ -415,6 +438,14 @@ impl RequestContext {
     #[must_use]
     pub fn stream_compressed_requests_received(&self) -> u64 {
         self.stream_compressed.get()
+    }
+
+    /// Returns how many of the call's request messages have arrived compressed without a
+    /// dictionary (`ZSTD_MESSAGE` frames without a `Dictionary_ID`) so far; see
+    /// [`CompressMessages`].
+    #[must_use]
+    pub fn plain_compressed_requests_received(&self) -> u64 {
+        self.plain_compressed.get()
     }
 
     /// Returns the call's cloneable cancellation token.
@@ -1043,14 +1074,16 @@ impl Server {
 
     /// Replaces all server options.
     pub fn set_options(&mut self, options: ServerOptions) -> &mut Self {
-        self.compression =
-            CompressionConfig::new(options.compression()).map_err(Error::into_status);
+        self.compression = CompressionConfig::new(options.compression())
+            .map(Some)
+            .map_err(Error::into_status);
         self.stream_budget = StreamBudget::new(options.stream_compression_memory());
         self.options = options;
         self
     }
 
-    /// The server's dictionaries, `None` without any.
+    /// The server's dictionaries, `None` before options set them, which means compression without
+    /// a dictionary only.
     pub(crate) fn compression(&self) -> Option<&Arc<CompressionConfig>> {
         self.compression.as_ref().ok().and_then(Option::as_ref)
     }
@@ -1250,6 +1283,17 @@ impl Server {
         }
     }
 
+    /// The directions of the route at `path` that may be compressed without a dictionary, or none
+    /// when there is no such route.
+    pub(crate) fn route_compress(&self, path: &str) -> CompressMessages {
+        match self.routes.get(path) {
+            Some(Route::Unary { options, .. } | Route::Streaming { options, .. }) => {
+                options.compress()
+            }
+            None => CompressMessages::NONE,
+        }
+    }
+
     /// The message types of the route at `path`, if it named them.
     pub(crate) fn route_message_types(&self, path: &str) -> Option<MessageTypes> {
         match self.routes.get(path)? {
@@ -1276,8 +1320,13 @@ impl Server {
         request: RpcRequest,
         body: Vec<u8>,
     ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
-        self.handle_request_with_cancellation(request, body, CancellationToken::new())
-            .await
+        self.handle_request_with_cancellation(
+            request,
+            body,
+            CancellationToken::new(),
+            RequestCounts::default(),
+        )
+        .await
     }
 
     pub(crate) async fn handle_request_with_cancellation(
@@ -1285,6 +1334,7 @@ impl Server {
         request: RpcRequest,
         body: Vec<u8>,
         cancellation: CancellationToken,
+        counts: RequestCounts,
     ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
         let started_at = Instant::now();
         let request_body_len = body.len();
@@ -1336,7 +1386,7 @@ impl Server {
             metadata,
             deadline,
             cancellation.clone(),
-            RequestCounts::default(),
+            counts,
         );
         let response_metadata = context.response.clone();
 

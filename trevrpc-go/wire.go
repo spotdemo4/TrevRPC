@@ -3,6 +3,7 @@ package trevrpc
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
@@ -91,6 +92,12 @@ type wireRequest struct {
 	compression *callCompression
 	// streamCompression is the directions the client may stream-compress.
 	streamCompression StreamCompression
+	// plainCompression is the directions the client may compress without a
+	// dictionary.
+	plainCompression PlainCompression
+	// plainRequests counts the request messages that arrived compressed
+	// without a dictionary, on the server.
+	plainRequests *atomic.Int64
 	// streams is the server's stream compression of the call, nil without.
 	streams *serverStreams
 }

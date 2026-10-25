@@ -19,7 +19,10 @@ import (
 // frames compressed with a dictionary both peers hold. Dictionaries are
 // negotiated per connection, so a message whose dictionary the peer lacks
 // travels uncompressed. Compression calls libzstd and needs cgo; Dial and
-// Listen fail when it is configured in a binary built without cgo.
+// Listen fail when dictionaries are configured in a binary built without cgo.
+//
+// Without dictionaries, a peer still compresses the messages of methods marked
+// for compression without a dictionary (see PlainCompression), at Level.
 type Compression struct {
 	// Dictionaries are the dictionaries this peer holds.
 	Dictionaries []Dictionary
@@ -51,7 +54,15 @@ type compressionDict struct {
 	accept []uint32
 	// only is the set of only this dictionary.
 	only *dictSet
+	// acceptPlain and withPlain are accept and only with compression without
+	// a dictionary added.
+	acceptPlain []uint32
+	withPlain   *dictSet
 }
+
+// plainDictID is the dictionary ID that stands for compression without a
+// dictionary in negotiation; no trained dictionary has it.
+const plainDictID = 0
 
 // compressionConfig is a validated Compression.
 type compressionConfig struct {
@@ -59,29 +70,48 @@ type compressionConfig struct {
 	level  int
 	byID   map[uint32]*compressionDict
 	byType map[protoreflect.FullName]*compressionDict
-	// query lists every dictionary, as a client's dictionary_query.
+	// plain is compression without a dictionary, also in byID under
+	// plainDictID.
+	plain *compressionDict
+	// dictionaries says that byID holds trained dictionaries besides plain.
+	dictionaries bool
+	// query lists every dictionary and plain, as a client's dictionary_query.
 	query []*dictionaryInfo
 }
 
-// newCompressionConfig validates and digests options. It returns nil when no
-// dictionaries are configured.
+// newCompressionConfig validates and digests options. Without cgo it returns
+// nil when no dictionaries are configured, and an error otherwise; with cgo the
+// configuration always has compression without a dictionary.
 func newCompressionConfig(options *Compression) (*compressionConfig, error) {
-	if options == nil || len(options.Dictionaries) == 0 {
-		return nil, nil
+	var dictionaries []Dictionary
+	level := 1
+	if options != nil {
+		dictionaries = options.Dictionaries
+		if options.Level != 0 {
+			level = options.Level
+		}
 	}
 	if !zstd.Available {
-		return nil, zstd.ErrUnavailable
+		if len(dictionaries) > 0 {
+			return nil, zstd.ErrUnavailable
+		}
+		return nil, nil
 	}
-	level := options.Level
-	if level == 0 {
-		level = 1
+	plain := &compressionDict{
+		Dict:   zstd.NewPlain(level),
+		info:   &dictionaryInfo{ID: plainDictID},
+		accept: []uint32{plainDictID},
 	}
+	plain.only = &dictSet{dicts: []*compressionDict{plain}}
 	config := &compressionConfig{
-		level:  level,
-		byID:   make(map[uint32]*compressionDict, len(options.Dictionaries)),
-		byType: make(map[protoreflect.FullName]*compressionDict),
+		level:        level,
+		byID:         map[uint32]*compressionDict{plainDictID: plain},
+		byType:       make(map[protoreflect.FullName]*compressionDict),
+		plain:        plain,
+		dictionaries: len(dictionaries) > 0,
+		query:        []*dictionaryInfo{plain.info},
 	}
-	for i, dictionary := range options.Dictionaries {
+	for i, dictionary := range dictionaries {
 		digested, err := zstd.NewDict(dictionary.Data, level)
 		if err != nil {
 			return nil, fmt.Errorf("trevrpc: compression dictionary %d: %w", i, err)
@@ -90,11 +120,13 @@ func newCompressionConfig(options *Compression) (*compressionConfig, error) {
 			return nil, fmt.Errorf("trevrpc: compression dictionaries share ID %d", digested.ID)
 		}
 		d := &compressionDict{
-			Dict:   digested,
-			info:   &dictionaryInfo{ID: digested.ID, Fingerprint: digested.Fingerprint[:]},
-			accept: []uint32{digested.ID},
+			Dict:        digested,
+			info:        &dictionaryInfo{ID: digested.ID, Fingerprint: digested.Fingerprint[:]},
+			accept:      []uint32{digested.ID},
+			acceptPlain: []uint32{digested.ID, plainDictID},
 		}
 		d.only = &dictSet{dicts: []*compressionDict{d}}
+		d.withPlain = &dictSet{dicts: []*compressionDict{d, plain}}
 		config.byID[d.ID] = d
 		config.query = append(config.query, d.info)
 		for _, name := range dictionary.Messages {
@@ -120,7 +152,7 @@ func (c *compressionConfig) dict(id uint32) *compressionDict {
 }
 
 // lookup implements dictionaryLookup: a server accepts every dictionary it
-// holds.
+// holds, and messages without a dictionary.
 func (c *compressionConfig) lookup(id uint32) *zstd.Dict {
 	if d := c.dict(id); d != nil {
 		return d.Dict
@@ -176,6 +208,32 @@ type dictionaryLookup interface {
 	lookup(id uint32) *zstd.Dict
 }
 
+// countingLookup is a server's dictionaryLookup for a call's request
+// messages, which counts those it decompresses without a dictionary.
+type countingLookup struct {
+	dicts dictionaryLookup
+	plain *atomic.Int64
+}
+
+func (l countingLookup) lookup(id uint32) *zstd.Dict {
+	dict := l.dicts.lookup(id)
+	if dict != nil && id == plainDictID {
+		l.plain.Add(1)
+	}
+	return dict
+}
+
+// requestLookup returns the dictionaryLookup of the request messages of
+// request, which counts those without a dictionary in request.plainRequests;
+// nil for a server without compression.
+func (c *compressionConfig) requestLookup(request *wireRequest) dictionaryLookup {
+	if c == nil {
+		return nil
+	}
+	request.plainRequests = new(atomic.Int64)
+	return countingLookup{dicts: c, plain: request.plainRequests}
+}
+
 // errUnacceptedCompression reports a ZSTD_MESSAGE frame where the receiver
 // accepts no dictionary.
 var errUnacceptedCompression = errors.New("compressed message where no dictionary is accepted")
@@ -225,9 +283,13 @@ func decompressChecked(dict *zstd.Dict, payload []byte, header zstd.Header) ([]b
 type messageCompressor struct {
 	config  *compressionConfig
 	allowed func(*compressionDict) bool
+	// plain lets messages without an allowed dictionary for their type be
+	// compressed without one, where negotiation allows that too.
+	plain bool
 }
 
-// dictFor returns the dictionary message may be compressed with, or nil.
+// dictFor returns the trained dictionary message may be compressed with, or
+// nil. It is also what a stream compression context starts from.
 func (c *messageCompressor) dictFor(message proto.Message) *compressionDict {
 	if c == nil {
 		return nil
@@ -239,12 +301,26 @@ func (c *messageCompressor) dictFor(message proto.Message) *compressionDict {
 	return d
 }
 
-// encode marshals message into a frame: a ZSTD_MESSAGE when its type has a
-// dictionary this direction may use and compressing makes it smaller, and a
-// MESSAGE otherwise. A nil compressor always writes a MESSAGE.
+// compressorFor returns what message may be compressed with on its own: its
+// type's dictionary, or else compression without a dictionary where the
+// direction may use it, or nil. A message without a dictionary is compressed
+// only from plainCompressionMinSize bytes (see encodePayload).
+func (c *messageCompressor) compressorFor(message proto.Message) *compressionDict {
+	if d := c.dictFor(message); d != nil {
+		return d
+	}
+	if c == nil || !c.plain || c.config.plain == nil || !c.allowed(c.config.plain) {
+		return nil
+	}
+	return c.config.plain
+}
+
+// encode marshals message into a frame: a ZSTD_MESSAGE when compressorFor
+// finds a way to compress it and that makes it smaller, and a MESSAGE
+// otherwise. A nil compressor always writes a MESSAGE.
 func (c *messageCompressor) encode(message ProtoMessage) (encodedMessage, error) {
 	protoMessage := protoMessageV2(message)
-	dict := c.dictFor(protoMessage)
+	dict := c.compressorFor(protoMessage)
 	if dict == nil {
 		return encodeProtoMessage(protoMessage)
 	}
@@ -259,7 +335,7 @@ func (c *messageCompressor) encode(message ProtoMessage) (encodedMessage, error)
 		return encodedMessage{}, err
 	}
 	*scratch = payload[:0]
-	return compressPayload(payload, dict.Dict), nil
+	return encodePayload(payload, dict), nil
 }
 
 // marshalScratch holds the buffers messages are marshalled into before they
@@ -274,9 +350,11 @@ const maxRetainedMarshalScratch = 64 * 1024
 const compressedFrameHeaderRoom = 1 + 8
 
 // encodePayload frames the marshalled message payload: compressed with dict,
-// if it is not nil and that is shorter, and as a MESSAGE otherwise.
+// if it is not nil and that is shorter, and as a MESSAGE otherwise. Without a
+// dictionary, only payloads of plainCompressionMinSize bytes or more are
+// compressed.
 func encodePayload(payload []byte, dict *compressionDict) encodedMessage {
-	if dict != nil {
+	if dict != nil && (dict.ID != plainDictID || len(payload) >= plainCompressionMinSize) {
 		return compressPayload(payload, dict.Dict)
 	}
 	frame := make([]byte, 0, frameHeaderLen(frameTypeMessage, len(payload))+len(payload)+frameTailSlack)
@@ -303,8 +381,11 @@ type clientCompression struct {
 	// shared is the connection's shared set, from the server's answer to a
 	// query; nil until one arrives.
 	shared atomic.Pointer[dictSet]
-	// requests compresses request messages with the shared set.
-	requests messageCompressor
+	// requests compresses request messages with the shared set, and
+	// plainRequests does too on calls that may also compress them without a
+	// dictionary.
+	requests      messageCompressor
+	plainRequests messageCompressor
 }
 
 func newClientCompression(config *compressionConfig) *clientCompression {
@@ -312,27 +393,44 @@ func newClientCompression(config *compressionConfig) *clientCompression {
 		return nil
 	}
 	c := &clientCompression{config: config}
-	c.requests = messageCompressor{config: config, allowed: func(d *compressionDict) bool { return c.shared.Load().has(d) }}
+	shared := func(d *compressionDict) bool { return c.shared.Load().has(d) }
+	c.requests = messageCompressor{config: config, allowed: shared}
+	c.plainRequests = messageCompressor{config: config, allowed: shared, plain: true}
 	return c
 }
 
 // prepare fills the negotiation fields of request. It returns the
 // dictionaries the call accepts on its responses, nil for none, and whether
 // the request queries the server.
+//
+// A client queries until the connection has an answer: on every call when it
+// holds dictionaries, and otherwise only on calls that may compress their
+// requests without a dictionary, so other calls carry no negotiation.
 func (c *clientCompression) prepare(request *wireRequest) (accept *dictSet, queried bool) {
 	if c == nil {
 		return nil, false
 	}
 	shared := c.shared.Load()
-	if shared == nil {
+	if shared == nil && (c.config.dictionaries || request.plainCompression.Requests) {
 		request.DictionaryQuery = c.config.query
 		queried = true
 	}
 	// A call that queries may already accept the dictionary it asks about:
 	// the server compresses with it only if its answer confirms it.
-	if d := c.config.byType[request.responseType]; d != nil && (shared == nil || shared.has(d)) {
-		request.AcceptDictionaries = d.accept
-		accept = d.only
+	d := c.config.byType[request.responseType]
+	if d != nil && shared != nil && !shared.has(d) {
+		d = nil
+	}
+	// Responses may be compressed without a dictionary from the first call: a
+	// server that does not do that ignores the ID, as any it does not hold.
+	plain := request.plainCompression.Responses
+	switch {
+	case d != nil && plain:
+		request.AcceptDictionaries, accept = d.acceptPlain, d.withPlain
+	case d != nil:
+		request.AcceptDictionaries, accept = d.accept, d.only
+	case plain:
+		request.AcceptDictionaries, accept = c.config.plain.accept, c.config.plain.only
 	}
 	return accept, queried
 }
@@ -349,12 +447,17 @@ func (c *clientCompression) learn(answer []*dictionaryInfo) {
 	c.shared.CompareAndSwap(nil, shared)
 }
 
-// requestCompressor returns the compressor of request messages, or nil.
-func (c *clientCompression) requestCompressor() *messageCompressor {
-	if c == nil {
+// requestCompressor returns the compressor of the request messages of a call,
+// which may compress them without a dictionary if plain is set, or nil.
+func (c *clientCompression) requestCompressor(plain bool) *messageCompressor {
+	switch {
+	case c == nil:
 		return nil
+	case plain:
+		return &c.plainRequests
+	default:
+		return &c.requests
 	}
-	return &c.requests
 }
 
 // callCompression is the server's negotiation result for one call.
@@ -367,10 +470,11 @@ type callCompression struct {
 }
 
 // negotiate answers the request's query, if it has one, and picks the
-// dictionaries the response messages may use. It returns nil for a request
-// without negotiation fields. A server without compression still answers, so
-// clients stop asking.
-func (c *compressionConfig) negotiate(request *wireRequest) *callCompression {
+// dictionaries the response messages may use, compressing them without a
+// dictionary only if plain is set. It returns nil for a request without
+// negotiation fields. A server without compression still answers, so clients
+// stop asking.
+func (c *compressionConfig) negotiate(request *wireRequest, plain bool) *callCompression {
 	if len(request.DictionaryQuery) == 0 && len(request.AcceptDictionaries) == 0 {
 		return nil
 	}
@@ -391,7 +495,7 @@ func (c *compressionConfig) negotiate(request *wireRequest) *callCompression {
 		allowed.dicts = append(allowed.dicts, d)
 	}
 	if len(allowed.dicts) > 0 {
-		result.responses = &messageCompressor{config: c, allowed: allowed.has}
+		result.responses = &messageCompressor{config: c, allowed: allowed.has, plain: plain}
 	}
 	return result
 }

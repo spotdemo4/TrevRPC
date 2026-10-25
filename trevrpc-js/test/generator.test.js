@@ -269,6 +269,45 @@ test("compress_stream applies to the streamed directions whose types have no red
   );
 });
 
+test("compress and compress_stream allow compression without a dictionary except for redacted types", () => {
+  const request = greeterRequest();
+  const file = request.protoFile[0];
+  file.messageType.push({
+    name: "Secret",
+    field: [field("token", 1, 9, { options: { debugRedact: true } })],
+  });
+  file.service[0].method = [
+    method("Unary", { options: { trevrpcMethod: { compress: true } } }),
+    method("Stream", {
+      clientStreaming: true,
+      serverStreaming: true,
+      options: { trevrpcMethod: { compressStream: true } },
+    }),
+    method("Redacted", {
+      inputType: ".hello.v1.Secret",
+      options: { trevrpcMethod: { compress: true } },
+    }),
+    method("Unmarked"),
+  ];
+
+  const js = fileContent(generate(request), "hello/v1/greeter.trevrpc.js");
+  const service = JSON.parse(
+    js.slice(js.indexOf("Object.freeze(") + 14, js.indexOf(");\n\n/** Client")),
+  );
+  const flags = Object.fromEntries(
+    Object.entries(service.methods).map(([name, method]) => [
+      name,
+      [method.compressRequests, method.compressResponses],
+    ]),
+  );
+  assert.deepEqual(flags, {
+    unary: [true, true],
+    stream: [true, true],
+    redacted: [undefined, true],
+    unmarked: [undefined, undefined],
+  });
+});
+
 test("protoc passes the trevrpc.method option through to the generated descriptor", async () => {
   const output = new URL("build/test-generated-unreliable/", packageRoot);
   await rm(output, { recursive: true, force: true });
@@ -290,6 +329,9 @@ test("protoc passes the trevrpc.method option through to the generated descripto
   const compressedBidi = compressed.CompressedEchoService.methods.bidi;
   assert.equal(compressedBidi.compressStreamRequests, true);
   assert.equal(compressedBidi.compressStreamResponses, true);
+  const plain = compressed.CompressedEchoService.methods.plain;
+  assert.equal(plain.compressRequests, true);
+  assert.equal(plain.compressResponses, true);
 
   await protoc("unreliable.proto");
   const generated = await import(

@@ -24,6 +24,17 @@ const OptimisticCompressed = CompressedStreamMessages - 2;
 /** The message types the interop dictionary compresses. */
 const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
 
+/**
+ * The text of the `compressed-plain` scenario: the 315-byte JSON record of the plain.records
+ * golden vector, twice over. Its message type has no dictionary, so it compresses without one.
+ */
+const PlainRecord =
+  '{"service":"search","region":"us-east-1","status":200,"latency_ms":118,"path":"/v1/search",' +
+  '"query":"wireless headphones","results":[{"id":"p-1001","title":"Wireless headphones",' +
+  '"price":59.99},{"id":"p-1002","title":"Wireless earbuds","price":39.99},{"id":"p-1003",' +
+  '"title":"Wireless headphones pro","price":129.99}]}';
+const PlainText = PlainRecord + PlainRecord;
+
 /** The i-th message of the `compressed` scenario: like the dictionary's training data. */
 function compressedMessage(i) {
   return `{"service":"search","region":"us-east-1","status":404,"latency_ms":${100 + i}}`;
@@ -296,7 +307,39 @@ const scenarios = {
       OptimisticCompressed,
     );
   },
+
+  // The first call's answer tells the client that the server decodes messages without a
+  // dictionary, so the second call's request travels compressed.
+  async "compressed-plain"(_echo, { compressed }) {
+    await plainEcho(compressed);
+    expect(
+      await plainEcho(compressed),
+      "plain: the second request did not arrive compressed without a dictionary",
+    );
+  },
 };
+
+/**
+ * CompressedEcho.Plain echoing the `compressed-plain` text; returns whether the server received
+ * the request compressed without a dictionary.
+ */
+async function plainEcho(compressed) {
+  let metadata;
+  const response = await compressed.plain(
+    { text: PlainText },
+    {
+      onResponseMetadata: (received) => {
+        metadata = received;
+      },
+    },
+  );
+  expect(response.text === PlainText, "plain: the text did not echo");
+  return (
+    new TextDecoder().decode(
+      metadata?.["interop-plain-compressed-received"] ?? new Uint8Array(),
+    ) === "1"
+  );
+}
 
 /** The messages of the `compressed-stream` scenario. */
 function compressedStreamMessages() {

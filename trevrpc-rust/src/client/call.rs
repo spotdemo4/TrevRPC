@@ -25,7 +25,7 @@ use super::{
     BidirectionalCall, CallOptions, ClientStreamingCall, MessageTypes, ResponseStream,
     RpcTransport, StreamingRpcTransport,
 };
-use crate::{BoxStream, CompressStream, ResponseEnvelope, Result, Unreliable};
+use crate::{BoxStream, CompressMessages, CompressStream, ResponseEnvelope, Result, Unreliable};
 
 /// The future of an awaited [`Call`].
 pub type CallFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -42,6 +42,8 @@ pub struct Call<'a, T: ?Sized, S> {
     message_types: Option<MessageTypes>,
     /// The directions that may use stream compression, from generated code.
     compress_stream: CompressStream,
+    /// The directions that may be compressed without a dictionary, from generated code.
+    compress: CompressMessages,
     shape: S,
 }
 
@@ -62,6 +64,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
             default_unreliable: Unreliable::NONE,
             message_types: None,
             compress_stream: CompressStream::NONE,
+            compress: CompressMessages::NONE,
             shape,
         }
     }
@@ -74,6 +77,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
             default_unreliable: self.default_unreliable,
             message_types: self.message_types,
             compress_stream: self.compress_stream,
+            compress: self.compress,
             shape: reshape(self.shape),
         }
     }
@@ -85,6 +89,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
         options.unreliable.get_or_insert(self.default_unreliable);
         options.message_types = self.message_types;
         options.compress_stream = self.compress_stream;
+        options.compress = self.compress;
         Parts {
             transport: self.transport,
             method: self.method,
@@ -129,6 +134,13 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
     /// call; see [`CompressStream`]. Generated clients pass the schema's `compress_stream`.
     pub const fn compress_stream(mut self, directions: CompressStream) -> Self {
         self.compress_stream = directions;
+        self
+    }
+
+    /// Lets the directions `directions` sets compress their messages without a dictionary; see
+    /// [`CompressMessages`]. Generated clients pass the schema's `compress` (or `compress_stream`).
+    pub const fn compress(mut self, directions: CompressMessages) -> Self {
+        self.compress = directions;
         self
     }
 

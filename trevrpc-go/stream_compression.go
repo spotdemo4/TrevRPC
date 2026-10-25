@@ -257,7 +257,7 @@ func (c *streamCompressor) encodeMarshalled(payload []byte, message proto.Messag
 		}
 	}
 	if c.encoder == nil {
-		return encodePayload(payload, c.per.dictFor(message)), nil
+		return encodePayload(payload, c.per.compressorFor(message)), nil
 	}
 	return c.compressStream(payload)
 }
@@ -566,7 +566,7 @@ func (c *streamClient) prepareStreams(request *wireRequest, accept *dictSet) *cl
 		streams.responses = newStreamInflater(accept.lookupOrNil(), reservation)
 	}
 	if allowed.Requests && !unreliable.Requests {
-		streams.requests = newStreamCompressor(c.streams, c.compression.requestCompressor())
+		streams.requests = newStreamCompressor(c.streams, c.compression.requestCompressor(request.plainCompression.Requests))
 	}
 	if streams.requests == nil && streams.responses == nil {
 		return nil

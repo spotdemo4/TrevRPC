@@ -21,6 +21,7 @@ export function createServiceClient(transport, service, root, options = {}) {
       types: { request: fullName(requestType), response: fullName(responseType) },
       datagrams: datagramUse(method),
       compressStream: streamCompressionUse(method),
+      compress: plainCompressionUse(method),
     };
     const resolve = (override) => mergeCallOptions(defaults, override);
 
@@ -160,6 +161,17 @@ function datagramUse({ kind, unreliableRequests, unreliableResponses }) {
 function streamCompressionUse({ compressStreamRequests, compressStreamResponses, ...method }) {
   const requests = Boolean(compressStreamRequests) && !method.unreliableRequests;
   const responses = Boolean(compressStreamResponses) && !method.unreliableResponses;
+  return requests || responses ? { requests, responses } : undefined;
+}
+
+/**
+ * The directions whose messages a method may compress without a dictionary, `{ requests,
+ * responses }`, or undefined for none: those its descriptor marks (the generator marks both for
+ * `compress` and `compress_stream`, except message types with redacted fields).
+ */
+function plainCompressionUse({ compressRequests, compressResponses }) {
+  const requests = Boolean(compressRequests);
+  const responses = Boolean(compressResponses);
   return requests || responses ? { requests, responses } : undefined;
 }
 

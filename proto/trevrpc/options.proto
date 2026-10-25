@@ -33,6 +33,15 @@ message MethodOptions {
   // data an attacker can influence together with secrets: compressed sizes
   // can reveal the secrets.
   bool compress_stream = 3;
+  // Messages may be compressed with zstd one at a time without a dictionary
+  // (a ZSTD_MESSAGE without a Dictionary_ID), where no configured dictionary
+  // applies to their type. Runtimes do it for messages of 256 bytes or more,
+  // and only when that makes them smaller; compress_stream implies it.
+  // Message types containing a field marked debug_redact are never
+  // compressed this way. Do not set it on a method whose messages carry data
+  // an attacker can influence together with secrets: compressed sizes can
+  // reveal the secrets.
+  bool compress = 4;
 }
 
 extend google.protobuf.MethodOptions {

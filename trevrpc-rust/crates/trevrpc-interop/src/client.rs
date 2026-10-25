@@ -12,7 +12,7 @@ use trevrpc::client::{CallOptions, Channel, TransportKind};
 use trevrpc::{Code, Error, Metadata};
 
 use crate::proto::{
-    CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, RefusingEchoClient,
+    CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, PlainMessage, RefusingEchoClient,
     UnreliableEchoClient,
 };
 use crate::{BoxError, Flags, connect};
@@ -107,7 +107,54 @@ fn scenarios<'a>(
             "refused-stream",
             Box::pin(refused_stream(compressed_client, refusing_client)),
         ),
+        (
+            "compressed-plain",
+            Box::pin(compressed_plain(compressed_client)),
+        ),
     ]
+}
+
+/// The text of `compressed-plain`: the 315-byte `plain.records` golden message, twice over.
+fn plain_text() -> String {
+    let hex = include_str!("../../../../testdata/zstd-golden-vectors.txt")
+        .lines()
+        .find_map(|line| line.strip_prefix("plain.records.message = "))
+        .unwrap_or_default();
+    let bytes: Vec<u8> = hex
+        .as_bytes()
+        .chunks(2)
+        .filter_map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect();
+    String::from_utf8_lossy(&bytes).repeat(2)
+}
+
+/// Echoes a message that compresses on its own twice on `CompressedEcho.Plain`, which allows
+/// compression without a dictionary: the first call's answer lets the second one's request travel
+/// compressed.
+async fn compressed_plain(client: &CompressedEcho) -> Scenario {
+    let text = plain_text();
+    let mut received = Vec::new();
+    for _ in 0..2 {
+        let response = client
+            .plain(&PlainMessage { text: text.clone() })
+            .options(|_| options())
+            .with_response()
+            .await
+            .map_err(rpc)?;
+        if response.message().text != text {
+            return Err("the echoed text differs".to_owned());
+        }
+        received.push(counter(
+            response.metadata(),
+            "interop-plain-compressed-received",
+        )?);
+    }
+    match received.as_slice() {
+        [_, 1] => Ok(()),
+        _ => Err(format!(
+            "plain-compressed requests per call {received:?}, want the second to be 1"
+        )),
+    }
 }
 
 /// How many messages the `compressed-stream` scenario echoes.

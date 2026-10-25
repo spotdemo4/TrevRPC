@@ -57,9 +57,10 @@ pub extern "C" fn zs_compress_bound(len: usize) -> usize {
     unsafe { ZSTD_compressBound(len) }
 }
 
-/// Creates the compression context that writes `ZSTD_MESSAGE` payloads, or returns null.
+/// Creates the compression context that writes `ZSTD_MESSAGE` payloads at `level` without a
+/// dictionary, or returns null. A referenced dictionary's own level takes precedence.
 #[unsafe(no_mangle)]
-pub extern "C" fn zs_cctx_new() -> *mut ZSTD_CCtx {
+pub extern "C" fn zs_cctx_new(level: c_int) -> *mut ZSTD_CCtx {
     // SAFETY: the context is checked before use and only ever passed back to libzstd.
     unsafe {
         let cctx = ZSTD_createCCtx();
@@ -67,6 +68,7 @@ pub extern "C" fn zs_cctx_new() -> *mut ZSTD_CCtx {
             return cctx;
         }
         let params = [
+            (ZSTD_cParameter::ZSTD_c_compressionLevel, level),
             (ZSTD_cParameter::ZSTD_c_experimentalParam2, FORMAT_MAGICLESS),
             (ZSTD_cParameter::ZSTD_c_checksumFlag, 0),
             (ZSTD_cParameter::ZSTD_c_dictIDFlag, 1),
@@ -126,7 +128,8 @@ pub unsafe extern "C" fn zs_ddict_new(dict: *const u8, len: usize) -> *mut ZSTD_
     unsafe { ZSTD_createDDict(dict.cast::<c_void>(), len) }
 }
 
-/// Compresses `src` with `cdict` into `dst`, returning the payload size or -1.
+/// Compresses `src` with `cdict`, or without a dictionary if it is null, into `dst`, returning the
+/// payload size or -1.
 ///
 /// # Safety
 ///
@@ -156,7 +159,8 @@ pub unsafe extern "C" fn zs_compress(
     }
 }
 
-/// Decompresses the frame in `src` with `ddict` into `dst`, returning the message size or -1.
+/// Decompresses the frame in `src` with `ddict`, or without a dictionary if it is null, into `dst`,
+/// returning the message size or -1.
 ///
 /// # Safety
 ///

@@ -217,10 +217,46 @@ service Telemetry {
         "server_streaming(&self.transport, telemetry_paths::HIDDEN, request, self.default_options.clone()).message_types(\"demo.v1.Secret\", \"demo.v1.Secret\")\n"
     ));
     assert!(content.contains(
-        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress_stream(::trevrpc::CompressStream::BOTH), move |context,"
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress_stream(::trevrpc::CompressStream::BOTH).with_compress(::trevrpc::CompressMessages::BOTH), move |context,"
     ));
     assert!(content.contains(
-        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Holder\").with_compress_stream(::trevrpc::CompressStream::REQUESTS), move |context,"
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Holder\").with_compress_stream(::trevrpc::CompressStream::REQUESTS).with_compress(::trevrpc::CompressMessages::REQUESTS), move |context,"
+    ));
+}
+
+#[test]
+fn compress_is_emitted_for_every_direction_without_redacted_fields() {
+    let content = generated(
+        r#"syntax = "proto3";
+package demo.v1;
+import "trevrpc/options.proto";
+message Position { int32 x = 1; }
+message Secret { string token = 1 [debug_redact = true]; }
+service Telemetry {
+    rpc Get(Position) returns (Position) { option (trevrpc.method) = { compress: true }; }
+    rpc Login(Position) returns (Secret) { option (trevrpc.method) = { compress: true }; }
+    rpc Upload(stream Position) returns (Position) { option (trevrpc.method) = { compress_stream: true }; }
+    rpc Plain(Position) returns (Position);
+}
+"#,
+    );
+
+    assert!(content.contains(
+        "unary(&self.transport, telemetry_paths::GET, request, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\").compress(::trevrpc::CompressMessages::BOTH)\n"
+    ), "{content}");
+    // A redacted type's direction is left out.
+    assert!(content.contains(
+        ".message_types(\"demo.v1.Position\", \"demo.v1.Secret\").compress(::trevrpc::CompressMessages::REQUESTS)\n"
+    ));
+    // compress_stream implies it, for the unary response direction too.
+    assert!(content.contains(
+        ".compress_stream(::trevrpc::CompressStream::REQUESTS).compress(::trevrpc::CompressMessages::BOTH)\n"
+    ));
+    assert!(content.contains(
+        "unary(&self.transport, telemetry_paths::PLAIN, request, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\")\n"
+    ));
+    assert!(content.contains(
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress(::trevrpc::CompressMessages::BOTH), move |context,"
     ));
 }
 

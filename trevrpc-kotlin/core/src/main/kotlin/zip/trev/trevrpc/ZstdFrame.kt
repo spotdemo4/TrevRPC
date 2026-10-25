@@ -4,7 +4,7 @@ import java.security.MessageDigest
 
 /** What a receiver needs from a ZSTD_MESSAGE payload before decompressing it. */
 internal class ZstdHeader(
-    /** The Dictionary_ID; never zero. */
+    /** The Dictionary_ID, or zero for a frame without one. */
     val dictionaryId: UInt,
     /** The Frame_Content_Size: the size of the message, saturated at [Long.MAX_VALUE]. */
     val contentSize: Long,
@@ -14,8 +14,9 @@ internal class ZstdHeader(
 private const val DICTIONARY_MAGIC = 0xEC30A437.toInt()
 
 /**
- * Validates that [payload] is exactly one magicless zstd frame with a non-zero Dictionary_ID and a
- * Frame_Content_Size, and returns both, or null if it is not. The block headers are walked to find
+ * Validates that [payload] is exactly one magicless zstd frame with a Frame_Content_Size, and
+ * returns it with the frame's Dictionary_ID (zero when the frame has none), or null if it is not.
+ * Whether the receiver accepts that dictionary, or none, is up to it. The block headers are walked to find
  * the frame's end, so trailing bytes, including a second frame, are rejected. Block contents are
  * not checked; decompression does that.
  */
@@ -28,7 +29,7 @@ internal fun parseZstdHeader(payload: ByteArray): ZstdHeader? {
     val checksum = descriptor and 0x04 != 0
     val dictionaryIdSize = intArrayOf(0, 1, 2, 4)[descriptor and 0x03]
     val contentSizeSize = if (contentSizeFlag == 0 && singleSegment) 1 else intArrayOf(0, 2, 4, 8)[contentSizeFlag]
-    if (dictionaryIdSize == 0 || contentSizeSize == 0) return null
+    if (contentSizeSize == 0) return null
     var position = if (singleSegment) 1 else 2 // the Window_Descriptor
     if (payload.size < position + dictionaryIdSize + contentSizeSize) return null
     val dictionaryId = littleEndian(payload, position, dictionaryIdSize).toUInt()
@@ -36,7 +37,6 @@ internal fun parseZstdHeader(payload: ByteArray): ZstdHeader? {
     var contentSize = littleEndian(payload, position, contentSizeSize)
     if (contentSizeSize == 2) contentSize += 256
     position += contentSizeSize
-    if (dictionaryId == 0u) return null
     while (true) {
         val block = nextBlock(payload, position) ?: return null
         position = block.next

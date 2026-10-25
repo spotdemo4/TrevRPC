@@ -628,17 +628,19 @@ type unreliableMethod struct {
 	// requests, responses and compress are the options; none set means no
 	// option.
 	requests, responses, compress bool
+	// plain sets the compress option.
+	plain bool
 	// input is the request message type, HelloRequest when empty.
 	input string
 }
 
 func (m unreliableMethod) options(t *testing.T) *descriptor.MethodOptions {
 	t.Helper()
-	if !m.requests && !m.responses && !m.compress {
+	if !m.requests && !m.responses && !m.compress && !m.plain {
 		return nil
 	}
 	options := &descriptor.MethodOptions{}
-	proto.SetExtension(options, trevrpcpb.E_Method, &trevrpcpb.MethodOptions{UnreliableRequests: m.requests, UnreliableResponses: m.responses, CompressStream: m.compress})
+	proto.SetExtension(options, trevrpcpb.E_Method, &trevrpcpb.MethodOptions{UnreliableRequests: m.requests, UnreliableResponses: m.responses, CompressStream: m.compress, Compress: m.plain})
 	return options
 }
 
@@ -655,17 +657,21 @@ func TestGeneratorEmitsStreamCompressionOptions(t *testing.T) {
 		t.Fatalf("generator returned error: %s", response.GetError())
 	}
 	content := response.File[0].GetContent()
+	// compress_stream implies compress, for the messages outside the stream.
+	plainBoth := "trevrpc_go.PlainCompression{Requests: true, Responses: true}"
+	plainResponses := "trevrpc_go.PlainCompression{Requests: false, Responses: true}"
 	for _, want := range []string{
-		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}))...)",
-		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}))...)",
-		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))...)",
+		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}), trevrpc_go.WithPlainCompression(" + plainBoth + "))...)",
+		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}), trevrpc_go.WithPlainCompression(" + plainBoth + "))...)",
+		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.WithPlainCompression(" + plainBoth + "))...)",
 		// A request type with a redacted field keeps its direction out.
-		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))...)",
-		"implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}))",
-		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))",
-		"implementation.Leaky, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}))",
-		// Nothing is left for a client-streaming method of a redacted type.
-		"implementation.SecretUpload)",
+		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.WithPlainCompression(" + plainResponses + "))...)",
+		"implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainBoth + "))",
+		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainBoth + "))",
+		"implementation.Leaky, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainResponses + "))",
+		// Only the unredacted response is left for a client-streaming method
+		// of a redacted request type.
+		"implementation.SecretUpload, trevrpc_go.RoutePlainCompression(" + plainResponses + "))",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("generated content missing %q:\n%s", want, content)
@@ -673,6 +679,30 @@ func TestGeneratorEmitsStreamCompressionOptions(t *testing.T) {
 	}
 	if _, err := parser.ParseFile(token.NewFileSet(), "greeter.trevrpc.go", content, parser.AllErrors); err != nil {
 		t.Fatalf("generated Go is not syntactically valid: %v\n%s", err, content)
+	}
+}
+
+func TestGeneratorEmitsPlainCompressionOptions(t *testing.T) {
+	request := unreliableRequest(t, "example.test/hello/v1;hellov1",
+		unreliableMethod{name: "Call", plain: true},
+		unreliableMethod{name: "SecretCall", plain: true, input: "Secret"},
+		unreliableMethod{name: "Bare"},
+	)
+	response := generate(request)
+	if response.GetError() != "" {
+		t.Fatalf("generator returned error: %s", response.GetError())
+	}
+	content := response.File[0].GetContent()
+	for _, want := range []string{
+		"c.mergedCallOptions(options, trevrpc_go.WithPlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))...)",
+		"implementation.Call, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))",
+		"c.mergedCallOptions(options, trevrpc_go.WithPlainCompression(trevrpc_go.PlainCompression{Requests: false, Responses: true}))...)",
+		"implementation.SecretCall, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: false, Responses: true}))",
+		"implementation.Bare)",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("generated content missing %q:\n%s", want, content)
+		}
 	}
 }
 

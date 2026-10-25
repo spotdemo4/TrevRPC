@@ -15,6 +15,7 @@ import org.junit.BeforeClass
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.Parameterized
+import trevrpc.interop.v1.Compressed.PlainMessage
 import trevrpc.interop.v1.CompressedEchoClient
 import trevrpc.interop.v1.EchoClient
 import trevrpc.interop.v1.Interop.EchoRequest
@@ -115,14 +116,22 @@ class EchoScenarioTest(
  * runner hands the server too. It compresses the Echo messages.
  */
 private fun interopCompression(): Compression {
-    val prefix = "dict.d1.dictionary = "
-    val vectors = checkNotNull(Clients::class.java.classLoader?.getResourceAsStream("zstd-golden-vectors.txt"))
-    val hex = vectors.bufferedReader().useLines { lines -> lines.first { it.startsWith(prefix) }.removePrefix(prefix) }
-    val dictionary = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    val dictionary = goldenVector("dict.d1.dictionary")
     return Compression(
         listOf(Dictionary(dictionary, listOf("trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"))),
     )
 }
+
+/** The value of entry [name] of the compression golden vectors. */
+private fun goldenVector(name: String): ByteArray {
+    val prefix = "$name = "
+    val vectors = checkNotNull(Clients::class.java.classLoader?.getResourceAsStream("zstd-golden-vectors.txt"))
+    val hex = vectors.bufferedReader().useLines { lines -> lines.first { it.startsWith(prefix) }.removePrefix(prefix) }
+    return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+}
+
+/** The text of `compressed-plain`: the `plain.records` JSON record, twice over. */
+private val plainText = goldenVector("plain.records.message").decodeToString().repeat(2)
 
 /** The generated clients a scenario can call; scenarios destructure the ones they use. */
 private data class Clients(
@@ -250,6 +259,15 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             // dispatch bring before its third message; that answer makes the client optimistic again.
             expectStreamCompressed("bidi", compressedBidi(client), 1)
             expectStreamCompressed("client-stream", upload { requests, options -> client.clientStream(requests) { options(this) } }, 6)
+        },
+        "compressed-plain" to { (_, _, client) ->
+            repeat(2) { call ->
+                val response = ResponseMetadata()
+                val echo = client.plain(PlainMessage.newBuilder().setText(plainText).build()) { response.capture(this) }
+                expect(echo.text == plainText) { "call $call: expected the ${plainText.length}-character text echoed" }
+                // This client never compresses unary requests; the server may compress its response.
+                expectCounter(response.trailers, "interop-plain-compressed-received", "0")
+            }
         },
     )
 

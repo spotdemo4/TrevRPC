@@ -149,7 +149,8 @@ buildNpmPackage (final: {
         ]);
         const zstd = await import("@trevrpc/trevrpc-js/zstd");
         assert.deepEqual(Object.keys(zstd), ["createCompression"]);
-        assert.deepEqual((await zstd.createCompression()).query, []);
+        // Without dictionaries, a channel still queries compression without one (ID 0).
+        assert.deepEqual((await zstd.createCompression()).query, [{}]);
       '
     )
 
@@ -163,7 +164,7 @@ buildNpmPackage (final: {
         "$out/bin/trevrpc-interop-browser" --browser "$browser" \
           --url https://127.0.0.1:49999/trevrpc --cert-hash "$hash" > "$browser.out" || status=$?
         test "$status" -eq 1
-        test "$(grep -c '^fail ' "$browser.out")" -eq 15
+        test "$(grep -c '^fail ' "$browser.out")" -eq 16
         ! grep -q '^ok ' "$browser.out"
       done
     ''}

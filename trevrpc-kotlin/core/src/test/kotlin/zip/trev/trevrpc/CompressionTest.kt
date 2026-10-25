@@ -13,6 +13,9 @@ class CompressionTest {
     private val dictionary = vectors.getValue("dict.d1.dictionary")
     private val d1 = DictionaryInfo(1u, vectors.getValue("dict.d1.fingerprint"))
     private val compressible = vectors.getValue("ok.small.message")
+
+    /** A message large enough to compress without a dictionary. */
+    private val record = vectors.getValue("plain.records.message")
     private val requests = MessageCodec(ByteArray::copyOf, ByteArray::copyOf, "test.Request")
     private val responses = MessageCodec(ByteArray::copyOf, ByteArray::copyOf, "test.Response")
 
@@ -33,6 +36,129 @@ class CompressionTest {
             assertArrayEquals(vectors.getValue("$name.frame"), encodeFrame(type, vectors.getValue("$name.payload")), name)
         }
     }
+
+    @Test
+    fun `compression without a dictionary is negotiated as ID 0, byte for byte`() {
+        val request = RpcRequest("/svc/m", acceptDictionaries = listOf(0u), dictionaryQuery = listOf(PLAIN_DICTIONARY))
+        assertArrayEquals(vectors.getValue("request.plain.payload"), WireCodec.encode(request))
+        assertEquals(request, WireCodec.decodeRequest(vectors.getValue("request.plain.payload")))
+
+        val frame = WireCodec.decodeResponseFrame(Frame(FrameType.HEADERS, vectors.getValue("headers.plain.payload")))
+        assertEquals(listOf(PLAIN_DICTIONARY), (frame as ResponseFrame.Headers).dictionaries)
+        assertArrayEquals(vectors.getValue("headers.plain.payload"), WireCodec.encode(RpcHeaders(dictionaries = listOf(PLAIN_DICTIONARY))))
+
+        listOf("request.plain", "headers.plain").forEach { name ->
+            val type = if (name.startsWith("request")) FrameType.REQUEST else FrameType.HEADERS
+            assertArrayEquals(vectors.getValue("$name.frame"), encodeFrame(type, vectors.getValue("$name.payload")), name)
+        }
+    }
+
+    @Test
+    fun `a call that accepts messages without a dictionary decodes them and still rejects the invalid ones`() {
+        val accepting = checkNotNull(compression("test.Response").call(null, "test.Response", false, CompressMessages.RESPONSES))
+        val plain = vectors.keys.filter { it.startsWith("plain.") && it.endsWith(".payload") }
+        assertTrue(plain.isNotEmpty())
+        plain.forEach { name ->
+            assertArrayEquals(vectors.getValue(name.replace(".payload", ".message")), inflate(accepting, vectors.getValue(name)), name)
+            // A call that listed only dict.d1 rejects it.
+            val error = assertThrows(TrevRpcException::class.java, { inflate(callCompression(), vectors.getValue(name)) }, name)
+            assertEquals(Code.INTERNAL, error.status.code, name)
+        }
+        // bad.no_dictionary_id, among the others, needs dict.d1 to decompress, so it fails here too.
+        vectors.keys.filter { it.startsWith("bad.") && it.endsWith(".payload") }.forEach { name ->
+            val error = assertThrows(TrevRpcException::class.java, { inflate(accepting, vectors.getValue(name)) }, name)
+            assertEquals(Code.INTERNAL, error.status.code, name)
+        }
+    }
+
+    @Test
+    fun `a unary call accepts responses without a dictionary but never compresses its request`() =
+        runBlocking {
+            val transport = ScriptedTransport(Compression(emptyList()))
+            transport.respond(plainCompressed(record), ok())
+            transport.end()
+            val response = Client(transport).unary("/svc/m", record, requests, responses, compressMessages = CompressMessages.BOTH)
+
+            assertArrayEquals(record, response)
+            val request = transport.requests.single()
+            assertEquals(listOf(0u), request.acceptDictionaries)
+            assertEquals(emptyList<DictionaryInfo>(), request.dictionaryQuery)
+            assertArrayEquals(record, transport.firstMessages.single())
+        }
+
+    @Test
+    fun `a request stream compresses without a dictionary from 256 bytes once its answer confirms ID 0`() =
+        runBlocking {
+            val transport = ScriptedTransport(Compression(emptyList()))
+            val call =
+                Client(transport).openBidirectionalStreaming(
+                    "/svc/m",
+                    requests,
+                    responses,
+                    compressMessages = CompressMessages.BOTH,
+                )
+            val request = transport.requests.single()
+            assertEquals(listOf(PLAIN_DICTIONARY), request.dictionaryQuery)
+            assertEquals(listOf(0u), request.acceptDictionaries)
+
+            call.send(record)
+            transport.respond(headers(PLAIN_DICTIONARY))
+            call.headers()
+            call.send(record)
+            call.send(record.copyOf(PLAIN_MIN_SIZE - 1))
+            // Random bytes do not shrink, so they travel as they are.
+            call.send(ByteArray(PLAIN_MIN_SIZE).also(java.util.Random(1)::nextBytes))
+
+            assertEquals(
+                listOf(FrameType.MESSAGE, FrameType.ZSTD_MESSAGE, FrameType.MESSAGE, FrameType.MESSAGE),
+                transport.sent.map { it.first },
+            )
+            val payload = transport.sent[1].second
+            val header = checkNotNull(parseZstdHeader(payload))
+            assertEquals(0u, header.dictionaryId)
+            assertArrayEquals(record, ZstdCodec(null, 1).decompress(payload, header))
+            call.close()
+        }
+
+    @Test
+    fun `a confirmed dictionary wins over compression without one`() =
+        runBlocking {
+            val transport = ScriptedTransport(compression("test.Request"))
+            val call =
+                Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressMessages = CompressMessages.REQUESTS)
+            assertEquals(listOf(d1, PLAIN_DICTIONARY), transport.requests.single().dictionaryQuery)
+            transport.respond(headers(d1, PLAIN_DICTIONARY))
+            call.headers()
+            call.send(record)
+            assertEquals(1u, parseZstdHeader(transport.sent.single().second)?.dictionaryId)
+            call.close()
+        }
+
+    @Test
+    fun `a request stream stays uncompressed when the answer does not confirm ID 0`() =
+        runBlocking {
+            val transport = ScriptedTransport(Compression(emptyList()))
+            val call =
+                Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressMessages = CompressMessages.REQUESTS)
+            transport.respond(headers())
+            call.headers()
+            call.send(record)
+            assertEquals(listOf(FrameType.MESSAGE), transport.sent.map { it.first })
+            call.close()
+        }
+
+    @Test
+    fun `responses without a dictionary fail a call that did not accept them`() =
+        runBlocking {
+            val transport = ScriptedTransport(Compression(emptyList()))
+            transport.respond(plainCompressed(record), ok())
+            val error =
+                assertThrows(TrevRpcException::class.java) {
+                    runBlocking { Client(transport).unary("/svc/m", record, requests, responses) }
+                }
+            assertEquals(Code.INTERNAL, error.status.code)
+            assertEquals(RpcRequest("/svc/m"), transport.requests.single())
+        }
 
     @Test
     fun `dictionary ID and fingerprint come from the dictionary`() {
@@ -194,6 +320,11 @@ class CompressionTest {
     ): ByteArray {
         val message = WireCodec.decodeResponseFrame(Frame(FrameType.ZSTD_MESSAGE, payload)) as ResponseFrame.Message
         return inflateResponse(message, compression, DEFAULT_MAX_FRAME_SIZE).body
+    }
+
+    private fun plainCompressed(message: ByteArray): ResponseFrame {
+        val payload = checkNotNull(ZstdCodec(null, 1).compress(message))
+        return WireCodec.decodeResponseFrame(Frame(FrameType.ZSTD_MESSAGE, payload))
     }
 
     private fun compressed(message: ByteArray): ResponseFrame {

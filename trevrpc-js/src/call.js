@@ -141,8 +141,13 @@ export class Call {
   #compression;
   /** The full protobuf type name of the request messages. */
   #requestType;
-  /** The dictionary the call accepts on its response messages, or undefined. */
+  /**
+   * What the call accepts on its response messages: a Map from dictionary ID to dictionary, 0 for
+   * compression without one; undefined without compression.
+   */
   #accept;
+  /** Whether request messages may be compressed without a dictionary. */
+  #plainRequests = false;
   /** Whether the REQUEST queried the server's dictionaries, so its HEADERS answer. */
   #queried = false;
   /** The call's stream compression, or undefined if its method or transport has none. */
@@ -182,7 +187,8 @@ export class Call {
    * is only known once the stream is open, so then the REQUEST is encoded after that. `send` makes
    * the call send request messages as datagrams, `receive` makes it accept response datagrams.
    * `rpc.compressStream` is `{ requests, responses }`, the directions the call may
-   * stream-compress when the transport has compression.
+   * stream-compress when the transport has compression, and `rpc.compress` the same for
+   * compression without a dictionary.
    */
   static async open(transport, request, message, options, rpc = {}) {
     const fields = { ...request, metadata: options.metadata, ...timeoutField(options) };
@@ -223,7 +229,7 @@ export class Call {
    * open again.
    */
   #requestOnSession(fields, message, session, compression, transport, rpc, replay = false) {
-    const { types, datagrams, compressStream } = rpc;
+    const { types, datagrams, compressStream, compress } = rpc;
     const request = { ...fields };
     if (datagrams !== undefined) {
       this.#flow = datagramEndpoint(session.datagrams)?.openFlow({
@@ -238,9 +244,10 @@ export class Call {
     if (compression !== undefined) {
       this.#compression = sessionCompression(compression, session.key);
       this.#requestType = types.request;
-      const negotiation = this.#compression.prepare(types.response);
+      const negotiation = this.#compression.prepare(types.response, Boolean(compress?.responses));
       Object.assign(request, negotiation.fields);
       this.#accept = negotiation.accept;
+      this.#plainRequests = Boolean(compress?.requests);
       this.#queried = negotiation.queried;
       if (compressStream?.requests || compressStream?.responses) {
         const budget = streamBudget(transport);
@@ -266,15 +273,15 @@ export class Call {
 
   /**
    * Encodes a request message for sending: through the call's stream context once that exists,
-   * and otherwise compressed when the session's shared set has the dictionary of the request type.
-   * Both are checked per message, so a request stream starts compressing as soon as the server's
-   * answer arrives.
+   * and otherwise compressed when the session's shared set has the dictionary of the request type,
+   * or compression without a dictionary where the method allows it. Both are checked per message,
+   * so a request stream starts compressing as soon as the server's answer arrives.
    */
   #encode(body) {
     if (body.byteLength > this.#maxFrameSize) {
       return encodeMessage(body);
     }
-    const dictionary = this.#compression?.requestDictionary(this.#requestType);
+    const dictionary = this.#compression?.requestCompressor(this.#requestType, this.#plainRequests);
     return this.#streams === undefined
       ? encodeMessage(body, dictionary)
       : this.#streams.encode(body, dictionary);

@@ -20,11 +20,13 @@ use prost_types::{
 const METHOD_OPTION_FIELD: u32 = 58247;
 
 /// The marks of the `(trevrpc.method)` option of one method.
+#[allow(clippy::struct_excessive_bools)] // The schema option's fields, one each.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MethodMarks {
     unreliable_requests: bool,
     unreliable_responses: bool,
     compress_stream: bool,
+    compress: bool,
 }
 
 /// The directions of a method that may use stream compression: those it streams, when the schema
@@ -43,7 +45,7 @@ struct CompressedDirections {
 /// (`name` 1, `service` 6) -> `ServiceDescriptorProto` (`name` 1, `method` 2) ->
 /// `MethodDescriptorProto` (`name` 1, `options` 4) -> `MethodOptions` (extension 58247) ->
 /// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2, `compress_stream`
-/// 3). It also reads `FieldOptions.debug_redact` (16), which `prost-types` does not know, through
+/// 3, `compress` 4). It also reads `FieldOptions.debug_redact` (16), which `prost-types` does not know, through
 /// `FileDescriptorProto.message_type` (4) -> `DescriptorProto` (`name` 1, `field` 2,
 /// `nested_type` 3) -> `FieldDescriptorProto` (`type_name` 6, `options` 8).
 mod mirror {
@@ -111,6 +113,7 @@ mod mirror {
         pub trevrpc: Option<TrevrpcOptions>,
     }
 
+    #[allow(clippy::struct_excessive_bools)] // The schema option's fields, one each.
     #[derive(Clone, PartialEq, Eq, prost::Message)]
     pub struct TrevrpcOptions {
         #[prost(bool, tag = "1")]
@@ -119,6 +122,8 @@ mod mirror {
         pub unreliable_responses: bool,
         #[prost(bool, tag = "3")]
         pub compress_stream: bool,
+        #[prost(bool, tag = "4")]
+        pub compress: bool,
     }
 
     /// A `FileDescriptorSet`, with its files left encoded.
@@ -183,6 +188,7 @@ impl MethodOptionIndex {
                             unreliable_requests: options.unreliable_requests,
                             unreliable_responses: options.unreliable_responses,
                             compress_stream: options.compress_stream,
+                            compress: options.compress,
                         },
                     );
                 }
@@ -547,6 +553,9 @@ struct Method {
     server_streaming: bool,
     unreliable: MethodMarks,
     compressed: CompressedDirections,
+    /// The directions that may be compressed without a dictionary: every one, when the schema sets
+    /// `compress` or `compress_stream`, whose message type has no field marked `debug_redact`.
+    plain: CompressedDirections,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -881,11 +890,15 @@ fn descriptor_service(
                 options,
             )
             .map(|mut generated| {
+                let requests = !method_options.is_redacted(&generated.input_proto_type);
+                let responses = !method_options.is_redacted(&generated.output_proto_type);
                 generated.compressed = CompressedDirections {
-                    requests: generated.compressed.requests
-                        && !method_options.is_redacted(&generated.input_proto_type),
-                    responses: generated.compressed.responses
-                        && !method_options.is_redacted(&generated.output_proto_type),
+                    requests: generated.compressed.requests && requests,
+                    responses: generated.compressed.responses && responses,
+                };
+                generated.plain = CompressedDirections {
+                    requests: generated.plain.requests && requests,
+                    responses: generated.plain.responses && responses,
                 };
                 generated
             })
@@ -963,6 +976,10 @@ fn descriptor_method(
         compressed: CompressedDirections {
             requests: marks.compress_stream && client_streaming,
             responses: marks.compress_stream && server_streaming,
+        },
+        plain: CompressedDirections {
+            requests: marks.compress || marks.compress_stream,
+            responses: marks.compress || marks.compress_stream,
         },
     })
 }
@@ -1069,16 +1086,32 @@ fn unreliable_expr(runtime_path: &str, method: &Method) -> Option<String> {
     Some(format!("{runtime_path}::Unreliable::{constant}"))
 }
 
-/// Returns the `CompressStream` constant for the directions of a method that may use stream
-/// compression, or `None` when neither may.
-fn compress_stream_expr(runtime_path: &str, method: &Method) -> Option<String> {
-    let constant = match (method.compressed.requests, method.compressed.responses) {
+/// Returns the constant of type `kind` (`CompressStream` or `CompressMessages`) for `directions`,
+/// or `None` when neither is set.
+fn directions_expr(
+    runtime_path: &str,
+    kind: &str,
+    directions: CompressedDirections,
+) -> Option<String> {
+    let constant = match (directions.requests, directions.responses) {
         (false, false) => return None,
         (true, false) => "REQUESTS",
         (false, true) => "RESPONSES",
         (true, true) => "BOTH",
     };
-    Some(format!("{runtime_path}::CompressStream::{constant}"))
+    Some(format!("{runtime_path}::{kind}::{constant}"))
+}
+
+/// Returns the `CompressStream` constant for the directions of a method that may use stream
+/// compression, or `None` when neither may.
+fn compress_stream_expr(runtime_path: &str, method: &Method) -> Option<String> {
+    directions_expr(runtime_path, "CompressStream", method.compressed)
+}
+
+/// Returns the `CompressMessages` constant for the directions of a method that may be compressed
+/// without a dictionary, or `None` when neither may.
+fn compress_expr(runtime_path: &str, method: &Method) -> Option<String> {
+    directions_expr(runtime_path, "CompressMessages", method.plain)
 }
 
 /// Returns the doc lines that say which directions of a method travel as datagrams when they can.
@@ -1236,11 +1269,14 @@ fn generate_client_method(
     let marks = unreliable_expr(runtime_path, method)
         .map(|unreliable| format!(".default_unreliable({unreliable})"))
         .unwrap_or_default();
-    let compress = compress_stream_expr(runtime_path, method)
+    let compress_stream = compress_stream_expr(runtime_path, method)
         .map(|directions| format!(".compress_stream({directions})"))
         .unwrap_or_default();
+    let compress = compress_expr(runtime_path, method)
+        .map(|directions| format!(".compress({directions})"))
+        .unwrap_or_default();
     let marks = format!(
-        ".message_types({:?}, {:?}){marks}{compress}",
+        ".message_types({:?}, {:?}){marks}{compress_stream}{compress}",
         method.input_proto_type, method.output_proto_type
     );
     let (shape, constructor, request_param, request_arg) =
@@ -1311,6 +1347,9 @@ fn generate_registration_method(
     }
     if let Some(directions) = compress_stream_expr(runtime_path, method) {
         options.push_str(&format!(".with_compress_stream({directions})"));
+    }
+    if let Some(directions) = compress_expr(runtime_path, method) {
+        options.push_str(&format!(".with_compress({directions})"));
     }
     let emitted = buf.split_off(start);
     buf.push_str(
@@ -1493,6 +1532,7 @@ mod tests {
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
                 compressed: CompressedDirections::default(),
+                plain: CompressedDirections::default(),
             }],
         };
         let mut generated = String::new();
@@ -1523,6 +1563,7 @@ mod tests {
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
                 compressed: CompressedDirections::default(),
+                plain: CompressedDirections::default(),
             }],
         };
         let mut generated = String::new();
@@ -1572,6 +1613,7 @@ mod tests {
                 server_streaming: false,
                 unreliable: MethodMarks::default(),
                 compressed: CompressedDirections::default(),
+                plain: CompressedDirections::default(),
             }],
         };
         let mut generated = String::new();
@@ -1599,6 +1641,7 @@ mod tests {
                     server_streaming: true,
                     unreliable: MethodMarks::default(),
                     compressed: CompressedDirections::default(),
+                    plain: CompressedDirections::default(),
                 },
                 Method {
                     name: "lots_of_greetings".to_owned(),
@@ -1611,6 +1654,7 @@ mod tests {
                     server_streaming: false,
                     unreliable: MethodMarks::default(),
                     compressed: CompressedDirections::default(),
+                    plain: CompressedDirections::default(),
                 },
                 Method {
                     name: "bidi_hello".to_owned(),
@@ -1623,6 +1667,7 @@ mod tests {
                     server_streaming: true,
                     unreliable: MethodMarks::default(),
                     compressed: CompressedDirections::default(),
+                    plain: CompressedDirections::default(),
                 },
             ],
         };

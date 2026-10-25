@@ -354,6 +354,36 @@ var scenarios = []scenario{
 	{"compressed", runCompressed},
 	{"compressed-stream", runCompressedStream},
 	{"refused-stream", runRefusedStream},
+	{"compressed-plain", runCompressedPlain},
+}
+
+// plainRecord is the message of the plain.records compression golden vector:
+// a JSON record that compresses without a dictionary.
+const plainRecord = `{"service":"search","region":"us-east-1","status":200,"latency_ms":118,"path":"/v1/search","query":"wireless headphones","results":[{"id":"p-1001","title":"Wireless headphones","price":59.99},{"id":"p-1002","title":"Wireless earbuds","price":39.99},{"id":"p-1003","title":"Wireless headphones pro","price":129.99}]}`
+
+// runCompressedPlain is the compressed-plain scenario: CompressedEcho.Plain
+// twice with plainRecord twice over. The first call's answer lets the second
+// compress its request without a dictionary.
+func runCompressedPlain(ctx context.Context, env *scenarioEnv) error {
+	text := strings.Repeat(plainRecord, 2)
+	for call := range 2 {
+		var trailers trevrpc.Metadata
+		response, err := env.compressed.Plain(ctx, &interoppb.PlainMessage{Text: text}, trevrpc.CaptureResponseMetadata(&trailers))
+		if err != nil {
+			return fmt.Errorf("call %d: %w", call, err)
+		}
+		if response.GetText() != text {
+			return fmt.Errorf("call %d: echoed %.32q, want %.32q", call, response.GetText(), text)
+		}
+		received := string(trailers[plainCompressedReceivedKey])
+		if received != "0" && received != "1" {
+			return fmt.Errorf("call %d: %s = %q, want 0 or 1", call, plainCompressedReceivedKey, received)
+		}
+		if call == 1 && received != "1" {
+			return fmt.Errorf("call %d: %s = %q: the request did not arrive compressed without a dictionary", call, plainCompressedReceivedKey, received)
+		}
+	}
+	return nil
 }
 
 // compressedMessage is the i-th message of the compressed scenario: like the

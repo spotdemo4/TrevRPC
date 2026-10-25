@@ -23,6 +23,7 @@ private const val METHOD_OPTION_FIELD = 58247
 private const val UNRELIABLE_REQUESTS_FIELD = 1
 private const val UNRELIABLE_RESPONSES_FIELD = 2
 private const val COMPRESS_STREAM_FIELD = 3
+private const val COMPRESS_FIELD = 4
 
 public fun main() {
     try {
@@ -420,6 +421,9 @@ private data class Method(
     /** The streamed directions that use stream compression. */
     val compressRequests: Boolean,
     val compressResponses: Boolean,
+    /** The directions whose messages may be compressed without a dictionary. */
+    val compressPlainRequests: Boolean,
+    val compressPlainResponses: Boolean,
 ) {
     val kotlinName: String
         get() = kotlinIdent(name)
@@ -531,7 +535,9 @@ private fun describeMethod(
     val input = types.resolve(file, descriptor.inputType)
     val output = types.resolve(file, descriptor.outputType)
     // Stream compression leaves out directions that are unreliable (their messages are meant for
-    // datagrams, which never use the context) and types with redacted fields.
+    // datagrams, which never use the context) and types with redacted fields. Compression without a
+    // dictionary, which compress_stream implies, leaves out only types with redacted fields.
+    val compressPlain = unreliable.compress || unreliable.compressStream
     return Method(
         name = lowerCamel(descriptor.name),
         constantName = screamingSnake(descriptor.name),
@@ -545,17 +551,20 @@ private fun describeMethod(
             unreliable.compressStream && descriptor.clientStreaming && !unreliable.requests && !types.hasRedactedField(input),
         compressResponses =
             unreliable.compressStream && descriptor.serverStreaming && !unreliable.responses && !types.hasRedactedField(output),
+        compressPlainRequests = compressPlain && !types.hasRedactedField(input),
+        compressPlainResponses = compressPlain && !types.hasRedactedField(output),
     )
 }
 
 /**
  * The `(trevrpc.method)` option of a method: which streamed directions the schema marks unreliable,
- * and whether it allows stream compression.
+ * and whether it allows stream compression and compression without a dictionary.
  */
 private data class TrevRpcMethodOptions(
     val requests: Boolean = false,
     val responses: Boolean = false,
     val compressStream: Boolean = false,
+    val compress: Boolean = false,
 ) {
     val any: Boolean
         get() = requests || responses
@@ -582,6 +591,7 @@ private fun readMethodOptions(descriptor: MethodDescriptorProto): TrevRpcMethodO
                 requests = result.requests || fields.getField(UNRELIABLE_REQUESTS_FIELD).varintList.any { it != 0L },
                 responses = result.responses || fields.getField(UNRELIABLE_RESPONSES_FIELD).varintList.any { it != 0L },
                 compressStream = result.compressStream || fields.getField(COMPRESS_STREAM_FIELD).varintList.any { it != 0L },
+                compress = result.compress || fields.getField(COMPRESS_FIELD).varintList.any { it != 0L },
             )
     }
     return result
@@ -651,21 +661,33 @@ private fun StringBuilder.generateClientMethod(
                     "): $output =\n        client.unary($pathConstant, request, $inputCodec, $outputCodec, defaultCallOptions.options())"
             }
         }
-    val compressStream =
-        when {
-            method.compressRequests && method.compressResponses -> "BOTH"
-            method.compressRequests -> "REQUESTS"
-            method.compressResponses -> "RESPONSES"
-            else -> null
-        }
+    val compressStream = directions(method.compressRequests, method.compressResponses)
+    val compressPlain = directions(method.compressPlainRequests, method.compressPlainResponses)
+    // The method's compression goes after the options, as the runtime's last arguments.
+    val compression =
+        listOfNotNull(
+            compressStream?.let { "$runtime.CompressStream.$it" },
+            compressPlain?.let { "compressMessages = $runtime.CompressMessages.$it" },
+        )
     val start = length
     appendLine("    $signature")
     appendLine("        options: $runtime.CallOptions.() -> $runtime.CallOptions = { this },")
-    // The method's stream compression goes after the options, as the runtime's last argument.
-    appendLine(if (compressStream == null) "    $call" else "    ${call.removeSuffix(")")}, $runtime.CompressStream.$compressStream)")
+    appendLine(if (compression.isEmpty()) "    $call" else "    ${call.removeSuffix(")")}, ${compression.joinToString(", ")})")
     if (method.unreliable.any) documentUnreliable(method, start)
     appendLine()
 }
+
+/** The `CompressStream` or `CompressMessages` constant of the directions that compress, or null. */
+private fun directions(
+    requests: Boolean,
+    responses: Boolean,
+): String? =
+    when {
+        requests && responses -> "BOTH"
+        requests -> "REQUESTS"
+        responses -> "RESPONSES"
+        else -> null
+    }
 
 /**
  * Inserts a KDoc block before each public function generated since [start]. The schema marks the

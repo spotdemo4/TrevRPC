@@ -12,6 +12,10 @@ type Dict struct {
 	Fingerprint [8]byte
 }
 
+// NewPlain returns a Dict without a dictionary, which cannot compress or
+// decompress without cgo either.
+func NewPlain(int) *Dict { return &Dict{} }
+
 // NewDict always fails with ErrUnavailable: compression requires cgo.
 func NewDict([]byte, int) (*Dict, error) { return nil, ErrUnavailable }
 

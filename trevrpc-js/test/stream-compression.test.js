@@ -57,7 +57,11 @@ function responseReceiver() {
     withDictionary,
     new StreamBudget(),
     { requests: false, responses: true },
-    { session: { requestDictionary: () => undefined }, requestType: "", accept: dictionary },
+    {
+      session: { requestDictionary: () => undefined },
+      requestType: "",
+      accept: new Map([[dictionary.id, dictionary]]),
+    },
   );
   streams.offer({});
   return streams;

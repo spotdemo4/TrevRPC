@@ -99,7 +99,9 @@ needs no TrevRPC options. Both files import from the include roots
 [`proto/compressed.proto`](proto/compressed.proto) defines
 `trevrpc.interop.v1.CompressedEcho`, whose methods allow
 [stream compression](../wiki/Protocol-and-Wire-Format.md#stream-compression)
-(`compress_stream`), in a separate file for the same reason, and
+(`compress_stream`) or
+[compression without a dictionary](../wiki/Protocol-and-Wire-Format.md#compression-without-a-dictionary)
+(`compress`), in a separate file for the same reason, and
 `trevrpc.interop.v1.RefusingEcho`, whose schema allows it too but which servers
 register by hand without stream compression, as a server built from a schema
 without `compress_stream` would. Servers therefore refuse every
@@ -110,6 +112,7 @@ call to it, and clients must replay the call.
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CompressedEcho.Bidi`         | As `Echo.Bidi`, and its `OK` status carries trailing metadata `interop-stream-compressed-received`: how many requests arrived as ZSTD_STREAM_MESSAGE frames, as a decimal string. |
 | `CompressedEcho.ClientStream` | As `Echo.ClientStream`, and its `OK` status carries trailing metadata `interop-stream-compressed-received` as `CompressedEcho.Bidi`'s does.                                       |
+| `CompressedEcho.Plain`        | Echo `{text}` back, ending with `OK` and trailing metadata `interop-plain-compressed-received`: `1` if the request arrived as a ZSTD_MESSAGE without a dictionary, `0` otherwise. |
 | `RefusingEcho.ClientStream`   | As `Echo.ClientStream`, registered without stream compression.                                                                                                                    |
 
 Every method also handles headers: when request metadata key `interop-header`
@@ -139,9 +142,11 @@ Clients run these in order, each with a 10 second deadline.
 | `compressed`            | `Unary` twice with messages like `{"service":"search","region":"us-east-1","status":404,"latency_ms":100}` (`latency_ms` 100, 101), then `Bidi` sending three such messages (100 … 102) without waiting, then closing the send side                                                 | each message echoed, the stream ones with index 0, 1, 2, then `OK`. With the interop dictionary on both sides the messages travel compressed                                                                                                                                                                                                                                                                                                                                                                 |
 | `compressed-stream`     | `CompressedEcho.Bidi` sending eight messages like those of `compressed` (`latency_ms` 100 … 107), awaiting each echo before the next send, then closing the send side; then `CompressedEcho.ClientStream` sending the same eight messages without waiting and closing the send side | the bidi messages echoed with index 0 … 7, then `OK`; then `{message: <the eight messages concatenated>, index: 8}` and `OK`. Each `OK` carries trailing metadata `interop-stream-compressed-received` of at least 6: the server received the third message and every later one as ZSTD_STREAM_MESSAGE frames                                                                                                                                                                                                |
 | `refused-stream`        | `RefusingEcho.ClientStream` sending the eight messages of `compressed-stream` without waiting and closing the send side; then `compressed-stream`'s `CompressedEcho.Bidi` call; then its `CompressedEcho.ClientStream` call                                                         | `{message: <the eight messages concatenated>, index: 8}` and `OK`, each message received once: the server refused the optimistic call and the client replayed it. Then the bidi messages echoed with index 0 … 7 and `OK` with `interop-stream-compressed-received` of at least 1, since that call is not optimistic and compresses once the answer arrives; then the client-stream echo and `OK` with `interop-stream-compressed-received` of at least 6, since the answer made the client optimistic again |
+| `compressed-plain`      | `CompressedEcho.Plain` twice with `text` the 315-byte JSON record of `plain.records` in [`zstd-golden-vectors.txt`](../testdata/zstd-golden-vectors.txt), twice over (630 characters)                                                                                               | `{text}` echoed and `OK` both times. The second call's `interop-plain-compressed-received` is `1`: the first call's answer let the client compress without a dictionary. The Kotlin client, which never compresses unary requests, sees `0`                                                                                                                                                                                                                                                                  |
 
-Every client runs `compressed-stream` and `refused-stream` and holds compression
-settings for them, so it stream-compresses on every lane. Clients compress their
+Every client runs `compressed-stream`, `refused-stream`, and `compressed-plain`
+and holds compression settings for them, so it stream-compresses, and compresses
+without a dictionary, on every lane. Clients compress their
 requests optimistically from the first call, so nothing waits for the server's
 answer; after the refusal in `refused-stream` they stop until a call is answered,
 which the bidi call of that scenario is, through the HEADERS the server sends at

@@ -127,6 +127,7 @@ where
         server
             .route_message_types(&request.method)
             .map(|types| types.response),
+        server.route_compress(&request.method),
     );
     let body = if request.rpc_kind().has_single_request_message() {
         let accept = budget.accept.clone();
@@ -251,6 +252,10 @@ pub async fn handle_stream<W, R>(
     }
 
     let method_for_failure = request.method.clone();
+    let counts = RequestCounts {
+        plain_compressed: budget.accept.plain_count(),
+        ..RequestCounts::default()
+    };
     let (_request_body, mut request_pump) = start_request_pump(
         recv,
         RequestInputKind::Unary,
@@ -259,7 +264,7 @@ pub async fn handle_stream<W, R>(
     );
     let response = tokio::select! {
         biased;
-        response = server.handle_request_with_cancellation(request, body, cancellation.clone()) => response,
+        response = server.handle_request_with_cancellation(request, body, cancellation.clone(), counts) => response,
         failure = request_pump.failure() => {
             server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
             if let Some(source) = failure.cancellation_source() {
@@ -474,6 +479,7 @@ async fn handle_streaming_rpc<W, R>(
     let max_frame_size = server.max_frame_size();
     let request_body_len = body.len();
     let method_for_failure = request.method.clone();
+    let plain_compressed = budget.accept.plain_count();
     let (request_body, mut request_pump) = start_request_pump(
         recv,
         RequestInputKind::for_rpc_kind(request.rpc_kind()),
@@ -514,6 +520,7 @@ async fn handle_streaming_rpc<W, R>(
             RequestCounts {
                 datagrams: datagram_count,
                 stream_compressed: stream.count,
+                plain_compressed,
             },
         ) => response,
         failure = request_pump.failure() => {

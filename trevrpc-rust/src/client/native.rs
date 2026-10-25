@@ -19,7 +19,7 @@ use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcReques
 
 use super::replay::{Optimism, Replay};
 use super::upload::UploadWriter;
-use super::{CallInfo, MessageTypes, RpcTransport, StreamingRpcTransport};
+use super::{CallInfo, RpcTransport, StreamingRpcTransport};
 use crate::Status;
 
 /// A native `TrevRPC` transport over any multiplexed connection: one RPC per bidirectional
@@ -31,8 +31,9 @@ pub struct NativeTransport<C> {
     /// The connection's datagram demultiplexer, created by the first call that needs it. It is
     /// `None` for connections without datagrams.
     datagrams: Arc<OnceLock<Option<Demux>>>,
-    /// The connection's compression state, `None` without dictionaries.
-    compression: Option<Arc<ClientCompression>>,
+    /// The connection's compression state: its dictionaries, if any, and compression without
+    /// one.
+    compression: Arc<ClientCompression>,
     /// The zstd level of outgoing messages.
     level: i32,
     /// The memory stream compression may hold, `None` when it is disabled.
@@ -52,17 +53,19 @@ impl<C: MuxConnection> NativeTransport<C> {
             connection,
             max_frame_size,
             datagrams: Arc::new(OnceLock::new()),
-            compression: None,
+            compression: ClientCompression::new(CompressionConfig::plain_only()),
             level: CompressionConfig::level(None),
             stream_budget: StreamBudget::new(DEFAULT_CLIENT_MEMORY),
             optimism: Arc::new(Optimism::default()),
         }
     }
 
-    /// Gives the connection the dictionaries of `config`, which it negotiates afresh.
+    /// Gives the connection the dictionaries of `config`, which it negotiates afresh; `None`
+    /// leaves it compression without a dictionary only.
     pub(crate) fn set_compression(&mut self, config: Option<Arc<CompressionConfig>>) {
         self.level = CompressionConfig::level(config.as_ref());
-        self.compression = config.map(ClientCompression::new);
+        self.compression =
+            ClientCompression::new(config.unwrap_or_else(CompressionConfig::plain_only));
     }
 
     /// Makes stream compression hold memory from `budget`, which channels share between their
@@ -71,12 +74,10 @@ impl<C: MuxConnection> NativeTransport<C> {
         self.stream_budget = budget;
     }
 
-    /// Fills the negotiation fields of `request` for a call whose message types are `types`.
-    fn prepare(&self, request: &mut RpcRequest, types: Option<MessageTypes>) -> ClientCall {
+    /// Fills the negotiation fields of `request` for a call described by `info`.
+    fn prepare(&self, request: &mut RpcRequest, info: &CallInfo) -> ClientCall {
         self.compression
-            .as_ref()
-            .map(|compression| compression.prepare(request, types))
-            .unwrap_or_default()
+            .prepare(request, info.message_types, info.compress)
     }
 
     fn demux(&self) -> Option<&Demux> {
@@ -154,7 +155,7 @@ impl<C: MuxConnection> NativeTransport<C> {
         info: CallInfo,
         optimistic: Option<(Replay, Retry)>,
     ) -> Result<BoxStream<ResponseFrame>> {
-        let call = self.prepare(&mut request, info.message_types);
+        let call = self.prepare(&mut request, &info);
         let directions = info
             .compress_stream
             .effective(request.rpc_kind())
@@ -250,7 +251,7 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
         body: Vec<u8>,
         info: CallInfo,
     ) -> Result<ResponseEnvelope<Bytes>> {
-        let negotiated = self.prepare(&mut request, info.message_types);
+        let negotiated = self.prepare(&mut request, &info);
         let (send, recv) = self.connection.open_stream().await?;
         let mut call = UnaryCall {
             send,

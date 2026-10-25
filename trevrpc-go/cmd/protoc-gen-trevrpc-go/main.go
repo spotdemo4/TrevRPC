@@ -260,6 +260,31 @@ func streamCompressionDirections(method *protogen.Method) (requests, responses b
 	return requests, responses
 }
 
+// plainCompressionLiteral returns the Go expression of the PlainCompression
+// value of method, or "" when no direction may be compressed without a
+// dictionary.
+func (g fileGenerator) plainCompressionLiteral(method *protogen.Method) string {
+	requests, responses := plainCompressionDirections(method)
+	if !requests && !responses {
+		return ""
+	}
+	return fmt.Sprintf("%s{Requests: %t, Responses: %t}", g.runtime("PlainCompression"), requests, responses)
+}
+
+// plainCompressionDirections returns the directions of method that its
+// compress option, or compress_stream, which implies it, lets be compressed
+// without a dictionary: those whose message type has no field marked
+// debug_redact.
+func plainCompressionDirections(method *protogen.Method) (requests, responses bool) {
+	options := methodOptions(method)
+	if !options.GetCompress() && !options.GetCompressStream() {
+		return false, false
+	}
+	requests = !hasRedactedField(method.Input.Desc, map[protoreflect.FullName]bool{})
+	responses = !hasRedactedField(method.Output.Desc, map[protoreflect.FullName]bool{})
+	return requests, responses
+}
+
 // hasRedactedField reports whether message has a field marked debug_redact,
 // directly or in a message type it contains. seen holds the types already
 // looked at, so recursive types end.
@@ -291,6 +316,9 @@ func (g fileGenerator) schemaCallOptions(method *protogen.Method) []string {
 	if streams := g.streamCompressionLiteral(method); streams != "" {
 		options = append(options, g.runtime("WithStreamCompression")+"("+streams+")")
 	}
+	if plain := g.plainCompressionLiteral(method); plain != "" {
+		options = append(options, g.runtime("WithPlainCompression")+"("+plain+")")
+	}
 	return options
 }
 
@@ -303,6 +331,9 @@ func (g fileGenerator) schemaRouteOptions(method *protogen.Method) []string {
 	}
 	if streams := g.streamCompressionLiteral(method); streams != "" {
 		options = append(options, g.runtime("RouteStreamCompression")+"("+streams+")")
+	}
+	if plain := g.plainCompressionLiteral(method); plain != "" {
+		options = append(options, g.runtime("RoutePlainCompression")+"("+plain+")")
 	}
 	return options
 }

@@ -10,6 +10,7 @@ import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
+	sync "sync"
 	_ "trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb"
 	unsafe "unsafe"
 )
@@ -21,30 +22,95 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// PlainMessage is not among the interop dictionary's message types, so it
+// compresses without a dictionary.
+type PlainMessage struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Text          string                 `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PlainMessage) Reset() {
+	*x = PlainMessage{}
+	mi := &file_compressed_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PlainMessage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PlainMessage) ProtoMessage() {}
+
+func (x *PlainMessage) ProtoReflect() protoreflect.Message {
+	mi := &file_compressed_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PlainMessage.ProtoReflect.Descriptor instead.
+func (*PlainMessage) Descriptor() ([]byte, []int) {
+	return file_compressed_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *PlainMessage) GetText() string {
+	if x != nil {
+		return x.Text
+	}
+	return ""
+}
+
 var File_compressed_proto protoreflect.FileDescriptor
 
 const file_compressed_proto_rawDesc = "" +
 	"\n" +
-	"\x10compressed.proto\x12\x12trevrpc.interop.v1\x1a\rinterop.proto\x1a\x15trevrpc/options.proto2\xc4\x01\n" +
+	"\x10compressed.proto\x12\x12trevrpc.interop.v1\x1a\rinterop.proto\x1a\x15trevrpc/options.proto\"\"\n" +
+	"\fPlainMessage\x12\x12\n" +
+	"\x04text\x18\x01 \x01(\tR\x04text2\x99\x02\n" +
 	"\x0eCompressedEcho\x12U\n" +
 	"\x04Bidi\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x010\x01\x12[\n" +
-	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x012k\n" +
+	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x01\x12S\n" +
+	"\x05Plain\x12 .trevrpc.interop.v1.PlainMessage\x1a .trevrpc.interop.v1.PlainMessage\"\x06\xba\xb8\x1c\x02 \x012k\n" +
 	"\fRefusingEcho\x12[\n" +
 	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x01b\x06proto3"
 
+var (
+	file_compressed_proto_rawDescOnce sync.Once
+	file_compressed_proto_rawDescData []byte
+)
+
+func file_compressed_proto_rawDescGZIP() []byte {
+	file_compressed_proto_rawDescOnce.Do(func() {
+		file_compressed_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_compressed_proto_rawDesc), len(file_compressed_proto_rawDesc)))
+	})
+	return file_compressed_proto_rawDescData
+}
+
+var file_compressed_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_compressed_proto_goTypes = []any{
-	(*EchoRequest)(nil),  // 0: trevrpc.interop.v1.EchoRequest
-	(*EchoResponse)(nil), // 1: trevrpc.interop.v1.EchoResponse
+	(*PlainMessage)(nil), // 0: trevrpc.interop.v1.PlainMessage
+	(*EchoRequest)(nil),  // 1: trevrpc.interop.v1.EchoRequest
+	(*EchoResponse)(nil), // 2: trevrpc.interop.v1.EchoResponse
 }
 var file_compressed_proto_depIdxs = []int32{
-	0, // 0: trevrpc.interop.v1.CompressedEcho.Bidi:input_type -> trevrpc.interop.v1.EchoRequest
-	0, // 1: trevrpc.interop.v1.CompressedEcho.ClientStream:input_type -> trevrpc.interop.v1.EchoRequest
-	0, // 2: trevrpc.interop.v1.RefusingEcho.ClientStream:input_type -> trevrpc.interop.v1.EchoRequest
-	1, // 3: trevrpc.interop.v1.CompressedEcho.Bidi:output_type -> trevrpc.interop.v1.EchoResponse
-	1, // 4: trevrpc.interop.v1.CompressedEcho.ClientStream:output_type -> trevrpc.interop.v1.EchoResponse
-	1, // 5: trevrpc.interop.v1.RefusingEcho.ClientStream:output_type -> trevrpc.interop.v1.EchoResponse
-	3, // [3:6] is the sub-list for method output_type
-	0, // [0:3] is the sub-list for method input_type
+	1, // 0: trevrpc.interop.v1.CompressedEcho.Bidi:input_type -> trevrpc.interop.v1.EchoRequest
+	1, // 1: trevrpc.interop.v1.CompressedEcho.ClientStream:input_type -> trevrpc.interop.v1.EchoRequest
+	0, // 2: trevrpc.interop.v1.CompressedEcho.Plain:input_type -> trevrpc.interop.v1.PlainMessage
+	1, // 3: trevrpc.interop.v1.RefusingEcho.ClientStream:input_type -> trevrpc.interop.v1.EchoRequest
+	2, // 4: trevrpc.interop.v1.CompressedEcho.Bidi:output_type -> trevrpc.interop.v1.EchoResponse
+	2, // 5: trevrpc.interop.v1.CompressedEcho.ClientStream:output_type -> trevrpc.interop.v1.EchoResponse
+	0, // 6: trevrpc.interop.v1.CompressedEcho.Plain:output_type -> trevrpc.interop.v1.PlainMessage
+	2, // 7: trevrpc.interop.v1.RefusingEcho.ClientStream:output_type -> trevrpc.interop.v1.EchoResponse
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -62,12 +128,13 @@ func file_compressed_proto_init() {
 			GoPackagePath: reflect.TypeFor[x]().PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_compressed_proto_rawDesc), len(file_compressed_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   0,
+			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   2,
 		},
 		GoTypes:           file_compressed_proto_goTypes,
 		DependencyIndexes: file_compressed_proto_depIdxs,
+		MessageInfos:      file_compressed_proto_msgTypes,
 	}.Build()
 	File_compressed_proto = out.File
 	file_compressed_proto_goTypes = nil

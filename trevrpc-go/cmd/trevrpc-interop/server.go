@@ -267,10 +267,26 @@ func (s *unreliableEcho) Close() error { return s.requests.Close() }
 // methods of CompressedEcho.
 const streamCompressedReceivedKey = "interop-stream-compressed-received"
 
+// plainCompressedReceivedKey is the trailing metadata key of
+// CompressedEcho.Plain.
+const plainCompressedReceivedKey = "interop-plain-compressed-received"
+
 // compressedEchoServer implements CompressedEcho in interop/README.md: Echo's
 // Bidi and ClientStream, reporting how many requests arrived
-// stream-compressed.
+// stream-compressed, and Plain, reporting whether its request arrived
+// compressed without a dictionary.
 type compressedEchoServer struct{}
+
+func (compressedEchoServer) Plain(ctx context.Context, request *interoppb.PlainMessage) (*interoppb.PlainMessage, error) {
+	received := "0"
+	if info, ok := trevrpc.HandlerContextFromContext(ctx); ok && info.PlainCompressedRequests() > 0 {
+		received = "1"
+	}
+	if err := trevrpc.SetResponseMetadata(ctx, plainCompressedReceivedKey, []byte(received)); err != nil {
+		return nil, err
+	}
+	return &interoppb.PlainMessage{Text: request.GetText()}, nil
+}
 
 func (compressedEchoServer) ClientStream(ctx context.Context, requests trevrpc.MessageStream[*interoppb.EchoRequest]) (*interoppb.EchoResponse, error) {
 	response, err := echoServer{}.ClientStream(ctx, requests)

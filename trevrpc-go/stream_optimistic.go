@@ -90,7 +90,7 @@ func newOptimisticUpload(ctx context.Context, client *streamClient, stream clien
 		request:    request,
 		accept:     accept,
 		compressor: compressor,
-		per:        client.compression.requestCompressor(),
+		per:        client.compression.requestCompressor(request.plainCompression.Requests),
 		keeping:    true,
 		settled:    make(chan struct{}),
 		decided:    make(chan struct{}),
@@ -145,7 +145,7 @@ func (u *optimisticUpload) encode(message ProtoMessage) (encodedMessage, error) 
 		if err != nil {
 			reservation.release()
 		} else {
-			u.kept = append(u.kept, keptRequest{payload: payload, dict: u.per.dictFor(protoMessage)})
+			u.kept = append(u.kept, keptRequest{payload: payload, dict: u.per.compressorFor(protoMessage)})
 			u.keptBytes += size
 			u.reservations = append(u.reservations, reservation)
 		}

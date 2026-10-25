@@ -94,6 +94,8 @@ type callConfig struct {
 	unreliable       Unreliable
 	// streamCompression is what the call may stream-compress.
 	streamCompression StreamCompression
+	// plainCompression is what the call may compress without a dictionary.
+	plainCompression PlainCompression
 }
 
 // CallOption customizes a single RPC call.
@@ -371,6 +373,7 @@ func prepareClientRequest(method string, kind RPCKind, config callConfig, deadli
 		unreliable:   config.unreliable,
 		// The kind decides which directions stream.
 		streamCompression: config.streamCompression.effective(kind),
+		plainCompression:  config.plainCompression,
 	}, nil
 }
 

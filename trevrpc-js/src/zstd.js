@@ -20,7 +20,8 @@ const FrameLimit = 60 << 10;
 /**
  * Creates the compression settings of a channel: the dictionaries it holds, each with the
  * protobuf message types it compresses, and the zstd level of outgoing messages. Settings without
- * dictionaries still enable stream compression on the methods that allow it.
+ * dictionaries still enable stream compression, and compression without a dictionary, on the
+ * methods that allow them.
  */
 export async function createCompression({ dictionaries = [], level = DefaultLevel } = {}) {
   if (!Number.isInteger(level)) {
@@ -90,12 +91,25 @@ class Compression {
         this.#byType.set(name, dictionary);
       }
     }
-    /** Every dictionary as `{ id, fingerprint }`, a client's dictionary_query. */
-    this.query = Object.freeze(dictionaries.map(({ id, fingerprint }) => ({ id, fingerprint })));
+    /**
+     * Compression without a dictionary, as the dictionary with ID 0 the negotiation treats it as:
+     * `compress(body)` and `decompress(payload, size)` like a dictionary's.
+     */
+    this.plain = codec.plain();
+    this.#byId.set(0, this.plain);
+    /**
+     * A client's dictionary_query: every dictionary as `{ id, fingerprint }`, then `{}`, the
+     * query for compression without a dictionary (ID 0 without a fingerprint, which encodes
+     * as an empty entry).
+     */
+    this.query = Object.freeze([
+      ...dictionaries.map(({ id, fingerprint }) => ({ id, fingerprint })),
+      Object.freeze({}),
+    ]);
     Object.freeze(this);
   }
 
-  /** The dictionary with Dictionary_ID id, or undefined. */
+  /** The dictionary with Dictionary_ID id, `plain` for 0, or undefined. */
   dictionary(id) {
     return this.#byId.get(id);
   }
@@ -179,7 +193,7 @@ class Codec {
   constructor(exports, level) {
     this.#exports = exports;
     this.#level = level;
-    this.#cctx = exports.zs_cctx_new();
+    this.#cctx = exports.zs_cctx_new(level);
     this.#dctx = exports.zs_dctx_new();
     if (this.#cctx === 0 || this.#dctx === 0) {
       throw new Error("zstd: cannot create contexts");
@@ -203,6 +217,17 @@ class Codec {
     });
     this.#handles.set(dictionary, { cdict, ddict });
     return dictionary;
+  }
+
+  /** Compression without a dictionary, as Compression.plain. */
+  plain() {
+    return Object.freeze({
+      id: 0,
+      fingerprint: new Uint8Array(0),
+      messages: Object.freeze([]),
+      compress: (body) => this.#compress(0, body),
+      decompress: (payload, size) => this.#decompress(0, payload, size),
+    });
   }
 
   /** See Compression.streamEncoder. */

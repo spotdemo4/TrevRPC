@@ -212,8 +212,12 @@ func isFrameTooLarge(err error) bool {
 func TestCompressionConfigValidation(t *testing.T) {
 	requireCompression(t)
 	dict := loadZstdVectors(t)["dict.d1.dictionary"]
-	if config, err := newCompressionConfig(&Compression{}); config != nil || err != nil {
-		t.Fatalf("empty Compression = %v, %v", config, err)
+	// Without dictionaries a peer still compresses without one.
+	for _, compression := range []*Compression{nil, {}} {
+		config, err := newCompressionConfig(compression)
+		if err != nil || config == nil || config.dictionaries || config.plain == nil || config.dict(plainDictID) != config.plain {
+			t.Fatalf("Compression %v = %+v, %v", compression, config, err)
+		}
 	}
 	for name, compression := range map[string]*Compression{
 		"raw content":       {Dictionaries: []Dictionary{{Data: []byte("not a zstd dictionary")}}},

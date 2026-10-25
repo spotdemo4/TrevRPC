@@ -15,7 +15,9 @@ use trevrpc::server::{
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, RpcKind, Status};
 
-use crate::proto::{self, CompressedEcho, Echo, EchoRequest, EchoResponse, UnreliableEcho};
+use crate::proto::{
+    self, CompressedEcho, Echo, EchoRequest, EchoResponse, PlainMessage, UnreliableEcho,
+};
 use crate::{BoxError, Flags, connect};
 
 const SUFFIX_METADATA_KEY: &str = "interop-suffix";
@@ -156,6 +158,7 @@ fn echo_each(
 }
 
 const STREAM_COMPRESSED_RECEIVED_METADATA_KEY: &str = "interop-stream-compressed-received";
+const PLAIN_COMPRESSED_RECEIVED_METADATA_KEY: &str = "interop-plain-compressed-received";
 
 struct CompressedEchoService;
 
@@ -194,6 +197,20 @@ impl CompressedEcho for CompressedEchoService {
             context.stream_compressed_requests_received().to_string(),
         )?;
         Ok(response)
+    }
+
+    /// Echoes the text, with trailing metadata `1` if the request arrived compressed without a
+    /// dictionary and `0` otherwise.
+    async fn plain(
+        &self,
+        context: RequestContext,
+        request: PlainMessage,
+    ) -> Result<PlainMessage, Status> {
+        context.set_response_metadata(
+            PLAIN_COMPRESSED_RECEIVED_METADATA_KEY,
+            context.plain_compressed_requests_received().to_string(),
+        )?;
+        Ok(request)
     }
 }
 

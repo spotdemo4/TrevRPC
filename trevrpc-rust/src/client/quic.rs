@@ -34,7 +34,9 @@ impl QuicTransport {
     /// Lets messages travel compressed with the dictionaries of `compression`; see
     /// [`Compression`](crate::Compression). Fails when they are invalid.
     pub fn with_compression(self, compression: &crate::Compression) -> Result<Self> {
-        Ok(self.with_compression_config(crate::compression::CompressionConfig::new(compression)?))
+        Ok(self.with_compression_config(
+            crate::compression::CompressionConfig::new(compression).map(Some)?,
+        ))
     }
 
     pub(crate) fn with_compression_config(

@@ -1,6 +1,6 @@
 // Package zstd implements TrevRPC's ZSTD_MESSAGE payloads: magicless zstd frames
-// compressed with a dictionary both peers hold (see the "Compressed Messages"
-// section of the wire format).
+// compressed with a dictionary both peers hold, or without one (see the
+// "Compressed Messages" section of the wire format).
 //
 // Frame validation is pure Go, so payloads are checked the same way with or
 // without cgo. Compression and decompression call libzstd through cgo and are
@@ -18,8 +18,8 @@ const dictMagic = 0xEC30A437
 
 var (
 	// ErrInvalid reports a payload that is not a single magicless zstd frame
-	// with a Dictionary_ID and a Frame_Content_Size, or that fails to
-	// decompress to exactly that size.
+	// with a Frame_Content_Size, or that fails to decompress to exactly that
+	// size.
 	ErrInvalid = errors.New("zstd: invalid ZSTD_MESSAGE payload")
 	// ErrUnavailable reports that the binary was built without cgo, so it
 	// cannot compress or decompress.
@@ -29,14 +29,15 @@ var (
 // Header is what a receiver needs from a ZSTD_MESSAGE payload before
 // decompressing it.
 type Header struct {
-	// DictID is the Dictionary_ID; never zero.
+	// DictID is the Dictionary_ID, zero for a frame without a dictionary.
 	DictID uint32
 	// ContentSize is the Frame_Content_Size: the size of the message.
 	ContentSize uint64
 }
 
 // ParseHeader validates that payload is exactly one magicless zstd frame with a
-// non-zero Dictionary_ID and a Frame_Content_Size, and returns both. It walks
+// Frame_Content_Size, and returns it and the Dictionary_ID, which is zero when
+// the frame has none or names zero. It walks
 // the block headers to find the frame's end, so trailing bytes, including a
 // second frame, are rejected. Block contents are not checked; decompression
 // does that.
@@ -56,7 +57,7 @@ func ParseHeader(payload []byte) (Header, error) {
 	if fcsFlag == 0 && singleSegment {
 		fcsSize = 1
 	}
-	if didSize == 0 || fcsSize == 0 {
+	if fcsSize == 0 {
 		return Header{}, ErrInvalid
 	}
 	pos := 1
@@ -78,9 +79,6 @@ func ParseHeader(payload []byte) (Header, error) {
 		h.ContentSize += 256
 	}
 	pos += fcsSize
-	if h.DictID == 0 {
-		return Header{}, ErrInvalid
-	}
 	for {
 		next, last, ok := nextBlock(payload, pos)
 		if !ok {
