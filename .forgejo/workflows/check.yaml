@@ -17,6 +17,9 @@ jobs:
   check:
     # zizmor: ignore[excessive-permissions]
     runs-on: ubuntu-26.04
+    # A backstop: max-silent-time below catches a hung build first. A full rebuild without the
+    # binary cache takes well under an hour.
+    timeout-minutes: 60
     steps:
       - name: Initialize
         uses: spotdemo4/nix-init@1501959c395e5bc6d66e87c7b84d1816c1b365bd # v1.73.0
@@ -24,5 +27,7 @@ jobs:
           github_token: ${{ secrets.GH_TOKEN }}
           niks3_url: https://niks3.trev.zip
 
+      # max-silent-time fails a build that prints nothing for 15 minutes, such as a deadlocked
+      # test, instead of letting the job run until it is cancelled.
       - name: Check
-        run: nix flake check --option log-lines 100
+        run: nix flake check --option log-lines 100 --option max-silent-time 900
