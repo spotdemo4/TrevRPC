@@ -64,10 +64,10 @@ class SummaryTest(unittest.TestCase):
         self.assertTrue(lines[0].startswith("scenario" + " " * 18 + "size"))
         bidi, unary = (line.split() for line in lines[1:])
         self.assertEqual(["bidi", "64", "0", "4", "quic", "none", "go", "go"], bidi[:8])
-        # ops/s, msgs/s, MB/s, p50us, p99us, wire_B/msg, lost%
-        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0"], bidi[8:])
+        # ops/s, msgs/s, MB/s, p50us, p99us, wire_B/msg, lost%, spread%
+        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[8:])
         self.assertEqual(["unary", "rust", "go"], [unary[0], unary[6], unary[7]])
-        self.assertEqual(["80", "33.33"], unary[13:])
+        self.assertEqual(["80", "33.33", "-"], unary[13:])
 
     def test_shows_the_compression_mode(self) -> None:
         result = run.parse_result(
@@ -92,6 +92,23 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(["", "netem delay 10ms"], lines[4:6])
         self.assertEqual(8, len(lines))
         self.assertEqual("delay 10ms", results[1].record["netem"])
+
+    def test_repeated_cells_report_the_median_run_and_the_spread(self) -> None:
+        results = [
+            run.parse_result("go", "go", json.dumps({**RESULT, "msgs_per_sec": rate, "msgs": rate}))
+            for rate in (1100.0, 1000.0, 1300.0)
+        ]
+
+        median = run.median_run(results)
+
+        self.assertEqual(1100.0, median.msgs_per_sec)
+        self.assertEqual((1100.0, 1000.0, 1300.0), median.runs)
+        self.assertEqual(3, median.record["repeats"])
+        self.assertEqual([1100.0, 1000.0, 1300.0], median.record["msgs_per_sec_runs"])
+        # (1300 - 1000) / 1100
+        self.assertEqual("27.27", median.row()[-1])
+        self.assertIs(results[0], run.median_run(results[:1]))
+        self.assertEqual(1000.0, run.median_run(results[:2]).msgs_per_sec)
 
     def test_plain_drops_a_trailing_zero(self) -> None:
         self.assertEqual("5", run.plain(5.0))

@@ -17,7 +17,7 @@ bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST]
              [--metadata-sizes LIST] [--payload repeat|records]
              [--compressions LIST] [--duration SECONDS] [--warmup SECONDS]
-             [--messages N] [--netem PROFILE...] [--out DIR]
+             [--messages N] [--repeat N] [--netem PROFILE...] [--out DIR]
 ```
 
 The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients
@@ -31,7 +31,12 @@ table and writes one JSON object per run to `DIR/results.jsonl`; without
 when its client exits non-zero or reports errors.
 
 Timings depend on the machine and on whatever else is running; compare runs
-from the same machine only. Nothing in CI gates on these numbers: the flake
+from the same machine only. `--repeat N` (default 1) runs each cell N times and
+reports the run with the median messages per second; its JSON object adds
+`repeats` and every run's rate as `msgs_per_sec_runs`, and the summary's
+`spread%` column is the range of those rates as a share of the median. Each
+run logs to `CELL-rI.log`. Single runs on a shared machine can be a third off,
+so use at least 3 before reading anything into one cell. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
 
 ## Compression

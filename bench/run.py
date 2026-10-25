@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -73,7 +73,7 @@ COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
 DEADLINE_SLACK = 60
 COLUMNS = (
     "scenario", "size", "md", "conc", "transport", "compression", "client", "server",
-    "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%",
+    "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%", "spread%",
 )  # fmt: skip
 
 
@@ -90,6 +90,8 @@ class Matrix:
     compressions: tuple[str, ...] = ("none",)
     # The trained dictionary, when a mode needs it.
     dictionary: Path | None = None
+    # How many times each cell runs; the median run by messages per second stands for it.
+    repeat: int = 1
 
     @property
     def deadline(self) -> int:
@@ -119,9 +121,16 @@ class Result:
     wire_bytes_per_msg: float | None
     netem: str | None
     record: dict[str, object]
+    # The messages per second of every run of the cell, when it ran more than once.
+    runs: tuple[float, ...] = ()
 
     def row(self) -> list[str]:
         lost = self.lost / (self.lost + self.msgs) * 100 if self.lost > 0 else 0
+        spread = (
+            (max(self.runs) - min(self.runs)) / self.msgs_per_sec * 100
+            if len(self.runs) > 1 and self.msgs_per_sec > 0
+            else None
+        )
         return [
             self.scenario,
             str(self.size),
@@ -138,6 +147,7 @@ class Result:
             str(math.floor(self.p99_us)),
             "-" if self.wire_bytes_per_msg is None else str(math.floor(self.wire_bytes_per_msg)),
             hundredths(lost),
+            "-" if spread is None else hundredths(spread),
         ]
 
     def sort_key(self) -> tuple[str, int, int, int, str, str, str, str]:
@@ -223,6 +233,18 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         netem=netem,
         record=record,
     )
+
+
+def median_run(results: list[Result]) -> Result:
+    """The run with the median messages per second (the lower of the two middle ones for an even
+    count), carrying every run's rate in `runs` and its record."""
+    ordered = sorted(results, key=lambda result: result.msgs_per_sec)
+    median = ordered[(len(ordered) - 1) // 2]
+    if len(results) == 1:
+        return median
+    rates = tuple(result.msgs_per_sec for result in results)
+    record = {**median.record, "repeats": len(results), "msgs_per_sec_runs": list(rates)}
+    return replace(median, runs=rates, record=record)
 
 
 def runs(compression: str, transport: str, scenario: str) -> bool:
@@ -320,6 +342,25 @@ class Runner:
     def run_one(
         self, cell: str, client: str, server: str, netem: str | None, command: list[str]
     ) -> None:
+        """Runs the cell `matrix.repeat` times and records its median run."""
+        results: list[Result] = []
+        repeat = self.matrix.repeat
+        for index in range(repeat):
+            name = cell if repeat == 1 else f"{cell}-r{index + 1}"
+            result = self.run_once(name, client, server, netem, command)
+            if result is None:
+                return
+            results.append(result)
+        result = median_run(results)
+        self.results.append(result)
+        with (self.out / "results.jsonl").open("a", encoding="utf-8") as jsonl:
+            _ = jsonl.write(json.dumps(result.record, separators=(",", ":")) + "\n")
+
+    def run_once(
+        self, cell: str, client: str, server: str, netem: str | None, command: list[str]
+    ) -> Result | None:
+        """Runs the cell once, logging to CELL.log, and returns its result, or None after
+        recording why it failed."""
         log = self.out / f"{cell}.log"
         with log.open("w", encoding="utf-8") as stderr:
             completed = run_with_deadline(
@@ -328,20 +369,18 @@ class Runner:
         line = completed.stdout.strip()
         if completed.returncode is None:
             self.fail(cell, f"timed out after {self.matrix.deadline}s (see {log})")
-            return
+            return None
         if completed.returncode != 0:
             self.fail(cell, f"exited {completed.returncode} (see {log})")
-            return
+            return None
         try:
             result = parse_result(client, server, line, netem)
         except ValueError as error:
             self.fail(cell, f"printed an invalid result ({error}): {line}")
-            return
-        self.results.append(result)
-        with (self.out / "results.jsonl").open("a", encoding="utf-8") as results:
-            _ = results.write(json.dumps(result.record, separators=(",", ":")) + "\n")
+            return None
         if result.errors != 0:
             self.fail(cell, f"reported errors: {line}")
+        return result
 
     def fail(self, cell: str, reason: str) -> None:
         print(f"failed: {cell} {reason}", file=sys.stderr, flush=True)
@@ -379,6 +418,16 @@ def int_list(value: str) -> list[int]:
         raise argparse.ArgumentTypeError(f"expected comma-separated integers: {value!r}") from error
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"expected a positive integer: {value!r}") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer: {value!r}")
+    return parsed
+
+
 def seconds(value: str) -> float:
     try:
         parsed = float(value)
@@ -412,6 +461,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument("--duration", type=seconds, default=5.0)
     _ = parser.add_argument("--warmup", type=seconds, default=1.0)
     _ = parser.add_argument("--messages", type=int, default=100)
+    _ = parser.add_argument(
+        "--repeat",
+        type=positive_int,
+        default=1,
+        metavar="N",
+        help="run each cell N times and report the run with the median messages per second",
+    )
     _ = parser.add_argument(
         "--payload",
         choices=PAYLOADS,
@@ -467,6 +523,7 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
             duration=args.duration,
             warmup=args.warmup,
             messages=args.messages,
+            repeat=args.repeat,
             payload=args.payload,
             compressions=compressions,
             dictionary=dictionary,
