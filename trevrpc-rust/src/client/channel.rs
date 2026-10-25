@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
-use super::pool::{DEFAULT_IDLE_TIMEOUT, default_max_connections};
+use super::pool::{
+    DEFAULT_BYTE_RATE, DEFAULT_CALL_RATE, DEFAULT_IDLE_TIMEOUT, default_max_connections,
+};
 use super::race::{
     DEFAULT_FALLBACK_DELAY, DEFAULT_REPROBE_INTERVAL, Dialer, GenerationTransport, TcpDialer,
     TransportKind, TransportPolicy,
@@ -124,6 +126,8 @@ pub struct ChannelConfig {
     stream_compression_memory: usize,
     max_quic_connections: usize,
     quic_idle_timeout: Duration,
+    quic_call_rate: u64,
+    quic_byte_rate: u64,
 }
 
 impl ChannelConfig {
@@ -141,6 +145,8 @@ impl ChannelConfig {
             stream_compression_memory: DEFAULT_CLIENT_MEMORY,
             max_quic_connections: default_max_connections(),
             quic_idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            quic_call_rate: DEFAULT_CALL_RATE,
+            quic_byte_rate: DEFAULT_BYTE_RATE,
         }
     }
 
@@ -168,12 +174,14 @@ impl ChannelConfig {
         self.stream_compression_memory
     }
 
-    /// Sets the most QUIC connections the channel spreads its calls over. The channel starts with
-    /// one and dials another whenever a new call finds every connection busy, which keeps calls
-    /// on many threads from waiting on each other inside Quinn. A call stays on the connection it
-    /// started on, so streams opened all at once share the first connection. The default is half
-    /// the available parallelism, from one to four; one disables it. `QMux` over TLS always uses
-    /// one connection.
+    /// Sets the most QUIC connections the channel spreads its calls over, which keeps calls on many
+    /// threads from waiting on each other inside Quinn and lets large messages use more than one
+    /// core. The channel starts with one. While it starts calls faster than
+    /// [`Self::with_quic_connection_call_rate`] or moves bytes faster than
+    /// [`Self::with_quic_connection_byte_rate`], it places each call on the connection with the
+    /// fewest in flight, and dials another when every connection carries one of those rates. A call stays on the connection it started on, so streams opened all at once share
+    /// the first connection. The default is half the available parallelism, from one to four; one
+    /// disables it. `QMux` over TLS always uses one connection.
     #[must_use]
     pub const fn with_max_quic_connections(mut self, connections: usize) -> Self {
         self.max_quic_connections = if connections == 0 { 1 } else { connections };
@@ -184,6 +192,26 @@ impl ChannelConfig {
     #[must_use]
     pub const fn max_quic_connections(&self) -> usize {
         self.max_quic_connections
+    }
+
+    /// Sets how many calls per second, per connection, the channel spreads its QUIC calls and dials
+    /// more connections at (see [`Self::with_max_quic_connections`]). Below it, every call goes to
+    /// the first connection, so a slow link with many calls waiting keeps one connection. The
+    /// default is 5,000.
+    #[must_use]
+    pub const fn with_quic_connection_call_rate(mut self, calls_per_second: u64) -> Self {
+        self.quic_call_rate = calls_per_second;
+        self
+    }
+
+    /// Sets how many bytes per second, per connection, the channel spreads its QUIC calls and
+    /// dials more connections at, counting what its connections send and receive (see
+    /// [`Self::with_max_quic_connections`]). The default is 100 MB/s, eight times what a 100 Mbit/s
+    /// link carries.
+    #[must_use]
+    pub const fn with_quic_connection_byte_rate(mut self, bytes_per_second: u64) -> Self {
+        self.quic_byte_rate = bytes_per_second;
+        self
     }
 
     /// Sets how long a QUIC connection the channel added (see
@@ -417,6 +445,8 @@ impl Channel {
             reprobe_interval: config.reprobe_interval,
             max_quic_connections: config.max_quic_connections,
             quic_idle_timeout: config.quic_idle_timeout,
+            quic_call_rate: config.quic_call_rate,
+            quic_byte_rate: config.quic_byte_rate,
             quic_failed_at: Arc::default(),
         };
         let transport = dialer.dial().await?;

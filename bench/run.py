@@ -2,16 +2,17 @@
 """Runs every load-benchmark client against every server over every native transport, plus the
 grpc-go and connect-go baselines; see README.md.
 
-    run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
+    run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
            [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--concurrency LIST]
            [--payload repeat|records] [--compressions LIST]
-           [--duration SECONDS] [--warmup SECONDS] [--messages N] [--netem PROFILE...]
-           [--out DIR]
+           [--duration SECONDS] [--warmup SECONDS] [--messages N]
+           [--repeat N] [--tolerance PERCENT] [--netem PROFILE...] [--out DIR]
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -30,6 +32,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "interop"))
 
 import netem
 import payload
+import tables
 from harness import (
     NamedCommand,
     RunnerError,
@@ -90,12 +93,44 @@ class Matrix:
     compressions: tuple[str, ...] = ("none",)
     # The trained dictionary, when a mode needs it.
     dictionary: Path | None = None
-    # How many times each cell runs; the median run by messages per second stands for it.
+    # How many times each cell runs at most; the median run by messages per second stands for it.
     repeat: int = 1
+    # A cell stops repeating once its runs' messages per second agree within this percentage.
+    tolerance: float = 0.0
+    # Which of the cells the options span run; see tables.py.
+    keep: Callable[[tables.Cell], bool] = lambda _cell: True
 
     @property
     def deadline(self) -> int:
         return int(self.duration + self.warmup + DEADLINE_SLACK)
+
+    def cells(
+        self, client: str, server: str, transport: str, netem: str | None
+    ) -> list[tables.Cell]:
+        """The cells this client runs against this server over the transport and netem profile:
+        every combination that runs (see `runs`) and that `keep` keeps."""
+        return [
+            cell
+            for scenario in self.scenarios
+            for compression in self.compressions
+            if runs(compression, transport, scenario)
+            for size in self.sizes
+            for metadata in self.metadata_sizes
+            for workers in self.concurrency
+            if self.keep(
+                cell := tables.Cell(
+                    client=client,
+                    server=server,
+                    transport=transport,
+                    scenario=scenario,
+                    compression=compression,
+                    size=size,
+                    metadata_size=metadata,
+                    concurrency=workers,
+                    netem=netem,
+                )
+            )
+        ]
 
 
 @dataclass(frozen=True)
@@ -235,6 +270,23 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
     )
 
 
+def spread(results: list[Result]) -> float:
+    """The range of the runs' messages per second as a percentage of their median."""
+    rates = sorted(result.msgs_per_sec for result in results)
+    median = rates[(len(rates) - 1) // 2]
+    return (rates[-1] - rates[0]) / median * 100 if median > 0 else math.inf
+
+
+def agree(results: list[Result], tolerance: float) -> bool:
+    """Whether two of the runs differ in messages per second by at most `tolerance` percent of
+    the lower. The median of runs that include such a pair is one of them or between them, unless
+    a third run lies even closer."""
+    rates = sorted(result.msgs_per_sec for result in results)
+    return any(
+        low > 0 and (high - low) / low * 100 <= tolerance for low, high in itertools.pairwise(rates)
+    )
+
+
 def median_run(results: list[Result]) -> Result:
     """The run with the median messages per second (the lower of the two middle ones for an even
     count), carrying every run's rate in `runs` and its record."""
@@ -309,40 +361,35 @@ class Runner:
         applied, if any."""
         m = self.matrix
         profile = "" if netem is None else "-" + re.sub(r"[^A-Za-z0-9.]+", "_", netem)
-        for scenario in m.scenarios:
-            for compression in m.compressions:
-                if not runs(compression, transport, scenario):
-                    continue
-                mode = ["--payload", m.payload, "--compression", compression]
-                if compression in DICTIONARY_COMPRESSIONS and m.dictionary is not None:
-                    mode += ["--dictionary", str(m.dictionary)]
-                suffix = "" if compression == "none" else f"-{compression}"
-                for size in m.sizes:
-                    for metadata in m.metadata_sizes:
-                        for workers in m.concurrency:
-                            cell = (
-                                f"{client}-{transport}-to-{server}-{scenario}{suffix}-{size}"
-                                f"-md{metadata}-c{workers}{profile}"
-                            )
-                            self.run_one(
-                                cell,
-                                client,
-                                server,
-                                netem,
-                                [
-                                    *command, "bench", *flags, "--transport", transport,
-                                    "--scenario", scenario, "--size", str(size),
-                                    "--metadata-size", str(metadata),
-                                    "--concurrency", str(workers),
-                                    "--duration", plain(m.duration), "--warmup", plain(m.warmup),
-                                    "--messages", str(m.messages), *mode,
-                                ],
-                            )  # fmt: skip
+        for cell in m.cells(client, server, transport, netem):
+            mode = ["--payload", m.payload, "--compression", cell.compression]
+            if cell.compression in DICTIONARY_COMPRESSIONS and m.dictionary is not None:
+                mode += ["--dictionary", str(m.dictionary)]
+            suffix = "" if cell.compression == "none" else f"-{cell.compression}"
+            name = (
+                f"{client}-{transport}-to-{server}-{cell.scenario}{suffix}-{cell.size}"
+                f"-md{cell.metadata_size}-c{cell.concurrency}{profile}"
+            )
+            self.run_one(
+                name,
+                client,
+                server,
+                netem,
+                [
+                    *command, "bench", *flags, "--transport", transport,
+                    "--scenario", cell.scenario, "--size", str(cell.size),
+                    "--metadata-size", str(cell.metadata_size),
+                    "--concurrency", str(cell.concurrency),
+                    "--duration", plain(m.duration), "--warmup", plain(m.warmup),
+                    "--messages", str(m.messages), *mode,
+                ],
+            )  # fmt: skip
 
     def run_one(
         self, cell: str, client: str, server: str, netem: str | None, command: list[str]
     ) -> None:
-        """Runs the cell `matrix.repeat` times and records its median run."""
+        """Runs the cell up to `matrix.repeat` times, stopping once two runs agree within
+        `matrix.tolerance` (see `agree`), and records its median run."""
         results: list[Result] = []
         repeat = self.matrix.repeat
         for index in range(repeat):
@@ -351,6 +398,8 @@ class Runner:
             if result is None:
                 return
             results.append(result)
+            if agree(results, self.matrix.tolerance):
+                break
         result = median_run(results)
         self.results.append(result)
         with (self.out / "results.jsonl").open("a", encoding="utf-8") as jsonl:
@@ -428,6 +477,16 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def percent(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"expected a percentage: {value!r}") from error
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative percentage: {value!r}")
+    return parsed
+
+
 def seconds(value: str) -> float:
     try:
         parsed = float(value)
@@ -439,6 +498,10 @@ def seconds(value: str) -> float:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    # A table's options become the defaults, so that explicit flags still win.
+    table_parser = argparse.ArgumentParser(add_help=False)
+    _ = table_parser.add_argument("--table", choices=tables.TABLES)
+    table_name = cast(str | None, table_parser.parse_known_args(argv)[0].table)
     parser = argparse.ArgumentParser(
         prog="trevrpc-bench",
         description="Runs every load-benchmark client against every server, plus the grpc-go and "
@@ -466,7 +529,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=positive_int,
         default=1,
         metavar="N",
-        help="run each cell N times and report the run with the median messages per second",
+        help="run each cell up to N times and report the run with the median messages per second",
+    )
+    _ = parser.add_argument(
+        "--tolerance",
+        type=percent,
+        default=0.0,
+        metavar="PERCENT",
+        help="with --repeat, stop repeating a cell once two runs agree within this percentage",
+    )
+    _ = parser.add_argument(
+        "--table",
+        choices=tables.TABLES,
+        help="run only the cells one table of the wiki's Benchmarks page reads: "
+        + "; ".join(f"{name} ({table.description})" for name, table in tables.TABLES.items()),
     )
     _ = parser.add_argument(
         "--payload",
@@ -493,7 +569,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument(
         "--out", type=Path, help="where results go (default: a new trevrpc-bench.* in $TMPDIR)"
     )
+    options = dict(tables.TABLES[table_name].options) if table_name is not None else {}
+    # --netem appends, so a table's profiles apply only when the command line names none.
+    table_netem = cast(list[str], options.pop("netem", []))
+    parser.set_defaults(**options)
     args = parse_with_defaults(parser, argv, ("server", "client", "baseline"))
+    if not args.netem:
+        args.netem = table_netem
     if (not args.server or not args.client) and args.baseline is None:
         parser.error("need at least one --server and one --client, or --baseline")
     if unknown := set(args.compressions) - set(COMPRESSIONS):
@@ -501,6 +583,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.payload == "repeat" and set(args.compressions) != {"none"}:
         parser.error("compression modes other than none need --payload records")
     return args
+
+
+def build_matrix(args: argparse.Namespace, dictionary: Path | None = None) -> Matrix:
+    return Matrix(
+        scenarios=args.scenarios,
+        sizes=args.sizes,
+        metadata_sizes=args.metadata_sizes,
+        concurrency=args.concurrency,
+        duration=args.duration,
+        warmup=args.warmup,
+        messages=args.messages,
+        repeat=args.repeat,
+        tolerance=args.tolerance,
+        keep=tables.TABLES[args.table].keep if args.table else (lambda _cell: True),
+        payload=args.payload,
+        compressions=tuple(args.compressions),
+        dictionary=dictionary,
+    )
 
 
 def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
@@ -514,22 +614,7 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
         if servers and set(compressions) & set(DICTIONARY_COMPRESSIONS)
         else None
     )
-    runner = Runner(
-        Matrix(
-            scenarios=args.scenarios,
-            sizes=args.sizes,
-            metadata_sizes=args.metadata_sizes,
-            concurrency=args.concurrency,
-            duration=args.duration,
-            warmup=args.warmup,
-            messages=args.messages,
-            repeat=args.repeat,
-            payload=args.payload,
-            compressions=compressions,
-            dictionary=dictionary,
-        ),
-        out,
-    )
+    runner = Runner(build_matrix(args, dictionary), out)
     profiles: list[str | None] = [*args.netem] or [None]
     if args.netem:
         netem.configure(args.netem)

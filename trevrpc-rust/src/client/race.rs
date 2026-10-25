@@ -160,6 +160,10 @@ pub struct Dialer {
     pub(crate) max_quic_connections: usize,
     /// How long a connection a generation added may go unused before it closes.
     pub(crate) quic_idle_timeout: Duration,
+    /// How many calls per second, per connection, a generation spreads and grows at.
+    pub(crate) quic_call_rate: u64,
+    /// How many bytes per second, per connection, a generation spreads and grows at.
+    pub(crate) quic_byte_rate: u64,
     /// When QUIC last lost a race, or `None` while QUIC is preferred.
     pub(crate) quic_failed_at: Arc<Mutex<Option<Instant>>>,
 }

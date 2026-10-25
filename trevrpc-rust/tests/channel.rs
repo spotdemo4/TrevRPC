@@ -279,6 +279,11 @@ async fn concurrent_calls(client: &Channel, count: usize) -> TestResult {
     Ok(())
 }
 
+/// Spreads calls at any call rate, so that tests reach it with a few slow calls.
+const fn fast(config: ChannelConfig) -> ChannelConfig {
+    config.with_quic_connection_call_rate(1)
+}
+
 /// Keeps making bursts of calls until the channel spreads them over `count` connections. Each
 /// burst that finds every connection busy dials one more.
 async fn grow_to(client: &Channel, count: usize) -> TestResult {
@@ -305,7 +310,11 @@ async fn wait_for_connections(client: &Channel, count: usize) -> TestResult {
 #[tokio::test]
 async fn busy_calls_spread_over_added_connections_up_to_the_limit() -> TestResult {
     let server = RawServer::spawn_with_delay(false, Duration::from_millis(100))?;
-    let client = connect_pooled(&server, ChannelConfig::new().with_max_quic_connections(3)).await?;
+    let client = connect_pooled(
+        &server,
+        fast(ChannelConfig::new().with_max_quic_connections(3)),
+    )
+    .await?;
 
     grow_to(&client, 3).await?;
     concurrent_calls(&client, 12).await?;
@@ -318,9 +327,45 @@ async fn busy_calls_spread_over_added_connections_up_to_the_limit() -> TestResul
 }
 
 #[tokio::test]
+async fn moving_bytes_fast_spreads_calls_at_any_call_rate() -> TestResult {
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(100))?;
+    let config = ChannelConfig::new()
+        .with_max_quic_connections(2)
+        .with_quic_connection_call_rate(u64::MAX)
+        .with_quic_connection_byte_rate(1);
+    let client = connect_pooled(&server, config).await?;
+
+    grow_to(&client, 2).await?;
+    ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 2);
+
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn slow_calls_keep_one_connection_however_many_are_in_flight() -> TestResult {
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(100))?;
+    let client = connect_pooled(&server, ChannelConfig::new().with_max_quic_connections(3)).await?;
+
+    // Eight calls in flight at a time, but fewer than 100 starting per second.
+    for _ in 0..5 {
+        concurrent_calls(&client, 8).await?;
+    }
+    ensure_eq!(client.quic_connections().len(), 1);
+    ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 1);
+
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn one_connection_when_the_limit_is_one() -> TestResult {
     let server = RawServer::spawn_with_delay(false, Duration::from_millis(50))?;
-    let client = connect_pooled(&server, ChannelConfig::new().with_max_quic_connections(1)).await?;
+    let client = connect_pooled(
+        &server,
+        fast(ChannelConfig::new()).with_max_quic_connections(1),
+    )
+    .await?;
 
     concurrent_calls(&client, 8).await?;
     ensure_eq!(client.quic_connections().len(), 1);
@@ -333,7 +378,7 @@ async fn one_connection_when_the_limit_is_one() -> TestResult {
 #[tokio::test]
 async fn added_connections_close_once_idle() -> TestResult {
     let server = RawServer::spawn_with_delay(false, Duration::from_millis(100))?;
-    let config = ChannelConfig::new()
+    let config = fast(ChannelConfig::new())
         .with_max_quic_connections(3)
         .with_quic_connection_idle_timeout(Duration::from_millis(200));
     let client = connect_pooled(&server, config).await?;
@@ -351,7 +396,7 @@ async fn added_connections_close_once_idle() -> TestResult {
 #[tokio::test]
 async fn losing_the_first_connection_drains_the_added_ones() -> TestResult {
     let server = RawServer::spawn_with_delay(false, Duration::from_millis(300))?;
-    let config = ChannelConfig::new()
+    let config = fast(ChannelConfig::new())
         .with_max_quic_connections(2)
         .with_reconnect_backoff(FixedBackoff(Duration::from_millis(50)));
     let client = connect_pooled(&server, config).await?;

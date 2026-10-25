@@ -157,5 +157,97 @@ class MatrixTest(unittest.TestCase):
         self.assertEqual(60, matrix.deadline)
 
 
+class TableTest(unittest.TestCase):
+    # Which client runs against which server over which transport: the packaged runtimes against
+    # each other, and the baseline's clients against the baseline.
+    PAIRS = [
+        (client, server, transport)
+        for client in ("go", "rust")
+        for server in ("go", "rust")
+        for transport in ("quic", "tcp")
+    ] + [("grpc", "grpc", "grpc"), ("connect", "connect", "connect")]
+
+    def cells(self, table: str) -> dict[tuple[str, str], int]:
+        args = run.parse_args(
+            ["--table", table, "--server", "go=go", "--server", "rust=rust",
+             "--client", "go=go", "--client", "rust=rust", "--baseline", "baseline"]
+        )  # fmt: skip
+        matrix = run.build_matrix(args)
+        counts: dict[tuple[str, str], int] = {}
+        for client, server, transport in self.PAIRS:
+            for profile in args.netem or [None]:
+                count = len(matrix.cells(client, server, transport, profile))
+                if count:
+                    self.assertEqual(client, server, (table, client, server))
+                    key = (client, transport)
+                    counts[key] = counts.get(key, 0) + count
+        return counts
+
+    def test_tables_run_only_the_cells_their_wiki_table_reads(self) -> None:
+        self.assertEqual(
+            {("go", "quic"): 12, ("go", "tcp"): 12, ("rust", "quic"): 12, ("rust", "tcp"): 12,
+             ("grpc", "grpc"): 12, ("connect", "connect"): 12},
+            self.cells("comparison"),
+        )  # fmt: skip
+        self.assertEqual(
+            {("go", "quic"): 12, ("go", "tcp"): 4, ("rust", "quic"): 10, ("rust", "tcp"): 8,
+             ("grpc", "grpc"): 15, ("connect", "connect"): 9},
+            self.cells("compression"),
+        )  # fmt: skip
+        self.assertEqual(
+            {("rust", "quic"): 12, ("grpc", "grpc"): 9, ("connect", "connect"): 3},
+            self.cells("link"),
+        )
+        self.assertEqual(12, self.cells("lossy")[("go", "quic")])
+        self.assertEqual({("go", "quic"): 6, ("rust", "quic"): 6}, self.cells("datagrams"))
+
+    def test_explicit_flags_override_the_table(self) -> None:
+        args = run.parse_args(
+            ["--table", "lossy", "--netem", "delay 1ms", "--sizes", "64", "--baseline", "b"]
+        )
+
+        self.assertEqual(["delay 1ms"], args.netem)
+        self.assertEqual([64], args.sizes)
+        self.assertEqual(10.0, args.duration)
+
+
+class RepeatTest(unittest.TestCase):
+    def results(self, *rates: float) -> list[run.Result]:
+        return [
+            run.parse_result("go", "go", json.dumps({**RESULT, "msgs_per_sec": rate}))
+            for rate in rates
+        ]
+
+    def test_spread_is_the_range_as_a_share_of_the_median(self) -> None:
+        self.assertEqual(2.0, run.spread(self.results(1000, 1020)))
+        self.assertAlmostEqual(27.27, run.spread(self.results(1000, 1300, 1100)), places=2)
+
+    def test_two_runs_agree_when_they_differ_by_at_most_the_tolerance(self) -> None:
+        self.assertTrue(run.agree(self.results(1000, 1030), 3))
+        self.assertFalse(run.agree(self.results(1000, 1031), 3))
+        self.assertTrue(run.agree(self.results(1000, 1300, 1290), 3))
+        self.assertFalse(run.agree(self.results(1000), 3))
+
+    def test_cells_stop_repeating_once_two_runs_agree(self) -> None:
+        rates = iter([1000.0, 1300.0, 1290.0, 999.0])
+        runner = run.Runner(
+            run.Matrix(["unary"], [64], [0], [1], 0.2, 0, 10, repeat=5, tolerance=3), Path("/")
+        )
+        calls: list[str] = []
+
+        def run_once(name: str, *_: object) -> run.Result:
+            calls.append(name)
+            return self.results(next(rates))[0]
+
+        runner.run_once = run_once  # pyright: ignore[reportAttributeAccessIssue]
+        with tempfile.TemporaryDirectory() as out:
+            runner.out = Path(out)
+            runner.run_one("cell", "go", "go", None, [])
+
+        # 1000 and 1300 differ by 30%; 1300 and 1290 agree within 3% of the median, 1290.
+        self.assertEqual(["cell-r1", "cell-r2", "cell-r3"], calls)
+        self.assertEqual(1290.0, runner.results[0].msgs_per_sec)
+
+
 if __name__ == "__main__":
     _ = unittest.main()

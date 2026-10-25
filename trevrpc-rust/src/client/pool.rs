@@ -3,15 +3,22 @@
 //! Quinn guards each connection with one lock, which every stream operation and the connection's
 //! packet processing take. Calls that share a connection from many threads wait on each other:
 //! on 8 threads, 64 concurrent unary calls ran 2.5 times as fast over four connections as over
-//! one. A pool starts with its generation's connection and dials another, up to its limit,
-//! whenever a new call finds every connection busy. The connections it added close once they
-//! sit idle, and when the generation ends, as soon as their last call finishes.
+//! one. Contention follows how fast calls start, not how many are in flight: on a slow link many
+//! calls wait a round trip each without touching the lock. Large messages hit a second limit: one
+//! connection's packet processing runs on one core, which carried about 500 MB/s on the bench host.
+//!
+//! A pool starts with its generation's connection. While the channel starts calls faster than its
+//! call rate, or moves bytes faster than its byte rate, it places each call on the connection with
+//! the fewest in flight, and dials another, up to its limit, when every connection carries one of
+//! those rates and two calls. Below both, every call goes to the generation's connection, so the
+//! ones it added fall idle and close; they also close when the generation ends, as soon as their
+//! last call finishes.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_core::Stream;
@@ -22,8 +29,21 @@ use super::{CallInfo, QuicTransport, RpcTransport, StreamingRpcTransport};
 use crate::sync::RwLockExt as _;
 use crate::{BoxStream, ResponseEnvelope, ResponseFrame, Result, RpcRequest};
 
-/// A new call that finds at least this many calls on every connection dials another one.
+/// A new call dials another connection only if it finds at least this many calls on every one, so
+/// that the calls can use it.
 const BUSY_CALLS: usize = 2;
+
+/// How many calls per second, per connection, the pool spreads and grows at, by default. On the
+/// bench host (8 threads) four workers on one connection already ran at 23k unary calls per second
+/// against 35k on two, while 64 workers over a 20 ms round trip start only 3,200.
+pub const DEFAULT_CALL_RATE: u64 = 5_000;
+
+/// How many bytes per second, per connection, the pool spreads and grows at, by default: a fifth of
+/// what one connection carried on the bench host, and eight times what a 100 Mbit/s link can.
+pub const DEFAULT_BYTE_RATE: u64 = 100_000_000;
+
+/// The shortest window the rates are measured over.
+const RATE_WINDOW: Duration = Duration::from_millis(100);
 
 /// How long a connection the pool added may go unused before it closes, by default.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,6 +76,11 @@ struct Pool {
     dialer: Dialer,
     max: usize,
     idle_timeout: Duration,
+    /// Calls per second, per connection, to spread and grow at.
+    call_rate: u64,
+    /// Bytes per second, per connection, to spread and grow at.
+    byte_rate: u64,
+    load: Load,
     dialing: AtomicBool,
     /// Becomes `true` when the pool is dropped, which drains the added connections.
     dropped: watch::Sender<bool>,
@@ -69,21 +94,38 @@ struct Member {
     used: AtomicBool,
     /// Notified when the last call in flight ends.
     idle: Notify,
+    /// The bytes the connection had sent and received when the pool last looked.
+    bytes: AtomicU64,
 }
 
 impl Member {
     fn new(transport: QuicTransport) -> Arc<Self> {
+        let bytes = AtomicU64::new(udp_bytes(transport.connection()));
         Arc::new(Self {
             transport,
             calls: AtomicUsize::new(0),
             used: AtomicBool::new(false),
             idle: Notify::new(),
+            bytes,
         })
     }
 
     const fn connection(&self) -> &quinn::Connection {
         self.transport.connection()
     }
+
+    /// The bytes the connection moved since this was last called.
+    fn moved(&self) -> u64 {
+        let now = udp_bytes(self.connection());
+        now.saturating_sub(self.bytes.swap(now, Ordering::Relaxed))
+    }
+}
+
+/// The UDP bytes a connection has sent and received. Reading them takes the connection's lock,
+/// which is why the pool does it once per window.
+fn udp_bytes(connection: &quinn::Connection) -> u64 {
+    let stats = connection.stats();
+    stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes)
 }
 
 /// Counts a call against its connection until it is dropped.
@@ -108,6 +150,9 @@ impl QuicPool {
                 max: dialer.max_quic_connections.max(1),
                 // `tokio::time::interval` rejects a zero period.
                 idle_timeout: dialer.quic_idle_timeout.max(Duration::from_millis(1)),
+                call_rate: dialer.quic_call_rate.max(1),
+                byte_rate: dialer.quic_byte_rate.max(1),
+                load: Load::new(),
                 dialer,
                 dialing: AtomicBool::new(false),
                 dropped: watch::Sender::new(false),
@@ -136,15 +181,18 @@ impl QuicPool {
         }
     }
 
-    /// Picks the connection with the fewest calls in flight for a new call, and dials another one
-    /// when even that one is busy.
+    /// Picks the connection for a new call: the one with the fewest calls in flight while the
+    /// pool reaches its call or byte rate, and the generation's own otherwise. Dials another one
+    /// when every connection carries one of those rates and is busy.
     fn pick(&self) -> (QuicTransport, CallGuard) {
         let pool = &self.inner;
+        let rates = pool.load.record(|| pool.moved());
+        let spread = pool.reaches(rates, 1);
         let (member, least, open) = {
             let added = pool.added.read_unpoisoned();
             let mut member = &pool.primary;
             let mut least = member.calls.load(Ordering::Relaxed);
-            for candidate in added.iter() {
+            for candidate in added.iter().filter(|_| spread) {
                 let calls = candidate.calls.load(Ordering::Relaxed);
                 if calls < least {
                     member = candidate;
@@ -156,7 +204,7 @@ impl QuicPool {
             member.used.store(true, Ordering::Relaxed);
             (Arc::clone(member), least, added.len().saturating_add(1))
         };
-        if least >= BUSY_CALLS && open < pool.max {
+        if spread && least >= BUSY_CALLS && open < pool.max && pool.reaches(rates, open) {
             self.grow();
         }
         (member.transport.clone(), CallGuard(member))
@@ -188,7 +236,87 @@ impl QuicPool {
     }
 }
 
+/// How fast a pool starts calls and moves bytes, measured over windows of at least
+/// [`RATE_WINDOW`]. Every call counts itself, and the call that finds the window over turns it
+/// into rates.
+struct Load {
+    epoch: Instant,
+    /// When the current window started, in milliseconds since `epoch`.
+    window_start: AtomicU64,
+    /// The calls started in the current window.
+    window_calls: AtomicU64,
+    /// Over the last window that ended: calls started per second.
+    calls: AtomicU64,
+    /// Over the last window that ended: bytes sent and received per second.
+    bytes: AtomicU64,
+}
+
+/// The rates of the last window, for the whole pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rates {
+    calls: u64,
+    bytes: u64,
+}
+
+impl Load {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            window_start: AtomicU64::new(0),
+            window_calls: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts a call started now and returns the rates. `moved` returns the bytes the pool's
+    /// connections moved since it was last asked; it runs once per window.
+    fn record(&self, moved: impl FnOnce() -> u64) -> Rates {
+        self.record_at(self.epoch.elapsed(), moved)
+    }
+
+    fn record_at(&self, now: Duration, moved: impl FnOnce() -> u64) -> Rates {
+        self.window_calls.fetch_add(1, Ordering::Relaxed);
+        let now = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+        let start = self.window_start.load(Ordering::Relaxed);
+        let elapsed = now.saturating_sub(start);
+        // A window that a pause stretched out yields low rates, which the next window corrects.
+        if u128::from(elapsed) >= RATE_WINDOW.as_millis()
+            && self
+                .window_start
+                .compare_exchange(start, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let per_second =
+                |count: u64| count.saturating_mul(1000).checked_div(elapsed).unwrap_or(0);
+            let calls = self.window_calls.swap(0, Ordering::Relaxed);
+            self.calls.store(per_second(calls), Ordering::Relaxed);
+            self.bytes.store(per_second(moved()), Ordering::Relaxed);
+        }
+        Rates {
+            calls: self.calls.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl Pool {
+    /// Whether `rates` reach the call or byte rate for each of `connections`.
+    fn reaches(&self, rates: Rates, connections: usize) -> bool {
+        let connections = u64::try_from(connections).unwrap_or(u64::MAX);
+        rates.calls >= self.call_rate.saturating_mul(connections)
+            || rates.bytes >= self.byte_rate.saturating_mul(connections)
+    }
+
+    /// The bytes every connection moved since this was last called.
+    fn moved(&self) -> u64 {
+        let added = self.added.read_unpoisoned();
+        std::iter::once(&self.primary)
+            .chain(added.iter())
+            .map(|member| member.moved())
+            .fold(0, u64::saturating_add)
+    }
+
     fn add(pool: &Arc<Self>, transport: QuicTransport) {
         let member = Member::new(transport);
         {
@@ -339,5 +467,35 @@ impl StreamingRpcTransport for QuicPool {
             inner,
             _guard: guard,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rates_are_measured_over_windows() {
+        let load = Load::new();
+        let ms = Duration::from_millis;
+        let none = Rates { calls: 0, bytes: 0 };
+        // No window has ended yet, so bytes are not read: they would show in the rates.
+        for i in 0..50 {
+            assert_eq!(load.record_at(ms(i), || 1 << 40), none);
+        }
+        // The 51st call ends a 100 ms window of 51 calls and 2 MB.
+        assert_eq!(
+            load.record_at(ms(100), || 2_000_000),
+            Rates {
+                calls: 510,
+                bytes: 20_000_000
+            }
+        );
+        // A window stretched by a pause reads low.
+        assert_eq!(load.record_at(ms(1100), || 0), Rates { calls: 1, bytes: 0 });
+        for i in 0..999 {
+            load.record_at(ms(1100 + i / 10), || 0);
+        }
+        assert_eq!(load.record_at(ms(1200), || 0).calls, 10_000);
     }
 }

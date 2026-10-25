@@ -13,11 +13,13 @@ nix run .#trevrpc-bench -- --scenarios unary,bidi --sizes 64,4096 --duration 10
 nix run .#trevrpc-bench -- --netem 'delay 10ms' --netem 'delay 10ms loss 1%'
 nix run .#trevrpc-bench -- --payload records --compressions none,gzip,zstd,dictionary,stream,stream-dictionary \
   --scenarios unary,client-stream,bidi --sizes 256,1024,4096
-bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD]
+nix run .#trevrpc-bench -- --table comparison --repeat 3 --tolerance 3
+bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST]
              [--metadata-sizes LIST] [--payload repeat|records]
              [--compressions LIST] [--duration SECONDS] [--warmup SECONDS]
-             [--messages N] [--repeat N] [--netem PROFILE...] [--out DIR]
+             [--messages N] [--repeat N] [--tolerance PERCENT]
+             [--netem PROFILE...] [--out DIR]
 ```
 
 The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients
@@ -31,12 +33,23 @@ table and writes one JSON object per run to `DIR/results.jsonl`; without
 when its client exits non-zero or reports errors.
 
 Timings depend on the machine and on whatever else is running; compare runs
-from the same machine only. `--repeat N` (default 1) runs each cell N times and
-reports the run with the median messages per second; its JSON object adds
-`repeats` and every run's rate as `msgs_per_sec_runs`, and the summary's
+from the same machine only. `--repeat N` (default 1) runs each cell up to N
+times and reports the run with the median messages per second; its JSON object
+adds `repeats` and every run's rate as `msgs_per_sec_runs`, and the summary's
 `spread%` column is the range of those rates as a share of the median. Each
 run logs to `CELL-rI.log`. Single runs on a shared machine can be a third off,
-so use at least 3 before reading anything into one cell. Nothing in CI gates on these numbers: the flake
+so use at least 3 before reading anything into one cell. `--tolerance PERCENT`
+stops repeating a cell as soon as two of its runs differ by at most that
+share of the lower one, so steady cells take two runs and noisy ones up to N.
+
+`--table NAME` runs only the cells that one table of the wiki's Benchmarks page
+reads, with that table's options (scenarios, sizes, concurrency, payload,
+compression modes, netem profiles, messages, duration) as defaults; explicit
+flags still override them. The tables are in [`tables.py`](tables.py):
+`comparison`, `compression`, `link`, `lossy`, `metadata`, and `datagrams`.
+They refer to the packaged servers and clients by name (`go`, `rust`, and the
+baseline's `grpc` and `connect`) and run each TrevRPC client against its own
+runtime's server only. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
 
 ## Compression
