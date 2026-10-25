@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::pool::QuicPool;
 use super::{CallInfo, QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
 use crate::compression::{CompressionConfig, StreamBudget};
 use crate::sync::MutexExt as _;
@@ -42,7 +43,8 @@ pub enum TransportKind {
 /// The established transport of one connection generation.
 #[derive(Clone)]
 pub enum GenerationTransport {
-    Quic(QuicTransport),
+    /// One or more QUIC connections; see [`QuicPool`].
+    Quic(QuicPool),
     Qmux(QmuxTransport),
 }
 
@@ -57,8 +59,8 @@ impl GenerationTransport {
     /// Resolves once the connection has ended.
     pub(crate) async fn closed(&self) {
         match self {
-            Self::Quic(transport) => {
-                transport.connection().closed().await;
+            Self::Quic(pool) => {
+                pool.primary().closed().await;
             }
             Self::Qmux(transport) => {
                 transport.closed().await;
@@ -68,7 +70,7 @@ impl GenerationTransport {
 
     pub(crate) fn close(&self, reason: &[u8]) {
         match self {
-            Self::Quic(transport) => transport.connection().close(0_u32.into(), reason),
+            Self::Quic(pool) => pool.close(reason),
             Self::Qmux(transport) => transport.close(),
         }
     }
@@ -154,6 +156,10 @@ pub struct Dialer {
     pub(crate) tcp: Option<TcpDialer>,
     pub(crate) fallback_delay: Duration,
     pub(crate) reprobe_interval: Duration,
+    /// The most QUIC connections a generation spreads its calls over.
+    pub(crate) max_quic_connections: usize,
+    /// How long a connection a generation added may go unused before it closes.
+    pub(crate) quic_idle_timeout: Duration,
     /// When QUIC last lost a race, or `None` while QUIC is preferred.
     pub(crate) quic_failed_at: Arc<Mutex<Option<Instant>>>,
 }
@@ -219,18 +225,25 @@ impl Dialer {
     }
 
     async fn dial_quic(&self) -> Result<GenerationTransport> {
+        let primary = self.dial_quic_transport().await?;
+        Ok(GenerationTransport::Quic(QuicPool::new(
+            primary,
+            self.clone(),
+        )))
+    }
+
+    /// Dials one QUIC connection, with the channel's settings.
+    pub(crate) async fn dial_quic_transport(&self) -> Result<QuicTransport> {
         let connection = self
             .endpoint
             .connect(self.remote_addr, &self.server_name)
             .map_err(Error::transport)?
             .await
             .map_err(Error::transport)?;
-        Ok(GenerationTransport::Quic(
-            QuicTransport::new(connection)
-                .with_max_frame_size(self.max_frame_size)
-                .with_compression_config(self.compression.clone())
-                .with_stream_budget(self.stream_budget.clone()),
-        ))
+        Ok(QuicTransport::new(connection)
+            .with_max_frame_size(self.max_frame_size)
+            .with_compression_config(self.compression.clone())
+            .with_stream_budget(self.stream_budget.clone()))
     }
 
     async fn dial_tcp(&self, tcp: &TcpDialer) -> Result<GenerationTransport> {

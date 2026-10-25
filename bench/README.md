@@ -124,7 +124,9 @@ for the whole run.
 - `--transport quic` dials native QUIC at `--addr`. `--transport tcp` dials
   QMux over TLS at `--tcp-addr`. `--transport grpc` and `--transport connect`
   are the baseline's gRPC and Connect clients at `--addr`. Every worker shares
-  one connection.
+  one channel, which uses one connection, except that a TrevRPC client uses
+  its runtime's defaults: the Rust channel spreads QUIC calls over several
+  connections (see the Rust guide).
 - `--size` (default 64) is the length of `EchoRequest.message` in bytes.
 - `--concurrency` (default 1) is the number of workers, each with exactly one
   call or stream in flight.

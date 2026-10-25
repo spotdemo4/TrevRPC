@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
-use trevrpc::client::{CallOptions, Channel, ChannelConfig, TransportKind, TransportPolicy};
+use trevrpc::client::{CallOptions, Channel, TransportKind};
 use trevrpc::{Code, Error, Metadata};
 
 use crate::proto::{
@@ -29,25 +29,7 @@ type RefusingEcho = RefusingEchoClient<Channel>;
 
 /// Runs every scenario and returns whether all of them passed.
 pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
-    let server_name = connect::server_name(flags);
-    let addr = connect::resolve(flags, "addr").await?;
-    let tls = connect::tls_config(flags)?;
-
-    let policy = match flags.get("transport").unwrap_or("quic") {
-        "quic" => TransportPolicy::QuicOnly,
-        "tcp" => TransportPolicy::TcpOnly,
-        "auto" => TransportPolicy::Auto,
-        other => return Err(format!("unknown --transport {other:?}").into()),
-    };
-    let mut config = ChannelConfig::new()
-        .with_compression(connect::compression(flags)?)
-        .with_transport_policy(policy)
-        .with_tcp_fallback(tls.clone());
-    if flags.get("tcp-addr").is_some() {
-        config = config.with_tcp_addr(connect::resolve(flags, "tcp-addr").await?);
-    }
-    let endpoint = connect::client_endpoint(addr, &config, tls)?;
-    let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config).await?;
+    let (channel, endpoint) = connect::channel(flags).await?;
     if let Some(expected) = flags.get("expect-transport") {
         let actual = match channel.transport() {
             Some(TransportKind::Quic) => "quic",

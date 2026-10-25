@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
-use trevrpc::client::ChannelConfig;
+use trevrpc::client::{Channel, ChannelConfig, TransportPolicy};
 
 use crate::{BoxError, Flags};
 
@@ -30,6 +30,30 @@ pub fn tls_config(flags: &Flags) -> Result<quinn::rustls::ClientConfig, BoxError
     Ok(quinn::rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth())
+}
+
+/// Connects a channel as `--transport` (quic, tcp or auto), `--addr`, `--tcp-addr` and
+/// `--dictionary` ask, and returns it with its endpoint.
+pub async fn channel(flags: &Flags) -> Result<(Channel, quinn::Endpoint), BoxError> {
+    let server_name = server_name(flags);
+    let addr = resolve(flags, "addr").await?;
+    let tls = tls_config(flags)?;
+    let policy = match flags.get("transport").unwrap_or("quic") {
+        "quic" => TransportPolicy::QuicOnly,
+        "tcp" => TransportPolicy::TcpOnly,
+        "auto" => TransportPolicy::Auto,
+        other => return Err(format!("unknown --transport {other:?}").into()),
+    };
+    let mut config = ChannelConfig::new()
+        .with_compression(compression(flags)?)
+        .with_transport_policy(policy)
+        .with_tcp_fallback(tls.clone());
+    if flags.get("tcp-addr").is_some() {
+        config = config.with_tcp_addr(resolve(flags, "tcp-addr").await?);
+    }
+    let endpoint = client_endpoint(addr, &config, tls)?;
+    let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config).await?;
+    Ok((channel, endpoint))
 }
 
 /// A client QUIC endpoint bound to the unspecified address of `remote`'s family.

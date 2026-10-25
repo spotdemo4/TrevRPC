@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
+use super::pool::{DEFAULT_IDLE_TIMEOUT, default_max_connections};
 use super::race::{
     DEFAULT_FALLBACK_DELAY, DEFAULT_REPROBE_INTERVAL, Dialer, GenerationTransport, TcpDialer,
     TransportKind, TransportPolicy,
@@ -121,6 +122,8 @@ pub struct ChannelConfig {
     reprobe_interval: Duration,
     compression: Compression,
     stream_compression_memory: usize,
+    max_quic_connections: usize,
+    quic_idle_timeout: Duration,
 }
 
 impl ChannelConfig {
@@ -136,6 +139,8 @@ impl ChannelConfig {
             reprobe_interval: DEFAULT_REPROBE_INTERVAL,
             compression: Compression::new(),
             stream_compression_memory: DEFAULT_CLIENT_MEMORY,
+            max_quic_connections: default_max_connections(),
+            quic_idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 
@@ -161,6 +166,33 @@ impl ChannelConfig {
     #[must_use]
     pub const fn stream_compression_memory(&self) -> usize {
         self.stream_compression_memory
+    }
+
+    /// Sets the most QUIC connections the channel spreads its calls over. The channel starts with
+    /// one and dials another whenever a new call finds every connection busy, which keeps calls
+    /// on many threads from waiting on each other inside Quinn. A call stays on the connection it
+    /// started on, so streams opened all at once share the first connection. The default is half
+    /// the available parallelism, from one to four; one disables it. `QMux` over TLS always uses
+    /// one connection.
+    #[must_use]
+    pub const fn with_max_quic_connections(mut self, connections: usize) -> Self {
+        self.max_quic_connections = if connections == 0 { 1 } else { connections };
+        self
+    }
+
+    /// Returns the most QUIC connections the channel spreads its calls over.
+    #[must_use]
+    pub const fn max_quic_connections(&self) -> usize {
+        self.max_quic_connections
+    }
+
+    /// Sets how long a QUIC connection the channel added (see
+    /// [`Self::with_max_quic_connections`]) may go unused before it closes. The default is 30
+    /// seconds; the generation's own connection never closes for being idle.
+    #[must_use]
+    pub const fn with_quic_connection_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.quic_idle_timeout = timeout;
+        self
     }
 
     /// Enables `QMux` over TLS to the server's TCP listener, the fallback for networks that block
@@ -383,6 +415,8 @@ impl Channel {
             tcp: config.tcp.clone(),
             fallback_delay: config.fallback_delay,
             reprobe_interval: config.reprobe_interval,
+            max_quic_connections: config.max_quic_connections,
+            quic_idle_timeout: config.quic_idle_timeout,
             quic_failed_at: Arc::default(),
         };
         let transport = dialer.dial().await?;
@@ -432,16 +466,28 @@ impl Channel {
         self.snapshot().ok().map(|transport| transport.kind())
     }
 
-    /// Returns the current QUIC connection, or `None` while not ready or when the channel is
-    /// connected over `QMux`.
+    /// Returns the current generation's QUIC connection, or `None` while not ready or when the
+    /// channel is connected over `QMux`.
     ///
-    /// It is for diagnostics, such as [`quinn::Connection::stats`] to see how many DATAGRAM frames
-    /// a call used. Closing it ends the channel's generation like any lost connection.
+    /// It is for diagnostics, such as [`quinn::Connection::stats`]. Calls may also run on the
+    /// other connections of [`Self::quic_connections`]. Closing it ends the channel's generation
+    /// like any lost connection.
     #[must_use]
     pub fn quic_connection(&self) -> Option<quinn::Connection> {
         match self.snapshot().ok()? {
-            GenerationTransport::Quic(transport) => Some(transport.connection().clone()),
+            GenerationTransport::Quic(pool) => Some(pool.primary().clone()),
             GenerationTransport::Qmux(_) => None,
+        }
+    }
+
+    /// Returns every QUIC connection the channel currently spreads its calls over, the
+    /// generation's own first (see [`ChannelConfig::with_max_quic_connections`]), or none while
+    /// not ready or when connected over `QMux`. It is for diagnostics.
+    #[must_use]
+    pub fn quic_connections(&self) -> Vec<quinn::Connection> {
+        match self.snapshot() {
+            Ok(GenerationTransport::Quic(pool)) => pool.connections(),
+            _ => Vec::new(),
         }
     }
 

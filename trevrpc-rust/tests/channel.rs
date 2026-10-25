@@ -37,6 +37,11 @@ struct RawServer {
 
 impl RawServer {
     fn spawn(fail_first_request: bool) -> TestResult<Self> {
+        Self::spawn_with_delay(fail_first_request, Duration::ZERO)
+    }
+
+    /// Spawns a server that answers each request after `delay`.
+    fn spawn_with_delay(fail_first_request: bool, delay: Duration) -> TestResult<Self> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
         let cert_der = CertificateDer::from(cert.cert);
         let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
@@ -56,6 +61,7 @@ impl RawServer {
             Arc::clone(&accepted_connections),
             Arc::clone(&received_requests),
             fail_first_request,
+            delay,
         ));
 
         Ok(Self {
@@ -80,6 +86,7 @@ async fn run_raw_server(
     accepted_connections: Arc<AtomicUsize>,
     received_requests: Arc<AtomicUsize>,
     fail_first_request: Arc<AtomicBool>,
+    delay: Duration,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let Ok(connection) = incoming.await else {
@@ -102,14 +109,14 @@ async fn run_raw_server(
                     break;
                 }
 
-                if support::write_message(&mut send, &body).await.is_err()
-                    || support::write_status(&mut send, Status::ok())
-                        .await
-                        .is_err()
-                {
-                    break;
-                }
-                let _ = send.finish();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if support::write_message(&mut send, &body).await.is_ok()
+                        && support::write_status(&mut send, Status::ok()).await.is_ok()
+                    {
+                        let _ = send.finish();
+                    }
+                });
             }
         });
     }
@@ -249,5 +256,135 @@ async fn close_stops_reconnect_and_rebind_preserves_generation() -> TestResult {
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 1);
+    server.shutdown().await
+}
+
+async fn connect_pooled(server: &RawServer, config: ChannelConfig) -> TestResult<Channel> {
+    let endpoint = make_client_endpoint(server.cert.clone())?;
+    Ok(Channel::connect_with_config(endpoint, server.addr, "localhost", config).await?)
+}
+
+/// Makes `count` calls at once and checks that every one succeeds.
+async fn concurrent_calls(client: &Channel, count: usize) -> TestResult {
+    let calls: Vec<_> = (0..count)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.call(request(), b"pool".to_vec()).await })
+        })
+        .collect();
+    for call in calls {
+        let response = tokio::time::timeout(TEST_TIMEOUT, call).await???;
+        ensure_eq!(response.message().as_ref(), b"pool");
+    }
+    Ok(())
+}
+
+/// Keeps making bursts of calls until the channel spreads them over `count` connections. Each
+/// burst that finds every connection busy dials one more.
+async fn grow_to(client: &Channel, count: usize) -> TestResult {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while client.quic_connections().len() < count {
+            concurrent_calls(client, 8).await?;
+        }
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    })
+    .await??;
+    Ok(())
+}
+
+async fn wait_for_connections(client: &Channel, count: usize) -> TestResult {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while client.quic_connections().len() != count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn busy_calls_spread_over_added_connections_up_to_the_limit() -> TestResult {
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(100))?;
+    let client = connect_pooled(&server, ChannelConfig::new().with_max_quic_connections(3)).await?;
+
+    grow_to(&client, 3).await?;
+    concurrent_calls(&client, 12).await?;
+    ensure_eq!(client.quic_connections().len(), 3);
+    ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 3);
+    ensure_eq!(client.state().generation(), 1);
+
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn one_connection_when_the_limit_is_one() -> TestResult {
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(50))?;
+    let client = connect_pooled(&server, ChannelConfig::new().with_max_quic_connections(1)).await?;
+
+    concurrent_calls(&client, 8).await?;
+    ensure_eq!(client.quic_connections().len(), 1);
+    ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 1);
+
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn added_connections_close_once_idle() -> TestResult {
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(100))?;
+    let config = ChannelConfig::new()
+        .with_max_quic_connections(3)
+        .with_quic_connection_idle_timeout(Duration::from_millis(200));
+    let client = connect_pooled(&server, config).await?;
+
+    grow_to(&client, 3).await?;
+    wait_for_connections(&client, 1).await?;
+    // The generation's own connection stays, and calls keep working.
+    concurrent_calls(&client, 1).await?;
+    ensure_eq!(client.state().generation(), 1);
+
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn losing_the_first_connection_drains_the_added_ones() -> TestResult {
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(300))?;
+    let config = ChannelConfig::new()
+        .with_max_quic_connections(2)
+        .with_reconnect_backoff(FixedBackoff(Duration::from_millis(50)));
+    let client = connect_pooled(&server, config).await?;
+    grow_to(&client, 2).await?;
+    let connections = client.quic_connections();
+    let (primary, added) = (connections[0].clone(), connections[1].clone());
+
+    // Busy both connections, then lose the first: calls on the added one still finish.
+    let calls: Vec<_> = (0..4)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.call(request(), b"pool".to_vec()).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    primary.close(0_u32.into(), b"test");
+    let mut succeeded = 0;
+    for call in calls {
+        if tokio::time::timeout(TEST_TIMEOUT, call).await??.is_ok() {
+            succeeded += 1;
+        }
+    }
+    ensure!(succeeded >= 1, "no call on the added connection finished");
+    ensure!(
+        succeeded < 4,
+        "every call finished despite the lost connection"
+    );
+    tokio::time::timeout(TEST_TIMEOUT, added.closed()).await?;
+
+    wait_for_phase(&client, ChannelPhase::Ready).await?;
+    concurrent_calls(&client, 1).await?;
+    ensure_eq!(client.state().generation(), 2);
+
+    client.close();
     server.shutdown().await
 }

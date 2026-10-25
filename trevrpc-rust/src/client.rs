@@ -26,6 +26,7 @@ pub mod call;
 mod call_end;
 mod channel;
 mod native;
+mod pool;
 mod qmux;
 mod quic;
 mod race;

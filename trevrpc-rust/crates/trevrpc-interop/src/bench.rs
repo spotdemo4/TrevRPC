@@ -1,6 +1,6 @@
 //! The `bench` subcommand: a load client for the contract in `bench/README.md`.
 //!
-//! Workers are tasks that share one connection and keep one call or stream in flight each. They
+//! Workers are tasks that share one channel and keep one call or stream in flight each. They
 //! run for a warmup period and then a measured window, and only operations that start and finish
 //! inside the window count. The client prints one JSON line with the throughput and latency
 //! percentiles.
@@ -11,8 +11,7 @@ use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 use trevrpc::Error;
 use trevrpc::client::{
-    BidirectionalCall, CallOptions, ChannelConfig, QmuxTransport, QuicTransport,
-    StreamingRpcTransport,
+    BidirectionalCall, CallOptions, Channel, StreamingRpcTransport, TransportKind,
 };
 use trevrpc::wire::MAX_METADATA_VALUE_LEN;
 
@@ -282,72 +281,60 @@ fn seconds(flags: &Flags, name: &str, default: f64) -> Result<Duration, BoxError
 }
 
 /// The transport a run measures and how to read its connection statistics.
-enum Link {
-    Quic {
-        endpoint: quinn::Endpoint,
-        transport: QuicTransport,
-    },
-    Qmux(QmuxTransport),
+/// The channel every worker shares, connected as `--transport` asks.
+struct Link {
+    channel: Channel,
+    endpoint: quinn::Endpoint,
+    /// The transport the channel connected over, which outlives closing it.
+    transport: TransportKind,
 }
 
 impl Link {
     /// Connects over `--transport` with the `--dictionary` compression, if any.
     async fn connect(flags: &Flags) -> Result<Self, BoxError> {
-        let tls = connect::tls_config(flags)?;
-        let server_name = connect::server_name(flags);
-        let compression = connect::compression(flags)?;
         match flags.get("transport").unwrap_or("quic") {
-            "quic" => {
-                let addr = connect::resolve(flags, "addr").await?;
-                let endpoint = connect::client_endpoint(addr, &ChannelConfig::new(), tls)?;
-                let connection = endpoint.connect(addr, server_name)?.await?;
-                Ok(Self::Quic {
-                    endpoint,
-                    transport: QuicTransport::new(connection).with_compression(&compression)?,
-                })
-            }
-            "tcp" => {
-                let addr = connect::resolve(flags, "tcp-addr").await?;
-                Ok(Self::Qmux(
-                    QmuxTransport::connect(addr, server_name, tls)
-                        .await?
-                        .with_compression(&compression)?,
-                ))
-            }
-            other => Err(format!("unknown --transport {other:?}, want quic or tcp").into()),
+            "quic" | "tcp" => {}
+            other => return Err(format!("unknown --transport {other:?}, want quic or tcp").into()),
         }
+        let (channel, endpoint) = connect::channel(flags).await?;
+        let transport = channel
+            .transport()
+            .ok_or("the channel lost its connection before the run")?;
+        Ok(Self {
+            channel,
+            endpoint,
+            transport,
+        })
     }
 
     const fn name(&self) -> &'static str {
-        match self {
-            Self::Quic { .. } => "quic",
-            Self::Qmux(_) => "qmux",
+        match self.transport {
+            TransportKind::Quic => "quic",
+            TransportKind::Qmux => "qmux",
         }
     }
 
-    /// Bytes the connection has sent and received so far, where the stack exposes them: the UDP
-    /// payload of the QUIC connection. The `QMux` session hides its TCP stream.
+    /// Bytes the channel's connections have sent and received so far, where the stack exposes
+    /// them: the UDP payload of its QUIC connections. The `QMux` session hides its TCP stream.
     fn wire_bytes(&self) -> Option<u64> {
-        match self {
-            Self::Quic { transport, .. } => {
-                let stats = transport.connection().stats();
-                Some(stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes))
-            }
-            Self::Qmux(_) => None,
+        if self.transport != TransportKind::Quic {
+            return None;
         }
+        Some(
+            self.channel
+                .quic_connections()
+                .iter()
+                .map(|connection| {
+                    let stats = connection.stats();
+                    stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes)
+                })
+                .sum(),
+        )
     }
 
     async fn close(&self) {
-        match self {
-            Self::Quic {
-                endpoint,
-                transport,
-            } => {
-                transport.connection().close(0_u8.into(), b"done");
-                endpoint.wait_idle().await;
-            }
-            Self::Qmux(transport) => transport.close(),
-        }
+        self.channel.close();
+        self.endpoint.wait_idle().await;
     }
 }
 
@@ -696,10 +683,7 @@ where
 pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let params = Params::parse(flags)?;
     let link = Link::connect(flags).await?;
-    let measured = match &link {
-        Link::Quic { transport, .. } => measure(transport.clone(), &params, &link).await,
-        Link::Qmux(transport) => measure(transport.clone(), &params, &link).await,
-    };
+    let measured = measure(link.channel.clone(), &params, &link).await;
     link.close().await;
     let (results, wire) = measured?;
 
