@@ -4,6 +4,7 @@ use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 
 use futures_util::StreamExt;
+use futures_util::future::{Either, ready};
 use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
@@ -250,41 +251,61 @@ struct UnreliableEchoService;
 
 #[trevrpc::async_trait]
 impl UnreliableEcho for UnreliableEchoService {
-    /// Reads every request, then sends `count` responses for each in order. The trailing metadata
-    /// counts the requests, and how many of them arrived as datagrams, so it is only known once
-    /// the request stream has ended.
+    /// Sends `count` responses for each request, in order, as it arrives. The trailing metadata
+    /// counts the requests, and how many of them arrived as datagrams, so it is set once the
+    /// request stream has ended.
     async fn bidi(
         &self,
         context: RequestContext,
-        mut requests: BoxStream<EchoRequest>,
+        requests: BoxStream<EchoRequest>,
     ) -> Result<BoxStream<EchoResponse>, Status> {
-        let mut received = 0_u64;
-        // The requests that ask for responses, as `(message, count)`.
-        let mut asked = Vec::new();
-        while let Some(request) = requests.next().await {
-            let EchoRequest { message, count, .. } = request?;
-            received = received.saturating_add(1);
-            if count > 0 {
-                asked.push((message, count));
-            }
-        }
-        let responses = asked.into_iter().flat_map(|(message, count)| {
-            (0..count).map(move |index| {
-                Ok(EchoResponse {
-                    message: message.clone(),
-                    index,
-                })
-            })
-        });
-
         answer_header(&context)?;
-        context.set_response_metadata(RECEIVED_METADATA_KEY, received.to_string())?;
-        context.set_response_metadata(
-            DATAGRAMS_RECEIVED_METADATA_KEY,
-            context.datagram_requests_received().to_string(),
-        )?;
-        Ok(Box::pin(futures_util::stream::iter(responses)))
+        // `(requests, received, context)`: the context is gone once the stream has failed or
+        // reported its counts.
+        let responses = futures_util::stream::unfold(
+            (requests, 0_u64, Some(context)),
+            |(mut requests, received, context)| async move {
+                let context = context?;
+                match requests.next().await {
+                    Some(Ok(EchoRequest { message, count, .. })) => {
+                        let echoes = (0..count).map(move |index| {
+                            Ok(EchoResponse {
+                                message: message.clone(),
+                                index,
+                            })
+                        });
+                        Some((
+                            Either::Left(futures_util::stream::iter(echoes)),
+                            (requests, received.saturating_add(1), Some(context)),
+                        ))
+                    }
+                    Some(Err(error)) => Some((
+                        Either::Right(futures_util::stream::once(ready(Err(error)))),
+                        (requests, received, None),
+                    )),
+                    None => report_received(&context, received).err().map(|status| {
+                        (
+                            Either::Right(futures_util::stream::once(ready(Err(Error::from(
+                                status,
+                            ))))),
+                            (requests, received, None),
+                        )
+                    }),
+                }
+            },
+        )
+        .flatten();
+        Ok(Box::pin(responses))
     }
+}
+
+/// Sets the trailing metadata of an `UnreliableEcho.Bidi` call whose request stream has ended.
+fn report_received(context: &RequestContext, received: u64) -> Result<(), Status> {
+    context.set_response_metadata(RECEIVED_METADATA_KEY, received.to_string())?;
+    context.set_response_metadata(
+        DATAGRAMS_RECEIVED_METADATA_KEY,
+        context.datagram_requests_received().to_string(),
+    )
 }
 
 /// Browsers connect from arbitrary origins, so any session on the shared path is admitted.

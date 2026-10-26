@@ -63,11 +63,24 @@ class SummaryTest(unittest.TestCase):
 
         self.assertTrue(lines[0].startswith("scenario" + " " * 18 + "size"))
         bidi, unary = (line.split() for line in lines[1:])
-        self.assertEqual(["bidi", "64", "0", "4", "quic", "none", "go", "go"], bidi[:8])
+        self.assertEqual(["bidi", "64", "0", "4", "-", "quic", "none", "go", "go"], bidi[:9])
         # ops/s, msgs/s, MB/s, p50us, p99us, wire_B/msg, lost%, spread%
-        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[8:])
-        self.assertEqual(["unary", "rust", "go"], [unary[0], unary[6], unary[7]])
-        self.assertEqual(["80", "33.33", "-"], unary[13:])
+        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[9:])
+        self.assertEqual(["unary", "rust", "go"], [unary[0], unary[7], unary[8]])
+        self.assertEqual(["80", "33.33", "-"], unary[14:])
+
+    def test_shows_the_rate_of_paced_runs_in_rate_order(self) -> None:
+        paced = {**RESULT, "scenario": "unreliable-paced"}
+        results = [
+            run.parse_result("go", "go", json.dumps({**paced, "rate": 1000})),
+            run.parse_result("go", "go", json.dumps({**paced, "rate": 100})),
+        ]
+
+        lines = run.summary(results).splitlines()
+
+        self.assertEqual("rate", lines[0].split()[4])
+        self.assertEqual(["100", "1000"], [line.split()[4] for line in lines[1:]])
+        self.assertIsNone(run.parse_result("go", "go", json.dumps(RESULT)).rate)
 
     def test_shows_the_compression_mode(self) -> None:
         result = run.parse_result(
@@ -75,7 +88,7 @@ class SummaryTest(unittest.TestCase):
         )
 
         self.assertEqual("stream", result.compression)
-        self.assertEqual("stream", run.summary([result]).splitlines()[1].split()[5])
+        self.assertEqual("stream", run.summary([result]).splitlines()[1].split()[6])
 
     def test_groups_rows_by_netem_profile_in_run_order(self) -> None:
         results = [
@@ -88,7 +101,7 @@ class SummaryTest(unittest.TestCase):
 
         self.assertEqual("netem delay 10ms loss 1%", lines[0])
         self.assertTrue(lines[1].startswith("scenario"))
-        self.assertEqual(["go", "rust"], [line.split()[6] for line in lines[2:4]])
+        self.assertEqual(["go", "rust"], [line.split()[7] for line in lines[2:4]])
         self.assertEqual(["", "netem delay 10ms"], lines[4:6])
         self.assertEqual(8, len(lines))
         self.assertEqual("delay 10ms", results[1].record["netem"])
@@ -156,6 +169,28 @@ class MatrixTest(unittest.TestCase):
 
         self.assertEqual(60, matrix.deadline)
 
+    def test_paced_cells_run_once_per_rate(self) -> None:
+        matrix = run.Matrix(
+            ["unary", "unreliable-paced"], [64], [0], [1], 0.2, 0, 10, rates=(100, 1000)
+        )
+
+        cells = matrix.cells("go", "go", "quic", None)
+
+        self.assertEqual(
+            [("unary", None), ("unreliable-paced", 100), ("unreliable-paced", 1000)],
+            [(cell.scenario, cell.rate) for cell in cells],
+        )
+        self.assertEqual([], matrix.cells("grpc", "grpc", "grpc", None)[1:])
+
+    def test_rates_must_be_positive(self) -> None:
+        for rates in ("0", "10,-1", "fast"):
+            with (
+                self.subTest(rates=rates),
+                self.assertRaises(SystemExit),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                _ = run.parse_args(["--baseline", "b", "--rates", rates])
+
 
 class TableTest(unittest.TestCase):
     # Which client runs against which server over which transport: the packaged runtimes against
@@ -198,8 +233,12 @@ class TableTest(unittest.TestCase):
             {("rust", "quic"): 12, ("grpc", "grpc"): 9, ("connect", "connect"): 3},
             self.cells("link"),
         )
-        self.assertEqual(16, self.cells("lossy")[("go", "quic")])
-        self.assertEqual({("go", "quic"): 6, ("rust", "quic"): 6}, self.cells("datagrams"))
+        self.assertEqual(20, self.cells("lossy")[("go", "quic")])
+        self.assertEqual(16, self.cells("lossy")[("grpc", "grpc")])
+        self.assertEqual(
+            {("go", "quic"): 9, ("go", "tcp"): 3, ("rust", "quic"): 9, ("rust", "tcp"): 3},
+            self.cells("datagrams"),
+        )
 
     def test_explicit_flags_override_the_table(self) -> None:
         args = run.parse_args(

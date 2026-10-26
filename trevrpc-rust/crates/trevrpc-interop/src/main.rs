@@ -9,9 +9,11 @@
 //! trevrpc-interop-rust bench --addr <host:port> [--tcp-addr <host:port>] --ca <pem>
 //!                            [--server-name localhost] --transport quic|tcp
 //!                            --scenario unary|server-stream|client-stream|bidi|
-//!                                       unreliable-server-stream|unreliable-client-stream
+//!                                       unreliable-server-stream|unreliable-client-stream|
+//!                                       unreliable-paced
 //!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
-//!                            [--messages 100] [--metadata-size 0] [--payload repeat|records]
+//!                            [--messages 100] [--rate 100] [--metadata-size 0]
+//!                            [--payload repeat|records]
 //!                            [--compression none|dictionary|stream|stream-dictionary]
 //!                            [--dictionary <file>]
 //! ```
@@ -69,6 +71,7 @@ async fn main() -> ExitCode {
                 "duration",
                 "warmup",
                 "messages",
+                "rate",
                 "metadata-size",
                 "payload",
                 "compression",

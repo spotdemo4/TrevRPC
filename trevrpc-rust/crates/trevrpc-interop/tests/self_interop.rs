@@ -197,6 +197,7 @@ fn bench_reports_every_scenario_over_both_transports() {
             "bidi",
             "unreliable-server-stream",
             "unreliable-client-stream",
+            "unreliable-paced",
         ] {
             let output = server.run(
                 "bench",
@@ -217,6 +218,8 @@ fn bench_reports_every_scenario_over_both_transports() {
                     "0.05",
                     "--messages",
                     "5",
+                    "--rate",
+                    "1000",
                 ],
             );
             let stdout = String::from_utf8(output.stdout).unwrap();
@@ -255,7 +258,20 @@ fn bench_reports_every_scenario_over_both_transports() {
                 1.0
             };
             let lost = number(json, "lost");
-            if scenario.starts_with("unreliable") && transport == "quic" {
+            if scenario == "unreliable-paced" {
+                // Each operation is one delivered message. Two workers at 1000 messages per
+                // second schedule about 400 in the window, each either delivered or lost, and
+                // QMux loses none.
+                let msgs = number(json, "msgs");
+                assert_close(msgs, ops, 1e-9, json);
+                assert_close(msgs + lost, 400.0, 100.0, json);
+                if transport == "tcp" {
+                    assert_close(lost, 0.0, 1e-9, json);
+                }
+                assert_close(number(json, "rate"), 1000.0, 1e-9, json);
+            } else if json.contains("\"rate\"") {
+                panic!("only unreliable-paced reports a rate: {json}");
+            } else if scenario.starts_with("unreliable") && transport == "quic" {
                 // Datagram messages may be lost, but each is either delivered or counted as lost.
                 assert_close(number(json, "msgs") + lost, ops * per_op, 1e-9, json);
                 assert!(number(json, "msgs") > 0.0, "{json}");
@@ -365,6 +381,9 @@ fn bench_rejects_unusable_flags() {
             "--compression",
             "stream",
         ],
+        &["--scenario", "unreliable-paced", "--compression", "stream"],
+        &["--scenario", "unreliable-paced", "--rate", "0"],
+        &["--scenario", "unreliable-paced", "--rate", "-5"],
         // The dictionary modes need --dictionary, and only they take it.
         &["--scenario", "bidi", "--compression", "dictionary"],
         &["--scenario", "bidi", "--dictionary", "none.dict"],

@@ -24,6 +24,8 @@ class Cell:
     size: int
     metadata_size: int
     concurrency: int
+    # Messages per second per worker, for the unreliable-paced scenario only.
+    rate: int | None
     netem: str | None
 
 
@@ -66,8 +68,19 @@ def link(cell: Cell) -> bool:
     return cell.client in ("rust", "grpc") or (cell.client == "connect" and cell.size == 1024)
 
 
+def lossy(cell: Cell) -> bool:
+    # Real-time traffic is small messages; 1 KiB at a fixed rate would only measure how little a
+    # lossy connection carries.
+    return own_server(cell) and (cell.size == 64) == (cell.scenario == "unreliable-paced")
+
+
 def datagrams(cell: Cell) -> bool:
-    if not own_server(cell) or cell.transport != "quic":
+    if not own_server(cell):
+        return False
+    if cell.scenario == "unreliable-paced":
+        # Datagrams against a stream at the same rates.
+        return cell.concurrency == 64
+    if cell.transport != "quic":
         return False
     return cell.scenario.startswith("unreliable-") or cell.concurrency == 1
 
@@ -130,10 +143,15 @@ TABLES: dict[str, Table] = {
     "lossy": Table(
         "Lossy links",
         {
-            "scenarios": ["unary", "bidi", "server-stream", "client-stream"],
-            "sizes": [1024],
+            "scenarios": ["unary", "bidi", "server-stream", "client-stream", "unreliable-paced"],
+            "sizes": [64, 1024],
             "concurrency": [64],
             "messages": 10,
+            # 64 workers at 25 messages of 64 bytes per second. One connection on these links
+            # carries roughly 1 MB/s, and a load near that queues until every echo is late:
+            # 25 messages of 1 KiB per worker lost nearly all of them, even over TCP, and 100 of
+            # 64 bytes already doubled the round trips.
+            "rates": [25],
             "duration": 10.0,
             "netem": [
                 "delay 10ms",
@@ -141,7 +159,7 @@ TABLES: dict[str, Table] = {
                 *GILBERT_ELLIOTT,
             ],
         },
-        own_server,
+        lossy,
     ),
     "metadata": Table(
         "Metadata cost",
@@ -161,11 +179,14 @@ TABLES: dict[str, Table] = {
             "scenarios": [
                 "unreliable-server-stream",
                 "unreliable-client-stream",
+                "unreliable-paced",
                 "server-stream",
                 "client-stream",
             ],
             "sizes": [64],
             "concurrency": [1, 64],
+            # 6.4k, 64k and 640k messages per second from 64 workers.
+            "rates": [100, 1000, 10000],
         },
         datagrams,
     ),

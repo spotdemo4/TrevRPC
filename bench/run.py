@@ -5,7 +5,7 @@ grpc-go and connect-go baselines; see README.md.
     run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
            [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--concurrency LIST]
            [--payload repeat|records] [--compressions LIST]
-           [--duration SECONDS] [--warmup SECONDS] [--messages N]
+           [--duration SECONDS] [--warmup SECONDS] [--messages N] [--rates LIST]
            [--repeat N] [--tolerance PERCENT] [--netem PROFILE...] [--out DIR]
 """
 
@@ -52,7 +52,10 @@ SCENARIOS = (
     "bidi",
     "unreliable-server-stream",
     "unreliable-client-stream",
+    "unreliable-paced",
 )
+# The scenario that sends at a fixed rate per worker, once per rate in --rates.
+PACED_SCENARIO = "unreliable-paced"
 # The baseline's transports, each served on the port of the same name. They have no datagram
 # messages, so they skip the unreliable-* scenarios.
 BASELINE_TRANSPORTS = ("grpc", "connect")
@@ -75,7 +78,7 @@ COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
 # Room on top of warmup and duration for connecting and draining.
 DEADLINE_SLACK = 60
 COLUMNS = (
-    "scenario", "size", "md", "conc", "transport", "compression", "client", "server",
+    "scenario", "size", "md", "conc", "rate", "transport", "compression", "client", "server",
     "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%", "spread%",
 )  # fmt: skip
 
@@ -89,6 +92,8 @@ class Matrix:
     duration: float
     warmup: float
     messages: int
+    # The messages per second each unreliable-paced worker sends, one cell per rate.
+    rates: tuple[int, ...] = (1000,)
     payload: str = "repeat"
     compressions: tuple[str, ...] = ("none",)
     # The trained dictionary, when a mode needs it.
@@ -117,6 +122,7 @@ class Matrix:
             for size in self.sizes
             for metadata in self.metadata_sizes
             for workers in self.concurrency
+            for rate in (self.rates if scenario == PACED_SCENARIO else (None,))
             if self.keep(
                 cell := tables.Cell(
                     client=client,
@@ -127,6 +133,7 @@ class Matrix:
                     size=size,
                     metadata_size=metadata,
                     concurrency=workers,
+                    rate=rate,
                     netem=netem,
                 )
             )
@@ -145,6 +152,8 @@ class Result:
     size: int
     metadata_size: int
     concurrency: int
+    # Messages per second per worker, for the unreliable-paced scenario.
+    rate: float | None
     errors: float
     msgs: float
     lost: float
@@ -171,6 +180,7 @@ class Result:
             str(self.size),
             str(self.metadata_size),
             str(self.concurrency),
+            "-" if self.rate is None else plain(self.rate),
             self.transport,
             self.compression,
             self.client,
@@ -185,12 +195,13 @@ class Result:
             "-" if spread is None else hundredths(spread),
         ]
 
-    def sort_key(self) -> tuple[str, int, int, int, str, str, str, str]:
+    def sort_key(self) -> tuple[str, int, int, int, float, str, str, str, str]:
         return (
             self.scenario,
             self.size,
             self.metadata_size,
             self.concurrency,
+            0 if self.rate is None else self.rate,
             self.transport,
             self.compression,
             self.client,
@@ -252,6 +263,7 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         size=int_field(record, "size"),
         metadata_size=int_field(record, "metadata_size", 0),
         concurrency=int_field(record, "concurrency"),
+        rate=None if record.get("rate") is None else number_field(record, "rate"),
         errors=number_field(record, "errors"),
         msgs=number_field(record, "msgs"),
         lost=number_field(record, "lost", 0),
@@ -363,10 +375,13 @@ class Runner:
             mode = ["--payload", m.payload, "--compression", cell.compression]
             if cell.compression in DICTIONARY_COMPRESSIONS and m.dictionary is not None:
                 mode += ["--dictionary", str(m.dictionary)]
+            if cell.rate is not None:
+                mode += ["--rate", str(cell.rate)]
             suffix = "" if cell.compression == "none" else f"-{cell.compression}"
+            rate = "" if cell.rate is None else f"-r{cell.rate}"
             name = (
                 f"{client}-{transport}-to-{server}-{cell.scenario}{suffix}-{cell.size}"
-                f"-md{cell.metadata_size}-c{cell.concurrency}{profile}"
+                f"-md{cell.metadata_size}-c{cell.concurrency}{rate}{profile}"
             )
             self.run_one(
                 name,
@@ -465,6 +480,10 @@ def int_list(value: str) -> list[int]:
         raise argparse.ArgumentTypeError(f"expected comma-separated integers: {value!r}") from error
 
 
+def positive_int_list(value: str) -> list[int]:
+    return [positive_int(item) for item in comma_list(value)]
+
+
 def positive_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -522,6 +541,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument("--duration", type=seconds, default=5.0)
     _ = parser.add_argument("--warmup", type=seconds, default=1.0)
     _ = parser.add_argument("--messages", type=int, default=100)
+    _ = parser.add_argument(
+        "--rates",
+        type=positive_int_list,
+        default=[1000],
+        metavar="LIST",
+        help="messages per second each unreliable-paced worker sends, one cell per rate",
+    )
     _ = parser.add_argument(
         "--repeat",
         type=positive_int,
@@ -592,6 +618,7 @@ def build_matrix(args: argparse.Namespace, dictionary: Path | None = None) -> Ma
         duration=args.duration,
         warmup=args.warmup,
         messages=args.messages,
+        rates=tuple(args.rates),
         repeat=args.repeat,
         tolerance=args.tolerance,
         keep=tables.TABLES[args.table].keep if args.table else (lambda _cell: True),

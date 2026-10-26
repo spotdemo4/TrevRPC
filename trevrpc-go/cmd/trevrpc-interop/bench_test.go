@@ -64,7 +64,7 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 		{"quic", "quic", true},
 		{"tcp", "qmux", false},
 	} {
-		for _, scenario := range []string{"unary", "server-stream", "client-stream", "bidi", "unreliable-server-stream", "unreliable-client-stream"} {
+		for _, scenario := range []string{"unary", "server-stream", "client-stream", "bidi", "unreliable-server-stream", "unreliable-client-stream", "unreliable-paced"} {
 			// A metadata size of 0 sends no metadata; the others send one entry
 			// of that many bytes, the largest being the limit.
 			for _, metadataSize := range []int{0, 300, benchMaxMetadataSize} {
@@ -83,6 +83,7 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 						"--size", strconv.Itoa(size),
 						"--metadata-size", strconv.Itoa(metadataSize),
 						"--messages", strconv.Itoa(messages),
+						"--rate", "1000",
 						"--concurrency", "2",
 						"--duration", "0.2",
 						"--warmup", "0.05",
@@ -134,12 +135,25 @@ func checkBenchLine(t *testing.T, output, scenario, transport string, size, meta
 	if strings.HasSuffix(scenario, "stream") {
 		perOp = float64(messages)
 	}
-	if strings.HasPrefix(scenario, "unreliable-") {
+	switch {
+	case scenario == "unreliable-paced":
+		// Each operation is one delivered message. Two workers at 1000
+		// messages per second schedule about 400 in the window, each either
+		// delivered or lost, and TCP loses none.
+		if ops < 1 || msgs != ops || msgs+lost < 300 || msgs+lost > 500 || (transport == "qmux" && lost != 0) {
+			t.Errorf("ops, msgs, lost = %v, %v, %v, want msgs = ops, about 400 messages and no loss over QMux", ops, msgs, lost)
+		}
+		if number("rate") != 1000 {
+			t.Errorf("rate = %v, want 1000", got["rate"])
+		}
+	case got["rate"] != nil:
+		t.Errorf("rate = %v, want none outside unreliable-paced", got["rate"])
+	case strings.HasPrefix(scenario, "unreliable-"):
 		// Every message is either delivered or lost, and TCP loses none.
 		if ops < 1 || msgs+lost != ops*perOp || (transport == "qmux" && lost != 0) {
 			t.Errorf("ops, msgs, lost = %v, %v, %v, want msgs + lost = %v per op and no loss over QMux", ops, msgs, lost, perOp)
 		}
-	} else if ops < 1 || msgs != ops*perOp || lost != 0 {
+	case ops < 1 || msgs != ops*perOp || lost != 0:
 		t.Errorf("ops, msgs, lost = %v, %v, %v, want msgs = %v per op and no loss", ops, msgs, lost, perOp)
 	}
 	if number("errors") != 0 {
@@ -255,6 +269,8 @@ func TestBenchCommandLineErrors(t *testing.T) {
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "server-stream", "--compression", "stream"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "server-stream", "--compression", "dictionary", "--dictionary", "d"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unreliable-client-stream", "--compression", "stream"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unreliable-paced", "--compression", "dictionary", "--dictionary", "d"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unreliable-paced", "--rate", "0"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "bidi", "--compression", "dictionary"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "bidi", "--dictionary", "d"},
 	} {
@@ -343,7 +359,7 @@ func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 		defer closeQuietly(channel)
 		clients := benchClients{echo: interoppb.NewEchoClient(channel), unreliable: interoppb.NewUnreliableEchoClient(channel)}
 		for _, scenario := range []string{"unary", "bidi"} {
-			operation := benchScenarios[scenario](clients, config, newBenchPayload("repeat", config.size, 0))
+			operation := benchScenarios[scenario](clients, config, newBenchPayload("repeat", config.size, 0)).(operationLoop).operation
 			if _, err := operation.run(ctx); err != nil {
 				t.Fatalf("%s with metadata size %d: %v", scenario, size, err)
 			}

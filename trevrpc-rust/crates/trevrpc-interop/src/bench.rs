@@ -6,6 +6,7 @@
 //! percentiles.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::{Instant, timeout_at};
@@ -34,6 +35,10 @@ const ERROR_BREAKDOWN_LEN: usize = 5;
 /// hung call cannot stall the run.
 const STRAGGLER_GRACE: Duration = Duration::from_secs(10);
 
+/// How long after its scheduled send an `unreliable-paced` message's echo may arrive and still
+/// count as delivered. A later echo is too late for real-time traffic, so it counts as lost.
+const PACED_DEADLINE: Duration = Duration::from_millis(500);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Unary,
@@ -44,6 +49,9 @@ enum Scenario {
     UnreliableServerStream,
     /// `messages` requests, which may travel as datagrams, ask for nothing back.
     UnreliableClientStream,
+    /// Requests that each ask for one echo, sent at `--rate` per second on one stream; both may
+    /// travel as datagrams.
+    UnreliablePaced,
 }
 
 impl Scenario {
@@ -55,6 +63,7 @@ impl Scenario {
             "bidi" => Ok(Self::Bidi),
             "unreliable-server-stream" => Ok(Self::UnreliableServerStream),
             "unreliable-client-stream" => Ok(Self::UnreliableClientStream),
+            "unreliable-paced" => Ok(Self::UnreliablePaced),
             other => Err(format!("unknown --scenario {other:?}").into()),
         }
     }
@@ -67,6 +76,7 @@ impl Scenario {
             Self::Bidi => "bidi",
             Self::UnreliableServerStream => "unreliable-server-stream",
             Self::UnreliableClientStream => "unreliable-client-stream",
+            Self::UnreliablePaced => "unreliable-paced",
         }
     }
 }
@@ -188,6 +198,10 @@ struct Params {
     duration: Duration,
     warmup: Duration,
     messages: usize,
+    /// The messages per second of an `unreliable-paced` worker.
+    rate: f64,
+    /// The time between them: one over `rate`.
+    interval: Duration,
     payload: Payload,
     compression: CompressionMode,
 }
@@ -224,6 +238,15 @@ impl Params {
         if concurrency == 0 || messages == 0 {
             return Err("--concurrency and --messages must be positive".into());
         }
+        let rate = flags.get("rate").map_or(Ok(100.0), |value| {
+            value
+                .parse::<f64>()
+                .map_err(|_| format!("invalid --rate {value:?}"))
+        })?;
+        let interval = Duration::try_from_secs_f64(rate.recip())
+            .ok()
+            .filter(|interval| rate > 0.0 && !interval.is_zero())
+            .ok_or_else(|| format!("--rate {rate} must be positive and at most 10^9"))?;
         let duration = seconds(flags, "duration", 5.0)?;
         if duration.is_zero() {
             return Err("--duration must be positive".into());
@@ -236,6 +259,8 @@ impl Params {
             duration,
             warmup: seconds(flags, "warmup", 1.0)?,
             messages,
+            rate,
+            interval,
             payload,
             compression,
         })
@@ -401,6 +426,7 @@ struct Worker<T> {
     messages_source: Messages,
     options: CallOptions,
     messages: usize,
+    interval: Duration,
     bidi: Option<BidirectionalCall<EchoRequest, EchoResponse>>,
 }
 
@@ -434,6 +460,9 @@ where
             Scenario::Bidi => self.bidi().await,
             Scenario::UnreliableServerStream => self.unreliable_server_stream().await,
             Scenario::UnreliableClientStream => self.unreliable_client_stream().await,
+            Scenario::UnreliablePaced => Err(Error::from(trevrpc::Status::internal(
+                "unreliable-paced runs on its schedule, not in operations",
+            ))),
         }
     }
 
@@ -543,6 +572,61 @@ where
         Ok(Outcome::unreliable(count_of(self.messages), received))
     }
 
+    /// Opens an `UnreliableEcho.Bidi` stream and sends the messages of `schedule` from `next`
+    /// on, recording their echoes, until the schedule ends or the stream fails. `next` is left at
+    /// the first message not sent.
+    async fn paced_stream(
+        &mut self,
+        schedule: &mut Schedule,
+        next: &mut usize,
+    ) -> Result<(), Error> {
+        use futures_util::StreamExt as _;
+
+        let (sender, mut responses) = self
+            .unreliable
+            .bidi()
+            .options(|_| self.options.clone())
+            .await?
+            .split();
+        let Schedule { base, sent, rtts } = schedule;
+        let (base, interval, sent) = (*base, self.interval, &*sent);
+        let messages = &mut self.messages_source;
+        let sending = async {
+            while let Some(sent_at) = sent.get(*next) {
+                tokio::time::sleep_until(scheduled(base, interval, *next)).await;
+                let request = EchoRequest {
+                    message: paced_message(*next, &messages.next()),
+                    count: 1,
+                    ..EchoRequest::default()
+                };
+                sent_at.store(since(base), Ordering::Relaxed);
+                sender.send(request).await?;
+                *next = next.saturating_add(1);
+            }
+            sender.finish()
+        };
+        let receiving = async {
+            while let Some(response) = responses.next().await {
+                let response = response?;
+                let arrived = since(base);
+                let (rtt, sent_at) = paced_sequence(&response.message)
+                    .and_then(|sequence| rtts.get_mut(sequence).zip(sent.get(sequence)))
+                    .map(|(rtt, sent_at)| (rtt, sent_at.load(Ordering::Relaxed)))
+                    .filter(|&(_, sent_at)| sent_at != UNSENT)
+                    .ok_or_else(|| {
+                        Error::from(trevrpc::Status::internal(
+                            "an echo carries no message number that was sent",
+                        ))
+                    })?;
+                if rtt.is_none() {
+                    *rtt = Some(Duration::from_nanos(arrived.saturating_sub(sent_at)));
+                }
+            }
+            Ok(())
+        };
+        tokio::try_join!(sending, receiving).map(drop)
+    }
+
     async fn bidi(&mut self) -> Result<Outcome, Error> {
         let request = self.request();
         let call = match &mut self.bidi {
@@ -573,6 +657,46 @@ where
     }
 }
 
+/// What an `unreliable-paced` worker knows of its messages, one scheduled every `interval` from
+/// `base`.
+struct Schedule {
+    base: Instant,
+    /// When each message was sent, in nanoseconds after `base`, or `UNSENT`. The sending half of
+    /// the stream writes it and the receiving half reads it.
+    sent: Vec<AtomicU64>,
+    /// How long after its send each message was echoed, if it was.
+    rtts: Vec<Option<Duration>>,
+}
+
+/// The send time of a message not sent.
+const UNSENT: u64 = u64::MAX;
+
+/// Nanoseconds from `base` to now.
+fn since(base: Instant) -> u64 {
+    u64::try_from(base.elapsed().as_nanos()).unwrap_or(UNSENT.saturating_sub(1))
+}
+
+/// When message `sequence` of a schedule that starts at `base` is sent.
+fn scheduled(base: Instant, interval: Duration, sequence: usize) -> Instant {
+    let offset = interval.saturating_mul(u32::try_from(sequence).unwrap_or(u32::MAX));
+    base.checked_add(offset).unwrap_or(base)
+}
+
+/// The request message of `unreliable-paced` message number `sequence`: the number in decimal and
+/// a space in place of the start of `payload`.
+fn paced_message(sequence: usize, payload: &str) -> String {
+    let mut message = format!("{sequence} ");
+    if let Some(rest) = payload.get(message.len()..).filter(|rest| !rest.is_empty()) {
+        message.push_str(rest);
+    }
+    message
+}
+
+/// The message number an `unreliable-paced` echo carries.
+fn paced_sequence(message: &str) -> Option<usize> {
+    message.split_once(' ')?.0.parse().ok()
+}
+
 /// A message count as the 64-bit counter the report uses.
 fn count_of(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
@@ -588,8 +712,90 @@ fn short_stream_check(got: usize, want: usize) -> Result<(), Error> {
     }
 }
 
+/// Runs the worker's scenario from the start of the warmup to the end of the window.
+async fn work<T>(worker: Worker<T>, window: Window) -> WorkerResult
+where
+    T: StreamingRpcTransport + Clone,
+{
+    if worker.scenario == Scenario::UnreliablePaced {
+        paced(worker, window).await
+    } else {
+        operations(worker, window).await
+    }
+}
+
+/// Sends a message that asks for one echo every `interval`, as real-time traffic does, and reads
+/// the echoes as they arrive. Sending goes on past the window, so the echoes of its last messages
+/// arrive under the same load. Each message scheduled inside the window is one operation:
+/// delivered, with the time from its send to its echo, if the echo arrives within
+/// `PACED_DEADLINE` of the send, and lost otherwise.
+async fn paced<T>(mut worker: Worker<T>, window: Window) -> WorkerResult
+where
+    T: StreamingRpcTransport + Clone,
+{
+    let mut result = WorkerResult::default();
+    let base = Instant::now();
+    let stop = window.end.checked_add(PACED_DEADLINE).unwrap_or(window.end);
+    let total = stop
+        .saturating_duration_since(base)
+        .as_nanos()
+        .checked_div(worker.interval.as_nanos())
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut schedule = Schedule {
+        base,
+        sent: (0..total).map(|_| AtomicU64::new(UNSENT)).collect(),
+        rtts: vec![None; total],
+    };
+    let mut next = 0;
+    while next < total {
+        let streamed = timeout_at(
+            window.straggler_deadline(),
+            worker.paced_stream(&mut schedule, &mut next),
+        )
+        .await;
+        let message = match streamed {
+            Ok(Ok(())) => break,
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "stream timed out".to_owned(),
+        };
+        let failed = Instant::now();
+        if failed >= window.start && failed <= window.end {
+            let count = result.errors.entry(message).or_default();
+            *count = count.saturating_add(1);
+        }
+        if failed >= window.straggler_deadline() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // The messages whose time passed while the stream was down are lost, not sent late.
+        let due = Instant::now()
+            .saturating_duration_since(base)
+            .as_nanos()
+            .checked_div(worker.interval.as_nanos())
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0);
+        next = next.max(due.saturating_add(1));
+    }
+    for (sequence, rtt) in schedule.rtts.into_iter().enumerate() {
+        let sent = scheduled(base, worker.interval, sequence);
+        if sent < window.start || sent >= window.end {
+            continue;
+        }
+        match rtt.filter(|rtt| *rtt <= PACED_DEADLINE) {
+            Some(rtt) => {
+                result.latencies.push(rtt);
+                result.messages = result.messages.saturating_add(1);
+            }
+            None => result.lost = result.lost.saturating_add(1),
+        }
+    }
+    result
+}
+
 /// Loops operations until the window ends, recording those that start and finish inside it.
-async fn work<T>(mut worker: Worker<T>, window: Window) -> WorkerResult
+async fn operations<T>(mut worker: Worker<T>, window: Window) -> WorkerResult
 where
     T: StreamingRpcTransport + Clone,
 {
@@ -657,6 +863,7 @@ where
                     messages_source: Messages::new(params.payload, params.size, index),
                     options: params.call_options(),
                     messages: params.messages,
+                    interval: params.interval,
                     bidi: None,
                 },
                 window,
@@ -706,6 +913,8 @@ fn error_breakdown(results: &[WorkerResult]) -> Vec<(&str, u64)> {
 
 struct Report {
     scenario: Scenario,
+    /// Messages per second per worker, for `unreliable-paced`.
+    rate: Option<f64>,
     payload: Payload,
     compression: CompressionMode,
     transport: &'static str,
@@ -757,6 +966,7 @@ impl Report {
         }
         Ok(Self {
             scenario: params.scenario,
+            rate: (params.scenario == Scenario::UnreliablePaced).then_some(params.rate),
             payload: params.payload,
             compression: params.compression,
             transport,
@@ -797,11 +1007,14 @@ impl Report {
             .map_or_else(String::new, |bytes| {
                 format!(r#","wire_bytes_per_msg":{:.1}"#, count(bytes) / msgs)
             });
+        let rate = self
+            .rate
+            .map_or_else(String::new, |rate| format!(r#","rate":{rate:?}"#));
         format!(
             concat!(
                 r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"concurrency":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
-                r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{},"#,
+                r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{}{},"#,
                 r#""payload":"{}","compression":"{}"}}"#,
             ),
             self.scenario.name(),
@@ -822,6 +1035,7 @@ impl Report {
             self.percentile(999),
             wire,
             self.lost,
+            rate,
             self.payload.name(),
             self.compression.name(),
         )

@@ -10,6 +10,8 @@ import (
 	"io"
 	"math"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +32,11 @@ const benchGrace = scenarioTimeout
 // dead connection does not turn into a busy loop.
 const benchErrorBackoff = time.Millisecond
 
+// pacedDeadline is how long after its scheduled send an unreliable-paced
+// message's echo may arrive and still count as delivered. A later echo is
+// too late for real-time traffic, so it counts as lost.
+const pacedDeadline = 500 * time.Millisecond
+
 const (
 	// benchPadKey is the request metadata key of --metadata-size.
 	benchPadKey = "bench-pad"
@@ -44,6 +51,7 @@ type benchConfig struct {
 	metadata    int
 	concurrency int
 	messages    int
+	rate        float64
 	duration    float64
 	warmup      float64
 	payload     string
@@ -53,11 +61,12 @@ type benchConfig struct {
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
 	c.connectionConfig.register(flags, "transport: quic or tcp (QMux over TLS)")
-	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream or unreliable-client-stream")
+	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream, unreliable-client-stream or unreliable-paced")
 	flags.IntVar(&c.size, "size", 64, "length of EchoRequest.message in bytes")
 	flags.IntVar(&c.metadata, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	flags.IntVar(&c.concurrency, "concurrency", 1, "workers, each with one call or stream in flight")
 	flags.IntVar(&c.messages, "messages", 100, "messages per streaming call")
+	flags.Float64Var(&c.rate, "rate", 100, "messages per second each unreliable-paced worker sends")
 	flags.Float64Var(&c.duration, "duration", 5, "measured seconds")
 	flags.Float64Var(&c.warmup, "warmup", 1, "seconds run before measuring")
 	flags.StringVar(&c.payload, "payload", "repeat", "EchoRequest.message: repeat (x repeated) or records (a new log-records message per request)")
@@ -112,6 +121,8 @@ func (c *benchConfig) validate() error {
 		return errors.New("bench: --concurrency must be at least 1")
 	case c.messages < 1 || c.messages > math.MaxUint32:
 		return errors.New("bench: --messages must be between 1 and 2^32-1")
+	case !(c.rate > 0) || time.Duration(float64(time.Second)/c.rate) < 1:
+		return errors.New("bench: --rate must be positive and at most 10^9")
 	case !(c.duration > 0):
 		return errors.New("bench: --duration must be positive")
 	case !(c.warmup >= 0):
@@ -127,6 +138,12 @@ func (c *benchConfig) callOptions() []trevrpc.CallOption {
 		return nil
 	}
 	return []trevrpc.CallOption{trevrpc.WithMetadata(benchPadKey, bytes.Repeat([]byte{'x'}, c.metadata))}
+}
+
+// benchWorkload is what one worker runs from the start of the warmup to the
+// end of the measured window, recording what it measured in w.
+type benchWorkload interface {
+	work(ctx context.Context, w *benchWorker, start, end time.Time)
 }
 
 // benchOperation is one worker's unit of work. A worker runs its operations
@@ -188,24 +205,32 @@ func (c benchClients) bidi(config benchConfig) openBidi {
 // benchScenarios builds the operation of one worker for each scenario of
 // bench/README.md. payload supplies the worker's request messages, all of
 // --size bytes.
-var benchScenarios = map[string]func(clients benchClients, config benchConfig, payload benchPayload) benchOperation{
-	"unary": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
-		return &unaryOperation{call: clients.unary(config), options: config.callOptions(), payload: payload}
+var benchScenarios = map[string]func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload{
+	"unary": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&unaryOperation{call: clients.unary(config), options: config.callOptions(), payload: payload}}
 	},
-	"server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
-		return &serverStreamOperation{client: clients.echo, options: config.callOptions(), payload: payload, count: config.messages}
+	"server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&serverStreamOperation{client: clients.echo, options: config.callOptions(), payload: payload, count: config.messages}}
 	},
-	"client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
-		return &clientStreamOperation{open: clients.clientStream(config), options: config.callOptions(), payload: payload, count: config.messages}
+	"client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&clientStreamOperation{open: clients.clientStream(config), options: config.callOptions(), payload: payload, count: config.messages}}
 	},
-	"bidi": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
-		return &bidiOperation{open: clients.bidi(config), options: config.callOptions(), payload: payload}
+	"bidi": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&bidiOperation{open: clients.bidi(config), options: config.callOptions(), payload: payload}}
 	},
-	"unreliable-server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
-		return &unreliableServerStreamOperation{client: clients.unreliable, options: config.callOptions(), message: payload.next(), count: config.messages}
+	"unreliable-server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&unreliableServerStreamOperation{client: clients.unreliable, options: config.callOptions(), message: payload.next(), count: config.messages}}
 	},
-	"unreliable-client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
-		return &unreliableClientStreamOperation{client: clients.unreliable, options: config.callOptions(), message: payload.next(), count: config.messages}
+	"unreliable-client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&unreliableClientStreamOperation{client: clients.unreliable, options: config.callOptions(), message: payload.next(), count: config.messages}}
+	},
+	"unreliable-paced": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return &unreliablePacedWorkload{
+			client:   clients.unreliable,
+			options:  config.callOptions(),
+			payload:  payload,
+			interval: time.Duration(float64(time.Second) / config.rate),
+		}
 	},
 }
 
@@ -397,6 +422,148 @@ func (o *unreliableClientStreamOperation) lost() int { return o.missing }
 
 func (*unreliableClientStreamOperation) close() {}
 
+// unreliablePacedWorkload keeps one UnreliableEcho.Bidi stream open and sends
+// a request that asks for one echo every interval, as real-time traffic does,
+// while it reads the echoes as they arrive. The requests and echoes may travel
+// as datagrams. Each message scheduled inside the measured window is one
+// operation: delivered, with the time from its send to its echo, if the echo
+// arrives within pacedDeadline of the send, and lost otherwise.
+type unreliablePacedWorkload struct {
+	client   *interoppb.UnreliableEchoClient
+	options  []trevrpc.CallOption
+	payload  benchPayload
+	interval time.Duration
+}
+
+func (p *unreliablePacedWorkload) work(ctx context.Context, w *benchWorker, start, end time.Time) {
+	base := time.Now()
+	// Sending goes on past the window, so the echoes of its last messages
+	// arrive under the same load.
+	total := int(end.Add(pacedDeadline).Sub(base)/p.interval) + 1
+	schedule := pacedSchedule{base: base, sent: make([]atomic.Int64, total), rtts: make([]time.Duration, total)}
+	for i := range schedule.rtts {
+		schedule.rtts[i] = -1
+	}
+	for next := 0; next < total; {
+		var err error
+		next, err = p.stream(ctx, &schedule, next)
+		if err == nil {
+			break
+		}
+		if now := time.Now(); !now.Before(start) && !now.After(end) {
+			w.errors++
+		}
+		if sleepUntil(ctx, time.Now().Add(benchErrorBackoff)) != nil {
+			break
+		}
+		// The messages whose time passed while the stream was down are lost,
+		// not sent late.
+		next = max(next, int(time.Since(base)/p.interval)+1)
+	}
+	for i, rtt := range schedule.rtts {
+		scheduled := base.Add(time.Duration(i) * p.interval)
+		if scheduled.Before(start) || !scheduled.Before(end) {
+			continue
+		}
+		if rtt >= 0 && rtt <= pacedDeadline {
+			w.latencies = append(w.latencies, rtt)
+			w.messages++
+		} else {
+			w.lost++
+		}
+	}
+}
+
+// pacedSchedule is what an unreliable-paced worker knows of its messages,
+// one scheduled every interval from base.
+type pacedSchedule struct {
+	base time.Time
+	// sent[i] is when message i was sent, as nanoseconds after base plus one,
+	// or 0 if it has not been. The sender writes it and the receiver reads it.
+	sent []atomic.Int64
+	// rtts[i] is how long after its send message i was echoed, or -1 if it
+	// has not been. Only the receiver writes it.
+	rtts []time.Duration
+}
+
+// stream opens a stream and sends messages next to the end of the schedule,
+// each at its time, recording their echoes. It returns the first message it
+// did not send.
+func (p *unreliablePacedWorkload) stream(ctx context.Context, schedule *pacedSchedule, next int) (int, error) {
+	call, err := p.client.Bidi(ctx, p.options...)
+	if err != nil {
+		return next, err
+	}
+	received := make(chan error, 1)
+	go func() { received <- receivePaced(call, schedule) }()
+	for ; next < len(schedule.sent) && err == nil; next++ {
+		if err = sleepUntil(ctx, schedule.base.Add(time.Duration(next)*p.interval)); err == nil {
+			request := &interoppb.EchoRequest{Message: pacedMessage(next, p.payload.next()), Count: 1}
+			schedule.sent[next].Store(int64(time.Since(schedule.base)) + 1)
+			err = call.Send(request)
+		}
+	}
+	if err == nil {
+		err = call.CloseSend()
+	}
+	if err != nil {
+		// Closing the call ends the receiver's Recv.
+		closeQuietly(call)
+		<-received
+		return next, err
+	}
+	err = <-received
+	closeQuietly(call)
+	return next, err
+}
+
+// receivePaced reads echoes until the status, recording how long after its
+// send each arrived.
+func receivePaced(call trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], schedule *pacedSchedule) error {
+	for {
+		response, err := call.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		arrived := int64(time.Since(schedule.base)) + 1
+		sequence, ok := pacedSequence(response.Message)
+		if !ok || sequence >= len(schedule.sent) {
+			return fmt.Errorf("echo %.20q carries no message number", response.Message)
+		}
+		sent := schedule.sent[sequence].Load()
+		if sent == 0 {
+			return fmt.Errorf("echo of message %d, which was not sent", sequence)
+		}
+		if schedule.rtts[sequence] < 0 {
+			schedule.rtts[sequence] = time.Duration(arrived - sent)
+		}
+	}
+}
+
+// pacedMessage is the request message of unreliable-paced message number
+// sequence: the number in decimal and a space in place of the start of
+// payload.
+func pacedMessage(sequence int, payload string) string {
+	prefix := strconv.Itoa(sequence) + " "
+	if len(payload) <= len(prefix) {
+		return prefix
+	}
+	return prefix + payload[len(prefix):]
+}
+
+// pacedSequence returns the message number an unreliable-paced echo carries.
+func pacedSequence(message string) (int, bool) {
+	digits, _, ok := strings.Cut(message, " ")
+	if !ok {
+		return 0, false
+	}
+	sequence, err := strconv.Atoi(digits)
+	return sequence, err == nil && sequence >= 0
+}
+
 // bidiOperation keeps one Bidi stream open across operations, opening it again
 // after a failure.
 type bidiOperation struct {
@@ -453,9 +620,12 @@ type benchWorker struct {
 	errors    uint64
 }
 
-// loop runs operations back to back until end. It counts only those that start
-// and finish within [start, end].
-func (w *benchWorker) loop(ctx context.Context, operation benchOperation, start, end time.Time) {
+// operationLoop runs its operation back to back until end. It counts only
+// the operations that start and finish within [start, end].
+type operationLoop struct{ operation benchOperation }
+
+func (l operationLoop) work(ctx context.Context, w *benchWorker, start, end time.Time) {
+	operation := l.operation
 	defer operation.close()
 	for {
 		began := time.Now()
@@ -548,9 +718,12 @@ type benchResult struct {
 	WireBytesPerMsg *float64     `json:"wire_bytes_per_msg,omitempty"`
 	// Lost counts the messages sent but not delivered, which only the
 	// unreliable scenarios can have.
-	Lost        uint64 `json:"lost"`
-	Payload     string `json:"payload"`
-	Compression string `json:"compression"`
+	Lost uint64 `json:"lost"`
+	// Rate is the messages per second each worker sends, which only the
+	// unreliable-paced scenario has.
+	Rate        float64 `json:"rate,omitempty"`
+	Payload     string  `json:"payload"`
+	Compression string  `json:"compression"`
 }
 
 // runBench connects, runs the scenario for the warmup and the measured window
@@ -592,8 +765,8 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	workers := make([]benchWorker, config.concurrency)
 	var group sync.WaitGroup
 	for i := range workers {
-		operation := benchScenarios[config.scenario](clients, config, newBenchPayload(config.payload, config.size, i))
-		group.Go(func() { workers[i].loop(opCtx, operation, start, end) })
+		workload := benchScenarios[config.scenario](clients, config, newBenchPayload(config.payload, config.size, i))
+		group.Go(func() { workload.work(opCtx, &workers[i], start, end) })
 	}
 	var wireBefore, wireAfter uint64
 	waitErr := sleepUntil(ctx, start)
@@ -653,6 +826,10 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 	slices.Sort(latencies)
 	seconds := window.Seconds()
 	ops := uint64(len(latencies))
+	var rate float64
+	if config.scenario == "unreliable-paced" {
+		rate = config.rate
+	}
 	return benchResult{
 		Scenario:     config.scenario,
 		Transport:    string(transport),
@@ -663,6 +840,7 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 		Ops:          ops,
 		Msgs:         messages,
 		Lost:         lost,
+		Rate:         rate,
 		Payload:      config.payload,
 		Compression:  config.compression,
 		Errors:       failures,
