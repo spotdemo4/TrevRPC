@@ -73,11 +73,12 @@ func RequestMetadataFromContext(ctx context.Context) Metadata {
 func newHandlerContext(request *wireRequest) HandlerContext {
 	service, method := request.serviceAndMethod()
 	return HandlerContext{
-		Service:       service,
-		Method:        method,
-		FullMethod:    request.Method,
-		Kind:          request.rpcKind(),
-		Metadata:      cloneMetadata(request.Metadata),
+		Service:    service,
+		Method:     method,
+		FullMethod: request.Method,
+		Kind:       request.rpcKind(),
+		// Decoded for this call, connection metadata included, so not copied.
+		Metadata:      ownedMetadata(request.Metadata),
 		flow:          request.flow,
 		streams:       request.streams,
 		plainRequests: request.plainRequests,

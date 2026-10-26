@@ -156,7 +156,9 @@ func (s *connectionMetadataStore) resolve(request *wireRequest) error {
 	}
 	for key, value := range set {
 		if _, ok := request.Metadata[key]; !ok {
-			request.Metadata[key] = value
+			// A copy: the connection's later calls share the stored values,
+			// and the handler owns its request metadata.
+			request.Metadata[key] = append([]byte(nil), value...)
 		}
 	}
 	return nil

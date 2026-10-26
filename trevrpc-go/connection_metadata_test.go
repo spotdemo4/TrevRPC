@@ -241,3 +241,36 @@ func TestConnectionMetadataStore(t *testing.T) {
 		t.Fatalf("reference without a store: %v, want InvalidArgument", err)
 	}
 }
+
+func TestHandlersCannotChangeTheConnectionMetadataOfLaterCalls(t *testing.T) {
+	pki := newTestPKI(t)
+	listener := startTestListenerWith(t, pki, nil, func(server *Server) {
+		// Answers with the suffix it got, then overwrites it in place.
+		RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*testMessage, error) {
+			suffix := RequestMetadataFromContext(ctx)["suffix"]
+			reply := &testMessage{Value: request.Value + string(suffix)}
+			for i := range suffix {
+				suffix[i] = 'x'
+			}
+			return reply, nil
+		})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+		TLSConfig:          pki.client,
+		Transport:          TransportQUICOnly,
+		ConnectionMetadata: Metadata{"suffix": []byte("!")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = channel.Close() }()
+	// The first call offers the set and the later ones refer to it: each still
+	// gets the stored value, not what an earlier handler wrote.
+	for range 3 {
+		if got := echoSuffix(t, channel); got != "v!" {
+			t.Fatalf("call = %q, want v!", got)
+		}
+	}
+}
