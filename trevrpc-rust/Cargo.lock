@@ -2175,6 +2175,7 @@ dependencies = [
  "prost",
  "qmux",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "ring",
  "time",

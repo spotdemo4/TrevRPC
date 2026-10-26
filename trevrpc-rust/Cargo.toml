@@ -66,6 +66,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14.4"
 qmux = { version = "=0.6.6", default-features = false, features = ["tcp", "ws"] }
 quinn = "0.11.8"
+# The congestion controller trait's RTT estimate, which quinn does not re-export.
+quinn-proto = { version = "0.11.19", default-features = false }
 ring = "0.17"
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }

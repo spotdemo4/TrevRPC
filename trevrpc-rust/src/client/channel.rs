@@ -297,6 +297,7 @@ impl ChannelConfig {
             quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(Error::transport)?;
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
         let mut transport = quinn::TransportConfig::default();
+        transport.congestion_controller_factory(crate::congestion::factory());
         let window = crate::quic::frame_receive_window(self.max_frame_size);
         transport.stream_receive_window(crate::quic::varint(window));
         transport.receive_window(crate::quic::varint(window));

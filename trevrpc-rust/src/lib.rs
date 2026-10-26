@@ -14,6 +14,7 @@ extern crate self as trevrpc;
 
 pub mod client;
 pub mod compression;
+mod congestion;
 mod datagram;
 pub mod error;
 pub mod fallback;

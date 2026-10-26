@@ -68,6 +68,7 @@ impl Server {
             quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(Error::transport)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         let mut transport = quinn::TransportConfig::default();
+        transport.congestion_controller_factory(crate::congestion::factory());
         apply_transport_limits(&mut transport, self.options());
         config.transport_config(Arc::new(transport));
         Ok(config)
