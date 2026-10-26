@@ -11,7 +11,8 @@
 //!                            --scenario unary|server-stream|client-stream|bidi|
 //!                                       unreliable-server-stream|unreliable-client-stream|
 //!                                       paced|unreliable-paced
-//!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
+//!                            [--size 64] [--concurrency 1] [--connections 1]
+//!                            [--duration 5] [--warmup 1]
 //!                            [--messages 100] [--rate 100] [--metadata-size 0]
 //!                            [--metadata-scope call|connection]
 //!                            [--payload repeat|records]
@@ -77,6 +78,7 @@ async fn main() -> ExitCode {
                 "scenario",
                 "size",
                 "concurrency",
+                "connections",
                 "duration",
                 "warmup",
                 "messages",

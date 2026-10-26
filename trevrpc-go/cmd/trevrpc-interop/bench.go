@@ -53,13 +53,15 @@ type benchConfig struct {
 	// every call, "connection" as connection metadata.
 	metadataScope string
 	concurrency   int
-	messages      int
-	rate          float64
-	duration      float64
-	warmup        float64
-	payload       string
-	compression   string
-	dictionary    string
+	// connections is how many channels the workers spread over.
+	connections int
+	messages    int
+	rate        float64
+	duration    float64
+	warmup      float64
+	payload     string
+	compression string
+	dictionary  string
 }
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
@@ -68,6 +70,7 @@ func (c *benchConfig) register(flags *flag.FlagSet) {
 	flags.IntVar(&c.size, "size", 64, "length of EchoRequest.message in bytes")
 	flags.IntVar(&c.metadata, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	flags.StringVar(&c.metadataScope, "metadata-scope", "call", "call (the bench-pad entry goes with every call) or connection (as connection metadata)")
+	flags.IntVar(&c.connections, "connections", 1, "channels, each with its own connection, that the workers spread over in turn")
 	flags.IntVar(&c.concurrency, "concurrency", 1, "workers, each with one call or stream in flight")
 	flags.IntVar(&c.messages, "messages", 100, "messages per streaming call")
 	flags.Float64Var(&c.rate, "rate", 100, "messages per second each paced or unreliable-paced worker sends")
@@ -125,6 +128,8 @@ func (c *benchConfig) validate() error {
 		return fmt.Errorf("bench: --metadata-size must be between 0 and %d", benchMaxMetadataSize)
 	case c.concurrency < 1:
 		return errors.New("bench: --concurrency must be at least 1")
+	case c.connections < 1 || c.connections > c.concurrency:
+		return errors.New("bench: --connections must be between 1 and --concurrency")
 	case c.messages < 1 || c.messages > math.MaxUint32:
 		return errors.New("bench: --messages must be between 1 and 2^32-1")
 	case !(c.rate > 0) || time.Duration(float64(time.Second)/c.rate) < 1:
@@ -731,6 +736,7 @@ type benchResult struct {
 	Size            int          `json:"size"`
 	MetadataSize    int          `json:"metadata_size"`
 	MetadataScope   string       `json:"metadata_scope"`
+	Connections     int          `json:"connections"`
 	Concurrency     int          `json:"concurrency"`
 	DurationS       float64      `json:"duration_s"`
 	Ops             uint64       `json:"ops"`
@@ -772,15 +778,20 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	if config.metadataScope == "connection" {
 		dialOptions.ConnectionMetadata = config.padMetadata()
 	}
-	channel, err := config.dial(ctx, dialOptions)
-	if err != nil {
-		return err
-	}
-	defer closeQuietly(channel)
-	clients := benchClients{
-		echo:       interoppb.NewEchoClient(channel),
-		unreliable: interoppb.NewUnreliableEchoClient(channel),
-		compressed: interoppb.NewCompressedEchoClient(channel),
+	channels := make([]*trevrpc.Channel, config.connections)
+	clients := make([]benchClients, config.connections)
+	for i := range channels {
+		channel, err := config.dial(ctx, dialOptions)
+		if err != nil {
+			return err
+		}
+		defer closeQuietly(channel)
+		channels[i] = channel
+		clients[i] = benchClients{
+			echo:       interoppb.NewEchoClient(channel),
+			unreliable: interoppb.NewUnreliableEchoClient(channel),
+			compressed: interoppb.NewCompressedEchoClient(channel),
+		}
 	}
 
 	warmup := time.Duration(config.warmup * float64(time.Second))
@@ -793,7 +804,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	workers := make([]benchWorker, config.concurrency)
 	var group sync.WaitGroup
 	for i := range workers {
-		workload := benchScenarios[config.scenario](clients, config, newBenchPayload(config.payload, config.size, i))
+		workload := benchScenarios[config.scenario](clients[i%len(clients)], config, newBenchPayload(config.payload, config.size, i))
 		group.Go(func() { workload.work(opCtx, &workers[i], start, end) })
 	}
 	var wireBefore, wireAfter uint64
@@ -815,7 +826,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		return waitErr
 	}
 
-	result, err := summarize(config, channel.Transport(), window, workers)
+	result, err := summarize(config, channels[0].Transport(), window, workers)
 	if err != nil {
 		return err
 	}
@@ -864,6 +875,7 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 		Size:          config.size,
 		MetadataSize:  config.metadata,
 		MetadataScope: config.metadataScope,
+		Connections:   config.connections,
 		Concurrency:   config.concurrency,
 		DurationS:     seconds,
 		Ops:           ops,

@@ -4,7 +4,7 @@ grpc-go and connect-go baselines; see README.md.
 
     run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
            [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--metadata-scopes LIST]
-           [--concurrency LIST]
+           [--concurrency LIST] [--connections LIST]
            [--payload repeat|records] [--compressions LIST]
            [--duration SECONDS] [--warmup SECONDS] [--messages N] [--rates LIST]
            [--repeat N] [--tolerance PERCENT] [--netem PROFILE...] [--out DIR]
@@ -80,8 +80,8 @@ COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
 # Room on top of warmup and duration for connecting and draining.
 DEADLINE_SLACK = 60
 COLUMNS = (
-    "scenario", "size", "md", "conc", "rate", "transport", "compression", "client", "server",
-    "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%", "spread%",
+    "scenario", "size", "md", "conc", "conns", "rate", "transport", "compression", "client",
+    "server", "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%", "spread%",
 )  # fmt: skip
 
 
@@ -98,6 +98,8 @@ class Matrix:
     rates: tuple[int, ...] = (1000,)
     # Where the metadata goes, one cell per scope: "call" or "connection".
     metadata_scopes: tuple[str, ...] = ("call",)
+    # How many channels the workers spread over, one cell per count.
+    connections: tuple[int, ...] = (1,)
     payload: str = "repeat"
     compressions: tuple[str, ...] = ("none",)
     # The trained dictionary, when a mode needs it.
@@ -128,6 +130,8 @@ class Matrix:
             for scope in self.metadata_scopes
             if scope == "call" or (metadata > 0 and transport in NATIVE_TRANSPORTS)
             for workers in self.concurrency
+            for conns in self.connections
+            if conns == 1 or (transport in NATIVE_TRANSPORTS and conns <= workers)
             for rate in (self.rates if scenario in PACED_SCENARIOS else (None,))
             if self.keep(
                 cell := tables.Cell(
@@ -140,6 +144,7 @@ class Matrix:
                     metadata_size=metadata,
                     metadata_scope=scope,
                     concurrency=workers,
+                    connections=conns,
                     rate=rate,
                     netem=netem,
                 )
@@ -160,6 +165,7 @@ class Result:
     metadata_size: int
     metadata_scope: str
     concurrency: int
+    connections: int
     # Messages per second per worker, for the paced scenarios.
     rate: float | None
     errors: float
@@ -188,6 +194,7 @@ class Result:
             str(self.size),
             metadata_column(self.metadata_size, self.metadata_scope),
             str(self.concurrency),
+            str(self.connections),
             "-" if self.rate is None else plain(self.rate),
             self.transport,
             self.compression,
@@ -203,13 +210,14 @@ class Result:
             "-" if spread is None else hundredths(spread),
         ]
 
-    def sort_key(self) -> tuple[str, int, int, str, int, float, str, str, str, str]:
+    def sort_key(self) -> tuple[str, int, int, str, int, int, float, str, str, str, str]:
         return (
             self.scenario,
             self.size,
             self.metadata_size,
             self.metadata_scope,
             self.concurrency,
+            self.connections,
             0 if self.rate is None else self.rate,
             self.transport,
             self.compression,
@@ -278,6 +286,7 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         metadata_size=int_field(record, "metadata_size", 0),
         metadata_scope=text_field(record, "metadata_scope", "call"),
         concurrency=int_field(record, "concurrency"),
+        connections=int_field(record, "connections", 1),
         rate=None if record.get("rate") is None else number_field(record, "rate"),
         errors=number_field(record, "errors"),
         msgs=number_field(record, "msgs"),
@@ -396,12 +405,15 @@ class Runner:
                 mode += ["--rate", str(cell.rate)]
             if cell.metadata_scope != "call":
                 mode += ["--metadata-scope", cell.metadata_scope]
+            if cell.connections != 1:
+                mode += ["--connections", str(cell.connections)]
             suffix = "" if cell.compression == "none" else f"-{cell.compression}"
             rate = "" if cell.rate is None else f"-r{cell.rate}"
             name = (
                 f"{client}-{transport}-to-{server}-{cell.scenario}{suffix}-{cell.size}"
                 f"-md{metadata_column(cell.metadata_size, cell.metadata_scope)}"
-                f"-c{cell.concurrency}{rate}{profile}"
+                f"-c{cell.concurrency}{'' if cell.connections == 1 else f'x{cell.connections}'}"
+                f"{rate}{profile}"
             )
             self.run_one(
                 name,
@@ -566,6 +578,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "(TrevRPC's connection metadata, which the baselines do not run)",
     )
     _ = parser.add_argument("--concurrency", type=int_list, default=[1, 64])
+    _ = parser.add_argument(
+        "--connections",
+        type=positive_int_list,
+        default=[1],
+        metavar="LIST",
+        help="how many channels the workers spread over, one cell per count; counts above 1 "
+        "run on the TrevRPC transports only, and only with at least that many workers",
+    )
     _ = parser.add_argument("--duration", type=seconds, default=5.0)
     _ = parser.add_argument("--warmup", type=seconds, default=1.0)
     _ = parser.add_argument("--messages", type=int, default=100)
@@ -650,6 +670,7 @@ def build_matrix(args: argparse.Namespace, dictionary: Path | None = None) -> Ma
         messages=args.messages,
         rates=tuple(args.rates),
         metadata_scopes=tuple(args.metadata_scopes),
+        connections=tuple(args.connections),
         repeat=args.repeat,
         tolerance=args.tolerance,
         keep=tables.TABLES[args.table].keep if args.table else (lambda _cell: True),

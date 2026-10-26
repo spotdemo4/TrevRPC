@@ -377,6 +377,38 @@ fn bench_metadata_size_pads_every_call() {
 }
 
 #[test]
+fn bench_spreads_workers_over_connections() {
+    let server = Server::start("bench-connections");
+    for transport in ["quic", "tcp"] {
+        let output = server.run(
+            "bench",
+            &[
+                "--transport",
+                transport,
+                "--scenario",
+                "unary",
+                "--concurrency",
+                "6",
+                "--connections",
+                "3",
+                "--duration",
+                "0.3",
+                "--warmup",
+                "0.05",
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{transport}: {stderr}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let json = stdout.lines().next().expect("one JSON line");
+        assert_close(number(json, "connections"), 3.0, 1e-9, json);
+        assert_close(number(json, "errors"), 0.0, 1e-9, json);
+        assert!(number(json, "ops") > 0.0, "{json}");
+    }
+    server.finish();
+}
+
+#[test]
 fn bench_rejects_unusable_flags() {
     let server = Server::start("bench-flags");
     for flags in [
@@ -388,6 +420,15 @@ fn bench_rejects_unusable_flags() {
         // One byte over the 8 KiB metadata value limit.
         &["--scenario", "unary", "--metadata-size", "8193"],
         &["--scenario", "unary", "--metadata-scope", "stream"],
+        &["--scenario", "unary", "--connections", "0"],
+        &[
+            "--scenario",
+            "unary",
+            "--concurrency",
+            "2",
+            "--connections",
+            "3",
+        ],
         &["--scenario", "unary", "--payload", "zeros"],
         &["--scenario", "unary", "--compression", "gzip"],
         // No compression runs on server-stream or the datagram scenarios.

@@ -200,6 +200,8 @@ struct Params {
     /// Whether the `bench-pad` entry is connection metadata rather than each call's.
     connection_metadata: bool,
     concurrency: usize,
+    /// How many channels the workers spread over.
+    connections: usize,
     duration: Duration,
     warmup: Duration,
     messages: usize,
@@ -248,6 +250,10 @@ impl Params {
         if concurrency == 0 || messages == 0 {
             return Err("--concurrency and --messages must be positive".into());
         }
+        let connections = number(flags, "connections", 1)?;
+        if connections == 0 || connections > concurrency {
+            return Err("--connections must be between 1 and --concurrency".into());
+        }
         let rate = flags.get("rate").map_or(Ok(100.0), |value| {
             value
                 .parse::<f64>()
@@ -267,6 +273,7 @@ impl Params {
             metadata_size,
             connection_metadata,
             concurrency,
+            connections,
             duration,
             warmup: seconds(flags, "warmup", 1.0)?,
             messages,
@@ -324,11 +331,11 @@ fn seconds(flags: &Flags, name: &str, default: f64) -> Result<Duration, BoxError
 }
 
 /// The transport a run measures and how to read its connection statistics.
-/// The channel every worker shares, connected as `--transport` asks.
+/// The channels the workers spread over, `--connections` of them, connected as `--transport`
+/// asks, each with its own endpoint.
 struct Link {
-    channel: Channel,
-    endpoint: quinn::Endpoint,
-    /// The transport the channel connected over, which outlives closing it.
+    channels: Vec<(Channel, quinn::Endpoint)>,
+    /// The transport the channels connected over, which outlives closing them.
     transport: TransportKind,
 }
 
@@ -340,16 +347,21 @@ impl Link {
             "quic" | "tcp" => {}
             other => return Err(format!("unknown --transport {other:?}, want quic or tcp").into()),
         }
-        let (channel, endpoint) = connect::channel_with(flags, |config| {
-            config.with_connection_metadata(params.connection_metadata())
-        })
-        .await?;
-        let transport = channel
-            .transport()
+        let mut channels = Vec::with_capacity(params.connections);
+        for _ in 0..params.connections {
+            channels.push(
+                connect::channel_with(flags, |config| {
+                    config.with_connection_metadata(params.connection_metadata())
+                })
+                .await?,
+            );
+        }
+        let transport = channels
+            .first()
+            .and_then(|(channel, _)| channel.transport())
             .ok_or("the channel lost its connection before the run")?;
         Ok(Self {
-            channel,
-            endpoint,
+            channels,
             transport,
         })
     }
@@ -368,9 +380,9 @@ impl Link {
             return None;
         }
         Some(
-            self.channel
-                .quic_connections()
+            self.channels
                 .iter()
+                .flat_map(|(channel, _)| channel.quic_connections())
                 .map(|connection| {
                     let stats = connection.stats();
                     stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes)
@@ -379,9 +391,19 @@ impl Link {
         )
     }
 
+    /// The channels, for the workers to take in turn.
+    fn transports(&self) -> Vec<Channel> {
+        self.channels
+            .iter()
+            .map(|(channel, _)| channel.clone())
+            .collect()
+    }
+
     async fn close(&self) {
-        self.channel.close();
-        self.endpoint.wait_idle().await;
+        for (channel, endpoint) in &self.channels {
+            channel.close();
+            endpoint.wait_idle().await;
+        }
     }
 }
 
@@ -865,7 +887,7 @@ where
 
 /// Runs the workers and the wire-byte sampling over `transport`.
 async fn measure<T>(
-    transport: T,
+    transports: Vec<T>,
     params: &Params,
     link: &Link,
 ) -> Result<(Vec<WorkerResult>, Option<u64>), BoxError>
@@ -882,7 +904,8 @@ where
             .ok_or("--duration is too long")?,
     };
     let workers: Vec<_> = (0..params.concurrency)
-        .map(|index| {
+        .zip(transports.iter().cycle())
+        .map(|(index, transport)| {
             tokio::spawn(work(
                 Worker {
                     client: EchoClient::new(transport.clone()),
@@ -920,7 +943,7 @@ where
 pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let params = Params::parse(flags)?;
     let link = Link::connect(flags, &params).await?;
-    let measured = measure(link.channel.clone(), &params, &link).await;
+    let measured = measure(link.transports(), &params, &link).await;
     link.close().await;
     let (results, wire) = measured?;
 
@@ -952,6 +975,7 @@ struct Report {
     metadata_size: usize,
     connection_metadata: bool,
     concurrency: usize,
+    connections: usize,
     duration: f64,
     ops: u64,
     msgs: u64,
@@ -1006,6 +1030,7 @@ impl Report {
             metadata_size: params.metadata_size,
             connection_metadata: params.connection_metadata,
             concurrency: params.concurrency,
+            connections: params.connections,
             duration: params.duration.as_secs_f64(),
             ops,
             msgs,
@@ -1046,7 +1071,7 @@ impl Report {
         format!(
             concat!(
                 r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"metadata_scope":"{}","#,
-                r#""concurrency":{},"duration_s":{:?},"#,
+                r#""concurrency":{},"connections":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
                 r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{}{},"#,
                 r#""payload":"{}","compression":"{}"}}"#,
@@ -1061,6 +1086,7 @@ impl Report {
                 "call"
             },
             self.concurrency,
+            self.connections,
             self.duration,
             self.ops,
             self.msgs,

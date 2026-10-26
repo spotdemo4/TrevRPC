@@ -63,11 +63,11 @@ class SummaryTest(unittest.TestCase):
 
         self.assertTrue(lines[0].startswith("scenario" + " " * 18 + "size"))
         bidi, unary = (line.split() for line in lines[1:])
-        self.assertEqual(["bidi", "64", "0", "4", "-", "quic", "none", "go", "go"], bidi[:9])
+        self.assertEqual(["bidi", "64", "0", "4", "1", "-", "quic", "none", "go", "go"], bidi[:10])
         # ops/s, msgs/s, MB/s, p50us, p99us, wire_B/msg, lost%, spread%
-        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[9:])
-        self.assertEqual(["unary", "rust", "go"], [unary[0], unary[7], unary[8]])
-        self.assertEqual(["80", "33.33", "-"], unary[14:])
+        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[10:])
+        self.assertEqual(["unary", "rust", "go"], [unary[0], unary[8], unary[9]])
+        self.assertEqual(["80", "33.33", "-"], unary[15:])
 
     def test_shows_the_rate_of_paced_runs_in_rate_order(self) -> None:
         paced = {**RESULT, "scenario": "unreliable-paced"}
@@ -78,8 +78,8 @@ class SummaryTest(unittest.TestCase):
 
         lines = run.summary(results).splitlines()
 
-        self.assertEqual("rate", lines[0].split()[4])
-        self.assertEqual(["100", "1000"], [line.split()[4] for line in lines[1:]])
+        self.assertEqual("rate", lines[0].split()[5])
+        self.assertEqual(["100", "1000"], [line.split()[5] for line in lines[1:]])
         self.assertIsNone(run.parse_result("go", "go", json.dumps(RESULT)).rate)
 
     def test_marks_connection_metadata(self) -> None:
@@ -94,13 +94,30 @@ class SummaryTest(unittest.TestCase):
 
         self.assertEqual(["1024", "1024c"], [result.row()[2] for result in results])
 
+    def test_spreads_workers_over_connections_on_trevrpc_only(self) -> None:
+        matrix = run.Matrix(["unary"], [64], [0], [1, 64], 0.2, 0, 10, connections=(1, 4))
+
+        self.assertEqual(
+            [(1, 1), (64, 1), (64, 4)],
+            [
+                (cell.concurrency, cell.connections)
+                for cell in matrix.cells("go", "go", "quic", None)
+            ],
+        )
+        self.assertEqual(
+            [1, 1], [cell.connections for cell in matrix.cells("grpc", "grpc", "grpc", None)]
+        )
+        result = run.parse_result("go", "go", json.dumps({**RESULT, "connections": 4}))
+        self.assertEqual("4", result.row()[4])
+        self.assertEqual(1, run.parse_result("go", "go", json.dumps(RESULT)).connections)
+
     def test_shows_the_compression_mode(self) -> None:
         result = run.parse_result(
             "go", "go", json.dumps({**RESULT, "payload": "records", "compression": "stream"})
         )
 
         self.assertEqual("stream", result.compression)
-        self.assertEqual("stream", run.summary([result]).splitlines()[1].split()[6])
+        self.assertEqual("stream", run.summary([result]).splitlines()[1].split()[7])
 
     def test_groups_rows_by_netem_profile_in_run_order(self) -> None:
         results = [
@@ -113,7 +130,7 @@ class SummaryTest(unittest.TestCase):
 
         self.assertEqual("netem delay 10ms loss 1%", lines[0])
         self.assertTrue(lines[1].startswith("scenario"))
-        self.assertEqual(["go", "rust"], [line.split()[7] for line in lines[2:4]])
+        self.assertEqual(["go", "rust"], [line.split()[8] for line in lines[2:4]])
         self.assertEqual(["", "netem delay 10ms"], lines[4:6])
         self.assertEqual(8, len(lines))
         self.assertEqual("delay 10ms", results[1].record["netem"])

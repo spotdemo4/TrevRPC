@@ -26,6 +26,8 @@ class Cell:
     # Where the metadata goes: "call" (every call) or "connection" (connection metadata).
     metadata_scope: str
     concurrency: int
+    # How many channels the workers spread over; TrevRPC clients only.
+    connections: int
     # Messages per second per worker, for the paced scenarios only.
     rate: int | None
     netem: str | None

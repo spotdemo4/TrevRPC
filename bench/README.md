@@ -16,7 +16,7 @@ nix run .#trevrpc-bench -- --payload records --compressions none,gzip,zstd,dicti
 nix run .#trevrpc-bench -- --table comparison --repeat 3 --tolerance 3
 nix run .#trevrpc-bench -- --scenarios unreliable-paced --concurrency 64 --rates 100,1000,10000
 bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
-             [--scenarios LIST] [--sizes LIST] [--concurrency LIST]
+             [--scenarios LIST] [--sizes LIST] [--concurrency LIST] [--connections LIST]
              [--metadata-sizes LIST] [--metadata-scopes LIST] [--payload repeat|records]
              [--compressions LIST] [--duration SECONDS] [--warmup SECONDS]
              [--messages N] [--rates LIST] [--repeat N] [--tolerance PERCENT]
@@ -150,7 +150,7 @@ for the whole run.
 <binary> bench --addr <host:port> [--tcp-addr <host:port>] --ca <cert.pem>
                [--server-name localhost] --transport quic|tcp|grpc|connect
                --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream|paced|unreliable-paced
-               [--size BYTES] [--concurrency N] [--duration SECONDS]
+               [--size BYTES] [--concurrency N] [--connections N] [--duration SECONDS]
                [--warmup SECONDS] [--messages N] [--rate N] [--metadata-size BYTES]
                [--metadata-scope call|connection] [--payload repeat|records] [--compression MODE] [--dictionary FILE]
 ```
@@ -164,6 +164,13 @@ for the whole run.
 - `--size` (default 64) is the length of `EchoRequest.message` in bytes.
 - `--concurrency` (default 1) is the number of workers, each with exactly one
   call or stream in flight.
+- `--connections` (default 1) gives the workers that many channels, each
+  with its own endpoint and connections, which they take in turn, as that
+  many clients would. One connection measures what one connection carries:
+  quic-go and the Go QMux session process each connection's packets on one
+  goroutine. Several measure what the server carries. It must not exceed
+  `--concurrency`; the baseline takes only 1, and `run.py --connections`
+  runs other counts on the TrevRPC transports only.
 - `--warmup` (default 1) seconds run before measuring; `--duration` (default 5) seconds are measured. Durations accept fractions. Only operations that
   start and finish inside the measured window count.
 - `--metadata-size` (default 0) adds one request metadata entry, `bench-pad`,
@@ -254,6 +261,7 @@ non-zero if it could not connect or measure:
   "metadata_size": 0,
   "metadata_scope": "call",
   "concurrency": 1,
+  "connections": 1,
   "duration_s": 5.0,
   "ops": 81234,
   "msgs": 81234,
@@ -270,6 +278,7 @@ non-zero if it could not connect or measure:
 ```
 
 - `transport` is `quic`, `qmux`, `grpc`, or `connect`.
+- `connections` echoes `--connections`; a result without it counts as 1.
 - `payload` and `compression` echo `--payload` and `--compression`, and
   `metadata_scope` echoes `--metadata-scope`; a result without it counts as
   `call`.
