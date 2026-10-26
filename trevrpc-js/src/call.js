@@ -4,6 +4,7 @@ import {
   sessionCompression,
   transportCompression,
 } from "./compression.js";
+import { transportConnectionMetadata } from "./connection-metadata.js";
 import { datagramEndpoint, messageFrameSize } from "./datagram.js";
 import {
   DefaultMaxFrameSize,
@@ -139,6 +140,10 @@ export class Call {
   #sendDatagrams = false;
   /** The compression state of the session that carries the call, or undefined without one. */
   #compression;
+  /** The connection metadata state of the session that carries the call, or undefined without. */
+  #connectionMetadata;
+  /** The ID of the connection metadata set the REQUEST offered, or zero. */
+  #offeredMetadata = 0;
   /** The full protobuf type name of the request messages. */
   #requestType;
   /**
@@ -193,7 +198,12 @@ export class Call {
   static async open(transport, request, message, options, rpc = {}) {
     const fields = { ...request, metadata: options.metadata, ...timeoutField(options) };
     const compression = transportCompression(transport);
-    const perSession = rpc.datagrams !== undefined || compression !== undefined;
+    // The REQUEST depends on the session that carries the call if it negotiates compression, opens
+    // a datagram flow or carries connection metadata.
+    const perSession =
+      rpc.datagrams !== undefined ||
+      compression !== undefined ||
+      transportConnectionMetadata(transport)?.current !== undefined;
     const header = perSession
       ? null
       : encodeRequestFrame(fields, outgoing(message), options.maxFrameSize);
@@ -264,6 +274,14 @@ export class Call {
         }
       }
     }
+    this.#connectionMetadata = transportConnectionMetadata(transport)?.session(session.key);
+    if (this.#connectionMetadata !== undefined) {
+      const { field, offered } = this.#connectionMetadata.prepare();
+      this.#offeredMetadata = offered;
+      if (field !== undefined) {
+        request.connectionMetadata = field;
+      }
+    }
     return encodeRequestFrame(
       request,
       message === undefined ? undefined : this.#encode(message),
@@ -305,9 +323,11 @@ export class Call {
   /**
    * Records the server's answers in the response HEADERS to what the REQUEST asked. HEADERS
    * accept an optimistic call, and a `stream_compression` answer lets the session's calls be
-   * optimistic again after a refusal.
+   * optimistic again after a refusal. A `connection_metadata` answer confirms the set the REQUEST
+   * offered, so the session's calls refer to it from now on.
    */
   learnAnswers(headers) {
+    this.#connectionMetadata?.learn(this.#offeredMetadata, headers);
     if (this.#queried) {
       this.#compression.learn(headers.dictionaries);
     }

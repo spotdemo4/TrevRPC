@@ -110,6 +110,20 @@ type Channel struct {
 	clock      reconnectClock
 	backoff    reconnectBackoff
 	events     *channelEventDispatcher
+	// connectionMetadata is the channel's connection metadata, nil for a
+	// channel built without Dial.
+	connectionMetadata *connectionMetadataSource
+}
+
+// SetConnectionMetadata replaces the channel's connection metadata (see
+// DialOptions.ConnectionMetadata), for example when a token is refreshed.
+// Calls that start afterwards carry the new metadata; each connection offers
+// it until the server confirms it. Empty metadata removes it.
+func (c *Channel) SetConnectionMetadata(metadata Metadata) error {
+	if c.connectionMetadata == nil {
+		return FailedPrecondition("the channel has no connection metadata source")
+	}
+	return c.connectionMetadata.set(metadata)
 }
 
 func dialChannel(

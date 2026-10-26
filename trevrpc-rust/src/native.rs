@@ -6,6 +6,7 @@ use bytes::Bytes;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
+use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::Demux;
 use crate::framed::{self, FrameRead, ResponseCodec};
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
@@ -13,7 +14,8 @@ use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::serve::{drain_streams, log_task_error};
 use crate::server::Server;
 use crate::server_transport::{
-    self, IncomingRequest, Permit, ResponseWriter, open_flow, reject_unreadable, try_acquire_permit,
+    self, IncomingRequest, Permit, ResponseWriter, open_flow, reject_unreadable,
+    resolve_connection_metadata, try_acquire_permit,
 };
 use crate::{ResponseFrame, Result};
 
@@ -116,6 +118,7 @@ pub async fn handle_connection<C: MuxConnection>(
             server.max_frame_size(),
         ))
     });
+    let connection_metadata = Arc::new(ConnectionMetadataStore::default());
 
     loop {
         if *shutdown.borrow() {
@@ -131,6 +134,7 @@ pub async fn handle_connection<C: MuxConnection>(
                     stream_tasks.spawn(reject_stream(
                         server.clone(),
                         connection.clone(),
+                        Arc::clone(&connection_metadata),
                         send,
                         recv,
                     ));
@@ -145,6 +149,7 @@ pub async fn handle_connection<C: MuxConnection>(
                     server,
                     stream_connection,
                     demux.clone(),
+                    Arc::clone(&connection_metadata),
                     request_limit,
                     stream_permit,
                     send,
@@ -175,13 +180,15 @@ pub async fn handle_connection<C: MuxConnection>(
     }
 }
 
-/// Reads the initial request frame and opens its datagram flow on `demux`, replying with the
-/// failure status when either fails. The stream slot is released before that reply.
+/// Reads the initial request frame, resolves its connection metadata against the connection's
+/// `connection_metadata` and opens its datagram flow on `demux`, replying with the failure status
+/// when any of them fails. The stream slot is released before that reply.
 async fn read_request<C: MuxConnection>(
     server: &Server,
     stream_permit: &mut Permit,
     connection: C,
     demux: Option<&Demux>,
+    connection_metadata: &ConnectionMetadataStore,
     send: C::SendStream,
     recv: C::RecvStream,
 ) -> Option<(
@@ -193,7 +200,11 @@ async fn read_request<C: MuxConnection>(
     let mut recv = NativePumpReader::new(recv, connection);
     let incoming = server_transport::read_initial_request(server, &mut recv.recv)
         .await
-        .and_then(|mut incoming| open_flow(demux, &mut incoming).map(|()| incoming));
+        .and_then(|mut incoming| {
+            resolve_connection_metadata(Some(connection_metadata), &mut incoming)?;
+            open_flow(demux, &mut incoming)?;
+            Ok(incoming)
+        });
     match incoming {
         Ok(incoming) => Some((
             NativeResponseWriter::new(send, max_frame_size),
@@ -219,6 +230,7 @@ async fn handle_stream<C: MuxConnection>(
     server: Server,
     connection: C,
     demux: Option<Arc<Demux>>,
+    connection_metadata: Arc<ConnectionMetadataStore>,
     request_limit: Option<Arc<Semaphore>>,
     mut stream_permit: Permit,
     send: C::SendStream,
@@ -230,6 +242,7 @@ async fn handle_stream<C: MuxConnection>(
         &mut stream_permit,
         connection,
         demux.as_deref(),
+        &connection_metadata,
         send,
         recv,
     )
@@ -251,12 +264,21 @@ async fn handle_stream<C: MuxConnection>(
 async fn reject_stream<C: MuxConnection>(
     server: Server,
     connection: C,
+    connection_metadata: Arc<ConnectionMetadataStore>,
     send: C::SendStream,
     recv: C::RecvStream,
 ) {
     let mut no_permit = Permit::none();
-    if let Some((send, recv, incoming)) =
-        read_request(&server, &mut no_permit, connection, None, send, recv).await
+    if let Some((send, recv, incoming)) = read_request(
+        &server,
+        &mut no_permit,
+        connection,
+        None,
+        &connection_metadata,
+        send,
+        recv,
+    )
+    .await
     {
         server_transport::reject_stream(server, send, recv, incoming).await;
     }

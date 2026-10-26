@@ -27,11 +27,19 @@
 #   request.metadata       RpcRequest{method:"/svc/m", metadata:{"authorization":"ok"}}
 #   request.extensions     RpcRequest{method:"/svc/m", extensions:[1, 300]} (packed)
 #   request.datagram_flow  RpcRequest{method:"/svc/m", kind:3, datagram_flow:1}
+#   request.connection_metadata_offer
+#                          RpcRequest{method:"/svc/m", connection_metadata:{id:1,
+#                          metadata:{"authorization":"ok"}}}
+#   request.connection_metadata_reference
+#                          RpcRequest{method:"/svc/m", metadata:{"x-a":"1"},
+#                          connection_metadata:{id:1}}
 #   message.hi             MESSAGE "hi"
 #   message.empty          MESSAGE with an empty payload
 #   headers.metadata       RpcHeaders{metadata:{"x-a":"1"}}
 #   headers.empty          RpcHeaders{}
 #   headers.extensions     RpcHeaders{extensions:[1]} (packed)
+#   headers.connection_metadata
+#                          RpcHeaders{connection_metadata:1}
 #   status.ok              RpcStatus{code:0}
 #   status.unavailable     RpcStatus{code:14, message:"down"}
 #   status.metadata        RpcStatus{code:9, message:"stop", metadata:{"x-t":"2"}}
@@ -55,6 +63,12 @@ request.extensions.frame = 010d0a062f7376632f6d420301ac02
 request.datagram_flow.payload = 0a062f7376632f6d28034801
 request.datagram_flow.frame = 010c0a062f7376632f6d28034801
 
+request.connection_metadata_offer.payload = 0a062f7376632f6d6a17080112130a0d617574686f72697a6174696f6e12026f6b
+request.connection_metadata_offer.frame = 01210a062f7376632f6d6a17080112130a0d617574686f72697a6174696f6e12026f6b
+
+request.connection_metadata_reference.payload = 0a062f7376632f6d22080a03782d611201316a020801
+request.connection_metadata_reference.frame = 01160a062f7376632f6d22080a03782d611201316a020801
+
 message.hi.payload = 6869
 message.hi.frame = 00026869
 
@@ -69,6 +83,9 @@ headers.empty.frame = 0200
 
 headers.extensions.payload = 120101
 headers.extensions.frame = 0203120101
+
+headers.connection_metadata.payload = 2801
+headers.connection_metadata.frame = 02022801
 
 status.ok.payload =
 status.ok.frame = 0300

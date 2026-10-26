@@ -2,6 +2,7 @@ use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -42,15 +43,7 @@ impl RawServer {
 
     /// Spawns a server that answers each request after `delay`.
     fn spawn_with_delay(fail_first_request: bool, delay: Duration) -> TestResult<Self> {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-        let cert_der = CertificateDer::from(cert.cert);
-        let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-        let crypto = quinn::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
-        let server_config = trevrpc::server::Server::new().quic_config(crypto)?;
-        let endpoint =
-            quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        let (endpoint, cert_der) = server_endpoint()?;
         let addr = endpoint.local_addr()?;
         let accepted_connections = Arc::new(AtomicUsize::new(0));
         let received_requests = Arc::new(AtomicUsize::new(0));
@@ -79,6 +72,19 @@ impl RawServer {
         tokio::time::timeout(TEST_TIMEOUT, self.task).await??;
         Ok(())
     }
+}
+
+/// A QUIC server endpoint with a new self-signed certificate.
+fn server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+    let cert_der = CertificateDer::from(cert.cert);
+    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let crypto = quinn::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
+    let server_config = trevrpc::server::Server::new().quic_config(crypto)?;
+    let endpoint = quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    Ok((endpoint, cert_der))
 }
 
 async fn run_raw_server(
@@ -484,6 +490,230 @@ async fn losing_the_first_connection_drains_the_added_ones() -> TestResult {
     concurrent_calls(&client, 1).await?;
     ensure_eq!(client.state().generation(), 2);
 
+    client.close();
+    server.shutdown().await
+}
+
+/// One REQUEST's connection metadata as a server saw it: the connection it came on, numbered in
+/// order of their first request, the set's ID, and whether it offered the set.
+type SeenConnectionMetadata = (usize, u32, bool);
+
+/// A server that records the connection metadata of every request and confirms every offer,
+/// answering each request after `delay`.
+struct ConnectionMetadataServer {
+    endpoint: quinn::Endpoint,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    seen: Arc<Mutex<Vec<SeenConnectionMetadata>>>,
+    connections: Arc<Mutex<Vec<quinn::Connection>>>,
+    task: JoinHandle<()>,
+}
+
+impl ConnectionMetadataServer {
+    fn spawn(delay: Duration) -> TestResult<Self> {
+        let (endpoint, cert) = server_endpoint()?;
+        let addr = endpoint.local_addr()?;
+        let seen = Arc::<Mutex<Vec<SeenConnectionMetadata>>>::default();
+        let connections = Arc::<Mutex<Vec<quinn::Connection>>>::default();
+        let task = tokio::spawn(run_connection_metadata_server(
+            endpoint.clone(),
+            Arc::clone(&seen),
+            Arc::clone(&connections),
+            delay,
+        ));
+        Ok(Self {
+            endpoint,
+            addr,
+            cert,
+            seen,
+            connections,
+            task,
+        })
+    }
+
+    fn seen(&self) -> Vec<SeenConnectionMetadata> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn shutdown(self) -> TestResult {
+        self.endpoint.close(0_u32.into(), b"test complete");
+        tokio::time::timeout(TEST_TIMEOUT, self.task).await??;
+        Ok(())
+    }
+}
+
+async fn run_connection_metadata_server(
+    endpoint: quinn::Endpoint,
+    seen: Arc<Mutex<Vec<SeenConnectionMetadata>>>,
+    connections: Arc<Mutex<Vec<quinn::Connection>>>,
+    delay: Duration,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let Ok(connection) = incoming.await else {
+            continue;
+        };
+        let seen = Arc::clone(&seen);
+        let connections = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                let Ok(request) = support::read_request(&mut recv).await else {
+                    break;
+                };
+                let Ok(Some(body)) = support::read_message(&mut recv).await else {
+                    break;
+                };
+                let index = connection_index(&connections, &connection);
+                let confirmed = request.connection_metadata.map_or(0, |set| {
+                    let offered = !set.metadata.is_empty();
+                    seen.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((index, set.id, offered));
+                    if offered { set.id } else { 0 }
+                });
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let headers = trevrpc::RpcHeaders {
+                        connection_metadata: confirmed,
+                        ..trevrpc::RpcHeaders::default()
+                    };
+                    let Ok(headers) = trevrpc::framing::encode_protobuf_frame(
+                        trevrpc::framing::frame_type::HEADERS,
+                        &headers,
+                        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+                    ) else {
+                        return;
+                    };
+                    if support::write_raw(&mut send, &headers).await.is_ok()
+                        && support::write_message(&mut send, &body).await.is_ok()
+                        && support::write_status(&mut send, Status::ok()).await.is_ok()
+                    {
+                        let _ = send.finish();
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// The number of `connection` among `connections`, which it joins if it is new.
+fn connection_index(
+    connections: &Mutex<Vec<quinn::Connection>>,
+    connection: &quinn::Connection,
+) -> usize {
+    let mut connections = connections.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(index) = connections
+        .iter()
+        .position(|known| known.stable_id() == connection.stable_id())
+    {
+        return index;
+    }
+    connections.push(connection.clone());
+    connections.len().saturating_sub(1)
+}
+
+fn suffix(value: &str) -> trevrpc::Metadata {
+    trevrpc::Metadata::from([("suffix".to_owned(), value.as_bytes().to_vec())])
+}
+
+async fn connect_with_connection_metadata(
+    server: &ConnectionMetadataServer,
+    config: ChannelConfig,
+) -> TestResult<Channel> {
+    let endpoint = make_client_endpoint(server.cert.clone())?;
+    Ok(tokio::time::timeout(
+        TEST_TIMEOUT,
+        Channel::connect_with_config(endpoint, server.addr, "localhost", config),
+    )
+    .await??)
+}
+
+async fn sequential_calls(client: &Channel, count: usize) -> TestResult {
+    for _ in 0..count {
+        tokio::time::timeout(TEST_TIMEOUT, client.call(request(), b"set".to_vec())).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn connection_metadata_is_offered_until_each_connection_confirms_it() -> TestResult {
+    let server = ConnectionMetadataServer::spawn(Duration::ZERO)?;
+    let client = connect_with_connection_metadata(
+        &server,
+        ChannelConfig::new()
+            .with_reconnect_backoff(FixedBackoff(Duration::from_millis(20)))
+            .with_connection_metadata(suffix("!")),
+    )
+    .await?;
+    sequential_calls(&client, 3).await?;
+    client.set_connection_metadata(suffix("#"))?;
+    sequential_calls(&client, 2).await?;
+
+    // The next generation's connection starts unconfirmed.
+    server
+        .connections
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)[0]
+        .close(0_u32.into(), b"test");
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while !(client.is_ready() && client.state().generation() == 2) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    sequential_calls(&client, 2).await?;
+
+    // Removing it stops sending it.
+    client.set_connection_metadata(trevrpc::Metadata::new())?;
+    sequential_calls(&client, 1).await?;
+
+    ensure_eq!(
+        server.seen(),
+        [
+            (0, 1, true),
+            (0, 1, false),
+            (0, 1, false),
+            (0, 2, true),
+            (0, 2, false),
+            (1, 2, true),
+            (1, 2, false),
+        ]
+    );
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn every_pooled_connection_offers_connection_metadata_before_referring_to_it() -> TestResult {
+    let server = ConnectionMetadataServer::spawn(Duration::from_millis(50))?;
+    let client = connect_with_connection_metadata(
+        &server,
+        ChannelConfig::new()
+            .with_min_quic_connections(2)
+            .with_connection_metadata(suffix("!")),
+    )
+    .await?;
+    for _ in 0..2 {
+        concurrent_calls(&client, 6).await?;
+    }
+
+    let seen = server.seen();
+    let connections: std::collections::BTreeSet<usize> =
+        seen.iter().map(|&(connection, _, _)| connection).collect();
+    ensure_eq!(connections.len(), 2, "{seen:?}");
+    for connection in connections {
+        let first = seen
+            .iter()
+            .find(|&&(seen_on, _, _)| seen_on == connection)
+            .copied();
+        ensure_eq!(first, Some((connection, 1, true)), "{seen:?}");
+    }
+    ensure!(
+        seen.iter().any(|&(_, _, offered)| !offered),
+        "no call referred to the confirmed set: {seen:?}"
+    );
     client.close();
     server.shutdown().await
 }

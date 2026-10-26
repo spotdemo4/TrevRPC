@@ -1005,6 +1005,90 @@ async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult 
     server.shutdown().await
 }
 
+/// Calls `SayHello` on a new stream of `session`, offering or referring to connection metadata
+/// set 1, and returns the set its HEADERS confirmed (zero for none) and its status.
+async fn say_hello_with_connection_metadata(
+    session: &web_transport_quinn::Session,
+    offered: Option<trevrpc::Metadata>,
+) -> TestResult<(u32, Status)> {
+    let (mut send, mut recv) = session.open_bi().await?;
+    let request = RpcRequest {
+        connection_metadata: Some(trevrpc::ConnectionMetadata {
+            id: 1,
+            metadata: offered.unwrap_or_default(),
+        }),
+        ..RpcRequest::new(greeter::greeter_paths::SAY_HELLO)
+    };
+    support::write_request(&mut send, &request).await?;
+    support::write_message(
+        &mut send,
+        &greeter::HelloRequest {
+            name: "set".to_owned(),
+        }
+        .encode_to_vec(),
+    )
+    .await?;
+    send.finish()?;
+    let mut confirmed = 0;
+    loop {
+        let frame = tokio::time::timeout(
+            TEST_TIMEOUT,
+            support::read_any_frame(&mut recv, trevrpc::framing::DEFAULT_MAX_FRAME_SIZE),
+        )
+        .await??
+        .ok_or("the response ended without a STATUS")?;
+        match frame.frame_type {
+            trevrpc::framing::frame_type::HEADERS => {
+                confirmed =
+                    trevrpc::framing::decode_payload::<trevrpc::RpcHeaders>(&frame.payload)?
+                        .connection_metadata;
+            }
+            trevrpc::framing::frame_type::STATUS => {
+                let status =
+                    trevrpc::framing::decode_payload::<trevrpc::RpcStatus>(&frame.payload)?;
+                return Ok((confirmed, Status::from(status)));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn webtransport_sessions_keep_connection_metadata() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
+    })?;
+    let token = trevrpc::Metadata::from([(
+        "authorization".to_owned(),
+        format!("Bearer {AUTH_TOKEN}").into_bytes(),
+    )]);
+    let (client, session, _) = connect_webtransport_client(&server).await?;
+    let (confirmed, status) = say_hello_with_connection_metadata(&session, Some(token)).await?;
+    ensure_eq!(
+        (confirmed, status.code()),
+        (1, Code::Ok),
+        "{}",
+        status.message()
+    );
+    // A reference resolves to the stored set, which authorizes the call.
+    let (confirmed, status) = say_hello_with_connection_metadata(&session, None).await?;
+    ensure_eq!(
+        (confirmed, status.code()),
+        (0, Code::Ok),
+        "{}",
+        status.message()
+    );
+
+    // Another session has its own sets.
+    let (other_client, other, _) = connect_webtransport_client(&server).await?;
+    let (_, status) = say_hello_with_connection_metadata(&other, None).await?;
+    ensure_eq!(status.code(), Code::InvalidArgument);
+
+    close_webtransport_client(other_client, other).await?;
+    close_webtransport_client(client, session).await?;
+    server.shutdown().await
+}
+
 #[tokio::test]
 async fn http3_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let server = spawn_http3_greeter_server(|server| {
@@ -4460,6 +4544,7 @@ fn frame_bytes(frames: &[trevrpc::ResponseFrame]) -> TestResult<Vec<u8>> {
                     extensions: Vec::new(),
                     dictionaries: Vec::new(),
                     stream_compression: None,
+                    connection_metadata: 0,
                 },
                 trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
             )?,

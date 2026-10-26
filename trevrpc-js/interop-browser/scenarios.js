@@ -61,8 +61,9 @@ function incompressible(n) {
 
 /**
  * Scenarios take the Echo client and a context: `unreliable` is the UnreliableEcho client,
- * `compressed` the CompressedEcho client, and `transport` the transport ("webtransport" or
- * "websocket") the channel connected over.
+ * `compressed` the CompressedEcho client, `transport` the transport ("webtransport" or
+ * "websocket") the channel connected over, and `open(options)` connects another channel to the
+ * same server, which the scenario closes.
  */
 const scenarios = {
   async unary(echo) {
@@ -317,6 +318,27 @@ const scenarios = {
       "plain: the second request did not arrive compressed without a dictionary",
     );
   },
+
+  // The first call offers the connection metadata and its HEADERS confirm it; the next ones refer
+  // to it. The call's own entry wins, and a new set is offered again.
+  async "connection-metadata"(_echo, { open }) {
+    const channel = await open({ connectionMetadata: { "interop-suffix": "!" } });
+    try {
+      const echo = new EchoClient(channel, { timeoutMs: DeadlineMs });
+      for (const message of ["a", "b", "c"]) {
+        expectEcho(await echo.unary({ message }), `${message}!`, 0);
+      }
+      expectEcho(
+        await echo.unary({ message: "d" }, { metadata: { "interop-suffix": "?" } }),
+        "d?",
+        0,
+      );
+      channel.setConnectionMetadata({ "interop-suffix": "#" });
+      expectEcho(await echo.unary({ message: "e" }), "e#", 0);
+    } finally {
+      channel.close();
+    }
+  },
 };
 
 /**
@@ -421,19 +443,23 @@ export async function runScenarios({
   };
 
   let channel;
+  let open;
   try {
     const compression = await createCompression({
       dictionaries: dictionary ? [{ data: base64Bytes(dictionary), messages: EchoTypes }] : [],
     });
-    channel = await connect(url, {
-      compression,
-      signal: AbortSignal.timeout(DeadlineMs),
-      transports: LaneTransports[transport],
-      webSocketUrl,
-      ...(certHash && {
-        serverCertificateHashes: [{ algorithm: "sha-256", value: Uint8Array.from(certHash) }],
-      }),
-    });
+    open = (options) =>
+      connect(url, {
+        compression,
+        signal: AbortSignal.timeout(DeadlineMs),
+        transports: LaneTransports[transport],
+        webSocketUrl,
+        ...(certHash && {
+          serverCertificateHashes: [{ algorithm: "sha-256", value: Uint8Array.from(certHash) }],
+        }),
+        ...options,
+      });
+    channel = await open();
     if (expectTransport && channel.transport !== expectTransport) {
       channel.close();
       throw new Error(`connected over ${channel.transport}, want ${expectTransport}`);
@@ -451,6 +477,7 @@ export async function runScenarios({
       unreliable: new UnreliableEchoClient(channel, { timeoutMs: DeadlineMs }),
       compressed: new CompressedEchoClient(channel, { timeoutMs: DeadlineMs }),
       refusing: new RefusingEchoClient(channel, { timeoutMs: DeadlineMs }),
+      open,
       get transport() {
         return channel.transport;
       },

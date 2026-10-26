@@ -337,8 +337,11 @@ type testFrame struct {
 	Request *wireRequest
 	Body    []byte
 	Headers Metadata
-	Status  uint32
-	Message string
+	// headersConnectionMetadata is the connection metadata set a HEADERS
+	// frame confirms.
+	headersConnectionMetadata uint32
+	Status                    uint32
+	Message                   string
 	// Metadata is the trailing metadata of a STATUS frame.
 	Metadata Metadata
 }
@@ -359,11 +362,11 @@ func decodeTestFrame(next frame) (testFrame, error) {
 	case frameTypeMessage:
 		decoded.Body = next.payload
 	case frameTypeHeaders:
-		headers, _, err := decodeHeaders(next.payload)
+		headers, answer, err := decodeHeaders(next.payload)
 		if err != nil {
 			return testFrame{}, err
 		}
-		decoded.Headers = headers
+		decoded.Headers, decoded.headersConnectionMetadata = headers, answer.connectionMetadata
 	case frameTypeStatus:
 		var status wireStatus
 		if err := decodePayload(next.payload, &status); err != nil {

@@ -940,13 +940,13 @@ func callBeforeStatus(beforeStatus func()) {
 // then a MESSAGE and an OK STATUS on success, or a lone failure STATUS.
 type unaryResponse struct {
 	headers Metadata
-	// dictionaries answers a dictionary query; answered says there was one,
-	// which makes HEADERS go out even without metadata.
-	dictionaries []*dictionaryInfo
-	answered     bool
-	message      encodedMessage
-	hasMessage   bool
-	status       *Status
+	// answer is what the call's HEADERS answer; answered says there is
+	// something to answer, which makes HEADERS go out even without metadata.
+	answer     headersAnswer
+	answered   bool
+	message    encodedMessage
+	hasMessage bool
+	status     *Status
 }
 
 func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
@@ -964,7 +964,7 @@ func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFram
 	} else {
 		frames = make([]byte, 0, len(r.message.frame)+frameTailSlack)
 		if len(r.headers) > 0 || r.answered {
-			if frames, err = appendHeadersFrame(frames, r.headers, headersAnswer{dictionaries: r.dictionaries}, maxFrameSize); err != nil {
+			if frames, err = appendHeadersFrame(frames, r.headers, r.answer, maxFrameSize); err != nil {
 				return true, err
 			}
 		}
@@ -1008,7 +1008,7 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 	if err != nil {
 		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(err, ServerDiagnosticInternalError, request)), request)
 	}
-	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message, request.compression), request)
+	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message, request), request)
 }
 
 func failedUnaryResponse(status *Status) *unaryResponse {
@@ -1017,7 +1017,7 @@ func failedUnaryResponse(status *Status) *unaryResponse {
 
 // successfulUnaryResponse is the response of a unary handler that returned
 // message, with the response metadata it set through ctx.
-func successfulUnaryResponse(ctx context.Context, message encodedMessage, compression *callCompression) *unaryResponse {
+func successfulUnaryResponse(ctx context.Context, message encodedMessage, request *wireRequest) *unaryResponse {
 	response := responseMetadataFromContext(ctx)
 	headers := response.takeHeaders()
 	unary := &unaryResponse{
@@ -1026,9 +1026,7 @@ func successfulUnaryResponse(ctx context.Context, message encodedMessage, compre
 		hasMessage: true,
 		status:     OK().WithMetadata(response.takeMetadata()),
 	}
-	if compression != nil && compression.answered {
-		unary.answered, unary.dictionaries = true, compression.answer
-	}
+	unary.answer, unary.answered = request.answer()
 	return unary
 }
 
@@ -1172,10 +1170,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 // still uploading. The handler can no longer set response headers.
 func (r *serverRuntime) sendHeadersAtDispatch(writer io.Writer, request *wireRequest, metadata *responseMetadata) error {
 	metadata.takeHeaders()
-	var answer headersAnswer
-	if compression := request.compression; compression != nil && compression.answered {
-		answer.dictionaries = compression.answer
-	}
+	answer, _ := request.answer()
 	if streams := request.streams; streams != nil {
 		answer.stream = streams.answer
 	}
@@ -1571,13 +1566,9 @@ type responseStreamItem struct {
 // HEADERS, empty ones included, before the first one. A call that queried
 // gets its answer in HEADERS, which then go out even without metadata.
 func (s *serverResponseStream) headersFrame(maxFrameSize int) ([]byte, error) {
-	answered := s.request.compression != nil && s.request.compression.answered
+	answer, answered := s.request.answer()
 	if len(s.headers) == 0 && s.flow == nil && !answered {
 		return nil, nil
-	}
-	var answer headersAnswer
-	if answered {
-		answer.dictionaries = s.request.compression.answer
 	}
 	return appendHeadersFrame(nil, s.headers, answer, maxFrameSize)
 }

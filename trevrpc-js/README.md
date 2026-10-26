@@ -132,6 +132,18 @@ const channel = await connect(url, {
 
 Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
 
+### Connection metadata
+
+Metadata every call of a channel carries, such as a bearer token, can be set once on the channel instead of on each call. The channel sends it in full on the first calls of each session, until the server confirms that it stored it for the session, and refers to it by ID after that, so it crosses the connection once. The server merges it into each call's metadata, and a call's own `metadata` wins over an entry with the same key.
+
+```js
+const channel = await connect(url, { connectionMetadata: { authorization: `Bearer ${token}` } });
+channel.setConnectionMetadata({ authorization: `Bearer ${refreshed}` }); // calls started from now on
+channel.setConnectionMetadata(); // removes it
+```
+
+A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. The `Channel` is the only transport that supports it.
+
 ### Compression
 
 Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). The codec lives in a separate entry point, `@trevrpc/trevrpc-js/zstd`, which loads libzstd as WebAssembly (about 85 KB gzipped), so applications without compression never load it:

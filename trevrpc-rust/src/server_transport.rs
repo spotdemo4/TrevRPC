@@ -6,6 +6,7 @@ use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::compression::{self, Accept, MessageEncoder, ServerCall, ServerStream};
+use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::{Demux, FlowSender, MergedRequests, MessageCount, ServerFlow};
 use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, ResponseCodec};
 use crate::request_pump::{
@@ -58,6 +59,25 @@ pub struct IncomingRequest {
     pub(crate) stream: ServerStream,
     /// Set once [`handle_stream`] has validated and authorized a streaming call.
     pub(crate) admitted: Option<Admitted>,
+    /// The connection metadata set the request offered and the connection stored, which the
+    /// call's HEADERS confirm; zero for none. See [`resolve_connection_metadata`].
+    pub(crate) connection_metadata: u32,
+}
+
+/// Merges the connection metadata the REQUEST offers or refers to into its metadata, and stores
+/// an offered set in the connection's `store`, `None` for the ordinary HTTP mapping. It runs
+/// before anything reads the metadata.
+///
+/// # Errors
+///
+/// `InvalidArgument` for an invalid offer or an unknown reference.
+pub fn resolve_connection_metadata(
+    store: Option<&ConnectionMetadataStore>,
+    incoming: &mut IncomingRequest,
+) -> Result<()> {
+    incoming.connection_metadata =
+        crate::connection_metadata::resolve(store, &mut incoming.request)?;
+    Ok(())
 }
 
 /// Registers the datagram flow that a streaming REQUEST asks for on the connection's `demux`,
@@ -160,6 +180,7 @@ where
         compression,
         stream: ServerStream::default(),
         admitted: None,
+        connection_metadata: 0,
     })
 }
 
@@ -189,6 +210,7 @@ pub async fn handle_stream<W, R>(
         compression,
         stream: _,
         admitted: _,
+        connection_metadata,
     } = incoming;
     let cancellation = CancellationToken::new();
     // A streaming call is validated and authorized first, so callers the authorizer rejects can
@@ -220,12 +242,14 @@ pub async fn handle_stream<W, R>(
         return;
     }
     budget.stream = stream.requests.take();
-    let answered = compression.answer.is_some() || stream.answer.is_some();
+    let answered =
+        compression.answer.is_some() || stream.answer.is_some() || connection_metadata != 0;
     send.set_codec(ResponseCodec {
         encoder: MessageEncoder::new(compression.responses.clone())
             .with_stream(stream.responses.take()),
         answer: compression.answer.clone(),
         stream_answer: stream.answer,
+        connection_answer: connection_metadata,
     });
     let request_body_len = body.len();
     let mut slots = StreamSlots::new(stream_permit);
@@ -246,6 +270,7 @@ pub async fn handle_stream<W, R>(
             compression,
             stream,
             admitted,
+            connection_metadata,
         };
         handle_streaming_rpc(server, slots, send, recv, incoming, cancellation, shutdown).await;
         return;
@@ -318,7 +343,8 @@ pub async fn handle_stream<W, R>(
 }
 
 /// Frames a unary response: `[HEADERS] MESSAGE STATUS` on success, a lone STATUS on failure.
-/// The HEADERS of a call that `answered` a dictionary query go out even when empty.
+/// The HEADERS of a call that `answered` a dictionary query or a connection metadata offer go
+/// out even when empty.
 fn unary_response_frames(
     response: std::result::Result<ResponseEnvelope<Vec<u8>>, Status>,
     answered: bool,
@@ -356,6 +382,7 @@ pub async fn reject_stream<W, R>(
         compression: _,
         stream: _,
         admitted: _,
+        connection_metadata: _,
     } = incoming;
     let status = Status::unavailable("too many concurrent streams on connection");
     server.record_rejected_request(&request, body.len(), &status);
@@ -460,6 +487,7 @@ async fn handle_streaming_rpc<W, R>(
         compression,
         stream,
         admitted,
+        connection_metadata,
     } = incoming;
     // Calls whose requests may be stream-compressed get HEADERS, with the answers, at dispatch,
     // before any request message is read, so the client learns the answer while it still
@@ -474,8 +502,8 @@ async fn handle_streaming_rpc<W, R>(
         cancel_from_transport_error(&cancellation, &error);
         return;
     }
-    let mut answer_pending =
-        !headers_at_dispatch && (compression.answer.is_some() || stream.answer.is_some());
+    let mut answer_pending = !headers_at_dispatch
+        && (compression.answer.is_some() || stream.answer.is_some() || connection_metadata != 0);
     let max_frame_size = server.max_frame_size();
     let request_body_len = body.len();
     let method_for_failure = request.method.clone();

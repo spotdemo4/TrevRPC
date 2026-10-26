@@ -148,10 +148,14 @@ func decodeStatus(payload []byte) (*Status, error) {
 }
 
 // headersAnswer is what the HEADERS of a response answer: the dictionary
-// query, and whether the server decodes stream-compressed requests.
+// query, whether the server decodes stream-compressed requests, and which
+// offered connection metadata set it stored.
 type headersAnswer struct {
 	dictionaries []*dictionaryInfo
 	stream       *streamCompressionInfo
+	// connectionMetadata is the ID of the connection metadata set the server
+	// confirms, zero for none.
+	connectionMetadata uint32
 }
 
 // decodeHeaders decodes the payload of a HEADERS frame into its metadata and
@@ -167,7 +171,8 @@ func decodeHeaders(payload []byte) (Metadata, headersAnswer, error) {
 			return nil, headersAnswer{}, err
 		}
 	}
-	return ownedMetadata(headers.Metadata), headersAnswer{dictionaries: headers.Dictionaries, stream: headers.StreamCompression}, nil
+	answer := headersAnswer{dictionaries: headers.Dictionaries, stream: headers.StreamCompression, connectionMetadata: headers.ConnectionMetadata}
+	return ownedMetadata(headers.Metadata), answer, nil
 }
 
 // encodedMessage is one message ready to send: a complete MESSAGE frame whose
@@ -267,7 +272,7 @@ func appendRequestFrame(dst []byte, request *wireRequest, maxFrameSize int) ([]b
 // appendHeadersFrame appends a HEADERS frame carrying metadata and the
 // answers to the request.
 func appendHeadersFrame(dst []byte, metadata Metadata, answer headersAnswer, maxFrameSize int) ([]byte, error) {
-	headers := wireHeaders{Metadata: metadata, Dictionaries: answer.dictionaries, StreamCompression: answer.stream}
+	headers := wireHeaders{Metadata: metadata, Dictionaries: answer.dictionaries, StreamCompression: answer.stream, ConnectionMetadata: answer.connectionMetadata}
 	size, ok := headers.payloadSize()
 	if !ok {
 		return appendLimitedProtoFrame(dst, frameTypeHeaders, &headers, maxFrameSize)

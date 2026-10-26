@@ -23,6 +23,8 @@ class Cell:
     compression: str
     size: int
     metadata_size: int
+    # Where the metadata goes: "call" (every call) or "connection" (connection metadata).
+    metadata_scope: str
     concurrency: int
     # Messages per second per worker, for the paced scenarios only.
     rate: int | None
@@ -182,6 +184,7 @@ TABLES: dict[str, Table] = {
             "scenarios": ["unary", "bidi"],
             "sizes": [64],
             "metadata_sizes": [0, 1024],
+            "metadata_scopes": ["call", "connection"],
             "concurrency": [1, 64],
         },
         own_server,

@@ -40,6 +40,9 @@ type streamClient struct {
 	// streams is the channel's stream compression budget, nil when stream
 	// compression is off. It is set before the client is used.
 	streams *streamBudget
+	// connectionMetadata is the connection's view of the channel's connection
+	// metadata, or nil. It is set before the client is used.
+	connectionMetadata *clientConnectionMetadata
 	// pessimistic is set while calls on the connection do not stream-compress
 	// their requests optimistically: from a refusal until a call's HEADERS
 	// answer stream compression again.
@@ -62,6 +65,7 @@ func (c *streamClient) call(
 ) (frameStream, error) {
 	protoMessage := protoMessageV2(message)
 	accept, queried := c.compression.prepare(request)
+	offered := c.connectionMetadata.prepare(request)
 	// A server-streaming call may stream-compress its responses.
 	streams := c.prepareStreams(request, accept)
 	// A message that may be compressed is encoded on its own; any other is
@@ -118,6 +122,8 @@ func (c *streamClient) call(
 		compression:  c.compression,
 		queried:      queried,
 		streams:      streams,
+		connection:   c.connectionMetadata,
+		offered:      offered,
 	}
 
 	if _, err := stream.Write(frames); err != nil {
@@ -163,6 +169,7 @@ func (c *streamClient) streamingCall(
 	requests encodedStream,
 ) (frameStream, error) {
 	accept, queried := c.compression.prepare(request)
+	offered := c.connectionMetadata.prepare(request)
 	streams := c.prepareStreams(request, accept)
 	setter, _ := requests.(compressorSetter)
 	if setter != nil {
@@ -227,6 +234,8 @@ func (c *streamClient) streamingCall(
 		flow:         flow,
 		compression:  c.compression,
 		queried:      queried,
+		connection:   c.connectionMetadata,
+		offered:      offered,
 		streams:      streams,
 		optimistic:   upload,
 		pessimistic:  &c.pessimistic,
@@ -371,6 +380,10 @@ type transportResponseStream struct {
 	// of the response answer it.
 	compression *clientCompression
 	queried     bool
+	// connection is the connection's connection metadata state, and offered
+	// the set the request offered, which the HEADERS of the response confirm.
+	connection *clientConnectionMetadata
+	offered    uint32
 	// streams is the call's stream compression, nil without it. HEADERS
 	// enable its request direction.
 	streams *clientStreams
@@ -682,6 +695,8 @@ func (s *transportResponseStream) Recv() (responseFrame, error) {
 			s.queried = false
 			s.compression.learn(answer.dictionaries)
 		}
+		s.connection.learn(s.offered, answer)
+		s.offered = 0
 		return responseFrame{kind: frameTypeHeaders, headers: headers}, nil
 	case frameTypeStatus:
 		if item.statusErr != nil {

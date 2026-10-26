@@ -12,6 +12,7 @@ use http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
+use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::Demux;
 use crate::fallback::{FallbackBody, HttpFallback, ResponseSink, multiplexed_head, write_body};
 use crate::http_admission::{
@@ -20,7 +21,9 @@ use crate::http_admission::{
 };
 use crate::quic::SessionDatagrams;
 use crate::request_pump::{RequestTransportEvent, poll_peer_reset};
-use crate::rpc_body::{BodySink, BodySource, handle_rpc_stream, reject_rpc_stream};
+use crate::rpc_body::{
+    BodySink, BodySource, WebTransportSessionState, handle_rpc_stream, reject_rpc_stream,
+};
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
 use crate::server::Server;
 use crate::server_transport::{Permit, try_acquire_permit};
@@ -378,6 +381,10 @@ async fn handle_webtransport_session(
             server.max_frame_size(),
         ))
     });
+    let session_state = Arc::new(WebTransportSessionState {
+        demux,
+        connection_metadata: ConnectionMetadataStore::default(),
+    });
     // A close from the client is only noticed while this is polled.
     let closed = session.closed();
     tokio::pin!(closed);
@@ -413,6 +420,7 @@ async fn handle_webtransport_session(
                             let (send, recv) = stream.split();
                             stream_tasks.spawn(reject_rpc_stream(
                                 server,
+                                Some(Arc::clone(&session_state)),
                                 WebTransportSink(send),
                                 WebTransportSource(recv, stream_connection),
                             ));
@@ -422,14 +430,14 @@ async fn handle_webtransport_session(
                         let request_limit = request_limit.clone();
                         let stream_connection = connection.clone();
                         let stream_shutdown = shutdown.clone();
-                        let stream_demux = demux.clone();
+                        let stream_session = Arc::clone(&session_state);
                         stream_tasks.spawn(async move {
                             let (send, recv) = stream.split();
                             handle_rpc_stream(
                                 server,
                                 request_limit,
                                 stream_permit,
-                                stream_demux,
+                                Some(stream_session),
                                 WebTransportSink(send),
                                 WebTransportSource(recv, stream_connection),
                                 stream_shutdown,

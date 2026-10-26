@@ -11,6 +11,7 @@ use crate::compression::{
     ClientCall, ClientCompression, CompressionConfig, DEFAULT_CLIENT_MEMORY, MessageEncoder,
     StreamBudget, offer_stream,
 };
+use crate::connection_metadata::{ClientConnectionMetadata, ConnectionMetadataSource, OfferedSet};
 use crate::datagram::{ClientFlow, Demux, FlowSender, MergedResponses};
 use crate::framed::{self, ResponseReading};
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
@@ -40,6 +41,8 @@ pub struct NativeTransport<C> {
     stream_budget: Option<Arc<StreamBudget>>,
     /// Whether calls on this connection stream-compress their requests optimistically.
     optimism: Arc<Optimism>,
+    /// The channel's connection metadata as this connection knows it, `None` without a channel.
+    connection_metadata: Option<Arc<ClientConnectionMetadata>>,
 }
 
 /// Opens the replay of a refused optimistic call with the requests to send on it.
@@ -57,6 +60,7 @@ impl<C: MuxConnection> NativeTransport<C> {
             level: CompressionConfig::level(None),
             stream_budget: StreamBudget::new(DEFAULT_CLIENT_MEMORY),
             optimism: Arc::new(Optimism::default()),
+            connection_metadata: None,
         }
     }
 
@@ -74,10 +78,27 @@ impl<C: MuxConnection> NativeTransport<C> {
         self.stream_budget = budget;
     }
 
-    /// Fills the negotiation fields of `request` for a call described by `info`.
-    fn prepare(&self, request: &mut RpcRequest, info: &CallInfo) -> ClientCall {
-        self.compression
-            .prepare(request, info.message_types, info.compress)
+    /// Makes calls carry the connection metadata of `source`, which this connection, new,
+    /// offers until the server confirms it.
+    pub(crate) fn set_connection_metadata(&mut self, source: Arc<ConnectionMetadataSource>) {
+        self.connection_metadata = Some(ClientConnectionMetadata::new(source));
+    }
+
+    /// Fills the negotiation fields of `request` for a call described by `info`, returning the
+    /// call's compression and the connection metadata set it offered.
+    fn prepare(
+        &self,
+        request: &mut RpcRequest,
+        info: &CallInfo,
+    ) -> (ClientCall, Option<OfferedSet>) {
+        let offered = self
+            .connection_metadata
+            .as_ref()
+            .and_then(|connection| connection.prepare(request));
+        let call = self
+            .compression
+            .prepare(request, info.message_types, info.compress);
+        (call, offered)
     }
 
     fn demux(&self) -> Option<&Demux> {
@@ -155,7 +176,7 @@ impl<C: MuxConnection> NativeTransport<C> {
         info: CallInfo,
         optimistic: Option<(Replay, Retry)>,
     ) -> Result<BoxStream<ResponseFrame>> {
-        let call = self.prepare(&mut request, &info);
+        let (call, offered) = self.prepare(&mut request, &info);
         let directions = info
             .compress_stream
             .effective(request.rpc_kind())
@@ -227,6 +248,7 @@ impl<C: MuxConnection> NativeTransport<C> {
                 replay,
                 refused: None,
                 optimism: directions.requests.then(|| Arc::clone(&self.optimism)),
+                connection_metadata: offered,
             },
             complete: false,
             retry,
@@ -251,7 +273,7 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
         body: Vec<u8>,
         info: CallInfo,
     ) -> Result<ResponseEnvelope<Bytes>> {
-        let negotiated = self.prepare(&mut request, &info);
+        let (negotiated, offered) = self.prepare(&mut request, &info);
         let (send, recv) = self.connection.open_stream().await?;
         let mut call = UnaryCall {
             send,
@@ -272,6 +294,7 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
         let mut reading = ResponseReading {
             accept: negotiated.accept,
             learn: negotiated.learn,
+            connection_metadata: offered,
             ..ResponseReading::default()
         };
         let mut response = UnaryResponse::default();

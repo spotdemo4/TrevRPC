@@ -76,6 +76,9 @@ type wireRequest struct {
 	// StreamCompression says the client decodes stream-compressed responses
 	// (field 12).
 	StreamCompression *streamCompressionInfo `protobuf:"bytes,12,opt,name=stream_compression,json=streamCompression,proto3" json:"stream_compression,omitempty"`
+	// ConnectionMetadata offers the connection's metadata set, or refers to
+	// one the server confirmed (field 13); see connection_metadata.go.
+	ConnectionMetadata *connectionMetadataInfo `protobuf:"bytes,13,opt,name=connection_metadata,json=connectionMetadata,proto3" json:"connection_metadata,omitempty"`
 
 	// The fields below are not on the wire.
 	//
@@ -100,6 +103,26 @@ type wireRequest struct {
 	plainRequests *atomic.Int64
 	// streams is the server's stream compression of the call, nil without.
 	streams *serverStreams
+	// connectionMetadataConfirmed is the connection metadata set the server
+	// stored from this call's offer, which its HEADERS confirms; zero for
+	// none.
+	connectionMetadataConfirmed uint32
+}
+
+// answer returns what the HEADERS of the call answer, and whether there is
+// anything to answer, which makes HEADERS go out even without metadata: the
+// dictionary query, and the connection metadata set the call offered and the
+// server stored. Stream compression's answer goes out at dispatch.
+func (m *wireRequest) answer() (headersAnswer, bool) {
+	var answer headersAnswer
+	answered := false
+	if compression := m.compression; compression != nil && compression.answered {
+		answer.dictionaries, answered = compression.answer, true
+	}
+	if m.connectionMetadataConfirmed != 0 {
+		answer.connectionMetadata, answered = m.connectionMetadataConfirmed, true
+	}
+	return answer, answered
 }
 
 // newWireRequest creates a unary RPC request for the method path
@@ -186,6 +209,9 @@ type wireHeaders struct {
 	// StreamCompression says the server decodes stream-compressed requests
 	// (field 4).
 	StreamCompression *streamCompressionInfo `protobuf:"bytes,4,opt,name=stream_compression,json=streamCompression,proto3" json:"stream_compression,omitempty"`
+	// ConnectionMetadata confirms that the server stored the connection
+	// metadata set the request offered (field 5).
+	ConnectionMetadata uint32 `protobuf:"varint,5,opt,name=connection_metadata,json=connectionMetadata,proto3" json:"connection_metadata,omitempty"`
 }
 
 // Reset clears the headers for protobuf compatibility.
@@ -231,6 +257,23 @@ func (m *streamCompressionInfo) String() string { return fmt.Sprintf("%+v", *m) 
 
 // ProtoMessage marks streamCompressionInfo as a protobuf message.
 func (*streamCompressionInfo) ProtoMessage() {}
+
+// connectionMetadataInfo is a request's connection metadata: with Metadata,
+// an offer of the connection's set ID; without, a reference to the set ID the
+// server confirmed.
+type connectionMetadataInfo struct {
+	ID       uint32   `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Metadata Metadata `protobuf:"bytes,2,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+}
+
+// Reset clears the info for protobuf compatibility.
+func (m *connectionMetadataInfo) Reset() { *m = connectionMetadataInfo{} }
+
+// String returns the info as a debug string for protobuf compatibility.
+func (m *connectionMetadataInfo) String() string { return fmt.Sprintf("%+v", *m) }
+
+// ProtoMessage marks connectionMetadataInfo as a protobuf message.
+func (*connectionMetadataInfo) ProtoMessage() {}
 
 // wireStatus is the payload of a STATUS frame.
 type wireStatus struct {

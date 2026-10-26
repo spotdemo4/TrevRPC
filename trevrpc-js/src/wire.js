@@ -34,6 +34,7 @@ const wireRoot = protobuf.Root.fromJSON({
             acceptDictionaries: { rule: "repeated", type: "uint32", id: 10 },
             dictionaryQuery: { rule: "repeated", type: "DictionaryInfo", id: 11 },
             streamCompression: { type: "StreamCompression", id: 12 },
+            connectionMetadata: { type: "ConnectionMetadata", id: 13 },
           },
           // Fields 2 (method name), 3 (request body) and 6 (wire version) must never be reused.
           reserved: [
@@ -47,6 +48,13 @@ const wireRoot = protobuf.Root.fromJSON({
             extensions: { rule: "repeated", type: "uint64", id: 2 },
             dictionaries: { rule: "repeated", type: "DictionaryInfo", id: 3 },
             streamCompression: { type: "StreamCompression", id: 4 },
+            connectionMetadata: { type: "uint32", id: 5 },
+          },
+        },
+        ConnectionMetadata: {
+          fields: {
+            id: { type: "uint32", id: 1 },
+            metadata: { keyType: "string", type: "bytes", id: 2 },
           },
         },
         StreamCompression: {

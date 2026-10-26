@@ -67,6 +67,7 @@ func (l *Listener) handleWebTransport(w http.ResponseWriter, r *http.Request) {
 
 	datagrams := l.newDatagramMux(session, datagramOverhead)
 	defer datagrams.close()
+	connectionMetadata := new(connectionMetadataStore)
 	l.serveStreams(l.ctx, streamAcceptor{
 		accept: func(ctx context.Context) (rpcStream, context.Context, error) {
 			stream, err := session.AcceptStream(ctx)
@@ -75,6 +76,7 @@ func (l *Listener) handleWebTransport(w http.ResponseWriter, r *http.Request) {
 			}
 			draining := newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) })
 			draining.datagrams = datagrams
+			draining.connectionMetadata = connectionMetadata
 			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = session.CloseWithError(0, message) },

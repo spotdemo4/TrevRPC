@@ -13,6 +13,7 @@
 //!                                       paced|unreliable-paced
 //!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
 //!                            [--messages 100] [--rate 100] [--metadata-size 0]
+//!                            [--metadata-scope call|connection]
 //!                            [--payload repeat|records]
 //!                            [--compression none|dictionary|stream|stream-dictionary]
 //!                            [--dictionary <file>] [--min-quic-connections 1]
@@ -81,6 +82,7 @@ async fn main() -> ExitCode {
                 "messages",
                 "rate",
                 "metadata-size",
+                "metadata-scope",
                 "payload",
                 "compression",
                 "dictionary",

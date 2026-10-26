@@ -148,6 +148,22 @@ pub struct RpcRequest {
     /// decodes stream-compressed responses up to this window. See [`crate::CompressStream`].
     #[prost(message, optional, tag = "12")]
     pub stream_compression: Option<StreamCompression>,
+    /// The call's connection metadata: an offer of the channel's set, or a reference to the set
+    /// the server confirmed on the connection; see [`ConnectionMetadata`].
+    #[prost(message, optional, tag = "13")]
+    pub connection_metadata: Option<ConnectionMetadata>,
+}
+
+/// A request's connection metadata; see `ChannelConfig::with_connection_metadata`.
+///
+/// With `metadata`, it offers the connection's set `id`, carried whole; without, it refers to the
+/// set `id` the server confirmed on the connection.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct ConnectionMetadata {
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    #[prost(map = "string, bytes", tag = "2")]
+    pub metadata: Metadata,
 }
 
 /// A compression dictionary in the negotiation fields: its `Dictionary_ID` and its fingerprint,
@@ -185,6 +201,7 @@ impl RpcRequest {
             accept_dictionaries: Vec::new(),
             dictionary_query: Vec::new(),
             stream_compression: None,
+            connection_metadata: None,
         }
     }
 
@@ -275,6 +292,10 @@ pub struct RpcHeaders {
     /// requests up to this window.
     #[prost(message, optional, tag = "4")]
     pub stream_compression: Option<StreamCompression>,
+    /// The connection metadata set the request offered and the server stored for the
+    /// connection, or zero.
+    #[prost(uint32, tag = "5")]
+    pub connection_metadata: u32,
 }
 
 /// The STATUS frame payload: the terminal status and trailing metadata.
@@ -307,8 +328,9 @@ mod tests {
     use crate::{Code, Metadata, Status};
 
     use super::{
-        MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN, RpcHeaders, RpcKind,
-        RpcRequest, RpcStatus, normalize_metadata_key, split_method_path, validate_metadata,
+        ConnectionMetadata, MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN,
+        RpcHeaders, RpcKind, RpcRequest, RpcStatus, normalize_metadata_key, split_method_path,
+        validate_metadata,
     };
 
     #[test]
@@ -662,6 +684,34 @@ mod tests {
                 .with_datagram_flow(1),
         )
         .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "request.connection_metadata_offer",
+            frame_type::REQUEST,
+            &RpcRequest {
+                connection_metadata: Some(ConnectionMetadata {
+                    id: 1,
+                    metadata: metadata("authorization", b"ok"),
+                }),
+                ..request()
+            },
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "request.connection_metadata_reference",
+            frame_type::REQUEST,
+            &RpcRequest {
+                connection_metadata: Some(ConnectionMetadata {
+                    id: 1,
+                    metadata: Metadata::new(),
+                }),
+                ..request().with_metadata(metadata("x-a", b"1"))
+            },
+        )
+        .await;
 
         check_raw_frame(
             &vectors,
@@ -690,6 +740,7 @@ mod tests {
                 extensions: Vec::new(),
                 dictionaries: Vec::new(),
                 stream_compression: None,
+                connection_metadata: 0,
             },
         )
         .await;
@@ -711,6 +762,18 @@ mod tests {
                 extensions: vec![1],
                 dictionaries: Vec::new(),
                 stream_compression: None,
+                connection_metadata: 0,
+            },
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "headers.connection_metadata",
+            frame_type::HEADERS,
+            &RpcHeaders {
+                connection_metadata: 1,
+                ..RpcHeaders::default()
             },
         )
         .await;

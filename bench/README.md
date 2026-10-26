@@ -17,7 +17,7 @@ nix run .#trevrpc-bench -- --table comparison --repeat 3 --tolerance 3
 nix run .#trevrpc-bench -- --scenarios unreliable-paced --concurrency 64 --rates 100,1000,10000
 bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST]
-             [--metadata-sizes LIST] [--payload repeat|records]
+             [--metadata-sizes LIST] [--metadata-scopes LIST] [--payload repeat|records]
              [--compressions LIST] [--duration SECONDS] [--warmup SECONDS]
              [--messages N] [--rates LIST] [--repeat N] [--tolerance PERCENT]
              [--netem PROFILE...] [--out DIR]
@@ -28,7 +28,7 @@ and the baselines unless the command line names any `--server`, `--client`, or
 `--baseline`, which then replace all three. The baseline runs its gRPC client
 against its gRPC server and its Connect client against its Connect server.
 `run.py` starts each server once, then runs every client over every transport
-for every combination of scenario, size, metadata size, and concurrency, and
+for every combination of scenario, size, metadata size and scope, and concurrency, and
 runs `paced` and `unreliable-paced` once per rate in `--rates` (default 1000). It prints a summary
 table and writes one JSON object per run to `DIR/results.jsonl`; without
 `--out`, `DIR` is a new `trevrpc-bench.*` directory under `$TMPDIR`. A run fails
@@ -152,7 +152,7 @@ for the whole run.
                --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream|paced|unreliable-paced
                [--size BYTES] [--concurrency N] [--duration SECONDS]
                [--warmup SECONDS] [--messages N] [--rate N] [--metadata-size BYTES]
-               [--payload repeat|records] [--compression MODE] [--dictionary FILE]
+               [--metadata-scope call|connection] [--payload repeat|records] [--compression MODE] [--dictionary FILE]
 ```
 
 - `--transport quic` dials native QUIC at `--addr`. `--transport tcp` dials
@@ -171,6 +171,13 @@ for the whole run.
   per-call metadata such as a bearer token. The baseline sends it as gRPC
   metadata or as a Connect request header. With `0`, calls carry no metadata. The maximum is 8192, the
   TrevRPC per-value metadata limit.
+- `--metadata-scope` (default `call`) says where `bench-pad` goes: with
+  `connection`, a TrevRPC client sets it as the channel's
+  [connection metadata](../wiki/Protocol-and-Wire-Format.md#connection-metadata),
+  which crosses each connection in its first calls instead of in every call.
+  The baseline only takes `call`. `run.py --metadata-scopes` runs
+  `connection` only for cells with metadata, on the TrevRPC transports, and
+  marks their metadata size with a `c` in its summary.
 - `--messages` (default 100) is the number of messages per streaming call. The
   `client-stream` response is `messages × size` bytes, so that product must stay
   under the 4 MiB frame limit.
@@ -245,6 +252,7 @@ non-zero if it could not connect or measure:
   "transport": "quic",
   "size": 64,
   "metadata_size": 0,
+  "metadata_scope": "call",
   "concurrency": 1,
   "duration_s": 5.0,
   "ops": 81234,
@@ -262,7 +270,9 @@ non-zero if it could not connect or measure:
 ```
 
 - `transport` is `quic`, `qmux`, `grpc`, or `connect`.
-- `payload` and `compression` echo `--payload` and `--compression`.
+- `payload` and `compression` echo `--payload` and `--compression`, and
+  `metadata_scope` echoes `--metadata-scope`; a result without it counts as
+  `call`.
 - `msgs` counts application messages: responses for `unary` and
   `server-stream`, requests for `client-stream`, round trips for `bidi`,
   messages echoed in time for the paced scenarios.

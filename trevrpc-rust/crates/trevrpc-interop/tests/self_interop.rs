@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_trevrpc-interop-rust");
-const SCENARIOS: [&str; 14] = [
+const SCENARIOS: [&str; 17] = [
     "unary",
     "unary-metadata",
     "unary-error",
@@ -24,6 +24,9 @@ const SCENARIOS: [&str; 14] = [
     "unreliable",
     "compressed",
     "compressed-stream",
+    "refused-stream",
+    "compressed-plain",
+    "connection-metadata",
 ];
 
 /// Writes the compression dictionary of the shared golden vectors into `dir`, as `interop/run.py`
@@ -318,7 +321,7 @@ fn bench_reports_every_scenario_over_both_transports() {
 #[test]
 fn bench_metadata_size_pads_every_call() {
     let server = Server::start("bench-metadata");
-    let wire_bytes_per_msg = |metadata_size: &str| {
+    let wire_bytes_per_msg = |metadata_size: &str, scope: &str| {
         let output = server.run(
             "bench",
             &[
@@ -334,10 +337,12 @@ fn bench_metadata_size_pads_every_call() {
                 "0.05",
                 "--metadata-size",
                 metadata_size,
+                "--metadata-scope",
+                scope,
             ],
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{metadata_size}: {stderr}");
+        assert!(output.status.success(), "{metadata_size} {scope}: {stderr}");
         let stdout = String::from_utf8(output.stdout).unwrap();
         let json = stdout.lines().next().expect("one JSON line");
         assert_close(number(json, "errors"), 0.0, 1e-9, json);
@@ -347,16 +352,26 @@ fn bench_metadata_size_pads_every_call() {
             1e-9,
             json,
         );
+        assert!(
+            json.contains(&format!(r#""metadata_scope":"{scope}""#)),
+            "{json}"
+        );
         number(json, "wire_bytes_per_msg")
     };
 
-    let bare = wire_bytes_per_msg("0");
-    let padded = wire_bytes_per_msg("2000");
+    let bare = wire_bytes_per_msg("0", "call");
+    let padded = wire_bytes_per_msg("2000", "call");
+    let connection = wire_bytes_per_msg("2000", "connection");
 
     // The padding rides in every request, so each call sends at least its bytes more.
     assert!(
         padded - bare >= 2000.0,
         "wire bytes per message: {bare} bare, {padded} padded"
+    );
+    // As connection metadata, it crossed the connection before the measured window.
+    assert!(
+        connection - bare < 50.0,
+        "wire bytes per message: {bare} bare, {connection} with connection metadata"
     );
     server.finish();
 }
@@ -372,6 +387,7 @@ fn bench_rejects_unusable_flags() {
         &["--scenario", "unary", "--metadata-size", "lots"],
         // One byte over the 8 KiB metadata value limit.
         &["--scenario", "unary", "--metadata-size", "8193"],
+        &["--scenario", "unary", "--metadata-scope", "stream"],
         &["--scenario", "unary", "--payload", "zeros"],
         &["--scenario", "unary", "--compression", "gzip"],
         // No compression runs on server-stream or the datagram scenarios.

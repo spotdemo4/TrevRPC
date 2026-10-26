@@ -50,9 +50,20 @@ class WireCodecTest {
                     ),
                 "request.metadata" to requestEntry(RpcRequest("/svc/m", metadata)),
                 "request.extensions" to requestEntry(RpcRequest("/svc/m", extensions = listOf(1uL, 300uL))),
+                "request.connection_metadata_offer" to
+                    requestEntry(RpcRequest("/svc/m", connectionMetadata = ConnectionMetadata(1u, metadata))),
+                "request.connection_metadata_reference" to
+                    requestEntry(
+                        RpcRequest(
+                            "/svc/m",
+                            Metadata.of("x-a" to "1".encodeToByteArray()),
+                            connectionMetadata = ConnectionMetadata(1u),
+                        ),
+                    ),
                 "headers.metadata" to headersEntry(RpcHeaders(Metadata.of("x-a" to "1".encodeToByteArray()))),
                 "headers.empty" to headersEntry(RpcHeaders()),
                 "headers.extensions" to headersEntry(RpcHeaders(extensions = listOf(1uL))),
+                "headers.connection_metadata" to headersEntry(RpcHeaders(connectionMetadataId = 1u)),
                 "status.ok" to statusEntry(RpcStatus()),
                 "status.unavailable" to statusEntry(RpcStatus.fromStatus(Status.unavailable("down"))),
                 "status.metadata" to

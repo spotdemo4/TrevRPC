@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::time::{Instant, timeout_at};
-use trevrpc::Error;
 use trevrpc::client::{
     BidirectionalCall, CallOptions, Channel, StreamingRpcTransport, TransportKind,
 };
 use trevrpc::wire::MAX_METADATA_VALUE_LEN;
+use trevrpc::{Error, Metadata};
 
 use crate::proto::{
     CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient,
@@ -197,6 +197,8 @@ struct Params {
     size: usize,
     /// Bytes of the `bench-pad` request metadata value on every call; no metadata when zero.
     metadata_size: usize,
+    /// Whether the `bench-pad` entry is connection metadata rather than each call's.
+    connection_metadata: bool,
     concurrency: usize,
     duration: Duration,
     warmup: Duration,
@@ -236,6 +238,11 @@ impl Params {
             )
             .into());
         }
+        let connection_metadata = match flags.get("metadata-scope").unwrap_or("call") {
+            "call" => false,
+            "connection" => true,
+            other => return Err(format!("unknown --metadata-scope {other:?}").into()),
+        };
         let concurrency = number(flags, "concurrency", 1)?;
         let messages = number(flags, "messages", 100)?;
         if concurrency == 0 || messages == 0 {
@@ -258,6 +265,7 @@ impl Params {
             scenario,
             size,
             metadata_size,
+            connection_metadata,
             concurrency,
             duration,
             warmup: seconds(flags, "warmup", 1.0)?,
@@ -280,10 +288,19 @@ impl Params {
             .with_max_response_messages(None)
             .with_max_response_stream_body_size(None)
             .with_stream_idle_timeout(None);
-        if self.metadata_size == 0 {
+        if self.metadata_size == 0 || self.connection_metadata {
             options
         } else {
             options.with_metadata(PAD_METADATA_KEY, vec![b'x'; self.metadata_size])
+        }
+    }
+
+    /// The channel's connection metadata: the `bench-pad` entry when it is connection metadata.
+    fn connection_metadata(&self) -> Metadata {
+        if self.metadata_size == 0 || !self.connection_metadata {
+            Metadata::new()
+        } else {
+            Metadata::from([(PAD_METADATA_KEY.to_owned(), vec![b'x'; self.metadata_size])])
         }
     }
 }
@@ -316,13 +333,17 @@ struct Link {
 }
 
 impl Link {
-    /// Connects over `--transport` with the `--dictionary` compression, if any.
-    async fn connect(flags: &Flags) -> Result<Self, BoxError> {
+    /// Connects over `--transport` with the `--dictionary` compression, if any, and the
+    /// connection metadata of `params`.
+    async fn connect(flags: &Flags, params: &Params) -> Result<Self, BoxError> {
         match flags.get("transport").unwrap_or("quic") {
             "quic" | "tcp" => {}
             other => return Err(format!("unknown --transport {other:?}, want quic or tcp").into()),
         }
-        let (channel, endpoint) = connect::channel(flags).await?;
+        let (channel, endpoint) = connect::channel_with(flags, |config| {
+            config.with_connection_metadata(params.connection_metadata())
+        })
+        .await?;
         let transport = channel
             .transport()
             .ok_or("the channel lost its connection before the run")?;
@@ -898,7 +919,7 @@ where
 /// Runs the load and prints the JSON report.
 pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let params = Params::parse(flags)?;
-    let link = Link::connect(flags).await?;
+    let link = Link::connect(flags, &params).await?;
     let measured = measure(link.channel.clone(), &params, &link).await;
     link.close().await;
     let (results, wire) = measured?;
@@ -929,6 +950,7 @@ struct Report {
     transport: &'static str,
     size: usize,
     metadata_size: usize,
+    connection_metadata: bool,
     concurrency: usize,
     duration: f64,
     ops: u64,
@@ -982,6 +1004,7 @@ impl Report {
             transport,
             size: params.size,
             metadata_size: params.metadata_size,
+            connection_metadata: params.connection_metadata,
             concurrency: params.concurrency,
             duration: params.duration.as_secs_f64(),
             ops,
@@ -1022,7 +1045,8 @@ impl Report {
             .map_or_else(String::new, |rate| format!(r#","rate":{rate:?}"#));
         format!(
             concat!(
-                r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"concurrency":{},"duration_s":{:?},"#,
+                r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"metadata_scope":"{}","#,
+                r#""concurrency":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
                 r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{}{},"#,
                 r#""payload":"{}","compression":"{}"}}"#,
@@ -1031,6 +1055,11 @@ impl Report {
             self.transport,
             self.size,
             self.metadata_size,
+            if self.connection_metadata {
+                "connection"
+            } else {
+                "call"
+            },
             self.concurrency,
             self.duration,
             self.ops,

@@ -57,6 +57,7 @@ class EchoScenarioTest(
                         UnreliableEchoClient(channel, options),
                         CompressedEchoClient(channel, options),
                         RefusingEchoClient(channel, options),
+                        { connectionMetadata -> newChannel(connectionMetadata) },
                     ),
                 )
             }
@@ -67,6 +68,7 @@ class EchoScenarioTest(
         private lateinit var engine: CronetEngine
         private lateinit var executor: ExecutorService
         private lateinit var channel: RpcChannel
+        private lateinit var origin: String
 
         @JvmStatic
         @Parameterized.Parameters(name = "{0}")
@@ -90,14 +92,18 @@ class EchoScenarioTest(
             }
             engine = builder.build()
             executor = Executors.newFixedThreadPool(2)
-            channel =
-                CronetRpcChannel.create(
-                    engine,
-                    "https://$host:$port",
-                    executor,
-                    CronetTransportOptions(compression = interopCompression()),
-                )
+            origin = "https://$host:$port"
+            channel = newChannel()
         }
+
+        /** A channel to the interop server on the shared engine; the caller closes it. */
+        private fun newChannel(connectionMetadata: Metadata = Metadata.EMPTY): RpcChannel =
+            CronetRpcChannel.create(
+                engine,
+                origin,
+                executor,
+                CronetTransportOptions(compression = interopCompression(), connectionMetadata = connectionMetadata),
+            )
 
         @JvmStatic
         @AfterClass
@@ -139,6 +145,8 @@ private data class Clients(
     val unreliable: UnreliableEchoClient,
     val compressed: CompressedEchoClient,
     val refusing: RefusingEchoClient,
+    /** Opens a channel of its own, with the given connection metadata, which the scenario closes. */
+    val newChannel: (Metadata) -> RpcChannel,
 )
 
 /** The i-th message of the compressed scenarios: like the documents the interop dictionary was trained on. */
@@ -152,6 +160,20 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
         "unary-metadata" to { (client) ->
             val response = client.unary(request("hello")) { copy(metadata = Metadata.of("interop-suffix" to "!".encodeToByteArray())) }
             expectEcho(response, "hello!", 0)
+        },
+        "connection-metadata" to { clients ->
+            val channel = clients.newChannel(suffix("!"))
+            try {
+                val echo = EchoClient(channel, CallOptions(timeout = 10.seconds))
+                // Cronet hides which calls share a connection, so every call offers the whole set.
+                for (message in listOf("a", "b", "c")) expectEcho(echo.unary(request(message)), "$message!", 0)
+                // The call's own entry wins over the connection metadata's.
+                expectEcho(echo.unary(request("d")) { copy(metadata = suffix("?")) }, "d?", 0)
+                channel.setConnectionMetadata(suffix("#"))
+                expectEcho(echo.unary(request("e")), "e#", 0)
+            } finally {
+                channel.close()
+            }
         },
         "unary-error" to { (client) ->
             expectStatus(Code.NOT_FOUND, "missing") { client.unary(request("", failCode = 5, failMessage = "missing")) }
@@ -341,6 +363,8 @@ private fun expectCounter(
     val actual = metadata[key]?.decodeToString()
     expect(actual == expected) { "expected trailing metadata $key=$expected, got $actual" }
 }
+
+private fun suffix(value: String): Metadata = Metadata.of("interop-suffix" to value.encodeToByteArray())
 
 private fun CallOptions.withHeaderRequest(): CallOptions = copy(metadata = Metadata.of("interop-header" to "h".encodeToByteArray()))
 

@@ -50,6 +50,7 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
     for (name, scenario) in scenarios(&client, &unreliable, &compressed, &refusing, &channel) {
         passed &= report(name, scenario).await;
     }
+    passed &= report("connection-metadata", connection_metadata(flags)).await;
 
     channel.close();
     endpoint.wait_idle().await;
@@ -112,6 +113,47 @@ fn scenarios<'a>(
             Box::pin(compressed_plain(compressed_client)),
         ),
     ]
+}
+
+/// The `connection-metadata` scenario, on a channel of its own.
+async fn connection_metadata(flags: &Flags) -> Scenario {
+    let suffix =
+        |value: &str| Metadata::from([("interop-suffix".to_owned(), value.as_bytes().to_vec())]);
+    let (channel, endpoint) =
+        connect::channel_with(flags, |config| config.with_connection_metadata(suffix("!")))
+            .await
+            .map_err(|error| format!("connect: {error}"))?;
+    let client = EchoClient::new(channel.clone());
+    let outcome = async {
+        let call = |text: &str, want: &str, call_suffix: Option<&str>| {
+            let mut options = options();
+            if let Some(value) = call_suffix {
+                options = options.with_metadata("interop-suffix", value.as_bytes().to_vec());
+            }
+            let client = &client;
+            let (text, want) = (text.to_owned(), want.to_owned());
+            async move {
+                let response = client
+                    .unary(&message(&text))
+                    .options(|_| options)
+                    .await
+                    .map_err(|error| format!("{text}: {}", rpc(error)))?;
+                expect_response(&response, &want, 0)
+            }
+        };
+        for text in ["a", "b", "c"] {
+            call(text, &format!("{text}!"), None).await?;
+        }
+        call("d", "d?", Some("?")).await?;
+        channel
+            .set_connection_metadata(suffix("#"))
+            .map_err(|error| error.to_string())?;
+        call("e", "e#", None).await
+    }
+    .await;
+    channel.close();
+    endpoint.wait_idle().await;
+    outcome
 }
 
 /// The text of `compressed-plain`: the 315-byte `plain.records` golden message, twice over.

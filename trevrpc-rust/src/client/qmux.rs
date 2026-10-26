@@ -115,6 +115,17 @@ impl QmuxTransport {
         self
     }
 
+    /// Makes a transport that was just connected carry the connection metadata of `source`.
+    pub(crate) fn with_connection_metadata(
+        mut self,
+        source: Arc<crate::connection_metadata::ConnectionMetadataSource>,
+    ) -> Self {
+        if let Some(transport) = Arc::get_mut(&mut self.0) {
+            transport.set_connection_metadata(source);
+        }
+        self
+    }
+
     /// Makes a transport that was just connected hold stream compression memory from `budget`.
     pub(crate) fn with_stream_budget(
         mut self,

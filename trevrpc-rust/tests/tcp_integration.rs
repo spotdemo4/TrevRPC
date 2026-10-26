@@ -1292,3 +1292,203 @@ async fn http3_serves_requests_alongside_a_webtransport_session() -> TestResult 
     drop(session);
     server.stop().await
 }
+
+// Connection metadata: what a client sets once for its calls, which servers keep per connection.
+
+const SUFFIX: &str = "/test.Meta/Suffix";
+
+/// Registers `SUFFIX`, which answers with the call's `suffix` metadata.
+fn register_suffix_route(server: &mut Server) {
+    server.route_with_context(SUFFIX, |context, _body| {
+        let suffix = context
+            .metadata()
+            .get("suffix")
+            .cloned()
+            .unwrap_or_default();
+        std::future::ready(Ok(suffix))
+    });
+}
+
+fn suffix_metadata(value: &str) -> trevrpc::Metadata {
+    trevrpc::Metadata::from([("suffix".to_owned(), value.as_bytes().to_vec())])
+}
+
+/// Calls `SUFFIX`, with `call_suffix` as the call's own `suffix` metadata.
+async fn call_suffix<T: RpcTransport>(
+    transport: &T,
+    call_suffix: Option<&str>,
+) -> Result<String, Status> {
+    let mut request = trevrpc::RpcRequest::new(SUFFIX);
+    if let Some(value) = call_suffix {
+        request = request.with_metadata(suffix_metadata(value));
+    }
+    let response = tokio::time::timeout(TEST_TIMEOUT, transport.call(request, Vec::new()))
+        .await
+        .map_err(|_| Status::deadline_exceeded("test call timed out"))??;
+    Ok(String::from_utf8_lossy(response.message()).into_owned())
+}
+
+#[tokio::test]
+async fn connection_metadata_joins_every_call_and_the_call_wins() -> TestResult {
+    let server = spawn_server_with(test_options(), |server| {
+        register_suffix_route(server);
+        server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer("token"));
+    })
+    .await?;
+    for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
+        let mut metadata = suffix_metadata("!");
+        metadata.insert("authorization".to_owned(), b"Bearer token".to_vec());
+        let channel = channel(
+            &server,
+            server.udp,
+            ChannelConfig::new()
+                .with_transport_policy(policy)
+                .with_connection_metadata(metadata),
+        )
+        .await?;
+        // The first call offers the set, the later ones refer to it.
+        for _ in 0..3 {
+            ensure_eq!(call_suffix(&channel, None).await?, "!", "{policy:?}");
+        }
+        ensure_eq!(call_suffix(&channel, Some("?")).await?, "?", "{policy:?}");
+
+        let mut replaced = suffix_metadata("#");
+        replaced.insert("authorization".to_owned(), b"Bearer token".to_vec());
+        channel.set_connection_metadata(replaced)?;
+        for _ in 0..2 {
+            ensure_eq!(call_suffix(&channel, None).await?, "#", "{policy:?}");
+        }
+
+        // Without it, the authorizer turns calls away.
+        channel.set_connection_metadata(trevrpc::Metadata::new())?;
+        ensure_eq!(
+            call_suffix(&channel, None)
+                .await
+                .map_err(|status| status.code()),
+            Err(Code::Unauthenticated),
+            "{policy:?}"
+        );
+        let reserved = trevrpc::Metadata::from([("trevrpc-x".to_owned(), b"1".to_vec())]);
+        ensure!(
+            channel.set_connection_metadata(reserved).is_err(),
+            "a reserved key was accepted"
+        );
+        channel.close();
+    }
+    server.stop().await
+}
+
+/// The frames of a call on `SUFFIX` that offers or refers to connection metadata set `id`.
+fn connection_metadata_call(id: u32, offered: Option<&str>) -> TestResult<Vec<u8>> {
+    let request = trevrpc::RpcRequest {
+        connection_metadata: Some(trevrpc::ConnectionMetadata {
+            id,
+            metadata: offered.map(suffix_metadata).unwrap_or_default(),
+        }),
+        ..trevrpc::RpcRequest::new(SUFFIX)
+    };
+    let mut frames = trevrpc::framing::encode_protobuf_frame(
+        trevrpc::framing::frame_type::REQUEST,
+        &request,
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )?;
+    frames.extend(trevrpc::framing::encode_message_frame(
+        b"",
+        trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
+    )?);
+    Ok(frames)
+}
+
+/// A decoded unary response: the set its HEADERS confirmed (zero for none), its message, and its
+/// status.
+fn decode_connection_metadata_reply(response: &[u8]) -> TestResult<(u32, String, Status)> {
+    use trevrpc::framing::frame_type;
+
+    let mut confirmed = 0;
+    let mut message = String::new();
+    let mut status = None;
+    for frame in support::parse_frames(response)? {
+        match frame.frame_type {
+            frame_type::HEADERS => {
+                confirmed =
+                    trevrpc::framing::decode_payload::<trevrpc::RpcHeaders>(&frame.payload)?
+                        .connection_metadata;
+            }
+            frame_type::MESSAGE => message = String::from_utf8(frame.payload)?,
+            frame_type::STATUS => {
+                status = Some(Status::from(trevrpc::framing::decode_payload::<
+                    trevrpc::RpcStatus,
+                >(&frame.payload)?));
+            }
+            other => return Err(format!("unexpected frame type {other}").into()),
+        }
+    }
+    Ok((confirmed, message, status.ok_or("no STATUS")?))
+}
+
+#[tokio::test]
+async fn servers_confirm_connection_metadata_on_connections_only() -> TestResult {
+    let server = spawn_server_with(test_options(), register_suffix_route).await?;
+
+    // A native QUIC connection stores and confirms an offer, then resolves references to it.
+    let tls = client_tls(&server.cert, trevrpc::ALPN)?;
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+    )));
+    let connection = endpoint.connect(server.udp, "localhost")?.await?;
+    let quic_call = |frames: Vec<u8>| {
+        let connection = connection.clone();
+        async move {
+            let (mut send, mut recv) = connection.open_bi().await?;
+            send.write_all(&frames).await?;
+            send.finish()?;
+            let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+            decode_connection_metadata_reply(&response)
+        }
+    };
+    let (confirmed, message, status) = quic_call(connection_metadata_call(7, Some("!"))?).await?;
+    ensure_eq!(
+        (confirmed, message.as_str(), status.code()),
+        (7, "!", Code::Ok)
+    );
+    let (confirmed, message, status) = quic_call(connection_metadata_call(7, None)?).await?;
+    ensure_eq!(
+        (confirmed, message.as_str(), status.code()),
+        (0, "!", Code::Ok)
+    );
+    let (_, _, status) = quic_call(connection_metadata_call(8, None)?).await?;
+    ensure_eq!(status.code(), Code::InvalidArgument);
+    connection.close(0_u32.into(), b"done");
+
+    // The ordinary HTTP mapping uses an offer for its own call and never confirms it.
+    let sender = http2_sender(&server).await?;
+    let post = || {
+        http::Request::post(format!("https://localhost:{}/trevrpc", server.tcp.port()))
+            .header(http::header::CONTENT_TYPE, "application/trevrpc")
+            .body(())
+    };
+    let (_, _, body) = http2_request(
+        &sender,
+        post()?,
+        Bytes::from(connection_metadata_call(7, Some("!"))?),
+    )
+    .await?;
+    let (confirmed, message, status) = decode_connection_metadata_reply(&body)?;
+    ensure_eq!(
+        (confirmed, message.as_str(), status.code()),
+        (0, "!", Code::Ok)
+    );
+    let (_, _, body) = http2_request(
+        &sender,
+        post()?,
+        Bytes::from(connection_metadata_call(7, None)?),
+    )
+    .await?;
+    ensure_eq!(
+        decode_connection_metadata_reply(&body)?.2.code(),
+        Code::InvalidArgument
+    );
+
+    server.stop().await
+}

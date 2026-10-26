@@ -3,7 +3,8 @@
 grpc-go and connect-go baselines; see README.md.
 
     run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
-           [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--concurrency LIST]
+           [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--metadata-scopes LIST]
+           [--concurrency LIST]
            [--payload repeat|records] [--compressions LIST]
            [--duration SECONDS] [--warmup SECONDS] [--messages N] [--rates LIST]
            [--repeat N] [--tolerance PERCENT] [--netem PROFILE...] [--out DIR]
@@ -95,6 +96,8 @@ class Matrix:
     messages: int
     # The messages per second each paced worker sends, one cell per rate.
     rates: tuple[int, ...] = (1000,)
+    # Where the metadata goes, one cell per scope: "call" or "connection".
+    metadata_scopes: tuple[str, ...] = ("call",)
     payload: str = "repeat"
     compressions: tuple[str, ...] = ("none",)
     # The trained dictionary, when a mode needs it.
@@ -122,6 +125,8 @@ class Matrix:
             if runs(compression, transport, scenario)
             for size in self.sizes
             for metadata in self.metadata_sizes
+            for scope in self.metadata_scopes
+            if scope == "call" or (metadata > 0 and transport in NATIVE_TRANSPORTS)
             for workers in self.concurrency
             for rate in (self.rates if scenario in PACED_SCENARIOS else (None,))
             if self.keep(
@@ -133,6 +138,7 @@ class Matrix:
                     compression=compression,
                     size=size,
                     metadata_size=metadata,
+                    metadata_scope=scope,
                     concurrency=workers,
                     rate=rate,
                     netem=netem,
@@ -152,6 +158,7 @@ class Result:
     compression: str
     size: int
     metadata_size: int
+    metadata_scope: str
     concurrency: int
     # Messages per second per worker, for the paced scenarios.
     rate: float | None
@@ -179,7 +186,7 @@ class Result:
         return [
             self.scenario,
             str(self.size),
-            str(self.metadata_size),
+            metadata_column(self.metadata_size, self.metadata_scope),
             str(self.concurrency),
             "-" if self.rate is None else plain(self.rate),
             self.transport,
@@ -196,11 +203,12 @@ class Result:
             "-" if spread is None else hundredths(spread),
         ]
 
-    def sort_key(self) -> tuple[str, int, int, int, float, str, str, str, str]:
+    def sort_key(self) -> tuple[str, int, int, str, int, float, str, str, str, str]:
         return (
             self.scenario,
             self.size,
             self.metadata_size,
+            self.metadata_scope,
             self.concurrency,
             0 if self.rate is None else self.rate,
             self.transport,
@@ -208,6 +216,11 @@ class Result:
             self.client,
             self.server,
         )
+
+
+def metadata_column(size: int, scope: str) -> str:
+    """The metadata size, marked with a `c` when it is connection metadata."""
+    return f"{size}c" if scope == "connection" else str(size)
 
 
 def plain(value: float) -> str:
@@ -263,6 +276,7 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         compression=text_field(record, "compression", "none"),
         size=int_field(record, "size"),
         metadata_size=int_field(record, "metadata_size", 0),
+        metadata_scope=text_field(record, "metadata_scope", "call"),
         concurrency=int_field(record, "concurrency"),
         rate=None if record.get("rate") is None else number_field(record, "rate"),
         errors=number_field(record, "errors"),
@@ -380,11 +394,14 @@ class Runner:
                 mode += ["--dictionary", str(m.dictionary)]
             if cell.rate is not None:
                 mode += ["--rate", str(cell.rate)]
+            if cell.metadata_scope != "call":
+                mode += ["--metadata-scope", cell.metadata_scope]
             suffix = "" if cell.compression == "none" else f"-{cell.compression}"
             rate = "" if cell.rate is None else f"-r{cell.rate}"
             name = (
                 f"{client}-{transport}-to-{server}-{cell.scenario}{suffix}-{cell.size}"
-                f"-md{cell.metadata_size}-c{cell.concurrency}{rate}{profile}"
+                f"-md{metadata_column(cell.metadata_size, cell.metadata_scope)}"
+                f"-c{cell.concurrency}{rate}{profile}"
             )
             self.run_one(
                 name,
@@ -540,6 +557,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     _ = parser.add_argument("--scenarios", type=comma_list, default=list(SCENARIOS))
     _ = parser.add_argument("--sizes", type=int_list, default=[64])
     _ = parser.add_argument("--metadata-sizes", type=int_list, default=[0])
+    _ = parser.add_argument(
+        "--metadata-scopes",
+        type=comma_list,
+        default=["call"],
+        metavar="LIST",
+        help="where the metadata goes, one cell per scope: call (every call) or connection "
+        "(TrevRPC's connection metadata, which the baselines do not run)",
+    )
     _ = parser.add_argument("--concurrency", type=int_list, default=[1, 64])
     _ = parser.add_argument("--duration", type=seconds, default=5.0)
     _ = parser.add_argument("--warmup", type=seconds, default=1.0)
@@ -605,6 +630,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.netem = table_netem
     if (not args.server or not args.client) and args.baseline is None:
         parser.error("need at least one --server and one --client, or --baseline")
+    if unknown := set(args.metadata_scopes) - {"call", "connection"}:
+        parser.error(f"unknown metadata scopes: {', '.join(sorted(unknown))}")
     if unknown := set(args.compressions) - set(COMPRESSIONS):
         parser.error(f"unknown compression modes: {', '.join(sorted(unknown))}")
     if args.payload == "repeat" and set(args.compressions) != {"none"}:
@@ -622,6 +649,7 @@ def build_matrix(args: argparse.Namespace, dictionary: Path | None = None) -> Ma
         warmup=args.warmup,
         messages=args.messages,
         rates=tuple(args.rates),
+        metadata_scopes=tuple(args.metadata_scopes),
         repeat=args.repeat,
         tolerance=args.tolerance,
         keep=tables.TABLES[args.table].keep if args.table else (lambda _cell: True),

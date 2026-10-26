@@ -116,6 +116,8 @@ type scenarioEnv struct {
 	// datagramFrames reports how many QUIC DATAGRAM frames the connection has
 	// received, or is nil when the client does not watch for them.
 	datagramFrames func() uint64
+	// dial opens another channel to the server, like the scenarios' own.
+	dial func(context.Context, trevrpc.DialOptions) (*trevrpc.Channel, error)
 }
 
 // scenario is one named call from interop/README.md.
@@ -155,6 +157,10 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 		compressed: interoppb.NewCompressedEchoClient(channel),
 		refusing:   interoppb.NewRefusingEchoClient(channel),
 		transport:  channel.Transport(),
+		dial: func(ctx context.Context, options trevrpc.DialOptions) (*trevrpc.Channel, error) {
+			options.Compression = compression
+			return config.dial(ctx, options)
+		},
 	}
 	if frames != nil {
 		env.datagramFrames = frames.datagramFrames.Load
@@ -355,6 +361,39 @@ var scenarios = []scenario{
 	{"compressed-stream", runCompressedStream},
 	{"refused-stream", runRefusedStream},
 	{"compressed-plain", runCompressedPlain},
+	{"connection-metadata", runConnectionMetadata},
+}
+
+// runConnectionMetadata is the connection-metadata scenario, on a channel of
+// its own.
+func runConnectionMetadata(ctx context.Context, env *scenarioEnv) error {
+	channel, err := env.dial(ctx, trevrpc.DialOptions{
+		ConnectionMetadata: trevrpc.Metadata{"interop-suffix": []byte("!")},
+	})
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(channel)
+	c := interoppb.NewEchoClient(channel)
+	call := func(message, want string, options ...trevrpc.CallOption) error {
+		response, err := c.Unary(ctx, &interoppb.EchoRequest{Message: message}, options...)
+		if err != nil {
+			return fmt.Errorf("%s: %w", message, err)
+		}
+		return expectResponse(response, want, 0)
+	}
+	for _, message := range []string{"a", "b", "c"} {
+		if err := call(message, message+"!"); err != nil {
+			return err
+		}
+	}
+	if err := call("d", "d?", trevrpc.WithMetadata("interop-suffix", []byte("?"))); err != nil {
+		return err
+	}
+	if err := channel.SetConnectionMetadata(trevrpc.Metadata{"interop-suffix": []byte("#")}); err != nil {
+		return err
+	}
+	return call("e", "e#")
 }
 
 // plainRecord is the message of the plain.records compression golden vector:

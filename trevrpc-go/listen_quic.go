@@ -70,6 +70,7 @@ func (l *Listener) serveQUICConn(conn *quic.Conn) {
 func (l *Listener) serveNative(conn *quic.Conn) {
 	datagrams := l.newDatagramMux(conn, 0)
 	defer datagrams.close()
+	connectionMetadata := new(connectionMetadataStore)
 	l.serveStreams(l.ctx, streamAcceptor{
 		accept: func(ctx context.Context) (rpcStream, context.Context, error) {
 			stream, err := conn.AcceptStream(ctx)
@@ -78,6 +79,7 @@ func (l *Listener) serveNative(conn *quic.Conn) {
 			}
 			draining := newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) })
 			draining.datagrams = datagrams
+			draining.connectionMetadata = connectionMetadata
 			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = conn.CloseWithError(0, message) },

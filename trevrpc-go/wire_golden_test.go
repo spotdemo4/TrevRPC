@@ -61,11 +61,19 @@ func requestVector(name string, request *wireRequest) goldenVector {
 			}
 			decoded := got.Request
 			if decoded.Method != request.Method || decoded.Kind != request.Kind || decoded.TimeoutNanos != request.TimeoutNanos || decoded.DatagramFlow != request.DatagramFlow ||
-				!slices.Equal(decoded.Extensions, request.Extensions) || !metadataEqual(decoded.Metadata, request.Metadata) {
+				!slices.Equal(decoded.Extensions, request.Extensions) || !metadataEqual(decoded.Metadata, request.Metadata) ||
+				!connectionMetadataEqual(decoded.ConnectionMetadata, request.ConnectionMetadata) {
 				t.Fatalf("decoded request = %#v, want %#v", decoded, request)
 			}
 		},
 	}
+}
+
+func connectionMetadataEqual(a, b *connectionMetadataInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.ID == b.ID && metadataEqual(a.Metadata, b.Metadata)
 }
 
 func TestWireGoldenVectors(t *testing.T) {
@@ -81,6 +89,11 @@ func TestWireGoldenVectors(t *testing.T) {
 	datagramFlow := newWireRequest("/svc/m")
 	datagramFlow.Kind = RPCKindBidirectionalStreaming
 	datagramFlow.DatagramFlow = 1
+	connectionOffer := newWireRequest("/svc/m")
+	connectionOffer.ConnectionMetadata = &connectionMetadataInfo{ID: 1, Metadata: Metadata{"authorization": []byte("ok")}}
+	connectionReference := newWireRequest("/svc/m")
+	connectionReference.Metadata["x-a"] = []byte("1")
+	connectionReference.ConnectionMetadata = &connectionMetadataInfo{ID: 1}
 
 	statusVector := func(name string, status *Status) goldenVector {
 		return goldenVector{
@@ -113,7 +126,7 @@ func TestWireGoldenVectors(t *testing.T) {
 			},
 			check: func(t *testing.T, got testFrame) {
 				t.Helper()
-				if got.Kind != frameTypeHeaders || !metadataEqual(got.Headers, headers.Metadata) {
+				if got.Kind != frameTypeHeaders || !metadataEqual(got.Headers, headers.Metadata) || got.headersConnectionMetadata != headers.ConnectionMetadata {
 					t.Fatalf("decoded headers = %#v, want %#v", got, headers)
 				}
 			},
@@ -139,11 +152,14 @@ func TestWireGoldenVectors(t *testing.T) {
 		requestVector("request.metadata", withMetadata),
 		requestVector("request.extensions", extensions),
 		requestVector("request.datagram_flow", datagramFlow),
+		requestVector("request.connection_metadata_offer", connectionOffer),
+		requestVector("request.connection_metadata_reference", connectionReference),
 		messageVector("message.hi", "hi"),
 		messageVector("message.empty", ""),
 		headersVector("headers.metadata", &wireHeaders{Metadata: Metadata{"x-a": []byte("1")}}),
 		headersVector("headers.empty", &wireHeaders{}),
 		headersVector("headers.extensions", &wireHeaders{Extensions: []uint64{1}}),
+		headersVector("headers.connection_metadata", &wireHeaders{ConnectionMetadata: 1}),
 		statusVector("status.ok", OK()),
 		statusVector("status.unavailable", Unavailable("down")),
 		statusVector("status.metadata", NewStatus(CodeFailedPrecondition, "stop").WithMetadata(Metadata{"x-t": []byte("2")})),

@@ -82,6 +82,18 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(["100", "1000"], [line.split()[4] for line in lines[1:]])
         self.assertIsNone(run.parse_result("go", "go", json.dumps(RESULT)).rate)
 
+    def test_marks_connection_metadata(self) -> None:
+        results = [
+            run.parse_result("go", "go", json.dumps({**RESULT, "metadata_size": 1024})),
+            run.parse_result(
+                "go",
+                "go",
+                json.dumps({**RESULT, "metadata_size": 1024, "metadata_scope": "connection"}),
+            ),
+        ]
+
+        self.assertEqual(["1024", "1024c"], [result.row()[2] for result in results])
+
     def test_shows_the_compression_mode(self) -> None:
         result = run.parse_result(
             "go", "go", json.dumps({**RESULT, "payload": "records", "compression": "stream"})
@@ -242,6 +254,12 @@ class TableTest(unittest.TestCase):
             {("go", "quic"): 12, ("go", "tcp"): 3, ("rust", "quic"): 12, ("rust", "tcp"): 3},
             self.cells("datagrams"),
         )
+        # Connection metadata runs with metadata, on TrevRPC only.
+        self.assertEqual(
+            {("go", "quic"): 12, ("go", "tcp"): 12, ("rust", "quic"): 12, ("rust", "tcp"): 12,
+             ("grpc", "grpc"): 8, ("connect", "connect"): 8},
+            self.cells("metadata"),
+        )  # fmt: skip
 
     def test_explicit_flags_override_the_table(self) -> None:
         args = run.parse_args(

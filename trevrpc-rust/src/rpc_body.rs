@@ -7,14 +7,25 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut as _, Bytes};
 use tokio::sync::{Semaphore, watch};
 
+use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::Demux;
 use crate::framed::{self, FrameRead, FrameWrite, ResponseCodec};
 use crate::request_pump::{RequestPumpReader, RequestTransportEvent};
 use crate::server::Server;
 use crate::server_transport::{
     self, IncomingRequest, Permit, ResponseWriter, open_flow, reject_unreadable,
+    resolve_connection_metadata,
 };
 use crate::{ResponseFrame, Result};
+
+/// What the RPC streams of one `WebTransport` session share. Ordinary HTTP requests have none:
+/// they use offered connection metadata for their own call only.
+#[derive(Default)]
+pub struct WebTransportSessionState {
+    /// The session's datagrams, when it has them.
+    pub demux: Option<Arc<Demux>>,
+    pub connection_metadata: ConnectionMetadataStore,
+}
 
 /// The send half of one HTTP request or `WebTransport` stream.
 pub trait BodySink: Send + 'static {
@@ -122,12 +133,13 @@ impl<S: BodySource> RequestPumpReader for BodyReader<S> {
     }
 }
 
-/// Reads the initial request frame and opens its datagram flow on `demux`, replying with the
-/// failure status when either fails. The stream slot is released before that reply.
+/// Reads the initial request frame, resolves its connection metadata and opens its datagram flow
+/// in `session`, replying with the failure status when any of them fails. The stream slot is
+/// released before that reply.
 async fn read_request<K, S>(
     server: &Server,
     stream_permit: &mut Permit,
-    demux: Option<&Demux>,
+    session: Option<&WebTransportSessionState>,
     sink: K,
     source: S,
 ) -> Option<(BodyWriter<K>, BodyReader<S>, IncomingRequest)>
@@ -146,7 +158,17 @@ where
     };
     let incoming = server_transport::read_initial_request(server, &mut reader)
         .await
-        .and_then(|mut incoming| open_flow(demux, &mut incoming).map(|()| incoming));
+        .and_then(|mut incoming| {
+            resolve_connection_metadata(
+                session.map(|session| &session.connection_metadata),
+                &mut incoming,
+            )?;
+            open_flow(
+                session.and_then(|session| session.demux.as_deref()),
+                &mut incoming,
+            )?;
+            Ok(incoming)
+        });
     match incoming {
         Ok(incoming) => Some((writer, reader, incoming)),
         Err(error) => {
@@ -158,12 +180,12 @@ where
 
 /// Serves one RPC carried by a body, holding `stream_permit` until its STATUS is written.
 ///
-/// `demux` carries the datagrams of the `WebTransport` session the body belongs to, if any.
+/// `session` is the `WebTransport` session the body belongs to, if any.
 pub async fn handle_rpc_stream<K, S>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
     mut stream_permit: Permit,
-    demux: Option<Arc<Demux>>,
+    session: Option<Arc<WebTransportSessionState>>,
     sink: K,
     source: S,
     shutdown: watch::Receiver<bool>,
@@ -171,8 +193,14 @@ pub async fn handle_rpc_stream<K, S>(
     K: BodySink,
     S: BodySource,
 {
-    if let Some((writer, reader, incoming)) =
-        read_request(&server, &mut stream_permit, demux.as_deref(), sink, source).await
+    if let Some((writer, reader, incoming)) = read_request(
+        &server,
+        &mut stream_permit,
+        session.as_deref(),
+        sink,
+        source,
+    )
+    .await
     {
         server_transport::handle_stream(
             server,
@@ -188,13 +216,23 @@ pub async fn handle_rpc_stream<K, S>(
 }
 
 /// Answers one RPC carried by a body with the over-limit status.
-pub async fn reject_rpc_stream<K, S>(server: Server, sink: K, source: S)
-where
+pub async fn reject_rpc_stream<K, S>(
+    server: Server,
+    session: Option<Arc<WebTransportSessionState>>,
+    sink: K,
+    source: S,
+) where
     K: BodySink,
     S: BodySource,
 {
-    if let Some((writer, reader, incoming)) =
-        read_request(&server, &mut Permit::none(), None, sink, source).await
+    if let Some((writer, reader, incoming)) = read_request(
+        &server,
+        &mut Permit::none(),
+        session.as_deref(),
+        sink,
+        source,
+    )
+    .await
     {
         server_transport::reject_stream(server, writer, reader, incoming).await;
     }

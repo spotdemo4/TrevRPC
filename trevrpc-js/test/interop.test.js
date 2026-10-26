@@ -57,7 +57,8 @@ test("the interop scenarios pass against a spec-conforming Echo server", () =>
       ScenarioNames.map((name) => ({ name, ok: true })),
     );
     assert.deepEqual(reported, [...ScenarioNames]);
-    assert.equal(sessions.length, 1);
+    // The main channel's session, and the one the connection-metadata scenario opens itself.
+    assert.equal(sessions.length, 2);
     assert.equal(sessions[0].url, url);
     assert.deepEqual(sessions[0].options.serverCertificateHashes, [
       { algorithm: "sha-256", value: Uint8Array.from(certHash) },
@@ -85,12 +86,14 @@ test("scenarios fail individually when the server misbehaves", () =>
         "unary-large",
         "unary-headers",
         "compressed",
+        "connection-metadata",
       ]);
       assert.match(failed["unary-metadata"], /expected \(hello!, 0\), got \(hello, 0\)/);
       assert.match(failed["unary-error"], /expected status NotFound "missing", got OK/);
       assert.match(failed["unary-large"], /\[1048576 chars\]/);
       assert.match(failed["unary-headers"], /expected trailing metadata .*, got \{\}/);
       assert.match(failed.compressed, /expected \(\{"service".*, 0\), got \(hello, 0\)/);
+      assert.match(failed["connection-metadata"], /expected \(a!, 0\), got \(hello, 0\)/);
       for (const reason of Object.values(failed)) {
         assert.doesNotMatch(reason, /\n/);
       }

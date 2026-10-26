@@ -52,9 +52,20 @@ const goldenCases = {
     RpcRequest,
     { ...request, kind: RpcKind.BidirectionalStreaming, datagramFlow: 1 },
   ],
+  "request.connection_metadata_offer": [
+    FrameType.Request,
+    RpcRequest,
+    { ...request, connectionMetadata: { id: 1, metadata: { authorization: bytes("ok") } } },
+  ],
+  "request.connection_metadata_reference": [
+    FrameType.Request,
+    RpcRequest,
+    { ...request, metadata: { "x-a": bytes("1") }, connectionMetadata: { id: 1 } },
+  ],
   "message.hi": [FrameType.Message, undefined, bytes("hi")],
   "message.empty": [FrameType.Message, undefined, new Uint8Array(0)],
   "headers.metadata": [FrameType.Headers, RpcHeaders, { metadata: { "x-a": bytes("1") } }],
+  "headers.connection_metadata": [FrameType.Headers, RpcHeaders, { connectionMetadata: 1 }],
   "headers.empty": [FrameType.Headers, RpcHeaders, {}],
   "headers.extensions": [FrameType.Headers, RpcHeaders, { extensions: [1] }],
   "status.ok": [FrameType.Status, RpcStatus, { code: Code.Ok }],
@@ -144,6 +155,16 @@ test("golden payloads decode to their logical fields", async () => {
     Buffer.from(decode("request.metadata", RpcRequest).metadata.authorization) + "",
     "ok",
   );
+  const offer = decode("request.connection_metadata_offer", RpcRequest).connectionMetadata;
+  assert.equal(offer.id, 1);
+  assert.equal(Buffer.from(offer.metadata.authorization) + "", "ok");
+  const reference = decode("request.connection_metadata_reference", RpcRequest);
+  assert.equal(reference.connectionMetadata.id, 1);
+  assert.deepEqual(Object.keys(reference.connectionMetadata.metadata), []);
+  assert.deepEqual(Object.keys(reference.metadata), ["x-a"]);
+  assert.equal(decode("request.unary", RpcRequest).connectionMetadata, null);
+  assert.equal(decode("headers.connection_metadata", RpcHeaders).connectionMetadata, 1);
+  assert.equal(decode("headers.empty", RpcHeaders).connectionMetadata, 0);
   assert.deepEqual(decode("headers.extensions", RpcHeaders).extensions.map(Number), [1]);
   assert.equal(Buffer.from(decode("headers.metadata", RpcHeaders).metadata["x-a"]) + "", "1");
 

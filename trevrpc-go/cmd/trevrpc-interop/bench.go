@@ -46,17 +46,20 @@ const (
 
 type benchConfig struct {
 	connectionConfig
-	scenario    string
-	size        int
-	metadata    int
-	concurrency int
-	messages    int
-	rate        float64
-	duration    float64
-	warmup      float64
-	payload     string
-	compression string
-	dictionary  string
+	scenario string
+	size     int
+	metadata int
+	// metadataScope is where the bench-pad entry goes: "call" sends it with
+	// every call, "connection" as connection metadata.
+	metadataScope string
+	concurrency   int
+	messages      int
+	rate          float64
+	duration      float64
+	warmup        float64
+	payload       string
+	compression   string
+	dictionary    string
 }
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
@@ -64,6 +67,7 @@ func (c *benchConfig) register(flags *flag.FlagSet) {
 	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream, unreliable-client-stream, paced or unreliable-paced")
 	flags.IntVar(&c.size, "size", 64, "length of EchoRequest.message in bytes")
 	flags.IntVar(&c.metadata, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
+	flags.StringVar(&c.metadataScope, "metadata-scope", "call", "call (the bench-pad entry goes with every call) or connection (as connection metadata)")
 	flags.IntVar(&c.concurrency, "concurrency", 1, "workers, each with one call or stream in flight")
 	flags.IntVar(&c.messages, "messages", 100, "messages per streaming call")
 	flags.Float64Var(&c.rate, "rate", 100, "messages per second each paced or unreliable-paced worker sends")
@@ -111,6 +115,8 @@ func (c *benchConfig) validate() error {
 		return fmt.Errorf("bench: --compression %s and --dictionary go together", c.compression)
 	case c.payload != "repeat" && c.payload != "records":
 		return fmt.Errorf("bench: unknown --payload %q", c.payload)
+	case c.metadataScope != "call" && c.metadataScope != "connection":
+		return fmt.Errorf("bench: unknown --metadata-scope %q", c.metadataScope)
 	}
 	switch {
 	case c.size < 0:
@@ -141,10 +147,19 @@ func (c *benchConfig) interval() time.Duration {
 	return time.Duration(float64(time.Second) / c.rate)
 }
 
-// callOptions returns the options every call carries: the bench-pad request
-// metadata entry, if --metadata-size asks for one.
-func (c *benchConfig) callOptions() []trevrpc.CallOption {
+// padMetadata returns the bench-pad request metadata entry, if --metadata-size
+// asks for one.
+func (c *benchConfig) padMetadata() trevrpc.Metadata {
 	if c.metadata == 0 {
+		return nil
+	}
+	return trevrpc.Metadata{benchPadKey: bytes.Repeat([]byte{'x'}, c.metadata)}
+}
+
+// callOptions returns the options every call carries: the bench-pad entry,
+// unless it is connection metadata.
+func (c *benchConfig) callOptions() []trevrpc.CallOption {
+	if c.metadata == 0 || c.metadataScope == "connection" {
 		return nil
 	}
 	return []trevrpc.CallOption{trevrpc.WithMetadata(benchPadKey, bytes.Repeat([]byte{'x'}, c.metadata))}
@@ -715,6 +730,7 @@ type benchResult struct {
 	Transport       string       `json:"transport"`
 	Size            int          `json:"size"`
 	MetadataSize    int          `json:"metadata_size"`
+	MetadataScope   string       `json:"metadata_scope"`
 	Concurrency     int          `json:"concurrency"`
 	DurationS       float64      `json:"duration_s"`
 	Ops             uint64       `json:"ops"`
@@ -752,6 +768,9 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 			return err
 		}
 		dialOptions.Compression = compression
+	}
+	if config.metadataScope == "connection" {
+		dialOptions.ConnectionMetadata = config.padMetadata()
 	}
 	channel, err := config.dial(ctx, dialOptions)
 	if err != nil {
@@ -840,22 +859,23 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 		rate = config.rate
 	}
 	return benchResult{
-		Scenario:     config.scenario,
-		Transport:    string(transport),
-		Size:         config.size,
-		MetadataSize: config.metadata,
-		Concurrency:  config.concurrency,
-		DurationS:    seconds,
-		Ops:          ops,
-		Msgs:         messages,
-		Lost:         lost,
-		Rate:         rate,
-		Payload:      config.payload,
-		Compression:  config.compression,
-		Errors:       failures,
-		OpsPerSec:    float64(ops) / seconds,
-		MsgsPerSec:   float64(messages) / seconds,
-		BytesPerSec:  float64(messages) / seconds * float64(config.size),
+		Scenario:      config.scenario,
+		Transport:     string(transport),
+		Size:          config.size,
+		MetadataSize:  config.metadata,
+		MetadataScope: config.metadataScope,
+		Concurrency:   config.concurrency,
+		DurationS:     seconds,
+		Ops:           ops,
+		Msgs:          messages,
+		Lost:          lost,
+		Rate:          rate,
+		Payload:       config.payload,
+		Compression:   config.compression,
+		Errors:        failures,
+		OpsPerSec:     float64(ops) / seconds,
+		MsgsPerSec:    float64(messages) / seconds,
+		BytesPerSec:   float64(messages) / seconds * float64(config.size),
 		LatencyUS: benchLatency{
 			P50:  percentileUS(latencies, 0.50),
 			P90:  percentileUS(latencies, 0.90),

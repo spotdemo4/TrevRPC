@@ -37,6 +37,9 @@ type drainingStream struct {
 	// datagrams is the demultiplexer of the connection's datagram messages, nil
 	// for a connection without them.
 	datagrams *datagramMux
+	// connectionMetadata is the connection metadata the server keeps for the
+	// stream's connection or session.
+	connectionMetadata *connectionMetadataStore
 	// shutdown ends a running drain early.
 	shutdown     context.Context
 	drainTimeout time.Duration
@@ -60,6 +63,10 @@ func newDrainingStream(shutdown context.Context, rw io.ReadWriteCloser, setReadD
 }
 
 func (s *drainingStream) trevrpcDatagrams() *datagramMux { return s.datagrams }
+
+func (s *drainingStream) trevrpcConnectionMetadata() *connectionMetadataStore {
+	return s.connectionMetadata
+}
 
 func (s *drainingStream) Read(data []byte) (int, error) {
 	s.mu.Lock()

@@ -17,9 +17,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import zip.trev.trevrpc.Compression
+import zip.trev.trevrpc.ConnectionMetadata
+import zip.trev.trevrpc.ConnectionMetadataSource
 import zip.trev.trevrpc.DEFAULT_MAX_FRAME_SIZE
 import zip.trev.trevrpc.DEFAULT_STREAM_COMPRESSION_MEMORY
 import zip.trev.trevrpc.FrameDecoder
+import zip.trev.trevrpc.Metadata
 import zip.trev.trevrpc.ResponseFrame
 import zip.trev.trevrpc.RpcChannel
 import zip.trev.trevrpc.RpcClientStream
@@ -47,7 +50,10 @@ internal const val TREV_RPC_CONTENT_TYPE = "application/trevrpc"
 /**
  * Cronet transport options. [compression] enables compressed messages on the channel's calls, and
  * [streamCompressionMemory] bounds the memory stream compression holds on the channel's calls (64
- * MiB by default; 0 turns stream compression off).
+ * MiB by default; 0 turns stream compression off). [connectionMetadata] is request metadata sent
+ * with every call of the channel, such as a bearer token, which the server merges into each call's
+ * metadata, the call's own entries winning; [RpcChannel.setConnectionMetadata] replaces it. Cronet
+ * does not say which calls share a connection, so every call carries the whole set.
  * [closeTimeout] strictly bounds TrevRPC's shutdown wait. Provider
  * cancellation and callback-executor submission run on detached daemon workers, and close never
  * waits for a provider call while holding a transport monitor. A non-cooperative borrowed
@@ -60,6 +66,7 @@ data class CronetTransportOptions(
     val closeTimeout: Duration = 5.seconds,
     val compression: Compression? = null,
     val streamCompressionMemory: Long = DEFAULT_STREAM_COMPRESSION_MEMORY,
+    val connectionMetadata: Metadata = Metadata.EMPTY,
 ) {
     init {
         require(streamCompressionMemory >= 0) { "streamCompressionMemory must be non-negative" }
@@ -151,6 +158,13 @@ internal class Http3RpcTransport(
         get() = options.compression
 
     override val streamCompressionBudget = StreamCompressionBudget(options.streamCompressionMemory)
+
+    private val connectionMetadataSource = ConnectionMetadataSource(options.connectionMetadata)
+
+    override val connectionMetadata: ConnectionMetadata?
+        get() = connectionMetadataSource.current()
+
+    override fun setConnectionMetadata(metadata: Metadata) = connectionMetadataSource.set(metadata)
 
     internal val activeExchangeCount: Int
         get() = exchanges.activeCount

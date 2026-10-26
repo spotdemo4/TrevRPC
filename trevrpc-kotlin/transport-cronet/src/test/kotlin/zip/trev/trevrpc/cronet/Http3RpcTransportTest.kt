@@ -27,6 +27,7 @@ import org.junit.jupiter.api.Test
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.Client
 import zip.trev.trevrpc.Code
+import zip.trev.trevrpc.ConnectionMetadata
 import zip.trev.trevrpc.DEFAULT_STREAM_COMPRESSION_MEMORY
 import zip.trev.trevrpc.Frame
 import zip.trev.trevrpc.FrameDecoder
@@ -113,6 +114,22 @@ class Http3RpcTransportTest {
             assertNull(stream.receive())
             assertTrue(fake.awaitCancel())
             assertEquals(1, fake.cancelCalls)
+        }
+
+    @Test
+    fun `the channel offers its connection metadata, which can be replaced and removed`() =
+        runTest {
+            fun set(value: String) = Metadata.of("authorization" to value.encodeToByteArray())
+            val options = CronetTransportOptions(connectionMetadata = set("a"))
+            val transport = Http3RpcTransport(FakeFactory(), options, coroutineContext, shutdownContext = coroutineContext)
+
+            assertEquals(ConnectionMetadata(1u, set("a")), transport.connectionMetadata)
+            transport.setConnectionMetadata(set("b"))
+            assertEquals(ConnectionMetadata(2u, set("b")), transport.connectionMetadata)
+            transport.setConnectionMetadata(Metadata.EMPTY)
+            assertNull(transport.connectionMetadata)
+            assertNull(Http3RpcTransport(FakeFactory(), coroutineContext = coroutineContext).connectionMetadata)
+            transport.close()
         }
 
     @Test

@@ -50,6 +50,14 @@ type DialOptions struct {
 	// compressed per message. Zero means 64 MiB, and a negative value turns
 	// stream compression off.
 	StreamCompressionMemory int64
+	// ConnectionMetadata is request metadata for every call of the channel,
+	// such as a bearer token, which each connection carries once instead of
+	// in every call: calls send it until the server confirms it stored it for
+	// the connection, and refer to it after that. A call's own metadata wins
+	// for a key both have. Channel.SetConnectionMetadata replaces it. It is
+	// held to the limits of request metadata, and so is each call's merged
+	// metadata.
+	ConnectionMetadata Metadata
 }
 
 // TransportPolicy selects the transports a Channel connects with.
@@ -106,6 +114,10 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 	}
 	// The budget is the channel's, shared by its connections.
 	streams := newStreamBudget(options.StreamCompressionMemory, defaultClientStreamCompressionMemory, compression)
+	connectionMetadata, err := newConnectionMetadataSource(options.ConnectionMetadata)
+	if err != nil {
+		return nil, err
+	}
 	quicConnector := &quicConnector{
 		addr:         addr,
 		tls:          clientTLSConfig(options.TLSConfig, host),
@@ -113,6 +125,7 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 		maxFrameSize: maxFrameSize,
 		compression:  compression,
 		streams:      streams,
+		metadata:     connectionMetadata,
 	}
 	qmuxConnector := &qmuxConnector{
 		addr:         tcpAddr,
@@ -120,6 +133,7 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 		maxFrameSize: maxFrameSize,
 		compression:  compression,
 		streams:      streams,
+		metadata:     connectionMetadata,
 	}
 	var connector channelConnector
 	switch options.Transport {
@@ -130,7 +144,12 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 	default:
 		connector = newRacingConnector(quicConnector, qmuxConnector, options.FallbackDelay, options.ReprobeInterval)
 	}
-	return dialChannel(ctx, connector, options.OnEvent)
+	channel, err := dialChannel(ctx, connector, options.OnEvent)
+	if err != nil {
+		return nil, err
+	}
+	channel.connectionMetadata = connectionMetadata
+	return channel, nil
 }
 
 type quicConnector struct {
@@ -140,6 +159,9 @@ type quicConnector struct {
 	maxFrameSize int
 	compression  *compressionConfig
 	streams      *streamBudget
+	// metadata is the channel's connection metadata, which every connection
+	// offers afresh.
+	metadata *connectionMetadataSource
 }
 
 func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) {
@@ -154,6 +176,7 @@ func (c *quicConnector) Connect(ctx context.Context) (channelGeneration, error) 
 	// Each connection negotiates its dictionaries afresh.
 	client.compression = newClientCompression(c.compression)
 	client.streams = c.streams
+	client.connectionMetadata = newClientConnectionMetadata(c.metadata)
 	if conn.ConnectionState().SupportsDatagrams.Remote {
 		// Each connection, and so each reconnect, has its own flow IDs.
 		client.datagrams = newDatagramMux(conn, 0, false, 0)

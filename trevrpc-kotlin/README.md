@@ -97,6 +97,21 @@ println(headers["x-request-id"])   // response headers
 println(trailers["x-cost"])        // trailing metadata
 ```
 
+### Connection metadata
+
+Request metadata that every call of a channel carries, such as a bearer token, is set once on the channel instead of in each call's options. The server merges it into each call's metadata before validation and authorization, and the call's own entries win. Pass it in `CronetTransportOptions` and replace it at any time with `setConnectionMetadata` (empty metadata removes it); calls opened afterwards use the new set.
+
+```kotlin
+val channel =
+    CronetRpcChannel.create(
+        engine, "https://rpc.example.com", executor,
+        CronetTransportOptions(connectionMetadata = Metadata.of("authorization" to "Bearer $token".encodeToByteArray())),
+    )
+channel.setConnectionMetadata(Metadata.of("authorization" to "Bearer $refreshed".encodeToByteArray()))
+```
+
+Cronet does not say which calls share a connection, and servers do not confirm a set over the ordinary HTTP mapping, so every call carries the whole set in its `REQUEST`.
+
 Frames use HTTP/3's layout (QUIC variable-length integer type and length, then the payload), so `core` skips unknown frame types, including after `STATUS`. Request messages are written raw in `MESSAGE` frames, and unary and server-streaming calls send `REQUEST`, the one `MESSAGE`, and the end of the request stream in a single write. See the [wire format](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format).
 
 Failed calls throw `TrevRpcException` carrying a `Status`. Calls are never retried, and deadlines, idle timeouts, and response size limits are set through `CallOptions`.

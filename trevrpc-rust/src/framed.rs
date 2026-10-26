@@ -11,6 +11,7 @@ use crate::client::replay::{Optimism, Replay};
 use crate::compression::{
     Accept, ClientCompression, Dict, Inflater, MessageEncoder, StreamEnable, inflate,
 };
+use crate::connection_metadata::OfferedSet;
 use crate::framing::{
     self, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_payload, frame_type, is_known_frame_type,
 };
@@ -141,6 +142,8 @@ pub struct FrameChunks {
     answer: Option<Vec<DictionaryInfo>>,
     /// The answer to a stream compression offer that the next HEADERS frame carries.
     stream_answer: Option<StreamCompression>,
+    /// The connection metadata set the next HEADERS frame confirms, or zero.
+    connection_answer: u32,
 }
 
 impl FrameChunks {
@@ -152,6 +155,7 @@ impl FrameChunks {
             max_frame_size,
             answer: None,
             stream_answer: None,
+            connection_answer: 0,
         }
     }
 
@@ -208,6 +212,7 @@ impl FrameChunks {
                     extensions: Vec::new(),
                     dictionaries: self.answer.take().unwrap_or_default(),
                     stream_compression: self.stream_answer.take(),
+                    connection_metadata: std::mem::take(&mut self.connection_answer),
                 };
                 self.protobuf(frame_type::HEADERS, &headers)
             }
@@ -236,6 +241,9 @@ pub struct ResponseCodec {
     pub(crate) answer: Option<Vec<DictionaryInfo>>,
     /// The answer to the request's stream compression offer, which the call's HEADERS carry.
     pub(crate) stream_answer: Option<StreamCompression>,
+    /// The connection metadata set the request offered and the server stored, which the call's
+    /// HEADERS confirm; zero for none.
+    pub(crate) connection_answer: u32,
 }
 
 /// Writes response frames, draining `frames`, with one write.
@@ -258,6 +266,7 @@ pub async fn write_response_frames<W: FrameWrite>(
     {
         chunks.answer = codec.answer.take();
         chunks.stream_answer = codec.stream_answer.take();
+        chunks.connection_answer = std::mem::take(&mut codec.connection_answer);
     }
     for frame in frames.drain(..) {
         chunks.response_frame(frame, &mut codec.encoder)?;
@@ -532,6 +541,8 @@ pub struct ResponseReading {
     pub(crate) refused: Option<Replay>,
     /// The connection to tell when HEADERS answer a stream compression offer.
     pub(crate) optimism: Option<Arc<Optimism>>,
+    /// The connection metadata set the request offered, which its HEADERS may confirm.
+    pub(crate) connection_metadata: Option<OfferedSet>,
 }
 
 /// Decodes a frame received on a response stream, decompressing a `ZSTD_MESSAGE` with the
@@ -561,6 +572,9 @@ pub fn decode_response_frame(
             let headers = decode_payload::<RpcHeaders>(&payload)?;
             if let Some(connection) = reading.learn.take() {
                 connection.learn(&headers.dictionaries);
+            }
+            if let Some(offered) = reading.connection_metadata.take() {
+                offered.learn(headers.connection_metadata);
             }
             if let Some(requests) = reading.enable_requests.take() {
                 requests.enable(headers.stream_compression.as_ref());
@@ -1090,8 +1104,7 @@ mod tests {
                 &RpcHeaders {
                     metadata: Metadata::new(),
                     extensions: vec![1],
-                    dictionaries: Vec::new(),
-                    stream_compression: None,
+                    ..RpcHeaders::default()
                 },
                 1024,
             )

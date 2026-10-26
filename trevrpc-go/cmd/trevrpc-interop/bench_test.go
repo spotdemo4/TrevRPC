@@ -99,6 +99,40 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 	}
 }
 
+// TestBenchSendsConnectionMetadata checks --metadata-scope connection, which
+// sends the bench-pad entry as connection metadata.
+func TestBenchSendsConnectionMetadata(t *testing.T) {
+	certFile, ports := startBenchServer(t)
+	for _, transport := range []string{"quic", "tcp"} {
+		t.Run(transport, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := []string{
+				"bench",
+				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+				"--tcp-addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.QMux)),
+				"--ca", certFile,
+				"--transport", transport,
+				"--scenario", "unary",
+				"--metadata-size", "300",
+				"--metadata-scope", "connection",
+				"--concurrency", "2",
+				"--duration", "0.2",
+				"--warmup", "0.05",
+			}
+			if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+				t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+			}
+			var got map[string]any
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("result %q: %v", stdout.String(), err)
+			}
+			if got["metadata_scope"] != "connection" || got["metadata_size"] != float64(300) || got["errors"] != float64(0) {
+				t.Fatalf("result = %s", stdout.String())
+			}
+		})
+	}
+}
+
 // checkBenchLine checks a result line against the contract. A compressed run
 // may carry fewer wire bytes than its payload.
 func checkBenchLine(t *testing.T, output, scenario, transport string, size, metadataSize, messages int, wantWire, compressed bool) {
@@ -263,6 +297,7 @@ func TestBenchCommandLineErrors(t *testing.T) {
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--concurrency", "0"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--duration", "0"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", "-1"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-scope", "stream"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--metadata-size", strconv.Itoa(benchMaxMetadataSize + 1)},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--payload", "bogus"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--compression", "gzip"},

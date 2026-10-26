@@ -14,10 +14,13 @@ use super::race::{
 };
 use super::{CallInfo, RpcTransport, StreamingRpcTransport};
 use crate::compression::{Compression, CompressionConfig, DEFAULT_CLIENT_MEMORY, StreamBudget};
+use crate::connection_metadata::ConnectionMetadataSource;
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
-use crate::{BoxStream, Error, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status};
+use crate::{
+    BoxStream, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcRequest, Status,
+};
 
 const EVENT_CAPACITY: usize = 32;
 const CLOSE_REASON: &[u8] = b"channel closed";
@@ -124,6 +127,7 @@ pub struct ChannelConfig {
     reprobe_interval: Duration,
     compression: Compression,
     stream_compression_memory: usize,
+    connection_metadata: Metadata,
     max_quic_connections: usize,
     min_quic_connections: usize,
     quic_idle_timeout: Duration,
@@ -144,6 +148,7 @@ impl ChannelConfig {
             reprobe_interval: DEFAULT_REPROBE_INTERVAL,
             compression: Compression::new(),
             stream_compression_memory: DEFAULT_CLIENT_MEMORY,
+            connection_metadata: Metadata::new(),
             max_quic_connections: default_max_connections(),
             min_quic_connections: 1,
             quic_idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -167,6 +172,16 @@ impl ChannelConfig {
     #[must_use]
     pub const fn with_stream_compression_memory(mut self, bytes: usize) -> Self {
         self.stream_compression_memory = bytes;
+        self
+    }
+
+    /// Sets metadata that joins every call's own, such as a bearer token. Each connection sends
+    /// it once, in the first calls until the server confirms it, instead of in every REQUEST; a
+    /// call's own value wins for a key both have. Connecting fails when it is invalid. See
+    /// [`Channel::set_connection_metadata`] to change it.
+    #[must_use]
+    pub fn with_connection_metadata(mut self, metadata: Metadata) -> Self {
+        self.connection_metadata = metadata;
         self
     }
 
@@ -466,6 +481,7 @@ impl Channel {
             server_name: server_name.into(),
             compression: Some(CompressionConfig::new(&config.compression)?),
             stream_budget: StreamBudget::new(config.stream_compression_memory),
+            connection_metadata: ConnectionMetadataSource::new(config.connection_metadata.clone())?,
             max_frame_size: config.max_frame_size,
             policy: config.policy,
             tcp: config.tcp.clone(),
@@ -511,6 +527,17 @@ impl Channel {
                 shutdown,
             }),
         })
+    }
+
+    /// Replaces the connection metadata (see [`ChannelConfig::with_connection_metadata`]) for the
+    /// calls that start from now on; empty metadata removes it.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` when `metadata` is invalid, which leaves the connection metadata as it
+    /// was.
+    pub fn set_connection_metadata(&self, metadata: Metadata) -> Result<()> {
+        self.inner.dialer.connection_metadata.set(metadata)
     }
 
     /// Returns the latest lifecycle state.

@@ -1,3 +1,4 @@
+import { ConnectionMetadataKey, ConnectionMetadataSource } from "./connection-metadata.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
 import { dialRace } from "./race.js";
 import { cancelled, failedPrecondition, statusFromTransportError, unavailable } from "./status.js";
@@ -44,18 +45,30 @@ export class Channel {
     const dial = sessionDialer(url, options);
     // Checked before dialing, so an invalid option never leaves a session behind.
     const streamBudget = new StreamBudget(options.streamCompressionMemory);
-    return new Channel(await dial(options.signal), dial, { ...options, streamBudget });
+    const connectionMetadata = new ConnectionMetadataSource(options.connectionMetadata);
+    return new Channel(await dial(options.signal), dial, {
+      ...options,
+      streamBudget,
+      connectionMetadata,
+    });
   }
 
   constructor(
     dialed,
     dial,
-    { compression, streamBudget = new StreamBudget(), onStateChange } = {},
+    {
+      compression,
+      streamBudget = new StreamBudget(),
+      connectionMetadata = new ConnectionMetadataSource(),
+      onStateChange,
+    } = {},
   ) {
     this.#dial = dial;
     this.#compression = compression;
     // The memory budget of the stream compression contexts of this channel's calls.
     this[StreamBudgetKey] = streamBudget;
+    // The connection metadata every call of this channel carries.
+    this[ConnectionMetadataKey] = connectionMetadata;
     this.#onStateChange = onStateChange;
     this.#adopt(dialed);
   }
@@ -73,6 +86,15 @@ export class Channel {
   /** The compression settings from the connect options, or undefined. */
   get compression() {
     return this.#compression;
+  }
+
+  /**
+   * Replaces the channel's connection metadata, which every call carries; empty or missing
+   * metadata removes it. Calls started after this use the new metadata. Throws InvalidArgument if
+   * it is invalid, and then keeps the old.
+   */
+  setConnectionMetadata(metadata) {
+    this[ConnectionMetadataKey].set(metadata);
   }
 
   /** Opens a bidirectional stream on the current session. */

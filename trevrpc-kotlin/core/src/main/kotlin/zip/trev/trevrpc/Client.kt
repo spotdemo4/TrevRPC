@@ -92,6 +92,13 @@ interface RpcTransport {
         get() = null
 
     /**
+     * The channel's connection metadata, which [Client] puts in the REQUEST of every call, or null
+     * for none.
+     */
+    val connectionMetadata: ConnectionMetadata?
+        get() = null
+
+    /**
      * Opens one call stream and writes REQUEST. When [firstMessage] is present (unary and
      * server-streaming calls) it is written in the same write as REQUEST, and when [finishSend] is
      * also set the request side is half-closed in that write too. Implementations clean up after
@@ -346,7 +353,7 @@ class Client(
         val budget = transport.streamCompressionBudget
         val directions = compressStream.effective(kind)
         val streams = configured?.let { CallStreams.open(it, budget, directions, compression) }
-        val request = request(path, kind, options, compression, streams)
+        val request = request(path, kind, options, compression, streams, transport.connectionMetadata)
         val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
         val stream =
             try {
@@ -882,6 +889,7 @@ private fun request(
     options: CallOptions,
     compression: CallCompression?,
     streams: CallStreams?,
+    connectionMetadata: ConnectionMetadata?,
 ): RpcRequest =
     RpcRequest(
         method = path,
@@ -891,6 +899,7 @@ private fun request(
         acceptDictionaries = compression?.accept.orEmpty(),
         dictionaryQuery = compression?.query.orEmpty(),
         streamCompression = streams?.offer,
+        connectionMetadata = connectionMetadata,
     )
 
 private fun timeoutNanos(timeout: Duration?): ULong {

@@ -35,6 +35,14 @@ pub fn tls_config(flags: &Flags) -> Result<quinn::rustls::ClientConfig, BoxError
 /// Connects a channel as `--transport` (quic, tcp or auto), `--addr`, `--tcp-addr` and
 /// `--dictionary` ask, and returns it with its endpoint.
 pub async fn channel(flags: &Flags) -> Result<(Channel, quinn::Endpoint), BoxError> {
+    channel_with(flags, |config| config).await
+}
+
+/// Connects a channel like [`channel`], with the configuration `configure` makes of the flags'.
+pub async fn channel_with(
+    flags: &Flags,
+    configure: impl FnOnce(ChannelConfig) -> ChannelConfig,
+) -> Result<(Channel, quinn::Endpoint), BoxError> {
     let server_name = server_name(flags);
     let addr = resolve(flags, "addr").await?;
     let tls = tls_config(flags)?;
@@ -58,6 +66,7 @@ pub async fn channel(flags: &Flags) -> Result<(Channel, quinn::Endpoint), BoxErr
                 .map_err(|_| format!("invalid --min-quic-connections {connections:?}"))?,
         );
     }
+    let config = configure(config);
     let endpoint = client_endpoint(addr, &config, tls)?;
     let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config).await?;
     Ok((channel, endpoint))

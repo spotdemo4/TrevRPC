@@ -39,6 +39,13 @@ data class RpcRequest(
      * [StreamCompression.optimistic] it compresses requests without waiting for the answer.
      */
     val streamCompression: StreamCompression? = null,
+    /**
+     * The channel's connection metadata, which the server merges into [metadata] before it
+     * validates and authorizes the call, the call's own entries winning. This client offers the set
+     * whole on every call: Cronet hides which calls share a connection, and a server confirms a set
+     * only on connections that keep one, which the ordinary HTTP mapping does not.
+     */
+    val connectionMetadata: ConnectionMetadata? = null,
 ) {
     val kind: RpcKind?
         get() = RpcKind.fromValue(kindValue)
@@ -52,6 +59,19 @@ data class RpcHeaders(
     val dictionaries: List<DictionaryInfo> = emptyList(),
     /** The server's answer to the request's `streamCompression`: it decodes stream-compressed requests. */
     val streamCompression: StreamCompression? = null,
+    /** The ID of the offered connection metadata the server stored for the connection, or zero. */
+    val connectionMetadataId: UInt = 0u,
+)
+
+/**
+ * Request metadata a channel sets once for all its calls, such as a bearer token. [id] names this
+ * version of the set, which changes with the set. A REQUEST carries it as an offer, with [metadata]
+ * non-empty, or as a reference to the set the server confirmed, with [metadata] empty; this client
+ * only offers.
+ */
+data class ConnectionMetadata(
+    val id: UInt,
+    val metadata: Metadata = Metadata.EMPTY,
 )
 
 /**

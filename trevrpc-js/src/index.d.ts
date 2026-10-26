@@ -341,6 +341,13 @@ export interface ConnectOptions {
    * Defaults to 64 MiB; 0 turns stream compression off. Calls beyond it compress per message.
    */
   streamCompressionMemory?: number;
+  /**
+   * Request metadata for all of the channel's calls, such as a bearer token, which crosses each
+   * connection once instead of in every request. A call's own `metadata` wins over an entry with
+   * the same key. Keys are lowercase ASCII and the `trevrpc-` prefix is reserved, as for call
+   * metadata. Replace it with `Channel.setConnectionMetadata()`.
+   */
+  connectionMetadata?: MetadataInput;
   /** Cancels the initial connection attempt only. */
   signal?: AbortSignal;
   /** Receives channel state transitions. */
@@ -381,6 +388,13 @@ export class Channel implements Transport {
   readonly transport: TransportKind;
   /** The compression settings from the connect options. */
   readonly compression?: Compression;
+  /**
+   * Replaces the channel's connection metadata (see `ConnectOptions.connectionMetadata`); empty or
+   * missing metadata removes it. Calls started after this use the new metadata, and each
+   * connection sends it again before referring to it. Throws if it is invalid, and then keeps the
+   * old.
+   */
+  setConnectionMetadata(metadata?: MetadataInput): void;
   createBidirectionalStream(): Promise<TransportStream>;
   /** Opens a stream together with the session that carries it. */
   createBidirectionalStreamWithSession(): Promise<{

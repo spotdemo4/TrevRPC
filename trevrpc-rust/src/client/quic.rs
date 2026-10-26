@@ -47,6 +47,14 @@ impl QuicTransport {
         self
     }
 
+    pub(crate) fn with_connection_metadata(
+        mut self,
+        source: Arc<crate::connection_metadata::ConnectionMetadataSource>,
+    ) -> Self {
+        self.0.set_connection_metadata(source);
+        self
+    }
+
     pub(crate) fn with_stream_budget(
         mut self,
         budget: Option<Arc<crate::compression::StreamBudget>>,

@@ -10,7 +10,8 @@ import {
   encodeOutgoingFrame,
   marshalMessage,
 } from "../src/framing.js";
-import { Code } from "../src/status.js";
+import { validateMetadata } from "../src/metadata.js";
+import { Code, TrevRpcError, invalidArgument } from "../src/status.js";
 import { createCompression } from "../src/zstd.js";
 import { ServerStreams, parseMethodPath } from "./support.js";
 
@@ -41,28 +42,99 @@ export const echoHandler = createEchoHandler();
 
 const text = new TextDecoder();
 
+/** How many connection metadata sets the server keeps per session. */
+const MaxConnectionMetadataSets = 4;
+/** The connection metadata sets the server stored, per session, oldest first. */
+const connectionMetadataSets = new WeakMap();
+
 /**
- * The HEADERS fields answering the call's dictionary query: this server holds no dictionaries but
- * decodes messages without one, so it confirms ID 0 when asked, as real servers do in every
- * HEADERS that follows a query.
+ * Merges the connection metadata a REQUEST offers or refers to into its metadata, the call's own
+ * entries winning, as real servers do before running the call. An offer is stored for the session
+ * and confirmed in the call's HEADERS (see `headersAnswer`); without a session, as over the
+ * ordinary HTTP mapping, nothing is stored or confirmed and a reference is unknown. Throws
+ * InvalidArgument for an invalid set and for a reference to an unknown one.
  */
-function queryAnswer(request) {
-  const query = request.dictionaryQuery ?? [];
-  if (query.length === 0) {
-    return {};
+function resolveConnectionMetadata(request, session) {
+  const info = request.connectionMetadata;
+  if (info == null) {
+    return;
   }
-  return { dictionaries: query.some(({ id }) => id === 0) ? [{}] : [] };
+  let set = info.metadata;
+  if (Object.keys(set).length > 0) {
+    validateMetadata(set);
+    if (session !== undefined) {
+      const sets = connectionMetadataSets.get(session) ?? new Map();
+      connectionMetadataSets.set(session, sets);
+      // Map order is insertion order: re-inserting an ID makes it the newest.
+      sets.delete(info.id);
+      sets.set(info.id, set);
+      if (sets.size > MaxConnectionMetadataSets) {
+        sets.delete(sets.keys().next().value);
+      }
+      request.connectionMetadataConfirmed = info.id;
+    }
+  } else {
+    set = connectionMetadataSets.get(session)?.get(info.id);
+    if (set === undefined) {
+      throw invalidArgument(`unknown connection metadata set ${info.id}`);
+    }
+  }
+  for (const [key, value] of Object.entries(set)) {
+    request.metadata[key] ??= value;
+  }
+}
+
+/**
+ * The HEADERS fields answering the call's dictionary query and confirming the connection metadata
+ * it offered. This server holds no dictionaries but decodes messages without one, so it confirms
+ * ID 0 when asked, as real servers do in every HEADERS that follows a query. A call that gets any
+ * answer gets HEADERS.
+ */
+function headersAnswer(request) {
+  const answer = {};
+  const query = request.dictionaryQuery ?? [];
+  if (query.length > 0) {
+    answer.dictionaries = query.some(({ id }) => id === 0) ? [{}] : [];
+  }
+  if (request.connectionMetadataConfirmed !== undefined) {
+    answer.connectionMetadata = request.connectionMetadataConfirmed;
+  }
+  return answer;
+}
+
+/** Whether the handler of the method writes the call's HEADERS itself, at dispatch. */
+function sendsOwnHeaders(method) {
+  const path = parseMethodPath(method);
+  return (
+    path?.service === CompressedEchoService ||
+    (path?.service === UnreliableEchoService && path.method === "Bidi")
+  );
 }
 
 async function serve(stream, request, unary, session) {
+  try {
+    resolveConnectionMetadata(request, session);
+  } catch (error) {
+    if (!(error instanceof TrevRpcError)) {
+      throw error;
+    }
+    await stream.writeStatus(error.code, error.statusMessage);
+    await stream.finish();
+    await stream.stopSending();
+    return;
+  }
   // The interop-header rule: echo the value as response header and, on success, as trailer.
   const marker = request.metadata["interop-header"];
   const trailers = marker === undefined ? {} : { "interop-trailer": new Uint8Array(marker) };
-  if (marker !== undefined) {
+  const answer = headersAnswer(request);
+  if (
+    marker !== undefined ||
+    (answer.connectionMetadata !== undefined && !sendsOwnHeaders(request.method))
+  ) {
     await stream.write(
       encodeHeadersFrame({
-        metadata: { "interop-header": new Uint8Array(marker) },
-        ...queryAnswer(request),
+        metadata: marker === undefined ? {} : { "interop-header": new Uint8Array(marker) },
+        ...answer,
       }),
     );
   }
@@ -94,7 +166,7 @@ async function serve(stream, request, unary, session) {
     await (path.method === "ClientStream" ? compressedClientStream : compressedBidi)(
       stream,
       streams,
-      queryAnswer(request),
+      headersAnswer(request),
     );
     await stream.finish();
     await stream.stopSending();
@@ -217,8 +289,8 @@ async function compressedBidi(stream, streams, answer) {
  * accepts it, and reports whether the request arrived compressed.
  */
 async function compressedPlain(stream, request) {
-  const answer = queryAnswer(request);
-  if (answer.dictionaries !== undefined) {
+  const answer = headersAnswer(request);
+  if (Object.keys(answer).length > 0) {
     await stream.write(encodeHeadersFrame({ metadata: {}, ...answer }));
   }
   const frame = await stream.readFrame();
@@ -294,7 +366,7 @@ async function unreliableBidi(stream, request, session) {
     });
   };
 
-  await stream.write(encodeHeadersFrame({ metadata: {}, ...queryAnswer(request) }));
+  await stream.write(encodeHeadersFrame({ metadata: {}, ...headersAnswer(request) }));
   const previousListener = datagrams?.onSend;
   if (datagrams !== undefined) {
     datagrams.onSend = (datagram) => {

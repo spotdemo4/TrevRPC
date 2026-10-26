@@ -80,6 +80,8 @@ let reply = client.lots_of_greetings().send_all(trevrpc::stream::from_iter(reque
 
 A client method returns a `trevrpc::client::Call`, and awaiting it makes the call. Its options start from the client's default call options (`GreeterClient::with_default_call_options`); `.timeout(d)`, `.metadata(key, value)` and `.options(|options| ...)` change them for that call only. `.with_response()` also returns the response headers and trailing metadata, and `.send_all(requests)` sends a stream of requests and finishes it.
 
+Metadata that every call carries, such as a bearer token, can instead be set once with `ChannelConfig::with_connection_metadata` and replaced with `Channel::set_connection_metadata`. Each connection then sends it in its first calls only, and the server merges it into every call's metadata, a call's own entry winning; see [Connection Metadata](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#connection-metadata).
+
 ### Response headers and trailing metadata
 
 A response carries two metadata maps. Headers are sent before the first response message, so a streaming call sees them without waiting for a message; trailing metadata arrives with the final status. `ResponseStream::headers()` (also on `BidirectionalCall` and `ClientStreamingCall`) resolves once the first response frame arrives, with empty headers if the server sent none, and never loses a message it read ahead. For unary and client-streaming calls, `.with_response()` (and `ClientStreamingCall::close_and_recv_with_response`) returns a `ResponseEnvelope` whose `headers()` and `metadata()` (the trailing metadata) are filled once the call completes.

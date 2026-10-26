@@ -10,6 +10,7 @@ use tokio::time::Instant;
 use super::pool::QuicPool;
 use super::{CallInfo, QmuxTransport, QuicTransport, RpcTransport, StreamingRpcTransport};
 use crate::compression::{CompressionConfig, StreamBudget};
+use crate::connection_metadata::ConnectionMetadataSource;
 use crate::sync::MutexExt as _;
 use bytes::Bytes;
 
@@ -151,6 +152,8 @@ pub struct Dialer {
     pub(crate) compression: Option<Arc<CompressionConfig>>,
     /// The memory the channel's stream compression may hold, shared by every connection.
     pub(crate) stream_budget: Option<Arc<StreamBudget>>,
+    /// The channel's connection metadata, which every connection offers afresh.
+    pub(crate) connection_metadata: Arc<ConnectionMetadataSource>,
     pub(crate) max_frame_size: usize,
     pub(crate) policy: TransportPolicy,
     pub(crate) tcp: Option<TcpDialer>,
@@ -267,7 +270,8 @@ impl Dialer {
         Ok(QuicTransport::new(connection)
             .with_max_frame_size(self.max_frame_size)
             .with_compression_config(self.compression.clone())
-            .with_stream_budget(self.stream_budget.clone()))
+            .with_stream_budget(self.stream_budget.clone())
+            .with_connection_metadata(Arc::clone(&self.connection_metadata)))
     }
 
     async fn dial_tcp(&self, tcp: &TcpDialer) -> Result<GenerationTransport> {
@@ -282,7 +286,8 @@ impl Dialer {
             GenerationTransport::Qmux(
                 transport
                     .with_compression_config(self.compression.clone())
-                    .with_stream_budget(self.stream_budget.clone()),
+                    .with_stream_budget(self.stream_budget.clone())
+                    .with_connection_metadata(Arc::clone(&self.connection_metadata)),
             )
         })
     }

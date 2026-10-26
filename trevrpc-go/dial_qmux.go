@@ -21,7 +21,10 @@ type qmuxConnector struct {
 	maxFrameSize int
 	compression  *compressionConfig
 	streams      *streamBudget
-	dialer       net.Dialer
+	// metadata is the channel's connection metadata, which every session
+	// offers afresh.
+	metadata *connectionMetadataSource
+	dialer   net.Dialer
 }
 
 func (c *qmuxConnector) Connect(parent context.Context) (channelGeneration, error) {
@@ -45,7 +48,9 @@ func (c *qmuxConnector) Connect(parent context.Context) (channelGeneration, erro
 		_ = conn.Close()
 		return nil, dialError(parent, err)
 	}
-	return newQMuxGeneration(session, c.maxFrameSize, c.compression, c.streams), nil
+	generation := newQMuxGeneration(session, c.maxFrameSize, c.compression, c.streams)
+	generation.client.connectionMetadata = newClientConnectionMetadata(c.metadata)
+	return generation, nil
 }
 
 // dialError reports a failed dial. Only the caller's context turns it into a
