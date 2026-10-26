@@ -172,7 +172,8 @@ where
     match incoming {
         Ok(incoming) => Some((writer, reader, incoming)),
         Err(error) => {
-            reject_unreadable(server, stream_permit, writer, error).await;
+            // Boxed: the rare failure keeps its room out of every stream's future.
+            Box::pin(reject_unreadable(server, stream_permit, writer, error)).await;
             None
         }
     }
@@ -193,15 +194,20 @@ pub async fn handle_rpc_stream<K, S>(
     K: BodySink,
     S: BodySource,
 {
-    if let Some((writer, reader, incoming)) = read_request(
-        &server,
-        &mut stream_permit,
-        session.as_deref(),
-        sink,
-        source,
-    )
-    .await
-    {
+    // The call's future is made in a block, so that what `read_request` returned is not kept
+    // beside it in this future.
+    let call = {
+        let Some((writer, reader, incoming)) = read_request(
+            &server,
+            &mut stream_permit,
+            session.as_deref(),
+            sink,
+            source,
+        )
+        .await
+        else {
+            return;
+        };
         server_transport::handle_stream(
             server,
             request_limit,
@@ -211,8 +217,8 @@ pub async fn handle_rpc_stream<K, S>(
             incoming,
             shutdown,
         )
-        .await;
-    }
+    };
+    call.await;
 }
 
 /// Answers one RPC carried by a body with the over-limit status.

@@ -213,12 +213,13 @@ async fn read_request<C: MuxConnection>(
         )),
         Err(error) => {
             recv.stop_trevrpc();
-            reject_unreadable(
+            // Boxed: the rare failure keeps its room out of every stream's future.
+            Box::pin(reject_unreadable(
                 server,
                 stream_permit,
                 NativeResponseWriter::new(send, max_frame_size),
                 error,
-            )
+            ))
             .await;
             None
         }
@@ -237,17 +238,22 @@ async fn handle_stream<C: MuxConnection>(
     recv: C::RecvStream,
     shutdown: watch::Receiver<bool>,
 ) {
-    if let Some((send, recv, incoming)) = read_request(
-        &server,
-        &mut stream_permit,
-        connection,
-        demux.as_deref(),
-        &connection_metadata,
-        send,
-        recv,
-    )
-    .await
-    {
+    // The call's future is made in a block, so that what `read_request` returned is not kept
+    // beside it in this future.
+    let call = {
+        let Some((send, recv, incoming)) = read_request(
+            &server,
+            &mut stream_permit,
+            connection,
+            demux.as_deref(),
+            &connection_metadata,
+            send,
+            recv,
+        )
+        .await
+        else {
+            return;
+        };
         server_transport::handle_stream(
             server,
             request_limit,
@@ -257,8 +263,8 @@ async fn handle_stream<C: MuxConnection>(
             incoming,
             shutdown,
         )
-        .await;
-    }
+    };
+    call.await;
 }
 
 async fn reject_stream<C: MuxConnection>(

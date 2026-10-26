@@ -189,8 +189,12 @@ where
 /// `stream_permit` is the connection's stream slot. It and the server-wide request slot are
 /// released before the call's terminal STATUS is written or its stream is reset, never after, so
 /// a client that sees the call end can start the next one without finding the slot still taken.
+///
+/// It is a plain function returning an `async` block rather than an `async fn`: an `async fn`
+/// keeps its arguments twice in its future, as arguments and as the locals they move into, and
+/// this future is moved into a task for every stream.
 #[allow(clippy::too_many_lines)]
-pub async fn handle_stream<W, R>(
+pub fn handle_stream<W, R>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
     stream_permit: Permit,
@@ -198,7 +202,8 @@ pub async fn handle_stream<W, R>(
     mut recv: R,
     incoming: IncomingRequest,
     mut shutdown: watch::Receiver<bool>,
-) where
+) -> impl Future<Output = ()>
+where
     W: ResponseWriter,
     R: RequestPumpReader,
 {
@@ -212,132 +217,145 @@ pub async fn handle_stream<W, R>(
         admitted: _,
         connection_metadata,
     } = incoming;
-    let cancellation = CancellationToken::new();
-    // A streaming call is validated and authorized first, so callers the authorizer rejects can
-    // neither probe its methods nor make it reserve stream compression memory. Unary calls never
-    // use stream compression, and their handlers authorize them as before.
-    let admitted = if request.rpc_kind() == RpcKind::Unary {
-        None
-    } else {
-        match server.admit(&request, &cancellation).await {
-            Ok(admitted) => Some(admitted),
-            Err(status) => {
-                drop(stream_permit);
-                server.record_rejected_request(&request, body.len(), &status);
-                reject_with_status(&server, &mut send, &mut recv, &request, budget, status).await;
+    async move {
+        let cancellation = CancellationToken::new();
+        // A streaming call is validated and authorized first, so callers the authorizer rejects can
+        // neither probe its methods nor make it reserve stream compression memory. Unary calls never
+        // use stream compression, and their handlers authorize them as before.
+        let admitted = if request.rpc_kind() == RpcKind::Unary {
+            None
+        } else {
+            match server.admit(&request, &cancellation).await {
+                Ok(admitted) => Some(admitted),
+                Err(status) => {
+                    drop(stream_permit);
+                    server.record_rejected_request(&request, body.len(), &status);
+                    reject_with_status(&server, &mut send, &mut recv, &request, budget, status)
+                        .await;
+                    return;
+                }
+            }
+        };
+        let mut stream = compression::negotiate_stream(
+            &request,
+            server.route_compress_stream(&request.method),
+            server.stream_budget(),
+            server.compression(),
+        );
+        if server.refuses_optimistic(&request, &stream) {
+            drop(stream_permit);
+            refuse(&server, &mut send, &request, body.len()).await;
+            tokio::spawn(crate::request_pump::discard_request(recv));
+            return;
+        }
+        budget.stream = stream.requests.take();
+        let answered =
+            compression.answer.is_some() || stream.answer.is_some() || connection_metadata != 0;
+        send.set_codec(ResponseCodec {
+            encoder: MessageEncoder::new(compression.responses.clone())
+                .with_stream(stream.responses.take()),
+            answer: compression.answer.clone(),
+            stream_answer: stream.answer,
+            connection_answer: connection_metadata,
+        });
+        let request_body_len = body.len();
+        let mut slots = StreamSlots::new(stream_permit);
+        if !slots.acquire_request(request_limit.as_ref()) {
+            let status = Status::unavailable("too many concurrent RPCs");
+            server.record_rejected_request(&request, request_body_len, &status);
+            slots.release();
+            reject_with_status(&server, &mut send, &mut recv, &request, budget, status).await;
+            return;
+        }
+
+        if admitted.is_some() {
+            let incoming = IncomingRequest {
+                request,
+                body,
+                budget,
+                flow,
+                compression,
+                stream,
+                admitted,
+                connection_metadata,
+            };
+            // Boxed, so that the futures of unary calls do not hold room for a streaming call's.
+            Box::pin(handle_streaming_rpc(
+                server,
+                slots,
+                send,
+                recv,
+                incoming,
+                cancellation,
+                shutdown,
+            ))
+            .await;
+            return;
+        }
+
+        let method_for_failure = request.method.clone();
+        let counts = RequestCounts {
+            plain_compressed: budget.accept.plain_count(),
+            ..RequestCounts::default()
+        };
+        let (_request_body, mut request_pump) = start_request_pump(
+            recv,
+            RequestInputKind::Unary,
+            server.max_frame_size(),
+            budget,
+        );
+        let response = tokio::select! {
+            biased;
+            response = server.handle_request_with_cancellation(request, body, cancellation.clone(), counts) => response,
+            failure = request_pump.failure() => {
+                server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
+                if let Some(source) = failure.cancellation_source() {
+                    cancellation.cancel(source);
+                }
+                if !failure.response_writable() {
+                    slots.release();
+                    send.reset();
+                    let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
+                    return;
+                }
+                Err(failure.status().clone())
+            },
+            stopped = send.stopped() => {
+                slots.release();
+                cancellation.cancel(if stopped.is_ok() {
+                    CancellationSource::PeerReset
+                } else {
+                    CancellationSource::ConnectionLost
+                });
+                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
+                tracing::debug!("client stopped response stream before RPC completed");
                 return;
             }
-        }
-    };
-    let mut stream = compression::negotiate_stream(
-        &request,
-        server.route_compress_stream(&request.method),
-        server.stream_budget(),
-        server.compression(),
-    );
-    if server.refuses_optimistic(&request, &stream) {
-        drop(stream_permit);
-        refuse(&server, &mut send, &request, body.len()).await;
-        tokio::spawn(crate::request_pump::discard_request(recv));
-        return;
-    }
-    budget.stream = stream.requests.take();
-    let answered =
-        compression.answer.is_some() || stream.answer.is_some() || connection_metadata != 0;
-    send.set_codec(ResponseCodec {
-        encoder: MessageEncoder::new(compression.responses.clone())
-            .with_stream(stream.responses.take()),
-        answer: compression.answer.clone(),
-        stream_answer: stream.answer,
-        connection_answer: connection_metadata,
-    });
-    let request_body_len = body.len();
-    let mut slots = StreamSlots::new(stream_permit);
-    if !slots.acquire_request(request_limit.as_ref()) {
-        let status = Status::unavailable("too many concurrent RPCs");
-        server.record_rejected_request(&request, request_body_len, &status);
-        slots.release();
-        reject_with_status(&server, &mut send, &mut recv, &request, budget, status).await;
-        return;
-    }
-
-    if admitted.is_some() {
-        let incoming = IncomingRequest {
-            request,
-            body,
-            budget,
-            flow,
-            compression,
-            stream,
-            admitted,
-            connection_metadata,
-        };
-        handle_streaming_rpc(server, slots, send, recv, incoming, cancellation, shutdown).await;
-        return;
-    }
-
-    let method_for_failure = request.method.clone();
-    let counts = RequestCounts {
-        plain_compressed: budget.accept.plain_count(),
-        ..RequestCounts::default()
-    };
-    let (_request_body, mut request_pump) = start_request_pump(
-        recv,
-        RequestInputKind::Unary,
-        server.max_frame_size(),
-        budget,
-    );
-    let response = tokio::select! {
-        biased;
-        response = server.handle_request_with_cancellation(request, body, cancellation.clone(), counts) => response,
-        failure = request_pump.failure() => {
-            server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
-            if let Some(source) = failure.cancellation_source() {
-                cancellation.cancel(source);
-            }
-            if !failure.response_writable() {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                cancellation.cancel(CancellationSource::ServerShutdown);
+                // Never end a response without its STATUS: the client sees a cancelled call.
                 slots.release();
                 send.reset();
-                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
+                let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
                 return;
             }
-            Err(failure.status().clone())
-        },
-        stopped = send.stopped() => {
-            slots.release();
-            cancellation.cancel(if stopped.is_ok() {
-                CancellationSource::PeerReset
-            } else {
-                CancellationSource::ConnectionLost
-            });
-            let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-            tracing::debug!("client stopped response stream before RPC completed");
-            return;
-        }
-        changed = shutdown.changed() => {
-            let _ = changed;
-            cancellation.cancel(CancellationSource::ServerShutdown);
-            // Never end a response without its STATUS: the client sees a cancelled call.
-            slots.release();
-            send.reset();
-            let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
-            return;
-        }
-    };
+        };
 
-    let mut frames = unary_response_frames(response, answered);
-    // The STATUS ends the call from the client's point of view.
-    drop(slots);
-    match send.write_frames(&mut frames).await {
-        Ok(()) => {
-            let _ = send.finish().await;
-            let _ = request_pump
-                .settle(RequestPumpSettle::ResponseCommitted)
-                .await;
-        }
-        Err(error) => {
-            cancel_from_transport_error(&cancellation, &error);
-            let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
+        let mut frames = unary_response_frames(response, answered);
+        // The STATUS ends the call from the client's point of view.
+        drop(slots);
+        match send.write_frames(&mut frames).await {
+            Ok(()) => {
+                let _ = send.finish().await;
+                let _ = request_pump
+                    .settle(RequestPumpSettle::ResponseCommitted)
+                    .await;
+            }
+            Err(error) => {
+                cancel_from_transport_error(&cancellation, &error);
+                let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
+            }
         }
     }
 }

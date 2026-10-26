@@ -150,8 +150,16 @@ impl RouteOptions {
     }
 }
 
-#[derive(Clone)]
+/// A server's routes and settings. It is cheap to clone: every connection and stream holds one,
+/// and they share its state.
+#[derive(Clone, Default)]
 pub struct Server {
+    inner: Arc<ServerState>,
+}
+
+/// What a [`Server`] shares between its clones; the setters copy it when it is shared.
+#[derive(Clone)]
+struct ServerState {
     routes: Arc<RouteMap>,
     options: ServerOptions,
     authorizer: Option<Arc<dyn Authorizer>>,
@@ -1072,7 +1080,7 @@ pub struct RpcFinished {
     pub elapsed: Duration,
 }
 
-impl Default for Server {
+impl Default for ServerState {
     fn default() -> Self {
         Self {
             routes: Arc::new(HashMap::new()),
@@ -1092,42 +1100,53 @@ impl Server {
         Self::default()
     }
 
+    /// The state to change, copied first if another clone shares it.
+    fn state_mut(&mut self) -> &mut ServerState {
+        Arc::make_mut(&mut self.inner)
+    }
+
     /// Returns the maximum `TrevRPC` frame size in bytes.
     #[must_use]
-    pub const fn max_frame_size(&self) -> usize {
-        self.options.frame_size
+    pub fn max_frame_size(&self) -> usize {
+        self.inner.options.frame_size
     }
 
     /// Returns the server options.
     #[must_use]
-    pub const fn options(&self) -> &ServerOptions {
-        &self.options
+    pub fn options(&self) -> &ServerOptions {
+        &self.inner.options
     }
 
     /// Replaces all server options.
     pub fn set_options(&mut self, options: ServerOptions) -> &mut Self {
-        self.compression = CompressionConfig::new(options.compression())
+        let state = self.state_mut();
+        state.compression = CompressionConfig::new(options.compression())
             .map(Some)
             .map_err(Error::into_status);
-        self.stream_budget = StreamBudget::new(options.stream_compression_memory());
-        self.options = options;
+        state.stream_budget = StreamBudget::new(options.stream_compression_memory());
+        state.options = options;
         self
     }
 
     /// The server's dictionaries, `None` before options set them, which means compression without
     /// a dictionary only.
     pub(crate) fn compression(&self) -> Option<&Arc<CompressionConfig>> {
-        self.compression.as_ref().ok().and_then(Option::as_ref)
+        self.inner
+            .compression
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
     }
 
     /// The memory stream compression may hold, `None` when it is disabled.
-    pub(crate) const fn stream_budget(&self) -> Option<&Arc<StreamBudget>> {
-        self.stream_budget.as_ref()
+    pub(crate) fn stream_budget(&self) -> Option<&Arc<StreamBudget>> {
+        self.inner.stream_budget.as_ref()
     }
 
     /// Fails when the configured compression is invalid; serving checks this first.
     pub(crate) fn check_compression(&self) -> Result<()> {
-        self.compression
+        self.inner
+            .compression
             .as_ref()
             .map(|_| ())
             .map_err(|status| Error::from(status.clone()))
@@ -1138,13 +1157,13 @@ impl Server {
     where
         A: Authorizer,
     {
-        self.authorizer = Some(Arc::new(authorizer));
+        self.state_mut().authorizer = Some(Arc::new(authorizer));
         self
     }
 
     /// Removes any configured authorizer.
     pub fn clear_authorizer(&mut self) -> &mut Self {
-        self.authorizer = None;
+        self.state_mut().authorizer = None;
         self
     }
 
@@ -1153,14 +1172,14 @@ impl Server {
     where
         M: Metrics,
     {
-        self.metrics = Arc::new(metrics);
+        self.state_mut().metrics = Arc::new(metrics);
         self
     }
 
     /// Returns the number of registered routes.
     #[must_use]
     pub fn route_count(&self) -> usize {
-        self.routes.len()
+        self.inner.routes.len()
     }
 
     /// Registers a unary route handler for a method path, `/<service>/<method>`.
@@ -1278,7 +1297,7 @@ impl Server {
     /// Returns the directions the streaming route at `path` marks unreliable, or none when there
     /// is no such route.
     pub(crate) fn route_unreliable(&self, path: &str) -> Unreliable {
-        match self.routes.get(path) {
+        match self.inner.routes.get(path) {
             Some(Route::Streaming { kind, options, .. }) => options.unreliable().effective(*kind),
             _ => Unreliable::NONE,
         }
@@ -1298,7 +1317,7 @@ impl Server {
     pub(crate) fn refuses_optimistic(&self, request: &RpcRequest, stream: &ServerStream) -> bool {
         compression::refuses_optimistic(request, stream)
             && matches!(
-                self.routes.get(request.method.as_str()),
+                self.inner.routes.get(request.method.as_str()),
                 Some(Route::Streaming { kind, .. }) if *kind == request.rpc_kind()
             )
     }
@@ -1306,7 +1325,7 @@ impl Server {
     /// The directions of the streaming route at `path` that may use stream compression, or none
     /// when there is no such route.
     pub(crate) fn route_compress_stream(&self, path: &str) -> CompressStream {
-        match self.routes.get(path) {
+        match self.inner.routes.get(path) {
             Some(Route::Streaming { kind, options, .. }) => options
                 .compress_stream()
                 .effective(*kind)
@@ -1318,7 +1337,7 @@ impl Server {
     /// The directions of the route at `path` that may be compressed without a dictionary, or none
     /// when there is no such route.
     pub(crate) fn route_compress(&self, path: &str) -> CompressMessages {
-        match self.routes.get(path) {
+        match self.inner.routes.get(path) {
             Some(Route::Unary { options, .. } | Route::Streaming { options, .. }) => {
                 options.compress()
             }
@@ -1328,7 +1347,7 @@ impl Server {
 
     /// The message types of the route at `path`, if it named them.
     pub(crate) fn route_message_types(&self, path: &str) -> Option<MessageTypes> {
-        match self.routes.get(path)? {
+        match self.inner.routes.get(path)? {
             Route::Unary { options, .. } | Route::Streaming { options, .. } => {
                 options.message_types()
             }
@@ -1341,7 +1360,7 @@ impl Server {
         if let Err(status) = validate_method_path(&path) {
             panic!("cannot register route: {}", status.message());
         }
-        Arc::make_mut(&mut self.routes).insert(path, route);
+        Arc::make_mut(&mut self.state_mut().routes).insert(path, route);
     }
 
     /// Handles a unary RPC request whose single message is `body`.
@@ -1371,7 +1390,11 @@ impl Server {
         let started_at = Instant::now();
         let request_body_len = body.len();
 
-        record_rpc_started(self.metrics.as_ref(), &request.method, request_body_len);
+        record_rpc_started(
+            self.inner.metrics.as_ref(),
+            &request.method,
+            request_body_len,
+        );
 
         let (service, method) = split_or_empty(&request.method);
         tracing::info!(
@@ -1394,7 +1417,8 @@ impl Server {
             }
         };
 
-        let Some(Route::Unary { handler, .. }) = self.routes.get(request.method.as_str()) else {
+        let Some(Route::Unary { handler, .. }) = self.inner.routes.get(request.method.as_str())
+        else {
             return self.finish_response(
                 &request.method,
                 request_body_len,
@@ -1475,7 +1499,11 @@ impl Server {
         let started_at = Instant::now();
         let request_body_len = body.len();
 
-        record_rpc_started(self.metrics.as_ref(), &request.method, request_body_len);
+        record_rpc_started(
+            self.inner.metrics.as_ref(),
+            &request.method,
+            request_body_len,
+        );
 
         let (service, method) = split_or_empty(&request.method);
         tracing::info!(
@@ -1506,7 +1534,8 @@ impl Server {
         let request_body =
             limit_stream(request_body, stream_limits, "request", cancellation.clone());
 
-        let Some(Route::Streaming { kind, handler, .. }) = self.routes.get(request.method.as_str())
+        let Some(Route::Streaming { kind, handler, .. }) =
+            self.inner.routes.get(request.method.as_str())
         else {
             let status =
                 Status::unimplemented(format!("unknown streaming RPC method {}", request.method));
@@ -1566,7 +1595,7 @@ impl Server {
                     headers,
                     response_metadata,
                     StreamingCompletion {
-                        metrics: Arc::clone(&self.metrics),
+                        metrics: Arc::clone(&self.inner.metrics),
                         path,
                         request_body_len,
                         started_at,
@@ -1592,7 +1621,7 @@ impl Server {
         request.validate_protocol()?;
         let deadline = request_deadline(request)?;
 
-        if let Some(authorizer) = &self.authorizer {
+        if let Some(authorizer) = &self.inner.authorizer {
             match with_deadline(authorizer.authorize(request), deadline).await {
                 Ok(result) => result?,
                 Err(status) => {
@@ -1621,7 +1650,7 @@ impl Server {
         };
 
         record_rpc_finished(
-            self.metrics.as_ref(),
+            self.inner.metrics.as_ref(),
             path,
             request_body_len,
             response_body_len,
@@ -1652,7 +1681,7 @@ impl Server {
         code: Code,
     ) {
         finish_streaming_response(
-            self.metrics.as_ref(),
+            self.inner.metrics.as_ref(),
             path,
             request_body_len,
             started_at,
@@ -1679,7 +1708,11 @@ impl Server {
         status: &Status,
     ) {
         let started_at = Instant::now();
-        record_rpc_started(self.metrics.as_ref(), &request.method, request_body_len);
+        record_rpc_started(
+            self.inner.metrics.as_ref(),
+            &request.method,
+            request_body_len,
+        );
         self.finish_streaming_response(
             &request.method,
             request_body_len,
@@ -1700,7 +1733,7 @@ impl Server {
 
     pub(crate) fn record_pre_handler_failure(&self, status: &Status) {
         let started_at = Instant::now();
-        record_rpc_started(self.metrics.as_ref(), "", 0);
+        record_rpc_started(self.inner.metrics.as_ref(), "", 0);
         self.finish_streaming_response("", 0, started_at, 0, status.code());
     }
 }
