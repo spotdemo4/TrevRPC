@@ -1234,7 +1234,10 @@ func invokeStreamingHandler(
 	result := make(chan streamingHandlerResult)
 	abandoned := make(chan struct{})
 	execution := lease.retain(ServerDiagnosticHandlerPanic)
-	lease.goRun(func() {
+	// A goroutine of its own, not a pooled worker: on a worker, 64 concurrent
+	// client-streaming calls ran 7% slower, while a streaming handler is
+	// long-lived enough that a fresh stack costs it little.
+	go func() {
 		defer execution.finish()
 		resultValue := func() (result streamingHandlerResult) {
 			defer func() {
@@ -1250,7 +1253,7 @@ func invokeStreamingHandler(
 		case <-abandoned:
 			discardMessageStream(resultValue.responses)
 		}
-	})
+	}()
 
 	select {
 	case result := <-result:

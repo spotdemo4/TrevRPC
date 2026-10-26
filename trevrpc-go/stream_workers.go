@@ -10,8 +10,9 @@ import (
 // it exits.
 const streamWorkerIdle = 10 * time.Second
 
-// streamWorkers runs a listener's RPC streams, and the handlers they start on
-// goroutines of their own, on goroutines that outlive them. A new goroutine
+// streamWorkers runs a listener's RPC streams, and the unary handlers and
+// authorizers they start on goroutines of their own, on goroutines that
+// outlive them. A new goroutine
 // starts with a small stack, and every stream's and handler's grew it at least
 // twice, copying it each time, which cost the server about a tenth of its CPU
 // on small unary calls. A worker keeps the stack it grew for the next task.
