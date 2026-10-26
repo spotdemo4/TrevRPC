@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
+use futures_core::Stream;
 use tokio::sync::watch;
 
 use crate::client::MessageTypes;
@@ -1843,6 +1843,7 @@ impl StreamLimits {
 struct LimitedStream {
     inner: BoxStream<Vec<u8>>,
     limits: StreamLimits,
+    timer: StreamTimer,
     direction: &'static str,
     cancellation: CancellationToken,
     messages: usize,
@@ -1856,79 +1857,129 @@ fn limit_stream(
     direction: &'static str,
     cancellation: CancellationToken,
 ) -> BoxStream<Vec<u8>> {
-    Box::pin(futures_util::stream::unfold(
-        LimitedStream {
-            inner,
-            limits,
-            direction,
-            cancellation,
-            messages: 0,
-            body_size: 0,
-            done: false,
-        },
-        |mut stream| async move {
-            if stream.done {
-                return None;
-            }
-
-            let body = match next_limited_item(
-                &mut stream.inner,
-                stream.limits,
-                stream.direction,
-                &stream.cancellation,
-            )
-            .await
-            {
-                Ok(Some(body)) => body,
-                Ok(None) => return None,
-                Err(error) => {
-                    stream.done = true;
-                    return Some((Err(error), stream));
-                }
-            };
-
-            let item = match check_stream_limits(
-                stream.direction,
-                stream.limits,
-                &mut stream.messages,
-                &mut stream.body_size,
-                body.len(),
-            ) {
-                Ok(()) => Ok(body),
-                Err(error) => {
-                    stream.done = true;
-                    Err(error)
-                }
-            };
-
-            Some((item, stream))
-        },
-    ))
+    Box::pin(LimitedStream {
+        inner,
+        limits,
+        timer: StreamTimer::new(limits),
+        direction,
+        cancellation,
+        messages: 0,
+        body_size: 0,
+        done: false,
+    })
 }
 
-async fn next_limited_item(
-    inner: &mut BoxStream<Vec<u8>>,
-    limits: StreamLimits,
-    direction: &'static str,
-    cancellation: &CancellationToken,
-) -> Result<Option<Vec<u8>>> {
-    let timeout = match stream_next_timeout(limits.deadline, limits.idle_timeout) {
-        Ok(timeout) => timeout,
-        Err(status) => {
-            cancellation.cancel(CancellationSource::Deadline);
-            return Err(Error::from(status));
-        }
-    };
+impl Stream for LimitedStream {
+    type Item = Result<Vec<u8>>;
 
-    match timeout {
-        Some((timeout, reason)) => tokio::time::timeout(timeout, inner.next())
-            .await
-            .map_err(|_| {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        let polled = this
+            .timer
+            .poll_item(&mut this.inner, this.direction, &this.cancellation, cx);
+        let body = match std::task::ready!(polled) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                this.done = true;
+                return Poll::Ready(None);
+            }
+            Err(error) => {
+                this.done = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+        };
+        let checked = check_stream_limits(
+            this.direction,
+            this.limits,
+            &mut this.messages,
+            &mut this.body_size,
+            body.len(),
+        );
+        if checked.is_err() {
+            this.done = true;
+        }
+        Poll::Ready(Some(checked.map(|()| body)))
+    }
+}
+
+/// The deadline and idle timeout of one direction of a streaming call.
+///
+/// The deadline's timer is made once and polled with every item, and the idle timer is armed only
+/// when the stream has to wait, so an item that is ready reads no clock and arms no timer. Making
+/// a timer for every item instead took a tenth of a server's time in a busy server-stream.
+struct StreamTimer {
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    idle_timeout: Option<Duration>,
+    idle: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// The stream returned `Pending` since it last yielded, which armed the idle timer.
+    waiting: bool,
+}
+
+impl StreamTimer {
+    fn new(limits: StreamLimits) -> Self {
+        Self {
+            deadline: limits.deadline.map(|deadline| {
+                Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    deadline,
+                )))
+            }),
+            idle_timeout: limits.idle_timeout,
+            idle: None,
+            waiting: false,
+        }
+    }
+
+    /// Polls `inner` for its next item, failing once the call's deadline passes or once the
+    /// stream's idle timeout runs out while it waits.
+    fn poll_item(
+        &mut self,
+        inner: &mut BoxStream<Vec<u8>>,
+        direction: &'static str,
+        cancellation: &CancellationToken,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Vec<u8>>>> {
+        Poll::Ready(match std::task::ready!(self.poll_next(inner, cx)) {
+            Ok(item) => item.transpose(),
+            Err(reason) => {
                 reason.cancel(cancellation);
-                Error::from(reason.status(direction))
-            })?
-            .transpose(),
-        None => inner.next().await.transpose(),
+                Err(Error::from(reason.status(direction)))
+            }
+        })
+    }
+
+    /// Polls `inner` for its next item, failing once the deadline passes or once the idle timeout
+    /// runs out after `inner` returned `Pending`.
+    fn poll_next(
+        &mut self,
+        inner: &mut BoxStream<Vec<u8>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<Option<Result<Vec<u8>>>, StreamTimeoutReason>> {
+        if let Some(deadline) = &mut self.deadline
+            && deadline.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(StreamTimeoutReason::Deadline));
+        }
+        if let Poll::Ready(item) = inner.as_mut().poll_next(cx) {
+            self.waiting = false;
+            return Poll::Ready(Ok(item));
+        }
+        if let Some(timeout) = self.idle_timeout {
+            let idle = self
+                .idle
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+            if !self.waiting {
+                self.waiting = true;
+                let now = tokio::time::Instant::now();
+                idle.as_mut().reset(now.checked_add(timeout).unwrap_or(now));
+            }
+            if idle.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(StreamTimeoutReason::Idle));
+            }
+        }
+        Poll::Pending
     }
 }
 
@@ -2065,22 +2116,6 @@ impl StreamTimeoutReason {
     }
 }
 
-fn stream_next_timeout(
-    deadline: Option<Instant>,
-    idle_timeout: Option<Duration>,
-) -> std::result::Result<Option<(Duration, StreamTimeoutReason)>, Status> {
-    let deadline =
-        remaining_deadline(deadline)?.map(|timeout| (timeout, StreamTimeoutReason::Deadline));
-    let idle = idle_timeout.map(|timeout| (timeout, StreamTimeoutReason::Idle));
-
-    Ok(match (deadline, idle) {
-        (Some(deadline), Some(idle)) if deadline.0 <= idle.0 => Some(deadline),
-        (Some(_) | None, Some(idle)) => Some(idle),
-        (Some(deadline), None) => Some(deadline),
-        (None, None) => None,
-    })
-}
-
 struct StreamingCompletion {
     metrics: Arc<dyn Metrics>,
     path: Arc<str>,
@@ -2110,6 +2145,7 @@ struct ServerResponseStream {
     completion: StreamingCompletion,
     response_body_len: usize,
     limits: StreamLimits,
+    timer: StreamTimer,
     cancellation: CancellationToken,
     messages: usize,
     done: bool,
@@ -2131,6 +2167,7 @@ impl ServerResponseStream {
             completion,
             response_body_len: 0,
             limits,
+            timer: StreamTimer::new(limits),
             cancellation,
             messages: 0,
             done: false,
@@ -2153,56 +2190,58 @@ fn server_response_stream(
     limits: StreamLimits,
     cancellation: CancellationToken,
 ) -> BoxStream<ResponseFrame> {
-    Box::pin(futures_util::stream::unfold(
-        ServerResponseStream::new(inner, headers, metadata, completion, limits, cancellation),
-        |mut stream| async move {
-            if stream.done {
-                return None;
-            }
-
-            if let Some(headers) = stream.headers.take() {
-                return Some((Ok(ResponseFrame::Headers(headers)), stream));
-            }
-
-            let frame = match next_limited_item(
-                &mut stream.inner,
-                stream.limits,
-                "response",
-                &stream.cancellation,
-            )
-            .await
-            {
-                Ok(Some(body)) => {
-                    if let Err(error) = check_stream_limits(
-                        "response",
-                        stream.limits,
-                        &mut stream.messages,
-                        &mut stream.response_body_len,
-                        body.len(),
-                    ) {
-                        let status = error.into_status();
-                        stream.finish(status.code());
-                        ResponseFrame::Status(status)
-                    } else {
-                        ResponseFrame::message(body)
-                    }
-                }
-                Err(error) => {
-                    let status = error.into_status();
-                    stream.finish(status.code());
-                    ResponseFrame::Status(status)
-                }
-                Ok(None) => {
-                    stream.finish(Code::Ok);
-                    ResponseFrame::Status(
-                        Status::ok().with_metadata(stream.metadata.take_metadata()),
-                    )
-                }
-            };
-
-            Some((Ok(frame), stream))
-        },
+    Box::pin(ServerResponseStream::new(
+        inner,
+        headers,
+        metadata,
+        completion,
+        limits,
+        cancellation,
     ))
+}
+
+impl Stream for ServerResponseStream {
+    type Item = Result<ResponseFrame>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        if let Some(headers) = this.headers.take() {
+            return Poll::Ready(Some(Ok(ResponseFrame::Headers(headers))));
+        }
+        let polled = this
+            .timer
+            .poll_item(&mut this.inner, "response", &this.cancellation, cx);
+        let frame = match std::task::ready!(polled) {
+            Ok(Some(body)) => {
+                if let Err(error) = check_stream_limits(
+                    "response",
+                    this.limits,
+                    &mut this.messages,
+                    &mut this.response_body_len,
+                    body.len(),
+                ) {
+                    let status = error.into_status();
+                    this.finish(status.code());
+                    ResponseFrame::Status(status)
+                } else {
+                    ResponseFrame::message(body)
+                }
+            }
+            Err(error) => {
+                let status = error.into_status();
+                this.finish(status.code());
+                ResponseFrame::Status(status)
+            }
+            Ok(None) => {
+                this.finish(Code::Ok);
+                ResponseFrame::Status(Status::ok().with_metadata(this.metadata.take_metadata()))
+            }
+        };
+        Poll::Ready(Some(Ok(frame)))
+    }
 }
 
 impl Drop for ServerResponseStream {
