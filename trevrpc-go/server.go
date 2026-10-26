@@ -762,6 +762,18 @@ type requestExecutionLease struct {
 	method  string
 	kind    RPCKind
 	refs    atomic.Int64
+	// workers run the goroutines the request starts, nil to start new ones.
+	workers *streamWorkers
+}
+
+// goRun runs task on a goroutine of its own: a worker of the listener that
+// received the request, whose stack has already grown, or a new goroutine.
+func (l *requestExecutionLease) goRun(task func()) {
+	if l != nil && l.workers != nil {
+		l.workers.run(task)
+		return
+	}
+	go task()
 }
 
 func (r *serverRuntime) tryRequestLease(request *wireRequest) (*requestExecutionLease, bool) {
@@ -1056,7 +1068,7 @@ func invokeUnaryHandler(
 	}
 	result := make(chan unaryResult, 1)
 	execution := lease.retain(ServerDiagnosticHandlerPanic)
-	go func() {
+	lease.goRun(func() {
 		defer execution.finish()
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -1065,7 +1077,7 @@ func invokeUnaryHandler(
 		}()
 		message, err := handler(ctx, body)
 		result <- unaryResult{message: message, err: err}
-	}()
+	})
 
 	select {
 	case result := <-result:
@@ -1222,7 +1234,7 @@ func invokeStreamingHandler(
 	result := make(chan streamingHandlerResult)
 	abandoned := make(chan struct{})
 	execution := lease.retain(ServerDiagnosticHandlerPanic)
-	go func() {
+	lease.goRun(func() {
 		defer execution.finish()
 		resultValue := func() (result streamingHandlerResult) {
 			defer func() {
@@ -1238,7 +1250,7 @@ func invokeStreamingHandler(
 		case <-abandoned:
 			discardMessageStream(resultValue.responses)
 		}
-	}()
+	})
 
 	select {
 	case result := <-result:
@@ -1307,7 +1319,7 @@ func invokeAuthorizer(ctx context.Context, authorizer Authorizer, info HandlerCo
 	}
 	result := make(chan error, 1)
 	execution := lease.retain(ServerDiagnosticAuthorizerPanic)
-	go func() { defer execution.finish(); result <- invoke() }()
+	lease.goRun(func() { defer execution.finish(); result <- invoke() })
 	select {
 	case err := <-result:
 		if ctxErr := ctx.Err(); ctxErr != nil {

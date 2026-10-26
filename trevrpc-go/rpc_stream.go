@@ -184,7 +184,7 @@ type rpcStream interface {
 // handleRPCStream runs one RPC on stream. slot is the connection's stream slot
 // the RPC occupies, or nil. It is released before the terminal STATUS is
 // written, so a client that sees the call complete finds the slot free.
-func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot *streamSlot) {
+func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot *streamSlot, workers *streamWorkers) {
 	defer slot.release()
 	runtime := server.freeze()
 	options := runtime.options
@@ -257,6 +257,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
+	lease.workers = workers
 
 	var response responseWriter
 	// upload is the request stream of a call that the client keeps uploading

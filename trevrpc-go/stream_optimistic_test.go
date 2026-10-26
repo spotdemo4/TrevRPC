@@ -124,7 +124,7 @@ func TestServerRefusesOptimisticCallsAfterAuthorization(t *testing.T) {
 			stream := &pipedRPCStream{pipe: pipe}
 			done := make(chan struct{})
 			go func() {
-				handleRPCStream(context.Background(), server, stream, nil)
+				handleRPCStream(context.Background(), server, stream, nil, nil)
 				close(done)
 			}()
 			if _, err := client.Write(frames); err != nil {

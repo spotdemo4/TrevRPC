@@ -395,7 +395,7 @@ func TestStreamSlotAndRequestLeaseAreFreeBeforeTerminalStatus(t *testing.T) {
 					return len(slot.limit) == 0 && (tc.handlerMayOutliveStatus || len(runtime.requestLimit) == 0)
 				},
 			}
-			handleRPCStream(context.Background(), server, stream, slot)
+			handleRPCStream(context.Background(), server, stream, slot, nil)
 
 			frames := readTestFrames(t, stream.written.Bytes(), DefaultMaxFrameSize)
 			if last := frames[len(frames)-1]; last.Kind != frameTypeStatus || CodeFromUint32(last.Status) != tc.code {
@@ -420,7 +420,7 @@ func TestStreamSlotAndRequestLeaseAreFreeBeforeTerminalStatus(t *testing.T) {
 		defer held.release()
 		slot, _ := acquireStreamSlot(newSemaphore(1))
 		stream := &slotProbeStream{reader: bytes.NewReader(unary("Echo")), free: func() bool { return len(slot.limit) == 0 }}
-		handleRPCStream(context.Background(), server, stream, slot)
+		handleRPCStream(context.Background(), server, stream, slot, nil)
 		requireStatusFrame(t, readTestFrames(t, stream.written.Bytes(), DefaultMaxFrameSize), CodeUnavailable)
 		if len(stream.freeAtWrite) != 1 || !stream.freeAtWrite[0] {
 			t.Fatalf("slot still held at the rejection write: %v", stream.freeAtWrite)
@@ -436,7 +436,7 @@ func TestStreamSlotAndRequestLeaseAreFreeBeforeTerminalStatus(t *testing.T) {
 			reader: bytes.NewReader(testRequestBytes(t, requestFor("Echo", RPCKindUnary), encodedTestMessage(t, "slow"))),
 			free:   func() bool { return true },
 		}
-		handleRPCStream(ctx, server, stream, slot)
+		handleRPCStream(ctx, server, stream, slot, nil)
 		if len(slot.limit) != 0 {
 			t.Fatal("slot leaked after a cancelled call")
 		}

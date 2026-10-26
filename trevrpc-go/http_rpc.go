@@ -61,7 +61,7 @@ func (l *Listener) handleHTTPRPC(w http.ResponseWriter, r *http.Request) {
 	if err := controller.Flush(); err != nil {
 		return
 	}
-	handleRPCStream(r.Context(), l.server, &httpBody{body: r.Body, writer: w, controller: controller}, slot)
+	handleRPCStream(r.Context(), l.server, &httpBody{body: r.Body, writer: w, controller: controller}, slot, l.workers)
 }
 
 // acquireHTTPStreamSlot takes a stream slot of the connection r arrived on.

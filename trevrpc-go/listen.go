@@ -67,6 +67,9 @@ type Listener struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// workers run the RPC streams of every connection.
+	workers *streamWorkers
+
 	serving      atomic.Bool
 	stopped      atomic.Bool
 	stopOnce     sync.Once
@@ -109,6 +112,7 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 		runtime: server.freeze(),
 		ctx:     ctx,
 		cancel:  cancel,
+		workers: newStreamWorkers(ctx.Done(), streamWorkerIdle),
 	}
 	if err := l.bind(addr, options); err != nil {
 		cancel()
@@ -311,10 +315,12 @@ func (l *Listener) serveStreams(ctx context.Context, acceptor streamAcceptor) {
 			continue
 		}
 
-		streamTasks.Go(func() {
+		streamTasks.Add(1)
+		l.workers.run(func() {
+			defer streamTasks.Done()
 			streamCtx, cancel := contextWithAdditionalCancel(streamCtx, ctx)
 			defer cancel()
-			handleRPCStream(streamCtx, l.server, stream, slot)
+			handleRPCStream(streamCtx, l.server, stream, slot, l.workers)
 		})
 	}
 
