@@ -136,23 +136,21 @@ impl CompressionMode {
         matches!(self, Self::Dictionary | Self::StreamDictionary)
     }
 
-    /// Whether the calls go to `CompressedEcho`, whose methods allow stream compression.
+    /// Whether the calls go to `CompressedEcho`, whose streaming methods allow stream compression
+    /// and whose `Unary` allows compression without a dictionary.
     const fn streams(self) -> bool {
         matches!(self, Self::Stream | Self::StreamDictionary)
     }
 
-    /// Whether the mode runs `scenario`: stream compression applies to streams only, and no mode
-    /// runs `server-stream`, whose responses repeat one message, or the datagram scenarios.
+    /// Whether the mode runs `scenario`: no mode runs `server-stream`, whose responses repeat one
+    /// message, or the datagram scenarios.
     const fn runs(self, scenario: Scenario) -> bool {
         match self {
             Self::None => true,
-            Self::Dictionary => matches!(
+            Self::Dictionary | Self::Stream | Self::StreamDictionary => matches!(
                 scenario,
                 Scenario::Unary | Scenario::ClientStream | Scenario::Bidi
             ),
-            Self::Stream | Self::StreamDictionary => {
-                matches!(scenario, Scenario::ClientStream | Scenario::Bidi)
-            }
         }
     }
 }
@@ -423,10 +421,12 @@ where
         match self.scenario {
             Scenario::Unary => {
                 let request = self.request();
-                self.client
-                    .unary(&request)
-                    .options(|_| self.options.clone())
-                    .await?;
+                let call = if self.streams {
+                    self.compressed.unary(&request)
+                } else {
+                    self.client.unary(&request)
+                };
+                call.options(|_| self.options.clone()).await?;
                 Ok(Outcome::delivered(1))
             }
             Scenario::ServerStream => self.server_stream().await,

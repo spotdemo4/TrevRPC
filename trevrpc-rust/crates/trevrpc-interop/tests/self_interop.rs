@@ -357,9 +357,7 @@ fn bench_rejects_unusable_flags() {
         &["--scenario", "unary", "--metadata-size", "8193"],
         &["--scenario", "unary", "--payload", "zeros"],
         &["--scenario", "unary", "--compression", "gzip"],
-        // Stream compression never applies to unary calls, and no compression runs on
-        // server-stream or the datagram scenarios.
-        &["--scenario", "unary", "--compression", "stream"],
+        // No compression runs on server-stream or the datagram scenarios.
         &["--scenario", "server-stream", "--compression", "stream"],
         &[
             "--scenario",
@@ -419,8 +417,8 @@ fn bench_runs_every_compression_mode_with_the_records_payload() {
         for (compression, scenarios) in [
             ("none", &["unary", "client-stream", "bidi"][..]),
             ("dictionary", &["unary", "client-stream", "bidi"]),
-            ("stream", &["client-stream", "bidi"]),
-            ("stream-dictionary", &["client-stream", "bidi"]),
+            ("stream", &["unary", "client-stream", "bidi"]),
+            ("stream-dictionary", &["unary", "client-stream", "bidi"]),
         ] {
             for scenario in scenarios {
                 let mut flags = vec![

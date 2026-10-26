@@ -125,7 +125,7 @@ class CompressionTest(unittest.TestCase):
         self.assertFalse(run.runs("zstd", "quic", "bidi"))
         self.assertFalse(run.runs("stream", "connect", "bidi"))
         self.assertTrue(run.runs("dictionary", "tcp", "unary"))
-        self.assertFalse(run.runs("stream", "quic", "unary"))
+        self.assertTrue(run.runs("stream", "quic", "unary"))
         self.assertTrue(run.runs("stream-dictionary", "quic", "client-stream"))
         self.assertFalse(run.runs("gzip", "connect", "server-stream"))
         self.assertFalse(run.runs("dictionary", "quic", "unreliable-server-stream"))
@@ -190,7 +190,7 @@ class TableTest(unittest.TestCase):
             self.cells("comparison"),
         )  # fmt: skip
         self.assertEqual(
-            {("go", "quic"): 12, ("go", "tcp"): 4, ("rust", "quic"): 10, ("rust", "tcp"): 8,
+            {("go", "quic"): 12, ("go", "tcp"): 4, ("rust", "quic"): 12, ("rust", "tcp"): 8,
              ("grpc", "grpc"): 15, ("connect", "connect"): 9},
             self.cells("compression"),
         )  # fmt: skip
@@ -198,7 +198,7 @@ class TableTest(unittest.TestCase):
             {("rust", "quic"): 12, ("grpc", "grpc"): 9, ("connect", "connect"): 3},
             self.cells("link"),
         )
-        self.assertEqual(12, self.cells("lossy")[("go", "quic")])
+        self.assertEqual(16, self.cells("lossy")[("go", "quic")])
         self.assertEqual({("go", "quic"): 6, ("rust", "quic"): 6}, self.cells("datagrams"))
 
     def test_explicit_flags_override_the_table(self) -> None:

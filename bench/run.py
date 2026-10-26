@@ -308,9 +308,7 @@ def runs(compression: str, transport: str, scenario: str) -> bool:
         return False
     if compression == "none":
         return True
-    if scenario not in COMPRESSED_SCENARIOS:
-        return False
-    return not (compression.startswith("stream") and scenario == "unary")
+    return scenario in COMPRESSED_SCENARIOS
 
 
 def train_dictionary(directory: Path) -> Path:

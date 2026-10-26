@@ -112,6 +112,7 @@ call to it, and clients must replay the call.
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CompressedEcho.Bidi`         | As `Echo.Bidi`, and its `OK` status carries trailing metadata `interop-stream-compressed-received`: how many requests arrived as ZSTD_STREAM_MESSAGE frames, as a decimal string. |
 | `CompressedEcho.ClientStream` | As `Echo.ClientStream`, and its `OK` status carries trailing metadata `interop-stream-compressed-received` as `CompressedEcho.Bidi`'s does.                                       |
+| `CompressedEcho.Unary`        | As `Echo.Unary`, allowing compression without a dictionary, for the load benchmarks.                                                                                              |
 | `CompressedEcho.Plain`        | Echo `{text}` back, ending with `OK` and trailing metadata `interop-plain-compressed-received`: `1` if the request arrived as a ZSTD_MESSAGE without a dictionary, `0` otherwise. |
 | `RefusingEcho.ClientStream`   | As `Echo.ClientStream`, registered without stream compression.                                                                                                                    |
 

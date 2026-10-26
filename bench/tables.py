@@ -80,6 +80,17 @@ ALL_COMPRESSIONS = ["none", "gzip", "zstd", "dictionary", "stream", "stream-dict
 # were noisy; 5 s measured the same as 3 s within the runs' spread.
 LOOPBACK = {"duration": 3.0, "warmup": 0.5}
 
+# Real links lose packets in bursts, not one at a time: Wi-Fi and cellular retransmit below IP, so
+# their losses show up as delay, and what does get dropped goes in runs. netem's Gilbert-Elliott
+# model alternates between a good state that loses nothing and a bad one, entered with
+# probability p per packet and left with probability r, that loses 1-h of its packets. These
+# lose about 1% (p 0.5%, r 25%, half the packets of 4-packet bad runs) and about 3% (p 1%,
+# r 20%, 60% of 5-packet bad runs). The random 1% profile stays for comparison.
+GILBERT_ELLIOTT = [
+    "delay 10ms loss gemodel 0.5% 25% 50% 0%",
+    "delay 10ms loss gemodel 1% 20% 60% 0%",
+]
+
 TABLES: dict[str, Table] = {
     "comparison": Table(
         "Comparison with gRPC and Connect",
@@ -124,7 +135,11 @@ TABLES: dict[str, Table] = {
             "concurrency": [64],
             "messages": 10,
             "duration": 10.0,
-            "netem": ["delay 10ms", "delay 10ms loss 1%", "delay 10ms loss 5%"],
+            "netem": [
+                "delay 10ms",
+                "delay 10ms loss 1%",
+                *GILBERT_ELLIOTT,
+            ],
         },
         own_server,
     ),

@@ -67,12 +67,12 @@ func (c *benchConfig) register(flags *flag.FlagSet) {
 
 // benchCompressions are the --compression modes and the scenarios each runs.
 // The stream modes call CompressedEcho, whose streaming methods allow stream
-// compression; stream compression never applies to unary calls.
+// compression and whose Unary allows compression without a dictionary.
 var benchCompressions = map[string][]string{
 	"none":              nil, // every scenario
 	"dictionary":        {"unary", "client-stream", "bidi"},
-	"stream":            {"client-stream", "bidi"},
-	"stream-dictionary": {"client-stream", "bidi"},
+	"stream":            {"unary", "client-stream", "bidi"},
+	"stream-dictionary": {"unary", "client-stream", "bidi"},
 }
 
 // usesDictionary reports whether the compression mode needs --dictionary.
@@ -154,12 +154,20 @@ type benchClients struct {
 	compressed *interoppb.CompressedEchoClient
 }
 
-// The streaming calls of Echo and CompressedEcho, which have the same
-// messages.
+// The calls of Echo and CompressedEcho, which have the same messages.
 type (
+	unaryCall        func(context.Context, *interoppb.EchoRequest, ...trevrpc.CallOption) (*interoppb.EchoResponse, error)
 	openClientStream func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error)
 	openBidi         func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error)
 )
+
+// unary returns the Unary call the compression mode uses.
+func (c benchClients) unary(config benchConfig) unaryCall {
+	if config.streamCompressed() {
+		return c.compressed.Unary
+	}
+	return c.echo.Unary
+}
 
 // clientStream returns the ClientStream call the compression mode uses.
 func (c benchClients) clientStream(config benchConfig) openClientStream {
@@ -182,7 +190,7 @@ func (c benchClients) bidi(config benchConfig) openBidi {
 // --size bytes.
 var benchScenarios = map[string]func(clients benchClients, config benchConfig, payload benchPayload) benchOperation{
 	"unary": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
-		return &unaryOperation{client: clients.echo, options: config.callOptions(), payload: payload}
+		return &unaryOperation{call: clients.unary(config), options: config.callOptions(), payload: payload}
 	},
 	"server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchOperation {
 		return &serverStreamOperation{client: clients.echo, options: config.callOptions(), payload: payload, count: config.messages}
@@ -202,14 +210,14 @@ var benchScenarios = map[string]func(clients benchClients, config benchConfig, p
 }
 
 type unaryOperation struct {
-	client  *interoppb.EchoClient
+	call    unaryCall
 	options []trevrpc.CallOption
 	payload benchPayload
 }
 
 func (o *unaryOperation) run(ctx context.Context) (int, error) {
 	message := o.payload.next()
-	response, err := o.client.Unary(ctx, &interoppb.EchoRequest{Message: message}, o.options...)
+	response, err := o.call(ctx, &interoppb.EchoRequest{Message: message}, o.options...)
 	if err != nil {
 		return 0, err
 	}

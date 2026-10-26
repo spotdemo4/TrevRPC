@@ -59,18 +59,19 @@ check runs a very short matrix only to keep the tool working.
 something real to work on. `--compressions LIST` (default `none`) then runs
 every cell once per compression mode, on the transports that have it:
 
-| Mode                | Transports        | What compresses                                                                                                           |
-| ------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `none`              | all               | nothing                                                                                                                   |
-| `gzip`              | `grpc`, `connect` | each message on its own, with the library's gzip                                                                          |
-| `zstd`              | `grpc`, `connect` | each message on its own, with zstd from a third-party codec (see [`baseline`](baseline/README.md))                        |
-| `dictionary`        | `quic`, `tcp`     | each message on its own, with TrevRPC's [dictionary compression](../wiki/Compression.md) and a trained dictionary         |
-| `stream`            | `quic`, `tcp`     | each streamed direction of a call with one zstd context ([stream compression](../wiki/Compression.md#stream-compression)) |
-| `stream-dictionary` | `quic`, `tcp`     | stream compression, starting from the trained dictionary                                                                  |
+| Mode                | Transports        | What compresses                                                                                                                                                                                                                                                    |
+| ------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `none`              | all               | nothing                                                                                                                                                                                                                                                            |
+| `gzip`              | `grpc`, `connect` | each message on its own, with the library's gzip                                                                                                                                                                                                                   |
+| `zstd`              | `grpc`, `connect` | each message on its own, with zstd from a third-party codec (see [`baseline`](baseline/README.md))                                                                                                                                                                 |
+| `dictionary`        | `quic`, `tcp`     | each message on its own, with TrevRPC's [dictionary compression](../wiki/Compression.md) and a trained dictionary                                                                                                                                                  |
+| `stream`            | `quic`, `tcp`     | each streamed direction of a call with one zstd context ([stream compression](../wiki/Compression.md#stream-compression)), and every other message of 256 bytes or more on its own [without a dictionary](../wiki/Compression.md#compression-without-a-dictionary) |
+| `stream-dictionary` | `quic`, `tcp`     | stream compression, starting from the trained dictionary, and the other messages with it                                                                                                                                                                           |
 
 Compression modes other than `none` run `unary`, `client-stream` and `bidi`
-only, and the `stream` modes only the last two, since stream compression never
-applies to unary calls. `server-stream` echoes one request message for every
+only; the `stream` modes call `CompressedEcho`, whose streaming methods allow
+stream compression and whose `Unary` allows compression without a dictionary.
+`server-stream` echoes one request message for every
 response, and the `unreliable-*` scenarios carry their messages as datagrams,
 so neither would show anything real. A mode never runs on a transport that
 lacks it.
@@ -94,6 +95,13 @@ one table per profile, and each JSON record carries the profile as `netem`.
 
 - Every packet crosses the link once, in either direction, so `delay 10ms`
   is a 20 ms round trip and `loss 1%` drops 1% of the packets each way.
+- `loss 1%` drops packets independently, which real links rarely do: Wi-Fi
+  and cellular retransmit below IP, so their losses show up as delay, and what
+  is lost goes in bursts. netem's Gilbert-Elliott model, `loss gemodel P R
+1-H 1-K`, drops in bursts: it enters a bad state with probability `P` per
+  packet, leaves it with probability `R`, and loses `1-H` of the packets in it
+  (`1-K` in the good state). The `lossy` table runs two such profiles, of
+  about 1% and 3% loss, beside `loss 1%` for comparison.
 - The link has a 1500-byte MTU. A `tbf` qdisc in front of netem segments TCP
   and UDP offload (TSO and GSO) super-packets into frames, as a NIC does, so
   loss applies to each frame. Otherwise netem would drop up to 64 KB of TCP,

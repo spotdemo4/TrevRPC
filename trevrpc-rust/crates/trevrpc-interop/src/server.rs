@@ -199,6 +199,15 @@ impl CompressedEcho for CompressedEchoService {
         Ok(response)
     }
 
+    /// `Echo.Unary`, for the load benchmarks' unary scenario without a dictionary.
+    async fn unary(
+        &self,
+        context: RequestContext,
+        request: EchoRequest,
+    ) -> Result<EchoResponse, Status> {
+        EchoService.unary(context, request).await
+    }
+
     /// Echoes the text, with trailing metadata `1` if the request arrived compressed without a
     /// dictionary and `0` otherwise.
     async fn plain(

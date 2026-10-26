@@ -277,6 +277,10 @@ const plainCompressedReceivedKey = "interop-plain-compressed-received"
 // compressed without a dictionary.
 type compressedEchoServer struct{}
 
+func (compressedEchoServer) Unary(ctx context.Context, request *interoppb.EchoRequest) (*interoppb.EchoResponse, error) {
+	return echoServer{}.Unary(ctx, request)
+}
+
 func (compressedEchoServer) Plain(ctx context.Context, request *interoppb.PlainMessage) (*interoppb.PlainMessage, error) {
 	received := "0"
 	if info, ok := trevrpc.HandlerContextFromContext(ctx); ok && info.PlainCompressedRequests() > 0 {

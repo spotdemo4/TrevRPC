@@ -11,6 +11,7 @@ import (
 const (
 	CompressedEcho_Bidi_FullMethodName         = "/trevrpc.interop.v1.CompressedEcho/Bidi"
 	CompressedEcho_ClientStream_FullMethodName = "/trevrpc.interop.v1.CompressedEcho/ClientStream"
+	CompressedEcho_Unary_FullMethodName        = "/trevrpc.interop.v1.CompressedEcho/Unary"
 	CompressedEcho_Plain_FullMethodName        = "/trevrpc.interop.v1.CompressedEcho/Plain"
 )
 
@@ -20,6 +21,8 @@ type CompressedEchoServer interface {
 	Bidi(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (trevrpc_go.MessageStream[*EchoResponse], error)
 	// ClientStream handles the ClientStream RPC.
 	ClientStream(context.Context, trevrpc_go.MessageStream[*EchoRequest]) (*EchoResponse, error)
+	// Unary handles the Unary RPC.
+	Unary(context.Context, *EchoRequest) (*EchoResponse, error)
 	// Plain handles the Plain RPC.
 	Plain(context.Context, *PlainMessage) (*PlainMessage, error)
 }
@@ -62,6 +65,11 @@ func (c *CompressedEchoClient) ClientStream(ctx context.Context, options ...trev
 	return trevrpc_go.ClientStreaming[*EchoRequest, *EchoResponse](ctx, c.transport, CompressedEcho_ClientStream_FullMethodName, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}), trevrpc_go.WithPlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))...)
 }
 
+// Unary calls the Unary RPC.
+func (c *CompressedEchoClient) Unary(ctx context.Context, request *EchoRequest, options ...trevrpc_go.CallOption) (*EchoResponse, error) {
+	return trevrpc_go.Unary[*EchoRequest, *EchoResponse](ctx, c.transport, CompressedEcho_Unary_FullMethodName, request, func() *EchoResponse { return &EchoResponse{} }, c.mergedCallOptions(options, trevrpc_go.WithPlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))...)
+}
+
 // Plain calls the Plain RPC.
 func (c *CompressedEchoClient) Plain(ctx context.Context, request *PlainMessage, options ...trevrpc_go.CallOption) (*PlainMessage, error) {
 	return trevrpc_go.Unary[*PlainMessage, *PlainMessage](ctx, c.transport, CompressedEcho_Plain_FullMethodName, request, func() *PlainMessage { return &PlainMessage{} }, c.mergedCallOptions(options, trevrpc_go.WithPlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))...)
@@ -71,6 +79,7 @@ func (c *CompressedEchoClient) Plain(ctx context.Context, request *PlainMessage,
 func RegisterCompressedEchoServer(server *trevrpc_go.Server, implementation CompressedEchoServer) {
 	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
 	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
+	trevrpc_go.RegisterUnary[*EchoRequest, *EchoResponse](server, CompressedEcho_Unary_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Unary, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
 	trevrpc_go.RegisterUnary[*PlainMessage, *PlainMessage](server, CompressedEcho_Plain_FullMethodName, func() *PlainMessage { return &PlainMessage{} }, implementation.Plain, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
 }
 
