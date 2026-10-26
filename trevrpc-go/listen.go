@@ -112,7 +112,7 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 		runtime: server.freeze(),
 		ctx:     ctx,
 		cancel:  cancel,
-		workers: newStreamWorkers(ctx.Done(), streamWorkerIdle),
+		workers: newStreamWorkers(ctx, streamWorkerIdle),
 	}
 	if err := l.bind(addr, options); err != nil {
 		cancel()

@@ -1,6 +1,7 @@
 package trevrpc
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -24,9 +25,7 @@ func waitForWorkers(t *testing.T, p *streamWorkers, want int) {
 }
 
 func TestStreamWorkersReuseIdleWorkers(t *testing.T) {
-	done := make(chan struct{})
-	defer close(done)
-	p := newStreamWorkers(done, time.Hour)
+	p := newStreamWorkers(t.Context(), time.Hour)
 	for range 100 {
 		ran := make(chan struct{})
 		p.run(func() { close(ran) })
@@ -43,9 +42,7 @@ func TestStreamWorkersReuseIdleWorkers(t *testing.T) {
 }
 
 func TestStreamWorkersGrowToConcurrentStreamsAndExitWhenIdle(t *testing.T) {
-	done := make(chan struct{})
-	defer close(done)
-	p := newStreamWorkers(done, 20*time.Millisecond)
+	p := newStreamWorkers(t.Context(), 20*time.Millisecond)
 	release := make(chan struct{})
 	var running sync.WaitGroup
 	running.Add(8)
@@ -71,8 +68,8 @@ func TestStreamWorkersGrowToConcurrentStreamsAndExitWhenIdle(t *testing.T) {
 }
 
 func TestStreamWorkersExitWhenTheListenerStops(t *testing.T) {
-	done := make(chan struct{})
-	p := newStreamWorkers(done, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	p := newStreamWorkers(ctx, time.Hour)
 	for range 4 {
 		p.run(func() {})
 	}
@@ -80,6 +77,6 @@ func TestStreamWorkersExitWhenTheListenerStops(t *testing.T) {
 	for p.count() == 0 && time.Now().Before(waitForWorkersAtLeast) {
 		time.Sleep(time.Millisecond)
 	}
-	close(done)
+	cancel()
 	waitForWorkers(t, p, 0)
 }

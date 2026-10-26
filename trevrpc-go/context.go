@@ -16,6 +16,8 @@ type callState struct {
 	compression *callCompression
 	// streams is the call's stream compression, nil without it.
 	streams *serverStreams
+	// request is the request the state describes.
+	request *wireRequest
 }
 
 // HandlerContext describes the request being handled. Handlers receive it
@@ -90,7 +92,14 @@ func contextWithHandlerContext(ctx context.Context, request *wireRequest) contex
 		return ctx
 	}
 
-	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression, streams: request.streams})
+	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression, streams: request.streams, request: request})
+}
+
+// carriesCall reports whether ctx already carries the handler context of
+// request, which requestLifetimeContext attaches with its deadline.
+func carriesCall(ctx context.Context, request *wireRequest) bool {
+	state, ok := ctx.Value(handlerContextKey{}).(*callState)
+	return ok && state.request == request
 }
 
 // setCallStreams records the call's stream compression, negotiated once the

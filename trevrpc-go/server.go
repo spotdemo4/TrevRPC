@@ -1289,12 +1289,19 @@ func validateRequest(request *wireRequest) error {
 }
 
 func (r *serverRuntime) prepareRequest(ctx context.Context, request *wireRequest, lease *requestExecutionLease) (context.Context, context.CancelFunc, error) {
-	if err := validateRequest(request); err != nil {
-		return ctx, func() {}, err
-	}
-	ctx, cancel, err := requestContext(ctx, request)
-	if err != nil {
-		return ctx, cancel, err
+	// A request served from a stream was validated, and ctx already carries
+	// its deadline and handler context, which the stream cancels when the
+	// call ends. Building them again cost each call a context and a timer.
+	cancel := func() {}
+	if !carriesCall(ctx, request) {
+		if err := validateRequest(request); err != nil {
+			return ctx, func() {}, err
+		}
+		var err error
+		ctx, cancel, err = requestContext(ctx, request)
+		if err != nil {
+			return ctx, cancel, err
+		}
 	}
 	if r.authorizer != nil {
 		if err := invokeAuthorizer(ctx, r.authorizer, newHandlerContext(request), handlerNeedsDeadlineRace(ctx), lease); err != nil {
@@ -1345,12 +1352,17 @@ func rpcRequestTimeout(request *wireRequest) (time.Duration, bool, error) {
 	return time.Duration(request.TimeoutNanos), true, nil
 }
 
+// requestLifetimeContext returns the context of a validated request served
+// from a stream: canceled when the stream's call ends or its deadline passes,
+// and carrying its handler context.
 func requestLifetimeContext(ctx context.Context, request *wireRequest) (context.Context, context.CancelFunc) {
-	timeout, ok, err := rpcRequestTimeout(request)
-	if err != nil || !ok {
-		return context.WithCancel(ctx)
+	var cancel context.CancelFunc
+	if timeout, ok, err := rpcRequestTimeout(request); err == nil && ok {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
-	return context.WithTimeout(ctx, timeout)
+	return contextWithHandlerContext(ctx, request), cancel
 }
 
 func requestContext(ctx context.Context, request *wireRequest) (context.Context, context.CancelFunc, error) {
