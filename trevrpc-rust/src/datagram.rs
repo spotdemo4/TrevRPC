@@ -28,12 +28,13 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
-use futures_util::FutureExt as _;
+use futures_util::{FutureExt as _, StreamExt as _};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::compression::{Accept, CallDict, inflate};
 use crate::sync::MutexExt as _;
+use crate::wake_gate::Gated;
 use crate::{BoxStream, ResponseFrame, Result, RpcKind, queue, varint};
 
 /// The most datagrams a server holds for flows it has not seen yet, per connection.
@@ -1022,7 +1023,8 @@ impl MessageCount {
 /// The datagram queue is read until the stream's request side ends, then drained of what it holds
 /// and dropped, so datagrams that arrive later are dropped.
 pub struct MergedRequests {
-    requests: BoxStream<Vec<u8>>,
+    /// Polled only when it woke, so a datagram does not also cost a poll of the stream.
+    requests: Gated<BoxStream<Vec<u8>>>,
     datagrams: Option<queue::Receiver<Bytes>>,
     drain: DrainHandle,
     count: MessageCount,
@@ -1042,7 +1044,7 @@ impl MergedRequests {
         count: MessageCount,
     ) -> BoxStream<Vec<u8>> {
         Box::pin(Self {
-            requests,
+            requests: Gated::new(requests),
             datagrams: Some(datagrams),
             drain,
             count,
@@ -1055,7 +1057,7 @@ impl MergedRequests {
         if self.requests_done {
             return Poll::Pending;
         }
-        match self.requests.as_mut().poll_next(cx) {
+        match self.requests.poll_next_unpin(cx) {
             Poll::Ready(Some(Err(error))) => {
                 // The call failed: nothing more is delivered.
                 self.requests_done = true;
@@ -1143,7 +1145,8 @@ enum ResponsePhase {
 /// The response frames of a call: its stream's frames, with the datagram messages merged in
 /// after the HEADERS frame and ahead of the terminal STATUS.
 pub struct MergedResponses {
-    frames: BoxStream<ResponseFrame>,
+    /// Polled only when it woke, so a datagram does not also cost a poll of the stream.
+    frames: Gated<BoxStream<ResponseFrame>>,
     datagrams: Option<queue::Receiver<Bytes>>,
     /// Keeps the call's flow registered until the response ends.
     guard: FlowGuard,
@@ -1163,7 +1166,7 @@ impl MergedResponses {
         guard: FlowGuard,
     ) -> BoxStream<ResponseFrame> {
         Box::pin(Self {
-            frames,
+            frames: Gated::new(frames),
             datagrams,
             guard,
             headers_read: false,
@@ -1193,7 +1196,7 @@ impl MergedResponses {
     /// The next frame of the stream. A terminal STATUS, or the end of the stream, starts the
     /// draining of the queued datagram messages instead of being returned.
     fn poll_frames(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<ResponseFrame>>> {
-        match self.frames.as_mut().poll_next(cx) {
+        match self.frames.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(frame))) => match frame {
                 ResponseFrame::Status(_) => {
                     self.guard.drain();
@@ -1233,7 +1236,7 @@ impl Stream for MergedResponses {
         this.datagrams_first = !this.datagrams_first;
         loop {
             match this.phase {
-                ResponsePhase::Ended => return this.frames.as_mut().poll_next(cx),
+                ResponsePhase::Ended => return this.frames.poll_next_unpin(cx),
                 ResponsePhase::Draining(_) => {
                     if let Some(message) = this.next_queued() {
                         return Poll::Ready(Some(Ok(ResponseFrame::Message(message))));
@@ -1273,7 +1276,6 @@ impl Stream for MergedResponses {
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use futures_util::StreamExt as _;
     use tokio::sync::{Notify, mpsc};
 
     use super::*;

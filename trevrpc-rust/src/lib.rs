@@ -47,6 +47,7 @@ pub mod tcp;
 mod test_io;
 mod transport_error;
 pub mod varint;
+mod wake_gate;
 mod websocket;
 pub mod wire;
 
