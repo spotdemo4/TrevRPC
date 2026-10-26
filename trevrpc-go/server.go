@@ -1036,7 +1036,7 @@ func successfulUnaryResponse(ctx context.Context, message encodedMessage, reques
 		headers:    headers,
 		message:    message,
 		hasMessage: true,
-		status:     OK().WithMetadata(response.takeMetadata()),
+		status:     okStatus(response.takeMetadata()),
 	}
 	unary.answer, unary.answered = request.answer()
 	return unary
@@ -1827,7 +1827,7 @@ func (s *serverResponseStream) acceptResponseMessage(message encodedMessage) *St
 // terminalResponseStatus is the final OK status of a response stream that
 // ended, with the trailing metadata the handler set through its context.
 func (s *serverResponseStream) terminalResponseStatus() *Status {
-	return OK().WithMetadata(s.metadata.takeMetadata())
+	return okStatus(s.metadata.takeMetadata())
 }
 
 func responseFrameBatchByteLimit(maxFrameSize int) int {

@@ -190,6 +190,11 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 	options := runtime.options
 	startedAt := time.Now()
 	reader := newFrameReader(stream, options.MaxFrameSize, options.MaxStreamBodySize)
+	// One watcher cancels the request's reads, REQUEST and single MESSAGE,
+	// when ctx is: a context.AfterFunc per read cost each call several
+	// allocations. Their read deadlines cover the call's deadline.
+	stopCancelRead := cancelReadOnContext(ctx, stream)
+	defer stopCancelRead()
 	request, err := readRequestFrame(ctx, options, startedAt, stream, reader)
 	if err != nil {
 		status := requestFrameStatus(err)
@@ -249,6 +254,9 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 			return
 		}
 	}
+	// The request stream reads the rest of a streaming request with
+	// watchers of its own.
+	stopCancelRead()
 
 	lease, ok := runtime.tryRequestLease(request)
 	if !ok {
@@ -376,11 +384,9 @@ type readDeadlineStream interface {
 	SetReadDeadline(time.Time) error
 }
 
-// readRequestFrame reads the REQUEST frame that opens a request stream.
+// readRequestFrame reads the REQUEST frame that opens a request stream. The
+// caller cancels the read when ctx is (see cancelReadOnContext).
 func readRequestFrame(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, reader *frameReader) (*wireRequest, error) {
-	stopCancelRead := cancelReadOnContext(ctx, stream)
-	defer stopCancelRead()
-
 	if deadline, ok := readDeadline(ctx, startedAt, options.InitialRequestTimeout); ok {
 		if deadlineStream, ok := stream.(readDeadlineStream); ok {
 			_ = deadlineStream.SetReadDeadline(deadline)
@@ -421,16 +427,20 @@ func readDeadline(ctx context.Context, startedAt time.Time, timeout time.Duratio
 // readRequestMessage reads the single MESSAGE of a unary or server-streaming
 // request and then waits for the end of the request stream. Frames of unknown
 // type are skipped; a missing message, a second one, or any other known frame
-// is InvalidArgument.
+// is InvalidArgument. The caller cancels the read when its own context, which
+// ctx derives from, is; ctx adds the call's deadline, which a read deadline
+// enforces where the stream has one and a watcher on ctx otherwise.
 func readRequestMessage(ctx context.Context, options ServerOptions, startedAt time.Time, stream rpcStream, reader *frameReader) ([]byte, error) {
-	stopCancelRead := cancelReadOnContext(ctx, stream)
-	defer stopCancelRead()
-
+	_, watch := ctx.Deadline()
 	if deadline, ok := readDeadline(ctx, startedAt, options.InitialRequestTimeout); ok {
-		if deadlineStream, ok := stream.(readDeadlineStream); ok {
-			_ = deadlineStream.SetReadDeadline(deadline)
+		if deadlineStream, ok := stream.(readDeadlineStream); ok && deadlineStream.SetReadDeadline(deadline) == nil {
 			defer func() { _ = deadlineStream.SetReadDeadline(time.Time{}) }()
+			watch = false
 		}
+	}
+	if watch {
+		stopCancelRead := cancelReadOnContext(ctx, stream)
+		defer stopCancelRead()
 	}
 
 	body, err := readSingleMessage(reader)

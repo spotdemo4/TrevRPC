@@ -134,6 +134,16 @@ func (r *responseMetadata) takeMetadata() Metadata {
 	return r.metadata
 }
 
+// okStatus is the OK status of a call whose handler set metadata, taken from
+// its responseMetadata: the values are copies the handler cannot change any
+// more, so unlike OK().WithMetadata it does not copy them again.
+func okStatus(metadata Metadata) *Status {
+	if metadata == nil {
+		metadata = Metadata{}
+	}
+	return &Status{Code: CodeOK, Metadata: metadata}
+}
+
 func cloneStatus(status *Status) *Status {
 	if status == nil {
 		return nil
