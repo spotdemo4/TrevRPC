@@ -10,7 +10,7 @@ use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::{Demux, FlowSender, MergedRequests, MessageCount, ServerFlow};
 use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, ResponseCodec};
 use crate::request_pump::{
-    RequestInputKind, RequestPumpReader, RequestPumpSettle, start_request_pump,
+    RequestInputKind, RequestPumpReader, RequestPumpSettle, UnaryRequestEnd, start_request_pump,
 };
 use crate::server::{
     Admitted, CancellationSource, CancellationToken, RequestBudget, RequestCounts, Server,
@@ -298,16 +298,11 @@ where
             plain_compressed: budget.accept.plain_count(),
             ..RequestCounts::default()
         };
-        let (_request_body, mut request_pump) = start_request_pump(
-            recv,
-            RequestInputKind::Unary,
-            server.max_frame_size(),
-            budget,
-        );
+        let mut request_end = UnaryRequestEnd::new(recv, server.max_frame_size(), budget);
         let response = tokio::select! {
             biased;
             response = server.handle_request_with_cancellation(request, body, cancellation.clone(), counts) => response,
-            failure = request_pump.failure() => {
+            failure = request_end.failure() => {
                 server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
                 if let Some(source) = failure.cancellation_source() {
                     cancellation.cancel(source);
@@ -315,7 +310,7 @@ where
                 if !failure.response_writable() {
                     slots.release();
                     send.reset();
-                    let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
+                    request_end.settle(RequestPumpSettle::ResponseStopped);
                     return;
                 }
                 Err(failure.status().clone())
@@ -327,7 +322,7 @@ where
                 } else {
                     CancellationSource::ConnectionLost
                 });
-                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
+                request_end.settle(RequestPumpSettle::ResponseStopped);
                 tracing::debug!("client stopped response stream before RPC completed");
                 return;
             }
@@ -337,7 +332,7 @@ where
                 // Never end a response without its STATUS: the client sees a cancelled call.
                 slots.release();
                 send.reset();
-                let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
+                request_end.settle(RequestPumpSettle::ServerShutdown);
                 return;
             }
         };
@@ -348,13 +343,11 @@ where
         match send.write_frames(&mut frames).await {
             Ok(()) => {
                 let _ = send.finish().await;
-                let _ = request_pump
-                    .settle(RequestPumpSettle::ResponseCommitted)
-                    .await;
+                request_end.settle(RequestPumpSettle::ResponseCommitted);
             }
             Err(error) => {
                 cancel_from_transport_error(&cancellation, &error);
-                let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
+                request_end.settle(RequestPumpSettle::ConnectionLost);
             }
         }
     }

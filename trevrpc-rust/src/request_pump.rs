@@ -2,6 +2,7 @@ use std::future::{Future, pending, poll_fn};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use futures_util::FutureExt as _;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -264,6 +265,92 @@ pub async fn discard_request<R: RequestPumpReader>(mut reader: R) {
     .unwrap_or(false);
     if !finished {
         reader.stop_trevrpc();
+    }
+}
+
+/// The end of a unary-input call's request: after its single message, only a FIN, a reset or a
+/// stray frame can follow. It is read inside the call's own future, beside the handler, instead
+/// of in a [`RequestPump`] task: for most calls the FIN is already there, and a task per call to
+/// find it cost far more than reading it.
+pub struct UnaryRequestEnd<R: RequestPumpReader> {
+    reader: PumpReaderGuard<R>,
+    max_frame_size: usize,
+    budget: RequestBudget,
+    /// The end was read cleanly or failed, so [`Self::failure`] has nothing left to report.
+    finished: bool,
+}
+
+impl<R: RequestPumpReader> UnaryRequestEnd<R> {
+    pub const fn new(reader: R, max_frame_size: usize, budget: RequestBudget) -> Self {
+        Self {
+            reader: PumpReaderGuard::new(reader),
+            max_frame_size,
+            budget,
+            finished: false,
+        }
+    }
+
+    /// Resolves with the failure if the request ends badly, and never after a clean end. Dropping
+    /// it mid-read is fine: [`Self::settle`] then discards the rest of the request.
+    pub async fn failure(&mut self) -> RequestPumpFailure {
+        if !self.finished {
+            let reader = self.reader.reader();
+            let read = reader
+                .read_request_end(self.max_frame_size, &mut self.budget, UNARY_TRAILING_FRAME)
+                .await;
+            let result = match read {
+                Ok(()) => reader.validate_transport_end().await,
+                Err(error) => Err(error),
+            };
+            self.finished = true;
+            match result {
+                Ok(()) => self.reader.settled = true,
+                Err(error) => {
+                    let failure = classify_error(error);
+                    // Only a stray frame leaves the stream open, to stop or discard on settling.
+                    if !matches!(failure, RequestPumpFailure::Protocol(_)) {
+                        self.reader.settled = true;
+                    }
+                    return failure;
+                }
+            }
+        }
+        pending().await
+    }
+
+    /// Ends the request side once the call's fate is known, like [`RequestPump::settle`]. A request
+    /// still open when the response is committed is discarded, at once when its end has already
+    /// arrived, as it usually has, and otherwise in a task.
+    pub fn settle(mut self, reason: RequestPumpSettle) {
+        if self.reader.settled {
+            return;
+        }
+        if matches!(reason, RequestPumpSettle::ResponseCommitted) && self.discard_buffered() {
+            self.reader.settled = true;
+            return;
+        }
+        let _ = settle_reader(&mut self.reader, reason);
+    }
+
+    /// Discards what the request has already delivered without waiting, up to `DISCARD_LIMIT`
+    /// bytes, and reports whether that reached its end.
+    fn discard_buffered(&mut self) -> bool {
+        let mut buffer = [0_u8; 1024];
+        let mut discarded = 0_usize;
+        while discarded <= DISCARD_LIMIT {
+            match self
+                .reader
+                .reader()
+                .read_frame_bytes(&mut buffer)
+                .now_or_never()
+            {
+                Some(Ok(Some(read))) => discarded = discarded.saturating_add(read),
+                // End of stream, a peer reset, or a lost connection: nothing is left to stop.
+                Some(Ok(None) | Err(_)) => return true,
+                None => return false,
+            }
+        }
+        false
     }
 }
 
@@ -721,7 +808,8 @@ mod tests {
 
     use super::{
         RequestInputKind, RequestPumpFailure, RequestPumpReader, RequestPumpSettle,
-        RequestPumpState, RequestTransportEvent, classify_error, start_request_pump as start_pump,
+        RequestPumpState, RequestTransportEvent, UnaryRequestEnd, classify_error,
+        start_request_pump as start_pump,
     };
 
     /// Starts a pump with no request limits.
@@ -1440,6 +1528,104 @@ mod tests {
         assert_eq!(failure.status().code(), Code::InvalidArgument);
         assert!(matches!(failure, RequestPumpFailure::Protocol(_)));
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    fn unary_end(io: TestPumpIo) -> (UnaryRequestEnd<TestReader>, DuplexStream, Arc<AtomicUsize>) {
+        let end = UnaryRequestEnd::new(io.reader, 1024, RequestBudget::new(None, None));
+        (end, io.writer, io.stops)
+    }
+
+    #[tokio::test]
+    async fn an_inline_unary_end_reports_nothing_after_a_clean_fin() {
+        let mut io = test_io(None);
+        io.writer.write_all(&grease(3)).await.unwrap();
+        io.writer.shutdown().await.unwrap();
+        let (mut end, _writer, stops) = unary_end(io);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), end.failure())
+                .await
+                .is_err(),
+            "a clean end is not a failure"
+        );
+        end.settle(RequestPumpSettle::ResponseStopped);
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "a finished request is not stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inline_unary_end_rejects_a_second_message_and_stops_it_when_unanswered() {
+        let mut io = test_io(None);
+        io.writer.write_all(&message(b"again")).await.unwrap();
+        let (mut end, _writer, stops) = unary_end(io);
+
+        let failure = end.failure().await;
+        assert!(matches!(failure, RequestPumpFailure::Protocol(_)));
+        assert_eq!(failure.status().code(), Code::InvalidArgument);
+        end.settle(RequestPumpSettle::ResponseStopped);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_inline_unary_end_classifies_a_failed_end_like_the_pump() {
+        let failed_end = || {
+            let io = test_io(Some(Status::cancelled("reset by peer")));
+            let mut writer = io.writer;
+            (io.reader, async move { writer.shutdown().await.unwrap() })
+        };
+        let (reader, finish) = failed_end();
+        finish.await;
+        let mut end = UnaryRequestEnd::new(reader, 1024, RequestBudget::new(None, None));
+        let inline = end.failure().await;
+
+        let (reader, finish) = failed_end();
+        finish.await;
+        let (_body, mut pump) = start_request_pump(reader, RequestInputKind::Unary, 1024);
+        let pumped = pump.failure().await;
+
+        assert_eq!(
+            std::mem::discriminant(&inline),
+            std::mem::discriminant(&pumped),
+            "{inline:?} against {pumped:?}"
+        );
+        assert_eq!(inline.status(), pumped.status());
+        end.settle(RequestPumpSettle::ResponseStopped);
+        let _ = pump.settle(RequestPumpSettle::ResponseStopped).await;
+    }
+
+    #[tokio::test]
+    async fn committing_discards_an_arrived_request_end_at_once() {
+        let mut io = test_io(None);
+        io.writer.write_all(&grease(3)).await.unwrap();
+        io.writer.shutdown().await.unwrap();
+        let (end, _writer, stops) = unary_end(io);
+
+        // The handler answered before the end was read: it is read now, without a drain task.
+        end.settle(RequestPumpSettle::ResponseCommitted);
+        tokio::time::sleep(super::DISCARD_TIMEOUT + Duration::from_millis(100)).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn committing_hands_a_request_still_open_to_the_bounded_drain() {
+        let (end, _writer, stops) = unary_end(test_io(None));
+
+        end.settle(RequestPumpSettle::ResponseCommitted);
+        tokio::time::sleep(super::DISCARD_TIMEOUT / 2).await;
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            0,
+            "the drain waits for the request"
+        );
+        tokio::time::sleep(super::DISCARD_TIMEOUT).await;
+        assert_eq!(
+            stops.load(Ordering::SeqCst),
+            1,
+            "and stops it at its time bound"
+        );
     }
 
     #[tokio::test]
