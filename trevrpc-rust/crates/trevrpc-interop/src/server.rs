@@ -316,6 +316,7 @@ const fn admit_webtransport(_request: &WebTransportAdmissionRequest<'_>) -> bool
 pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let host: IpAddr = flags.get("host").unwrap_or("127.0.0.1").parse()?;
     let port: u16 = flags.get("port").unwrap_or("0").parse()?;
+    let connection_threads: usize = flags.get("connection-threads").unwrap_or("0").parse()?;
     let certs =
         CertificateDer::pem_file_iter(flags.require("cert")?)?.collect::<Result<Vec<_>, _>>()?;
     let key = PrivateKeyDer::from_pem_file(flags.require("key")?)?;
@@ -331,6 +332,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
             .with_http_enabled(true)
             .with_webtransport_enabled(true)
             .with_webtransport_admission(Some(admit_webtransport))
+            .with_connection_threads(connection_threads)
             .with_http_fallback(
                 flags
                     .get("web-root")

@@ -37,6 +37,7 @@ mod rpc_body;
 mod serve;
 pub mod server;
 mod server_transport;
+mod shards;
 pub mod status;
 pub mod stream;
 mod structured_fields;

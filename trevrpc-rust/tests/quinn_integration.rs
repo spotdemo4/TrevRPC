@@ -475,6 +475,55 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     server.shutdown().await
 }
 
+/// Records the thread each call starts on.
+#[derive(Clone, Default)]
+struct ThreadMetrics(Arc<Mutex<Vec<Option<String>>>>);
+
+impl Metrics for ThreadMetrics {
+    fn rpc_started(&self, _event: &RpcStarted) {
+        lock(&self.0).push(std::thread::current().name().map(str::to_owned));
+    }
+
+    fn rpc_finished(&self, _event: &RpcFinished) {}
+}
+
+#[tokio::test]
+async fn connection_threads_run_every_call_of_a_connection() -> TestResult {
+    let threads = ThreadMetrics::default();
+    let recorded = threads.clone();
+    let server = spawn_greeter_server(|server| {
+        server.set_options(server.options().clone().with_connection_threads(2));
+        server.set_metrics(recorded);
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+
+    let reply = client
+        .say_hello(&greeter::HelloRequest {
+            name: "unary".to_owned(),
+        })
+        .await?;
+    ensure_eq!(reply.message, "hello, unary");
+    let summary = run_client_greetings(&client, &["one", "two"], CallOptions::new()).await?;
+    ensure_eq!(summary.message, "one,two");
+    let messages = run_bidi_greetings(&client, &["left", "right"], CallOptions::new()).await?;
+    ensure_eq!(messages, ["echo, left", "echo, right"]);
+
+    close_client(endpoint, connection).await?;
+    server.shutdown().await?;
+    let names = lock(&threads.0).clone();
+    ensure_eq!(names.len(), 3);
+    ensure!(
+        names
+            .iter()
+            .all(|name| name.as_deref() == names[0].as_deref()
+                && name
+                    .as_deref()
+                    .is_some_and(|name| name.starts_with("trevrpc-connections-"))),
+        "calls ran on {names:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn quinn_preserves_success_metadata_for_every_rpc_shape() -> TestResult {
     let server = spawn_greeter_server(|server| {

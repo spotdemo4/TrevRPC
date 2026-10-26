@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! trevrpc-interop-rust server --cert <pem> --key <pem> [--host 127.0.0.1] [--port 0]
-//!                             [--web-root <dir>] [--dictionary <file>]
+//!                             [--web-root <dir>] [--dictionary <file>] [--connection-threads 0]
 //! trevrpc-interop-rust client --addr <host:port> --ca <pem> [--server-name localhost]
 //!                             [--transport quic|tcp|auto] [--tcp-addr <host:port>]
 //!                             [--expect-transport quic|qmux] [--dictionary <file>]
@@ -41,7 +41,15 @@ async fn main() -> ExitCode {
     let result = match args.next().as_deref() {
         Some("server") => parse_flags(
             args,
-            &["cert", "key", "host", "port", "web-root", "dictionary"],
+            &[
+                "cert",
+                "key",
+                "host",
+                "port",
+                "web-root",
+                "dictionary",
+                "connection-threads",
+            ],
         )
         .map(Command::Server),
         Some("client") => parse_flags(

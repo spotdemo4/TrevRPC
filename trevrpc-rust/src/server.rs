@@ -547,6 +547,7 @@ pub struct ServerOptions {
     http_fallback: Option<HttpFallback>,
     compression: Compression,
     stream_compression_memory: usize,
+    connection_threads: usize,
 }
 
 impl Default for ServerOptions {
@@ -572,6 +573,7 @@ impl Default for ServerOptions {
             http_fallback: None,
             compression: Compression::new(),
             stream_compression_memory: DEFAULT_SERVER_MEMORY,
+            connection_threads: 0,
         }
     }
 }
@@ -752,6 +754,36 @@ impl ServerOptions {
     pub const fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
         self.frame_size = max_frame_size;
         self
+    }
+
+    /// Runs QUIC connections on `threads` threads of their own, each connection wholly on one of
+    /// them, instead of on the runtime that serves; 0, the default, turns this off.
+    ///
+    /// Every operation on a Quinn stream takes its connection's lock, so one connection whose
+    /// streams run on many threads spends much of its time handing that lock between them: on the
+    /// bench host, a QUIC connection carrying 64 busy streams did 146k round trips per second on
+    /// one thread and 110k on eight. Each of these threads runs a single-threaded Tokio runtime
+    /// that owns whole connections, native and HTTP/3: their drivers, their streams, and the
+    /// handlers of their calls, together with whatever those spawn. New connections go to the
+    /// thread with the fewest.
+    ///
+    /// Handlers then share their connection's thread with every other connection on it: one that
+    /// blocks or computes for long stalls them all, and `tokio::task::block_in_place` panics.
+    /// Move such work to `tokio::task::spawn_blocking` or another runtime. When serving ends,
+    /// tasks that handlers spawned on these threads are cancelled. `QMux`, HTTP/2 and WebSocket
+    /// connections stay on the serving runtime. Starting the threads fails serving if the system
+    /// refuses them.
+    #[must_use]
+    pub const fn with_connection_threads(mut self, threads: usize) -> Self {
+        self.connection_threads = threads;
+        self
+    }
+
+    /// Returns how many threads of their own QUIC connections run on; see
+    /// [`ServerOptions::with_connection_threads`].
+    #[must_use]
+    pub const fn connection_threads(&self) -> usize {
+        self.connection_threads
     }
 
     /// Sets the maximum number of concurrent transport connections.

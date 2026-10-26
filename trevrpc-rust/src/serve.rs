@@ -13,6 +13,7 @@ use tokio::task::{JoinError, JoinSet};
 use crate::quic::{frame_receive_window, negotiated_protocol, saturating_usize_to_u64, varint};
 use crate::server::{Server, ServerOptions};
 use crate::server_transport::try_acquire_permit;
+use crate::shards::Shards;
 use crate::tcp::TcpFallback;
 use crate::{Error, Result};
 use crate::{http3, native, tcp};
@@ -142,6 +143,7 @@ impl Server {
             .map(|limit| Arc::new(Semaphore::new(limit)));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut connection_tasks = JoinSet::new();
+        let shards = Shards::start(self.options().connection_threads())?;
 
         tokio::pin!(shutdown);
 
@@ -160,7 +162,11 @@ impl Server {
                     let server = self.clone();
                     let request_limit = request_limit.clone();
                     let shutdown = shutdown_rx.clone();
-                    connection_tasks.spawn(async move {
+                    // Accepting creates the connection's driver on the runtime that accepts it.
+                    let shard = shards.pick();
+                    let (shard_handle, shard_guard) = shard.unzip();
+                    let connection_task = async move {
+                        let _shard_guard = shard_guard;
                         let Ok(connection) = incoming.await else {
                             return;
                         };
@@ -182,7 +188,15 @@ impl Server {
                             }
                             _ => connection.close(0_u32.into(), b"unsupported ALPN"),
                         }
-                    });
+                    };
+                    match shard_handle {
+                        Some(handle) => {
+                            connection_tasks.spawn_on(connection_task, handle);
+                        }
+                        None => {
+                            connection_tasks.spawn(connection_task);
+                        }
+                    }
                 }
                 accepted = accept_tcp(tcp.as_ref()) => {
                     let (stream, fallback) = match accepted {
@@ -228,6 +242,7 @@ impl Server {
             &endpoint,
         )
         .await;
+        drop(shards);
 
         Ok(())
     }

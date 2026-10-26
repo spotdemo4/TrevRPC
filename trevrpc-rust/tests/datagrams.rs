@@ -282,6 +282,29 @@ async fn native_quic_carries_unreliable_messages_in_datagrams_both_ways() -> Tes
 }
 
 #[tokio::test]
+async fn datagrams_and_qmux_work_with_connection_threads() -> TestResult {
+    let server = spawn_server(server_options().with_connection_threads(2)).await?;
+    let (endpoint, connection) = connect_quic(&server).await?;
+    let transport = QuicTransport::new(connection.clone());
+    let sent = numbered(40);
+    let reply = run_call(&transport, ECHO_ALL, Unreliable::BOTH, sent.clone()).await?;
+    ensure_delivered_at_most_once(&sent, &reply.messages)?;
+    ensure!(
+        reply.trailer("datagrams")? > 0,
+        "no request arrived as a datagram"
+    );
+
+    // QMux connections stay on the serving runtime.
+    let qmux = connect_qmux(&server).await?;
+    let reply = run_call(&qmux, ECHO_ALL, Unreliable::BOTH, sent.clone()).await?;
+    ensure_eq!(reply.messages, sent);
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    server.stop().await
+}
+
+#[tokio::test]
 async fn messages_too_large_for_a_datagram_travel_on_the_stream() -> TestResult {
     let server = spawn_server(server_options()).await?;
     let (endpoint, connection) = connect_quic(&server).await?;
