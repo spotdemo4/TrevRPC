@@ -158,6 +158,8 @@ pub struct Dialer {
     pub(crate) reprobe_interval: Duration,
     /// The most QUIC connections a generation spreads its calls over.
     pub(crate) max_quic_connections: usize,
+    /// The QUIC connections a generation keeps open and spreads every call over.
+    pub(crate) min_quic_connections: usize,
     /// How long a connection a generation added may go unused before it closes.
     pub(crate) quic_idle_timeout: Duration,
     /// How many calls per second, per connection, a generation spreads and grows at.
@@ -228,11 +230,29 @@ impl Dialer {
         }
     }
 
+    /// Dials the generation's QUIC connections, the minimum of them in parallel. The first to
+    /// connect is the generation's own; the others join its pool, and those that fail are dialed
+    /// again later.
     async fn dial_quic(&self) -> Result<GenerationTransport> {
-        let primary = self.dial_quic_transport().await?;
+        let dials = (0..self.min_quic_connections.max(1)).map(|_| self.dial_quic_transport());
+        let mut connections = Vec::new();
+        let mut failure = None;
+        for result in futures_util::future::join_all(dials).await {
+            match result {
+                Ok(transport) => connections.push(transport),
+                Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+        let mut connections = connections.into_iter();
+        let Some(primary) = connections.next() else {
+            return Err(failure.unwrap_or_else(|| {
+                Error::from(Status::unavailable("no QUIC connection was dialed"))
+            }));
+        };
         Ok(GenerationTransport::Quic(QuicPool::new(
             primary,
             self.clone(),
+            connections,
         )))
     }
 

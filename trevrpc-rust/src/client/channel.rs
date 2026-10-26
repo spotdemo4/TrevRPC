@@ -125,6 +125,7 @@ pub struct ChannelConfig {
     compression: Compression,
     stream_compression_memory: usize,
     max_quic_connections: usize,
+    min_quic_connections: usize,
     quic_idle_timeout: Duration,
     quic_call_rate: u64,
     quic_byte_rate: u64,
@@ -144,6 +145,7 @@ impl ChannelConfig {
             compression: Compression::new(),
             stream_compression_memory: DEFAULT_CLIENT_MEMORY,
             max_quic_connections: default_max_connections(),
+            min_quic_connections: 1,
             quic_idle_timeout: DEFAULT_IDLE_TIMEOUT,
             quic_call_rate: DEFAULT_CALL_RATE,
             quic_byte_rate: DEFAULT_BYTE_RATE,
@@ -180,7 +182,7 @@ impl ChannelConfig {
     /// [`Self::with_quic_connection_call_rate`] or moves bytes faster than
     /// [`Self::with_quic_connection_byte_rate`], it places each call on the connection with the
     /// fewest in flight, and dials another when every connection carries one of those rates. A call stays on the connection it started on, so streams opened all at once share
-    /// the first connection. The default is half the available parallelism, from one to four; one
+    /// the first connection unless [`Self::with_min_quic_connections`] opened more first. The default is half the available parallelism, from one to four; one
     /// disables it. `QMux` over TLS always uses one connection.
     #[must_use]
     pub const fn with_max_quic_connections(mut self, connections: usize) -> Self {
@@ -192,6 +194,31 @@ impl ChannelConfig {
     #[must_use]
     pub const fn max_quic_connections(&self) -> usize {
         self.max_quic_connections
+    }
+
+    /// Sets how many QUIC connections the channel keeps open and spreads every call over from the
+    /// start, for clients that open many busy, long-lived streams at once. The default is one.
+    ///
+    /// A call never moves to another connection, so streams opened together before the channel
+    /// grows (see [`Self::with_max_quic_connections`]) all share the first connection and wait on
+    /// each other inside Quinn: on the bench host, 64 `bidi` streams opened at once carried 114k
+    /// round trips per second over one connection and 169k over four. With more than one, the
+    /// channel dials them all in parallel when it connects, is ready once they are up (a failed
+    /// extra one does not hold it up), places each call on the one with the fewest in flight,
+    /// never closes them for being idle, and dials again when one is lost. It still grows beyond
+    /// them, up to the maximum, as the call and byte rates ask. Every connection has its own
+    /// congestion controller, so over a slow or lossy link they take a larger share than one would.
+    /// `QMux` over TLS always uses one connection.
+    #[must_use]
+    pub const fn with_min_quic_connections(mut self, connections: usize) -> Self {
+        self.min_quic_connections = if connections == 0 { 1 } else { connections };
+        self
+    }
+
+    /// Returns how many QUIC connections the channel keeps open from the start.
+    #[must_use]
+    pub const fn min_quic_connections(&self) -> usize {
+        self.min_quic_connections
     }
 
     /// Sets how many calls per second, per connection, the channel spreads its QUIC calls and dials
@@ -444,7 +471,8 @@ impl Channel {
             tcp: config.tcp.clone(),
             fallback_delay: config.fallback_delay,
             reprobe_interval: config.reprobe_interval,
-            max_quic_connections: config.max_quic_connections,
+            max_quic_connections: config.max_quic_connections.max(config.min_quic_connections),
+            min_quic_connections: config.min_quic_connections,
             quic_idle_timeout: config.quic_idle_timeout,
             quic_call_rate: config.quic_call_rate,
             quic_byte_rate: config.quic_byte_rate,

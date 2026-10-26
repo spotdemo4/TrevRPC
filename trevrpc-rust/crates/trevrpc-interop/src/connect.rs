@@ -51,6 +51,13 @@ pub async fn channel(flags: &Flags) -> Result<(Channel, quinn::Endpoint), BoxErr
     if flags.get("tcp-addr").is_some() {
         config = config.with_tcp_addr(resolve(flags, "tcp-addr").await?);
     }
+    if let Some(connections) = flags.get("min-quic-connections") {
+        config = config.with_min_quic_connections(
+            connections
+                .parse()
+                .map_err(|_| format!("invalid --min-quic-connections {connections:?}"))?,
+        );
+    }
     let endpoint = client_endpoint(addr, &config, tls)?;
     let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config).await?;
     Ok((channel, endpoint))

@@ -12,7 +12,8 @@
 //! the fewest in flight, and dials another, up to its limit, when every connection carries one of
 //! those rates and two calls. Below both, every call goes to the generation's connection, so the
 //! ones it added fall idle and close; they also close when the generation ends, as soon as their
-//! last call finishes.
+//! last call finishes. A pool with a minimum above one keeps that many open from the start, never
+//! idle-closes them, and spreads every call over its connections regardless of the rates.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -75,6 +76,8 @@ struct Pool {
     added: RwLock<Vec<Arc<Member>>>,
     dialer: Dialer,
     max: usize,
+    /// The connections the pool keeps open and spreads every call over.
+    min: usize,
     idle_timeout: Duration,
     /// Calls per second, per connection, to spread and grow at.
     call_rate: u64,
@@ -96,10 +99,12 @@ struct Member {
     idle: Notify,
     /// The bytes the connection had sent and received when the pool last looked.
     bytes: AtomicU64,
+    /// One of the pool's minimum, which never closes for being idle.
+    pinned: bool,
 }
 
 impl Member {
-    fn new(transport: QuicTransport) -> Arc<Self> {
+    fn new(transport: QuicTransport, pinned: bool) -> Arc<Self> {
         let bytes = AtomicU64::new(udp_bytes(transport.connection()));
         Arc::new(Self {
             transport,
@@ -107,6 +112,7 @@ impl Member {
             used: AtomicBool::new(false),
             idle: Notify::new(),
             bytes,
+            pinned,
         })
     }
 
@@ -140,14 +146,21 @@ impl Drop for CallGuard {
 }
 
 impl QuicPool {
-    /// Creates the pool of a generation whose connection is `primary`. `dialer` dials the
-    /// connections it adds, up to its `max_quic_connections` in all.
-    pub(crate) fn new(primary: QuicTransport, dialer: Dialer) -> Self {
-        Self {
+    /// Creates the pool of a generation whose connection is `primary`, with `others` already
+    /// dialed toward its minimum. `dialer` dials the connections it adds, up to its
+    /// `max_quic_connections` in all.
+    pub(crate) fn new(
+        primary: QuicTransport,
+        dialer: Dialer,
+        others: impl IntoIterator<Item = QuicTransport>,
+    ) -> Self {
+        let max = dialer.max_quic_connections.max(1);
+        let pool = Self {
             inner: Arc::new(Pool {
-                primary: Member::new(primary),
+                primary: Member::new(primary, true),
                 added: RwLock::new(Vec::new()),
-                max: dialer.max_quic_connections.max(1),
+                max,
+                min: dialer.min_quic_connections.clamp(1, max),
                 // `tokio::time::interval` rejects a zero period.
                 idle_timeout: dialer.quic_idle_timeout.max(Duration::from_millis(1)),
                 call_rate: dialer.quic_call_rate.max(1),
@@ -157,7 +170,11 @@ impl QuicPool {
                 dialing: AtomicBool::new(false),
                 dropped: watch::Sender::new(false),
             }),
+        };
+        for transport in others {
+            Pool::add(&pool.inner, transport);
         }
+        pool
     }
 
     /// Returns the generation's own connection.
@@ -182,12 +199,13 @@ impl QuicPool {
     }
 
     /// Picks the connection for a new call: the one with the fewest calls in flight while the
-    /// pool reaches its call or byte rate, and the generation's own otherwise. Dials another one
-    /// when every connection carries one of those rates and is busy.
+    /// pool keeps more than one connection or reaches its call or byte rate, and the generation's
+    /// own otherwise. Dials another one when the pool is below its minimum, or when every
+    /// connection carries one of those rates and is busy.
     fn pick(&self) -> (QuicTransport, CallGuard) {
         let pool = &self.inner;
         let rates = pool.load.record(|| pool.moved());
-        let spread = pool.reaches(rates, 1);
+        let spread = pool.min > 1 || pool.reaches(rates, 1);
         let (member, least, open) = {
             let added = pool.added.read_unpoisoned();
             let mut member = &pool.primary;
@@ -204,7 +222,8 @@ impl QuicPool {
             member.used.store(true, Ordering::Relaxed);
             (Arc::clone(member), least, added.len().saturating_add(1))
         };
-        if spread && least >= BUSY_CALLS && open < pool.max && pool.reaches(rates, open) {
+        let busy = least >= BUSY_CALLS && open < pool.max && pool.reaches(rates, open);
+        if open < pool.min || (spread && busy) {
             self.grow();
         }
         (member.transport.clone(), CallGuard(member))
@@ -318,15 +337,17 @@ impl Pool {
     }
 
     fn add(pool: &Arc<Self>, transport: QuicTransport) {
-        let member = Member::new(transport);
-        {
+        let member = {
             let mut added = pool.added.write_unpoisoned();
-            if added.len().saturating_add(1) >= pool.max {
-                member.connection().close(0_u32.into(), IDLE_REASON);
+            let open = added.len().saturating_add(1);
+            if open >= pool.max {
+                transport.connection().close(0_u32.into(), IDLE_REASON);
                 return;
             }
+            let member = Member::new(transport, open < pool.min);
             added.push(Arc::clone(&member));
-        }
+            member
+        };
         tokio::spawn(watch_added(
             Arc::downgrade(pool),
             pool.idle_timeout,
@@ -381,7 +402,8 @@ async fn watch_added(
             }
             _ = idle_check.tick() => {
                 let Some(pool) = pool.upgrade() else { break };
-                if !member.used.swap(false, Ordering::Relaxed) && pool.retire_if_idle(&member) {
+                let used = member.used.swap(false, Ordering::Relaxed);
+                if !member.pinned && !used && pool.retire_if_idle(&member) {
                     member.connection().close(0_u32.into(), IDLE_REASON);
                     return;
                 }

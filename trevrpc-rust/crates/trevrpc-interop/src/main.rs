@@ -15,7 +15,7 @@
 //!                            [--messages 100] [--rate 100] [--metadata-size 0]
 //!                            [--payload repeat|records]
 //!                            [--compression none|dictionary|stream|stream-dictionary]
-//!                            [--dictionary <file>]
+//!                            [--dictionary <file>] [--min-quic-connections 1]
 //! ```
 //!
 //! The `bench` subcommand follows `bench/README.md`.
@@ -84,6 +84,7 @@ async fn main() -> ExitCode {
                 "payload",
                 "compression",
                 "dictionary",
+                "min-quic-connections",
             ],
         )
         .map(Command::Bench),

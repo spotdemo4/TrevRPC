@@ -174,6 +174,9 @@ for the whole run.
 - `--messages` (default 100) is the number of messages per streaming call. The
   `client-stream` response is `messages × size` bytes, so that product must stay
   under the 4 MiB frame limit.
+- `--min-quic-connections` (Rust client only, default 1) sets
+  `ChannelConfig::with_min_quic_connections`: the channel opens that many QUIC
+  connections when it connects and spreads every call over them.
 - `--rate` (default 100) is the number of messages per second each
   `paced` or `unreliable-paced` worker sends. Fractions are allowed. A worker sends on a
   schedule, message `i` at `i / rate` seconds after it starts, as precisely as

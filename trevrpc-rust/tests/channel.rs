@@ -394,6 +394,60 @@ async fn added_connections_close_once_idle() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_minimum_connections_are_open_from_the_start_and_share_every_call() -> TestResult {
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(100))?;
+    // Slow calls at a low rate, which alone would keep one connection, and an idle timeout the
+    // minimum connections outlast.
+    let config = ChannelConfig::new()
+        .with_min_quic_connections(3)
+        .with_max_quic_connections(2)
+        .with_quic_connection_idle_timeout(Duration::from_millis(100));
+    let client = connect_pooled(&server, config).await?;
+    ensure_eq!(client.quic_connections().len(), 3);
+    // The server finishes its handshakes one at a time, after the client.
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while server.accepted_connections.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    // Six calls opened at once go two to a connection.
+    let calls: Vec<_> = (0..6)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.call(request(), b"pool".to_vec()).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let busy: Vec<u64> = client
+        .quic_connections()
+        .iter()
+        .map(|connection| connection.stats().frame_tx.stream)
+        .collect();
+    for call in calls {
+        tokio::time::timeout(TEST_TIMEOUT, call).await???;
+    }
+    ensure!(
+        busy.iter().all(|&frames| frames > 0),
+        "calls did not reach every connection: {busy:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    ensure_eq!(client.quic_connections().len(), 3);
+
+    // A lost one is dialed again by the next call.
+    client.quic_connections()[2].close(0_u32.into(), b"test");
+    wait_for_connections(&client, 2).await?;
+    concurrent_calls(&client, 1).await?;
+    wait_for_connections(&client, 3).await?;
+    ensure_eq!(client.state().generation(), 1);
+
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
 async fn losing_the_first_connection_drains_the_added_ones() -> TestResult {
     let server = RawServer::spawn_with_delay(false, Duration::from_millis(300))?;
     let config = fast(ChannelConfig::new())
