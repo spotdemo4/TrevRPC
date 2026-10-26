@@ -64,7 +64,7 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 		{"quic", "quic", true},
 		{"tcp", "qmux", false},
 	} {
-		for _, scenario := range []string{"unary", "server-stream", "client-stream", "bidi", "unreliable-server-stream", "unreliable-client-stream", "unreliable-paced"} {
+		for _, scenario := range []string{"unary", "server-stream", "client-stream", "bidi", "unreliable-server-stream", "unreliable-client-stream", "paced", "unreliable-paced"} {
 			// A metadata size of 0 sends no metadata; the others send one entry
 			// of that many bytes, the largest being the limit.
 			for _, metadataSize := range []int{0, 300, benchMaxMetadataSize} {
@@ -136,18 +136,18 @@ func checkBenchLine(t *testing.T, output, scenario, transport string, size, meta
 		perOp = float64(messages)
 	}
 	switch {
-	case scenario == "unreliable-paced":
+	case strings.HasSuffix(scenario, "paced"):
 		// Each operation is one delivered message. Two workers at 1000
 		// messages per second schedule about 400 in the window, each either
-		// delivered or lost, and TCP loses none.
-		if ops < 1 || msgs != ops || msgs+lost < 300 || msgs+lost > 500 || (transport == "qmux" && lost != 0) {
-			t.Errorf("ops, msgs, lost = %v, %v, %v, want msgs = ops, about 400 messages and no loss over QMux", ops, msgs, lost)
+		// delivered or lost, and a stream loses none.
+		if ops < 1 || msgs != ops || msgs+lost < 300 || msgs+lost > 500 || ((transport == "qmux" || scenario == "paced") && lost != 0) {
+			t.Errorf("ops, msgs, lost = %v, %v, %v, want msgs = ops, about 400 messages and no loss on a stream", ops, msgs, lost)
 		}
 		if number("rate") != 1000 {
 			t.Errorf("rate = %v, want 1000", got["rate"])
 		}
 	case got["rate"] != nil:
-		t.Errorf("rate = %v, want none outside unreliable-paced", got["rate"])
+		t.Errorf("rate = %v, want none outside the paced scenarios", got["rate"])
 	case strings.HasPrefix(scenario, "unreliable-"):
 		// Every message is either delivered or lost, and TCP loses none.
 		if ops < 1 || msgs+lost != ops*perOp || (transport == "qmux" && lost != 0) {

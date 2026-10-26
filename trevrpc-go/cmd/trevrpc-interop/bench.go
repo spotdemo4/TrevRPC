@@ -32,9 +32,9 @@ const benchGrace = scenarioTimeout
 // dead connection does not turn into a busy loop.
 const benchErrorBackoff = time.Millisecond
 
-// pacedDeadline is how long after its scheduled send an unreliable-paced
-// message's echo may arrive and still count as delivered. A later echo is
-// too late for real-time traffic, so it counts as lost.
+// pacedDeadline is how long after its send a paced message's echo may arrive
+// and still count as delivered. A later echo is too late for real-time
+// traffic, so it counts as lost.
 const pacedDeadline = 500 * time.Millisecond
 
 const (
@@ -61,12 +61,12 @@ type benchConfig struct {
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
 	c.connectionConfig.register(flags, "transport: quic or tcp (QMux over TLS)")
-	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream, unreliable-client-stream or unreliable-paced")
+	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream, unreliable-client-stream, paced or unreliable-paced")
 	flags.IntVar(&c.size, "size", 64, "length of EchoRequest.message in bytes")
 	flags.IntVar(&c.metadata, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	flags.IntVar(&c.concurrency, "concurrency", 1, "workers, each with one call or stream in flight")
 	flags.IntVar(&c.messages, "messages", 100, "messages per streaming call")
-	flags.Float64Var(&c.rate, "rate", 100, "messages per second each unreliable-paced worker sends")
+	flags.Float64Var(&c.rate, "rate", 100, "messages per second each paced or unreliable-paced worker sends")
 	flags.Float64Var(&c.duration, "duration", 5, "measured seconds")
 	flags.Float64Var(&c.warmup, "warmup", 1, "seconds run before measuring")
 	flags.StringVar(&c.payload, "payload", "repeat", "EchoRequest.message: repeat (x repeated) or records (a new log-records message per request)")
@@ -129,6 +129,16 @@ func (c *benchConfig) validate() error {
 		return errors.New("bench: --warmup must not be negative")
 	}
 	return nil
+}
+
+// paced reports whether the scenario sends at --rate.
+func (c *benchConfig) paced() bool {
+	return c.scenario == "paced" || c.scenario == "unreliable-paced"
+}
+
+// interval is the time between the messages of a paced worker.
+func (c *benchConfig) interval() time.Duration {
+	return time.Duration(float64(time.Second) / c.rate)
 }
 
 // callOptions returns the options every call carries: the bench-pad request
@@ -224,13 +234,11 @@ var benchScenarios = map[string]func(clients benchClients, config benchConfig, p
 	"unreliable-client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
 		return operationLoop{&unreliableClientStreamOperation{client: clients.unreliable, options: config.callOptions(), message: payload.next(), count: config.messages}}
 	},
+	"paced": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return &pacedWorkload{open: clients.echo.Bidi, options: config.callOptions(), payload: payload, interval: config.interval()}
+	},
 	"unreliable-paced": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
-		return &unreliablePacedWorkload{
-			client:   clients.unreliable,
-			options:  config.callOptions(),
-			payload:  payload,
-			interval: time.Duration(float64(time.Second) / config.rate),
-		}
+		return &pacedWorkload{open: clients.unreliable.Bidi, options: config.callOptions(), payload: payload, interval: config.interval()}
 	},
 }
 
@@ -422,20 +430,21 @@ func (o *unreliableClientStreamOperation) lost() int { return o.missing }
 
 func (*unreliableClientStreamOperation) close() {}
 
-// unreliablePacedWorkload keeps one UnreliableEcho.Bidi stream open and sends
-// a request that asks for one echo every interval, as real-time traffic does,
-// while it reads the echoes as they arrive. The requests and echoes may travel
-// as datagrams. Each message scheduled inside the measured window is one
-// operation: delivered, with the time from its send to its echo, if the echo
-// arrives within pacedDeadline of the send, and lost otherwise.
-type unreliablePacedWorkload struct {
-	client   *interoppb.UnreliableEchoClient
+// pacedWorkload keeps one Bidi stream open and sends a request that asks for
+// one echo every interval, as real-time traffic does, while it reads the
+// echoes as they arrive: on Echo.Bidi for paced, and on UnreliableEcho.Bidi,
+// whose requests and echoes may travel as datagrams, for unreliable-paced.
+// Each message scheduled inside the measured window is one operation:
+// delivered, with the time from its send to its echo, if the echo arrives
+// within pacedDeadline of the send, and lost otherwise.
+type pacedWorkload struct {
+	open     openBidi
 	options  []trevrpc.CallOption
 	payload  benchPayload
 	interval time.Duration
 }
 
-func (p *unreliablePacedWorkload) work(ctx context.Context, w *benchWorker, start, end time.Time) {
+func (p *pacedWorkload) work(ctx context.Context, w *benchWorker, start, end time.Time) {
 	base := time.Now()
 	// Sending goes on past the window, so the echoes of its last messages
 	// arrive under the same load.
@@ -474,7 +483,7 @@ func (p *unreliablePacedWorkload) work(ctx context.Context, w *benchWorker, star
 	}
 }
 
-// pacedSchedule is what an unreliable-paced worker knows of its messages,
+// pacedSchedule is what a paced worker knows of its messages,
 // one scheduled every interval from base.
 type pacedSchedule struct {
 	base time.Time
@@ -489,8 +498,8 @@ type pacedSchedule struct {
 // stream opens a stream and sends messages next to the end of the schedule,
 // each at its time, recording their echoes. It returns the first message it
 // did not send.
-func (p *unreliablePacedWorkload) stream(ctx context.Context, schedule *pacedSchedule, next int) (int, error) {
-	call, err := p.client.Bidi(ctx, p.options...)
+func (p *pacedWorkload) stream(ctx context.Context, schedule *pacedSchedule, next int) (int, error) {
+	call, err := p.open(ctx, p.options...)
 	if err != nil {
 		return next, err
 	}
@@ -543,7 +552,7 @@ func receivePaced(call trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest
 	}
 }
 
-// pacedMessage is the request message of unreliable-paced message number
+// pacedMessage is the request message of paced message number
 // sequence: the number in decimal and a space in place of the start of
 // payload.
 func pacedMessage(sequence int, payload string) string {
@@ -554,7 +563,7 @@ func pacedMessage(sequence int, payload string) string {
 	return prefix + payload[len(prefix):]
 }
 
-// pacedSequence returns the message number an unreliable-paced echo carries.
+// pacedSequence returns the message number a paced echo carries.
 func pacedSequence(message string) (int, bool) {
 	digits, _, ok := strings.Cut(message, " ")
 	if !ok {
@@ -719,8 +728,8 @@ type benchResult struct {
 	// Lost counts the messages sent but not delivered, which only the
 	// unreliable scenarios can have.
 	Lost uint64 `json:"lost"`
-	// Rate is the messages per second each worker sends, which only the
-	// unreliable-paced scenario has.
+	// Rate is the messages per second each worker sends, which only the paced
+	// scenarios have.
 	Rate        float64 `json:"rate,omitempty"`
 	Payload     string  `json:"payload"`
 	Compression string  `json:"compression"`
@@ -827,7 +836,7 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 	seconds := window.Seconds()
 	ops := uint64(len(latencies))
 	var rate float64
-	if config.scenario == "unreliable-paced" {
+	if config.paced() {
 		rate = config.rate
 	}
 	return benchResult{

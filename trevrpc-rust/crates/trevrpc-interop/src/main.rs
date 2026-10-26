@@ -10,7 +10,7 @@
 //!                            [--server-name localhost] --transport quic|tcp
 //!                            --scenario unary|server-stream|client-stream|bidi|
 //!                                       unreliable-server-stream|unreliable-client-stream|
-//!                                       unreliable-paced
+//!                                       paced|unreliable-paced
 //!                            [--size 64] [--concurrency 1] [--duration 5] [--warmup 1]
 //!                            [--messages 100] [--rate 100] [--metadata-size 0]
 //!                            [--payload repeat|records]

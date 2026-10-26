@@ -29,7 +29,7 @@ and the baselines unless the command line names any `--server`, `--client`, or
 against its gRPC server and its Connect client against its Connect server.
 `run.py` starts each server once, then runs every client over every transport
 for every combination of scenario, size, metadata size, and concurrency, and
-runs `unreliable-paced` once per rate in `--rates` (default 1000). It prints a summary
+runs `paced` and `unreliable-paced` once per rate in `--rates` (default 1000). It prints a summary
 table and writes one JSON object per run to `DIR/results.jsonl`; without
 `--out`, `DIR` is a new `trevrpc-bench.*` directory under `$TMPDIR`. A run fails
 when its client exits non-zero or reports errors.
@@ -149,7 +149,7 @@ for the whole run.
 ```text
 <binary> bench --addr <host:port> [--tcp-addr <host:port>] --ca <cert.pem>
                [--server-name localhost] --transport quic|tcp|grpc|connect
-               --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream|unreliable-paced
+               --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream|paced|unreliable-paced
                [--size BYTES] [--concurrency N] [--duration SECONDS]
                [--warmup SECONDS] [--messages N] [--rate N] [--metadata-size BYTES]
                [--payload repeat|records] [--compression MODE] [--dictionary FILE]
@@ -175,7 +175,7 @@ for the whole run.
   `client-stream` response is `messages × size` bytes, so that product must stay
   under the 4 MiB frame limit.
 - `--rate` (default 100) is the number of messages per second each
-  `unreliable-paced` worker sends. Fractions are allowed. A worker sends on a
+  `paced` or `unreliable-paced` worker sends. Fractions are allowed. A worker sends on a
   schedule, message `i` at `i / rate` seconds after it starts, as precisely as
   its runtime's timers allow: tokio's tick every millisecond, so faster rates
   leave in bursts. A worker that falls behind sends the messages it owes at
@@ -191,22 +191,28 @@ for the whole run.
   `CompressedEcho.Bidi` and `CompressedEcho.ClientStream`, which allow stream
   compression, instead of `Echo`.
 
-| Scenario                   | One operation                                                                                                                     | Messages per operation |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| `unary`                    | `Unary {message}`                                                                                                                 | 1                      |
-| `server-stream`            | `ServerStream {message, count: messages}`, reading every response                                                                 | `messages`             |
-| `client-stream`            | `ClientStream` sending `messages` requests, then reading the response (`messages × size` bytes)                                   | `messages`             |
-| `bidi`                     | One round trip on a `Bidi` stream that each worker keeps open: send `{message}`, read its echo                                    | 1                      |
-| `unreliable-server-stream` | `UnreliableEcho.Bidi` sending `{message, count: messages}`, closing the send side, and reading every response until the status    | responses delivered    |
-| `unreliable-client-stream` | `UnreliableEcho.Bidi` sending `messages` requests `{message, count: 0}`, closing the send side, and reading the status            | `interop-received`     |
-| `unreliable-paced`         | One message on an `UnreliableEcho.Bidi` stream that each worker keeps open: send `{message, count: 1}` on schedule, read its echo | 1 if echoed in time    |
+| Scenario                   | One operation                                                                                                                  | Messages per operation |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
+| `unary`                    | `Unary {message}`                                                                                                              | 1                      |
+| `server-stream`            | `ServerStream {message, count: messages}`, reading every response                                                              | `messages`             |
+| `client-stream`            | `ClientStream` sending `messages` requests, then reading the response (`messages × size` bytes)                                | `messages`             |
+| `bidi`                     | One round trip on a `Bidi` stream that each worker keeps open: send `{message}`, read its echo                                 | 1                      |
+| `unreliable-server-stream` | `UnreliableEcho.Bidi` sending `{message, count: messages}`, closing the send side, and reading every response until the status | responses delivered    |
+| `unreliable-client-stream` | `UnreliableEcho.Bidi` sending `messages` requests `{message, count: 0}`, closing the send side, and reading the status         | `interop-received`     |
+| `paced`                    | One message on a `Bidi` stream that each worker keeps open: send `{message, count: 1}` on schedule, read its echo              | 1 if echoed in time    |
+| `unreliable-paced`         | `paced` on `UnreliableEcho.Bidi`                                                                                               | 1 if echoed in time    |
 
 The `unreliable-*` scenarios measure [datagram messages](../wiki/Protocol-and-Wire-Format.md#datagram-messages): over `quic` the streamed messages travel as datagrams and may be lost, while over `tcp` they stay on the QMux stream. The baselines have no equivalent and do not run them.
 
-`unreliable-paced` measures datagrams the way real-time traffic such as game
-state, voice or telemetry uses them: at a fixed rate, where what counts is how
-many arrive and how late, not how many fit through. The other two send as fast
-as they can, so they measure overload.
+The paced scenarios measure traffic the way real-time applications such as game
+state, voice or telemetry send it: at a fixed rate, where what counts is how
+many messages arrive and how late, not how many fit through. `unreliable-paced`
+sends datagrams; `paced` sends the same messages on a reliable stream, so over
+`quic` it shows what a QUIC stream does with them (a loss stalls only its own
+stream) and over `tcp` what a QMux stream does (a loss stalls every stream on
+the connection). The other unreliable scenarios send as fast as they can, so
+they measure overload. The baselines do not run the paced scenarios: over
+HTTP/2 they would show what `tcp` does.
 
 - Each worker opens one stream when it starts and sends `--rate` requests per
   second on it from the start of the warmup until 500 ms after the end of the
@@ -256,18 +262,19 @@ non-zero if it could not connect or measure:
 - `payload` and `compression` echo `--payload` and `--compression`.
 - `msgs` counts application messages: responses for `unary` and
   `server-stream`, requests for `client-stream`, round trips for `bidi`,
-  messages echoed in time for `unreliable-paced`.
+  messages echoed in time for the paced scenarios.
 - `bytes_per_sec` is `msgs_per_sec × size`.
 - `latency_us` holds percentiles of whole-operation latency in microseconds;
-  for `unreliable-paced`, of each delivered message's round trip.
+  for the paced scenarios, of each delivered message's round trip.
 - `wire_bytes_per_msg` is the bytes the client's connection sent and received
   during the measured window (UDP payload for QUIC), divided by `msgs`. It is
   omitted where the transport stack does not expose connection statistics.
 - `errors` counts failed operations. Workers carry on after an error.
-- `lost` counts messages sent but not delivered, for the `unreliable-*`
-  scenarios only (`0` elsewhere). Loss is not an error. For `unreliable-paced`
-  it includes echoes that arrived too late, so even `tcp` can lose messages.
-- `rate` echoes `--rate`, for `unreliable-paced` only.
+- `lost` counts messages sent but not delivered, for the `unreliable-*` and
+  paced scenarios only (`0` elsewhere). Loss is not an error. For the paced
+  scenarios it includes echoes that arrived too late, so even a reliable stream
+  can lose messages.
+- `rate` echoes `--rate`, for the paced scenarios only.
 
 ## Payload
 

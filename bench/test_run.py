@@ -134,6 +134,8 @@ class CompressionTest(unittest.TestCase):
         self.assertTrue(run.runs("none", "quic", "server-stream"))
         self.assertTrue(run.runs("none", "quic", "unreliable-client-stream"))
         self.assertFalse(run.runs("none", "grpc", "unreliable-client-stream"))
+        self.assertTrue(run.runs("none", "tcp", "paced"))
+        self.assertFalse(run.runs("none", "connect", "paced"))
         self.assertTrue(run.runs("zstd", "grpc", "bidi"))
         self.assertFalse(run.runs("zstd", "quic", "bidi"))
         self.assertFalse(run.runs("stream", "connect", "bidi"))
@@ -233,10 +235,11 @@ class TableTest(unittest.TestCase):
             {("rust", "quic"): 12, ("grpc", "grpc"): 9, ("connect", "connect"): 3},
             self.cells("link"),
         )
-        self.assertEqual(20, self.cells("lossy")[("go", "quic")])
+        self.assertEqual(24, self.cells("lossy")[("go", "quic")])
+        self.assertEqual(20, self.cells("lossy")[("go", "tcp")])
         self.assertEqual(16, self.cells("lossy")[("grpc", "grpc")])
         self.assertEqual(
-            {("go", "quic"): 9, ("go", "tcp"): 3, ("rust", "quic"): 9, ("rust", "tcp"): 3},
+            {("go", "quic"): 12, ("go", "tcp"): 3, ("rust", "quic"): 12, ("rust", "tcp"): 3},
             self.cells("datagrams"),
         )
 

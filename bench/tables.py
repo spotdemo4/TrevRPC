@@ -24,7 +24,7 @@ class Cell:
     size: int
     metadata_size: int
     concurrency: int
-    # Messages per second per worker, for the unreliable-paced scenario only.
+    # Messages per second per worker, for the paced scenarios only.
     rate: int | None
     netem: str | None
 
@@ -70,16 +70,23 @@ def link(cell: Cell) -> bool:
 
 def lossy(cell: Cell) -> bool:
     # Real-time traffic is small messages; 1 KiB at a fixed rate would only measure how little a
-    # lossy connection carries.
-    return own_server(cell) and (cell.size == 64) == (cell.scenario == "unreliable-paced")
+    # lossy connection carries. Paced streams run over QUIC only: over QMux, unreliable-paced is
+    # already a stream.
+    paced = cell.scenario.endswith("paced")
+    if cell.scenario == "paced" and cell.transport != "quic":
+        return False
+    return own_server(cell) and (cell.size == 64) == paced
 
 
 def datagrams(cell: Cell) -> bool:
     if not own_server(cell):
         return False
     if cell.scenario == "unreliable-paced":
-        # Datagrams against a stream at the same rates.
+        # Datagrams against a QMux stream at the same rates.
         return cell.concurrency == 64
+    if cell.scenario == "paced":
+        # And against a QUIC stream; over QMux, unreliable-paced is already a stream.
+        return cell.concurrency == 64 and cell.transport == "quic"
     if cell.transport != "quic":
         return False
     return cell.scenario.startswith("unreliable-") or cell.concurrency == 1
@@ -143,7 +150,14 @@ TABLES: dict[str, Table] = {
     "lossy": Table(
         "Lossy links",
         {
-            "scenarios": ["unary", "bidi", "server-stream", "client-stream", "unreliable-paced"],
+            "scenarios": [
+                "unary",
+                "bidi",
+                "server-stream",
+                "client-stream",
+                "paced",
+                "unreliable-paced",
+            ],
             "sizes": [64, 1024],
             "concurrency": [64],
             "messages": 10,
@@ -179,6 +193,7 @@ TABLES: dict[str, Table] = {
             "scenarios": [
                 "unreliable-server-stream",
                 "unreliable-client-stream",
+                "paced",
                 "unreliable-paced",
                 "server-stream",
                 "client-stream",

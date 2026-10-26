@@ -197,6 +197,7 @@ fn bench_reports_every_scenario_over_both_transports() {
             "bidi",
             "unreliable-server-stream",
             "unreliable-client-stream",
+            "paced",
             "unreliable-paced",
         ] {
             let output = server.run(
@@ -258,19 +259,19 @@ fn bench_reports_every_scenario_over_both_transports() {
                 1.0
             };
             let lost = number(json, "lost");
-            if scenario == "unreliable-paced" {
+            if scenario.ends_with("paced") {
                 // Each operation is one delivered message. Two workers at 1000 messages per
                 // second schedule about 400 in the window, each either delivered or lost, and
-                // QMux loses none.
+                // a stream loses none.
                 let msgs = number(json, "msgs");
                 assert_close(msgs, ops, 1e-9, json);
                 assert_close(msgs + lost, 400.0, 100.0, json);
-                if transport == "tcp" {
+                if transport == "tcp" || scenario == "paced" {
                     assert_close(lost, 0.0, 1e-9, json);
                 }
                 assert_close(number(json, "rate"), 1000.0, 1e-9, json);
             } else if json.contains("\"rate\"") {
-                panic!("only unreliable-paced reports a rate: {json}");
+                panic!("only the paced scenarios report a rate: {json}");
             } else if scenario.starts_with("unreliable") && transport == "quic" {
                 // Datagram messages may be lost, but each is either delivered or counted as lost.
                 assert_close(number(json, "msgs") + lost, ops * per_op, 1e-9, json);

@@ -52,12 +52,13 @@ SCENARIOS = (
     "bidi",
     "unreliable-server-stream",
     "unreliable-client-stream",
+    "paced",
     "unreliable-paced",
 )
-# The scenario that sends at a fixed rate per worker, once per rate in --rates.
-PACED_SCENARIO = "unreliable-paced"
+# The scenarios that send at a fixed rate per worker, once per rate in --rates.
+PACED_SCENARIOS = ("paced", "unreliable-paced")
 # The baseline's transports, each served on the port of the same name. They have no datagram
-# messages, so they skip the unreliable-* scenarios.
+# messages, so they skip the unreliable-* scenarios, and no paced client.
 BASELINE_TRANSPORTS = ("grpc", "connect")
 # The TrevRPC transports, as the clients' --transport names them.
 NATIVE_TRANSPORTS = ("quic", "tcp")
@@ -92,7 +93,7 @@ class Matrix:
     duration: float
     warmup: float
     messages: int
-    # The messages per second each unreliable-paced worker sends, one cell per rate.
+    # The messages per second each paced worker sends, one cell per rate.
     rates: tuple[int, ...] = (1000,)
     payload: str = "repeat"
     compressions: tuple[str, ...] = ("none",)
@@ -122,7 +123,7 @@ class Matrix:
             for size in self.sizes
             for metadata in self.metadata_sizes
             for workers in self.concurrency
-            for rate in (self.rates if scenario == PACED_SCENARIO else (None,))
+            for rate in (self.rates if scenario in PACED_SCENARIOS else (None,))
             if self.keep(
                 cell := tables.Cell(
                     client=client,
@@ -152,7 +153,7 @@ class Result:
     size: int
     metadata_size: int
     concurrency: int
-    # Messages per second per worker, for the unreliable-paced scenario.
+    # Messages per second per worker, for the paced scenarios.
     rate: float | None
     errors: float
     msgs: float
@@ -316,7 +317,9 @@ def runs(compression: str, transport: str, scenario: str) -> bool:
     something real with it (see README.md)."""
     if transport not in COMPRESSIONS[compression]:
         return False
-    if transport in BASELINE_TRANSPORTS and scenario.startswith("unreliable-"):
+    if transport in BASELINE_TRANSPORTS and (
+        scenario.startswith("unreliable-") or scenario in PACED_SCENARIOS
+    ):
         return False
     if compression == "none":
         return True
@@ -546,7 +549,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=positive_int_list,
         default=[1000],
         metavar="LIST",
-        help="messages per second each unreliable-paced worker sends, one cell per rate",
+        help="messages per second each paced worker sends, one cell per rate",
     )
     _ = parser.add_argument(
         "--repeat",
