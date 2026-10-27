@@ -274,3 +274,22 @@ func TestHandlersCannotChangeTheConnectionMetadataOfLaterCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestALateConfirmationOfAReplacedSetIsIgnored(t *testing.T) {
+	source, err := newConnectionMetadataSource(Metadata{"k": []byte("1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := newClientConnectionMetadata(source)
+	first := client.prepare(newWireRequest("/svc/m"))
+	if err := source.set(Metadata{"k": []byte("2")}); err != nil {
+		t.Fatal(err)
+	}
+	second := client.prepare(newWireRequest("/svc/m"))
+	client.learn(second, headersAnswer{connectionMetadata: second})
+	// The first call's HEADERS arrive last.
+	client.learn(first, headersAnswer{connectionMetadata: first})
+	if got := client.confirmed.Load(); got != second {
+		t.Fatalf("confirmed set = %d after a late confirmation of %d, want %d", got, first, second)
+	}
+}

@@ -471,7 +471,8 @@ internal class Http3Exchange(
         if (stream !== this.stream) return
         try {
             if (!completed.get() && !remoteTerminalSeen.get()) {
-                fail(transportException("Cronet stream failed", error))
+                // Cronet's message names the network error, such as net::ERR_CONNECTION_RESET.
+                fail(transportException("Cronet stream failed: ${error.message}", error))
             }
         } finally {
             nativeTerminated()

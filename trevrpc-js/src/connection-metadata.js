@@ -54,7 +54,8 @@ export class ConnectionMetadataSource {
     for (const key of keys) {
       normalized[key] = normalized[key].slice();
     }
-    this.#ids += 1;
+    // IDs are uint32 on the wire and 0 means none: they run from 1 to 2^32 - 1 and wrap.
+    this.#ids = (this.#ids % 0xffffffff) + 1;
     this.#current = { id: this.#ids, metadata: normalized };
   }
 
@@ -100,7 +101,13 @@ class SessionConnectionMetadata {
 
   /** Records that the server stored the `offered` set, once the call's HEADERS confirm it. */
   learn(offered, headers) {
-    if (offered !== 0 && headers.connectionMetadata === offered) {
+    // Only the current set counts: a late confirmation of one since replaced would make calls
+    // offer the current one again.
+    if (
+      offered !== 0 &&
+      headers.connectionMetadata === offered &&
+      this.#source.current?.id === offered
+    ) {
       this.#confirmed = offered;
     }
   }

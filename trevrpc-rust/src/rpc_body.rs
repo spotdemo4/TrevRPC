@@ -133,13 +133,14 @@ impl<S: BodySource> RequestPumpReader for BodyReader<S> {
     }
 }
 
-/// Reads the initial request frame, resolves its connection metadata and opens its datagram flow
-/// in `session`, replying with the failure status when any of them fails. The stream slot is
-/// released before that reply.
+/// Reads the initial request frame, resolves its connection metadata against
+/// `connection_metadata` and opens its datagram flow on `demux`, replying with the failure status
+/// when any of them fails. The stream slot is released before that reply.
 async fn read_request<K, S>(
     server: &Server,
     stream_permit: &mut Permit,
-    session: Option<&WebTransportSessionState>,
+    connection_metadata: Option<&ConnectionMetadataStore>,
+    demux: Option<&Demux>,
     sink: K,
     source: S,
 ) -> Option<(BodyWriter<K>, BodyReader<S>, IncomingRequest)>
@@ -159,14 +160,8 @@ where
     let incoming = server_transport::read_initial_request(server, &mut reader)
         .await
         .and_then(|mut incoming| {
-            resolve_connection_metadata(
-                session.map(|session| &session.connection_metadata),
-                &mut incoming,
-            )?;
-            open_flow(
-                session.and_then(|session| session.demux.as_deref()),
-                &mut incoming,
-            )?;
+            resolve_connection_metadata(connection_metadata, &mut incoming)?;
+            open_flow(demux, &mut incoming)?;
             Ok(incoming)
         });
     match incoming {
@@ -200,7 +195,10 @@ pub async fn handle_rpc_stream<K, S>(
         let Some((writer, reader, incoming)) = read_request(
             &server,
             &mut stream_permit,
-            session.as_deref(),
+            session.as_ref().map(|session| &session.connection_metadata),
+            session
+                .as_ref()
+                .and_then(|session| session.demux.as_deref()),
             sink,
             source,
         )
@@ -231,10 +229,12 @@ pub async fn reject_rpc_stream<K, S>(
     K: BodySink,
     S: BodySource,
 {
+    // A rejected stream opens no datagram flow, as on native connections: it is answered at once.
     if let Some((writer, reader, incoming)) = read_request(
         &server,
         &mut Permit::none(),
-        session.as_deref(),
+        session.as_ref().map(|session| &session.connection_metadata),
+        None,
         sink,
         source,
     )

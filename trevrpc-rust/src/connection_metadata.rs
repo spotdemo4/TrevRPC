@@ -52,7 +52,11 @@ impl ConnectionMetadataSource {
                 .map(|(key, value)| (normalize_metadata_key(&key), value))
                 .collect();
             validate_metadata(&metadata)?;
-            let id = self.ids.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let mut id = self.ids.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            if id == 0 {
+                // IDs wrap after 2^32 sets, past 0, which means none.
+                id = self.ids.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            }
             Some(Arc::new(Set { id, metadata }))
         };
         *self.current.write_unpoisoned() = set;

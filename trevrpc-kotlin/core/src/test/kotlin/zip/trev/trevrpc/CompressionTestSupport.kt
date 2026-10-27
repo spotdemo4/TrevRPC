@@ -97,6 +97,10 @@ internal class MultiStreamTransport(
         var closed = false
             private set
 
+        /** Set to make every send fail with it, as a write to a stream the server stopped reading does. */
+        @Volatile
+        var sendFailure: Throwable? = null
+
         val sent: List<Pair<Long, ByteArray>>
             get() = sentFrames.toList()
 
@@ -112,6 +116,7 @@ internal class MultiStreamTransport(
             frameType: Long,
         ) {
             if (closed) throw TrevRpcException(Status.cancelled("stream is closed"))
+            sendFailure?.let { throw it }
             sentFrames += frameType to body.copyOf()
         }
 

@@ -24,6 +24,12 @@ class ConnectionMetadataSource(
     /** Replaces the connection metadata; calls opened afterwards offer the new set. */
     @Synchronized
     fun set(metadata: Metadata) {
-        current.set(if (metadata.isEmpty) null else ConnectionMetadata(++lastId, metadata))
+        if (metadata.isEmpty) {
+            current.set(null)
+            return
+        }
+        // IDs wrap after 2^32 sets, past 0, which means none.
+        if (++lastId == 0u) ++lastId
+        current.set(ConnectionMetadata(lastId, metadata))
     }
 }

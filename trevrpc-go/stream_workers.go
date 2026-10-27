@@ -82,17 +82,25 @@ func (p *streamWorkers) run(task func()) {
 }
 
 func (p *streamWorkers) work(task func()) {
+	// A task that ends its goroutine (runtime.Goexit, as t.FailNow does) must
+	// still leave the pool, or its count, and the idle timer, never settle.
+	left := false
+	defer func() {
+		if !left {
+			p.mu.Lock()
+			p.workers--
+			p.mu.Unlock()
+		}
+	}()
 	worker := &streamWorker{tasks: make(chan func(), 1)}
 	for task != nil {
 		task()
 		if !p.park(worker) {
+			left = true
 			return
 		}
 		task = <-worker.tasks
 	}
-	p.mu.Lock()
-	p.workers--
-	p.mu.Unlock()
 }
 
 // park makes worker idle, or reports false when the pool stopped, in which

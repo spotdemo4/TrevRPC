@@ -283,8 +283,15 @@ class Emulator:
         self.wait_for_boot(previous)
 
     def root(self) -> None:
-        _ = adb("root")
-        self.wait_until(lambda: adb_probe("shell", "id", "-u") == "0", "restart adbd as root", 60)
+        # Right after a boot adbd may not take the request yet, and `adb root` then fails (CI saw
+        # it exit 1), so it is retried until adbd runs as root.
+        def rooted() -> bool:
+            if adb_probe("shell", "id", "-u") == "0":
+                return True
+            _ = adb_probe("root")
+            return False
+
+        self.wait_until(rooted, "restart adbd as root", 60)
 
     def install_ca(self, ca: Path, work_dir: Path) -> None:
         """Adds the CA to the system trust store, which Cronet's verifier consults.

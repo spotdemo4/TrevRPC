@@ -18,6 +18,9 @@ type callState struct {
 	streams *serverStreams
 	// request is the request the state describes.
 	request *wireRequest
+	// cancel cancels the context requestLifetimeContext attached the state
+	// to, nil for one that requestContext built.
+	cancel context.CancelFunc
 }
 
 // HandlerContext describes the request being handled. Handlers receive it
@@ -95,11 +98,15 @@ func contextWithHandlerContext(ctx context.Context, request *wireRequest) contex
 	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression, streams: request.streams, request: request})
 }
 
-// carriesCall reports whether ctx already carries the handler context of
-// request, which requestLifetimeContext attaches with its deadline.
-func carriesCall(ctx context.Context, request *wireRequest) bool {
+// carriedCall returns the cancel func of ctx when it already carries the
+// handler context of request, which requestLifetimeContext attaches with its
+// deadline.
+func carriedCall(ctx context.Context, request *wireRequest) (context.CancelFunc, bool) {
 	state, ok := ctx.Value(handlerContextKey{}).(*callState)
-	return ok && state.request == request
+	if !ok || state.request != request || state.cancel == nil {
+		return nil, false
+	}
+	return state.cancel, true
 }
 
 // setCallStreams records the call's stream compression, negotiated once the

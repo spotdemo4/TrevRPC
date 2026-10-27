@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -78,5 +79,11 @@ func TestStreamWorkersExitWhenTheListenerStops(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
+	waitForWorkers(t, p, 0)
+}
+
+func TestStreamWorkersCountATaskThatEndsItsGoroutine(t *testing.T) {
+	p := newStreamWorkers(t.Context(), time.Hour)
+	p.run(runtime.Goexit)
 	waitForWorkers(t, p, 0)
 }

@@ -286,3 +286,18 @@ test("the echo server stores offered sets per session, newest four, and rejects 
   assert.equal(await statusOf(transport, reference(1)), Code.InvalidArgument);
   assert.equal(await statusOf(transport, reference(2)), Code.Ok);
 });
+
+test("a late confirmation of a replaced set does not undo the current one's", async () => {
+  const { ConnectionMetadataSource } = await import("../src/connection-metadata.js");
+  const source = new ConnectionMetadataSource({ k: "1" });
+  const session = source.session({});
+  const first = session.prepare().offered;
+  source.set({ k: "2" });
+  const second = session.prepare().offered;
+  session.learn(second, { connectionMetadata: second });
+  // The first call's HEADERS arrive last.
+  session.learn(first, { connectionMetadata: first });
+  const { field, offered } = session.prepare();
+  assert.equal(offered, 0, "the current set is still confirmed");
+  assert.deepEqual(field, { id: second });
+});

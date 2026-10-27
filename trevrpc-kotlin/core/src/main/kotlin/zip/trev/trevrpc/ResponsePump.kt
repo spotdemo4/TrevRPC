@@ -166,6 +166,13 @@ internal class CallStream(
     /** Whether the first response frame has yet to arrive on an optimistic call. */
     private var awaitingFirstFrame = replay != null
 
+    /**
+     * Completes once an optimistic call has handled its first response frame, switching to the
+     * replayed stream if it was a refusal, or once the call closes. A write that fails before then
+     * may have failed because the server refused the call, so it waits for this to tell.
+     */
+    private val firstFrameHandled = CompletableDeferred<Unit>()
+
     private val headersReported = AtomicBoolean(false)
 
     /**
@@ -233,7 +240,12 @@ internal class CallStream(
         }
     }
 
-    /** Runs [operation] on [target]; a failure after the call switched streams was resent. */
+    /**
+     * Runs [operation] on [target]; a failure after the call switched streams was resent. A refused
+     * server stops reading, so a write can fail on the refused stream before the response pump has
+     * read the refusal: an optimistic call's failed write waits for its first frame to be handled
+     * before deciding, or the caller would see the refusal instead of the replayed call.
+     */
     private suspend fun onTarget(
         target: Target,
         operation: suspend () -> Unit,
@@ -242,6 +254,9 @@ internal class CallStream(
             operation()
         } catch (error: Throwable) {
             if (error is CancellationException && !currentCoroutineContext().isActive) throw error
+            if (replay != null && target.generation == generation && !closed.get()) {
+                withTimeoutOrNull(EXPLANATION_TIMEOUT) { firstFrameHandled.await() }
+            }
             if (target.generation == generation || closed.get()) throw error
         }
     }
@@ -265,15 +280,24 @@ internal class CallStream(
      * decompressed. A refusal of an optimistic call is replaced by the replayed call's frames.
      */
     suspend fun receive(): ResponseFrame? {
-        val frame = stream.receive()
+        val frame =
+            try {
+                stream.receive()
+            } catch (error: Throwable) {
+                firstFrameHandled.complete(Unit)
+                throw error
+            }
         val replay = replay
         if (replay != null && awaitingFirstFrame) {
             awaitingFirstFrame = false
-            if (frame is ResponseFrame.Status && frame.refusedStreamCompression) {
-                replay(replay)
-                return receive()
+            val refused = frame is ResponseFrame.Status && frame.refusedStreamCompression
+            try {
+                if (refused) replay(replay) else replay.copies.settle()
+            } finally {
+                // Before the replayed stream is read, which may wait for its response.
+                firstFrameHandled.complete(Unit)
             }
-            replay.copies.settle()
+            if (refused) return receive()
         }
         return when (frame) {
             is ResponseFrame.Headers -> {
@@ -371,6 +395,7 @@ internal class CallStream(
     /** Closes the transport stream once, releasing the pump, failing blocked sends, and freeing compression contexts. */
     suspend fun close(cause: Throwable? = null) {
         end.closed()
+        firstFrameHandled.complete(Unit)
         if (!closed.compareAndSet(false, true)) return
         try {
             pump?.cancel()

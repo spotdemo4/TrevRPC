@@ -57,7 +57,12 @@ func (s *connectionMetadataSource) set(metadata Metadata) error {
 	if err := validateMetadata(normalized); err != nil {
 		return err
 	}
-	s.current.Store(&connectionMetadataSet{id: s.ids.Add(1), metadata: normalized})
+	id := s.ids.Add(1)
+	if id == 0 {
+		// IDs wrap after 2^32 sets, past 0, which means none.
+		id = s.ids.Add(1)
+	}
+	s.current.Store(&connectionMetadataSet{id: id, metadata: normalized})
 	return nil
 }
 
@@ -97,9 +102,13 @@ func (c *clientConnectionMetadata) prepare(request *wireRequest) uint32 {
 }
 
 // learn records that the server stored the offered set, once its HEADERS
-// confirm it.
+// confirm it. Only the current set counts: a late confirmation of one the
+// channel has since replaced would make calls offer the current one again.
 func (c *clientConnectionMetadata) learn(offered uint32, answer headersAnswer) {
-	if c != nil && offered != 0 && answer.connectionMetadata == offered {
+	if c == nil || offered == 0 || answer.connectionMetadata != offered {
+		return
+	}
+	if current := c.source.current.Load(); current != nil && current.id == offered {
 		c.confirmed.Store(offered)
 	}
 }

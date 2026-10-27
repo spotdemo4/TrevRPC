@@ -135,6 +135,36 @@ class OptimisticStreamCompressionTest {
         }
 
     @Test
+    fun `a write that fails before the refusal is read is resent on the replay`() =
+        runBlocking<Unit> {
+            val transport = MultiStreamTransport(Compression(emptyList()), StreamCompressionBudget())
+            val call = Client(transport).openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS)
+            val refused = transport.opened.receive()
+            messages.take(2).forEach { call.send(it) }
+            // The server refused and stopped reading: the next write fails with its status before
+            // the response pump has read the refusal.
+            val refusal = Status.resourceExhausted("stream-compressed requests refused")
+            refused.sendFailure = TrevRpcException(refusal)
+            val respond =
+                async {
+                    delay(100.milliseconds)
+                    refused.respond(ResponseFrame.Status(refusal, refusedStreamCompression = true))
+                }
+            withTimeout(5.seconds) { call.send(messages[2]) }
+            respond.await()
+
+            val replayed = withTimeout(5.seconds) { transport.opened.receive() }
+            call.closeSend()
+            eventually { replayed.finished }
+            // Every message reaches the replayed stream once, the one whose write failed included.
+            messages.take(3).zip(replayed.sent).forEach { (message, frame) -> assertArrayEquals(message, frame.second) }
+            assertEquals(3, replayed.sent.size)
+            replayed.respond(ResponseFrame.Message(messages[0]), ResponseFrame.Status(Status.ok()))
+            assertArrayEquals(messages[0], call.receive())
+            call.close()
+        }
+
+    @Test
     fun `calls stop being optimistic after a refusal until a call is answered`() =
         runBlocking {
             val budget = StreamCompressionBudget()

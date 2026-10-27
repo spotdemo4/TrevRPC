@@ -1290,10 +1290,13 @@ func validateRequest(request *wireRequest) error {
 
 func (r *serverRuntime) prepareRequest(ctx context.Context, request *wireRequest, lease *requestExecutionLease) (context.Context, context.CancelFunc, error) {
 	// A request served from a stream was validated, and ctx already carries
-	// its deadline and handler context, which the stream cancels when the
-	// call ends. Building them again cost each call a context and a timer.
-	cancel := func() {}
-	if !carriesCall(ctx, request) {
+	// its deadline and handler context: building them again cost each call a
+	// context and a timer. Its cancel func is the one returned, so the
+	// handler's context still ends when the handler is done with it, as it
+	// would with a context of its own; a streaming response's Close may wait
+	// for that.
+	cancel, carried := carriedCall(ctx, request)
+	if !carried {
 		if err := validateRequest(request); err != nil {
 			return ctx, func() {}, err
 		}
@@ -1304,7 +1307,12 @@ func (r *serverRuntime) prepareRequest(ctx context.Context, request *wireRequest
 		}
 	}
 	if r.authorizer != nil {
-		if err := invokeAuthorizer(ctx, r.authorizer, newHandlerContext(request), handlerNeedsDeadlineRace(ctx), lease); err != nil {
+		// The authorizer gets a map of its own: the handler's is the request's,
+		// and an authorizer that changes it, or one that outlives its deadline,
+		// must not touch what the handler reads.
+		info := newHandlerContext(request)
+		info.Metadata = maps.Clone(info.Metadata)
+		if err := invokeAuthorizer(ctx, r.authorizer, info, handlerNeedsDeadlineRace(ctx), lease); err != nil {
 			cancel()
 			return ctx, func() {}, err
 		}
@@ -1362,7 +1370,9 @@ func requestLifetimeContext(ctx context.Context, request *wireRequest) (context.
 	} else {
 		ctx, cancel = context.WithCancel(ctx)
 	}
-	return contextWithHandlerContext(ctx, request), cancel
+	ctx = contextWithHandlerContext(ctx, request)
+	ctx.Value(handlerContextKey{}).(*callState).cancel = cancel
+	return ctx, cancel
 }
 
 func requestContext(ctx context.Context, request *wireRequest) (context.Context, context.CancelFunc, error) {
