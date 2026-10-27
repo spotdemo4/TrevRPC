@@ -341,7 +341,7 @@
           };
           kotlin-interop-android = self.packages.${system}.trevrpc-kotlin.interopAndroid;
 
-          golangci-lint = {
+          trevrpc-go-lint = {
             src = self.packages.${system}.trevrpc-go;
             packages = with pkgs; [ golangci-lint ];
             script = ''
@@ -349,7 +349,54 @@
             '';
           };
 
-          buf = {
+          trevrpc-bench-baseline-lint = {
+            src = self.packages.${system}.trevrpc-bench-baseline;
+            packages = with pkgs; [ golangci-lint ];
+            script = ''
+              golangci-lint run ./...
+            '';
+          };
+
+          trevrpc-rust-lint = {
+            src = self.packages.${system}.trevrpc-rust;
+            packages = with pkgs; [
+              rustfmt
+              clippy
+            ];
+            script = ''
+              cargo fmt --all --check
+              cargo clippy --workspace --all-targets --offline -- -D warnings
+            '';
+          };
+
+          trevrpc-js-lint = {
+            src = self.packages.${system}.trevrpc-js;
+            packages = with pkgs; [
+              oxfmt
+              oxlint
+            ];
+            script = ''
+              oxfmt --check
+              # oxlint's type-aware rules and tsc read the generated interop clients.
+              npm run build
+              oxlint --deny-warnings
+              npm exec -- tsc -p tsconfig.json
+            '';
+          };
+
+          # ktlint needs none of the dependencies, so it reads the sources instead of the package.
+          trevrpc-kotlin-lint = {
+            root = ./trevrpc-kotlin;
+            filter = file: file.hasExt "kt" || file.hasExt "kts";
+            packages = with pkgs; [
+              ktlint
+            ];
+            script = ''
+              ktlint --relative "**/src/**/*.kt" "**/*.gradle.kts"
+            '';
+          };
+
+          protobuf-lint = {
             root = ./proto;
             filter = file: file.hasExt "proto" || file.hasExt "yaml" || file.hasExt "md";
             packages = with pkgs; [
@@ -360,42 +407,6 @@
               buf lint
               buf format --diff --exit-code
               buf build -o /dev/null
-            '';
-          };
-
-          rustfmt = {
-            root = ./trevrpc-rust;
-            filter = file: file.hasExt "rs" || file.name == "Cargo.toml";
-            include = [ ./trevrpc-rust/Cargo.lock ];
-            packages = with pkgs; [
-              cargo
-              rustfmt
-            ];
-            script = ''
-              cargo fmt --all --check
-            '';
-          };
-
-          oxfmt = {
-            root = ./trevrpc-js;
-            filter = file: file.hasExt "js" || file.hasExt "ts" || file.hasExt "html";
-            include = [ ./trevrpc-js/.oxfmtrc.json ];
-            packages = with pkgs; [
-              oxfmt
-            ];
-            script = ''
-              oxfmt --check
-            '';
-          };
-
-          ktlint = {
-            root = ./trevrpc-kotlin;
-            filter = file: file.hasExt "kt" || file.hasExt "kts";
-            packages = with pkgs; [
-              ktlint
-            ];
-            script = ''
-              ktlint --relative "**/src/**/*.kt" "**/*.gradle.kts"
             '';
           };
 
@@ -410,7 +421,7 @@
             '';
           };
 
-          shell = {
+          shell-lint = {
             root = ./.;
             filter = file: file.hasExt "sh";
             packages = with pkgs; [
@@ -421,7 +432,7 @@
             '';
           };
 
-          python = {
+          python-lint = {
             root = ./.;
             filter = file: file.hasExt "py";
             include = [ ./pyproject.toml ];

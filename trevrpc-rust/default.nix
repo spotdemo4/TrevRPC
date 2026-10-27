@@ -36,19 +36,30 @@ mkRustPackage (final: {
   doCheck = canExecute;
   # The tests and benchmarks bind loopback UDP sockets and run the interop executable against itself.
   __darwinAllowLocalNetworking = true;
-  nativeCheckInputs = [
-    # The generator tests format its output to compare against the checked-in bindings.
-    rustfmt
-    clippy
-  ];
+  # The generator tests format its output to compare against the checked-in bindings.
+  nativeCheckInputs = [ rustfmt ];
   checkPhase = ''
     runHook preCheck
     cargo test --workspace --offline
     # Run every benchmark once so they keep compiling and working; the numbers are not checked.
     cargo bench --offline --bench frames --bench loopback -- --test
-    cargo clippy --workspace --all-targets --offline -- -D warnings
     runHook postCheck
   '';
+
+  # The dependencies are also checked for Clippy, whose lints run in the trevrpc-rust-lint check.
+  cargoArtifactsArgs = {
+    nativeCheckInputs = [
+      rustfmt
+      clippy
+    ];
+    checkPhase = ''
+      runHook preCheck
+      cargo test --workspace --offline
+      cargo bench --offline --bench frames --bench loopback -- --test
+      cargo clippy --workspace --all-targets --offline
+      runHook postCheck
+    '';
+  };
 
   installPhase = ''
     runHook preInstall

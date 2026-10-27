@@ -6,7 +6,6 @@
   importNpmLock,
   nodejs_26,
   makeWrapper,
-  oxlint,
   protobuf,
   gnugrep,
   playwright-driver,
@@ -83,13 +82,8 @@ buildNpmPackage (final: {
   '';
 
   doCheck = true;
-  nativeCheckInputs = [
-    oxlint
-  ];
   checkPhase = ''
     runHook preCheck
-    oxlint --deny-warnings
-    npm run typecheck
     npm test
     runHook postCheck
   '';
