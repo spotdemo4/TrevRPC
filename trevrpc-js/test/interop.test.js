@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -236,4 +236,37 @@ test("the CLI fails every scenario cleanly when safaridriver cannot start", () =
       (name) => `fail ${name}: cannot start safaridriver: spawn /nonexistent/safaridriver ENOENT`,
     ),
   );
+});
+
+test("a safaridriver that exits early is started once more, and its output kept off stdout", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "trevrpc-safaridriver-"));
+  try {
+    // Counts its launches, says why it gives up on stdout, and exits as a failing driver does.
+    const driver = join(dir, "safaridriver");
+    await writeFile(
+      driver,
+      `#!${process.execPath}
+const { appendFileSync } = require("node:fs");
+appendFileSync(${JSON.stringify(join(dir, "launches"))}, "x");
+console.log("driver gave up");
+process.exit(1);
+`,
+      { mode: 0o755 },
+    );
+    const result = spawnSync(
+      process.execPath,
+      [cli, "--browser", "safari", "--url", url, "--cert-hash", "ab".repeat(32)],
+      { encoding: "utf8", env: { ...process.env, TREVRPC_BROWSER_SAFARI: driver } },
+    );
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(await readFile(join(dir, "launches"), "utf8"), "xx");
+    assert.equal(result.stderr.match(/driver gave up/g)?.length, 2, result.stderr);
+    assert.match(result.stderr, /safaridriver exited \(1\); starting it again/);
+    assert.deepEqual(
+      result.stdout.trim().split("\n"),
+      ScenarioNames.map((name) => `fail ${name}: safaridriver exited (1)`),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

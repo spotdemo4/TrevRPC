@@ -11,19 +11,44 @@ import { setTimeout as sleep } from "node:timers/promises";
 const DefaultDriver = "/usr/bin/safaridriver";
 const RequestTimeoutMs = 30_000;
 const PollIntervalMs = 100;
+const LaunchAttempts = 2;
 
 /**
  * Starts safaridriver (TREVRPC_BROWSER_SAFARI, or the system one) and opens url in a new Safari
  * automation session. Resolves with a handle whose close() ends the session and the driver.
+ *
+ * A driver that exits before it has a session is started once more: on CI runners safaridriver
+ * occasionally exits right after a previous one closed, and one more launch costs far less than a
+ * failed run.
  */
-export async function openSafari(url, { launchTimeoutMs, closeTimeoutMs }) {
+export async function openSafari(url, options) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await openSafariOnce(url, options);
+    } catch (error) {
+      if (!(error instanceof DriverExited) || attempt >= LaunchAttempts) {
+        throw error;
+      }
+      console.error(`${error.message}; starting it again`);
+    }
+  }
+}
+
+/** safaridriver exited before it had a session. */
+class DriverExited extends Error {}
+
+async function openSafariOnce(url, { launchTimeoutMs, closeTimeoutMs }) {
   const port = await freePort();
+  // The driver may say why it fails on either stream; both go to stderr, which keeps this process's
+  // stdout for its own results.
   const driver = spawn(process.env.TREVRPC_BROWSER_SAFARI || DefaultDriver, ["--port", port], {
-    stdio: ["ignore", "ignore", "inherit"],
+    stdio: ["ignore", 2, 2],
   });
+  let sessionId;
   const exited = once(driver, "exit").then(
     ([code, signal]) => {
-      throw new Error(`safaridriver exited (${signal ?? code})`);
+      const message = `safaridriver exited (${signal ?? code})`;
+      throw sessionId === undefined ? new DriverExited(message) : new Error(message);
     },
     (error) => {
       throw new Error(`cannot start safaridriver: ${error.message}`);
@@ -33,7 +58,6 @@ export async function openSafari(url, { launchTimeoutMs, closeTimeoutMs }) {
   exited.catch(() => {});
   const base = `http://127.0.0.1:${port}`;
 
-  let sessionId;
   const close = async () => {
     if (sessionId !== undefined) {
       await webDriver(base, "DELETE", `/session/${sessionId}`, undefined, closeTimeoutMs).catch(
