@@ -77,47 +77,42 @@ func (s *countingRequests) Close() error { return s.inner.Close() }
 
 func TestStreamCompressionNegotiationGoldenVectors(t *testing.T) {
 	vectors := loadZstdVectors(t)
-	request := &wireRequest{Method: "/svc/m", StreamCompression: streamOffer()}
-	frame, err := appendRequestFrame(nil, request, DefaultMaxFrameSize)
-	if err != nil || !bytes.Equal(frame, vectors["request.stream_compression.frame"]) {
-		t.Fatalf("REQUEST frame = %x, %v; want %x", frame, err, vectors["request.stream_compression.frame"])
+	for _, test := range []struct {
+		name string
+		mode streamCompressionMode
+	}{
+		{"request.stream_compression", streamCompressionEnabled},
+		{"request.optimistic_stream_compression", streamCompressionOptimistic},
+	} {
+		request := &wireRequest{Method: "/svc/m", StreamCompression: test.mode}
+		frame, err := appendRequestFrame(nil, request, DefaultMaxFrameSize)
+		if err != nil || !bytes.Equal(frame, vectors[test.name+".frame"]) {
+			t.Fatalf("%s REQUEST frame = %x, %v; want %x", test.name, frame, err, vectors[test.name+".frame"])
+		}
+		var decoded wireRequest
+		if err := decodeRequest(vectors[test.name+".payload"], &decoded); err != nil || decoded.StreamCompression != test.mode {
+			t.Fatalf("decoded %s %+v, %v", test.name, decoded, err)
+		}
+		var reflected wireRequest
+		if err := decodePayload(vectors[test.name+".payload"], &reflected); err != nil || reflected.StreamCompression != test.mode {
+			t.Fatalf("reflected %s %+v, %v", test.name, reflected, err)
+		}
 	}
-	var decoded wireRequest
-	if err := decodeRequest(vectors["request.stream_compression.payload"], &decoded); err != nil || decoded.StreamCompression.GetMaxWindowLog() != zstd.StreamWindowLog {
-		t.Fatalf("decoded request %+v, %v", decoded, err)
+	frame, err := appendAnswerFrame(nil, &wireAnswer{StreamCompression: true}, DefaultMaxFrameSize)
+	if err != nil || !bytes.Equal(frame, vectors["answer.stream_compression.frame"]) {
+		t.Fatalf("ANSWER frame = %x, %v; want %x", frame, err, vectors["answer.stream_compression.frame"])
 	}
-	frame, err = appendHeadersFrame(nil, nil, headersAnswer{stream: streamOffer()}, DefaultMaxFrameSize)
-	if err != nil || !bytes.Equal(frame, vectors["headers.stream_compression.frame"]) {
-		t.Fatalf("HEADERS frame = %x, %v; want %x", frame, err, vectors["headers.stream_compression.frame"])
-	}
-	if _, answer, err := decodeHeaders(vectors["headers.stream_compression.payload"]); err != nil || answer.stream.GetMaxWindowLog() != zstd.StreamWindowLog {
+	if answer, err := decodeAnswer(vectors["answer.stream_compression.payload"]); err != nil || !answer.StreamCompression {
 		t.Fatalf("decoded answer %+v, %v", answer, err)
 	}
 }
 
-// GetMaxWindowLog returns the window, or zero for a nil info.
-func (m *streamCompressionInfo) GetMaxWindowLog() uint32 {
-	if m == nil {
-		return 0
-	}
-	return m.MaxWindowLog
-}
-
-func TestSenderWindowLog(t *testing.T) {
-	for _, test := range []struct {
-		info *streamCompressionInfo
-		want int
-	}{
-		{nil, 0},
-		{&streamCompressionInfo{}, 0},
-		{&streamCompressionInfo{MaxWindowLog: 9}, 0},
-		{&streamCompressionInfo{MaxWindowLog: 10}, 10},
-		{&streamCompressionInfo{MaxWindowLog: 16}, 16},
-		{&streamCompressionInfo{MaxWindowLog: 31}, 16},
-	} {
-		if got := senderWindowLog(test.info); got != test.want {
-			t.Errorf("senderWindowLog(%+v) = %d, want %d", test.info, got, test.want)
-		}
+// TestUnknownStreamCompressionIsInvalid checks that a stream_compression value
+// beyond the defined ones fails the request.
+func TestUnknownStreamCompressionIsInvalid(t *testing.T) {
+	request := &wireRequest{Method: "/svc/m", StreamCompression: 3}
+	if err := request.validateProtocol(); StatusFromError(err).Code != CodeInvalidArgument {
+		t.Fatalf("validateProtocol = %v, want InvalidArgument", err)
 	}
 }
 
@@ -255,7 +250,7 @@ func exerciseStreamCalls(t *testing.T, transport Transport) {
 		if err := chat.Send(compressionSample(i)); err != nil {
 			t.Fatal(err)
 		}
-		// Waiting for the echo makes the answer in HEADERS arrive before the
+		// Waiting for the echo makes the ANSWER arrive before the
 		// third request.
 		got, err := chat.Recv()
 		if err != nil || got.GetValue() != compressionSample(i).GetValue() {
@@ -332,7 +327,7 @@ func checkStreamFrames(t *testing.T, mu *sync.Mutex, log *[]*recordedStream) {
 	if want := "[" + streamedFrames("REQUEST") + "]"; fmt.Sprint(sent) != want {
 		t.Fatalf("chat sent %v, want %s", sent, want)
 	}
-	if want := "[" + streamedFrames("HEADERS") + " STATUS]"; fmt.Sprint(received) != want {
+	if want := "[" + streamedFrames("ANSWER") + " STATUS]"; fmt.Sprint(received) != want {
 		t.Fatalf("chat received %v, want %s", received, want)
 	}
 	sent, received = (*log)[1].frames(t)
@@ -340,7 +335,7 @@ func checkStreamFrames(t *testing.T, mu *sync.Mutex, log *[]*recordedStream) {
 		t.Fatalf("feed sent %v", sent)
 	}
 	// A server-streaming call has no request stream to answer for, so it
-	// sends no HEADERS.
+	// sends no ANSWER.
 	if want := "[" + strings.TrimPrefix(streamedFrames(""), " ") + " STATUS]"; fmt.Sprint(received) != want {
 		t.Fatalf("feed received %v, want %s", received, want)
 	}
@@ -348,7 +343,7 @@ func checkStreamFrames(t *testing.T, mu *sync.Mutex, log *[]*recordedStream) {
 	if want := "[" + streamedFrames("REQUEST") + "]"; fmt.Sprint(sent) != want {
 		t.Fatalf("upload sent %v, want %s", sent, want)
 	}
-	if fmt.Sprint(received) != "[HEADERS MESSAGE STATUS]" {
+	if fmt.Sprint(received) != "[ANSWER MESSAGE STATUS]" {
 		t.Fatalf("upload received %v", received)
 	}
 }
@@ -434,7 +429,7 @@ func TestStreamCompressionStartsFromDictionaries(t *testing.T) {
 	}
 	client := generation.(*streamGeneration).client
 	mu, log := streamClientFor(client, client.streams)
-	// A first call learns the shared set from its HEADERS, so the chat's
+	// A first call learns the shared set from its ANSWER, so the chat's
 	// requests use it.
 	feed, err := ServerStreaming(t.Context(), channel, testPath("StreamFeed"), compressionSample(0), newStringValue)
 	if err != nil {
@@ -552,23 +547,21 @@ func TestNegotiateStreamsFollowsTheRoute(t *testing.T) {
 		RouteStreamCompression(StreamCompression{Requests: true, Responses: true}), RouteUnreliable(Unreliable{Requests: true, Responses: true}))
 	RegisterBidirectionalStreaming(server, testPath("Plain"), newStringValue, echo)
 	runtime := server.freeze()
-	optimistic := &streamCompressionInfo{MaxWindowLog: zstd.StreamWindowLog, Optimistic: true}
+	enabled, optimistic := streamCompressionEnabled, streamCompressionOptimistic
 	for _, test := range []struct {
 		method                       string
-		offer                        *streamCompressionInfo
+		offer                        streamCompressionMode
 		answers, compresses, refuses bool
 	}{
-		{"Both", streamOffer(), true, true, false},
-		{"Both", nil, false, false, false},
-		{"Both", &streamCompressionInfo{MaxWindowLog: 9}, true, false, false},
-		{"Requests", streamOffer(), true, false, false},
-		{"Unreliable", streamOffer(), false, false, false},
-		{"Plain", streamOffer(), false, false, false},
-		{"Missing", streamOffer(), false, false, false},
+		{"Both", enabled, true, true, false},
+		{"Both", streamCompressionNone, false, false, false},
+		{"Requests", enabled, true, false, false},
+		{"Unreliable", enabled, false, false, false},
+		{"Plain", enabled, false, false, false},
+		{"Missing", enabled, false, false, false},
 		// An optimistic call is answered or refused, never left waiting.
 		{"Both", optimistic, true, true, false},
 		{"Requests", optimistic, true, false, false},
-		{"Both", &streamCompressionInfo{MaxWindowLog: zstd.StreamWindowLog + 1, Optimistic: true}, false, false, true},
 		{"Unreliable", optimistic, false, false, true},
 		{"Plain", optimistic, false, false, true},
 		// An unknown route fails as one.
@@ -577,7 +570,7 @@ func TestNegotiateStreamsFollowsTheRoute(t *testing.T) {
 		request := requestFor(test.method, RPCKindBidirectionalStreaming)
 		request.StreamCompression = test.offer
 		streams, refused := runtime.negotiateStreams(request)
-		if (streams.requestInflater() != nil) != test.answers || (streams != nil && (streams.answer != nil) != test.answers) || (streams.responseCompressor() != nil) != test.compresses || refused != test.refuses {
+		if (streams.requestInflater() != nil) != test.answers || streams.decodesRequests() != test.answers || (streams.responseCompressor() != nil) != test.compresses || refused != test.refuses {
 			t.Errorf("%s with %+v: %+v, refused %v", test.method, test.offer, streams, refused)
 		}
 		streams.close()
@@ -596,7 +589,7 @@ func TestStreamCompressorStartsAtTheThirdMessage(t *testing.T) {
 	for i := range 5 {
 		if i == 3 {
 			// Enabled late, it starts with the next message.
-			compressor.enable(zstd.StreamWindowLog)
+			compressor.enable()
 		}
 		encoded, err := compressor.encode(compressionSample(i))
 		if err != nil {
@@ -639,11 +632,10 @@ func (s *pipedRPCStream) Read(data []byte) (int, error) { return s.pipe.Read(dat
 
 func (s *pipedRPCStream) Close() error { return s.pipe.Close() }
 
-// TestHeadersAtDispatch checks that a call to a route whose requests may be
-// stream-compressed gets HEADERS before the handler runs, with the answer to
-// its offer, and that the handler then cannot set response headers; other
-// routes are unchanged.
-func TestHeadersAtDispatch(t *testing.T) {
+// TestAnswerAtDispatch checks that a call to a route whose requests may be
+// stream-compressed gets the ANSWER to its offer before the handler runs, and
+// that the handler still sets response headers, as on every other route.
+func TestAnswerAtDispatch(t *testing.T) {
 	server := NewServer()
 	headerErrs := make(chan error, 1)
 	upload := func(ctx context.Context, requests MessageStream[*wrapperspb.StringValue]) (*wrapperspb.StringValue, error) {
@@ -669,7 +661,7 @@ func TestHeadersAtDispatch(t *testing.T) {
 		t.Run(fmt.Sprintf("%s offer=%v", test.method, test.offer), func(t *testing.T) {
 			request := requestFor(test.method, RPCKindClientStreaming)
 			if test.offer {
-				request.StreamCompression = streamOffer()
+				request.StreamCompression = streamCompressionEnabled
 			}
 			frame, err := appendRequestFrame(nil, request, DefaultMaxFrameSize)
 			if err != nil {
@@ -687,29 +679,20 @@ func TestHeadersAtDispatch(t *testing.T) {
 			}
 
 			// The handler runs before any request message was sent.
-			headerErr := <-headerErrs
+			if err := <-headerErrs; err != nil {
+				t.Fatalf("SetResponseHeader = %v", err)
+			}
 			early := parseRawFrames(t, stream.snapshot())
-			if test.dispatched {
-				if !errors.Is(headerErr, ErrResponseHeadersSent) {
-					t.Fatalf("SetResponseHeader = %v, want ErrResponseHeadersSent", headerErr)
-				}
-				if len(early) != 1 || early[0].typ != frameTypeHeaders {
+			answered := test.dispatched && test.offer && zstd.Available
+			if answered {
+				if len(early) != 1 || early[0].typ != frameTypeAnswer {
 					t.Fatalf("written before the requests: %v", early)
 				}
-				metadata, answer, err := decodeHeaders(early[0].payload)
-				if err != nil || len(metadata) != 0 {
-					t.Fatalf("HEADERS = %v, %v", metadata, err)
+				if answer, err := decodeAnswer(early[0].payload); err != nil || !answer.StreamCompression {
+					t.Fatalf("ANSWER = %+v, %v", answer, err)
 				}
-				if answered := answer.stream != nil; answered != (test.offer && zstd.Available) {
-					t.Fatalf("HEADERS answer = %+v", answer.stream)
-				}
-			} else {
-				if headerErr != nil {
-					t.Fatalf("SetResponseHeader = %v", headerErr)
-				}
-				if len(early) != 0 {
-					t.Fatalf("written before the requests: %v", early)
-				}
+			} else if len(early) != 0 {
+				t.Fatalf("written before the requests: %v", early)
 			}
 
 			for _, value := range []string{"a", "b"} {
@@ -724,16 +707,13 @@ func TestHeadersAtDispatch(t *testing.T) {
 			_ = client.Close()
 			<-done
 			frames := readTestFrames(t, stream.snapshot(), DefaultMaxFrameSize)
+			if answered {
+				frames = frames[1:]
+			}
 			if len(frames) != 3 || frames[0].Kind != frameTypeHeaders || frames[1].Kind != frameTypeMessage || frames[2].Kind != frameTypeStatus || CodeFromUint32(frames[2].Status) != CodeOK {
 				t.Fatalf("frames = %#v, want HEADERS, MESSAGE, STATUS(OK)", frames)
 			}
-			if test.dispatched {
-				if len(frames[0].Headers) != 0 {
-					t.Fatalf("headers = %v, want none", frames[0].Headers)
-				}
-			} else {
-				requireHeaders(t, "headers", frames[0].Headers, testHeaderKey, "v")
-			}
+			requireHeaders(t, "headers", frames[0].Headers, testHeaderKey, "v")
 		})
 	}
 }

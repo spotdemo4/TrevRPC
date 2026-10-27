@@ -4,14 +4,10 @@ import { root as compressedRoot } from "../build/interop/gen/compressed.trevrpc.
 import { root } from "../build/interop/gen/interop.trevrpc.js";
 import { encodeMessage, inflateMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
-import {
-  FrameType,
-  encodeHeadersFrame,
-  encodeOutgoingFrame,
-  marshalMessage,
-} from "../src/framing.js";
+import { FrameType, encodeOutgoingFrame, marshalMessage } from "../src/framing.js";
 import { validateMetadata } from "../src/metadata.js";
 import { Code, TrevRpcError, invalidArgument } from "../src/status.js";
+import { StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import { ServerStreams, parseMethodPath } from "./support.js";
 
@@ -50,7 +46,7 @@ const connectionMetadataSets = new WeakMap();
 /**
  * Merges the connection metadata a REQUEST offers or refers to into its metadata, the call's own
  * entries winning, as real servers do before running the call. An offer is stored for the session
- * and confirmed in the call's HEADERS (see `headersAnswer`); without a session, as over the
+ * and confirmed in the call's ANSWER (see `negotiationAnswer`); without a session, as over the
  * ordinary HTTP mapping, nothing is stored or confirmed and a reference is unknown. Throws
  * InvalidArgument for an invalid set and for a reference to an unknown one.
  */
@@ -85,12 +81,11 @@ function resolveConnectionMetadata(request, session) {
 }
 
 /**
- * The HEADERS fields answering the call's dictionary query and confirming the connection metadata
+ * The ANSWER fields answering the call's dictionary query and confirming the connection metadata
  * it offered. This server holds no dictionaries but decodes messages without one, so it confirms
- * ID 0 when asked, as real servers do in every HEADERS that follows a query. A call that gets any
- * answer gets HEADERS.
+ * ID 0 when asked, as real servers do in every ANSWER to a query.
  */
-function headersAnswer(request) {
+function negotiationAnswer(request) {
   const answer = {};
   const query = request.dictionaryQuery ?? [];
   if (query.length > 0) {
@@ -100,15 +95,6 @@ function headersAnswer(request) {
     answer.connectionMetadata = request.connectionMetadataConfirmed;
   }
   return answer;
-}
-
-/** Whether the handler of the method writes the call's HEADERS itself, at dispatch. */
-function sendsOwnHeaders(method) {
-  const path = parseMethodPath(method);
-  return (
-    path?.service === CompressedEchoService ||
-    (path?.service === UnreliableEchoService && path.method === "Bidi")
-  );
 }
 
 async function serve(stream, request, unary, session) {
@@ -123,24 +109,6 @@ async function serve(stream, request, unary, session) {
     await stream.stopSending();
     return;
   }
-  // The interop-header rule: echo the value as response header and, on success, as trailer.
-  const marker = request.metadata["interop-header"];
-  const trailers = marker === undefined ? {} : { "interop-trailer": new Uint8Array(marker) };
-  const answer = headersAnswer(request);
-  if (
-    marker !== undefined ||
-    (answer.connectionMetadata !== undefined && !sendsOwnHeaders(request.method))
-  ) {
-    await stream.write(
-      encodeHeadersFrame({
-        metadata: marker === undefined ? {} : { "interop-header": new Uint8Array(marker) },
-        ...answer,
-      }),
-    );
-  }
-  const done = (code = Code.Ok, message = "") =>
-    stream.writeStatus(code, message, code === Code.Ok ? trailers : {});
-
   // A malformed path is a protocol error; a well-formed path with no handler is unimplemented.
   const path = parseMethodPath(request.method);
   if (path === null) {
@@ -150,64 +118,69 @@ async function serve(stream, request, unary, session) {
     return;
   }
 
-  if (path.service === CompressedEchoService && path.method === "Plain") {
-    await compressedPlain(stream, request);
-    await stream.finish();
-    await stream.stopSending();
+  // An optimistic call is accepted or refused at dispatch, before anything else is sent for it.
+  // RefusingEcho is registered without stream compression, as by a server built from a schema
+  // without COMPRESSION_STREAM: it never answers, so it refuses every optimistic call.
+  const answer = negotiationAnswer(request);
+  let streams;
+  if (path.service === CompressedEchoService && path.method !== "Plain") {
+    streams = new ServerStreams(compression, request);
+    Object.assign(answer, streams.answer);
+  }
+  if (
+    streams?.refuses ||
+    (path.service === RefusingEchoService &&
+      request.streamCompression === StreamCompression.Optimistic)
+  ) {
+    streams?.close();
+    await stream.refuse();
     return;
   }
+  // The server answers at dispatch, so a client-streaming call learns the answer while uploading.
+  if (Object.keys(answer).length > 0) {
+    await stream.writeAnswer(answer);
+  }
+  // The interop-header rule: echo the value as response header and, on success, as trailer.
+  // UnreliableEcho.Bidi sends HEADERS before its first datagram even without it.
+  const marker = request.metadata["interop-header"];
+  const trailers = marker === undefined ? {} : { "interop-trailer": new Uint8Array(marker) };
+  if (marker !== undefined || (path.service === UnreliableEchoService && path.method === "Bidi")) {
+    await stream.writeHeaders(
+      marker === undefined ? {} : { "interop-header": new Uint8Array(marker) },
+    );
+  }
+  const done = (code = Code.Ok, message = "", metadata = {}) =>
+    stream.writeStatus(code, message, code === Code.Ok ? { ...trailers, ...metadata } : {});
 
-  if (path.service === CompressedEchoService) {
-    const streams = new ServerStreams(compression, request);
-    if (streams.refuses) {
-      await stream.refuse();
-      return;
-    }
+  if (path.service === CompressedEchoService && path.method === "Plain") {
+    await compressedPlain(stream, request);
+  } else if (streams !== undefined) {
     await (path.method === "ClientStream" ? compressedClientStream : compressedBidi)(
       stream,
       streams,
-      headersAnswer(request),
+      done,
     );
-    await stream.finish();
-    await stream.stopSending();
-    return;
-  }
-
-  // RefusingEcho is registered without stream compression, as by a server built from a schema
-  // without COMPRESSION_STREAM: it never answers, so it refuses every optimistic call.
-  if (path.service === RefusingEchoService && path.method === "ClientStream") {
-    if (request.streamCompression?.optimistic) {
-      await stream.refuse();
-      return;
-    }
+  } else if (path.service === RefusingEchoService && path.method === "ClientStream") {
     await clientStream(stream, done);
-    await stream.finish();
-    await stream.stopSending();
-    return;
-  }
-
-  if (path.service === UnreliableEchoService && path.method === "Bidi") {
+  } else if (path.service === UnreliableEchoService && path.method === "Bidi") {
     await unreliableBidi(stream, request, session);
-    await stream.finish();
-    await stream.stopSending();
-    return;
-  }
-
-  switch (path.service === EchoService ? path.method : undefined) {
-    case "Unary":
-      await unary(stream, request, await stream.readMessage(EchoRequest), done);
-      break;
-    case "ClientStream":
-      await clientStream(stream, done);
-      break;
-    case "ServerStream":
-      await serverStream(stream, await stream.readMessage(EchoRequest), done);
-      break;
-    case "Bidi":
-      await bidi(stream, done);
-      break;
-    default:
-      await stream.writeStatus(Code.Unimplemented, `unknown method ${request.method}`);
+  } else {
+    switch (path.service === EchoService ? path.method : undefined) {
+      case "Unary":
+        await unary(stream, request, await stream.readMessage(EchoRequest), done);
+        break;
+      case "ClientStream":
+        await clientStream(stream, done);
+        break;
+      case "ServerStream":
+        await serverStream(stream, await stream.readMessage(EchoRequest), done);
+        break;
+      case "Bidi":
+        await bidi(stream, done);
+        break;
+      default:
+        await stream.writeStatus(Code.Unimplemented, `unknown method ${request.method}`);
+    }
   }
   await stream.finish();
   await stream.stopSending();
@@ -263,9 +236,8 @@ async function bidi(stream, done) {
  * CompressedEcho.Bidi as the interop README specifies: Echo.Bidi with stream compression, whose
  * OK status reports how many requests arrived stream-compressed.
  */
-async function compressedBidi(stream, streams, answer) {
+async function compressedBidi(stream, streams, done) {
   try {
-    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers, ...answer }));
     for (let index = 0, frame; (frame = await stream.readFrame()) !== null; index += 1) {
       const message = EchoRequest.decode(streams.receive(frame));
       if (message.failCode !== 0) {
@@ -275,7 +247,7 @@ async function compressedBidi(stream, streams, answer) {
       const response = marshalMessage(EchoResponse, { message: message.message, index });
       await stream.write(encodeOutgoingFrame(streams.encode(response)));
     }
-    await stream.writeStatus(Code.Ok, "", {
+    await done(Code.Ok, "", {
       "interop-stream-compressed-received": new TextEncoder().encode(String(streams.received)),
     });
   } finally {
@@ -289,10 +261,6 @@ async function compressedBidi(stream, streams, answer) {
  * accepts it, and reports whether the request arrived compressed.
  */
 async function compressedPlain(stream, request) {
-  const answer = headersAnswer(request);
-  if (Object.keys(answer).length > 0) {
-    await stream.write(encodeHeadersFrame({ metadata: {}, ...answer }));
-  }
   const frame = await stream.readFrame();
   const plain = new Map([[0, compression.plain]]);
   const compressed = frame.type === FrameType.ZstdMessage;
@@ -310,12 +278,10 @@ async function compressedPlain(stream, request) {
 
 /**
  * CompressedEcho.ClientStream as the interop README specifies: Echo.ClientStream with stream
- * compression. HEADERS go out at dispatch, as servers send them on methods whose requests may be
- * stream-compressed.
+ * compression.
  */
-async function compressedClientStream(stream, streams, answer) {
+async function compressedClientStream(stream, streams, done) {
   try {
-    await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers, ...answer }));
     let message = "";
     let count = 0;
     for (let frame; (frame = await stream.readFrame()) !== null; count += 1) {
@@ -323,7 +289,7 @@ async function compressedClientStream(stream, streams, answer) {
     }
     const response = marshalMessage(EchoResponse, { message, index: count });
     await stream.write(encodeOutgoingFrame(streams.encode(response)));
-    await stream.writeStatus(Code.Ok, "", {
+    await done(Code.Ok, "", {
       "interop-stream-compressed-received": new TextEncoder().encode(String(streams.received)),
     });
   } finally {
@@ -334,7 +300,7 @@ async function compressedClientStream(stream, streams, answer) {
 /**
  * UnreliableEcho.Bidi as the interop README specifies. Requests arrive on the stream or, for a call
  * with a datagram flow, as datagrams from the session; responses to small requests go out as
- * datagrams on such a call, after HEADERS.
+ * datagrams on such a call, after the HEADERS serve() sends.
  */
 async function unreliableBidi(stream, request, session) {
   const flow = Number(request.datagramFlow);
@@ -366,7 +332,6 @@ async function unreliableBidi(stream, request, session) {
     });
   };
 
-  await stream.write(encodeHeadersFrame({ metadata: {}, ...headersAnswer(request) }));
   const previousListener = datagrams?.onSend;
   if (datagrams !== undefined) {
     datagrams.onSend = (datagram) => {

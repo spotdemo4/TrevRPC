@@ -31,7 +31,7 @@ type keptRequest struct {
 // optimisticUpload is the request side of a call that stream-compresses its
 // requests without waiting for the server's answer (see "Optimistic Stream
 // Compression" in the wire format). It keeps every request it sends until the
-// server's HEADERS accept the call. If the server refuses it instead, the
+// server's ANSWER accepts the call. If the server refuses it instead, the
 // upload replays the call on a new stream: the same REQUEST without
 // optimistic, the kept requests, then the rest of the caller's requests, all
 // without the caller noticing.
@@ -281,7 +281,7 @@ func (u *optimisticUpload) end() {
 }
 
 // replay replaces the refused call with a new one on a new stream: the same
-// REQUEST without optimistic, with the time that remains, then the kept
+// REQUEST, no longer optimistic, with the time that remains, then the kept
 // requests per message, then, from the writer, the rest. The writer is held
 // off while it happens, and the old stream is aborted.
 func (u *optimisticUpload) replay() (stream clientStream, err error) {
@@ -310,7 +310,7 @@ func (u *optimisticUpload) replay() (stream clientStream, err error) {
 	}()
 
 	request := *u.request
-	request.StreamCompression = streamOffer()
+	request.StreamCompression = streamCompressionEnabled
 	if deadline, ok := u.ctx.Deadline(); ok {
 		request.TimeoutNanos = deadlineTimeoutNanos(clientDeadline{at: deadline, set: true}, time.Now)
 	}
@@ -340,15 +340,6 @@ func (u *optimisticUpload) replay() (stream clientStream, err error) {
 		}
 	}
 	return stream, nil
-}
-
-// isRefusal reports whether frame is a STATUS refusing an optimistic call.
-func isRefusal(frame frame) bool {
-	if frame.typ != frameTypeStatus {
-		return false
-	}
-	status, err := decodeStatus(frame.payload)
-	return err == nil && status.refusedStreamCompression
 }
 
 // requestSink is where a call's requests are written: its stream, or the

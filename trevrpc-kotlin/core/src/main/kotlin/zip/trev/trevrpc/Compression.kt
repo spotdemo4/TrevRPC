@@ -187,7 +187,7 @@ internal class CallCompression(
     val acceptedResponse: ConfiguredDictionary?
         get() = response
 
-    /** Records the server's answer from the call's HEADERS. */
+    /** Records the server's answer to the dictionary query from the call's ANSWER. */
     fun learn(answer: List<DictionaryInfo>) {
         if (request != null && request.info in answer) requestConfirmed = true
         if (plainRequests != null && PLAIN_DICTIONARY in answer) plainConfirmed = true

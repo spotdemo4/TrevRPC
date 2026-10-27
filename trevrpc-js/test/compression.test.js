@@ -17,13 +17,13 @@ import { encodeDatagram } from "../src/datagram.js";
 import {
   DefaultMaxFrameSize,
   FrameType,
-  encodeHeadersFrame,
+  encodeAnswerFrame,
   encodeOutgoingFrame,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
 import { Code, TrevRpcError } from "../src/status.js";
-import { RpcHeaders, RpcRequest } from "../src/wire.js";
+import { RpcAnswer, RpcRequest } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import { fakeDatagrams, fakeTransport, hex, readGoldenVectors, turn } from "./support.js";
 
@@ -180,15 +180,12 @@ test("the negotiation fields match the golden vectors", async () => {
   assert.deepEqual(decoded.acceptDictionaries, [1, 300]);
   assert.equal(hex(decoded.dictionaryQuery[0].fingerprint), hex(fingerprint));
 
-  const headers = unmarshalMessage(
-    RpcHeaders,
-    fromHex(vectors.get("headers.dictionaries.payload")),
-  );
-  assert.equal(headers.dictionaries[0].id, 1);
-  assert.equal(hex(headers.dictionaries[0].fingerprint), hex(fingerprint));
+  const answered = unmarshalMessage(RpcAnswer, fromHex(vectors.get("answer.dictionaries.payload")));
+  assert.equal(answered.dictionaries[0].id, 1);
+  assert.equal(hex(answered.dictionaries[0].fingerprint), hex(fingerprint));
   assert.equal(
-    hex(encodeHeadersFrame({ dictionaries: [{ id: 1, fingerprint }] })),
-    vectors.get("headers.dictionaries.frame"),
+    hex(encodeAnswerFrame({ dictionaries: [{ id: 1, fingerprint }] })),
+    vectors.get("answer.dictionaries.frame"),
   );
 
   // A client that offers only compression without a dictionary, on a method that allows it.
@@ -198,7 +195,7 @@ test("the negotiation fields match the golden vectors", async () => {
     hex(marshalMessage(RpcRequest, { method: "/svc/m", ...prepared.fields })),
     vectors.get("request.plain.payload"),
   );
-  const answer = unmarshalMessage(RpcHeaders, fromHex(vectors.get("headers.plain.payload")));
+  const answer = unmarshalMessage(RpcAnswer, fromHex(vectors.get("answer.plain.payload")));
   assert.equal(answer.dictionaries.length, 1);
   assert.equal(answer.dictionaries[0].id, 0);
 });
@@ -232,7 +229,7 @@ test("createCompression rejects invalid settings", async () => {
 });
 
 /**
- * An Echo server holding the dictionary: it answers queries in HEADERS right after the REQUEST,
+ * An Echo server holding the dictionary: it answers queries in ANSWER right after the REQUEST,
  * echoes each request message as it arrives, compresses responses with a dictionary the call
  * accepts, and decompresses requests. `confirm: false` makes it answer that it holds none.
  * Every call is recorded as `{ request, requestFrames, responseFrames }`.
@@ -250,7 +247,7 @@ function compressingEcho(calls, { confirm = true } = {}) {
       (request.acceptDictionaries ?? []).includes(1) && (query.length === 0 || confirmed);
     if (query.length > 0) {
       const dictionaries = confirmed ? [{ id: 1, fingerprint }] : [];
-      await stream.write(encodeHeadersFrame({ metadata: {}, dictionaries }));
+      await stream.write(encodeAnswerFrame({ dictionaries }));
     }
     let index = 0;
     for (let frame; (frame = await stream.readFrame()) !== null; index += 1) {
@@ -302,7 +299,7 @@ test("a session queries once, then compresses requests and accepts compressed re
   assert.deepEqual(calls[2].responseFrames, [FrameType.Message]);
 });
 
-test("a request stream starts compressing as soon as its HEADERS answer", async () => {
+test("a request stream starts compressing as soon as its ANSWER arrives", async () => {
   const calls = [];
   const echo = new EchoClient(compressedTransport(compressingEcho(calls)));
   const call = await echo.bidi();
@@ -367,13 +364,11 @@ test("a lone STATUS leaves the query unanswered, so the next call asks again", a
   );
 });
 
-/** A server that answers a unary call with HEADERS and then the given response frame. */
+/** A server that answers a unary call with ANSWER and then the given response frame. */
 function respondingWith(frame) {
   return async (stream) => {
     await stream.readRequest();
-    await stream.write(
-      encodeHeadersFrame({ metadata: {}, dictionaries: [{ id: 1, fingerprint }] }),
-    );
+    await stream.write(encodeAnswerFrame({ dictionaries: [{ id: 1, fingerprint }] }));
     await stream.write(frame);
     await stream.writeStatus();
     await stream.finish();
@@ -416,9 +411,7 @@ test("compressed response datagrams are decompressed, and an invalid one drops i
     const request = await stream.readRequest();
     const flow = Number(request.datagramFlow);
     assert.deepEqual(request.acceptDictionaries, [1]);
-    await stream.write(
-      encodeHeadersFrame({ metadata: {}, dictionaries: [{ id: 1, fingerprint }] }),
-    );
+    await stream.write(encodeAnswerFrame({ dictionaries: [{ id: 1, fingerprint }] }));
     datagrams.push(encodeDatagram(flow, [response(compressible(0))]));
     const invalid = {
       type: FrameType.ZstdMessage,
@@ -442,7 +435,7 @@ test("compressed response datagrams are decompressed, and an invalid one drops i
 
 /**
  * A CompressedEcho.Plain server that decodes messages without a dictionary: it answers the query
- * for ID 0 in HEADERS, decompresses requests, and compresses responses without a dictionary when
+ * for ID 0 in ANSWER, decompresses requests, and compresses responses without a dictionary when
  * the call accepts that. `decodes: false` makes it a server without the feature, which answers
  * nothing. Every call is recorded as `{ request, requestFrames, responseFrames }`.
  */
@@ -453,9 +446,7 @@ function plainEcho(calls, { decodes = true } = {}) {
     calls.push(call);
     const queried = (request.dictionaryQuery ?? []).some(({ id }) => id === 0);
     if ((request.dictionaryQuery ?? []).length > 0) {
-      await stream.write(
-        encodeHeadersFrame({ metadata: {}, dictionaries: decodes && queried ? [{}] : [] }),
-      );
+      await stream.write(encodeAnswerFrame({ dictionaries: decodes && queried ? [{}] : [] }));
     }
     const accepted = decodes && (request.acceptDictionaries ?? []).includes(0);
     const frame = await stream.readFrame();

@@ -1,7 +1,7 @@
 import { byteView } from "./bytes.js";
 import { internal, invalidArgument, resourceExhausted, unavailable } from "./status.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
-import { RpcHeaders, RpcRequest, RpcStatus, preflightWireMessage } from "./wire.js";
+import { RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, preflightWireMessage } from "./wire.js";
 
 export const DefaultMaxFrameSize = 4 * 1024 * 1024;
 
@@ -13,6 +13,7 @@ export const FrameType = Object.freeze({
   Status: 3,
   ZstdMessage: 4,
   ZstdStreamMessage: 5,
+  Answer: 6,
 });
 
 const KnownFrameTypes = new Set(Object.values(FrameType));
@@ -86,6 +87,11 @@ export function encodeRequestFrame(request, message, maxFrameSize = DefaultMaxFr
 /** Encodes a HEADERS frame from RpcHeaders fields. */
 export function encodeHeadersFrame(headers, maxFrameSize = DefaultMaxFrameSize) {
   return encodeFrame(FrameType.Headers, marshalMessage(RpcHeaders, headers), maxFrameSize);
+}
+
+/** Encodes an ANSWER frame from RpcAnswer fields. */
+export function encodeAnswerFrame(answer, maxFrameSize = DefaultMaxFrameSize) {
+  return encodeFrame(FrameType.Answer, marshalMessage(RpcAnswer, answer), maxFrameSize);
 }
 
 /** Encodes a STATUS frame from RpcStatus fields. */

@@ -9,15 +9,14 @@ object WireCodec {
         Writer()
             .apply {
                 string(1, request.method)
-                metadata(4, request.metadata)
-                int32(5, request.kindValue)
-                uint64(7, request.timeoutNanos)
-                packedUint64(8, request.extensions)
-                uint64(9, request.datagramFlow)
-                packedUint32(10, request.acceptDictionaries)
-                dictionaries(11, request.dictionaryQuery)
-                streamCompression(12, request.streamCompression)
-                connectionMetadata(13, request.connectionMetadata)
+                metadata(2, request.metadata)
+                int32(3, request.kindValue)
+                uint64(4, request.timeoutNanos)
+                uint64(5, request.datagramFlow)
+                packedUint32(6, request.acceptDictionaries)
+                dictionaries(7, request.dictionaryQuery)
+                int32(8, request.streamCompression.value)
+                connectionMetadata(9, request.connectionMetadata)
             }.toByteArray()
 
     fun decodeRequest(bytes: ByteArray): RpcRequest {
@@ -26,25 +25,23 @@ object WireCodec {
         val metadata = linkedMapOf<String, ByteArray>()
         var kind = 0
         var timeoutNanos = 0uL
-        val extensions = mutableListOf<ULong>()
         var datagramFlow = 0uL
         val acceptDictionaries = mutableListOf<UInt>()
         val dictionaryQuery = mutableListOf<DictionaryInfo>()
-        var streamCompression: StreamCompression? = null
+        var streamCompression = StreamCompression.NONE
         var connectionMetadata: ConnectionMetadata? = null
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
                 1 -> method = reader.string(tag, "request method")
-                4 -> reader.mapEntry(tag, metadata)
-                5 -> kind = reader.int32(tag)
-                7 -> timeoutNanos = reader.uint64(tag)
-                8 -> reader.uint64Elements(tag, extensions)
-                9 -> datagramFlow = reader.uint64(tag)
-                10 -> reader.uint32Elements(tag, acceptDictionaries)
-                11 -> dictionaryQuery += reader.dictionaryInfo(tag)
-                12 -> streamCompression = reader.streamCompression(tag)
-                13 -> connectionMetadata = reader.connectionMetadata(tag)
+                2 -> reader.mapEntry(tag, metadata)
+                3 -> kind = reader.int32(tag)
+                4 -> timeoutNanos = reader.uint64(tag)
+                5 -> datagramFlow = reader.uint64(tag)
+                6 -> reader.uint32Elements(tag, acceptDictionaries)
+                7 -> dictionaryQuery += reader.dictionaryInfo(tag)
+                8 -> streamCompression = reader.streamCompression(tag)
+                9 -> connectionMetadata = reader.connectionMetadata(tag)
                 else -> reader.skip(tag)
             }
         }
@@ -53,7 +50,6 @@ object WireCodec {
             Metadata.fromWire(metadata),
             kind,
             timeoutNanos,
-            extensions,
             datagramFlow,
             acceptDictionaries,
             dictionaryQuery,
@@ -62,35 +58,44 @@ object WireCodec {
         )
     }
 
-    fun encode(headers: RpcHeaders): ByteArray =
-        Writer()
-            .apply {
-                metadata(1, headers.metadata)
-                packedUint64(2, headers.extensions)
-                dictionaries(3, headers.dictionaries)
-                streamCompression(4, headers.streamCompression)
-                uint32(5, headers.connectionMetadataId)
-            }.toByteArray()
+    fun encode(headers: RpcHeaders): ByteArray = Writer().apply { metadata(1, headers.metadata) }.toByteArray()
 
     fun decodeHeaders(bytes: ByteArray): RpcHeaders {
         val reader = Reader(bytes)
         val metadata = linkedMapOf<String, ByteArray>()
-        val extensions = mutableListOf<ULong>()
-        val dictionaries = mutableListOf<DictionaryInfo>()
-        var streamCompression: StreamCompression? = null
-        var connectionMetadataId = 0u
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
                 1 -> reader.mapEntry(tag, metadata)
-                2 -> reader.uint64Elements(tag, extensions)
-                3 -> dictionaries += reader.dictionaryInfo(tag)
-                4 -> streamCompression = reader.streamCompression(tag)
-                5 -> connectionMetadataId = reader.uint32(tag)
                 else -> reader.skip(tag)
             }
         }
-        return RpcHeaders(Metadata.fromWire(metadata), extensions, dictionaries, streamCompression, connectionMetadataId)
+        return RpcHeaders(Metadata.fromWire(metadata))
+    }
+
+    fun encode(answer: RpcAnswer): ByteArray =
+        Writer()
+            .apply {
+                dictionaries(1, answer.dictionaries)
+                bool(2, answer.streamCompression)
+                uint32(3, answer.connectionMetadataId)
+            }.toByteArray()
+
+    fun decodeAnswer(bytes: ByteArray): RpcAnswer {
+        val reader = Reader(bytes)
+        val dictionaries = mutableListOf<DictionaryInfo>()
+        var streamCompression = false
+        var connectionMetadataId = 0u
+        while (reader.hasRemaining) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> dictionaries += reader.dictionaryInfo(tag)
+                2 -> streamCompression = reader.bool(tag)
+                3 -> connectionMetadataId = reader.uint32(tag)
+                else -> reader.skip(tag)
+            }
+        }
+        return RpcAnswer(dictionaries, streamCompression, connectionMetadataId)
     }
 
     fun encode(status: RpcStatus): ByteArray =
@@ -145,8 +150,12 @@ object WireCodec {
                 streamMessage(frame.payload, maxFrameSize)
             }
 
+            FrameType.ANSWER -> {
+                decodeAnswer(frame.payload).let { ResponseFrame.Answer(it.dictionaries, it.streamCompression) }
+            }
+
             FrameType.HEADERS -> {
-                decodeHeaders(frame.payload).let { ResponseFrame.Headers(it.metadata, it.dictionaries, it.streamCompression) }
+                ResponseFrame.Headers(decodeHeaders(frame.payload).metadata)
             }
 
             FrameType.STATUS -> {
@@ -228,21 +237,16 @@ private class Writer {
         }
     }
 
-    fun packedUint64(
+    fun packedUint32(
         field: Int,
-        values: List<ULong>,
+        values: List<UInt>,
     ) {
         if (values.isEmpty()) return
-        val packed = Writer().apply { values.forEach { varint(it) } }.toByteArray()
+        val packed = Writer().apply { values.forEach { varint(it.toULong()) } }.toByteArray()
         tag(field, 2)
         varint(packed.size.toULong())
         output.write(packed)
     }
-
-    fun packedUint32(
-        field: Int,
-        values: List<UInt>,
-    ) = packedUint64(field, values.map(UInt::toULong))
 
     fun dictionaries(
         field: Int,
@@ -259,23 +263,6 @@ private class Writer {
             varint(entry.size.toULong())
             output.write(entry)
         }
-    }
-
-    /** Writes a present `StreamCompression` message, even one whose fields are all zero. */
-    fun streamCompression(
-        field: Int,
-        value: StreamCompression?,
-    ) {
-        if (value == null) return
-        val entry =
-            Writer()
-                .apply {
-                    uint32(1, value.maxWindowLog)
-                    bool(2, value.optimistic)
-                }.toByteArray()
-        tag(field, 2)
-        varint(entry.size.toULong())
-        output.write(entry)
     }
 
     /** Writes a present `ConnectionMetadata` message, even one whose fields are all zero. */
@@ -436,18 +423,8 @@ private class Reader(
     }
 
     fun streamCompression(tag: Tag): StreamCompression {
-        val entry = Reader(bytes(tag))
-        var maxWindowLog = 0u
-        var optimistic = false
-        while (entry.hasRemaining) {
-            val entryTag = entry.tag()
-            when (entryTag.field) {
-                1 -> maxWindowLog = entry.uint32(entryTag)
-                2 -> optimistic = entry.bool(entryTag)
-                else -> entry.skip(entryTag)
-            }
-        }
-        return StreamCompression(maxWindowLog, optimistic)
+        val value = int32(tag)
+        return StreamCompression.fromValue(value) ?: malformed("unknown stream compression value $value")
     }
 
     fun connectionMetadata(tag: Tag): ConnectionMetadata {

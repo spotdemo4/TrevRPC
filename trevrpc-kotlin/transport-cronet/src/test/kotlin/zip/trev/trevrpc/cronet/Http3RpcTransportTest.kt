@@ -1397,7 +1397,6 @@ private fun assertRequestEquals(
     assertEquals(expected.kindValue, actual.kindValue)
     assertEquals(expected.timeoutNanos, actual.timeoutNanos)
     assertEquals(expected.metadata, actual.metadata)
-    assertEquals(expected.extensions, actual.extensions)
 }
 
 private class FakeFactory : DuplexStreamFactory {

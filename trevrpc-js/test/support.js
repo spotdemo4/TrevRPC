@@ -8,6 +8,7 @@ import { encodeMessage, parseStreamChunk } from "../src/compression.js";
 import {
   FrameReader,
   FrameType,
+  encodeAnswerFrame,
   encodeHeadersFrame,
   encodeMessageFrame,
   encodeStatusFrame,
@@ -16,7 +17,7 @@ import {
 } from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
-import { RpcRequest } from "../src/wire.js";
+import { RpcRequest, StreamCompression } from "../src/wire.js";
 
 /**
  * Splits a wire method path into `{ service, method }`, or returns null unless it is exactly
@@ -71,6 +72,10 @@ export class ServerStream {
 
   writeHeaders(metadata = {}) {
     return this.write(encodeHeadersFrame({ metadata }));
+  }
+
+  writeAnswer(answer = {}) {
+    return this.write(encodeAnswerFrame(answer));
   }
 
   writeMessage(messageType, message) {
@@ -316,8 +321,10 @@ export class ServerStreams {
 
   constructor(compression, request, { answer = true, compressResponses = true } = {}) {
     this.#compression = compression;
-    this.#offered = (request.streamCompression?.maxWindowLog ?? 0) >= 10;
-    this.#optimistic = this.#offered && Boolean(request.streamCompression.optimistic);
+    this.#offered =
+      request.streamCompression === StreamCompression.Enabled ||
+      request.streamCompression === StreamCompression.Optimistic;
+    this.#optimistic = request.streamCompression === StreamCompression.Optimistic;
     this.#answer = this.#offered && answer;
     this.#compressResponses = this.#offered && compressResponses;
   }
@@ -327,9 +334,9 @@ export class ServerStreams {
     return this.#optimistic && !this.#answer;
   }
 
-  /** The HEADERS fields of the answer, if any. */
-  get headers() {
-    return this.#answer ? { streamCompression: { maxWindowLog: 16 } } : {};
+  /** The ANSWER fields of the answer, if any. */
+  get answer() {
+    return this.#answer ? { streamCompression: true } : {};
   }
 
   /** The message of a request frame `{ type, payload }`. */

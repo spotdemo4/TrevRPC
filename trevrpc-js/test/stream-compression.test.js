@@ -7,7 +7,6 @@ import { parseStreamChunk } from "../src/compression.js";
 import {
   DefaultMaxFrameSize,
   FrameType,
-  encodeHeadersFrame,
   encodeOutgoingFrame,
   marshalMessage,
   unmarshalMessage,
@@ -21,7 +20,7 @@ import {
   StreamBudgetKey,
 } from "../src/stream-compression.js";
 import { varintLength, writeVarint } from "../src/varint.js";
-import { RpcHeaders, RpcRequest, RpcStatus } from "../src/wire.js";
+import { RpcAnswer, RpcRequest, RpcStatus, StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import {
   ServerStreams,
@@ -173,19 +172,24 @@ test("the stream encoder ends a frame every 60 KiB, starting the next from its d
 
 test("the stream negotiation fields match the golden vectors", () => {
   assert.equal(
-    hex(marshalMessage(RpcRequest, { method: "/svc/m", streamCompression: { maxWindowLog: 16 } })),
+    hex(
+      marshalMessage(RpcRequest, {
+        method: "/svc/m",
+        streamCompression: StreamCompression.Enabled,
+      }),
+    ),
     vectors.get("request.stream_compression.payload"),
   );
-  const headers = unmarshalMessage(
-    RpcHeaders,
-    fromHex(vectors.get("headers.stream_compression.payload")),
+  const answer = unmarshalMessage(
+    RpcAnswer,
+    fromHex(vectors.get("answer.stream_compression.payload")),
   );
-  assert.equal(headers.streamCompression.maxWindowLog, 16);
+  assert.equal(answer.streamCompression, true);
   assert.equal(
     hex(
       marshalMessage(RpcRequest, {
         method: "/svc/m",
-        streamCompression: { maxWindowLog: 16, optimistic: true },
+        streamCompression: StreamCompression.Optimistic,
       }),
     ),
     vectors.get("request.optimistic_stream_compression.payload"),
@@ -222,7 +226,9 @@ function streamEcho(calls, options) {
       return;
     }
     try {
-      await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
+      if (streams.answer.streamCompression) {
+        await stream.writeAnswer(streams.answer);
+      }
       for (let index = 0, frame; (frame = await stream.readFrame()) !== null; index += 1) {
         call.requestFrames.push(frame.type);
         const { message } = EchoRequest.decode(streams.receive(frame));
@@ -267,8 +273,7 @@ test("a call offers stream compression optimistically and compresses from the th
   const transport = compressedTransport(streamEcho(calls));
   await pingPong(new CompressedEchoClient(transport), 5);
   await transport.settled();
-  assert.equal(calls[0].request.streamCompression.maxWindowLog, 16);
-  assert.equal(calls[0].request.streamCompression.optimistic, true);
+  assert.equal(calls[0].request.streamCompression, StreamCompression.Optimistic);
   const compressed = [Message, Message, ZstdStreamMessage, ZstdStreamMessage, ZstdStreamMessage];
   assert.deepEqual(calls[0].requestFrames, compressed);
   assert.deepEqual(calls[0].responseFrames, compressed);
@@ -283,7 +288,10 @@ test("a refused call is replayed without stream compression, and requests stay p
   await pingPong(client, 4);
   await transport.settled();
   assert.deepEqual(
-    calls.map((call) => [call.refused, call.request.streamCompression.optimistic]),
+    calls.map((call) => [
+      call.refused,
+      call.request.streamCompression === StreamCompression.Optimistic,
+    ]),
     [
       [true, true],
       [false, false],
@@ -304,7 +312,7 @@ test("a budget too small for the decoding context makes the call offer nothing",
   const transport = compressedTransport(streamEcho(calls), new StreamBudget(1000));
   await pingPong(new CompressedEchoClient(transport), 4);
   await transport.settled();
-  assert.equal(calls[0].request.streamCompression, null);
+  assert.equal(calls[0].request.streamCompression, StreamCompression.None);
   assert.deepEqual(calls[0].responseFrames, [Message, Message, Message, Message]);
 });
 
@@ -376,7 +384,7 @@ test("directions marked unreliable are not stream-compressed", async () => {
   };
   await pingPong(createServiceClient(transport, service, root), 3);
   await transport.settled();
-  assert.equal(calls[0].request.streamCompression, null);
+  assert.equal(calls[0].request.streamCompression, StreamCompression.None);
 });
 
 /**
@@ -384,15 +392,15 @@ test("directions marked unreliable are not stream-compressed", async () => {
  * `behavior(i)` says how to serve the i-th stream: "answer" to accept it and answer its offer,
  * "quiet" to serve it without answering, as a server out of budget, and "now" or "after" to refuse
  * an optimistic call right after its REQUEST or once its request stream ended, as a slow server
- * might; an unanswered call that is not optimistic is served "quiet". `headers`, if given, holds
- * back the HEADERS until it settles.
+ * might; an unanswered call that is not optimistic is served "quiet". `answer`, if given, holds
+ * back the ANSWER until it settles.
  */
-function uploadEcho(calls, { behavior = () => "answer", headers } = {}) {
+function uploadEcho(calls, { behavior = () => "answer", answer } = {}) {
   return async (stream) => {
     const request = await stream.readRequest();
     const call = { request, frames: [], refused: false };
     let mode = behavior(calls.push(call) - 1);
-    if (!request.streamCompression?.optimistic && mode !== "answer") {
+    if (request.streamCompression !== StreamCompression.Optimistic && mode !== "answer") {
       mode = "quiet";
     }
     if (mode === "now") {
@@ -403,8 +411,10 @@ function uploadEcho(calls, { behavior = () => "answer", headers } = {}) {
     const streams = new ServerStreams(plain, request, { answer: mode === "answer" });
     try {
       if (mode !== "after") {
-        await headers;
-        await stream.write(encodeHeadersFrame({ metadata: {}, ...streams.headers }));
+        await answer;
+        if (streams.answer.streamCompression) {
+          await stream.writeAnswer(streams.answer);
+        }
       }
       const messages = [];
       for (let frame; (frame = await stream.readFrame()) !== null;) {
@@ -446,13 +456,13 @@ async function upload(client, count, options) {
 test("an optimistic upload compresses from the third request before the server answers", async () => {
   const calls = [];
   const gate = deferred();
-  const transport = compressedTransport(uploadEcho(calls, { headers: gate.promise }));
+  const transport = compressedTransport(uploadEcho(calls, { answer: gate.promise }));
   const client = new CompressedEchoClient(transport);
   const call = await client.clientStream();
   for (const message of uploadMessages(5)) {
     await call.send({ message });
   }
-  // Every request went out before the HEADERS.
+  // Every request went out before the ANSWER.
   const echo = call.closeAndRecv();
   await turn();
   gate.resolve();
@@ -479,7 +489,10 @@ test("a refused upload is replayed, whether the refusal comes before or after cl
     await transport.settled();
     assert.equal(transport.opened, 2, when);
     assert.deepEqual(
-      calls.map((call) => [call.refused, call.request.streamCompression.optimistic]),
+      calls.map((call) => [
+        call.refused,
+        call.request.streamCompression === StreamCompression.Optimistic,
+      ]),
       [
         [true, true],
         [false, false],
@@ -532,7 +545,7 @@ test("cancelling a call during its replay ends it and returns its memory", async
   const transport = compressedTransport(async (stream) => {
     const request = await stream.readRequest();
     streams += 1;
-    if (request.streamCompression?.optimistic) {
+    if (request.streamCompression === StreamCompression.Optimistic) {
       await stream.refuse();
       return;
     }
@@ -566,7 +579,7 @@ test("requests that do not fit the copy budget or cap wait for the server's deci
   ]) {
     const gate = deferred();
     const calls = [];
-    const transport = compressedTransport(uploadEcho(calls, { headers: gate.promise }), budget);
+    const transport = compressedTransport(uploadEcho(calls, { answer: gate.promise }), budget);
     const call = await new CompressedEchoClient(transport).clientStream();
     const taken = sizes.length > 1 ? budget.reserve(encoderCost - messageSize) : undefined;
     const sends = [];
@@ -579,7 +592,7 @@ test("requests that do not fit the copy budget or cap wait for the server's deci
     const { index } = await call.closeAndRecv();
     assert.equal(index, sizes.length);
     await transport.settled();
-    assert.equal(calls[0].request.streamCompression.optimistic, true);
+    assert.equal(calls[0].request.streamCompression, StreamCompression.Optimistic);
     taken?.();
   }
 });
@@ -596,9 +609,27 @@ test("after a refusal the session waits for an answer, then is optimistic again"
   await upload(client, 3);
   await transport.settled();
   assert.deepEqual(
-    calls.map((call) => Boolean(call.request.streamCompression.optimistic)),
+    calls.map((call) => call.request.streamCompression === StreamCompression.Optimistic),
     [true, false, false, true],
   );
+});
+
+test("an optimistic call must be answered by an ANSWER accepting it, or by a STATUS", async () => {
+  for (const answer of [undefined, {}]) {
+    const transport = compressedTransport(async (stream) => {
+      const request = await stream.readRequest();
+      assert.equal(request.streamCompression, StreamCompression.Optimistic);
+      if (answer !== undefined) {
+        await stream.writeAnswer(answer);
+      }
+      await stream.writeHeaders();
+      await stream.writeMessage(EchoResponse, { message: "", index: 0 });
+      await stream.writeStatus();
+      await stream.finish();
+    });
+    const call = await new CompressedEchoClient(transport).clientStream();
+    await assert.rejects(call.closeAndRecv(), isStatus(Code.Internal));
+  }
 });
 
 test("a refusal flag on a call that was not optimistic is a plain status", async () => {
@@ -616,7 +647,7 @@ test("a channel whose budget has no room for a compressing context is not optimi
   const transport = compressedTransport(uploadEcho(calls), new StreamBudget(0));
   await upload(new CompressedEchoClient(transport), 3);
   await transport.settled();
-  assert.equal(Boolean(calls[0].request.streamCompression.optimistic), false);
+  assert.equal(calls[0].request.streamCompression === StreamCompression.Optimistic, false);
   assert.deepEqual(calls[0].frames, [Message, Message, Message]);
 });
 
@@ -637,7 +668,7 @@ test("a call with a datagram flow is not optimistic and keeps no copies", async 
   };
   for (const withDatagrams of [true, false]) {
     const calls = [];
-    // A budget without room for copies: a call that kept them would wait for every HEADERS.
+    // A budget without room for copies: a call that kept them would wait for every ANSWER.
     const budget = new StreamBudget(plain.streamEncoderCost(16));
     const transport = compressedTransport(streamEcho(calls, { compressResponses: false }), budget);
     if (withDatagrams) {
@@ -647,6 +678,6 @@ test("a call with a datagram flow is not optimistic and keeps no copies", async 
     await transport.settled();
     const { datagramFlow, streamCompression } = calls[0].request;
     assert.equal(Number(datagramFlow) !== 0, withDatagrams);
-    assert.equal(Boolean(streamCompression.optimistic), !withDatagrams);
+    assert.equal(streamCompression === StreamCompression.Optimistic, !withDatagrams);
   }
 });

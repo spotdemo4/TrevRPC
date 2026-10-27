@@ -126,12 +126,12 @@ func TestCompressionNegotiationGoldenVectors(t *testing.T) {
 		}
 	}
 
-	frame, err = appendHeadersFrame(nil, nil, headersAnswer{dictionaries: []*dictionaryInfo{{ID: 1, Fingerprint: fingerprint}}}, DefaultMaxFrameSize)
-	if err != nil || !bytes.Equal(frame, vectors["headers.dictionaries.frame"]) {
-		t.Fatalf("HEADERS frame = %x, %v; want %x", frame, err, vectors["headers.dictionaries.frame"])
+	frame, err = appendAnswerFrame(nil, &wireAnswer{Dictionaries: []*dictionaryInfo{{ID: 1, Fingerprint: fingerprint}}}, DefaultMaxFrameSize)
+	if err != nil || !bytes.Equal(frame, vectors["answer.dictionaries.frame"]) {
+		t.Fatalf("ANSWER frame = %x, %v; want %x", frame, err, vectors["answer.dictionaries.frame"])
 	}
-	_, decoded, err := decodeHeaders(vectors["headers.dictionaries.payload"])
-	answer := decoded.dictionaries
+	decoded, err := decodeAnswer(vectors["answer.dictionaries.payload"])
+	answer := decoded.Dictionaries
 	if err != nil || len(answer) != 1 || answer[0].ID != 1 || !bytes.Equal(answer[0].Fingerprint, fingerprint) {
 		t.Fatalf("decoded answer %+v, %v", answer, err)
 	}
@@ -316,11 +316,11 @@ func TestServerAnswersQueryAndCompressesResponses(t *testing.T) {
 	request.AcceptDictionaries = []uint32{1}
 	stream, _ := serveTestStreamRaw(t, server, compressionTestRequest(t, request, protoMessageFrame(t, sample)))
 	frames := parseRawFrames(t, stream)
-	if len(frames) != 3 || frames[0].typ != frameTypeHeaders || frames[1].typ != frameTypeZstdMessage || frames[2].typ != frameTypeStatus {
-		t.Fatalf("frames = %v, want HEADERS ZSTD_MESSAGE STATUS", frames)
+	if len(frames) != 3 || frames[0].typ != frameTypeAnswer || frames[1].typ != frameTypeZstdMessage || frames[2].typ != frameTypeStatus {
+		t.Fatalf("frames = %v, want ANSWER ZSTD_MESSAGE STATUS", frames)
 	}
-	_, decoded, err := decodeHeaders(frames[0].payload)
-	answer := decoded.dictionaries
+	decoded, err := decodeAnswer(frames[0].payload)
+	answer := decoded.Dictionaries
 	if err != nil || len(answer) != 1 || !d1.matches(answer[0]) {
 		t.Fatalf("answer = %+v, %v", answer, err)
 	}
@@ -343,10 +343,10 @@ func TestServerRefusesUnconfirmedDictionary(t *testing.T) {
 	request.AcceptDictionaries = []uint32{1}
 	stream, _ := serveTestStreamRaw(t, server, compressionTestRequest(t, request, protoMessageFrame(t, compressionSample(1))))
 	frames := parseRawFrames(t, stream)
-	if len(frames) != 3 || frames[0].typ != frameTypeHeaders || frames[1].typ != frameTypeMessage {
-		t.Fatalf("frames = %v, want HEADERS MESSAGE STATUS", frames)
+	if len(frames) != 3 || frames[0].typ != frameTypeAnswer || frames[1].typ != frameTypeMessage {
+		t.Fatalf("frames = %v, want ANSWER MESSAGE STATUS", frames)
 	}
-	if _, answer, err := decodeHeaders(frames[0].payload); err != nil || len(answer.dictionaries) != 0 {
+	if answer, err := decodeAnswer(frames[0].payload); err != nil || len(answer.Dictionaries) != 0 {
 		t.Fatalf("answer = %+v, %v; want none", answer, err)
 	}
 }
@@ -359,7 +359,7 @@ func TestServerWithoutCompressionAnswersQuery(t *testing.T) {
 	request.AcceptDictionaries = []uint32{1}
 	stream, _ := serveTestStreamRaw(t, server, compressionTestRequest(t, request, protoMessageFrame(t, compressionSample(1))))
 	frames := parseRawFrames(t, stream)
-	if len(frames) != 3 || frames[0].typ != frameTypeHeaders || frames[1].typ != frameTypeMessage {
+	if len(frames) != 3 || frames[0].typ != frameTypeAnswer || frames[1].typ != frameTypeMessage {
 		t.Fatalf("frames = %v, want an empty answer, then MESSAGE STATUS", frames)
 	}
 }
@@ -523,12 +523,12 @@ func TestCompressionOverEveryTransport(t *testing.T) {
 			// The first call queries, accepts dictionary 1 unconfirmed, and
 			// gets its answer and a compressed response.
 			sent, received := log[0].frames(t)
-			if fmt.Sprint(sent) != "[REQUEST MESSAGE]" || fmt.Sprint(received) != "[HEADERS ZSTD_MESSAGE STATUS]" {
+			if fmt.Sprint(sent) != "[REQUEST MESSAGE]" || fmt.Sprint(received) != "[ANSWER ZSTD_MESSAGE STATUS]" {
 				t.Fatalf("first call sent %v, received %v", sent, received)
 			}
 			// The second compresses its requests too, and queries no more.
 			sent, received = log[1].frames(t)
-			if fmt.Sprint(sent) != "[REQUEST ZSTD_MESSAGE ZSTD_MESSAGE ZSTD_MESSAGE]" || !strings.Contains(fmt.Sprint(received), "ZSTD_MESSAGE ZSTD_MESSAGE ZSTD_MESSAGE STATUS") || strings.Contains(fmt.Sprint(received), "HEADERS") {
+			if fmt.Sprint(sent) != "[REQUEST ZSTD_MESSAGE ZSTD_MESSAGE ZSTD_MESSAGE]" || !strings.Contains(fmt.Sprint(received), "ZSTD_MESSAGE ZSTD_MESSAGE ZSTD_MESSAGE STATUS") || strings.Contains(fmt.Sprint(received), "ANSWER") {
 				t.Fatalf("second call sent %v, received %v", sent, received)
 			}
 		})

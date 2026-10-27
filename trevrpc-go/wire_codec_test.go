@@ -45,9 +45,6 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 		if rng.IntN(2) == 0 {
 			// A well-formed payload from the reflective encoder.
 			request := &wireRequest{Method: string(prefix(randomWireBytes(rng), rng.IntN(6))), Metadata: randomMetadata(rng), Kind: RPCKind(rng.Int32N(6) - 1), TimeoutNanos: rng.Uint64() >> rng.UintN(64)}
-			if rng.IntN(4) == 0 {
-				request.Extensions = []uint64{rng.Uint64() >> rng.UintN(64), 1}
-			}
 			addRandomDictionaries(rng, request)
 			payload, _ = proto.Marshal(protoMessageV2(request))
 			if rng.IntN(3) == 0 && len(payload) > 0 {
@@ -82,32 +79,40 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 
 		var wantHeaders wireHeaders
 		wantHeadersErr := unmarshalMessage(payload, &wantHeaders)
-		headers, answer, err := decodeHeaders(payload)
+		headers, err := decodeHeaders(payload)
 		if (err == nil) != (wantHeadersErr == nil) {
 			t.Fatalf("headers %x: err = %v, protobuf err = %v", payload, err, wantHeadersErr)
 		}
-		if err == nil && (!metadataEqual(headers, cloneMetadata(wantHeaders.Metadata)) || !dictionaryInfosEqual(answer.dictionaries, wantHeaders.Dictionaries) ||
-			!streamCompressionInfoEqual(answer.stream, wantHeaders.StreamCompression)) {
-			t.Fatalf("headers %x: got %v %v, want %v %v", payload, headers, answer, wantHeaders.Metadata, wantHeaders.Dictionaries)
+		if err == nil && !metadataEqual(headers, cloneMetadata(wantHeaders.Metadata)) {
+			t.Fatalf("headers %x: got %v, want %v", payload, headers, wantHeaders.Metadata)
+		}
+
+		var wantAnswer wireAnswer
+		wantAnswerErr := unmarshalMessage(payload, &wantAnswer)
+		answer, err := decodeAnswer(payload)
+		if (err == nil) != (wantAnswerErr == nil) {
+			t.Fatalf("answer %x: err = %v, protobuf err = %v", payload, err, wantAnswerErr)
+		}
+		if err == nil && !answerEqual(answer, wantAnswer) {
+			t.Fatalf("answer %x: got %+v, want %+v", payload, answer, wantAnswer)
 		}
 	}
 
 	for range 20000 {
 		request := &wireRequest{Method: string(prefix(randomWireBytes(rng), rng.IntN(6))), Metadata: randomMetadata(rng), Kind: RPCKind(rng.Int32N(6) - 1), TimeoutNanos: rng.Uint64() >> rng.UintN(64)}
-		if rng.IntN(4) == 0 {
-			request.Extensions = []uint64{rng.Uint64() >> rng.UintN(64), 1}
-		}
 		addRandomDictionaries(rng, request)
 		checkEncoding(t, frameTypeRequest, func(dst []byte) ([]byte, error) { return appendRequestFrame(dst, request, DefaultMaxFrameSize) }, request, len(request.Metadata) > 1)
 
 		headers := &wireHeaders{Metadata: randomMetadata(rng)}
-		if rng.IntN(3) == 0 {
-			headers.Dictionaries = randomDictionaryInfos(rng)
-		}
-		headers.StreamCompression = randomStreamCompression(rng)
 		checkEncoding(t, frameTypeHeaders, func(dst []byte) ([]byte, error) {
-			return appendHeadersFrame(dst, headers.Metadata, headersAnswer{dictionaries: headers.Dictionaries, stream: headers.StreamCompression}, DefaultMaxFrameSize)
+			return appendHeadersFrame(dst, headers.Metadata, DefaultMaxFrameSize)
 		}, headers, len(headers.Metadata) > 1)
+
+		answer := &wireAnswer{StreamCompression: rng.IntN(2) == 0, ConnectionMetadata: rng.Uint32() >> rng.UintN(33)}
+		if rng.IntN(3) == 0 {
+			answer.Dictionaries = randomDictionaryInfos(rng)
+		}
+		checkEncoding(t, frameTypeAnswer, func(dst []byte) ([]byte, error) { return appendAnswerFrame(dst, answer, DefaultMaxFrameSize) }, answer, false)
 
 		status := &Status{Code: Code(rng.IntN(20)), Message: string(prefix(randomWireBytes(rng), rng.IntN(5))), Metadata: randomMetadata(rng)}
 		if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 {
@@ -151,9 +156,9 @@ func checkEncoding(t *testing.T, typ frameType, appendFrame func([]byte) ([]byte
 
 func wireRequestEqual(a, b *wireRequest) bool {
 	return a.Method == b.Method && a.Kind == b.Kind && a.TimeoutNanos == b.TimeoutNanos &&
-		slices.Equal(a.Extensions, b.Extensions) && metadataEqual(a.Metadata, b.Metadata) &&
+		a.DatagramFlow == b.DatagramFlow && metadataEqual(a.Metadata, b.Metadata) &&
 		slices.Equal(a.AcceptDictionaries, b.AcceptDictionaries) && dictionaryInfosEqual(a.DictionaryQuery, b.DictionaryQuery) &&
-		streamCompressionInfoEqual(a.StreamCompression, b.StreamCompression)
+		a.StreamCompression == b.StreamCompression && connectionMetadataEqual(a.ConnectionMetadata, b.ConnectionMetadata)
 }
 
 func dictionaryInfosEqual(a, b []*dictionaryInfo) bool {
@@ -170,20 +175,8 @@ func addRandomDictionaries(rng *rand.Rand, request *wireRequest) {
 	if rng.IntN(4) == 0 {
 		request.DictionaryQuery = randomDictionaryInfos(rng)
 	}
-	request.StreamCompression = randomStreamCompression(rng)
-}
-
-// randomStreamCompression returns a stream_compression field, sometimes with
-// an unusual window and sometimes none.
-func randomStreamCompression(rng *rand.Rand) *streamCompressionInfo {
-	switch rng.IntN(4) {
-	case 0:
-		return nil
-	case 1:
-		return &streamCompressionInfo{}
-	default:
-		return &streamCompressionInfo{MaxWindowLog: rng.Uint32() >> rng.UintN(32)}
-	}
+	// Sometimes a value beyond the defined ones, which decodes all the same.
+	request.StreamCompression = streamCompressionMode(rng.Int32N(4))
 }
 
 func randomDictionaryInfos(rng *rand.Rand) []*dictionaryInfo {
@@ -203,14 +196,10 @@ func TestAppendFramesRejectInvalidUTF8(t *testing.T) {
 	if frame, err := appendStatusFrame(prefix, Internal("\xff"), DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("status frame = %x, err = %v", frame, err)
 	}
-	if frame, err := appendHeadersFrame(prefix, Metadata{"\xff": nil}, headersAnswer{}, DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
+	if frame, err := appendHeadersFrame(prefix, Metadata{"\xff": nil}, DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("headers frame = %x, err = %v", frame, err)
 	}
 	if frame, err := appendRequestFrame(prefix, newWireRequest("/svc/\xff"), DefaultMaxFrameSize); err == nil || !bytes.Equal(frame, prefix) {
 		t.Fatalf("request frame = %x, err = %v", frame, err)
 	}
-}
-
-func streamCompressionInfoEqual(a, b *streamCompressionInfo) bool {
-	return (a == nil) == (b == nil) && (a == nil || a.MaxWindowLog == b.MaxWindowLog)
 }

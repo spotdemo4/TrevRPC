@@ -40,9 +40,10 @@ import (
 // refusal, calls on that connection wait for the server's answer again until
 // one is answered.
 //
-// A server sends HEADERS at dispatch, before the handler runs, on every call
-// to a route whose request messages may be stream-compressed, so handlers of
-// such routes cannot set response headers (see SetResponseHeader).
+// A server sends its ANSWER at dispatch, before the handler runs, on calls to
+// a route whose request messages may be stream-compressed, so that a
+// client-streaming client learns it while it is still uploading. Response
+// headers are unaffected.
 //
 // Compressed sizes depend on earlier messages of the call, so do not mark a
 // method whose streams carry data an attacker can influence together with
@@ -72,9 +73,8 @@ func WithStreamCompression(s StreamCompression) CallOption {
 
 // RouteStreamCompression lets the route's calls stream-compress the
 // directions s marks; see StreamCompression. Generated registration passes the
-// method's schema option. With Requests, the route's calls send HEADERS at
-// dispatch and their handlers cannot set response headers (see
-// SetResponseHeader).
+// method's schema option. With Requests, the route's calls send their ANSWER
+// at dispatch.
 func RouteStreamCompression(s StreamCompression) RouteOption {
 	return func(config *routeConfig) {
 		config.streamCompression = s
@@ -158,20 +158,6 @@ func (r *streamReservation) release() {
 	}
 }
 
-// streamOffer is what a peer sends to enable a direction it decodes.
-func streamOffer() *streamCompressionInfo {
-	return &streamCompressionInfo{MaxWindowLog: zstd.StreamWindowLog}
-}
-
-// senderWindowLog returns the window a sender uses for a peer that sent info,
-// or zero if info enables nothing.
-func senderWindowLog(info *streamCompressionInfo) int {
-	if info == nil || info.MaxWindowLog < zstd.MinStreamWindowLog {
-		return 0
-	}
-	return int(min(info.MaxWindowLog, zstd.StreamWindowLog))
-}
-
 // streamCompressor encodes the messages of one direction of a call. The first
 // messages, and every message when the direction is not enabled or the budget
 // is spent, go through per, the per-message compressor (nil for none). From
@@ -181,9 +167,9 @@ func senderWindowLog(info *streamCompressionInfo) int {
 type streamCompressor struct {
 	budget *streamBudget
 	per    *messageCompressor
-	// windowLog is the peer's window once the direction is enabled, zero
-	// until then. A client learns it from HEADERS, on another goroutine.
-	windowLog atomic.Int32
+	// enabled is set once the peer enabled the direction. A client learns it
+	// from ANSWER, on another goroutine.
+	enabled atomic.Bool
 
 	mu          sync.Mutex
 	sent        int
@@ -198,10 +184,9 @@ func newStreamCompressor(budget *streamBudget, per *messageCompressor) *streamCo
 	return &streamCompressor{budget: budget, per: per}
 }
 
-// enable lets the direction be stream-compressed with a window of
-// 2^windowLog bytes.
-func (c *streamCompressor) enable(windowLog int) {
-	c.windowLog.Store(int32(windowLog))
+// enable lets the direction be stream-compressed.
+func (c *streamCompressor) enable() {
+	c.enabled.Store(true)
 }
 
 // encode marshals message into its frame.
@@ -209,10 +194,8 @@ func (c *streamCompressor) encode(message ProtoMessage) (encodedMessage, error) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sent++
-	if c.encoder == nil && !c.stopped && c.sent >= streamCompressionStart {
-		if windowLog := int(c.windowLog.Load()); windowLog > 0 {
-			c.start(protoMessageV2(message), windowLog)
-		}
+	if c.encoder == nil && !c.stopped && c.sent >= streamCompressionStart && c.enabled.Load() {
+		c.start(protoMessageV2(message))
 	}
 	if c.encoder == nil {
 		return c.per.encode(message)
@@ -222,7 +205,7 @@ func (c *streamCompressor) encode(message ProtoMessage) (encodedMessage, error) 
 
 // start creates the direction's context, starting from the dictionary the
 // per-message compressor would use for message, if the budget allows it.
-func (c *streamCompressor) start(message proto.Message, windowLog int) {
+func (c *streamCompressor) start(message proto.Message) {
 	reservation := c.budget.reserve(c.budget.encoderCost)
 	if reservation == nil {
 		c.stopped = true
@@ -232,7 +215,7 @@ func (c *streamCompressor) start(message proto.Message, windowLog int) {
 	if d := c.per.dictFor(message); d != nil {
 		dict = d.Dict
 	}
-	encoder, err := zstd.NewStreamEncoder(dict, c.budget.level, windowLog)
+	encoder, err := zstd.NewStreamEncoder(dict, c.budget.level, zstd.StreamWindowLog)
 	if err != nil {
 		reservation.release()
 		c.stopped = true
@@ -251,10 +234,8 @@ func (c *streamCompressor) encodeMarshalled(payload []byte, message proto.Messag
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sent++
-	if c.encoder == nil && !c.stopped && c.sent >= streamCompressionStart {
-		if windowLog := int(c.windowLog.Load()); windowLog > 0 {
-			c.start(message, windowLog)
-		}
+	if c.encoder == nil && !c.stopped && c.sent >= streamCompressionStart && c.enabled.Load() {
+		c.start(message)
 	}
 	if c.encoder == nil {
 		return encodePayload(payload, c.per.compressorFor(message)), nil
@@ -274,7 +255,7 @@ func (c *streamCompressor) reset(sent int) {
 	}
 	c.reservation.release()
 	c.reservation = nil
-	c.windowLog.Store(0)
+	c.enabled.Store(false)
 	c.sent = sent
 	c.stopped = false
 }
@@ -345,16 +326,15 @@ type streamInflater struct {
 	// received counts the messages decompressed.
 	received atomic.Int64
 
-	mu           sync.Mutex
-	decoder      *zstd.StreamDecoder
-	inFrame      bool
-	closed       bool
-	failed       bool
-	maxWindowLog int
+	mu      sync.Mutex
+	decoder *zstd.StreamDecoder
+	inFrame bool
+	closed  bool
+	failed  bool
 }
 
 func newStreamInflater(dicts dictionaryLookup, reservation *streamReservation) *streamInflater {
-	return &streamInflater{dicts: dicts, reservation: reservation, maxWindowLog: zstd.StreamWindowLog}
+	return &streamInflater{dicts: dicts, reservation: reservation}
 }
 
 // inflate decompresses the payload of a ZSTD_STREAM_MESSAGE frame. The message
@@ -388,7 +368,7 @@ func (s *streamInflater) inflate(payload []byte, maxSize int, charge func(int) e
 }
 
 func (s *streamInflater) decode(chunk []byte, size int) ([]byte, error) {
-	info, err := zstd.ParseStreamChunk(chunk, !s.inFrame, s.maxWindowLog)
+	info, err := zstd.ParseStreamChunk(chunk, !s.inFrame, zstd.StreamWindowLog)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +382,7 @@ func (s *streamInflater) decode(chunk []byte, size int) ([]byte, error) {
 		}
 	}
 	if s.decoder == nil {
-		if s.decoder, err = zstd.NewStreamDecoder(s.maxWindowLog); err != nil {
+		if s.decoder, err = zstd.NewStreamDecoder(zstd.StreamWindowLog); err != nil {
 			return nil, err
 		}
 	}
@@ -434,9 +414,8 @@ func (s *streamInflater) close() {
 
 // serverStreams is the server's stream compression of one call.
 type serverStreams struct {
-	// answer goes out in HEADERS when the server decodes stream-compressed
-	// requests, and requests then decompresses them; both are nil otherwise.
-	answer   *streamCompressionInfo
+	// requests decompresses the request messages when the server decodes
+	// stream-compressed requests, which its ANSWER then says; nil otherwise.
 	requests *streamInflater
 	// responses encodes the response messages when they may be
 	// stream-compressed, and is nil otherwise.
@@ -446,8 +425,8 @@ type serverStreams struct {
 // streamCompressesRequests reports whether the route's request messages may
 // be stream-compressed. A direction marked unreliable is left out: its
 // messages may be datagrams, which cannot carry stream-compressed messages.
-// The calls of such a route send HEADERS at dispatch, so a client learns the
-// answer while it is still uploading.
+// The calls of such a route send their ANSWER at dispatch, so a client learns
+// it while it is still uploading.
 func (rt route) streamCompressesRequests() bool {
 	return rt.streamCompression.Requests && !rt.unreliable.Requests
 }
@@ -459,44 +438,41 @@ func (rt route) streamCompressesRequests() bool {
 //
 // refused is set for an optimistic request to a route the server finds, whose
 // stream-compressed requests it does not decode on this call: the route does
-// not allow them, the window is too large, stream compression is off, or the
-// budget is spent. The call must then be refused before anything else runs
-// for it; see refuseOptimistic.
+// not allow them, stream compression is off, or the budget is spent. The
+// call must then be refused before anything else runs for it, with
+// refusedStreamCompression.
 func (r *serverRuntime) negotiateStreams(request *wireRequest) (streams *serverStreams, refused bool) {
 	offer := request.StreamCompression
-	if offer == nil {
+	if offer == streamCompressionNone {
 		return nil, false
 	}
+	optimistic := offer == streamCompressionOptimistic
 	route, ok := r.routes[request.Method]
 	if !ok || route.kind != request.rpcKind() {
 		// The call fails with the status of an unknown route or kind.
 		return nil, false
 	}
 	if r.streams == nil {
-		return nil, offer.Optimistic
+		return nil, optimistic
 	}
 	streams = &serverStreams{}
-	// An optimistic client compresses with up to its own window, which the
-	// decoder must then take.
-	window := !offer.Optimistic || (offer.MaxWindowLog >= zstd.MinStreamWindowLog && offer.MaxWindowLog <= zstd.StreamWindowLog)
-	if route.streamCompressesRequests() && window {
+	if route.streamCompressesRequests() {
 		if reservation := r.streams.reserve(r.streams.decoderCost); reservation != nil {
-			streams.answer = streamOffer()
 			streams.requests = newStreamInflater(r.compression.lookupOrNil(), reservation)
 		}
 	}
-	if offer.Optimistic && streams.requests == nil {
+	if optimistic && streams.requests == nil {
 		return nil, true
 	}
-	if windowLog := senderWindowLog(request.StreamCompression); windowLog > 0 && route.streamCompression.Responses && !route.unreliable.Responses {
+	if route.streamCompression.Responses && !route.unreliable.Responses {
 		var per *messageCompressor
 		if request.compression != nil {
 			per = request.compression.responses
 		}
 		streams.responses = newStreamCompressor(r.streams, per)
-		streams.responses.enable(windowLog)
+		streams.responses.enable()
 	}
-	if streams.answer == nil && streams.responses == nil {
+	if streams.requests == nil && streams.responses == nil {
 		return nil, false
 	}
 	return streams, false
@@ -509,6 +485,12 @@ func refusedStreamCompression() *Status {
 	status := ResourceExhausted("stream-compressed requests refused")
 	status.refusedStreamCompression = true
 	return status
+}
+
+// decodesRequests reports whether the server decodes the call's
+// stream-compressed requests, which its ANSWER says; nil-safe.
+func (s *serverStreams) decodesRequests() bool {
+	return s != nil && s.requests != nil
 }
 
 // requestInflater returns the decompressor of the request messages; nil-safe.
@@ -571,18 +553,15 @@ func (c *streamClient) prepareStreams(request *wireRequest, accept *dictSet) *cl
 	if streams.requests == nil && streams.responses == nil {
 		return nil
 	}
-	request.StreamCompression = streamOffer()
+	request.StreamCompression = streamCompressionEnabled
 	return streams
 }
 
-// learn enables the request direction when the server's HEADERS answer the
-// offer; it is safe on nil.
-func (s *clientStreams) learn(answer *streamCompressionInfo) {
-	if s == nil || s.requests == nil {
-		return
-	}
-	if windowLog := senderWindowLog(answer); windowLog > 0 {
-		s.requests.enable(windowLog)
+// learn enables the request direction when the server's ANSWER accepts
+// stream-compressed requests; it is safe on nil.
+func (s *clientStreams) learn(answer wireAnswer) {
+	if s != nil && s.requests != nil && answer.StreamCompression {
+		s.requests.enable()
 	}
 }
 

@@ -65,10 +65,13 @@ const (
 	// context of its direction of the call. Readers turn it into a MESSAGE
 	// frame too.
 	frameTypeZstdStreamMessage frameType = 5
+	// frameTypeAnswer carries the server's answer to the negotiation fields
+	// of the REQUEST, before the response's HEADERS.
+	frameTypeAnswer frameType = 6
 )
 
 // known reports whether t is a frame type this runtime interprets.
-func (t frameType) known() bool { return t <= frameTypeZstdStreamMessage }
+func (t frameType) known() bool { return t <= frameTypeAnswer }
 
 func (t frameType) String() string {
 	switch t {
@@ -84,6 +87,8 @@ func (t frameType) String() string {
 		return "ZSTD_MESSAGE"
 	case frameTypeZstdStreamMessage:
 		return "ZSTD_STREAM_MESSAGE"
+	case frameTypeAnswer:
+		return "ANSWER"
 	default:
 		return fmt.Sprintf("unknown frame type %#x", uint64(t))
 	}
@@ -112,8 +117,8 @@ func unmarshalMessage(payload []byte, message ProtoMessage) error {
 	return proto.Unmarshal(payload, protoMessage)
 }
 
-// decodePayload decodes the protobuf payload of a REQUEST, HEADERS or STATUS
-// frame, reporting malformed payloads as frameDecodeError.
+// decodePayload decodes the protobuf payload of a REQUEST, HEADERS, ANSWER or
+// STATUS frame, reporting malformed payloads as frameDecodeError.
 func decodePayload(payload []byte, message ProtoMessage) error {
 	if err := unmarshalMessage(payload, message); err != nil {
 		return &frameDecodeError{Err: err}
@@ -147,32 +152,31 @@ func decodeStatus(payload []byte) (*Status, error) {
 	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata), refusedStreamCompression: status.RefusedStreamCompression}, nil
 }
 
-// headersAnswer is what the HEADERS of a response answer: the dictionary
-// query, whether the server decodes stream-compressed requests, and which
-// offered connection metadata set it stored.
-type headersAnswer struct {
-	dictionaries []*dictionaryInfo
-	stream       *streamCompressionInfo
-	// connectionMetadata is the ID of the connection metadata set the server
-	// confirms, zero for none.
-	connectionMetadata uint32
-}
-
-// decodeHeaders decodes the payload of a HEADERS frame into its metadata and
-// its answers. Extensions are decoded and dropped: the registry is empty.
-func decodeHeaders(payload []byte) (Metadata, headersAnswer, error) {
+// decodeHeaders decodes the payload of a HEADERS frame into its metadata.
+func decodeHeaders(payload []byte) (Metadata, error) {
 	if len(payload) == 0 {
-		return Metadata{}, headersAnswer{}, nil
+		return Metadata{}, nil
 	}
 	var headers wireHeaders
 	if !headers.decodeFast(payload) {
 		headers = wireHeaders{}
 		if err := decodePayload(payload, &headers); err != nil {
-			return nil, headersAnswer{}, err
+			return nil, err
 		}
 	}
-	answer := headersAnswer{dictionaries: headers.Dictionaries, stream: headers.StreamCompression, connectionMetadata: headers.ConnectionMetadata}
-	return ownedMetadata(headers.Metadata), answer, nil
+	return ownedMetadata(headers.Metadata), nil
+}
+
+// decodeAnswer decodes the payload of an ANSWER frame.
+func decodeAnswer(payload []byte) (wireAnswer, error) {
+	var answer wireAnswer
+	if !answer.decodeFast(payload) {
+		answer = wireAnswer{}
+		if err := decodePayload(payload, &answer); err != nil {
+			return wireAnswer{}, err
+		}
+	}
+	return answer, nil
 }
 
 // encodedMessage is one message ready to send: a complete MESSAGE frame whose
@@ -269,10 +273,19 @@ func appendRequestFrame(dst []byte, request *wireRequest, maxFrameSize int) ([]b
 	return request.appendPayload(dst), nil
 }
 
-// appendHeadersFrame appends a HEADERS frame carrying metadata and the
-// answers to the request.
-func appendHeadersFrame(dst []byte, metadata Metadata, answer headersAnswer, maxFrameSize int) ([]byte, error) {
-	headers := wireHeaders{Metadata: metadata, Dictionaries: answer.dictionaries, StreamCompression: answer.stream, ConnectionMetadata: answer.connectionMetadata}
+// appendAnswerFrame appends an ANSWER frame.
+func appendAnswerFrame(dst []byte, answer *wireAnswer, maxFrameSize int) ([]byte, error) {
+	size := answer.payloadSize()
+	dst, err := appendDirectFrameHeader(dst, frameTypeAnswer, size, maxFrameSize)
+	if err != nil {
+		return dst, err
+	}
+	return answer.appendPayload(dst), nil
+}
+
+// appendHeadersFrame appends a HEADERS frame carrying metadata.
+func appendHeadersFrame(dst []byte, metadata Metadata, maxFrameSize int) ([]byte, error) {
+	headers := wireHeaders{Metadata: metadata}
 	size, ok := headers.payloadSize()
 	if !ok {
 		return appendLimitedProtoFrame(dst, frameTypeHeaders, &headers, maxFrameSize)

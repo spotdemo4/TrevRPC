@@ -6,7 +6,7 @@ import { connect } from "../src/channel.js";
 import {
   FrameReader,
   FrameType,
-  encodeHeadersFrame,
+  encodeAnswerFrame,
   encodeMessageFrame,
   encodeRequestFrame,
   unmarshalMessage,
@@ -80,7 +80,7 @@ async function echo(client, message, metadata) {
   return (await client.unary({ message }, { metadata })).message;
 }
 
-test("a session offers the set until a HEADERS confirms it, then refers to it", async () => {
+test("a session offers the set until an ANSWER confirms it, then refers to it", async () => {
   const fake = fakeWebTransport();
   const channel = await channelTo(fake, { connectionMetadata: { "Interop-Suffix": "!" } });
   const client = new EchoClient(channel);
@@ -204,15 +204,12 @@ test("a new session starts unconfirmed and offers the set again", async () => {
   channel.close();
 });
 
-test("only a HEADERS that confirms the offered ID confirms the set", async () => {
+test("only an ANSWER that confirms the offered ID confirms the set", async () => {
   let confirm = 99;
   const fake = fakeWebTransport(async (stream) => {
     const request = await stream.readRequest();
     await stream.write(
-      encodeHeadersFrame({
-        metadata: {},
-        connectionMetadata: confirm ?? request.connectionMetadata.id,
-      }),
+      encodeAnswerFrame({ connectionMetadata: confirm ?? request.connectionMetadata.id }),
     );
     await stream.readMessage(EchoRequest);
     await stream.writeMessage(EchoResponse, { message: "x" });
@@ -295,7 +292,7 @@ test("a late confirmation of a replaced set does not undo the current one's", as
   source.set({ k: "2" });
   const second = session.prepare().offered;
   session.learn(second, { connectionMetadata: second });
-  // The first call's HEADERS arrive last.
+  // The first call's ANSWER arrives last.
   session.learn(first, { connectionMetadata: first });
   const { field, offered } = session.prepare();
   assert.equal(offered, 0, "the current set is still confirmed");

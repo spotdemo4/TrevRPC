@@ -245,6 +245,31 @@ func streamingTestResponse(t *testing.T, data []byte) (ServerStreamingCall[*test
 	return call, stream
 }
 
+// TestTransportTakesTheAnswerBeforeHeaders checks that an ANSWER is not
+// reported as the call's headers: Headers waits for the HEADERS behind it.
+func TestTransportTakesTheAnswerBeforeHeaders(t *testing.T) {
+	first, err := encodeMessage(&testMessage{Value: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := appendAnswerFrame(nil, &wireAnswer{ConnectionMetadata: 1}, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := concat(answer, headersBytes(t, Metadata{"x-h": []byte("1")}), first.frame, statusBytes(t, OK()))
+	call, _ := streamingTestResponse(t, response)
+	defer func() { _ = call.Close() }()
+	if headers, err := call.Headers(); err != nil || string(headers["x-h"]) != "1" {
+		t.Fatalf("Headers() = %v, %v", headers, err)
+	}
+	if message, err := call.Recv(); err != nil || message.Value != "one" {
+		t.Fatalf("Recv() = %v, %v", message, err)
+	}
+	if _, err := call.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("Recv() = %v, want EOF", err)
+	}
+}
+
 func TestTransportServerStreamingSkipsUnknownFramesAndReadsHeaders(t *testing.T) {
 	grease := greaseFrame(0x21, 4)
 	first, err := encodeMessage(&testMessage{Value: "one"})
@@ -326,9 +351,16 @@ func TestTransportRejectsMisplacedHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	headers := headersBytes(t, Metadata{"x-h": []byte("1")})
+	answer, err := appendAnswerFrame(nil, &wireAnswer{}, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, response := range map[string][]byte{
 		"second HEADERS":        concat(headers, headers, first.frame, statusBytes(t, OK())),
 		"HEADERS after MESSAGE": concat(first.frame, headers, statusBytes(t, OK())),
+		"second ANSWER":         concat(answer, answer, first.frame, statusBytes(t, OK())),
+		"ANSWER after HEADERS":  concat(headers, answer, first.frame, statusBytes(t, OK())),
+		"ANSWER after MESSAGE":  concat(first.frame, answer, statusBytes(t, OK())),
 		"REQUEST":               concat(testRequestBytes(t, requestFor("Echo", RPCKindUnary)), first.frame, statusBytes(t, OK())),
 	} {
 		t.Run(name, func(t *testing.T) {

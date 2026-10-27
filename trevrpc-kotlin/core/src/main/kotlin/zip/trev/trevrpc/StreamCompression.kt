@@ -131,7 +131,7 @@ private const val STREAM_COMPRESSION_START = 3
  * The stream compression of one call. Created only when the call offers it: [offer] is the call's
  * `stream_compression`. Responses are decompressed with one context if the response direction is
  * enabled, and requests are compressed with another from their third message once the server's
- * HEADERS answered, or from the start of an [optimistic] call, which the server accepts or refuses
+ * ANSWER accepted them, or from the start of an [optimistic] call, which the server accepts or refuses
  * before reading any of them. The sender and the receiver each use their half; [close] may come
  * from either.
  */
@@ -143,17 +143,17 @@ internal class CallStreams private constructor(
     private val decoderReservation: StreamCompressionBudget.Reservation?,
     val optimistic: Boolean,
 ) {
-    val offer = StreamCompression(STREAM_WINDOW_LOG.toUInt(), optimistic)
+    val offer = if (optimistic) StreamCompression.OPTIMISTIC else StreamCompression.ENABLED
 
     private val lock = Any()
     private var closed = false
 
     /**
-     * The window of compressed requests once the server answered, or 0 until then. An optimistic
-     * call uses its own window from the start: a server that accepts it decodes that window.
+     * Whether requests may be compressed: once the server answered, or from the start of an
+     * optimistic call, which a server accepts or refuses before reading any of them.
      */
     @Volatile
-    private var requestWindowLog = if (optimistic) STREAM_WINDOW_LOG else 0
+    private var requestsEnabled = optimistic
     private var sent = 0
     private var stopped = false
     private var encoder: ZstdStreamEncoder? = null
@@ -164,21 +164,14 @@ internal class CallStreams private constructor(
     private var failed = false
 
     /**
-     * Records the server's answer from the call's HEADERS, and returns whether it is one: it
-     * enables compressed requests. An optimistic call already compresses; HEADERS without an
-     * answer, which a server must not send on it, stop it from starting a context.
+     * Records the server's answer from the call's ANSWER: [accepted] enables compressed requests.
+     * An optimistic call already compresses, and the server accepts it with its ANSWER.
      */
-    fun learn(answer: StreamCompression?): Boolean {
-        val windowLog = answer?.maxWindowLog?.toLong() ?: 0L
-        val answered = windowLog >= MIN_STREAM_WINDOW_LOG
-        if (optimistic) {
-            if (!answered) synchronized(lock) { stopped = true }
-        } else if (directions.requests && answered) {
-            requestWindowLog = minOf(windowLog, STREAM_WINDOW_LOG.toLong()).toInt()
-        }
+    fun learn(accepted: Boolean) {
+        if (!accepted || !directions.requests) return
+        requestsEnabled = true
         // The server decodes again: later calls to it may be optimistic.
-        if (answered && directions.requests) budget.optimistic = true
-        return answered
+        budget.optimistic = true
     }
 
     /**
@@ -189,7 +182,7 @@ internal class CallStreams private constructor(
         synchronized(lock) {
             sent++
             if (closed) return null
-            if (encoder == null && !stopped && sent >= STREAM_COMPRESSION_START && requestWindowLog > 0) start()
+            if (encoder == null && !stopped && sent >= STREAM_COMPRESSION_START && requestsEnabled) start()
             val encoder = encoder ?: return null
             val chunk =
                 try {
@@ -209,7 +202,7 @@ internal class CallStreams private constructor(
             return
         }
         try {
-            encoder = ZstdStreamEncoder(compression.level, requestWindowLog, dictionaries?.confirmedRequest?.codec)
+            encoder = ZstdStreamEncoder(compression.level, dictionaries?.confirmedRequest?.codec)
             encoderReservation = reservation
         } catch (_: RuntimeException) {
             reservation.release()

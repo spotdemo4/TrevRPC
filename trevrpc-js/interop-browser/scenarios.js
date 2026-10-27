@@ -368,19 +368,25 @@ function compressedStreamMessages() {
 }
 
 /**
- * CompressedEcho.Bidi echoing the `compressed-stream` messages one at a time; returns its trailing
- * metadata.
+ * CompressedEcho.Bidi echoing the `compressed-stream` messages one at a time, with metadata
+ * `interop-header`; checks that the handler's headers arrive before the first echo and its trailer
+ * with the final status, as on any other method, and returns its trailing metadata.
  */
 async function compressedBidi(compressed) {
-  const call = await compressed.bidi();
+  const call = await compressed.bidi({ metadata: { "interop-header": "h" } });
   for (const [i, message] of compressedStreamMessages().entries()) {
     await call.send({ message });
+    if (i === 0) {
+      expectMetadata(await call.headers, { "interop-header": "h" }, "headers");
+    }
     expectEcho(await call.recv(), message, i);
   }
   await call.closeSend();
   expect((await call.recv()) === undefined, "expected the stream to end after closeSend");
   const status = await call.status;
   expect(status.code === Code.Ok, "stream did not end with OK");
+  const trailer = new TextDecoder().decode(status.metadata["interop-trailer"] ?? new Uint8Array());
+  expect(trailer === "h", `expected trailing metadata interop-trailer "h", got "${trailer}"`);
   return status.metadata;
 }
 

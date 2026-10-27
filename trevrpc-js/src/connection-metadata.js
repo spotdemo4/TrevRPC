@@ -1,11 +1,11 @@
 // Connection metadata is request metadata a client sets once for all its calls, such as a bearer
 // token, so that it crosses each connection once instead of in every REQUEST. A call offers the
-// set (RpcRequest.connection_metadata with entries) until a HEADERS confirms that the server
+// set (RpcRequest.connection_metadata with entries) until an ANSWER confirms that the server
 // stored it for the session, then refers to it by ID. Calls on different streams reach the server
 // in any order, so a reference only follows a confirmation. The server merges the set into each
 // call's metadata, the call's own entries winning, so the client just sends both; see the wiki's
 // Connection Metadata section. This module holds the channel's set and what each session
-// confirmed; call.js puts them on the REQUEST and learns the confirmation from the HEADERS.
+// confirmed; call.js puts them on the REQUEST and learns the confirmation from the ANSWER.
 import { normalizeMetadata } from "./metadata.js";
 
 /** The property of a transport that holds its ConnectionMetadataSource. */
@@ -86,7 +86,7 @@ class SessionConnectionMetadata {
    * The connection metadata of one REQUEST as `{ field, offered }`: `field` is the value of
    * `connectionMetadata`, a reference to the current set once the session confirmed it and an
    * offer of it otherwise, or undefined without a set; `offered` is the ID the REQUEST offers,
-   * which `learn` checks the HEADERS against, or zero.
+   * which `learn` checks the ANSWER against, or zero.
    */
   prepare() {
     const set = this.#source.current;
@@ -99,13 +99,13 @@ class SessionConnectionMetadata {
     return { field: { id: set.id, metadata: set.metadata }, offered: set.id };
   }
 
-  /** Records that the server stored the `offered` set, once the call's HEADERS confirm it. */
-  learn(offered, headers) {
+  /** Records that the server stored the `offered` set, once the call's ANSWER confirms it. */
+  learn(offered, answer) {
     // Only the current set counts: a late confirmation of one since replaced would make calls
     // offer the current one again.
     if (
       offered !== 0 &&
-      headers.connectionMetadata === offered &&
+      answer.connectionMetadata === offered &&
       this.#source.current?.id === offered
     ) {
       this.#confirmed = offered;

@@ -25,7 +25,8 @@ func FuzzFrameDecodeNeverPanics(f *testing.F) {
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		for _, decode := range []func([]byte) error{
 			func(payload []byte) error { return decodePayload(payload, &wireRequest{}) },
-			func(payload []byte) error { _, _, err := decodeHeaders(payload); return err },
+			func(payload []byte) error { _, err := decodeHeaders(payload); return err },
+			func(payload []byte) error { _, err := decodeAnswer(payload); return err },
 			func(payload []byte) error { _, err := decodeStatus(payload); return err },
 		} {
 			err := decode(payload)

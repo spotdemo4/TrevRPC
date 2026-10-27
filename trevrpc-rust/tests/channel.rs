@@ -575,18 +575,18 @@ async fn run_connection_metadata_server(
                 });
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let headers = trevrpc::RpcHeaders {
+                    let answer = trevrpc::RpcAnswer {
                         connection_metadata: confirmed,
-                        ..trevrpc::RpcHeaders::default()
+                        ..trevrpc::RpcAnswer::default()
                     };
-                    let Ok(headers) = trevrpc::framing::encode_protobuf_frame(
-                        trevrpc::framing::frame_type::HEADERS,
-                        &headers,
+                    let Ok(answer) = trevrpc::framing::encode_protobuf_frame(
+                        trevrpc::framing::frame_type::ANSWER,
+                        &answer,
                         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
                     ) else {
                         return;
                     };
-                    if support::write_raw(&mut send, &headers).await.is_ok()
+                    if support::write_raw(&mut send, &answer).await.is_ok()
                         && support::write_message(&mut send, &body).await.is_ok()
                         && support::write_status(&mut send, Status::ok()).await.is_ok()
                     {

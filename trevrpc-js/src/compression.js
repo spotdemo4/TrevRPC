@@ -49,7 +49,7 @@ class SessionCompression {
   #shared;
   /**
    * Whether calls on the session stream-compress requests optimistically: from the start, until
-   * the server refuses one, and again once a later call's HEADERS answer `stream_compression`.
+   * the server refuses one, and again once a later call's ANSWER accepts `stream_compression`.
    */
   optimisticStreams = true;
 

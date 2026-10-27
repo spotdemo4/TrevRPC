@@ -1,14 +1,16 @@
 package zip.trev.trevrpc
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
-import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.milliseconds
 
 class StreamCompressionTest {
     private val vectors = zstdVectors()
@@ -19,12 +21,16 @@ class StreamCompressionTest {
 
     @Test
     fun `negotiation fields match the shared vectors byte for byte`() {
-        val request = RpcRequest("/svc/m", streamCompression = StreamCompression(16u))
+        val request = RpcRequest("/svc/m", streamCompression = StreamCompression.ENABLED)
         assertArrayEquals(vectors.getValue("request.stream_compression.payload"), WireCodec.encode(request))
         assertEquals(request, WireCodec.decodeRequest(vectors.getValue("request.stream_compression.payload")))
-        val headers = RpcHeaders(streamCompression = StreamCompression(16u))
-        assertArrayEquals(vectors.getValue("headers.stream_compression.payload"), WireCodec.encode(headers))
-        assertEquals(headers, WireCodec.decodeHeaders(vectors.getValue("headers.stream_compression.payload")))
+        val answer = RpcAnswer(streamCompression = true)
+        assertArrayEquals(vectors.getValue("answer.stream_compression.payload"), WireCodec.encode(answer))
+        assertEquals(answer, WireCodec.decodeAnswer(vectors.getValue("answer.stream_compression.payload")))
+        assertArrayEquals(
+            vectors.getValue("answer.stream_compression.frame"),
+            encodeFrame(FrameType.ANSWER, vectors.getValue("answer.stream_compression.payload")),
+        )
         assertArrayEquals(
             vectors.getValue("zstd_stream_message.first.frame"),
             encodeMessageFrame(FrameType.ZSTD_STREAM_MESSAGE, vectors.getValue("zstd_stream_message.first.payload")),
@@ -81,7 +87,7 @@ class StreamCompressionTest {
     @Test
     fun `the encoder writes the shared payloads byte for byte`() {
         for ((name, seed) in listOf("plain" to null, "seeded" to ConfiguredDictionary(dictionary, 1).codec)) {
-            val encoder = ZstdStreamEncoder(1, STREAM_WINDOW_LOG, seed)
+            val encoder = ZstdStreamEncoder(1, seed)
             var index = 0
             while (vectors.containsKey("stream.$name.$index.payload")) {
                 val message = vectors.getValue("stream.$name.$index.message")
@@ -91,7 +97,7 @@ class StreamCompressionTest {
             }
             encoder.close()
         }
-        val encoder = ZstdStreamEncoder(1, STREAM_WINDOW_LOG, null)
+        val encoder = ZstdStreamEncoder(1, null)
         assertEquals(0, encoder.compress(ByteArray(0)).size)
         encoder.close()
     }
@@ -99,7 +105,7 @@ class StreamCompressionTest {
     @Test
     fun `the encoder ends a frame every 60 KiB and starts the next from its dictionary`() {
         for (seed in listOf(null, ConfiguredDictionary(dictionary, 1).codec)) {
-            val encoder = ZstdStreamEncoder(1, STREAM_WINDOW_LOG, seed)
+            val encoder = ZstdStreamEncoder(1, seed)
             val streams = responseStreams()
             var atFrameStart = true
             var frames = 0
@@ -133,11 +139,11 @@ class StreamCompressionTest {
             budget.optimistic = false
             val transport = ScriptedTransport(Compression(emptyList()), budget)
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
-            assertEquals(StreamCompression(16u), transport.requests.single().streamCompression)
+            assertEquals(StreamCompression.ENABLED, transport.requests.single().streamCompression)
 
             call.send(compressible)
             call.send(compressible)
-            transport.respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
+            transport.respond(ResponseFrame.Answer(streamCompression = true), ResponseFrame.Headers())
             call.headers()
             val more = (1..3).map { vectors.getValue("stream.plain.${it % 3}.message") }
             more.forEach { call.send(it) }
@@ -163,7 +169,7 @@ class StreamCompressionTest {
         }
 
     @Test
-    fun `a client-streaming call reports the answer's headers mid-upload, and compresses the requests after them`() =
+    fun `a client-streaming call learns the answer mid-upload, and compresses the requests after it`() =
         runBlocking {
             val transport = ScriptedTransport(Compression(emptyList()), StreamCompressionBudget())
             val headers = CompletableDeferred<Metadata>()
@@ -171,8 +177,9 @@ class StreamCompressionTest {
             val upload =
                 flow {
                     emit(compressible)
-                    // The server sends HEADERS at dispatch, before its only response.
-                    transport.respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
+                    // The server answers at dispatch, and this handler sends its headers before
+                    // its only response.
+                    transport.respond(ResponseFrame.Answer(streamCompression = true), ResponseFrame.Headers())
                     headers.await()
                     emit(compressible)
                     more.forEach { emit(it) }
@@ -197,7 +204,10 @@ class StreamCompressionTest {
     @Test
     fun `without an answer requests stay per-message`() =
         runBlocking {
-            val transport = ScriptedTransport(Compression(emptyList()), StreamCompressionBudget())
+            // A call that is not optimistic waits for the answer, which never comes.
+            val budget = StreamCompressionBudget()
+            budget.optimistic = false
+            val transport = ScriptedTransport(Compression(emptyList()), budget)
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
             transport.respond(ResponseFrame.Headers())
             call.headers()
@@ -213,8 +223,8 @@ class StreamCompressionTest {
             val tight = StreamCompressionBudget(400_000)
             val transport = ScriptedTransport(Compression(emptyList()), tight)
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
-            assertEquals(StreamCompression(16u, optimistic = true), transport.requests.single().streamCompression)
-            transport.respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
+            assertEquals(StreamCompression.OPTIMISTIC, transport.requests.single().streamCompression)
+            transport.respond(ResponseFrame.Answer(streamCompression = true), ResponseFrame.Headers())
             call.headers()
             repeat(4) { call.send(compressible) }
             assertEquals(List(4) { FrameType.MESSAGE }, transport.sent.map { it.first })
@@ -224,13 +234,13 @@ class StreamCompressionTest {
                 Client(
                     transport,
                 ).openServerStreaming("/svc/m", compressible, requests, responses, compressStream = CompressStream.RESPONSES)
-            assertNull(transport.requests.last().streamCompression)
+            assertEquals(StreamCompression.NONE, transport.requests.last().streamCompression)
             second.close()
             call.close()
 
             val off = ScriptedTransport(Compression(emptyList()), StreamCompressionBudget(0))
             Client(off).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH).close()
-            assertNull(off.requests.single().streamCompression)
+            assertEquals(StreamCompression.NONE, off.requests.single().streamCompression)
         }
 
     @Test
@@ -240,11 +250,11 @@ class StreamCompressionTest {
             // A client-streaming call offers so the server can answer, but a stream-compressed
             // response is still invalid: its response direction does not stream.
             val upload = Client(transport).openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
-            assertEquals(StreamCompression(16u, optimistic = true), transport.requests.single().streamCompression)
+            assertEquals(StreamCompression.OPTIMISTIC, transport.requests.single().streamCompression)
             upload.close()
 
             val plain = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses)
-            assertNull(transport.requests.last().streamCompression)
+            assertEquals(StreamCompression.NONE, transport.requests.last().streamCompression)
             transport.respond(streamFrame(vectors.getValue("stream.plain.0.payload")))
             val error = assertThrows(TrevRpcException::class.java) { runBlocking { plain.receive() } }
             assertEquals(Code.INTERNAL, error.status.code)
@@ -253,7 +263,7 @@ class StreamCompressionTest {
             // Without a compression configuration there is no stream compression either.
             val unconfigured = ScriptedTransport(null, StreamCompressionBudget())
             Client(unconfigured).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH).close()
-            assertNull(unconfigured.requests.single().streamCompression)
+            assertEquals(StreamCompression.NONE, unconfigured.requests.single().streamCompression)
         }
 
     @Test
@@ -263,10 +273,8 @@ class StreamCompressionTest {
             val transport = ScriptedTransport(compression, StreamCompressionBudget())
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS)
             transport.respond(
-                ResponseFrame.Headers(
-                    dictionaries = listOf(DictionaryInfo(1u, vectors.getValue("dict.d1.fingerprint"))),
-                    streamCompression = StreamCompression(16u),
-                ),
+                ResponseFrame.Answer(listOf(DictionaryInfo(1u, vectors.getValue("dict.d1.fingerprint"))), streamCompression = true),
+                ResponseFrame.Headers(),
             )
             call.headers()
             val messages = (0..2).map { vectors.getValue("stream.seeded.$it.message") }
@@ -277,6 +285,43 @@ class StreamCompressionTest {
             val chunk = streamMessage(sent.second).body
             assertEquals(1u, parseZstdStreamChunk(chunk, atFrameStart = true)?.dictionaryId)
             call.close()
+        }
+
+    @Test
+    fun `ANSWER comes first, at most once, and is not the headers`() =
+        runBlocking {
+            val transport = ScriptedTransport(Compression(emptyList()), StreamCompressionBudget())
+            val headers = CompletableDeferred<Metadata>()
+            val call =
+                Client(transport).openBidirectionalStreaming(
+                    "/svc/m",
+                    requests,
+                    responses,
+                    CallOptions(onResponseHeaders = { headers.complete(it) }),
+                    compressStream = CompressStream.BOTH,
+                )
+            transport.respond(ResponseFrame.Answer(streamCompression = true))
+            delay(50.milliseconds)
+            assertFalse(headers.isCompleted, "an ANSWER does not resolve the headers")
+            transport.respond(ResponseFrame.Headers(Metadata.of("h" to "1".encodeToByteArray())))
+            assertEquals("1", call.headers()["h"]?.decodeToString())
+            assertEquals("1", headers.await()["h"]?.decodeToString())
+            call.close()
+
+            listOf(
+                listOf(ResponseFrame.Answer(), ResponseFrame.Answer()),
+                listOf(ResponseFrame.Headers(), ResponseFrame.Answer()),
+                listOf(ResponseFrame.Message(compressible), ResponseFrame.Answer()),
+            ).forEach { response ->
+                val scripted = ScriptedTransport(Compression(emptyList()), StreamCompressionBudget())
+                val misordered = Client(scripted).openServerStreaming("/svc/m", compressible, requests, responses)
+                scripted.respond(*response.toTypedArray(), ResponseFrame.Status(Status.ok()))
+                val error =
+                    assertThrows(TrevRpcException::class.java) {
+                        runBlocking { while (misordered.receive() != null) continue }
+                    }
+                assertEquals(Code.INTERNAL, error.status.code)
+            }
         }
 
     /** A response direction that may be stream-compressed, accepting dict.d1. */

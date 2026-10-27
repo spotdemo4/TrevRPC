@@ -462,7 +462,8 @@ func (c *clientCompression) requestCompressor(plain bool) *messageCompressor {
 
 // callCompression is the server's negotiation result for one call.
 type callCompression struct {
-	// answered says the request queried, so HEADERS must carry answer.
+	// answered says the request queried, so the call's ANSWER must carry
+	// answer.
 	answered bool
 	answer   []*dictionaryInfo
 	// responses compresses the response messages, or is nil.

@@ -18,29 +18,15 @@ import (
 	"trev.zip/llc/trevrpc/trevrpc-go/internal/zstd"
 )
 
-func TestOptimisticStreamCompressionGoldenVectors(t *testing.T) {
+// TestRefusalGoldenVectors checks the STATUS refusing an optimistic call; the
+// optimistic REQUEST is checked with the other negotiation fields.
+func TestRefusalGoldenVectors(t *testing.T) {
 	vectors := loadZstdVectors(t)
-	request := &wireRequest{Method: "/svc/m", StreamCompression: &streamCompressionInfo{MaxWindowLog: zstd.StreamWindowLog, Optimistic: true}}
-	frame, err := appendRequestFrame(nil, request, DefaultMaxFrameSize)
-	if err != nil || !bytes.Equal(frame, vectors["request.optimistic_stream_compression.frame"]) {
-		t.Fatalf("REQUEST frame = %x, %v; want %x", frame, err, vectors["request.optimistic_stream_compression.frame"])
-	}
-	payload := vectors["request.optimistic_stream_compression.payload"]
-	var decoded wireRequest
-	if err := decodeRequest(payload, &decoded); err != nil || !decoded.StreamCompression.Optimistic || decoded.StreamCompression.MaxWindowLog != zstd.StreamWindowLog {
-		t.Fatalf("decoded request %+v, %v", decoded.StreamCompression, err)
-	}
-	// The reflective codec agrees with the direct one.
-	var reflected wireRequest
-	if err := decodePayload(payload, &reflected); err != nil || !reflected.StreamCompression.Optimistic {
-		t.Fatalf("reflected request %+v, %v", reflected.StreamCompression, err)
-	}
-
-	frame, err = appendStatusFrame(nil, &Status{Code: CodeResourceExhausted, refusedStreamCompression: true}, DefaultMaxFrameSize)
+	frame, err := appendStatusFrame(nil, &Status{Code: CodeResourceExhausted, refusedStreamCompression: true}, DefaultMaxFrameSize)
 	if err != nil || !bytes.Equal(frame, vectors["status.refused_stream_compression.frame"]) {
 		t.Fatalf("STATUS frame = %x, %v; want %x", frame, err, vectors["status.refused_stream_compression.frame"])
 	}
-	payload = vectors["status.refused_stream_compression.payload"]
+	payload := vectors["status.refused_stream_compression.payload"]
 	status, err := decodeStatus(payload)
 	if err != nil || status.Code != CodeResourceExhausted || !status.refusedStreamCompression {
 		t.Fatalf("decoded status %+v, %v", status, err)
@@ -101,7 +87,7 @@ func TestServerRefusesOptimisticCallsAfterAuthorization(t *testing.T) {
 			RegisterClientStreaming(server, testPath("Plain"), newStringValue, upload)
 
 			request := requestFor(test.method, RPCKindClientStreaming)
-			request.StreamCompression = &streamCompressionInfo{MaxWindowLog: zstd.StreamWindowLog, Optimistic: true}
+			request.StreamCompression = streamCompressionOptimistic
 			frames, err := appendRequestFrame(nil, request, DefaultMaxFrameSize)
 			if err != nil {
 				t.Fatal(err)
@@ -110,7 +96,7 @@ func TestServerRefusesOptimisticCallsAfterAuthorization(t *testing.T) {
 				// Every request at once: the client does not wait.
 				budget := newStreamBudget(0, defaultClientStreamCompressionMemory, nil)
 				compressor := newStreamCompressor(budget, nil)
-				compressor.enable(zstd.StreamWindowLog)
+				compressor.enable()
 				defer compressor.close()
 				for i := range streamTestMessages {
 					encoded, err := compressor.encode(compressionSample(i))
@@ -154,11 +140,11 @@ func TestServerRefusesOptimisticCallsAfterAuthorization(t *testing.T) {
 				return
 			}
 			got := parseRawFrames(t, stream.snapshot())
-			if len(got) != 3 || got[0].typ != frameTypeHeaders || got[1].typ != frameTypeMessage || got[2].typ != frameTypeStatus {
-				t.Fatalf("response frames %v, want HEADERS MESSAGE STATUS", got)
+			if len(got) != 3 || got[0].typ != frameTypeAnswer || got[1].typ != frameTypeMessage || got[2].typ != frameTypeStatus {
+				t.Fatalf("response frames %v, want ANSWER MESSAGE STATUS", got)
 			}
-			if _, answer, err := decodeHeaders(got[0].payload); err != nil || answer.stream == nil {
-				t.Fatalf("HEADERS answer %+v, %v", answer.stream, err)
+			if answer, err := decodeAnswer(got[0].payload); err != nil || !answer.StreamCompression {
+				t.Fatalf("ANSWER %+v, %v", answer, err)
 			}
 			if compressed := streamCompressedRequests.Load(); compressed != streamTestMessages-streamCompressionStart+1 {
 				t.Fatalf("%d requests arrived stream-compressed, want %d", compressed, streamTestMessages-streamCompressionStart+1)
@@ -263,10 +249,10 @@ func checkReplayed(t *testing.T, client *optimisticTestClient, requests int) {
 		t.Fatalf("%d streams, want the refused call and its replay", len(streams))
 	}
 	first, second := recordedRequest(t, streams[0]), recordedRequest(t, streams[1])
-	if !first.StreamCompression.Optimistic {
+	if first.StreamCompression != streamCompressionOptimistic {
 		t.Fatalf("first REQUEST %+v is not optimistic", first.StreamCompression)
 	}
-	if second.StreamCompression == nil || second.StreamCompression.Optimistic || second.Method != first.Method {
+	if second.StreamCompression != streamCompressionEnabled || second.Method != first.Method {
 		t.Fatalf("replayed REQUEST %s %+v", second.Method, second.StreamCompression)
 	}
 	if _, received := streams[0].rawFrames(t); len(received) != 1 || !isRefusal(frame{typ: received[0].typ, payload: received[0].payload}) {
@@ -422,7 +408,7 @@ func TestOptimisticCallsReplayRefusals(t *testing.T) {
 				t.Fatal(err)
 			}
 			streams := client.streams()
-			if request := recordedRequest(t, streams[2]); request.StreamCompression == nil || request.StreamCompression.Optimistic {
+			if request := recordedRequest(t, streams[2]); request.StreamCompression != streamCompressionEnabled {
 				t.Fatalf("call after the refusal offered %+v", request.StreamCompression)
 			}
 			// ...and its answer makes the one after optimistic again.
@@ -434,7 +420,7 @@ func TestOptimisticCallsReplayRefusals(t *testing.T) {
 				t.Fatalf("upload = %q, %v", got.GetValue(), err)
 			}
 			streams = client.streams()
-			if len(streams) != 4 || !recordedRequest(t, streams[3]).StreamCompression.Optimistic {
+			if len(streams) != 4 || recordedRequest(t, streams[3]).StreamCompression != streamCompressionOptimistic {
 				t.Fatalf("%d streams; the last call is not optimistic", len(streams))
 			}
 			if compressed := streamCompressedRequests.Load(); compressed != streamTestMessages-streamCompressionStart+1 {
@@ -458,7 +444,7 @@ func TestOptimisticCallsReplayRefusals(t *testing.T) {
 				}
 				// A call with a datagram flow offers, but waits for the answer.
 				request := recordedRequest(t, client.streams()[0])
-				if request.DatagramFlow == 0 || request.StreamCompression == nil || request.StreamCompression.Optimistic {
+				if request.DatagramFlow == 0 || request.StreamCompression != streamCompressionEnabled {
 					t.Fatalf("REQUEST flow %d, offer %+v; want a flow and an offer without optimism", request.DatagramFlow, request.StreamCompression)
 				}
 			})
@@ -575,4 +561,62 @@ func TestOptimisticUploadWaitsForRoom(t *testing.T) {
 			t.Fatalf("encode = %v, want Cancelled", err)
 		}
 	})
+}
+
+// isRefusal reports whether frame is a STATUS refusing an optimistic call.
+func isRefusal(frame frame) bool {
+	if frame.typ != frameTypeStatus {
+		return false
+	}
+	status, err := decodeStatus(frame.payload)
+	return err == nil && status.refusedStreamCompression
+}
+
+// TestOptimisticCallNeedsAnAnswer checks that the response to an optimistic
+// call that the server neither refused nor accepted with an ANSWER is a
+// protocol error: the server would be decoding requests it was never asked
+// to take.
+func TestOptimisticCallNeedsAnAnswer(t *testing.T) {
+	requireCompression(t)
+	reply, err := encodeMessage(wrapperspb.String("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	declined, err := appendAnswerFrame(nil, &wireAnswer{}, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, response := range map[string][]byte{
+		"HEADERS":                           concat(headersBytes(t, Metadata{"x-h": []byte("1")}), reply.frame, statusBytes(t, OK())),
+		"MESSAGE":                           concat(reply.frame, statusBytes(t, OK())),
+		"ANSWER without stream compression": concat(declined, reply.frame, statusBytes(t, OK())),
+	} {
+		t.Run(name, func(t *testing.T) {
+			stream := newUnaryTransportTestStream(response)
+			close(stream.eof)
+			client := newStreamClient(unaryTestOpener{stream: stream}, DefaultMaxFrameSize)
+			client.streams = newStreamBudget(0, defaultClientStreamCompressionMemory, nil)
+			call, err := ClientStreaming[*wrapperspb.StringValue](t.Context(), client, testPath("Upload"), newStringValue, WithStreamCompression(StreamCompression{Requests: true}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = call.Close() }()
+			if _, err := call.CloseAndRecv(); StatusFromError(err).Code != CodeInternal {
+				t.Fatalf("CloseAndRecv() = %v, want Internal", err)
+			}
+			if request := recordedRequestBytes(t, stream.written.Bytes()); request.StreamCompression != streamCompressionOptimistic {
+				t.Fatalf("REQUEST %+v is not optimistic", request)
+			}
+		})
+	}
+}
+
+// recordedRequestBytes decodes the REQUEST frame data starts with.
+func recordedRequestBytes(t *testing.T, data []byte) *wireRequest {
+	t.Helper()
+	frames := readTestFrames(t, data, DefaultMaxFrameSize)
+	if len(frames) == 0 || frames[0].Kind != frameTypeRequest {
+		t.Fatalf("sent %#v, want a REQUEST first", frames)
+	}
+	return frames[0].Request
 }

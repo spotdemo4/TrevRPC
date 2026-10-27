@@ -20,7 +20,7 @@ use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::wire::DictionaryInfo;
 use trevrpc::{
-    CompressMessages, CompressStream, Compression, Dictionary, RpcHeaders, RpcKind, RpcRequest,
+    CompressMessages, CompressStream, Compression, Dictionary, RpcAnswer, RpcKind, RpcRequest,
     RpcStatus,
 };
 
@@ -353,13 +353,13 @@ async fn the_server_answers_and_compresses_its_responses() -> TestResult {
     ensure_eq!(
         types(&frames),
         [
-            frame_type::HEADERS,
+            frame_type::ANSWER,
             frame_type::ZSTD_MESSAGE,
             frame_type::STATUS
         ]
     );
-    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
-    ensure_eq!(headers.dictionaries, [dictionary_info()?]);
+    let answer: RpcAnswer = decode_payload(&frames[0].payload)?;
+    ensure_eq!(answer.dictionaries, [dictionary_info()?]);
 
     // A wrong fingerprint gets an empty answer and an uncompressed response.
     let mut request = querying_request(UNARY)?;
@@ -376,10 +376,10 @@ async fn the_server_answers_and_compresses_its_responses() -> TestResult {
     let frames = parse_frames(&response)?;
     ensure_eq!(
         types(&frames),
-        [frame_type::HEADERS, frame_type::MESSAGE, frame_type::STATUS]
+        [frame_type::ANSWER, frame_type::MESSAGE, frame_type::STATUS]
     );
-    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
-    ensure!(headers.dictionaries.is_empty());
+    let answer: RpcAnswer = decode_payload(&frames[0].payload)?;
+    ensure!(answer.dictionaries.is_empty());
 
     // A compressed request with a dictionary the server lacks is InvalidArgument.
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -507,14 +507,14 @@ fn decompress(payload: &[u8]) -> TestResult<Vec<u8>> {
     Ok(message)
 }
 
-/// The fake server's response to the request frames of one call: HEADERS carrying `answer`, an
+/// The fake server's response to the request frames of one call: an ANSWER carrying `answer`, an
 /// uncompressed echo of each request message, and an OK STATUS.
 fn fake_response(frames: &[RawFrame], answer: &[DictionaryInfo]) -> TestResult<Vec<u8>> {
-    let headers = RpcHeaders {
+    let answer = RpcAnswer {
         dictionaries: answer.to_vec(),
-        ..RpcHeaders::default()
+        ..RpcAnswer::default()
     };
-    let mut response = encode_protobuf_frame(frame_type::HEADERS, &headers, 1 << 20)?;
+    let mut response = encode_protobuf_frame(frame_type::ANSWER, &answer, 1 << 20)?;
     for frame in frames {
         let message = match frame.frame_type {
             frame_type::MESSAGE => frame.payload.clone(),
@@ -527,7 +527,7 @@ fn fake_response(frames: &[RawFrame], answer: &[DictionaryInfo]) -> TestResult<V
     Ok(response)
 }
 
-/// Accepts one connection and answers every call with HEADERS carrying `answer`, an echo of each
+/// Accepts one connection and answers every call with an ANSWER carrying `answer`, an echo of each
 /// request message, and STATUS, recording what each call sent.
 fn fake_server(
     answer: Vec<DictionaryInfo>,
@@ -692,18 +692,27 @@ async fn raw_stream_call(
     parse_frames(&response)
 }
 
-/// The stream compression offer of a client that decodes a 64 KiB window.
-const fn stream_offer(optimistic: bool) -> trevrpc::wire::StreamCompression {
-    trevrpc::wire::StreamCompression {
-        max_window_log: 16,
-        optimistic,
+/// The stream compression offer of a client, optimistic or not.
+fn stream_offer(optimistic: bool) -> i32 {
+    i32::from(if optimistic {
+        trevrpc::wire::StreamCompression::Optimistic
+    } else {
+        trevrpc::wire::StreamCompression::Enabled
+    })
+}
+
+/// An ANSWER that accepts stream-compressed requests.
+fn stream_answer() -> RpcAnswer {
+    RpcAnswer {
+        stream_compression: true,
+        ..RpcAnswer::default()
     }
 }
 
 fn stream_request(offer: bool) -> RpcRequest {
     let mut request = RpcRequest::new(STREAM).with_kind(RpcKind::BidirectionalStreaming);
     if offer {
-        request.stream_compression = Some(stream_offer(false));
+        request.stream_compression = stream_offer(false);
     }
     request
 }
@@ -729,7 +738,7 @@ async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_t
     ensure_eq!(
         types(&frames),
         [
-            frame_type::HEADERS,
+            frame_type::ANSWER,
             frame_type::MESSAGE,
             frame_type::MESSAGE,
             frame_type::ZSTD_STREAM_MESSAGE,
@@ -737,8 +746,10 @@ async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_t
             frame_type::STATUS,
         ]
     );
-    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
-    ensure_eq!(headers.stream_compression, Some(stream_offer(false)));
+    ensure_eq!(
+        decode_payload::<RpcAnswer>(&frames[0].payload)?,
+        stream_answer()
+    );
     ensure_eq!(&frames[1].payload, &messages[0]);
     ensure_eq!(&frames[2].payload, &messages[1]);
     let mut reader = StreamReader::new()?;
@@ -754,15 +765,10 @@ async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_t
         Some(&b"4"[..])
     );
 
-    // Without an offer the server answers nothing, though it sends its HEADERS at dispatch, and
-    // rejects stream-compressed requests.
+    // Without an offer the server answers nothing and rejects stream-compressed requests.
     let frames = raw_stream_call(&connection, &stream_request(false), &requests).await?;
-    ensure_eq!(types(&frames), [frame_type::HEADERS, frame_type::STATUS]);
-    ensure_eq!(
-        decode_payload::<RpcHeaders>(&frames[0].payload)?,
-        RpcHeaders::default()
-    );
-    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[1].payload)?);
+    ensure_eq!(types(&frames), [frame_type::STATUS]);
+    let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[0].payload)?);
     ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
 
     // An invalid chunk fails the call.
@@ -794,21 +800,16 @@ async fn a_server_without_stream_compression_memory_neither_answers_nor_compress
         )?;
     }
     let frames = raw_stream_call(&connection, &stream_request(true), &requests).await?;
-    // The HEADERS at dispatch carry no answer.
+    // There is nothing to answer.
     ensure_eq!(
         types(&frames),
         [
-            frame_type::HEADERS,
             frame_type::MESSAGE,
             frame_type::MESSAGE,
             frame_type::MESSAGE,
             frame_type::MESSAGE,
             frame_type::STATUS,
         ]
-    );
-    ensure_eq!(
-        decode_payload::<RpcHeaders>(&frames[0].payload)?,
-        RpcHeaders::default()
     );
     drop(connection);
     server.stop().await
@@ -876,14 +877,14 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> TestResult<RawFrame> {
 }
 
 #[tokio::test]
-async fn the_server_sends_headers_before_reading_a_request_message() -> TestResult {
+async fn the_server_answers_before_reading_a_request_message() -> TestResult {
     let server = spawn_server(Compression::new()).await?;
     let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
     for offer in [true, false] {
         let (mut send, mut recv) = connection.open_bi().await?;
         let mut request = RpcRequest::new(UPLOAD).with_kind(RpcKind::ClientStreaming);
         if offer {
-            request.stream_compression = Some(stream_offer(false));
+            request.stream_compression = stream_offer(false);
         }
         send.write_all(&encode_protobuf_frame(
             frame_type::REQUEST,
@@ -891,14 +892,15 @@ async fn the_server_sends_headers_before_reading_a_request_message() -> TestResu
             1 << 20,
         )?)
         .await?;
-        // No request message has been sent, and the request stream is still open.
-        let headers = tokio::time::timeout(TEST_TIMEOUT, read_frame(&mut recv)).await??;
-        ensure_eq!(headers.frame_type, frame_type::HEADERS);
-        let headers: RpcHeaders = decode_payload(&headers.payload)?;
-        ensure_eq!(
-            headers.stream_compression,
-            offer.then_some(stream_offer(false))
-        );
+        if offer {
+            // No request message has been sent, and the request stream is still open.
+            let answer = tokio::time::timeout(TEST_TIMEOUT, read_frame(&mut recv)).await??;
+            ensure_eq!(answer.frame_type, frame_type::ANSWER);
+            ensure_eq!(
+                decode_payload::<RpcAnswer>(&answer.payload)?,
+                stream_answer()
+            );
+        }
 
         let mut messages = Vec::new();
         for i in 0..2 {
@@ -910,6 +912,7 @@ async fn the_server_sends_headers_before_reading_a_request_message() -> TestResu
         }
         send.write_all(&messages).await?;
         send.finish()?;
+        // Without an offer there is nothing to answer.
         let rest = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
         let frames = parse_frames(&rest)?;
         ensure_eq!(types(&frames), [frame_type::MESSAGE, frame_type::STATUS]);
@@ -928,40 +931,32 @@ async fn client_streaming_uploads_are_stream_compressed_from_the_third_message()
     let server = spawn_server(Compression::new()).await?;
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let (_endpoint, channel) = compressed_channel(&server, policy).await?;
-        // Calls are optimistic, so a burst compresses without waiting for the server's answer,
-        // and waiting for the headers, sent at dispatch, changes nothing.
-        for wait_for_headers in [true, false] {
-            let mut upload = trevrpc::client::client_streaming::<_, Echo, Echo>(
-                &channel,
-                UPLOAD,
-                trevrpc::client::CallOptions::new(),
-            )
-            .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
-            .compress_stream(CompressStream::REQUESTS)
-            .await?;
-            upload.send(sample(0)).await?;
-            if wait_for_headers {
-                let headers = tokio::time::timeout(TEST_TIMEOUT, upload.headers()).await??;
-                ensure!(headers.is_empty(), "{headers:?}");
-            }
-            for i in 1..8 {
-                upload.send(sample(i)).await?;
-            }
-            let response =
-                tokio::time::timeout(TEST_TIMEOUT, upload.close_and_recv_with_response()).await??;
-            let expected: String = (0..8).map(|i| sample(i).value).collect();
-            ensure_eq!(response.message().value, expected, "{policy:?}");
-            // Messages 3 to 8 travel in the stream's context: [MESSAGE, MESSAGE,
-            // ZSTD_STREAM_MESSAGE, ...].
-            ensure_eq!(
-                response
-                    .metadata()
-                    .get(STREAM_COMPRESSED_KEY)
-                    .map(Vec::as_slice),
-                Some(&b"6"[..]),
-                "{policy:?}, waiting for headers: {wait_for_headers}"
-            );
+        // Calls are optimistic, so a burst compresses without waiting for the server's answer.
+        let upload = trevrpc::client::client_streaming::<_, Echo, Echo>(
+            &channel,
+            UPLOAD,
+            trevrpc::client::CallOptions::new(),
+        )
+        .message_types(MESSAGE_TYPE, MESSAGE_TYPE)
+        .compress_stream(CompressStream::REQUESTS)
+        .await?;
+        for i in 0..8 {
+            upload.send(sample(i)).await?;
         }
+        let response =
+            tokio::time::timeout(TEST_TIMEOUT, upload.close_and_recv_with_response()).await??;
+        let expected: String = (0..8).map(|i| sample(i).value).collect();
+        ensure_eq!(response.message().value, expected, "{policy:?}");
+        // Messages 3 to 8 travel in the stream's context: [MESSAGE, MESSAGE,
+        // ZSTD_STREAM_MESSAGE, ...].
+        ensure_eq!(
+            response
+                .metadata()
+                .get(STREAM_COMPRESSED_KEY)
+                .map(Vec::as_slice),
+            Some(&b"6"[..]),
+            "{policy:?}"
+        );
 
         // A call that sends a stream, with a pause, compresses the same way.
         let requests = futures_util::stream::iter(0..8).then(|i| async move {
@@ -1013,7 +1008,7 @@ async fn optimistic_raw_call_with(
     mut request: RpcRequest,
     messages: &[u8],
 ) -> TestResult<Vec<RawFrame>> {
-    request.stream_compression = Some(stream_offer(true));
+    request.stream_compression = stream_offer(true);
     let (mut send, mut recv) = connection.open_bi().await?;
     let mut bytes = encode_protobuf_frame(frame_type::REQUEST, &request, 1 << 20)?;
     bytes.extend_from_slice(messages);
@@ -1096,8 +1091,8 @@ async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() 
     )?);
     ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
 
-    // An accepted optimistic call gets the answer in the HEADERS at dispatch and may send
-    // stream-compressed requests from its first message.
+    // An accepted optimistic call gets the ANSWER at dispatch and may send stream-compressed
+    // requests from its first message.
     let mut requests = Vec::new();
     for i in 0..4 {
         push_frame(
@@ -1113,12 +1108,12 @@ async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() 
         &requests,
     )
     .await?;
+    let answer = frames.first().ok_or("no frames")?;
+    ensure_eq!(answer.frame_type, frame_type::ANSWER);
     ensure_eq!(
-        frames.first().map(|frame| frame.frame_type),
-        Some(frame_type::HEADERS)
+        decode_payload::<RpcAnswer>(&answer.payload)?,
+        stream_answer()
     );
-    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
-    ensure_eq!(headers.stream_compression, Some(stream_offer(false)));
     let status = trevrpc::Status::from(decode_payload::<RpcStatus>(
         &frames.last().ok_or("no frames")?.payload,
     )?);
@@ -1223,11 +1218,11 @@ async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
 enum Script {
     /// Refuses the call after `after`.
     Refuse { after: Duration },
-    /// Sends HEADERS after `headers_after`, with a stream compression answer if `answer`, then
-    /// answers with the concatenation of the requests.
+    /// Sends an ANSWER accepting stream-compressed requests after `answer_after` if `answer`, then
+    /// responds with the concatenation of the requests.
     Answer {
         answer: bool,
-        headers_after: Duration,
+        answer_after: Duration,
     },
     /// Never answers, and reports whether the client stops the response.
     Hang,
@@ -1318,20 +1313,18 @@ async fn scripted_call(
         }
         Script::Answer {
             answer,
-            headers_after,
+            answer_after,
         } => {
-            tokio::time::sleep(headers_after).await;
+            tokio::time::sleep(answer_after).await;
             take_arrived(&mut before);
-            let headers = RpcHeaders {
-                stream_compression: answer.then_some(stream_offer(false)),
-                ..RpcHeaders::default()
-            };
-            send.write_all(&encode_protobuf_frame(
-                frame_type::HEADERS,
-                &headers,
-                1 << 20,
-            )?)
-            .await?;
+            if answer {
+                send.write_all(&encode_protobuf_frame(
+                    frame_type::ANSWER,
+                    &stream_answer(),
+                    1 << 20,
+                )?)
+                .await?;
+            }
             let mut all: Vec<RawFrame> = before
                 .iter()
                 .map(|frame| RawFrame {
@@ -1400,7 +1393,7 @@ async fn a_refused_call_is_replayed_with_the_rest_of_its_deadline() -> TestResul
         },
         Script::Answer {
             answer: false,
-            headers_after: Duration::ZERO,
+            answer_after: Duration::ZERO,
         },
     ])?;
     let (_endpoint, connection) = quic_connection(addr, &cert).await?;
@@ -1412,7 +1405,7 @@ async fn a_refused_call_is_replayed_with_the_rest_of_its_deadline() -> TestResul
 
     let refused = calls.recv().await.ok_or("no first call")?;
     let replayed = calls.recv().await.ok_or("no replay")?;
-    ensure_eq!(refused.request.stream_compression, Some(stream_offer(true)));
+    ensure_eq!(refused.request.stream_compression, stream_offer(true));
     // The refused call compressed from its third message without waiting.
     ensure_eq!(
         types(&refused.before),
@@ -1422,10 +1415,7 @@ async fn a_refused_call_is_replayed_with_the_rest_of_its_deadline() -> TestResul
             .collect::<Vec<_>>()
     );
     // The replay offers without being optimistic, with the time left.
-    ensure_eq!(
-        replayed.request.stream_compression,
-        Some(stream_offer(false))
-    );
+    ensure_eq!(replayed.request.stream_compression, stream_offer(false));
     ensure_eq!(replayed.request.metadata, refused.request.metadata);
     let waited = u64::try_from(Duration::from_millis(300).as_nanos())?;
     ensure!(
@@ -1442,7 +1432,7 @@ async fn a_refused_call_is_replayed_with_the_rest_of_its_deadline() -> TestResul
 async fn the_client_stops_being_optimistic_after_a_refusal_until_an_answer() -> TestResult {
     let answer = |answer| Script::Answer {
         answer,
-        headers_after: Duration::ZERO,
+        answer_after: Duration::ZERO,
     };
     let (addr, cert, mut calls) = scripted_server(vec![
         Script::Refuse {
@@ -1467,11 +1457,7 @@ async fn the_client_stops_being_optimistic_after_a_refusal_until_an_answer() -> 
     }
     for _ in 0..4 {
         let call = calls.recv().await.ok_or("missing call")?;
-        optimistic.push(
-            call.request
-                .stream_compression
-                .is_some_and(|offer| offer.optimistic),
-        );
+        optimistic.push(call.request.stream_compression == stream_offer(true));
     }
     ensure_eq!(optimistic, [true, false, false, true]);
     Ok(())
@@ -1481,7 +1467,7 @@ async fn the_client_stops_being_optimistic_after_a_refusal_until_an_answer() -> 
 async fn an_optimistic_call_keeps_at_most_a_mebibyte_until_the_answer() -> TestResult {
     let (addr, cert, mut calls) = scripted_server(vec![Script::Answer {
         answer: true,
-        headers_after: Duration::from_millis(500),
+        answer_after: Duration::from_millis(500),
     }])?;
     let (_endpoint, connection) = quic_connection(addr, &cert).await?;
     let transport = QuicTransport::new(connection);
@@ -1567,13 +1553,13 @@ async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_i
     ensure_eq!(
         types(&frames),
         [
-            frame_type::HEADERS,
+            frame_type::ANSWER,
             frame_type::ZSTD_MESSAGE,
             frame_type::STATUS
         ]
     );
-    let headers: RpcHeaders = decode_payload(&frames[0].payload)?;
-    ensure_eq!(headers.dictionaries, [DictionaryInfo::default()]);
+    let answer: RpcAnswer = decode_payload(&frames[0].payload)?;
+    ensure_eq!(answer.dictionaries, [DictionaryInfo::default()]);
     ensure_eq!(decompress_plain(&frames[1].payload)?, message);
 
     // A plain request is accepted and counted, even on a route that does not compress.

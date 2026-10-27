@@ -112,45 +112,37 @@ pub fn validate_method_path(path: &str) -> std::result::Result<(), crate::Status
 }
 
 /// The REQUEST frame payload: everything about a call except its messages.
-///
-/// Tags 2, 3 and 6 are reserved and must never be reused: 2 carried the method name, 3 the
-/// request body before messages moved into MESSAGE frames, and 6 the wire version, which each
-/// transport now negotiates for the whole connection or request instead.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct RpcRequest {
     /// The method path `/package.Service/Method`; see [`split_method_path`].
     #[prost(string, tag = "1")]
     pub method: String,
-    #[prost(map = "string, bytes", tag = "4")]
+    #[prost(map = "string, bytes", tag = "2")]
     pub metadata: Metadata,
-    #[prost(enumeration = "RpcKind", tag = "5")]
+    #[prost(enumeration = "RpcKind", tag = "3")]
     pub kind: i32,
-    #[prost(uint64, tag = "7")]
+    #[prost(uint64, tag = "4")]
     pub timeout_nanos: u64,
-    /// Extensions the client supports. The registry is empty, so clients send none and servers
-    /// ignore the field.
-    #[prost(uint64, repeated, tag = "8")]
-    pub extensions: Vec<u64>,
     /// The call's datagram flow ID, or zero when the call has none. A client sets it only on a
     /// connection that carries datagrams, for a method with an unreliable streaming direction;
     /// connections without datagrams ignore it. See [`crate::Unreliable`].
-    #[prost(uint64, tag = "9")]
+    #[prost(uint64, tag = "5")]
     pub datagram_flow: u64,
     /// The dictionaries the client accepts on the call's response messages; see
     /// [`crate::Compression`].
-    #[prost(uint32, repeated, tag = "10")]
+    #[prost(uint32, repeated, tag = "6")]
     pub accept_dictionaries: Vec<u32>,
     /// The dictionaries the client asks the server about, on calls until the connection has an
     /// answer.
-    #[prost(message, repeated, tag = "11")]
+    #[prost(message, repeated, tag = "7")]
     pub dictionary_query: Vec<DictionaryInfo>,
-    /// Set by a client that implements stream compression, on calls to methods that allow it: it
-    /// decodes stream-compressed responses up to this window. See [`crate::CompressStream`].
-    #[prost(message, optional, tag = "12")]
-    pub stream_compression: Option<StreamCompression>,
+    /// Set by a client that implements stream compression, on calls to methods that allow it; see
+    /// [`StreamCompression`] and [`crate::CompressStream`].
+    #[prost(enumeration = "StreamCompression", tag = "8")]
+    pub stream_compression: i32,
     /// The call's connection metadata: an offer of the channel's set, or a reference to the set
     /// the server confirmed on the connection; see [`ConnectionMetadata`].
-    #[prost(message, optional, tag = "13")]
+    #[prost(message, optional, tag = "9")]
     pub connection_metadata: Option<ConnectionMetadata>,
 }
 
@@ -176,15 +168,19 @@ pub struct DictionaryInfo {
     pub fingerprint: Vec<u8>,
 }
 
-/// What a peer decodes in stream compression: the largest zstd window, as a base-2 logarithm.
-#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
-pub struct StreamCompression {
-    #[prost(uint32, tag = "1")]
-    pub max_window_log: u32,
-    /// REQUEST only: the client stream-compresses its requests without waiting for the server's
-    /// answer, which accepts or refuses the call at dispatch.
-    #[prost(bool, tag = "2")]
-    pub optimistic: bool,
+/// Whether a client takes part in stream compression on a call, the `stream_compression` of its
+/// REQUEST. Stream compression always uses a 64 KiB window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, prost::Enumeration)]
+#[repr(i32)]
+pub enum StreamCompression {
+    /// The client neither decodes nor sends stream-compressed messages.
+    None = 0,
+    /// The client decodes stream-compressed responses, and stream-compresses its requests once
+    /// the server's ANSWER enables them.
+    Enabled = 1,
+    /// As `Enabled`, and the client stream-compresses its requests without waiting for the
+    /// answer: the server accepts or refuses the call at dispatch.
+    Optimistic = 2,
 }
 
 impl RpcRequest {
@@ -196,16 +192,15 @@ impl RpcRequest {
             metadata: Metadata::new(),
             kind: i32::from(RpcKind::Unary),
             timeout_nanos: 0,
-            extensions: Vec::new(),
             datagram_flow: 0,
             accept_dictionaries: Vec::new(),
             dictionary_query: Vec::new(),
-            stream_compression: None,
+            stream_compression: i32::from(StreamCompression::None),
             connection_metadata: None,
         }
     }
 
-    /// Validates the method path and the RPC kind.
+    /// Validates the method path, the RPC kind and the stream compression value.
     pub fn validate_protocol(&self) -> std::result::Result<(), crate::Status> {
         validate_method_path(&self.method)?;
 
@@ -213,6 +208,13 @@ impl RpcRequest {
             return Err(crate::Status::invalid_argument(format!(
                 "unsupported TrevRPC RPC kind {}",
                 self.kind
+            )));
+        }
+
+        if StreamCompression::try_from(self.stream_compression).is_err() {
+            return Err(crate::Status::invalid_argument(format!(
+                "unsupported TrevRPC stream compression {}",
+                self.stream_compression
             )));
         }
 
@@ -282,19 +284,22 @@ impl RpcKind {
 pub struct RpcHeaders {
     #[prost(map = "string, bytes", tag = "1")]
     pub metadata: Metadata,
-    /// Extensions the server accepts. The registry is empty, so receivers ignore the field.
-    #[prost(uint64, repeated, tag = "2")]
-    pub extensions: Vec<u64>,
+}
+
+/// The ANSWER frame payload: the server's answer to the negotiation fields of the REQUEST,
+/// sent at most once, before anything else on the response stream. A field it leaves out means
+/// no, or none.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct RpcAnswer {
     /// The server's answer to the request's `dictionary_query`.
-    #[prost(message, repeated, tag = "3")]
+    #[prost(message, repeated, tag = "1")]
     pub dictionaries: Vec<DictionaryInfo>,
-    /// The server's answer to the request's `stream_compression`: it decodes stream-compressed
-    /// requests up to this window.
-    #[prost(message, optional, tag = "4")]
-    pub stream_compression: Option<StreamCompression>,
+    /// The server decodes the call's stream-compressed requests.
+    #[prost(bool, tag = "2")]
+    pub stream_compression: bool,
     /// The connection metadata set the request offered and the server stored for the
     /// connection, or zero.
-    #[prost(uint32, tag = "5")]
+    #[prost(uint32, tag = "3")]
     pub connection_metadata: u32,
 }
 
@@ -329,8 +334,8 @@ mod tests {
 
     use super::{
         ConnectionMetadata, MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN,
-        RpcHeaders, RpcKind, RpcRequest, RpcStatus, normalize_metadata_key, split_method_path,
-        validate_metadata,
+        RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus, normalize_metadata_key,
+        split_method_path, validate_metadata,
     };
 
     #[test]
@@ -407,7 +412,6 @@ mod tests {
         let request = RpcRequest::new("/service/method");
 
         assert_eq!(request.rpc_kind(), RpcKind::Unary);
-        assert!(request.extensions.is_empty());
     }
 
     #[test]
@@ -450,6 +454,18 @@ mod tests {
         let status = request
             .validate_protocol()
             .expect_err("unknown RPC kind should be rejected");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn rejects_unknown_stream_compression_values() {
+        let mut request = RpcRequest::new("/service/method");
+        request.stream_compression = 3;
+
+        let status = request
+            .validate_protocol()
+            .expect_err("unknown stream compression should be rejected");
 
         assert_eq!(status.code(), Code::InvalidArgument);
     }
@@ -666,17 +682,6 @@ mod tests {
         check_protobuf_frame(
             &vectors,
             &mut checked,
-            "request.extensions",
-            frame_type::REQUEST,
-            &RpcRequest {
-                extensions: vec![1, 300],
-                ..request()
-            },
-        )
-        .await;
-        check_protobuf_frame(
-            &vectors,
-            &mut checked,
             "request.datagram_flow",
             frame_type::REQUEST,
             &request()
@@ -737,10 +742,6 @@ mod tests {
             frame_type::HEADERS,
             &RpcHeaders {
                 metadata: metadata("x-a", b"1"),
-                extensions: Vec::new(),
-                dictionaries: Vec::new(),
-                stream_compression: None,
-                connection_metadata: 0,
             },
         )
         .await;
@@ -755,26 +756,20 @@ mod tests {
         check_protobuf_frame(
             &vectors,
             &mut checked,
-            "headers.extensions",
-            frame_type::HEADERS,
-            &RpcHeaders {
-                metadata: Metadata::new(),
-                extensions: vec![1],
-                dictionaries: Vec::new(),
-                stream_compression: None,
-                connection_metadata: 0,
+            "answer.connection_metadata",
+            frame_type::ANSWER,
+            &RpcAnswer {
+                connection_metadata: 1,
+                ..RpcAnswer::default()
             },
         )
         .await;
         check_protobuf_frame(
             &vectors,
             &mut checked,
-            "headers.connection_metadata",
-            frame_type::HEADERS,
-            &RpcHeaders {
-                connection_metadata: 1,
-                ..RpcHeaders::default()
-            },
+            "answer.empty",
+            frame_type::ANSWER,
+            &RpcAnswer::default(),
         )
         .await;
 

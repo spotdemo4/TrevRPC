@@ -8,8 +8,9 @@ object FrameType {
     const val STATUS: Long = 3
     const val ZSTD_MESSAGE: Long = 4
     const val ZSTD_STREAM_MESSAGE: Long = 5
+    const val ANSWER: Long = 6
 
-    fun isKnown(type: Long): Boolean = type in MESSAGE..ZSTD_STREAM_MESSAGE
+    fun isKnown(type: Long): Boolean = type in MESSAGE..ANSWER
 }
 
 /** A known frame read from the wire. [type] is one of [FrameType]. */

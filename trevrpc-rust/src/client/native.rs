@@ -249,6 +249,7 @@ impl<C: MuxConnection> NativeTransport<C> {
                 refused: None,
                 optimism: directions.requests.then(|| Arc::clone(&self.optimism)),
                 connection_metadata: offered,
+                ..ResponseReading::default()
             },
             complete: false,
             retry,
@@ -419,6 +420,9 @@ struct StreamingCall<R: MuxRecvStream> {
 }
 
 /// Where a streaming response stands.
+///
+/// Boxing the call would cost every streaming call an allocation; a replayed call is rare.
+#[allow(clippy::large_enum_variant)]
 enum Response<R: MuxRecvStream> {
     Call(StreamingCall<R>),
     /// The server refused the optimistic call; its replay answers instead.

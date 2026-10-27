@@ -125,9 +125,9 @@ internal class CallEnd {
  * receive through it, so the call's [compression] and stream compression apply to every message:
  * responses larger than [maxMessageSize] are rejected before they are decompressed.
  *
- * An optimistic call ([replay] set) keeps its requests until its first response frame. If that
- * frame is the server's refusal, the call switches to a new stream that is not optimistic and
- * resends them there, in order, before any later send; a write to the refused stream that fails
+ * An optimistic call ([replay] set) keeps its requests until its first response frame, which is
+ * the server's ANSWER accepting it or a STATUS. If that frame is the server's refusal, the call
+ * switches to a new stream that is not optimistic and resends them there, in order, before any later send; a write to the refused stream that fails
  * meanwhile was resent, so it does not fail the send. The caller never sees the refused stream.
  */
 internal class CallStream(
@@ -165,6 +165,9 @@ internal class CallStream(
 
     /** Whether the first response frame has yet to arrive on an optimistic call. */
     private var awaitingFirstFrame = replay != null
+
+    /** Whether an ANSWER may still arrive: only before every other known frame, and once. */
+    private var answerAllowed = true
 
     /**
      * Completes once an optimistic call has handled its first response frame, switching to the
@@ -275,50 +278,71 @@ internal class CallStream(
     }
 
     /**
-     * Receives the next response frame from the transport: HEADERS carry the server's answers to
-     * the call's dictionary query and stream compression offer, and compressed messages are
-     * decompressed. A refusal of an optimistic call is replaced by the replayed call's frames.
+     * Receives the next response frame from the transport. The server's ANSWER is consumed here:
+     * it carries the answers to the call's dictionary query and stream compression offer, and
+     * never reaches the caller. Compressed messages are decompressed. A refusal of an optimistic
+     * call is replaced by the replayed call's frames.
      */
     suspend fun receive(): ResponseFrame? {
-        val frame =
-            try {
-                stream.receive()
-            } catch (error: Throwable) {
-                firstFrameHandled.complete(Unit)
-                throw error
-            }
-        val replay = replay
-        if (replay != null && awaitingFirstFrame) {
-            awaitingFirstFrame = false
-            val refused = frame is ResponseFrame.Status && frame.refusedStreamCompression
-            try {
-                if (refused) replay(replay) else replay.copies.settle()
-            } finally {
-                // Before the replayed stream is read, which may wait for its response.
-                firstFrameHandled.complete(Unit)
-            }
-            if (refused) return receive()
-        }
-        return when (frame) {
-            is ResponseFrame.Headers -> {
-                frame.also {
-                    compression?.learn(it.dictionaries)
-                    streams?.learn(it.streamCompression)
-                    reportHeaders(it.metadata)
+        while (true) {
+            val frame =
+                try {
+                    stream.receive()
+                } catch (error: Throwable) {
+                    firstFrameHandled.complete(Unit)
+                    throw error
                 }
-            }
-
-            is ResponseFrame.Message -> {
-                if (frame.streamSize == null) {
-                    inflateResponse(frame, compression, maxMessageSize)
-                } else {
-                    streams?.inflate(frame, maxMessageSize)
-                        ?: throw TrevRpcException(Status.internal("stream-compressed message where stream compression is not enabled"))
+            val replay = replay
+            if (replay != null && awaitingFirstFrame) {
+                awaitingFirstFrame = false
+                val refused = frame is ResponseFrame.Status && frame.refusedStreamCompression
+                try {
+                    if (refused) {
+                        replay(replay)
+                    } else {
+                        replay.copies.settle()
+                        // A server accepts an optimistic call with its ANSWER, before anything else.
+                        val accepted =
+                            when (frame) {
+                                null, is ResponseFrame.Status -> true
+                                is ResponseFrame.Answer -> frame.streamCompression
+                                else -> false
+                            }
+                        if (!accepted) throw TrevRpcException(Status.internal("the server did not accept an optimistic call first"))
+                    }
+                } finally {
+                    // Before the replayed stream is read, which may wait for its response.
+                    firstFrameHandled.complete(Unit)
                 }
+                if (refused) continue
             }
+            if (frame is ResponseFrame.Answer) {
+                if (!answerAllowed) {
+                    throw TrevRpcException(Status.internal("response ANSWER must be the first frame and appear at most once"))
+                }
+                answerAllowed = false
+                compression?.learn(frame.dictionaries)
+                streams?.learn(frame.streamCompression)
+                continue
+            }
+            answerAllowed = false
+            return when (frame) {
+                is ResponseFrame.Headers -> {
+                    frame.also { reportHeaders(it.metadata) }
+                }
 
-            else -> {
-                frame
+                is ResponseFrame.Message -> {
+                    if (frame.streamSize == null) {
+                        inflateResponse(frame, compression, maxMessageSize)
+                    } else {
+                        streams?.inflate(frame, maxMessageSize)
+                            ?: throw TrevRpcException(Status.internal("stream-compressed message where stream compression is not enabled"))
+                    }
+                }
+
+                else -> {
+                    frame
+                }
             }
         }
     }

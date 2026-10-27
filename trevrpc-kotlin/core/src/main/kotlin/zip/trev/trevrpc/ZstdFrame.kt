@@ -75,11 +75,8 @@ private fun nextBlock(
     return Block(position + 3 + size, header and 1 != 0)
 }
 
-/** The window TrevRPC's stream compression uses and decodes, as a base-2 logarithm. */
+/** The window TrevRPC's stream compression uses and decodes, 64 KiB, as a base-2 logarithm. */
 internal const val STREAM_WINDOW_LOG = 16
-
-/** The smallest window a peer may advertise; a smaller `max_window_log` enables nothing. */
-internal const val MIN_STREAM_WINDOW_LOG = 10
 
 /**
  * What a receiver learns from validating the zstd data of a ZSTD_STREAM_MESSAGE: whether it starts
@@ -95,13 +92,12 @@ internal class ZstdStreamChunk(
  * Validates [chunk], the zstd data of a ZSTD_STREAM_MESSAGE, or returns null if it is invalid.
  * [atFrameStart] says that no frame is open, so a non-empty chunk must start with a frame header
  * without Single_Segment_flag, Frame_Content_Size_flag, Content_Checksum_flag or the reserved bit,
- * whose window is at most 2^[maxWindowLog]. The block headers are then walked: a chunk is whole
+ * whose window is at most 64 KiB. The block headers are then walked: a chunk is whole
  * blocks, and a Last_Block ends it. An empty chunk is an empty message and changes nothing.
  */
 internal fun parseZstdStreamChunk(
     chunk: ByteArray,
     atFrameStart: Boolean,
-    maxWindowLog: Int = STREAM_WINDOW_LOG,
 ): ZstdStreamChunk? {
     if (chunk.isEmpty()) return ZstdStreamChunk(startsFrame = false, dictionaryId = 0u, endsFrame = false)
     var position = 0
@@ -113,7 +109,7 @@ internal fun parseZstdStreamChunk(
         if (descriptor and 0xEC != 0 || chunk.size < 2) return null
         val windowDescriptor = chunk[1].toInt() and 0xff
         val base = 1L shl (10 + (windowDescriptor ushr 3))
-        if (base + base / 8 * (windowDescriptor and 7) > 1L shl maxWindowLog) return null
+        if (base + base / 8 * (windowDescriptor and 7) > 1L shl STREAM_WINDOW_LOG) return null
         val dictionaryIdSize = intArrayOf(0, 1, 2, 4)[descriptor and 0x03]
         position = 2 + dictionaryIdSize
         if (chunk.size < position) return null

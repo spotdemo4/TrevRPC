@@ -1038,10 +1038,9 @@ async fn say_hello_with_connection_metadata(
         .await??
         .ok_or("the response ended without a STATUS")?;
         match frame.frame_type {
-            trevrpc::framing::frame_type::HEADERS => {
-                confirmed =
-                    trevrpc::framing::decode_payload::<trevrpc::RpcHeaders>(&frame.payload)?
-                        .connection_metadata;
+            trevrpc::framing::frame_type::ANSWER => {
+                confirmed = trevrpc::framing::decode_payload::<trevrpc::RpcAnswer>(&frame.payload)?
+                    .connection_metadata;
             }
             trevrpc::framing::frame_type::STATUS => {
                 let status =
@@ -2838,7 +2837,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
 }
 
 #[tokio::test]
-async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> TestResult {
+async fn quinn_a_request_status_is_invalid_argument() -> TestResult {
     task_panics::install();
     let server = spawn_greeter_server(register_status_upload_route)?;
     let (endpoint, connection, _client) = connect_client(&server).await?;
@@ -2846,27 +2845,12 @@ async fn quinn_terminal_request_status_drains_fin_without_stop_sending() -> Test
     let request =
         RpcRequest::new(support::greeter_path("StatusUpload")).with_kind(RpcKind::ClientStreaming);
 
+    // A request stream ends with FIN; a STATUS has no place on it.
     support::write_request(&mut send, &request).await?;
     support::write_status(&mut send, Status::ok()).await?;
-
-    let (read_started_tx, read_started_rx) = oneshot::channel();
-    let response_task = tokio::spawn(async move {
-        let _ = read_started_tx.send(());
-        let status = support::read_lone_status(&mut recv).await;
-        (status, recv)
-    });
-    read_started_rx.await?;
-    ensure!(
-        !response_task.is_finished(),
-        "terminal request status must wait for clean request FIN"
-    );
     send.finish()?;
-    let (status, mut recv) = tokio::time::timeout(TEST_TIMEOUT, response_task).await??;
-    ensure!(status?.is_ok());
-    read_quinn_fin(&mut recv).await?;
-
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
-    ensure_eq!(stopped, None);
+    let status = tokio::time::timeout(TEST_TIMEOUT, support::read_lone_status(&mut recv)).await??;
+    ensure_eq!(status.code(), Code::InvalidArgument);
 
     settle_detached_server_tasks().await;
     close_client(endpoint, connection).await?;
@@ -4330,7 +4314,7 @@ async fn quinn_server_skips_unknown_frames_everywhere_on_a_request() -> TestResu
     assert_response_shape_header(&reply.headers, "unary");
     read_quinn_fin(&mut recv).await?;
 
-    // Unknown frames also interleave with streamed request messages and the request status.
+    // Unknown frames also interleave with streamed request messages and follow the last one.
     let request = RpcRequest::new(support::greeter_path("LotsOfGreetings"))
         .with_kind(RpcKind::ClientStreaming);
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -4346,8 +4330,7 @@ async fn quinn_server_skips_unknown_frames_everywhere_on_a_request() -> TestResu
         )
         .await?;
     }
-    support::write_status(&mut send, Status::ok()).await?;
-    support::write_grease(&mut send, b"after status").await?;
+    support::write_grease(&mut send, b"after the messages").await?;
     send.finish()?;
     let reply = read_raw_quinn_reply(&mut recv).await?;
     ensure_eq!(reply.status.code(), Code::Ok);
@@ -4541,10 +4524,6 @@ fn frame_bytes(frames: &[trevrpc::ResponseFrame]) -> TestResult<Vec<u8>> {
                 trevrpc::framing::frame_type::HEADERS,
                 &trevrpc::RpcHeaders {
                     metadata: metadata.clone(),
-                    extensions: Vec::new(),
-                    dictionaries: Vec::new(),
-                    stream_compression: None,
-                    connection_metadata: 0,
                 },
                 trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
             )?,

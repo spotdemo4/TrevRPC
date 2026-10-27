@@ -26,7 +26,7 @@ internal class OptimisticReplay(
     /** The REQUEST of the replayed call: not optimistic, with [streams]' offer and the time left. */
     fun replayedRequest(streams: CallStreams?): RpcRequest =
         request.copy(
-            streamCompression = streams?.offer,
+            streamCompression = streams?.offer ?: StreamCompression.NONE,
             timeoutNanos = deadline?.let { (-it.elapsedNow()).inWholeNanoseconds.coerceAtLeast(1).toULong() } ?: 0uL,
         )
 }

@@ -165,14 +165,14 @@ struct CompressedEchoService;
 
 #[trevrpc::async_trait]
 impl CompressedEcho for CompressedEchoService {
-    /// `Echo.Bidi`, whose trailing metadata counts the requests that arrived stream-compressed,
-    /// known once the request stream has ended. Its HEADERS go out at dispatch, so it sets no
-    /// response headers.
+    /// `Echo.Bidi`, whose trailing metadata also counts the requests that arrived
+    /// stream-compressed, known once the request stream has ended.
     async fn bidi(
         &self,
         context: RequestContext,
         requests: BoxStream<EchoRequest>,
     ) -> Result<BoxStream<EchoResponse>, Status> {
+        answer_header(&context)?;
         let report = futures_util::stream::once(async move {
             context.set_response_metadata(
                 STREAM_COMPRESSED_RECEIVED_METADATA_KEY,
@@ -193,6 +193,7 @@ impl CompressedEcho for CompressedEchoService {
         requests: BoxStream<EchoRequest>,
     ) -> Result<EchoResponse, Status> {
         let response = concatenate(requests).await?;
+        answer_header(&context)?;
         context.set_response_metadata(
             STREAM_COMPRESSED_RECEIVED_METADATA_KEY,
             context.stream_compressed_requests_received().to_string(),
@@ -216,6 +217,7 @@ impl CompressedEcho for CompressedEchoService {
         context: RequestContext,
         request: PlainMessage,
     ) -> Result<PlainMessage, Status> {
+        answer_header(&context)?;
         context.set_response_metadata(
             PLAIN_COMPRESSED_RECEIVED_METADATA_KEY,
             context.plain_compressed_requests_received().to_string(),

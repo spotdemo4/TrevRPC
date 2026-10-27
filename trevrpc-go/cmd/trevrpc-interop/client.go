@@ -514,11 +514,12 @@ func runRefusedStream(ctx context.Context, env *scenarioEnv) error {
 	return nil
 }
 
-// runCompressedBidi echoes the compressed-stream messages one at a time and
-// expects the server to have received at least minCompressed of them
-// stream-compressed.
+// runCompressedBidi echoes the compressed-stream messages one at a time, with
+// response headers read before the first echo, and expects the server to have
+// received at least minCompressed of them stream-compressed. Stream
+// compression leaves response headers to the handler, as on any method.
 func runCompressedBidi(ctx context.Context, env *scenarioEnv, minCompressed int) error {
-	stream, err := env.compressed.Bidi(ctx)
+	stream, err := env.compressed.Bidi(ctx, trevrpc.WithMetadata(headerKey, []byte("h")))
 	if err != nil {
 		return err
 	}
@@ -526,6 +527,15 @@ func runCompressedBidi(ctx context.Context, env *scenarioEnv, minCompressed int)
 	for i := range compressedStreamMessages {
 		if err := stream.Send(&interoppb.EchoRequest{Message: compressedMessage(i)}); err != nil {
 			return fmt.Errorf("send %d: %w", i, err)
+		}
+		if i == 0 {
+			headers, err := stream.Headers()
+			if err != nil {
+				return fmt.Errorf("headers: %w", err)
+			}
+			if err := expectMetadata("headers", headers, headerKey, "h"); err != nil {
+				return err
+			}
 		}
 		response, err := stream.Recv()
 		if err != nil {
@@ -544,6 +554,9 @@ func runCompressedBidi(ctx context.Context, env *scenarioEnv, minCompressed int)
 	status, ok := stream.TerminalStatus()
 	if !ok {
 		return errors.New("no terminal status after the end of the stream")
+	}
+	if value := string(status.Metadata[trailerKey]); value != "h" {
+		return fmt.Errorf("trailing metadata %s = %q, want %q", trailerKey, value, "h")
 	}
 	return expectStreamCompressed(status.Metadata, minCompressed)
 }

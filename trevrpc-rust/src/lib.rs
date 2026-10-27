@@ -69,4 +69,6 @@ pub use futures_core::Stream;
 pub use response::ResponseEnvelope;
 pub use status::{Code, Status};
 pub use stream::BoxStream;
-pub use wire::{ConnectionMetadata, Metadata, RpcHeaders, RpcKind, RpcRequest, RpcStatus};
+pub use wire::{
+    ConnectionMetadata, Metadata, RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus,
+};

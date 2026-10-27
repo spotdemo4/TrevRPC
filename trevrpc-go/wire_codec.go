@@ -7,35 +7,31 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
-// This file is the direct protobuf codec of the REQUEST, HEADERS and STATUS
-// payloads. Going through the protobuf runtime costs a reflective wrapper per
+// This file is the direct protobuf codec of the REQUEST, HEADERS, ANSWER and
+// STATUS payloads. Going through the protobuf runtime costs a reflective wrapper per
 // message, so the frame functions try these first. The codec accepts only
 // what a conforming sender produces and reports everything else as "not
 // handled" (ok == false), leaving the reflective path to decode it or to
 // produce the error, so both agree on every payload.
 
-// Field numbers of the wire messages (see wireRequest, wireHeaders and
-// wireStatus).
+// Field numbers of the wire messages (see wireRequest, wireHeaders,
+// wireAnswer and wireStatus).
 const (
 	requestMethodField     protowire.Number = 1
-	requestMetadataField   protowire.Number = 4
-	requestKindField       protowire.Number = 5
-	requestTimeoutField    protowire.Number = 7
-	requestExtensionsField protowire.Number = 8
-	requestDatagramField   protowire.Number = 9
-	requestAcceptField     protowire.Number = 10
-	requestQueryField      protowire.Number = 11
-	requestStreamField     protowire.Number = 12
-	requestConnectionField protowire.Number = 13
+	requestMetadataField   protowire.Number = 2
+	requestKindField       protowire.Number = 3
+	requestTimeoutField    protowire.Number = 4
+	requestDatagramField   protowire.Number = 5
+	requestAcceptField     protowire.Number = 6
+	requestQueryField      protowire.Number = 7
+	requestStreamField     protowire.Number = 8
+	requestConnectionField protowire.Number = 9
 	headersMetadataField   protowire.Number = 1
-	headersExtensionsField protowire.Number = 2
-	headersDictionaryField protowire.Number = 3
-	headersStreamField     protowire.Number = 4
-	headersConnectionField protowire.Number = 5
+	answerDictionaryField  protowire.Number = 1
+	answerStreamField      protowire.Number = 2
+	answerConnectionField  protowire.Number = 3
 	connectionIDField      protowire.Number = 1
 	connectionEntriesField protowire.Number = 2
-	streamWindowField      protowire.Number = 1
-	streamOptimisticField  protowire.Number = 2
 	dictionaryIDField      protowire.Number = 1
 	dictionaryFingerField  protowire.Number = 2
 	statusCodeField        protowire.Number = 1
@@ -86,34 +82,6 @@ func appendMetadataField(b []byte, num protowire.Number, metadata Metadata) []by
 		b = protowire.AppendBytes(b, value)
 	}
 	return b
-}
-
-// packedVarintsSize is the size of the payload of a packed repeated uint64.
-func packedVarintsSize(values []uint64) int {
-	size := 0
-	for _, value := range values {
-		size += protowire.SizeVarint(value)
-	}
-	return size
-}
-
-func appendPackedVarints(b []byte, num protowire.Number, values []uint64) []byte {
-	if len(values) == 0 {
-		return b
-	}
-	b = protowire.AppendTag(b, num, protowire.BytesType)
-	b = protowire.AppendVarint(b, uint64(packedVarintsSize(values)))
-	for _, value := range values {
-		b = protowire.AppendVarint(b, value)
-	}
-	return b
-}
-
-func packedVarintsFieldSize(num protowire.Number, values []uint64) int {
-	if len(values) == 0 {
-		return 0
-	}
-	return protowire.SizeTag(num) + protowire.SizeBytes(packedVarintsSize(values))
 }
 
 func packedUint32sSize(values []uint32) int {
@@ -175,43 +143,6 @@ func appendDictionaryInfos(b []byte, num protowire.Number, infos []*dictionaryIn
 			b = protowire.AppendTag(b, dictionaryFingerField, protowire.BytesType)
 			b = protowire.AppendBytes(b, info.Fingerprint)
 		}
-	}
-	return b
-}
-
-// streamCompressionInfoSize is the encoded size of a StreamCompression
-// message.
-func streamCompressionInfoSize(info *streamCompressionInfo) int {
-	size := 0
-	if info.MaxWindowLog != 0 {
-		size += protowire.SizeTag(streamWindowField) + protowire.SizeVarint(uint64(info.MaxWindowLog))
-	}
-	if info.Optimistic {
-		size += protowire.SizeTag(streamOptimisticField) + 1
-	}
-	return size
-}
-
-func streamCompressionFieldSize(num protowire.Number, info *streamCompressionInfo) int {
-	if info == nil {
-		return 0
-	}
-	return protowire.SizeTag(num) + protowire.SizeBytes(streamCompressionInfoSize(info))
-}
-
-func appendStreamCompression(b []byte, num protowire.Number, info *streamCompressionInfo) []byte {
-	if info == nil {
-		return b
-	}
-	b = protowire.AppendTag(b, num, protowire.BytesType)
-	b = protowire.AppendVarint(b, uint64(streamCompressionInfoSize(info)))
-	if info.MaxWindowLog != 0 {
-		b = protowire.AppendTag(b, streamWindowField, protowire.VarintType)
-		b = protowire.AppendVarint(b, uint64(info.MaxWindowLog))
-	}
-	if info.Optimistic {
-		b = protowire.AppendTag(b, streamOptimisticField, protowire.VarintType)
-		b = protowire.AppendVarint(b, 1)
 	}
 	return b
 }
@@ -287,44 +218,6 @@ func consumeConnectionMetadata(data []byte) (*connectionMetadataInfo, bool) {
 	return info, true
 }
 
-// consumeStreamCompression decodes a StreamCompression message, skipping
-// unknown fields.
-func consumeStreamCompression(data []byte) (*streamCompressionInfo, bool) {
-	info := &streamCompressionInfo{}
-	for len(data) > 0 {
-		num, typ, n := protowire.ConsumeTag(data)
-		if n < 0 || num > protowire.MaxValidNumber {
-			return nil, false
-		}
-		data = data[n:]
-		switch {
-		case num == streamWindowField && typ == protowire.VarintType:
-			value, n := protowire.ConsumeVarint(data)
-			if n < 0 || value > math.MaxUint32 {
-				return nil, false
-			}
-			info.MaxWindowLog = uint32(value)
-			data = data[n:]
-		case num == streamOptimisticField && typ == protowire.VarintType:
-			value, n := protowire.ConsumeVarint(data)
-			if n < 0 {
-				return nil, false
-			}
-			info.Optimistic = protowire.DecodeBool(value)
-			data = data[n:]
-		case num == streamWindowField || num == streamOptimisticField:
-			return nil, false
-		default:
-			n, ok := skipField(num, typ, data)
-			if !ok {
-				return nil, false
-			}
-			data = data[n:]
-		}
-	}
-	return info, true
-}
-
 // payloadSize returns the encoded size of the request, and false when the
 // codec does not handle it.
 func (m *wireRequest) payloadSize() (int, bool) {
@@ -349,9 +242,10 @@ func (m *wireRequest) payloadSize() (int, bool) {
 	}
 	size += packedUint32sFieldSize(requestAcceptField, m.AcceptDictionaries)
 	size += dictionaryInfosFieldSize(requestQueryField, m.DictionaryQuery)
-	size += streamCompressionFieldSize(requestStreamField, m.StreamCompression)
-	size += connectionMetadataFieldSize(requestConnectionField, m.ConnectionMetadata)
-	return size + packedVarintsFieldSize(requestExtensionsField, m.Extensions), true
+	if m.StreamCompression != 0 {
+		size += protowire.SizeTag(requestStreamField) + protowire.SizeVarint(uint64(m.StreamCompression))
+	}
+	return size + connectionMetadataFieldSize(requestConnectionField, m.ConnectionMetadata), true
 }
 
 // appendPayload appends the request in field order. The request must have
@@ -370,14 +264,16 @@ func (m *wireRequest) appendPayload(b []byte) []byte {
 		b = protowire.AppendTag(b, requestTimeoutField, protowire.VarintType)
 		b = protowire.AppendVarint(b, m.TimeoutNanos)
 	}
-	b = appendPackedVarints(b, requestExtensionsField, m.Extensions)
 	if m.DatagramFlow != 0 {
 		b = protowire.AppendTag(b, requestDatagramField, protowire.VarintType)
 		b = protowire.AppendVarint(b, m.DatagramFlow)
 	}
 	b = appendPackedUint32s(b, requestAcceptField, m.AcceptDictionaries)
 	b = appendDictionaryInfos(b, requestQueryField, m.DictionaryQuery)
-	b = appendStreamCompression(b, requestStreamField, m.StreamCompression)
+	if m.StreamCompression != 0 {
+		b = protowire.AppendTag(b, requestStreamField, protowire.VarintType)
+		b = protowire.AppendVarint(b, uint64(m.StreamCompression))
+	}
 	return appendConnectionMetadata(b, requestConnectionField, m.ConnectionMetadata)
 }
 
@@ -385,21 +281,32 @@ func (m *wireHeaders) payloadSize() (int, bool) {
 	if !metadataValid(m.Metadata) {
 		return 0, false
 	}
-	size := metadataFieldSize(headersMetadataField, m.Metadata) + packedVarintsFieldSize(headersExtensionsField, m.Extensions) +
-		dictionaryInfosFieldSize(headersDictionaryField, m.Dictionaries) + streamCompressionFieldSize(headersStreamField, m.StreamCompression)
-	if m.ConnectionMetadata != 0 {
-		size += protowire.SizeTag(headersConnectionField) + protowire.SizeVarint(uint64(m.ConnectionMetadata))
-	}
-	return size, true
+	return metadataFieldSize(headersMetadataField, m.Metadata), true
 }
 
 func (m *wireHeaders) appendPayload(b []byte) []byte {
-	b = appendMetadataField(b, headersMetadataField, m.Metadata)
-	b = appendPackedVarints(b, headersExtensionsField, m.Extensions)
-	b = appendDictionaryInfos(b, headersDictionaryField, m.Dictionaries)
-	b = appendStreamCompression(b, headersStreamField, m.StreamCompression)
+	return appendMetadataField(b, headersMetadataField, m.Metadata)
+}
+
+func (m *wireAnswer) payloadSize() int {
+	size := dictionaryInfosFieldSize(answerDictionaryField, m.Dictionaries)
+	if m.StreamCompression {
+		size += protowire.SizeTag(answerStreamField) + 1
+	}
 	if m.ConnectionMetadata != 0 {
-		b = protowire.AppendTag(b, headersConnectionField, protowire.VarintType)
+		size += protowire.SizeTag(answerConnectionField) + protowire.SizeVarint(uint64(m.ConnectionMetadata))
+	}
+	return size
+}
+
+func (m *wireAnswer) appendPayload(b []byte) []byte {
+	b = appendDictionaryInfos(b, answerDictionaryField, m.Dictionaries)
+	if m.StreamCompression {
+		b = protowire.AppendTag(b, answerStreamField, protowire.VarintType)
+		b = protowire.AppendVarint(b, 1)
+	}
+	if m.ConnectionMetadata != 0 {
+		b = protowire.AppendTag(b, answerConnectionField, protowire.VarintType)
 		b = protowire.AppendVarint(b, uint64(m.ConnectionMetadata))
 	}
 	return b
@@ -553,15 +460,12 @@ func (m *wireRequest) decodeFast(b []byte) bool {
 				data = data[n:]
 			}
 			b = b[n:]
-		case num == requestStreamField && typ == protowire.BytesType && m.StreamCompression == nil:
-			data, n := protowire.ConsumeBytes(b)
+		case num == requestStreamField && typ == protowire.VarintType:
+			value, n := protowire.ConsumeVarint(b)
 			if n < 0 {
 				return false
 			}
-			var ok bool
-			if m.StreamCompression, ok = consumeStreamCompression(data); !ok {
-				return false
-			}
+			m.StreamCompression = streamCompressionMode(int32(value))
 			b = b[n:]
 		case num == requestConnectionField && typ == protowire.BytesType && m.ConnectionMetadata == nil:
 			data, n := protowire.ConsumeBytes(b)
@@ -574,12 +478,11 @@ func (m *wireRequest) decodeFast(b []byte) bool {
 			}
 			b = b[n:]
 		case num == requestMethodField || num == requestMetadataField || num == requestKindField ||
-			num == requestTimeoutField || num == requestExtensionsField || num == requestDatagramField ||
-			num == requestAcceptField || num == requestQueryField || num == requestStreamField ||
-			num == requestConnectionField:
-			// A known field of an unexpected wire type, the extension list, an
-			// unpacked dictionary list or the dictionary query, which a client
-			// sends once per connection: all are left to the reflective decoder.
+			num == requestTimeoutField || num == requestDatagramField || num == requestAcceptField ||
+			num == requestQueryField || num == requestStreamField || num == requestConnectionField:
+			// A known field of an unexpected wire type, an unpacked dictionary
+			// list or the dictionary query, which a client sends once per
+			// connection: all are left to the reflective decoder.
 			return false
 		default:
 			n, ok := skipField(num, typ, b)
@@ -611,25 +514,45 @@ func (m *wireHeaders) decodeFast(b []byte) bool {
 				return false
 			}
 			b = b[n:]
-		case num == headersStreamField && typ == protowire.BytesType && m.StreamCompression == nil:
-			data, n := protowire.ConsumeBytes(b)
-			if n < 0 {
-				return false
-			}
-			var ok bool
-			if m.StreamCompression, ok = consumeStreamCompression(data); !ok {
+		case num == headersMetadataField:
+			return false
+		default:
+			n, ok := skipField(num, typ, b)
+			if !ok {
 				return false
 			}
 			b = b[n:]
-		case num == headersConnectionField && typ == protowire.VarintType:
+		}
+	}
+	return true
+}
+
+// decodeFast decodes an ANSWER payload into m, which must be empty. The
+// dictionary answer, which a server sends once per connection, is left to the
+// reflective decoder.
+func (m *wireAnswer) decodeFast(b []byte) bool {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 || num > protowire.MaxValidNumber {
+			return false
+		}
+		b = b[n:]
+		switch {
+		case num == answerStreamField && typ == protowire.VarintType:
+			value, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return false
+			}
+			m.StreamCompression = protowire.DecodeBool(value)
+			b = b[n:]
+		case num == answerConnectionField && typ == protowire.VarintType:
 			value, n := protowire.ConsumeVarint(b)
 			if n < 0 || value > math.MaxUint32 {
 				return false
 			}
 			m.ConnectionMetadata = uint32(value)
 			b = b[n:]
-		case num == headersMetadataField || num == headersExtensionsField || num == headersDictionaryField ||
-			num == headersStreamField || num == headersConnectionField:
+		case num == answerDictionaryField || num == answerStreamField || num == answerConnectionField:
 			return false
 		default:
 			n, ok := skipField(num, typ, b)

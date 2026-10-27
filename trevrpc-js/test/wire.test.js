@@ -6,6 +6,7 @@ import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import {
   FrameReader,
   FrameType,
+  encodeAnswerFrame,
   encodeFrame,
   encodeHeadersFrame,
   encodeMessageFrame,
@@ -25,7 +26,7 @@ import {
 } from "../src/metadata.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
-import { RpcHeaders, RpcKind, RpcRequest, RpcStatus, createRoot } from "../src/wire.js";
+import { RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus, createRoot } from "../src/wire.js";
 import { chunked, concatBytes, hex, readGoldenVectors, readerOf } from "./support.js";
 
 const bytes = (text) => new TextEncoder().encode(text);
@@ -46,7 +47,6 @@ const goldenCases = {
     RpcRequest,
     { ...request, metadata: { authorization: bytes("ok") } },
   ],
-  "request.extensions": [FrameType.Request, RpcRequest, { ...request, extensions: [1, 300] }],
   "request.datagram_flow": [
     FrameType.Request,
     RpcRequest,
@@ -65,9 +65,9 @@ const goldenCases = {
   "message.hi": [FrameType.Message, undefined, bytes("hi")],
   "message.empty": [FrameType.Message, undefined, new Uint8Array(0)],
   "headers.metadata": [FrameType.Headers, RpcHeaders, { metadata: { "x-a": bytes("1") } }],
-  "headers.connection_metadata": [FrameType.Headers, RpcHeaders, { connectionMetadata: 1 }],
   "headers.empty": [FrameType.Headers, RpcHeaders, {}],
-  "headers.extensions": [FrameType.Headers, RpcHeaders, { extensions: [1] }],
+  "answer.connection_metadata": [FrameType.Answer, RpcAnswer, { connectionMetadata: 1 }],
+  "answer.empty": [FrameType.Answer, RpcAnswer, {}],
   "status.ok": [FrameType.Status, RpcStatus, { code: Code.Ok }],
   "status.unavailable": [FrameType.Status, RpcStatus, { code: Code.Unavailable, message: "down" }],
   "status.metadata": [
@@ -138,10 +138,6 @@ test("golden payloads decode to their logical fields", async () => {
   const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   const decode = (name, type) => unmarshalMessage(type, fromHex(vectors.get(`${name}.payload`)));
 
-  const withExtensions = decode("request.extensions", RpcRequest);
-  assert.deepEqual(withExtensions.extensions.map(Number), [1, 300]);
-  assert.equal(withExtensions.method, "/svc/m");
-
   const timeout = decode("request.bidi_timeout", RpcRequest);
   assert.equal(timeout.kind, RpcKind.BidirectionalStreaming);
   assert.equal(Number(timeout.timeoutNanos), 123456);
@@ -163,9 +159,10 @@ test("golden payloads decode to their logical fields", async () => {
   assert.deepEqual(Object.keys(reference.connectionMetadata.metadata), []);
   assert.deepEqual(Object.keys(reference.metadata), ["x-a"]);
   assert.equal(decode("request.unary", RpcRequest).connectionMetadata, null);
-  assert.equal(decode("headers.connection_metadata", RpcHeaders).connectionMetadata, 1);
-  assert.equal(decode("headers.empty", RpcHeaders).connectionMetadata, 0);
-  assert.deepEqual(decode("headers.extensions", RpcHeaders).extensions.map(Number), [1]);
+  assert.equal(decode("answer.connection_metadata", RpcAnswer).connectionMetadata, 1);
+  assert.equal(decode("answer.empty", RpcAnswer).connectionMetadata, 0);
+  assert.equal(decode("answer.empty", RpcAnswer).streamCompression, false);
+  assert.deepEqual(decode("answer.empty", RpcAnswer).dictionaries, []);
   assert.equal(Buffer.from(decode("headers.metadata", RpcHeaders).metadata["x-a"]) + "", "1");
 
   const status = decode("status.metadata", RpcStatus);
@@ -266,16 +263,15 @@ test("request frames carry the request message in the same buffer", () => {
   );
 });
 
-test("the reserved request fields are ignored when decoding", () => {
-  // Field 2 (old method name), field 3 and field 6 (old version) from an older peer.
-  const payload = fromHex("0a062f7376632f6d" + "12016d" + "1a0100" + "3001");
+test("unknown request fields are ignored when decoding", () => {
+  // Fields 10 (varint) and 16 (bytes), which a later peer may send.
+  const payload = fromHex("0a062f7376632f6d" + "5001" + "820101" + "6d");
   const decoded = unmarshalMessage(RpcRequest, payload);
   assert.equal(decoded.method, "/svc/m");
-  assert.equal(decoded.version, undefined);
   assert.equal(hex(marshalMessage(RpcRequest, decoded)), "0a062f7376632f6d");
 });
 
-test("status and headers encoders match the golden frames", async () => {
+test("status, headers and answer encoders match the golden frames", async () => {
   const vectors = await readGoldenVectors("wire-golden-vectors.txt");
   assert.equal(
     hex(encodeStatusFrame({ code: Code.Unavailable, message: "down" })),
@@ -284,6 +280,10 @@ test("status and headers encoders match the golden frames", async () => {
   assert.equal(
     hex(encodeHeadersFrame({ metadata: { "x-a": bytes("1") } })),
     vectors.get("headers.metadata.frame"),
+  );
+  assert.equal(
+    hex(encodeAnswerFrame({ connectionMetadata: 1 })),
+    vectors.get("answer.connection_metadata.frame"),
   );
 });
 
@@ -396,7 +396,7 @@ test("unknown frames are skipped wherever they appear", async () => {
     unknown(0x21), // grease before everything
     encodeMessageFrame(bytes("a")),
     unknown(0x40, 0),
-    unknown(6),
+    unknown(7),
     unknown(2 ** 40), // 8-byte type that still fits a number
     encodeFrame(2n ** 62n - 1n, new Uint8Array(2)), // largest type, a bigint
     encodeMessageFrame(bytes("b")),

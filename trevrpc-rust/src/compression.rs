@@ -711,7 +711,7 @@ pub(crate) struct ClientCall {
     pub(crate) accept: Accept,
     /// The dictionary request messages are compressed with.
     pub(crate) requests: CallDict,
-    /// The connection to teach the answer in the call's HEADERS, when the request queried.
+    /// The connection to teach the answer in the call's ANSWER, when the request queried.
     pub(crate) learn: Option<Arc<ClientCompression>>,
 }
 
@@ -781,7 +781,7 @@ impl ClientCompression {
 /// What negotiation decided for one server call.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ServerCall {
-    /// The answer to the request's query; `Some`, if empty, when it queried, which makes HEADERS
+    /// The answer to the request's query; `Some`, if empty, when it queried, which makes ANSWER
     /// go out.
     pub(crate) answer: Option<Vec<DictionaryInfo>>,
     /// The dictionary response messages are compressed with, if any.
@@ -1051,11 +1051,11 @@ mod tests {
         assert!(matches!(&call.accept, Accept::One(dict) if dict.is_plain()));
 
         let server = negotiate(None, &request, Some("a.Response"), CompressMessages::BOTH);
-        let headers = crate::RpcHeaders {
+        let answer = crate::RpcAnswer {
             dictionaries: server.answer.clone().unwrap(),
-            ..crate::RpcHeaders::default()
+            ..crate::RpcAnswer::default()
         };
-        assert_eq!(headers.encode_to_vec(), vectors["headers.plain.payload"]);
+        assert_eq!(answer.encode_to_vec(), vectors["answer.plain.payload"]);
         assert!(
             server
                 .responses
@@ -1065,7 +1065,7 @@ mod tests {
 
         // Requests compress once the answer confirms it, the call that queried included.
         assert!(call.requests.get().is_none());
-        client.learn(&headers.dictionaries);
+        client.learn(&answer.dictionaries);
         assert!(call.requests.get().is_some_and(|dict| dict.is_plain()));
     }
 

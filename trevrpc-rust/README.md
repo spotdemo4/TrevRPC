@@ -84,7 +84,7 @@ Metadata that every call carries, such as a bearer token, can instead be set onc
 
 ### Response headers and trailing metadata
 
-A response carries two metadata maps. Headers are sent before the first response message, so a streaming call sees them without waiting for a message; trailing metadata arrives with the final status. `ResponseStream::headers()` (also on `BidirectionalCall` and `ClientStreamingCall`) resolves once the first response frame arrives, with empty headers if the server sent none, and never loses a message it read ahead. For unary and client-streaming calls, `.with_response()` (and `ClientStreamingCall::close_and_recv_with_response`) returns a `ResponseEnvelope` whose `headers()` and `metadata()` (the trailing metadata) are filled once the call completes.
+A response carries two metadata maps. Headers are sent before the first response message, so a streaming call sees them without waiting for a message; trailing metadata arrives with the final status. `ResponseStream::headers()` (also on `BidirectionalCall` and `ClientStreamingCall`) resolves once the headers, the first message or the final status arrives, with empty headers if the server sent none, and never loses a message it read ahead. For unary and client-streaming calls, `.with_response()` (and `ClientStreamingCall::close_and_recv_with_response`) returns a `ResponseEnvelope` whose `headers()` and `metadata()` (the trailing metadata) are filled once the call completes.
 
 ```rust
 let mut replies = client.lots_of_replies(&greeter::HelloRequest { name: "Alice".into() }).await?;

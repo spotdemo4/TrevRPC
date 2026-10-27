@@ -51,34 +51,28 @@ const (
 	RPCKindBidirectionalStreaming RPCKind = 3
 )
 
-// wireRequest is the payload of a REQUEST frame. Fields 2 (the method name),
-// 3 (the request body) and 6 (the wire version) are reserved: the method is the
-// full path in field 1, the request message travels in a MESSAGE frame, and
-// transports fix the wire version while negotiating.
+// wireRequest is the payload of a REQUEST frame.
 type wireRequest struct {
 	// Method is the method path "/package.Service/Method".
 	Method       string   `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
-	Metadata     Metadata `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	Kind         RPCKind  `protobuf:"varint,5,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
-	TimeoutNanos uint64   `protobuf:"varint,7,opt,name=timeout_nanos,json=timeoutNanos,proto3" json:"timeout_nanos,omitempty"`
-	// Extensions lists the extension IDs the client supports (field 8). The
-	// registry is empty, so clients send none and servers ignore the field.
-	Extensions []uint64 `protobuf:"varint,8,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
-	// DatagramFlow is the datagram flow ID of the call (field 9), or zero for
+	Metadata     Metadata `protobuf:"bytes,2,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	Kind         RPCKind  `protobuf:"varint,3,opt,name=kind,proto3,enum=trevrpc.RpcKind" json:"kind,omitempty"`
+	TimeoutNanos uint64   `protobuf:"varint,4,opt,name=timeout_nanos,json=timeoutNanos,proto3" json:"timeout_nanos,omitempty"`
+	// DatagramFlow is the datagram flow ID of the call (field 5), or zero for
 	// a call without one.
-	DatagramFlow uint64 `protobuf:"varint,9,opt,name=datagram_flow,json=datagramFlow,proto3" json:"datagram_flow,omitempty"`
+	DatagramFlow uint64 `protobuf:"varint,5,opt,name=datagram_flow,json=datagramFlow,proto3" json:"datagram_flow,omitempty"`
 	// AcceptDictionaries lists the dictionaries the client accepts on the
-	// call's response messages (field 10).
-	AcceptDictionaries []uint32 `protobuf:"varint,10,rep,packed,name=accept_dictionaries,json=acceptDictionaries,proto3" json:"accept_dictionaries,omitempty"`
+	// call's response messages (field 6).
+	AcceptDictionaries []uint32 `protobuf:"varint,6,rep,packed,name=accept_dictionaries,json=acceptDictionaries,proto3" json:"accept_dictionaries,omitempty"`
 	// DictionaryQuery asks the server which of these dictionaries it holds
-	// (field 11).
-	DictionaryQuery []*dictionaryInfo `protobuf:"bytes,11,rep,name=dictionary_query,json=dictionaryQuery,proto3" json:"dictionary_query,omitempty"`
-	// StreamCompression says the client decodes stream-compressed responses
-	// (field 12).
-	StreamCompression *streamCompressionInfo `protobuf:"bytes,12,opt,name=stream_compression,json=streamCompression,proto3" json:"stream_compression,omitempty"`
+	// (field 7).
+	DictionaryQuery []*dictionaryInfo `protobuf:"bytes,7,rep,name=dictionary_query,json=dictionaryQuery,proto3" json:"dictionary_query,omitempty"`
+	// StreamCompression says whether the client takes part in stream
+	// compression (field 8).
+	StreamCompression streamCompressionMode `protobuf:"varint,8,opt,name=stream_compression,json=streamCompression,proto3,enum=trevrpc.StreamCompression" json:"stream_compression,omitempty"`
 	// ConnectionMetadata offers the connection's metadata set, or refers to
-	// one the server confirmed (field 13); see connection_metadata.go.
-	ConnectionMetadata *connectionMetadataInfo `protobuf:"bytes,13,opt,name=connection_metadata,json=connectionMetadata,proto3" json:"connection_metadata,omitempty"`
+	// one the server confirmed (field 9); see connection_metadata.go.
+	ConnectionMetadata *connectionMetadataInfo `protobuf:"bytes,9,opt,name=connection_metadata,json=connectionMetadata,proto3" json:"connection_metadata,omitempty"`
 
 	// The fields below are not on the wire.
 	//
@@ -104,23 +98,25 @@ type wireRequest struct {
 	// streams is the server's stream compression of the call, nil without.
 	streams *serverStreams
 	// connectionMetadataConfirmed is the connection metadata set the server
-	// stored from this call's offer, which its HEADERS confirms; zero for
+	// stored from this call's offer, which its ANSWER confirms; zero for
 	// none.
 	connectionMetadataConfirmed uint32
 }
 
-// answer returns what the HEADERS of the call answer, and whether there is
-// anything to answer, which makes HEADERS go out even without metadata: the
-// dictionary query, and the connection metadata set the call offered and the
-// server stored. Stream compression's answer goes out at dispatch.
-func (m *wireRequest) answer() (headersAnswer, bool) {
-	var answer headersAnswer
+// answer returns the call's ANSWER, and whether it has one: the answer to the
+// dictionary query, the connection metadata set the call offered and the
+// server stored, and whether the server decodes stream-compressed requests.
+func (m *wireRequest) answer() (wireAnswer, bool) {
+	var answer wireAnswer
 	answered := false
 	if compression := m.compression; compression != nil && compression.answered {
-		answer.dictionaries, answered = compression.answer, true
+		answer.Dictionaries, answered = compression.answer, true
 	}
 	if m.connectionMetadataConfirmed != 0 {
-		answer.connectionMetadata, answered = m.connectionMetadataConfirmed, true
+		answer.ConnectionMetadata, answered = m.connectionMetadataConfirmed, true
+	}
+	if m.streams.decodesRequests() {
+		answer.StreamCompression, answered = true, true
 	}
 	return answer, answered
 }
@@ -176,6 +172,10 @@ func (m *wireRequest) validateProtocol() error {
 		return InvalidArgument(fmt.Sprintf("unsupported TrevRPC RPC kind %d", m.Kind))
 	}
 
+	if m.StreamCompression < streamCompressionNone || m.StreamCompression > streamCompressionOptimistic {
+		return InvalidArgument(fmt.Sprintf("unsupported TrevRPC stream compression %d", m.StreamCompression))
+	}
+
 	return nil
 }
 
@@ -189,6 +189,23 @@ func (k RPCKind) isValid() bool {
 	}
 }
 
+// streamCompressionMode is the request's stream_compression: whether the
+// client takes part in stream compression, and whether it does so
+// optimistically.
+type streamCompressionMode int32
+
+const (
+	// streamCompressionNone: the client neither decodes nor sends
+	// stream-compressed messages.
+	streamCompressionNone streamCompressionMode = 0
+	// streamCompressionEnabled: the client decodes stream-compressed
+	// responses, and sends stream-compressed requests once answered.
+	streamCompressionEnabled streamCompressionMode = 1
+	// streamCompressionOptimistic: as streamCompressionEnabled, and the client
+	// already sends them, before the server's answer.
+	streamCompressionOptimistic streamCompressionMode = 2
+)
+
 // rpcKind returns the request RPC kind, defaulting to unary for invalid values.
 func (m *wireRequest) rpcKind() RPCKind {
 	if m.Kind.isValid() {
@@ -198,20 +215,10 @@ func (m *wireRequest) rpcKind() RPCKind {
 	return RPCKindUnary
 }
 
-// wireHeaders is the payload of a HEADERS frame.
+// wireHeaders is the payload of a HEADERS frame: the response header
+// metadata.
 type wireHeaders struct {
 	Metadata Metadata `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	// Extensions lists the extension IDs the server accepts (field 2). The
-	// registry is empty, so servers send none and clients ignore the field.
-	Extensions []uint64 `protobuf:"varint,2,rep,packed,name=extensions,proto3" json:"extensions,omitempty"`
-	// Dictionaries answers the request's DictionaryQuery (field 3).
-	Dictionaries []*dictionaryInfo `protobuf:"bytes,3,rep,name=dictionaries,proto3" json:"dictionaries,omitempty"`
-	// StreamCompression says the server decodes stream-compressed requests
-	// (field 4).
-	StreamCompression *streamCompressionInfo `protobuf:"bytes,4,opt,name=stream_compression,json=streamCompression,proto3" json:"stream_compression,omitempty"`
-	// ConnectionMetadata confirms that the server stored the connection
-	// metadata set the request offered (field 5).
-	ConnectionMetadata uint32 `protobuf:"varint,5,opt,name=connection_metadata,json=connectionMetadata,proto3" json:"connection_metadata,omitempty"`
 }
 
 // Reset clears the headers for protobuf compatibility.
@@ -222,6 +229,28 @@ func (m *wireHeaders) String() string { return fmt.Sprintf("%+v", *m) }
 
 // ProtoMessage marks wireHeaders as a protobuf message.
 func (*wireHeaders) ProtoMessage() {}
+
+// wireAnswer is the payload of an ANSWER frame: the server's answer to the
+// negotiation fields of the REQUEST. A field it leaves out means no, or none.
+type wireAnswer struct {
+	// Dictionaries answers the request's DictionaryQuery (field 1).
+	Dictionaries []*dictionaryInfo `protobuf:"bytes,1,rep,name=dictionaries,proto3" json:"dictionaries,omitempty"`
+	// StreamCompression says the server decodes the call's stream-compressed
+	// requests (field 2).
+	StreamCompression bool `protobuf:"varint,2,opt,name=stream_compression,json=streamCompression,proto3" json:"stream_compression,omitempty"`
+	// ConnectionMetadata confirms that the server stored the connection
+	// metadata set the request offered (field 3).
+	ConnectionMetadata uint32 `protobuf:"varint,3,opt,name=connection_metadata,json=connectionMetadata,proto3" json:"connection_metadata,omitempty"`
+}
+
+// Reset clears the answer for protobuf compatibility.
+func (m *wireAnswer) Reset() { *m = wireAnswer{} }
+
+// String returns the answer as a debug string for protobuf compatibility.
+func (m *wireAnswer) String() string { return fmt.Sprintf("%+v", *m) }
+
+// ProtoMessage marks wireAnswer as a protobuf message.
+func (*wireAnswer) ProtoMessage() {}
 
 // dictionaryInfo identifies a compression dictionary in the negotiation
 // fields: its Dictionary_ID and its fingerprint, the first 8 bytes of its
@@ -239,24 +268,6 @@ func (m *dictionaryInfo) String() string { return fmt.Sprintf("%+v", *m) }
 
 // ProtoMessage marks dictionaryInfo as a protobuf message.
 func (*dictionaryInfo) ProtoMessage() {}
-
-// streamCompressionInfo describes what a peer decodes in stream compression:
-// the largest zstd window, as a base-2 logarithm. In a REQUEST, Optimistic
-// says the client stream-compresses its requests without waiting for the
-// server's answer, which the server then gives or refuses at dispatch.
-type streamCompressionInfo struct {
-	MaxWindowLog uint32 `protobuf:"varint,1,opt,name=max_window_log,json=maxWindowLog,proto3" json:"max_window_log,omitempty"`
-	Optimistic   bool   `protobuf:"varint,2,opt,name=optimistic,proto3" json:"optimistic,omitempty"`
-}
-
-// Reset clears the info for protobuf compatibility.
-func (m *streamCompressionInfo) Reset() { *m = streamCompressionInfo{} }
-
-// String returns the info as a debug string for protobuf compatibility.
-func (m *streamCompressionInfo) String() string { return fmt.Sprintf("%+v", *m) }
-
-// ProtoMessage marks streamCompressionInfo as a protobuf message.
-func (*streamCompressionInfo) ProtoMessage() {}
 
 // connectionMetadataInfo is a request's connection metadata: with Metadata,
 // an offer of the connection's set ID; without, a reference to the set ID the

@@ -2,7 +2,7 @@ import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
 import { FrameType, marshalMessage, unmarshalMessage } from "./framing.js";
 import { validateMetadata } from "./metadata.js";
 import { Code, cancelled, internal, statusError } from "./status.js";
-import { RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
+import { RpcAnswer, RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
 
 /** Creates a service client from a generated service descriptor. */
 export function createServiceClient(transport, service, root, options = {}) {
@@ -179,8 +179,8 @@ function plainCompressionUse({ compressRequests, compressResponses }) {
  * A bidirectional-streaming RPC. Messages are received with recv() or async iteration. The call
  * ends with the server's final status: a non-OK status makes recv() throw it, and `status`
  * settles with the final status or the error that ended the call. `headers` resolves once the
- * first response frame arrived; reading it starts that read, so headers are available before the
- * first message.
+ * first response frame after any ANSWER arrived; reading it starts that read, so headers are
+ * available before the first message.
  *
  * While the request side is open, the response is read ahead of recv() (see ReadAheadFrames), so
  * a final status reaches a caller that is only sending. It stops the upload at once: pending and
@@ -190,9 +190,9 @@ function plainCompressionUse({ compressRequests, compressResponses }) {
  * The final status settles the outcome as soon as it is read. Responses read before it are still
  * delivered in order, and the call's deadline and abort signal no longer apply to it.
  *
- * The call options' `onResponseHeaders` is called with the headers when the first response frame
- * is read, and `onResponseMetadata` with the trailing metadata when the final status is OK. A
- * callback that throws fails the call.
+ * The call options' `onResponseHeaders` is called with the headers when the first frame after
+ * ANSWER is read, and `onResponseMetadata` with the trailing metadata when the final status is
+ * OK. A callback that throws fails the call.
  *
  * A call that stream-compresses its requests optimistically and is refused by the server is
  * replayed without that, transparently: the caller's sends and the response continue on the
@@ -226,6 +226,7 @@ export class BidirectionalStreamingCall {
   /** Receivers waiting for a frame. */
   #demand = 0;
   #headersWanted = false;
+  #sawAnswer = false;
   #sawHeaders = false;
   #sawMessage = false;
   /** Settles on every change a waiter may care about. */
@@ -276,8 +277,8 @@ export class BidirectionalStreamingCall {
   }
 
   /**
-   * The response headers, empty when the server sent none. Settles when the first response frame
-   * arrives, or rejects with the error that ended the call first.
+   * The response headers, empty when the server sent none. Settles when the first frame after
+   * ANSWER arrives, or rejects with the error that ended the call first.
    */
   get headers() {
     this.#headersWanted = true;
@@ -521,9 +522,10 @@ export class BidirectionalStreamingCall {
   }
 
   /**
-   * Reads the next MESSAGE or STATUS event, consuming HEADERS on the way. Enforces the response
-   * grammar `[HEADERS] MESSAGE* STATUS`. A ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE is a MESSAGE,
-   * decompressed.
+   * Reads the next MESSAGE or STATUS event, consuming ANSWER and HEADERS on the way. Enforces the
+   * response grammar `[ANSWER] [HEADERS] MESSAGE* STATUS`, and that an optimistic call's response
+   * starts with ANSWER or STATUS. A ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE is a MESSAGE,
+   * decompressed. ANSWER is not the headers: they settle with the first frame after it.
    */
   async #readEvent() {
     for (;;) {
@@ -532,7 +534,26 @@ export class BidirectionalStreamingCall {
         throw this.#call.uploadFailure ?? internal("response stream ended before final status");
       }
 
+      if (
+        frame.type !== FrameType.Status &&
+        frame.type !== FrameType.Answer &&
+        this.#call.replayable
+      ) {
+        throw internal("optimistic call answered without an ANSWER frame");
+      }
       switch (frame.type) {
+        case FrameType.Answer: {
+          if (this.#sawAnswer || this.#sawHeaders || this.#sawMessage) {
+            throw internal(
+              this.#sawAnswer
+                ? "duplicate ANSWER frame"
+                : `ANSWER frame after ${this.#sawMessage ? "MESSAGE" : "HEADERS"}`,
+            );
+          }
+          this.#sawAnswer = true;
+          this.#call.learnAnswers(unmarshalMessage(RpcAnswer, frame.payload));
+          continue;
+        }
         case FrameType.Headers: {
           if (this.#sawHeaders || this.#sawMessage) {
             throw internal(
@@ -541,7 +562,6 @@ export class BidirectionalStreamingCall {
           }
           const headers = unmarshalMessage(RpcHeaders, frame.payload);
           validateResponseMetadata(headers.metadata, "headers");
-          this.#call.learnAnswers(headers);
           this.#sawHeaders = true;
           this.#settleHeaders(headers.metadata);
           this.#flow?.connect(this.#onDatagram);
@@ -558,12 +578,7 @@ export class BidirectionalStreamingCall {
         }
         case FrameType.Status: {
           const status = unmarshalMessage(RpcStatus, frame.payload);
-          if (
-            status.refusedStreamCompression &&
-            !this.#sawHeaders &&
-            !this.#sawMessage &&
-            this.#call.replayable
-          ) {
+          if (status.refusedStreamCompression && this.#call.replayable) {
             // The server refused the optimistic call before running anything for it: the call
             // continues on a replay, and its response is read from there.
             // A call with a datagram flow is never optimistic, but its replay, on a session
@@ -699,8 +714,8 @@ export class ResponseStream {
   }
 
   /**
-   * The response headers, empty when the server sent none. Settles when the first response frame
-   * arrives, even before the first message is received, or rejects with the call error.
+   * The response headers, empty when the server sent none. Settles when the first frame after
+   * ANSWER arrives, even before the first message is received, or rejects with the call error.
    */
   get headers() {
     return this.#call.headers;

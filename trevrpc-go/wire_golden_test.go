@@ -61,12 +61,20 @@ func requestVector(name string, request *wireRequest) goldenVector {
 			}
 			decoded := got.Request
 			if decoded.Method != request.Method || decoded.Kind != request.Kind || decoded.TimeoutNanos != request.TimeoutNanos || decoded.DatagramFlow != request.DatagramFlow ||
-				!slices.Equal(decoded.Extensions, request.Extensions) || !metadataEqual(decoded.Metadata, request.Metadata) ||
+				decoded.StreamCompression != request.StreamCompression || !metadataEqual(decoded.Metadata, request.Metadata) ||
 				!connectionMetadataEqual(decoded.ConnectionMetadata, request.ConnectionMetadata) {
 				t.Fatalf("decoded request = %#v, want %#v", decoded, request)
 			}
 		},
 	}
+}
+
+// answerEqual reports whether two ANSWER payloads hold the same answers.
+func answerEqual(a, b wireAnswer) bool {
+	return a.StreamCompression == b.StreamCompression && a.ConnectionMetadata == b.ConnectionMetadata &&
+		slices.EqualFunc(a.Dictionaries, b.Dictionaries, func(x, y *dictionaryInfo) bool {
+			return x.ID == y.ID && bytes.Equal(x.Fingerprint, y.Fingerprint)
+		})
 }
 
 func connectionMetadataEqual(a, b *connectionMetadataInfo) bool {
@@ -84,8 +92,6 @@ func TestWireGoldenVectors(t *testing.T) {
 	bidi := newWireRequest("/svc/m")
 	bidi.Kind = RPCKindBidirectionalStreaming
 	bidi.TimeoutNanos = 123456
-	extensions := newWireRequest("/svc/m")
-	extensions.Extensions = []uint64{1, 300}
 	datagramFlow := newWireRequest("/svc/m")
 	datagramFlow.Kind = RPCKindBidirectionalStreaming
 	datagramFlow.DatagramFlow = 1
@@ -126,8 +132,24 @@ func TestWireGoldenVectors(t *testing.T) {
 			},
 			check: func(t *testing.T, got testFrame) {
 				t.Helper()
-				if got.Kind != frameTypeHeaders || !metadataEqual(got.Headers, headers.Metadata) || got.headersConnectionMetadata != headers.ConnectionMetadata {
+				if got.Kind != frameTypeHeaders || !metadataEqual(got.Headers, headers.Metadata) {
 					t.Fatalf("decoded headers = %#v, want %#v", got, headers)
+				}
+			},
+		}
+	}
+	answerVector := func(name string, answer *wireAnswer) goldenVector {
+		return goldenVector{
+			name:    name,
+			payload: func(t *testing.T) []byte { return mustMarshal(t, answer) },
+			frame: func(t *testing.T) []byte {
+				frame, err := appendAnswerFrame(nil, answer, DefaultMaxFrameSize)
+				return mustFrame(t, frame, err)
+			},
+			check: func(t *testing.T, got testFrame) {
+				t.Helper()
+				if got.Kind != frameTypeAnswer || !answerEqual(got.Answer, *answer) {
+					t.Fatalf("decoded answer = %#v, want %#v", got, answer)
 				}
 			},
 		}
@@ -150,7 +172,6 @@ func TestWireGoldenVectors(t *testing.T) {
 		requestVector("request.unary", newWireRequest("/svc/m")),
 		requestVector("request.bidi_timeout", bidi),
 		requestVector("request.metadata", withMetadata),
-		requestVector("request.extensions", extensions),
 		requestVector("request.datagram_flow", datagramFlow),
 		requestVector("request.connection_metadata_offer", connectionOffer),
 		requestVector("request.connection_metadata_reference", connectionReference),
@@ -158,8 +179,8 @@ func TestWireGoldenVectors(t *testing.T) {
 		messageVector("message.empty", ""),
 		headersVector("headers.metadata", &wireHeaders{Metadata: Metadata{"x-a": []byte("1")}}),
 		headersVector("headers.empty", &wireHeaders{}),
-		headersVector("headers.extensions", &wireHeaders{Extensions: []uint64{1}}),
-		headersVector("headers.connection_metadata", &wireHeaders{ConnectionMetadata: 1}),
+		answerVector("answer.connection_metadata", &wireAnswer{ConnectionMetadata: 1}),
+		answerVector("answer.empty", &wireAnswer{}),
 		statusVector("status.ok", OK()),
 		statusVector("status.unavailable", Unavailable("down")),
 		statusVector("status.metadata", NewStatus(CodeFailedPrecondition, "stop").WithMetadata(Metadata{"x-t": []byte("2")})),
@@ -186,16 +207,6 @@ func TestWireGoldenVectors(t *testing.T) {
 			tt.check(t, decoded)
 		})
 	}
-
-	t.Run("headers.extensions.decode", func(t *testing.T) {
-		var decoded wireHeaders
-		if err := decodePayload(vectors["headers.extensions.payload"], &decoded); err != nil {
-			t.Fatal(err)
-		}
-		if !slices.Equal(decoded.Extensions, []uint64{1}) {
-			t.Fatalf("decoded headers = %#v", decoded)
-		}
-	})
 
 	t.Run("grease.two_byte_type", func(t *testing.T) {
 		frame := appendFrameHeader(nil, 0x40, 3)

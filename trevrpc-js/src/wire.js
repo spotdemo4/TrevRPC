@@ -11,6 +11,13 @@ export const RpcKind = Object.freeze({
   BidirectionalStreaming: 3,
 });
 
+/** The values of `RpcRequest.stream_compression`. */
+export const StreamCompression = Object.freeze({
+  None: 0,
+  Enabled: 1,
+  Optimistic: 2,
+});
+
 const wireRoot = protobuf.Root.fromJSON({
   nested: {
     trevrpc: {
@@ -23,44 +30,42 @@ const wireRoot = protobuf.Root.fromJSON({
             BidirectionalStreaming: 3,
           },
         },
+        StreamCompression: {
+          values: {
+            STREAM_COMPRESSION_NONE: 0,
+            STREAM_COMPRESSION_ENABLED: 1,
+            STREAM_COMPRESSION_OPTIMISTIC: 2,
+          },
+        },
         RpcRequest: {
           fields: {
             method: { type: "string", id: 1 },
-            metadata: { keyType: "string", type: "bytes", id: 4 },
-            kind: { type: "RpcKind", id: 5 },
-            timeoutNanos: { type: "uint64", id: 7 },
-            extensions: { rule: "repeated", type: "uint64", id: 8 },
-            datagramFlow: { type: "uint64", id: 9 },
-            acceptDictionaries: { rule: "repeated", type: "uint32", id: 10 },
-            dictionaryQuery: { rule: "repeated", type: "DictionaryInfo", id: 11 },
-            streamCompression: { type: "StreamCompression", id: 12 },
-            connectionMetadata: { type: "ConnectionMetadata", id: 13 },
+            metadata: { keyType: "string", type: "bytes", id: 2 },
+            kind: { type: "RpcKind", id: 3 },
+            timeoutNanos: { type: "uint64", id: 4 },
+            datagramFlow: { type: "uint64", id: 5 },
+            acceptDictionaries: { rule: "repeated", type: "uint32", id: 6 },
+            dictionaryQuery: { rule: "repeated", type: "DictionaryInfo", id: 7 },
+            streamCompression: { type: "StreamCompression", id: 8 },
+            connectionMetadata: { type: "ConnectionMetadata", id: 9 },
           },
-          // Fields 2 (method name), 3 (request body) and 6 (wire version) must never be reused.
-          reserved: [
-            [2, 3],
-            [6, 6],
-          ],
         },
         RpcHeaders: {
           fields: {
             metadata: { keyType: "string", type: "bytes", id: 1 },
-            extensions: { rule: "repeated", type: "uint64", id: 2 },
-            dictionaries: { rule: "repeated", type: "DictionaryInfo", id: 3 },
-            streamCompression: { type: "StreamCompression", id: 4 },
-            connectionMetadata: { type: "uint32", id: 5 },
+          },
+        },
+        RpcAnswer: {
+          fields: {
+            dictionaries: { rule: "repeated", type: "DictionaryInfo", id: 1 },
+            streamCompression: { type: "bool", id: 2 },
+            connectionMetadata: { type: "uint32", id: 3 },
           },
         },
         ConnectionMetadata: {
           fields: {
             id: { type: "uint32", id: 1 },
             metadata: { keyType: "string", type: "bytes", id: 2 },
-          },
-        },
-        StreamCompression: {
-          fields: {
-            maxWindowLog: { type: "uint32", id: 1 },
-            optimistic: { type: "bool", id: 2 },
           },
         },
         DictionaryInfo: {
@@ -84,6 +89,7 @@ const wireRoot = protobuf.Root.fromJSON({
 
 export const RpcRequest = wireRoot.lookupType("trevrpc.RpcRequest");
 export const RpcHeaders = wireRoot.lookupType("trevrpc.RpcHeaders");
+export const RpcAnswer = wireRoot.lookupType("trevrpc.RpcAnswer");
 export const RpcStatus = wireRoot.lookupType("trevrpc.RpcStatus");
 
 const MaxFieldNumber = 0x1fffffff;

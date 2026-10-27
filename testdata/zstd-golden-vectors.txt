@@ -61,11 +61,11 @@
 #   zstd_message.small        a ZSTD_MESSAGE frame carrying ok.small
 #   request.dictionaries      RpcRequest{method:"/svc/m", accept_dictionaries:[1, 300]
 #                             (packed), dictionary_query:[{id:1, fingerprint:dict.d1}]}
-#   headers.dictionaries      RpcHeaders{dictionaries:[{id:1, fingerprint:dict.d1}]}
+#   answer.dictionaries       RpcAnswer{dictionaries:[{id:1, fingerprint:dict.d1}]}
 #   request.plain             RpcRequest{method:"/svc/m", accept_dictionaries:[0]
 #                             (packed), dictionary_query:[{}]}: compression
 #                             without a dictionary, offered and queried
-#   headers.plain             RpcHeaders{dictionaries:[{}]}: the answer
+#   answer.plain              RpcAnswer{dictionaries:[{}]}: the answer
 #   stream.plain              four messages in one 64 KiB-window stream without
 #                             a dictionary: three that compress against each
 #                             other, then a 40-byte incompressible one in a
@@ -87,10 +87,10 @@
 #   stream_too_large.zeros    4 MiB + 1 zero bytes
 #   zstd_stream_message.first a ZSTD_STREAM_MESSAGE frame carrying stream.plain.0
 #   request.stream_compression RpcRequest{method:"/svc/m",
-#                             stream_compression:{max_window_log:16}}
-#   headers.stream_compression RpcHeaders{stream_compression:{max_window_log:16}}
+#                             stream_compression:STREAM_COMPRESSION_ENABLED}
+#   answer.stream_compression RpcAnswer{stream_compression:true}
 #   request.optimistic_stream_compression RpcRequest{method:"/svc/m",
-#                             stream_compression:{max_window_log:16, optimistic:true}}
+#                             stream_compression:STREAM_COMPRESSION_OPTIMISTIC}
 #   status.refused_stream_compression RpcStatus{code:8 (ResourceExhausted),
 #                             refused_stream_compression:true}
 
@@ -131,17 +131,17 @@ plain.records.message = 7b2273657276696365223a22736561726368222c22726567696f6e22
 zstd_message.small.payload = 2101478d0000203238397d047c00cac4a5bd2f4f413605
 zstd_message.small.frame = 04172101478d0000203238397d047c00cac4a5bd2f4f413605
 
-request.dictionaries.payload = 0a062f7376632f6d520301ac025a0c08011208084fd69b50b28542
-request.dictionaries.frame = 011b0a062f7376632f6d520301ac025a0c08011208084fd69b50b28542
+request.dictionaries.payload = 0a062f7376632f6d320301ac023a0c08011208084fd69b50b28542
+request.dictionaries.frame = 011b0a062f7376632f6d320301ac023a0c08011208084fd69b50b28542
 
-headers.dictionaries.payload = 1a0c08011208084fd69b50b28542
-headers.dictionaries.frame = 020e1a0c08011208084fd69b50b28542
+answer.dictionaries.payload = 0a0c08011208084fd69b50b28542
+answer.dictionaries.frame = 060e0a0c08011208084fd69b50b28542
 
-request.plain.payload = 0a062f7376632f6d5201005a00
-request.plain.frame = 010d0a062f7376632f6d5201005a00
+request.plain.payload = 0a062f7376632f6d3201003a00
+request.plain.frame = 010d0a062f7376632f6d3201003a00
 
-headers.plain.payload = 1a00
-headers.plain.frame = 02021a00
+answer.plain.payload = 0a00
+answer.plain.frame = 06020a00
 
 stream.plain.0.message = 7b2273657276696365223a22736561726368222c22726567696f6e223a2275732d656173742d31222c22737461747573223a3430342c226c6174656e63795f6d73223a3130307d
 stream.plain.0.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
@@ -192,14 +192,14 @@ stream_too_large.zeros.payload = 8040000100305400001000000100fb7f1d6001020008000
 zstd_stream_message.first.payload = 404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
 zstd_stream_message.first.frame = 054048404700300c020072440f15b037070d68b79c3112489a6c69c9831d33539f4c558931077d0238d2d2cdc1870c42bf6dee7d3e659f5ade8c5e850a94f92c24967aa3352983e98d0400
 
-request.stream_compression.payload = 0a062f7376632f6d62020810
-request.stream_compression.frame = 010c0a062f7376632f6d62020810
+request.stream_compression.payload = 0a062f7376632f6d4001
+request.stream_compression.frame = 010a0a062f7376632f6d4001
 
-headers.stream_compression.payload = 22020810
-headers.stream_compression.frame = 020422020810
+answer.stream_compression.payload = 1001
+answer.stream_compression.frame = 06021001
 
-request.optimistic_stream_compression.payload = 0a062f7376632f6d620408101001
-request.optimistic_stream_compression.frame = 010e0a062f7376632f6d620408101001
+request.optimistic_stream_compression.payload = 0a062f7376632f6d4002
+request.optimistic_stream_compression.frame = 010a0a062f7376632f6d4002
 
 status.refused_stream_compression.payload = 08082001
 status.refused_stream_compression.frame = 030408082001

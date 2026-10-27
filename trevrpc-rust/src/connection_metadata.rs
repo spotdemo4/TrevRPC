@@ -1,8 +1,8 @@
 //! Connection metadata: request metadata a client sets once for all its calls, such as a bearer
 //! token, so that it crosses each connection once instead of in every REQUEST.
 //!
-//! A client offers the set (`RpcRequest::connection_metadata` with entries) on its calls until a
-//! HEADERS confirms that the server stored it for the connection, then refers to it by ID. Calls
+//! A client offers the set (`RpcRequest::connection_metadata` with entries) on its calls until an
+//! ANSWER confirms that the server stored it for the connection, then refers to it by ID. Calls
 //! on different streams reach the server in any order, so a reference only follows a
 //! confirmation. The server merges the set into each call's metadata before validation and
 //! authorization, the call's own entries winning; see the wiki's Connection Metadata section.
@@ -75,7 +75,7 @@ pub struct ClientConnectionMetadata {
     confirmed: AtomicU32,
 }
 
-/// A call that offered its connection's set, which the call's HEADERS may confirm.
+/// A call that offered its connection's set, which the call's ANSWER may confirm.
 #[derive(Debug)]
 pub struct OfferedSet {
     connection: Arc<ClientConnectionMetadata>,
@@ -100,7 +100,7 @@ impl ClientConnectionMetadata {
     }
 
     /// Sets the connection metadata of `request`: a reference to the current set once the
-    /// connection confirmed it, an offer of it otherwise, which the call's HEADERS may confirm.
+    /// connection confirmed it, an offer of it otherwise, which the call's ANSWER may confirm.
     pub(crate) fn prepare(self: &Arc<Self>, request: &mut RpcRequest) -> Option<OfferedSet> {
         let Some(set) = self.source.current() else {
             request.connection_metadata = None;
@@ -130,7 +130,7 @@ impl ClientConnectionMetadata {
 }
 
 impl OfferedSet {
-    /// Records the server's answer in the call's HEADERS: `confirmed` is the set it stored. Only
+    /// Records the server's answer in the call's ANSWER: `confirmed` is the set it stored. Only
     /// the current set counts: a confirmation of one the channel has since replaced would not
     /// make calls refer to the new one.
     pub(crate) fn learn(self, confirmed: u32) {
@@ -173,7 +173,7 @@ impl ConnectionMetadataStore {
 
 /// Merges the connection metadata `request` offers or refers to into its metadata, the call's own
 /// entries winning, and stores an offered set in `store`. Returns the ID of the stored set, which
-/// the call's HEADERS confirm, or zero.
+/// the call's ANSWER confirms, or zero.
 ///
 /// `store` is `None` on a connection that keeps no connection metadata, the ordinary HTTP
 /// mapping's: an offer serves its own call only, and references are unknown.

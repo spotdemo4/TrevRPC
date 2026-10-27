@@ -948,13 +948,13 @@ func callBeforeStatus(beforeStatus func()) {
 	}
 }
 
-// unaryResponse is the complete response of a unary call: optional HEADERS,
-// then a MESSAGE and an OK STATUS on success, or a lone failure STATUS.
+// unaryResponse is the complete response of a unary call: optional ANSWER and
+// HEADERS, then a MESSAGE and an OK STATUS on success, or a lone failure
+// STATUS.
 type unaryResponse struct {
 	headers Metadata
-	// answer is what the call's HEADERS answer; answered says there is
-	// something to answer, which makes HEADERS go out even without metadata.
-	answer     headersAnswer
+	// answer is the call's ANSWER, which goes out when answered is set.
+	answer     wireAnswer
 	answered   bool
 	message    encodedMessage
 	hasMessage bool
@@ -975,8 +975,13 @@ func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFram
 		frames = r.message.frame
 	} else {
 		frames = make([]byte, 0, len(r.message.frame)+frameTailSlack)
-		if len(r.headers) > 0 || r.answered {
-			if frames, err = appendHeadersFrame(frames, r.headers, r.answer, maxFrameSize); err != nil {
+		if r.answered {
+			if frames, err = appendAnswerFrame(frames, &r.answer, maxFrameSize); err != nil {
+				return true, err
+			}
+		}
+		if len(r.headers) > 0 {
+			if frames, err = appendHeadersFrame(frames, r.headers, maxFrameSize); err != nil {
 				return true, err
 			}
 		}
@@ -1143,10 +1148,9 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		stream.reader.stream = streams.requestInflater()
 	}
 
-	metadata := responseMetadataFromContext(ctx)
 	dispatched := route.streamCompressesRequests()
 	if dispatched {
-		if err := r.sendHeadersAtDispatch(writer, request, metadata); err != nil {
+		if err := r.sendAnswerAtDispatch(writer, request); err != nil {
 			cancel()
 			lease.release()
 			return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request), request)
@@ -1166,7 +1170,8 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), request)
 	}
 	responses = closeStreamOnContext(ctx, responses)
-	stream := &serverResponseStream{responses: responses, headers: metadata.takeHeaders(), headersDispatched: dispatched, metadata: metadata, runtime: r, request: request, flow: responseFlow(request, route), lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
+	metadata := responseMetadataFromContext(ctx)
+	stream := &serverResponseStream{responses: responses, headers: metadata.takeHeaders(), answerDispatched: dispatched, metadata: metadata, runtime: r, request: request, flow: responseFlow(request, route), lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
 	if isNonBlockingStream(responses) {
 		// Such a stream is read where it is written, and drained in batches.
 		stream.receiver = newStreamReceiver(ctx, responses, limits.idleTimeout, "response", lease)
@@ -1176,21 +1181,19 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	return stream
 }
 
-// sendHeadersAtDispatch writes the HEADERS of a call whose requests may be
-// stream-compressed before its handler runs, with the answers the call gets
-// and no metadata, so a client-streaming client learns the answer while it is
-// still uploading. The handler can no longer set response headers.
-func (r *serverRuntime) sendHeadersAtDispatch(writer io.Writer, request *wireRequest, metadata *responseMetadata) error {
-	metadata.takeHeaders()
-	answer, _ := request.answer()
-	if streams := request.streams; streams != nil {
-		answer.stream = streams.answer
+// sendAnswerAtDispatch writes the ANSWER of a call whose requests may be
+// stream-compressed, if it has one, before its handler runs, so a
+// client-streaming client learns the answer while it is still uploading.
+func (r *serverRuntime) sendAnswerAtDispatch(writer io.Writer, request *wireRequest) error {
+	answer, answered := request.answer()
+	if !answered {
+		return nil
 	}
-	headers, err := appendHeadersFrame(nil, nil, answer, r.options.MaxFrameSize)
+	frame, err := appendAnswerFrame(nil, &answer, r.options.MaxFrameSize)
 	if err != nil {
 		return err
 	}
-	if _, err := writer.Write(headers); err != nil {
+	if _, err := writer.Write(frame); err != nil {
 		return Cancelled("response stream closed")
 	}
 	return nil
@@ -1550,8 +1553,8 @@ func checkStreamLimits(direction string, limits streamLimits, messages, bodySize
 }
 
 // serverResponseStream writes the response of a streaming call: optional
-// HEADERS before the first message, MESSAGE frames pulled from the handler's
-// stream, and a terminal STATUS.
+// ANSWER and HEADERS before the first message, MESSAGE frames pulled from the
+// handler's stream, and a terminal STATUS.
 //
 // A stream that never blocks is read where it is written. Any other stream is
 // read ahead by a goroutine (see responseReadAhead), and each write carries
@@ -1574,12 +1577,13 @@ type serverResponseStream struct {
 	limits          streamLimits
 	messages        int
 	headersSent     bool
-	// headersDispatched says HEADERS went out before the handler ran.
-	headersDispatched bool
-	pending           encodedMessage
-	hasPending        bool
-	done              bool
-	cancel            context.CancelFunc
+	// answerDispatched says the call's ANSWER, if any, went out before the
+	// handler ran.
+	answerDispatched bool
+	pending          encodedMessage
+	hasPending       bool
+	done             bool
+	cancel           context.CancelFunc
 	// flow is the call's datagram flow when the route sends its responses as
 	// datagrams, and nil otherwise.
 	flow *datagramFlow
@@ -1598,25 +1602,32 @@ type responseStreamItem struct {
 	status  *Status
 }
 
-// headersFrame returns the HEADERS of a call that did not send them at
-// dispatch, or nil if it sends none. A call that sends datagrams flushes
-// HEADERS, empty ones included, before the first one. A call that queried
-// gets its answer in HEADERS, which then go out even without metadata.
-func (s *serverResponseStream) headersFrame(maxFrameSize int) ([]byte, error) {
-	answer, answered := s.request.answer()
-	if len(s.headers) == 0 && s.flow == nil && !answered {
-		return nil, nil
+// headersFrames returns the ANSWER, if the call has one it did not send at
+// dispatch, and the HEADERS of a call, or nil if it sends neither. A call that
+// sends datagrams flushes HEADERS, empty ones included, before the first one.
+func (s *serverResponseStream) headersFrames(maxFrameSize int) ([]byte, error) {
+	var frames []byte
+	if !s.answerDispatched {
+		if answer, answered := s.request.answer(); answered {
+			var err error
+			if frames, err = appendAnswerFrame(frames, &answer, maxFrameSize); err != nil {
+				return nil, err
+			}
+		}
 	}
-	return appendHeadersFrame(nil, s.headers, answer, maxFrameSize)
+	if len(s.headers) == 0 && s.flow == nil {
+		return frames, nil
+	}
+	return appendHeadersFrame(frames, s.headers, maxFrameSize)
 }
 
 // maxRetainedWriteBuffer is the largest buffer a response keeps between
 // writes. A bigger one is rare, and not worth holding for the rest of the call.
 const maxRetainedWriteBuffer = 256 * 1024
 
-// writeNext writes the next frames of the response. HEADERS that did not go
-// out at dispatch go out as soon as the handler has returned, in a write of
-// their own when pulling the first message may block. A write carries every
+// writeNext writes the next frames of the response. An ANSWER that did not go
+// out at dispatch, and HEADERS, go out as soon as the handler has returned, in
+// a write of their own when pulling the first message may block. A write carries every
 // message that is ready, up to the batch limits and without waiting for more,
 // and the terminal STATUS joins the write of the last messages.
 func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
@@ -1634,17 +1645,15 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 			// The handler starts on the first message while HEADERS go out.
 			s.readAhead.start()
 		}
-		if !s.headersDispatched {
-			var err error
-			if headers, err = s.headersFrame(maxFrameSize); err != nil {
-				return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
+		var err error
+		if headers, err = s.headersFrames(maxFrameSize); err != nil {
+			return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
+		}
+		if headers != nil && (s.readAhead != nil || s.flow != nil) {
+			if _, err := writer.Write(headers); err != nil {
+				return true, err
 			}
-			if headers != nil && (s.readAhead != nil || s.flow != nil) {
-				if _, err := writer.Write(headers); err != nil {
-					return true, err
-				}
-				headers = nil
-			}
+			headers = nil
 		}
 	}
 

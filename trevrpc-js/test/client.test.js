@@ -6,6 +6,7 @@ import { createServiceClient } from "../src/client.js";
 import { encodeMessage } from "../src/compression.js";
 import {
   FrameType,
+  encodeAnswerFrame,
   encodeFrame,
   encodeHeadersFrame,
   encodeMessageFrame,
@@ -638,6 +639,45 @@ test("HEADERS after a MESSAGE fails the call", async () => {
     await stream.writeStatus();
   });
   await assert.rejects(unary.echo.unary({}), isStatus(Code.Internal));
+});
+
+test("ANSWER is not the headers: they settle with the frame after it", async () => {
+  const reported = [];
+  const { echo, transport } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.writeAnswer({ connectionMetadata: 1 });
+    await stream.writeHeaders({ h: bytes("1") });
+    await stream.writeMessage(EchoResponse, { index: 3 });
+    await stream.writeStatus();
+    await stream.finish();
+  });
+  const stream = await echo.serverStream(
+    {},
+    { onResponseHeaders: (headers) => reported.push(metadataText(headers)) },
+  );
+  assert.deepEqual(metadataText(await stream.headers), { h: "1" });
+  const received = [];
+  for await (const response of stream) {
+    received.push(response.index);
+  }
+  assert.deepEqual(received, [3]);
+  assert.deepEqual(reported, [{ h: "1" }]);
+  await transport.settled();
+});
+
+test("ANSWER twice, or after HEADERS or a MESSAGE, fails the call", async () => {
+  const answer = encodeAnswerFrame({});
+  for (const wire of [
+    [answer, answer],
+    [encodeHeadersFrame({}), answer],
+    [encodeMessageFrame(EchoResponse.encode({}).finish()), answer],
+  ]) {
+    const { echo } = setup(async (stream) => {
+      await stream.readRequest();
+      await stream.write(concatBytes([...wire, encodeStatusFrame({ code: Code.Ok })]));
+    });
+    await assert.rejects(echo.unary({}), isStatus(Code.Internal));
+  }
 });
 
 test("request frames are not valid on a response stream", async () => {

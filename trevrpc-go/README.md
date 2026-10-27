@@ -91,7 +91,7 @@ reply, _ := client.SayHello(ctx, request,
 )
 ```
 
-A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the first response frame arrives (headers, a message, or the final status), returns empty metadata if the server sent none, and does not consume a message. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
+A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the headers, the first message or the final status arrives (headers, a message, or the final status), returns empty metadata if the server sent none, and does not consume a message. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
 
 Metadata that every call carries, such as a bearer token, can instead be set once with `DialOptions.ConnectionMetadata` and replaced with `channel.SetConnectionMetadata`. Each connection then sends it in its first calls only, and the server merges it into every call's metadata, a call's own entry winning; see [Connection Metadata](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#connection-metadata).
 
@@ -161,7 +161,7 @@ trevrpc.RegisterUnary(server, "/example.greeter.Greeter/SayHello",
 
 `Register*` panics if the path is not exactly `/<service>/<method>` with both parts non-empty. The server answers a request whose path is malformed with `InvalidArgument` and a well-formed path without a handler with `Unimplemented`. `HandlerContext` carries the `FullMethod` path and its `Service` and `Method` parts.
 
-On the wire a call is a sequence of frames, each a QUIC variable-length type, a QUIC variable-length length and a payload: `REQUEST MESSAGE* [STATUS]` from the client and `[HEADERS] MESSAGE* STATUS` from the server. `MESSAGE` payloads are the protobuf message itself. Frames of unknown type are skipped everywhere, and count towards `MaxFrameSize` (checked before a payload is read) and, on servers, towards `MaxStreamBodySize`.
+On the wire a call is a sequence of frames, each a QUIC variable-length type, a QUIC variable-length length and a payload: `REQUEST MESSAGE*` from the client, ended by its FIN, and `[ANSWER] [HEADERS] MESSAGE* STATUS` from the server, where ANSWER answers the request's negotiation fields (dictionaries, stream compression, connection metadata). `MESSAGE` payloads are the protobuf message itself. Frames of unknown type are skipped everywhere, and count towards `MaxFrameSize` (checked before a payload is read) and, on servers, towards `MaxStreamBodySize`.
 
 Frames carry no wire version: each transport fixes it while negotiating (ALPN `trevrpc/1`, ALPN or subprotocol `qmux-02.trevrpc-1`, `Content-Type: application/trevrpc`). For WebTransport the server selects the protocol `trevrpc-1` in `WT-Protocol`, answers `400` to a CONNECT whose `WT-Available-Protocols` is a valid list without `"trevrpc-1"`, and treats a missing or malformed field as version 1.
 

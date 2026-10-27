@@ -123,12 +123,9 @@ func nextBlock(data []byte, pos int) (next int, last bool, ok bool) {
 }
 
 // StreamWindowLog is the window, as a base-2 logarithm, that TrevRPC's stream
-// compression contexts use and that its receivers decode. A peer advertising
-// less than MinStreamWindowLog enables nothing.
-const (
-	StreamWindowLog    = 16
-	MinStreamWindowLog = 10
-)
+// compression contexts use and the largest its receivers decode: the wire
+// format fixes it at 64 KiB.
+const StreamWindowLog = 16
 
 // StreamChunk is what a receiver learns from validating the zstd data of a
 // ZSTD_STREAM_MESSAGE.

@@ -207,10 +207,16 @@ const OPTIMISTIC_STREAM_COMPRESSED: usize = 6;
 
 /// Echoes messages that compress against each other on a `CompressedEcho` stream, one at a time,
 /// then uploads them in one burst on a client-streaming call. Calls are optimistic, so both
-/// compress from the third message without waiting for the server's answer.
+/// compress from the third message without waiting for the server's answer. The stream also asks
+/// for response headers, which a stream-compressed method's handler sends like any other.
 async fn compressed_stream(client: &CompressedEcho) -> Scenario {
-    let trailers = compressed_bidi(client).await?;
+    let trailers = compressed_bidi(client, true).await?;
     expect_stream_compressed(&trailers, OPTIMISTIC_STREAM_COMPRESSED)?;
+    if trailers.get("interop-trailer").map(Vec::as_slice) != Some(&b"h"[..]) {
+        return Err(format!(
+            "expected trailing metadata interop-trailer: h, got {trailers:?}"
+        ));
+    }
     let trailers = compressed_upload(client).await?;
     expect_stream_compressed(&trailers, OPTIMISTIC_STREAM_COMPRESSED)
 }
@@ -232,7 +238,7 @@ async fn refused_stream(compressed: &CompressedEcho, refusing: &RefusingEcho) ->
         &all_compressed_messages(),
         COMPRESSED_STREAM_MESSAGES,
     )?;
-    let trailers = compressed_bidi(compressed).await?;
+    let trailers = compressed_bidi(compressed, false).await?;
     expect_stream_compressed(&trailers, 1)?;
     let trailers = compressed_upload(compressed).await?;
     expect_stream_compressed(&trailers, OPTIMISTIC_STREAM_COMPRESSED)
@@ -246,11 +252,12 @@ fn all_compressed_messages() -> String {
 }
 
 /// `CompressedEcho.Bidi` with the `compressed-stream` messages, awaiting each echo: returns the
-/// trailing metadata.
-async fn compressed_bidi(client: &CompressedEcho) -> Result<Metadata, String> {
+/// trailing metadata. With `headers`, the call asks for response headers and checks them before
+/// the first echo.
+async fn compressed_bidi(client: &CompressedEcho, headers: bool) -> Result<Metadata, String> {
     let (sender, mut responses) = client
         .bidi()
-        .options(|_| options())
+        .options(|_| if headers { header_options() } else { options() })
         .await
         .map_err(rpc)?
         .split();
@@ -259,6 +266,10 @@ async fn compressed_bidi(client: &CompressedEcho) -> Result<Metadata, String> {
             .send(message(&compressed_message(index)))
             .await
             .map_err(rpc)?;
+        if headers && index == 0 {
+            let headers = responses.headers().await.map_err(rpc)?;
+            expect_metadata(headers, "interop-header", "headers")?;
+        }
         let response = responses
             .next()
             .await

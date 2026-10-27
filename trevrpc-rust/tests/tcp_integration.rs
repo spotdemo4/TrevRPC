@@ -1409,10 +1409,9 @@ fn decode_connection_metadata_reply(response: &[u8]) -> TestResult<(u32, String,
     let mut status = None;
     for frame in support::parse_frames(response)? {
         match frame.frame_type {
-            frame_type::HEADERS => {
-                confirmed =
-                    trevrpc::framing::decode_payload::<trevrpc::RpcHeaders>(&frame.payload)?
-                        .connection_metadata;
+            frame_type::ANSWER => {
+                confirmed = trevrpc::framing::decode_payload::<trevrpc::RpcAnswer>(&frame.payload)?
+                    .connection_metadata;
             }
             frame_type::MESSAGE => message = String::from_utf8(frame.payload)?,
             frame_type::STATUS => {

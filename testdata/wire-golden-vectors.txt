@@ -1,7 +1,7 @@
 # TrevRPC wire golden vectors.
 #
 # Every frame is: type (QUIC varint) | length (QUIC varint) | payload.
-# Frame types: 0 MESSAGE, 1 REQUEST, 2 HEADERS, 3 STATUS; 0x1f*N+0x21 grease.
+# Frame types: 0 MESSAGE, 1 REQUEST, 2 HEADERS, 3 STATUS, 6 ANSWER; 0x1f*N+0x21 grease.
 #
 # Entry kinds (values are lowercase hex; an empty value means zero bytes):
 #   <name>.payload  frame payload bytes (protobuf for REQUEST/HEADERS/STATUS,
@@ -25,7 +25,6 @@
 #   request.unary          RpcRequest{method:"/svc/m"}
 #   request.bidi_timeout   RpcRequest{method:"/svc/m", kind:3, timeout_nanos:123456}
 #   request.metadata       RpcRequest{method:"/svc/m", metadata:{"authorization":"ok"}}
-#   request.extensions     RpcRequest{method:"/svc/m", extensions:[1, 300]} (packed)
 #   request.datagram_flow  RpcRequest{method:"/svc/m", kind:3, datagram_flow:1}
 #   request.connection_metadata_offer
 #                          RpcRequest{method:"/svc/m", connection_metadata:{id:1,
@@ -37,9 +36,9 @@
 #   message.empty          MESSAGE with an empty payload
 #   headers.metadata       RpcHeaders{metadata:{"x-a":"1"}}
 #   headers.empty          RpcHeaders{}
-#   headers.extensions     RpcHeaders{extensions:[1]} (packed)
-#   headers.connection_metadata
-#                          RpcHeaders{connection_metadata:1}
+#   answer.connection_metadata
+#                          RpcAnswer{connection_metadata:1}
+#   answer.empty           RpcAnswer{}
 #   status.ok              RpcStatus{code:0}
 #   status.unavailable     RpcStatus{code:14, message:"down"}
 #   status.metadata        RpcStatus{code:9, message:"stop", metadata:{"x-t":"2"}}
@@ -47,27 +46,27 @@
 #   stream.unknown_frames  grease, HEADERS, an unknown 4-byte type, a MESSAGE with a
 #                          non-minimal 2-byte length, grease, STATUS with an 8-byte length,
 #                          and an unknown 8-byte type after STATUS
+#   stream.answered_response
+#                          ANSWER{connection_metadata:1}, HEADERS{metadata:{"x-a":"1"}},
+#                          MESSAGE "hi", STATUS OK
 
 request.unary.payload = 0a062f7376632f6d
 request.unary.frame = 01080a062f7376632f6d
 
-request.bidi_timeout.payload = 0a062f7376632f6d280338c0c407
-request.bidi_timeout.frame = 010e0a062f7376632f6d280338c0c407
+request.bidi_timeout.payload = 0a062f7376632f6d180320c0c407
+request.bidi_timeout.frame = 010e0a062f7376632f6d180320c0c407
 
-request.metadata.payload = 0a062f7376632f6d22130a0d617574686f72697a6174696f6e12026f6b
-request.metadata.frame = 011d0a062f7376632f6d22130a0d617574686f72697a6174696f6e12026f6b
+request.metadata.payload = 0a062f7376632f6d12130a0d617574686f72697a6174696f6e12026f6b
+request.metadata.frame = 011d0a062f7376632f6d12130a0d617574686f72697a6174696f6e12026f6b
 
-request.extensions.payload = 0a062f7376632f6d420301ac02
-request.extensions.frame = 010d0a062f7376632f6d420301ac02
+request.datagram_flow.payload = 0a062f7376632f6d18032801
+request.datagram_flow.frame = 010c0a062f7376632f6d18032801
 
-request.datagram_flow.payload = 0a062f7376632f6d28034801
-request.datagram_flow.frame = 010c0a062f7376632f6d28034801
+request.connection_metadata_offer.payload = 0a062f7376632f6d4a17080112130a0d617574686f72697a6174696f6e12026f6b
+request.connection_metadata_offer.frame = 01210a062f7376632f6d4a17080112130a0d617574686f72697a6174696f6e12026f6b
 
-request.connection_metadata_offer.payload = 0a062f7376632f6d6a17080112130a0d617574686f72697a6174696f6e12026f6b
-request.connection_metadata_offer.frame = 01210a062f7376632f6d6a17080112130a0d617574686f72697a6174696f6e12026f6b
-
-request.connection_metadata_reference.payload = 0a062f7376632f6d22080a03782d611201316a020801
-request.connection_metadata_reference.frame = 01160a062f7376632f6d22080a03782d611201316a020801
+request.connection_metadata_reference.payload = 0a062f7376632f6d12080a03782d611201314a020801
+request.connection_metadata_reference.frame = 01160a062f7376632f6d12080a03782d611201314a020801
 
 message.hi.payload = 6869
 message.hi.frame = 00026869
@@ -81,11 +80,11 @@ headers.metadata.frame = 020a0a080a03782d61120131
 headers.empty.payload =
 headers.empty.frame = 0200
 
-headers.extensions.payload = 120101
-headers.extensions.frame = 0203120101
+answer.connection_metadata.payload = 1801
+answer.connection_metadata.frame = 06021801
 
-headers.connection_metadata.payload = 2801
-headers.connection_metadata.frame = 02022801
+answer.empty.payload =
+answer.empty.frame = 0600
 
 status.ok.payload =
 status.ok.frame = 0300
@@ -110,6 +109,9 @@ stream.server_stream.frames = 2:0a080a03782d61120131,0:6869,0:,3:0809120473746f7
 
 stream.unknown_frames.stream = 404003000102020a0a080a03782d61120131923456780000400268692101ff03c000000000000000ffffffffffffffff027a7a
 stream.unknown_frames.frames = 2:0a080a03782d61120131,0:6869,3:
+
+stream.answered_response.stream = 06021801020a0a080a03782d61120131000268690300
+stream.answered_response.frames = 6:1801,2:0a080a03782d61120131,0:6869,3:
 
 datagram.flow_1.flow = 01
 datagram.flow_1.messages = 6869

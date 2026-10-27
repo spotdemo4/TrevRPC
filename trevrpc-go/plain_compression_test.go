@@ -67,15 +67,15 @@ func TestPlainCompressionNegotiationGoldenVectors(t *testing.T) {
 	if result == nil || !result.answered || len(result.answer) != 1 || result.answer[0].ID != plainDictID || result.responses.compressorFor(plainSample(t)) != server.plain {
 		t.Fatalf("negotiate = %+v", result)
 	}
-	frame, err = appendHeadersFrame(nil, nil, headersAnswer{dictionaries: result.answer}, DefaultMaxFrameSize)
-	if err != nil || !bytes.Equal(frame, vectors["headers.plain.frame"]) {
-		t.Fatalf("HEADERS frame = %x, %v; want %x", frame, err, vectors["headers.plain.frame"])
+	frame, err = appendAnswerFrame(nil, &wireAnswer{Dictionaries: result.answer}, DefaultMaxFrameSize)
+	if err != nil || !bytes.Equal(frame, vectors["answer.plain.frame"]) {
+		t.Fatalf("ANSWER frame = %x, %v; want %x", frame, err, vectors["answer.plain.frame"])
 	}
-	_, decoded, err := decodeHeaders(vectors["headers.plain.payload"])
+	decoded, err := decodeAnswer(vectors["answer.plain.payload"])
 	if err != nil {
 		t.Fatal(err)
 	}
-	client.learn(decoded.dictionaries)
+	client.learn(decoded.Dictionaries)
 	if !client.shared.Load().has(client.config.plain) {
 		t.Fatalf("shared set %+v lacks compression without a dictionary", client.shared.Load())
 	}
@@ -188,7 +188,7 @@ func TestPlainCompressionGivesWayToStreamCompression(t *testing.T) {
 	config := plainOnlyConfig(t)
 	per := &messageCompressor{config: config, allowed: config.plain.only.has, plain: true}
 	compressor := newStreamCompressor(newStreamBudget(0, 1<<20, config), per)
-	compressor.enable(zstd.StreamWindowLog)
+	compressor.enable()
 	defer compressor.close()
 	var types []frameType
 	for range 4 {
@@ -276,7 +276,7 @@ func TestPlainCompressionEndToEnd(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	want := []string{
-		"[REQUEST MESSAGE] [HEADERS ZSTD_MESSAGE STATUS]",
+		"[REQUEST MESSAGE] [ANSWER ZSTD_MESSAGE STATUS]",
 		"[REQUEST ZSTD_MESSAGE] [ZSTD_MESSAGE STATUS]",
 		"[REQUEST MESSAGE] [MESSAGE STATUS]",
 	}

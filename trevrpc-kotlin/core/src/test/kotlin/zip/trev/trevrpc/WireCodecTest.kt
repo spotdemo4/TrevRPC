@@ -49,7 +49,6 @@ class WireCodecTest {
                         RpcRequest("/svc/m", kindValue = RpcKind.BIDIRECTIONAL_STREAMING.value, datagramFlow = 1uL),
                     ),
                 "request.metadata" to requestEntry(RpcRequest("/svc/m", metadata)),
-                "request.extensions" to requestEntry(RpcRequest("/svc/m", extensions = listOf(1uL, 300uL))),
                 "request.connection_metadata_offer" to
                     requestEntry(RpcRequest("/svc/m", connectionMetadata = ConnectionMetadata(1u, metadata))),
                 "request.connection_metadata_reference" to
@@ -62,8 +61,8 @@ class WireCodecTest {
                     ),
                 "headers.metadata" to headersEntry(RpcHeaders(Metadata.of("x-a" to "1".encodeToByteArray()))),
                 "headers.empty" to headersEntry(RpcHeaders()),
-                "headers.extensions" to headersEntry(RpcHeaders(extensions = listOf(1uL))),
-                "headers.connection_metadata" to headersEntry(RpcHeaders(connectionMetadataId = 1u)),
+                "answer.connection_metadata" to answerEntry(RpcAnswer(connectionMetadataId = 1u)),
+                "answer.empty" to answerEntry(RpcAnswer()),
                 "status.ok" to statusEntry(RpcStatus()),
                 "status.unavailable" to statusEntry(RpcStatus.fromStatus(Status.unavailable("down"))),
                 "status.metadata" to
@@ -152,6 +151,15 @@ class WireCodecTest {
         assertArrayEquals(byteArrayOf(5), (message as ResponseFrame.Message).body)
         val status = WireCodec.decodeResponseFrame(Frame(FrameType.STATUS, WireCodec.encode(RpcStatus.fromStatus(Status.unavailable("x")))))
         assertEquals(Status.unavailable("x"), (status as ResponseFrame.Status).status)
+        val answer =
+            WireCodec.decodeResponseFrame(
+                Frame(
+                    FrameType.ANSWER,
+                    WireCodec.encode(RpcAnswer(listOf(PLAIN_DICTIONARY), streamCompression = true, connectionMetadataId = 2u)),
+                ),
+            ) as ResponseFrame.Answer
+        assertEquals(listOf(PLAIN_DICTIONARY), answer.dictionaries)
+        assertTrue(answer.streamCompression)
 
         val unexpected =
             assertThrows(TrevRpcException::class.java) { WireCodec.decodeResponseFrame(Frame(FrameType.REQUEST, byteArrayOf())) }
@@ -225,8 +233,8 @@ class WireCodecTest {
     }
 
     @Test
-    fun `codec skips unknown fields including the reserved request body and preserves unknown enums`() {
-        val request = WireCodec.decodeRequest(byteArrayOf(0x28, 0x63, 0x30, 0x01, 0x40, 0x07, 0x1a, 0x01, 0x7a))
+    fun `codec skips unknown fields and preserves unknown kinds`() {
+        val request = WireCodec.decodeRequest(byteArrayOf(0x18, 0x63, 0x50, 0x01, 0x60, 0x07, 0x5a, 0x01, 0x7a))
         assertEquals(99, request.kindValue)
         assertNull(request.kind)
         assertEquals("", request.method)
@@ -237,13 +245,13 @@ class WireCodecTest {
     }
 
     @Test
-    fun `request codec reads the method path from field 1 and ignores reserved tags 2 3 and 6`() {
+    fun `request codec reads the method path from field 1 and ignores unknown tags`() {
         val path = "/example.greeter.Greeter/SayHello"
         val encoded = WireCodec.encode(RpcRequest(path))
         assertEquals(path, WireCodec.decodeRequest(encoded).method)
-        // A peer sending the retired method name (2), request body (3) or wire version (6) is skipped.
-        val withReserved = encoded + byteArrayOf(0x12, 0x01, 0x6d, 0x1a, 0x01, 0x7a, 0x30, 0x01)
-        assertEquals(RpcRequest(path), WireCodec.decodeRequest(withReserved))
+        // Fields a later peer adds are skipped, whatever their wire type.
+        val withUnknown = encoded + byteArrayOf(0x52, 0x01, 0x6d, 0x5a, 0x01, 0x7a, 0x60, 0x01)
+        assertEquals(RpcRequest(path), WireCodec.decodeRequest(withUnknown))
         assertEquals(path, WireCodec.decodeRequest(WireCodec.encode(RpcRequest(path))).method)
         assertEquals(
             listOf<Byte>(0x0a, path.length.toByte()),
@@ -252,10 +260,17 @@ class WireCodecTest {
     }
 
     @Test
-    fun `extensions decode packed and unpacked and are ignored by the response frame`() {
-        assertEquals(listOf(1uL, 300uL), WireCodec.decodeRequest(byteArrayOf(0x42, 0x03, 0x01, 0xac.toByte(), 0x02)).extensions)
-        assertEquals(listOf(1uL, 300uL), WireCodec.decodeRequest(byteArrayOf(0x40, 0x01, 0x40, 0xac.toByte(), 0x02)).extensions)
-        val frame = WireCodec.decodeResponseFrame(Frame(FrameType.HEADERS, byteArrayOf(0x12, 0x01, 0x01)))
+    fun `stream compression is an enum whose unknown values are rejected`() {
+        StreamCompression.entries.forEach { value ->
+            assertEquals(
+                value,
+                WireCodec.decodeRequest(WireCodec.encode(RpcRequest("/svc/m", streamCompression = value))).streamCompression,
+            )
+        }
+        val unknown = assertThrows(TrevRpcException::class.java) { WireCodec.decodeRequest(byteArrayOf(0x40, 0x03)) }
+        assertEquals(Code.INVALID_ARGUMENT, unknown.status.code)
+        // HEADERS hold only metadata now: the fields that used to answer negotiation are skipped.
+        val frame = WireCodec.decodeResponseFrame(Frame(FrameType.HEADERS, byteArrayOf(0x12, 0x01, 0x01, 0x28, 0x01)))
         assertTrue((frame as ResponseFrame.Headers).metadata.isEmpty)
     }
 
@@ -287,6 +302,8 @@ class WireCodecTest {
     private fun requestEntry(value: RpcRequest) = Entry(FrameType.REQUEST, value, WireCodec::encode, WireCodec::decodeRequest)
 
     private fun headersEntry(value: RpcHeaders) = Entry(FrameType.HEADERS, value, WireCodec::encode, WireCodec::decodeHeaders)
+
+    private fun answerEntry(value: RpcAnswer) = Entry(FrameType.ANSWER, value, WireCodec::encode, WireCodec::decodeAnswer)
 
     private fun statusEntry(value: RpcStatus) = Entry(FrameType.STATUS, value, WireCodec::encode, WireCodec::decodeStatus)
 

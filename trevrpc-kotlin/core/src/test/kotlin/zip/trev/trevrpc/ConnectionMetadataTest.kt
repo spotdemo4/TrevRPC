@@ -112,7 +112,7 @@ class ConnectionMetadataTest {
     fun `the offer survives the wire with an ID that needs several bytes`() {
         val request = RpcRequest("/svc/m", connectionMetadata = ConnectionMetadata(300u, metadata("authorization", "ok")))
         assertEquals(request, WireCodec.decodeRequest(WireCodec.encode(request)))
-        val headers = RpcHeaders(connectionMetadataId = UInt.MAX_VALUE)
-        assertEquals(headers, WireCodec.decodeHeaders(WireCodec.encode(headers)))
+        val answer = RpcAnswer(connectionMetadataId = UInt.MAX_VALUE)
+        assertEquals(answer, WireCodec.decodeAnswer(WireCodec.encode(answer)))
     }
 }

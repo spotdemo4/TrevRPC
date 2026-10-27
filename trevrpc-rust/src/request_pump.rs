@@ -2,11 +2,12 @@ use std::future::{Future, pending, poll_fn};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::FutureExt as _;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::framed::{self, FrameRead, RequestFrame};
+use crate::framed::{self, FrameRead};
 use crate::server::{CancellationSource, RequestBudget};
 use crate::transport_error::{self, TransportFailureKind};
 use crate::{BoxStream, Code, Error, Result, Status};
@@ -38,13 +39,10 @@ impl RequestInputKind {
 
 /// The error for a known frame after the single request message of a unary-input call.
 const UNARY_TRAILING_FRAME: &str = "request stream contained a frame after the request message";
-/// The error for a known frame after a request's terminal STATUS.
-const TERMINAL_TRAILING_FRAME: &str = "request stream continued after terminal status";
 
 #[derive(Clone, Debug)]
 pub enum RequestPumpFailure {
     Protocol(Status),
-    PeerStatus(Status),
     PeerReset(Status),
     ConnectionLost(Status),
 }
@@ -52,16 +50,15 @@ pub enum RequestPumpFailure {
 impl RequestPumpFailure {
     pub(crate) const fn status(&self) -> &Status {
         match self {
-            Self::Protocol(status)
-            | Self::PeerStatus(status)
-            | Self::PeerReset(status)
-            | Self::ConnectionLost(status) => status,
+            Self::Protocol(status) | Self::PeerReset(status) | Self::ConnectionLost(status) => {
+                status
+            }
         }
     }
 
     pub(crate) const fn cancellation_source(&self) -> Option<CancellationSource> {
         match self {
-            Self::PeerStatus(_) | Self::PeerReset(_) => Some(CancellationSource::PeerReset),
+            Self::PeerReset(_) => Some(CancellationSource::PeerReset),
             Self::ConnectionLost(_) => Some(CancellationSource::ConnectionLost),
             Self::Protocol(_) => None,
         }
@@ -75,7 +72,6 @@ impl RequestPumpFailure {
 #[derive(Clone, Debug)]
 pub enum RequestPumpState {
     Receiving,
-    DrainingTerminalFin,
     Failed(RequestPumpFailure),
     Settled(RequestPumpOutcome),
 }
@@ -156,12 +152,12 @@ pub trait RequestPumpReader: FrameRead + Send + Sized + 'static {
     /// registrations.
     fn backpressure_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
 
-    /// Reads the next frame after REQUEST, charging unknown frames to `budget`.
+    /// Reads the next request message after REQUEST, charging unknown frames to `budget`.
     fn read_request_frame(
         &mut self,
         max_frame_size: usize,
         budget: &mut RequestBudget,
-    ) -> impl Future<Output = Result<Option<RequestFrame>>> + Send {
+    ) -> impl Future<Output = Result<Option<Bytes>>> + Send {
         async move {
             let accept = budget.accept.clone();
             let mut stream = budget.stream.take();
@@ -369,7 +365,7 @@ impl RequestPump {
                     let _ = outcome;
                     true
                 }
-                RequestPumpState::Receiving | RequestPumpState::DrainingTerminalFin => false,
+                RequestPumpState::Receiving => false,
             };
             if self.state.changed().await.is_err() {
                 if settled {
@@ -587,44 +583,13 @@ where
         };
 
         match frame {
-            Ok(Some(RequestFrame::Message(body))) => {
+            Ok(Some(body)) => {
                 if let Err(error) = budget.charge_message(body.len()) {
                     let failure = RequestPumpFailure::Protocol(error.into_status());
                     return fail_and_wait(reader, failure, state_tx, settle_rx, Some(permit)).await;
                 }
                 let size = body.len();
                 permit.send(Ok(Vec::from(body)), size);
-            }
-            Ok(Some(RequestFrame::Status(status))) => {
-                let _ = state_tx.send(RequestPumpState::DrainingTerminalFin);
-                match drain_terminal::<R>(reader, max_frame_size, &mut budget, settle_rx).await {
-                    Ok(RequestPumpOutcome::CleanFin) if status.is_ok() => {
-                        reader.settled = true;
-                        return RequestPumpOutcome::CleanFin;
-                    }
-                    Ok(RequestPumpOutcome::CleanFin) => {
-                        reader.settled = true;
-                        return fail_and_wait(
-                            reader,
-                            RequestPumpFailure::PeerStatus(status),
-                            state_tx,
-                            settle_rx,
-                            None,
-                        )
-                        .await;
-                    }
-                    Ok(outcome) => return outcome,
-                    Err(error) => {
-                        return fail_and_wait(
-                            reader,
-                            classify_error(error),
-                            state_tx,
-                            settle_rx,
-                            None,
-                        )
-                        .await;
-                    }
-                }
             }
             Ok(None) => {
                 if let Err(error) = reader.reader().validate_transport_end().await {
@@ -648,46 +613,6 @@ where
     }
 }
 
-/// Waits for the clean end of a request stream whose terminal STATUS has been read.
-///
-/// The read stays pinned while the response is committed, so no partially read frame is lost.
-async fn drain_terminal<R>(
-    reader: &mut PumpReaderGuard<R>,
-    max_frame_size: usize,
-    budget: &mut RequestBudget,
-    settle_rx: &mut latest::Receiver<Option<RequestPumpSettle>>,
-) -> Result<RequestPumpOutcome>
-where
-    R: RequestPumpReader,
-{
-    let mut read = Box::pin(reader.reader().read_request_end(
-        max_frame_size,
-        budget,
-        TERMINAL_TRAILING_FRAME,
-    ));
-    loop {
-        tokio::select! {
-            biased;
-            changed = settle_rx.changed() => {
-                let _ = changed;
-                match settle_rx.borrow_and_update().unwrap_or(RequestPumpSettle::ResponseStopped) {
-                    RequestPumpSettle::ResponseCommitted => {}
-                    reason => {
-                        drop(read);
-                        return Ok(settle_reader(reader, reason));
-                    }
-                }
-            }
-            result = &mut read => {
-                drop(read);
-                result?;
-                reader.reader().validate_transport_end().await?;
-                return Ok(RequestPumpOutcome::CleanFin);
-            }
-        }
-    }
-}
-
 async fn fail_and_wait<R>(
     reader: &mut PumpReaderGuard<R>,
     failure: RequestPumpFailure,
@@ -699,9 +624,7 @@ where
     R: RequestPumpReader,
 {
     let outcome = match &failure {
-        RequestPumpFailure::PeerStatus(_) | RequestPumpFailure::PeerReset(_) => {
-            RequestPumpOutcome::PeerReset
-        }
+        RequestPumpFailure::PeerReset(_) => RequestPumpOutcome::PeerReset,
         RequestPumpFailure::ConnectionLost(_) => RequestPumpOutcome::ConnectionLost,
         RequestPumpFailure::Protocol(_) => RequestPumpOutcome::LocallyStopped,
     };
@@ -1187,8 +1110,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_frame_wakes_control_before_body_poll() {
         let mut io = test_io(None);
-        // A STATUS frame whose payload is a truncated protobuf varint.
-        io.writer.write_all(&[0x03, 0x01, 0xff]).await.unwrap();
+        // A ZSTD_MESSAGE frame whose payload is not a zstd frame.
+        io.writer.write_all(&[0x04, 0x01, 0xff]).await.unwrap();
         let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
 
         let failure = pump.failure().await;
@@ -1197,42 +1120,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_status_settlement_waits_for_clean_fin() {
+    async fn a_status_on_the_request_stream_is_invalid_argument() {
         let mut io = test_io(None);
-        let terminal = status_frame(Status::ok());
-        io.writer.write_all(&terminal).await.unwrap();
-        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if matches!(*pump.state.borrow(), RequestPumpState::DrainingTerminalFin) {
-                    break;
-                }
-                pump.state.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        let mut settlement = tokio::spawn(pump.settle(RequestPumpSettle::ResponseCommitted));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut settlement)
-                .await
-                .is_err()
-        );
-
-        io.writer.shutdown().await.unwrap();
-        assert_eq!(
-            settlement.await.unwrap(),
-            super::RequestPumpOutcome::CleanFin
-        );
-        assert_eq!(io.stops.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn frame_after_terminal_status_reports_invalid_argument() {
-        let mut io = test_io(None);
-        let terminal = status_frame(Status::ok());
         io.writer
-            .write_all(&[terminal, message(b"trailing")].concat())
+            .write_all(&status_frame(Status::ok()))
             .await
             .unwrap();
         io.writer.shutdown().await.unwrap();
@@ -1242,7 +1133,7 @@ mod tests {
         assert_eq!(failure.status().code(), Code::InvalidArgument);
         assert_eq!(
             failure.status().message(),
-            "request stream continued after terminal status"
+            "request stream contained a STATUS frame"
         );
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
     }
@@ -1423,22 +1314,6 @@ mod tests {
             collect_bodies(&mut body).await,
             [b"a".to_vec(), b"b".to_vec()]
         );
-        let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
-        assert_eq!(outcome, super::RequestPumpOutcome::CleanFin);
-        assert_eq!(io.stops.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn unknown_frames_are_skipped_after_the_terminal_status() {
-        let mut io = test_io(None);
-        io.writer
-            .write_all(&[status_frame(Status::ok()), grease(3)].concat())
-            .await
-            .unwrap();
-        io.writer.shutdown().await.unwrap();
-        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
-
-        wait_for_clean_fin(&mut pump).await;
         let outcome = pump.settle(RequestPumpSettle::ResponseCommitted).await;
         assert_eq!(outcome, super::RequestPumpOutcome::CleanFin);
         assert_eq!(io.stops.load(Ordering::SeqCst), 0);

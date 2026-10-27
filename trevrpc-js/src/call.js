@@ -156,7 +156,7 @@ export class Call {
   #accept;
   /** Whether request messages may be compressed without a dictionary. */
   #plainRequests = false;
-  /** Whether the REQUEST queried the server's dictionaries, so its HEADERS answer. */
+  /** Whether the REQUEST queried the server's dictionaries, so its ANSWER answers the query. */
   #queried = false;
   /** The call's stream compression, or undefined if its method or transport has none. */
   #streams;
@@ -324,24 +324,32 @@ export class Call {
   }
 
   /**
-   * Records the server's answers in the response HEADERS to what the REQUEST asked. HEADERS
-   * accept an optimistic call, and a `stream_compression` answer lets the session's calls be
-   * optimistic again after a refusal. A `connection_metadata` answer confirms the set the REQUEST
-   * offered, so the session's calls refer to it from now on.
+   * Records the server's ANSWER to what the REQUEST asked. It answers a dictionary query whole,
+   * and must accept an optimistic call; a `stream_compression` answer also lets the session's
+   * calls be optimistic again after a refusal. A `connection_metadata` answer confirms the set the
+   * REQUEST offered, so the session's calls refer to it from now on.
    */
-  learnAnswers(headers) {
-    this.#connectionMetadata?.learn(this.#offeredMetadata, headers);
+  learnAnswers(answer) {
+    if (this.#copies !== undefined && !answer.streamCompression) {
+      throw internal("ANSWER of an optimistic call did not accept stream compression");
+    }
+    this.#connectionMetadata?.learn(this.#offeredMetadata, answer);
     if (this.#queried) {
-      this.#compression.learn(headers.dictionaries);
+      this.#compression.learn(answer.dictionaries);
     }
-    this.#streams?.learn(headers.streamCompression);
+    if (answer.streamCompression) {
+      this.#streams?.accept();
+      if (this.#compression !== undefined) {
+        this.#compression.optimisticStreams = true;
+      }
+    }
     this.#settleCopies("accepted");
-    if ((headers.streamCompression?.maxWindowLog ?? 0) >= 10 && this.#compression !== undefined) {
-      this.#compression.optimisticStreams = true;
-    }
   }
 
-  /** Whether a STATUS refusing the call's optimistic stream compression can still be replayed. */
+  /**
+   * Whether the server has yet to accept or refuse the call's optimistic stream compression, so a
+   * refusing STATUS can still be replayed.
+   */
   get replayable() {
     return this.#copies !== undefined;
   }

@@ -23,7 +23,6 @@ data class RpcRequest(
     val metadata: Metadata = Metadata.EMPTY,
     val kindValue: Int = RpcKind.UNARY.value,
     val timeoutNanos: ULong = 0uL,
-    val extensions: List<ULong> = emptyList(),
     /**
      * The datagram flow ID the client allocated for the call, or zero for none. Cronet exposes no
      * datagram API, so this client never sets it and its calls stay reliable on the stream. The
@@ -35,10 +34,11 @@ data class RpcRequest(
     /** The dictionaries the client asks the server about, with their fingerprints. */
     val dictionaryQuery: List<DictionaryInfo> = emptyList(),
     /**
-     * The client's offer of stream compression: it decodes stream-compressed responses, and with
-     * [StreamCompression.optimistic] it compresses requests without waiting for the answer.
+     * The client's part in stream compression: with [StreamCompression.ENABLED] it decodes
+     * stream-compressed responses, and with [StreamCompression.OPTIMISTIC] it also compresses
+     * requests without waiting for the answer.
      */
-    val streamCompression: StreamCompression? = null,
+    val streamCompression: StreamCompression = StreamCompression.NONE,
     /**
      * The channel's connection metadata, which the server merges into [metadata] before it
      * validates and authorizes the call, the call's own entries winning. This client offers the set
@@ -51,14 +51,20 @@ data class RpcRequest(
         get() = RpcKind.fromValue(kindValue)
 }
 
-/** HEADERS frame payload. */
+/** HEADERS frame payload: the response header metadata. */
 data class RpcHeaders(
     val metadata: Metadata = Metadata.EMPTY,
-    val extensions: List<ULong> = emptyList(),
-    /** The server's answer to the request's `dictionaryQuery`: the queried dictionaries it holds. */
+)
+
+/**
+ * ANSWER frame payload: the server's answer to the REQUEST's negotiation fields, which it sends
+ * before any HEADERS. A field it leaves out means no, or none.
+ */
+data class RpcAnswer(
+    /** The answer to the request's `dictionaryQuery`: the queried dictionaries the server holds. */
     val dictionaries: List<DictionaryInfo> = emptyList(),
-    /** The server's answer to the request's `streamCompression`: it decodes stream-compressed requests. */
-    val streamCompression: StreamCompression? = null,
+    /** The server decodes the call's stream-compressed requests. */
+    val streamCompression: Boolean = false,
     /** The ID of the offered connection metadata the server stored for the connection, or zero. */
     val connectionMetadataId: UInt = 0u,
 )
@@ -75,15 +81,23 @@ data class ConnectionMetadata(
 )
 
 /**
- * What a peer decodes in stream compression: zstd windows of at most 2^[maxWindowLog] bytes. A
- * value below 10 enables nothing. [optimistic], in a REQUEST only, says the client sends
- * stream-compressed requests from the start of the call, without waiting for the server's answer;
- * the server accepts the call or refuses it before any application code runs.
+ * A client's part in stream compression, whose zstd windows are at most 64 KiB. [ENABLED] says the
+ * client decodes stream-compressed responses and would compress requests once the server answers;
+ * [OPTIMISTIC] says it compresses requests from the start of the call, without waiting for the
+ * answer, and the server accepts the call or refuses it before any application code runs.
  */
-data class StreamCompression(
-    val maxWindowLog: UInt,
-    val optimistic: Boolean = false,
-)
+enum class StreamCompression(
+    val value: Int,
+) {
+    NONE(0),
+    ENABLED(1),
+    OPTIMISTIC(2),
+    ;
+
+    companion object {
+        fun fromValue(value: Int): StreamCompression? = entries.firstOrNull { it.value == value }
+    }
+}
 
 /** A compression dictionary in negotiation fields: its Dictionary_ID and fingerprint. */
 class DictionaryInfo(
@@ -122,20 +136,21 @@ data class RpcStatus(
     }
 }
 
-/**
- * A decoded response-stream frame. Unknown frames never reach this type, and extension lists are
- * dropped because the client negotiates none.
- */
+/** A decoded response-stream frame. Unknown frames never reach this type. */
 sealed interface ResponseFrame {
     /**
-     * Response headers. Absent headers are equivalent to empty ones. [dictionaries] and
-     * [streamCompression] are the server's answers to the call's dictionary query and stream
-     * compression offer.
+     * The server's answer to the call's negotiation: [dictionaries] answers its dictionary query,
+     * and [streamCompression] says the server decodes its stream-compressed requests. It is not
+     * header metadata; [Client] consumes it before the headers.
      */
+    class Answer(
+        val dictionaries: List<DictionaryInfo> = emptyList(),
+        val streamCompression: Boolean = false,
+    ) : ResponseFrame
+
+    /** Response headers. Absent headers are equivalent to empty ones. */
     class Headers(
         val metadata: Metadata = Metadata.EMPTY,
-        val dictionaries: List<DictionaryInfo> = emptyList(),
-        val streamCompression: StreamCompression? = null,
     ) : ResponseFrame
 
     /**

@@ -74,7 +74,10 @@ func TestStreamReceiverGivesUpOnIdleStreamAndKeepsAdmission(t *testing.T) {
 	}
 	defer lease.release()
 	release := make(chan struct{})
-	receiver := newStreamReceiver(context.Background(), MessageStream[struct{}](&controlledStream[struct{}]{release: release}), time.Millisecond, "request", lease)
+	// The goroutine must pick the receive up before the idle timeout, or the
+	// receiver takes it back instead of abandoning it, so the timeout leaves
+	// room for a loaded machine.
+	receiver := newStreamReceiver(context.Background(), MessageStream[struct{}](&controlledStream[struct{}]{release: release}), 100*time.Millisecond, "request", lease)
 	defer receiver.close()
 
 	_, err := receiver.recv()

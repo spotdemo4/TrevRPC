@@ -8,7 +8,9 @@ use std::any::TypeId;
 use bytes::{BufMut, Bytes};
 use prost::Message;
 
-use crate::{Error, Metadata, Result, RpcHeaders, RpcRequest, RpcStatus, Status, varint};
+use crate::{
+    Error, Metadata, Result, RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, Status, varint,
+};
 
 /// The default maximum frame payload size, 4 MiB.
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
@@ -32,17 +34,20 @@ pub mod frame_type {
     /// A message compressed with the zstd context of its direction of the call; see
     /// [`crate::CompressStream`]. Readers hand it on as a message.
     pub const ZSTD_STREAM_MESSAGE: u64 = 5;
+    /// An `RpcAnswer`: the server's answer to the negotiation fields of the REQUEST.
+    pub const ANSWER: u64 = 6;
 }
 
 /// Returns whether `frame_type` is defined by wire version 1.
 #[must_use]
 pub const fn is_known_frame_type(frame_type: u64) -> bool {
-    frame_type <= frame_type::ZSTD_STREAM_MESSAGE
+    frame_type <= frame_type::ANSWER
 }
 
 /// A frame of a response stream, the currency between the transports and the call layer.
 ///
-/// A well-formed response is `[Headers] Message* Status`: see the wire format documentation.
+/// A well-formed response is `[Headers] Message* Status`: see the wire format documentation. The
+/// ANSWER that may precede it is the runtime's own, written and read below this level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseFrame {
     /// Response header metadata, sent at most once and before anything else.
@@ -148,33 +153,20 @@ pub const fn validate_payload_len(len: usize, max_frame_size: usize) -> Result<(
 const METADATA_ENTRY: &[(u64, u64)] = &[(1, 2), (2, 2)];
 /// The fields of a `DictionaryInfo`: the ID, a varint, and the fingerprint.
 const DICTIONARY_INFO: &[(u64, u64)] = &[(1, 0), (2, 2)];
-/// The field of a `StreamCompression`: the window, a varint.
-const STREAM_COMPRESSION: &[(u64, u64)] = &[(1, 0)];
-
 fn preflight_known_wire<M: 'static>(body: &[u8]) -> Result<()> {
-    // Field 8 and 10 of `RpcRequest` and field 2 of `RpcHeaders` are repeated integers, which may
-    // be packed (length-delimited) or not, so they are not pinned to one wire type here. Fields 2,
-    // 3 and 6 of `RpcRequest` are reserved and skipped like any unknown field.
+    // Field 6 of `RpcRequest` is a repeated integer, which may be packed (length-delimited) or
+    // not, so it is not pinned to one wire type here.
     type Nested = &'static [(u64, &'static [(u64, u64)])];
     let (fields, nested): (&[(u64, u64)], Nested) =
         if TypeId::of::<M>() == TypeId::of::<RpcRequest>() {
             (
-                &[(1, 2), (4, 2), (5, 0), (7, 0), (9, 0), (11, 2), (12, 2)],
-                &[
-                    (4, METADATA_ENTRY),
-                    (11, DICTIONARY_INFO),
-                    (12, STREAM_COMPRESSION),
-                ],
+                &[(1, 2), (2, 2), (3, 0), (4, 0), (5, 0), (7, 2), (8, 0)],
+                &[(2, METADATA_ENTRY), (7, DICTIONARY_INFO)],
             )
         } else if TypeId::of::<M>() == TypeId::of::<RpcHeaders>() {
-            (
-                &[(1, 2), (3, 2), (4, 2)],
-                &[
-                    (1, METADATA_ENTRY),
-                    (3, DICTIONARY_INFO),
-                    (4, STREAM_COMPRESSION),
-                ],
-            )
+            (&[(1, 2)], &[(1, METADATA_ENTRY)])
+        } else if TypeId::of::<M>() == TypeId::of::<RpcAnswer>() {
+            (&[(1, 2), (2, 0), (3, 0)], &[(1, DICTIONARY_INFO)])
         } else if TypeId::of::<M>() == TypeId::of::<RpcStatus>() {
             (&[(1, 0), (2, 2), (3, 2)], &[(3, METADATA_ENTRY)])
         } else {
@@ -313,7 +305,7 @@ mod tests {
         encode_message_frame, encode_protobuf_frame, frame_type, is_known_frame_type,
         put_frame_header, validate_payload_len,
     };
-    use crate::{Code, Metadata, RpcHeaders, RpcKind, RpcRequest, RpcStatus, Status};
+    use crate::{Code, Metadata, RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus, Status};
 
     #[test]
     fn frame_headers_use_minimal_varints() {
@@ -365,10 +357,10 @@ mod tests {
 
     #[test]
     fn known_frame_types_are_exactly_the_defined_ones() {
-        for known in 0..=5 {
+        for known in 0..=6 {
             assert!(is_known_frame_type(known));
         }
-        for unknown in [6, 0x21, 0x40, 0x5f, u64::MAX] {
+        for unknown in [7, 0x21, 0x40, 0x5f, u64::MAX] {
             assert!(!is_known_frame_type(unknown));
         }
         // The grease types 0x1f * N + 0x21 are all unknown.
@@ -403,8 +395,8 @@ mod tests {
             .into_status();
         assert_eq!(status.code(), Code::InvalidArgument);
 
-        // RpcRequest.datagram_flow (field 9) as bytes.
-        let status = decode_payload::<RpcRequest>(&[0x4a, 0x01, 0x01])
+        // RpcRequest.datagram_flow (field 5) as bytes.
+        let status = decode_payload::<RpcRequest>(&[0x2a, 0x01, 0x01])
             .expect_err("wrong wire type should fail")
             .into_status();
         assert_eq!(status.code(), Code::InvalidArgument);
@@ -412,13 +404,14 @@ mod tests {
         // RpcStatus.code (field 1) as bytes, RpcHeaders.metadata (field 1) as a varint.
         assert!(decode_payload::<RpcStatus>(&[0x0a, 0x00]).is_err());
         assert!(decode_payload::<RpcHeaders>(&[0x08, 0x01]).is_err());
+        // RpcAnswer.stream_compression (field 2) as bytes.
+        assert!(decode_payload::<RpcAnswer>(&[0x12, 0x00]).is_err());
     }
 
     #[test]
-    fn the_reserved_fields_and_unknown_fields_are_ignored() {
-        // Field 2 (formerly the method name, here with the wrong wire type), field 3 (formerly the
-        // request body), field 6 (formerly the wire version), and field 99 are skipped.
-        let mut payload = vec![0x10, 0x07, 0x1a, 0x02, b'x', b'y', 0x30, 0x01];
+    fn unknown_fields_are_ignored() {
+        // Fields 10 and 99 are skipped.
+        let mut payload = vec![0x52, 0x02, b'x', b'y'];
         payload.extend([0x9a, 0x06, 0x01, 0x00]);
         payload.extend([0x0a, 0x04, b'/', b's', b'/', b'm']);
         let request = decode_payload::<RpcRequest>(&payload).expect("request should decode");
@@ -427,20 +420,17 @@ mod tests {
     }
 
     #[test]
-    fn extensions_decode_packed_or_unpacked_and_are_ignored() {
-        let packed = decode_payload::<RpcHeaders>(&[0x12, 0x02, 0x01, 0xac])
+    fn accepted_dictionaries_decode_packed_or_unpacked() {
+        let packed = decode_payload::<RpcRequest>(&[0x32, 0x02, 0x01, 0xac])
             .expect_err("a truncated packed varint is malformed");
         assert_eq!(packed.into_status().code(), Code::InvalidArgument);
 
-        let packed = decode_payload::<RpcHeaders>(&[0x12, 0x03, 0x01, 0xac, 0x02])
-            .expect("packed extensions should decode");
-        assert_eq!(packed.extensions, [1, 300]);
-        let unpacked = decode_payload::<RpcHeaders>(&[0x10, 0x01, 0x10, 0xac, 0x02])
-            .expect("unpacked extensions should decode");
-        assert_eq!(unpacked.extensions, [1, 300]);
-        let request = decode_payload::<RpcRequest>(&[0x42, 0x03, 0x01, 0xac, 0x02])
-            .expect("request extensions should decode");
-        assert_eq!(request.extensions, [1, 300]);
+        let packed = decode_payload::<RpcRequest>(&[0x32, 0x03, 0x01, 0xac, 0x02])
+            .expect("packed dictionaries should decode");
+        assert_eq!(packed.accept_dictionaries, [1, 300]);
+        let unpacked = decode_payload::<RpcRequest>(&[0x30, 0x01, 0x30, 0xac, 0x02])
+            .expect("unpacked dictionaries should decode");
+        assert_eq!(unpacked.accept_dictionaries, [1, 300]);
     }
 
     #[test]

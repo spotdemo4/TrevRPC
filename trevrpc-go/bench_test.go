@@ -122,13 +122,13 @@ func BenchmarkFrameDecodeStatus(b *testing.B) {
 // metadata value is size bytes long.
 func BenchmarkFrameDecodeHeaders(b *testing.B) {
 	runSizes(b, func(b *testing.B, size int) {
-		frame, err := appendHeadersFrame(nil, Metadata{"x-header": []byte(strings.Repeat("x", size))}, headersAnswer{}, DefaultMaxFrameSize)
+		frame, err := appendHeadersFrame(nil, Metadata{"x-header": []byte(strings.Repeat("x", size))}, DefaultMaxFrameSize)
 		if err != nil {
 			b.Fatal(err)
 		}
 		payload := benchFramePayload(b, frame)
 		for b.Loop() {
-			metadata, _, err := decodeHeaders(payload)
+			metadata, err := decodeHeaders(payload)
 			if err != nil || len(metadata["x-header"]) != size {
 				b.Fatalf("metadata length = %d, err = %v", len(metadata["x-header"]), err)
 			}

@@ -725,7 +725,8 @@ internal class ResponseReader<T>(
         try {
             while (true) {
                 when (val frame = readAhead?.also { readAhead = null } ?: nextFrame()) {
-                    is ResponseFrame.Headers -> {}
+                    // CallStream consumes ANSWER, so it never arrives here.
+                    is ResponseFrame.Headers, is ResponseFrame.Answer -> {}
 
                     is ResponseFrame.Message -> {
                         return receiveMessage(frame)
@@ -769,7 +770,7 @@ internal class ResponseReader<T>(
 
     /**
      * Reads one frame from the transport and applies the response grammar: HEADERS is allowed
-     * once, and only as the first known frame.
+     * once, and only as the first known frame after the ANSWER, which [CallStream] consumes.
      */
     private suspend fun nextFrame(): ResponseFrame {
         val frame =
@@ -898,7 +899,7 @@ private fun request(
         timeoutNanos = timeoutNanos(options.timeout),
         acceptDictionaries = compression?.accept.orEmpty(),
         dictionaryQuery = compression?.query.orEmpty(),
-        streamCompression = streams?.offer,
+        streamCompression = streams?.offer ?: StreamCompression.NONE,
         connectionMetadata = connectionMetadata,
     )
 

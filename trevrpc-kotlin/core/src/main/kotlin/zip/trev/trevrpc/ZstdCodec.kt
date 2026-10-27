@@ -87,7 +87,6 @@ internal class ZstdCodec(
  */
 internal class ZstdStreamEncoder(
     level: Int,
-    windowLog: Int,
     dictionary: ZstdCodec?,
 ) {
     private val context =
@@ -97,7 +96,7 @@ internal class ZstdStreamEncoder(
             .setChecksum(false)
             .setDictID(true)
             .setContentSize(false)
-            .setWindowLog(windowLog)
+            .setWindowLog(STREAM_WINDOW_LOG)
             .also { context -> dictionary?.compressDictionary?.let(context::loadDict) }
 
     /** The bytes of the messages in the current frame. */

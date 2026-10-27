@@ -25,14 +25,14 @@ class CompressionTest {
         assertArrayEquals(vectors.getValue("request.dictionaries.payload"), WireCodec.encode(request))
         assertEquals(request, WireCodec.decodeRequest(vectors.getValue("request.dictionaries.payload")))
 
-        val headers = RpcHeaders(dictionaries = listOf(d1))
-        assertArrayEquals(vectors.getValue("headers.dictionaries.payload"), WireCodec.encode(headers))
-        assertEquals(headers, WireCodec.decodeHeaders(vectors.getValue("headers.dictionaries.payload")))
-        val frame = WireCodec.decodeResponseFrame(Frame(FrameType.HEADERS, vectors.getValue("headers.dictionaries.payload")))
-        assertEquals(listOf(d1), (frame as ResponseFrame.Headers).dictionaries)
+        val answer = RpcAnswer(dictionaries = listOf(d1))
+        assertArrayEquals(vectors.getValue("answer.dictionaries.payload"), WireCodec.encode(answer))
+        assertEquals(answer, WireCodec.decodeAnswer(vectors.getValue("answer.dictionaries.payload")))
+        val frame = WireCodec.decodeResponseFrame(Frame(FrameType.ANSWER, vectors.getValue("answer.dictionaries.payload")))
+        assertEquals(listOf(d1), (frame as ResponseFrame.Answer).dictionaries)
 
-        listOf("request.dictionaries", "headers.dictionaries").forEach { name ->
-            val type = if (name.startsWith("request")) FrameType.REQUEST else FrameType.HEADERS
+        listOf("request.dictionaries", "answer.dictionaries").forEach { name ->
+            val type = if (name.startsWith("request")) FrameType.REQUEST else FrameType.ANSWER
             assertArrayEquals(vectors.getValue("$name.frame"), encodeFrame(type, vectors.getValue("$name.payload")), name)
         }
     }
@@ -43,12 +43,12 @@ class CompressionTest {
         assertArrayEquals(vectors.getValue("request.plain.payload"), WireCodec.encode(request))
         assertEquals(request, WireCodec.decodeRequest(vectors.getValue("request.plain.payload")))
 
-        val frame = WireCodec.decodeResponseFrame(Frame(FrameType.HEADERS, vectors.getValue("headers.plain.payload")))
-        assertEquals(listOf(PLAIN_DICTIONARY), (frame as ResponseFrame.Headers).dictionaries)
-        assertArrayEquals(vectors.getValue("headers.plain.payload"), WireCodec.encode(RpcHeaders(dictionaries = listOf(PLAIN_DICTIONARY))))
+        val frame = WireCodec.decodeResponseFrame(Frame(FrameType.ANSWER, vectors.getValue("answer.plain.payload")))
+        assertEquals(listOf(PLAIN_DICTIONARY), (frame as ResponseFrame.Answer).dictionaries)
+        assertArrayEquals(vectors.getValue("answer.plain.payload"), WireCodec.encode(RpcAnswer(dictionaries = listOf(PLAIN_DICTIONARY))))
 
-        listOf("request.plain", "headers.plain").forEach { name ->
-            val type = if (name.startsWith("request")) FrameType.REQUEST else FrameType.HEADERS
+        listOf("request.plain", "answer.plain").forEach { name ->
+            val type = if (name.startsWith("request")) FrameType.REQUEST else FrameType.ANSWER
             assertArrayEquals(vectors.getValue("$name.frame"), encodeFrame(type, vectors.getValue("$name.payload")), name)
         }
     }
@@ -102,7 +102,7 @@ class CompressionTest {
             assertEquals(listOf(0u), request.acceptDictionaries)
 
             call.send(record)
-            transport.respond(headers(PLAIN_DICTIONARY))
+            transport.respond(answer(PLAIN_DICTIONARY), ResponseFrame.Headers())
             call.headers()
             call.send(record)
             call.send(record.copyOf(PLAIN_MIN_SIZE - 1))
@@ -127,7 +127,7 @@ class CompressionTest {
             val call =
                 Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressMessages = CompressMessages.REQUESTS)
             assertEquals(listOf(d1, PLAIN_DICTIONARY), transport.requests.single().dictionaryQuery)
-            transport.respond(headers(d1, PLAIN_DICTIONARY))
+            transport.respond(answer(d1, PLAIN_DICTIONARY), ResponseFrame.Headers())
             call.headers()
             call.send(record)
             assertEquals(1u, parseZstdHeader(transport.sent.single().second)?.dictionaryId)
@@ -140,7 +140,7 @@ class CompressionTest {
             val transport = ScriptedTransport(Compression(emptyList()))
             val call =
                 Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressMessages = CompressMessages.REQUESTS)
-            transport.respond(headers())
+            transport.respond(answer(), ResponseFrame.Headers())
             call.headers()
             call.send(record)
             assertEquals(listOf(FrameType.MESSAGE), transport.sent.map { it.first })
@@ -234,7 +234,7 @@ class CompressionTest {
     fun `a unary call queries and accepts the response dictionary and decompresses the response`() =
         runBlocking {
             val transport = ScriptedTransport(compression("test.Request", "test.Response"))
-            transport.respond(headers(d1), compressed(compressible), ok())
+            transport.respond(answer(d1), compressed(compressible), ok())
             transport.end()
             val response = Client(transport).unary("/svc/m", compressible, requests, responses)
 
@@ -265,7 +265,7 @@ class CompressionTest {
             assertEquals(emptyList<UInt>(), transport.requests.single().acceptDictionaries)
 
             call.send(compressible)
-            transport.respond(headers(d1))
+            transport.respond(answer(d1), ResponseFrame.Headers())
             call.headers()
             call.send(compressible)
             call.send(vectors.getValue("ok.raw_block.message"))
@@ -281,7 +281,7 @@ class CompressionTest {
         runBlocking {
             val transport = ScriptedTransport(compression("test.Request"))
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses)
-            transport.respond(headers(DictionaryInfo(1u, ByteArray(8))))
+            transport.respond(answer(DictionaryInfo(1u, ByteArray(8))), ResponseFrame.Headers())
             call.headers()
             call.send(compressible)
             assertEquals(listOf(FrameType.MESSAGE), transport.sent.map { it.first })
@@ -300,7 +300,7 @@ class CompressionTest {
             assertEquals(Code.INTERNAL, error.status.code)
 
             val small = ScriptedTransport(compression("test.Response"))
-            small.respond(headers(d1), compressed(compressible), ok())
+            small.respond(answer(d1), compressed(compressible), ok())
             val tooLarge =
                 assertThrows(TrevRpcException::class.java) {
                     runBlocking {
@@ -332,7 +332,7 @@ class CompressionTest {
         return WireCodec.decodeResponseFrame(Frame(FrameType.ZSTD_MESSAGE, payload))
     }
 
-    private fun headers(vararg answer: DictionaryInfo): ResponseFrame = ResponseFrame.Headers(dictionaries = answer.toList())
+    private fun answer(vararg answer: DictionaryInfo): ResponseFrame = ResponseFrame.Answer(answer.toList())
 
     private fun message(body: ByteArray): ResponseFrame = ResponseFrame.Message(body)
 

@@ -10,7 +10,7 @@ import (
 // Connection metadata is request metadata a client sets once for all its calls,
 // such as a bearer token, so that it crosses each connection once instead of in
 // every REQUEST. A client offers the set (RpcRequest.connection_metadata with
-// entries) on its calls until a HEADERS confirms that the server stored it for
+// entries) on its calls until an ANSWER confirms that the server stored it for
 // the connection, then refers to it by ID. Calls on different streams reach
 // the server in any order, so a reference only follows a confirmation. The
 // server merges the set into each call's metadata before validation and
@@ -84,7 +84,7 @@ func newClientConnectionMetadata(source *connectionMetadataSource) *clientConnec
 
 // prepare sets the connection metadata of request: a reference to the current
 // set once the connection confirmed it, an offer of it otherwise. It returns
-// the ID it offered, which learn checks the HEADERS against, or zero.
+// the ID it offered, which learn checks the ANSWER against, or zero.
 func (c *clientConnectionMetadata) prepare(request *wireRequest) uint32 {
 	if c == nil {
 		return 0
@@ -101,11 +101,11 @@ func (c *clientConnectionMetadata) prepare(request *wireRequest) uint32 {
 	return set.id
 }
 
-// learn records that the server stored the offered set, once its HEADERS
-// confirm it. Only the current set counts: a late confirmation of one the
+// learn records that the server stored the offered set, once its ANSWER
+// confirms it. Only the current set counts: a late confirmation of one the
 // channel has since replaced would make calls offer the current one again.
-func (c *clientConnectionMetadata) learn(offered uint32, answer headersAnswer) {
-	if c == nil || offered == 0 || answer.connectionMetadata != offered {
+func (c *clientConnectionMetadata) learn(offered uint32, answer wireAnswer) {
+	if c == nil || offered == 0 || answer.ConnectionMetadata != offered {
 		return
 	}
 	if current := c.source.current.Load(); current != nil && current.id == offered {
@@ -138,7 +138,7 @@ func streamConnectionMetadata(stream rpcStream) *connectionMetadataStore {
 
 // resolve merges the connection metadata request offers or refers to into its
 // metadata, the call's own entries winning, and stores an offered set for the
-// connection, which the call's HEADERS then confirm. s is nil on a connection
+// connection, which the call's ANSWER then confirms. s is nil on a connection
 // that keeps none.
 func (s *connectionMetadataStore) resolve(request *wireRequest) error {
 	info := request.ConnectionMetadata

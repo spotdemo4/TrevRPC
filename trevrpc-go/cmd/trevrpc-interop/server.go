@@ -272,7 +272,7 @@ const streamCompressedReceivedKey = "interop-stream-compressed-received"
 const plainCompressedReceivedKey = "interop-plain-compressed-received"
 
 // compressedEchoServer implements CompressedEcho in interop/README.md: Echo's
-// Bidi and ClientStream, reporting how many requests arrived
+// Bidi and ClientStream, headers included, reporting how many requests arrived
 // stream-compressed, and Plain, reporting whether its request arrived
 // compressed without a dictionary.
 type compressedEchoServer struct{}

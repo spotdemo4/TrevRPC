@@ -52,9 +52,9 @@ type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// Headers returns the response headers. It blocks until the first response
 	// frame (headers, the response, or the final status) arrives and returns
 	// empty metadata if the server sent no headers. It does not consume the
-	// response: CloseAndRecv still returns it. A server sends HEADERS at
-	// dispatch on methods whose requests may be stream-compressed, so there it
-	// returns while the requests are still being sent.
+	// response: CloseAndRecv still returns it. It returns while the requests
+	// are still being sent if the server sends headers before reading them
+	// all.
 	Headers() (Metadata, error)
 }
 

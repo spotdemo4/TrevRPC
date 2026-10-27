@@ -16,8 +16,8 @@ use crate::server::{
     Admitted, CancellationSource, CancellationToken, RequestBudget, RequestCounts, Server,
 };
 use crate::{
-    Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcKind, RpcRequest, Status,
-    varint,
+    Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcAnswer, RpcKind, RpcRequest,
+    Status, varint,
 };
 
 /// Sends response frames without imposing a transport framing format.
@@ -37,8 +37,8 @@ pub trait ResponseWriter: Send + 'static {
 
     fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
 
-    /// Sets how the call's frames are written: how its messages are compressed and the answers
-    /// its HEADERS carry.
+    /// Sets how the call's frames are written: how its messages are compressed and the ANSWER
+    /// that goes out first; see [`framed::write_response_frames`].
     fn set_codec(&mut self, codec: ResponseCodec);
 }
 
@@ -60,7 +60,7 @@ pub struct IncomingRequest {
     /// Set once [`handle_stream`] has validated and authorized a streaming call.
     pub(crate) admitted: Option<Admitted>,
     /// The connection metadata set the request offered and the connection stored, which the
-    /// call's HEADERS confirm; zero for none. See [`resolve_connection_metadata`].
+    /// call's ANSWER confirms; zero for none. See [`resolve_connection_metadata`].
     pub(crate) connection_metadata: u32,
 }
 
@@ -157,12 +157,7 @@ where
         })
         .await?;
         match frame {
-            Some(framed::RequestFrame::Message(body)) => Vec::from(body),
-            Some(framed::RequestFrame::Status(_)) => {
-                return Err(Error::from(Status::invalid_argument(
-                    "request stream carried a STATUS frame instead of the request message",
-                )));
-            }
+            Some(body) => Vec::from(body),
             None => {
                 return Err(Error::from(Status::invalid_argument(
                     "request stream ended before the request message",
@@ -212,7 +207,7 @@ where
         body,
         mut budget,
         flow,
-        compression,
+        mut compression,
         stream: _,
         admitted: _,
         connection_metadata,
@@ -249,14 +244,16 @@ where
             return;
         }
         budget.stream = stream.requests.take();
-        let answered =
-            compression.answer.is_some() || stream.answer.is_some() || connection_metadata != 0;
+        let answer = (compression.answer.is_some() || stream.answer || connection_metadata != 0)
+            .then(|| RpcAnswer {
+                dictionaries: compression.answer.take().unwrap_or_default(),
+                stream_compression: stream.answer,
+                connection_metadata,
+            });
         send.set_codec(ResponseCodec {
             encoder: MessageEncoder::new(compression.responses.clone())
                 .with_stream(stream.responses.take()),
-            answer: compression.answer.clone(),
-            stream_answer: stream.answer,
-            connection_answer: connection_metadata,
+            answer,
         });
         let request_body_len = body.len();
         let mut slots = StreamSlots::new(stream_permit);
@@ -337,7 +334,7 @@ where
             }
         };
 
-        let mut frames = unary_response_frames(response, answered);
+        let mut frames = unary_response_frames(response);
         // The STATUS ends the call from the client's point of view.
         drop(slots);
         match send.write_frames(&mut frames).await {
@@ -354,17 +351,14 @@ where
 }
 
 /// Frames a unary response: `[HEADERS] MESSAGE STATUS` on success, a lone STATUS on failure.
-/// The HEADERS of a call that `answered` a dictionary query or a connection metadata offer go
-/// out even when empty.
 fn unary_response_frames(
     response: std::result::Result<ResponseEnvelope<Vec<u8>>, Status>,
-    answered: bool,
 ) -> Vec<ResponseFrame> {
     match response {
         Ok(response) => {
             let (body, headers, metadata) = response.into_parts();
             let mut frames = Vec::with_capacity(3);
-            if !headers.is_empty() || answered {
+            if !headers.is_empty() {
                 frames.push(ResponseFrame::Headers(headers));
             }
             frames.push(ResponseFrame::Message(Bytes::from(body)));
@@ -498,23 +492,17 @@ async fn handle_streaming_rpc<W, R>(
         compression,
         stream,
         admitted,
-        connection_metadata,
+        connection_metadata: _,
     } = incoming;
-    // Calls whose requests may be stream-compressed get HEADERS, with the answers, at dispatch,
-    // before any request message is read, so the client learns the answer while it still
-    // streams; their handlers cannot set headers. Other calls that queried or offered get their
-    // answers in HEADERS before their first message.
-    let headers_at_dispatch = server.sends_headers_at_dispatch(&request.method);
-    if headers_at_dispatch
-        && let Err(error) = send
-            .write_frames(&mut vec![ResponseFrame::Headers(Metadata::new())])
-            .await
+    // Calls whose requests may be stream-compressed get their ANSWER at dispatch, before any
+    // request message is read, so the client learns it while it still streams. Other calls get
+    // theirs with their first response frames.
+    if server.answers_at_dispatch(&request.method)
+        && let Err(error) = send.write_frames(&mut Vec::new()).await
     {
         cancel_from_transport_error(&cancellation, &error);
         return;
     }
-    let mut answer_pending = !headers_at_dispatch
-        && (compression.answer.is_some() || stream.answer.is_some() || connection_metadata != 0);
     let max_frame_size = server.max_frame_size();
     let request_body_len = body.len();
     let method_for_failure = request.method.clone();
@@ -539,10 +527,7 @@ async fn handle_streaming_rpc<W, R>(
                 None => request_body,
             };
             let responses = server.route_unreliable(&request.method).responses.then(|| {
-                ResponseDatagrams::new(
-                    flow.sender.with_compression(compression.responses.clone()),
-                    headers_at_dispatch,
-                )
+                ResponseDatagrams::new(flow.sender.with_compression(compression.responses.clone()))
             });
             (request_body, count, responses, Some(flow.guard))
         }
@@ -656,18 +641,6 @@ async fn handle_streaming_rpc<W, R>(
             }
         }
 
-        if answer_pending {
-            answer_pending = false;
-            let has_message = batch
-                .frames
-                .iter()
-                .any(|frame| matches!(frame, ResponseFrame::Message(_)));
-            if has_message && !matches!(batch.frames.first(), Some(ResponseFrame::Headers(_))) {
-                batch
-                    .frames
-                    .insert(0, ResponseFrame::Headers(Metadata::new()));
-            }
-        }
         if batch.terminal {
             // The STATUS ends the call from the client's point of view.
             slots.release();
@@ -706,11 +679,10 @@ struct ResponseDatagrams {
 }
 
 impl ResponseDatagrams {
-    /// `headers_flushed` is whether the call's HEADERS have already been written.
-    const fn new(sender: FlowSender, headers_flushed: bool) -> Self {
+    const fn new(sender: FlowSender) -> Self {
         Self {
             sender,
-            headers_flushed,
+            headers_flushed: false,
             sent_any: false,
         }
     }
@@ -1074,12 +1046,9 @@ mod tests {
     fn unary_responses_are_headers_message_status() {
         let headers = Metadata::from([("x-a".to_owned(), b"1".to_vec())]);
         let trailers = Metadata::from([("x-t".to_owned(), b"2".to_vec())]);
-        let frames = unary_response_frames(
-            Ok(ResponseEnvelope::new(b"reply".to_vec())
-                .with_headers(headers.clone())
-                .with_metadata(trailers.clone())),
-            false,
-        );
+        let frames = unary_response_frames(Ok(ResponseEnvelope::new(b"reply".to_vec())
+            .with_headers(headers.clone())
+            .with_metadata(trailers.clone())));
         assert_eq!(
             frames,
             [
@@ -1090,7 +1059,7 @@ mod tests {
         );
 
         // Without headers there is no HEADERS frame.
-        let frames = unary_response_frames(Ok(ResponseEnvelope::new(Vec::new())), false);
+        let frames = unary_response_frames(Ok(ResponseEnvelope::new(Vec::new())));
         assert_eq!(
             frames,
             [
@@ -1100,7 +1069,7 @@ mod tests {
         );
 
         // Failures are a lone STATUS.
-        let frames = unary_response_frames(Err(Status::not_found("gone")), false);
+        let frames = unary_response_frames(Err(Status::not_found("gone")));
         assert_eq!(frames, [ResponseFrame::Status(Status::not_found("gone"))]);
     }
 }

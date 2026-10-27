@@ -269,16 +269,17 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
             expectCounter(response.trailers, "interop-datagrams-received", "0")
         },
         "compressed-stream" to { (_, _, client) ->
-            // Requests compress optimistically from the third message, without waiting for the answer.
-            expectStreamCompressed("bidi", compressedBidi(client), 6)
+            // Requests compress optimistically from the third message, without waiting for the answer,
+            // and the handler still sends its headers.
+            expectStreamCompressed("bidi", compressedBidi(client, headers = true), 6)
             expectStreamCompressed("client-stream", upload { requests, options -> client.clientStream(requests) { options(this) } }, 6)
         },
         "refused-stream" to { (_, _, client, refusing) ->
             // The server refuses the optimistic call and the client replays it, so each message
             // arrives once.
             upload { requests, options -> refusing.clientStream(requests) { options(this) } }
-            // After the refusal the bidi call waits for the answer, which the server's HEADERS at
-            // dispatch bring before its third message; that answer makes the client optimistic again.
+            // After the refusal the bidi call waits for the answer, which the server's ANSWER at
+            // dispatch brings before its third message; that answer makes the client optimistic again.
             expectStreamCompressed("bidi", compressedBidi(client), 1)
             expectStreamCompressed("client-stream", upload { requests, options -> client.clientStream(requests) { options(this) } }, 6)
         },
@@ -316,19 +317,25 @@ private val compressedMessages = (0 until 8).map(::compressedMessage)
 
 /**
  * `CompressedEcho.Bidi` sending [compressedMessages], each after the echo of the one before; returns
- * the trailing metadata.
+ * the trailing metadata. With [headers] the call asks for response headers and checks them, before
+ * the first message, and the trailer that comes with them.
  */
-private suspend fun compressedBidi(client: CompressedEchoClient): Metadata {
+private suspend fun compressedBidi(
+    client: CompressedEchoClient,
+    headers: Boolean = false,
+): Metadata {
     val requests = Channel<EchoRequest>(Channel.UNLIMITED)
     requests.send(request(compressedMessages[0]))
     val response = ResponseMetadata()
     var echoed = 0
-    client.bidi(requests.consumeAsFlow()) { response.capture(this) }.collect { echo ->
+    client.bidi(requests.consumeAsFlow()) { response.capture(if (headers) withHeaderRequest() else this) }.collect { echo ->
+        if (headers && echoed == 0) expectMetadata("headers", response.headers, "interop-header")
         expectEcho(echo, compressedMessages[echoed], echoed)
         echoed++
         if (echoed < compressedMessages.size) requests.send(request(compressedMessages[echoed])) else requests.close()
     }
     expect(echoed == compressedMessages.size) { "expected ${compressedMessages.size} echoes, got $echoed" }
+    if (headers) expectCounter(response.trailers, "interop-trailer", "h")
     return response.trailers
 }
 

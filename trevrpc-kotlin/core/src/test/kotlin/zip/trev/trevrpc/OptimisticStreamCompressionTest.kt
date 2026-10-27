@@ -24,7 +24,7 @@ class OptimisticStreamCompressionTest {
 
     @Test
     fun `the optimistic fields match the shared vectors byte for byte`() {
-        val request = RpcRequest("/svc/m", streamCompression = StreamCompression(16u, optimistic = true))
+        val request = RpcRequest("/svc/m", streamCompression = StreamCompression.OPTIMISTIC)
         assertArrayEquals(vectors.getValue("request.optimistic_stream_compression.payload"), WireCodec.encode(request))
         assertArrayEquals(vectors.getValue("request.optimistic_stream_compression.frame"), encodeRequestFrames(request, null))
         assertEquals(request, WireCodec.decodeRequest(vectors.getValue("request.optimistic_stream_compression.payload")))
@@ -46,7 +46,7 @@ class OptimisticStreamCompressionTest {
             val client = Client(transport)
             val call = client.openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS)
             val stream = transport.streams.single()
-            assertEquals(StreamCompression(16u, optimistic = true), stream.request.streamCompression)
+            assertEquals(StreamCompression.OPTIMISTIC, stream.request.streamCompression)
             messages.forEach { call.send(it) }
             assertEquals(
                 listOf(FrameType.MESSAGE, FrameType.MESSAGE) + List(3) { FrameType.ZSTD_STREAM_MESSAGE },
@@ -59,7 +59,7 @@ class OptimisticStreamCompressionTest {
             }
             server.close()
             stream.respond(
-                ResponseFrame.Headers(streamCompression = StreamCompression(16u)),
+                ResponseFrame.Answer(streamCompression = true),
                 ResponseFrame.Message(messages[0]),
                 ResponseFrame.Status(Status.ok()),
             )
@@ -69,7 +69,7 @@ class OptimisticStreamCompressionTest {
             // Directions whose requests do not stream are never optimistic.
             client.openServerStreaming("/svc/m", messages[0], requests, responses, compressStream = CompressStream.BOTH).close()
             assertEquals(
-                StreamCompression(16u),
+                StreamCompression.ENABLED,
                 transport.streams
                     .last()
                     .request.streamCompression,
@@ -105,8 +105,11 @@ class OptimisticStreamCompressionTest {
             refused.respond(ResponseFrame.Status(Status.resourceExhausted("no memory"), refusedStreamCompression = true))
 
             val replayed = withTimeout(5.seconds) { transport.opened.receive() }
-            assertEquals(StreamCompression(16u), replayed.request.streamCompression)
-            assertEquals(refused.request.copy(streamCompression = null), replayed.request.copy(streamCompression = null))
+            assertEquals(StreamCompression.ENABLED, replayed.request.streamCompression)
+            assertEquals(
+                refused.request.copy(streamCompression = StreamCompression.NONE),
+                replayed.request.copy(streamCompression = StreamCompression.NONE),
+            )
             if (!closeFirst) {
                 call.send(messages[4])
                 call.closeSend()
@@ -173,25 +176,25 @@ class OptimisticStreamCompressionTest {
             budget.optimistic = false
             val waiting = client.openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS)
             assertEquals(
-                StreamCompression(16u),
+                StreamCompression.ENABLED,
                 transport.streams
                     .last()
                     .request.streamCompression,
             )
-            transport.streams.last().respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
+            transport.streams.last().respond(ResponseFrame.Answer(streamCompression = true), ResponseFrame.Headers())
             waiting.headers()
             assertTrue(budget.optimistic, "an answer resumes optimistic calls")
             waiting.close()
 
             client.openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS).close()
             assertEquals(
-                StreamCompression(16u, optimistic = true),
+                StreamCompression.OPTIMISTIC,
                 transport.streams
                     .last()
                     .request.streamCompression,
             )
 
-            // HEADERS without an answer neither resume nor stop them.
+            // HEADERS without an ANSWER neither resume nor stop them.
             budget.optimistic = false
             val unanswered = client.openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS)
             transport.streams.last().respond(ResponseFrame.Headers())
@@ -244,7 +247,7 @@ class OptimisticStreamCompressionTest {
             val transport = MultiStreamTransport(Compression(emptyList()), StreamCompressionBudget())
             val call = Client(transport).openBidirectionalStreaming("/svc/m", requests, responses, compressStream = CompressStream.BOTH)
             val refused = transport.opened.receive()
-            assertEquals(StreamCompression(16u, optimistic = true), refused.request.streamCompression)
+            assertEquals(StreamCompression.OPTIMISTIC, refused.request.streamCompression)
             messages.take(3).forEach { call.send(it) }
             refused.respond(ResponseFrame.Status(Status.resourceExhausted("no memory"), refusedStreamCompression = true))
             val replayed = withTimeout(5.seconds) { transport.opened.receive() }
@@ -261,12 +264,29 @@ class OptimisticStreamCompressionTest {
             val transport = MultiStreamTransport(Compression(emptyList()), StreamCompressionBudget())
             val call = Client(transport).openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS)
             transport.streams.single().respond(
-                ResponseFrame.Headers(streamCompression = StreamCompression(16u)),
+                ResponseFrame.Answer(streamCompression = true),
                 ResponseFrame.Status(Status.resourceExhausted("quota"), refusedStreamCompression = true),
             )
             val error = assertThrows(TrevRpcException::class.java) { runBlocking { call.receive() } }
             assertEquals(Code.RESOURCE_EXHAUSTED, error.status.code)
             assertEquals(1, transport.streams.size)
+        }
+
+    @Test
+    fun `an optimistic call must be accepted by an ANSWER before anything else`() =
+        runBlocking {
+            listOf(
+                listOf(ResponseFrame.Headers(), ResponseFrame.Status(Status.ok())),
+                listOf(ResponseFrame.Answer(), ResponseFrame.Status(Status.ok())),
+                listOf(ResponseFrame.Message(messages[0]), ResponseFrame.Status(Status.ok())),
+            ).forEach { response ->
+                val transport = MultiStreamTransport(Compression(emptyList()), StreamCompressionBudget())
+                val call = Client(transport).openClientStreaming("/svc/m", requests, responses, compressStream = CompressStream.REQUESTS)
+                transport.streams.single().respond(*response.toTypedArray())
+                val error = assertThrows(TrevRpcException::class.java) { runBlocking { call.receive() } }
+                assertEquals(Code.INTERNAL, error.status.code)
+                assertEquals(1, transport.streams.size)
+            }
         }
 
     @Test
@@ -282,7 +302,7 @@ class OptimisticStreamCompressionTest {
             delay(100.milliseconds)
             assertFalse(blocked.isCompleted)
             assertEquals(1, stream.sent.size)
-            stream.respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
+            stream.respond(ResponseFrame.Answer(streamCompression = true))
             withTimeout(5.seconds) { blocked.await() }
             assertEquals(2, stream.sent.size)
             call.close()
@@ -294,7 +314,7 @@ class OptimisticStreamCompressionTest {
             val big = async(start = CoroutineStart.UNDISPATCHED) { bigCall.send(ByteArray(OPTIMISTIC_COPY_CAP.toInt() + 1)) }
             delay(100.milliseconds)
             assertFalse(big.isCompleted)
-            bigStream.respond(ResponseFrame.Headers(streamCompression = StreamCompression(16u)))
+            bigStream.respond(ResponseFrame.Answer(streamCompression = true))
             withTimeout(5.seconds) { big.await() }
             assertEquals(1, bigStream.sent.size)
             bigCall.close()

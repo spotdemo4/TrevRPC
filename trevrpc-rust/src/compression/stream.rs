@@ -11,7 +11,7 @@
 //! `client::replay`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::Bytes;
@@ -31,10 +31,9 @@ use crate::{Result, RpcKind, varint, wire};
 /// A direction is set only if the method streams it and its message type has no field marked
 /// `debug_redact`.
 ///
-/// A server sends HEADERS at dispatch, before the handler runs, on every call to a method whose
+/// A server sends its ANSWER at dispatch, before the handler runs, on calls to a method whose
 /// requests it may stream-compress (`requests` is set, the method streams requests and they are
-/// not unreliable), so the client learns the answer while it still streams. Handlers of such
-/// methods cannot set response headers; the runtime reports them as already sent.
+/// not unreliable), so the client learns the answer while it still streams.
 ///
 /// Clients compress such requests optimistically, without waiting for the answer, while their
 /// connection's server accepts them. A server that does not decode them on a call, for instance
@@ -98,10 +97,9 @@ impl CompressStream {
     }
 }
 
-/// The window, as a base-2 logarithm, that stream compression contexts use and receivers decode.
+/// The window, as a base-2 logarithm, that stream compression contexts use and receivers decode:
+/// the protocol fixes it at 64 KiB.
 pub const STREAM_WINDOW_LOG: u32 = 16;
-/// A peer that advertises a smaller window enables nothing.
-const MIN_STREAM_WINDOW_LOG: u32 = 10;
 /// A sender starts a direction's context at this message; earlier ones go per message, so short
 /// streams cost nothing.
 const FIRST_STREAMED_MESSAGE: usize = 3;
@@ -109,21 +107,6 @@ const FIRST_STREAMED_MESSAGE: usize = 3;
 pub const DEFAULT_SERVER_MEMORY: usize = 256 << 20;
 /// What stream compression may hold by default on a client channel, in bytes.
 pub const DEFAULT_CLIENT_MEMORY: usize = 64 << 20;
-
-/// The negotiation field this runtime sends: the window it decodes.
-pub const fn advertised() -> wire::StreamCompression {
-    wire::StreamCompression {
-        max_window_log: STREAM_WINDOW_LOG,
-        optimistic: false,
-    }
-}
-
-/// The window a sender uses for a receiver that advertised `info`, or `None` when it enables
-/// nothing.
-pub fn sending_window(info: Option<&wire::StreamCompression>) -> Option<u32> {
-    let window = info?.max_window_log;
-    (window >= MIN_STREAM_WINDOW_LOG).then(|| window.min(STREAM_WINDOW_LOG))
-}
 
 // ---------------------------------------------------------------------------------------------
 // Memory
@@ -197,7 +180,7 @@ pub fn encoder_cost(level: i32, dict: Option<&Dict>) -> usize {
     if let Some(cost) = costs.lock_unpoisoned().get(&key) {
         return *cost;
     }
-    let cost = StreamEncoder::context(level, STREAM_WINDOW_LOG, dict)
+    let cost = StreamEncoder::context(level, dict)
         .ok()
         .and_then(|mut context| {
             compress_chunk(
@@ -223,7 +206,7 @@ pub fn decoder_cost(dict: Option<&Arc<Dict>>) -> usize {
         return *cost;
     }
     let accept = dict.map_or(Accept::None, |dict| Accept::One(Arc::clone(dict)));
-    let cost = StreamEncoder::context(1, STREAM_WINDOW_LOG, dict.map(AsRef::as_ref))
+    let cost = StreamEncoder::context(1, dict.map(AsRef::as_ref))
         .ok()
         .and_then(|mut context| {
             let payload = compress_chunk(
@@ -233,7 +216,7 @@ pub fn decoder_cost(dict: Option<&Arc<Dict>>) -> usize {
                 ZSTD_EndDirective::ZSTD_e_flush,
             )
             .ok()?;
-            let mut decoder = Inflater::new(accept, STREAM_WINDOW_LOG);
+            let mut decoder = Inflater::new(accept);
             decoder.decode(&payload, 1).ok()?;
             decoder.context.as_ref().map(DCtx::sizeof)
         })
@@ -272,13 +255,13 @@ pub struct StreamEncoder {
 }
 
 impl StreamEncoder {
-    /// A context that writes the chunks of magicless frames with a `2^window_log` window and no
-    /// checksum or content size, starting every frame from `dict` if set.
-    fn context(level: i32, window_log: u32, dict: Option<&Dict>) -> Result<CCtx<'static>> {
+    /// A context that writes the chunks of magicless frames with the stream compression window
+    /// and no checksum or content size, starting every frame from `dict` if set.
+    fn context(level: i32, dict: Option<&Dict>) -> Result<CCtx<'static>> {
         let mut context = CCtx::try_create().ok_or_else(|| zstd_error(0))?;
         for parameter in [
             CParameter::CompressionLevel(level),
-            CParameter::WindowLog(window_log),
+            CParameter::WindowLog(STREAM_WINDOW_LOG),
             CParameter::ChecksumFlag(false),
             CParameter::ContentSizeFlag(false),
             CParameter::DictIdFlag(true),
@@ -338,27 +321,25 @@ fn compress_chunk(
     }
 }
 
-/// How a direction learns that the receiver enabled stream compression: the window it decodes,
-/// zero until then.
+/// How a direction learns that the receiver enabled stream compression.
 #[derive(Debug, Default)]
-pub struct StreamEnable(AtomicU32);
+pub struct StreamEnable(AtomicBool);
 
 impl StreamEnable {
-    /// A direction the receiver enabled already, with `window_log`.
-    pub fn enabled(window_log: u32) -> Arc<Self> {
-        Arc::new(Self(AtomicU32::new(window_log)))
+    /// A direction the receiver enabled already.
+    pub fn enabled() -> Arc<Self> {
+        Arc::new(Self(AtomicBool::new(true)))
     }
 
-    /// Records the receiver's answer, if it enables anything.
-    pub fn enable(&self, info: Option<&wire::StreamCompression>) {
-        if let Some(window) = sending_window(info) {
-            self.0.store(window, Ordering::Release);
+    /// Records the receiver's answer, if it enables the direction.
+    pub fn enable(&self, enabled: bool) {
+        if enabled {
+            self.0.store(true, Ordering::Release);
         }
     }
 
-    fn window_log(&self) -> Option<u32> {
-        let window = self.0.load(Ordering::Acquire);
-        (window != 0).then_some(window)
+    fn is_enabled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -405,10 +386,10 @@ impl StreamSender {
         self.sent = self.sent.saturating_add(1);
         if matches!(self.state, SenderState::Waiting)
             && self.sent >= FIRST_STREAMED_MESSAGE
-            && let Some(window_log) = self.enable.window_log()
+            && self.enable.is_enabled()
         {
             self.state = self
-                .start(window_log, dict)
+                .start(dict)
                 .map_or(SenderState::Off, SenderState::Active);
         }
         let SenderState::Active(encoder) = &mut self.state else {
@@ -420,9 +401,9 @@ impl StreamSender {
         payload.map_err(|_| self.state = SenderState::Off).ok()
     }
 
-    fn start(&self, window_log: u32, dict: Option<&Dict>) -> Option<StreamEncoder> {
+    fn start(&self, dict: Option<&Dict>) -> Option<StreamEncoder> {
         let reservation = self.budget.reserve(encoder_cost(self.level, dict))?;
-        let context = StreamEncoder::context(self.level, window_log, dict).ok()?;
+        let context = StreamEncoder::context(self.level, dict).ok()?;
         Some(StreamEncoder {
             context,
             in_frame: 0,
@@ -519,20 +500,16 @@ pub(super) fn next_block(data: &[u8], pos: usize) -> Option<(usize, bool)> {
 ///
 /// With `at_frame_start`, no frame is open, so a non-empty chunk must start with a frame header:
 /// one without `Single_Segment_flag`, `Frame_Content_Size_flag`, `Content_Checksum_flag` or the
-/// reserved bit, whose window is at most `2^max_window_log`. The chunk must then be whole blocks,
+/// reserved bit, whose window is at most 64 KiB. The chunk must then be whole blocks,
 /// and a `Last_Block` ends it. An empty chunk is an empty message and changes nothing. Block
 /// contents are not checked; decompression does that.
-pub fn parse_stream_chunk(
-    chunk: &[u8],
-    at_frame_start: bool,
-    max_window_log: u32,
-) -> Option<StreamChunk> {
+pub fn parse_stream_chunk(chunk: &[u8], at_frame_start: bool) -> Option<StreamChunk> {
     let mut result = StreamChunk::default();
     if chunk.is_empty() {
         return Some(result);
     }
     let mut pos = if at_frame_start {
-        let (header_len, dict_id) = parse_frame_header(chunk, max_window_log)?;
+        let (header_len, dict_id) = parse_frame_header(chunk)?;
         result.dict_id = dict_id;
         result.starts_frame = true;
         header_len
@@ -551,7 +528,7 @@ pub fn parse_stream_chunk(
 }
 
 /// Validates the frame header that opens `chunk` and returns its length and `Dictionary_ID`.
-fn parse_frame_header(chunk: &[u8], max_window_log: u32) -> Option<(usize, u32)> {
+fn parse_frame_header(chunk: &[u8]) -> Option<(usize, u32)> {
     let (&descriptor, rest) = chunk.split_first()?;
     // Frame_Content_Size_flag (bits 7-6), Single_Segment_flag (bit 5), the reserved bit (bit 3)
     // and Content_Checksum_flag (bit 2) must be unset.
@@ -562,7 +539,7 @@ fn parse_frame_header(chunk: &[u8], max_window_log: u32) -> Option<(usize, u32)>
     let &window = rest.first()?;
     let base = 1_u64.checked_shl(u32::from(window >> 3).checked_add(10)?)?;
     let size = base.checked_add((base / 8).checked_mul(u64::from(window & 7))?)?;
-    if size > 1_u64.checked_shl(max_window_log)? {
+    if size > 1_u64 << STREAM_WINDOW_LOG {
         return None;
     }
     let dict_id_len: usize = match descriptor & 0x03 {
@@ -580,7 +557,6 @@ fn parse_frame_header(chunk: &[u8], max_window_log: u32) -> Option<(usize, u32)>
 pub struct Inflater {
     /// The dictionaries a frame may start from.
     accept: Accept,
-    max_window_log: u32,
     /// The context of the open frame, created when a frame starts.
     context: Option<DCtx<'static>>,
     at_frame_start: bool,
@@ -598,12 +574,10 @@ impl std::fmt::Debug for Inflater {
 }
 
 impl Inflater {
-    /// A receiver that decodes windows up to `2^max_window_log` and frames starting from the
-    /// dictionaries `accept` holds.
-    pub fn new(accept: Accept, max_window_log: u32) -> Self {
+    /// A receiver that decodes frames starting from the dictionaries `accept` holds.
+    pub fn new(accept: Accept) -> Self {
         Self {
             accept,
-            max_window_log,
             context: None,
             at_frame_start: true,
             count: MessageCount::default(),
@@ -643,8 +617,7 @@ impl Inflater {
             return Err(Rejected::TooLarge { len, max: max_size });
         }
         let chunk = payload.get(size_len..).ok_or_else(invalid)?;
-        let parsed = parse_stream_chunk(chunk, self.at_frame_start, self.max_window_log)
-            .ok_or_else(invalid)?;
+        let parsed = parse_stream_chunk(chunk, self.at_frame_start).ok_or_else(invalid)?;
         if chunk.is_empty() {
             return if len == 0 {
                 self.count.add();
@@ -689,7 +662,7 @@ impl Inflater {
         let mut context = DCtx::try_create().ok_or_else(|| failed(0))?;
         for parameter in [
             DParameter::Format(FrameFormat::Magicless),
-            DParameter::WindowLogMax(self.max_window_log),
+            DParameter::WindowLogMax(STREAM_WINDOW_LOG),
         ] {
             context.set_parameter(parameter).map_err(failed)?;
         }
@@ -712,8 +685,8 @@ impl Inflater {
 /// What stream compression negotiation decided for one server call.
 #[derive(Debug, Default)]
 pub struct ServerStream {
-    /// The answer the call's HEADERS carry, when the server enabled stream-compressed requests.
-    pub answer: Option<wire::StreamCompression>,
+    /// The server enabled stream-compressed requests, which the call's ANSWER says.
+    pub answer: bool,
     /// The decompressing state of the request messages, when enabled.
     pub requests: Option<Inflater>,
     /// The compressing state of the response messages, when the client enabled them.
@@ -725,9 +698,8 @@ pub struct ServerStream {
 /// Answers the request's stream compression offer for the directions of the route that may use
 /// it, within `budget`. A request that does not offer gets nothing: its client cannot use it.
 ///
-/// An optimistic request may stream-compress its requests from the start with its own window, so
-/// it gets them only if the server decodes that window; otherwise the server refuses the call
-/// (see [`refuses_optimistic`]).
+/// An optimistic request may stream-compress its requests from the start; if the server cannot
+/// decode them, it refuses the call (see [`refuses_optimistic`]).
 pub fn negotiate_stream(
     request: &crate::RpcRequest,
     directions: CompressStream,
@@ -735,33 +707,28 @@ pub fn negotiate_stream(
     config: Option<&Arc<CompressionConfig>>,
 ) -> ServerStream {
     let mut stream = ServerStream::default();
-    let (Some(window_log), Some(budget)) =
-        (sending_window(request.stream_compression.as_ref()), budget)
+    let Some(budget) =
+        budget.filter(|_| request.stream_compression() != wire::StreamCompression::None)
     else {
         return stream;
     };
     if directions.responses {
         stream.responses = Some(StreamSender::new(
-            StreamEnable::enabled(window_log),
+            StreamEnable::enabled(),
             Arc::clone(budget),
             CompressionConfig::level(config),
         ));
     }
-    // An optimistic client compresses with its own window, which may be too wide to decode.
-    let too_wide = request
-        .stream_compression
-        .is_some_and(|offer| offer.optimistic && offer.max_window_log > STREAM_WINDOW_LOG);
     if directions.requests
-        && !too_wide
         && let Some(reservation) = budget.reserve(server_decoder_cost(config))
     {
         stream.count = MessageCount::new();
         stream.requests = Some(
-            Inflater::new(Accept::server(config), STREAM_WINDOW_LOG)
+            Inflater::new(Accept::server(config))
                 .with_reservation(reservation)
                 .with_count(stream.count.clone()),
         );
-        stream.answer = Some(advertised());
+        stream.answer = true;
     }
     stream
 }
@@ -769,10 +736,7 @@ pub fn negotiate_stream(
 /// Whether the server refuses `request`: it is optimistic, but negotiation did not enable its
 /// stream-compressed requests (`stream`), so the server cannot decode what the client sends.
 pub fn refuses_optimistic(request: &crate::RpcRequest, stream: &ServerStream) -> bool {
-    request
-        .stream_compression
-        .is_some_and(|offer| offer.optimistic)
-        && stream.requests.is_none()
+    request.stream_compression() == wire::StreamCompression::Optimistic && stream.requests.is_none()
 }
 
 /// What stream compression negotiation decided for one client call.
@@ -816,15 +780,16 @@ pub fn offer_stream(
         let Some(reservation) = budget.reserve(decoder_cost(dict)) else {
             return stream;
         };
-        stream.responses =
-            Some(Inflater::new(accept.clone(), STREAM_WINDOW_LOG).with_reservation(reservation));
+        stream.responses = Some(Inflater::new(accept.clone()).with_reservation(reservation));
     }
-    let mut offer = advertised();
+    let mut offer = wire::StreamCompression::Enabled;
     if directions.requests {
         stream.optimistic = optimistic;
-        offer.optimistic = optimistic;
+        if optimistic {
+            offer = wire::StreamCompression::Optimistic;
+        }
         let enable = if optimistic {
-            StreamEnable::enabled(STREAM_WINDOW_LOG)
+            StreamEnable::enabled()
         } else {
             Arc::new(StreamEnable::default())
         };
@@ -835,7 +800,7 @@ pub fn offer_stream(
         ));
         stream.enable_requests = Some(enable);
     }
-    request.stream_compression = Some(offer);
+    request.set_stream_compression(offer);
     stream
 }
 
@@ -846,10 +811,11 @@ mod tests {
     use super::*;
     use crate::compression::tests::{config, vectors};
     use crate::framing::frame_type;
-    use crate::{RpcHeaders, RpcRequest};
+    use crate::{RpcAnswer, RpcRequest};
+    use wire::StreamCompression as Offer;
 
     fn inflater() -> Inflater {
-        Inflater::new(Accept::server(Some(&config())), STREAM_WINDOW_LOG)
+        Inflater::new(Accept::server(Some(&config())))
     }
 
     /// The payloads and messages of the golden sequence `name`, in order.
@@ -905,7 +871,7 @@ mod tests {
     #[test]
     fn a_seeded_frame_needs_an_accepted_dictionary() {
         let (payload, _) = sequence("seeded").swap_remove(0);
-        let mut receiver = Inflater::new(Accept::None, STREAM_WINDOW_LOG);
+        let mut receiver = Inflater::new(Accept::None);
         assert!(matches!(
             receiver.decode(&payload, 1 << 20),
             Err(Rejected::Invalid(_))
@@ -920,7 +886,7 @@ mod tests {
         for (name, dict) in [("plain", None), ("seeded", Some(dict.as_ref()))] {
             let budget = StreamBudget::new(usize::MAX).unwrap();
             let mut encoder = StreamEncoder {
-                context: StreamEncoder::context(1, STREAM_WINDOW_LOG, dict).unwrap(),
+                context: StreamEncoder::context(1, dict).unwrap(),
                 in_frame: 0,
                 _reservation: budget.reserve(0).unwrap(),
             };
@@ -938,32 +904,28 @@ mod tests {
     fn the_negotiation_fields_match_the_golden_vectors() {
         let vectors = vectors();
         let mut request = RpcRequest::new("/svc/m");
-        request.stream_compression = Some(advertised());
+        request.set_stream_compression(Offer::Enabled);
         assert_eq!(
             request.encode_to_vec(),
             vectors["request.stream_compression.payload"]
         );
-        let headers = RpcHeaders {
-            stream_compression: Some(advertised()),
-            ..RpcHeaders::default()
+        let answer = RpcAnswer {
+            stream_compression: true,
+            ..RpcAnswer::default()
         };
         assert_eq!(
-            headers.encode_to_vec(),
-            vectors["headers.stream_compression.payload"]
+            answer.encode_to_vec(),
+            vectors["answer.stream_compression.payload"]
         );
-        assert_eq!(
-            crate::framing::decode_payload::<RpcHeaders>(
-                &vectors["headers.stream_compression.payload"]
+        assert!(
+            crate::framing::decode_payload::<RpcAnswer>(
+                &vectors["answer.stream_compression.payload"]
             )
             .unwrap()
-            .stream_compression,
-            Some(advertised())
+            .stream_compression
         );
 
-        request.stream_compression = Some(wire::StreamCompression {
-            optimistic: true,
-            ..advertised()
-        });
+        request.set_stream_compression(Offer::Optimistic);
         assert_eq!(
             request.encode_to_vec(),
             vectors["request.optimistic_stream_compression.payload"]
@@ -986,20 +948,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn windows_below_the_minimum_enable_nothing() {
-        let window = |max_window_log| {
-            sending_window(Some(&wire::StreamCompression {
-                max_window_log,
-                optimistic: false,
-            }))
-        };
-        assert_eq!(window(9), None);
-        assert_eq!(window(10), Some(10));
-        assert_eq!(window(20), Some(STREAM_WINDOW_LOG));
-        assert_eq!(sending_window(None), None);
-    }
-
     fn message(i: usize) -> Bytes {
         Bytes::from(format!(
             r#"{{"service":"search","region":"us-east-1","status":404,"latency_ms":{}}}"#,
@@ -1020,7 +968,7 @@ mod tests {
         let mut types = Vec::new();
         for i in 0..6 {
             if i == 3 {
-                enable.enable(Some(&advertised()));
+                enable.enable(true);
             }
             let (frame_type, payload) = encoder.encode(message(i));
             if frame_type == frame_type::ZSTD_STREAM_MESSAGE {
@@ -1042,10 +990,9 @@ mod tests {
         let plain = CompressionConfig::plain_only();
         let dict = Arc::clone(plain.dict(0).unwrap());
         let budget = StreamBudget::new(64 << 20).unwrap();
-        let mut encoder = MessageEncoder::new(Some(Arc::clone(&dict))).with_stream(Some(
-            StreamSender::new(StreamEnable::enabled(STREAM_WINDOW_LOG), budget, 1),
-        ));
-        let mut receiver = Inflater::new(Accept::One(dict), STREAM_WINDOW_LOG);
+        let mut encoder = MessageEncoder::new(Some(Arc::clone(&dict)))
+            .with_stream(Some(StreamSender::new(StreamEnable::enabled(), budget, 1)));
+        let mut receiver = Inflater::new(Accept::One(dict));
         let long = |i: usize| Bytes::from(message(i).repeat(5));
         let mut types = Vec::new();
         for i in 0..4 {
@@ -1053,7 +1000,7 @@ mod tests {
             if frame_type == frame_type::ZSTD_STREAM_MESSAGE {
                 // The context starts from nothing, not from a "dictionary" with ID 0.
                 let chunk = &payload[varint::decode(&payload).unwrap().1..];
-                let parsed = parse_stream_chunk(chunk, i == 2, STREAM_WINDOW_LOG).unwrap();
+                let parsed = parse_stream_chunk(chunk, i == 2).unwrap();
                 assert_eq!(parsed.dict_id, 0);
                 assert_eq!(receiver.decode(&payload, 1 << 20).unwrap(), long(i));
             }
@@ -1069,7 +1016,7 @@ mod tests {
     fn a_spent_budget_keeps_the_direction_per_message() {
         let budget = StreamBudget::new(1).unwrap();
         let mut encoder = MessageEncoder::new(None).with_stream(Some(StreamSender::new(
-            StreamEnable::enabled(STREAM_WINDOW_LOG),
+            StreamEnable::enabled(),
             budget,
             1,
         )));
@@ -1094,7 +1041,7 @@ mod tests {
     fn an_empty_message_is_an_empty_chunk_even_before_the_frame_header() {
         let budget = StreamBudget::new(64 << 20).unwrap();
         let mut encoder = StreamEncoder {
-            context: StreamEncoder::context(1, STREAM_WINDOW_LOG, None).unwrap(),
+            context: StreamEncoder::context(1, None).unwrap(),
             in_frame: 0,
             _reservation: budget.reserve(0).unwrap(),
         };
@@ -1113,7 +1060,7 @@ mod tests {
         for dict in [None, Some(dict.as_ref())] {
             let budget = StreamBudget::new(usize::MAX).unwrap();
             let mut encoder = StreamEncoder {
-                context: StreamEncoder::context(1, STREAM_WINDOW_LOG, dict).unwrap(),
+                context: StreamEncoder::context(1, dict).unwrap(),
                 in_frame: 0,
                 _reservation: budget.reserve(0).unwrap(),
             };
@@ -1128,9 +1075,7 @@ mod tests {
                     .collect();
                 let payload = encoder.encode(&message).unwrap();
                 let (_, size_len) = varint::decode(&payload).unwrap();
-                let chunk =
-                    parse_stream_chunk(&payload[size_len..], at_frame_start, STREAM_WINDOW_LOG)
-                        .unwrap();
+                let chunk = parse_stream_chunk(&payload[size_len..], at_frame_start).unwrap();
                 if chunk.starts_frame {
                     frames += 1;
                     assert_eq!(
@@ -1168,14 +1113,14 @@ mod tests {
     fn servers_answer_only_offers_for_the_directions_the_route_allows() {
         let budget = StreamBudget::new(64 << 20);
         let mut offer = RpcRequest::new("/svc/m");
-        offer.stream_compression = Some(advertised());
+        offer.set_stream_compression(Offer::Enabled);
 
         let both = negotiate_stream(&offer, CompressStream::BOTH, budget.as_ref(), None);
-        assert_eq!(both.answer, Some(advertised()));
+        assert!(both.answer);
         assert!(both.requests.is_some() && both.responses.is_some());
 
         let responses = negotiate_stream(&offer, CompressStream::RESPONSES, budget.as_ref(), None);
-        assert!(responses.answer.is_none() && responses.responses.is_some());
+        assert!(!responses.answer && responses.responses.is_some());
 
         let no_offer = negotiate_stream(
             &RpcRequest::new("/svc/m"),
@@ -1183,49 +1128,39 @@ mod tests {
             budget.as_ref(),
             None,
         );
-        assert!(no_offer.answer.is_none() && no_offer.responses.is_none());
+        assert!(!no_offer.answer && no_offer.responses.is_none());
 
         let disabled = negotiate_stream(&offer, CompressStream::BOTH, None, None);
-        assert!(disabled.answer.is_none() && disabled.responses.is_none());
+        assert!(!disabled.answer && disabled.responses.is_none());
 
         let spent = StreamBudget::new(1);
         let spent = negotiate_stream(&offer, CompressStream::BOTH, spent.as_ref(), None);
-        assert!(spent.answer.is_none(), "no room for the request context");
+        assert!(!spent.answer, "no room for the request context");
     }
 
     #[test]
     fn servers_refuse_optimistic_requests_they_cannot_decode() {
         let budget = StreamBudget::new(64 << 20);
-        let optimistic = |max_window_log| {
-            let mut request = RpcRequest::new("/svc/m");
-            request.stream_compression = Some(wire::StreamCompression {
-                max_window_log,
-                optimistic: true,
-            });
-            request
-        };
-        let accepted =
-            negotiate_stream(&optimistic(16), CompressStream::BOTH, budget.as_ref(), None);
-        assert_eq!(accepted.answer, Some(advertised()));
-        assert!(!refuses_optimistic(&optimistic(16), &accepted));
+        let mut optimistic = RpcRequest::new("/svc/m");
+        optimistic.set_stream_compression(Offer::Optimistic);
+        let accepted = negotiate_stream(&optimistic, CompressStream::BOTH, budget.as_ref(), None);
+        assert!(accepted.answer);
+        assert!(!refuses_optimistic(&optimistic, &accepted));
 
-        // A window wider than the server decodes, a route that does not decode requests, and a
-        // server without memory all refuse.
-        let wide = negotiate_stream(&optimistic(17), CompressStream::BOTH, budget.as_ref(), None);
-        assert!(refuses_optimistic(&optimistic(17), &wide));
+        // A route that does not decode requests and a server without memory both refuse.
         let responses = negotiate_stream(
-            &optimistic(16),
+            &optimistic,
             CompressStream::RESPONSES,
             budget.as_ref(),
             None,
         );
-        assert!(refuses_optimistic(&optimistic(16), &responses));
-        let disabled = negotiate_stream(&optimistic(16), CompressStream::BOTH, None, None);
-        assert!(refuses_optimistic(&optimistic(16), &disabled));
+        assert!(refuses_optimistic(&optimistic, &responses));
+        let disabled = negotiate_stream(&optimistic, CompressStream::BOTH, None, None);
+        assert!(refuses_optimistic(&optimistic, &disabled));
 
         // Calls that are not optimistic are never refused.
         let mut offer = RpcRequest::new("/svc/m");
-        offer.stream_compression = Some(advertised());
+        offer.set_stream_compression(Offer::Enabled);
         let plain = negotiate_stream(&offer, CompressStream::RESPONSES, budget.as_ref(), None);
         assert!(!refuses_optimistic(&offer, &plain));
     }
@@ -1243,13 +1178,7 @@ mod tests {
             true,
         );
         assert!(stream.optimistic);
-        assert_eq!(
-            request.stream_compression,
-            Some(wire::StreamCompression {
-                optimistic: true,
-                ..advertised()
-            })
-        );
+        assert_eq!(request.stream_compression(), Offer::Optimistic);
         let mut encoder = MessageEncoder::new(None).with_stream(stream.requests);
         let types: Vec<u64> = (0..4).map(|i| encoder.encode(message(i)).0).collect();
         assert_eq!(types, [0, 0, 5, 5]);
@@ -1265,7 +1194,7 @@ mod tests {
             true,
         );
         assert!(!stream.optimistic);
-        assert_eq!(request.stream_compression, Some(advertised()));
+        assert_eq!(request.stream_compression(), Offer::Enabled);
     }
 
     #[test]
@@ -1280,7 +1209,7 @@ mod tests {
             1,
             false,
         );
-        assert_eq!(request.stream_compression, Some(advertised()));
+        assert_eq!(request.stream_compression(), Offer::Enabled);
         assert!(stream.responses.is_some() && stream.requests.is_some());
 
         // A client-streaming method offers without reserving a response context.
@@ -1293,7 +1222,7 @@ mod tests {
             1,
             false,
         );
-        assert!(request.stream_compression.is_some() && stream.responses.is_none());
+        assert!(request.stream_compression() == Offer::Enabled && stream.responses.is_none());
 
         // Without room for the response context there is no offer at all.
         let spent = StreamBudget::new(1);
@@ -1306,7 +1235,7 @@ mod tests {
             1,
             false,
         );
-        assert!(request.stream_compression.is_none() && stream.requests.is_none());
+        assert!(request.stream_compression() == Offer::None && stream.requests.is_none());
 
         let mut request = RpcRequest::new("/svc/m");
         let _ = offer_stream(
@@ -1317,6 +1246,6 @@ mod tests {
             1,
             false,
         );
-        assert!(request.stream_compression.is_none());
+        assert_eq!(request.stream_compression(), Offer::None);
     }
 }

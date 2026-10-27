@@ -50,7 +50,7 @@ impl Optimism {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Decision {
     Pending,
-    /// The call's HEADERS arrived, or it ended: nothing will be replayed.
+    /// The call's ANSWER arrived, or it ended: nothing will be replayed.
     Settled,
     /// The server refused the call: the replay owns the requests.
     Refused,

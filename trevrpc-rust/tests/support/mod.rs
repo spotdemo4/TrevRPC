@@ -304,13 +304,7 @@ pub async fn write_status<S: RawSend>(send: &mut S, status: Status) -> Result<()
 pub async fn write_headers<S: RawSend>(send: &mut S, metadata: Metadata) -> Result<()> {
     send.write_all(&framing::encode_protobuf_frame(
         frame_type::HEADERS,
-        &RpcHeaders {
-            metadata,
-            extensions: Vec::new(),
-            dictionaries: Vec::new(),
-            stream_compression: None,
-            connection_metadata: 0,
-        },
+        &RpcHeaders { metadata },
         DEFAULT_MAX_FRAME_SIZE,
     )?)
     .await

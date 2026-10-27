@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // greaseFrame is a frame of a reserved grease type with size payload bytes.
@@ -30,7 +32,7 @@ func statusBytes(t testing.TB, status *Status) []byte {
 // headersBytes is a HEADERS frame.
 func headersBytes(t testing.TB, metadata Metadata) []byte {
 	t.Helper()
-	frame, err := appendHeadersFrame(nil, metadata, headersAnswer{}, DefaultMaxFrameSize)
+	frame, err := appendHeadersFrame(nil, metadata, DefaultMaxFrameSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +116,7 @@ func TestServerSkipsUnknownFramesEverywhere(t *testing.T) {
 			method := map[RPCKind]string{RPCKindClientStreaming: "Concat", RPCKindBidirectionalStreaming: "Chat"}[kind]
 			request := testRequestBytes(t, requestFor(method, kind))
 			input := concat(grease, request, greaseTwoByte, messageBytes(encodedTestMessage(t, "a")), grease,
-				messageBytes(encodedTestMessage(t, "b")), greaseEmpty, statusBytes(t, OK()), greaseTwoByte)
+				messageBytes(encodedTestMessage(t, "b")), greaseEmpty, greaseTwoByte)
 			_, frames := serveTestStream(t, server, input)
 			if kind == RPCKindClientStreaming {
 				requireReply(t, frames, "ab")
@@ -145,6 +147,10 @@ func TestServerRejectsKnownFramesOutOfPlace(t *testing.T) {
 	one, two := messageBytes(""), messageBytes("x")
 	headers := headersBytes(t, Metadata{"x-a": []byte("1")})
 	status := statusBytes(t, OK())
+	answer, err := appendAnswerFrame(nil, &wireAnswer{}, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name  string
@@ -167,6 +173,12 @@ func TestServerRejectsKnownFramesOutOfPlace(t *testing.T) {
 		{name: "client streaming with headers", input: concat(concatRequest, headers), handler: true},
 		{name: "client streaming with a second REQUEST", input: concat(concatRequest, concatRequest), handler: true},
 		{name: "bidirectional with headers", input: concat(chatRequest, headers), handler: true},
+		{name: "unary with answer", input: concat(unary, answer, one)},
+		{name: "client streaming with answer", input: concat(concatRequest, one, answer), handler: true},
+		// A request side ends with FIN alone: a STATUS is out of place, OK or not.
+		{name: "client streaming with status", input: concat(concatRequest, one, status), handler: true},
+		{name: "client streaming with failed status", input: concat(concatRequest, one, statusBytes(t, Cancelled("stop"))), handler: true},
+		{name: "bidirectional with status", input: concat(chatRequest, status), handler: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -349,11 +361,20 @@ func (s *notifyingStream) Recv() (*testMessage, error) {
 
 func (*notifyingStream) Close() error { return nil }
 
-func TestServerIgnoresRequestExtensions(t *testing.T) {
+// TestServerIgnoresUnknownRequestFields checks that a REQUEST field the
+// server does not know, such as a later feature's announcement, is ignored.
+func TestServerIgnoresUnknownRequestFields(t *testing.T) {
 	server := newProtocolTestServer()
 	request := requestFor("Echo", RPCKindUnary)
-	request.Extensions = []uint64{1, 300}
-	_, frames := serveTestStream(t, server, testRequestBytes(t, request, encodedTestMessage(t, "hi")))
+	payload, ok := request.payloadSize()
+	if !ok {
+		t.Fatal("request not handled by the codec")
+	}
+	extra := protowire.AppendVarint(protowire.AppendTag(nil, 15, protowire.VarintType), 300)
+	frame := appendFrameHeader(nil, frameTypeRequest, payload+len(extra))
+	frame = append(request.appendPayload(frame), extra...)
+	frame = append(frame, rawMessage([]byte(encodedTestMessage(t, "hi"))).frame...)
+	_, frames := serveTestStream(t, server, frame)
 	requireReply(t, frames, "hi")
 }
 

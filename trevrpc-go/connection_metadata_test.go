@@ -286,9 +286,9 @@ func TestALateConfirmationOfAReplacedSetIsIgnored(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := client.prepare(newWireRequest("/svc/m"))
-	client.learn(second, headersAnswer{connectionMetadata: second})
-	// The first call's HEADERS arrive last.
-	client.learn(first, headersAnswer{connectionMetadata: first})
+	client.learn(second, wireAnswer{ConnectionMetadata: second})
+	// The first call's ANSWER arrives last.
+	client.learn(first, wireAnswer{ConnectionMetadata: first})
 	if got := client.confirmed.Load(); got != second {
 		t.Fatalf("confirmed set = %d after a late confirmation of %d, want %d", got, first, second)
 	}

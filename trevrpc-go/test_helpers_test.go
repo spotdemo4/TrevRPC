@@ -337,11 +337,10 @@ type testFrame struct {
 	Request *wireRequest
 	Body    []byte
 	Headers Metadata
-	// headersConnectionMetadata is the connection metadata set a HEADERS
-	// frame confirms.
-	headersConnectionMetadata uint32
-	Status                    uint32
-	Message                   string
+	// Answer is the payload of an ANSWER frame.
+	Answer  wireAnswer
+	Status  uint32
+	Message string
 	// Metadata is the trailing metadata of a STATUS frame.
 	Metadata Metadata
 }
@@ -362,11 +361,17 @@ func decodeTestFrame(next frame) (testFrame, error) {
 	case frameTypeMessage:
 		decoded.Body = next.payload
 	case frameTypeHeaders:
-		headers, answer, err := decodeHeaders(next.payload)
+		headers, err := decodeHeaders(next.payload)
 		if err != nil {
 			return testFrame{}, err
 		}
-		decoded.Headers, decoded.headersConnectionMetadata = headers, answer.connectionMetadata
+		decoded.Headers = headers
+	case frameTypeAnswer:
+		answer, err := decodeAnswer(next.payload)
+		if err != nil {
+			return testFrame{}, err
+		}
+		decoded.Answer = answer
 	case frameTypeStatus:
 		var status wireStatus
 		if err := decodePayload(next.payload, &status); err != nil {
@@ -658,8 +663,8 @@ func (s *Server) handleStreamingWriter(ctx context.Context, request *wireRequest
 	return &dispatchedResponse{responseWriter: response, headers: dispatched.Bytes()}
 }
 
-// dispatchedResponse is a response whose HEADERS went out at dispatch: they
-// lead its first write.
+// dispatchedResponse is a response whose ANSWER went out at dispatch: it
+// leads its first write.
 type dispatchedResponse struct {
 	responseWriter
 	headers []byte

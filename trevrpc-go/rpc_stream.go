@@ -511,8 +511,8 @@ func writeStatusAndAbort(stream rpcStream, status *Status, maxFrameSize int, slo
 }
 
 // rpcRequestStream yields the MESSAGE payloads of a client-streaming or
-// bidirectional request. A request STATUS ends the stream: OK as io.EOF and any
-// other status as an error.
+// bidirectional request, until the request side ends. Any other known frame is
+// InvalidArgument.
 type rpcRequestStream struct {
 	reader              *frameReader
 	cancelReadOnContext func(context.Context) func()
@@ -524,7 +524,7 @@ type rpcRequestStream struct {
 	// than Recv, and the connection handler reads ended after the response.
 	done atomic.Bool
 	// ended is set once the client finished its request side: the stream
-	// reached its end or carried an OK STATUS.
+	// reached its end.
 	ended atomic.Bool
 }
 
@@ -573,25 +573,11 @@ func (s *rpcRequestStream) receive(next frame, err error) ([]byte, error) {
 		return nil, transportStatus(err)
 	}
 
-	switch next.typ {
-	case frameTypeMessage:
-		return next.payload, nil
-	case frameTypeStatus:
-		s.done.Store(true)
-		status, err := decodeStatus(next.payload)
-		if err != nil {
-			return nil, transportStatus(err)
-		}
-		if status.IsOK() {
-			s.ended.Store(true)
-			return nil, io.EOF
-		}
-
-		return nil, status
-	default:
+	if next.typ != frameTypeMessage {
 		s.done.Store(true)
 		return nil, InvalidArgument(fmt.Sprintf("request stream carried %s after REQUEST", next.typ))
 	}
+	return next.payload, nil
 }
 
 func (s *rpcRequestStream) Close() error {

@@ -3,6 +3,7 @@ package trevrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -182,8 +183,8 @@ func (c *streamClient) streamingCall(
 	// would have to move its flow to the new call.
 	optimistic := setter != nil && streams.requestCompressor() != nil && flow == nil && !c.pessimistic.Load()
 	if optimistic {
-		request.StreamCompression.Optimistic = true
-		streams.requests.enable(int(request.StreamCompression.MaxWindowLog))
+		request.StreamCompression = streamCompressionOptimistic
+		streams.requests.enable()
 	}
 	header, err := appendRequestFrame(nil, request, c.maxFrameSize)
 	if err != nil {
@@ -353,12 +354,44 @@ type uploadAborter interface {
 }
 
 // pumpedFrame is what the pump read from the response: a frame, a decoded
-// STATUS, or the error that ended the stream.
+// STATUS or ANSWER, or the error that ended the stream.
 type pumpedFrame struct {
 	frame     frame
 	status    *Status
 	statusErr error
+	answer    wireAnswer
+	answerErr error
 	err       error
+}
+
+// readFrame reads the next frame and decodes it if it is a STATUS or an
+// ANSWER.
+func readFrame(reader *frameReader) pumpedFrame {
+	next, err := reader.next()
+	item := pumpedFrame{frame: next, err: err}
+	if err == nil {
+		switch next.typ {
+		case frameTypeStatus:
+			item.status, item.statusErr = decodeStatus(next.payload)
+		case frameTypeAnswer:
+			item.answer, item.answerErr = decodeAnswer(next.payload)
+		}
+	}
+	return item
+}
+
+// acceptsOptimistic reports whether item may be the first frame of the
+// response to an optimistic call that was not refused: a STATUS, or an ANSWER
+// accepting its stream-compressed requests.
+func (item pumpedFrame) acceptsOptimistic() bool {
+	switch item.frame.typ {
+	case frameTypeStatus:
+		return true
+	case frameTypeAnswer:
+		return item.answerErr == nil && item.answer.StreamCompression
+	default:
+		return false
+	}
 }
 
 // transportResponseStream reads the response frames of one call from its
@@ -376,16 +409,19 @@ type transportResponseStream struct {
 	maxFrameSize int
 	done         bool
 	// compression is the connection's compression state, and queried says
-	// the request asked the server for its dictionaries, so that the HEADERS
-	// of the response answer it.
+	// the request asked the server for its dictionaries, so that the ANSWER
+	// of the response answers it.
 	compression *clientCompression
 	queried     bool
 	// connection is the connection's connection metadata state, and offered
-	// the set the request offered, which the HEADERS of the response confirm.
+	// the set the request offered, which the ANSWER of the response confirms.
 	connection *clientConnectionMetadata
 	offered    uint32
-	// streams is the call's stream compression, nil without it. HEADERS
-	// enable its request direction.
+	// answerClosed is set once a frame other than ANSWER was delivered: the
+	// response may not carry an ANSWER from then on.
+	answerClosed bool
+	// streams is the call's stream compression, nil without it. ANSWER
+	// enables its request direction.
 	streams *clientStreams
 	// optimistic is the upload of a call that stream-compresses its requests
 	// optimistically, nil otherwise; it may replace stream. pessimistic is
@@ -470,31 +506,33 @@ func (s *transportResponseStream) pump() {
 				return
 			}
 		}
-		next, err := s.reader.next()
+		item := readFrame(s.reader)
 		if upload := s.optimistic; upload != nil && upload.undecided() {
-			if err == nil && isRefusal(next) {
+			if item.err == nil && item.statusErr == nil && item.frame.typ == frameTypeStatus && item.status.refusedStreamCompression {
 				// The server ran nothing for the call: it is replayed, and
 				// the refusal is not delivered.
-				if err = s.replayRefused(upload); err == nil {
+				err := s.replayRefused(upload)
+				if err == nil {
 					continue
 				}
-				next = frame{}
+				item = pumpedFrame{err: err}
 			} else {
 				upload.decide(false)
 				upload.settle()
+				if item.err == nil && !item.acceptsOptimistic() {
+					item = pumpedFrame{err: Internal(fmt.Sprintf("response to an optimistic call started with %s, not an ANSWER accepting it", item.frame.typ))}
+				}
 			}
 		}
-		item := pumpedFrame{frame: next, err: err}
+		err := item.err
 		switch {
-		case err == nil && next.typ == frameTypeHeaders && s.streams.requestCompressor() != nil:
+		case err == nil && item.frame.typ == frameTypeAnswer && item.answerErr == nil && s.streams.requestCompressor() != nil:
 			// The answer enables compressed requests, so it is read here, as
 			// soon as it arrives, not when Recv gets to it.
-			if _, answer, err := decodeHeaders(next.payload); err == nil {
-				s.streams.learn(answer.stream)
-				if answer.stream != nil {
-					// The server decodes again: later calls are optimistic.
-					s.pessimistic.Store(false)
-				}
+			s.streams.learn(item.answer)
+			if item.answer.StreamCompression {
+				// The server decodes again: later calls are optimistic.
+				s.pessimistic.Store(false)
 			}
 		case err != nil:
 			// The response direction ended: late datagrams are dropped.
@@ -504,14 +542,13 @@ func (s *transportResponseStream) pump() {
 			} else {
 				s.endUpload(nil)
 			}
-		case next.typ == frameTypeStatus:
+		case item.frame.typ == frameTypeStatus:
 			s.flow.endReceive()
-			item.status, item.statusErr = decodeStatus(next.payload)
 			if item.statusErr == nil {
 				s.endUpload(uploadEndError(item.status))
 			}
 		}
-		s.queued.Add(int64(len(next.payload)))
+		s.queued.Add(int64(len(item.frame.payload)))
 		select {
 		case s.frames <- item:
 		case <-s.pumpStop:
@@ -570,12 +607,7 @@ func (s *transportResponseStream) endUpload(err error) {
 // nextFrame returns the next known frame of the response.
 func (s *transportResponseStream) nextFrame() (pumpedFrame, error) {
 	if s.frames == nil {
-		next, err := s.reader.next()
-		item := pumpedFrame{frame: next, err: err}
-		if err == nil && next.typ == frameTypeStatus {
-			item.status, item.statusErr = decodeStatus(next.payload)
-		}
-		return item, nil
+		return readFrame(s.reader), nil
 	}
 	if s.sink != nil {
 		return s.nextMergedFrame()
@@ -607,9 +639,9 @@ func (s *transportResponseStream) takeFrame(item pumpedFrame) {
 
 // nextMergedFrame returns the next frame of a call that also receives its
 // response messages as datagrams: the pumped stream frames and the datagram
-// messages in the order they arrive. The messages wait until the first frame,
-// HEADERS if there is any, was delivered, and the messages queued when the
-// terminal frame arrives go before it. Messages that arrive after the stream
+// messages in the order they arrive. The messages wait until the first frame
+// after any ANSWER, HEADERS if there is any, was delivered, and the messages
+// queued when the terminal frame arrives go before it. Messages that arrive after the stream
 // ended were dropped by the pump.
 func (s *transportResponseStream) nextMergedFrame() (pumpedFrame, error) {
 	for {
@@ -635,7 +667,9 @@ func (s *transportResponseStream) nextMergedFrame() (pumpedFrame, error) {
 				return pumpedFrame{err: io.EOF}, nil
 			}
 			s.takeFrame(item)
-			s.gateOpen = true
+			if item.err != nil || item.frame.typ != frameTypeAnswer {
+				s.gateOpen = true
+			}
 			if item.err == nil && item.frame.typ != frameTypeStatus {
 				return item, nil
 			}
@@ -658,15 +692,43 @@ func datagramMessageFrame(message []byte) pumpedFrame {
 	return pumpedFrame{frame: frame{typ: frameTypeMessage, payload: message}}
 }
 
-// Recv returns the next known response frame. After the STATUS frame it keeps
-// reading, skipping unknown frames, so the end of the stream can be told from
-// more data: the next call returns io.EOF when the stream ended cleanly.
+// nextResponseFrame returns the next frame after any ANSWER, which it takes:
+// at most one ANSWER, before every other frame.
+func (s *transportResponseStream) nextResponseFrame() (pumpedFrame, error) {
+	for {
+		item, err := s.nextFrame()
+		if err != nil || item.err != nil || item.frame.typ != frameTypeAnswer {
+			if err == nil && item.err == nil {
+				s.answerClosed = true
+			}
+			return item, err
+		}
+		if s.answerClosed {
+			return pumpedFrame{}, Internal("response stream contained ANSWER after another frame")
+		}
+		s.answerClosed = true
+		if item.answerErr != nil {
+			return pumpedFrame{}, item.answerErr
+		}
+		if s.queried {
+			s.queried = false
+			s.compression.learn(item.answer.Dictionaries)
+		}
+		s.connection.learn(s.offered, item.answer)
+		s.offered = 0
+	}
+}
+
+// Recv returns the next known response frame other than ANSWER, whose answers
+// it records. After the STATUS frame it keeps reading, skipping unknown
+// frames, so the end of the stream can be told from more data: the next call
+// returns io.EOF when the stream ended cleanly.
 func (s *transportResponseStream) Recv() (responseFrame, error) {
 	if s.done {
 		return responseFrame{}, io.EOF
 	}
 
-	item, err := s.nextFrame()
+	item, err := s.nextResponseFrame()
 	if err != nil {
 		return responseFrame{}, err
 	}
@@ -677,7 +739,10 @@ func (s *transportResponseStream) Recv() (responseFrame, error) {
 			statusErr = callStatus(s.ctx, item.err)
 		}
 		s.finish(false)
-		if writerErr := s.writerError(false); writerErr != nil {
+		// A response that failed for a reason of its own, such as a protocol
+		// error, cancelled the upload: that cancellation is not the cause.
+		ownCause := !errors.Is(statusErr, io.EOF) && StatusFromError(statusErr).Code != CodeCancelled
+		if writerErr := s.writerError(ownCause); writerErr != nil {
 			return responseFrame{}, writerErr
 		}
 		return responseFrame{}, statusErr
@@ -687,16 +752,10 @@ func (s *transportResponseStream) Recv() (responseFrame, error) {
 	case frameTypeMessage:
 		return responseFrame{kind: frameTypeMessage, body: next.payload}, nil
 	case frameTypeHeaders:
-		headers, answer, err := decodeHeaders(next.payload)
+		headers, err := decodeHeaders(next.payload)
 		if err != nil {
 			return responseFrame{}, err
 		}
-		if s.queried {
-			s.queried = false
-			s.compression.learn(answer.dictionaries)
-		}
-		s.connection.learn(s.offered, answer)
-		s.offered = 0
 		return responseFrame{kind: frameTypeHeaders, headers: headers}, nil
 	case frameTypeStatus:
 		if item.statusErr != nil {

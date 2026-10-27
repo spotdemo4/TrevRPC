@@ -1,17 +1,16 @@
 // Stream compression: each direction of a call may compress its messages with one zstd context
 // that lasts as long as the call, sent as ZSTD_STREAM_MESSAGE frames (see the "Stream Compression"
 // section of the wire format). A client offers it in its REQUEST on methods that allow it, and
-// may compress its requests once the server's HEADERS answer, or from the start when it offers
+// may compress its requests once the server's ANSWER accepts them, or from the start when it offers
 // optimistically. Contexts hold memory for the whole call, so every channel has a budget for them.
 import { encodeMessage, parseStreamChunk } from "./compression.js";
 import { FrameType } from "./framing.js";
 import { internal, resourceExhausted } from "./status.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
+import { StreamCompression } from "./wire.js";
 
-/** The window, as a base-2 logarithm, the client's contexts use and its decoders accept. */
+/** The window of every stream context, as a base-2 logarithm: the wire format fixes it at 64 KiB. */
 const StreamWindowLog = 16;
-/** A peer advertising a smaller window enables nothing. */
-const MinStreamWindowLog = 10;
 /** A direction's context starts with this message; earlier ones are compressed per message. */
 const StreamCompressionStart = 3;
 
@@ -85,8 +84,8 @@ export class CallStreams {
   #accept;
   /** Whether the REQUEST offered stream compression. */
   #offered = false;
-  /** The window the server's answer allows request contexts, or 0 until it arrives. */
-  #requestWindowLog = 0;
+  /** Whether requests may be stream-compressed: the call is optimistic, or the server accepted. */
+  #requestsEnabled = false;
   #requestsSent = 0;
   /** Whether the request direction stays per-message for the rest of the call. */
   #requestsStopped = false;
@@ -123,25 +122,24 @@ export class CallStreams {
       }
       this.#releases.push(release);
     }
-    fields.streamCompression = { maxWindowLog: StreamWindowLog };
     this.#offered = true;
     if (
       optimistic &&
       this.#requests &&
       this.#budget.fits(this.#compression.streamEncoderCost(StreamWindowLog))
     ) {
-      fields.streamCompression.optimistic = true;
-      this.#requestWindowLog = StreamWindowLog;
+      fields.streamCompression = StreamCompression.Optimistic;
+      this.#requestsEnabled = true;
       return true;
     }
+    fields.streamCompression = StreamCompression.Enabled;
     return false;
   }
 
-  /** Records the server's answer from the response HEADERS. */
-  learn(answer) {
-    const windowLog = answer?.maxWindowLog ?? 0;
-    if (this.#offered && this.#requests && windowLog >= MinStreamWindowLog) {
-      this.#requestWindowLog = Math.min(StreamWindowLog, windowLog);
+  /** Records that the server's ANSWER accepted stream-compressed requests. */
+  accept() {
+    if (this.#offered && this.#requests) {
+      this.#requestsEnabled = true;
     }
   }
 
@@ -158,7 +156,7 @@ export class CallStreams {
     if (
       this.#encoder === undefined &&
       !this.#requestsStopped &&
-      this.#requestWindowLog > 0 &&
+      this.#requestsEnabled &&
       this.#requestsSent >= StreamCompressionStart
     ) {
       this.#startEncoder();
@@ -173,9 +171,7 @@ export class CallStreams {
   }
 
   #startEncoder() {
-    const release = this.#budget.reserve(
-      this.#compression.streamEncoderCost(this.#requestWindowLog),
-    );
+    const release = this.#budget.reserve(this.#compression.streamEncoderCost(StreamWindowLog));
     if (release === undefined) {
       this.#requestsStopped = true;
       return;
@@ -183,7 +179,7 @@ export class CallStreams {
     try {
       this.#encoder = this.#compression.streamEncoder(
         this.#session.requestDictionary(this.#requestType),
-        this.#requestWindowLog,
+        StreamWindowLog,
       );
     } catch {
       release();

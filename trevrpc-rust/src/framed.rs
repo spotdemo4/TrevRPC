@@ -15,8 +15,9 @@ use crate::connection_metadata::OfferedSet;
 use crate::framing::{
     self, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_payload, frame_type, is_known_frame_type,
 };
-use crate::wire::{DictionaryInfo, StreamCompression};
-use crate::{BoxStream, Error, Result, RpcHeaders, RpcRequest, RpcStatus, Status, varint};
+use crate::{
+    BoxStream, Error, Result, RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, Status, varint,
+};
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt};
 use prost::Message;
@@ -138,12 +139,6 @@ pub struct FrameChunks {
     scratch: BytesMut,
     chunks: Vec<Bytes>,
     max_frame_size: usize,
-    /// The answer to a dictionary query that the next HEADERS frame carries.
-    answer: Option<Vec<DictionaryInfo>>,
-    /// The answer to a stream compression offer that the next HEADERS frame carries.
-    stream_answer: Option<StreamCompression>,
-    /// The connection metadata set the next HEADERS frame confirms, or zero.
-    connection_answer: u32,
 }
 
 impl FrameChunks {
@@ -153,9 +148,6 @@ impl FrameChunks {
             scratch: BytesMut::with_capacity(scratch),
             chunks: Vec::new(),
             max_frame_size,
-            answer: None,
-            stream_answer: None,
-            connection_answer: 0,
         }
     }
 
@@ -207,14 +199,7 @@ impl FrameChunks {
         match frame {
             ResponseFrame::Message(body) => self.message(body, encoder),
             ResponseFrame::Headers(metadata) => {
-                let headers = RpcHeaders {
-                    metadata,
-                    extensions: Vec::new(),
-                    dictionaries: self.answer.take().unwrap_or_default(),
-                    stream_compression: self.stream_answer.take(),
-                    connection_metadata: std::mem::take(&mut self.connection_answer),
-                };
-                self.protobuf(frame_type::HEADERS, &headers)
+                self.protobuf(frame_type::HEADERS, &RpcHeaders { metadata })
             }
             ResponseFrame::Status(status) => {
                 self.protobuf(frame_type::STATUS, &RpcStatus::from(status))
@@ -228,8 +213,8 @@ impl FrameChunks {
     }
 }
 
-/// What a HEADERS or STATUS frame is expected to need in the scratch buffer. Larger frames grow
-/// it.
+/// What an ANSWER, HEADERS or STATUS frame is expected to need in the scratch buffer. Larger
+/// frames grow it.
 const FRAME_ESTIMATE: usize = 64;
 
 /// How a server call writes its response frames.
@@ -237,36 +222,39 @@ const FRAME_ESTIMATE: usize = 64;
 pub struct ResponseCodec {
     /// How the response messages are compressed.
     pub(crate) encoder: MessageEncoder,
-    /// The answer to the request's dictionary query, which the call's HEADERS carry.
-    pub(crate) answer: Option<Vec<DictionaryInfo>>,
-    /// The answer to the request's stream compression offer, which the call's HEADERS carry.
-    pub(crate) stream_answer: Option<StreamCompression>,
-    /// The connection metadata set the request offered and the server stored, which the call's
-    /// HEADERS confirm; zero for none.
-    pub(crate) connection_answer: u32,
+    /// The call's ANSWER, until it is written: set only when the server has something to answer.
+    pub(crate) answer: Option<RpcAnswer>,
 }
 
 /// Writes response frames, draining `frames`, with one write.
+///
+/// The call's pending ANSWER goes out first, with the first frames that are not a lone STATUS: a
+/// call that fails before responding may go unanswered. With `frames` empty, only the pending
+/// ANSWER is written, if there is one.
 pub async fn write_response_frames<W: FrameWrite>(
     send: &mut W,
     frames: &mut Vec<ResponseFrame>,
     max_frame_size: usize,
     codec: &mut ResponseCodec,
 ) -> Result<()> {
-    let scratch = frames.iter().fold(0_usize, |total, frame| {
-        total.saturating_add(match frame {
-            ResponseFrame::Message(body) => FrameChunks::scratch_len(body.len()),
-            ResponseFrame::Headers(_) | ResponseFrame::Status(_) => FRAME_ESTIMATE,
-        })
-    });
+    let answer = codec
+        .answer
+        .take_if(|_| frames.is_empty() || !frames.iter().all(ResponseFrame::is_status));
+    if frames.is_empty() && answer.is_none() {
+        return Ok(());
+    }
+    let scratch = frames.iter().fold(
+        if answer.is_some() { FRAME_ESTIMATE } else { 0 },
+        |total, frame| {
+            total.saturating_add(match frame {
+                ResponseFrame::Message(body) => FrameChunks::scratch_len(body.len()),
+                ResponseFrame::Headers(_) | ResponseFrame::Status(_) => FRAME_ESTIMATE,
+            })
+        },
+    );
     let mut chunks = FrameChunks::with_capacity(max_frame_size, scratch);
-    if frames
-        .iter()
-        .any(|frame| matches!(frame, ResponseFrame::Headers(_)))
-    {
-        chunks.answer = codec.answer.take();
-        chunks.stream_answer = codec.stream_answer.take();
-        chunks.connection_answer = std::mem::take(&mut codec.connection_answer);
+    if let Some(answer) = answer {
+        chunks.protobuf(frame_type::ANSWER, &answer)?;
     }
     for frame in frames.drain(..) {
         chunks.response_frame(frame, &mut codec.encoder)?;
@@ -528,26 +516,77 @@ async fn discard_payload<R: FrameRead>(recv: &mut R, len: usize) -> Result<()> {
 pub struct ResponseReading {
     /// The dictionaries the call accepts on compressed messages.
     pub(crate) accept: Accept,
-    /// The connection to teach the answer in the call's HEADERS, when the request queried.
+    /// The connection to teach the answer in the call's ANSWER, when the request queried.
     pub(crate) learn: Option<Arc<ClientCompression>>,
     /// The decompressing state of stream-compressed responses, when the request offered them.
     pub(crate) stream: Option<Inflater>,
-    /// The request direction to enable when the call's HEADERS answer the stream compression
-    /// offer.
+    /// The request direction to enable when the call's ANSWER accepts stream-compressed
+    /// requests.
     pub(crate) enable_requests: Option<Arc<StreamEnable>>,
-    /// The requests of an optimistic call, until its HEADERS or STATUS decide it.
+    /// The requests of an optimistic call, until its ANSWER or STATUS decide it.
     pub(crate) replay: Option<Replay>,
     /// Set when the server refused the optimistic call, which the client then replays.
     pub(crate) refused: Option<Replay>,
-    /// The connection to tell when HEADERS answer a stream compression offer.
+    /// The connection to tell when an ANSWER accepts stream-compressed requests.
     pub(crate) optimism: Option<Arc<Optimism>>,
-    /// The connection metadata set the request offered, which its HEADERS may confirm.
+    /// The connection metadata set the request offered, which its ANSWER may confirm.
     pub(crate) connection_metadata: Option<OfferedSet>,
+    /// An ANSWER, HEADERS, message or STATUS has arrived, after which no ANSWER may.
+    pub(crate) answer_closed: bool,
+}
+
+impl ResponseReading {
+    /// Notes the first frame of the response that is not an ANSWER. On an optimistic call it
+    /// must be the STATUS that settles the call: an accepted call is answered first.
+    fn start(&mut self, is_status: bool) -> Result<()> {
+        if !self.answer_closed {
+            self.answer_closed = true;
+            if self.replay.is_some() && !is_status {
+                return Err(Error::from(Status::internal(
+                    "optimistic call responded without an ANSWER",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Learns the call's ANSWER: the shared dictionaries, the stored connection metadata set, and
+    /// whether requests may be stream-compressed, which settles an optimistic call.
+    fn answer(&mut self, answer: &RpcAnswer) -> Result<()> {
+        if std::mem::replace(&mut self.answer_closed, true) {
+            return Err(Error::from(Status::internal(
+                "response stream contained an ANSWER after its first frame",
+            )));
+        }
+        if let Some(connection) = self.learn.take() {
+            connection.learn(&answer.dictionaries);
+        }
+        if let Some(offered) = self.connection_metadata.take() {
+            offered.learn(answer.connection_metadata);
+        }
+        if let Some(requests) = self.enable_requests.take() {
+            requests.enable(answer.stream_compression);
+        }
+        if let Some(replay) = self.replay.take() {
+            if !answer.stream_compression {
+                return Err(Error::from(Status::internal(
+                    "optimistic call answered without accepting stream compression",
+                )));
+            }
+            replay.settle();
+        }
+        if answer.stream_compression
+            && let Some(optimism) = &self.optimism
+        {
+            optimism.answered();
+        }
+        Ok(())
+    }
 }
 
 /// Decodes a frame received on a response stream, decompressing a `ZSTD_MESSAGE` with the
-/// dictionaries `reading` accepts and a `ZSTD_STREAM_MESSAGE` with its stream state, and learning
-/// the answers of its HEADERS.
+/// dictionaries `reading` accepts and a `ZSTD_STREAM_MESSAGE` with its stream state. An ANSWER
+/// is learned into `reading` and yields `None`.
 ///
 /// A REQUEST frame has no place on a response stream.
 pub fn decode_response_frame(
@@ -555,7 +594,12 @@ pub fn decode_response_frame(
     payload: Bytes,
     reading: &mut ResponseReading,
     max_frame_size: usize,
-) -> Result<ResponseFrame> {
+) -> Result<Option<ResponseFrame>> {
+    if frame_type == frame_type::ANSWER {
+        reading.answer(&decode_payload::<RpcAnswer>(&payload)?)?;
+        return Ok(None);
+    }
+    reading.start(frame_type == frame_type::STATUS)?;
     match frame_type {
         frame_type::MESSAGE => Ok(ResponseFrame::Message(payload)),
         frame_type::ZSTD_MESSAGE => inflate(&reading.accept, &payload, max_frame_size)
@@ -568,30 +612,11 @@ pub fn decode_response_frame(
             .decode(&payload, max_frame_size)
             .map(ResponseFrame::Message)
             .map_err(|rejected| rejected.into_error(Status::internal)),
-        frame_type::HEADERS => {
-            let headers = decode_payload::<RpcHeaders>(&payload)?;
-            if let Some(connection) = reading.learn.take() {
-                connection.learn(&headers.dictionaries);
-            }
-            if let Some(offered) = reading.connection_metadata.take() {
-                offered.learn(headers.connection_metadata);
-            }
-            if let Some(requests) = reading.enable_requests.take() {
-                requests.enable(headers.stream_compression.as_ref());
-            }
-            if let Some(replay) = reading.replay.take() {
-                replay.settle();
-            }
-            if headers.stream_compression.is_some()
-                && let Some(optimism) = &reading.optimism
-            {
-                optimism.answered();
-            }
-            Ok(ResponseFrame::Headers(headers.metadata))
-        }
+        frame_type::HEADERS => decode_payload::<RpcHeaders>(&payload)
+            .map(|headers| ResponseFrame::Headers(headers.metadata)),
         frame_type::STATUS => {
             let status = decode_payload::<RpcStatus>(&payload)?;
-            // Only a STATUS before any HEADERS of an optimistic call can refuse it.
+            // Only a STATUS before any ANSWER of an optimistic call can refuse it.
             if let Some(replay) = reading.replay.take() {
                 if status.refused_stream_compression {
                     if let Some(optimism) = &reading.optimism {
@@ -608,35 +633,36 @@ pub fn decode_response_frame(
             "response stream contained a REQUEST frame",
         ))),
     }
+    .map(Some)
 }
 
-/// Reads the next frame of a response stream, skipping unknown frames, or `None` at a clean end
-/// of stream.
+/// Reads the next frame of a response stream, skipping unknown frames and learning its ANSWER,
+/// or `None` at a clean end of stream.
 pub async fn read_response_frame<R: FrameRead>(
     recv: &mut R,
     max_frame_size: usize,
     reading: &mut ResponseReading,
 ) -> Result<Option<ResponseFrame>> {
-    let Some(header) = next_known_header(recv, max_frame_size, &mut |_| Ok(())).await? else {
-        return Ok(None);
-    };
-    if header.frame_type == frame_type::REQUEST {
-        return decode_response_frame(header.frame_type, Bytes::new(), reading, max_frame_size)
-            .map(Some);
+    loop {
+        let Some(header) = next_known_header(recv, max_frame_size, &mut |_| Ok(())).await? else {
+            return Ok(None);
+        };
+        let payload = if header.frame_type == frame_type::REQUEST {
+            Bytes::new()
+        } else {
+            read_payload(recv, header.payload_len).await?
+        };
+        if let Some(frame) =
+            decode_response_frame(header.frame_type, payload, reading, max_frame_size)?
+        {
+            return Ok(Some(frame));
+        }
     }
-    let payload = read_payload(recv, header.payload_len).await?;
-    decode_response_frame(header.frame_type, payload, reading, max_frame_size).map(Some)
 }
 
 /// A `ZSTD_STREAM_MESSAGE` in a direction whose receiver did not enable stream compression.
 const NOT_STREAM_COMPRESSED: &str =
     "stream-compressed message where stream compression is not enabled";
-
-/// A frame that follows the REQUEST frame on a request stream.
-pub enum RequestFrame {
-    Message(Bytes),
-    Status(Status),
-}
 
 /// Reads the REQUEST frame that opens a request stream, skipping unknown frames.
 ///
@@ -662,11 +688,11 @@ where
     decode_payload::<RpcRequest>(&payload)
 }
 
-/// Reads the next frame after REQUEST on a request stream, skipping unknown frames, or `None` at
-/// a clean end of stream.
+/// Reads the next request message after REQUEST on a request stream, skipping unknown frames, or
+/// `None` at a clean end of stream.
 ///
-/// A second REQUEST or a HEADERS frame is a protocol error, rejected before its payload is read. A
-/// `ZSTD_MESSAGE` is decompressed with the dictionaries `accept` holds, and a
+/// Any known frame other than a message is a protocol error, rejected before its payload is read.
+/// A `ZSTD_MESSAGE` is decompressed with the dictionaries `accept` holds, and a
 /// `ZSTD_STREAM_MESSAGE` with `stream`, the direction's state when the server enabled it.
 pub async fn read_request_frame<R, F>(
     recv: &mut R,
@@ -674,7 +700,7 @@ pub async fn read_request_frame<R, F>(
     accept: &Accept,
     stream: Option<&mut Inflater>,
     mut on_skipped: F,
-) -> Result<Option<RequestFrame>>
+) -> Result<Option<Bytes>>
 where
     R: FrameRead,
     F: FnMut(usize) -> Result<()> + Send,
@@ -683,15 +709,12 @@ where
         return Ok(None);
     };
     match header.frame_type {
-        frame_type::MESSAGE => {
-            let payload = read_payload(recv, header.payload_len).await?;
-            Ok(Some(RequestFrame::Message(payload)))
-        }
+        frame_type::MESSAGE => read_payload(recv, header.payload_len).await.map(Some),
         frame_type::ZSTD_MESSAGE => {
             let payload = read_payload(recv, header.payload_len).await?;
             let message = inflate(accept, &payload, max_frame_size)
                 .map_err(|rejected| rejected.into_error(Status::invalid_argument))?;
-            Ok(Some(RequestFrame::Message(message)))
+            Ok(Some(message))
         }
         frame_type::ZSTD_STREAM_MESSAGE => {
             let Some(stream) = stream else {
@@ -701,17 +724,14 @@ where
             let message = stream
                 .decode(&payload, max_frame_size)
                 .map_err(|rejected| rejected.into_error(Status::invalid_argument))?;
-            Ok(Some(RequestFrame::Message(message)))
-        }
-        frame_type::STATUS => {
-            let payload = read_payload(recv, header.payload_len).await?;
-            let status = decode_payload::<RpcStatus>(&payload)?;
-            Ok(Some(RequestFrame::Status(Status::from(status))))
+            Ok(Some(message))
         }
         frame_type::REQUEST => Err(invalid_argument(
             "request stream contained a second REQUEST",
         )),
-        _ => Err(invalid_argument("request stream contained a HEADERS frame")),
+        frame_type::HEADERS => Err(invalid_argument("request stream contained a HEADERS frame")),
+        frame_type::STATUS => Err(invalid_argument("request stream contained a STATUS frame")),
+        _ => Err(invalid_argument("request stream contained an ANSWER frame")),
     }
 }
 
@@ -822,7 +842,7 @@ mod tests {
 
     use super::Chunked;
     use super::{
-        FrameChunks, RequestFrame, ResponseCodec, ResponseReading, drain_fin_after_terminal_status,
+        FrameChunks, ResponseCodec, ResponseReading, drain_fin_after_terminal_status,
         read_frame_header, read_request, read_request_end, read_request_frame, read_response_frame,
     };
     use crate::compression::{Accept, MessageEncoder};
@@ -831,7 +851,7 @@ mod tests {
         encode_protobuf_frame, frame_type,
     };
     use crate::test_io::{Chunks, Script, Sink};
-    use crate::{Code, Metadata, RpcHeaders, RpcRequest, RpcStatus, Status};
+    use crate::{Code, Metadata, RpcAnswer, RpcRequest, RpcStatus, Status};
 
     fn status_frame(status: Status) -> Vec<u8> {
         encode_protobuf_frame(
@@ -1096,21 +1116,101 @@ mod tests {
         );
     }
 
+    fn answer_frame(answer: &RpcAnswer) -> Vec<u8> {
+        encode_protobuf_frame(frame_type::ANSWER, answer, 1024).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_answer_goes_out_first_with_the_first_frames_that_are_not_a_lone_status() {
+        let answer = RpcAnswer {
+            connection_metadata: 1,
+            ..RpcAnswer::default()
+        };
+        let pending = || ResponseCodec {
+            answer: Some(answer.clone()),
+            ..ResponseCodec::default()
+        };
+        let write = |mut frames: Vec<ResponseFrame>, mut codec: ResponseCodec| async move {
+            let mut sink = Sink::default();
+            super::write_response_frames(&mut sink, &mut frames, 1024, &mut codec)
+                .await
+                .unwrap();
+            (sink.0.concat(), codec)
+        };
+
+        // A lone STATUS goes unanswered, and the answer stays pending.
+        let (wire, codec) = write(vec![ResponseFrame::Status(Status::ok())], pending()).await;
+        assert_eq!(wire, status_frame(Status::ok()));
+        assert!(codec.answer.is_some());
+
+        // The first message takes it along, ahead of itself, once.
+        let (wire, codec) = write(vec![ResponseFrame::message(&b"m"[..])], codec).await;
+        assert_eq!(
+            wire,
+            [
+                answer_frame(&answer),
+                encode_message_frame(b"m", 1024).unwrap()
+            ]
+            .concat()
+        );
+        assert!(codec.answer.is_none());
+        let (wire, _) = write(vec![ResponseFrame::message(&b"m"[..])], codec).await;
+        assert_eq!(wire, encode_message_frame(b"m", 1024).unwrap());
+
+        // No frames at all write the answer alone, and nothing without one.
+        let (wire, codec) = write(Vec::new(), pending()).await;
+        assert_eq!(wire, answer_frame(&answer));
+        let (wire, _) = write(Vec::new(), codec).await;
+        assert!(wire.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readers_learn_the_answer_and_reject_it_out_of_place() {
+        let answer = answer_frame(&RpcAnswer::default());
+        let headers = encode_frame(frame_type::HEADERS, &[], 1024).unwrap();
+        let message = encode_message_frame(b"m", 1024).unwrap();
+        let read_all = |wire: Vec<u8>| async move {
+            let mut recv = Script::new(wire);
+            let mut reading = ResponseReading::default();
+            let mut frames = Vec::new();
+            loop {
+                match read_response_frame(&mut recv, 1024, &mut reading).await {
+                    Ok(Some(frame)) => frames.push(frame),
+                    Ok(None) => return Ok(frames),
+                    Err(error) => return Err(error.into_status()),
+                }
+            }
+        };
+
+        // The answer is not a frame of the call.
+        let frames =
+            read_all([answer.clone(), headers.clone(), status_frame(Status::ok())].concat())
+                .await
+                .unwrap();
+        assert_eq!(
+            frames,
+            [
+                ResponseFrame::Headers(Metadata::new()),
+                ResponseFrame::Status(Status::ok())
+            ]
+        );
+
+        // A second answer, or one after HEADERS or a message, is a protocol error.
+        for wire in [
+            [answer.clone(), answer.clone()].concat(),
+            [headers.clone(), answer.clone()].concat(),
+            [message.clone(), answer.clone()].concat(),
+        ] {
+            let status = read_all(wire).await.expect_err("misplaced ANSWER");
+            assert_eq!(status.code(), Code::Internal);
+        }
+    }
+
     #[tokio::test]
     async fn unknown_and_grease_frames_are_skipped_anywhere_on_a_response() {
         let mut wire = grease(5);
-        wire.extend(
-            encode_protobuf_frame(
-                frame_type::HEADERS,
-                &RpcHeaders {
-                    metadata: Metadata::new(),
-                    extensions: vec![1],
-                    ..RpcHeaders::default()
-                },
-                1024,
-            )
-            .unwrap(),
-        );
+        // An unknown field in HEADERS is ignored too.
+        wire.extend(encode_frame(frame_type::HEADERS, &[0x10, 0x01], 1024).unwrap());
         wire.extend(encode_frame(0x1234, b"unknown", 1024).unwrap());
         wire.extend(encode_message_frame(b"m", 1024).unwrap());
         wire.extend(grease(0));
@@ -1210,7 +1310,7 @@ mod tests {
 
         // 1 type + 1 length + 10 payload, then 2 type + 1 length + 3 payload.
         assert_eq!(skipped, [12, 6]);
-        assert!(matches!(frame, Some(RequestFrame::Message(body)) if body == b"m"[..]));
+        assert_eq!(frame.as_deref(), Some(&b"m"[..]));
     }
 
     #[tokio::test]
@@ -1220,8 +1320,7 @@ mod tests {
             Err(Status::resource_exhausted("too much").into())
         })
         .await
-        .err()
-        .expect("budget failure should surface");
+        .expect_err("budget failure should surface");
         assert_eq!(error.into_status().code(), Code::ResourceExhausted);
     }
 
@@ -1230,6 +1329,8 @@ mod tests {
         let request =
             encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new("/svc/m"), 1024).unwrap();
         let headers = encode_frame(frame_type::HEADERS, &[], 1024).unwrap();
+        let answer = encode_frame(frame_type::ANSWER, &[], 1024).unwrap();
+        let status = status_frame(Status::ok());
         let message = encode_message_frame(b"m", 1024).unwrap();
 
         // The first known frame must be REQUEST.
@@ -1246,8 +1347,8 @@ mod tests {
             RpcRequest::new("/svc/m")
         );
 
-        // Afterwards only MESSAGE and STATUS may follow.
-        for wire in [&request, &headers] {
+        // Afterwards only messages may follow.
+        for wire in [&request, &headers, &answer, &status] {
             let error = read_request_frame(
                 &mut Script::new(wire.clone()),
                 1024,
@@ -1256,8 +1357,7 @@ mod tests {
                 |_| Ok(()),
             )
             .await
-            .err()
-            .expect("REQUEST and HEADERS must be rejected");
+            .expect_err("REQUEST, HEADERS, ANSWER and STATUS must be rejected");
             assert_eq!(error.into_status().code(), Code::InvalidArgument);
         }
     }

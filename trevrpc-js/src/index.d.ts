@@ -53,8 +53,8 @@ export interface CallOptions {
   /** Cancels the call. */
   signal?: AbortSignal;
   /**
-   * Called with the response headers, empty when the server sent none, as soon as the first
-   * response frame arrives. A callback that throws fails the call.
+   * Called with the response headers, empty when the server sent none, as soon as they, the first
+   * message or the final status arrive. A callback that throws fails the call.
    */
   onResponseHeaders?(headers: Metadata): void;
   /**
@@ -179,8 +179,9 @@ export interface ResponseStream<TResponse> extends AsyncIterable<TResponse> {
   /** Settles with the final status, or rejects with the error that ended the call. */
   readonly status: Promise<StreamStatus>;
   /**
-   * The response headers, empty when the server sent none. Settles when the first response frame
-   * arrives, before the first message is received, or rejects with the error that ended the call.
+   * The response headers, empty when the server sent none. Settles when they, the first message or
+   * the final status arrive, before the first message is received, or rejects with the error that
+   * ended the call.
    */
   readonly headers: Promise<Metadata>;
   /** Cancels the call unless it already finished. */
@@ -228,8 +229,9 @@ export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIt
   /** Settles with the final status, or rejects with the error that ended the call. */
   readonly status: Promise<StreamStatus>;
   /**
-   * The response headers, empty when the server sent none. Settles when the first response frame
-   * arrives, before the first message is received, or rejects with the error that ended the call.
+   * The response headers, empty when the server sent none. Settles when they, the first message or
+   * the final status arrive, before the first message is received, or rejects with the error that
+   * ended the call.
    */
   readonly headers: Promise<Metadata>;
   /**
