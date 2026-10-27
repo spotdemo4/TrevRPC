@@ -4,13 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
@@ -162,7 +164,7 @@ func (c grpcClient) Bidi(ctx context.Context) (bidiStream, error) {
 // free stream rather than opening a second connection once the server's stream
 // limit (250 in net/http) is reached, so that every worker shares one
 // connection.
-func dialConnect(ctx context.Context, addr string, tlsConfig *tls.Config, pad string, options []connect.ClientOption) (connection, error) {
+func dialConnect(ctx context.Context, addr string, tlsConfig *tls.Config, pad string, options []connecthttp.Option) (connection, error) {
 	counter := &wireCounter{}
 	var protocols http.Protocols
 	protocols.SetHTTP2(true)
@@ -173,7 +175,7 @@ func dialConnect(ctx context.Context, addr string, tlsConfig *tls.Config, pad st
 		HTTP2:           &http.HTTP2Config{StrictMaxConcurrentRequests: true},
 	}
 	client := connectClient{
-		client: echopbconnect.NewEchoClient(&http.Client{Transport: transport}, "https://"+addr, options...),
+		client: echopbconnect.NewEchoClient(connect.NewClient(connecthttp.NewTransport(&http.Client{Transport: transport}, "https://"+addr, options...))),
 		pad:    pad,
 	}
 	// One call establishes the connection the workers will share.
@@ -190,26 +192,23 @@ type connectClient struct {
 	pad    string // the bench-pad value, or empty without --metadata-size
 }
 
-func (c connectClient) setPad(header http.Header) {
-	if c.pad != "" {
-		header.Set(padKey, c.pad)
+// withPad returns ctx carrying the bench-pad request header, or ctx itself
+// without --metadata-size, so unpadded calls allocate no call info.
+func (c connectClient) withPad(ctx context.Context) context.Context {
+	if c.pad == "" {
+		return ctx
 	}
+	ctx, info := connect.NewClientContext(ctx)
+	info.RequestHeader().Set(padKey, c.pad)
+	return ctx
 }
 
 func (c connectClient) Unary(ctx context.Context, req *echopb.EchoRequest) (*echopb.EchoResponse, error) {
-	request := connect.NewRequest(req)
-	c.setPad(request.Header())
-	resp, err := c.client.Unary(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Msg, nil
+	return c.client.Unary(c.withPad(ctx), req)
 }
 
 func (c connectClient) ServerStream(ctx context.Context, req *echopb.EchoRequest) (responseStream, error) {
-	request := connect.NewRequest(req)
-	c.setPad(request.Header())
-	stream, err := c.client.ServerStream(ctx, request)
+	stream, err := c.client.ServerStream(c.withPad(ctx), req)
 	if err != nil {
 		return nil, err
 	}
@@ -217,65 +216,52 @@ func (c connectClient) ServerStream(ctx context.Context, req *echopb.EchoRequest
 }
 
 func (c connectClient) ClientStream(ctx context.Context) (requestStream, error) {
-	stream := c.client.ClientStream(ctx)
-	c.setPad(stream.RequestHeader())
+	stream, err := c.client.ClientStream(c.withPad(ctx))
+	if err != nil {
+		return nil, err
+	}
 	return connectRequestStream{stream}, nil
 }
 
 func (c connectClient) Bidi(ctx context.Context) (bidiStream, error) {
-	stream := c.client.Bidi(ctx)
-	c.setPad(stream.RequestHeader())
+	stream, err := c.client.Bidi(c.withPad(ctx))
+	if err != nil {
+		return nil, err
+	}
 	return connectBidiStream{stream}, nil
 }
 
 type connectResponseStream struct {
-	stream *connect.ServerStreamForClient[echopb.EchoResponse]
+	stream echopbconnect.EchoServerStreamClientStream
 }
 
 // Recv returns the next response, or io.EOF once the call ended with OK. At
 // the end it closes the stream, releasing the HTTP response.
 func (s connectResponseStream) Recv() (*echopb.EchoResponse, error) {
-	if s.stream.Receive() {
-		return s.stream.Msg(), nil
-	}
-	err := s.stream.Err()
-	if closeErr := s.stream.Close(); err == nil {
-		err = closeErr
-	}
+	resp, err := s.stream.Receive()
 	if err == nil {
-		err = io.EOF
+		return resp, nil
+	}
+	if closeErr := s.stream.Close(); errors.Is(err, io.EOF) && closeErr != nil {
+		err = closeErr
 	}
 	return nil, err
 }
 
+// connectRequestStream renames the generated stream's CloseAndReceive.
 type connectRequestStream struct {
-	stream *connect.ClientStreamForClient[echopb.EchoRequest, echopb.EchoResponse]
-}
-
-func (s connectRequestStream) Send(req *echopb.EchoRequest) error {
-	return s.stream.Send(req)
+	echopbconnect.EchoClientStreamClientStream
 }
 
 func (s connectRequestStream) CloseAndRecv() (*echopb.EchoResponse, error) {
-	resp, err := s.stream.CloseAndReceive()
-	if err != nil {
-		return nil, err
-	}
-	return resp.Msg, nil
+	return s.CloseAndReceive()
 }
 
+// connectBidiStream renames the generated stream's Receive.
 type connectBidiStream struct {
-	stream *connect.BidiStreamForClient[echopb.EchoRequest, echopb.EchoResponse]
-}
-
-func (s connectBidiStream) Send(req *echopb.EchoRequest) error {
-	return s.stream.Send(req)
+	echopbconnect.EchoBidiClientStream
 }
 
 func (s connectBidiStream) Recv() (*echopb.EchoResponse, error) {
-	return s.stream.Receive()
-}
-
-func (s connectBidiStream) CloseSend() error {
-	return s.stream.CloseRequest()
+	return s.Receive()
 }

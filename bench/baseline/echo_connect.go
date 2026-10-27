@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connectgzip"
+	"connectrpc.com/connect/v2/connecthttp"
 	"github.com/quic-go/quic-go/http3"
 
 	"trev.zip/llc/trevrpc/bench/baseline/echopb"
@@ -22,7 +24,9 @@ import (
 // responses with an encoding the client accepts.
 func newConnectHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle(echopbconnect.NewEchoHandler(connectEcho{}, connectZstdAtFastest))
+	server := connect.NewServer()
+	echopbconnect.RegisterEchoHandler(server, connectEcho{})
+	connecthttp.Mount(mux, server, connecthttp.WithCompressors(connectgzip.New(), connectZstd))
 	return allowCrossOrigin(mux)
 }
 
@@ -83,72 +87,76 @@ type connectEcho struct {
 // connectFailure converts an EchoRequest's fail_code / fail_message into an
 // error.
 func connectFailure(req *echopb.EchoRequest) error {
-	return connect.NewError(connect.Code(req.GetFailCode()), errors.New(req.GetFailMessage()))
+	return connect.NewError(connect.Code(req.GetFailCode()), req.GetFailMessage())
 }
 
-// connectHeaders sets the response header when the request carries
+// connectHeaders sets the response header when the call's request carries
 // interop-header, and returns a function that sets the matching trailer for an
 // OK finish. Without that key both are no-ops.
-func connectHeaders(request, response, trailer http.Header) func() {
-	values := request.Values(headerKey)
+func connectHeaders(ctx context.Context) func() {
+	info, _ := connect.CallInfoForServerContext(ctx)
+	values := info.RequestHeader().Values(headerKey)
 	if len(values) == 0 {
 		return func() {}
 	}
-	response.Set(headerKey, values[0])
-	return func() { trailer.Set(trailerKey, values[0]) }
+	info.ResponseHeader().Set(headerKey, values[0])
+	return func() { info.ResponseTrailer().Set(trailerKey, values[0]) }
 }
 
-func (connectEcho) Unary(_ context.Context, req *connect.Request[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error) {
-	if req.Msg.GetFailCode() != 0 {
-		return nil, connectFailure(req.Msg)
+func (connectEcho) Unary(ctx context.Context, req *echopb.EchoRequest) (*echopb.EchoResponse, error) {
+	if req.GetFailCode() != 0 {
+		return nil, connectFailure(req)
 	}
-	message := req.Msg.GetMessage()
-	if suffix := req.Header().Values(suffixKey); len(suffix) > 0 {
+	message := req.GetMessage()
+	info, _ := connect.CallInfoForServerContext(ctx)
+	if suffix := info.RequestHeader().Values(suffixKey); len(suffix) > 0 {
 		message += suffix[0]
 	}
-	resp := connect.NewResponse(&echopb.EchoResponse{Message: message})
-	connectHeaders(req.Header(), resp.Header(), resp.Trailer())()
-	return resp, nil
+	connectHeaders(ctx)()
+	return &echopb.EchoResponse{Message: message}, nil
 }
 
-func (connectEcho) ClientStream(_ context.Context, stream *connect.ClientStream[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error) {
+func (connectEcho) ClientStream(ctx context.Context, stream echopbconnect.EchoClientStreamServerStream) (*echopb.EchoResponse, error) {
 	var message strings.Builder
 	var count uint32
-	for stream.Receive() {
-		req := stream.Msg()
+	for {
+		req, err := stream.Receive()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
 		if req.GetFailCode() != 0 {
 			return nil, connectFailure(req)
 		}
 		message.WriteString(req.GetMessage())
 		count++
 	}
-	if err := stream.Err(); err != nil {
-		return nil, err
-	}
-	resp := connect.NewResponse(&echopb.EchoResponse{Message: message.String(), Index: count})
-	connectHeaders(stream.RequestHeader(), resp.Header(), resp.Trailer())()
-	return resp, nil
+
+	connectHeaders(ctx)()
+	return &echopb.EchoResponse{Message: message.String(), Index: count}, nil
 }
 
-func (connectEcho) ServerStream(_ context.Context, req *connect.Request[echopb.EchoRequest], stream *connect.ServerStream[echopb.EchoResponse]) error {
-	finish := connectHeaders(req.Header(), stream.ResponseHeader(), stream.ResponseTrailer())
+func (connectEcho) ServerStream(ctx context.Context, req *echopb.EchoRequest, stream echopbconnect.EchoServerStreamServerStream) error {
+	finish := connectHeaders(ctx)
 	// One response value is reused: Send marshals it before returning.
-	resp := &echopb.EchoResponse{Message: req.Msg.GetMessage()}
-	for i := range req.Msg.GetCount() {
+	resp := &echopb.EchoResponse{Message: req.GetMessage()}
+	for i := range req.GetCount() {
 		resp.Index = i
 		if err := stream.Send(resp); err != nil {
 			return err
 		}
 	}
-	if req.Msg.GetFailCode() != 0 {
-		return connectFailure(req.Msg)
+	if req.GetFailCode() != 0 {
+		return connectFailure(req)
 	}
 	finish()
 	return nil
 }
 
-func (connectEcho) Bidi(_ context.Context, stream *connect.BidiStream[echopb.EchoRequest, echopb.EchoResponse]) error {
-	finish := connectHeaders(stream.RequestHeader(), stream.ResponseHeader(), stream.ResponseTrailer())
+func (connectEcho) Bidi(ctx context.Context, stream echopbconnect.EchoBidiServerStream) error {
+	finish := connectHeaders(ctx)
 	resp := &echopb.EchoResponse{}
 	for i := uint32(0); ; i++ {
 		req, err := stream.Receive()

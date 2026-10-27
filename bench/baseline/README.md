@@ -13,9 +13,9 @@ Both use their library's defaults, with no tuning, except where Connect needs tw
 
 Compression, as the `gzip` and `zstd` modes of `--compression` set it, compresses every message on its own, which is all gRPC and Connect offer:
 
-| Mode   | gRPC                                                                                                                | Connect                                                                                                                                                           |
-| ------ | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gzip` | grpc-go's `encoding/gzip`, at Go's default gzip level (6)                                                           | connect-go's built-in gzip, at Go's default gzip level (6)                                                                                                        |
-| `zstd` | klauspost's zstd at `SpeedFastest` with a 512 KiB window, through a small `encoding.Compressor` in `compression.go` | [`klauspost/connect-compress`](https://github.com/klauspost/connect-compress)'s zstd at `LevelFastest` (klauspost's `SpeedFastest`, with its 64 KiB window limit) |
+| Mode   | gRPC                                                      | Connect                                                    |
+| ------ | --------------------------------------------------------- | ---------------------------------------------------------- |
+| `gzip` | grpc-go's `encoding/gzip`, at Go's default gzip level (6) | connect-go's `connectgzip`, at Go's default gzip level (6) |
+| `zstd` | klauspost's zstd at `SpeedFastest` with a 512 KiB window  | the same codec                                             |
 
-zstd runs at klauspost's fastest level, the closest to the zstd level 1 that TrevRPC compresses at. The client compresses every request (`grpc.UseCompressor`, or `connect.WithSendCompression` and accepting only that encoding), and both servers, which accept gzip and zstd, answer with the request's encoding, so responses are compressed too.
+zstd runs at klauspost's fastest level, the closest to the zstd level 1 that TrevRPC compresses at. Neither library ships zstd, so `compression.go` wraps one klauspost encoder and decoder as both a gRPC `encoding.Compressor` and a connect-go `connect.Compressor`. The client compresses every request (`grpc.UseCompressor`, or `connecthttp.WithSendCompression` with only that encoding registered), and both servers, which accept gzip and zstd, answer with the request's encoding, so responses are compressed too.

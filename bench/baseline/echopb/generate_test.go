@@ -52,7 +52,7 @@ func TestGeneratedCodeMatchesProto(t *testing.T) {
 	run(t, "go", "build", "-o", binDir,
 		"google.golang.org/protobuf/cmd/protoc-gen-go",
 		"google.golang.org/grpc/cmd/protoc-gen-go-grpc",
-		"connectrpc.com/connect/cmd/protoc-gen-connect-go")
+		"connectrpc.com/connect/v2/cmd/protoc-gen-connect-go")
 
 	outDir := t.TempDir()
 	run(t, protoc,

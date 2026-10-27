@@ -22,7 +22,7 @@ mkGoModule (final: {
     ];
   };
   sourceRoot = "${final.src.name}/bench/baseline";
-  vendorHash = "sha256-HG7vB3u7p817fBA41n3EM3bw8owFYhukz69REe6+bzs=";
+  vendorHash = "sha256-r6PIDzmTwuwQ361Xkt+2BDzP2y9egsAyyZh52GB5IKo=";
 
   subPackages = [ "." ];
 

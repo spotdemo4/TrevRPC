@@ -3,11 +3,15 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
+	"io"
+	"maps"
 	"net/http"
 	"os"
 	"testing"
 
-	"connectrpc.com/connect"
+	"connectrpc.com/connect/v2"
+	"connectrpc.com/connect/v2/connecthttp"
 	"github.com/quic-go/quic-go/http3"
 
 	"trev.zip/llc/trevrpc/bench/baseline/echopb"
@@ -33,25 +37,28 @@ func TestConnectOverHTTP3(t *testing.T) {
 	transport := &http3.Transport{TLSClientConfig: serverTLS(t, srv)}
 	t.Cleanup(func() { _ = transport.Close() })
 	httpClient := &http.Client{Transport: transport}
-	for name, option := range map[string]connect.ClientOption{
-		"connect":  connect.WithProtoJSON(),
-		"grpc-web": connect.WithGRPCWeb(),
+	for name, option := range map[string]connecthttp.Option{
+		"connect":  connecthttp.WithProtoJSON(),
+		"grpc-web": connecthttp.WithGRPCWeb(),
 	} {
 		t.Run(name, func(t *testing.T) {
-			client := echopbconnect.NewEchoClient(httpClient, "https://"+srv.addrs["connect"], option)
-			resp, err := client.Unary(t.Context(), connect.NewRequest(&echopb.EchoRequest{Message: "h3"}))
-			if err != nil || resp.Msg.GetMessage() != "h3" {
+			client := echopbconnect.NewEchoClient(connect.NewClient(connecthttp.NewTransport(httpClient, "https://"+srv.addrs["connect"], option)))
+			resp, err := client.Unary(t.Context(), &echopb.EchoRequest{Message: "h3"})
+			if err != nil || resp.GetMessage() != "h3" {
 				t.Fatalf("unary: resp = %v, err = %v", resp, err)
 			}
-			stream, err := client.ServerStream(t.Context(), connect.NewRequest(&echopb.EchoRequest{Message: "s", Count: 3}))
+			stream, err := client.ServerStream(t.Context(), &echopb.EchoRequest{Message: "s", Count: 3})
 			if err != nil {
 				t.Fatal(err)
 			}
 			received := 0
-			for stream.Receive() {
+			for {
+				if _, err = stream.Receive(); err != nil {
+					break
+				}
 				received++
 			}
-			if err := stream.Err(); err != nil || received != 3 {
+			if !errors.Is(err, io.EOF) || received != 3 {
 				t.Fatalf("server stream: %d messages, err = %v", received, err)
 			}
 		})
@@ -86,14 +93,15 @@ func TestCrossOriginRequests(t *testing.T) {
 		t.Fatalf("preflight answered %d with %v", resp.StatusCode, resp.Header)
 	}
 
-	client := echopbconnect.NewEchoClient(httpClient, "https://"+srv.addrs["connect"])
-	req := connect.NewRequest(&echopb.EchoRequest{Message: "cors"})
-	req.Header().Set("Origin", "http://127.0.0.1:1")
-	echoed, err := client.Unary(t.Context(), req)
-	if err != nil || echoed.Msg.GetMessage() != "cors" {
+	client := echopbconnect.NewEchoClient(connect.NewClient(connecthttp.NewTransport(httpClient, "https://"+srv.addrs["connect"])))
+	ctx, info := connect.NewClientContext(t.Context())
+	info.RequestHeader().Set("Origin", "http://127.0.0.1:1")
+	echoed, err := client.Unary(ctx, &echopb.EchoRequest{Message: "cors"})
+	if err != nil || echoed.GetMessage() != "cors" {
 		t.Fatalf("resp = %v, err = %v", echoed, err)
 	}
-	if echoed.Header().Get("Access-Control-Allow-Origin") != "*" || echoed.Header().Get("Access-Control-Expose-Headers") != "*" {
-		t.Errorf("response headers %v do not allow the page to read them", echoed.Header())
+	header := info.ResponseHeader()
+	if header.Get("Access-Control-Allow-Origin") != "*" || header.Get("Access-Control-Expose-Headers") != "*" {
+		t.Errorf("response headers %v do not allow the page to read them", maps.Collect(header.All()))
 	}
 }

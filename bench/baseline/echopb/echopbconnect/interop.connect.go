@@ -5,188 +5,322 @@
 package echopbconnect
 
 import (
-	connect "connectrpc.com/connect"
+	connect "connectrpc.com/connect/v2"
 	context "context"
-	errors "errors"
-	http "net/http"
-	strings "strings"
+	sync "sync"
 	echopb "trev.zip/llc/trevrpc/bench/baseline/echopb"
 )
-
-// This is a compile-time assertion to ensure that this generated file and the connect package are
-// compatible. If you get a compiler error that this constant is not defined, this code was
-// generated with a version of connect newer than the one compiled into your binary. You can fix the
-// problem by either regenerating this code with an older version of connect or updating the connect
-// version compiled into your binary.
-const _ = connect.IsAtLeastVersion1_13_0
 
 const (
 	// EchoName is the fully-qualified name of the Echo service.
 	EchoName = "trevrpc.interop.v1.Echo"
 )
 
-// These constants are the fully-qualified names of the RPCs defined in this package. They're
-// exposed at runtime as Spec.Procedure and as the final two segments of the HTTP route.
+// These constants are the procedure names of the RPCs defined in this package. They're exposed at
+// runtime as Spec.Procedure and as the final two segments of the HTTP route.
 //
 // Note that these are different from the fully-qualified method names used by
 // google.golang.org/protobuf/reflect/protoreflect. To convert from these constants to
 // reflection-formatted method names, remove the leading slash and convert the remaining slash to a
 // period.
 const (
-	// EchoUnaryProcedure is the fully-qualified name of the Echo's Unary RPC.
+	// EchoUnaryProcedure is the procedure name of the Echo's Unary RPC.
 	EchoUnaryProcedure = "/trevrpc.interop.v1.Echo/Unary"
-	// EchoClientStreamProcedure is the fully-qualified name of the Echo's ClientStream RPC.
+	// EchoClientStreamProcedure is the procedure name of the Echo's ClientStream RPC.
 	EchoClientStreamProcedure = "/trevrpc.interop.v1.Echo/ClientStream"
-	// EchoServerStreamProcedure is the fully-qualified name of the Echo's ServerStream RPC.
+	// EchoServerStreamProcedure is the procedure name of the Echo's ServerStream RPC.
 	EchoServerStreamProcedure = "/trevrpc.interop.v1.Echo/ServerStream"
-	// EchoBidiProcedure is the fully-qualified name of the Echo's Bidi RPC.
+	// EchoBidiProcedure is the procedure name of the Echo's Bidi RPC.
 	EchoBidiProcedure = "/trevrpc.interop.v1.Echo/Bidi"
+)
+
+var (
+	echoUnarySpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeUnary,
+			Schema:     echopb.File_interop_proto.Services().ByName("Echo").Methods().ByName("Unary"),
+			Procedure:  EchoUnaryProcedure,
+		}
+	})
+	echoClientStreamSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeClient,
+			Schema:     echopb.File_interop_proto.Services().ByName("Echo").Methods().ByName("ClientStream"),
+			Procedure:  EchoClientStreamProcedure,
+		}
+	})
+	echoServerStreamSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeServer,
+			Schema:     echopb.File_interop_proto.Services().ByName("Echo").Methods().ByName("ServerStream"),
+			Procedure:  EchoServerStreamProcedure,
+		}
+	})
+	echoBidiSpec = sync.OnceValue(func() connect.Spec {
+		return connect.Spec{
+			StreamType: connect.StreamTypeBidi,
+			Schema:     echopb.File_interop_proto.Services().ByName("Echo").Methods().ByName("Bidi"),
+			Procedure:  EchoBidiProcedure,
+		}
+	})
 )
 
 // EchoClient is a client for the trevrpc.interop.v1.Echo service.
 type EchoClient interface {
-	Unary(context.Context, *connect.Request[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error)
-	ClientStream(context.Context) *connect.ClientStreamForClient[echopb.EchoRequest, echopb.EchoResponse]
-	ServerStream(context.Context, *connect.Request[echopb.EchoRequest]) (*connect.ServerStreamForClient[echopb.EchoResponse], error)
-	Bidi(context.Context) *connect.BidiStreamForClient[echopb.EchoRequest, echopb.EchoResponse]
+	Unary(context.Context, *echopb.EchoRequest) (*echopb.EchoResponse, error)
+	ClientStream(context.Context) (EchoClientStreamClientStream, error)
+	ServerStream(context.Context, *echopb.EchoRequest) (EchoServerStreamClientStream, error)
+	Bidi(context.Context) (EchoBidiClientStream, error)
 }
 
-// NewEchoClient constructs a client for the trevrpc.interop.v1.Echo service. By default, it uses
-// the Connect protocol with the binary Protobuf Codec, asks for gzipped responses, and sends
-// uncompressed requests. To use the gRPC or gRPC-Web protocols, supply the connect.WithGRPC() or
-// connect.WithGRPCWeb() options.
-//
-// The URL supplied here should be the base URL for the Connect or gRPC server (for example,
-// http://api.acme.com or https://acme.com/grpc).
-func NewEchoClient(httpClient connect.HTTPClient, baseURL string, opts ...connect.ClientOption) EchoClient {
-	baseURL = strings.TrimRight(baseURL, "/")
-	echoMethods := echopb.File_interop_proto.Services().ByName("Echo").Methods()
-	return &echoClient{
-		unary: connect.NewClient[echopb.EchoRequest, echopb.EchoResponse](
-			httpClient,
-			baseURL+EchoUnaryProcedure,
-			connect.WithSchema(echoMethods.ByName("Unary")),
-			connect.WithClientOptions(opts...),
-		),
-		clientStream: connect.NewClient[echopb.EchoRequest, echopb.EchoResponse](
-			httpClient,
-			baseURL+EchoClientStreamProcedure,
-			connect.WithSchema(echoMethods.ByName("ClientStream")),
-			connect.WithClientOptions(opts...),
-		),
-		serverStream: connect.NewClient[echopb.EchoRequest, echopb.EchoResponse](
-			httpClient,
-			baseURL+EchoServerStreamProcedure,
-			connect.WithSchema(echoMethods.ByName("ServerStream")),
-			connect.WithClientOptions(opts...),
-		),
-		bidi: connect.NewClient[echopb.EchoRequest, echopb.EchoResponse](
-			httpClient,
-			baseURL+EchoBidiProcedure,
-			connect.WithSchema(echoMethods.ByName("Bidi")),
-			connect.WithClientOptions(opts...),
-		),
+// NewEchoClient constructs a client for the trevrpc.interop.v1.Echo service. Multiple service
+// clients may share a single connect.Client.
+func NewEchoClient(client *connect.Client) EchoClient {
+	return &echoClient{client: client}
+}
+
+// EchoClientStreamClientStream is the client stream for the Echo's ClientStream RPC.
+type EchoClientStreamClientStream struct {
+	stream connect.ClientStream
+}
+
+// SendHeaders opens the stream and flushes the request headers without a message. The first Send or
+// Receive does this implicitly.
+func (s EchoClientStreamClientStream) SendHeaders() error {
+	return s.stream.SendHeaders()
+}
+
+// Send sends a request message to the server.
+func (s EchoClientStreamClientStream) Send(req *echopb.EchoRequest) error {
+	return s.stream.Send(req)
+}
+
+// CloseAndReceive closes the request side of the stream and returns the single response message. It
+// reads the stream to completion to release its resources.
+func (s EchoClientStreamClientStream) CloseAndReceive() (*echopb.EchoResponse, error) {
+	if err := s.stream.CloseSend(); err != nil {
+		return nil, err
 	}
+	var res echopb.EchoResponse
+	if err := s.stream.Receive(&res); err != nil {
+		return nil, err
+	}
+	return &res, nil
 }
 
-// echoClient implements EchoClient.
-type echoClient struct {
-	unary        *connect.Client[echopb.EchoRequest, echopb.EchoResponse]
-	clientStream *connect.Client[echopb.EchoRequest, echopb.EchoResponse]
-	serverStream *connect.Client[echopb.EchoRequest, echopb.EchoResponse]
-	bidi         *connect.Client[echopb.EchoRequest, echopb.EchoResponse]
+// EchoServerStreamClientStream is the client stream for the Echo's ServerStream RPC.
+type EchoServerStreamClientStream struct {
+	stream connect.ClientStream
 }
 
-// Unary calls trevrpc.interop.v1.Echo.Unary.
-func (c *echoClient) Unary(ctx context.Context, req *connect.Request[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error) {
-	return c.unary.CallUnary(ctx, req)
+// Receive returns the next response message from the server.
+func (s EchoServerStreamClientStream) Receive() (*echopb.EchoResponse, error) {
+	var res echopb.EchoResponse
+	if err := s.stream.Receive(&res); err != nil {
+		return nil, err
+	}
+	return &res, nil
 }
 
-// ClientStream calls trevrpc.interop.v1.Echo.ClientStream.
-func (c *echoClient) ClientStream(ctx context.Context) *connect.ClientStreamForClient[echopb.EchoRequest, echopb.EchoResponse] {
-	return c.clientStream.CallClientStream(ctx)
+// Close releases the stream's resources. It is idempotent and is typically deferred to clean up a
+// stream abandoned before io.EOF.
+func (s EchoServerStreamClientStream) Close() error {
+	return s.stream.Close()
 }
 
-// ServerStream calls trevrpc.interop.v1.Echo.ServerStream.
-func (c *echoClient) ServerStream(ctx context.Context, req *connect.Request[echopb.EchoRequest]) (*connect.ServerStreamForClient[echopb.EchoResponse], error) {
-	return c.serverStream.CallServerStream(ctx, req)
+// EchoBidiClientStream is the client stream for the Echo's Bidi RPC.
+type EchoBidiClientStream struct {
+	stream connect.ClientStream
 }
 
-// Bidi calls trevrpc.interop.v1.Echo.Bidi.
-func (c *echoClient) Bidi(ctx context.Context) *connect.BidiStreamForClient[echopb.EchoRequest, echopb.EchoResponse] {
-	return c.bidi.CallBidiStream(ctx)
+// SendHeaders opens the stream and flushes the request headers without a message. The first Send or
+// Receive does this implicitly.
+func (s EchoBidiClientStream) SendHeaders() error {
+	return s.stream.SendHeaders()
+}
+
+// Send sends a request message to the server.
+func (s EchoBidiClientStream) Send(req *echopb.EchoRequest) error {
+	return s.stream.Send(req)
+}
+
+// CloseSend closes the request side of the stream.
+func (s EchoBidiClientStream) CloseSend() error {
+	return s.stream.CloseSend()
+}
+
+// Receive returns the next response message from the server.
+func (s EchoBidiClientStream) Receive() (*echopb.EchoResponse, error) {
+	var res echopb.EchoResponse
+	if err := s.stream.Receive(&res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// Close releases the stream's resources. It is idempotent and is typically deferred to clean up a
+// stream abandoned before io.EOF.
+func (s EchoBidiClientStream) Close() error {
+	return s.stream.Close()
 }
 
 // EchoHandler is an implementation of the trevrpc.interop.v1.Echo service.
 type EchoHandler interface {
-	Unary(context.Context, *connect.Request[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error)
-	ClientStream(context.Context, *connect.ClientStream[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error)
-	ServerStream(context.Context, *connect.Request[echopb.EchoRequest], *connect.ServerStream[echopb.EchoResponse]) error
-	Bidi(context.Context, *connect.BidiStream[echopb.EchoRequest, echopb.EchoResponse]) error
+	Unary(context.Context, *echopb.EchoRequest) (*echopb.EchoResponse, error)
+	ClientStream(context.Context, EchoClientStreamServerStream) (*echopb.EchoResponse, error)
+	ServerStream(context.Context, *echopb.EchoRequest, EchoServerStreamServerStream) error
+	Bidi(context.Context, EchoBidiServerStream) error
 }
 
-// NewEchoHandler builds an HTTP handler from the service implementation. It returns the path on
-// which to mount the handler and the handler itself.
-//
-// By default, handlers support the Connect, gRPC, and gRPC-Web protocols with the binary Protobuf
-// and JSON codecs. They also support gzip compression.
-func NewEchoHandler(svc EchoHandler, opts ...connect.HandlerOption) (string, http.Handler) {
-	echoMethods := echopb.File_interop_proto.Services().ByName("Echo").Methods()
-	echoUnaryHandler := connect.NewUnaryHandler(
-		EchoUnaryProcedure,
-		svc.Unary,
-		connect.WithSchema(echoMethods.ByName("Unary")),
-		connect.WithHandlerOptions(opts...),
+// RegisterEchoHandler registers svc as the trevrpc.interop.v1.Echo implementation on server.
+func RegisterEchoHandler(server *connect.Server, svc EchoHandler) {
+	adapter := echoHandler{svc: svc}
+	server.Register(
+		connect.Method{Spec: echoUnarySpec(), Handler: adapter.unary},
+		connect.Method{Spec: echoClientStreamSpec(), Handler: adapter.clientStream},
+		connect.Method{Spec: echoServerStreamSpec(), Handler: adapter.serverStream},
+		connect.Method{Spec: echoBidiSpec(), Handler: adapter.bidi},
 	)
-	echoClientStreamHandler := connect.NewClientStreamHandler(
-		EchoClientStreamProcedure,
-		svc.ClientStream,
-		connect.WithSchema(echoMethods.ByName("ClientStream")),
-		connect.WithHandlerOptions(opts...),
-	)
-	echoServerStreamHandler := connect.NewServerStreamHandler(
-		EchoServerStreamProcedure,
-		svc.ServerStream,
-		connect.WithSchema(echoMethods.ByName("ServerStream")),
-		connect.WithHandlerOptions(opts...),
-	)
-	echoBidiHandler := connect.NewBidiStreamHandler(
-		EchoBidiProcedure,
-		svc.Bidi,
-		connect.WithSchema(echoMethods.ByName("Bidi")),
-		connect.WithHandlerOptions(opts...),
-	)
-	return "/trevrpc.interop.v1.Echo/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case EchoUnaryProcedure:
-			echoUnaryHandler.ServeHTTP(w, r)
-		case EchoClientStreamProcedure:
-			echoClientStreamHandler.ServeHTTP(w, r)
-		case EchoServerStreamProcedure:
-			echoServerStreamHandler.ServeHTTP(w, r)
-		case EchoBidiProcedure:
-			echoBidiHandler.ServeHTTP(w, r)
-		default:
-			http.NotFound(w, r)
-		}
-	})
+}
+
+// EchoClientStreamServerStream is the server stream for the Echo's ClientStream RPC.
+type EchoClientStreamServerStream struct {
+	stream connect.ServerStream
+}
+
+// Receive returns the next request message from the client.
+func (s EchoClientStreamServerStream) Receive() (*echopb.EchoRequest, error) {
+	var req echopb.EchoRequest
+	if err := s.stream.Receive(&req); err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+// EchoServerStreamServerStream is the server stream for the Echo's ServerStream RPC.
+type EchoServerStreamServerStream struct {
+	stream connect.ServerStream
+}
+
+// SendHeaders flushes the response headers without a message. The first Send does this implicitly.
+func (s EchoServerStreamServerStream) SendHeaders() error {
+	return s.stream.SendHeaders()
+}
+
+// Send sends a response message to the client.
+func (s EchoServerStreamServerStream) Send(res *echopb.EchoResponse) error {
+	return s.stream.Send(res)
+}
+
+// EchoBidiServerStream is the server stream for the Echo's Bidi RPC.
+type EchoBidiServerStream struct {
+	stream connect.ServerStream
+}
+
+// Receive returns the next request message from the client.
+func (s EchoBidiServerStream) Receive() (*echopb.EchoRequest, error) {
+	var req echopb.EchoRequest
+	if err := s.stream.Receive(&req); err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+// SendHeaders flushes the response headers without a message. The first Send does this implicitly.
+func (s EchoBidiServerStream) SendHeaders() error {
+	return s.stream.SendHeaders()
+}
+
+// Send sends a response message to the client.
+func (s EchoBidiServerStream) Send(res *echopb.EchoResponse) error {
+	return s.stream.Send(res)
 }
 
 // UnimplementedEchoHandler returns CodeUnimplemented from all methods.
 type UnimplementedEchoHandler struct{}
 
-func (UnimplementedEchoHandler) Unary(context.Context, *connect.Request[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("trevrpc.interop.v1.Echo.Unary is not implemented"))
+func (UnimplementedEchoHandler) Unary(context.Context, *echopb.EchoRequest) (*echopb.EchoResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, "trevrpc.interop.v1.Echo.Unary is not implemented")
 }
 
-func (UnimplementedEchoHandler) ClientStream(context.Context, *connect.ClientStream[echopb.EchoRequest]) (*connect.Response[echopb.EchoResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("trevrpc.interop.v1.Echo.ClientStream is not implemented"))
+func (UnimplementedEchoHandler) ClientStream(context.Context, EchoClientStreamServerStream) (*echopb.EchoResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, "trevrpc.interop.v1.Echo.ClientStream is not implemented")
 }
 
-func (UnimplementedEchoHandler) ServerStream(context.Context, *connect.Request[echopb.EchoRequest], *connect.ServerStream[echopb.EchoResponse]) error {
-	return connect.NewError(connect.CodeUnimplemented, errors.New("trevrpc.interop.v1.Echo.ServerStream is not implemented"))
+func (UnimplementedEchoHandler) ServerStream(context.Context, *echopb.EchoRequest, EchoServerStreamServerStream) error {
+	return connect.NewError(connect.CodeUnimplemented, "trevrpc.interop.v1.Echo.ServerStream is not implemented")
 }
 
-func (UnimplementedEchoHandler) Bidi(context.Context, *connect.BidiStream[echopb.EchoRequest, echopb.EchoResponse]) error {
-	return connect.NewError(connect.CodeUnimplemented, errors.New("trevrpc.interop.v1.Echo.Bidi is not implemented"))
+func (UnimplementedEchoHandler) Bidi(context.Context, EchoBidiServerStream) error {
+	return connect.NewError(connect.CodeUnimplemented, "trevrpc.interop.v1.Echo.Bidi is not implemented")
+}
+
+type echoClient struct {
+	client *connect.Client
+}
+
+func (c *echoClient) Unary(ctx context.Context, req *echopb.EchoRequest) (*echopb.EchoResponse, error) {
+	var res echopb.EchoResponse
+	if err := c.client.CallUnary(ctx, echoUnarySpec(), req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (c *echoClient) ClientStream(ctx context.Context) (EchoClientStreamClientStream, error) {
+	stream, err := c.client.CallClientStream(ctx, echoClientStreamSpec())
+	if err != nil {
+		return EchoClientStreamClientStream{}, err
+	}
+	return EchoClientStreamClientStream{stream: stream}, nil
+}
+
+func (c *echoClient) ServerStream(ctx context.Context, req *echopb.EchoRequest) (EchoServerStreamClientStream, error) {
+	stream, err := c.client.CallServerStream(ctx, echoServerStreamSpec(), req)
+	if err != nil {
+		return EchoServerStreamClientStream{}, err
+	}
+	return EchoServerStreamClientStream{stream: stream}, nil
+}
+
+func (c *echoClient) Bidi(ctx context.Context) (EchoBidiClientStream, error) {
+	stream, err := c.client.CallClientStream(ctx, echoBidiSpec())
+	if err != nil {
+		return EchoBidiClientStream{}, err
+	}
+	return EchoBidiClientStream{stream: stream}, nil
+}
+
+type echoHandler struct{ svc EchoHandler }
+
+func (h echoHandler) unary(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req echopb.EchoRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	res, err := h.svc.Unary(ctx, &req)
+	if err != nil {
+		return err
+	}
+	return stream.Send(res)
+}
+
+func (h echoHandler) clientStream(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	res, err := h.svc.ClientStream(ctx, EchoClientStreamServerStream{stream: stream})
+	if err != nil {
+		return err
+	}
+	return stream.Send(res)
+}
+
+func (h echoHandler) serverStream(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	var req echopb.EchoRequest
+	if err := stream.Receive(&req); err != nil {
+		return err
+	}
+	return h.svc.ServerStream(ctx, &req, EchoServerStreamServerStream{stream: stream})
+}
+
+func (h echoHandler) bidi(ctx context.Context, _ connect.Spec, stream connect.ServerStream) error {
+	return h.svc.Bidi(ctx, EchoBidiServerStream{stream: stream})
 }
