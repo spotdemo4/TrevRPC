@@ -5,25 +5,29 @@
 //   trevrpc-interop-browser bench --browser chromium|firefox --transport <lane> --url <url>
 //       [--ws-url <url>] [--cert-hash <hex>] [--cert <pem>] [--scenario S] [--size N]
 //       [--metadata-size N] [--concurrency N] [--duration S] [--warmup S] [--messages N]
-//       [--payload repeat] [--compression none]
+//       [--payload repeat|records] [--compression MODE] [--dictionary <file>]
 //
 // The lanes are webtransport and websocket, the TrevRPC transports (--url is the WebTransport URL
 // and --cert-hash trusts its certificate; --ws-url is the WebSocket URL), and connect-web,
 // connect-web-h3 and grpc-web, which call a Connect server at --url through fetch over HTTP/2 or
 // HTTP/3. connect-web-h3 needs --cert to trust the certificate for HTTP/3.
 //
+// Only the TrevRPC lanes compress: --compression is none, dictionary, stream or
+// stream-dictionary, and the dictionary modes compress Echo messages with the zstd dictionary
+// in --dictionary, as the native clients do.
+//
 // The page is cross-origin isolated, so its timers resolve to microseconds; servers reached
 // through fetch must answer CORS requests.
 import { parseArgs } from "node:util";
 
-import { BenchLanes } from "./bench-lanes.js";
-import { Browsers, describe, pageHtml, runPage } from "./driver.js";
+import { BenchLanes, Compressions, Payloads } from "./bench-lanes.js";
+import { Browsers, describe, pageHtml, readDictionary, runPage } from "./driver.js";
 
 const Usage =
   "usage: trevrpc-interop-browser bench --browser chromium|firefox --transport <lane> --url <url>" +
   " [--ws-url <url>] [--cert-hash <hex>] [--cert <pem>] [--scenario S] [--size N]" +
   " [--metadata-size N] [--concurrency N] [--duration S] [--warmup S] [--messages N]" +
-  " [--payload repeat] [--compression none]";
+  " [--payload repeat|records] [--compression MODE] [--dictionary <file>]";
 const BenchBundle = new URL("../build/interop/bench.js", import.meta.url);
 /**
  * How long the page may take to open, and the room on top of the warmup and the window for
@@ -79,6 +83,7 @@ export async function parseBenchArguments(args) {
         messages: { type: "string", default: "100" },
         payload: { type: "string", default: "repeat" },
         compression: { type: "string", default: "none" },
+        dictionary: { type: "string" },
       },
       strict: true,
     }));
@@ -100,8 +105,21 @@ export async function parseBenchArguments(args) {
   if (!lane.scenarios.includes(values.scenario)) {
     usageError(`the ${values.transport} lane runs ${lane.scenarios.join(", ")}`);
   }
-  if (values.payload !== "repeat" || values.compression !== "none") {
-    usageError("browsers run the repeat payload without compression");
+  if (!Payloads.includes(values.payload)) {
+    usageError(`--payload must be one of ${Payloads.join(", ")}`);
+  }
+  const mode = Compressions[values.compression];
+  if (mode === undefined) {
+    usageError(`--compression must be one of ${Object.keys(Compressions).join(", ")}`);
+  }
+  if (values.compression !== "none" && lane.transport === undefined) {
+    usageError(`the ${values.transport} lane does not compress`);
+  }
+  if (!mode.scenarios.includes(values.scenario)) {
+    usageError(`--compression ${values.compression} runs ${mode.scenarios.join(", ")}`);
+  }
+  if (Boolean(mode.dictionary) !== (values.dictionary !== undefined)) {
+    usageError("--dictionary goes with the dictionary and stream-dictionary compression modes");
   }
   const certHash = values["cert-hash"];
   if (lane.transport === "webtransport" && !/^(?:[0-9a-fA-F]{2}){32}$/.test(certHash ?? "")) {
@@ -132,6 +150,11 @@ export async function parseBenchArguments(args) {
     messages: integer(values, "messages", 1),
     duration: seconds(values, "duration", false),
     warmup: seconds(values, "warmup", true),
+    payload: values.payload,
+    compression: values.compression,
+    dictionary: await readDictionary(values.dictionary).catch((error) =>
+      usageError(`--dictionary: ${error.message}`),
+    ),
   };
 }
 

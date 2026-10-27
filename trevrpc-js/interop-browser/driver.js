@@ -256,6 +256,11 @@ async function readJson(request) {
   return JSON.parse(body);
 }
 
+/** The dictionary in file, in base64 for a page, or undefined without one. */
+export async function readDictionary(file) {
+  return file === undefined ? undefined : (await readFile(file)).toString("base64");
+}
+
 export function withTimeout(promise, timeoutMs, message) {
   let timer;
   const timeout = new Promise((_, reject) => {

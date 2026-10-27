@@ -52,7 +52,7 @@ reads, with that table's options (scenarios, sizes, concurrency, payload,
 compression modes, netem profiles, messages, duration) as defaults; explicit
 flags still override them. The tables are in [`tables.py`](tables.py):
 `comparison`, `compression`, `link`, `lossy`, `metadata`, `datagrams`,
-`browser`, and `browser-lossy`. They refer to the packaged servers and clients
+`browser`, `browser-compression`, and `browser-lossy`. They refer to the packaged servers and clients
 by name (`go`, `rust`, the baseline's `grpc` and `connect`, and `chromium`) and
 run each native TrevRPC client against its own runtime's server only. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
@@ -69,9 +69,9 @@ every cell once per compression mode, on the transports that have it:
 | `none`              | all               | nothing                                                                                                                                                                                                                                                            |
 | `gzip`              | `grpc`, `connect` | each message on its own, with the library's gzip                                                                                                                                                                                                                   |
 | `zstd`              | `grpc`, `connect` | each message on its own, with zstd from a third-party codec (see [`baseline`](baseline/README.md))                                                                                                                                                                 |
-| `dictionary`        | `quic`, `tcp`     | each message on its own, with TrevRPC's [dictionary compression](../wiki/Compression.md) and a trained dictionary                                                                                                                                                  |
-| `stream`            | `quic`, `tcp`     | each streamed direction of a call with one zstd context ([stream compression](../wiki/Compression.md#stream-compression)), and every other message of 256 bytes or more on its own [without a dictionary](../wiki/Compression.md#compression-without-a-dictionary) |
-| `stream-dictionary` | `quic`, `tcp`     | stream compression, starting from the trained dictionary, and the other messages with it                                                                                                                                                                           |
+| `dictionary`        | TrevRPC           | each message on its own, with TrevRPC's [dictionary compression](../wiki/Compression.md) and a trained dictionary                                                                                                                                                  |
+| `stream`            | TrevRPC           | each streamed direction of a call with one zstd context ([stream compression](../wiki/Compression.md#stream-compression)), and every other message of 256 bytes or more on its own [without a dictionary](../wiki/Compression.md#compression-without-a-dictionary) |
+| `stream-dictionary` | TrevRPC           | stream compression, starting from the trained dictionary, and the other messages with it                                                                                                                                                                           |
 
 Compression modes other than `none` run `unary`, `client-stream` and `bidi`
 only; the `stream` modes call `CompressedEcho`, whose streaming methods allow
@@ -79,7 +79,8 @@ stream compression and whose `Unary` allows compression without a dictionary.
 `server-stream` echoes one request message for every
 response, and the `unreliable-*` scenarios carry their messages as datagrams,
 so neither would show anything real. A mode never runs on a transport that
-lacks it.
+lacks it. The TrevRPC transports are `quic`, `tcp`, and the browsers'
+`webtransport` and `websocket` lanes.
 
 The trained dictionary comes from `payload.py`: `run.py` generates its training
 samples, trains an 8 KiB dictionary with ID 2 using `zstd --train` (the result
@@ -149,7 +150,11 @@ result line. Its lanes, as the `transport` column names them:
 - The four Echo scenarios are `unary`, `server-stream`, `client-stream`, and
   `bidi`. connect-web and gRPC-Web call through `fetch`, which cannot stream a
   request, so they run `unary` and `server-stream` only. Browsers run no
-  datagram, paced, or compression cells, and send metadata per call only.
+  datagram or paced cells, and send metadata per call only.
+- Both payloads run on every lane. Only the TrevRPC lanes compress, in the
+  `dictionary`, `stream` and `stream-dictionary` [modes](#compression) as the
+  native clients do (with `--dictionary`), with the zstd codec trevrpc-js runs
+  as WebAssembly on the page's thread.
 - Every worker shares one channel, or one connect-web transport, in one page.
   Before warming up, each run checks that it really runs over its lane: the
   channel's transport, or the HTTP version of a first call.

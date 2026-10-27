@@ -5,9 +5,12 @@ import { createClient } from "@connectrpc/connect";
 import { createConnectTransport, createGrpcWebTransport } from "@connectrpc/connect-web";
 
 import { Echo } from "../build/interop/gen-es/interop_pb.js";
+import { CompressedEchoClient } from "../build/interop/gen/compressed.trevrpc.js";
 import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
-import { BenchLanes } from "./bench-lanes.js";
+import { BenchLanes, Compressions } from "./bench-lanes.js";
+import { interopCompression } from "./compression.js";
 import { connectLane } from "./lane.js";
+import { newPayload } from "./records.js";
 
 const ConnectTimeoutMs = 10_000;
 /** How long operations still running at the end of the window get to finish, as natively. */
@@ -18,8 +21,9 @@ const PadKey = "bench-pad";
 
 /**
  * Runs the benchmark that input describes: { transport (the lane), url, webSocketUrl, certHash,
- * scenario, size, metadataSize, concurrency, duration, warmup (seconds), messages }. Resolves
- * with the result line's fields. onError sees the first operation that fails.
+ * scenario, size, metadataSize, concurrency, duration, warmup (seconds), messages, payload,
+ * compression, dictionary (the trained dictionary in base64, for the modes that use it) }.
+ * Resolves with the result line's fields. onError sees the first operation that fails.
  */
 export async function runBench(input, { now = () => performance.now(), onError = () => {} } = {}) {
   const lane = BenchLanes[input.transport];
@@ -34,8 +38,12 @@ export async function runBench(input, { now = () => performance.now(), onError =
       () => abort.abort(new Error("the measured window ended")),
       end + GraceMs - now(),
     );
-    const operations = Array.from({ length: input.concurrency }, () =>
-      target.operation(input.scenario, "x".repeat(input.size), input.messages),
+    const operations = Array.from({ length: input.concurrency }, (_, worker) =>
+      target.operation(
+        input.scenario,
+        newPayload(input.payload, input.size, worker),
+        input.messages,
+      ),
     );
     const measured = await measure({ operations, start, end, now, onError });
     clearTimeout(stop);
@@ -130,8 +138,8 @@ export function summarize(input, { latencies, messages, errors }) {
       p999: percentile(sorted, 0.999),
     },
     lost: 0,
-    payload: "repeat",
-    compression: "none",
+    payload: input.payload,
+    compression: input.compression,
   };
 }
 
@@ -145,30 +153,40 @@ function padValue(input) {
   return input.metadataSize > 0 ? "x".repeat(input.metadataSize) : undefined;
 }
 
-/** A TrevRPC channel over the lane's transport, and the scenarios' operations on it. */
+/**
+ * A TrevRPC channel over the lane's transport, and the scenarios' operations on it. A compression
+ * mode gives the channel compression settings, and the stream modes call CompressedEcho, as the
+ * native clients do.
+ */
 async function trevrpcTarget(input, signal) {
+  const mode = Compressions[input.compression];
   const channel = await connectLane({
     url: input.url,
     certHash: input.certHash,
     transport: input.transport,
     webSocketUrl: input.webSocketUrl,
+    ...((mode.dictionary || mode.stream) && {
+      compression: await interopCompression(mode.dictionary ? input.dictionary : undefined),
+    }),
     signal: AbortSignal.timeout(ConnectTimeoutMs),
   });
   if (channel.transport !== input.transport) {
     channel.close();
     throw new Error(`connected over ${channel.transport}, want ${input.transport}`);
   }
-  const echo = new EchoClient(channel);
+  const echo = mode.stream ? new CompressedEchoClient(channel) : new EchoClient(channel);
   const pad = padValue(input);
   const options = { signal, ...(pad && { metadata: { [PadKey]: pad } }) };
   const operations = {
-    unary: (message) =>
+    unary: (payload) =>
       once(async () => {
+        const message = payload.next();
         expectLength(await echo.unary({ message }, options), message);
         return 1;
       }),
-    "server-stream": (message, count) =>
+    "server-stream": (payload, count) =>
       once(async () => {
+        const message = payload.next();
         const stream = await echo.serverStream({ message, count }, options);
         let received = 0;
         for await (const response of stream) {
@@ -177,17 +195,17 @@ async function trevrpcTarget(input, signal) {
         }
         return expectCount(received, count);
       }),
-    "client-stream": (message, count) =>
+    "client-stream": (payload, count) =>
       once(async () => {
         const call = await echo.clientStream(options);
         for (let i = 0; i < count; i++) {
-          await call.send({ message });
+          await call.send({ message: payload.next() });
         }
         const response = await call.closeAndRecv();
         expectCount(response.index, count);
         return count;
       }),
-    bidi: (message) => {
+    bidi: (payload) => {
       // One stream per worker, open across operations and opened again after a failure.
       let call;
       const close = () => {
@@ -198,6 +216,7 @@ async function trevrpcTarget(input, signal) {
         async run() {
           try {
             call ??= await echo.bidi(options);
+            const message = payload.next();
             await call.send({ message });
             const response = await call.recv();
             if (response === undefined) {
@@ -215,7 +234,7 @@ async function trevrpcTarget(input, signal) {
     },
   };
   return {
-    operation: (scenario, message, count) => operations[scenario](message, count),
+    operation: (scenario, payload, count) => operations[scenario](payload, count),
     close: () => channel.close(),
   };
 }
@@ -242,13 +261,15 @@ async function fetchTarget(input, lane, signal) {
   performance.setResourceTimingBufferSize(0);
 
   const operations = {
-    unary: (message) =>
+    unary: (payload) =>
       once(async () => {
+        const message = payload.next();
         expectLength(await client.unary({ message }, options), message);
         return 1;
       }),
-    "server-stream": (message, count) =>
+    "server-stream": (payload, count) =>
       once(async () => {
+        const message = payload.next();
         let received = 0;
         for await (const response of client.serverStream({ message, count }, options)) {
           expectLength(response, message);
@@ -258,7 +279,7 @@ async function fetchTarget(input, lane, signal) {
       }),
   };
   return {
-    operation: (scenario, message, count) => operations[scenario](message, count),
+    operation: (scenario, payload, count) => operations[scenario](payload, count),
     close: () => {},
   };
 }

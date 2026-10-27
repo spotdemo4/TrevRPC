@@ -7,7 +7,7 @@ import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
 // only needs the web platform, so it runs unchanged in a browser bundle and under Node tests.
 import { Code, TrevRpcError, codeName } from "../src/index.js";
-import { createCompression } from "../src/zstd.js";
+import { interopCompression } from "./compression.js";
 import { connectLane } from "./lane.js";
 import { ScenarioNames } from "./names.js";
 
@@ -22,8 +22,6 @@ const CompressedMessages = 3;
 const CompressedStreamMessages = 8;
 /** How many of them an optimistic call stream-compresses: the third and every later one. */
 const OptimisticCompressed = CompressedStreamMessages - 2;
-/** The message types the interop dictionary compresses. */
-const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
 
 /**
  * The text of the `compressed-plain` scenario: the 315-byte JSON record of the plain.records
@@ -439,9 +437,7 @@ export async function runScenarios({
   let channel;
   let open;
   try {
-    const compression = await createCompression({
-      dictionaries: dictionary ? [{ data: base64Bytes(dictionary), messages: EchoTypes }] : [],
-    });
+    const compression = await interopCompression(dictionary);
     open = (options) =>
       connectLane({
         url,
@@ -504,10 +500,6 @@ function expectStreamCompressed(metadata, what, least) {
     received >= least,
     `${what}: interop-stream-compressed-received ${received}, want at least ${least}`,
   );
-}
-
-function base64Bytes(text) {
-  return Uint8Array.from(atob(text), (character) => character.charCodeAt(0));
 }
 
 function expect(condition, message) {

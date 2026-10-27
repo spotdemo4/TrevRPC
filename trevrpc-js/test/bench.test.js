@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { measure, percentile, summarize } from "../interop-browser/bench.js";
+import { Records, newPayload } from "../interop-browser/records.js";
 
 const cli = fileURLToPath(new URL("../interop-browser/cli.js", import.meta.url));
 const benchBundle = new URL("../build/interop/bench.js", import.meta.url);
@@ -64,7 +66,14 @@ test("operations close when their worker stops", async () => {
 });
 
 test("the result line has the native clients' fields", () => {
-  const input = { scenario: "unary", transport: "webtransport", size: 64, metadataSize: 0 };
+  const input = {
+    scenario: "unary",
+    transport: "webtransport",
+    size: 64,
+    metadataSize: 0,
+    payload: "records",
+    compression: "stream",
+  };
   const latencies = Array.from({ length: 1000 }, (_, i) => 1000 - i);
   const result = summarize(
     { ...input, concurrency: 4, duration: 2 },
@@ -87,13 +96,35 @@ test("the result line has the native clients' fields", () => {
     bytes_per_sec: 32000,
     latency_us: { p50: 500, p90: 900, p99: 990, p999: 999 },
     lost: 0,
-    payload: "repeat",
-    compression: "none",
+    payload: "records",
+    compression: "stream",
   });
   assert.throws(
     () => summarize({ ...input, duration: 1 }, { latencies: [], messages: 0, errors: 3 }),
     /no operation completed in the 1s measured window \(3 failed\)/,
   );
+});
+
+test("records messages are bench/payload.py's, byte for byte", () => {
+  // GOLDEN_SHA256 of bench/payload.py: worker 0's messages of these sizes, in turn.
+  const records = new Records(0);
+  const digest = createHash("sha256");
+  for (const size of [64, 256, 1024, 4096]) {
+    digest.update(records.message(size));
+  }
+  assert.equal(
+    digest.digest("hex"),
+    "1414f2e3835a891eecc8579d6736157e456eee7f4f3547b5a326b48f625a8a98",
+  );
+
+  // Each worker has its own messages; each message starts a new record.
+  const first = newPayload("records", 300, 0);
+  const second = newPayload("records", 300, 1);
+  const message = first.next();
+  assert.equal(message.length, 300);
+  assert.notEqual(message, second.next());
+  assert.match(first.next(), /^\{"ts":/);
+  assert.equal(newPayload("repeat", 3, 0).next(), "xxx");
 });
 
 test("percentiles are nearest-rank", () => {
@@ -132,8 +163,13 @@ test("the bench command validates its arguments before launching a browser", () 
     webtransport.filter((value, i) => i < 7),
     webtransport.map((value) => (value === "https://127.0.0.1:4433/trevrpc" ? "/trevrpc" : value)),
     [...webtransport, "--scenario", "unreliable-paced"],
+    [...webtransport, "--compression", "gzip"],
     [...webtransport, "--compression", "dictionary"],
-    [...webtransport, "--payload", "records"],
+    [...webtransport, "--dictionary", "records.dict"],
+    [...webtransport, "--compression", "stream", "--scenario", "server-stream"],
+    [...webtransport, "--compression", "dictionary", "--dictionary", "/nonexistent/records.dict"],
+    [...webtransport, "--payload", "random"],
+    connect("connect-web", "--payload", "records", "--compression", "stream"),
     [...webtransport, "--duration", "0"],
     [...webtransport, "--warmup", "-1"],
     [...webtransport, "--size", "1.5"],

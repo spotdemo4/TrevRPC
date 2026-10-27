@@ -33,11 +33,11 @@
 // use QUIC for the page's origin; it ignores Alt-Svc from a connection with certificate errors.
 // Firefox does not use HTTP/3 with an overridden certificate, so it loads the page over HTTP/2
 // only; Safari cannot be told either way.
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
-import { Browsers, describe, pageHtml, runPage } from "./driver.js";
+import { Browsers, describe, pageHtml, readDictionary, runPage } from "./driver.js";
 import { ScenarioNames } from "./names.js";
 
 const Usage =
@@ -158,11 +158,6 @@ function parseArguments() {
 function usageError(message) {
   console.error(`trevrpc-interop-browser: ${message}\n${Usage}`);
   process.exit(2);
-}
-
-/** The dictionary in file, in base64 for the page, or undefined without one. */
-async function readDictionary(file) {
-  return file === undefined ? undefined : (await readFile(file)).toString("base64");
 }
 
 /** Writes the page to dir: index.html, and the page.js bundle it loads. */

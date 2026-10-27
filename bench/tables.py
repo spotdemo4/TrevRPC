@@ -105,6 +105,18 @@ def browser(cell: Cell) -> bool:
     return own_server(cell) and (cell.transport == "quic" or cell.client == "connect")
 
 
+def browser_compression(cell: Cell) -> bool:
+    """Chromium's TrevRPC lanes, and for reference the native TrevRPC clients over QUIC against
+    their own server: bidi at every size over WebTransport and QUIC, the rest at 1 KiB."""
+    if cell.client == "chromium":
+        if cell.transport not in ("webtransport", "websocket"):
+            return False
+    elif not own_server(cell) or cell.transport != "quic":
+        return False
+    every_size = cell.scenario == "bidi" and cell.transport in ("webtransport", "quic")
+    return every_size or cell.size == 1024
+
+
 ALL_COMPRESSIONS = ["none", "gzip", "zstd", "dictionary", "stream", "stream-dictionary"]
 
 # Loopback cells settle well inside half a second. Only operations that start and end inside the
@@ -197,6 +209,18 @@ TABLES: dict[str, Table] = {
             "concurrency": [1, 64],
         },
         browser,
+    ),
+    "browser-compression": Table(
+        "Compression in browsers",
+        {
+            **LOOPBACK,
+            "payload": "records",
+            "compressions": ["none", "dictionary", "stream", "stream-dictionary"],
+            "scenarios": ["unary", "client-stream", "bidi"],
+            "sizes": [256, 1024, 4096],
+            "concurrency": [64],
+        },
+        browser_compression,
     ),
     "browser-lossy": Table(
         "Browsers on a lossy link",

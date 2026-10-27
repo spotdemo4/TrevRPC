@@ -120,6 +120,11 @@ class SummaryTest(unittest.TestCase):
 
         self.assertEqual("stream", result.compression)
         self.assertEqual("stream", run.summary([result]).splitlines()[1].split()[7])
+        # A mode longer than its column still stands apart from the client.
+        longer = replace(result, compression="stream-dictionary")
+        self.assertEqual(
+            ["stream-dictionary", "go"], run.summary([longer]).splitlines()[1].split()[7:9]
+        )
 
     def test_groups_rows_by_netem_profile_in_run_order(self) -> None:
         results = [
@@ -168,7 +173,10 @@ class BrowserTest(unittest.TestCase):
         self.assertTrue(run.runs("none", "connect-web-h3", "server-stream"))
         self.assertFalse(run.runs("none", "connect-web", "client-stream"))
         self.assertFalse(run.runs("none", "grpc-web", "bidi"))
-        self.assertFalse(run.runs("dictionary", "webtransport", "unary"))
+        self.assertTrue(run.runs("dictionary", "webtransport", "unary"))
+        self.assertTrue(run.runs("stream", "websocket", "bidi"))
+        self.assertFalse(run.runs("stream", "webtransport", "server-stream"))
+        self.assertFalse(run.runs("stream", "connect-web", "unary"))
         self.assertFalse(run.runs("gzip", "connect-web", "unary"))
 
     def test_a_browser_lane_runs_the_browser_command(self) -> None:
@@ -190,12 +198,27 @@ class BrowserTest(unittest.TestCase):
             commands,
         )  # fmt: skip
 
-    def test_browsers_run_the_repeat_payload_only(self) -> None:
-        matrix = run.Matrix(["unary"], [64], [0], [1], 1, 0, 10)
-        self.assertEqual(1, len(matrix.cells("chromium", "go", "webtransport", None)))
-        records = replace(matrix, payload="records")
-        self.assertEqual([], records.cells("chromium", "go", "webtransport", None))
-        self.assertEqual(1, len(records.cells("go", "go", "quic", None)))
+    def test_a_browser_lane_gets_the_dictionary(self) -> None:
+        matrix = run.Matrix(
+            ["unary"], [64], [0], [4], 1, 0.5, 10, payload="records",
+            compressions=("dictionary",), dictionary=Path("/records.dict"),
+        )  # fmt: skip
+        runner = run.Runner(matrix, Path("/"))
+        commands: list[list[str]] = []
+
+        def run_one(*cell: object) -> None:
+            commands.append(cast(list[str], cell[-1]))
+
+        runner.run_one = run_one  # pyright: ignore[reportAttributeAccessIssue]
+        runner.run_matrix("chromium", "go", run.BROWSER_COMMAND, "webtransport", [], None)
+        runner.run_matrix("chromium", "connect", run.BROWSER_COMMAND, "connect-web", [], None)
+
+        self.assertEqual(1, len(commands))
+        self.assertEqual(
+            ["--payload", "records", "--compression", "dictionary",
+             "--dictionary", "/records.dict"],
+            commands[0][-6:],
+        )  # fmt: skip
 
     def test_a_browser_is_a_client(self) -> None:
         args = run.parse_args(["--server", "go=go", "--browser", "chromium"])
@@ -337,6 +360,13 @@ class TableTest(unittest.TestCase):
              ("chromium", "connect-web"): 8, ("chromium", "connect-web-h3"): 8,
              ("chromium", "grpc-web"): 8},
             self.cells("browser"),
+        )  # fmt: skip
+        # Compression on the TrevRPC lanes: bidi at every size over WebTransport, the rest at
+        # 1 KiB, in each of four modes, against both servers.
+        self.assertEqual(
+            {("go", "quic"): 20, ("rust", "quic"): 20,
+             ("chromium", "webtransport"): 40, ("chromium", "websocket"): 24},
+            self.cells("browser-compression"),
         )  # fmt: skip
         self.assertEqual(8, self.cells("browser-lossy")[("chromium", "webtransport")])
         self.assertEqual(2, self.cells("browser-lossy")[("chromium", "grpc-web")])

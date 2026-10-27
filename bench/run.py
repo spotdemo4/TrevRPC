@@ -88,9 +88,9 @@ COMPRESSIONS = {
     "none": (*NATIVE_TRANSPORTS, *BASELINE_TRANSPORTS, *BROWSER_TRANSPORTS),
     "gzip": BASELINE_TRANSPORTS,
     "zstd": BASELINE_TRANSPORTS,
-    "dictionary": NATIVE_TRANSPORTS,
-    "stream": NATIVE_TRANSPORTS,
-    "stream-dictionary": NATIVE_TRANSPORTS,
+    "dictionary": (*NATIVE_TRANSPORTS, *TREVRPC_BROWSER_TRANSPORTS),
+    "stream": (*NATIVE_TRANSPORTS, *TREVRPC_BROWSER_TRANSPORTS),
+    "stream-dictionary": (*NATIVE_TRANSPORTS, *TREVRPC_BROWSER_TRANSPORTS),
 }
 # The modes that compress with the trained dictionary.
 DICTIONARY_COMPRESSIONS = ("dictionary", "stream-dictionary")
@@ -138,10 +138,7 @@ class Matrix:
         self, client: str, server: str, transport: str, netem: str | None
     ) -> list[tables.Cell]:
         """The cells this client runs against this server over the transport and netem profile:
-        every combination that runs (see `runs`) and that `keep` keeps. Browsers generate only
-        the repeat payload."""
-        if transport in BROWSER_TRANSPORTS and self.payload != "repeat":
-            return []
+        every combination that runs (see `runs`) and that `keep` keeps."""
         return [
             cell
             for scenario in self.scenarios
@@ -523,9 +520,16 @@ def summary(results: list[Result]) -> str:
 
 
 def table(results: list[Result]) -> str:
+    """The rows in columns 16 characters wide, the first 26, each widened to keep a space after
+    its longest value, such as `stream-dictionary`."""
     rows = [list(COLUMNS), *(r.row() for r in sorted(results, key=Result.sort_key))]
+    widths = [
+        max(26 if index == 0 else 16, *(len(str(row[index])) + 1 for row in rows))
+        for index in range(len(rows[0]))
+    ]
     return "".join(
-        f"{row[0]:<26}" + "".join(f"{column:<16}" for column in row[1:]) + "\n" for row in rows
+        "".join(f"{column:<{width}}" for column, width in zip(row, widths, strict=True)) + "\n"
+        for row in rows
     )
 
 
