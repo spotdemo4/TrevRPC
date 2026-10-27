@@ -1,5 +1,8 @@
 //! Quinn helpers shared by the native client and the server.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use bytes::Bytes;
 use futures_util::FutureExt as _;
 
@@ -35,18 +38,18 @@ pub fn negotiated_protocol(connection: &quinn::Connection) -> Option<Vec<u8>> {
 }
 
 impl MuxConnection for quinn::Connection {
-    type SendStream = quinn::SendStream;
+    type SendStream = QuicSendStream;
     type RecvStream = Chunked<quinn::RecvStream>;
     type Datagrams = Self;
 
-    async fn accept_stream(&self) -> Option<(quinn::SendStream, Chunked<quinn::RecvStream>)> {
+    async fn accept_stream(&self) -> Option<(QuicSendStream, Chunked<quinn::RecvStream>)> {
         let (send, recv) = self.accept_bi().await.ok()?;
-        Some((send, Chunked::new(recv)))
+        Some((QuicSendStream::new(send), Chunked::new(recv)))
     }
 
-    async fn open_stream(&self) -> Result<(quinn::SendStream, Chunked<quinn::RecvStream>)> {
+    async fn open_stream(&self) -> Result<(QuicSendStream, Chunked<quinn::RecvStream>)> {
         let (send, recv) = self.open_bi().await.map_err(Error::transport)?;
-        Ok((send, Chunked::new(recv)))
+        Ok((QuicSendStream::new(send), Chunked::new(recv)))
     }
 
     fn close_connection(&self, reason: &'static [u8]) {
@@ -149,17 +152,50 @@ impl DatagramTransport for SessionDatagrams {
     }
 }
 
-impl MuxSendStream for quinn::SendStream {
+type Stopped = Pin<
+    Box<
+        dyn Future<Output = std::result::Result<Option<quinn::VarInt>, quinn::StoppedError>> + Send,
+    >,
+>;
+
+/// The sending half of a native QUIC stream.
+///
+/// It keeps the future that waits for the peer's `STOP_SENDING` across calls to
+/// [`MuxSendStream::peer_stopped`]: a server selects on that for every response frame its handler
+/// is not ready with, and each new Quinn `stopped()` future takes the connection lock when first
+/// polled, while one that is already waiting takes none.
+pub struct QuicSendStream {
+    pub(crate) stream: quinn::SendStream,
+    stopped: Option<Stopped>,
+}
+
+impl QuicSendStream {
+    const fn new(stream: quinn::SendStream) -> Self {
+        Self {
+            stream,
+            stopped: None,
+        }
+    }
+}
+
+impl MuxSendStream for QuicSendStream {
     async fn peer_stopped(&mut self) -> Result<()> {
-        self.stopped().await.map(|_| ()).map_err(Error::transport)
+        let stream = &self.stream;
+        let stopped = self
+            .stopped
+            .get_or_insert_with(|| Box::pin(stream.stopped()));
+        let result = stopped.as_mut().await;
+        // Quinn keeps the outcome with the stream, so a later call resolves just as fast.
+        self.stopped = None;
+        result.map(|_| ()).map_err(Error::transport)
     }
 
     fn reset_stream(&mut self, code: u32) {
-        let _ = self.reset(code.into());
+        let _ = self.stream.reset(code.into());
     }
 
     fn finish_stream(&mut self) -> Result<()> {
-        self.finish().map_err(Error::transport)
+        self.stream.finish().map_err(Error::transport)
     }
 }
 

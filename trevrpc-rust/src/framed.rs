@@ -793,9 +793,10 @@ pub fn unexpected_eof() -> Error {
     ))
 }
 
-impl FrameWrite for quinn::SendStream {
+impl FrameWrite for crate::quic::QuicSendStream {
     async fn write_frame_chunks(&mut self, chunks: &mut [Bytes]) -> Result<()> {
-        self.write_all_chunks(chunks)
+        self.stream
+            .write_all_chunks(chunks)
             .await
             .map_err(Error::transport)
     }

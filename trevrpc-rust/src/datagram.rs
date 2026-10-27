@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -58,6 +58,9 @@ const QUEUE: queue::Limits = queue::Limits {
 const MAX_DRAINED: usize = 1024;
 /// How long a call waits for its datagrams to reach the network before it ends regardless.
 const FLUSH_WAIT: Duration = Duration::from_millis(2);
+/// How long a connection reuses the largest datagram size it read from the transport; see
+/// [`Link`].
+const MAX_SIZE_REUSE: Duration = Duration::from_millis(100);
 /// The fewest ended flows a server remembers per connection.
 const MIN_ENDED_FLOWS: usize = 16;
 /// The ended flows a server remembers per stream the connection may have open, so a late datagram
@@ -237,6 +240,59 @@ impl<T: DatagramTransport> SendLink for T {
         datagram: Bytes,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), Unsent>> + Send + '_>> {
         Box::pin(DatagramTransport::send(self, datagram))
+    }
+}
+
+/// A connection's datagram transport, with the largest datagram size it last read from it.
+///
+/// Quinn reads that size under the connection lock, which every send already takes; reading it
+/// for every datagram doubled the lock traffic of senders that send one message at a time. The
+/// size only moves when path MTU discovery moves it, so it is read again after
+/// [`MAX_SIZE_REUSE`], or as soon as the transport refuses a datagram, which may have outgrown a
+/// shrunken path. A stale size costs little either way: one too large sends a datagram's messages
+/// on the stream, one too small packs datagrams less.
+struct Link {
+    transport: Arc<dyn SendLink>,
+    /// The size last read plus one, or zero when the transport had no datagrams.
+    max_size: AtomicUsize,
+    /// When `max_size` was read, in milliseconds since `epoch`, or [`Link::UNREAD`].
+    read_at: AtomicU64,
+    epoch: Instant,
+}
+
+impl Link {
+    const UNREAD: u64 = u64::MAX;
+
+    fn new(transport: Arc<dyn SendLink>) -> Self {
+        Self {
+            transport,
+            max_size: AtomicUsize::new(0),
+            read_at: AtomicU64::new(Self::UNREAD),
+            epoch: Instant::now(),
+        }
+    }
+
+    /// The largest datagram the transport sends, prefix included, as read at most
+    /// [`MAX_SIZE_REUSE`] ago; `None` when the peer does not accept datagrams.
+    fn max_size(&self) -> Option<usize> {
+        let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        let read_at = self.read_at.load(Ordering::Acquire);
+        let reuse = u64::try_from(MAX_SIZE_REUSE.as_millis()).unwrap_or(u64::MAX);
+        if read_at != Self::UNREAD && now.saturating_sub(read_at) < reuse {
+            return self.max_size.load(Ordering::Relaxed).checked_sub(1);
+        }
+        let max = self.transport.max_size();
+        self.max_size.store(
+            max.map_or(0, |max| max.saturating_add(1)),
+            Ordering::Relaxed,
+        );
+        self.read_at.store(now, Ordering::Release);
+        max
+    }
+
+    /// Makes the next [`Link::max_size`] read the size from the transport.
+    fn reread_max_size(&self) {
+        self.read_at.store(Self::UNREAD, Ordering::Release);
     }
 }
 
@@ -486,7 +542,7 @@ struct State {
 
 struct Shared {
     role: Role,
-    link: Arc<dyn SendLink>,
+    link: Arc<Link>,
     state: Mutex<State>,
     /// The largest message a datagram may carry, and the largest this side sends in one.
     max_frame_size: usize,
@@ -498,12 +554,12 @@ struct Shared {
 
 impl Shared {
     fn dispatch(&self, datagram: Bytes) {
-        let prefix_len = self.link.prefix().len();
+        let prefix_len = self.link.transport.prefix().len();
         let datagram = if prefix_len == 0 {
             datagram
         } else {
             // A datagram of another session, or without the prefix, is not ours.
-            if datagram.get(..prefix_len) != Some(self.link.prefix()) {
+            if datagram.get(..prefix_len) != Some(self.link.transport.prefix()) {
                 return;
             }
             datagram.slice(prefix_len..)
@@ -537,7 +593,7 @@ impl Shared {
     fn drain(&self) {
         // A peer that keeps sending cannot keep a call from ending.
         for _ in 0..MAX_DRAINED {
-            let Some(datagram) = self.link.try_recv() else {
+            let Some(datagram) = self.link.transport.try_recv() else {
                 return;
             };
             self.dispatch(datagram);
@@ -623,7 +679,7 @@ impl Demux {
         let link: Arc<dyn SendLink> = link;
         let shared = Arc::new(Shared {
             role,
-            link,
+            link: Arc::new(Link::new(link)),
             state: Mutex::new(State {
                 flows: HashMap::new(),
                 ended: EndedFlows::new(ended_capacity),
@@ -660,7 +716,7 @@ impl Demux {
     fn sender(&self, flow: u64) -> Option<FlowSender> {
         Some(FlowSender {
             link: Arc::clone(&self.shared.link),
-            header: flow_header(self.shared.link.prefix(), flow)?,
+            header: flow_header(self.shared.link.transport.prefix(), flow)?,
             max_frame_size: self.shared.max_frame_size,
             queued: Arc::clone(&self.shared.queued),
             compress: CallDict::None,
@@ -839,7 +895,7 @@ pub struct ServerFlow {
 /// Sends one call's messages as datagrams.
 #[derive(Clone)]
 pub struct FlowSender {
-    link: Arc<dyn SendLink>,
+    link: Arc<Link>,
     /// The transport prefix and the flow ID.
     header: Bytes,
     /// The largest message sent in a datagram.
@@ -946,6 +1002,7 @@ impl FlowSender {
         let mut cancelled = std::pin::pin!(cancelled);
         while self
             .link
+            .transport
             .transmitted()
             .is_some_and(|written| written < queued)
             && Instant::now() < deadline
@@ -968,25 +1025,32 @@ impl FlowSender {
         fired: &mut bool,
     ) {
         let datagram = datagram.split().freeze();
-        let sent = if let Some(sent) = self.link.send_now(&datagram) {
-            sent.is_ok()
+        // `None` when `cancelled` gave up on a send that had to wait.
+        let sent = if let Some(sent) = self.link.transport.send_now(&datagram) {
+            Some(sent)
         } else if *fired {
-            false
+            None
         } else {
             tokio::select! {
                 biased;
                 () = cancelled => {
                     *fired = true;
-                    false
+                    None
                 }
-                sent = self.link.send_wait(datagram) => sent.is_ok(),
+                sent = self.link.transport.send_wait(datagram) => Some(sent),
             }
         };
-        if sent {
-            self.queued.fetch_add(1, Ordering::Relaxed);
-            packed.clear();
-        } else {
-            on_stream.append(packed);
+        match sent {
+            Some(Ok(())) => {
+                self.queued.fetch_add(1, Ordering::Relaxed);
+                packed.clear();
+            }
+            Some(Err(Unsent)) => {
+                // The datagram may have outgrown a path that shrank since the size was read.
+                self.link.reread_max_size();
+                on_stream.append(packed);
+            }
+            None => on_stream.append(packed),
         }
     }
 }
@@ -1376,7 +1440,10 @@ mod tests {
                 tokio::pin!(unblocked);
                 // Register before checking, so an unblock in between is not missed.
                 unblocked.as_mut().enable();
-                if self.0.fail.load(Ordering::SeqCst) {
+                // Quinn refuses a datagram larger than the path carries.
+                if self.0.fail.load(Ordering::SeqCst)
+                    || DatagramTransport::max_size(self).is_none_or(|max| datagram.len() > max)
+                {
                     return Err(Unsent);
                 }
                 if !self.0.blocked.load(Ordering::SeqCst) {
@@ -1771,15 +1838,24 @@ mod tests {
         assert_eq!(sent[0].len(), 100);
         assert_eq!(&sent[0][..5], &[0x2a, 0x01, 0x00, 0x40, 95]);
 
-        // The limit moves with the connection's path MTU.
+        // The limit moves with the connection's path MTU. A datagram that outgrew a shrunken path
+        // is refused and its message goes on the stream, and the sender reads the limit again.
         fake.0.max.store(50, Ordering::SeqCst);
         assert_eq!(send_all(&flow.sender, &[&[7; 95]]).await.len(), 1);
         assert!(send_all(&flow.sender, &[&[7; 46]]).await.is_empty());
+        assert_eq!(fake.sent().len(), 2);
+        // A limit that grew is read again once the last reading is old enough.
+        fake.0.max.store(100, Ordering::SeqCst);
+        assert_eq!(send_all(&flow.sender, &[&[7; 95]]).await.len(), 1);
+        tokio::time::advance(MAX_SIZE_REUSE).await;
+        assert!(send_all(&flow.sender, &[&[7; 95]]).await.is_empty());
 
         // No datagrams at all, or a refused send, mean the stream.
         fake.0.max.store(0, Ordering::SeqCst);
+        tokio::time::advance(MAX_SIZE_REUSE).await;
         assert_eq!(send_all(&flow.sender, &[b"x"]).await.len(), 1);
         fake.0.max.store(100, Ordering::SeqCst);
+        tokio::time::advance(MAX_SIZE_REUSE).await;
         fake.0.fail.store(true, Ordering::SeqCst);
         assert_eq!(send_all(&flow.sender, &[b"x"]).await.len(), 1);
     }
@@ -2031,6 +2107,7 @@ mod tests {
 
         // The peer does not accept datagrams.
         fake.0.max.store(0, Ordering::SeqCst);
+        tokio::time::advance(MAX_SIZE_REUSE).await;
         assert!(!demux.supported());
         assert!(
             demux
