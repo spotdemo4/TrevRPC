@@ -29,17 +29,15 @@ jobs:
           fetch_depth: 0
           shell: release
 
-      - name: Release to Forgejo
+      - name: Release to Forgejo and pkg.go.dev
         run: flake-release
         env:
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          PKG_GO_DEV_PUBLISHING: true
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-go
-
-      - name: Seed proxy.golang.org and pkg.go.dev
-        run: .forgejo/scripts/release-go-module.sh
 
   js:
     # zizmor: ignore[excessive-permissions]
