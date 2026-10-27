@@ -9,24 +9,69 @@ import (
 	"strings"
 
 	"connectrpc.com/connect"
+	"github.com/quic-go/quic-go/http3"
 
 	"trev.zip/llc/trevrpc/bench/baseline/echopb"
 	"trev.zip/llc/trevrpc/bench/baseline/echopb/echopbconnect"
 )
 
-// newConnectServer returns a net/http server for Echo with connect-go's and
-// net/http's defaults, plus zstd. Served with TLS, it negotiates HTTP/2 with
-// ALPN, which Connect needs for bidirectional streams. Its handlers also accept
-// gRPC and gRPC-Web, though the bench client only speaks the Connect protocol.
-// They accept gzip (built in) and zstd requests, and compress responses with an
-// encoding the client accepts.
-func newConnectServer(certificate tls.Certificate) *http.Server {
+// newConnectHandler returns the Echo handler with connect-go's defaults, plus
+// zstd and CORS. Its handlers also accept gRPC and gRPC-Web, which the browser
+// benchmark's gRPC-Web client speaks; the bench client only speaks the Connect
+// protocol. They accept gzip (built in) and zstd requests, and compress
+// responses with an encoding the client accepts.
+func newConnectHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle(echopbconnect.NewEchoHandler(connectEcho{}, connectZstdAtFastest))
+	return allowCrossOrigin(mux)
+}
+
+// newConnectServer returns a net/http server for handler with net/http's
+// defaults. Served with TLS, it negotiates HTTP/2 with ALPN, which Connect
+// needs for bidirectional streams.
+func newConnectServer(certificate tls.Certificate, handler http.Handler) *http.Server {
 	return &http.Server{
-		Handler:   mux,
+		Handler:   handler,
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}},
 	}
+}
+
+// newConnectHTTP3Server returns an HTTP/3 server for handler, for browsers:
+// the native clients reach Connect over HTTP/2 only.
+func newConnectHTTP3Server(certificate tls.Certificate, handler http.Handler) *http3.Server {
+	return &http3.Server{
+		Handler:   handler,
+		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{certificate}}),
+	}
+}
+
+// corsMaxAge is how long, in seconds, a browser may reuse a preflight's
+// answer: the most Chromium honours, so a benchmark pays for one preflight.
+const corsMaxAge = "7200"
+
+// allowCrossOrigin lets pages from any origin call next: the browser
+// benchmark's page is served from the runner's own loopback origin. Requests
+// carry no credentials, so the wildcards apply to every header and origin.
+func allowCrossOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		header := w.Header()
+		header.Set("Access-Control-Allow-Origin", "*")
+		header.Set("Access-Control-Expose-Headers", "*")
+		// The page checks which HTTP version a call took in its resource timing.
+		header.Set("Timing-Allow-Origin", "*")
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			header.Set("Access-Control-Allow-Methods", "GET, POST")
+			header.Set("Access-Control-Allow-Headers", "*")
+			header.Set("Access-Control-Max-Age", corsMaxAge)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // connectEcho implements the interop Echo semantics from interop/README.md

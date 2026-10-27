@@ -97,9 +97,10 @@ buildNpmPackage (final: {
   postInstall = ''
     interop="$out/lib/trevrpc-interop-browser"
     mkdir -p "$interop/interop-browser" "$interop/build/interop"
-    cp interop-browser/cli.js interop-browser/names.js interop-browser/safari.js \
+    cp interop-browser/cli.js interop-browser/driver.js interop-browser/names.js \
+      interop-browser/safari.js interop-browser/bench-cli.js interop-browser/bench-lanes.js \
       "$interop/interop-browser/"
-    cp build/interop/page.js "$interop/build/interop/"
+    cp build/interop/page.js build/interop/bench.js "$interop/build/interop/"
     cp -R "$TMPDIR/interop-node_modules" "$interop/node_modules"
     chmod -R u+w "$interop"
     makeWrapper ${nodejs_26}/bin/node "$out/bin/trevrpc-interop-browser" \
@@ -147,6 +148,12 @@ buildNpmPackage (final: {
         assert.deepEqual((await zstd.createCompression()).query, [{}]);
       '
     )
+
+    # The load benchmark's subcommand validates its arguments before launching a browser.
+    status=0
+    "$out/bin/trevrpc-interop-browser" bench 2> bench.out || status=$?
+    test "$status" -eq 2
+    grep -q 'usage: trevrpc-interop-browser bench' bench.out
 
     ${lib.optionalString stdenv.hostPlatform.isLinux ''
       # The CLI must launch each browser and report a clean failure when no server listens.

@@ -6,8 +6,9 @@ import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
 import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
 // only needs the web platform, so it runs unchanged in a browser bundle and under Node tests.
-import { Code, TrevRpcError, codeName, connect } from "../src/index.js";
+import { Code, TrevRpcError, codeName } from "../src/index.js";
 import { createCompression } from "../src/zstd.js";
+import { connectLane } from "./lane.js";
 import { ScenarioNames } from "./names.js";
 
 const DeadlineMs = 10_000;
@@ -407,13 +408,6 @@ async function compressedUpload(compressed) {
   return trailers;
 }
 
-/** The channel transports each interop lane allows. */
-const LaneTransports = {
-  webtransport: ["webtransport"],
-  websocket: ["websocket"],
-  auto: ["webtransport", "websocket"],
-};
-
 /**
  * Runs every scenario against the server at url, reporting each result as it completes through
  * onResult({ name, ok, reason }). Resolves with all results. A server that cannot be reached
@@ -449,14 +443,13 @@ export async function runScenarios({
       dictionaries: dictionary ? [{ data: base64Bytes(dictionary), messages: EchoTypes }] : [],
     });
     open = (options) =>
-      connect(url, {
+      connectLane({
+        url,
+        certHash,
+        transport,
+        webSocketUrl,
         compression,
         signal: AbortSignal.timeout(DeadlineMs),
-        transports: LaneTransports[transport],
-        webSocketUrl,
-        ...(certHash && {
-          serverCertificateHashes: [{ algorithm: "sha-256", value: Uint8Array.from(certHash) }],
-        }),
         ...options,
       });
     channel = await open();

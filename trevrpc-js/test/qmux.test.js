@@ -398,6 +398,22 @@ test("pings are answered", async () => {
   session.close();
 });
 
+test("a first ping may have sequence 0, and later ones must increase", async () => {
+  const server = fakeServer();
+  const session = await openSession(server);
+  server.sockets[0].deliver(frames((w) => writePing(w, FrameType.Ping, 0)));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const reply = server.sockets[0].received.at(-1);
+  assert.equal(reply.type, FrameType.PingResponse);
+  assert.equal(reply.sequence, 0);
+
+  server.sockets[0].deliver(frames((w) => writePing(w, FrameType.Ping, 0)));
+  await assert.rejects(session.closed, /QX_PING sequence is not increasing/);
+  const close = server.sockets[0].received.at(-1);
+  assert.equal(close.type, FrameType.ConnectionClose);
+  assert.equal(close.code, TransportError.ProtocolViolation);
+});
+
 test("a server that selects another subprotocol is refused", async () => {
   const server = fakeServer({ protocol: "chat" });
   const session = new QMuxWebSocketSession("wss://example.test/trevrpc", {

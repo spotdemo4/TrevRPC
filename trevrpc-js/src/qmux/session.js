@@ -66,7 +66,8 @@ export class QMuxWebSocketSession {
   #pending = new FrameWriter();
   #flushScheduled = false;
   #waiters = new Set();
-  #pingReceived = 0;
+  /** The highest QX_PING request sequence received, -1 before the first: a peer may start at 0. */
+  #pingReceived = -1;
   #closedError = null;
   #lastActivity = Date.now();
   #idleTimer;

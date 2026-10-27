@@ -3,7 +3,8 @@
 A table names its options, which become the defaults of the command line (explicit flags still
 win), and a filter over the cells those options span. Tables refer to the packaged servers and
 clients by name: `go` and `rust` run against their own server only, and the baseline's clients are
-`grpc` and `connect`.
+`grpc` and `connect`. Browsers are clients named after themselves, such as `chromium`, whose
+TrevRPC lanes run against every TrevRPC server and whose fetch lanes run against `connect`.
 """
 
 from __future__ import annotations
@@ -96,6 +97,14 @@ def datagrams(cell: Cell) -> bool:
     return cell.scenario.startswith("unreliable-") or cell.concurrency == 1
 
 
+def browser(cell: Cell) -> bool:
+    """Chromium's lanes, and for reference the native TrevRPC clients over QUIC and connect-go's
+    client, each against its own server."""
+    if cell.client == "chromium":
+        return True
+    return own_server(cell) and (cell.transport == "quic" or cell.client == "connect")
+
+
 ALL_COMPRESSIONS = ["none", "gzip", "zstd", "dictionary", "stream", "stream-dictionary"]
 
 # Loopback cells settle well inside half a second. Only operations that start and end inside the
@@ -178,6 +187,28 @@ TABLES: dict[str, Table] = {
             ],
         },
         lossy,
+    ),
+    "browser": Table(
+        "Browsers",
+        {
+            **LOOPBACK,
+            "scenarios": ["unary", "server-stream", "client-stream", "bidi"],
+            "sizes": [64, 4096],
+            "concurrency": [1, 64],
+        },
+        browser,
+    ),
+    "browser-lossy": Table(
+        "Browsers on a lossy link",
+        {
+            "scenarios": ["unary", "server-stream", "client-stream", "bidi"],
+            "sizes": [1024],
+            "concurrency": [64],
+            "messages": 10,
+            "duration": 10.0,
+            "netem": [GILBERT_ELLIOTT[1]],
+        },
+        browser,
     ),
     "metadata": Table(
         "Metadata cost",

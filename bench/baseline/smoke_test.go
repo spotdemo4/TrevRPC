@@ -96,8 +96,11 @@ func startServer(t *testing.T) *testServer {
 		t.Fatalf("read port line: %v", err)
 	}
 	var ports map[string]int
-	if err := json.Unmarshal(line, &ports); err != nil || len(ports) != len(transports) {
-		t.Fatalf("port line %q is not {\"grpc\":<port>,\"connect\":<port>}: %v", line, err)
+	if err := json.Unmarshal(line, &ports); err != nil || len(ports) != len(transports)+1 {
+		t.Fatalf("port line %q is not {\"grpc\":<port>,\"connect\":<port>,\"connect_h3\":<port>}: %v", line, err)
+	}
+	if ports["connect_h3"] != ports["connect"] {
+		t.Fatalf("port line %q serves Connect over HTTP/3 on another port", line)
 	}
 	srv.addrs = make(map[string]string)
 	for _, transport := range transports {
@@ -194,12 +197,11 @@ func startPadCountingServer(t *testing.T, transport string, counter *padCounter)
 		t.Fatal(err)
 	}
 	if transport == "connect" {
-		srv := newConnectServer(certificate)
-		echo := srv.Handler
-		srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		echo := newConnectHandler()
+		srv := newConnectServer(certificate, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			counter.observe(r.Header.Values(padKey))
 			echo.ServeHTTP(w, r)
-		})
+		}))
 		go func() { _ = srv.ServeTLS(lis, "", "") }()
 		t.Cleanup(func() { _ = srv.Close() })
 		return lis.Addr().String(), certPath

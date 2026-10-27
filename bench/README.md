@@ -2,7 +2,8 @@
 
 `bench/` measures end-to-end throughput and latency of every native client
 against every server over QUIC and QMux over TLS, plus grpc-go and connect-go
-baselines over HTTP/2. Per-function microbenchmarks live in each runtime (`go test -bench` in
+baselines over HTTP/2, and the browser client in Chromium next to connect-web
+and gRPC-Web ([Browsers](#browsers)). Per-function microbenchmarks live in each runtime (`go test -bench` in
 `trevrpc-go`, `cargo bench` in `trevrpc-rust`), which `bench/micro.py`
 (`nix run .#trevrpc-bench-micro`) runs and compares across commits with
 benchstat; see the wiki's Benchmarks page.
@@ -15,7 +16,9 @@ nix run .#trevrpc-bench -- --payload records --compressions none,gzip,zstd,dicti
   --scenarios unary,client-stream,bidi --sizes 256,1024,4096
 nix run .#trevrpc-bench -- --table comparison --repeat 3 --tolerance 3
 nix run .#trevrpc-bench -- --scenarios unreliable-paced --concurrency 64 --rates 100,1000,10000
-bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
+nix run .#trevrpc-bench -- --table browser --repeat 3 --tolerance 3
+bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--browser NAME...]
+             [--table NAME]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST] [--connections LIST]
              [--metadata-sizes LIST] [--metadata-scopes LIST] [--payload repeat|records]
              [--compressions LIST] [--duration SECONDS] [--warmup SECONDS]
@@ -23,9 +26,9 @@ bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table
              [--netem PROFILE...] [--out DIR]
 ```
 
-The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients
-and the baselines unless the command line names any `--server`, `--client`, or
-`--baseline`, which then replace all three. The baseline runs its gRPC client
+The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients,
+the baselines, and on Linux Chromium's lanes, unless the command line names any
+`--server`, `--client`, `--baseline`, or `--browser`, which then replace all four. The baseline runs its gRPC client
 against its gRPC server and its Connect client against its Connect server.
 `run.py` starts each server once, then runs every client over every transport
 for every combination of scenario, size, metadata size and scope, and concurrency, and
@@ -48,10 +51,10 @@ share of the lower one, so steady cells take two runs and noisy ones up to N.
 reads, with that table's options (scenarios, sizes, concurrency, payload,
 compression modes, netem profiles, messages, duration) as defaults; explicit
 flags still override them. The tables are in [`tables.py`](tables.py):
-`comparison`, `compression`, `link`, `lossy`, `metadata`, and `datagrams`.
-They refer to the packaged servers and clients by name (`go`, `rust`, and the
-baseline's `grpc` and `connect`) and run each TrevRPC client against its own
-runtime's server only. Nothing in CI gates on these numbers: the flake
+`comparison`, `compression`, `link`, `lossy`, `metadata`, `datagrams`,
+`browser`, and `browser-lossy`. They refer to the packaged servers and clients
+by name (`go`, `rust`, the baseline's `grpc` and `connect`, and `chromium`) and
+run each native TrevRPC client against its own runtime's server only. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
 
 ## Compression
@@ -128,6 +131,39 @@ one table per profile, and each JSON record carries the profile as `netem`.
   roughly 1 MB/s, 64 workers sending 25 messages of 1 KiB a second queue until
   every echo is late, over TCP as well.
 
+## Browsers
+
+`--browser chromium` (or `firefox`) runs a browser's lanes through
+`trevrpc-interop-browser bench` from `trevrpc-js`, which opens a page in the
+browser with Playwright, runs one cell there, and prints the [client](#client)
+result line. Its lanes, as the `transport` column names them:
+
+| Lane             | Client                         | Server                                  | Scenarios            |
+| ---------------- | ------------------------------ | --------------------------------------- | -------------------- |
+| `webtransport`   | trevrpc-js over WebTransport   | every TrevRPC server                    | the four Echo        |
+| `websocket`      | trevrpc-js, QMux on WebSocket  | every TrevRPC server                    | the four Echo        |
+| `connect-web`    | connect-web, HTTP/2            | the baseline's Connect server (connect) | unary, server-stream |
+| `connect-web-h3` | connect-web, HTTP/3            | the baseline's Connect server (connect) | unary, server-stream |
+| `grpc-web`       | connect-web's gRPC-Web, HTTP/2 | the baseline's Connect server (connect) | unary, server-stream |
+
+- The four Echo scenarios are `unary`, `server-stream`, `client-stream`, and
+  `bidi`. connect-web and gRPC-Web call through `fetch`, which cannot stream a
+  request, so they run `unary` and `server-stream` only. Browsers run no
+  datagram, paced, or compression cells, and send metadata per call only.
+- Every worker shares one channel, or one connect-web transport, in one page.
+  Before warming up, each run checks that it really runs over its lane: the
+  channel's transport, or the HTTP version of a first call.
+- Chromium reaches the Connect server over HTTP/3 because it is told to
+  (`--origin-to-force-quic-on`) and trusts the certificate by its public key;
+  it ignores Alt-Svc from a server whose certificate it does not trust.
+- The page is served from a loopback origin of its own, so the Connect server
+  answers CORS requests. It is cross-origin isolated, which gives its timers
+  5 µs resolution instead of 100 µs.
+- Browsers expose no byte counts, so the lanes report no `wire_B/msg`.
+- The numbers measure the browser as much as the protocol: Chromium's network
+  service runs in a process of its own, and the client runs on the page's one
+  JavaScript thread.
+
 ## Server
 
 Servers are the interop executables' `server` subcommand (see
@@ -135,9 +171,10 @@ Servers are the interop executables' `server` subcommand (see
 started with `--dictionary` and the [trained dictionary](#compression).
 The baseline ([`bench/baseline`](baseline/README.md)) follows the same
 contract: it serves the same `Echo` service over gRPC with grpc-go and over the
-Connect protocol with connect-go (both HTTP/2 over TLS, on separate ports),
-prints `{"grpc":<port>,"connect":<port>}` once it is accepting, and exits when
-its stdin reaches EOF. It accepts gzip and zstd requests and compresses its
+Connect protocol with connect-go (both HTTP/2 over TLS, on separate ports, and
+Connect also over HTTP/3 on the UDP port of the same number, for browsers),
+prints `{"grpc":<port>,"connect":<port>,"connect_h3":<port>}` once it is
+accepting, and exits when its stdin reaches EOF. It accepts gzip and zstd requests and compresses its
 responses with the encoding of the request.
 
 Servers must not log per RPC while benchmarking, and must not cap the message

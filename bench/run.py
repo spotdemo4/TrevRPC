@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Runs every load-benchmark client against every server over every native transport, plus the
-grpc-go and connect-go baselines; see README.md.
+grpc-go and connect-go baselines and the browsers' lanes; see README.md.
 
-    run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--table NAME]
+    run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--browser NAME...]
+           [--table NAME]
            [--scenarios LIST] [--sizes LIST] [--metadata-sizes LIST] [--metadata-scopes LIST]
            [--concurrency LIST] [--connections LIST]
            [--payload repeat|records] [--compressions LIST]
@@ -13,6 +14,7 @@ grpc-go and connect-go baselines; see README.md.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import math
@@ -63,10 +65,27 @@ PACED_SCENARIOS = ("paced", "unreliable-paced")
 BASELINE_TRANSPORTS = ("grpc", "connect")
 # The TrevRPC transports, as the clients' --transport names them.
 NATIVE_TRANSPORTS = ("quic", "tcp")
+# The browsers' lanes, as `trevrpc-interop-browser bench --transport` names them: TrevRPC over
+# WebTransport and over QMux on a WebSocket, against the TrevRPC servers, and connect-web and
+# gRPC-Web through fetch, over HTTP/2 or HTTP/3, against the baseline's Connect server. Fetch
+# cannot stream a request, so the fetch lanes run the unary and server-streaming scenarios only.
+TREVRPC_BROWSER_TRANSPORTS = ("webtransport", "websocket")
+FETCH_TRANSPORTS = ("connect-web", "connect-web-h3", "grpc-web")
+BROWSER_TRANSPORTS = (*TREVRPC_BROWSER_TRANSPORTS, *FETCH_TRANSPORTS)
+ECHO_SCENARIOS = ("unary", "server-stream", "client-stream", "bidi")
+BROWSER_SCENARIOS = {
+    **dict.fromkeys(TREVRPC_BROWSER_TRANSPORTS, ECHO_SCENARIOS),
+    **dict.fromkeys(FETCH_TRANSPORTS, ECHO_SCENARIOS[:2]),
+}
+# The baseline port each fetch lane calls: Connect over HTTP/3 is on the UDP port of the number.
+FETCH_PORTS = {"connect-web": "connect", "connect-web-h3": "connect_h3", "grpc-web": "connect"}
+# The command that runs a browser's lanes, from the trevrpc-js package.
+BROWSER_COMMAND = ["trevrpc-interop-browser"]
+BROWSERS = ("chromium", "firefox")
 PAYLOADS = ("repeat", "records")
 # Each compression mode, with the transports that have it; see README.md.
 COMPRESSIONS = {
-    "none": (*NATIVE_TRANSPORTS, *BASELINE_TRANSPORTS),
+    "none": (*NATIVE_TRANSPORTS, *BASELINE_TRANSPORTS, *BROWSER_TRANSPORTS),
     "gzip": BASELINE_TRANSPORTS,
     "zstd": BASELINE_TRANSPORTS,
     "dictionary": NATIVE_TRANSPORTS,
@@ -119,7 +138,10 @@ class Matrix:
         self, client: str, server: str, transport: str, netem: str | None
     ) -> list[tables.Cell]:
         """The cells this client runs against this server over the transport and netem profile:
-        every combination that runs (see `runs`) and that `keep` keeps."""
+        every combination that runs (see `runs`) and that `keep` keeps. Browsers generate only
+        the repeat payload."""
+        if transport in BROWSER_TRANSPORTS and self.payload != "repeat":
+            return []
         return [
             cell
             for scenario in self.scenarios
@@ -344,6 +366,8 @@ def runs(compression: str, transport: str, scenario: str) -> bool:
         scenario.startswith("unreliable-") or scenario in PACED_SCENARIOS
     ):
         return False
+    if transport in BROWSER_TRANSPORTS and scenario not in BROWSER_SCENARIOS[transport]:
+        return False
     if compression == "none":
         return True
     return scenario in COMPRESSED_SCENARIOS
@@ -501,7 +525,7 @@ def summary(results: list[Result]) -> str:
 def table(results: list[Result]) -> str:
     rows = [list(COLUMNS), *(r.row() for r in sorted(results, key=Result.sort_key))]
     return "".join(
-        f"{row[0]:<26}" + "".join(f"{column:<14}" for column in row[1:]) + "\n" for row in rows
+        f"{row[0]:<26}" + "".join(f"{column:<16}" for column in row[1:]) + "\n" for row in rows
     )
 
 
@@ -565,6 +589,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     _ = parser.add_argument(
         "--baseline", type=command_line, metavar="CMD", help="the grpc-go and connect-go baseline"
+    )
+    _ = parser.add_argument(
+        "--browser",
+        choices=BROWSERS,
+        action="append",
+        default=[],
+        help="a browser whose lanes run: TrevRPC against every server, and connect-web and "
+        "gRPC-Web against the baseline's Connect server, through trevrpc-interop-browser",
     )
     _ = parser.add_argument("--scenarios", type=comma_list, default=list(SCENARIOS))
     _ = parser.add_argument("--sizes", type=int_list, default=[64])
@@ -645,11 +677,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # --netem appends, so a table's profiles apply only when the command line names none.
     table_netem = cast(list[str], options.pop("netem", []))
     parser.set_defaults(**options)
-    args = parse_with_defaults(parser, argv, ("server", "client", "baseline"))
+    args = parse_with_defaults(parser, argv, ("server", "client", "baseline", "browser"))
     if not args.netem:
         args.netem = table_netem
-    if (not args.server or not args.client) and args.baseline is None:
-        parser.error("need at least one --server and one --client, or --baseline")
+    if (not args.server or not (args.client or args.browser)) and args.baseline is None:
+        parser.error("need at least one --server and one --client or --browser, or --baseline")
     if unknown := set(args.metadata_scopes) - {"call", "connection"}:
         parser.error(f"unknown metadata scopes: {', '.join(sorted(unknown))}")
     if unknown := set(args.compressions) - set(COMPRESSIONS):
@@ -684,6 +716,7 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
     servers: list[NamedCommand] = args.server
     clients: list[NamedCommand] = args.client
     baseline: list[str] | None = args.baseline
+    browsers: list[str] = args.browser
     compressions: tuple[str, ...] = tuple(args.compressions)
     # Servers hold the trained dictionary only when a mode uses it, so zstd is needed only then.
     dictionary = (
@@ -698,6 +731,8 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
     certificate = generate_certificate(work)
     _ = (out / "results.jsonl").write_text("", encoding="utf-8")
     tls = ["--ca", str(certificate.cert), "--server-name", "localhost"]
+    # WebTransport trusts the certificate by its hash; fetch over HTTP/3 by its public key.
+    cert_hash = hashlib.sha256(certificate.der()).hexdigest()
 
     server_arguments = [] if dictionary is None else ["--dictionary", str(dictionary)]
     for spec in servers:
@@ -709,12 +744,27 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
                 "quic": ["--addr", native, *tls],
                 "tcp": ["--addr", native, "--tcp-addr", qmux, *tls],
             }
+            lanes = [
+                "--url", f"https://127.0.0.1:{server.port('webtransport')}/trevrpc",
+                "--ws-url", f"wss://127.0.0.1:{server.port('websocket')}/trevrpc",
+                "--cert-hash", cert_hash,
+            ]  # fmt: skip
             for profile in profiles:
                 apply(profile)
                 for client in clients:
                     for transport, flags in transports.items():
                         runner.run_matrix(
                             client.name, spec.name, client.command, transport, flags, profile
+                        )
+                for browser in browsers:
+                    for transport in TREVRPC_BROWSER_TRANSPORTS:
+                        runner.run_matrix(
+                            browser,
+                            spec.name,
+                            BROWSER_COMMAND,
+                            transport,
+                            ["--browser", browser, *lanes],
+                            profile,
                         )
         finally:
             runner.stop(server)
@@ -734,6 +784,17 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
                         ["--addr", address, *tls],
                         profile,
                     )
+                for browser in browsers:
+                    for transport in FETCH_TRANSPORTS:
+                        url = f"https://127.0.0.1:{server.port(FETCH_PORTS[transport])}"
+                        runner.run_matrix(
+                            browser,
+                            "connect",
+                            BROWSER_COMMAND,
+                            transport,
+                            ["--browser", browser, "--url", url, "--cert", str(certificate.cert)],
+                            profile,
+                        )
         finally:
             runner.stop(server)
     return runner

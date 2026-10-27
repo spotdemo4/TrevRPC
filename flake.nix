@@ -300,7 +300,12 @@
             };
             # nix run .#trevrpc-bench: the load benchmarks; see bench/README.md.
             trevrpc-bench = pkgs.callPackage ./bench {
-              inherit (self.packages.${system}) trevrpc-bench-baseline trevrpc-go trevrpc-rust;
+              inherit (self.packages.${system})
+                trevrpc-bench-baseline
+                trevrpc-go
+                trevrpc-js
+                trevrpc-rust
+                ;
             };
             # nix run .#trevrpc-bench-micro: the Go and Rust microbenchmarks, from the checkout.
             trevrpc-bench-micro = pkgs.callPackage ./bench/micro.nix { };

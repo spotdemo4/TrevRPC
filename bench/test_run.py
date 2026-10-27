@@ -6,7 +6,9 @@ import json
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import run
 
@@ -158,6 +160,53 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual("12345678.9", run.plain(12345678.9))
 
 
+class BrowserTest(unittest.TestCase):
+    def test_lanes_run_what_their_browser_client_can(self) -> None:
+        self.assertTrue(run.runs("none", "webtransport", "bidi"))
+        self.assertTrue(run.runs("none", "websocket", "client-stream"))
+        self.assertFalse(run.runs("none", "webtransport", "unreliable-paced"))
+        self.assertTrue(run.runs("none", "connect-web-h3", "server-stream"))
+        self.assertFalse(run.runs("none", "connect-web", "client-stream"))
+        self.assertFalse(run.runs("none", "grpc-web", "bidi"))
+        self.assertFalse(run.runs("dictionary", "webtransport", "unary"))
+        self.assertFalse(run.runs("gzip", "connect-web", "unary"))
+
+    def test_a_browser_lane_runs_the_browser_command(self) -> None:
+        runner = run.Runner(run.Matrix(["unary"], [64], [0], [4], 1, 0.5, 10), Path("/"))
+        commands: list[list[str]] = []
+
+        def run_one(*cell: object) -> None:
+            commands.append(cast(list[str], cell[-1]))
+
+        runner.run_one = run_one  # pyright: ignore[reportAttributeAccessIssue]
+        flags = ["--browser", "chromium", "--url", "https://127.0.0.1:1"]
+        runner.run_matrix("chromium", "connect", run.BROWSER_COMMAND, "grpc-web", flags, None)
+
+        self.assertEqual(
+            [["trevrpc-interop-browser", "bench", *flags, "--transport", "grpc-web",
+              "--scenario", "unary", "--size", "64", "--metadata-size", "0",
+              "--concurrency", "4", "--duration", "1", "--warmup", "0.5", "--messages", "10",
+              "--payload", "repeat", "--compression", "none"]],
+            commands,
+        )  # fmt: skip
+
+    def test_browsers_run_the_repeat_payload_only(self) -> None:
+        matrix = run.Matrix(["unary"], [64], [0], [1], 1, 0, 10)
+        self.assertEqual(1, len(matrix.cells("chromium", "go", "webtransport", None)))
+        records = replace(matrix, payload="records")
+        self.assertEqual([], records.cells("chromium", "go", "webtransport", None))
+        self.assertEqual(1, len(records.cells("go", "go", "quic", None)))
+
+    def test_a_browser_is_a_client(self) -> None:
+        args = run.parse_args(["--server", "go=go", "--browser", "chromium"])
+        self.assertEqual(["chromium"], args.browser)
+        with (
+            self.assertRaises(SystemExit),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            _ = run.parse_args(["--browser", "chromium"])
+
+
 class CompressionTest(unittest.TestCase):
     def test_modes_run_only_where_they_mean_something(self) -> None:
         self.assertTrue(run.runs("none", "quic", "server-stream"))
@@ -232,19 +281,27 @@ class TableTest(unittest.TestCase):
         for server in ("go", "rust")
         for transport in ("quic", "tcp")
     ] + [("grpc", "grpc", "grpc"), ("connect", "connect", "connect")]
+    # And a browser's lanes: TrevRPC against each TrevRPC server, fetch against Connect.
+    BROWSER_PAIRS = [
+        ("chromium", server, transport)
+        for server in ("go", "rust")
+        for transport in run.TREVRPC_BROWSER_TRANSPORTS
+    ] + [("chromium", "connect", transport) for transport in run.FETCH_TRANSPORTS]
 
     def cells(self, table: str) -> dict[tuple[str, str], int]:
         args = run.parse_args(
             ["--table", table, "--server", "go=go", "--server", "rust=rust",
-             "--client", "go=go", "--client", "rust=rust", "--baseline", "baseline"]
+             "--client", "go=go", "--client", "rust=rust", "--baseline", "baseline",
+             "--browser", "chromium"]
         )  # fmt: skip
         matrix = run.build_matrix(args)
         counts: dict[tuple[str, str], int] = {}
-        for client, server, transport in self.PAIRS:
+        for client, server, transport in self.PAIRS + self.BROWSER_PAIRS:
             for profile in args.netem or [None]:
                 count = len(matrix.cells(client, server, transport, profile))
                 if count:
-                    self.assertEqual(client, server, (table, client, server))
+                    if client not in run.BROWSERS:
+                        self.assertEqual(client, server, (table, client, server))
                     key = (client, transport)
                     counts[key] = counts.get(key, 0) + count
         return counts
@@ -271,6 +328,18 @@ class TableTest(unittest.TestCase):
             {("go", "quic"): 12, ("go", "tcp"): 3, ("rust", "quic"): 12, ("rust", "tcp"): 3},
             self.cells("datagrams"),
         )
+        # Browsers run in their own tables, with the native clients over QUIC and connect-go's
+        # for reference; their TrevRPC lanes run against both servers, and fetch has no client
+        # streams.
+        self.assertEqual(
+            {("go", "quic"): 16, ("rust", "quic"): 16, ("connect", "connect"): 16,
+             ("chromium", "webtransport"): 32, ("chromium", "websocket"): 32,
+             ("chromium", "connect-web"): 8, ("chromium", "connect-web-h3"): 8,
+             ("chromium", "grpc-web"): 8},
+            self.cells("browser"),
+        )  # fmt: skip
+        self.assertEqual(8, self.cells("browser-lossy")[("chromium", "webtransport")])
+        self.assertEqual(2, self.cells("browser-lossy")[("chromium", "grpc-web")])
         # Connection metadata runs with metadata, on TrevRPC only.
         self.assertEqual(
             {("go", "quic"): 12, ("go", "tcp"): 12, ("rust", "quic"): 12, ("rust", "tcp"): 12,
