@@ -411,9 +411,15 @@ func callContext(ctx context.Context, deadline clientDeadline) (context.Context,
 	return context.WithCancel(ctx)
 }
 
+// callContextWithoutLocalCancel is callContext for a call that nothing but
+// ctx cancels: it adds a context only for a deadline ctx does not already end
+// at. The call stops watching ctx when it ends, so a child context would cost
+// each call a registration on ctx and a cancel for nothing.
 func callContextWithoutLocalCancel(ctx context.Context, deadline clientDeadline) (context.Context, context.CancelFunc) {
-	if deadline.set || ctx.Done() != nil {
-		return callContext(ctx, deadline)
+	if deadline.set {
+		if parent, ok := ctx.Deadline(); !ok || !parent.Equal(deadline.at) {
+			return context.WithDeadline(ctx, deadline.at)
+		}
 	}
 
 	return ctx, func() {}
