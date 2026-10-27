@@ -1,4 +1,4 @@
-import { Call, defaultCallOptions, mergeCallOptions } from "./call.js";
+import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
 import { FrameType, marshalMessage, unmarshalMessage } from "./framing.js";
 import { validateMetadata } from "./metadata.js";
 import { Code, cancelled, internal, statusError } from "./status.js";
@@ -174,8 +174,6 @@ function plainCompressionUse({ compressRequests, compressResponses }) {
   const responses = Boolean(compressResponses);
   return requests || responses ? { requests, responses } : undefined;
 }
-
-const EarlyOk = "the server completed the call before the request stream ended";
 
 /**
  * A bidirectional-streaming RPC. Messages are received with recv() or async iteration. The call
@@ -487,7 +485,7 @@ export class BidirectionalStreamingCall {
     }
     const error = code === Code.Ok ? undefined : statusError(code, message, metadata);
     this.#terminal = { status: { code, message, metadata }, error };
-    this.#call.finish(error ?? cancelled(EarlyOk));
+    this.#call.finish(error);
     if (error === undefined) {
       this.#outcomeSettled = true;
       this.#resolveStatus({ code, message, metadata });

@@ -116,6 +116,9 @@ class CallScope {
  * call's cancellation scope. Transport failures surface as TrevRpcError, and once the call is
  * aborted every operation fails with the abort reason.
  */
+/** Why sends fail once the server completed the call with OK before the upload ended. */
+export const EarlyOk = "the server completed the call before the request stream ended";
+
 export class Call {
   #scope;
   #writer;
@@ -635,15 +638,21 @@ export class Call {
   }
 
   /**
-   * Ends the call after its final status was received. The request side stops: pending and later
-   * sends fail with `uploadError`, and an unfinished upload is reset. The rest of the response
-   * stream is drained in the background: unknown frames are skipped, and a known frame after
-   * STATUS cancels the stream without changing the outcome.
+   * Ends the call after its final status was received: `error` for a failed call, undefined for
+   * an OK one. An unfinished upload stops: pending and later sends fail with `error`, or with a
+   * Cancelled status saying the server completed the call early, and the request side is reset.
+   * A request side the caller already closed is left to finish, since the server either read all
+   * of it or stops it after its STATUS (see the wire format): resetting it would only cost the
+   * transport, and a browser's WebTransport a round trip to its network service, on every call.
+   * The rest of the response stream is drained in the background: unknown frames are skipped,
+   * and a known frame after STATUS cancels the stream without changing the outcome.
    */
-  finish(uploadError) {
+  finish(error) {
     this.#scope.settle();
     this.#releaseSessionState();
-    this.#endUpload(uploadError, cancelled("RPC completed"));
+    if (!this.#sendClosed || this.#uploadEnded !== undefined) {
+      this.#endUpload(error ?? cancelled(EarlyOk), cancelled("RPC completed"));
+    }
     this.#frames.expectEnd(this.#maxFrameSize).catch(() => this.#cancelReader().catch(() => {}));
   }
 

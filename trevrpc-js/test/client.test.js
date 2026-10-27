@@ -1286,6 +1286,41 @@ test("a send after an early OK status reports that the call is already over", as
   assert.deepEqual([...seen.metadata.t], [3]);
 });
 
+test("a completed call leaves the request side it closed to finish instead of resetting it", async () => {
+  const transport = fakeTransport(async (stream) => {
+    await stream.readRequest();
+    await reply(stream, { message: "done" });
+  });
+  // Records every reset of a request side, which a browser's WebTransport pays for per call.
+  const resets = [];
+  const open = transport.createBidirectionalStream.bind(transport);
+  transport.createBidirectionalStream = async () => {
+    const stream = await open();
+    const getWriter = stream.writable.getWriter.bind(stream.writable);
+    stream.writable.getWriter = () => {
+      const writer = getWriter();
+      const abort = writer.abort.bind(writer);
+      writer.abort = (reason) => {
+        resets.push(reason);
+        return abort(reason);
+      };
+      return writer;
+    };
+    return stream;
+  };
+  const echo = new EchoClient(transport);
+
+  assert.equal((await echo.unary({ message: "hi" })).message, "done");
+  const responses = [];
+  for await (const response of await echo.serverStream({ message: "hi" })) {
+    responses.push(response.message);
+  }
+  assert.deepEqual(responses, ["done"]);
+  await turn();
+  assert.deepEqual(resets, []);
+  await transport.settled();
+});
+
 test("an early OK status ends a bidirectional upload without an error status", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();

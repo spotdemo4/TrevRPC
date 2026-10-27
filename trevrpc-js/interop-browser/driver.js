@@ -23,7 +23,7 @@ export function pageHtml(bundle) {
 
 /**
  * The browsers by name. Each opens a URL with extra launch options ({ args, firefoxUserPrefs },
- * which only Playwright's browsers take) and resolves with a session to close.
+ * which only Playwright's browsers take), within timeoutMs, and resolves with a session to close.
  *
  * pageProtocols maps each HTTP version a browser can be made to load a server's page over to the
  * extra launch options that do it, given the page ({ url, cert }). forceQuic(host, cert), where a
@@ -96,7 +96,7 @@ export async function runPage({
   timeoutMessage,
 }) {
   const origin = await serve({ input, page, html, bundles, isolated, routes });
-  const opening = browser.open(origin.pageUrl, extra);
+  const opening = browser.open(origin.pageUrl, extra, setupTimeoutMs);
   try {
     await withTimeout(opening, setupTimeoutMs, `${browser.name} did not open the page in time`);
     return await withTimeout(origin.done, runTimeoutMs, timeoutMessage);
@@ -115,7 +115,7 @@ export async function runPage({
 function playwrightBrowser(type, executableVariable, launchOptions) {
   return {
     name: type.name(),
-    async open(url, extra = {}) {
+    async open(url, extra = {}, timeoutMs = SetupTimeoutMs) {
       const instance = await type.launch({
         ...launchOptions,
         ...(extra.args && { args: [...(launchOptions.args ?? []), ...extra.args] }),
@@ -135,7 +135,8 @@ function playwrightBrowser(type, executableVariable, launchOptions) {
             console.error(`[browser ${message.type()}] ${message.text()}`);
           }
         });
-        await page.goto(url, { waitUntil: "load" });
+        // Playwright's own navigation timeout would otherwise cut a slow load short.
+        await page.goto(url, { waitUntil: "load", timeout: timeoutMs });
       } catch (error) {
         await close();
         throw error;
