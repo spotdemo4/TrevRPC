@@ -225,7 +225,7 @@ impl CompressedEcho for CompressedEchoService {
 }
 
 /// Registers `RefusingEcho.ClientStream` as `Echo.ClientStream`, by hand and without stream
-/// compression, as a server built from a schema without `compress_stream` would: the server
+/// compression, as a server built from a schema without `COMPRESSION_STREAM` would: the server
 /// refuses every optimistic call to it, and clients replay them.
 fn register_refusing_echo(server: &mut Server) {
     server.route_streaming_with_options(

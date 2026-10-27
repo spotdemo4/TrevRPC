@@ -211,12 +211,19 @@ func methodOptions(method *protogen.Method) *trevrpcpb.MethodOptions {
 }
 
 // validateMethodOptions rejects an unreliable direction of a method that does
-// not stream that direction, and stream compression on a unary method.
+// not stream that direction, stream compression on a unary method, and a
+// compression this generator does not know.
 func validateMethodOptions(service *protogen.Service) error {
 	for _, method := range service.Methods {
 		options := methodOptions(method)
-		if options.GetCompressStream() && !method.Desc.IsStreamingClient() && !method.Desc.IsStreamingServer() {
-			return fmt.Errorf("%s: compress_stream requires a streaming method", method.Desc.FullName())
+		switch compression := options.GetCompression(); compression {
+		case trevrpcpb.Compression_COMPRESSION_UNSPECIFIED, trevrpcpb.Compression_COMPRESSION_MESSAGE:
+		case trevrpcpb.Compression_COMPRESSION_STREAM:
+			if !method.Desc.IsStreamingClient() && !method.Desc.IsStreamingServer() {
+				return fmt.Errorf("%s: COMPRESSION_STREAM requires a streaming method", method.Desc.FullName())
+			}
+		default:
+			return fmt.Errorf("%s: unknown compression %d", method.Desc.FullName(), compression)
 		}
 		if options.GetUnreliableRequests() && !method.Desc.IsStreamingClient() {
 			return fmt.Errorf("%s: unreliable_requests requires a client-streaming or bidirectional method", method.Desc.FullName())
@@ -248,11 +255,11 @@ func (g fileGenerator) streamCompressionLiteral(method *protogen.Method) string 
 	return fmt.Sprintf("%s{Requests: %t, Responses: %t}", g.runtime("StreamCompression"), requests, responses)
 }
 
-// streamCompressionDirections returns the directions of method that its
-// compress_stream option lets be stream-compressed: those that stream and
-// whose message type has no field marked debug_redact.
+// streamCompressionDirections returns the directions of method that
+// COMPRESSION_STREAM lets be stream-compressed: those that stream and whose
+// message type has no field marked debug_redact.
 func streamCompressionDirections(method *protogen.Method) (requests, responses bool) {
-	if !methodOptions(method).GetCompressStream() {
+	if methodOptions(method).GetCompression() != trevrpcpb.Compression_COMPRESSION_STREAM {
 		return false, false
 	}
 	requests = method.Desc.IsStreamingClient() && !hasRedactedField(method.Input.Desc, map[protoreflect.FullName]bool{})
@@ -271,13 +278,12 @@ func (g fileGenerator) plainCompressionLiteral(method *protogen.Method) string {
 	return fmt.Sprintf("%s{Requests: %t, Responses: %t}", g.runtime("PlainCompression"), requests, responses)
 }
 
-// plainCompressionDirections returns the directions of method that its
-// compress option, or compress_stream, which implies it, lets be compressed
-// without a dictionary: those whose message type has no field marked
-// debug_redact.
+// plainCompressionDirections returns the directions of method that
+// COMPRESSION_MESSAGE, or COMPRESSION_STREAM, which includes it, lets be
+// compressed without a dictionary: those whose message type has no field
+// marked debug_redact.
 func plainCompressionDirections(method *protogen.Method) (requests, responses bool) {
-	options := methodOptions(method)
-	if !options.GetCompress() && !options.GetCompressStream() {
+	if methodOptions(method).GetCompression() == trevrpcpb.Compression_COMPRESSION_UNSPECIFIED {
 		return false, false
 	}
 	requests = !hasRedactedField(method.Input.Desc, map[protoreflect.FullName]bool{})

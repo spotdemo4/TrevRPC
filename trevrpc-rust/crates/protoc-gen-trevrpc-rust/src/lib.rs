@@ -20,17 +20,20 @@ use prost_types::{
 const METHOD_OPTION_FIELD: u32 = 58247;
 
 /// The marks of the `(trevrpc.method)` option of one method.
-#[allow(clippy::struct_excessive_bools)] // The schema option's fields, one each.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MethodMarks {
     unreliable_requests: bool,
     unreliable_responses: bool,
-    compress_stream: bool,
-    compress: bool,
+    /// The `trevrpc.Compression` value, as the schema has it.
+    compression: i32,
 }
 
+/// `trevrpc.Compression` values; `COMPRESSION_UNSPECIFIED` is 0.
+const COMPRESSION_MESSAGE: i32 = 1;
+const COMPRESSION_STREAM: i32 = 2;
+
 /// The directions of a method that may use stream compression: those it streams, when the schema
-/// sets `compress_stream` and the direction's message type has no field marked `debug_redact`.
+/// sets `COMPRESSION_STREAM` and the direction's message type has no field marked `debug_redact`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CompressedDirections {
     requests: bool,
@@ -44,8 +47,8 @@ struct CompressedDirections {
 /// declares the path to it: `CodeGeneratorRequest.proto_file` (15) -> `FileDescriptorProto`
 /// (`name` 1, `service` 6) -> `ServiceDescriptorProto` (`name` 1, `method` 2) ->
 /// `MethodDescriptorProto` (`name` 1, `options` 4) -> `MethodOptions` (extension 58247) ->
-/// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2, `compress_stream`
-/// 3, `compress` 4). It also reads `FieldOptions.debug_redact` (16), which `prost-types` does not know, through
+/// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2, `compression` 5).
+/// It also reads `FieldOptions.debug_redact` (16), which `prost-types` does not know, through
 /// `FileDescriptorProto.message_type` (4) -> `DescriptorProto` (`name` 1, `field` 2,
 /// `nested_type` 3) -> `FieldDescriptorProto` (`type_name` 6, `options` 8).
 mod mirror {
@@ -113,17 +116,14 @@ mod mirror {
         pub trevrpc: Option<TrevrpcOptions>,
     }
 
-    #[allow(clippy::struct_excessive_bools)] // The schema option's fields, one each.
     #[derive(Clone, PartialEq, Eq, prost::Message)]
     pub struct TrevrpcOptions {
         #[prost(bool, tag = "1")]
         pub unreliable_requests: bool,
         #[prost(bool, tag = "2")]
         pub unreliable_responses: bool,
-        #[prost(bool, tag = "3")]
-        pub compress_stream: bool,
-        #[prost(bool, tag = "4")]
-        pub compress: bool,
+        #[prost(int32, tag = "5")]
+        pub compression: i32,
     }
 
     /// A `FileDescriptorSet`, with its files left encoded.
@@ -187,8 +187,7 @@ impl MethodOptionIndex {
                         MethodMarks {
                             unreliable_requests: options.unreliable_requests,
                             unreliable_responses: options.unreliable_responses,
-                            compress_stream: options.compress_stream,
-                            compress: options.compress,
+                            compression: options.compression,
                         },
                     );
                 }
@@ -554,7 +553,8 @@ struct Method {
     unreliable: MethodMarks,
     compressed: CompressedDirections,
     /// The directions that may be compressed without a dictionary: every one, when the schema sets
-    /// `compress` or `compress_stream`, whose message type has no field marked `debug_redact`.
+    /// `COMPRESSION_MESSAGE` or `COMPRESSION_STREAM`, whose message type has no field marked
+    /// `debug_redact`.
     plain: CompressedDirections,
 }
 
@@ -957,9 +957,16 @@ fn descriptor_method(
             "{full_name}: unreliable_responses requires a server-streaming or bidirectional method"
         ));
     }
-    if marks.compress_stream && !client_streaming && !server_streaming {
+    // COMPRESSION_STREAM includes COMPRESSION_MESSAGE, for the messages outside the stream.
+    let (stream, plain) = match marks.compression {
+        0 => (false, false),
+        COMPRESSION_MESSAGE => (false, true),
+        COMPRESSION_STREAM => (true, true),
+        other => return Err(format!("{full_name}: unknown compression {other}")),
+    };
+    if stream && !client_streaming && !server_streaming {
         return Err(format!(
-            "{full_name}: compress_stream requires a streaming method"
+            "{full_name}: COMPRESSION_STREAM requires a streaming method"
         ));
     }
 
@@ -974,12 +981,12 @@ fn descriptor_method(
         server_streaming,
         unreliable: marks,
         compressed: CompressedDirections {
-            requests: marks.compress_stream && client_streaming,
-            responses: marks.compress_stream && server_streaming,
+            requests: stream && client_streaming,
+            responses: stream && server_streaming,
         },
         plain: CompressedDirections {
-            requests: marks.compress || marks.compress_stream,
-            responses: marks.compress || marks.compress_stream,
+            requests: plain,
+            responses: plain,
         },
     })
 }

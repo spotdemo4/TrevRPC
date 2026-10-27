@@ -26,6 +26,77 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Compression is how a method's messages may be compressed with zstd beyond
+// the configured dictionaries, set with
+//
+//	rpc Subscribe(SubscribeRequest) returns (stream MetricSample) {
+//	  option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+//	}
+//
+// Message types containing a field marked debug_redact are never compressed
+// this way. Do not let a method compress data an attacker can influence
+// together with secrets: compressed sizes can reveal the secrets.
+type Compression int32
+
+const (
+	// Only configured dictionaries compress the method's messages.
+	Compression_COMPRESSION_UNSPECIFIED Compression = 0
+	// Messages may also be compressed one at a time without a dictionary (a
+	// ZSTD_MESSAGE without a Dictionary_ID), where no configured dictionary
+	// applies to their type. Runtimes do it for messages of 256 bytes or more,
+	// and only when that makes them smaller.
+	Compression_COMPRESSION_MESSAGE Compression = 1
+	// As COMPRESSION_MESSAGE, and each streamed direction of a call may also be
+	// compressed with one zstd context, so later messages compress against
+	// earlier ones (ZSTD_STREAM_MESSAGE). The context takes over from each
+	// direction's third message; unreliable directions and unary ones keep
+	// compressing one message at a time. Only methods that stream requests or
+	// responses can set it. Within a call, one message's compressed size
+	// depends on the earlier ones, so secrets can leak across messages too.
+	Compression_COMPRESSION_STREAM Compression = 2
+)
+
+// Enum value maps for Compression.
+var (
+	Compression_name = map[int32]string{
+		0: "COMPRESSION_UNSPECIFIED",
+		1: "COMPRESSION_MESSAGE",
+		2: "COMPRESSION_STREAM",
+	}
+	Compression_value = map[string]int32{
+		"COMPRESSION_UNSPECIFIED": 0,
+		"COMPRESSION_MESSAGE":     1,
+		"COMPRESSION_STREAM":      2,
+	}
+)
+
+func (x Compression) Enum() *Compression {
+	p := new(Compression)
+	*p = x
+	return p
+}
+
+func (x Compression) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (Compression) Descriptor() protoreflect.EnumDescriptor {
+	return file_trevrpc_options_proto_enumTypes[0].Descriptor()
+}
+
+func (Compression) Type() protoreflect.EnumType {
+	return &file_trevrpc_options_proto_enumTypes[0]
+}
+
+func (x Compression) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use Compression.Descriptor instead.
+func (Compression) EnumDescriptor() ([]byte, []int) {
+	return file_trevrpc_options_proto_rawDescGZIP(), []int{0}
+}
+
 // MethodOptions are TrevRPC's per-method settings, set with
 //
 //	rpc Track(stream Position) returns (stream Position) {
@@ -40,23 +111,9 @@ type MethodOptions struct {
 	// Response messages may travel as datagrams. Only server-streaming and
 	// bidirectional methods stream responses.
 	UnreliableResponses bool `protobuf:"varint,2,opt,name=unreliable_responses,json=unreliableResponses,proto3" json:"unreliable_responses,omitempty"`
-	// Streamed messages may be compressed with one zstd context per direction
-	// of a call, so later messages compress against earlier ones
-	// (ZSTD_STREAM_MESSAGE). Only methods that stream requests or responses
-	// can set it. Message types containing a field marked debug_redact are
-	// never compressed this way. Do not set it on a method whose streams carry
-	// data an attacker can influence together with secrets: compressed sizes
-	// can reveal the secrets.
-	CompressStream bool `protobuf:"varint,3,opt,name=compress_stream,json=compressStream,proto3" json:"compress_stream,omitempty"`
-	// Messages may be compressed with zstd one at a time without a dictionary
-	// (a ZSTD_MESSAGE without a Dictionary_ID), where no configured dictionary
-	// applies to their type. Runtimes do it for messages of 256 bytes or more,
-	// and only when that makes them smaller; compress_stream implies it.
-	// Message types containing a field marked debug_redact are never
-	// compressed this way. Do not set it on a method whose messages carry data
-	// an attacker can influence together with secrets: compressed sizes can
-	// reveal the secrets.
-	Compress      bool `protobuf:"varint,4,opt,name=compress,proto3" json:"compress,omitempty"`
+	// How the method's messages may be compressed without a dictionary.
+	// Configured dictionaries apply to every method whatever this says.
+	Compression   Compression `protobuf:"varint,5,opt,name=compression,proto3,enum=trevrpc.Compression" json:"compression,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -105,18 +162,11 @@ func (x *MethodOptions) GetUnreliableResponses() bool {
 	return false
 }
 
-func (x *MethodOptions) GetCompressStream() bool {
+func (x *MethodOptions) GetCompression() Compression {
 	if x != nil {
-		return x.CompressStream
+		return x.Compression
 	}
-	return false
-}
-
-func (x *MethodOptions) GetCompress() bool {
-	if x != nil {
-		return x.Compress
-	}
-	return false
+	return Compression_COMPRESSION_UNSPECIFIED
 }
 
 var file_trevrpc_options_proto_extTypes = []protoimpl.ExtensionInfo{
@@ -140,12 +190,15 @@ var File_trevrpc_options_proto protoreflect.FileDescriptor
 
 const file_trevrpc_options_proto_rawDesc = "" +
 	"\n" +
-	"\x15trevrpc/options.proto\x12\atrevrpc\x1a google/protobuf/descriptor.proto\"\xb8\x01\n" +
+	"\x15trevrpc/options.proto\x12\atrevrpc\x1a google/protobuf/descriptor.proto\"\xd2\x01\n" +
 	"\rMethodOptions\x12/\n" +
 	"\x13unreliable_requests\x18\x01 \x01(\bR\x12unreliableRequests\x121\n" +
-	"\x14unreliable_responses\x18\x02 \x01(\bR\x13unreliableResponses\x12'\n" +
-	"\x0fcompress_stream\x18\x03 \x01(\bR\x0ecompressStream\x12\x1a\n" +
-	"\bcompress\x18\x04 \x01(\bR\bcompress:P\n" +
+	"\x14unreliable_responses\x18\x02 \x01(\bR\x13unreliableResponses\x126\n" +
+	"\vcompression\x18\x05 \x01(\x0e2\x14.trevrpc.CompressionR\vcompressionJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05R\x0fcompress_streamR\bcompress*[\n" +
+	"\vCompression\x12\x1b\n" +
+	"\x17COMPRESSION_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13COMPRESSION_MESSAGE\x10\x01\x12\x16\n" +
+	"\x12COMPRESSION_STREAM\x10\x02:P\n" +
 	"\x06method\x12\x1e.google.protobuf.MethodOptions\x18\x87\xc7\x03 \x01(\v2\x16.trevrpc.MethodOptionsR\x06methodB_\n" +
 	"\x18zip.trev.trevrpc.optionsB\fOptionsProtoP\x01Z3trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb;trevrpcpbb\x06proto3"
 
@@ -161,19 +214,22 @@ func file_trevrpc_options_proto_rawDescGZIP() []byte {
 	return file_trevrpc_options_proto_rawDescData
 }
 
+var file_trevrpc_options_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_trevrpc_options_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_trevrpc_options_proto_goTypes = []any{
-	(*MethodOptions)(nil),              // 0: trevrpc.MethodOptions
-	(*descriptorpb.MethodOptions)(nil), // 1: google.protobuf.MethodOptions
+	(Compression)(0),                   // 0: trevrpc.Compression
+	(*MethodOptions)(nil),              // 1: trevrpc.MethodOptions
+	(*descriptorpb.MethodOptions)(nil), // 2: google.protobuf.MethodOptions
 }
 var file_trevrpc_options_proto_depIdxs = []int32{
-	1, // 0: trevrpc.method:extendee -> google.protobuf.MethodOptions
-	0, // 1: trevrpc.method:type_name -> trevrpc.MethodOptions
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	1, // [1:2] is the sub-list for extension type_name
-	0, // [0:1] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	0, // 0: trevrpc.MethodOptions.compression:type_name -> trevrpc.Compression
+	2, // 1: trevrpc.method:extendee -> google.protobuf.MethodOptions
+	1, // 2: trevrpc.method:type_name -> trevrpc.MethodOptions
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	2, // [2:3] is the sub-list for extension type_name
+	1, // [1:2] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_trevrpc_options_proto_init() }
@@ -186,13 +242,14 @@ func file_trevrpc_options_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeFor[x]().PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_trevrpc_options_proto_rawDesc), len(file_trevrpc_options_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   1,
 			NumExtensions: 1,
 			NumServices:   0,
 		},
 		GoTypes:           file_trevrpc_options_proto_goTypes,
 		DependencyIndexes: file_trevrpc_options_proto_depIdxs,
+		EnumInfos:         file_trevrpc_options_proto_enumTypes,
 		MessageInfos:      file_trevrpc_options_proto_msgTypes,
 		ExtensionInfos:    file_trevrpc_options_proto_extTypes,
 	}.Build()

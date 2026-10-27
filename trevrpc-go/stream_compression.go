@@ -16,10 +16,10 @@ import (
 // StreamCompression marks the directions of a streaming method whose messages
 // may be compressed with one zstd context per direction of a call
 // (ZSTD_STREAM_MESSAGE), so that later messages compress against earlier
-// ones. Generated code passes the method's schema option, compress_stream,
-// with a direction left out when its message type has a field marked
-// debug_redact; hand-written code can pass it to WithStreamCompression
-// (clients) and RouteStreamCompression (servers).
+// ones. Generated code passes it for methods whose schema sets
+// COMPRESSION_STREAM, with a direction left out when its message type has a
+// field marked debug_redact; hand-written code can pass it to
+// WithStreamCompression (clients) and RouteStreamCompression (servers).
 //
 // Requests applies to client-streaming and bidirectional methods and Responses
 // to server-streaming and bidirectional ones; a flag for a direction that does

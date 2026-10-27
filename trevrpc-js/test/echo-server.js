@@ -174,7 +174,7 @@ async function serve(stream, request, unary, session) {
   }
 
   // RefusingEcho is registered without stream compression, as by a server built from a schema
-  // without compress_stream: it never answers, so it refuses every optimistic call.
+  // without COMPRESSION_STREAM: it never answers, so it refuses every optimistic call.
   if (path.service === RefusingEchoService && path.method === "ClientStream") {
     if (request.streamCompression?.optimistic) {
       await stream.refuse();

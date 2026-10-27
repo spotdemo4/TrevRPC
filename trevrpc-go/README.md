@@ -178,8 +178,8 @@ Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `Web
 Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in three ways that combine. All call libzstd through cgo, and are off in binaries built without it.
 
 - **Dictionaries:** `DialOptions.Compression` and `ServerOptions.Compression` take dictionaries trained with `zstd --train`, each with the protobuf message types it compresses.
-- **Without a dictionary:** a method marked `option (trevrpc.method) = {compress: true}` (or `compress_stream`) compresses its messages of 256 bytes or more on their own where no dictionary applies, with nothing to configure. Responses compress from a connection's first call, requests once its answer arrives. `HandlerContext.PlainCompressedRequests` counts the requests that arrived so.
-- **Stream compression:** a streaming method marked `option (trevrpc.method) = {compress_stream: true}` compresses each streamed direction with one zstd context per call, from its third message, with nothing to configure. `ServerOptions.StreamCompressionMemory` (256 MiB by default) and `DialOptions.StreamCompressionMemory` (64 MiB) bound the memory those contexts hold; a negative value turns it off.
+- **Without a dictionary:** a method marked `option (trevrpc.method) = {compression: COMPRESSION_MESSAGE}` (or `COMPRESSION_STREAM`) compresses its messages of 256 bytes or more on their own where no dictionary applies, with nothing to configure. Responses compress from a connection's first call, requests once its answer arrives. `HandlerContext.PlainCompressedRequests` counts the requests that arrived so.
+- **Stream compression:** a streaming method marked `option (trevrpc.method) = {compression: COMPRESSION_STREAM}` compresses each streamed direction with one zstd context per call, from its third message, with nothing to configure. `ServerOptions.StreamCompressionMemory` (256 MiB by default) and `DialOptions.StreamCompressionMemory` (64 MiB) bound the memory those contexts hold; a negative value turns it off.
 
 ## Interop
 

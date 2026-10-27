@@ -102,8 +102,8 @@ message MethodOptions {
 message TrevrpcMethodOptions {
   optional bool unreliable_requests = 1;
   optional bool unreliable_responses = 2;
-  optional bool compress_stream = 3;
-  optional bool compress = 4;
+  // trevrpc.Compression, read as its number so that unknown values reach the check.
+  optional int32 compression = 5;
 }
 
 message FieldOptions {
@@ -429,14 +429,7 @@ function serviceDescriptor(file, service, redacted) {
       inputType,
       outputType,
       ...unreliableDirections(methodName, kind, options),
-      ...streamCompressionDirections(
-        methodName,
-        kind,
-        options,
-        { inputType, outputType },
-        redacted,
-      ),
-      ...plainCompressionDirections(options, { inputType, outputType }, redacted),
+      ...compressionDirections(methodName, kind, options, { inputType, outputType }, redacted),
     };
   }
 
@@ -473,25 +466,37 @@ function unreliableDirections(methodName, kind, options) {
   return directions;
 }
 
+/** `trevrpc.Compression` values, from proto/trevrpc/options.proto. */
+const Compression = { unspecified: 0, message: 1, stream: 2 };
+
 /**
- * The directions a method's `compress_stream` flag applies to, as descriptor fields: those that
- * stream and whose message type has no field marked `debug_redact`. The flag on a unary method is
- * an error.
+ * The directions a method's `compression` lets compress, as descriptor fields, leaving out message
+ * types with a field marked `debug_redact`. `COMPRESSION_MESSAGE` compresses messages without a
+ * dictionary in both directions. `COMPRESSION_STREAM` does too, for the messages outside the
+ * stream, and stream-compresses the directions that stream; on a unary method it is an error, and
+ * so is a value this generator does not know.
  */
-function streamCompressionDirections(
-  methodName,
-  kind,
-  options,
-  { inputType, outputType },
-  redacted,
-) {
-  if (!options?.compressStream) {
+function compressionDirections(methodName, kind, options, { inputType, outputType }, redacted) {
+  const compression = options?.compression ?? Compression.unspecified;
+  if (compression === Compression.unspecified) {
     return {};
   }
-  if (kind === "unary") {
-    throw new Error(`${methodName}: compress_stream requires a streaming method`);
+  if (compression !== Compression.message && compression !== Compression.stream) {
+    throw new Error(`${methodName}: unknown compression ${compression}`);
   }
   const directions = {};
+  if (!redacted.has(inputType)) {
+    directions.compressRequests = true;
+  }
+  if (!redacted.has(outputType)) {
+    directions.compressResponses = true;
+  }
+  if (compression === Compression.message) {
+    return directions;
+  }
+  if (kind === "unary") {
+    throw new Error(`${methodName}: COMPRESSION_STREAM requires a streaming method`);
+  }
   if (
     (kind === "clientStreaming" || kind === "bidirectionalStreaming") &&
     !redacted.has(inputType)
@@ -503,25 +508,6 @@ function streamCompressionDirections(
     !redacted.has(outputType)
   ) {
     directions.compressStreamResponses = true;
-  }
-  return directions;
-}
-
-/**
- * The directions whose messages compress without a dictionary, as descriptor fields: both, for a
- * method that sets `compress` or `compress_stream`, except a message type with a field marked
- * `debug_redact`.
- */
-function plainCompressionDirections(options, { inputType, outputType }, redacted) {
-  if (!options?.compress && !options?.compressStream) {
-    return {};
-  }
-  const directions = {};
-  if (!redacted.has(inputType)) {
-    directions.compressRequests = true;
-  }
-  if (!redacted.has(outputType)) {
-    directions.compressResponses = true;
   }
   return directions;
 }

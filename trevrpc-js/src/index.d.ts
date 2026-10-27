@@ -138,9 +138,9 @@ export interface RpcMethodDescriptor {
    */
   unreliableResponses?: boolean;
   /**
-   * The method's request messages may be stream-compressed (`compress_stream` in the
-   * `trevrpc.method` option, on a method that streams requests, whose request type has no field
-   * marked `debug_redact`). Calls on a transport with compression then compress them with one zstd
+   * The method's request messages may be stream-compressed (`compression: COMPRESSION_STREAM` in
+   * the `trevrpc.method` option, on a method that streams requests, whose request type has no
+   * field marked `debug_redact`). Calls on a transport with compression then compress them with one zstd
    * context per call, once the server agrees.
    */
   compressStreamRequests?: boolean;
@@ -149,8 +149,8 @@ export interface RpcMethodDescriptor {
   /**
    * The method's request messages may be compressed without a dictionary: one at a time, from 256
    * bytes, where no dictionary applies to their type and the server decodes it. The generator
-   * sets it for `compress` and `compress_stream`, except for message types with a field marked
-   * `debug_redact`.
+   * sets it for `COMPRESSION_MESSAGE` and `COMPRESSION_STREAM`, except for message types with a
+   * field marked `debug_redact`.
    */
   compressRequests?: boolean;
   /** The method's response messages may be compressed without a dictionary; see `compressRequests`. */

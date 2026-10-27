@@ -40,11 +40,11 @@ const STREAM_COMPRESSED_KEY: &str = "stream-compressed";
 /// its requests, and reports, in its trailing metadata, how many arrived stream-compressed.
 const UPLOAD: &str = "/test.Compressed/Upload";
 /// `UPLOAD` and `STREAM` registered without stream compression, as a server built from a schema
-/// without `compress_stream` would: the server refuses optimistic calls to them.
+/// without `COMPRESSION_STREAM` would: the server refuses optimistic calls to them.
 const REFUSING_UPLOAD: &str = "/test.Compressed/RefusingUpload";
 const REFUSING_STREAM: &str = "/test.Compressed/RefusingStream";
 /// A unary route whose messages may be compressed without a dictionary, as the schema's
-/// `compress` asks; its type has none. It reports in its trailing metadata, under
+/// `COMPRESSION_MESSAGE` asks; its type has none. It reports in its trailing metadata, under
 /// [`PLAIN_COMPRESSED_KEY`], how many requests arrived so.
 const PLAIN: &str = "/test.Compressed/Plain";
 const PLAIN_TYPE: &str = "test.Plain";

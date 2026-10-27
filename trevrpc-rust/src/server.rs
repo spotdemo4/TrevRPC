@@ -74,9 +74,9 @@ impl RouteOptions {
     }
 
     /// Lets the route's messages be compressed without a dictionary in the directions
-    /// `directions` sets; see [`CompressMessages`]. Generated code passes the schema's `compress`
-    /// (or `compress_stream`). Requests compressed so are accepted on every route whatever this
-    /// says; it decides which responses may be.
+    /// `directions` sets; see [`CompressMessages`]. Generated code passes it for
+    /// `COMPRESSION_MESSAGE` and `COMPRESSION_STREAM`. Requests compressed so are accepted on
+    /// every route whatever this says; it decides which responses may be.
     #[must_use]
     pub const fn with_compress(mut self, directions: CompressMessages) -> Self {
         self.compress = directions;
@@ -90,8 +90,8 @@ impl RouteOptions {
     }
 
     /// Lets the route's streamed messages be compressed with one zstd context per call in the
-    /// directions `directions` sets; see [`CompressStream`]. Generated code passes the schema's
-    /// `compress_stream`. Directions the route's kind does not stream are ignored.
+    /// directions `directions` sets; see [`CompressStream`]. Generated code passes it for
+    /// `COMPRESSION_STREAM`. Directions the route's kind does not stream are ignored.
     ///
     /// When the requests direction is set, the route streams requests and they are not marked
     /// unreliable, every call sends HEADERS at dispatch, before the handler runs, carrying the

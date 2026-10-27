@@ -11,20 +11,20 @@ import "trevrpc/options.proto";
 // unreliable.proto: the gRPC baseline compiles only interop.proto.
 service CompressedEcho {
   rpc Bidi(stream EchoRequest) returns (stream EchoResponse) {
-    option (trevrpc.method) = {compress_stream: true};
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
   }
   // For the load benchmarks' client-stream scenario.
   rpc ClientStream(stream EchoRequest) returns (EchoResponse) {
-    option (trevrpc.method) = {compress_stream: true};
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
   }
   // Echo.Unary, compressed without a dictionary where no dictionary applies:
   // for the load benchmarks' unary scenario in the modes without one.
   rpc Unary(EchoRequest) returns (EchoResponse) {
-    option (trevrpc.method) = {compress: true};
+    option (trevrpc.method) = {compression: COMPRESSION_MESSAGE};
   }
   // Echoes text, compressed without a dictionary where both sides allow it.
   rpc Plain(PlainMessage) returns (PlainMessage) {
-    option (trevrpc.method) = {compress: true};
+    option (trevrpc.method) = {compression: COMPRESSION_MESSAGE};
   }
 }
 
@@ -39,6 +39,6 @@ message PlainMessage {
 // would, so they refuse every optimistic call (see interop/README.md).
 service RefusingEcho {
   rpc ClientStream(stream EchoRequest) returns (EchoResponse) {
-    option (trevrpc.method) = {compress_stream: true};
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
   }
 }

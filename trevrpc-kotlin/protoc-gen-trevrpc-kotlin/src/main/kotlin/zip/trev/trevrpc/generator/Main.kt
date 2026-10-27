@@ -22,8 +22,11 @@ private const val HEX_DIGITS = "0123456789abcdef"
 private const val METHOD_OPTION_FIELD = 58247
 private const val UNRELIABLE_REQUESTS_FIELD = 1
 private const val UNRELIABLE_RESPONSES_FIELD = 2
-private const val COMPRESS_STREAM_FIELD = 3
-private const val COMPRESS_FIELD = 4
+private const val COMPRESSION_FIELD = 5
+
+/** `trevrpc.Compression` values; `COMPRESSION_UNSPECIFIED` is 0. */
+private const val COMPRESSION_MESSAGE = 1L
+private const val COMPRESSION_STREAM = 2L
 
 public fun main() {
     try {
@@ -529,15 +532,22 @@ private fun describeMethod(
             "$serviceName.${descriptor.name}: unreliable_responses requires a server-streaming or bidirectional method",
         )
     }
-    if (unreliable.compressStream && !descriptor.clientStreaming && !descriptor.serverStreaming) {
-        throw GeneratorException("$serviceName.${descriptor.name}: compress_stream requires a streaming method")
+    // COMPRESSION_STREAM includes COMPRESSION_MESSAGE, for the messages outside the stream.
+    val (compressStream, compressPlain) =
+        when (unreliable.compression) {
+            0L -> false to false
+            COMPRESSION_MESSAGE -> false to true
+            COMPRESSION_STREAM -> true to true
+            else -> throw GeneratorException("$serviceName.${descriptor.name}: unknown compression ${unreliable.compression}")
+        }
+    if (compressStream && !descriptor.clientStreaming && !descriptor.serverStreaming) {
+        throw GeneratorException("$serviceName.${descriptor.name}: COMPRESSION_STREAM requires a streaming method")
     }
     val input = types.resolve(file, descriptor.inputType)
     val output = types.resolve(file, descriptor.outputType)
     // Stream compression leaves out directions that are unreliable (their messages are meant for
     // datagrams, which never use the context) and types with redacted fields. Compression without a
-    // dictionary, which compress_stream implies, leaves out only types with redacted fields.
-    val compressPlain = unreliable.compress || unreliable.compressStream
+    // dictionary leaves out only types with redacted fields.
     return Method(
         name = lowerCamel(descriptor.name),
         constantName = screamingSnake(descriptor.name),
@@ -548,9 +558,9 @@ private fun describeMethod(
         serverStreaming = descriptor.serverStreaming,
         unreliable = unreliable,
         compressRequests =
-            unreliable.compressStream && descriptor.clientStreaming && !unreliable.requests && !types.hasRedactedField(input),
+            compressStream && descriptor.clientStreaming && !unreliable.requests && !types.hasRedactedField(input),
         compressResponses =
-            unreliable.compressStream && descriptor.serverStreaming && !unreliable.responses && !types.hasRedactedField(output),
+            compressStream && descriptor.serverStreaming && !unreliable.responses && !types.hasRedactedField(output),
         compressPlainRequests = compressPlain && !types.hasRedactedField(input),
         compressPlainResponses = compressPlain && !types.hasRedactedField(output),
     )
@@ -558,13 +568,12 @@ private fun describeMethod(
 
 /**
  * The `(trevrpc.method)` option of a method: which streamed directions the schema marks unreliable,
- * and whether it allows stream compression and compression without a dictionary.
+ * and its `trevrpc.Compression` value.
  */
 private data class TrevRpcMethodOptions(
     val requests: Boolean = false,
     val responses: Boolean = false,
-    val compressStream: Boolean = false,
-    val compress: Boolean = false,
+    val compression: Long = 0,
 ) {
     val any: Boolean
         get() = requests || responses
@@ -573,8 +582,8 @@ private data class TrevRpcMethodOptions(
 /**
  * Reads `(trevrpc.method)` from the unknown fields of `MethodOptions`: the generator's descriptors
  * carry no extension registry, so protoc's extension bytes stay as raw fields, and decoding the
- * bool fields by hand avoids shipping generated option classes. Repeated occurrences merge, as
- * protobuf message fields do.
+ * fields by hand avoids shipping generated option classes. Repeated occurrences merge, as protobuf
+ * message fields do: the last compression wins.
  */
 private fun readMethodOptions(descriptor: MethodDescriptorProto): TrevRpcMethodOptions {
     val field = descriptor.options.unknownFields.getField(METHOD_OPTION_FIELD)
@@ -590,8 +599,7 @@ private fun readMethodOptions(descriptor: MethodDescriptorProto): TrevRpcMethodO
             TrevRpcMethodOptions(
                 requests = result.requests || fields.getField(UNRELIABLE_REQUESTS_FIELD).varintList.any { it != 0L },
                 responses = result.responses || fields.getField(UNRELIABLE_RESPONSES_FIELD).varintList.any { it != 0L },
-                compressStream = result.compressStream || fields.getField(COMPRESS_STREAM_FIELD).varintList.any { it != 0L },
-                compress = result.compress || fields.getField(COMPRESS_FIELD).varintList.any { it != 0L },
+                compression = fields.getField(COMPRESSION_FIELD).varintList.lastOrNull() ?: result.compression,
             )
     }
     return result

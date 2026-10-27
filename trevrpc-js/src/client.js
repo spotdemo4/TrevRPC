@@ -167,7 +167,7 @@ function streamCompressionUse({ compressStreamRequests, compressStreamResponses,
 /**
  * The directions whose messages a method may compress without a dictionary, `{ requests,
  * responses }`, or undefined for none: those its descriptor marks (the generator marks both for
- * `compress` and `compress_stream`, except message types with redacted fields).
+ * `COMPRESSION_MESSAGE` and `COMPRESSION_STREAM`, except message types with redacted fields).
  */
 function plainCompressionUse({ compressRequests, compressResponses }) {
   const requests = Boolean(compressRequests);

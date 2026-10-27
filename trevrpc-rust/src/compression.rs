@@ -104,7 +104,8 @@ impl Dictionary {
 }
 
 /// The directions of a method whose messages may be compressed without a dictionary, from the
-/// `compress` field of the `trevrpc.method` schema option (which `compress_stream` implies).
+/// `compression` of the `trevrpc.method` schema option: `COMPRESSION_MESSAGE` or
+/// `COMPRESSION_STREAM`.
 ///
 /// Generated code passes them with [`Call::compress`](crate::client::Call::compress) and
 /// [`RouteOptions::with_compress`](crate::server::RouteOptions::with_compress). A direction is set

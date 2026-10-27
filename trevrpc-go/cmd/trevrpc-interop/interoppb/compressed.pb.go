@@ -76,12 +76,12 @@ const file_compressed_proto_rawDesc = "" +
 	"\fPlainMessage\x12\x12\n" +
 	"\x04text\x18\x01 \x01(\tR\x04text2\xed\x02\n" +
 	"\x0eCompressedEcho\x12U\n" +
-	"\x04Bidi\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x010\x01\x12[\n" +
-	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x01\x12R\n" +
-	"\x05Unary\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02 \x01\x12S\n" +
-	"\x05Plain\x12 .trevrpc.interop.v1.PlainMessage\x1a .trevrpc.interop.v1.PlainMessage\"\x06\xba\xb8\x1c\x02 \x012k\n" +
+	"\x04Bidi\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02(\x02(\x010\x01\x12[\n" +
+	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02(\x02(\x01\x12R\n" +
+	"\x05Unary\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02(\x01\x12S\n" +
+	"\x05Plain\x12 .trevrpc.interop.v1.PlainMessage\x1a .trevrpc.interop.v1.PlainMessage\"\x06\xba\xb8\x1c\x02(\x012k\n" +
 	"\fRefusingEcho\x12[\n" +
-	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02\x18\x01(\x01b\x06proto3"
+	"\fClientStream\x12\x1f.trevrpc.interop.v1.EchoRequest\x1a .trevrpc.interop.v1.EchoResponse\"\x06\xba\xb8\x1c\x02(\x02(\x01b\x06proto3"
 
 var (
 	file_compressed_proto_rawDescOnce sync.Once

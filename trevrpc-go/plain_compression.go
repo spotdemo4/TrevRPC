@@ -3,10 +3,10 @@ package trevrpc
 // PlainCompression marks the directions of a method whose messages may be
 // compressed with zstd one at a time without a dictionary: a ZSTD_MESSAGE with
 // no Dictionary_ID, where no dictionary the peers share applies to the message
-// type. Generated code passes the method's schema option, compress (which
-// compress_stream implies), with a direction left out when its message type
-// has a field marked debug_redact; hand-written code can pass it to
-// WithPlainCompression (clients) and RoutePlainCompression (servers).
+// type. Generated code passes it for methods whose schema sets
+// COMPRESSION_MESSAGE or COMPRESSION_STREAM, with a direction left out when
+// its message type has a field marked debug_redact; hand-written code can pass
+// it to WithPlainCompression (clients) and RoutePlainCompression (servers).
 //
 // Messages of plainCompressionMinSize bytes or more are compressed, and sent
 // so only when that makes them smaller. Peers negotiate it per connection as

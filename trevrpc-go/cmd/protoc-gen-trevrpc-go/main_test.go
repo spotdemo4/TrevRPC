@@ -622,42 +622,47 @@ func unreliableRequest(t *testing.T, goPackage string, methods ...unreliableMeth
 	return decoded
 }
 
+const (
+	message = trevrpcpb.Compression_COMPRESSION_MESSAGE
+	stream  = trevrpcpb.Compression_COMPRESSION_STREAM
+)
+
 type unreliableMethod struct {
 	name                             string
 	clientStreaming, serverStreaming bool
-	// requests, responses and compress are the options; none set means no
-	// option.
-	requests, responses, compress bool
-	// plain sets the compress option.
-	plain bool
+	// requests, responses and compression are the options; none set means
+	// no option.
+	requests, responses bool
+	compression         trevrpcpb.Compression
 	// input is the request message type, HelloRequest when empty.
 	input string
 }
 
 func (m unreliableMethod) options(t *testing.T) *descriptor.MethodOptions {
 	t.Helper()
-	if !m.requests && !m.responses && !m.compress && !m.plain {
+	if !m.requests && !m.responses && m.compression == trevrpcpb.Compression_COMPRESSION_UNSPECIFIED {
 		return nil
 	}
 	options := &descriptor.MethodOptions{}
-	proto.SetExtension(options, trevrpcpb.E_Method, &trevrpcpb.MethodOptions{UnreliableRequests: m.requests, UnreliableResponses: m.responses, CompressStream: m.compress, Compress: m.plain})
+	proto.SetExtension(options, trevrpcpb.E_Method, &trevrpcpb.MethodOptions{UnreliableRequests: m.requests, UnreliableResponses: m.responses, Compression: m.compression})
 	return options
 }
 
 func TestGeneratorEmitsStreamCompressionOptions(t *testing.T) {
 	request := unreliableRequest(t, "example.test/hello/v1;hellov1",
-		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, compress: true},
-		unreliableMethod{name: "Upload", clientStreaming: true, compress: true},
-		unreliableMethod{name: "Download", serverStreaming: true, compress: true, responses: true},
-		unreliableMethod{name: "Leaky", clientStreaming: true, serverStreaming: true, compress: true, input: "Secret"},
-		unreliableMethod{name: "SecretUpload", clientStreaming: true, compress: true, input: "Secret"},
+		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, compression: stream},
+		unreliableMethod{name: "Upload", clientStreaming: true, compression: stream},
+		unreliableMethod{name: "Download", serverStreaming: true, compression: stream, responses: true},
+		unreliableMethod{name: "Leaky", clientStreaming: true, serverStreaming: true, compression: stream, input: "Secret"},
+		unreliableMethod{name: "SecretUpload", clientStreaming: true, compression: stream, input: "Secret"},
 	)
 	response := generate(request)
 	if response.GetError() != "" {
 		t.Fatalf("generator returned error: %s", response.GetError())
 	}
 	content := response.File[0].GetContent()
-	// compress_stream implies compress, for the messages outside the stream.
+	// COMPRESSION_STREAM includes COMPRESSION_MESSAGE, for the messages
+	// outside the stream.
 	plainBoth := "trevrpc_go.PlainCompression{Requests: true, Responses: true}"
 	plainResponses := "trevrpc_go.PlainCompression{Requests: false, Responses: true}"
 	for _, want := range []string{
@@ -684,8 +689,8 @@ func TestGeneratorEmitsStreamCompressionOptions(t *testing.T) {
 
 func TestGeneratorEmitsPlainCompressionOptions(t *testing.T) {
 	request := unreliableRequest(t, "example.test/hello/v1;hellov1",
-		unreliableMethod{name: "Call", plain: true},
-		unreliableMethod{name: "SecretCall", plain: true, input: "Secret"},
+		unreliableMethod{name: "Call", compression: message},
+		unreliableMethod{name: "SecretCall", compression: message, input: "Secret"},
 		unreliableMethod{name: "Bare"},
 	)
 	response := generate(request)
@@ -707,8 +712,15 @@ func TestGeneratorEmitsPlainCompressionOptions(t *testing.T) {
 }
 
 func TestGeneratorRejectsStreamCompressionOnUnaryMethods(t *testing.T) {
-	response := generate(unreliableRequest(t, "example.test/hello/v1;hellov1", unreliableMethod{name: "Call", compress: true}))
-	if want := "hello.v1.Greeter.Call: compress_stream requires a streaming method"; response.GetError() != want {
+	response := generate(unreliableRequest(t, "example.test/hello/v1;hellov1", unreliableMethod{name: "Call", compression: stream}))
+	if want := "hello.v1.Greeter.Call: COMPRESSION_STREAM requires a streaming method"; response.GetError() != want {
+		t.Fatalf("error = %q, want %q", response.GetError(), want)
+	}
+}
+
+func TestGeneratorRejectsUnknownCompression(t *testing.T) {
+	response := generate(unreliableRequest(t, "example.test/hello/v1;hellov1", unreliableMethod{name: "Call", compression: 7}))
+	if want := "hello.v1.Greeter.Call: unknown compression 7"; response.GetError() != want {
 		t.Fatalf("error = %q, want %q", response.GetError(), want)
 	}
 }
@@ -770,9 +782,9 @@ func TestGeneratorRejectsUnreliableDirectionsThatDoNotStream(t *testing.T) {
 func TestGeneratedUnreliableOptionsCompile(t *testing.T) {
 	runtimeRoot, root, relativeRoot, importPrefix := newInModuleFixture(t)
 	response := generate(unreliableRequest(t, importPrefix+"/hello/v1;hellov1",
-		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, requests: true, responses: true, compress: true},
+		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, requests: true, responses: true, compression: stream},
 		unreliableMethod{name: "Upload", clientStreaming: true, requests: true},
-		unreliableMethod{name: "Download", serverStreaming: true, responses: true, compress: true},
+		unreliableMethod{name: "Download", serverStreaming: true, responses: true, compression: stream},
 	))
 	if response.GetError() != "" {
 		t.Fatalf("generator returned error: %s", response.GetError())

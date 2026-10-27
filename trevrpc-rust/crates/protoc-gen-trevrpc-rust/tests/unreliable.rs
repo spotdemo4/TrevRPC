@@ -185,7 +185,7 @@ fn false_flags_are_not_marks() {
 }
 
 #[test]
-fn compress_stream_is_emitted_for_the_directions_that_stream_without_redacted_fields() {
+fn stream_compression_is_emitted_for_the_directions_that_stream_without_redacted_fields() {
     let content = generated(
         r#"syntax = "proto3";
 package demo.v1;
@@ -194,10 +194,10 @@ message Position { int32 x = 1; }
 message Secret { string token = 1 [debug_redact = true]; }
 message Holder { repeated Secret secrets = 1; }
 service Telemetry {
-    rpc Track(stream Position) returns (stream Position) { option (trevrpc.method) = { compress_stream: true }; }
-    rpc Upload(stream Position) returns (Position) { option (trevrpc.method) = { compress_stream: true }; }
-    rpc Leak(stream Position) returns (stream Holder) { option (trevrpc.method) = { compress_stream: true }; }
-    rpc Hidden(Secret) returns (stream Secret) { option (trevrpc.method) = { compress_stream: true }; }
+    rpc Track(stream Position) returns (stream Position) { option (trevrpc.method) = { compression: COMPRESSION_STREAM }; }
+    rpc Upload(stream Position) returns (Position) { option (trevrpc.method) = { compression: COMPRESSION_STREAM }; }
+    rpc Leak(stream Position) returns (stream Holder) { option (trevrpc.method) = { compression: COMPRESSION_STREAM }; }
+    rpc Hidden(Secret) returns (stream Secret) { option (trevrpc.method) = { compression: COMPRESSION_STREAM }; }
 }
 "#,
     );
@@ -225,7 +225,7 @@ service Telemetry {
 }
 
 #[test]
-fn compress_is_emitted_for_every_direction_without_redacted_fields() {
+fn message_compression_is_emitted_for_every_direction_without_redacted_fields() {
     let content = generated(
         r#"syntax = "proto3";
 package demo.v1;
@@ -233,9 +233,9 @@ import "trevrpc/options.proto";
 message Position { int32 x = 1; }
 message Secret { string token = 1 [debug_redact = true]; }
 service Telemetry {
-    rpc Get(Position) returns (Position) { option (trevrpc.method) = { compress: true }; }
-    rpc Login(Position) returns (Secret) { option (trevrpc.method) = { compress: true }; }
-    rpc Upload(stream Position) returns (Position) { option (trevrpc.method) = { compress_stream: true }; }
+    rpc Get(Position) returns (Position) { option (trevrpc.method) = { compression: COMPRESSION_MESSAGE }; }
+    rpc Login(Position) returns (Secret) { option (trevrpc.method) = { compression: COMPRESSION_MESSAGE }; }
+    rpc Upload(stream Position) returns (Position) { option (trevrpc.method) = { compression: COMPRESSION_STREAM }; }
     rpc Plain(Position) returns (Position);
 }
 "#,
@@ -248,7 +248,7 @@ service Telemetry {
     assert!(content.contains(
         ".message_types(\"demo.v1.Position\", \"demo.v1.Secret\").compress(::trevrpc::CompressMessages::REQUESTS)\n"
     ));
-    // compress_stream implies it, for the unary response direction too.
+    // COMPRESSION_STREAM includes it, for the unary response direction too.
     assert!(content.contains(
         ".compress_stream(::trevrpc::CompressStream::REQUESTS).compress(::trevrpc::CompressMessages::BOTH)\n"
     ));
@@ -261,12 +261,23 @@ service Telemetry {
 }
 
 #[test]
-fn compress_stream_needs_a_streaming_method() {
+fn stream_compression_needs_a_streaming_method() {
     let response = generate(&service(
-        "rpc Call(Position) returns (Position) { option (trevrpc.method) = { compress_stream: true }; }",
+        "rpc Call(Position) returns (Position) { option (trevrpc.method) = { compression: COMPRESSION_STREAM }; }",
     ));
     assert_eq!(
         response.error.as_deref(),
-        Some("demo.v1.Telemetry.Call: compress_stream requires a streaming method")
+        Some("demo.v1.Telemetry.Call: COMPRESSION_STREAM requires a streaming method")
+    );
+}
+
+#[test]
+fn an_unknown_compression_is_an_error() {
+    let response = generate(&service(
+        "rpc Call(stream Position) returns (Position) { option (trevrpc.method) = { compression: 7 }; }",
+    ));
+    assert_eq!(
+        response.error.as_deref(),
+        Some("demo.v1.Telemetry.Call: unknown compression 7")
     );
 }

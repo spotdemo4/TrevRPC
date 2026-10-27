@@ -2,7 +2,7 @@
 //! context of its direction of a call, so each message compresses against the direction's earlier
 //! ones.
 //!
-//! A method allows it in its schema (`compress_stream`), which generated code passes as
+//! A method allows it in its schema (`COMPRESSION_STREAM`), which generated code passes as
 //! [`CompressStream`]. The client offers it on each call and the server answers, per direction;
 //! senders start a direction's context from its third message, within a memory budget that every
 //! server and channel has, and receivers validate each chunk before decompressing it. Clients
@@ -24,7 +24,7 @@ use crate::sync::MutexExt;
 use crate::{Result, RpcKind, varint, wire};
 
 /// The directions of a method whose messages may be compressed with one zstd context per call
-/// (stream compression), from the `compress_stream` field of the `trevrpc.method` schema option.
+/// (stream compression), from `COMPRESSION_STREAM` in the `trevrpc.method` schema option.
 ///
 /// Generated code passes them with [`Call::compress_stream`](crate::client::Call::compress_stream)
 /// and [`RouteOptions::with_compress_stream`](crate::server::RouteOptions::with_compress_stream).

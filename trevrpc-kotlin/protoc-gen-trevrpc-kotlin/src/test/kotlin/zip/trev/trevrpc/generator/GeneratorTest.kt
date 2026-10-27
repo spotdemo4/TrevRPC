@@ -541,7 +541,7 @@ class GeneratorTest {
         ) = method(name, input, output)
             .setClientStreaming(true)
             .setServerStreaming(true)
-            .setOptions(trevrpcOptions(requests = unreliableRequests, compressStream = true))
+            .setOptions(trevrpcOptions(requests = unreliableRequests, compression = COMPRESSION_STREAM))
 
         val file =
             FileDescriptorProto
@@ -591,7 +591,7 @@ class GeneratorTest {
     }
 
     @Test
-    fun `passes compression without a dictionary for compress and compress_stream methods without redacted messages`() {
+    fun `passes compression without a dictionary for message and stream compression without redacted messages`() {
         val redacted =
             FieldDescriptorProto
                 .newBuilder()
@@ -612,12 +612,14 @@ class GeneratorTest {
                     ServiceDescriptorProto
                         .newBuilder()
                         .setName("Svc")
-                        .addMethod(method("Get", ".plain.Report", ".plain.Report").setOptions(trevrpcOptions(compress = true)))
-                        .addMethod(method("Login", ".plain.Secret", ".plain.Report").setOptions(trevrpcOptions(compress = true)))
                         .addMethod(
+                            method("Get", ".plain.Report", ".plain.Report").setOptions(trevrpcOptions(compression = COMPRESSION_MESSAGE)),
+                        ).addMethod(
+                            method("Login", ".plain.Secret", ".plain.Report").setOptions(trevrpcOptions(compression = COMPRESSION_MESSAGE)),
+                        ).addMethod(
                             method("Stream", ".plain.Report", ".plain.Report")
                                 .setServerStreaming(true)
-                                .setOptions(trevrpcOptions(compressStream = true)),
+                                .setOptions(trevrpcOptions(compression = COMPRESSION_STREAM)),
                         ).addMethod(method("Off", ".plain.Report", ".plain.Report")),
                 ).build()
 
@@ -639,14 +641,14 @@ class GeneratorTest {
                 ?.get(1)
         assertEquals("BOTH", plain("GET"))
         assertEquals("RESPONSES", plain("LOGIN"))
-        // compress_stream implies compress, for the messages outside the stream context.
+        // COMPRESSION_STREAM includes COMPRESSION_MESSAGE, for the messages outside the stream context.
         assertEquals("BOTH", plain("STREAM"))
         assertTrue("CompressStream.RESPONSES, compressMessages" in calls.getValue("STREAM"), calls.getValue("STREAM"))
         assertEquals(null, plain("OFF"))
     }
 
     @Test
-    fun `rejects compress_stream on a unary method`() {
+    fun `rejects stream compression on a unary method`() {
         val response =
             generate(
                 request(
@@ -656,13 +658,39 @@ class GeneratorTest {
                             .newBuilder()
                             .setName("Svc")
                             .addMethod(
-                                method("M", ".collision.Request", ".collision.Reply").setOptions(trevrpcOptions(compressStream = true)),
+                                method(
+                                    "M",
+                                    ".collision.Request",
+                                    ".collision.Reply",
+                                ).setOptions(trevrpcOptions(compression = COMPRESSION_STREAM)),
                             ).build(),
                     ),
                 ),
             )
         assertTrue(response.fileList.isEmpty())
-        assertEquals("collision.Svc.M: compress_stream requires a streaming method", response.error)
+        assertEquals("collision.Svc.M: COMPRESSION_STREAM requires a streaming method", response.error)
+    }
+
+    @Test
+    fun `rejects an unknown compression`() {
+        val response =
+            generate(
+                request(
+                    collisionFile(
+                        "api/unknown.proto",
+                        ServiceDescriptorProto
+                            .newBuilder()
+                            .setName("Svc")
+                            .addMethod(
+                                method("M", ".collision.Request", ".collision.Reply")
+                                    .setClientStreaming(true)
+                                    .setOptions(trevrpcOptions(compression = 7)),
+                            ).build(),
+                    ),
+                ),
+            )
+        assertTrue(response.fileList.isEmpty())
+        assertEquals("collision.Svc.M: unknown compression 7", response.error)
     }
 
     @Test
@@ -887,15 +915,13 @@ class GeneratorTest {
     private fun trevrpcOptions(
         requests: Boolean = false,
         responses: Boolean = false,
-        compressStream: Boolean = false,
-        compress: Boolean = false,
+        compression: Int = 0,
     ): MethodOptions {
         val bytes = ByteArrayOutputStream()
         val out = CodedOutputStream.newInstance(bytes)
         if (requests) out.writeBool(1, true)
         if (responses) out.writeBool(2, true)
-        if (compressStream) out.writeBool(3, true)
-        if (compress) out.writeBool(4, true)
+        if (compression != 0) out.writeEnum(5, compression)
         out.flush()
         return MethodOptions
             .newBuilder()
@@ -926,6 +952,10 @@ class GeneratorTest {
             .setOutputType(output)
 
     private companion object {
+        /** `trevrpc.Compression` values. */
+        const val COMPRESSION_MESSAGE = 1
+        const val COMPRESSION_STREAM = 2
+
         val SNAPSHOT_MARKERS =
             listOf(
                 "package ",

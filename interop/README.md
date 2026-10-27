@@ -99,12 +99,12 @@ needs no TrevRPC options. Both files import from the include roots
 [`proto/compressed.proto`](proto/compressed.proto) defines
 `trevrpc.interop.v1.CompressedEcho`, whose methods allow
 [stream compression](../wiki/Protocol-and-Wire-Format.md#stream-compression)
-(`compress_stream`) or
+(`COMPRESSION_STREAM`) or
 [compression without a dictionary](../wiki/Protocol-and-Wire-Format.md#compression-without-a-dictionary)
-(`compress`), in a separate file for the same reason, and
+(`COMPRESSION_MESSAGE`), in a separate file for the same reason, and
 `trevrpc.interop.v1.RefusingEcho`, whose schema allows it too but which servers
 register by hand without stream compression, as a server built from a schema
-without `compress_stream` would. Servers therefore refuse every
+without `COMPRESSION_STREAM` would. Servers therefore refuse every
 [optimistic](../wiki/Protocol-and-Wire-Format.md#optimistic-stream-compression)
 call to it, and clients must replay the call.
 

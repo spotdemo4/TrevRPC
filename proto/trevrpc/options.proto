@@ -25,23 +25,40 @@ message MethodOptions {
   // Response messages may travel as datagrams. Only server-streaming and
   // bidirectional methods stream responses.
   bool unreliable_responses = 2;
-  // Streamed messages may be compressed with one zstd context per direction
-  // of a call, so later messages compress against earlier ones
-  // (ZSTD_STREAM_MESSAGE). Only methods that stream requests or responses
-  // can set it. Message types containing a field marked debug_redact are
-  // never compressed this way. Do not set it on a method whose streams carry
-  // data an attacker can influence together with secrets: compressed sizes
-  // can reveal the secrets.
-  bool compress_stream = 3;
-  // Messages may be compressed with zstd one at a time without a dictionary
-  // (a ZSTD_MESSAGE without a Dictionary_ID), where no configured dictionary
+  // How the method's messages may be compressed without a dictionary.
+  // Configured dictionaries apply to every method whatever this says.
+  Compression compression = 5;
+
+  reserved 3, 4;
+  reserved "compress_stream", "compress";
+}
+
+// Compression is how a method's messages may be compressed with zstd beyond
+// the configured dictionaries, set with
+//
+//   rpc Subscribe(SubscribeRequest) returns (stream MetricSample) {
+//     option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+//   }
+//
+// Message types containing a field marked debug_redact are never compressed
+// this way. Do not let a method compress data an attacker can influence
+// together with secrets: compressed sizes can reveal the secrets.
+enum Compression {
+  // Only configured dictionaries compress the method's messages.
+  COMPRESSION_UNSPECIFIED = 0;
+  // Messages may also be compressed one at a time without a dictionary (a
+  // ZSTD_MESSAGE without a Dictionary_ID), where no configured dictionary
   // applies to their type. Runtimes do it for messages of 256 bytes or more,
-  // and only when that makes them smaller; compress_stream implies it.
-  // Message types containing a field marked debug_redact are never
-  // compressed this way. Do not set it on a method whose messages carry data
-  // an attacker can influence together with secrets: compressed sizes can
-  // reveal the secrets.
-  bool compress = 4;
+  // and only when that makes them smaller.
+  COMPRESSION_MESSAGE = 1;
+  // As COMPRESSION_MESSAGE, and each streamed direction of a call may also be
+  // compressed with one zstd context, so later messages compress against
+  // earlier ones (ZSTD_STREAM_MESSAGE). The context takes over from each
+  // direction's third message; unreliable directions and unary ones keep
+  // compressing one message at a time. Only methods that stream requests or
+  // responses can set it. Within a call, one message's compressed size
+  // depends on the earlier ones, so secrets can leak across messages too.
+  COMPRESSION_STREAM = 2;
 }
 
 extend google.protobuf.MethodOptions {

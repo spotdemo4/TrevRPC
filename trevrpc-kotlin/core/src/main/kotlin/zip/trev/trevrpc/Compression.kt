@@ -7,10 +7,10 @@ package zip.trev.trevrpc
  * - With dictionaries both peers hold. The channel asks the server on every call which of the
  *   call's dictionaries it holds, since Cronet does not say which calls share a connection, so a
  *   message whose dictionary the server lacks travels uncompressed.
- * - Without a dictionary on methods whose schema sets `compress` or `compress_stream`: messages of
- *   [PLAIN_MIN_SIZE] bytes or more that no dictionary applies to, negotiated on every call as the
- *   dictionary with ID 0 (see [CompressMessages]).
- * - With stream compression on methods whose schema sets `compress_stream`: one zstd context per
+ * - Without a dictionary on methods whose schema sets `COMPRESSION_MESSAGE` or
+ *   `COMPRESSION_STREAM`: messages of [PLAIN_MIN_SIZE] bytes or more that no dictionary applies to,
+ *   negotiated on every call as the dictionary with ID 0 (see [CompressMessages]).
+ * - With stream compression on methods whose schema sets `COMPRESSION_STREAM`: one zstd context per
  *   streamed direction of a call.
  *
  * The last two need no dictionaries, so an empty [dictionaries] list enables only them.
@@ -108,10 +108,11 @@ class Dictionary(
 /**
  * The directions of a method whose messages may be compressed without a dictionary (a ZSTD_MESSAGE
  * without a Dictionary_ID) where no dictionary applies to their type. Generated clients pass it for
- * methods whose schema sets `compress` or `compress_stream`, leaving out directions whose message
- * type has a field marked `debug_redact`. Messages of [PLAIN_MIN_SIZE] bytes or more are compressed
- * when that makes them shorter. Responses may be compressed from the first call; requests only on
- * calls that stream them, once the call's answer confirms that the server decodes them.
+ * methods whose schema sets `COMPRESSION_MESSAGE` or `COMPRESSION_STREAM`, leaving out directions
+ * whose message type has a field marked `debug_redact`. Messages of [PLAIN_MIN_SIZE] bytes or more
+ * are compressed when that makes them shorter. Responses may be compressed from the first call;
+ * requests only on calls that stream them, once the call's answer confirms that the server decodes
+ * them.
  */
 data class CompressMessages(
     val requests: Boolean = false,

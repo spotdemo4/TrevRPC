@@ -6,9 +6,9 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * The streamed directions of a method that may use stream compression: one zstd context per
  * direction of a call, so later messages compress against earlier ones (ZSTD_STREAM_MESSAGE).
- * Generated clients pass it for methods whose schema sets `compress_stream`, leaving out directions
- * that do not stream, that the schema marks unreliable, or whose message type has a field marked
- * `debug_redact`. A direction that does not stream is ignored.
+ * Generated clients pass it for methods whose schema sets `COMPRESSION_STREAM`, leaving out
+ * directions that do not stream, that the schema marks unreliable, or whose message type has a field
+ * marked `debug_redact`. A direction that does not stream is ignored.
  */
 data class CompressStream(
     val requests: Boolean = false,

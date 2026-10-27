@@ -202,7 +202,7 @@ The runtime options underneath are `trevrpc::Unreliable`, set on a client call w
 Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in two ways that combine:
 
 - **Dictionaries:** `ChannelConfig::with_compression` and `ServerOptions::with_compression` take a `Compression` holding dictionaries trained with `zstd --train`, each with the protobuf message types it compresses. Generated code passes each method's message types, which pick the dictionaries.
-- **Stream compression:** a streaming method marked `option (trevrpc.method) = {compress_stream: true}` compresses each streamed direction with one zstd context per call, from its third message, with nothing to configure. `ServerOptions::with_stream_compression_memory` (256 MiB by default) and `ChannelConfig::with_stream_compression_memory` (64 MiB) bound the memory those contexts hold; 0 turns it off.
+- **Stream compression:** a streaming method marked `option (trevrpc.method) = {compression: COMPRESSION_STREAM}` compresses each streamed direction with one zstd context per call, from its third message, with nothing to configure. `ServerOptions::with_stream_compression_memory` (256 MiB by default) and `ChannelConfig::with_stream_compression_memory` (64 MiB) bound the memory those contexts hold; 0 turns it off.
 
 ## TCP fallback
 

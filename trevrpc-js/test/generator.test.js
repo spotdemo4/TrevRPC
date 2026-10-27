@@ -219,7 +219,7 @@ test("the option is rejected on a direction that does not stream", () => {
   }
 });
 
-test("compress_stream applies to the streamed directions whose types have no redacted field", () => {
+test("COMPRESSION_STREAM applies to the streamed directions whose types have no redacted field", () => {
   const request = greeterRequest();
   const file = request.protoFile[0];
   // Secret is redacted; Wrapper holds one two levels down; Loop refers to itself.
@@ -229,7 +229,7 @@ test("compress_stream applies to the streamed directions whose types have no red
     { name: "Wrapper", field: [field("middle", 1, 11, { typeName: ".hello.v1.Middle" })] },
     { name: "Loop", field: [field("next", 1, 11, { typeName: ".hello.v1.Loop" })] },
   );
-  const compress = { trevrpcMethod: { compressStream: true } };
+  const compress = { trevrpcMethod: { compression: 2 } };
   file.service[0].method = [
     method("Plain", { clientStreaming: true, serverStreaming: true, options: compress }),
     method("Server", { serverStreaming: true, options: compress }),
@@ -265,11 +265,16 @@ test("compress_stream applies to the streamed directions whose types have no red
   file.service[0].method = [method("SayHello", { options: compress })];
   assert.equal(
     generate(request).error,
-    "hello.v1.Greeter.SayHello: compress_stream requires a streaming method",
+    "hello.v1.Greeter.SayHello: COMPRESSION_STREAM requires a streaming method",
   );
+
+  file.service[0].method = [
+    method("Upload", { clientStreaming: true, options: { trevrpcMethod: { compression: 7 } } }),
+  ];
+  assert.equal(generate(request).error, "hello.v1.Greeter.Upload: unknown compression 7");
 });
 
-test("compress and compress_stream allow compression without a dictionary except for redacted types", () => {
+test("COMPRESSION_MESSAGE and COMPRESSION_STREAM allow compression without a dictionary except for redacted types", () => {
   const request = greeterRequest();
   const file = request.protoFile[0];
   file.messageType.push({
@@ -277,15 +282,15 @@ test("compress and compress_stream allow compression without a dictionary except
     field: [field("token", 1, 9, { options: { debugRedact: true } })],
   });
   file.service[0].method = [
-    method("Unary", { options: { trevrpcMethod: { compress: true } } }),
+    method("Unary", { options: { trevrpcMethod: { compression: 1 } } }),
     method("Stream", {
       clientStreaming: true,
       serverStreaming: true,
-      options: { trevrpcMethod: { compressStream: true } },
+      options: { trevrpcMethod: { compression: 2 } },
     }),
     method("Redacted", {
       inputType: ".hello.v1.Secret",
-      options: { trevrpcMethod: { compress: true } },
+      options: { trevrpcMethod: { compression: 1 } },
     }),
     method("Unmarked"),
   ];

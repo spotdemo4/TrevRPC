@@ -131,14 +131,15 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
     }
 
     /// Lets the directions `directions` sets compress their messages with one zstd context per
-    /// call; see [`CompressStream`]. Generated clients pass the schema's `compress_stream`.
+    /// call; see [`CompressStream`]. Generated clients pass it for `COMPRESSION_STREAM`.
     pub const fn compress_stream(mut self, directions: CompressStream) -> Self {
         self.compress_stream = directions;
         self
     }
 
     /// Lets the directions `directions` sets compress their messages without a dictionary; see
-    /// [`CompressMessages`]. Generated clients pass the schema's `compress` (or `compress_stream`).
+    /// [`CompressMessages`]. Generated clients pass it for `COMPRESSION_MESSAGE` and
+    /// `COMPRESSION_STREAM`.
     pub const fn compress(mut self, directions: CompressMessages) -> Self {
         self.compress = directions;
         self
