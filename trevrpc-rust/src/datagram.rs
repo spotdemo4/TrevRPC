@@ -1100,7 +1100,6 @@ pub struct MergedRequests {
 impl MergedRequests {
     /// Merges `requests` with the datagram messages in `datagrams`, counting the latter in
     /// `count` as they are delivered.
-    #[must_use]
     pub fn boxed(
         requests: BoxStream<Vec<u8>>,
         datagrams: queue::Receiver<Bytes>,
@@ -1223,7 +1222,6 @@ pub struct MergedResponses {
 impl MergedResponses {
     /// Merges `frames` with the datagram messages in `datagrams`, if the call receives any, and
     /// keeps `guard` until the response ends or is dropped.
-    #[must_use]
     pub fn boxed(
         frames: BoxStream<ResponseFrame>,
         datagrams: Option<queue::Receiver<Bytes>>,
@@ -1819,7 +1817,7 @@ mod tests {
         sender
             .send_batch(&mut batch, &mut on_stream, std::future::pending())
             .await;
-        assert!(batch.is_empty());
+        assert_eq!(batch, Vec::<Bytes>::new());
         on_stream.iter().map(|message| message.to_vec()).collect()
     }
 
@@ -1831,7 +1829,10 @@ mod tests {
         let demux = server(&fake);
         let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
 
-        assert!(send_all(&flow.sender, &[&[7; 95]]).await.is_empty());
+        assert_eq!(
+            send_all(&flow.sender, &[&[7; 95]]).await,
+            Vec::<Vec<u8>>::new()
+        );
         assert_eq!(send_all(&flow.sender, &[&[7; 96]]).await, [vec![7; 96]]);
         let sent = fake.sent();
         assert_eq!(sent.len(), 1);
@@ -1842,13 +1843,19 @@ mod tests {
         // is refused and its message goes on the stream, and the sender reads the limit again.
         fake.0.max.store(50, Ordering::SeqCst);
         assert_eq!(send_all(&flow.sender, &[&[7; 95]]).await.len(), 1);
-        assert!(send_all(&flow.sender, &[&[7; 46]]).await.is_empty());
+        assert_eq!(
+            send_all(&flow.sender, &[&[7; 46]]).await,
+            Vec::<Vec<u8>>::new()
+        );
         assert_eq!(fake.sent().len(), 2);
         // A limit that grew is read again once the last reading is old enough.
         fake.0.max.store(100, Ordering::SeqCst);
         assert_eq!(send_all(&flow.sender, &[&[7; 95]]).await.len(), 1);
         tokio::time::advance(MAX_SIZE_REUSE).await;
-        assert!(send_all(&flow.sender, &[&[7; 95]]).await.is_empty());
+        assert_eq!(
+            send_all(&flow.sender, &[&[7; 95]]).await,
+            Vec::<Vec<u8>>::new()
+        );
 
         // No datagrams at all, or a refused send, mean the stream.
         fake.0.max.store(0, Ordering::SeqCst);
@@ -1868,7 +1875,10 @@ mod tests {
 
         // Flow (1) + frames of 2 + 10 bytes: three fit in a datagram of 40, the fourth does not.
         let messages: Vec<&[u8]> = vec![&[1; 10], &[2; 10], &[3; 10], &[4; 10], &[5; 10]];
-        assert!(send_all(&flow.sender, &messages).await.is_empty());
+        assert_eq!(
+            send_all(&flow.sender, &messages).await,
+            Vec::<Vec<u8>>::new()
+        );
 
         let sent = fake.sent();
         assert_eq!(sent.len(), 2);
@@ -1890,7 +1900,7 @@ mod tests {
         flow.sender.flushed(std::future::pending()).await;
         assert!(started.elapsed() < FLUSH_WAIT);
 
-        assert!(send_all(&flow.sender, &[b"x"]).await.is_empty());
+        assert_eq!(send_all(&flow.sender, &[b"x"]).await, Vec::<Vec<u8>>::new());
 
         // The transport writes it while the call waits.
         let writer = fake.clone();
@@ -1907,7 +1917,7 @@ mod tests {
         assert!(started.elapsed() < FLUSH_WAIT);
 
         // A transport that never writes it holds the call up for the limit and no longer.
-        assert!(send_all(&flow.sender, &[b"y"]).await.is_empty());
+        assert_eq!(send_all(&flow.sender, &[b"y"]).await, Vec::<Vec<u8>>::new());
         let started = std::time::Instant::now();
         flow.sender.flushed(std::future::pending()).await;
         assert!(started.elapsed() >= FLUSH_WAIT);
@@ -1951,7 +1961,7 @@ mod tests {
             on_stream,
             [vec![1; 10], vec![2; 10], vec![3; 10], vec![4; 10]]
         );
-        assert!(fake.sent().is_empty());
+        assert_eq!(fake.sent(), Vec::<Bytes>::new());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1990,7 +2000,7 @@ mod tests {
         fake.arrive(&[0x09, 0x00, 0x01, b'a', 0x00, 0x09, b'b']);
         settle().await;
 
-        assert!(drain(&mut requests).is_empty());
+        assert_eq!(drain(&mut requests), Vec::<Vec<u8>>::new());
         assert!(
             demux
                 .shared
@@ -2036,7 +2046,7 @@ mod tests {
             .await;
         assert_eq!(on_stream.len(), 1);
         assert_eq!(started.elapsed(), Duration::from_millis(50));
-        assert!(fake.sent().is_empty());
+        assert_eq!(fake.sent(), Vec::<Bytes>::new());
 
         // A send that waits completes when room appears.
         let sender = first.sender.clone();
@@ -2044,7 +2054,7 @@ mod tests {
         settle().await;
         assert!(!waiting.is_finished());
         fake.block_sends(false);
-        assert!(waiting.await.unwrap().is_empty());
+        assert_eq!(waiting.await.unwrap(), Vec::<Vec<u8>>::new());
         assert_eq!(fake.sent().len(), 1);
     }
 

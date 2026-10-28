@@ -131,7 +131,7 @@ impl StreamBudget {
     /// Reserves `cost` bytes, or returns `None` when the budget has less left.
     pub fn reserve(self: &Arc<Self>, cost: usize) -> Option<Reservation> {
         self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |available| {
                 available.checked_sub(cost)
             })
             .ok()?;

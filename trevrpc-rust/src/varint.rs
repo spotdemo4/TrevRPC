@@ -164,7 +164,7 @@ mod tests {
     fn rejects_values_above_the_maximum() {
         let mut out = Vec::new();
         assert!(push(&mut out, MAX + 1).is_err());
-        assert!(out.is_empty());
+        assert_eq!(out, []);
     }
 
     #[test]

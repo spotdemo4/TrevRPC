@@ -932,7 +932,7 @@ mod tests {
             let incoming = read(&server, vec![request_frame(kind), message_frame(b"later")])
                 .await
                 .expect("request should read");
-            assert!(incoming.body.is_empty());
+            assert_eq!(incoming.body, []);
         }
     }
 

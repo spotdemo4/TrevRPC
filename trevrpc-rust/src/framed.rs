@@ -887,7 +887,7 @@ mod tests {
         .await
         .expect("frames should write");
 
-        assert!(frames.is_empty());
+        assert_eq!(frames, []);
         assert_eq!(sink.0.len(), 1, "one write per batch");
         let mut wire = Script::new(sink.0.remove(0));
         for expected in [
@@ -1161,7 +1161,7 @@ mod tests {
         let (wire, codec) = write(Vec::new(), pending()).await;
         assert_eq!(wire, answer_frame(&answer));
         let (wire, _) = write(Vec::new(), codec).await;
-        assert!(wire.is_empty());
+        assert_eq!(wire, []);
     }
 
     #[tokio::test]

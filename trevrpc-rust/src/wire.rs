@@ -881,7 +881,7 @@ mod tests {
         let headers = decode_payload::<RpcHeaders>(&frames[0].1).expect("headers should decode");
         assert_eq!(headers.metadata, metadata("x-a", b"1"));
         assert_eq!(frames[1].1, b"hi");
-        assert!(frames[2].1.is_empty());
+        assert_eq!(frames[2].1, []);
         let status = Status::from(decode_payload::<RpcStatus>(&frames[3].1).expect("status"));
         assert_eq!(status.code(), Code::FailedPrecondition);
         assert_eq!(status.message(), "stop");

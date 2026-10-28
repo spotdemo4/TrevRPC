@@ -770,7 +770,7 @@ func (m *datagramMux) send(ctx context.Context, reply chan error, payload []byte
 	})
 	// A result nobody collected belongs to a send that was given up on.
 	select {
-	case <-reply:
+	case <-reply: //nolint:errcheck // its send was given up on
 	default:
 	}
 	select {

@@ -1828,7 +1828,7 @@ mod tests {
         let response = generate_plugin_response(&request);
 
         assert!(response.error.is_some());
-        assert!(response.file.is_empty());
+        assert_eq!(response.file, []);
     }
 
     #[test]
@@ -1853,7 +1853,7 @@ mod tests {
             .expect("colliding Rust package modules should fail generation");
         assert!(error.contains("protobuf packages \"helloV1\" and \"hello_v1\""));
         assert!(error.contains("Rust module path \"hello_v1\""));
-        assert!(response.file.is_empty());
+        assert_eq!(response.file, []);
     }
 
     #[test]
@@ -1869,7 +1869,7 @@ mod tests {
             .expect("unresolved input should fail generation");
         assert!(error.contains("input type \".hello.v1.MissingRequest\""));
         assert!(error.contains("unresolved protobuf message type"));
-        assert!(response.file.is_empty());
+        assert_eq!(response.file, []);
     }
 
     #[test]
@@ -1885,7 +1885,7 @@ mod tests {
             .expect("unresolved output should fail generation");
         assert!(error.contains("output type \".hello.v1.MissingReply\""));
         assert!(error.contains("unresolved protobuf message type"));
-        assert!(response.file.is_empty());
+        assert_eq!(response.file, []);
     }
 
     #[test]
@@ -1905,7 +1905,7 @@ mod tests {
         assert!(error.contains(".hello.v1.Outer.FooBar"));
         assert!(error.contains(".hello.v1.Outer.Foo_Bar"));
         assert!(error.contains("both map to Rust path \"outer::FooBar\""));
-        assert!(response.file.is_empty());
+        assert_eq!(response.file, []);
     }
 
     #[test]
@@ -1933,7 +1933,7 @@ mod tests {
             .expect("synthetic map-entry RPC type should fail generation");
         assert!(error.contains("input type \".hello.v1.Container.LabelsEntry\""));
         assert!(error.contains("unresolved protobuf message type"));
-        assert!(response.file.is_empty());
+        assert_eq!(response.file, []);
     }
 
     #[test]

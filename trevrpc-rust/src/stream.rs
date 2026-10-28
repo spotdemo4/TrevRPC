@@ -34,7 +34,6 @@ impl<T> Stream for EmptyStream<T> {
 }
 
 /// Returns an empty boxed message stream.
-#[must_use]
 pub fn empty<T>() -> BoxStream<T>
 where
     T: Send + 'static,
@@ -65,7 +64,6 @@ where
 }
 
 /// Returns a boxed message stream that yields items from an iterator.
-#[must_use]
 pub fn from_iter<T, I>(iter: I) -> BoxStream<T>
 where
     T: Send + 'static,
@@ -104,7 +102,6 @@ where
 }
 
 /// Wraps a message stream and encodes each protobuf message into bytes.
-#[must_use]
 pub fn encode<T>(inner: BoxStream<T>) -> BoxStream<Vec<u8>>
 where
     T: Message + Send + 'static,
@@ -147,7 +144,6 @@ where
 }
 
 /// Wraps a byte stream and decodes each body into a protobuf message.
-#[must_use]
 pub fn decode<T>(inner: BoxStream<Vec<u8>>) -> BoxStream<T>
 where
     T: Message + Default + Send + 'static,

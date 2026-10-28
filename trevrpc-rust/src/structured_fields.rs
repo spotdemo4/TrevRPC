@@ -275,8 +275,8 @@ mod tests {
 
     #[test]
     fn empty_and_blank_values_are_the_empty_list() {
-        assert!(list("").is_empty());
-        assert!(list("   ").is_empty());
+        assert_eq!(list(""), Vec::<String>::new());
+        assert_eq!(list("   "), Vec::<String>::new());
     }
 
     #[test]

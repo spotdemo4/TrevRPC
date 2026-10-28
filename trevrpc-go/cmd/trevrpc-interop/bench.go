@@ -538,7 +538,7 @@ func (p *pacedWorkload) stream(ctx context.Context, schedule *pacedSchedule, nex
 	if err != nil {
 		// Closing the call ends the receiver's Recv.
 		closeQuietly(call)
-		<-received
+		<-received //nolint:errcheck // the send error is the one to report
 		return next, err
 	}
 	err = <-received

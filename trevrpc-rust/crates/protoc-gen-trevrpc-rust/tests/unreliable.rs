@@ -152,7 +152,7 @@ fn requests_cannot_be_unreliable_on_methods_that_do_not_stream_them() {
                 .as_str()
             )
         );
-        assert!(response.file.is_empty());
+        assert_eq!(response.file, []);
     }
 }
 
