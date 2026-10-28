@@ -1192,6 +1192,8 @@ class GeneratedCodeCompilationTest {
                 this.destination = destination.toString()
                 this.classpath = classpath
                 jvmTarget = "21"
+                languageVersion = checkNotNull(System.getProperty("trevrpc.kotlin.minimum"))
+                apiVersion = languageVersion
                 noStdlib = true
                 noReflect = true
                 allWarningsAsErrors = true

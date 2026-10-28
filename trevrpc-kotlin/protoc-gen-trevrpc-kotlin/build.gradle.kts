@@ -105,4 +105,11 @@ tasks.test {
             .get()
             .asFile,
     )
+    // Generated code must compile on the oldest Kotlin the libraries support.
+    systemProperty(
+        "trevrpc.kotlin.minimum",
+        libs.versions.minimum.kotlin
+            .get()
+            .substringBeforeLast('.'),
+    )
 }

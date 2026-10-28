@@ -124,7 +124,13 @@ def dependency_rows(
     return rows
 
 
-def verify_pom(path: pathlib.Path, module: str, version: str, protobuf_version: str) -> None:
+def verify_pom(
+    path: pathlib.Path,
+    module: str,
+    version: str,
+    protobuf_version: str,
+    minimum_kotlin_version: str,
+) -> None:
     require(path.is_file(), f"missing POM {path}")
     verify_checksums(path)
     root = ET.parse(path).getroot()
@@ -163,6 +169,12 @@ def verify_pom(path: pathlib.Path, module: str, version: str, protobuf_version: 
     )
 
     rows = dependency_rows(root)
+    if module in {"core", "transport-cronet"}:
+        require(
+            ("org.jetbrains.kotlin", "kotlin-stdlib", minimum_kotlin_version, "compile", None)
+            in rows,
+            f"{module} must depend on the oldest supported kotlin-stdlib {minimum_kotlin_version}",
+        )
     if module == "core":
         require(
             (
@@ -283,11 +295,12 @@ def verify_generator_legal_metadata(
 
 def parse_arguments(
     argv: list[str],
-) -> tuple[pathlib.Path, str, str, str, str]:
+) -> tuple[pathlib.Path, str, str, str, str, str]:
     require(
-        len(argv) == 9,
+        len(argv) == 11,
         "usage: verify_staged_repository.py REPOSITORY --version VERSION "
-        + "--protobuf-version VERSION --kotlin-version VERSION --gradle-version VERSION",
+        + "--protobuf-version VERSION --kotlin-version VERSION "
+        + "--minimum-kotlin-version VERSION --gradle-version VERSION",
     )
     (
         repository,
@@ -297,6 +310,8 @@ def parse_arguments(
         protobuf_version,
         kotlin_flag,
         kotlin_version,
+        minimum_kotlin_flag,
+        minimum_kotlin_version,
         gradle_flag,
         gradle_version,
     ) = argv
@@ -310,6 +325,10 @@ def parse_arguments(
         f"expected --kotlin-version, got {kotlin_flag}",
     )
     require(
+        minimum_kotlin_flag == "--minimum-kotlin-version",
+        f"expected --minimum-kotlin-version, got {minimum_kotlin_flag}",
+    )
+    require(
         gradle_flag == "--gradle-version",
         f"expected --gradle-version, got {gradle_flag}",
     )
@@ -318,14 +337,20 @@ def parse_arguments(
         version,
         protobuf_version,
         kotlin_version,
+        minimum_kotlin_version,
         gradle_version,
     )
 
 
 def main() -> None:
-    repository, version, protobuf_version, kotlin_version, gradle_version = parse_arguments(
-        sys.argv[1:]
-    )
+    (
+        repository,
+        version,
+        protobuf_version,
+        kotlin_version,
+        minimum_kotlin_version,
+        gradle_version,
+    ) = parse_arguments(sys.argv[1:])
     repository = repository.resolve()
     expected_generator_coordinates = [
         f"com.google.protobuf:protobuf-java:{protobuf_version}",
@@ -358,7 +383,7 @@ def main() -> None:
                 )
         verify_archive(sources_jar, required_suffixes=(".kt", ".java"))
         verify_archive(javadoc_jar, required_suffixes=(".html",))
-        verify_pom(pom, module, version, protobuf_version)
+        verify_pom(pom, module, version, protobuf_version, minimum_kotlin_version)
         verify_module_metadata(module_metadata, module, gradle_version)
 
         version_directory = main_jar.parent

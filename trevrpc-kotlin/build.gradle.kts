@@ -7,6 +7,8 @@ import org.gradle.api.tasks.Exec
 import org.gradle.api.tasks.bundling.Zip
 import org.gradle.jvm.tasks.Jar
 import org.gradle.plugins.signing.SigningExtension
+import org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension
+import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 
 plugins {
     alias(libs.plugins.android.application) apply false
@@ -43,6 +45,9 @@ val isSigningEnabled = !signingKey.isNullOrBlank()
 val protobufVersion =
     libs.versions.protobuf.get()
 val kotlinVersion = libs.versions.kotlin.get()
+val minimumKotlinVersion =
+    libs.versions.minimum.kotlin
+        .get()
 
 version = "1.1.0"
 providers.gradleProperty("trevrpcVersion").orNull?.let { version = it }
@@ -110,6 +115,22 @@ val updateGradleDependencyState =
         dependsOn(subprojects.map { "${it.path}:resolveAndLockAll" })
         dependsOn(":core:dokkaGeneratePublicationHtml")
     }
+
+// Libraries compile at the oldest supported Kotlin so applications on that compiler can consume them.
+listOf("core", "transport-cronet").forEach { moduleName ->
+    project(":$moduleName") {
+        pluginManager.withPlugin("org.jetbrains.kotlin.jvm") {
+            extensions.configure<KotlinJvmProjectExtension> {
+                coreLibrariesVersion = minimumKotlinVersion
+                compilerOptions {
+                    val version = KotlinVersion.fromVersion(minimumKotlinVersion.substringBeforeLast('.'))
+                    languageVersion.set(version)
+                    apiVersion.set(version)
+                }
+            }
+        }
+    }
+}
 
 val stagingRepository = layout.buildDirectory.dir("staging-repository")
 val publishableModules =
@@ -248,6 +269,8 @@ tasks.register<Exec>("verifyStagedMavenRepository") {
         protobufVersion,
         "--kotlin-version",
         kotlinVersion,
+        "--minimum-kotlin-version",
+        minimumKotlinVersion,
         "--gradle-version",
         gradle.gradleVersion,
     )
