@@ -9,13 +9,13 @@ import { createServer } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const DefaultDriver = "/usr/bin/safaridriver";
-const RequestTimeoutMs = 30_000;
 const PollIntervalMs = 100;
 const LaunchAttempts = 2;
 
 /**
- * Starts safaridriver (TREVRPC_BROWSER_SAFARI, or the system one) and opens url in a new Safari
- * automation session. Resolves with a handle whose close() ends the session and the driver.
+ * Starts safaridriver (TREVRPC_BROWSER_SAFARI, or the system one) within launchTimeoutMs and opens
+ * url in a new Safari automation session, giving launching Safari and loading the page timeoutMs
+ * each. Resolves with a handle whose close() ends the session and the driver.
  *
  * A driver that exits before it has a session is started once more: on CI runners safaridriver
  * occasionally exits right after a previous one closed, and one more launch costs far less than a
@@ -37,7 +37,7 @@ export async function openSafari(url, options) {
 /** safaridriver exited before it had a session. */
 class DriverExited extends Error {}
 
-async function openSafariOnce(url, { launchTimeoutMs, closeTimeoutMs }) {
+async function openSafariOnce(url, { launchTimeoutMs, timeoutMs, closeTimeoutMs }) {
   const port = await freePort();
   // The driver may say why it fails on either stream; both go to stderr, which keeps this process's
   // stdout for its own results.
@@ -74,12 +74,19 @@ async function openSafariOnce(url, { launchTimeoutMs, closeTimeoutMs }) {
   try {
     await Promise.race([waitForReady(base, launchTimeoutMs), exited]);
     ({ sessionId } = await Promise.race([
-      webDriver(base, "POST", "/session", {
-        capabilities: { alwaysMatch: { browserName: "safari" } },
-      }),
+      webDriver(
+        base,
+        "POST",
+        "/session",
+        { capabilities: { alwaysMatch: { browserName: "safari" } } },
+        timeoutMs,
+      ),
       exited,
     ]));
-    await Promise.race([webDriver(base, "POST", `/session/${sessionId}/url`, { url }), exited]);
+    await Promise.race([
+      webDriver(base, "POST", `/session/${sessionId}/url`, { url }, timeoutMs),
+      exited,
+    ]);
   } catch (error) {
     await close();
     throw error;
@@ -105,7 +112,7 @@ async function waitForReady(base, timeoutMs) {
 }
 
 /** Sends one WebDriver command and resolves with its value, or rejects with the WebDriver error. */
-async function webDriver(base, method, path, body, timeoutMs = RequestTimeoutMs) {
+async function webDriver(base, method, path, body, timeoutMs) {
   const init = { method, signal: AbortSignal.timeout(timeoutMs) };
   if (body !== undefined) {
     init.headers = { "content-type": "application/json" };

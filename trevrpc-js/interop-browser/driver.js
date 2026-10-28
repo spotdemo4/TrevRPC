@@ -24,6 +24,7 @@ export function pageHtml(bundle) {
 /**
  * The browsers by name. Each opens a URL with extra launch options ({ args, firefoxUserPrefs },
  * which only Playwright's browsers take), within timeoutMs, and resolves with a session to close.
+ * setupTimeoutMs, where a browser has it, replaces SetupTimeoutMs as its default timeoutMs.
  *
  * pageProtocols maps each HTTP version a browser can be made to load a server's page over to the
  * extra launch options that do it, given the page ({ url, cert }). forceQuic(host, cert), where a
@@ -57,8 +58,14 @@ export const Browsers = {
   },
   safari: {
     name: "safari",
-    open: (url) =>
-      openSafari(url, { launchTimeoutMs: LaunchTimeoutMs, closeTimeoutMs: CloseTimeoutMs }),
+    // Safari's first launch on a fresh CI runner can take over 30 seconds; later ones take a few.
+    setupTimeoutMs: 90_000,
+    open: (url, _extra, timeoutMs) =>
+      openSafari(url, {
+        launchTimeoutMs: LaunchTimeoutMs,
+        timeoutMs,
+        closeTimeoutMs: CloseTimeoutMs,
+      }),
   },
 };
 
@@ -80,7 +87,8 @@ async function chromiumForceQuic(host, cert) {
  *
  * With page ({ url, cert, key }), the page comes from page.url instead, and the origin is HTTPS
  * with page.cert and page.key and answers cross-origin requests. isolated makes the page
- * cross-origin isolated, which sharpens its timers. setupTimeoutMs bounds opening the page.
+ * cross-origin isolated, which sharpens its timers. setupTimeoutMs bounds opening the page, by
+ * default within the browser's own setup timeout.
  */
 export async function runPage({
   browser,
@@ -91,7 +99,7 @@ export async function runPage({
   input,
   isolated = false,
   routes = {},
-  setupTimeoutMs = SetupTimeoutMs,
+  setupTimeoutMs = browser.setupTimeoutMs ?? SetupTimeoutMs,
   runTimeoutMs,
   timeoutMessage,
 }) {

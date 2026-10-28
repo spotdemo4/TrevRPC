@@ -4,8 +4,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
+import { runPage } from "../interop-browser/driver.js";
 import { ScenarioNames } from "../interop-browser/names.js";
 import { runScenarios } from "../interop-browser/scenarios.js";
 import { encodeMessageFrame } from "../src/framing.js";
@@ -218,6 +220,25 @@ test("the CLI writes the page for a server to serve", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a browser's own setup timeout bounds opening the page, and a late browser is still closed", async () => {
+  let closed = false;
+  const browser = {
+    name: "slow",
+    setupTimeoutMs: 50,
+    open: async () => {
+      await sleep(200);
+      return { close: async () => (closed = true) };
+    },
+  };
+  const started = Date.now();
+  await assert.rejects(
+    runPage({ browser, html: "", bundles: {}, input: {}, runTimeoutMs: 1_000 }),
+    /slow did not open the page in time/,
+  );
+  assert.ok(closed);
+  assert.ok(Date.now() - started < 1_000);
 });
 
 test("the CLI fails every scenario cleanly when safaridriver cannot start", () => {
