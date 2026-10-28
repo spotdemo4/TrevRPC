@@ -62,6 +62,9 @@
     {
       "matchManagers": ["nix"],
       "addLabels": ["nix"],
+      // One PR per run instead of one per flake input.
+      "groupName": "nix flake inputs",
+      "groupSlug": "nix-flake-inputs",
       "postUpgradeTasks": {
         "commands": ["nix run .#sync-playwright"],
         "fileFilters": ["trevrpc-js/package.json", "trevrpc-js/package-lock.json"],
