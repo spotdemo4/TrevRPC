@@ -1,0 +1,39 @@
+name: review
+
+on:
+  pull_request:
+    # CODEOWNERS requests pi's review when a pull request opens. Pushes make
+    # pi's approval stale; re-request pi's review when the pull request is
+    # ready again.
+    types: [review_requested]
+
+# Queue pi's reviews of the same pull request so re-requests don't overlap.
+# Key on the reviewer so skipped runs for other reviewers can't cancel a
+# queued review.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.requested_reviewer.login }}
+
+jobs:
+  review:
+    # zizmor: ignore[excessive-permissions]
+    if: github.event.requested_reviewer.login == 'pi'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Review pull request
+        uses: trev-zip/pi-action@19f064a6269bd5e4d7315730968b15c491ba948b # v0.5.1
+        with:
+          token: ${{ secrets.PI_TOKEN }}
+          base-url: ${{ secrets.PI_ACTION_BASE_URL }}
+          api: anthropic-messages
+          api-key: ${{ secrets.PI_ACTION_API_KEY }}
+          model: claude-sonnet-5-5
+          thinking: medium
+          exclude-tools: bash,edit,write
+          review: approve
+          reapprove-unchanged: true
+          prompt: .forgejo/prompts/review.md
