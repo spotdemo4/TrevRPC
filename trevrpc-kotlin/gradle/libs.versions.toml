@@ -11,7 +11,7 @@ kotlin = "2.4.21"
 # version and their kotlin-stdlib dependency. The README version badge reads it.
 minimum-kotlin = "2.3.0"
 protobuf = "4.36.2"
-zstd-jni = "1.5.7-24"
+zstd-jni = "1.5.7-25"
 
 [libraries]
 android-test-junit = { module = "androidx.test.ext:junit", version.ref = "android-test-junit" }
