@@ -1,0 +1,97 @@
+schema = 3
+cachePackages = [
+  'github.com/DataDog/zstd',
+  'github.com/coder/websocket',
+  'github.com/dunglas/httpsfv',
+  'github.com/quic-go/qpack',
+  'github.com/quic-go/quic-go',
+  'github.com/quic-go/quic-go/http3',
+  'github.com/quic-go/quic-go/http3/qlog',
+  'github.com/quic-go/quic-go/qlog',
+  'github.com/quic-go/quic-go/qlogwriter',
+  'github.com/quic-go/quic-go/qlogwriter/jsontext',
+  'github.com/quic-go/quic-go/quicvarint',
+  'github.com/quic-go/webtransport-go',
+  'golang.org/x/crypto/chacha20',
+  'golang.org/x/crypto/chacha20poly1305',
+  'golang.org/x/net/bpf',
+  'golang.org/x/net/http/httpguts',
+  'golang.org/x/net/http2',
+  'golang.org/x/net/http2/hpack',
+  'golang.org/x/net/idna',
+  'golang.org/x/net/ipv4',
+  'golang.org/x/net/ipv6',
+  'golang.org/x/sys/cpu',
+  'golang.org/x/sys/unix',
+  'golang.org/x/text/secure/bidirule',
+  'golang.org/x/text/transform',
+  'golang.org/x/text/unicode/bidi',
+  'golang.org/x/text/unicode/norm',
+  'google.golang.org/protobuf/cmd/protoc-gen-go',
+  'google.golang.org/protobuf/compiler/protogen',
+  'google.golang.org/protobuf/encoding/prototext',
+  'google.golang.org/protobuf/encoding/protowire',
+  'google.golang.org/protobuf/proto',
+  'google.golang.org/protobuf/protoadapt',
+  'google.golang.org/protobuf/reflect/protodesc',
+  'google.golang.org/protobuf/reflect/protopath',
+  'google.golang.org/protobuf/reflect/protorange',
+  'google.golang.org/protobuf/reflect/protoreflect',
+  'google.golang.org/protobuf/reflect/protoregistry',
+  'google.golang.org/protobuf/runtime/protoiface',
+  'google.golang.org/protobuf/runtime/protoimpl',
+  'google.golang.org/protobuf/types/descriptorpb',
+  'google.golang.org/protobuf/types/dynamicpb',
+  'google.golang.org/protobuf/types/gofeaturespb',
+  'google.golang.org/protobuf/types/known/wrapperspb',
+  'google.golang.org/protobuf/types/pluginpb',
+]
+
+[mod]
+[mod.'github.com/DataDog/zstd']
+version = 'v1.5.7'
+hash = 'sha256-GlSZOyix7Ct7tOKmSKpGckDjMhTtiYPBTpoWdwGLx5M='
+
+[mod.'github.com/coder/websocket']
+version = 'v1.8.15'
+hash = 'sha256-6QnIQMMUSzrDXaUfO+9cl4uDh0SHizFUf4GpHmJedtk='
+
+[mod.'github.com/dunglas/httpsfv']
+version = 'v1.1.1'
+hash = 'sha256-MwE5SaqcGD5RxpQqSpbydi6cMriyeT/FrvJoBB9KoE4='
+
+[mod.'github.com/klauspost/compress']
+version = 'v1.20.3'
+hash = 'sha256-34ifN/7hw8GbGDEAjOxfYK2ndxkzeQJf4tS/ynJzhXM='
+
+[mod.'github.com/quic-go/qpack']
+version = 'v0.6.0'
+hash = 'sha256-xaxHnTKIZt1cHK5ZqTuSTOt5RNSjQB37GlrIgEGBskM='
+
+[mod.'github.com/quic-go/quic-go']
+version = 'v0.64.1'
+hash = 'sha256-lbt3F0zedf5iGYOTkNknGsrSQClxWy+/1i5GnmWgCI4='
+
+[mod.'github.com/quic-go/webtransport-go']
+version = 'v0.13.0'
+hash = 'sha256-fl+X0Vy7SqCximk9bv63sr8KWdARxSgtQNV6K0d8Q2c='
+
+[mod.'golang.org/x/crypto']
+version = 'v0.58.0'
+hash = 'sha256-33ioL7suoYfgBIEQDAeqy+lwhbCgy885BkcXavowffo='
+
+[mod.'golang.org/x/net']
+version = 'v0.61.0'
+hash = 'sha256-yCy7Bik5cvIVfX7G08rVYhkVDuro3sPk3iicVz4j/kA='
+
+[mod.'golang.org/x/sys']
+version = 'v0.49.0'
+hash = 'sha256-/1S3yy3in72ygZT1CKymvOzJZqCMYiGSqZDfvSyB3LI='
+
+[mod.'golang.org/x/text']
+version = 'v0.43.0'
+hash = 'sha256-gykmMKFe61Tc4tblLPd3IyMKCqL0MSTQpgb6yE5EnDA='
+
+[mod.'google.golang.org/protobuf']
+version = 'v1.36.12'
+hash = 'sha256-MKd0AdkWEe2A79mGPzOY5I76nMqTsGJKQNPJOKyOwkQ='

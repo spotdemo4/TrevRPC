@@ -1,0 +1,139 @@
+schema = 3
+cachePackages = [
+  'connectrpc.com/connect/v2',
+  'connectrpc.com/connect/v2/cmd/protoc-gen-connect-go',
+  'connectrpc.com/connect/v2/connectgzip',
+  'connectrpc.com/connect/v2/connecthttp',
+  'connectrpc.com/connect/v2/connectproto',
+  'github.com/klauspost/compress',
+  'github.com/klauspost/compress/fse',
+  'github.com/klauspost/compress/huff0',
+  'github.com/klauspost/compress/zstd',
+  'github.com/quic-go/qpack',
+  'github.com/quic-go/quic-go',
+  'github.com/quic-go/quic-go/http3',
+  'github.com/quic-go/quic-go/http3/qlog',
+  'github.com/quic-go/quic-go/qlog',
+  'github.com/quic-go/quic-go/qlogwriter',
+  'github.com/quic-go/quic-go/qlogwriter/jsontext',
+  'github.com/quic-go/quic-go/quicvarint',
+  'golang.org/x/crypto/chacha20',
+  'golang.org/x/crypto/chacha20poly1305',
+  'golang.org/x/net/bpf',
+  'golang.org/x/net/http/httpguts',
+  'golang.org/x/net/http2',
+  'golang.org/x/net/http2/hpack',
+  'golang.org/x/net/idna',
+  'golang.org/x/net/ipv4',
+  'golang.org/x/net/ipv6',
+  'golang.org/x/net/trace',
+  'golang.org/x/sys/cpu',
+  'golang.org/x/sys/unix',
+  'golang.org/x/text/secure/bidirule',
+  'golang.org/x/text/transform',
+  'golang.org/x/text/unicode/bidi',
+  'golang.org/x/text/unicode/norm',
+  'google.golang.org/genproto/googleapis/rpc/status',
+  'google.golang.org/grpc',
+  'google.golang.org/grpc/attributes',
+  'google.golang.org/grpc/backoff',
+  'google.golang.org/grpc/balancer',
+  'google.golang.org/grpc/balancer/base',
+  'google.golang.org/grpc/balancer/endpointsharding',
+  'google.golang.org/grpc/balancer/grpclb/state',
+  'google.golang.org/grpc/balancer/pickfirst',
+  'google.golang.org/grpc/balancer/roundrobin',
+  'google.golang.org/grpc/binarylog/grpc_binarylog_v1',
+  'google.golang.org/grpc/channelz',
+  'google.golang.org/grpc/cmd/protoc-gen-go-grpc',
+  'google.golang.org/grpc/codes',
+  'google.golang.org/grpc/connectivity',
+  'google.golang.org/grpc/credentials',
+  'google.golang.org/grpc/credentials/insecure',
+  'google.golang.org/grpc/encoding',
+  'google.golang.org/grpc/encoding/gzip',
+  'google.golang.org/grpc/encoding/proto',
+  'google.golang.org/grpc/experimental/balancer/weight',
+  'google.golang.org/grpc/experimental/stats',
+  'google.golang.org/grpc/grpclog',
+  'google.golang.org/grpc/keepalive',
+  'google.golang.org/grpc/mem',
+  'google.golang.org/grpc/metadata',
+  'google.golang.org/grpc/peer',
+  'google.golang.org/grpc/resolver',
+  'google.golang.org/grpc/resolver/dns',
+  'google.golang.org/grpc/serviceconfig',
+  'google.golang.org/grpc/stats',
+  'google.golang.org/grpc/status',
+  'google.golang.org/grpc/tap',
+  'google.golang.org/protobuf/cmd/protoc-gen-go',
+  'google.golang.org/protobuf/compiler/protogen',
+  'google.golang.org/protobuf/encoding/protojson',
+  'google.golang.org/protobuf/encoding/prototext',
+  'google.golang.org/protobuf/encoding/protowire',
+  'google.golang.org/protobuf/proto',
+  'google.golang.org/protobuf/protoadapt',
+  'google.golang.org/protobuf/reflect/protodesc',
+  'google.golang.org/protobuf/reflect/protopath',
+  'google.golang.org/protobuf/reflect/protorange',
+  'google.golang.org/protobuf/reflect/protoreflect',
+  'google.golang.org/protobuf/reflect/protoregistry',
+  'google.golang.org/protobuf/runtime/protoiface',
+  'google.golang.org/protobuf/runtime/protoimpl',
+  'google.golang.org/protobuf/types/descriptorpb',
+  'google.golang.org/protobuf/types/dynamicpb',
+  'google.golang.org/protobuf/types/gofeaturespb',
+  'google.golang.org/protobuf/types/known/anypb',
+  'google.golang.org/protobuf/types/known/durationpb',
+  'google.golang.org/protobuf/types/known/timestamppb',
+  'google.golang.org/protobuf/types/pluginpb',
+]
+
+[mod]
+[mod.'connectrpc.com/connect/v2']
+version = 'v2.0.2'
+hash = 'sha256-I0Q4oLCrXJ/IibErlqgPpjxaxhEkCd/c3PaDhaW5DTY='
+
+[mod.'github.com/klauspost/compress']
+version = 'v1.20.3'
+hash = 'sha256-34ifN/7hw8GbGDEAjOxfYK2ndxkzeQJf4tS/ynJzhXM='
+
+[mod.'github.com/quic-go/qpack']
+version = 'v0.6.0'
+hash = 'sha256-xaxHnTKIZt1cHK5ZqTuSTOt5RNSjQB37GlrIgEGBskM='
+
+[mod.'github.com/quic-go/quic-go']
+version = 'v0.64.1'
+hash = 'sha256-lbt3F0zedf5iGYOTkNknGsrSQClxWy+/1i5GnmWgCI4='
+
+[mod.'golang.org/x/crypto']
+version = 'v0.54.0'
+hash = 'sha256-m8jsqlPuoPxGDjClzcAVbXf1aiU07L+9j7vYcqJu/0Q='
+
+[mod.'golang.org/x/net']
+version = 'v0.57.0'
+hash = 'sha256-gKo8UMw4hfETBHm8N5GOfuNadse9TWEQXJo2YWq5bY4='
+
+[mod.'golang.org/x/sys']
+version = 'v0.47.0'
+hash = 'sha256-TpbRyWWqHjddP6QzUgAbaLd2EE0S+GYNRUIDJd18r98='
+
+[mod.'golang.org/x/text']
+version = 'v0.40.0'
+hash = 'sha256-LJfnki46XEreGbSgjl+DeqgcTsINTOu2owyXNvijMcA='
+
+[mod.'google.golang.org/genproto/googleapis/rpc']
+version = 'v0.0.0-20260706201446-f0a921348800'
+hash = 'sha256-ldJTTb7hhj1mdmzTn9IEkQVwCoj3KRlENZtUSEKHABU='
+
+[mod.'google.golang.org/grpc']
+version = 'v1.84.0'
+hash = 'sha256-gUDleBLGxwuzhA0emDRNAr1GnPlMfjgpkOX9u/0WsOk='
+
+[mod.'google.golang.org/grpc/cmd/protoc-gen-go-grpc']
+version = 'v1.6.2'
+hash = 'sha256-P+zrryDtKpIvhWRmSVRF/Flze3yMqUDSOkQsGFx0Jps='
+
+[mod.'google.golang.org/protobuf']
+version = 'v1.36.12'
+hash = 'sha256-MKd0AdkWEe2A79mGPzOY5I76nMqTsGJKQNPJOKyOwkQ='

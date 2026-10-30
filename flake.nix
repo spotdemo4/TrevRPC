@@ -18,12 +18,18 @@
       inputs.systems.follows = "systems";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    gomod2nix = {
+      url = "github:nix-community/gomod2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.inputs.systems.follows = "systems";
+    };
   };
 
   outputs =
     {
       self,
       trevpkgs,
+      gomod2nix,
       ...
     }:
     trevpkgs.libs.mkFlake (
@@ -101,7 +107,7 @@
               # util
               treefmt
               bumper
-              fix-hash
+              gomod2nix.packages.${system}.default
               jq
               openssl
             ];
@@ -160,7 +166,7 @@
               cargo
               # go
               go
-              fix-hash
+              gomod2nix.packages.${system}.default
               # javascript
               nodejs_26
               # kotlin
@@ -191,15 +197,15 @@
         # nix run [#...]
         apps = pkgs.mkApps {
           update-go-deps = {
-            packages = with pkgs; [
-              go
-              fix-hash
+            packages = [
+              pkgs.go
+              gomod2nix.packages.${system}.default
             ];
             script = ''
-              go -C trevrpc-go mod tidy
-              fix-hash .#trevrpc-go
-              go -C bench/baseline mod tidy
-              fix-hash .#trevrpc-bench-baseline
+              for module in trevrpc-go bench/baseline; do
+                go -C "$module" mod tidy
+                gomod2nix generate --with-deps --dir "$module"
+              done
             '';
           };
 
@@ -492,6 +498,11 @@
           config = {
             root = ./.;
             filter = file: file.hasExt "json" || file.hasExt "yaml" || file.hasExt "toml" || file.hasExt "md";
+            # generated
+            ignore = [
+              ./trevrpc-go/gomod2nix.toml
+              ./bench/baseline/gomod2nix.toml
+            ];
             packages = with pkgs; [
               oxfmt
             ];

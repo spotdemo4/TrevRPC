@@ -18,11 +18,16 @@ mkGoModule (final: {
     root = ../../.;
     fileset = lib.fileset.unions [
       interopProto
-      (lib.fileset.difference ./. ./default.nix)
+      (lib.fileset.difference ./. (
+        lib.fileset.unions [
+          ./default.nix
+          ./gomod2nix.toml
+        ]
+      ))
     ];
   };
   sourceRoot = "${final.src.name}/bench/baseline";
-  vendorHash = "sha256-r6PIDzmTwuwQ361Xkt+2BDzP2y9egsAyyZh52GB5IKo=";
+  modules = ./gomod2nix.toml;
 
   subPackages = [ "." ];
 

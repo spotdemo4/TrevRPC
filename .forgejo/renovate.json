@@ -47,7 +47,10 @@
       "fileFilters": [
         "trevrpc-go/go.mod",
         "trevrpc-go/go.sum",
-        "trevrpc-go/default.nix",
+        "trevrpc-go/gomod2nix.toml",
+        "bench/baseline/go.mod",
+        "bench/baseline/go.sum",
+        "bench/baseline/gomod2nix.toml",
         "trevrpc-js/package.json",
         "trevrpc-js/package-lock.json"
       ],
@@ -86,14 +89,11 @@
     },
     {
       "matchManagers": ["gomod"],
-      "addLabels": ["go"]
-    },
-    {
-      "matchManagers": ["gomod"],
-      "matchFileNames": ["trevrpc-go/go.mod"],
+      "addLabels": ["go"],
+      // gomod2nix.toml has an entry per module, so updates do not conflict
       "postUpgradeTasks": {
         "commands": ["nix run .#update-go-deps"],
-        "fileFilters": ["trevrpc-go/go.mod", "trevrpc-go/go.sum", "trevrpc-go/default.nix"],
+        "fileFilters": ["**/go.mod", "**/go.sum", "**/gomod2nix.toml"],
         "executionMode": "branch"
       }
     },

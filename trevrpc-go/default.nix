@@ -27,11 +27,16 @@ mkGoModule (final: {
       zstdGolden
       interopProto
       trevrpcProto
-      (lib.fileset.difference ./. ./default.nix)
+      (lib.fileset.difference ./. (
+        lib.fileset.unions [
+          ./default.nix
+          ./gomod2nix.toml
+        ]
+      ))
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-Uq02AJI+4C1NCBj8lVhS1Sypam2V+fBN0tAvBkpU4vA=";
+  modules = ./gomod2nix.toml;
 
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"

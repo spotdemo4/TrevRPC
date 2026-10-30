@@ -36,3 +36,4 @@ includes = ["*.py"]
 command = "oxfmt"
 options = ["--write"]
 includes = ["*.js", "*.ts", "*.html", "*.json", "*.yaml", "*.toml", "*.md"]
+excludes = ["gomod2nix.toml"] # generated
