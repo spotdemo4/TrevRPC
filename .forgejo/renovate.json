@@ -62,54 +62,73 @@
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "automerge": true
     },
-    {
-      "matchManagers": ["nix"],
-      "addLabels": ["nix"],
-      // One PR per run instead of one per flake input.
-      "groupName": "nix flake inputs",
-      "groupSlug": "nix-flake-inputs",
-      "postUpgradeTasks": {
-        "commands": ["nix run .#sync-playwright"],
-        "fileFilters": ["trevrpc-js/package.json", "trevrpc-js/package-lock.json"],
-        "executionMode": "branch"
-      }
-    },
+
+    // disable nix digest updates
     {
       "matchManagers": ["nix"],
       "matchUpdateTypes": ["digest"],
       "enabled": false
     },
+
+    // disable npm engine updates
     {
-      "matchManagers": ["github-actions"],
-      "addLabels": ["actions"]
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["engines"],
+      "enabled": false
+    },
+
+    // add labels
+    {
+      "matchManagers": ["gomod"],
+      "addLabels": ["go"]
+    },
+    {
+      "matchManagers": ["npm"],
+      "addLabels": ["node"]
+    },
+    {
+      "matchManagers": ["gradle", "gradle-wrapper", "maven"],
+      "addLabels": ["kotlin"]
     },
     {
       "matchManagers": ["cargo"],
       "addLabels": ["rust"]
     },
     {
+      "matchManagers": ["github-actions"],
+      "addLabels": ["actions"]
+    },
+    {
+      "matchManagers": ["nix"],
+      "addLabels": ["nix"]
+    },
+
+    // sync playwright from nix to npm
+    {
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["playwright", "playwright-core"],
+      "enabled": false
+    },
+    {
+      "matchManagers": ["nix"],
+      "postUpgradeTasks": {
+        "commands": ["nix run .#sync-playwright"],
+        "fileFilters": ["trevrpc-js/package.json", "trevrpc-js/package-lock.json"],
+        "executionMode": "branch"
+      }
+    },
+
+    // update go deps
+    {
       "matchManagers": ["gomod"],
-      "addLabels": ["go"],
-      // gomod2nix.toml has an entry per module, so updates do not conflict
       "postUpgradeTasks": {
         "commands": ["nix run .#update-go-deps"],
         "fileFilters": ["**/go.mod", "**/go.sum", "**/gomod2nix.toml"],
         "executionMode": "branch"
       }
     },
-    {
-      // quic-go and webtransport-go release as a compatible pair.
-      "matchManagers": ["gomod"],
-      "matchFileNames": ["trevrpc-go/go.mod"],
-      "matchPackageNames": ["github.com/quic-go/quic-go", "github.com/quic-go/webtransport-go"],
-      "groupName": "quic-go transport stack",
-      "groupSlug": "quic-go-transport-stack",
-      "separateMajorMinor": false
-    },
-    {
-      "matchManagers": ["gradle", "gradle-wrapper"],
-      "addLabels": ["kotlin"]
-    },
+
+    // update kotlin deps
     {
       "matchManagers": ["gradle", "gradle-wrapper", "maven"],
       "postUpgradeTasks": {
@@ -123,24 +142,26 @@
         "executionMode": "branch"
       }
     },
-    {
-      // Nixpkgs supplies the matching browser binaries and is the version authority.
-      "matchManagers": ["npm"],
-      "matchPackageNames": ["playwright", "playwright-core"],
-      "enabled": false
-    },
+
+    // update npm deps
     {
       "matchManagers": ["npm"],
-      "addLabels": ["node"],
       "rangeStrategy": "bump",
       "postUpdateOptions": ["npmInstallTwice"]
     },
+
+    // group quic-go
     {
-      "matchManagers": ["npm"],
-      "matchDepTypes": ["engines"],
-      "enabled": false
+      "matchManagers": ["gomod"],
+      "matchFileNames": ["trevrpc-go/go.mod"],
+      "matchPackageNames": ["github.com/quic-go/**"],
+      "groupName": "quic-go",
+      "separateMajorMinor": false
     },
+
+    // group connectrpc (go & js)
     {
+      "matchManagers": ["gomod", "npm"],
       "matchPackageNames": ["@connectrpc/**", "connectrpc.com/**"],
       "groupName": "connectrpc"
     }
