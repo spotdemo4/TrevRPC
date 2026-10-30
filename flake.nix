@@ -212,7 +212,6 @@
           update-kotlin-deps = {
             packages = with pkgs; [
               jdk25
-              oxfmt
             ];
             script = ''
               export ANDROID_HOME=${self.packages.${system}.trevrpc-kotlin.androidSdk}/libexec/android-sdk
@@ -228,8 +227,6 @@
 
               update_script=$(nix build .#trevrpc-kotlin.interopAndroid.mitmCache.updateScript --no-link --print-out-paths)
               USE_BWRAP=0 "$update_script"
-
-              oxfmt --write trevrpc-kotlin/gradle/deps.json
             '';
           };
 
