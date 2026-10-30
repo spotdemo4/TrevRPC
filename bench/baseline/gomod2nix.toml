@@ -86,54 +86,54 @@ cachePackages = [
   'google.golang.org/protobuf/types/known/anypb',
   'google.golang.org/protobuf/types/known/durationpb',
   'google.golang.org/protobuf/types/known/timestamppb',
-  'google.golang.org/protobuf/types/pluginpb',
+  'google.golang.org/protobuf/types/pluginpb'
 ]
 
 [mod]
-[mod.'connectrpc.com/connect/v2']
-version = 'v2.0.2'
-hash = 'sha256-I0Q4oLCrXJ/IibErlqgPpjxaxhEkCd/c3PaDhaW5DTY='
+  [mod.'connectrpc.com/connect/v2']
+    version = 'v2.0.2'
+    hash = 'sha256-I0Q4oLCrXJ/IibErlqgPpjxaxhEkCd/c3PaDhaW5DTY='
 
-[mod.'github.com/klauspost/compress']
-version = 'v1.20.3'
-hash = 'sha256-34ifN/7hw8GbGDEAjOxfYK2ndxkzeQJf4tS/ynJzhXM='
+  [mod.'github.com/klauspost/compress']
+    version = 'v1.20.3'
+    hash = 'sha256-34ifN/7hw8GbGDEAjOxfYK2ndxkzeQJf4tS/ynJzhXM='
 
-[mod.'github.com/quic-go/qpack']
-version = 'v0.6.0'
-hash = 'sha256-xaxHnTKIZt1cHK5ZqTuSTOt5RNSjQB37GlrIgEGBskM='
+  [mod.'github.com/quic-go/qpack']
+    version = 'v0.6.0'
+    hash = 'sha256-xaxHnTKIZt1cHK5ZqTuSTOt5RNSjQB37GlrIgEGBskM='
 
-[mod.'github.com/quic-go/quic-go']
-version = 'v0.64.1'
-hash = 'sha256-lbt3F0zedf5iGYOTkNknGsrSQClxWy+/1i5GnmWgCI4='
+  [mod.'github.com/quic-go/quic-go']
+    version = 'v0.64.1'
+    hash = 'sha256-lbt3F0zedf5iGYOTkNknGsrSQClxWy+/1i5GnmWgCI4='
 
-[mod.'golang.org/x/crypto']
-version = 'v0.54.0'
-hash = 'sha256-m8jsqlPuoPxGDjClzcAVbXf1aiU07L+9j7vYcqJu/0Q='
+  [mod.'golang.org/x/crypto']
+    version = 'v0.54.0'
+    hash = 'sha256-m8jsqlPuoPxGDjClzcAVbXf1aiU07L+9j7vYcqJu/0Q='
 
-[mod.'golang.org/x/net']
-version = 'v0.57.0'
-hash = 'sha256-gKo8UMw4hfETBHm8N5GOfuNadse9TWEQXJo2YWq5bY4='
+  [mod.'golang.org/x/net']
+    version = 'v0.57.0'
+    hash = 'sha256-gKo8UMw4hfETBHm8N5GOfuNadse9TWEQXJo2YWq5bY4='
 
-[mod.'golang.org/x/sys']
-version = 'v0.47.0'
-hash = 'sha256-TpbRyWWqHjddP6QzUgAbaLd2EE0S+GYNRUIDJd18r98='
+  [mod.'golang.org/x/sys']
+    version = 'v0.47.0'
+    hash = 'sha256-TpbRyWWqHjddP6QzUgAbaLd2EE0S+GYNRUIDJd18r98='
 
-[mod.'golang.org/x/text']
-version = 'v0.40.0'
-hash = 'sha256-LJfnki46XEreGbSgjl+DeqgcTsINTOu2owyXNvijMcA='
+  [mod.'golang.org/x/text']
+    version = 'v0.40.0'
+    hash = 'sha256-LJfnki46XEreGbSgjl+DeqgcTsINTOu2owyXNvijMcA='
 
-[mod.'google.golang.org/genproto/googleapis/rpc']
-version = 'v0.0.0-20260706201446-f0a921348800'
-hash = 'sha256-ldJTTb7hhj1mdmzTn9IEkQVwCoj3KRlENZtUSEKHABU='
+  [mod.'google.golang.org/genproto/googleapis/rpc']
+    version = 'v0.0.0-20260706201446-f0a921348800'
+    hash = 'sha256-ldJTTb7hhj1mdmzTn9IEkQVwCoj3KRlENZtUSEKHABU='
 
-[mod.'google.golang.org/grpc']
-version = 'v1.84.0'
-hash = 'sha256-gUDleBLGxwuzhA0emDRNAr1GnPlMfjgpkOX9u/0WsOk='
+  [mod.'google.golang.org/grpc']
+    version = 'v1.84.0'
+    hash = 'sha256-gUDleBLGxwuzhA0emDRNAr1GnPlMfjgpkOX9u/0WsOk='
 
-[mod.'google.golang.org/grpc/cmd/protoc-gen-go-grpc']
-version = 'v1.6.2'
-hash = 'sha256-P+zrryDtKpIvhWRmSVRF/Flze3yMqUDSOkQsGFx0Jps='
+  [mod.'google.golang.org/grpc/cmd/protoc-gen-go-grpc']
+    version = 'v1.6.2'
+    hash = 'sha256-P+zrryDtKpIvhWRmSVRF/Flze3yMqUDSOkQsGFx0Jps='
 
-[mod.'google.golang.org/protobuf']
-version = 'v1.36.12'
-hash = 'sha256-MKd0AdkWEe2A79mGPzOY5I76nMqTsGJKQNPJOKyOwkQ='
+  [mod.'google.golang.org/protobuf']
+    version = 'v1.36.12'
+    hash = 'sha256-MKd0AdkWEe2A79mGPzOY5I76nMqTsGJKQNPJOKyOwkQ='
