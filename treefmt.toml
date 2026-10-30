@@ -34,6 +34,5 @@ includes = ["*.py"]
 
 [formatter.oxfmt]
 command = "oxfmt"
-options = ["--write"]
+options = ["--write", "--no-error-on-unmatched-pattern"]
 includes = ["*.js", "*.ts", "*.html", "*.json", "*.yaml", "*.toml", "*.md"]
-excludes = ["**/gomod2nix.toml"] # generated

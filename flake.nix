@@ -498,11 +498,6 @@
           config = {
             root = ./.;
             filter = file: file.hasExt "json" || file.hasExt "yaml" || file.hasExt "toml" || file.hasExt "md";
-            # generated
-            ignore = [
-              ./trevrpc-go/gomod2nix.toml
-              ./bench/baseline/gomod2nix.toml
-            ];
             packages = with pkgs; [
               oxfmt
             ];
