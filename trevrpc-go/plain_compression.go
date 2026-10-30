@@ -14,7 +14,7 @@ package trevrpc
 // receiving MESSAGE frames: responses may use it from a connection's first
 // call, requests once the server's answer to that call has arrived. On a
 // stream-compressed direction, the stream context takes over from its third
-// message. It calls libzstd and needs cgo; without cgo it is off.
+// message.
 //
 // As with any compression, the compressed size of a message that mixes data an
 // attacker can influence with secrets can reveal the secrets, so do not mark

@@ -28,8 +28,7 @@ import (
 // (DialOptions.StreamCompressionMemory) and of the server
 // (ServerOptions.StreamCompressionMemory). A direction marked Unreliable keeps
 // compressing per message, since datagrams cannot carry stream-compressed
-// messages. Stream compression calls libzstd and needs cgo; without cgo it is
-// off.
+// messages.
 //
 // Clients stream-compress requests optimistically, without waiting for the
 // server's answer, except on calls with a datagram flow. A server that cannot
@@ -106,10 +105,10 @@ type streamBudget struct {
 }
 
 // newStreamBudget returns the budget of memory bytes, fallback when it is
-// zero, or nil when it is negative or the binary cannot compress. Contexts
+// zero, or nil when it is negative. Contexts
 // compress at the level of compression, or 1 without it.
 func newStreamBudget(memory, fallback int64, compression *compressionConfig) *streamBudget {
-	if memory < 0 || !zstd.Available {
+	if memory < 0 {
 		return nil
 	}
 	if memory == 0 {

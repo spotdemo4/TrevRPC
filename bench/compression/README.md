@@ -123,7 +123,8 @@ count, valyala/gozstd only the window log. Both dictionary APIs write libzstd's 
 frame (magic number, dictionary ID, content size, no checksum). The shim is ~60 lines of cgo over
 the advanced API (reused contexts, `ZSTD_c_format` magicless) that vendors no C: it declares the
 prototypes it calls and blank-imports DataDog/zstd for the compiled libzstd objects. TrevRPC's Go
-runtime uses this approach until klauspost/compress handles small dictionary messages well.
+runtime uses this approach until klauspost/compress handles small dictionary messages well; binaries
+built without cgo use klauspost/compress, stripping and restoring the magic number.
 
 Per message, family 32 KiB dictionaries, level 1, encode / decode ns and frame size:
 

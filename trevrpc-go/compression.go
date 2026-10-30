@@ -18,8 +18,8 @@ import (
 // Compression configures compressed messages: messages that travel as zstd
 // frames compressed with a dictionary both peers hold. Dictionaries are
 // negotiated per connection, so a message whose dictionary the peer lacks
-// travels uncompressed. Compression calls libzstd and needs cgo; Dial and
-// Listen fail when dictionaries are configured in a binary built without cgo.
+// travels uncompressed. Compression calls libzstd in binaries built with cgo,
+// and a pure-Go zstd without it; the two interoperate.
 //
 // Without dictionaries, a peer still compresses the messages of methods marked
 // for compression without a dictionary (see PlainCompression), at Level.
@@ -79,9 +79,8 @@ type compressionConfig struct {
 	query []*dictionaryInfo
 }
 
-// newCompressionConfig validates and digests options. Without cgo it returns
-// nil when no dictionaries are configured, and an error otherwise; with cgo the
-// configuration always has compression without a dictionary.
+// newCompressionConfig validates and digests options. The configuration
+// always has compression without a dictionary.
 func newCompressionConfig(options *Compression) (*compressionConfig, error) {
 	var dictionaries []Dictionary
 	level := 1
@@ -90,12 +89,6 @@ func newCompressionConfig(options *Compression) (*compressionConfig, error) {
 		if options.Level != 0 {
 			level = options.Level
 		}
-	}
-	if !zstd.Available {
-		if len(dictionaries) > 0 {
-			return nil, zstd.ErrUnavailable
-		}
-		return nil, nil
 	}
 	plain := &compressionDict{
 		Dict:   zstd.NewPlain(level),

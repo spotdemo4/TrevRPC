@@ -2,9 +2,10 @@
 // compressed with a dictionary both peers hold, or without one (see the
 // "Compressed Messages" section of the wire format).
 //
-// Frame validation is pure Go, so payloads are checked the same way with or
-// without cgo. Compression and decompression call libzstd through cgo and are
-// unavailable when cgo is disabled; see Available.
+// Frame validation is shared, so payloads are checked the same way by both
+// codecs: libzstd through cgo (zstd_cgo.go, stream_cgo.go), and, without cgo
+// or with the trevrpc_purego tag, the pure-Go klauspost/compress
+// (zstd_purego.go). Each decodes what the other writes.
 package zstd
 
 import (
@@ -16,15 +17,9 @@ import (
 // dictMagic opens every zstd-format dictionary (RFC 8878, section 5).
 const dictMagic = 0xEC30A437
 
-var (
-	// ErrInvalid reports a payload that is not a single magicless zstd frame
-	// with a Frame_Content_Size, or that fails to decompress to exactly that
-	// size.
-	ErrInvalid = errors.New("zstd: invalid ZSTD_MESSAGE payload")
-	// ErrUnavailable reports that the binary was built without cgo, so it
-	// cannot compress or decompress.
-	ErrUnavailable = errors.New("zstd: compression requires cgo")
-)
+// ErrInvalid reports a payload that is not a single magicless zstd frame with
+// a Frame_Content_Size, or that fails to decompress to exactly that size.
+var ErrInvalid = errors.New("zstd: invalid ZSTD_MESSAGE payload")
 
 // Header is what a receiver needs from a ZSTD_MESSAGE payload before
 // decompressing it.

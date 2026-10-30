@@ -19,7 +19,6 @@ import (
 // still compresses without one.
 func plainOnlyConfig(t testing.TB) *compressionConfig {
 	t.Helper()
-	requireCompression(t)
 	config, err := newCompressionConfig(nil)
 	if err != nil || config == nil || config.plain == nil {
 		t.Fatalf("plain-only config = %+v, %v", config, err)
@@ -118,7 +117,6 @@ func TestPlainCompressionNegotiatesOnlyWhereAllowed(t *testing.T) {
 }
 
 func TestPlainCompressionEncodes(t *testing.T) {
-	requireCompression(t)
 	config := testCompressionConfig(t)
 	all := func(*compressionDict) bool { return true }
 	plainOnly := func(d *compressionDict) bool { return d == config.plain }
@@ -207,7 +205,6 @@ func TestPlainCompressionGivesWayToStreamCompression(t *testing.T) {
 }
 
 func TestFrameReaderDecompressesPlainGoldenVectors(t *testing.T) {
-	requireCompression(t)
 	vectors := loadZstdVectors(t)
 	config := testCompressionConfig(t)
 	read := func(payload []byte, inflate dictionaryLookup) ([]byte, error) {
@@ -233,7 +230,6 @@ func TestFrameReaderDecompressesPlainGoldenVectors(t *testing.T) {
 // compression without a dictionary: the first's response travels compressed
 // and its answer lets the second compress its request too.
 func TestPlainCompressionEndToEnd(t *testing.T) {
-	requireCompression(t)
 	pki := newTestPKI(t)
 	var plainRequests atomic.Int64
 	register := func(server *Server) {

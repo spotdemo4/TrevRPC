@@ -31,7 +31,7 @@ mkGoModule (final: {
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-go";
-  vendorHash = "sha256-6M0gbE9HsHcXBx75SisSoFM9P3mlU62VFJS7i/nn3Hs=";
+  vendorHash = "sha256-Uq02AJI+4C1NCBj8lVhS1Sypam2V+fBN0tAvBkpU4vA=";
 
   subPackages = [
     "cmd/protoc-gen-trevrpc-go"
@@ -48,9 +48,11 @@ mkGoModule (final: {
   checkPhase = ''
     runHook preCheck
     export HOME=$(mktemp -d)
-    # Compression calls libzstd through cgo; without it its tests would skip.
+    # The default build compresses with libzstd through cgo; trevrpc_purego
+    # tests the pure-Go codec that builds without cgo use.
     test "$(go env CGO_ENABLED)" = 1
     go test ./...
+    go test -tags trevrpc_purego ./...
     # One iteration each, so the benchmarks keep compiling and running.
     go test -run '^$' -bench . -benchtime 1x ./...
     runHook postCheck

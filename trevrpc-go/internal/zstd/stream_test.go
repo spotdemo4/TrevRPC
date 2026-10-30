@@ -1,5 +1,3 @@
-//go:build cgo
-
 package zstd
 
 import (
@@ -150,12 +148,25 @@ func TestStreamEncoderWritesTheVectors(t *testing.T) {
 			t.Fatal(err)
 		}
 		payloads, messages := streamSequence(v, test.name)
+		var written [][]byte
 		for i, message := range messages {
-			if got := appendStreamPayload(t, encoder, message); !bytes.Equal(got, payloads[i]) {
+			got := appendStreamPayload(t, encoder, message)
+			// Other encoders write other, equally valid, chunks.
+			if libzstd && !bytes.Equal(got, payloads[i]) {
 				t.Fatalf("stream.%s.%d payload = %x, want %x", test.name, i, got, payloads[i])
 			}
+			written = append(written, got)
 		}
 		encoder.Close()
+		decoded, err := decodeSequence(t, d1, written)
+		if err != nil {
+			t.Fatalf("stream.%s: %v", test.name, err)
+		}
+		for i := range messages {
+			if !bytes.Equal(decoded[i], messages[i]) {
+				t.Fatalf("stream.%s.%d does not round-trip", test.name, i)
+			}
+		}
 	}
 }
 

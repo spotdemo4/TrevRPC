@@ -66,7 +66,7 @@ func TestServerRefusesOptimisticCallsAfterAuthorization(t *testing.T) {
 		deny    bool
 		refuses bool
 	}{
-		{"accepted", "Upload", 0, false, !zstd.Available},
+		{"accepted", "Upload", 0, false, false},
 		{"route without request compression", "Plain", 0, false, true},
 		{"stream compression off", "Upload", -1, false, true},
 		{"unauthenticated", "Plain", 0, true, false},
@@ -314,7 +314,6 @@ func waitFor(t *testing.T, what string, condition func() bool) {
 // replays each one transparently, and that it stops and resumes being
 // optimistic as the server refuses and answers.
 func TestOptimisticCallsReplayRefusals(t *testing.T) {
-	requireCompression(t)
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, registerRefusingService)
 	native, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
@@ -491,7 +490,6 @@ func (o *blockingOpener) openStream(ctx context.Context) (clientStream, error) {
 // the copies would pass maxOptimisticCopies or the budget, until the upload
 // settles or its call ends, and that settling returns the copies' memory.
 func TestOptimisticUploadWaitsForRoom(t *testing.T) {
-	requireCompression(t)
 	newUpload := func(ctx context.Context, limit int64) (*optimisticUpload, *streamBudget) {
 		budget := &streamBudget{limit: limit, level: 1, encoderCost: zstd.StreamEncoderCost(1, zstd.StreamWindowLog)}
 		client := newStreamClient(nil, DefaultMaxFrameSize)
@@ -577,7 +575,6 @@ func isRefusal(frame frame) bool {
 // protocol error: the server would be decoding requests it was never asked
 // to take.
 func TestOptimisticCallNeedsAnAnswer(t *testing.T) {
-	requireCompression(t)
 	reply, err := encodeMessage(wrapperspb.String("x"))
 	if err != nil {
 		t.Fatal(err)

@@ -16,8 +16,6 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
-
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/zstd"
 )
 
 // compressedType is the message type the test dictionary compresses: its
@@ -54,13 +52,6 @@ func loadZstdVectors(t testing.TB) map[string][]byte {
 		t.Fatal(err)
 	}
 	return vectors
-}
-
-func requireCompression(t testing.TB) {
-	t.Helper()
-	if !zstd.Available {
-		t.Skip("compression needs cgo")
-	}
 }
 
 func testCompression(t testing.TB) *Compression {
@@ -159,7 +150,6 @@ func compressedFrame(payload []byte) []byte {
 }
 
 func TestFrameReaderDecompressesGoldenVectors(t *testing.T) {
-	requireCompression(t)
 	vectors := loadZstdVectors(t)
 	config := testCompressionConfig(t)
 	read := func(frame []byte, inflate dictionaryLookup) (frame, error) {
@@ -210,7 +200,6 @@ func isFrameTooLarge(err error) bool {
 }
 
 func TestCompressionConfigValidation(t *testing.T) {
-	requireCompression(t)
 	dict := loadZstdVectors(t)["dict.d1.dictionary"]
 	// Without dictionaries a peer still compresses without one.
 	for _, compression := range []*Compression{nil, {}} {
@@ -305,7 +294,6 @@ func protoMessageFrame(t testing.TB, message proto.Message) []byte {
 }
 
 func TestServerAnswersQueryAndCompressesResponses(t *testing.T) {
-	requireCompression(t)
 	config := testCompressionConfig(t)
 	d1 := config.byID[1]
 	server := newCompressionTestServer(t, testCompression(t))
@@ -335,7 +323,6 @@ func TestServerAnswersQueryAndCompressesResponses(t *testing.T) {
 }
 
 func TestServerRefusesUnconfirmedDictionary(t *testing.T) {
-	requireCompression(t)
 	server := newCompressionTestServer(t, testCompression(t))
 	request := requestFor("CompressedEcho", RPCKindUnary)
 	// The fingerprint does not match the server's dictionary 1.
@@ -352,7 +339,6 @@ func TestServerRefusesUnconfirmedDictionary(t *testing.T) {
 }
 
 func TestServerWithoutCompressionAnswersQuery(t *testing.T) {
-	requireCompression(t)
 	server := newCompressionTestServer(t, nil)
 	request := requestFor("CompressedEcho", RPCKindUnary)
 	request.DictionaryQuery = testCompressionConfig(t).query
@@ -365,7 +351,6 @@ func TestServerWithoutCompressionAnswersQuery(t *testing.T) {
 }
 
 func TestServerDecompressesRequests(t *testing.T) {
-	requireCompression(t)
 	vectors := loadZstdVectors(t)
 	config := testCompressionConfig(t)
 	server := newCompressionTestServer(t, testCompression(t))
@@ -418,7 +403,6 @@ func serveTestStreamRaw(t *testing.T, server *Server, input []byte) ([]byte, *co
 }
 
 func TestCompressPayloadKeepsIncompressibleMessages(t *testing.T) {
-	requireCompression(t)
 	dict := testCompressionConfig(t).byID[1].Dict
 	vectors := loadZstdVectors(t)
 	for _, message := range [][]byte{nil, vectors["ok.raw_block.message"]} {
@@ -496,7 +480,6 @@ func (s *recordedStream) frames(t testing.TB) (sent, received []frameType) {
 // the server serves, checking which frames crossed the wire: the first call
 // queries, and once the answer is in both directions compress.
 func TestCompressionOverEveryTransport(t *testing.T) {
-	requireCompression(t)
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, func(options *ServerOptions) { options.Compression = testCompression(t) }, registerCompressionService)
 	config := testCompressionConfig(t)
@@ -597,7 +580,6 @@ func exerciseCompressedCalls(t *testing.T, transport Transport) {
 }
 
 func TestDatagramSinkDecompresses(t *testing.T) {
-	requireCompression(t)
 	vectors := loadZstdVectors(t)
 	plain := appendFrameHeader(nil, frameTypeMessage, 2)
 	plain = append(plain, "hi"...)

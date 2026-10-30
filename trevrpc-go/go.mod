@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/DataDog/zstd v1.5.7
 	github.com/coder/websocket v1.8.15
+	github.com/klauspost/compress v1.20.3
 	github.com/quic-go/quic-go v0.64.1
 	github.com/quic-go/webtransport-go v0.13.0
 	golang.org/x/net v0.61.0

@@ -7,8 +7,6 @@ import (
 	"testing"
 
 	"github.com/quic-go/quic-go/quicvarint"
-
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/zstd"
 )
 
 func FuzzFrameDecodeNeverPanics(f *testing.F) {
@@ -64,8 +62,8 @@ func FuzzFrameReaderNeverPanics(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		reader := newFrameReader(bytes.NewReader(data), 64, -1)
-		// Odd inputs enable stream compression, so random chunks reach libzstd.
-		if len(data) > 0 && data[len(data)-1]&1 == 1 && zstd.Available {
+		// Odd inputs enable stream compression, so random chunks reach the decoder.
+		if len(data) > 0 && data[len(data)-1]&1 == 1 {
 			reader.stream = newStreamInflater(nil, nil)
 			defer reader.stream.close()
 		}

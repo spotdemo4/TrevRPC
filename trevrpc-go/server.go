@@ -94,7 +94,7 @@ type Server struct {
 // connection are not affected; DisableConnectionIdleTimeout turns it off.
 //
 // Compression lets messages travel compressed with the dictionaries it
-// holds; see Compression. It needs cgo, and Listen fails when it is invalid.
+// holds; see Compression. Listen fails when it is invalid.
 //
 // StreamCompressionMemory bounds the memory, in bytes, of the zstd contexts
 // that stream compression holds for the server's calls (see

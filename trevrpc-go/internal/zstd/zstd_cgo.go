@@ -1,4 +1,4 @@
-//go:build cgo
+//go:build cgo && !trevrpc_purego
 
 package zstd
 
@@ -47,8 +47,9 @@ const (
 	formatMagicless   = 1    // ZSTD_f_zstd1_magicless
 )
 
-// Available reports whether this binary can compress and decompress.
-const Available = true
+// libzstd reports that the codec is libzstd, whose output the golden vectors
+// hold byte for byte.
+const libzstd = true
 
 // Dict is a dictionary digested for both directions, or, from NewPlain, the
 // absence of one. It is safe for concurrent use and frees its libzstd state

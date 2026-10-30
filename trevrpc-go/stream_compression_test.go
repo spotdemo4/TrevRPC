@@ -122,7 +122,6 @@ func streamFrame(payload []byte) []byte {
 }
 
 func TestFrameReaderDecompressesStreamVectors(t *testing.T) {
-	requireCompression(t)
 	vectors := loadZstdVectors(t)
 	config := testCompressionConfig(t)
 	read := func(payloads ...[]byte) ([][]byte, error) {
@@ -194,7 +193,6 @@ func TestFrameReaderRejectsStreamMessagesUnlessEnabled(t *testing.T) {
 }
 
 func TestStreamInflaterChargesMessageSizes(t *testing.T) {
-	requireCompression(t)
 	vectors := loadZstdVectors(t)
 	payload := vectors["stream.plain.0.payload"]
 	size := len(vectors["stream.plain.0.message"])
@@ -365,7 +363,6 @@ func waitForEmptyBudget(t *testing.T, name string, budget *streamBudget) {
 // each transport the server serves, checking which frames crossed the wire
 // and that every context's memory is returned afterwards.
 func TestStreamCompressionOverEveryTransport(t *testing.T) {
-	requireCompression(t)
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, registerStreamCompressionService)
 	clients := map[string]*streamClient{
@@ -415,7 +412,6 @@ func TestStreamCompressionOverEveryTransport(t *testing.T) {
 // TestStreamCompressionStartsFromDictionaries checks that a stream starts
 // from the dictionary negotiated for its message type, on both sides.
 func TestStreamCompressionStartsFromDictionaries(t *testing.T) {
-	requireCompression(t)
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, func(options *ServerOptions) { options.Compression = testCompression(t) }, registerStreamCompressionService)
 	channel, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Compression: testCompression(t), Transport: TransportQUICOnly})
@@ -476,7 +472,6 @@ func TestStreamCompressionStartsFromDictionaries(t *testing.T) {
 // TestStreamCompressionWithinBudget checks that calls beyond the budget, and
 // on a peer that turned stream compression off, compress per message only.
 func TestStreamCompressionWithinBudget(t *testing.T) {
-	requireCompression(t)
 	pki := newTestPKI(t)
 	for _, test := range []struct {
 		name   string
@@ -536,7 +531,6 @@ func TestStreamCompressionWithinBudget(t *testing.T) {
 }
 
 func TestNegotiateStreamsFollowsTheRoute(t *testing.T) {
-	requireCompression(t)
 	server := NewServer()
 	echo := func(_ context.Context, requests MessageStream[*wrapperspb.StringValue]) (MessageStream[*wrapperspb.StringValue], error) {
 		return requests, nil
@@ -581,7 +575,6 @@ func TestNegotiateStreamsFollowsTheRoute(t *testing.T) {
 }
 
 func TestStreamCompressorStartsAtTheThirdMessage(t *testing.T) {
-	requireCompression(t)
 	budget := newStreamBudget(0, defaultClientStreamCompressionMemory, nil)
 	compressor := newStreamCompressor(budget, nil)
 	defer compressor.close()
@@ -609,15 +602,6 @@ func TestStreamCompressorStartsAtTheThirdMessage(t *testing.T) {
 	compressor.close()
 	if budget.used.Load() != 0 {
 		t.Fatalf("budget holds %d after close", budget.used.Load())
-	}
-}
-
-func TestStreamCompressionIsOffWithoutCgo(t *testing.T) {
-	if zstd.Available {
-		t.Skip("built with cgo")
-	}
-	if newStreamBudget(0, defaultServerStreamCompressionMemory, nil) != nil {
-		t.Fatal("a budget without cgo")
 	}
 }
 
@@ -683,7 +667,7 @@ func TestAnswerAtDispatch(t *testing.T) {
 				t.Fatalf("SetResponseHeader = %v", err)
 			}
 			early := parseRawFrames(t, stream.snapshot())
-			answered := test.dispatched && test.offer && zstd.Available
+			answered := test.dispatched && test.offer
 			if answered {
 				if len(early) != 1 || early[0].typ != frameTypeAnswer {
 					t.Fatalf("written before the requests: %v", early)

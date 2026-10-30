@@ -20,8 +20,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"trev.zip/llc/trevrpc/trevrpc-go/internal/zstd"
 )
 
 var wantScenarios = []string{
@@ -118,9 +116,6 @@ func writeTestCertificate(t *testing.T) (certFile, keyFile string) {
 func TestServerAndClientCommandsFollowTheContract(t *testing.T) {
 	t.Run("plain", func(t *testing.T) { exerciseContract(t, nil) })
 	t.Run("compressed", func(t *testing.T) {
-		if !zstd.Available {
-			t.Skip("compression needs cgo")
-		}
 		exerciseContract(t, []string{"--dictionary", writeTestDictionary(t)})
 	})
 }

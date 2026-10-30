@@ -39,7 +39,7 @@ type DialOptions struct {
 	// OnEvent receives channel lifecycle events asynchronously from a bounded queue.
 	OnEvent func(ChannelEvent)
 	// Compression lets messages travel compressed with the dictionaries it
-	// holds; see Compression. It needs cgo, and Dial fails when it is invalid.
+	// holds; see Compression. Dial fails when it is invalid.
 	Compression *Compression
 	// StreamCompressionMemory bounds the memory, in bytes, of the zstd
 	// contexts that stream compression holds for the channel's calls (see

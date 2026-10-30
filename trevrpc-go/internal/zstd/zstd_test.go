@@ -96,9 +96,6 @@ func decode(dict *Dict, payload []byte, limit uint64) ([]byte, error) {
 var errTooLarge = errors.New("too large")
 
 func TestGoldenVectors(t *testing.T) {
-	if !Available {
-		t.Skip("built without cgo")
-	}
 	v := loadVectors(t)
 	dict, err := NewDict(v["dict.d1.dictionary"], 1)
 	if err != nil {
@@ -140,9 +137,6 @@ func TestGoldenVectors(t *testing.T) {
 }
 
 func TestRoundTrip(t *testing.T) {
-	if !Available {
-		t.Skip("built without cgo")
-	}
 	v := loadVectors(t)
 	dict, err := NewDict(v["dict.d1.dictionary"], 1)
 	if err != nil {
@@ -199,9 +193,6 @@ func FuzzParseHeader(f *testing.F) {
 }
 
 func BenchmarkCompress(b *testing.B) {
-	if !Available {
-		b.Skip("built without cgo")
-	}
 	v := loadVectors(b)
 	dict, err := NewDict(v["dict.d1.dictionary"], 1)
 	if err != nil {
@@ -216,9 +207,6 @@ func BenchmarkCompress(b *testing.B) {
 }
 
 func BenchmarkDecompress(b *testing.B) {
-	if !Available {
-		b.Skip("built without cgo")
-	}
 	v := loadVectors(b)
 	dict, err := NewDict(v["dict.d1.dictionary"], 1)
 	if err != nil {

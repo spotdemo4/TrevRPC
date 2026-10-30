@@ -175,7 +175,7 @@ Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `Web
 
 ## Compression
 
-Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in three ways that combine. All call libzstd through cgo, and are off in binaries built without it.
+Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in three ways that combine. They call libzstd in binaries built with cgo, and the pure-Go `klauspost/compress` without it; the two interoperate.
 
 - **Dictionaries:** `DialOptions.Compression` and `ServerOptions.Compression` take dictionaries trained with `zstd --train`, each with the protobuf message types it compresses.
 - **Without a dictionary:** a method marked `option (trevrpc.method) = {compression: COMPRESSION_MESSAGE}` (or `COMPRESSION_STREAM`) compresses its messages of 256 bytes or more on their own where no dictionary applies, with nothing to configure. Responses compress from a connection's first call, requests once its answer arrives. `HandlerContext.PlainCompressedRequests` counts the requests that arrived so.
