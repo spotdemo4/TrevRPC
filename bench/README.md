@@ -35,7 +35,10 @@ for every combination of scenario, size, metadata size and scope, and concurrenc
 runs `paced` and `unreliable-paced` once per rate in `--rates` (default 1000). It prints a summary
 table and writes one JSON object per run to `DIR/results.jsonl`; without
 `--out`, `DIR` is a new `trevrpc-bench.*` directory under `$TMPDIR`. A run fails
-when its client exits non-zero or reports errors.
+when its client exits non-zero or reports errors. Each run's client stderr is kept in
+`DIR/CELL.log`, and a benchmark with failed runs ends with every failed cell, why it failed, and
+the last lines of its log, so the reason survives logs cut to their last lines, as CI and Nix
+print them.
 
 Timings depend on the machine and on whatever else is running; compare runs
 from the same machine only. `--repeat N` (default 1) runs each cell up to N

@@ -171,6 +171,35 @@ def run_checked(
     return result.stdout
 
 
+# How many lines of a failed cell's log the closing summary repeats.
+FAILURE_LINES = 20
+
+
+@dataclass(frozen=True)
+class Failure:
+    """A failed cell, or a server that did not stop cleanly, with the lines that say why."""
+
+    name: str
+    details: list[str]
+
+
+def failure_details(log: str, limit: int = FAILURE_LINES) -> list[str]:
+    """The last `limit` lines of a failed cell's log that are not passing interop scenarios: its
+    `fail` lines, browser errors, timeouts, and anything a crashing client printed."""
+    lines = [line for line in log.splitlines() if line.strip() and not line.startswith("ok ")]
+    return lines[-limit:]
+
+
+def failure_summary(failures: list[Failure]) -> str:
+    """The closing report of failed cells and why each failed. It comes last, so it survives a
+    log truncated to its final lines, as CI and Nix print them."""
+    lines: list[str] = []
+    for failure in failures:
+        lines.append(f"failed: {failure.name}")
+        lines += [f"    {detail}" for detail in failure.details]
+    return "\n".join(lines)
+
+
 # --- compression -----------------------------------------------------------------------------
 
 # The golden vector holding the interop dictionary, which every interop server and compressing

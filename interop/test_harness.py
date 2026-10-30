@@ -144,6 +144,35 @@ class ServerTest(unittest.TestCase):
             self.assertRegex(server.stop() or "", "exited with 1")
 
 
+class FailureSummaryTest(unittest.TestCase):
+    def test_keeps_what_explains_a_failure_and_drops_passing_scenarios(self) -> None:
+        log = "\n".join(
+            ["ok unary", "[browser error] Failed to load resource", "ok bidi", "",
+             "fail compressed-stream: deadline exceeded", "ok refused-stream"]
+        )  # fmt: skip
+
+        self.assertEqual(
+            [
+                "[browser error] Failed to load resource",
+                "fail compressed-stream: deadline exceeded",
+            ],
+            harness.failure_details(log),
+        )
+        self.assertEqual(["b"], harness.failure_details("a\nb", limit=1))
+
+    def test_the_summary_lists_each_failure_with_its_reasons(self) -> None:
+        summary = harness.failure_summary(
+            [harness.Failure("chromium-websocket-to-go", ["fail bidi: reset"]),
+             harness.Failure("server-rust", ["exited with status 1"])]
+        )  # fmt: skip
+
+        self.assertEqual(
+            "failed: chromium-websocket-to-go\n    fail bidi: reset\n"
+            "failed: server-rust\n    exited with status 1",
+            summary,
+        )
+
+
 class CertificateTest(unittest.TestCase):
     def test_certificate_validates_for_localhost_and_loopback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -425,5 +425,24 @@ class RepeatTest(unittest.TestCase):
         self.assertEqual(1290.0, runner.results[0].msgs_per_sec)
 
 
+class FailureTest(unittest.TestCase):
+    def test_a_failed_run_keeps_why_and_the_end_of_its_log(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            runner = run.Runner(run.Matrix(["unary"], [64], [0], [1], 0.2, 0, 10), Path(out))
+            command = [
+                "sh",
+                "-c",
+                "echo starting >&2; echo >&2; echo 'call failed: reset' >&2; exit 3",
+            ]
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(runner.run_once("cell", "go", "go", None, command))
+
+            self.assertEqual(
+                [run.Failure("cell", [f"exited 3 (see {out}/cell.log)", "starting",
+                                      "call failed: reset"])],
+                runner.failures,
+            )  # fmt: skip
+
+
 if __name__ == "__main__":
     _ = unittest.main()

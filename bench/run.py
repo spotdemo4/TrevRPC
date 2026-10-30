@@ -37,11 +37,14 @@ import netem
 import payload
 import tables
 from harness import (
+    Failure,
     NamedCommand,
     RunnerError,
     Server,
     comma_list,
     command_line,
+    failure_details,
+    failure_summary,
     generate_certificate,
     named_command,
     parse_with_defaults,
@@ -396,7 +399,7 @@ class Runner:
     matrix: Matrix
     out: Path
     results: list[Result]
-    failures: list[str]
+    failures: list[Failure]
 
     def __init__(self, matrix: Matrix, out: Path) -> None:
         self.matrix = matrix
@@ -483,28 +486,31 @@ class Runner:
             )
         line = completed.stdout.strip()
         if completed.returncode is None:
-            self.fail(cell, f"timed out after {self.matrix.deadline}s (see {log})")
+            self.fail(cell, f"timed out after {self.matrix.deadline}s (see {log})", log)
             return None
         if completed.returncode != 0:
-            self.fail(cell, f"exited {completed.returncode} (see {log})")
+            self.fail(cell, f"exited {completed.returncode} (see {log})", log)
             return None
         try:
             result = parse_result(client, server, line, netem)
         except ValueError as error:
-            self.fail(cell, f"printed an invalid result ({error}): {line}")
+            self.fail(cell, f"printed an invalid result ({error}): {line}", log)
             return None
         if result.errors != 0:
-            self.fail(cell, f"reported errors: {line}")
+            self.fail(cell, f"reported errors: {line}", log)
         return result
 
-    def fail(self, cell: str, reason: str) -> None:
+    def fail(self, cell: str, reason: str, log: Path) -> None:
+        """Reports the failure now and keeps it, with the end of the cell's log, for the closing
+        summary, which survives a log cut to its last lines, as CI and Nix print them."""
         print(f"failed: {cell} {reason}", file=sys.stderr, flush=True)
-        self.failures.append(cell)
+        text = log.read_text(encoding="utf-8", errors="replace")
+        self.failures.append(Failure(cell, [reason, *failure_details(text)]))
 
     def stop(self, server: Server) -> None:
         if (problem := server.stop()) is not None:
             print(problem, file=sys.stderr)
-            self.failures.append(f"server-{server.name}")
+            self.failures.append(Failure(f"server-{server.name}", [problem]))
 
 
 def summary(results: list[Result]) -> str:
@@ -831,9 +837,10 @@ def main(argv: list[str]) -> int:
             return 1
     table = summary(runner.results)
     _ = sys.stdout.write(table)
+    _ = sys.stdout.flush()
     _ = (out / "summary.txt").write_text(table, encoding="utf-8")
     if runner.failures:
-        print("\n".join(f"failed: {cell}" for cell in runner.failures), file=sys.stderr)
+        print(failure_summary(runner.failures), file=sys.stderr)
         return 1
     print(f"all benchmark runs passed; results in {out / 'results.jsonl'}")
     return 0

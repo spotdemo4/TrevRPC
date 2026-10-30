@@ -107,35 +107,6 @@ def quiet() -> contextlib.redirect_stderr[io.StringIO]:
     return contextlib.redirect_stderr(io.StringIO())
 
 
-class FailureSummaryTest(unittest.TestCase):
-    def test_keeps_what_explains_a_failure_and_drops_passing_scenarios(self) -> None:
-        log = "\n".join(
-            ["ok unary", "[browser error] Failed to load resource", "ok bidi", "",
-             "fail compressed-stream: deadline exceeded", "ok refused-stream"]
-        )  # fmt: skip
-
-        self.assertEqual(
-            [
-                "[browser error] Failed to load resource",
-                "fail compressed-stream: deadline exceeded",
-            ],
-            run.failure_details(log),
-        )
-        self.assertEqual(["b"], run.failure_details("a\nb", limit=1))
-
-    def test_the_summary_lists_each_failure_with_its_reasons(self) -> None:
-        summary = run.summary(
-            [run.Failure("chromium-websocket-to-go", ["fail bidi: reset"]),
-             run.Failure("server-rust", ["exited with status 1"])]
-        )  # fmt: skip
-
-        self.assertEqual(
-            "failed: chromium-websocket-to-go\n    fail bidi: reset\n"
-            "failed: server-rust\n    exited with status 1",
-            summary,
-        )
-
-
 class ArgumentsTest(unittest.TestCase):
     def test_requires_a_server_and_a_client_or_browser(self) -> None:
         for argv in [["--client", "go=a"], ["--server", "go=a"]]:
