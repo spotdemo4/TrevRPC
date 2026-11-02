@@ -230,6 +230,7 @@ func serveTestListener(t testing.TB, server *Server, listenOptions ListenOptions
 			}
 		case <-time.After(rpcTestTimeout):
 			t.Error("Serve did not stop after cancellation")
+			logGoroutines(t)
 		}
 	})
 	return listener

@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
+	"runtime/pprof"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +23,34 @@ func closeOnCleanup(t testing.TB, c io.Closer) {
 			t.Errorf("Close() error = %v", err)
 		}
 	})
+}
+
+// logGoroutines logs the stacks of the goroutines that run code of this
+// package or of quic-go, each distinct stack once with how many goroutines
+// share it, to show where a test hung. Frames are cut to function and
+// file:line to keep the dump short in a build log.
+func logGoroutines(t testing.TB) {
+	t.Helper()
+	var profile strings.Builder
+	_ = pprof.Lookup("goroutine").WriteTo(&profile, 1)
+	var dump strings.Builder
+	for record := range strings.SplitSeq(profile.String(), "\n\n") {
+		if !strings.Contains(record, "/trevrpc-go.") && !strings.Contains(record, "github.com/quic-go/") ||
+			strings.Contains(record, ".logGoroutines") {
+			continue
+		}
+		for line := range strings.SplitSeq(record, "\n") {
+			switch fields := strings.Fields(line); {
+			case strings.Contains(line, " @ "):
+				count, _, _ := strings.Cut(line, " @ ")
+				dump.WriteString("\n" + count + " goroutines:\n")
+			case len(fields) == 4:
+				function, _, _ := strings.Cut(fields[2], "+0x")
+				dump.WriteString("  " + function[strings.LastIndex(function, "/")+1:] + " " + filepath.Base(fields[3]) + "\n")
+			}
+		}
+	}
+	t.Logf("goroutines running trevrpc or quic-go code:%s", dump.String())
 }
 
 func runTestClientStreaming(ctx context.Context, transport Transport, method string, values []string, options ...CallOption) (*testMessage, error) {

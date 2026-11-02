@@ -443,11 +443,20 @@ func TestAClientsReadyRequestsShareDatagrams(t *testing.T) {
 	// Send without waiting for replies: the writer takes the requests that are
 	// ready together and packs them.
 	const messages = 400
+	replied := make(chan struct{})
 	go func() {
 		for i := range messages {
 			if call.Send(&testMessage{Value: "request " + strconv.Itoa(i)}) != nil {
 				return
 			}
+		}
+		// quic-go sends a stream's end ahead of the datagrams still in its
+		// queue when a DATAGRAM frame does not fit beside an ACK, and the
+		// server drops the datagrams of a call whose requests ended. Every
+		// request may then be lost: end the requests once one came back.
+		select {
+		case <-replied:
+		case <-ctx.Done():
 		}
 		_ = call.CloseSend()
 	}()
@@ -457,6 +466,11 @@ func TestAClientsReadyRequestsShareDatagrams(t *testing.T) {
 				t.Fatalf("Recv: %v", err)
 			}
 			break
+		}
+		select {
+		case <-replied:
+		default:
+			close(replied)
 		}
 	}
 	status, ok := call.TerminalStatus()

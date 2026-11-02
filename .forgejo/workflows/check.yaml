@@ -28,6 +28,7 @@ jobs:
           niks3_url: https://niks3.trev.zip
 
       # max-silent-time fails a build that prints nothing for 15 minutes, such as a deadlocked
-      # test, instead of letting the job run until it is cancelled.
+      # test, instead of letting the job run until it is cancelled. log-lines leaves room for the
+      # goroutine dump a Go test logs when its listener does not shut down.
       - name: Check
-        run: nix flake check --option log-lines 100 --option max-silent-time 900
+        run: nix flake check --option log-lines 1000 --option max-silent-time 900
