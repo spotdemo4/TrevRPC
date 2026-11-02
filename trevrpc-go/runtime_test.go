@@ -1593,11 +1593,14 @@ func TestServerStreamingContextCancellationReturnsCancelled(t *testing.T) {
 }
 
 func TestClientStreamingDeadlineCancelsPendingUpload(t *testing.T) {
-	stream, err := ClientStreaming[*testMessage, *testMessage](context.Background(), uploadWaitingTransport{}, "/example.Greeter/LotsOfGreetings", func() *testMessage { return &testMessage{} }, WithTimeout(time.Millisecond))
+	transport := uploadWaitingTransport{uploadEnded: make(chan struct{})}
+	stream, err := ClientStreaming[*testMessage, *testMessage](context.Background(), transport, "/example.Greeter/LotsOfGreetings", func() *testMessage { return &testMessage{} }, WithTimeout(time.Millisecond))
 	if err != nil {
 		t.Fatalf("start client stream: %v", err)
 	}
-	time.Sleep(2 * time.Millisecond)
+	// Close the send side only once the deadline has ended the upload: the
+	// deadline's timer may run late, and closing first would end it with EOF.
+	<-transport.uploadEnded
 	_, err = stream.CloseAndRecv()
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)

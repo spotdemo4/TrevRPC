@@ -310,32 +310,48 @@ class CallTerminationTest {
                     },
                 )
             }
-            val options = CallOptions(timeout = 300.milliseconds)
+            // The deadline must leave room to read the frames before it cuts the wait short, even
+            // on a slow machine. Every call waits it out, so the calls run together.
+            val options = CallOptions(timeout = 2.seconds)
 
             val streaming =
-                Client(hangingAfter(message("a"), status(Status.ok())))
-                    .openServerStreaming("/svc/m", "request", strings, strings, options)
-            assertEquals("a", streaming.receive())
-            assertNull(streaming.receive())
-            assertEquals(Code.OK, streaming.terminalStatus?.code)
+                async {
+                    val call =
+                        Client(hangingAfter(message("a"), status(Status.ok())))
+                            .openServerStreaming("/svc/m", "request", strings, strings, options)
+                    assertEquals("a", call.receive())
+                    assertNull(call.receive())
+                    assertEquals(Code.OK, call.terminalStatus?.code)
+                }
 
             val unary =
-                Client(hangingAfter(message("a"), status(Status.ok())))
-                    .unary("/svc/m", "request", strings, strings, options)
-            assertEquals("a", unary)
+                async {
+                    val reply =
+                        Client(hangingAfter(message("a"), status(Status.ok())))
+                            .unary("/svc/m", "request", strings, strings, options)
+                    assertEquals("a", reply)
+                }
 
             val failed =
-                Client(hangingAfter(status(Status(Code.ABORTED, "stop"))))
-                    .openServerStreaming("/svc/m", "request", strings, strings, options)
-            val error = runCatching { failed.receive() }.exceptionOrNull() as TrevRpcException
-            assertEquals(Code.ABORTED, error.status.code)
-            assertEquals(Code.ABORTED, failed.terminalStatus?.code)
+                async {
+                    val call =
+                        Client(hangingAfter(status(Status(Code.ABORTED, "stop"))))
+                            .openServerStreaming("/svc/m", "request", strings, strings, options)
+                    val error = runCatching { call.receive() }.exceptionOrNull() as TrevRpcException
+                    assertEquals(Code.ABORTED, error.status.code)
+                    assertEquals(Code.ABORTED, call.terminalStatus?.code)
+                }
 
             val upload =
-                Client(hangingAfter(message("a"), status(Status.ok())))
-                    .openClientStreaming<String, String>("/svc/m", strings, strings, options)
-            upload.closeSend()
-            assertEquals("a", upload.receive())
+                async {
+                    val call =
+                        Client(hangingAfter(message("a"), status(Status.ok())))
+                            .openClientStreaming<String, String>("/svc/m", strings, strings, options)
+                    call.closeSend()
+                    assertEquals("a", call.receive())
+                }
+
+            listOf(streaming, unary, failed, upload).forEach { it.await() }
         }
 
     @Test

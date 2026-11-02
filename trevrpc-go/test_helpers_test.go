@@ -564,17 +564,22 @@ func (s contextBlockingFrameStream) Recv() (responseFrame, error) {
 
 func (contextBlockingFrameStream) Close() error { return nil }
 
-type uploadWaitingTransport struct{}
+// uploadWaitingTransport waits for the first request message and reports how
+// that wait ended as the response. It closes uploadEnded once the wait is over.
+type uploadWaitingTransport struct {
+	uploadEnded chan struct{}
+}
 
 func (uploadWaitingTransport) call(context.Context, *wireRequest, ProtoMessage) (frameStream, error) {
 	return nil, Unimplemented("unary not implemented")
 }
 
-func (uploadWaitingTransport) streamingCall(ctx context.Context, _ *wireRequest, requests encodedStream) (frameStream, error) {
+func (t uploadWaitingTransport) streamingCall(ctx context.Context, _ *wireRequest, requests encodedStream) (frameStream, error) {
 	errors := make(chan error, 1)
 	go func() {
 		_, err := recvRequestBody(ctx, requests)
 		errors <- err
+		close(t.uploadEnded)
 	}()
 	return uploadErrorFrameStream{errors: errors}, nil
 }
