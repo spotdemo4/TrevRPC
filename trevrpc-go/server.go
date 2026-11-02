@@ -2,7 +2,6 @@ package trevrpc
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -239,44 +238,6 @@ func DefaultServerOptions() ServerOptions {
 	}
 }
 
-// Authorizer authorizes a request after metadata and protocol validation. The
-// request body is not available to it. A call the server refuses for
-// optimistic stream compression is replayed by the client and authorized
-// again (see StreamCompression), so authorizers must not have side effects
-// that a second authorization of the same call would repeat: put those, such
-// as counting calls against a rate limit, in an Interceptor, which runs once
-// per handler invocation.
-type Authorizer interface {
-	// Authorize returns nil when the request is authorized. A returned *Status
-	// is sent to the caller; any other error becomes Internal.
-	Authorize(context.Context, HandlerContext) error
-}
-
-// metadataValueAuthorizer authorizes requests with an exact metadata value.
-type metadataValueAuthorizer struct {
-	key   string
-	value []byte
-}
-
-// NewMetadataValueAuthorizer creates an authorizer for an exact metadata key/value pair.
-func NewMetadataValueAuthorizer(key string, value []byte) Authorizer {
-	return metadataValueAuthorizer{key: NormalizeMetadataKey(key), value: append([]byte(nil), value...)}
-}
-
-// BearerAuthorizer creates an authorizer for the authorization bearer token metadata.
-func BearerAuthorizer(token string) Authorizer {
-	return NewMetadataValueAuthorizer("authorization", []byte("Bearer "+token))
-}
-
-// Authorize checks whether request metadata contains the expected value.
-func (a metadataValueAuthorizer) Authorize(_ context.Context, info HandlerContext) error {
-	if subtle.ConstantTimeCompare(info.Metadata[a.key], a.value) == 1 {
-		return nil
-	}
-
-	return Unauthenticated("request is not authenticated")
-}
-
 // Metrics receives RPC lifecycle events.
 type Metrics interface {
 	// RPCStarted is called when an RPC starts.
@@ -439,7 +400,7 @@ func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 		if isNilRegisteredValue(response) {
 			return nil, Internal("handler returned nil response message")
 		}
-		return newCompressedEncodeStream(newSliceStream(response), responseCompressorFromContext(ctx)), nil
+		return newCompressedEncodeStream(StreamOf(response), responseCompressorFromContext(ctx)), nil
 	}, options...)
 }
 

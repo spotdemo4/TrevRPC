@@ -47,7 +47,7 @@ func registerDatagramService(server *Server) {
 			for i := range messages {
 				messages[i] = &testMessage{Value: "burst " + strconv.Itoa(i)}
 			}
-			return newSliceStream(messages...), nil
+			return StreamOf(messages...), nil
 		}, RouteUnreliable(Unreliable{Responses: true}))
 	RegisterServerStreaming(server, datagramWatchPath, newTestMessage,
 		func(ctx context.Context, request *testMessage) (MessageStream[*testMessage], error) {

@@ -529,7 +529,7 @@ func (t *capturingClientTransport) response(status *Status) frameStream {
 	if status.IsOK() {
 		frames = append(frames, messageFrame(t.responseBody))
 	}
-	return newSliceStream(append(frames, statusFrameWithMetadata(status, t.metadata))...)
+	return StreamOf(append(frames, statusFrameWithMetadata(status, t.metadata))...)
 }
 
 func (t *capturingClientTransport) capture(ctx context.Context, request *wireRequest) {
@@ -577,7 +577,7 @@ func (t *mutatingClientTransport) call(_ context.Context, request *wireRequest, 
 		delete(request.Metadata, key)
 	}
 	request.Metadata["transport"] = []byte("mutation")
-	return newSliceStream(messageFrame(t.responseBody), statusFrame(OK())), nil
+	return StreamOf(messageFrame(t.responseBody), statusFrame(OK())), nil
 }
 
 func (t *mutatingClientTransport) streamingCall(context.Context, *wireRequest, encodedStream) (frameStream, error) {
@@ -599,7 +599,7 @@ func (t *readingClientTransport) call(_ context.Context, request *wireRequest, _
 	for {
 		select {
 		case <-t.release:
-			return newSliceStream(messageFrame(t.responseBody), statusFrame(OK())), nil
+			return StreamOf(messageFrame(t.responseBody), statusFrame(OK())), nil
 		default:
 			value := request.Metadata["custom"]
 			if len(value) > 0 {

@@ -37,7 +37,7 @@ func registerStreamCompressionService(server *Server) {
 		for i := range responses {
 			responses[i] = compressionSample(i)
 		}
-		return newSliceStream(responses...), nil
+		return StreamOf(responses...), nil
 	}, both)
 	RegisterClientStreaming(server, testPath("StreamUpload"), newStringValue, joinUpload, both)
 }

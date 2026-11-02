@@ -303,7 +303,7 @@ func rawStream(bodies ...string) encodedStream {
 	for index, body := range bodies {
 		messages[index] = rawMessage([]byte(body))
 	}
-	return newSliceStream(messages...)
+	return StreamOf(messages...)
 }
 
 // rawResponse is a streaming handler response of messages with the given payloads.
@@ -718,7 +718,7 @@ func (r *dispatchedResponse) writeNext(ctx context.Context, writer io.Writer, ma
 
 // singleMessageResponse is a streaming handler response of one message.
 func singleMessageResponse[T ProtoMessage](message T) (encodedStream, error) {
-	return newEncodeStream(newSliceStream(message)), nil
+	return newEncodeStream(StreamOf(message)), nil
 }
 
 // responseStreamFailureReason returns the stable reason for a response-stream failure.

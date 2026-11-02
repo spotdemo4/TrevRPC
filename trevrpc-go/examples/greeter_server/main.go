@@ -9,14 +9,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"io"
 	"log"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
@@ -44,37 +42,10 @@ func (greeterService) SayHello(_ context.Context, request *greeter.HelloRequest)
 }
 
 func (greeterService) LotsOfReplies(_ context.Context, request *greeter.HelloRequest) (trevrpc.MessageStream[*greeter.HelloReply], error) {
-	return &fixedReplies{replies: []*greeter.HelloReply{
-		{Message: "hello " + request.Name},
-		{Message: "welcome to TrevRPC over QUIC"},
-	}}, nil
-}
-
-// fixedReplies streams a fixed list of replies.
-// fixedReplies is safe for Close to run concurrently with Recv, as
-// trevrpc.MessageStream requires.
-type fixedReplies struct {
-	mu      sync.Mutex
-	replies []*greeter.HelloReply
-}
-
-func (s *fixedReplies) Recv() (*greeter.HelloReply, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.replies) == 0 {
-		return nil, io.EOF
-	}
-
-	next := s.replies[0]
-	s.replies = s.replies[1:]
-	return next, nil
-}
-
-func (s *fixedReplies) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.replies = nil
-	return nil
+	return trevrpc.StreamOf(
+		&greeter.HelloReply{Message: "hello " + request.Name},
+		&greeter.HelloReply{Message: "welcome to TrevRPC over QUIC"},
+	), nil
 }
 
 func (greeterService) LotsOfGreetings(_ context.Context, requests trevrpc.MessageStream[*greeter.HelloRequest]) (*greeter.HelloReply, error) {

@@ -308,7 +308,7 @@ func TestStreamingClientServer(t *testing.T) {
 			return nil, err
 		}
 
-		return newEncodeStream(newSliceStream(
+		return newEncodeStream(StreamOf(
 			&testMessage{Value: request.Value + " 1"},
 			&testMessage{Value: request.Value + " 2"},
 		)), nil
@@ -799,7 +799,7 @@ func TestRequestStreamMessageLimitReturnsResourceExhausted(t *testing.T) {
 
 	request := newWireRequest("/example.Greeter/Upload")
 	request.Kind = RPCKindClientStreaming
-	response := server.handleStreamingRequest(context.Background(), request, newSliceStream([]byte("one"), []byte("two")))
+	response := server.handleStreamingRequest(context.Background(), request, StreamOf([]byte("one"), []byte("two")))
 	frame, err := response.Recv()
 	if err != nil {
 		t.Fatalf("read status frame: %v", err)
@@ -832,7 +832,7 @@ func TestRequestStreamLimitBoundaries(t *testing.T) {
 
 	request := newWireRequest("/example.Greeter/Upload")
 	request.Kind = RPCKindClientStreaming
-	response := server.handleStreamingRequest(context.Background(), request, newSliceStream([]byte("a"), []byte("bc")))
+	response := server.handleStreamingRequest(context.Background(), request, StreamOf([]byte("a"), []byte("bc")))
 	frame, err := response.Recv()
 	if err != nil {
 		t.Fatalf("read exact-limit status frame: %v", err)
@@ -841,7 +841,7 @@ func TestRequestStreamLimitBoundaries(t *testing.T) {
 		t.Fatalf("expected ok status at exact limit, got %#v", frame)
 	}
 
-	response = server.handleStreamingRequest(context.Background(), request, newSliceStream([]byte("abc"), []byte("d")))
+	response = server.handleStreamingRequest(context.Background(), request, StreamOf([]byte("abc"), []byte("d")))
 	frame, err = response.Recv()
 	if err != nil {
 		t.Fatalf("read over-limit status frame: %v", err)

@@ -276,7 +276,7 @@ func (g *fakeChannelGeneration) call(ctx context.Context, _ *wireRequest, _ Prot
 	default:
 	}
 	if !g.blockCalls {
-		return newSliceStream(statusFrame(NewStatus(CodeOK, g.message))), nil
+		return StreamOf(statusFrame(NewStatus(CodeOK, g.message))), nil
 	}
 	select {
 	case <-g.done:

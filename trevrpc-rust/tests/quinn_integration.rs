@@ -15,8 +15,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{CallOptions, ChannelConfig, RpcTransport, StreamingRpcTransport};
 use trevrpc::server::{
-    CancellationSource, MetadataValueAuthorizer, Metrics, RequestContext, RpcFinished, RpcStarted,
-    Server, ServerOptions,
+    CancellationSource, HttpAdmission, MetadataValueAuthorizer, Metrics, RequestContext,
+    RpcFinished, RpcStarted, Server, ServerOptions, WebTransportAdmission,
 };
 use trevrpc::{Code, RpcKind, RpcRequest, Status};
 
@@ -1365,7 +1365,7 @@ async fn http3_rejects_invalid_path_method_and_media_type() -> TestResult {
             server
                 .options()
                 .clone()
-                .with_http_admission(Some(reject_http3_admission)),
+                .with_http_admission(Some(HttpAdmission::new(reject_http3_admission))),
         );
     })?;
     let (endpoint, connection, transport) = connect_http3_transport(&server).await?;
@@ -1692,12 +1692,9 @@ async fn webtransport_allows_configured_browser_origin() -> TestResult {
 #[tokio::test]
 async fn webtransport_admission_receives_generic_request_headers() -> TestResult {
     let server = spawn_greeter_server(|server| {
-        server.set_options(
-            server
-                .options()
-                .clone()
-                .with_webtransport_admission(Some(require_webtransport_admission_header)),
-        );
+        server.set_options(server.options().clone().with_webtransport_admission(Some(
+            WebTransportAdmission::new(require_webtransport_admission_header),
+        )));
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
     let client = make_webtransport_client(&server)?;
@@ -3747,7 +3744,9 @@ fn spawn_http3_greeter_server(configure: impl FnOnce(&mut Server)) -> TestResult
         server.set_options(
             fast_server_options()
                 .with_http_enabled(true)
-                .with_webtransport_admission(Some(reject_webtransport_admission)),
+                .with_webtransport_admission(Some(WebTransportAdmission::new(
+                    reject_webtransport_admission,
+                ))),
         );
         configure(server);
     })

@@ -89,10 +89,24 @@ func DeadlineExceeded(message string) *Status { return NewStatus(CodeDeadlineExc
 // NotFound creates a not-found status.
 func NotFound(message string) *Status { return NewStatus(CodeNotFound, message) }
 
+// AlreadyExists creates an already-exists status.
+func AlreadyExists(message string) *Status { return NewStatus(CodeAlreadyExists, message) }
+
+// PermissionDenied creates a permission-denied status.
+func PermissionDenied(message string) *Status {
+	return NewStatus(CodePermissionDenied, message)
+}
+
 // ResourceExhausted creates a resource-exhausted status.
 func ResourceExhausted(message string) *Status {
 	return NewStatus(CodeResourceExhausted, message)
 }
+
+// Aborted creates an aborted status.
+func Aborted(message string) *Status { return NewStatus(CodeAborted, message) }
+
+// OutOfRange creates an out-of-range status.
+func OutOfRange(message string) *Status { return NewStatus(CodeOutOfRange, message) }
 
 // Unavailable creates an unavailable status.
 func Unavailable(message string) *Status { return NewStatus(CodeUnavailable, message) }
@@ -101,6 +115,9 @@ func Unavailable(message string) *Status { return NewStatus(CodeUnavailable, mes
 func FailedPrecondition(message string) *Status {
 	return NewStatus(CodeFailedPrecondition, message)
 }
+
+// DataLoss creates a data-loss status.
+func DataLoss(message string) *Status { return NewStatus(CodeDataLoss, message) }
 
 // Unauthenticated creates an unauthenticated status.
 func Unauthenticated(message string) *Status { return NewStatus(CodeUnauthenticated, message) }

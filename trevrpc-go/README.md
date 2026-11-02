@@ -123,16 +123,16 @@ func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*gre
 	return &greeter.HelloReply{Message: "hello, " + r.Name}, nil
 }
 
-// LotsOfReplies and BidiHello return a trevrpc.MessageStream; LotsOfGreetings
+// LotsOfReplies and BidiHello return a trevrpc.MessageStream, such as
+// trevrpc.StreamOf(replies...) or trevrpc.StreamFromSeq(seq); LotsOfGreetings
 // returns a *greeter.HelloReply like SayHello. See examples/greeter_server.
 
 server := trevrpc.NewServer()
 options := server.Options()
 options.EnableHTTP = true          // POST /trevrpc over HTTP/3 and HTTP/2, for Android / Cronet
 options.EnableWebTransport = true   // /trevrpc for browsers: WebTransport and QMux over WebSocket
-options.WebTransportAdmission = func(r trevrpc.AdmissionRequest) bool {
-	return r.Origin == "https://app.example.com"
-}
+// Pages served by this server, and https://app.example.com.
+options.WebTransportAdmission = trevrpc.SameOriginAdmission("https://app.example.com")
 server.SetOptions(options)
 greeter.RegisterGreeterServer(server, greeterService{})
 
@@ -165,7 +165,7 @@ On the wire a call is a sequence of frames, each a QUIC variable-length type, a 
 
 Frames carry no wire version: each transport fixes it while negotiating (ALPN `trevrpc/1`, ALPN or subprotocol `qmux-02.trevrpc-1`, `Content-Type: application/trevrpc`). For WebTransport the server selects the protocol `trevrpc-1` in `WT-Protocol`, answers `400` to a CONNECT whose `WT-Available-Protocols` is a valid list without `"trevrpc-1"`, and treats a missing or malformed field as version 1.
 
-Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `WebTransportAdmission` admits them; HTTP requests (HTTP/3 and HTTP/2) are admitted unless `HTTPAdmission` denies them. `AdmissionRequest.Proto` reports the HTTP version (`HTTP/3.0`, `HTTP/2.0`, or `HTTP/1.1`), `Method` is `POST`, `CONNECT` (WebTransport), or `GET` (WebSocket), and `RemoteAddr` is the client's address. Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
+Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `WebTransportAdmission` admits them (`SameOriginAdmission` admits the server's own pages and listed origins); HTTP requests (HTTP/3 and HTTP/2) are admitted unless `HTTPAdmission` denies them. `AdmissionRequest.Proto` reports the HTTP version (`HTTP/3.0`, `HTTP/2.0`, or `HTTP/1.1`), `Method` is `POST`, `CONNECT` (WebTransport), or `GET` (WebSocket), and `RemoteAddr` is the client's address. Cancelling the context passed to `Serve` (or calling `Close`) cancels in-flight RPCs and waits up to `GracefulShutdownTimeout` for handlers to return.
 
 `ServerOptions.HTTPFallback` serves every other HTTP request on the same sockets, over HTTP/3, HTTP/2 and HTTP/1.1, such as the static content of the web application that calls the server (`options.HTTPFallback = http.FileServerFS(dist)`). TrevRPC keeps `HTTPPath` while `EnableHTTP` or `EnableWebTransport` is set; see [Serving Other HTTP Content](https://trev.zip/llc/TrevRPC/wiki/HTTP3#serving-other-http-content).
 

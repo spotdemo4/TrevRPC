@@ -18,6 +18,7 @@ use crate::compression::{
 use crate::datagram::MessageCount;
 use crate::fallback::HttpFallback;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
+use crate::http_admission::{normalize_origin, parse_origin};
 use crate::response::ResponseMetadata;
 use crate::sync::MutexExt as _;
 use crate::wire::{
@@ -563,7 +564,6 @@ pub struct WebTransportAdmissionRequest<'a> {
     pub headers: &'a [AdmissionHeader<'a>],
 }
 
-pub type WebTransportAdmission = for<'a> fn(&WebTransportAdmissionRequest<'a>) -> bool;
 #[derive(Clone, Copy)]
 pub struct HttpAdmissionRequest<'a> {
     pub request: &'a http::Request<()>,
@@ -575,7 +575,102 @@ pub struct HttpAdmissionRequest<'a> {
     pub headers: &'a [AdmissionHeader<'a>],
 }
 
-pub type HttpAdmission = for<'a> fn(&HttpAdmissionRequest<'a>) -> bool;
+/// Defines an admission callback type: a shared function of a request type that returns whether
+/// to accept the request.
+macro_rules! admission {
+    ($(#[$meta:meta])* $name:ident, $request:ident) => {
+        $(#[$meta])*
+        #[derive(Clone)]
+        pub struct $name(Arc<dyn for<'a> Fn(&$request<'a>) -> bool + Send + Sync>);
+
+        impl $name {
+            /// Wraps `admit`, which returns whether to accept a request. It may capture
+            /// configuration, such as an allowlist.
+            pub fn new<F>(admit: F) -> Self
+            where
+                F: for<'a> Fn(&$request<'a>) -> bool + Send + Sync + 'static,
+            {
+                Self(Arc::new(admit))
+            }
+
+            /// Returns whether to accept `request`.
+            #[must_use]
+            pub fn admits(&self, request: &$request<'_>) -> bool {
+                (self.0)(request)
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(concat!(stringify!($name), "(..)"))
+            }
+        }
+    };
+}
+
+admission!(
+    /// Decides whether to accept an otherwise valid HTTP RPC request; see
+    /// [`ServerOptions::with_http_admission`].
+    HttpAdmission,
+    HttpAdmissionRequest
+);
+
+admission!(
+    /// Decides whether to accept a browser session, over `WebTransport` or WebSocket; see
+    /// [`ServerOptions::with_webtransport_admission`].
+    WebTransportAdmission,
+    WebTransportAdmissionRequest
+);
+
+impl WebTransportAdmission {
+    /// Creates an admission for a server that serves its own web app. It admits:
+    ///
+    /// - requests without an `Origin` header, which do not come from a web page, so cross-site
+    ///   WebSocket hijacking does not apply to them;
+    /// - pages from the server's own origin: an `Origin` whose scheme is `https` (`http` when the
+    ///   request is not secure) and whose host and port are the request's authority;
+    /// - pages from `allowed_origins`, such as `http://localhost:3000` for a development server.
+    ///
+    /// Origins compare as browsers serialize them: the scheme and host ignore case, and a default
+    /// port (443 for `https`, 80 for `http`) equals no port. The opaque origin `null` is never
+    /// admitted.
+    ///
+    /// # Errors
+    ///
+    /// An invalid-argument status when an allowed origin is not of the form
+    /// `scheme://host[:port]`.
+    pub fn same_origin<I, S>(allowed_origins: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let allowed = allowed_origins
+            .into_iter()
+            .map(|origin| {
+                let origin = origin.as_ref();
+                parse_origin(origin).ok_or_else(|| {
+                    Error::from(Status::invalid_argument(format!(
+                        "invalid origin {origin:?}"
+                    )))
+                })
+            })
+            .collect::<Result<std::collections::HashSet<_>>>()?;
+        Ok(Self::new(move |request| {
+            let Some(origin) = request.origin.filter(|origin| !origin.is_empty()) else {
+                return true;
+            };
+            let Some(origin) = parse_origin(origin) else {
+                return false;
+            };
+            let scheme = if request.secure { "https" } else { "http" };
+            request
+                .authority
+                .and_then(|authority| normalize_origin(scheme, authority))
+                .is_some_and(|own| own == origin)
+                || allowed.contains(&origin)
+        }))
+    }
+}
 
 /// Server limits, timeouts, and the HTTP and browser session transports.
 ///
@@ -749,8 +844,8 @@ impl ServerOptions {
 
     /// Returns the HTTP/3 POST admission callback, if configured.
     #[must_use]
-    pub const fn http_admission(&self) -> Option<HttpAdmission> {
-        self.http_admission
+    pub const fn http_admission(&self) -> Option<&HttpAdmission> {
+        self.http_admission.as_ref()
     }
 
     /// Returns whether `WebTransport` sessions are accepted. Off by default: every `WebTransport`
@@ -777,8 +872,8 @@ impl ServerOptions {
     /// Returns the `WebTransport` admission callback, if configured. When set, it replaces the
     /// authority and origin allowlists; the shared path is always checked first.
     #[must_use]
-    pub const fn webtransport_admission(&self) -> Option<WebTransportAdmission> {
-        self.webtransport_admission
+    pub const fn webtransport_admission(&self) -> Option<&WebTransportAdmission> {
+        self.webtransport_admission.as_ref()
     }
 
     /// Returns the service for the HTTP requests `TrevRPC` does not claim, if configured.
@@ -948,7 +1043,7 @@ impl ServerOptions {
 
     /// Sets the HTTP/3 POST admission callback.
     #[must_use]
-    pub const fn with_http_admission(mut self, http_admission: Option<HttpAdmission>) -> Self {
+    pub fn with_http_admission(mut self, http_admission: Option<HttpAdmission>) -> Self {
         self.http_admission = http_admission;
         self
     }
@@ -982,7 +1077,10 @@ impl ServerOptions {
         self
     }
 
-    /// Sets the `WebTransport` origins allowed by the server.
+    /// Sets the `WebTransport` origins allowed by the server, such as `https://app.example`.
+    /// Origins compare as browsers serialize them: the scheme and host ignore case, and a default
+    /// port equals no port. An entry that is not of the form `scheme://host[:port]`, such as
+    /// `null`, matches nothing.
     #[must_use]
     pub fn with_webtransport_allowed_origins<I, S>(
         mut self,
@@ -1001,7 +1099,7 @@ impl ServerOptions {
 
     /// Sets the `WebTransport` admission callback.
     #[must_use]
-    pub const fn with_webtransport_admission(
+    pub fn with_webtransport_admission(
         mut self,
         webtransport_admission: Option<WebTransportAdmission>,
     ) -> Self {
@@ -1128,6 +1226,85 @@ impl Authorizer for MetadataValueAuthorizer {
             Err(Status::unauthenticated("request is not authenticated"))
         }
     }
+}
+
+/// Runs authorizers in order, and authorizes a call only when every one of them does: the first
+/// error ends the chain.
+#[derive(Clone, Default)]
+pub struct AuthorizerChain(Vec<Arc<dyn Authorizer>>);
+
+impl AuthorizerChain {
+    /// Creates an empty chain, which authorizes every call.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends `authorizer`, which runs after those appended before it.
+    #[must_use]
+    pub fn with<A>(mut self, authorizer: A) -> Self
+    where
+        A: Authorizer,
+    {
+        self.0.push(Arc::new(authorizer));
+        self
+    }
+}
+
+impl std::fmt::Debug for AuthorizerChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AuthorizerChain({} authorizers)", self.0.len())
+    }
+}
+
+#[crate::async_trait]
+impl Authorizer for AuthorizerChain {
+    async fn authorize(
+        &self,
+        request: &AuthorizationRequest<'_>,
+    ) -> std::result::Result<(), Status> {
+        for authorizer in &self.0 {
+            authorizer.authorize(request).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns the token of the `authorization` metadata, which must hold bearer credentials as RFC
+/// 6750 defines them: the case-insensitive scheme `Bearer`, one or more spaces, and the token.
+///
+/// # Errors
+///
+/// An unauthenticated status when the metadata is missing or holds anything else, with a message
+/// that tells the two apart.
+pub fn bearer_token(metadata: &Metadata) -> std::result::Result<&str, Status> {
+    const SCHEME: &[u8] = b"bearer ";
+    let malformed = || Status::unauthenticated("malformed bearer token");
+    let value = metadata
+        .get("authorization")
+        .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
+    let (_, credentials) = value
+        .split_at_checked(SCHEME.len())
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(SCHEME))
+        .ok_or_else(malformed)?;
+    let token = credentials
+        .iter()
+        .position(|&byte| byte != b' ')
+        .and_then(|start| credentials.get(start..))
+        .unwrap_or_default();
+    // RFC 6750's b64token: 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"=".
+    let mut unpadded = token;
+    while let [rest @ .., b'='] = unpadded {
+        unpadded = rest;
+    }
+    if unpadded.is_empty()
+        || !unpadded
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte))
+    {
+        return Err(malformed());
+    }
+    std::str::from_utf8(token).map_err(|_| malformed())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -3265,8 +3442,9 @@ mod tests {
 
     #[test]
     fn webtransport_admission_callback_is_configurable() {
-        let options =
-            ServerOptions::new().with_webtransport_admission(Some(allow_any_webtransport));
+        let options = ServerOptions::new().with_webtransport_admission(Some(
+            super::WebTransportAdmission::new(allow_any_webtransport),
+        ));
 
         assert!(options.webtransport_admission().is_some());
     }
@@ -4174,5 +4352,207 @@ mod tests {
 
         assert_eq!(response.message().as_slice(), b"");
         assert_eq!(log.take(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn authorizer_chain_runs_in_order_until_one_fails() {
+        struct Recording {
+            name: &'static str,
+            result: Result<(), Status>,
+            log: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[crate::async_trait]
+        impl Authorizer for Recording {
+            async fn authorize(
+                &self,
+                _request: &super::AuthorizationRequest<'_>,
+            ) -> Result<(), Status> {
+                self.log.lock().unwrap().push(self.name);
+                self.result.clone()
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let recording = |name, result| Recording {
+            name,
+            result,
+            log: Arc::clone(&log),
+        };
+        let request = RpcRequest::new("/service/method");
+        let request = super::AuthorizationRequest {
+            request: &request,
+            remote_addr: None,
+        };
+
+        let chain = super::AuthorizerChain::new()
+            .with(recording("limiter", Ok(())))
+            .with(recording("session", Err(Status::permission_denied("no"))))
+            .with(recording("later", Ok(())));
+        let status = chain.authorize(&request).await.unwrap_err();
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(*log.lock().unwrap(), ["limiter", "session"]);
+
+        log.lock().unwrap().clear();
+        let chain = super::AuthorizerChain::new()
+            .with(recording("a", Ok(())))
+            .with(recording("b", Ok(())));
+        assert_eq!(chain.authorize(&request).await, Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["a", "b"]);
+        assert_eq!(
+            super::AuthorizerChain::new().authorize(&request).await,
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bearer_token_parses_rfc_6750_credentials() {
+        let token = |value: Option<&str>| {
+            let mut metadata = Metadata::new();
+            if let Some(value) = value {
+                metadata.insert("authorization".to_owned(), value.as_bytes().to_vec());
+            }
+            super::bearer_token(&metadata)
+                .map(str::to_owned)
+                .map_err(|status| (status.code(), status.message().to_owned()))
+        };
+        for (value, want) in [
+            (Some("Bearer abc.DEF-123_~+/=="), "abc.DEF-123_~+/=="),
+            (Some("bEaReR token"), "token"),
+            (Some("Bearer   token"), "token"),
+        ] {
+            assert_eq!(token(value), Ok(want.to_owned()), "{value:?}");
+        }
+        assert_eq!(
+            token(None),
+            Err((Code::Unauthenticated, "missing bearer token".to_owned()))
+        );
+        for value in [
+            "",
+            "token",
+            "Bearer",
+            "Bearer ",
+            "Basic dXNlcjpwYXNz",
+            "Bearertoken",
+            "Bearer\ttoken",
+            "Bearer token ",
+            "Bearer to ken",
+            "Bearer ==",
+            "Bearer a=b",
+            "Bearer a,b",
+        ] {
+            assert_eq!(
+                token(Some(value)),
+                Err((Code::Unauthenticated, "malformed bearer token".to_owned())),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_constructors_cover_every_code() {
+        type Constructor = fn(&'static str) -> Status;
+        let constructors: [(Code, Constructor); 16] = [
+            (Code::Cancelled, Status::cancelled),
+            (Code::Unknown, Status::unknown),
+            (Code::InvalidArgument, Status::invalid_argument),
+            (Code::DeadlineExceeded, Status::deadline_exceeded),
+            (Code::NotFound, Status::not_found),
+            (Code::AlreadyExists, Status::already_exists),
+            (Code::PermissionDenied, Status::permission_denied),
+            (Code::ResourceExhausted, Status::resource_exhausted),
+            (Code::FailedPrecondition, Status::failed_precondition),
+            (Code::Aborted, Status::aborted),
+            (Code::OutOfRange, Status::out_of_range),
+            (Code::Unimplemented, Status::unimplemented),
+            (Code::Internal, Status::internal),
+            (Code::Unavailable, Status::unavailable),
+            (Code::DataLoss, Status::data_loss),
+            (Code::Unauthenticated, Status::unauthenticated),
+        ];
+        for (code, constructor) in constructors {
+            let status = constructor("message");
+            assert_eq!((status.code(), status.message()), (code, "message"));
+        }
+    }
+
+    #[test]
+    fn same_origin_admission() {
+        let admission = super::WebTransportAdmission::same_origin([
+            "http://localhost:3000",
+            "HTTPS://Partner.Example:443",
+            "https://[::1]:8443",
+        ])
+        .unwrap();
+        let admits = |origin: Option<&str>, authority: Option<&str>, secure: bool| {
+            admission.admits(&super::WebTransportAdmissionRequest {
+                remote_addr: "127.0.0.1:1".parse().unwrap(),
+                path: "/trevrpc",
+                authority,
+                origin,
+                secure,
+                headers: &[],
+            })
+        };
+        let host = Some("rpc.example");
+        for (origin, authority, secure, want) in [
+            (None, host, true, true),
+            (Some(""), host, true, true),
+            (Some("https://rpc.example"), host, true, true),
+            (
+                Some("https://rpc.example:8443"),
+                Some("rpc.example:8443"),
+                true,
+                true,
+            ),
+            (Some("HTTPS://RPC.Example"), Some("rpc.EXAMPLE"), true, true),
+            (Some("https://rpc.example:443"), host, true, true),
+            (
+                Some("https://rpc.example"),
+                Some("rpc.example:443"),
+                true,
+                true,
+            ),
+            (Some("https://[::1]:9000"), Some("[::1]:9000"), true, true),
+            (Some("http://rpc.example"), host, false, true),
+            (Some("http://rpc.example"), host, true, false),
+            (Some("https://rpc.example"), host, false, false),
+            (Some("https://rpc.example"), None, true, false),
+            (Some("https://rpc.example:8443"), host, true, false),
+            (Some("https://evil.example"), host, true, false),
+            (Some("https://rpc.example.evil"), host, true, false),
+            (Some("null"), host, true, false),
+            (Some("https://rpc.example/"), host, true, false),
+            (Some("https://user@rpc.example"), host, true, false),
+            (Some("https://rpc.example:"), host, true, false),
+            (Some("https://rpc.example:+443"), host, true, false),
+            (Some("http://localhost:3000"), host, true, true),
+            (Some("http://localhost:3001"), host, true, false),
+            (Some("https://localhost:3000"), host, true, false),
+            (Some("https://partner.example"), host, true, true),
+            (Some("https://[::1]:8443"), host, true, true),
+            (Some("https://::1"), host, true, false),
+        ] {
+            assert_eq!(
+                admits(origin, authority, secure),
+                want,
+                "origin {origin:?}, authority {authority:?}, secure {secure}"
+            );
+        }
+
+        for origin in [
+            "null",
+            "localhost:3000",
+            "https://",
+            "https://host/path",
+            "https://host:http",
+        ] {
+            let error = super::WebTransportAdmission::same_origin([origin]).unwrap_err();
+            assert_eq!(
+                error.into_status().code(),
+                Code::InvalidArgument,
+                "{origin}"
+            );
+        }
     }
 }

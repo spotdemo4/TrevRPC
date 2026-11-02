@@ -118,6 +118,12 @@ impl Status {
         Self::new(Code::Cancelled, message)
     }
 
+    /// Creates an unknown status.
+    #[must_use]
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self::new(Code::Unknown, message)
+    }
+
     /// Creates an internal error status.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
@@ -142,10 +148,34 @@ impl Status {
         Self::new(Code::NotFound, message)
     }
 
+    /// Creates an already-exists status.
+    #[must_use]
+    pub fn already_exists(message: impl Into<String>) -> Self {
+        Self::new(Code::AlreadyExists, message)
+    }
+
+    /// Creates a permission-denied status.
+    #[must_use]
+    pub fn permission_denied(message: impl Into<String>) -> Self {
+        Self::new(Code::PermissionDenied, message)
+    }
+
     /// Creates a resource-exhausted status.
     #[must_use]
     pub fn resource_exhausted(message: impl Into<String>) -> Self {
         Self::new(Code::ResourceExhausted, message)
+    }
+
+    /// Creates an aborted status.
+    #[must_use]
+    pub fn aborted(message: impl Into<String>) -> Self {
+        Self::new(Code::Aborted, message)
+    }
+
+    /// Creates an out-of-range status.
+    #[must_use]
+    pub fn out_of_range(message: impl Into<String>) -> Self {
+        Self::new(Code::OutOfRange, message)
     }
 
     /// Creates an unavailable status.
@@ -158,6 +188,12 @@ impl Status {
     #[must_use]
     pub fn failed_precondition(message: impl Into<String>) -> Self {
         Self::new(Code::FailedPrecondition, message)
+    }
+
+    /// Creates a data-loss status.
+    #[must_use]
+    pub fn data_loss(message: impl Into<String>) -> Self {
+        Self::new(Code::DataLoss, message)
     }
 
     /// Creates an unauthenticated status.

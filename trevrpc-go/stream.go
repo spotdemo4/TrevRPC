@@ -212,15 +212,16 @@ func (s *messagePipe[T]) closedError() error {
 	return io.ErrClosedPipe
 }
 
+// StreamOf returns a stream that yields items in order, such as the fixed
+// responses of a server-streaming handler.
+func StreamOf[T any](items ...T) MessageStream[T] {
+	return &sliceStream[T]{items: items}
+}
+
 type sliceStream[T any] struct {
 	mu    sync.Mutex
 	items []T
 	next  int
-}
-
-// newSliceStream returns a stream that yields the provided items in order.
-func newSliceStream[T any](items ...T) MessageStream[T] {
-	return &sliceStream[T]{items: items}
 }
 
 func (s *sliceStream[T]) trevrpcNonBlockingStream() bool { return true }
@@ -242,6 +243,96 @@ func (s *sliceStream[T]) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.next = len(s.items)
+	return nil
+}
+
+// StreamFromSeq returns a stream that yields the values of seq, pulling each
+// one when Recv is called, so a server-streaming handler can produce its
+// responses as the client reads them:
+//
+//	return trevrpc.StreamFromSeq(func(yield func(*Reply, error) bool) {
+//		defer rows.Close()
+//		for rows.Next() {
+//			... if !yield(reply, nil) { return }
+//		}
+//		if err := rows.Err(); err != nil {
+//			yield(nil, err)
+//		}
+//	}), nil
+//
+// The stream ends when seq returns. A value yielded with an error is returned
+// by Recv as is, and the server ends the call with that error, so seq should
+// return after yielding one. Close stops seq: the yield that is waiting for the
+// next Recv returns false, so seq's deferred cleanup runs exactly once however
+// the stream ends. Close does not interrupt a Recv that is waiting for seq to
+// yield, which then stops seq when it does; seq should watch the handler's
+// context, which is done when the call is cancelled or times out.
+func StreamFromSeq[T any](seq iter.Seq2[T, error]) MessageStream[T] {
+	next, stop := iter.Pull2(seq)
+	return &seqStream[T]{next: next, stop: stop}
+}
+
+// seqStream is a MessageStream that pulls from an iter.Seq2. Close may run
+// concurrently with Recv, but iter.Pull2's next and stop must not, so a Close
+// during a Recv leaves stop to that Recv.
+type seqStream[T any] struct {
+	// recvMu serializes Recv calls.
+	recvMu sync.Mutex
+	next   func() (T, error, bool)
+	stop   func()
+
+	mu sync.Mutex
+	// receiving is whether a Recv is in next.
+	receiving bool
+	// done is whether the stream ended or was closed; stop has been called or
+	// will be by the Recv in next.
+	done bool
+}
+
+func (s *seqStream[T]) Recv() (T, error) {
+	s.recvMu.Lock()
+	defer s.recvMu.Unlock()
+
+	var zero T
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return zero, io.EOF
+	}
+	s.receiving = true
+	s.mu.Unlock()
+
+	ended := true
+	defer func() {
+		s.mu.Lock()
+		s.receiving = false
+		closed := s.done
+		s.done = s.done || ended
+		s.mu.Unlock()
+		if closed || ended {
+			s.stop()
+		}
+	}()
+	value, err, ok := s.next()
+	if !ok {
+		return zero, io.EOF
+	}
+	ended = false
+	return value, err
+}
+
+func (s *seqStream[T]) Close() error {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil
+	}
+	s.done = true
+	receiving := s.receiving
+	s.mu.Unlock()
+	if !receiving {
+		s.stop()
+	}
 	return nil
 }
 

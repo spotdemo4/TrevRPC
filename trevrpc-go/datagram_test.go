@@ -677,7 +677,7 @@ func TestRequestDatagramsFollowTheFlushedRequestAndOversizedMessagesStayOnTheStr
 
 	small, large := rawMessage([]byte("small")), rawMessage(bytes.Repeat([]byte("L"), 64))
 	header := []byte("REQUEST")
-	requests := newSliceStream(small, large, small)
+	requests := StreamOf(small, large, small)
 	err := writeRequestFrames(context.Background(), recorder, header, requests, &datagramSender{flow: flow, ctx: context.Background()}, DefaultMaxFrameSize)
 	if err != nil {
 		t.Fatal(err)
@@ -704,7 +704,7 @@ func TestRequestDatagramsFollowTheFlushedRequestAndOversizedMessagesStayOnTheStr
 
 func TestRequestFramesStayOnTheStreamWithoutDatagrams(t *testing.T) {
 	recorder := &orderRecorder{}
-	requests := newSliceStream(rawMessage([]byte("a")), rawMessage([]byte("b")))
+	requests := StreamOf(rawMessage([]byte("a")), rawMessage([]byte("b")))
 	if err := writeRequestFrames(context.Background(), recorder, []byte("REQUEST"), requests, nil, DefaultMaxFrameSize); err != nil {
 		t.Fatal(err)
 	}

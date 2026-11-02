@@ -92,7 +92,7 @@ func registerTestService(server *Server) {
 			replies = append(replies, &testMessage{Value: request.Value + suffix})
 		}
 		answerTestHeaders(ctx)
-		return newSliceStream(replies...), nil
+		return StreamOf(replies...), nil
 	})
 	// Gated sends its headers at once and its only message once the test
 	// opens the gate registered under the request value.

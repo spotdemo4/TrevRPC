@@ -19,7 +19,8 @@ use trevrpc::client::{
 };
 use trevrpc::fallback::{FallbackBody, HttpFallback};
 use trevrpc::server::{
-    CancellationSource, RequestContext, Server, ServerOptions, WebTransportAdmissionRequest,
+    CancellationSource, RequestContext, Server, ServerOptions, WebTransportAdmission,
+    WebTransportAdmissionRequest,
 };
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{Code, RpcKind, Status};
@@ -172,7 +173,7 @@ fn test_options() -> ServerOptions {
     ServerOptions::new()
         .with_http_enabled(true)
         .with_webtransport_enabled(true)
-        .with_webtransport_admission(Some(admit_test_origin))
+        .with_webtransport_admission(Some(WebTransportAdmission::new(admit_test_origin)))
         .with_graceful_shutdown_timeout(Some(Duration::from_millis(500)))
 }
 
@@ -493,6 +494,29 @@ async fn websocket_upgrades_require_admission_and_the_subprotocol() -> TestResul
     ensure_eq!(
         websocket_session(&server, ORIGIN, "chat").await?.err(),
         Some(http::StatusCode::BAD_REQUEST)
+    );
+    server.stop().await
+}
+
+#[tokio::test]
+async fn same_origin_admission_admits_the_servers_own_pages() -> TestResult {
+    let server = spawn_server(
+        test_options()
+            .with_webtransport_admission(Some(WebTransportAdmission::same_origin([ORIGIN])?)),
+    )
+    .await?;
+    let own = format!("https://localhost:{}", server.tcp.port());
+    for origin in [own.as_str(), ORIGIN] {
+        let session = websocket_session(&server, origin, "qmux-02.trevrpc-1")
+            .await?
+            .map_err(|status| format!("WebSocket upgrade from {origin} refused with {status}"))?;
+        session.close(0, "done");
+    }
+    ensure_eq!(
+        websocket_session(&server, "https://evil.example.test", "qmux-02.trevrpc-1")
+            .await?
+            .err(),
+        Some(http::StatusCode::FORBIDDEN)
     );
     server.stop().await
 }

@@ -11,7 +11,8 @@ use tokio::io::AsyncReadExt;
 use tower_http::services::ServeDir;
 use trevrpc::fallback::HttpFallback;
 use trevrpc::server::{
-    RequestContext, RouteOptions, Server, ServerOptions, WebTransportAdmissionRequest,
+    RequestContext, RouteOptions, Server, ServerOptions, WebTransportAdmission,
+    WebTransportAdmissionRequest,
 };
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, RpcKind, Status};
@@ -333,7 +334,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
             .with_compression(connect::compression(flags)?)
             .with_http_enabled(true)
             .with_webtransport_enabled(true)
-            .with_webtransport_admission(Some(admit_webtransport))
+            .with_webtransport_admission(Some(WebTransportAdmission::new(admit_webtransport)))
             .with_connection_threads(connection_threads)
             .with_http_fallback(
                 flags

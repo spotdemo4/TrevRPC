@@ -15,7 +15,8 @@ use tokio::task::JoinHandle;
 use trevrpc::Status;
 use trevrpc::client::{Channel, ChannelConfig, QmuxTransport};
 use trevrpc::server::{
-    AuthorizationRequest, Authorizer, HttpAdmissionRequest, RequestContext, Server, ServerOptions,
+    AuthorizationRequest, Authorizer, HttpAdmission, HttpAdmissionRequest, RequestContext, Server,
+    ServerOptions,
 };
 use trevrpc::tcp::{IpPrefix, TcpFallback};
 
@@ -134,7 +135,7 @@ async fn spawn_server(trusted_proxies: &[&str]) -> TestResult<RunningServer> {
     server.set_options(
         ServerOptions::new()
             .with_http_enabled(true)
-            .with_http_admission(Some(admit_client))
+            .with_http_admission(Some(HttpAdmission::new(admit_client)))
             .with_graceful_shutdown_timeout(Some(Duration::from_millis(500))),
     );
     greeter::register_greeter(&mut server, Greeter);

@@ -78,7 +78,7 @@ func registerInspectService(server *Server) {
 		return &testMessage{Value: contextValues(ctx)}, nil
 	})
 	RegisterServerStreaming(server, "/example.Inspect/ServerStreaming", newTestMessage, func(ctx context.Context, _ *testMessage) (MessageStream[*testMessage], error) {
-		return newSliceStream(&testMessage{Value: contextValues(ctx)}), nil
+		return StreamOf(&testMessage{Value: contextValues(ctx)}), nil
 	})
 	RegisterClientStreaming(server, "/example.Inspect/ClientStreaming", newTestMessage, func(ctx context.Context, requests MessageStream[*testMessage]) (*testMessage, error) {
 		for _, err := range Messages(requests) {
@@ -92,7 +92,7 @@ func registerInspectService(server *Server) {
 		if err := requests.Close(); err != nil {
 			return nil, err
 		}
-		return newSliceStream(&testMessage{Value: contextValues(ctx)}), nil
+		return StreamOf(&testMessage{Value: contextValues(ctx)}), nil
 	})
 }
 

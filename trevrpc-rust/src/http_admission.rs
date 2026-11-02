@@ -60,7 +60,7 @@ pub fn validate_http_request(
             secure: request.uri().scheme_str() == Some("https"),
             headers: &headers,
         };
-        if !admission(&admission_request) {
+        if !admission.admits(&admission_request) {
             return Some(StatusCode::FORBIDDEN);
         }
     }
@@ -110,7 +110,7 @@ pub fn validate_webtransport_admission(
             secure,
             headers,
         };
-        return (!admission(&request)).then_some(StatusCode::FORBIDDEN);
+        return (!admission.admits(&request)).then_some(StatusCode::FORBIDDEN);
     }
     let allowed_authorities = options.webtransport_allowed_authorities();
     if !allowed_authorities.is_empty()
@@ -123,14 +123,95 @@ pub fn validate_webtransport_admission(
         return Some(StatusCode::FORBIDDEN);
     }
     if origin.is_some_and(|origin| {
+        let origin = parse_origin(origin);
         !options
             .webtransport_allowed_origins()
             .iter()
-            .any(|allowed| allowed == origin)
+            .any(|allowed| origin.is_some() && parse_origin(allowed) == origin)
     }) {
         return Some(StatusCode::FORBIDDEN);
     }
     None
+}
+
+/// Returns the normalized form of an origin serialized as `scheme://host[:port]` (see
+/// [`normalize_origin`]), or `None` when `origin` is not one, such as the opaque origin `null`.
+pub fn parse_origin(origin: &str) -> Option<String> {
+    let (scheme, hostport) = origin.split_once("://")?;
+    normalize_origin(scheme, hostport)
+}
+
+/// Returns `scheme://host[:port]` with the scheme and host in lower case and the port in decimal,
+/// omitted when it is the scheme's default, or `None` when `scheme` or `hostport` is malformed.
+pub fn normalize_origin(scheme: &str, hostport: &str) -> Option<String> {
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
+        || hostport.is_empty()
+        || hostport.contains(['/', '?', '#', '@', '\\', ' '])
+    {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        // An IPv6 address, which must be in brackets.
+        let (host, after) = rest.split_once(']')?;
+        if !host.contains(':') {
+            return None;
+        }
+        let port = if after.is_empty() {
+            None
+        } else {
+            Some(after.strip_prefix(':').filter(|port| !port.is_empty())?)
+        };
+        (host, port)
+    } else if let Some((host, port)) = hostport.split_once(':') {
+        if port.is_empty() || port.contains(':') {
+            return None;
+        }
+        (host, Some(port))
+    } else {
+        (hostport, None)
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    let port = match port {
+        Some(port) if port.bytes().all(|byte| byte.is_ascii_digit()) => {
+            let port = port.parse::<u16>().ok()?;
+            (Some(port) != default_port(&scheme)).then_some(port)
+        }
+        Some(_) => return None,
+        None => None,
+    };
+
+    let host = host.to_ascii_lowercase();
+    let mut origin = scheme;
+    origin.push_str("://");
+    if host.contains(':') {
+        origin.push('[');
+        origin.push_str(&host);
+        origin.push(']');
+    } else {
+        origin.push_str(&host);
+    }
+    if let Some(port) = port {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    Some(origin)
+}
+
+/// Returns the port a URL of `scheme` has when it names none.
+fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "https" | "wss" => Some(443),
+        "http" | "ws" => Some(80),
+        _ => None,
+    }
 }
 
 fn authority_host(authority: &str) -> &str {
@@ -142,4 +223,42 @@ fn authority_host(authority: &str) -> &str {
     authority
         .rsplit_once(':')
         .map_or(authority, |(host, _)| host)
+}
+
+#[cfg(test)]
+mod tests {
+    use http::StatusCode;
+
+    use super::validate_webtransport_admission;
+    use crate::server::{Server, ServerOptions};
+
+    #[test]
+    fn allowed_origins_compare_as_browsers_serialize_them() {
+        let mut server = Server::new();
+        server.set_options(
+            ServerOptions::new()
+                .with_webtransport_enabled(true)
+                .with_webtransport_allowed_origins(["HTTPS://App.Example:443", "null"]),
+        );
+        let admit = |origin| {
+            validate_webtransport_admission(
+                &server,
+                "127.0.0.1:1".parse().unwrap(),
+                "/trevrpc",
+                Some("rpc.example"),
+                Some(origin),
+                true,
+                &[],
+            )
+        };
+        assert_eq!(admit("https://app.example"), None);
+        assert_eq!(admit("https://APP.example:443"), None);
+        assert_eq!(
+            admit("https://app.example:8443"),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(admit("http://app.example"), Some(StatusCode::FORBIDDEN));
+        // The opaque origin is never admitted, even when listed.
+        assert_eq!(admit("null"), Some(StatusCode::FORBIDDEN));
+    }
 }
