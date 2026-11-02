@@ -65,6 +65,59 @@ export interface CallOptions {
   onResponseMetadata?(metadata: Metadata): void;
 }
 
+/** The kind of an RPC, as in its generated descriptor. */
+export type CallKind = "unary" | "serverStreaming" | "clientStreaming" | "bidirectionalStreaming";
+
+/** What a call interceptor sees of a call before it starts. */
+export interface InterceptedCall {
+  /** The method's full path, such as `/example.greeter.Greeter/SayHello`. */
+  readonly method: string;
+  /** The service's full name, such as `example.greeter.Greeter`. */
+  readonly service: string;
+  /** The method's name, such as `SayHello`. */
+  readonly name: string;
+  readonly kind: CallKind;
+  /**
+   * The call's request metadata. An interceptor may add, replace and delete entries, such as a
+   * refreshed token; the result is validated after the last interceptor, and invalid metadata
+   * fails the call with InvalidArgument.
+   */
+  metadata: Record<string, MetadataValue>;
+  /** The call's deadline, which starts once the interceptors are done. */
+  readonly timeoutMs: number | undefined;
+  /** The call's abort signal, which an interceptor that waits can watch. */
+  readonly signal: AbortSignal | undefined;
+}
+
+/** How an intercepted call ended. */
+export interface CallEnd {
+  /** `Code.Ok` when the call succeeded; the code of `error` otherwise, or `Code.Unknown`. */
+  readonly code: StatusCode;
+  /** What failed the call, usually a TrevRpcError; undefined when it succeeded. */
+  readonly error: unknown;
+}
+
+/** Called once when an intercepted call ends. A finish function that throws is reported, not rethrown. */
+export type CallFinish = (end: CallEnd) => void;
+
+/**
+ * Runs before each call of a client, in order with the others. It may change the call's metadata,
+ * wait (for example for a token refresh), and return a function that is called once when the call
+ * ends: when a unary call settles, and when a streaming call receives its final status or fails,
+ * including when it is cancelled. Finish functions run innermost first. A streaming call that is
+ * neither read to its end nor closed does not end. An interceptor that throws fails the call with
+ * what it threw, before it starts; the finish functions of earlier interceptors still run.
+ */
+export type CallInterceptor = (
+  call: InterceptedCall,
+) => void | CallFinish | Promise<void | CallFinish>;
+
+/** Options of a service client: defaults for its calls, and interceptors that run around them. */
+export interface ClientOptions extends CallOptions {
+  /** Interceptors for the client's calls, after those of its transport, such as a Channel's. */
+  interceptors?: readonly CallInterceptor[];
+}
+
 export interface TransportStream {
   readable: ReadableStream<Uint8Array>;
   writable: WritableStream<Uint8Array>;
@@ -132,6 +185,11 @@ export interface Transport {
    * own.
    */
   readonly streamCompressionBudget?: StreamCompressionBudget;
+  /**
+   * Interceptors that clients created on this transport run around every call, before their own;
+   * a Channel's own. A transport that wraps a Channel forwards them, or its clients skip them.
+   */
+  readonly interceptors?: readonly CallInterceptor[];
   /**
    * Like `createBidirectionalStream()`, but also returns the session that opened the stream.
    * Calls negotiate dictionaries and open datagram flows per session, so transports whose session
@@ -240,6 +298,8 @@ export interface ClientStreamingCall<TRequest, TResponse> {
    * the call and reject with what they threw.
    */
   sendAll(requests: Iterable<TRequest> | AsyncIterable<TRequest>): Promise<void>;
+  /** Settles with the final status, or rejects with the error that ended the call. */
+  readonly status: Promise<StreamStatus>;
   /** Closes the request stream and returns the final response. */
   closeAndRecv(): Promise<TResponse>;
   /** Cancels the call unless it already finished. */
@@ -305,12 +365,15 @@ export type ServiceClient = Record<
   (requestOrOptions?: unknown, options?: CallOptions) => Promise<unknown>
 >;
 
-/** Creates a service client from a generated service descriptor. */
+/**
+ * Creates a service client from a generated service descriptor. Its calls run the transport's
+ * interceptors, then those of `options.interceptors`.
+ */
 export function createServiceClient<TClient extends ServiceClient = ServiceClient>(
   transport: Transport,
   service: RpcServiceDescriptor,
   root: Root,
-  options?: CallOptions,
+  options?: ClientOptions,
 ): TClient;
 
 export interface WebTransportCertificateHash {
@@ -379,6 +442,11 @@ export interface ConnectOptions {
    * metadata. Replace it with `Channel.setConnectionMetadata()`.
    */
   connectionMetadata?: MetadataInput;
+  /**
+   * Interceptors that every client created on the channel runs around its calls, before the
+   * client's own; see `CallInterceptor`.
+   */
+  interceptors?: readonly CallInterceptor[];
   /** Cancels the initial connection attempt of `connect()` only; `createChannel()` ignores it. */
   signal?: AbortSignal;
   /** Receives channel state transitions. */
@@ -436,6 +504,8 @@ export class Channel implements Transport {
   readonly connectionMetadata: ConnectionMetadataSource;
   /** The stream compression memory budget of the channel's calls, which a wrapping Transport forwards. */
   readonly streamCompressionBudget: StreamCompressionBudget;
+  /** The interceptors from the connect options, which a wrapping Transport forwards. */
+  readonly interceptors: readonly CallInterceptor[];
   /**
    * Replaces the channel's connection metadata (see `ConnectOptions.connectionMetadata`); empty or
    * missing metadata removes it. Calls started after this use the new metadata, and each

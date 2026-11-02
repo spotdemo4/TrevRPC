@@ -473,6 +473,39 @@ test("closing a connecting channel abandons the attempt and fails waiting calls"
   assert.equal(sessions.length, 1, "no reconnect after close");
 });
 
+test("a channel's interceptors run around the calls of every client on it", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const events = [];
+  const intercept = (name) => (call) => {
+    events.push(`${name} ${call.method}`);
+    call.metadata["interop-suffix"] = `+${name}`;
+    return ({ code }) => events.push(`${name} finished ${code}`);
+  };
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    interceptors: [intercept("channel")],
+  });
+  assert.equal(channel.interceptors.length, 1);
+  assert.ok(Object.isFrozen(channel.interceptors));
+  await waitFor(() => sessions.length === 1);
+  sessions[0].becomeReady();
+
+  const plain = new EchoClient(channel);
+  const intercepted = new EchoClient(channel, { interceptors: [intercept("client")] });
+  assert.equal((await plain.unary({ message: "a" })).message, "a+channel");
+  assert.equal((await intercepted.unary({ message: "b" })).message, "b+client");
+  assert.deepEqual(events, [
+    "channel /trevrpc.interop.v1.Echo/Unary",
+    `channel finished ${Code.Ok}`,
+    "channel /trevrpc.interop.v1.Echo/Unary",
+    "client /trevrpc.interop.v1.Echo/Unary",
+    `client finished ${Code.Ok}`,
+    `channel finished ${Code.Ok}`,
+  ]);
+  channel.close();
+});
+
 test("createChannel throws on invalid options without starting a session", () => {
   const { WebTransport, sessions } = fakeWebTransport();
   assert.throws(
@@ -485,5 +518,14 @@ test("createChannel throws on invalid options without starting a session", () =>
     (error) => error.code === Code.InvalidArgument,
   );
   assert.throws(() => createChannel("https://example.test/trevrpc", { transports: [] }), TypeError);
+  assert.throws(
+    () =>
+      createChannel("https://example.test/trevrpc", {
+        transports: WebTransportOnly,
+        WebTransport,
+        interceptors: [null],
+      }),
+    (error) => error.code === Code.InvalidArgument,
+  );
   assert.equal(sessions.length, 0);
 });

@@ -82,7 +82,7 @@ channel.close();
 
 ### Call options
 
-Every method takes `CallOptions` as its last argument; the same options can be given to the client constructor as defaults, and per-call `metadata` is merged over the defaults per key.
+Every method takes `CallOptions` as its last argument; the same options can be given to the client constructor as defaults, and per-call `metadata` is merged over the defaults per key. The constructor also takes `interceptors` ([below](#interceptors)).
 
 | Option               | Meaning                                                                                       |
 | -------------------- | --------------------------------------------------------------------------------------------- |
@@ -132,7 +132,7 @@ const channel = await connect(url, {
 
 `connect()` always offers the WebTransport protocol `trevrpc-1` (wire version 1) through the `protocols` constructor option; it cannot be changed. If the server selects any other protocol, that connection attempt fails with `Code.FailedPrecondition` and the channel carries on as after any failed dial: the WebSocket fallback starts, or a reconnect is retried with backoff. An empty or missing selection means version 1, because older browsers cannot negotiate protocols.
 
-Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. A transport that wraps a `Channel` should forward its `createBidirectionalStreamWithSession()`, `compression`, `connectionMetadata` and `streamCompressionBudget`; without them its calls carry no connection metadata and get a stream compression budget of their own. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
+Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. A transport that wraps a `Channel` should forward its `createBidirectionalStreamWithSession()`, `compression`, `connectionMetadata`, `streamCompressionBudget` and `interceptors`; without them its calls carry no connection metadata, get a stream compression budget of their own, and skip the channel's interceptors. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
 
 ### Connection metadata
 
@@ -145,6 +145,34 @@ channel.setConnectionMetadata(); // removes it
 ```
 
 A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. Other transports carry it when they forward a channel's `connectionMetadata`.
+
+### Interceptors
+
+Interceptors run around every call of a client, for what each call needs, such as reacting to an expired session. Set them on the channel, for every client created on it, or on a client, after the channel's:
+
+```js
+const channel = createChannel(url, {
+  interceptors: [
+    async (call) => {
+      // call.method, .service, .name, .kind, .timeoutMs and .signal describe the call.
+      call.metadata.authorization = `Bearer ${await session.token()}`;
+      const started = session.id;
+      return ({ code }) => {
+        if (code === Code.Unauthenticated && session.id === started) {
+          session.clear();
+          location.assign("/sign-in");
+        }
+      };
+    },
+  ],
+});
+const client = new GreeterClient(channel, { interceptors: [logCalls] });
+```
+
+- An interceptor runs before the call starts, in order with the others, and may wait. It may add, replace and delete entries of `call.metadata`, which is validated after the last interceptor. The call's deadline starts after the interceptors; an interceptor that waits can watch `call.signal`.
+- It may return a finish function, which is called once with `{ code, error }` when the call ends: when a unary call settles, and when a streaming call receives its final status or fails, including when it is cancelled, so nothing has to wrap a stream's iterator. `code` is `Code.Ok` on success. Finish functions run innermost first; one that throws is reported and does not affect the call. A streaming call that is neither read to its end nor closed does not end.
+- An interceptor that throws fails the call with what it threw before it starts; the finish functions of earlier interceptors still run.
+- A client-streaming call has a `status` promise too, like the other streaming calls.
 
 ### Compression
 

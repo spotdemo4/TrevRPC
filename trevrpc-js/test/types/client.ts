@@ -6,6 +6,8 @@ import {
   createChannel,
   createServiceClient,
   type BidirectionalStreamingCall,
+  type CallEnd,
+  type CallInterceptor,
   type ChannelStateChange,
   type ClientStreamingCall,
   type ResponseStream,
@@ -39,9 +41,25 @@ channel.state satisfies "connecting" | "ready" | "reconnecting" | "closed";
 channel.transport satisfies "webtransport" | "websocket" | undefined;
 await channel.waitUntilReady();
 
+const authenticate: CallInterceptor = async (call) => {
+  call.method satisfies string;
+  call.service satisfies string;
+  call.name satisfies string;
+  call.kind satisfies "unary" | "serverStreaming" | "clientStreaming" | "bidirectionalStreaming";
+  call.timeoutMs satisfies number | undefined;
+  call.signal satisfies AbortSignal | undefined;
+  call.metadata["authorization"] = "Bearer refreshed";
+  return (end: CallEnd) => {
+    if (end.code === Code.Unauthenticated) {
+      end.error satisfies unknown;
+    }
+  };
+};
 const lazy: Channel = createChannel("https://localhost:4433/trevrpc", {
   connectionMetadata: { authorization: "Bearer token" },
+  interceptors: [authenticate, () => {}],
 });
+lazy.interceptors satisfies readonly CallInterceptor[];
 new EchoClient(lazy);
 const wrapper: Transport = {
   createBidirectionalStream: () => lazy.createBidirectionalStream(),
@@ -49,8 +67,11 @@ const wrapper: Transport = {
   compression: lazy.compression,
   connectionMetadata: lazy.connectionMetadata,
   streamCompressionBudget: lazy.streamCompressionBudget,
+  interceptors: lazy.interceptors,
 };
-new EchoClient(wrapper);
+new EchoClient(wrapper, { interceptors: [authenticate], timeoutMs: 1_000 });
+// @ts-expect-error An interceptor returns a finish function or nothing.
+new EchoClient(wrapper, { interceptors: [() => 1] });
 ({
   createBidirectionalStream: () => lazy.createBidirectionalStream(),
   // @ts-expect-error connection metadata is set through the channel, not built by hand
@@ -86,6 +107,7 @@ upload satisfies ClientStreamingCall<{ message?: string }, EchoResponse>;
 await upload.send({ message: "a" });
 await upload.sendAll([{ message: "b" }]);
 (await upload.closeAndRecv()) satisfies EchoResponse;
+(await upload.status) satisfies StreamStatus;
 
 const bidi = await echo.bidi({ signal: new AbortController().signal });
 bidi satisfies BidirectionalStreamingCall<{ message?: string }, EchoResponse>;

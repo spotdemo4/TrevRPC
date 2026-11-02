@@ -1,4 +1,5 @@
 import { ConnectionMetadataSource } from "./connection-metadata.js";
+import { interceptorList } from "./interceptor.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
 import { dialRace } from "./race.js";
 import { cancelled, failedPrecondition, statusFromTransportError, unavailable } from "./status.js";
@@ -36,6 +37,7 @@ export class Channel {
   #compression;
   #streamCompressionBudget;
   #connectionMetadata;
+  #interceptors;
   #onStateChange;
   #session;
   #transport;
@@ -78,6 +80,7 @@ export class Channel {
   constructor(url, options = {}, { retry = true } = {}) {
     // Checked before dialing, so an invalid option never leaves a session behind.
     this.#dial = sessionDialer(url, options);
+    this.#interceptors = interceptorList(options.interceptors, "interceptors");
     this.#streamCompressionBudget = new StreamBudget(options.streamCompressionMemory);
     this.#connectionMetadata = new ConnectionMetadataSource(options.connectionMetadata);
     this.#compression = options.compression;
@@ -114,6 +117,11 @@ export class Channel {
   /** The connection metadata every call of this channel carries. */
   get connectionMetadata() {
     return this.#connectionMetadata;
+  }
+
+  /** The interceptors that every client created on this channel runs around its calls. */
+  get interceptors() {
+    return this.#interceptors;
   }
 
   /**

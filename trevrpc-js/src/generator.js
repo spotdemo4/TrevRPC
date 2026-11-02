@@ -358,6 +358,7 @@ function generateDeclarationFile(protoFiles, file, typeNames, redacted, options)
   const protobufImports = sections.includes("string | Long") ? "Long, Root" : "Root";
   const runtimeImports = [
     "CallOptions",
+    "ClientOptions",
     "RpcServiceDescriptor",
     "Transport",
     ...GeneratedTypeImports.filter((name) => sections.includes(`${name}<`)),
@@ -392,7 +393,7 @@ function generateServiceDeclaration(service, typeNames) {
     .map(([jsName, method]) => generateMethodDeclaration(jsName, method, typeNames))
     .join("\n");
 
-  return `/** Service descriptor for the ${service.name} service. */\nexport declare const ${service.exportName}: RpcServiceDescriptor;\n\n/** Client for the ${service.name} service. */\nexport declare class ${className} {\n  /** Creates a client for the ${service.name} service. */\n  constructor(transport: Transport, options?: CallOptions);\n\n${methods}\n}\n\n/** Creates a client for the ${service.name} service. */\nexport declare function ${factoryName}(transport: Transport, options?: CallOptions): ${className};`;
+  return `/** Service descriptor for the ${service.name} service. */\nexport declare const ${service.exportName}: RpcServiceDescriptor;\n\n/** Client for the ${service.name} service. */\nexport declare class ${className} {\n  /** Creates a client for the ${service.name} service. */\n  constructor(transport: Transport, options?: ClientOptions);\n\n${methods}\n}\n\n/** Creates a client for the ${service.name} service. */\nexport declare function ${factoryName}(transport: Transport, options?: ClientOptions): ${className};`;
 }
 
 function generateMethodDeclaration(jsName, method, typeNames) {

@@ -53,7 +53,7 @@ test("generated declarations type every call shape", () => {
   );
   assert.match(
     types,
-    /import type \{ BidirectionalStreamingCall, CallOptions, ClientStreamingCall, ResponseStream, RpcServiceDescriptor, Transport \} from "@trevrpc\/trevrpc-js";/,
+    /import type \{ BidirectionalStreamingCall, CallOptions, ClientOptions, ClientStreamingCall, ResponseStream, RpcServiceDescriptor, Transport \} from "@trevrpc\/trevrpc-js";/,
   );
   assert.match(types, /import type \{ Root \} from "protobufjs";/);
 });
@@ -64,7 +64,10 @@ test("declarations import only the types they use", () => {
   assert.match(types, /import type \{ Long, Root \} from "protobufjs";/);
   assert.match(types, /count\?: number \| string \| Long;/);
   assert.match(types, /labels\?: Record<string, string>;/);
-  assert.match(types, /import type \{ CallOptions, RpcServiceDescriptor, Transport \} from/);
+  assert.match(
+    types,
+    /import type \{ CallOptions, ClientOptions, RpcServiceDescriptor, Transport \} from/,
+  );
   assert.match(types, /getValues\(request: Values, options\?: CallOptions\): Promise<Values>;/);
 });
 

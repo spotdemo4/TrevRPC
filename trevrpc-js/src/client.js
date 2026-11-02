@@ -1,12 +1,21 @@
 import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
 import { FrameType, marshalMessage, unmarshalMessage } from "./framing.js";
+import { interceptCall, interceptorList } from "./interceptor.js";
 import { validateMetadata } from "./metadata.js";
 import { Code, cancelled, internal, statusError } from "./status.js";
 import { RpcAnswer, RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
 
-/** Creates a service client from a generated service descriptor. */
+/**
+ * Creates a service client from a generated service descriptor. Its calls run the interceptors of
+ * the transport, then those of `options.interceptors`.
+ */
 export function createServiceClient(transport, service, root, options = {}) {
-  const defaults = mergeCallOptions(defaultCallOptions(), options);
+  const { interceptors: clientInterceptors, ...callOptions } = options;
+  const defaults = mergeCallOptions(defaultCallOptions(), callOptions);
+  const interceptors = [
+    ...interceptorList(transport.interceptors, "transport interceptors"),
+    ...interceptorList(clientInterceptors, "interceptors"),
+  ];
   const client = {};
 
   for (const [jsName, method] of Object.entries(service.methods)) {
@@ -24,30 +33,60 @@ export function createServiceClient(transport, service, root, options = {}) {
       compress: plainCompressionUse(method),
     };
     const resolve = (override) => mergeCallOptions(defaults, override);
-
-    switch (method.kind) {
-      case "unary":
-        client[jsName] = async (request, override) =>
-          unaryCall(transport, rpc, request, resolve(override));
-        break;
-      case "serverStreaming":
-        client[jsName] = (request, override) =>
-          serverStreamingCall(transport, rpc, request, resolve(override));
-        break;
-      case "clientStreaming":
-        client[jsName] = (override) => clientStreamingCall(transport, rpc, resolve(override));
-        break;
-      case "bidirectionalStreaming":
-        client[jsName] = (override) =>
-          bidirectionalStreamingCall(transport, rpc, resolve(override));
-        break;
-      default:
-        throw internal(`unsupported generated RPC kind ${JSON.stringify(method.kind)}`);
+    const shape = MethodShapes[method.kind];
+    if (shape === undefined) {
+      throw internal(`unsupported generated RPC kind ${JSON.stringify(method.kind)}`);
     }
+    const info = {
+      method: rpc.path,
+      service: service.fullName,
+      name: method.name,
+      kind: method.kind,
+    };
+    const call =
+      interceptors.length === 0
+        ? async (request, override) => shape.start(transport, rpc, request, resolve(override))
+        : async (request, override) =>
+            interceptCall(
+              interceptors,
+              info,
+              resolve(override),
+              (options) => shape.start(transport, rpc, request, options),
+              shape.ended,
+            );
+    client[jsName] = shape.takesRequest ? call : (override) => call(undefined, override);
   }
 
   return client;
 }
+
+/**
+ * How each kind of RPC is called: whether its client method takes a request message, how it
+ * starts, and, for streaming calls, what settles when the call ends after it started.
+ */
+const MethodShapes = Object.freeze({
+  __proto__: null,
+  unary: {
+    takesRequest: true,
+    start: unaryCall,
+  },
+  serverStreaming: {
+    takesRequest: true,
+    start: serverStreamingCall,
+    ended: (stream) => stream.status,
+  },
+  clientStreaming: {
+    takesRequest: false,
+    start: (transport, rpc, _request, options) => clientStreamingCall(transport, rpc, options),
+    ended: (call) => call.status,
+  },
+  bidirectionalStreaming: {
+    takesRequest: false,
+    start: (transport, rpc, _request, options) =>
+      bidirectionalStreamingCall(transport, rpc, options),
+    ended: (call) => call.status,
+  },
+});
 
 /** Calls a unary RPC and returns the decoded response. */
 export async function unaryCall(transport, rpc, request, options) {
@@ -676,6 +715,11 @@ export class ClientStreamingCall {
 
   constructor(call) {
     this.#call = call;
+  }
+
+  /** The final status, or the error that ended the call. */
+  get status() {
+    return this.#call.status;
   }
 
   /** Sends one request message. */
