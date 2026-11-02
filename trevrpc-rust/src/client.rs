@@ -22,6 +22,7 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+mod builder;
 pub mod call;
 mod call_end;
 mod channel;
@@ -31,8 +32,10 @@ mod qmux;
 mod quic;
 mod race;
 pub(crate) mod replay;
+mod resolve;
 mod upload;
 
+pub use builder::ChannelBuilder;
 pub use call::{Call, bidirectional_streaming, client_streaming, server_streaming, unary};
 pub use channel::{
     Channel, ChannelConfig, ChannelEvent, ChannelPhase, ChannelState, ExponentialBackoff,

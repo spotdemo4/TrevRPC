@@ -679,6 +679,120 @@ async fn channel_can_use_tcp_only() -> TestResult {
     server.stop().await
 }
 
+#[tokio::test]
+async fn channel_builder_connects_to_a_url() -> TestResult {
+    let server = spawn_server(test_options()).await?;
+    let channel = tokio::time::timeout(
+        TEST_TIMEOUT,
+        Channel::builder(&format!("https://{}", server.udp))?
+            .server_name("localhost")
+            .add_root_certificates([server.cert.clone()])
+            .config(ChannelConfig::new().with_tcp_addr(server.tcp))
+            .connect_timeout(TEST_TIMEOUT)
+            .connect(),
+    )
+    .await??;
+    ensure_eq!(channel.transport(), Some(TransportKind::Quic));
+    ensure_eq!(channel.remote_addr(), server.udp);
+    ensure!(channel.local_addr()?.is_ipv4());
+    tokio::time::timeout(
+        TEST_TIMEOUT,
+        exercise_greeter(&greeter::GreeterClient::new(channel.clone())),
+    )
+    .await??;
+    channel.close();
+
+    // The builder's TLS configuration also verifies the TCP fallback.
+    let channel = tokio::time::timeout(
+        TEST_TIMEOUT,
+        Channel::builder(&format!("https://{}", server.udp))?
+            .server_name("localhost")
+            .add_root_certificates([server.cert.clone()])
+            .config(
+                ChannelConfig::new()
+                    .with_transport_policy(TransportPolicy::TcpOnly)
+                    .with_tcp_addr(server.tcp),
+            )
+            .connect(),
+    )
+    .await??;
+    ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
+    ensure_eq!(channel.remote_addr(), server.tcp);
+    ensure!(channel.local_addr().is_err());
+    let reply = greeter::GreeterClient::new(channel.clone())
+        .say_hello(&greeter::HelloRequest {
+            name: "url".to_owned(),
+        })
+        .await?;
+    ensure_eq!(reply.message, "hello, url");
+    channel.close();
+
+    // The configuration's own TCP fallback still applies without the builder's.
+    let channel = tokio::time::timeout(
+        TEST_TIMEOUT,
+        Channel::builder(&format!("https://{}", server.udp))?
+            .server_name("localhost")
+            .add_root_certificates([server.cert.clone()])
+            .tcp_fallback(false)
+            .config(
+                ChannelConfig::new()
+                    .with_tcp_fallback(client_tls(&server.cert, trevrpc::QMUX_ALPN)?)
+                    .with_transport_policy(TransportPolicy::TcpOnly)
+                    .with_tcp_addr(server.tcp),
+            )
+            .connect(),
+    )
+    .await??;
+    ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
+    channel.close();
+    server.stop().await
+}
+
+/// `localhost` resolves to `::1` as well as `127.0.0.1`, where the server listens; whichever comes
+/// first, the channel connects to the address that answers.
+#[tokio::test]
+async fn channel_builder_tries_every_address_of_a_host() -> TestResult {
+    let server = spawn_server(test_options()).await?;
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(server.cert.clone())?;
+    let channel = tokio::time::timeout(
+        TEST_TIMEOUT,
+        Channel::builder(&format!("localhost:{}", server.udp.port()))?
+            .roots(roots)
+            .tcp_fallback(false)
+            .connect(),
+    )
+    .await??;
+    ensure_eq!(channel.transport(), Some(TransportKind::Quic));
+    ensure_eq!(channel.remote_addr(), server.udp);
+    channel.close();
+    server.stop().await
+}
+
+#[tokio::test]
+async fn channel_builder_connect_timeout_bounds_connecting() -> TestResult {
+    // Nothing answers QUIC on this UDP port.
+    let dead = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let started = tokio::time::Instant::now();
+    let result = Channel::builder(&format!("https://{}", dead.local_addr()?))?
+        .tcp_fallback(false)
+        .connect_timeout(Duration::from_millis(100))
+        .connect()
+        .await;
+    let Err(error) = result else {
+        return Err("connected to nothing".into());
+    };
+    ensure!(started.elapsed() < TEST_TIMEOUT);
+    let status = error.into_status();
+    ensure_eq!(status.code(), Code::Unavailable);
+    ensure!(
+        status.message().contains("timed out"),
+        "{}",
+        status.message()
+    );
+    Ok(())
+}
+
 // A `QMux` session can die while calls are in flight. Every call must then fail, and the server
 // must cancel its handlers, without waiting for a deadline or an idle timeout.
 

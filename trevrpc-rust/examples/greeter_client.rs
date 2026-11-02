@@ -1,5 +1,4 @@
 use std::error::Error;
-use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -12,7 +11,7 @@ mod cert;
 #[path = "shared/greeter.rs"]
 mod greeter;
 
-const DEFAULT_ADDR: &str = "127.0.0.1:5000";
+const DEFAULT_URL: &str = "https://127.0.0.1:5000";
 const DEFAULT_NAME: &str = "TrevRPC";
 const AUTH_TOKEN: &str = "trevrpc-example-token";
 
@@ -20,13 +19,17 @@ const AUTH_TOKEN: &str = "trevrpc-example-token";
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     let name = args.next().unwrap_or_else(|| DEFAULT_NAME.to_owned());
-    let addr = args
-        .next()
-        .unwrap_or_else(|| DEFAULT_ADDR.to_owned())
-        .parse::<SocketAddr>()?;
+    let url = args.next().unwrap_or_else(|| DEFAULT_URL.to_owned());
 
-    let endpoint = make_client_endpoint()?;
-    let channel = trevrpc::client::Channel::connect(endpoint.clone(), addr, "localhost").await?;
+    // The server writes its current and next development certificates.
+    let certificate_pem = std::fs::read(cert::certificate_path()?)?;
+    let certificates =
+        CertificateDer::pem_slice_iter(&certificate_pem).collect::<Result<Vec<_>, _>>()?;
+    let channel = trevrpc::client::Channel::builder(&url)?
+        .add_root_certificates(certificates)
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await?;
     let client = greeter::GreeterClient::new(channel.clone());
 
     let reply = client
@@ -85,7 +88,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
 
     channel.close();
-    endpoint.wait_idle().await;
+    channel.wait_idle().await;
 
     Ok(())
 }
@@ -94,23 +97,4 @@ fn call_options() -> trevrpc::client::CallOptions {
     trevrpc::client::CallOptions::new()
         .with_timeout(Duration::from_secs(5))
         .with_metadata("authorization", format!("Bearer {AUTH_TOKEN}").into_bytes())
-}
-
-fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
-    let cert_pem = std::fs::read(cert::certificate_path()?)?;
-    // The server writes its current and next development certificates.
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    for cert_der in CertificateDer::pem_slice_iter(&cert_pem) {
-        roots.add(cert_der?)?;
-    }
-
-    let client_crypto = quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))?;
-    let client_config = trevrpc::client::ChannelConfig::new().quic_config(client_crypto)?;
-    endpoint.set_default_client_config(client_config);
-
-    Ok(endpoint)
 }

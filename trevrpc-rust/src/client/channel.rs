@@ -12,6 +12,7 @@ use super::race::{
     DEFAULT_FALLBACK_DELAY, DEFAULT_REPROBE_INTERVAL, Dialer, GenerationTransport, TcpDialer,
     TransportKind, TransportPolicy,
 };
+use super::resolve::{Route, Target};
 use super::{CallInfo, RpcTransport, StreamingRpcTransport};
 use crate::compression::{Compression, CompressionConfig, DEFAULT_CLIENT_MEMORY, StreamBudget};
 use crate::connection_metadata::ConnectionMetadataSource;
@@ -122,9 +123,11 @@ pub struct ChannelConfig {
     max_frame_size: usize,
     reconnect_backoff: Arc<dyn ReconnectBackoff>,
     policy: TransportPolicy,
-    tcp: Option<TcpDialer>,
+    tcp_tls: Option<quinn::rustls::ClientConfig>,
+    tcp_addr: Option<SocketAddr>,
     fallback_delay: Duration,
     reprobe_interval: Duration,
+    connect_timeout: Option<Duration>,
     compression: Compression,
     stream_compression_memory: usize,
     connection_metadata: Metadata,
@@ -143,9 +146,11 @@ impl ChannelConfig {
             max_frame_size: crate::framing::DEFAULT_MAX_FRAME_SIZE,
             reconnect_backoff: Arc::new(ExponentialBackoff::default()),
             policy: TransportPolicy::Auto,
-            tcp: None,
+            tcp_tls: None,
+            tcp_addr: None,
             fallback_delay: DEFAULT_FALLBACK_DELAY,
             reprobe_interval: DEFAULT_REPROBE_INTERVAL,
+            connect_timeout: None,
             compression: Compression::new(),
             stream_compression_memory: DEFAULT_CLIENT_MEMORY,
             connection_metadata: Metadata::new(),
@@ -267,20 +272,18 @@ impl ChannelConfig {
 
     /// Enables `QMux` over TLS to the server's TCP listener, the fallback for networks that block
     /// UDP. `tls` verifies the server; its ALPN list is replaced with [`crate::QMUX_ALPN`]. The
-    /// TCP address defaults to the channel's remote address.
+    /// TCP address defaults to the channel's remote address, or to the addresses its host name
+    /// resolves to (see [`Channel::builder`]).
     #[must_use]
     pub fn with_tcp_fallback(mut self, tls: quinn::rustls::ClientConfig) -> Self {
-        let addr = self.tcp.as_ref().and_then(|tcp| tcp.addr);
-        self.tcp = Some(TcpDialer { addr, tls });
+        self.tcp_tls = Some(tls);
         self
     }
 
     /// Sets the address of the server's TCP listener when it differs from the remote address.
     #[must_use]
     pub const fn with_tcp_addr(mut self, addr: SocketAddr) -> Self {
-        if let Some(tcp) = &mut self.tcp {
-            tcp.addr = Some(addr);
-        }
+        self.tcp_addr = Some(addr);
         self
     }
 
@@ -305,6 +308,16 @@ impl ChannelConfig {
     #[must_use]
     pub const fn with_reprobe_interval(mut self, interval: Duration) -> Self {
         self.reprobe_interval = interval;
+        self
+    }
+
+    /// Bounds how long each connection attempt may take, the initial connect and every reconnect,
+    /// after which it fails with `Unavailable`. It covers resolving the host name and every
+    /// transport and address tried. The default is no bound beyond the transports' own: QUIC
+    /// gives up when its idle timeout passes, and `QMux` over TLS after 10 seconds.
+    #[must_use]
+    pub const fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
         self
     }
 
@@ -348,6 +361,12 @@ impl ChannelConfig {
         transport.max_concurrent_uni_streams(0_u8.into());
         config.transport_config(Arc::new(transport));
         Ok(config)
+    }
+
+    /// Enables `QMux` over TLS with `tls` unless it is enabled already.
+    pub(crate) fn with_default_tcp_fallback(mut self, tls: quinn::rustls::ClientConfig) -> Self {
+        self.tcp_tls.get_or_insert(tls);
+        self
     }
 }
 
@@ -475,18 +494,41 @@ impl Channel {
         server_name: impl Into<String>,
         config: ChannelConfig,
     ) -> Result<Self> {
-        let dialer = Dialer {
+        let route = Route {
+            addr: remote_addr,
+            endpoint: Some(endpoint.clone()),
+        };
+        let target = Target::Addr {
             endpoint,
-            remote_addr,
-            server_name: server_name.into(),
+            addr: remote_addr,
+        };
+        Self::connect_to(target, route, server_name.into(), config).await
+    }
+
+    /// Establishes an initial connection to `target`. `route` stands for the channel's connection
+    /// until it has one.
+    pub(crate) async fn connect_to(
+        target: Target,
+        route: Route,
+        server_name: String,
+        config: ChannelConfig,
+    ) -> Result<Self> {
+        let dialer = Dialer {
+            target,
+            route: Arc::new(Mutex::new(route)),
+            server_name,
             compression: Some(CompressionConfig::new(&config.compression)?),
             stream_budget: StreamBudget::new(config.stream_compression_memory),
             connection_metadata: ConnectionMetadataSource::new(config.connection_metadata.clone())?,
             max_frame_size: config.max_frame_size,
             policy: config.policy,
-            tcp: config.tcp.clone(),
+            tcp: config.tcp_tls.clone().map(|tls| TcpDialer {
+                addr: config.tcp_addr,
+                tls,
+            }),
             fallback_delay: config.fallback_delay,
             reprobe_interval: config.reprobe_interval,
+            connect_timeout: config.connect_timeout,
             max_quic_connections: config.max_quic_connections.max(config.min_quic_connections),
             min_quic_connections: config.min_quic_connections,
             quic_idle_timeout: config.quic_idle_timeout,
@@ -628,23 +670,58 @@ impl Channel {
         }
     }
 
-    /// Returns the remote address this channel dials.
-    #[must_use]
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.inner.dialer.remote_addr
+    /// Waits until the channel's Quinn endpoints have no connections left, for example after
+    /// [`Self::close`], so the server learns of the close before the process exits. An endpoint
+    /// given to [`Self::connect_with_config`] may also carry other connections, which this waits
+    /// for too.
+    pub async fn wait_idle(&self) {
+        self.inner.dialer.target.wait_idle().await;
     }
 
-    /// Returns the local address of the channel's Quinn endpoint.
+    /// Returns the address of the channel's current or most recent connection: the remote address
+    /// it was given, the TCP address of a `QMux` over TLS connection, or the address its host name
+    /// resolved to that answered (see [`Channel::builder`]).
+    #[must_use]
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.inner.dialer.route.lock_unpoisoned().addr
+    }
+
+    /// Returns the local address of the channel's Quinn endpoint: for a channel that resolves a
+    /// host name, the endpoint of its most recent QUIC connection.
+    ///
+    /// # Errors
+    ///
+    /// `NotConnected` when a channel that resolves a host name has only connected over `QMux`.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.inner.dialer.endpoint.local_addr()
+        self.endpoint()?.local_addr()
     }
 
     /// Switches the UDP socket used by the channel's Quinn endpoint, for example after a network
-    /// change.
+    /// change: for a channel that resolves a host name, the endpoint of its most recent QUIC
+    /// connection.
     ///
     /// Rebinding is endpoint-wide and does not itself change the channel generation.
+    ///
+    /// # Errors
+    ///
+    /// `NotConnected` when a channel that resolves a host name has only connected over `QMux`.
     pub fn rebind(&self, socket: UdpSocket) -> std::io::Result<()> {
-        self.inner.dialer.endpoint.rebind(socket)
+        self.endpoint()?.rebind(socket)
+    }
+
+    fn endpoint(&self) -> std::io::Result<quinn::Endpoint> {
+        self.inner
+            .dialer
+            .route
+            .lock_unpoisoned()
+            .endpoint
+            .clone()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "the channel has no QUIC connection",
+                )
+            })
     }
 
     fn snapshot(&self) -> Result<GenerationTransport> {

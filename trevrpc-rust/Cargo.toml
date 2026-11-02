@@ -62,8 +62,11 @@ name = "loopback"
 harness = false
 
 [features]
+default = ["webpki-roots"]
 # DevelopmentCertificate, a rotating self-signed certificate for local development.
 dev-certificate = ["dep:rcgen", "dep:time"]
+# The Mozilla roots that Channel::builder verifies servers with by default.
+webpki-roots = ["dep:webpki-roots"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -98,6 +101,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tower-service = "0.3"
 tracing = "0.1.44"
 web-transport-trait = "0.5"
+# Channel::builder's default roots, behind the "webpki-roots" feature.
+webpki-roots = { version = "1", optional = true }
 # libzstd, for compressed messages. No legacy-format decoders; "experimental" has the magicless
 # frame format.
 zstd-safe = { version = "8.2", default-features = false, features = ["std", "experimental"] }

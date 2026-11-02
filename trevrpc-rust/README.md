@@ -8,7 +8,7 @@ The Rust crate is built on [Quinn](https://github.com/quinn-rs/quinn):
 - **Server:** `server::Server` serves native QUIC always, plus ordinary HTTP/3 (`POST /trevrpc`) and WebTransport (`/trevrpc`) when enabled, from one Quinn endpoint dispatching on the negotiated ALPN. With a TCP listener it also serves QMux over TLS, HTTP/2, and QMux over WebSocket; see [TCP fallback](#tcp-fallback).
 - **Codegen:** `protoc-gen-trevrpc-rust` generates service traits, `register_*` functions and typed clients.
 
-The transports need no Cargo features: the HTTP/3, WebTransport, and TCP fallback servers are a handful of small crates next to Quinn (`h3`, `h2`, `tokio-rustls`, and the [`qmux`](https://crates.io/crates/qmux) crate), so a feature matrix would buy almost no compile time. The one optional feature, `dev-certificate`, adds the development certificate below and its `rcgen` dependency.
+The transports need no Cargo features: the HTTP/3, WebTransport, and TCP fallback servers are a handful of small crates next to Quinn (`h3`, `h2`, `tokio-rustls`, and the [`qmux`](https://crates.io/crates/qmux) crate), so a feature matrix would buy almost no compile time. Two features are optional: `webpki-roots` (on by default) gives `Channel::builder` the Mozilla roots to verify servers with, and `dev-certificate` adds the development certificate below and its `rcgen` dependency.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
@@ -39,14 +39,11 @@ The complete, runnable version is [`examples/greeter_client.rs`](examples/greete
 ```rust
 use futures_util::StreamExt;
 
-// `ChannelConfig::quic_config` sets the ALPN and sizes the QUIC windows.
-let tls = quinn::rustls::ClientConfig::builder()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
-endpoint.set_default_client_config(trevrpc::client::ChannelConfig::new().quic_config(tls)?);
-
-let channel = trevrpc::client::Channel::connect(endpoint, "127.0.0.1:50051".parse()?, "localhost").await?;
+// Resolves the host, tries each of its addresses, and verifies the server with the webpki roots.
+let channel = trevrpc::client::Channel::builder("https://example.com:50051")?
+    .connect_timeout(std::time::Duration::from_secs(5))
+    .connect()
+    .await?;
 let client = greeter::GreeterClient::new(channel.clone());
 
 // Unary
@@ -76,6 +73,19 @@ let reply = client
     .metadata("authorization", "Bearer token")
     .await?;
 let reply = client.lots_of_greetings().send_all(trevrpc::stream::from_iter(requests)).await?;
+```
+
+`Channel::builder(url)` takes `https://host[:port]` or `host:port` (port 443 by default). It resolves the host before every dial and tries each address Happy Eyeballs style, alternating IPv6 and IPv4 and starting the next attempt 250 ms after the one before, with a Quinn endpoint for each address family. The builder also sets `roots`, `add_root_certificates`, `tls` (for a client certificate), `server_name`, `tcp_fallback` (on by default), `connect_timeout` and `config` (a `ChannelConfig`). For full control over the endpoint and address, build the TLS configuration and endpoint yourself and call `Channel::connect_with_config`:
+
+```rust
+// `ChannelConfig::quic_config` sets the ALPN and sizes the QUIC windows.
+let tls = quinn::rustls::ClientConfig::builder()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
+let config = trevrpc::client::ChannelConfig::new();
+endpoint.set_default_client_config(config.quic_config(tls)?);
+let channel = trevrpc::client::Channel::connect_with_config(endpoint, "127.0.0.1:50051".parse()?, "localhost", config).await?;
 ```
 
 A client method returns a `trevrpc::client::Call`, and awaiting it makes the call. Its options start from the client's default call options (`GreeterClient::with_default_call_options`); `.timeout(d)`, `.metadata(key, value)` and `.options(|options| ...)` change them for that call only. `.with_response()` also returns the response headers and trailing metadata, and `.send_all(requests)` sends a stream of requests and finishes it.
@@ -241,7 +251,7 @@ let channel = trevrpc::client::Channel::connect_with_config(endpoint, addr, "loc
 println!("{:?}", channel.transport()); // Some(TransportKind::Quic) or Some(TransportKind::Qmux)
 ```
 
-`ChannelEvent::Ready` carries the `transport` of the new generation. Without `with_tcp_fallback`, `Auto` is QUIC only. `client::QmuxTransport::connect(addr, server_name, tls)` opens a single QMux connection without reconnection. `remote_addr`, `rebind`, and `local_addr` concern the QUIC endpoint only. See [`crates/trevrpc-interop/src/server.rs`](crates/trevrpc-interop/src/server.rs) and [`tests/tcp_integration.rs`](tests/tcp_integration.rs) for complete usage.
+`ChannelEvent::Ready` carries the `transport` of the new generation. Without `with_tcp_fallback`, `Auto` is QUIC only; `Channel::builder` enables it by default, with its own TLS configuration and the URL's host and port. `client::QmuxTransport::connect(addr, server_name, tls)` opens a single QMux connection without reconnection. `local_addr` and `rebind` concern the QUIC endpoint only. See [`crates/trevrpc-interop/src/server.rs`](crates/trevrpc-interop/src/server.rs) and [`tests/tcp_integration.rs`](tests/tcp_integration.rs) for complete usage.
 
 ## Interop
 
