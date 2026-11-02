@@ -1,11 +1,30 @@
 package trevrpc
 
 import (
+	"context"
 	"errors"
 	"io"
 	"slices"
 	"testing"
 )
+
+// The upload closes a call's request pipe when the call ends, and a Send that
+// sees the closed pipe first reports why the call ended, not a closed pipe.
+func TestMessagePipeSendReportsTheEndedCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	pipe := newMessagePipe[int](ctx)
+	cancel()
+	_ = pipe.Close()
+	if err := pipe.Send(1); StatusFromError(err).Code != CodeCancelled {
+		t.Fatalf("Send = %v, want Cancelled", err)
+	}
+	// A pipe closed while its call goes on is just closed.
+	live := newMessagePipe[int](t.Context())
+	_ = live.Close()
+	if err := live.Send(1); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Send after Close = %v, want io.ErrClosedPipe", err)
+	}
+}
 
 func TestMessages(t *testing.T) {
 	t.Run("complete stream", func(t *testing.T) {

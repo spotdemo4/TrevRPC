@@ -204,6 +204,11 @@ func (s *messagePipe[T]) closedError() error {
 	if err := s.closeError(); err != nil {
 		return err
 	}
+	// The call's upload closes the pipe when the call ends, which can be seen
+	// before the reason reaches abortUpload.
+	if err := s.ctx.Err(); err != nil {
+		return statusFromContextError(err)
+	}
 	return io.ErrClosedPipe
 }
 
