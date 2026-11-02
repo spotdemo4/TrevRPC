@@ -8,12 +8,12 @@
 // confirmed; call.js puts them on the REQUEST and learns the confirmation from the ANSWER.
 import { normalizeMetadata } from "./metadata.js";
 
-/** The property of a transport that holds its ConnectionMetadataSource. */
-export const ConnectionMetadataKey = Symbol("trevrpc.connectionMetadata");
-
-/** The connection metadata of a transport, or undefined without a source. */
+/**
+ * The connection metadata of a transport: a Channel's own, which a transport that wraps one
+ * forwards; undefined without a source.
+ */
 export function transportConnectionMetadata(transport) {
-  return transport[ConnectionMetadataKey];
+  return transport.connectionMetadata ?? undefined;
 }
 
 /** A request that carries no connection metadata. */

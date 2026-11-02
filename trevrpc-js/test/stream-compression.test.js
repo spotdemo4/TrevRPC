@@ -17,7 +17,6 @@ import {
   DefaultStreamCompressionMemory,
   MaxReplayBytes,
   StreamBudget,
-  StreamBudgetKey,
 } from "../src/stream-compression.js";
 import { varintLength, writeVarint } from "../src/varint.js";
 import { RpcAnswer, RpcRequest, RpcStatus, StreamCompression } from "../src/wire.js";
@@ -248,7 +247,7 @@ function compressedTransport(handler, budget) {
   const transport = fakeTransport(handler);
   transport.compression = plain;
   if (budget !== undefined) {
-    transport[StreamBudgetKey] = budget;
+    transport.streamCompressionBudget = budget;
   }
   return transport;
 }

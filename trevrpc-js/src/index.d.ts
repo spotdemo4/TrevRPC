@@ -83,6 +83,8 @@ export interface DatagramTransport {
 }
 
 declare const compressionBrand: unique symbol;
+declare const connectionMetadataBrand: unique symbol;
+declare const streamCompressionBudgetBrand: unique symbol;
 
 /**
  * Compression settings, made by `createCompression()` from `@trevrpc/trevrpc-js/zstd`: the zstd
@@ -90,6 +92,22 @@ declare const compressionBrand: unique symbol;
  */
 export interface Compression {
   readonly [compressionBrand]: true;
+}
+
+/**
+ * A Channel's connection metadata, which `Channel.setConnectionMetadata()` replaces. See
+ * `Transport.connectionMetadata`.
+ */
+export interface ConnectionMetadataSource {
+  readonly [connectionMetadataBrand]: true;
+}
+
+/**
+ * A Channel's stream compression memory budget, from `ConnectOptions.streamCompressionMemory`.
+ * See `Transport.streamCompressionBudget`.
+ */
+export interface StreamCompressionBudget {
+  readonly [streamCompressionBudgetBrand]: true;
 }
 
 /**
@@ -103,6 +121,17 @@ export interface Transport {
   readonly datagrams?: DatagramTransport;
   /** Compression settings for calls on this transport; absent without compression. */
   readonly compression?: Compression;
+  /**
+   * The connection metadata calls on this transport carry; a Channel's own. A transport that
+   * wraps a Channel forwards it, or its calls carry no connection metadata.
+   */
+  readonly connectionMetadata?: ConnectionMetadataSource;
+  /**
+   * The memory budget of the stream compression contexts of calls on this transport; a Channel's
+   * own. A transport that wraps a Channel forwards it, or its calls get a default budget of their
+   * own.
+   */
+  readonly streamCompressionBudget?: StreamCompressionBudget;
   /**
    * Like `createBidirectionalStream()`, but also returns the session that opened the stream.
    * Calls negotiate dictionaries and open datagram flows per session, so transports whose session
@@ -350,13 +379,13 @@ export interface ConnectOptions {
    * metadata. Replace it with `Channel.setConnectionMetadata()`.
    */
   connectionMetadata?: MetadataInput;
-  /** Cancels the initial connection attempt only. */
+  /** Cancels the initial connection attempt of `connect()` only; `createChannel()` ignores it. */
   signal?: AbortSignal;
   /** Receives channel state transitions. */
   onStateChange?(change: ChannelStateChange): void;
 }
 
-export type ChannelState = "ready" | "reconnecting" | "closed";
+export type ChannelState = "connecting" | "ready" | "reconnecting" | "closed";
 
 export interface ChannelStateChange {
   state: ChannelState;
@@ -371,13 +400,26 @@ export interface ChannelStateChange {
   transport?: TransportKind;
 }
 
-/** Opens a channel to a TrevRPC server and waits for its session to be ready. */
+/**
+ * Opens a channel to a TrevRPC server and waits for its session to be ready. It rejects, leaving
+ * nothing behind, if the first attempt fails.
+ */
 export function connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
 
 /**
+ * Returns a channel to a TrevRPC server that connects in the background, so that clients can be
+ * created on it right away. Calls started before its first session is ready wait for that attempt
+ * (within their own deadline and signal); a failed attempt fails them, and the channel goes on
+ * reconnecting with backoff. Close the channel to give up; the `signal` option does not apply.
+ * Throws if an option is invalid.
+ */
+export function createChannel(url: string | URL, options?: ConnectOptions): Channel;
+
+/**
  * A session that reconnects in the background after it is lost: WebTransport, or QMux over
- * WebSocket when WebTransport is unavailable or blocked. Calls fail fast with Unavailable while it
- * reconnects and are never replayed.
+ * WebSocket when WebTransport is unavailable or blocked. Calls started while it first connects wait
+ * for that attempt; afterwards they fail fast with Unavailable while it reconnects and are never
+ * replayed.
  */
 export class Channel implements Transport {
   private constructor();
@@ -386,10 +428,14 @@ export class Channel implements Transport {
   static connect(url: string | URL, options?: ConnectOptions): Promise<Channel>;
 
   readonly state: ChannelState;
-  /** The transport of the current or last session. */
-  readonly transport: TransportKind;
+  /** The transport of the current or last session; undefined before the first. */
+  readonly transport: TransportKind | undefined;
   /** The compression settings from the connect options. */
   readonly compression?: Compression;
+  /** The connection metadata of the channel's calls, which a wrapping Transport forwards. */
+  readonly connectionMetadata: ConnectionMetadataSource;
+  /** The stream compression memory budget of the channel's calls, which a wrapping Transport forwards. */
+  readonly streamCompressionBudget: StreamCompressionBudget;
   /**
    * Replaces the channel's connection metadata (see `ConnectOptions.connectionMetadata`); empty or
    * missing metadata removes it. Calls started after this use the new metadata, and each

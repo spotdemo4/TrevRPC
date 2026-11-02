@@ -3,6 +3,7 @@ import {
   Code,
   TrevRpcError,
   connect,
+  createChannel,
   createServiceClient,
   type BidirectionalStreamingCall,
   type ChannelStateChange,
@@ -29,14 +30,33 @@ const channel = await connect("https://localhost:4433/trevrpc", {
   fallbackDelayMs: 300,
   reprobeIntervalMs: 300_000,
   onStateChange(change: ChannelStateChange) {
-    change.state satisfies "ready" | "reconnecting" | "closed";
+    change.state satisfies "connecting" | "ready" | "reconnecting" | "closed";
     change.transport satisfies "webtransport" | "websocket" | undefined;
   },
 });
 channel satisfies Channel satisfies Transport;
-channel.state satisfies "ready" | "reconnecting" | "closed";
-channel.transport satisfies "webtransport" | "websocket";
+channel.state satisfies "connecting" | "ready" | "reconnecting" | "closed";
+channel.transport satisfies "webtransport" | "websocket" | undefined;
 await channel.waitUntilReady();
+
+const lazy: Channel = createChannel("https://localhost:4433/trevrpc", {
+  connectionMetadata: { authorization: "Bearer token" },
+});
+new EchoClient(lazy);
+const wrapper: Transport = {
+  createBidirectionalStream: () => lazy.createBidirectionalStream(),
+  createBidirectionalStreamWithSession: () => lazy.createBidirectionalStreamWithSession(),
+  compression: lazy.compression,
+  connectionMetadata: lazy.connectionMetadata,
+  streamCompressionBudget: lazy.streamCompressionBudget,
+};
+new EchoClient(wrapper);
+({
+  createBidirectionalStream: () => lazy.createBidirectionalStream(),
+  // @ts-expect-error connection metadata is set through the channel, not built by hand
+  connectionMetadata: {},
+}) satisfies Transport;
+lazy.close();
 
 const echo = new EchoClient(channel, { timeoutMs: 10_000, metadata: { trace: "abc" } });
 createEchoClient(channel) satisfies EchoClient;

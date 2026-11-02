@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
-import { Channel, connect } from "../src/channel.js";
+import { Channel, connect, createChannel } from "../src/channel.js";
 import { Code } from "../src/status.js";
 import { echoHandler } from "./echo-server.js";
 import { deferred, fakeTransport, isPending, turn } from "./support.js";
@@ -228,14 +228,17 @@ test("the channel reconnects after its session is lost", async () => {
   });
   sessions[0].becomeReady();
   const channel = await connecting;
+  assert.deepEqual(changes, [
+    { state: "ready", previousState: "connecting", transport: "webtransport" },
+  ]);
 
   sessions[0].lose({ closeCode: 1, reason: "restart" });
   await waitFor(() => channel.state === "reconnecting");
-  assert.equal(changes[0].state, "reconnecting");
-  assert.equal(changes[0].previousState, "ready");
-  assert.equal(changes[0].attempt, 1);
-  assert.equal(changes[0].error.reason, "restart");
-  assert.ok(changes[0].delayMs >= 80 && changes[0].delayMs <= 120);
+  assert.equal(changes[1].state, "reconnecting");
+  assert.equal(changes[1].previousState, "ready");
+  assert.equal(changes[1].attempt, 1);
+  assert.equal(changes[1].error.reason, "restart");
+  assert.ok(changes[1].delayMs >= 80 && changes[1].delayMs <= 120);
 
   // Calls fail fast while there is no session, and are not queued.
   await assert.rejects(new EchoClient(channel).unary({}), (error) => {
@@ -343,4 +346,144 @@ test("a failing state callback does not break the channel", async () => {
     delete globalThis.reportError;
     channel.close();
   }
+});
+
+test("connect closes the channel when the first attempt fails, without reconnecting", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const changes = [];
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    onStateChange: (change) => changes.push(change),
+  });
+  sessions[0].failToConnect(new Error("handshake failed"));
+  await assert.rejects(connecting, (error) => error.code === Code.Unavailable);
+  assert.deepEqual(
+    changes.map((change) => [change.previousState, change.state]),
+    [["connecting", "closed"]],
+  );
+  await turn(5);
+  assert.equal(sessions.length, 1, "no reconnect after a failed connect");
+});
+
+test("createChannel returns at once, and calls wait for the first session", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const changes = [];
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    onStateChange: (change) => changes.push(change),
+  });
+  assert.ok(channel instanceof Channel);
+  assert.equal(channel.state, "connecting");
+  assert.equal(channel.transport, undefined);
+  assert.equal(sessions.length, 1, "the first attempt starts right away");
+
+  const client = new EchoClient(channel);
+  const first = client.unary({ message: "early" });
+  const ready = channel.waitUntilReady();
+  assert.equal(await isPending(first), true);
+  assert.equal(await isPending(ready), true);
+
+  sessions[0].becomeReady();
+  assert.equal((await first).message, "early");
+  await ready;
+  assert.equal(channel.state, "ready");
+  assert.equal(channel.transport, "webtransport");
+  assert.deepEqual(changes, [
+    { state: "ready", previousState: "connecting", transport: "webtransport" },
+  ]);
+  channel.close();
+});
+
+test("calls waiting for the first session fail with its error, and the channel reconnects", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const changes = [];
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    onStateChange: (change) => changes.push(change),
+  });
+  const client = new EchoClient(channel);
+  const waiting = client.unary({ message: "early" });
+  const ready = channel.waitUntilReady();
+
+  sessions[0].failToConnect(new Error("handshake failed"));
+  await assert.rejects(waiting, (error) => {
+    return error.code === Code.Unavailable && /handshake failed/.test(error.statusMessage);
+  });
+  assert.equal(channel.state, "reconnecting");
+  assert.equal(changes[0].previousState, "connecting");
+  assert.equal(changes[0].attempt, 1);
+  assert.match(changes[0].error.statusMessage, /handshake failed/);
+
+  // Once the first attempt failed, calls fail fast like during any reconnect.
+  await assert.rejects(client.unary({}), (error) => {
+    return error.code === Code.Unavailable && /reconnecting/.test(error.statusMessage);
+  });
+  assert.equal(await isPending(ready), true, "waitUntilReady waits across attempts");
+
+  await waitFor(() => sessions.length === 2);
+  sessions[1].becomeReady();
+  await ready;
+  assert.equal((await client.unary({ message: "later" })).message, "later");
+  channel.close();
+});
+
+test("a call waiting for the first session ends at its deadline or signal", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+  });
+  const client = new EchoClient(channel);
+  await assert.rejects(
+    client.unary({}, { timeoutMs: 10 }),
+    (error) => error.code === Code.DeadlineExceeded,
+  );
+  const controller = new AbortController();
+  const aborted = client.unary({}, { signal: controller.signal });
+  controller.abort(new Error("gave up"));
+  await assert.rejects(aborted, (error) => error.code === Code.Cancelled);
+  assert.equal(channel.state, "connecting");
+
+  sessions[0].becomeReady();
+  await channel.waitUntilReady();
+  assert.equal((await client.unary({ message: "after" })).message, "after");
+  channel.close();
+});
+
+test("closing a connecting channel abandons the attempt and fails waiting calls", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+  });
+  const waiting = new EchoClient(channel).unary({});
+  const ready = channel.waitUntilReady();
+  channel.close();
+
+  await assert.rejects(waiting, (error) => {
+    return error.code === Code.Unavailable && /closed/.test(error.statusMessage);
+  });
+  await assert.rejects(ready, (error) => error.code === Code.Unavailable);
+  assert.equal(channel.state, "closed");
+  assert.ok(sessions[0].closeCalls.length >= 1, "the pending session is closed");
+  await turn(5);
+  assert.equal(sessions.length, 1, "no reconnect after close");
+});
+
+test("createChannel throws on invalid options without starting a session", () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  assert.throws(
+    () =>
+      createChannel("https://example.test/trevrpc", {
+        transports: WebTransportOnly,
+        WebTransport,
+        connectionMetadata: { "trevrpc-x": "1" },
+      }),
+    (error) => error.code === Code.InvalidArgument,
+  );
+  assert.throws(() => createChannel("https://example.test/trevrpc", { transports: [] }), TypeError);
+  assert.equal(sessions.length, 0);
 });

@@ -17,9 +17,6 @@ const StreamCompressionStart = 3;
 /** The default memory budget of one channel's stream contexts, in bytes. */
 export const DefaultStreamCompressionMemory = 64 * 1024 * 1024;
 
-/** The key of a transport's StreamBudget; a Channel sets it from its connect options. */
-export const StreamBudgetKey = Symbol("trevrpc.streamBudget");
-
 /** The memory stream contexts may hold, shared by the calls of one channel. */
 export class StreamBudget {
   #available;
@@ -54,9 +51,12 @@ export class StreamBudget {
 
 const defaultBudgets = new WeakMap();
 
-/** The stream budget of a transport: a Channel's own, or a default one per other transport. */
+/**
+ * The stream budget of a transport: a Channel's own, which a transport that wraps one forwards, or
+ * a default one per other transport.
+ */
 export function streamBudget(transport) {
-  const budget = transport[StreamBudgetKey];
+  const budget = transport.streamCompressionBudget;
   if (budget !== undefined) {
     return budget;
   }

@@ -1,8 +1,8 @@
-import { ConnectionMetadataKey, ConnectionMetadataSource } from "./connection-metadata.js";
+import { ConnectionMetadataSource } from "./connection-metadata.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
 import { dialRace } from "./race.js";
 import { cancelled, failedPrecondition, statusFromTransportError, unavailable } from "./status.js";
-import { StreamBudget, StreamBudgetKey } from "./stream-compression.js";
+import { StreamBudget } from "./stream-compression.js";
 
 /**
  * The WebTransport protocol that names wire version 1, offered through the `protocols` constructor
@@ -28,57 +28,75 @@ const DefaultReprobeIntervalMs = 5 * 60_000;
  * A session that reconnects in the background after it is lost: WebTransport, or QMux over
  * WebSocket when WebTransport is unavailable or blocked. Calls open their streams on the current
  * session and fail fast with Unavailable while it reconnects; a call that was in flight when the
- * session was lost is never replayed.
+ * session was lost is never replayed. Calls started while the channel first connects wait for
+ * that attempt, and fail with its error if it fails.
  */
 export class Channel {
   #dial;
   #compression;
+  #streamCompressionBudget;
+  #connectionMetadata;
   #onStateChange;
   #session;
   #transport;
-  #state = "ready";
+  #state = "connecting";
+  /**
+   * Settles once the first attempt to connect did: with undefined if it established a session,
+   * and with its error otherwise.
+   */
+  #connecting;
   #waiters = [];
   #stopped = new AbortController();
 
   /** Opens a channel and waits for its first session; use connect() instead. */
   static async connect(url, options = {}) {
-    const dial = sessionDialer(url, options);
+    const { signal } = options;
+    if (signal?.aborted) {
+      throw abortError(signal);
+    }
+    const channel = new Channel(url, options, { retry: false });
+    const abandon = () => channel.close();
+    signal?.addEventListener("abort", abandon, { once: true });
+    try {
+      const failure = await channel.#connecting;
+      if (signal?.aborted) {
+        throw abortError(signal);
+      }
+      if (failure !== undefined) {
+        throw failure;
+      }
+      return channel;
+    } finally {
+      signal?.removeEventListener("abort", abandon);
+    }
+  }
+
+  /**
+   * Starts connecting; use createChannel() or connect() instead. Unless `retry` is false, a first
+   * attempt that fails is retried like a reconnect; otherwise it closes the channel.
+   */
+  constructor(url, options = {}, { retry = true } = {}) {
     // Checked before dialing, so an invalid option never leaves a session behind.
-    const streamBudget = new StreamBudget(options.streamCompressionMemory);
-    const connectionMetadata = new ConnectionMetadataSource(options.connectionMetadata);
-    return new Channel(await dial(options.signal), dial, {
-      ...options,
-      streamBudget,
-      connectionMetadata,
-    });
+    this.#dial = sessionDialer(url, options);
+    this.#streamCompressionBudget = new StreamBudget(options.streamCompressionMemory);
+    this.#connectionMetadata = new ConnectionMetadataSource(options.connectionMetadata);
+    this.#compression = options.compression;
+    this.#onStateChange = options.onStateChange;
+    this.#connecting = this.#connect(retry);
   }
 
-  constructor(
-    dialed,
-    dial,
-    {
-      compression,
-      streamBudget = new StreamBudget(),
-      connectionMetadata = new ConnectionMetadataSource(),
-      onStateChange,
-    } = {},
-  ) {
-    this.#dial = dial;
-    this.#compression = compression;
-    // The memory budget of the stream compression contexts of this channel's calls.
-    this[StreamBudgetKey] = streamBudget;
-    // The connection metadata every call of this channel carries.
-    this[ConnectionMetadataKey] = connectionMetadata;
-    this.#onStateChange = onStateChange;
-    this.#adopt(dialed);
-  }
-
-  /** "ready", "reconnecting" while the session is being re-established, or "closed". */
+  /**
+   * "connecting" until the first session is ready, "ready", "reconnecting" while the session is
+   * being re-established, or "closed".
+   */
   get state() {
     return this.#state;
   }
 
-  /** The transport of the current or last session: "webtransport" or "websocket". */
+  /**
+   * The transport of the current or last session: "webtransport" or "websocket"; undefined before
+   * the first.
+   */
   get transport() {
     return this.#transport;
   }
@@ -88,21 +106,28 @@ export class Channel {
     return this.#compression;
   }
 
+  /** The memory budget of the stream compression contexts of this channel's calls. */
+  get streamCompressionBudget() {
+    return this.#streamCompressionBudget;
+  }
+
+  /** The connection metadata every call of this channel carries. */
+  get connectionMetadata() {
+    return this.#connectionMetadata;
+  }
+
   /**
    * Replaces the channel's connection metadata, which every call carries; empty or missing
    * metadata removes it. Calls started after this use the new metadata. Throws InvalidArgument if
    * it is invalid, and then keeps the old.
    */
   setConnectionMetadata(metadata) {
-    this[ConnectionMetadataKey].set(metadata);
+    this.#connectionMetadata.set(metadata);
   }
 
   /** Opens a bidirectional stream on the current session. */
   createBidirectionalStream() {
-    if (this.#state !== "ready") {
-      return Promise.reject(unavailable(`channel is ${this.#state}`));
-    }
-    return this.#session.createBidirectionalStream();
+    return this.#withSession((session) => session.createBidirectionalStream());
   }
 
   /**
@@ -113,11 +138,29 @@ export class Channel {
    * meanwhile.
    */
   createBidirectionalStreamWithSession() {
-    if (this.#state !== "ready") {
-      return Promise.reject(unavailable(`channel is ${this.#state}`));
+    return this.#withSession((session) =>
+      session.createBidirectionalStream().then((stream) => ({ stream, session })),
+    );
+  }
+
+  /**
+   * Calls `open` with the current session. While the channel first connects, that waits for the
+   * attempt, and a failed attempt fails the call with its error; otherwise a channel without a
+   * session fails it with Unavailable.
+   */
+  #withSession(open) {
+    if (this.#state === "ready") {
+      return open(this.#session);
     }
-    const session = this.#session;
-    return session.createBidirectionalStream().then((stream) => ({ stream, session }));
+    if (this.#state === "connecting") {
+      // The state has moved on once the attempt settled, so this does not wait again.
+      return this.#connecting.then((failure) =>
+        failure === undefined || this.#state === "closed"
+          ? this.#withSession(open)
+          : Promise.reject(failure),
+      );
+    }
+    return Promise.reject(unavailable(`channel is ${this.#state}`));
   }
 
   /** Resolves once the channel is ready, immediately if it already is. */
@@ -144,6 +187,42 @@ export class Channel {
       waiter.reject(unavailable("channel is closed"));
     }
     closeQuietly(session, closeInfo);
+  }
+
+  /**
+   * Makes the first attempt to connect, and returns its error, or undefined once it established a
+   * session. A failure starts reconnecting if `retry` is true and closes the channel otherwise.
+   */
+  async #connect(retry) {
+    const { signal } = this.#stopped;
+    let dialed;
+    try {
+      dialed = await this.#dial(signal);
+    } catch (error) {
+      if (!signal.aborted) {
+        if (retry) {
+          void this.#reconnect(error);
+        } else {
+          this.close();
+        }
+      }
+      return error;
+    }
+    if (signal.aborted) {
+      closeQuietly(dialed.session);
+      return abortError(signal);
+    }
+    this.#ready(dialed);
+    return undefined;
+  }
+
+  /** Adopts a new session and wakes up whoever waits for the channel to be ready. */
+  #ready(dialed, extra) {
+    this.#adopt(dialed);
+    this.#transition("ready", { ...extra, transport: dialed.transport });
+    for (const waiter of this.#waiters.splice(0)) {
+      waiter.resolve();
+    }
   }
 
   #adopt({ session, transport }) {
@@ -178,11 +257,7 @@ export class Channel {
           closeQuietly(dialed.session);
           return;
         }
-        this.#adopt(dialed);
-        this.#transition("ready", { attempt, transport: dialed.transport });
-        for (const waiter of this.#waiters.splice(0)) {
-          waiter.resolve();
-        }
+        this.#ready(dialed, { attempt });
         return;
       } catch (dialError) {
         error = dialError;
@@ -201,9 +276,22 @@ export class Channel {
   }
 }
 
-/** Opens a channel to a TrevRPC server and waits for its session to be ready. */
+/**
+ * Opens a channel to a TrevRPC server and waits for its session to be ready. It rejects, leaving
+ * nothing behind, if the first attempt fails.
+ */
 export function connect(url, options = {}) {
   return Channel.connect(url, options);
+}
+
+/**
+ * Returns a channel to a TrevRPC server that connects in the background, so that clients can be
+ * created on it right away. Calls started before its first session is ready wait for that attempt;
+ * a failed attempt fails them and the channel goes on reconnecting with backoff. The `signal`
+ * option does not apply: close the channel instead.
+ */
+export function createChannel(url, options = {}) {
+  return new Channel(url, options);
 }
 
 /**

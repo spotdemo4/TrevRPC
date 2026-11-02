@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
-import { connect } from "../src/channel.js";
+import { connect, createChannel } from "../src/channel.js";
 import {
   FrameReader,
   FrameType,
@@ -297,4 +297,49 @@ test("a late confirmation of a replaced set does not undo the current one's", as
   const { field, offered } = session.prepare();
   assert.equal(offered, 0, "the current set is still confirmed");
   assert.deepEqual(field, { id: second });
+});
+
+test("clients created on a connecting channel carry its connection metadata", async () => {
+  const fake = fakeWebTransport();
+  const channel = createChannel(url, {
+    transports: ["webtransport"],
+    WebTransport: fake.WebTransport,
+    connectionMetadata: { "interop-suffix": "!" },
+  });
+  const client = new EchoClient(channel);
+  assert.equal(await echo(client, "a"), "a!");
+  assert.deepEqual(fake.requests[0].connection, { id: 1, metadata: { "interop-suffix": "!" } });
+  channel.close();
+});
+
+test("a transport that wraps a channel forwards its connection metadata", async () => {
+  const fake = fakeWebTransport();
+  const channel = await channelTo(fake, { connectionMetadata: { "interop-suffix": "!" } });
+  const wrapper = {
+    createBidirectionalStream: () => channel.createBidirectionalStream(),
+    createBidirectionalStreamWithSession: () => channel.createBidirectionalStreamWithSession(),
+    get compression() {
+      return channel.compression;
+    },
+    get connectionMetadata() {
+      return channel.connectionMetadata;
+    },
+    get streamCompressionBudget() {
+      return channel.streamCompressionBudget;
+    },
+  };
+  const client = new EchoClient(wrapper);
+  assert.equal(await echo(client, "a"), "a!");
+  assert.equal(await echo(client, "b"), "b!");
+  // The wrapper and the channel share what each session confirmed.
+  assert.equal(await echo(new EchoClient(channel), "c"), "c!");
+  assert.deepEqual(
+    fake.requests.map((request) => request.connection),
+    [
+      { id: 1, metadata: { "interop-suffix": "!" } },
+      { id: 1, metadata: {} },
+      { id: 1, metadata: {} },
+    ],
+  );
+  channel.close();
 });

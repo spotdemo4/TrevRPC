@@ -118,6 +118,8 @@ call.
 
 `connect()` opens a session and resolves when it is ready; it rejects if no transport can establish one. After that the `Channel` re-establishes the session in the background with exponential backoff whenever it is lost. Calls fail fast with `Unavailable` while `channel.state` is `"reconnecting"` and are never replayed; use `await channel.waitUntilReady()` or the `onStateChange` option to follow the state. `channel.close()` stops reconnecting.
 
+`createChannel(url, options)` takes the same options but returns the channel right away, in the `"connecting"` state, so generated clients can be created before it is connected. Calls started while it connects wait for that first attempt, within their own deadline and signal; if it fails they fail with its error, and the channel goes on reconnecting with backoff like after a lost session. The `signal` option does not apply to it; close the channel to give up.
+
 ```js
 const channel = await connect(url, {
   signal: AbortSignal.timeout(10_000), // cancels the initial connection only
@@ -130,7 +132,7 @@ const channel = await connect(url, {
 
 `connect()` always offers the WebTransport protocol `trevrpc-1` (wire version 1) through the `protocols` constructor option; it cannot be changed. If the server selects any other protocol, that connection attempt fails with `Code.FailedPrecondition` and the channel carries on as after any failed dial: the WebSocket fallback starts, or a reconnect is retried with backoff. An empty or missing selection means version 1, because older browsers cannot negotiate protocols.
 
-Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
+Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. A transport that wraps a `Channel` should forward its `createBidirectionalStreamWithSession()`, `compression`, `connectionMetadata` and `streamCompressionBudget`; without them its calls carry no connection metadata and get a stream compression budget of their own. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
 
 ### Connection metadata
 
@@ -142,7 +144,7 @@ channel.setConnectionMetadata({ authorization: `Bearer ${refreshed}` }); // call
 channel.setConnectionMetadata(); // removes it
 ```
 
-A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. The `Channel` is the only transport that supports it.
+A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. Other transports carry it when they forward a channel's `connectionMetadata`.
 
 ### Compression
 
