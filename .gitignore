@@ -31,3 +31,6 @@ __pycache__/
 # nix
 /result*
 /.direnv/
+
+# scratch
+/tmp/

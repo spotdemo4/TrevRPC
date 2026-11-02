@@ -1,6 +1,5 @@
 {
   "files.associations": {
-    "renovate.json": "jsonc",
     ".envrc*": "shellscript",
     // bufbuild.vscode-buf claims these, and one is a Forgejo workflow
     "buf.yaml": "yaml",

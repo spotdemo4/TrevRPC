@@ -483,18 +483,24 @@
 
           renovate-fj = {
             root = ./.forgejo;
-            files = ./.forgejo/renovate.json;
+            files = ./.forgejo/renovate.jsonc;
             packages = with pkgs; [
               renovate
             ];
             script = ''
-              renovate-config-validator renovate.json
+              renovate-config-validator renovate.jsonc
             '';
           };
 
           config = {
             root = ./.;
-            filter = file: file.hasExt "json" || file.hasExt "yaml" || file.hasExt "toml" || file.hasExt "md";
+            filter =
+              file:
+              file.hasExt "json"
+              || file.hasExt "jsonc"
+              || file.hasExt "yaml"
+              || file.hasExt "toml"
+              || file.hasExt "md";
             packages = with pkgs; [
               oxfmt
             ];

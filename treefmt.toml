@@ -35,4 +35,4 @@ includes = ["*.py"]
 [formatter.oxfmt]
 command = "oxfmt"
 options = ["--write", "--no-error-on-unmatched-pattern"]
-includes = ["*.js", "*.ts", "*.html", "*.json", "*.yaml", "*.toml", "*.md"]
+includes = ["*.js", "*.ts", "*.html", "*.json", "*.jsonc", "*.yaml", "*.toml", "*.md"]
