@@ -43,11 +43,12 @@ buildNpmPackage (final: {
 
   # The interop clients are generated from the shared interop protos, which import the TrevRPC
   # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
-  # of them live outside this directory. The wasm module is built on its own; only the script that
-  # embeds it is needed here.
+  # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
+  # module is built on its own; only the script that embeds it is needed here.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
+      ../.oxlintrc.json
       wireGolden
       qmuxGolden
       zstdGolden
