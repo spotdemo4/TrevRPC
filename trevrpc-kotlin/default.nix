@@ -69,6 +69,8 @@ let
       ];
       buildToolsVersions = [ "37.0.0" ];
       includeEmulator = true;
+      # 37.2.13 segfaults (exit -11) in SwiftShader rendering around the CA-install reboots.
+      emulatorVersion = "37.2.12";
       includeSystemImages = true;
       systemImageTypes = [ "google_apis" ];
       abiVersions = [ "x86_64" ];
