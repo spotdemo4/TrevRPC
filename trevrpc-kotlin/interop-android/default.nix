@@ -18,7 +18,7 @@
 }:
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin-interop-android";
-  version = "1.3.1";
+  version = "1.3.2";
 
   src = lib.fileset.toSource {
     root = ../../.;
