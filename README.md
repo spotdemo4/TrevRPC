@@ -34,7 +34,8 @@ messages as QUIC datagrams.
 - [unreliable methods](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages)
   that send messages as QUIC datagrams, and fall back to the stream wherever datagrams are unavailable
 - one UDP port for native QUIC, HTTP/3, and WebTransport, and one TCP port for every fallback
-- reconnecting client channels that fall back to TCP when UDP is blocked; RPCs are never retried or replayed
+- reconnecting client channels that fall back to TCP when UDP is blocked; RPCs are never retried, and a handler
+  never runs twice for one call
 - server limits, authorization hooks, metrics, and graceful shutdown
 - a shared wire format pinned by golden vectors, and an [interop](interop) suite that tests every client
   against every server over every transport it speaks
@@ -65,7 +66,6 @@ package example.greeter;
 
 service Greeter {
   rpc SayHello(HelloRequest) returns (HelloReply);
-  rpc LotsOfReplies(HelloRequest) returns (stream HelloReply);
 }
 
 message HelloRequest { string name = 1; }

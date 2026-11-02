@@ -45,7 +45,7 @@ protoc \
 
 ## Client
 
-The application owns the `CronetEngine` and callback executor; the channel never shuts them down. `transport-cronet` is a JVM 17 library that compiles against Cronet but does not ship it, so the application adds Cronet and chooses its provider: `org.chromium.net:cronet-bundled` embeds the native library, while `org.chromium.net:cronet` alone uses the platform `HttpEngine` (Android 14+) or a Google Play services provider. Cronet 500.x requires `minSdk` 24 (Android 7.0) and no longer merges its permissions into the app, so the application must declare `android.permission.INTERNET` and `android.permission.ACCESS_NETWORK_STATE`.
+The application owns the `CronetEngine` and callback executor; the channel never shuts them down. `transport-cronet` is a JVM 17 library that compiles against Cronet but does not ship it, so the application adds Cronet and chooses its provider: `org.chromium.net:cronet-bundled` embeds the native library, while `org.chromium.net:cronet` alone uses the platform `HttpEngine` (Android 14+) or a Google Play services provider. Cronet 500.x requires `minSdk` 24 (Android 7.0) and no longer merges its permissions into the app, so the application must declare `android.permission.INTERNET` and `android.permission.ACCESS_NETWORK_STATE`. `core` and `transport-cronet` are built for Kotlin 2.3 (language and API version, against kotlin-stdlib 2.3.0), so applications can use Kotlin 2.3 or newer.
 
 ```kotlin
 val engine = CronetEngine.Builder(context).enableQuic(true).build()
@@ -93,8 +93,8 @@ val reply =
     client.sayHello(req("TrevRPC")) {
         copy(onResponseHeaders = { headers = it }, onResponseMetadata = { trailers = it })
     }
-println(headers["x-request-id"])   // response headers
-println(trailers["x-cost"])        // trailing metadata
+println(headers["x-request-id"]?.decodeToString())   // response headers
+println(trailers["x-cost"]?.decodeToString())        // trailing metadata
 ```
 
 ### Connection metadata
@@ -136,7 +136,7 @@ If the call's own deadline passes while the client waits for the end of the stre
 
 ### Compression
 
-Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). Compression calls [zstd-jni](https://github.com/luben/zstd-jni), which `core` compiles against but does not ship, so the application adds it: `com.github.luben:zstd-jni:1.5.7-24@aar` on Android (its AAR needs `compileSdk` 37), or the plain JAR on the JVM. Configure it on the channel:
+Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). Compression calls [zstd-jni](https://github.com/luben/zstd-jni), which `core` compiles against but does not ship, so the application adds it: `com.github.luben:zstd-jni:1.5.7-25@aar` on Android (its AAR needs `compileSdk` 37), or the plain JAR on the JVM. Configure it on the channel:
 
 ```kotlin
 val compression =
@@ -163,7 +163,7 @@ nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go --command \
 
 `--transport http3` (the default) runs the scenarios over HTTP/3. `--transport http2` runs them with Cronet's QUIC disabled, as on a network that blocks UDP, to exercise the HTTP/2 mapping on the server's TCP listener. The GitHub `android` workflow runs both for each server.
 
-The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, and runs the server command with `server --cert <pem> --key <pem> --host 0.0.0.0`. It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if every scenario passed and the server exited 0 once its stdin closed.
+The runner generates a certificate for `10.0.2.2` (the emulator's alias for the host), trusts it in the emulator's system store, and runs the server command with `server --cert <pem> --key <pem> --host 0.0.0.0 --dictionary <file>`. It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if every scenario passed and the server exited 0 once its stdin closed.
 
 ## Development
 

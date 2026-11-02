@@ -91,7 +91,7 @@ reply, _ := client.SayHello(ctx, request,
 )
 ```
 
-A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the headers, the first message or the final status arrives (headers, a message, or the final status), returns empty metadata if the server sent none, and does not consume a message. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
+A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the headers, the first message or the final status arrives, returns empty metadata if the server sent none, and does not consume a message. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
 
 Metadata that every call carries, such as a bearer token, can instead be set once with `DialOptions.ConnectionMetadata` and replaced with `channel.SetConnectionMetadata`. Each connection then sends it in its first calls only, and the server merges it into every call's metadata, a call's own entry winning; see [Connection Metadata](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#connection-metadata).
 
@@ -175,7 +175,7 @@ Browser sessions (WebTransport and QMux over WebSocket) are rejected unless `Web
 
 ## Compression
 
-Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in three ways that combine. They call libzstd in binaries built with cgo, and the pure-Go `klauspost/compress` without it; the two interoperate.
+Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in three ways that combine. They call libzstd in binaries built with cgo, and the pure-Go `klauspost/compress` without it or with the `trevrpc_purego` build tag; the two interoperate.
 
 - **Dictionaries:** `DialOptions.Compression` and `ServerOptions.Compression` take dictionaries trained with `zstd --train`, each with the protobuf message types it compresses.
 - **Without a dictionary:** a method marked `option (trevrpc.method) = {compression: COMPRESSION_MESSAGE}` (or `COMPRESSION_STREAM`) compresses its messages of 256 bytes or more on their own where no dictionary applies, with nothing to configure. Responses compress from a connection's first call, requests once its answer arrives. `HandlerContext.PlainCompressedRequests` counts the requests that arrived so.
@@ -183,4 +183,4 @@ Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc
 
 ## Interop
 
-`cmd/trevrpc-interop` (installed as `trevrpc-interop-go`) implements the `server` and `client` subcommands of the cross-runtime [interop suite](../interop/README.md). Its Echo bindings in `cmd/trevrpc-interop/interoppb` are generated from `interop/proto/interop.proto`; `go test ./cmd/trevrpc-interop/interoppb` fails when they drift, and `-update` rewrites them.
+`cmd/trevrpc-interop` (installed as `trevrpc-interop-go`) implements the `server` and `client` subcommands of the cross-runtime [interop suite](../interop/README.md), and the `bench` load client of the [benchmarks](../bench/README.md). Its Echo, UnreliableEcho, CompressedEcho and RefusingEcho bindings in `cmd/trevrpc-interop/interoppb` are generated from `interop/proto/*.proto`; `go test ./cmd/trevrpc-interop/interoppb` fails when they drift, and `-update` rewrites them.

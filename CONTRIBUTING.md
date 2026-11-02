@@ -25,7 +25,7 @@ direnv allow
 | `trevrpc-kotlin/` | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`   |
 | `interop/`        | cross-runtime test suite                                        |
 | `bench/`          | load benchmarks and the grpc-go and connect-go baselines        |
-| `testdata/`       | wire and QMux golden vectors shared by every runtime's tests    |
+| `testdata/`       | wire, QMux, and zstd golden vectors shared by the runtimes      |
 
 ### run
 

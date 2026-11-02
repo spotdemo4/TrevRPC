@@ -46,7 +46,8 @@ class MessageCodec<T>(
  * [maxResponseStreamBodySize], and [streamIdleTimeout] are off until set.
  *
  * [onResponseHeaders] is called with the response headers, empty when the server sent none, as
- * soon as the first response frame arrives, also while a streaming request is still uploading.
+ * soon as the headers, the first message or the final status arrives, also while a streaming
+ * request is still uploading.
  * [onResponseMetadata] is called with the trailing metadata of the final status when the call
  * succeeds, before its result is returned or its response flow completes; a failed call carries
  * its metadata on the [TrevRpcException] instead. Both run in the coroutine that reads the

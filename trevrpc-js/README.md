@@ -128,7 +128,7 @@ const channel = await connect(url, {
 
 `serverCertificateHashes` trusts a self-signed ECDSA certificate that is valid for at most 14 days by its SHA-256 hash, which is how development servers and the interop tests are reached. It applies to WebTransport only: the WebSocket fallback needs a certificate the browser trusts. `allowPooling`, `congestionControl` and `requireUnreliable` are passed to the `WebTransport` constructor.
 
-`connect()` always offers the WebTransport protocol `trevrpc-1` (wire version 1) through the `protocols` constructor option; it cannot be changed. If the server selects any other protocol, that connection attempt fails with `Code.FailedPrecondition` and the channel carries on as after any failed dial: the WebSocket fallback starts, or a reconnect is retried with backoff. An empty or missing selection means version 1, because older browsers cannot negotiate protocols and the Rust server cannot echo one.
+`connect()` always offers the WebTransport protocol `trevrpc-1` (wire version 1) through the `protocols` constructor option; it cannot be changed. If the server selects any other protocol, that connection attempt fails with `Code.FailedPrecondition` and the channel carries on as after any failed dial: the WebSocket fallback starts, or a reconnect is retried with backoff. An empty or missing selection means version 1, because older browsers cannot negotiate protocols.
 
 Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
 
@@ -187,17 +187,17 @@ trevrpc-interop-browser --browser chromium|firefox|safari \
   --url https://127.0.0.1:4433/trevrpc \
   --cert-hash <hex sha256 of the server certificate DER> \
   [--transport webtransport|websocket|auto] [--ws-url wss://127.0.0.1:4433/trevrpc] \
-  [--expect-transport webtransport|websocket]
+  [--expect-transport webtransport|websocket] [--dictionary <file>]
 ```
 
-It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. Chromium and Firefox are launched through Playwright from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM` and `TREVRPC_BROWSER_FIREFOX` when those name an executable, and ignore certificate errors because WSS cannot pin a certificate hash. Safari is driven through `safaridriver` (`TREVRPC_BROWSER_SAFARI` overrides its path), which needs `sudo safaridriver --enable` once; Safari cannot ignore certificate errors, so the server certificate must be trusted by the system, as `interop/run.py` does. The CLI serves the page from a loopback origin; the page fetches its input from there and posts each result back, so where the browser has no WebTransport at all every scenario fails with a clear reason. `--write-page <dir>` writes that page to a directory instead, and `--page-url <url> --cert <pem> --key <pem>` opens it from a TrevRPC server that serves the directory through its HTTP fallback; the page then reports to the CLI over HTTPS, at the origin in its `report` query parameter. `--page-protocol h2|h3` has the browser load that page over HTTP/2 or HTTP/3 and fails every scenario unless it did (`h3` in Chromium only).
+It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only if all scenarios passed. `--dictionary` makes the channel compress Echo messages with that zstd dictionary, the one the interop servers hold. `trevrpc-interop-browser bench` runs the load benchmark in a browser instead (see [`bench/README.md`](../bench/README.md#browsers)). Chromium and Firefox are launched through Playwright from `PLAYWRIGHT_BROWSERS_PATH`, or from `TREVRPC_BROWSER_CHROMIUM` and `TREVRPC_BROWSER_FIREFOX` when those name an executable, and ignore certificate errors because WSS cannot pin a certificate hash. Safari is driven through `safaridriver` (`TREVRPC_BROWSER_SAFARI` overrides its path), which needs `sudo safaridriver --enable` once; Safari cannot ignore certificate errors, so the server certificate must be trusted by the system, as `interop/run.py` does. The CLI serves the page from a loopback origin; the page fetches its input from there and posts each result back, so where the browser has no WebTransport at all every scenario fails with a clear reason. `--write-page <dir>` writes that page to a directory instead, and `--page-url <url> --cert <pem> --key <pem>` opens it from a TrevRPC server that serves the directory through its HTTP fallback; the page then reports to the CLI over HTTPS, at the origin in its `report` query parameter. `--page-protocol h2|h3` has the browser load that page over HTTP/2 or HTTP/3 and fails every scenario unless it did (`h3` in Chromium only).
 
 ## Development
 
 ```sh
 npm ci
 npm run check      # format check, lint, typecheck, tests
-npm run build      # generate the Echo client and bundle the interop page into build/interop/
+npm run build      # generate the interop clients and bundle the interop and benchmark pages into build/interop/
 npm run interop -- --browser chromium --url ... --cert-hash ...
 ```
 

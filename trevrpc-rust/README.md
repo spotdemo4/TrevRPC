@@ -159,7 +159,7 @@ server.serve(endpoint).await?;
 
 Handlers set response metadata through their `RequestContext`. `context.set_response_header(key, value)` adds a response header, sent before the first response message as soon as the handler returns. `context.set_response_metadata(key, value)` adds trailing metadata, sent with the final `OK` status: when a unary or client-streaming handler returns, or when a streaming handler's response stream ends, so a clone of the context moved into the stream may still set it until then. Keys are lowercased and validated like request metadata; an invalid entry, a header set after the handler has returned, or metadata set after the final status, is an `Internal` status, ready for `?`. A failed call sends the metadata of its `Status` instead.
 
-Native QUIC is always served. HTTP/3 and WebTransport are opt-in through `ServerOptions`; the `h3` ALPN is negotiated only when at least one is enabled:
+Native QUIC is always served. HTTP/3 and WebTransport are opt-in through `ServerOptions`; the `h3` ALPN is negotiated only when at least one is enabled or an HTTP fallback is set:
 
 ```rust
 server.set_options(
@@ -206,7 +206,7 @@ Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc
 
 ## TCP fallback
 
-TCP is opt-in. `Server::tcp_tls_config` builds the TLS configuration for a TCP listener, setting the ALPN list from the options (`qmux-02.trevrpc-1` always, `h2` when HTTP is enabled, `http/1.1` for the WebSocket upgrade when WebTransport is enabled). `Server::serve_with_tcp` then serves QUIC and TCP together, sharing the connection and request limits and graceful shutdown:
+TCP is opt-in. `Server::tcp_tls_config` builds the TLS configuration for a TCP listener, setting the ALPN list from the options (`qmux-02.trevrpc-1` always, `h2` when HTTP is enabled, `http/1.1` for the WebSocket upgrade when WebTransport is enabled; an HTTP fallback adds both). `Server::serve_with_tcp` then serves QUIC and TCP together, sharing the connection and request limits and graceful shutdown:
 
 ```rust
 let tcp = trevrpc::tcp::TcpFallback {
@@ -235,7 +235,7 @@ println!("{:?}", channel.transport()); // Some(TransportKind::Quic) or Some(Tran
 
 ## Interop
 
-`trevrpc-interop-rust server|client` is the Rust half of the cross-runtime interop suite in `interop/`. The `Echo` and `UnreliableEcho` services are generated from `interop/proto/interop.proto` and `interop/proto/unreliable.proto`, the single copy of the contract.
+`trevrpc-interop-rust server|client` is the Rust half of the cross-runtime interop suite in `interop/`, and `trevrpc-interop-rust bench` is its load client for the [benchmarks](../bench/README.md). The `Echo`, `UnreliableEcho`, `CompressedEcho` and `RefusingEcho` services are generated from `interop/proto/interop.proto`, `interop/proto/unreliable.proto` and `interop/proto/compressed.proto`, the single copy of the contract.
 
 ## Development
 
