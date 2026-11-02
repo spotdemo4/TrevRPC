@@ -175,6 +175,24 @@ For local development, `trevrpc.NewDevelopmentCertificate(hosts...)` generates a
 
 `EnableHTTP3`, `HTTP3Path`, and `HTTP3Admission` were renamed `EnableHTTP`, `HTTPPath`, and `HTTPAdmission`, because the HTTP mapping is now also served over HTTP/2.
 
+## Observability
+
+`server.SetMetrics` and `server.SetInterceptors` report every call, and `server.SetDiagnostics` reports local failures such as panics; `trevrpc.LogDiagnostics(logger)` logs diagnostics to `log/slog` at the level each phase recommends. The separate module [`oteltrevrpc`](oteltrevrpc) builds OpenTelemetry metrics, server spans and trace propagation on them:
+
+```go
+metrics, err := oteltrevrpc.NewMetrics()
+if err != nil {
+	return err
+}
+server.SetMetrics(metrics)
+server.SetInterceptors(oteltrevrpc.NewInterceptor())
+server.SetDiagnostics(trevrpc.LogDiagnostics(slog.Default()))
+
+reply, err := client.SayHello(ctx, request, oteltrevrpc.Propagate(ctx))
+```
+
+See [Observability](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#observability).
+
 ## Compression
 
 Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)), in three ways that combine. They call libzstd in binaries built with cgo, and the pure-Go `klauspost/compress` without it or with the `trevrpc_purego` build tag; the two interoperate.

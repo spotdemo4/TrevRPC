@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -52,6 +53,22 @@ const (
 	// RPCKindBidirectionalStreaming is a request stream and a response stream.
 	RPCKindBidirectionalStreaming RPCKind = 3
 )
+
+// String returns the kind's name, such as "server_streaming".
+func (k RPCKind) String() string {
+	switch k {
+	case RPCKindUnary:
+		return "unary"
+	case RPCKindClientStreaming:
+		return "client_streaming"
+	case RPCKindServerStreaming:
+		return "server_streaming"
+	case RPCKindBidirectionalStreaming:
+		return "bidirectional_streaming"
+	default:
+		return "RPCKind(" + strconv.Itoa(int(k)) + ")"
+	}
+}
 
 // wireRequest is the payload of a REQUEST frame.
 type wireRequest struct {

@@ -27,6 +27,8 @@ mkGoModule (final: {
         lib.fileset.unions [
           ./default.nix
           ./gomod2nix.toml
+          # a separate module, with its own package
+          ./oteltrevrpc
         ]
       ))
     ];

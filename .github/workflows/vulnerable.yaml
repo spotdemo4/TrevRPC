@@ -49,6 +49,10 @@ jobs:
         working-directory: trevrpc-go
         run: govulncheck ./...
 
+      - name: Run govulncheck on the OpenTelemetry module
+        working-directory: trevrpc-go/oteltrevrpc
+        run: govulncheck ./...
+
   kotlin:
     runs-on: ubuntu-26.04
     permissions:

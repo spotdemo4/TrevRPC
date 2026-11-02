@@ -737,6 +737,26 @@ func TestServerUnaryCompletionMetricsForTerminalStatuses(t *testing.T) {
 	})
 }
 
+func TestServerMetricsReportWhetherTheMethodIsRegistered(t *testing.T) {
+	metrics := &recordingMetrics{}
+	server := NewServer()
+	server.SetMetrics(metrics)
+	routeBytes(server, "/example.Greeter/SayHello", func(context.Context, []byte) ([]byte, error) {
+		return []byte("hello"), nil
+	})
+
+	server.handleRequest(context.Background(), newWireRequest("/example.Greeter/SayHello"))
+	server.handleRequest(context.Background(), newWireRequest("/example.Greeter/Missing"))
+
+	expectMetrics(t, metrics, CodeOK, CodeUnimplemented)
+	started, finished := metrics.snapshot()
+	for index, want := range []bool{true, false} {
+		if started[index].Registered != want || finished[index].Registered != want {
+			t.Fatalf("event %d registered = %t, %t, want %t", index, started[index].Registered, finished[index].Registered, want)
+		}
+	}
+}
+
 func TestServerRequestStreamPanicReturnsInternal(t *testing.T) {
 	server := NewServer()
 	server.routeStreaming("/example.Greeter/Upload", RPCKindClientStreaming, func(_ context.Context, _ []byte, requests byteStream) (encodedStream, error) {

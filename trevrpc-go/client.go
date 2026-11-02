@@ -126,6 +126,26 @@ func WithMetadata(key string, value []byte) CallOption {
 	}
 }
 
+// WithMetadataEntries adds every entry of metadata as WithMetadata adds one,
+// for entries that something else computes, such as trace context a
+// propagator injects.
+func WithMetadataEntries(metadata Metadata) CallOption {
+	entries := make(Metadata, len(metadata))
+	for key, value := range metadata {
+		entries[NormalizeMetadataKey(key)] = append([]byte(nil), value...)
+	}
+	return func(config *callConfig) {
+		if len(entries) == 0 {
+			return
+		}
+		merged := cloneMetadata(config.metadata)
+		for key, value := range entries {
+			merged[key] = append([]byte(nil), value...)
+		}
+		config.metadata = merged
+	}
+}
+
 // WithMaxFrameSize bounds the encoded size of each response message in bytes.
 // It defaults to DefaultMaxFrameSize; the channel's own frame size limit still applies.
 func WithMaxFrameSize(size int) CallOption {

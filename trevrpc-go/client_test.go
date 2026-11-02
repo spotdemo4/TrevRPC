@@ -9,6 +9,24 @@ import (
 	"time"
 )
 
+func TestWithMetadataEntriesAddsEveryEntry(t *testing.T) {
+	entries := Metadata{"Traceparent": []byte("00-a"), "tracestate": []byte("b")}
+	option := WithMetadataEntries(entries)
+	entries["tracestate"][0] = 'x'
+
+	config := applyCallOptions([]CallOption{WithMetadata("traceparent", []byte("old")), WithMetadata("other", []byte("1")), option})
+
+	want := Metadata{"traceparent": []byte("00-a"), "tracestate": []byte("b"), "other": []byte("1")}
+	if len(config.metadata) != len(want) {
+		t.Fatalf("metadata = %q, want %q", config.metadata, want)
+	}
+	for key, value := range want {
+		if string(config.metadata[key]) != string(value) {
+			t.Fatalf("metadata = %q, want %q", config.metadata, want)
+		}
+	}
+}
+
 func TestResolveClientDeadline(t *testing.T) {
 	now := time.Date(2040, time.January, 2, 3, 4, 5, 0, time.UTC)
 	clock := func() time.Time { return now }

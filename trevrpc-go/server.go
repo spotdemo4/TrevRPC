@@ -260,6 +260,11 @@ type RPCStarted struct {
 	Service        string
 	Method         string
 	RequestBodyLen int
+	// Registered reports whether Service and Method name a method registered
+	// on the server. Otherwise they are whatever the client sent, unchecked,
+	// so metrics should not label measurements with them: the authorizer and
+	// other checks reject calls before the server looks up their method.
+	Registered bool
 }
 
 // RPCFinished describes an RPC completion event.
@@ -270,6 +275,9 @@ type RPCFinished struct {
 	ResponseBodyLen int
 	Code            Code
 	Elapsed         time.Duration
+	// Registered reports whether Service and Method name a registered method,
+	// as for RPCStarted.
+	Registered bool
 }
 
 // NewServer creates an empty server with default options.
@@ -1393,6 +1401,7 @@ func (r *serverRuntime) finishStreamingResponse(service, method string, requestB
 }
 
 func (r *serverRuntime) recordStarted(event RPCStarted, request *wireRequest) {
+	event.Registered = r.registered(request)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
@@ -1402,6 +1411,7 @@ func (r *serverRuntime) recordStarted(event RPCStarted, request *wireRequest) {
 }
 
 func (r *serverRuntime) recordFinished(event RPCFinished, request *wireRequest) {
+	event.Registered = r.registered(request)
 	if request != nil && request.intercepted != nil {
 		request.intercepted.finish(r, request, event)
 	}
@@ -1411,6 +1421,16 @@ func (r *serverRuntime) recordFinished(event RPCFinished, request *wireRequest) 
 		}
 	}()
 	r.metrics.RPCFinished(event)
+}
+
+// registered reports whether request names a method registered on the
+// server, whatever its kind.
+func (r *serverRuntime) registered(request *wireRequest) bool {
+	if request == nil {
+		return false
+	}
+	_, ok := r.routes[request.Method]
+	return ok
 }
 
 type streamLimits struct {

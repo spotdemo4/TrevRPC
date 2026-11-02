@@ -202,7 +202,7 @@
               gomod2nix.packages.${system}.default
             ];
             script = ''
-              for module in trevrpc-go bench/baseline; do
+              for module in trevrpc-go trevrpc-go/oteltrevrpc bench/baseline; do
                 go -C "$module" mod tidy
                 gomod2nix generate --with-deps --dir "$module"
               done
@@ -269,6 +269,7 @@
                 trevrpcProto
                 ;
             };
+            trevrpc-go-otel = pkgs.callPackage ./trevrpc-go/oteltrevrpc { };
             trevrpc-js = pkgs.callPackage ./trevrpc-js {
               inherit
                 wireGolden
@@ -334,6 +335,7 @@
         checks = pkgs.mkChecks {
           inherit (self.packages.${system})
             trevrpc-go
+            trevrpc-go-otel
             trevrpc-js
             trevrpc-kotlin
             trevrpc-rust
@@ -351,6 +353,14 @@
 
           trevrpc-go-lint = {
             src = self.packages.${system}.trevrpc-go;
+            packages = with pkgs; [ golangci-lint ];
+            script = ''
+              golangci-lint run ./...
+            '';
+          };
+
+          trevrpc-go-otel-lint = {
+            src = self.packages.${system}.trevrpc-go-otel;
             packages = with pkgs; [ golangci-lint ];
             script = ''
               golangci-lint run ./...
