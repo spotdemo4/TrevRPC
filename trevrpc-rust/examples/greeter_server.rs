@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use futures_util::StreamExt;
-use quinn::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use trevrpc::server::DevelopmentCertificate;
 
 #[path = "shared/cert.rs"]
 mod cert;
@@ -90,9 +90,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(|| DEFAULT_QUIC_ADDR.to_owned())
         .parse::<SocketAddr>()?;
 
-    let identity = make_identity()?;
+    let certificate = DevelopmentCertificate::for_hosts(["localhost", "127.0.0.1"])?;
     let certificate_path = cert::certificate_path()?;
-    write_certificate(&identity, &certificate_path)?;
+    write_certificate(&certificate, &certificate_path)?;
     let webtransport_authorities =
         env_list("TREVRPC_EXAMPLE_AUTHORITIES").unwrap_or_else(|| vec![addr.to_string()]);
     let browser_example_origin = env_or("TREVRPC_EXAMPLE_ORIGIN", DEFAULT_BROWSER_EXAMPLE_ORIGIN);
@@ -106,14 +106,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_http_enabled(true)
         .with_webtransport_enabled(true)
         .with_webtransport_allowed_authorities(webtransport_authorities)
-        .with_webtransport_allowed_origins([browser_example_origin]);
+        .with_webtransport_allowed_origins([browser_example_origin])
+        // Browsers trust the certificate by its hashes, which a development web server fetches
+        // from here and hands to the page. The certificate answers every path it is routed.
+        .with_http_fallback(Some(trevrpc::fallback::HttpFallback::new(
+            certificate.clone(),
+        )));
     server.set_options(options);
     server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(
         &auth_token,
     ));
     greeter::register_greeter(&mut server, GreeterService);
 
-    let endpoint = make_endpoint(addr, &identity, &server)?;
+    let endpoint = quinn::Endpoint::server(server.quic_config(certificate.server_config())?, addr)?;
 
     println!(
         "TrevRPC greeter native QUIC server listening on {}",
@@ -127,6 +132,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "TrevRPC greeter WebTransport server listening on https://{}/trevrpc",
         endpoint.local_addr()?
     );
+    println!(
+        "certificate hashes at https://{}/certificate-hashes",
+        endpoint.local_addr()?
+    );
     println!("certificate written to {}", certificate_path.display());
     println!("bearer token: {auth_token}");
     println!("press Ctrl+C to shut down");
@@ -136,38 +145,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
 
     Ok(())
-}
-
-fn make_identity() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, Box<dyn Error + Send + Sync>> {
-    let signing_key = rcgen::KeyPair::generate()?;
-    let not_before = time::OffsetDateTime::now_utc()
-        .checked_sub(time::Duration::hours(1))
-        .ok_or("certificate start time is out of range")?;
-    let mut params =
-        rcgen::CertificateParams::new(["localhost".to_owned(), "127.0.0.1".to_owned()])?;
-    params.not_before = not_before;
-    params.not_after = not_before
-        .checked_add(time::Duration::hours(25))
-        .ok_or("certificate expiry time is out of range")?;
-    let cert = params.self_signed(&signing_key)?;
-
-    Ok(rcgen::CertifiedKey { cert, signing_key })
-}
-
-fn make_endpoint(
-    addr: SocketAddr,
-    identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
-    server: &trevrpc::server::Server,
-) -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
-    let cert_der = identity.cert.der().clone();
-    let key_der = PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
-
-    let server_crypto = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], PrivateKeyDer::from(key_der))?;
-    let server_config = server.quic_config(server_crypto)?;
-
-    Ok(quinn::Endpoint::server(server_config, addr)?)
 }
 
 fn env_or(name: &str, fallback: &str) -> String {
@@ -190,13 +167,13 @@ fn env_list(name: &str) -> Option<Vec<String>> {
 }
 
 fn write_certificate(
-    identity: &rcgen::CertifiedKey<rcgen::KeyPair>,
+    certificate: &DevelopmentCertificate,
     path: &Path,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, identity.cert.pem())?;
+    std::fs::write(path, certificate.pem()?)?;
     Ok(())
 }
 

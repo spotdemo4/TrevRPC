@@ -36,7 +36,7 @@ mkRustPackage (final: {
   nativeCheckInputs = [ rustfmt ];
   checkPhase = ''
     runHook preCheck
-    cargo test --workspace --offline
+    cargo test --workspace --all-features --offline
     # Run every benchmark once so they keep compiling and working; the numbers are not checked.
     cargo bench --offline --bench frames --bench loopback -- --test
     runHook postCheck
@@ -50,9 +50,10 @@ mkRustPackage (final: {
     ];
     checkPhase = ''
       runHook preCheck
-      cargo test --workspace --offline
+      cargo test --workspace --all-features --offline
       cargo bench --offline --bench frames --bench loopback -- --test
       cargo clippy --workspace --all-targets --offline
+      cargo clippy --workspace --all-targets --all-features --offline
       runHook postCheck
     '';
   };

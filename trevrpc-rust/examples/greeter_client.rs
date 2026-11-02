@@ -98,9 +98,11 @@ fn call_options() -> trevrpc::client::CallOptions {
 
 fn make_client_endpoint() -> Result<quinn::Endpoint, Box<dyn Error + Send + Sync>> {
     let cert_pem = std::fs::read(cert::certificate_path()?)?;
-    let cert_der = CertificateDer::from_pem_slice(&cert_pem)?;
+    // The server writes its current and next development certificates.
     let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert_der)?;
+    for cert_der in CertificateDer::pem_slice_iter(&cert_pem) {
+        roots.add(cert_der?)?;
+    }
 
     let client_crypto = quinn::rustls::ClientConfig::builder()
         .with_root_certificates(roots)

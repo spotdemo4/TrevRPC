@@ -41,7 +41,7 @@ with [cargo](https://doc.rust-lang.org/cargo/):
 
 ```sh
 cd trevrpc-rust
-cargo run --example greeter_server
+cargo run --features dev-certificate --example greeter_server
 cargo run --example greeter_client -- TrevRPC
 ```
 

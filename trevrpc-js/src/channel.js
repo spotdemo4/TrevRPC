@@ -1,3 +1,4 @@
+import { fetchServerCertificateHashes } from "./certificate-hashes.js";
 import { ConnectionMetadataSource } from "./connection-metadata.js";
 import { interceptorList } from "./interceptor.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
@@ -359,7 +360,11 @@ function defaultWebSocketUrl(url) {
   return webSocketUrl.href;
 }
 
-/** Establishes a ready WebTransport session; aborting the signal abandons the attempt. */
+/**
+ * Establishes a ready WebTransport session; aborting the signal abandons the attempt. With
+ * `serverCertificateHashesUrl`, each attempt first fetches the hashes, so that reconnects trust a
+ * development certificate that rotated meanwhile.
+ */
 function dialWebTransport(url, options, signal) {
   const WebTransportConstructor = options.WebTransport ?? globalThis.WebTransport;
   if (typeof WebTransportConstructor !== "function") {
@@ -368,11 +373,28 @@ function dialWebTransport(url, options, signal) {
   if (signal?.aborted) {
     throw abortError(signal);
   }
-  return establish(
-    new WebTransportConstructor(url, transportOptions(options)),
-    "WebTransport",
-    signal,
-    requireWireVersion,
+  const open = (transport) =>
+    establish(
+      new WebTransportConstructor(url, transport),
+      "WebTransport",
+      signal,
+      requireWireVersion,
+    );
+  if (options.serverCertificateHashesUrl === undefined) {
+    return open(transportOptions(options));
+  }
+  return fetchServerCertificateHashes(options.serverCertificateHashesUrl, { signal }).then(
+    (fetched) => {
+      if (signal?.aborted) {
+        throw abortError(signal);
+      }
+      const transport = transportOptions(options);
+      const hashes = [...(transport.serverCertificateHashes ?? []), ...fetched];
+      if (hashes.length > 0) {
+        transport.serverCertificateHashes = hashes;
+      }
+      return open(transport);
+    },
   );
 }
 

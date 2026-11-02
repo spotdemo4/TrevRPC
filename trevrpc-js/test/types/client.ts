@@ -5,6 +5,7 @@ import {
   connect,
   createChannel,
   createServiceClient,
+  fetchServerCertificateHashes,
   type BidirectionalStreamingCall,
   type CallEnd,
   type CallInterceptor,
@@ -26,6 +27,7 @@ import {
 
 const channel = await connect("https://localhost:4433/trevrpc", {
   serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(32) }],
+  serverCertificateHashesUrl: "/certificate-hashes",
   signal: AbortSignal.timeout(5_000),
   transports: ["webtransport", "websocket"],
   webSocketUrl: "wss://localhost:4433/trevrpc",
@@ -37,6 +39,12 @@ const channel = await connect("https://localhost:4433/trevrpc", {
   },
 });
 channel satisfies Channel satisfies Transport;
+(
+  await fetchServerCertificateHashes(new URL("https://localhost:5173/certificate-hashes"), {
+    signal: AbortSignal.timeout(5_000),
+    fetch,
+  })
+)[0]?.value satisfies ArrayBuffer | ArrayBufferView | undefined;
 channel.state satisfies "connecting" | "ready" | "reconnecting" | "closed";
 channel.transport satisfies "webtransport" | "websocket" | undefined;
 await channel.waitUntilReady();

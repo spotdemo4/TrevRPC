@@ -159,6 +159,62 @@ test("the channel keeps reconnecting when a reconnect selects another protocol",
   channel.close();
 });
 
+test("each attempt fetches serverCertificateHashesUrl and adds its hashes", async (t) => {
+  const published = [["11"], ["22"]];
+  const fetch = t.mock.method(globalThis, "fetch", async () =>
+    Response.json(
+      published.shift().map((byte) => ({ algorithm: "sha-256", value: byte.repeat(32) })),
+    ),
+  );
+  const { WebTransport, sessions } = fakeWebTransport();
+  const fixed = { algorithm: "sha-256", value: new Uint8Array(32) };
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    serverCertificateHashes: [fixed],
+    serverCertificateHashesUrl: "https://app.example.test/certificate-hashes",
+  });
+  await waitFor(() => sessions.length === 1);
+  assert.equal(fetch.mock.calls[0].arguments[0], "https://app.example.test/certificate-hashes");
+  assert.deepEqual(sessions[0].options.serverCertificateHashes, [
+    fixed,
+    { algorithm: "sha-256", value: new Uint8Array(32).fill(0x11) },
+  ]);
+  sessions[0].becomeReady();
+  const channel = await connecting;
+
+  // The certificate rotated: the reconnect fetches the new hashes.
+  sessions[0].lose();
+  await waitFor(() => sessions.length === 2);
+  assert.deepEqual(sessions[1].options.serverCertificateHashes, [
+    fixed,
+    { algorithm: "sha-256", value: new Uint8Array(32).fill(0x22) },
+  ]);
+  channel.close();
+});
+
+test("a 404 from serverCertificateHashesUrl adds no hashes, and a failed fetch fails the attempt", async (t) => {
+  let status = 404;
+  t.mock.method(globalThis, "fetch", async () => new Response("", { status }));
+  const { WebTransport, sessions } = fakeWebTransport();
+  const options = {
+    transports: WebTransportOnly,
+    WebTransport,
+    serverCertificateHashesUrl: "/certificate-hashes",
+  };
+  const connecting = connect("https://example.test/trevrpc", options);
+  await waitFor(() => sessions.length === 1);
+  assert.deepEqual(sessions[0].options, { protocols: ["trevrpc-1"] });
+  sessions[0].becomeReady();
+  (await connecting).close();
+
+  status = 500;
+  await assert.rejects(connect("https://example.test/trevrpc", options), (error) => {
+    return error.code === Code.Unavailable && /HTTP 500/.test(error.statusMessage);
+  });
+  assert.equal(sessions.length, 1, "no session is opened without the hashes");
+});
+
 test("connect fails when the session cannot be established", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
   const connecting = connect("https://example.test/trevrpc", {

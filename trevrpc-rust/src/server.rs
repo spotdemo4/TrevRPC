@@ -29,6 +29,9 @@ use crate::{
     Status, Unreliable,
 };
 
+#[cfg(feature = "dev-certificate")]
+pub use crate::dev_certificate::DevelopmentCertificate;
+
 type UnaryHandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
 type UnaryHandler =
     Arc<dyn Fn(RequestContext, Vec<u8>) -> UnaryHandlerFuture + Send + Sync + 'static>;

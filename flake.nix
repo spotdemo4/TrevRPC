@@ -374,6 +374,7 @@
             script = ''
               cargo fmt --all --check
               cargo clippy --workspace --all-targets --offline -- -D warnings
+              cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
             '';
           };
 

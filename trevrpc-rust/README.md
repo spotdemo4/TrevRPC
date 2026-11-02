@@ -8,7 +8,7 @@ The Rust crate is built on [Quinn](https://github.com/quinn-rs/quinn):
 - **Server:** `server::Server` serves native QUIC always, plus ordinary HTTP/3 (`POST /trevrpc`) and WebTransport (`/trevrpc`) when enabled, from one Quinn endpoint dispatching on the negotiated ALPN. With a TCP listener it also serves QMux over TLS, HTTP/2, and QMux over WebSocket; see [TCP fallback](#tcp-fallback).
 - **Codegen:** `protoc-gen-trevrpc-rust` generates service traits, `register_*` functions and typed clients.
 
-There are no Cargo features: the HTTP/3, WebTransport, and TCP fallback servers are a handful of small crates next to Quinn (`h3`, `h2`, `tokio-rustls`, and the [`qmux`](https://crates.io/crates/qmux) crate), so a feature matrix would buy almost no compile time.
+The transports need no Cargo features: the HTTP/3, WebTransport, and TCP fallback servers are a handful of small crates next to Quinn (`h3`, `h2`, `tokio-rustls`, and the [`qmux`](https://crates.io/crates/qmux) crate), so a feature matrix would buy almost no compile time. The one optional feature, `dev-certificate`, adds the development certificate below and its `rcgen` dependency.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
@@ -177,6 +177,8 @@ WebTransport policy: a session must use the shared path, then pass the authority
 
 `with_http_fallback` serves every other HTTP request on the same endpoint and TCP listener, over HTTP/3, HTTP/2 and HTTP/1.1, with any `tower_service::Service`, such as the static content of the web application that calls the server (`HttpFallback::new(tower_http::services::ServeDir::new("dist"))`). `TrevRPC` keeps the HTTP path while HTTP or WebTransport is enabled; see [Serving Other HTTP Content](https://trev.zip/llc/TrevRPC/wiki/HTTP3#serving-other-http-content).
 
+For local development, `server::DevelopmentCertificate::new()` (feature `dev-certificate`) generates a self-signed ECDSA certificate for `localhost`, `127.0.0.1` and `::1` that rotates itself within the 14-day limit browsers place on certificates they trust by hash. Pass its `server_config()` to `quic_config` and `tcp_tls_config`. As a `tower_service::Service` it answers its current and next SHA-256 hashes as JSON, which the browser client's `serverCertificateHashesUrl` reads, and `pem()` returns both certificates for native clients to trust. See [Development certificates](https://trev.zip/llc/TrevRPC/wiki/WebTransport#development-certificates).
+
 `Server::serve_with_shutdown` drains in-flight RPCs for up to `ServerOptions::graceful_shutdown_timeout` before closing the endpoint.
 
 `http3_enabled`, `http3_path`, and `http3_admission` (and their `with_*` builders) were renamed `http_enabled`, `http_path`, and `http_admission`, and `Http3Admission`/`Http3AdmissionRequest` became `HttpAdmission`/`HttpAdmissionRequest`, because the HTTP mapping is now also served over HTTP/2.
@@ -250,6 +252,6 @@ println!("{:?}", channel.transport()); // Some(TransportKind::Quic) or Some(Tran
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run --example greeter_server   # then, in another shell:
+cargo run --features dev-certificate --example greeter_server   # then, in another shell:
 cargo run --example greeter_client
 ```

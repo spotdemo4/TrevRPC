@@ -143,7 +143,17 @@ async fn spawn_server_with(
     let tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key)?;
+    spawn_server_with_tls(options, configure, tls, cert_der).await
+}
 
+/// Spawns a server like [`spawn_server_with`] that presents `tls`, which clients trust through
+/// `cert`.
+async fn spawn_server_with_tls(
+    options: ServerOptions,
+    configure: impl FnOnce(&mut Server),
+    tls: quinn::rustls::ServerConfig,
+    cert_der: CertificateDer<'static>,
+) -> TestResult<RunningServer> {
     let mut server = Server::new();
     server.set_options(options);
     greeter::register_greeter(&mut server, Greeter);
@@ -582,6 +592,61 @@ async fn channel_falls_back_to_qmux_when_udp_is_unreachable() -> TestResult {
     )
     .await??;
     channel.close();
+    server.stop().await
+}
+
+#[cfg(feature = "dev-certificate")]
+#[tokio::test]
+async fn development_certificate_serves_every_transport_and_its_hashes() -> TestResult {
+    use quinn::rustls::pki_types::pem::PemObject as _;
+
+    let certificate = trevrpc::server::DevelopmentCertificate::new()?;
+    let pem = certificate.pem()?;
+    let current = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .next()
+        .ok_or("no certificate in the PEM")??;
+    let options = test_options().with_http_fallback(Some(HttpFallback::new(certificate.clone())));
+    let server =
+        spawn_server_with_tls(options, |_| {}, certificate.server_config(), current).await?;
+
+    let quic = channel(&server, server.udp, ChannelConfig::new()).await?;
+    ensure_eq!(quic.transport(), Some(TransportKind::Quic));
+    tokio::time::timeout(
+        TEST_TIMEOUT,
+        exercise_greeter(&greeter::GreeterClient::new(quic.clone())),
+    )
+    .await??;
+    quic.close();
+    let qmux = channel(
+        &server,
+        server.udp,
+        ChannelConfig::new().with_transport_policy(TransportPolicy::TcpOnly),
+    )
+    .await?;
+    ensure_eq!(qmux.transport(), Some(TransportKind::Qmux));
+    qmux.close();
+
+    let [hash, next] = certificate.hashes()?;
+    let hex = |hash: [u8; 32]| {
+        hash.iter()
+            .fold(String::new(), |hex, byte| format!("{hex}{byte:02x}"))
+    };
+    let expected = format!(
+        r#"[{{"algorithm":"sha-256","value":"{}"}},{{"algorithm":"sha-256","value":"{}"}}]"#,
+        hex(hash),
+        hex(next),
+    );
+    let sender = http2_sender(&server).await?;
+    let (status, _, body) =
+        http2_fallback_request(&server, &sender, "GET", "/certificate-hashes", "").await?;
+    ensure_eq!(status, http::StatusCode::OK);
+    ensure_eq!(body, expected);
+    ensure_eq!(
+        http3_request(&server, "GET", "/certificate-hashes", "")
+            .await?
+            .2,
+        expected
+    );
     server.stop().await
 }
 

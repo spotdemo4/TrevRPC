@@ -17,6 +17,8 @@ pub mod compression;
 mod congestion;
 mod connection_metadata;
 mod datagram;
+#[cfg(feature = "dev-certificate")]
+mod dev_certificate;
 pub mod error;
 pub mod fallback;
 mod framed;

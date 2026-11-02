@@ -511,6 +511,22 @@ export interface WebTransportCertificateHash {
   value: ArrayBuffer | ArrayBufferView;
 }
 
+export interface FetchServerCertificateHashesOptions {
+  signal?: AbortSignal;
+  /** The fetch implementation to use instead of the global one. */
+  fetch?: (input: string | URL, init?: RequestInit) => Promise<Response>;
+}
+
+/**
+ * Fetches the certificate hashes a TrevRPC development server publishes, as JSON such as
+ * `[{"algorithm":"sha-256","value":"<hex>"}]`, for `serverCertificateHashes`. A 404 yields no
+ * hashes; any other failure rejects with Unavailable.
+ */
+export function fetchServerCertificateHashes(
+  url: string | URL,
+  options?: FetchServerCertificateHashesOptions,
+): Promise<WebTransportCertificateHash[]>;
+
 export interface WebTransportSessionLike extends Transport {
   readonly ready: Promise<unknown>;
   /**
@@ -548,6 +564,14 @@ export interface ConnectOptions {
    * only: the WebSocket fallback needs a certificate the browser trusts.
    */
   serverCertificateHashes?: readonly WebTransportCertificateHash[];
+  /**
+   * A URL that publishes the server's development certificate hashes, such as a path that the
+   * development web server proxies to the TrevRPC server's DevelopmentCertificate. Every
+   * WebTransport attempt fetches it, so reconnects follow a rotated certificate, and adds its
+   * hashes to `serverCertificateHashes`; a 404 adds none, so the same build works against a server
+   * with a trusted certificate. A failed fetch fails the WebTransport attempt.
+   */
+  serverCertificateHashesUrl?: string | URL;
   /**
    * WebTransport implementation to use instead of the global one. It is constructed with
    * `protocols: ["trevrpc-1"]`, the wire version, which cannot be changed.

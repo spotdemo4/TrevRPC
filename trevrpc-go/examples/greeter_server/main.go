@@ -2,20 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"log"
-	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/examples/greeter"
@@ -87,10 +79,14 @@ func (s *echoReplies) Close() error {
 }
 
 func main() {
-	tlsConfig, certPath, err := serverTLSConfig()
+	certificate, certPath, err := developmentCertificate()
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Browsers trust the certificate by its hashes, which a development web
+	// server fetches from here and hands to the page.
+	fallback := http.NewServeMux()
+	fallback.Handle("GET /certificate-hashes", certificate)
 
 	server := trevrpc.NewServer()
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
@@ -98,10 +94,11 @@ func main() {
 	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = allowBrowserExampleSession
+	options.HTTPFallback = fallback
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
 
-	listener, err := trevrpc.Listen(listenAddr, server, trevrpc.ListenOptions{TLSConfig: tlsConfig})
+	listener, err := trevrpc.Listen(listenAddr, server, trevrpc.ListenOptions{TLSConfig: certificate.TLSConfig()})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -115,6 +112,7 @@ func main() {
 	log.Printf("HTTP/3 URL: https://%s/trevrpc", listener.Addr())
 	log.Printf("WebTransport URL: https://%s/trevrpc", listener.Addr())
 	log.Printf("bearer token: %s", authToken)
+	log.Printf("certificate hashes: https://%s/certificate-hashes", listener.Addr())
 	log.Printf("wrote client trust certificate to %s", certPath)
 	if err := listener.Serve(context.Background()); err != nil {
 		log.Fatal(err)
@@ -157,30 +155,17 @@ func allowedWebTransportAuthorities(addr string) map[string]struct{} {
 	return authorities
 }
 
-func serverTLSConfig() (*tls.Config, string, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// developmentCertificate generates the server's rotating development
+// certificate and writes it where the example client loads its trust from.
+func developmentCertificate() (*trevrpc.DevelopmentCertificate, string, error) {
+	certificate, err := trevrpc.NewDevelopmentCertificate("localhost", "127.0.0.1")
 	if err != nil {
 		return nil, "", err
 	}
-
-	notBefore := time.Now().Add(-time.Hour)
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "localhost"},
-		NotBefore:    notBefore,
-		NotAfter:     notBefore.Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	certPEM, err := certificate.PEM()
 	if err != nil {
 		return nil, "", err
 	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	certPath, err := examplecert.Path()
 	if err != nil {
 		return nil, "", err
@@ -192,7 +177,5 @@ func serverTLSConfig() (*tls.Config, string, error) {
 		return nil, "", err
 	}
 
-	return &tls.Config{
-		Certificates: []tls.Certificate{{Certificate: [][]byte{certDER}, PrivateKey: key}},
-	}, certPath, nil
+	return certificate, certPath, nil
 }
