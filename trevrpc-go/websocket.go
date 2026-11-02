@@ -76,7 +76,7 @@ func (l *Listener) handleWebSocket(w http.ResponseWriter, r *http.Request, h *ht
 		_ = conn.CloseNow()
 		return
 	}
-	l.serveQMuxSession(session, func(err error) {
+	l.serveQMuxSession(session, remoteAddrOf(r.RemoteAddr), func(err error) {
 		runtime.emitDiagnostic(ServerDiagnostic{
 			Phase:      ServerDiagnosticSessionClosed,
 			Message:    err.Error(),

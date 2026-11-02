@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -40,6 +41,8 @@ type drainingStream struct {
 	// connectionMetadata is the connection metadata the server keeps for the
 	// stream's connection or session.
 	connectionMetadata *connectionMetadataStore
+	// remoteAddr is the client address of the stream's connection or session.
+	remoteAddr netip.AddrPort
 	// shutdown ends a running drain early.
 	shutdown     context.Context
 	drainTimeout time.Duration
@@ -67,6 +70,8 @@ func (s *drainingStream) trevrpcDatagrams() *datagramMux { return s.datagrams }
 func (s *drainingStream) trevrpcConnectionMetadata() *connectionMetadataStore {
 	return s.connectionMetadata
 }
+
+func (s *drainingStream) trevrpcRemoteAddr() netip.AddrPort { return s.remoteAddr }
 
 func (s *drainingStream) Read(data []byte) (int, error) {
 	s.mu.Lock()

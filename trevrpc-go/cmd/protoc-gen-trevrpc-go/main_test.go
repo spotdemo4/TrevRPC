@@ -77,6 +77,19 @@ func TestGenerateAllRPCShapes(t *testing.T) {
 	}
 }
 
+// TestGeneratorSupportsProto3Optional checks the response declares proto3
+// optional support, without which protoc refuses files with optional fields.
+func TestGeneratorSupportsProto3Optional(t *testing.T) {
+	response := generate(greeterRequest(""))
+	if response.GetError() != "" {
+		t.Fatalf("generator returned error: %s", response.GetError())
+	}
+	want := uint64(plugin.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
+	if response.GetSupportedFeatures()&want == 0 {
+		t.Fatalf("supported features %#x lack FEATURE_PROTO3_OPTIONAL", response.GetSupportedFeatures())
+	}
+}
+
 func TestGeneratedAllRPCShapesCompileAndRoundTripMetadata(t *testing.T) {
 	runtimeRoot, root, relativeRoot, importPrefix := newInModuleFixture(t)
 	response := generate(greeterRequestWithPackage("", importPrefix+"/hello/v1;hellov1"))

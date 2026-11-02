@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"net/netip"
 
 	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
 )
@@ -30,8 +31,9 @@ func (l *Listener) openServerQMux(timeout context.Context, conn qmux.RecordConn)
 	return qmux.Open(timeout, conn, qmux.RoleServer, serverQMuxConfig(l.runtime.options))
 }
 
-// serveQMuxSession serves RPCs on the streams of a QMux session until it ends.
-func (l *Listener) serveQMuxSession(session *qmux.Session, onClosed func(error)) {
+// serveQMuxSession serves RPCs on the streams of a QMux session with the
+// client at remoteAddr until it ends.
+func (l *Listener) serveQMuxSession(session *qmux.Session, remoteAddr netip.AddrPort, onClosed func(error)) {
 	connectionMetadata := new(connectionMetadataStore)
 	l.serveStreams(l.ctx, streamAcceptor{
 		accept: func(ctx context.Context) (rpcStream, context.Context, error) {
@@ -41,6 +43,7 @@ func (l *Listener) serveQMuxSession(session *qmux.Session, onClosed func(error))
 			}
 			draining := newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) })
 			draining.connectionMetadata = connectionMetadata
+			draining.remoteAddr = remoteAddr
 			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = session.CloseWithError(0, message) },

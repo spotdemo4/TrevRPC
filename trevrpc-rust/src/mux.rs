@@ -4,6 +4,7 @@
 //! connection handler and stream adapters are written once.
 
 use std::future::Future;
+use std::net::SocketAddr;
 
 use crate::datagram::DatagramTransport;
 use crate::framed::{FrameRead, FrameWrite};
@@ -35,6 +36,10 @@ pub trait MuxConnection: Clone + Send + Sync + 'static {
 
     /// Resolves with the reason once the connection has ended.
     fn connection_lost(&self) -> impl Future<Output = Error> + Send;
+
+    /// The client's address (see [`crate::server::RequestContext::remote_addr`]), or `None` when
+    /// it is not known, as on the client side of a `QMux` connection.
+    fn remote_addr(&self) -> Option<SocketAddr>;
 
     /// The connection's datagrams, or `None` when the transport has none (`QMux` does not).
     ///

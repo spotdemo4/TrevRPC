@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"net/netip"
 	"sync/atomic"
 )
 
@@ -36,6 +37,12 @@ type HandlerContext struct {
 	FullMethod string
 	Kind       RPCKind
 	Metadata   Metadata
+	// RemoteAddr is the address of the client: the source address of a QUIC
+	// connection, or of a TCP connection unless it came from a trusted proxy
+	// (see ListenOptions.TrustedProxies), whose PROXY header then names the
+	// client. IPv4 clients have IPv4 addresses on every transport. It is the
+	// zero AddrPort when the transport does not know it.
+	RemoteAddr netip.AddrPort
 
 	// flow is the call's datagram flow, nil without one.
 	flow *datagramFlow
@@ -84,6 +91,7 @@ func newHandlerContext(request *wireRequest) HandlerContext {
 		Kind:       request.rpcKind(),
 		// Decoded for this call, connection metadata included, so not copied.
 		Metadata:      ownedMetadata(request.Metadata),
+		RemoteAddr:    request.remoteAddr,
 		flow:          request.flow,
 		streams:       request.streams,
 		plainRequests: request.plainRequests,

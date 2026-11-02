@@ -28,6 +28,7 @@ mod http_admission;
 mod latest;
 mod mux;
 mod native;
+mod proxy_protocol;
 mod qmux_conn;
 mod queue;
 mod quic;

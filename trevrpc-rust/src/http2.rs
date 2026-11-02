@@ -2,6 +2,7 @@
 //! clients such as Cronet that fall back from HTTP/3 when UDP is blocked.
 
 use std::future::{pending, poll_fn};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,10 +23,12 @@ use crate::server::Server;
 use crate::server_transport::{Permit, try_acquire_permit};
 use crate::{Error, Result, Status};
 
-/// Serves one HTTP/2 connection until it closes or the server shuts down.
+/// Serves one HTTP/2 connection from the client at `remote_addr` until it closes or the server
+/// shuts down.
 pub async fn handle_connection<T>(
     server: Server,
     io: T,
+    remote_addr: SocketAddr,
     alt_svc: Option<HeaderValue>,
     handshake_timeout: Duration,
     request_limit: Option<Arc<Semaphore>>,
@@ -83,6 +86,7 @@ pub async fn handle_connection<T>(
                     server,
                     request_limit,
                     stream_permit,
+                    remote_addr,
                     request,
                     respond,
                     alt_svc,
@@ -119,6 +123,7 @@ async fn handle_request(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
     mut stream_permit: Permit,
+    remote_addr: SocketAddr,
     request: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     alt_svc: Option<HeaderValue>,
@@ -134,7 +139,7 @@ async fn handle_request(
     }
     let (parts, body) = request.into_parts();
     let head = Request::from_parts(parts, ());
-    if let Some(status) = validate_http_request(&server, &head) {
+    if let Some(status) = validate_http_request(&server, &head, remote_addr) {
         stream_permit.release();
         reject(respond, status);
         return;
@@ -149,7 +154,11 @@ async fn handle_request(
         // HTTP/2 request streams have no datagrams.
         None,
         H2Sink(send),
-        H2Source { body, closed },
+        H2Source {
+            body,
+            closed,
+            remote_addr,
+        },
         shutdown,
     )
     .await;
@@ -233,6 +242,7 @@ impl ResponseSink for H2Sink {
 struct H2Source {
     body: h2::RecvStream,
     closed: watch::Receiver<bool>,
+    remote_addr: SocketAddr,
 }
 
 impl BodySource for H2Source {
@@ -266,5 +276,9 @@ impl BodySource for H2Source {
         Some(RequestTransportEvent::ConnectionLost(Status::unavailable(
             "transport unavailable: HTTP/2 connection closed",
         )))
+    }
+
+    fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
     }
 }

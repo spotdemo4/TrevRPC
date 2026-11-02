@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -61,7 +62,8 @@ func (l *Listener) handleHTTPRPC(w http.ResponseWriter, r *http.Request) {
 	if err := controller.Flush(); err != nil {
 		return
 	}
-	handleRPCStream(r.Context(), l.server, &httpBody{body: r.Body, writer: w, controller: controller}, slot, l.workers)
+	body := &httpBody{body: r.Body, writer: w, controller: controller, remoteAddr: remoteAddrOf(r.RemoteAddr)}
+	handleRPCStream(r.Context(), l.server, body, slot, l.workers)
 }
 
 // acquireHTTPStreamSlot takes a stream slot of the connection r arrived on.
@@ -92,6 +94,7 @@ type httpBody struct {
 	body       io.ReadCloser
 	writer     http.ResponseWriter
 	controller *http.ResponseController
+	remoteAddr netip.AddrPort
 	closeOnce  sync.Once
 }
 
@@ -116,6 +119,8 @@ func (b *httpBody) SetReadDeadline(deadline time.Time) error {
 }
 
 func (b *httpBody) trevrpcCancelRead() { _ = b.Close() }
+
+func (b *httpBody) trevrpcRemoteAddr() netip.AddrPort { return b.remoteAddr }
 
 func (b *httpBody) trevrpcCancelReadOnContext(ctx context.Context) func() {
 	return watchContextCancellation(ctx, b.trevrpcCancelRead)
@@ -209,12 +214,13 @@ func (r *serverRuntime) invokeAdmission(callback Admission, defaultAdmit bool, r
 		}
 	}()
 	return callback(AdmissionRequest{
-		Header:    request.Header.Clone(),
-		Path:      request.URL.Path,
-		Method:    request.Method,
-		Proto:     request.Proto,
-		Authority: request.Host,
-		Origin:    request.Header.Get("Origin"),
-		Secure:    request.TLS != nil,
+		Header:     request.Header.Clone(),
+		Path:       request.URL.Path,
+		Method:     request.Method,
+		Proto:      request.Proto,
+		Authority:  request.Host,
+		Origin:     request.Header.Get("Origin"),
+		Secure:     request.TLS != nil,
+		RemoteAddr: remoteAddrOf(request.RemoteAddr),
 	}), nil
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -30,6 +31,15 @@ type ListenOptions struct {
 	TCPAddr string
 	// DisableTCP serves QUIC only.
 	DisableTCP bool
+	// TrustedProxies lists the networks of TCP load balancers that forward
+	// client connections with a PROXY protocol header, version 1 or 2, in
+	// front of the TLS handshake. A connection from one of them must begin
+	// with the header, whose source address becomes the client's
+	// RemoteAddr; one from anywhere else is never read for a header. QUIC
+	// connections always report their UDP source address, so load balancers
+	// in front of the UDP socket must preserve it. IPv4 networks match IPv4
+	// clients however the socket reports them.
+	TrustedProxies []netip.Prefix
 	// TLSHandshakeTimeout bounds the TLS handshake of TCP connections and the
 	// QMux handshake or HTTP request headers that follow it. It defaults to
 	// 10 seconds.
@@ -59,6 +69,7 @@ type Listener struct {
 
 	tcp              net.Listener // nil when TCP is disabled
 	tcpTLS           *tls.Config
+	trustedProxies   []netip.Prefix
 	handshakeTimeout time.Duration
 	httpTCP          *httpTCPServer // nil unless HTTP or WebTransport is enabled
 
@@ -106,13 +117,18 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 	if err := server.compressionError(); err != nil {
 		return nil, err
 	}
+	trustedProxies, err := trustedProxyPrefixes(options.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
-		server:  server,
-		runtime: server.freeze(),
-		ctx:     ctx,
-		cancel:  cancel,
-		workers: newStreamWorkers(ctx, streamWorkerIdle),
+		server:         server,
+		runtime:        server.freeze(),
+		trustedProxies: trustedProxies,
+		ctx:            ctx,
+		cancel:         cancel,
+		workers:        newStreamWorkers(ctx, streamWorkerIdle),
 	}
 	if err := l.bind(addr, options); err != nil {
 		cancel()

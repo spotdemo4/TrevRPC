@@ -185,6 +185,9 @@ const FieldLabel = Object.freeze({
   Repeated: 3,
 });
 
+/** The CodeGeneratorResponse features this generator supports. */
+const FEATURE_PROTO3_OPTIONAL = 1;
+
 /** Generic runtime types that generated declarations import only when they use them. */
 const GeneratedTypeImports = [
   "BidirectionalStreamingCall",
@@ -262,9 +265,9 @@ export function generate(request) {
       });
     }
 
-    return { file: files };
+    return { file: files, supportedFeatures: FEATURE_PROTO3_OPTIONAL };
   } catch (error) {
-    return { error: error.message };
+    return { error: error.message, supportedFeatures: FEATURE_PROTO3_OPTIONAL };
   }
 }
 
@@ -605,12 +608,25 @@ function generateMessageDeclaration({ fullName, message }, typeNames) {
 
 function generateFieldDeclaration(field, mapEntries, typeNames, currentFullName) {
   const optional = field.label === FieldLabel.Required ? "" : "?";
+  const nullable = decodesAbsentAsNull(field) ? " | null" : "";
   return `  ${typescriptPropertyName(fieldJsonName(field))}${optional}: ${fieldTypeScriptType(
     field,
     mapEntries,
     typeNames,
     currentFullName,
-  )};`;
+  )}${nullable};`;
+}
+
+/** Reports whether protobuf.js decodes the field as null when it is absent. */
+function decodesAbsentAsNull(field) {
+  if (field.label === FieldLabel.Repeated) {
+    return false;
+  }
+  return (
+    field.proto3Optional === true ||
+    field.type === FieldType.Message ||
+    field.type === FieldType.Group
+  );
 }
 
 function fieldTypeScriptType(field, mapEntries, typeNames, currentFullName) {
@@ -786,6 +802,11 @@ function fieldToJson(field, mapEntries) {
   if (field.defaultValue != null && field.defaultValue !== "") {
     json.options = { default: field.defaultValue };
   }
+  if (field.proto3Optional) {
+    // protobuf.js gives the field presence, decoding it as null when absent,
+    // only when this option marks its synthetic oneof.
+    json.options = { ...json.options, proto3_optional: true };
+  }
 
   return json;
 }
@@ -806,7 +827,9 @@ function oneofsToJson(message) {
   const oneofs = {};
   for (const [index, oneof] of (message.oneofDecl ?? []).entries()) {
     const fields = (message.field ?? [])
-      .filter((field) => field.oneofIndex === index)
+      // A decoded descriptor reads an unset oneof_index as 0 from its
+      // prototype, so only an own property places the field in a oneof.
+      .filter((field) => Object.hasOwn(field, "oneofIndex") && field.oneofIndex === index)
       .map(fieldJsonName);
     if (fields.length > 0) {
       oneofs[oneof.name] = { oneof: fields };

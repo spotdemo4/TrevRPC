@@ -202,6 +202,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
+	request.remoteAddr = streamRemoteAddr(stream)
 	// The connection's metadata joins the call's before anything reads it.
 	err = streamConnectionMetadata(stream).resolve(request)
 	if err == nil {

@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -13,7 +14,7 @@ use crate::request_pump::{
     RequestInputKind, RequestPumpReader, RequestPumpSettle, UnaryRequestEnd, start_request_pump,
 };
 use crate::server::{
-    Admitted, CancellationSource, CancellationToken, RequestBudget, RequestCounts, Server,
+    Admitted, CallInfo, CancellationSource, CancellationToken, RequestBudget, Server,
 };
 use crate::{
     Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcAnswer, RpcKind, RpcRequest,
@@ -62,6 +63,8 @@ pub struct IncomingRequest {
     /// The connection metadata set the request offered and the connection stored, which the
     /// call's ANSWER confirms; zero for none. See [`resolve_connection_metadata`].
     pub(crate) connection_metadata: u32,
+    /// The client's address, which the transport sets once the REQUEST frame is read.
+    pub(crate) remote_addr: Option<SocketAddr>,
 }
 
 /// Merges the connection metadata the REQUEST offers or refers to into its metadata, and stores
@@ -176,6 +179,7 @@ where
         stream: ServerStream::default(),
         admitted: None,
         connection_metadata: 0,
+        remote_addr: None,
     })
 }
 
@@ -211,6 +215,7 @@ where
         stream: _,
         admitted: _,
         connection_metadata,
+        remote_addr,
     } = incoming;
     async move {
         let cancellation = CancellationToken::new();
@@ -220,7 +225,7 @@ where
         let admitted = if request.rpc_kind() == RpcKind::Unary {
             None
         } else {
-            match server.admit(&request, &cancellation).await {
+            match server.admit(&request, remote_addr, &cancellation).await {
                 Ok(admitted) => Some(admitted),
                 Err(status) => {
                     drop(stream_permit);
@@ -275,6 +280,7 @@ where
                 stream,
                 admitted,
                 connection_metadata,
+                remote_addr,
             };
             // Boxed, so that the futures of unary calls do not hold room for a streaming call's.
             Box::pin(handle_streaming_rpc(
@@ -291,14 +297,15 @@ where
         }
 
         let method_for_failure = request.method.clone();
-        let counts = RequestCounts {
+        let info = CallInfo {
             plain_compressed: budget.accept.plain_count(),
-            ..RequestCounts::default()
+            remote_addr,
+            ..CallInfo::default()
         };
         let mut request_end = UnaryRequestEnd::new(recv, server.max_frame_size(), budget);
         let response = tokio::select! {
             biased;
-            response = server.handle_request_with_cancellation(request, body, cancellation.clone(), counts) => response,
+            response = server.handle_request_with_cancellation(request, body, cancellation.clone(), info) => response,
             failure = request_end.failure() => {
                 server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
                 if let Some(source) = failure.cancellation_source() {
@@ -388,6 +395,7 @@ pub async fn reject_stream<W, R>(
         stream: _,
         admitted: _,
         connection_metadata: _,
+        remote_addr: _,
     } = incoming;
     let status = Status::unavailable("too many concurrent streams on connection");
     server.record_rejected_request(&request, body.len(), &status);
@@ -493,6 +501,7 @@ async fn handle_streaming_rpc<W, R>(
         stream,
         admitted,
         connection_metadata: _,
+        remote_addr,
     } = incoming;
     // Calls whose requests may be stream-compressed get their ANSWER at dispatch, before any
     // request message is read, so the client learns it while it still streams. Other calls get
@@ -541,10 +550,11 @@ async fn handle_streaming_rpc<W, R>(
             request_body,
             admitted,
             cancellation.clone(),
-            RequestCounts {
+            CallInfo {
                 datagrams: datagram_count,
                 stream_compressed: stream.count,
                 plain_compressed,
+                remote_addr,
             },
         ) => response,
         failure = request_pump.failure() => {

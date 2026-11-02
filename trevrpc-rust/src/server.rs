@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -167,15 +168,30 @@ struct ServerState {
     stream_budget: Option<Arc<StreamBudget>>,
 }
 
-/// The counters of a call's request messages that its handler context reports.
+/// What a call's handler context reports beyond its REQUEST frame: the counters of its request
+/// messages and the client's address.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct RequestCounts {
+pub(crate) struct CallInfo {
     /// The request messages that arrived as datagrams.
     pub(crate) datagrams: MessageCount,
     /// The request messages that arrived stream-compressed.
     pub(crate) stream_compressed: MessageCount,
     /// The request messages that arrived compressed without a dictionary.
     pub(crate) plain_compressed: MessageCount,
+    /// The client's address, `None` for a call that did not arrive over a connection.
+    pub(crate) remote_addr: Option<SocketAddr>,
+}
+
+/// Returns `addr` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as plain IPv4, so that a
+/// client has the same address over every transport, dual-stack sockets included.
+pub(crate) fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
 }
 
 /// Identifies the first lifecycle event that cancelled an RPC.
@@ -292,6 +308,7 @@ pub struct RequestContext {
     stream_compressed: MessageCount,
     /// Counts the request messages that arrived compressed without a dictionary.
     plain_compressed: MessageCount,
+    remote_addr: Option<SocketAddr>,
     /// The response metadata the handler sets, shared by every clone of the context.
     response: ResponseMetadata,
 }
@@ -305,7 +322,7 @@ impl RequestContext {
             request.metadata.clone(),
             deadline,
             CancellationToken::new(),
-            RequestCounts::default(),
+            CallInfo::default(),
         )
     }
 
@@ -315,7 +332,7 @@ impl RequestContext {
         metadata: Metadata,
         deadline: Option<Instant>,
         cancellation: CancellationToken,
-        counts: RequestCounts,
+        info: CallInfo,
     ) -> Self {
         let service_len = split_method_path(&path).map(|(service, _)| service.len());
         Self {
@@ -325,11 +342,19 @@ impl RequestContext {
             metadata,
             deadline,
             cancellation,
-            datagrams: counts.datagrams,
-            stream_compressed: counts.stream_compressed,
-            plain_compressed: counts.plain_compressed,
+            datagrams: info.datagrams,
+            stream_compressed: info.stream_compressed,
+            plain_compressed: info.plain_compressed,
+            remote_addr: info.remote_addr,
             response: ResponseMetadata::default(),
         }
+    }
+
+    /// Sets the client's address [`RequestContext::remote_addr`] returns, for tests of handlers.
+    #[must_use]
+    pub const fn with_remote_addr(mut self, remote_addr: SocketAddr) -> Self {
+        self.remote_addr = Some(remote_addr);
+        self
     }
 
     /// Sets a response header of the call, sent in a HEADERS frame ahead of the first response
@@ -406,6 +431,19 @@ impl RequestContext {
     #[must_use]
     pub const fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    /// Returns the client's address: the QUIC connection's remote address for native QUIC,
+    /// HTTP/3 and `WebTransport` calls, and for calls on the TCP listener the TCP peer's address,
+    /// or the client address in the PROXY header of a trusted proxy (see
+    /// [`crate::tcp::TcpFallback::trusted_proxies`]). An IPv4 client's address is always IPv4,
+    /// even on a dual-stack socket.
+    ///
+    /// `None` for a call that did not arrive over a connection, such as one passed to
+    /// [`Server::handle_request`].
+    #[must_use]
+    pub const fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
     }
 
     #[must_use]
@@ -499,6 +537,8 @@ pub struct AdmissionHeader<'a> {
 
 #[derive(Clone, Copy)]
 pub struct WebTransportAdmissionRequest<'a> {
+    /// The client's address; see [`RequestContext::remote_addr`].
+    pub remote_addr: SocketAddr,
     pub path: &'a str,
     pub authority: Option<&'a str>,
     pub origin: Option<&'a str>,
@@ -510,6 +550,8 @@ pub type WebTransportAdmission = for<'a> fn(&WebTransportAdmissionRequest<'a>) -
 #[derive(Clone, Copy)]
 pub struct HttpAdmissionRequest<'a> {
     pub request: &'a http::Request<()>,
+    /// The client's address; see [`RequestContext::remote_addr`].
+    pub remote_addr: SocketAddr,
     pub path: &'a str,
     pub authority: Option<&'a str>,
     pub secure: bool,
@@ -970,11 +1012,22 @@ impl ServerOptions {
     }
 }
 
+/// What an [`Authorizer`] decides on: the call's REQUEST frame and the client's address.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthorizationRequest<'a> {
+    pub request: &'a RpcRequest,
+    /// The client's address; see [`RequestContext::remote_addr`].
+    pub remote_addr: Option<SocketAddr>,
+}
+
 #[crate::async_trait]
 pub trait Authorizer: Send + Sync + 'static {
     /// Authorizes a request after metadata validation but before route lookup.
     /// This intentionally avoids leaking method existence to unauthenticated callers.
-    async fn authorize(&self, request: &RpcRequest) -> std::result::Result<(), Status>;
+    async fn authorize(
+        &self,
+        request: &AuthorizationRequest<'_>,
+    ) -> std::result::Result<(), Status>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1007,8 +1060,12 @@ impl MetadataValueAuthorizer {
 
 #[crate::async_trait]
 impl Authorizer for MetadataValueAuthorizer {
-    async fn authorize(&self, request: &RpcRequest) -> std::result::Result<(), Status> {
+    async fn authorize(
+        &self,
+        request: &AuthorizationRequest<'_>,
+    ) -> std::result::Result<(), Status> {
         if request
+            .request
             .metadata
             .get(&self.key)
             .is_some_and(|value| constant_time_eq(value, &self.value))
@@ -1367,7 +1424,7 @@ impl Server {
             request,
             body,
             CancellationToken::new(),
-            RequestCounts::default(),
+            CallInfo::default(),
         )
         .await
     }
@@ -1377,7 +1434,7 @@ impl Server {
         request: RpcRequest,
         body: Vec<u8>,
         cancellation: CancellationToken,
-        counts: RequestCounts,
+        info: CallInfo,
     ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
         let started_at = Instant::now();
         let request_body_len = body.len();
@@ -1397,7 +1454,7 @@ impl Server {
             "rpc started"
         );
 
-        let deadline = match self.admit(&request, &cancellation).await {
+        let deadline = match self.admit(&request, info.remote_addr, &cancellation).await {
             Ok(Admitted { deadline }) => deadline,
             Err(status) => {
                 return self.finish_response(
@@ -1434,7 +1491,7 @@ impl Server {
             metadata,
             deadline,
             cancellation.clone(),
-            counts,
+            info,
         );
         let response_metadata = context.response.clone();
 
@@ -1471,7 +1528,7 @@ impl Server {
             request_body,
             None,
             CancellationToken::new(),
-            RequestCounts::default(),
+            CallInfo::default(),
         )
         .await
     }
@@ -1486,7 +1543,7 @@ impl Server {
         request_body: BoxStream<Vec<u8>>,
         admitted: Option<Admitted>,
         cancellation: CancellationToken,
-        counts: RequestCounts,
+        info: CallInfo,
     ) -> BoxStream<ResponseFrame> {
         let started_at = Instant::now();
         let request_body_len = body.len();
@@ -1509,7 +1566,7 @@ impl Server {
 
         let admission = match admitted {
             Some(admitted) => Ok(admitted),
-            None => self.admit(&request, &cancellation).await,
+            None => self.admit(&request, info.remote_addr, &cancellation).await,
         };
         let deadline = match admission {
             Ok(Admitted { deadline }) => deadline,
@@ -1565,7 +1622,7 @@ impl Server {
             metadata,
             deadline,
             cancellation.clone(),
-            counts,
+            info,
         );
         let response_metadata = context.response.clone();
         let handler_result = match invoke_streaming_handler(handler, context, body, request_body) {
@@ -1600,10 +1657,11 @@ impl Server {
         }
     }
 
-    /// Validates `request` and runs the authorizer.
+    /// Validates `request` from the client at `remote_addr` and runs the authorizer.
     pub(crate) async fn admit(
         &self,
         request: &RpcRequest,
+        remote_addr: Option<SocketAddr>,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Admitted, Status> {
         validate_metadata(&request.metadata)?;
@@ -1611,7 +1669,11 @@ impl Server {
         let deadline = request_deadline(request)?;
 
         if let Some(authorizer) = &self.inner.authorizer {
-            match with_deadline(authorizer.authorize(request), deadline).await {
+            let authorization = AuthorizationRequest {
+                request,
+                remote_addr,
+            };
+            match with_deadline(authorizer.authorize(&authorization), deadline).await {
                 Ok(result) => result?,
                 Err(status) => {
                     if status.code() == Code::DeadlineExceeded {
@@ -2423,7 +2485,10 @@ mod tests {
 
     #[crate::async_trait]
     impl Authorizer for PendingAuthorizer {
-        async fn authorize(&self, _request: &RpcRequest) -> std::result::Result<(), Status> {
+        async fn authorize(
+            &self,
+            _request: &super::AuthorizationRequest<'_>,
+        ) -> std::result::Result<(), Status> {
             std::future::pending().await
         }
     }

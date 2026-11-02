@@ -91,6 +91,9 @@ func generate(request *plugin.CodeGeneratorRequest) *plugin.CodeGeneratorRespons
 	if err != nil {
 		return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
 	}
+	// The generated code only names message types, so proto3 optional fields
+	// need nothing from it.
+	generator.SupportedFeatures = uint64(plugin.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 	if err := options.validate(); err != nil {
 		return &plugin.CodeGeneratorResponse{Error: new(err.Error())}
 	}

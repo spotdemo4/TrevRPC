@@ -159,6 +159,8 @@ server.serve(endpoint).await?;
 
 Handlers set response metadata through their `RequestContext`. `context.set_response_header(key, value)` adds a response header, sent before the first response message as soon as the handler returns. `context.set_response_metadata(key, value)` adds trailing metadata, sent with the final `OK` status: when a unary or client-streaming handler returns, or when a streaming handler's response stream ends, so a clone of the context moved into the stream may still set it until then. Keys are lowercased and validated like request metadata; an invalid entry, a header set after the handler has returned, or metadata set after the final status, is an `Internal` status, ready for `?`. A failed call sends the metadata of its `Status` instead.
 
+`RequestContext::remote_addr()` is the client's address: the QUIC connection's remote address for native QUIC, HTTP/3 and WebTransport calls, and on the TCP listener the TCP peer's, or the client a trusted proxy names in its PROXY header (see [TCP fallback](#tcp-fallback)). An IPv4 client's address is IPv4 even on a dual-stack socket. Authorizers get it in their `AuthorizationRequest`, beside the REQUEST frame, and admission callbacks in `HttpAdmissionRequest::remote_addr` and `WebTransportAdmissionRequest::remote_addr`, so per-client limits, such as on login attempts, can key on it.
+
 Native QUIC is always served. HTTP/3 and WebTransport are opt-in through `ServerOptions`; the `h3` ALPN is negotiated only when at least one is enabled or an HTTP fallback is set:
 
 ```rust
@@ -209,11 +211,17 @@ Messages can travel compressed with zstd (see [Compression](https://trev.zip/llc
 TCP is opt-in. `Server::tcp_tls_config` builds the TLS configuration for a TCP listener, setting the ALPN list from the options (`qmux-02.trevrpc-1` always, `h2` when HTTP is enabled, `http/1.1` for the WebSocket upgrade when WebTransport is enabled; an HTTP fallback adds both). `Server::serve_with_tcp` then serves QUIC and TCP together, sharing the connection and request limits and graceful shutdown:
 
 ```rust
-let tcp = trevrpc::tcp::TcpFallback {
-    listener: tokio::net::TcpListener::bind("[::]:50051").await?,
-    tls: server.tcp_tls_config(tls),         // the same rustls config (clone it for `quic_config`); call after the options are final
-};
+let tcp = trevrpc::tcp::TcpFallback::new(
+    tokio::net::TcpListener::bind("[::]:50051").await?,
+    server.tcp_tls_config(tls),              // the same rustls config (clone it for `quic_config`); call after the options are final
+);
 server.serve_with_tcp(endpoint, tcp, shutdown_signal()).await?;
+```
+
+Behind a TCP load balancer, `with_trusted_proxies` names its networks. A connection from one of them must start with a PROXY protocol header, version 1 or 2, and the client it names becomes the calls' `remote_addr`; a connection without one is closed. A version 2 `LOCAL` header (a health check), version 1 `UNKNOWN`, or an address family other than TCP over IPv4 or IPv6 leaves the proxy's own address. Connections from anywhere else are never read for a header. The header must arrive within the TLS handshake timeout (10 s). QUIC is not affected: a UDP load balancer must preserve the client's source address.
+
+```rust
+let tcp = tcp.with_trusted_proxies(["10.0.0.0/8".parse::<trevrpc::tcp::IpPrefix>()?]);
 ```
 
 The channel falls back to QMux over TLS when given a rustls client configuration for it. QUIC starts first; QMux starts after the fallback delay (300 ms) or immediately if QUIC fails, and the first to connect wins. After QMux wins, reconnects use it until the reprobe interval (5 minutes) has passed since QUIC was lost.

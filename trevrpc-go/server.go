@@ -9,6 +9,7 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"reflect"
 	"runtime/debug"
@@ -161,6 +162,9 @@ type AdmissionRequest struct {
 	// Origin is the value of the Origin header, if any.
 	Origin string
 	Secure bool
+	// RemoteAddr is the address of the client, as HandlerContext.RemoteAddr
+	// reports it.
+	RemoteAddr netip.AddrPort
 }
 
 // Admission decides whether to accept an otherwise valid HTTP RPC request or
@@ -187,6 +191,7 @@ const (
 	ServerDiagnosticSessionClosed          ServerDiagnosticPhase = "session_closed"
 	ServerDiagnosticHTTP3ConnectionClosed  ServerDiagnosticPhase = "http3_connection_closed"
 	ServerDiagnosticTLSHandshakeFailed     ServerDiagnosticPhase = "tls_handshake_failed"
+	ServerDiagnosticProxyHeaderFailed      ServerDiagnosticPhase = "proxy_header_failed"
 	ServerDiagnosticInvalidResponse        ServerDiagnosticPhase = "invalid_response"
 	ServerDiagnosticInternalError          ServerDiagnosticPhase = "internal_error"
 	ServerDiagnosticExecutionDetached      ServerDiagnosticPhase = "execution_detached"

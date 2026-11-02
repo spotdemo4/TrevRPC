@@ -1,6 +1,8 @@
 //! Validation and admission shared by every HTTP binding: HTTP/3 and HTTP/2 requests, and
 //! `WebTransport` and WebSocket browser sessions.
 
+use std::net::SocketAddr;
+
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 
 use crate::server::{AdmissionHeader, Server};
@@ -31,9 +33,13 @@ pub fn rejection_head(status: StatusCode) -> Response<()> {
     response
 }
 
-/// Validates an HTTP RPC request and runs the HTTP admission callback, returning the rejection
-/// status when it is not accepted.
-pub fn validate_http_request(server: &Server, request: &Request<()>) -> Option<StatusCode> {
+/// Validates an HTTP RPC request from the client at `remote_addr` and runs the HTTP admission
+/// callback, returning the rejection status when it is not accepted.
+pub fn validate_http_request(
+    server: &Server,
+    request: &Request<()>,
+    remote_addr: SocketAddr,
+) -> Option<StatusCode> {
     let options = server.options();
     if !options.http_enabled() || request.uri().path() != options.http_path() {
         return Some(StatusCode::NOT_FOUND);
@@ -48,6 +54,7 @@ pub fn validate_http_request(server: &Server, request: &Request<()>) -> Option<S
         let headers = admission_headers(request.headers());
         let admission_request = crate::server::HttpAdmissionRequest {
             request,
+            remote_addr,
             path: request.uri().path(),
             authority: request.uri().authority().map(http::uri::Authority::as_str),
             secure: request.uri().scheme_str() == Some("https"),
@@ -78,10 +85,12 @@ pub fn admission_headers(headers: &http::HeaderMap) -> Vec<AdmissionHeader<'_>> 
         .collect()
 }
 
-/// Validates a browser session request (`WebTransport` or WebSocket) against the shared path and
-/// the session admission policy, returning the rejection status when it is not accepted.
+/// Validates a browser session request (`WebTransport` or WebSocket) from the client at
+/// `remote_addr` against the shared path and the session admission policy, returning the
+/// rejection status when it is not accepted.
 pub fn validate_webtransport_admission(
     server: &Server,
+    remote_addr: SocketAddr,
     path: &str,
     authority: Option<&str>,
     origin: Option<&str>,
@@ -94,6 +103,7 @@ pub fn validate_webtransport_admission(
     }
     if let Some(admission) = options.webtransport_admission() {
         let request = crate::server::WebTransportAdmissionRequest {
+            remote_addr,
             path,
             authority,
             origin,

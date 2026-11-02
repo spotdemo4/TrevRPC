@@ -204,8 +204,14 @@ func startTestListenerWith(t testing.TB, pki testPKI, configure func(*ServerOpti
 	}
 	server.SetOptions(options)
 	register(server)
+	return serveTestListener(t, server, ListenOptions{TLSConfig: pki.server})
+}
 
-	listener, err := Listen("127.0.0.1:0", server, ListenOptions{TLSConfig: pki.server})
+// serveTestListener serves server on a loopback UDP port until the test ends
+// and checks that Serve shuts down cleanly.
+func serveTestListener(t testing.TB, server *Server, listenOptions ListenOptions) *Listener {
+	t.Helper()
+	listener, err := Listen("127.0.0.1:0", server, listenOptions)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}

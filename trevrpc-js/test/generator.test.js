@@ -164,6 +164,61 @@ test("protoc runs the plugin and its output works against the runtime", async ()
   assert.match(types, /from "@trevrpc\/trevrpc-js";/);
 });
 
+test("protoc accepts proto3 optional fields and the root keeps their presence", async () => {
+  const output = new URL("build/test-optional/", packageRoot);
+  await rm(output, { recursive: true, force: true });
+  await mkdir(output, { recursive: true });
+  await writeFile(
+    new URL("optional.proto", output),
+    `syntax = "proto3";
+package optional.v1;
+message Sub { string x = 1; }
+message Values {
+  optional string name = 1;
+  optional int32 count = 2;
+  string plain = 3;
+  Sub sub = 4;
+  oneof choice {
+    int32 a = 5;
+    string b = 6;
+  }
+}
+service OptionalService { rpc Get(Values) returns (Values); }
+`,
+  );
+  await run("protoc", [
+    `--plugin=protoc-gen-trevrpc-js=${fileURLToPath(new URL("bin/protoc-gen-trevrpc-js.js", packageRoot))}`,
+    `--trevrpc-js_out=${fileURLToPath(output)}`,
+    `--proto_path=${fileURLToPath(output)}`,
+    "optional.proto",
+  ]);
+
+  const js = await readFile(new URL("optional.trevrpc.js", output), "utf8");
+  const json = JSON.parse(js.slice(js.indexOf("createRoot(") + 11, js.indexOf(");\n")));
+  const Values = protobuf.Root.fromJSON(json).lookupType("optional.v1.Values");
+  // Fields outside a oneof stay out of every oneof, including synthetic ones.
+  assert.deepEqual(
+    Object.fromEntries(Values.oneofsArray.map((oneof) => [oneof.name, oneof.oneof])),
+    { choice: ["a", "b"], _name: ["name"], _count: ["count"] },
+  );
+
+  const decoded = Values.decode(Values.encode({ name: "", plain: "p", a: 1 }).finish());
+  assert.equal(decoded.name, "");
+  assert.equal(decoded.count, null);
+  assert.equal(decoded.plain, "p");
+  assert.equal(decoded.a, 1);
+
+  const types = await readFile(new URL("optional.trevrpc.d.ts", output), "utf8");
+  assert.match(types, /name\?: string \| null;/);
+  assert.match(types, /plain\?: string;/);
+  assert.match(types, /sub\?: Sub \| null;/);
+});
+
+test("the response declares proto3 optional support, with or without an error", () => {
+  assert.equal(generate(greeterRequest()).supportedFeatures, 1);
+  assert.equal(generate(greeterRequest("unknown=1")).supportedFeatures, 1);
+});
+
 test("the generator reads the trevrpc.method option into the method descriptors", () => {
   const request = greeterRequest();
   const [unary, serverStream, clientStream, bidi] = request.protoFile[0].service[0].method;

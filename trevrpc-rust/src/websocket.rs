@@ -1,6 +1,7 @@
 //! Server side of `QMux` over WebSocket (draft-lcurley-qmux-websocket) on the TCP listener (ALPN
 //! `http/1.1`): the browser fallback for networks or browsers without `WebTransport`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
@@ -43,9 +44,10 @@ fn header_has_token(headers: &HeaderMap, name: &header::HeaderName, token: &str)
 pub fn accept(
     server: &Server,
     mut request: Request<Incoming>,
+    remote_addr: SocketAddr,
     upgrades: &mpsc::Sender<OnUpgrade>,
 ) -> Response<ResponseBody> {
-    if let Err(status) = admit(server, &request) {
+    if let Err(status) = admit(server, &request, remote_addr) {
         return empty_response(status);
     }
     let headers = request.headers();
@@ -80,7 +82,11 @@ pub fn accept(
 }
 
 /// Admits a WebSocket upgrade like a `WebTransport` session: same path, same admission policy.
-fn admit(server: &Server, request: &Request<Incoming>) -> Result<(), StatusCode> {
+fn admit(
+    server: &Server,
+    request: &Request<Incoming>,
+    remote_addr: SocketAddr,
+) -> Result<(), StatusCode> {
     let headers = request.headers();
     if !header_has_token(headers, &header::SEC_WEBSOCKET_PROTOCOL, SUBPROTOCOL) {
         return Err(StatusCode::BAD_REQUEST);
@@ -93,6 +99,7 @@ fn admit(server: &Server, request: &Request<Incoming>) -> Result<(), StatusCode>
         .and_then(|origin| origin.to_str().ok());
     validate_webtransport_admission(
         server,
+        remote_addr,
         request.uri().path(),
         authority,
         origin,
@@ -102,10 +109,12 @@ fn admit(server: &Server, request: &Request<Incoming>) -> Result<(), StatusCode>
     .map_or(Ok(()), Err)
 }
 
-/// Serves the `QMux` session of an upgraded WebSocket connection until it ends.
+/// Serves the `QMux` session of an upgraded WebSocket connection from the client at
+/// `remote_addr` until it ends.
 pub async fn serve_session(
     server: Server,
     upgrade: OnUpgrade,
+    remote_addr: SocketAddr,
     request_limit: Option<Arc<Semaphore>>,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -124,7 +133,7 @@ pub async fn serve_session(
         .accept();
     native::handle_connection(
         server,
-        QmuxConnection::from(session),
+        QmuxConnection::new(session, Some(remote_addr)),
         request_limit,
         shutdown,
     )

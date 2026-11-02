@@ -197,10 +197,12 @@ async fn read_request<C: MuxConnection>(
     IncomingRequest,
 )> {
     let max_frame_size = server.max_frame_size();
+    let remote_addr = connection.remote_addr();
     let mut recv = NativePumpReader::new(recv, connection);
     let incoming = server_transport::read_initial_request(server, &mut recv.recv)
         .await
         .and_then(|mut incoming| {
+            incoming.remote_addr = remote_addr;
             resolve_connection_metadata(Some(connection_metadata), &mut incoming)?;
             open_flow(demux, &mut incoming)?;
             Ok(incoming)

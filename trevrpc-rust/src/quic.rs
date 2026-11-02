@@ -1,6 +1,7 @@
 //! Quinn helpers shared by the native client and the server.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 use bytes::Bytes;
@@ -10,6 +11,7 @@ use crate::datagram::{DatagramTransport, Unsent};
 use crate::framed::Chunked;
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::{RESET_PROBE_INTERVAL, RequestTransportEvent};
+use crate::server::canonical_addr;
 use crate::{Error, Result};
 
 /// The longest `TrevRPC` frame header: a type and a length, each a QUIC variable-length integer
@@ -50,6 +52,11 @@ impl MuxConnection for quinn::Connection {
     async fn open_stream(&self) -> Result<(QuicSendStream, Chunked<quinn::RecvStream>)> {
         let (send, recv) = self.open_bi().await.map_err(Error::transport)?;
         Ok((QuicSendStream::new(send), Chunked::new(recv)))
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        // Read for every call: the client may have migrated since the connection was accepted.
+        Some(canonical_addr(self.remote_address()))
     }
 
     fn close_connection(&self, reason: &'static [u8]) {

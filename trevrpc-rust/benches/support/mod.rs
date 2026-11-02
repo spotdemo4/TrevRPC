@@ -211,10 +211,7 @@ impl Fixture {
         let listener = TcpListener::bind(loopback).await.unwrap();
         let udp = endpoint.local_addr().unwrap();
         let tcp = listener.local_addr().unwrap();
-        let fallback = TcpFallback {
-            listener,
-            tls: server.tcp_tls_config(server_tls),
-        };
+        let fallback = TcpFallback::new(listener, server.tcp_tls_config(server_tls));
         let (shutdown, stopped) = oneshot::channel();
         let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
             let _ = stopped.await;

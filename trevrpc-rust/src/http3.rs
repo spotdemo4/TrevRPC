@@ -2,6 +2,7 @@
 //! (ALPN `h3`).
 
 use std::future::pending;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ use crate::rpc_body::{
     BodySink, BodySource, WebTransportSessionState, handle_rpc_stream, reject_rpc_stream,
 };
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
-use crate::server::Server;
+use crate::server::{Server, canonical_addr};
 use crate::server_transport::{Permit, try_acquire_permit};
 use crate::{Error, Result, Status};
 // RFC WebTransport reserves this error-code range for application protocol errors. Code 1 maps
@@ -101,7 +102,8 @@ pub async fn handle_connection(
                     continue;
                 };
                 if is_webtransport_request(&request) {
-                    let response_headers = match validate_webtransport_request(&server, &request) {
+                    let remote_addr = canonical_addr(raw_connection.remote_address());
+                    let response_headers = match validate_webtransport_request(&server, &request, remote_addr) {
                         Ok(headers) => headers,
                         Err(status) => {
                             reject_h3(stream, status).await;
@@ -223,7 +225,8 @@ async fn handle_http_request(
         serve_fallback(fallback, request, stream).await;
         return;
     }
-    if let Some(status) = validate_http_request(&server, &request) {
+    let remote_addr = canonical_addr(connection.remote_address());
+    if let Some(status) = validate_http_request(&server, &request, remote_addr) {
         stream_permit.release();
         reject_h3(stream, status).await;
         return;
@@ -294,6 +297,7 @@ const WT_PROTOCOL_VALUE: &str = "\"trevrpc-1\"";
 fn validate_webtransport_request(
     server: &Server,
     request: &Request<()>,
+    remote_addr: SocketAddr,
 ) -> std::result::Result<HeaderMap, StatusCode> {
     let origin = request
         .headers()
@@ -301,6 +305,7 @@ fn validate_webtransport_request(
         .and_then(|origin| origin.to_str().ok());
     if let Some(status) = validate_webtransport_admission(
         server,
+        remote_addr,
         request.uri().path(),
         request.uri().authority().map(http::uri::Authority::as_str),
         origin,
@@ -573,6 +578,10 @@ impl BodySource for H3Source {
         self.0.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
     }
 
+    fn remote_addr(&self) -> SocketAddr {
+        canonical_addr(self.1.remote_address())
+    }
+
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
         let Self(recv, connection) = self;
         let reset = poll_peer_reset(|context| {
@@ -638,6 +647,10 @@ impl BodySource for WebTransportSource {
 
     fn stop(&mut self) {
         h3::quic::RecvStream::stop_sending(&mut self.0, CANCELLED_STREAM_CODE);
+    }
+
+    fn remote_addr(&self) -> SocketAddr {
+        canonical_addr(self.1.remote_address())
     }
 
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {

@@ -80,6 +80,8 @@ func (l *Listener) serveNative(conn *quic.Conn) {
 			draining := newDrainingStream(ctx, stream, stream.SetReadDeadline, func() { stream.CancelRead(streamErrorCancelled) })
 			draining.datagrams = datagrams
 			draining.connectionMetadata = connectionMetadata
+			// Read per stream: the client may have migrated to a new address.
+			draining.remoteAddr = addrPortOf(conn.RemoteAddr())
 			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = conn.CloseWithError(0, message) },

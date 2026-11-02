@@ -356,10 +356,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let udp = endpoint.local_addr()?.port();
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(host, port)).await?;
     let tcp = listener.local_addr()?.port();
-    let fallback = TcpFallback {
-        listener,
-        tls: server.tcp_tls_config(tls),
-    };
+    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
 
     let serving = tokio::spawn(server.serve_with_tcp(endpoint, fallback, shutdown_requested()));
 

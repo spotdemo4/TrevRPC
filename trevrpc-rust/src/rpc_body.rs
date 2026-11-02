@@ -2,6 +2,7 @@
 //! `WebTransport` streams, which share the same body-oriented libraries.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut as _, Bytes};
@@ -53,6 +54,9 @@ pub trait BodySource: Send + 'static {
     /// Resolves when the transport ends the request without consuming its data, or never if it
     /// cannot tell. It must be cancel-safe.
     fn transport_event(&mut self) -> impl Future<Output = Option<RequestTransportEvent>> + Send;
+
+    /// The client's address; see [`crate::server::RequestContext::remote_addr`].
+    fn remote_addr(&self) -> SocketAddr;
 }
 
 /// Adapts a body's send half to the server's response writer.
@@ -148,6 +152,7 @@ where
     K: BodySink,
     S: BodySource,
 {
+    let remote_addr = source.remote_addr();
     let writer = BodyWriter {
         sink,
         max_frame_size: server.max_frame_size(),
@@ -160,6 +165,7 @@ where
     let incoming = server_transport::read_initial_request(server, &mut reader)
         .await
         .and_then(|mut incoming| {
+            incoming.remote_addr = Some(remote_addr);
             resolve_connection_metadata(connection_metadata, &mut incoming)?;
             open_flow(demux, &mut incoming)?;
             Ok(incoming)

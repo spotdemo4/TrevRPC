@@ -117,9 +117,12 @@ struct CountingAuthorizer(Arc<AtomicUsize>);
 
 #[trevrpc::async_trait]
 impl trevrpc::server::Authorizer for CountingAuthorizer {
-    async fn authorize(&self, request: &RpcRequest) -> Result<(), trevrpc::Status> {
+    async fn authorize(
+        &self,
+        request: &trevrpc::server::AuthorizationRequest<'_>,
+    ) -> Result<(), trevrpc::Status> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        if request.metadata.contains_key(DENY_KEY) {
+        if request.request.metadata.contains_key(DENY_KEY) {
             return Err(trevrpc::Status::unauthenticated("denied"));
         }
         Ok(())
@@ -255,10 +258,7 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let udp = endpoint.local_addr()?;
     let tcp = listener.local_addr()?;
-    let fallback = TcpFallback {
-        listener,
-        tls: server.tcp_tls_config(tls),
-    };
+    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
     let (shutdown, stopped) = oneshot::channel();
     let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
         let _ = stopped.await;

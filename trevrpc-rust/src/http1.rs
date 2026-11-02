@@ -3,6 +3,7 @@
 
 use std::convert::Infallible;
 use std::future::pending;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use http::{HeaderValue, Request, Response, StatusCode};
@@ -19,12 +20,13 @@ use crate::fallback::{FallbackBody, ResponseBody, empty_response};
 use crate::server::Server;
 use crate::websocket;
 
-/// Serves one HTTP/1.1 connection until it closes or the server shuts down. A WebSocket upgrade
-/// ends the HTTP/1.1 exchange, and its `QMux` session then runs here, so that it keeps holding
-/// the connection's permit.
+/// Serves one HTTP/1.1 connection from the client at `remote_addr` until it closes or the server
+/// shuts down. A WebSocket upgrade ends the HTTP/1.1 exchange, and its `QMux` session then runs
+/// here, so that it keeps holding the connection's permit.
 pub async fn handle_connection<T>(
     server: Server,
     io: T,
+    remote_addr: SocketAddr,
     alt_svc: Option<HeaderValue>,
     request_limit: Option<Arc<Semaphore>>,
     mut shutdown: watch::Receiver<bool>,
@@ -39,7 +41,9 @@ pub async fn handle_connection<T>(
             let alt_svc = alt_svc.clone();
             let upgrades = upgrades.clone();
             async move {
-                Ok::<_, Infallible>(handle_request(&server, request, alt_svc, &upgrades).await)
+                Ok::<_, Infallible>(
+                    handle_request(&server, request, remote_addr, alt_svc, &upgrades).await,
+                )
             }
         })
     };
@@ -77,13 +81,14 @@ pub async fn handle_connection<T>(
         }
     }
     if let Ok(upgrade) = pending_upgrade.try_recv() {
-        websocket::serve_session(server, upgrade, request_limit, shutdown).await;
+        websocket::serve_session(server, upgrade, remote_addr, request_limit, shutdown).await;
     }
 }
 
 async fn handle_request(
     server: &Server,
     request: Request<Incoming>,
+    remote_addr: SocketAddr,
     alt_svc: Option<HeaderValue>,
     upgrades: &mpsc::Sender<OnUpgrade>,
 ) -> Response<ResponseBody> {
@@ -100,7 +105,7 @@ async fn handle_request(
         };
     }
     if options.webtransport_enabled() && websocket::is_upgrade(&request) {
-        return websocket::accept(server, request, upgrades);
+        return websocket::accept(server, request, remote_addr, upgrades);
     }
     // `TrevRPC` over HTTP needs HTTP/2 or HTTP/3.
     empty_response(StatusCode::HTTP_VERSION_NOT_SUPPORTED)

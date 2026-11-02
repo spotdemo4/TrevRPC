@@ -154,10 +154,7 @@ async fn spawn_server_with(
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let udp = endpoint.local_addr()?;
     let tcp = listener.local_addr()?;
-    let fallback = TcpFallback {
-        listener,
-        tls: server.tcp_tls_config(tls),
-    };
+    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
     let (shutdown, stopped) = oneshot::channel();
     let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
         let _ = stopped.await;

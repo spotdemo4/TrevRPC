@@ -2,6 +2,7 @@
 //! native `TrevRPC` runs over TLS and WebSocket unchanged.
 
 use std::future::pending;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,11 +67,19 @@ pub fn client_config(max_frame_size: usize) -> qmux::Config {
 ///
 /// Streams hold the connection, as QUIC streams do, so it stays open while any of them is in use.
 #[derive(Clone)]
-pub struct QmuxConnection(Arc<qmux::Session>);
+pub struct QmuxConnection {
+    session: Arc<qmux::Session>,
+    /// The client's address, on the server side.
+    remote_addr: Option<SocketAddr>,
+}
 
-impl From<qmux::Session> for QmuxConnection {
-    fn from(session: qmux::Session) -> Self {
-        Self(Arc::new(session))
+impl QmuxConnection {
+    /// Wraps `session`, whose client is at `remote_addr` when it is known.
+    pub fn new(session: qmux::Session, remote_addr: Option<SocketAddr>) -> Self {
+        Self {
+            session: Arc::new(session),
+            remote_addr,
+        }
     }
 }
 
@@ -80,7 +89,7 @@ impl MuxConnection for QmuxConnection {
     type Datagrams = NoDatagrams;
 
     async fn accept_stream(&self) -> Option<(QmuxSendStream, QmuxRecvStream)> {
-        let (send, recv) = self.0.accept_bi().await.ok()?;
+        let (send, recv) = self.session.accept_bi().await.ok()?;
         Some((
             QmuxSendStream {
                 stream: send,
@@ -94,7 +103,7 @@ impl MuxConnection for QmuxConnection {
     }
 
     async fn open_stream(&self) -> Result<(QmuxSendStream, QmuxRecvStream)> {
-        let (send, recv) = self.0.open_bi().await.map_err(Error::transport)?;
+        let (send, recv) = self.session.open_bi().await.map_err(Error::transport)?;
         Ok((
             QmuxSendStream {
                 stream: send,
@@ -107,12 +116,16 @@ impl MuxConnection for QmuxConnection {
         ))
     }
 
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
+    }
+
     fn close_connection(&self, reason: &'static [u8]) {
-        self.0.close(0, &String::from_utf8_lossy(reason));
+        self.session.close(0, &String::from_utf8_lossy(reason));
     }
 
     async fn connection_lost(&self) -> Error {
-        Error::transport(self.0.closed().await)
+        Error::transport(self.session.closed().await)
     }
 
     /// `QMux` is configured with `max_datagram_frame_size = 0`: it has no datagrams.

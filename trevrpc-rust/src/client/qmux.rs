@@ -90,7 +90,7 @@ impl QmuxTransport {
             .await
             .map_err(Error::transport)?;
         Ok(Self(Arc::new(NativeTransport::new(
-            session.into(),
+            QmuxConnection::new(session, None),
             max_frame_size,
         ))))
     }

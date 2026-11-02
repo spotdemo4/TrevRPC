@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 
@@ -101,6 +102,9 @@ type wireRequest struct {
 	// stored from this call's offer, which its ANSWER confirms; zero for
 	// none.
 	connectionMetadataConfirmed uint32
+	// remoteAddr is the client address of the call's connection or session,
+	// on the server; the zero AddrPort when it is not known.
+	remoteAddr netip.AddrPort
 }
 
 // answer returns the call's ANSWER, and whether it has one: the answer to the

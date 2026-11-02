@@ -99,12 +99,26 @@ func acceptWithBackoff(ctx context.Context, ln net.Listener) (net.Conn, error) {
 	}
 }
 
-// serveTCPConn completes the TLS handshake of one TCP connection and serves it
-// on its negotiated ALPN until it ends.
+// serveTCPConn reads the PROXY header of a connection from a trusted proxy,
+// completes the TLS handshake of one TCP connection and serves it on its
+// negotiated ALPN until it ends.
 func (l *Listener) serveTCPConn(raw net.Conn) {
-	conn := tls.Server(raw, l.tcpTLS)
 	ctx, cancel := context.WithTimeout(l.ctx, l.handshakeTimeout)
 	defer cancel()
+	if trustedProxy(l.trustedProxies, raw.RemoteAddr()) {
+		proxied, err := readProxyHeaderBefore(ctx, raw)
+		if err != nil {
+			l.runtime.emitDiagnostic(ServerDiagnostic{
+				Phase:      ServerDiagnosticProxyHeaderFailed,
+				Err:        err,
+				RemoteAddr: raw.RemoteAddr().String(),
+			})
+			_ = raw.Close()
+			return
+		}
+		raw = proxied
+	}
+	conn := tls.Server(raw, l.tcpTLS)
 	if err := conn.HandshakeContext(ctx); err != nil {
 		l.runtime.emitDiagnostic(ServerDiagnostic{
 			Phase:      ServerDiagnosticTLSHandshakeFailed,
@@ -122,7 +136,7 @@ func (l *Listener) serveTCPConn(raw net.Conn) {
 			return
 		}
 		cancel()
-		l.serveQMuxSession(session, nil)
+		l.serveQMuxSession(session, addrPortOf(conn.RemoteAddr()), nil)
 	case l.httpTCP != nil && (proto == http2ALPN || proto == http1ALPN || proto == ""):
 		cancel()
 		l.httpTCP.serveConn(conn)

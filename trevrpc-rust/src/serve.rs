@@ -2,6 +2,7 @@
 //! optionally one TCP listener serving the fallbacks.
 
 use std::future::{Future, pending};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -199,7 +200,7 @@ impl Server {
                     }
                 }
                 accepted = accept_tcp(tcp.as_ref()) => {
-                    let (stream, fallback) = match accepted {
+                    let (stream, peer, fallback) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
                             tracing::warn!(%error, "TCP accept failed");
@@ -214,6 +215,8 @@ impl Server {
                     let connection = tcp::handle_connection(
                         self.clone(),
                         stream,
+                        peer,
+                        fallback.trusts(peer.ip()),
                         tls,
                         alt_svc.clone(),
                         request_limit.clone(),
@@ -249,13 +252,15 @@ impl Server {
 }
 
 /// Accepts the next TCP connection, or never when TCP is disabled.
-async fn accept_tcp(tcp: Option<&TcpFallback>) -> std::io::Result<(TcpStream, &TcpFallback)> {
+async fn accept_tcp(
+    tcp: Option<&TcpFallback>,
+) -> std::io::Result<(TcpStream, SocketAddr, &TcpFallback)> {
     match tcp {
         Some(fallback) => fallback
             .listener
             .accept()
             .await
-            .map(|(stream, _)| (stream, fallback)),
+            .map(|(stream, peer)| (stream, peer, fallback)),
         None => pending().await,
     }
 }
