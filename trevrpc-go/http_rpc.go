@@ -63,7 +63,7 @@ func (l *Listener) handleHTTPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body := &httpBody{body: r.Body, writer: w, controller: controller, remoteAddr: remoteAddrOf(r.RemoteAddr)}
-	handleRPCStream(r.Context(), l.server, body, slot, l.workers)
+	handleRPCStream(r.Context(), l.serveCtx, l.server, body, slot, l.workers)
 }
 
 // acquireHTTPStreamSlot takes a stream slot of the connection r arrived on.

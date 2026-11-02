@@ -398,7 +398,7 @@ func TestServerDecompressesRequests(t *testing.T) {
 func serveTestStreamRaw(t *testing.T, server *Server, input []byte) ([]byte, *countingRPCStream) {
 	t.Helper()
 	stream := &countingRPCStream{reader: bytes.NewReader(input)}
-	handleRPCStream(context.Background(), server, stream, nil, nil)
+	handleRPCStream(context.Background(), nil, server, stream, nil, nil)
 	return stream.written.Bytes(), stream
 }
 

@@ -211,11 +211,18 @@ func startTestListenerWith(t testing.TB, pki testPKI, configure func(*ServerOpti
 // and checks that Serve shuts down cleanly.
 func serveTestListener(t testing.TB, server *Server, listenOptions ListenOptions) *Listener {
 	t.Helper()
+	return serveTestListenerContext(context.Background(), t, server, listenOptions)
+}
+
+// serveTestListenerContext is serveTestListener serving with a context
+// derived from parent.
+func serveTestListenerContext(parent context.Context, t testing.TB, server *Server, listenOptions ListenOptions) *Listener {
+	t.Helper()
 	listener, err := Listen("127.0.0.1:0", server, listenOptions)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- listener.Serve(ctx) }()
 	for !listener.serving.Load() {

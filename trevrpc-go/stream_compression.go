@@ -35,7 +35,8 @@ import (
 // decode them on a call (a route without Requests, stream compression off, or
 // the budget spent) refuses the call once it is authorized, before the
 // handler runs, and the client replays it without stream compression,
-// transparently; the authorizer then runs again for the replay. After a
+// transparently; the authorizer then runs again for the replay, while
+// interceptors, which run after the refusal, see the call once. After a
 // refusal, calls on that connection wait for the server's answer again until
 // one is answered.
 //

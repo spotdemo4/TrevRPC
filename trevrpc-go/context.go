@@ -103,7 +103,32 @@ func contextWithHandlerContext(ctx context.Context, request *wireRequest) contex
 		return ctx
 	}
 
-	return context.WithValue(ctx, handlerContextKey{}, &callState{info: newHandlerContext(request), compression: request.compression, streams: request.streams, request: request})
+	return &handlerCallContext{Context: ctx, state: &callState{info: newHandlerContext(request), compression: request.compression, streams: request.streams, request: request}, serveCtx: request.serveCtx}
+}
+
+// handlerCallContext is the context of a call: ctx, carrying the call's state and
+// then the values of the context passed to Listener.Serve, which the contexts
+// of the transports do not derive from. It takes the place of the
+// context.WithValue that would carry the state, so the values cost a call
+// nothing.
+type handlerCallContext struct {
+	context.Context
+	state *callState
+	// serveCtx is the context passed to Listener.Serve, nil for a call served
+	// otherwise.
+	serveCtx context.Context
+}
+
+func (c *handlerCallContext) Value(key any) any {
+	if _, ok := key.(handlerContextKey); ok {
+		return c.state
+	}
+	// ctx always holds the call's cancelation, so the context package finds
+	// its own keys there and never in serveCtx.
+	if value := c.Context.Value(key); value != nil || c.serveCtx == nil {
+		return value
+	}
+	return c.serveCtx.Value(key)
 }
 
 // carriedCall returns the cancel func of ctx when it already carries the

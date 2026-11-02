@@ -110,7 +110,7 @@ func TestServerRefusesOptimisticCallsAfterAuthorization(t *testing.T) {
 			stream := &pipedRPCStream{pipe: pipe}
 			done := make(chan struct{})
 			go func() {
-				handleRPCStream(context.Background(), server, stream, nil, nil)
+				handleRPCStream(context.Background(), nil, server, stream, nil, nil)
 				close(done)
 			}()
 			if _, err := client.Write(frames); err != nil {
@@ -153,11 +153,13 @@ func TestServerRefusesOptimisticCallsAfterAuthorization(t *testing.T) {
 	}
 }
 
-// refusingAuthorizer authorizes every call of the refusing service, and
+// refusingAuthorizer authorizes every call of the refusing service,
+// refusingInterceptions counts the calls its interceptor saw, and
 // plainUploads counts the calls of its PlainUpload handler.
 var (
-	refusingAuthorizer = &recordingAuthorizer{}
-	plainUploads       atomic.Int64
+	refusingAuthorizer    = &recordingAuthorizer{}
+	refusingInterceptions atomic.Int64
+	plainUploads          atomic.Int64
 )
 
 // registerRefusingService registers the stream compression test routes, and
@@ -166,6 +168,10 @@ var (
 func registerRefusingService(server *Server) {
 	registerStreamCompressionService(server)
 	server.SetAuthorizer(refusingAuthorizer)
+	server.SetInterceptors(InterceptorFunc(func(ctx context.Context, _ HandlerContext) (context.Context, func(RPCFinished), error) {
+		refusingInterceptions.Add(1)
+		return ctx, nil, nil
+	}))
 	RegisterClientStreaming(server, testPath("PlainUpload"), newStringValue, func(ctx context.Context, requests MessageStream[*wrapperspb.StringValue]) (*wrapperspb.StringValue, error) {
 		plainUploads.Add(1)
 		return joinUpload(ctx, requests)
@@ -331,15 +337,17 @@ func TestOptimisticCallsReplayRefusals(t *testing.T) {
 		client := newOptimisticTestClient(t, channel)
 		t.Run(name+"/refused after the requests ended", func(t *testing.T) {
 			client.reset()
-			authorized, handled := refusingAuthorizer.calls.Load(), plainUploads.Load()
+			authorized, intercepted, handled := refusingAuthorizer.calls.Load(), refusingInterceptions.Load(), plainUploads.Load()
 			got, err := uploadSamples(t.Context(), t, channel, "PlainUpload", nil)
 			if err != nil || got.GetValue() != joinedSamples() {
 				t.Fatalf("upload = %q, %v", got.GetValue(), err)
 			}
 			checkReplayed(t, client, streamTestMessages)
-			// Each attempt is authorized; only the replay reaches the handler.
-			if authorized, handled := refusingAuthorizer.calls.Load()-authorized, plainUploads.Load()-handled; authorized != 2 || handled != 1 {
-				t.Fatalf("authorized %d times, handled %d times; want 2 and 1", authorized, handled)
+			// Each attempt is authorized; only the replay reaches the
+			// interceptor and the handler.
+			authorized, intercepted, handled = refusingAuthorizer.calls.Load()-authorized, refusingInterceptions.Load()-intercepted, plainUploads.Load()-handled
+			if authorized != 2 || intercepted != 1 || handled != 1 {
+				t.Fatalf("authorized %d times, intercepted %d times, handled %d times; want 2, 1 and 1", authorized, intercepted, handled)
 			}
 		})
 		t.Run(name+"/refused while uploading", func(t *testing.T) {

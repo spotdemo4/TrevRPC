@@ -184,7 +184,7 @@ type rpcStream interface {
 // handleRPCStream runs one RPC on stream. slot is the connection's stream slot
 // the RPC occupies, or nil. It is released before the terminal STATUS is
 // written, so a client that sees the call complete finds the slot free.
-func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot *streamSlot, workers *streamWorkers) {
+func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcStream, slot *streamSlot, workers *streamWorkers) {
 	defer slot.release()
 	runtime := server.freeze()
 	options := runtime.options
@@ -203,6 +203,7 @@ func handleRPCStream(ctx context.Context, server *Server, stream rpcStream, slot
 		return
 	}
 	request.remoteAddr = streamRemoteAddr(stream)
+	request.serveCtx = serveCtx
 	// The connection's metadata joins the call's before anything reads it.
 	err = streamConnectionMetadata(stream).resolve(request)
 	if err == nil {

@@ -1,6 +1,7 @@
 package trevrpc
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -105,6 +106,12 @@ type wireRequest struct {
 	// remoteAddr is the client address of the call's connection or session,
 	// on the server; the zero AddrPort when it is not known.
 	remoteAddr netip.AddrPort
+	// intercepted holds the finish functions of the call's interceptors, nil
+	// on a server without interceptors.
+	intercepted *interceptedCall
+	// serveCtx is the context passed to Listener.Serve, whose values the
+	// call's context carries; nil for a call served otherwise.
+	serveCtx context.Context
 }
 
 // answer returns the call's ANSWER, and whether it has one: the answer to the

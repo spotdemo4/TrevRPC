@@ -161,6 +161,8 @@ struct ServerState {
     routes: Arc<RouteMap>,
     options: ServerOptions,
     authorizer: Option<Arc<dyn Authorizer>>,
+    /// Run in order around every handler.
+    interceptors: Arc<[Arc<dyn Interceptor>]>,
     metrics: Arc<dyn Metrics>,
     /// The digested dictionaries of `options`, or why they are invalid, which serving reports.
     compression: std::result::Result<Option<Arc<CompressionConfig>>, Status>,
@@ -311,6 +313,8 @@ pub struct RequestContext {
     remote_addr: Option<SocketAddr>,
     /// The response metadata the handler sets, shared by every clone of the context.
     response: ResponseMetadata,
+    /// Values interceptors pass to the handler, such as a tracing span.
+    extensions: http::Extensions,
 }
 
 impl RequestContext {
@@ -347,6 +351,7 @@ impl RequestContext {
             plain_compressed: info.plain_compressed,
             remote_addr: info.remote_addr,
             response: ResponseMetadata::default(),
+            extensions: http::Extensions::new(),
         }
     }
 
@@ -393,6 +398,18 @@ impl RequestContext {
         value: impl Into<Vec<u8>>,
     ) -> std::result::Result<(), Status> {
         self.response.set_metadata(key, value.into())
+    }
+
+    /// Values an [`Interceptor`] passed to the handler, such as a tracing span or a database
+    /// handle. A clone of the context copies them.
+    #[must_use]
+    pub const fn extensions(&self) -> &http::Extensions {
+        &self.extensions
+    }
+
+    /// Values to pass to the handler; see [`RequestContext::extensions`].
+    pub const fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.extensions
     }
 
     /// Returns the fully-qualified service name, such as `example.greeter.Greeter`.
@@ -1020,6 +1037,12 @@ pub struct AuthorizationRequest<'a> {
     pub remote_addr: Option<SocketAddr>,
 }
 
+/// Authorizes calls before route lookup.
+///
+/// A call the server refuses for optimistic stream compression is replayed by the client and
+/// authorized again, so an authorizer must not have side effects that a second authorization of
+/// the same call would repeat: put those, such as counting calls against a rate limit, in an
+/// [`Interceptor`], which runs once per handler invocation.
 #[crate::async_trait]
 pub trait Authorizer: Send + Sync + 'static {
     /// Authorizes a request after metadata validation but before route lookup.
@@ -1028,6 +1051,36 @@ pub trait Authorizer: Send + Sync + 'static {
         &self,
         request: &AuthorizationRequest<'_>,
     ) -> std::result::Result<(), Status>;
+}
+
+/// Called once when a call that reached an [`Interceptor`] ends, with how it ended.
+pub type Finish = Box<dyn FnOnce(&RpcFinished) + Send + 'static>;
+
+/// Runs around the handler of every call, for what each call needs once, such as a tracing span,
+/// a log line or a rate limit.
+///
+/// It runs after the authorizer, route lookup and the negotiation of stream compression,
+/// immediately before the handler, so it runs once per handler invocation: a call the client
+/// replays after a refusal of optimistic stream compression reaches it once, unlike the
+/// [`Authorizer`]. It does not see request or response messages. Install interceptors with
+/// [`Server::add_interceptor`].
+#[crate::async_trait]
+pub trait Interceptor: Send + Sync + 'static {
+    /// Prepares the call, and returns a function the server calls once when the call ends, or
+    /// `None`. It may add values for the handler to [`RequestContext::extensions_mut`].
+    ///
+    /// It runs on the call's task like the handler, so a call that ends while it runs drops it:
+    /// at the call's deadline, when the client cancels the call or its connection closes, and
+    /// when the server shuts down.
+    ///
+    /// # Errors
+    ///
+    /// A returned status ends the call instead, without running the handler or later
+    /// interceptors. The finish functions of earlier interceptors still run.
+    async fn intercept(
+        &self,
+        context: &mut RequestContext,
+    ) -> std::result::Result<Option<Finish>, Status>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1135,6 +1188,7 @@ impl Default for ServerState {
             routes: Arc::new(HashMap::new()),
             options: ServerOptions::default(),
             authorizer: None,
+            interceptors: Arc::new([]),
             metrics: Arc::new(NoopMetrics),
             compression: Ok(None),
             stream_budget: StreamBudget::new(DEFAULT_SERVER_MEMORY),
@@ -1213,6 +1267,25 @@ impl Server {
     /// Removes any configured authorizer.
     pub fn clear_authorizer(&mut self) -> &mut Self {
         self.state_mut().authorizer = None;
+        self
+    }
+
+    /// Adds an interceptor that runs around every handler, after those added before: the first
+    /// added is the outermost, whose finish function runs last.
+    pub fn add_interceptor<I>(&mut self, interceptor: I) -> &mut Self
+    where
+        I: Interceptor,
+    {
+        let state = self.state_mut();
+        let mut interceptors = state.interceptors.to_vec();
+        interceptors.push(Arc::new(interceptor));
+        state.interceptors = interceptors.into();
+        self
+    }
+
+    /// Removes every interceptor.
+    pub fn clear_interceptors(&mut self) -> &mut Self {
+        self.state_mut().interceptors = Arc::new([]);
         self
     }
 
@@ -1462,6 +1535,7 @@ impl Server {
                     request_body_len,
                     started_at,
                     Err(status),
+                    Vec::new(),
                 );
             }
         };
@@ -1476,6 +1550,7 @@ impl Server {
                     "unknown RPC method {}",
                     request.method
                 ))),
+                Vec::new(),
             );
         };
         let kind = request.rpc_kind();
@@ -1485,7 +1560,7 @@ impl Server {
             ..
         } = request;
         let path: Arc<str> = Arc::from(path);
-        let context = RequestContext::from_parts(
+        let mut context = RequestContext::from_parts(
             Arc::clone(&path),
             kind,
             metadata,
@@ -1494,6 +1569,16 @@ impl Server {
             info,
         );
         let response_metadata = context.response.clone();
+        let (finishes, intercepted) = self.intercept(&mut context, deadline, &cancellation).await;
+        if let Err(status) = intercepted {
+            return self.finish_response(
+                &path,
+                request_body_len,
+                started_at,
+                Err(status),
+                finishes,
+            );
+        }
 
         let result = match invoke_unary_handler(handler, context, body) {
             Ok(future) => match run_handler_with_deadline(future, deadline, &cancellation).await {
@@ -1509,7 +1594,7 @@ impl Server {
             Err(status) => Err(status),
         };
 
-        self.finish_response(&path, request_body_len, started_at, result)
+        self.finish_response(&path, request_body_len, started_at, result, finishes)
     }
 
     /// Handles a streaming RPC request and returns response frames.
@@ -1616,7 +1701,7 @@ impl Server {
             ..
         } = request;
         let path: Arc<str> = Arc::from(path);
-        let context = RequestContext::from_parts(
+        let mut context = RequestContext::from_parts(
             Arc::clone(&path),
             request_kind,
             metadata,
@@ -1625,15 +1710,23 @@ impl Server {
             info,
         );
         let response_metadata = context.response.clone();
-        let handler_result = match invoke_streaming_handler(handler, context, body, request_body) {
-            Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,
+        let (finishes, intercepted) = self.intercept(&mut context, deadline, &cancellation).await;
+        let handler_result = match intercepted {
+            Ok(()) => match invoke_streaming_handler(handler, context, body, request_body) {
+                Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,
+                Err(status) => Err(status),
+            },
             Err(status) => Err(status),
         };
 
         match handler_result {
-            Err(status) => {
-                self.finish_streaming_status(&path, request_body_len, started_at, status)
-            }
+            Err(status) => self.finish_intercepted_status(
+                &path,
+                request_body_len,
+                started_at,
+                status,
+                finishes,
+            ),
             Ok(Ok(response_body)) => {
                 let headers = response_metadata.take_headers();
                 server_response_stream(
@@ -1645,6 +1738,7 @@ impl Server {
                         path,
                         request_body_len,
                         started_at,
+                        finishes,
                     },
                     stream_limits,
                     cancellation,
@@ -1652,9 +1746,48 @@ impl Server {
             }
             Ok(Err(error)) => {
                 let status = error.into_status();
-                self.finish_streaming_status(&path, request_body_len, started_at, status)
+                self.finish_intercepted_status(
+                    &path,
+                    request_body_len,
+                    started_at,
+                    status,
+                    finishes,
+                )
             }
         }
+    }
+
+    /// Runs the interceptors on `context`, the handler's, and returns the finish functions they
+    /// returned, with the status that ends the call instead of the handler if one failed.
+    async fn intercept(
+        &self,
+        context: &mut RequestContext,
+        deadline: Option<Instant>,
+        cancellation: &CancellationToken,
+    ) -> (Vec<Finish>, std::result::Result<(), Status>) {
+        let mut finishes = Vec::new();
+        for interceptor in self.inner.interceptors.iter() {
+            let intercepted = with_deadline(
+                CatchUnwindFuture::new(interceptor.intercept(context)),
+                deadline,
+            )
+            .await;
+            match intercepted {
+                Ok(Ok(Ok(finish))) => finishes.extend(finish),
+                Ok(Ok(Err(status))) => return (finishes, Err(status)),
+                Ok(Err(_)) => {
+                    tracing::error!(method = context.full_method(), "RPC interceptor panicked");
+                    return (finishes, Err(Status::internal("RPC interceptor panicked")));
+                }
+                Err(status) => {
+                    if status.code() == Code::DeadlineExceeded {
+                        cancellation.cancel(CancellationSource::Deadline);
+                    }
+                    return (finishes, Err(status));
+                }
+            }
+        }
+        (finishes, Ok(()))
     }
 
     /// Validates `request` from the client at `remote_addr` and runs the authorizer.
@@ -1693,6 +1826,7 @@ impl Server {
         request_body_len: usize,
         started_at: Instant,
         result: std::result::Result<ResponseEnvelope<Vec<u8>>, Status>,
+        finishes: Vec<Finish>,
     ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
         let elapsed = started_at.elapsed();
         let (code, response_body_len) = match &result {
@@ -1707,6 +1841,7 @@ impl Server {
             response_body_len,
             code,
             elapsed,
+            finishes,
         );
 
         let (service, method) = split_or_empty(path);
@@ -1738,6 +1873,7 @@ impl Server {
             started_at,
             response_body_len,
             code,
+            Vec::new(),
         );
     }
 
@@ -1748,7 +1884,27 @@ impl Server {
         started_at: Instant,
         status: Status,
     ) -> BoxStream<ResponseFrame> {
-        self.finish_streaming_response(path, request_body_len, started_at, 0, status.code());
+        self.finish_intercepted_status(path, request_body_len, started_at, status, Vec::new())
+    }
+
+    /// Ends a streaming call that reached the interceptors with `status`.
+    fn finish_intercepted_status(
+        &self,
+        path: &str,
+        request_body_len: usize,
+        started_at: Instant,
+        status: Status,
+        finishes: Vec<Finish>,
+    ) -> BoxStream<ResponseFrame> {
+        finish_streaming_response(
+            self.inner.metrics.as_ref(),
+            path,
+            request_body_len,
+            started_at,
+            0,
+            status.code(),
+            finishes,
+        );
         status_stream(status)
     }
 
@@ -2205,10 +2361,12 @@ struct StreamingCompletion {
     path: Arc<str>,
     request_body_len: usize,
     started_at: Instant,
+    /// The finish functions of the call's interceptors.
+    finishes: Vec<Finish>,
 }
 
 impl StreamingCompletion {
-    fn finish(&self, response_body_len: usize, code: Code) {
+    fn finish(&mut self, response_body_len: usize, code: Code) {
         finish_streaming_response(
             self.metrics.as_ref(),
             &self.path,
@@ -2216,6 +2374,7 @@ impl StreamingCompletion {
             self.started_at,
             response_body_len,
             code,
+            std::mem::take(&mut self.finishes),
         );
     }
 }
@@ -2347,6 +2506,7 @@ fn finish_streaming_response(
     started_at: Instant,
     response_body_len: usize,
     code: Code,
+    finishes: Vec<Finish>,
 ) {
     let elapsed = started_at.elapsed();
 
@@ -2357,6 +2517,7 @@ fn finish_streaming_response(
         response_body_len,
         code,
         elapsed,
+        finishes,
     );
 
     let (service, method) = split_or_empty(path);
@@ -2390,6 +2551,8 @@ fn record_rpc_started(metrics: &dyn Metrics, path: &str, request_body_len: usize
     let _ = catch_unwind(AssertUnwindSafe(|| metrics.rpc_started(&event)));
 }
 
+/// Reports a finished call to the metrics and runs the finish functions of its interceptors, the
+/// last added first.
 fn record_rpc_finished(
     metrics: &dyn Metrics,
     path: &str,
@@ -2397,8 +2560,10 @@ fn record_rpc_finished(
     response_body_len: usize,
     code: Code,
     elapsed: Duration,
+    finishes: Vec<Finish>,
 ) {
-    if !metrics.enabled() {
+    let enabled = metrics.enabled();
+    if !enabled && finishes.is_empty() {
         return;
     }
 
@@ -2411,7 +2576,14 @@ fn record_rpc_finished(
         code,
         elapsed,
     };
-    let _ = catch_unwind(AssertUnwindSafe(|| metrics.rpc_finished(&event)));
+    for finish in finishes.into_iter().rev() {
+        if catch_unwind(AssertUnwindSafe(|| finish(&event))).is_err() {
+            tracing::error!(service, method, "RPC interceptor finish panicked");
+        }
+    }
+    if enabled {
+        let _ = catch_unwind(AssertUnwindSafe(|| metrics.rpc_finished(&event)));
+    }
 }
 
 #[cfg(test)]
@@ -3747,5 +3919,260 @@ mod tests {
         budget.charge_skipped(100).expect("no byte limit");
         budget.charge_message(5).expect("first message");
         assert!(budget.charge_message(5).is_err(), "second message is over");
+    }
+
+    /// Records what each interceptor saw and how each call it saw ended.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<String>>>);
+
+    impl Log {
+        fn push(&self, entry: String) {
+            self.0
+                .lock()
+                .expect("log lock should not be poisoned")
+                .push(entry);
+        }
+
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.lock().expect("log lock should not be poisoned"))
+        }
+    }
+
+    /// A value interceptors pass to the handler: the names of those that ran, outermost first.
+    #[derive(Clone, Debug)]
+    struct Trail(String);
+
+    /// Adds its name to the [`Trail`] and logs the end of each call, or fails the call with
+    /// `fail`.
+    struct NamedInterceptor {
+        name: &'static str,
+        log: Log,
+        fail: Option<Code>,
+    }
+
+    #[crate::async_trait]
+    impl super::Interceptor for NamedInterceptor {
+        async fn intercept(
+            &self,
+            context: &mut RequestContext,
+        ) -> std::result::Result<Option<super::Finish>, Status> {
+            let trail = match context.extensions().get::<Trail>() {
+                Some(Trail(outer)) => format!("{outer}>{}", self.name),
+                None => self.name.to_owned(),
+            };
+            context.extensions_mut().insert(Trail(trail));
+            let (name, log) = (self.name, self.log.clone());
+            let finish: super::Finish = Box::new(move |event: &RpcFinished| {
+                log.push(format!("{name} {} {:?}", event.method, event.code));
+            });
+            match self.fail {
+                Some(code) => {
+                    // A failing interceptor may still return nothing to finish.
+                    drop(finish);
+                    Err(Status::new(code, "intercepted"))
+                }
+                None => Ok(Some(finish)),
+            }
+        }
+    }
+
+    fn named(name: &'static str, log: &Log) -> NamedInterceptor {
+        NamedInterceptor {
+            name,
+            log: log.clone(),
+            fail: None,
+        }
+    }
+
+    fn trail(context: &RequestContext) -> Vec<u8> {
+        context
+            .extensions()
+            .get::<Trail>()
+            .map(|Trail(trail)| trail.clone().into_bytes())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn interceptors_wrap_unary_handlers_in_order() {
+        let log = Log::default();
+        let mut server = Server::new();
+        server.add_interceptor(named("outer", &log));
+        server.add_interceptor(named("inner", &log));
+        server.route_with_context("/example.Greeter/SayHello", |context, _body| async move {
+            Ok(trail(&context))
+        });
+
+        let response = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect("intercepted request should succeed");
+
+        assert_eq!(response.message(), b"outer>inner");
+        assert_eq!(log.take(), ["inner SayHello Ok", "outer SayHello Ok"]);
+    }
+
+    #[tokio::test]
+    async fn interceptors_finish_streaming_calls_when_their_responses_end() {
+        let log = Log::default();
+        let mut server = Server::new();
+        server.add_interceptor(named("outer", &log));
+        server.add_interceptor(named("inner", &log));
+        server.route_streaming_with_context(
+            "/example.Greeter/Watch",
+            RpcKind::ServerStreaming,
+            |context, _body, _requests| async move {
+                Ok(crate::stream::from_iter([trail(&context)]))
+            },
+        );
+
+        let mut frames = server
+            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .await;
+        assert!(log.take().is_empty(), "the call is still streaming");
+        let first = frames
+            .next()
+            .await
+            .expect("a frame")
+            .expect("frame should be ok");
+        assert_eq!(first, ResponseFrame::message(b"outer>inner".to_vec()));
+        let rest: Vec<_> = frames.collect().await;
+        assert_eq!(rest.len(), 1, "the final status");
+        assert_eq!(log.take(), ["inner Watch Ok", "outer Watch Ok"]);
+    }
+
+    #[tokio::test]
+    async fn an_interceptor_error_ends_the_call_before_the_handler() {
+        let log = Log::default();
+        let handled = Arc::new(Mutex::new(0));
+        let mut server = Server::new();
+        server.add_interceptor(named("outer", &log));
+        server.add_interceptor(NamedInterceptor {
+            name: "limiter",
+            log: log.clone(),
+            fail: Some(Code::ResourceExhausted),
+        });
+        server.add_interceptor(named("never", &log));
+        let count = Arc::clone(&handled);
+        server.route("/example.Greeter/SayHello", move |_body| {
+            *count.lock().expect("lock should not be poisoned") += 1;
+            async { Ok(Vec::new()) }
+        });
+
+        let status = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect_err("the interceptor should end the call");
+
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(*handled.lock().expect("lock should not be poisoned"), 0);
+        assert_eq!(log.take(), ["outer SayHello ResourceExhausted"]);
+
+        let frames: Vec<_> = {
+            let mut server = Server::new();
+            server.add_interceptor(named("outer", &log));
+            server.add_interceptor(NamedInterceptor {
+                name: "limiter",
+                log: log.clone(),
+                fail: Some(Code::ResourceExhausted),
+            });
+            server.route_streaming(
+                "/example.Greeter/Watch",
+                RpcKind::ServerStreaming,
+                |_body, _requests| async { Ok(crate::stream::empty()) },
+            );
+            server
+                .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+                .await
+                .collect()
+                .await
+        };
+        assert!(matches!(
+            frames.as_slice(),
+            [Ok(ResponseFrame::Status(status))] if status.code() == Code::ResourceExhausted
+        ));
+        assert_eq!(log.take(), ["outer Watch ResourceExhausted"]);
+    }
+
+    struct PanickingInterceptor;
+
+    #[crate::async_trait]
+    impl super::Interceptor for PanickingInterceptor {
+        async fn intercept(
+            &self,
+            _context: &mut RequestContext,
+        ) -> std::result::Result<Option<super::Finish>, Status> {
+            panic!("interceptor bug")
+        }
+    }
+
+    struct PendingInterceptor;
+
+    #[crate::async_trait]
+    impl super::Interceptor for PendingInterceptor {
+        async fn intercept(
+            &self,
+            _context: &mut RequestContext,
+        ) -> std::result::Result<Option<super::Finish>, Status> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interceptor_panic_is_internal_and_finishes_earlier_interceptors() {
+        let log = Log::default();
+        let mut server = Server::new();
+        server.add_interceptor(named("outer", &log));
+        server.add_interceptor(PanickingInterceptor);
+        server.route("/example.Greeter/SayHello", |_body| async {
+            Ok(Vec::new())
+        });
+
+        let status = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect_err("the panic should end the call");
+
+        assert_eq!(status.code(), Code::Internal);
+        assert!(!status.message().contains("bug"), "{status:?}");
+        assert_eq!(log.take(), ["outer SayHello Internal"]);
+    }
+
+    #[tokio::test]
+    async fn interceptors_are_bounded_by_the_rpc_timeout() {
+        let log = Log::default();
+        let mut server = Server::new();
+        server.add_interceptor(named("outer", &log));
+        server.add_interceptor(PendingInterceptor);
+        server.route("/example.Greeter/SayHello", |_body| async {
+            Ok(Vec::new())
+        });
+        let request = RpcRequest::new("/example.Greeter/SayHello").with_timeout_nanos(1_000_000);
+
+        let status = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect_err("the interceptor should hit the deadline");
+
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert_eq!(log.take(), ["outer SayHello DeadlineExceeded"]);
+    }
+
+    #[tokio::test]
+    async fn clearing_interceptors_removes_them() {
+        let log = Log::default();
+        let mut server = Server::new();
+        server.add_interceptor(named("outer", &log));
+        server.clear_interceptors();
+        server.route_with_context("/example.Greeter/SayHello", |context, _body| async move {
+            Ok(trail(&context))
+        });
+
+        let response = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.message().as_slice(), b"");
+        assert_eq!(log.take(), Vec::<String>::new());
     }
 }

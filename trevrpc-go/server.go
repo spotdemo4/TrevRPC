@@ -51,13 +51,14 @@ var ErrServerFrozen = errors.New("trevrpc: server configuration is frozen")
 
 // Server routes and handles TrevRPC requests.
 type Server struct {
-	mu          sync.Mutex
-	routes      map[string]route
-	options     ServerOptions
-	authorizer  Authorizer
-	metrics     Metrics
-	diagnostics ServerDiagnosticHandler
-	runtime     *serverRuntime
+	mu           sync.Mutex
+	routes       map[string]route
+	options      ServerOptions
+	authorizer   Authorizer
+	interceptors []Interceptor
+	metrics      Metrics
+	diagnostics  ServerDiagnosticHandler
+	runtime      *serverRuntime
 	// frozen is runtime, once set, for lock-free reads on the request path.
 	frozen atomic.Pointer[serverRuntime]
 	// compression is options.Compression digested by SetOptions, and
@@ -180,6 +181,7 @@ type ServerDiagnosticPhase string
 const (
 	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
 	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"
+	ServerDiagnosticInterceptorPanic       ServerDiagnosticPhase = "interceptor_panic"
 	ServerDiagnosticRequestStreamPanic     ServerDiagnosticPhase = "request_stream_panic"
 	ServerDiagnosticResponseStreamPanic    ServerDiagnosticPhase = "response_stream_panic"
 	ServerDiagnosticMetricsPanic           ServerDiagnosticPhase = "metrics_panic"
@@ -241,7 +243,9 @@ func DefaultServerOptions() ServerOptions {
 // request body is not available to it. A call the server refuses for
 // optimistic stream compression is replayed by the client and authorized
 // again (see StreamCompression), so authorizers must not have side effects
-// that a second authorization of the same call would repeat.
+// that a second authorization of the same call would repeat: put those, such
+// as counting calls against a rate limit, in an Interceptor, which runs once
+// per handler invocation.
 type Authorizer interface {
 	// Authorize returns nil when the request is authorized. A returned *Status
 	// is sent to the caller; any other error becomes Internal.
@@ -514,6 +518,7 @@ type serverRuntime struct {
 	options         ServerOptions
 	routes          map[string]route
 	authorizer      Authorizer
+	interceptors    []Interceptor
 	metrics         Metrics
 	requestLimit    semaphore
 	connectionLimit semaphore
@@ -638,6 +643,7 @@ func (s *Server) freeze() *serverRuntime {
 		options:         options,
 		routes:          routes,
 		authorizer:      s.authorizer,
+		interceptors:    s.interceptors,
 		metrics:         metrics,
 		requestLimit:    newSemaphore(options.MaxConcurrentRequests),
 		connectionLimit: newSemaphore(options.MaxConcurrentConnections),
@@ -1026,7 +1032,7 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 	if !ok || route.unary == nil {
 		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(Unimplemented(fmt.Sprintf("unknown RPC method %s", request.Method))), request)
 	}
-	message, err := invokeUnaryHandler(ctx, route.unary, body, handlerNeedsDeadlineRace(ctx), lease)
+	message, err := invokeUnaryHandler(ctx, r.interceptUnary(route.unary, request), body, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
 		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(err, ServerDiagnosticInternalError, request)), request)
 	}
@@ -1162,7 +1168,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		}
 	}
 
-	responses, err := invokeStreamingHandler(ctx, route.streaming, body, requestBody, handlerNeedsDeadlineRace(ctx), lease)
+	responses, err := invokeStreamingHandler(ctx, r.interceptStreaming(route.streaming, request), body, requestBody, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
 		cancel()
 		lease.release()
@@ -1435,6 +1441,9 @@ func (r *serverRuntime) recordStarted(event RPCStarted, request *wireRequest) {
 }
 
 func (r *serverRuntime) recordFinished(event RPCFinished, request *wireRequest) {
+	if request != nil && request.intercepted != nil {
+		request.intercepted.finish(r, request, event)
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})

@@ -104,8 +104,10 @@ struct RunningServer {
     cert: CertificateDer<'static>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<trevrpc::Result<()>>,
-    /// How many calls the authorizer saw, and how many reached a streaming handler.
+    /// How many calls the authorizer and the interceptor saw, and how many reached a refusing
+    /// route's handler.
     authorized: Arc<AtomicUsize>,
+    intercepted: Arc<AtomicUsize>,
     handled: Arc<AtomicUsize>,
 }
 
@@ -126,6 +128,20 @@ impl trevrpc::server::Authorizer for CountingAuthorizer {
             return Err(trevrpc::Status::unauthenticated("denied"));
         }
         Ok(())
+    }
+}
+
+/// Counts the calls it sees.
+struct CountingInterceptor(Arc<AtomicUsize>);
+
+#[trevrpc::async_trait]
+impl trevrpc::server::Interceptor for CountingInterceptor {
+    async fn intercept(
+        &self,
+        _context: &mut trevrpc::server::RequestContext,
+    ) -> Result<Option<trevrpc::server::Finish>, trevrpc::Status> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
     }
 }
 
@@ -196,8 +212,10 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
     let mut server = Server::new();
     server.set_options(options);
     let authorized = Arc::new(AtomicUsize::new(0));
+    let intercepted = Arc::new(AtomicUsize::new(0));
     let handled = Arc::new(AtomicUsize::new(0));
     server.set_authorizer(CountingAuthorizer(Arc::clone(&authorized)));
+    server.add_interceptor(CountingInterceptor(Arc::clone(&intercepted)));
     server.route_with_options(
         PLAIN,
         RouteOptions::new()
@@ -270,6 +288,7 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
         shutdown: Some(shutdown),
         task,
         authorized,
+        intercepted,
         handled,
     })
 }
@@ -1206,10 +1225,12 @@ async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
         // A bidirectional call, refused at its first message, echoes each message once.
         ensure_eq!(ping_pong(&channel, REFUSING_STREAM).await?.as_slice(), b"0");
     }
-    // The authorizer ran once per attempt, refused or replayed, and each handler once per call:
-    // per policy, three refused calls and their replays and two answered calls in between.
+    // The authorizer ran once per attempt, refused or replayed, and the interceptor and each
+    // handler once per call: per policy, three refused calls and their replays and two answered
+    // calls in between.
     ensure_eq!(server.handled.load(Ordering::SeqCst), 6);
     ensure_eq!(server.authorized.load(Ordering::SeqCst), 16);
+    ensure_eq!(server.intercepted.load(Ordering::SeqCst), 10);
     server.stop().await
 }
 

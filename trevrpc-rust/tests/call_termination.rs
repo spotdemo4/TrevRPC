@@ -12,12 +12,13 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{
     CallOptions, ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport,
 };
-use trevrpc::server::{RequestContext, Server, ServerOptions};
+use trevrpc::server::{Finish, Interceptor, RequestContext, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{Code, RpcKind, Status};
 
@@ -141,6 +142,14 @@ impl RunningServer {
 }
 
 async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
+    spawn_server_with(options, |_| {}).await
+}
+
+/// [`spawn_server`], with `configure` adding to the server before it serves.
+async fn spawn_server_with(
+    options: ServerOptions,
+    configure: impl FnOnce(&mut Server),
+) -> TestResult<RunningServer> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
     let cert_der = CertificateDer::from(cert.cert);
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
@@ -152,6 +161,7 @@ async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
     server.set_options(options);
     greeter::register_greeter(&mut server, Greeter);
     register_routes(&mut server);
+    configure(&mut server);
     let endpoint = quinn::Endpoint::server(
         server.quic_config(tls.clone())?,
         SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -819,3 +829,140 @@ async fn send_reports_the_response_error_when_the_upload_stops_first() -> TestRe
     ensure!(status.message().contains("connection lost"));
     Ok(())
 }
+
+/// Notifies when dropped.
+struct DropSignal(Arc<Notify>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+/// Never returns from `intercept`, as a rate limiter that waits might not; reports when it starts
+/// and when the server drops it.
+struct PendingInterceptor {
+    entered: Arc<Notify>,
+    dropped: Arc<Notify>,
+}
+
+#[trevrpc::async_trait]
+impl Interceptor for PendingInterceptor {
+    async fn intercept(&self, _context: &mut RequestContext) -> Result<Option<Finish>, Status> {
+        let _dropped = DropSignal(Arc::clone(&self.dropped));
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+
+/// How a call waiting in an interceptor ends.
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    ClientCancels,
+    ConnectionCloses,
+    ServerShutsDown,
+}
+
+/// Starts a call without a deadline that waits in an interceptor forever, ends it as `ending`
+/// says, and checks that the server drops the interceptor's future.
+async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
+    let entered = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let interceptor = PendingInterceptor {
+        entered: Arc::clone(&entered),
+        dropped: Arc::clone(&dropped),
+    };
+    let server = spawn_server_with(ServerOptions::new(), |server| {
+        server.add_interceptor(interceptor);
+    })
+    .await?;
+    let (endpoint, transport, close): (_, Arc<dyn StreamingRpcTransport>, Box<dyn FnOnce()>) =
+        match wire {
+            Wire::Quic => {
+                let (endpoint, quic) = connect_quic(&server).await?;
+                let connection = quic.connection().clone();
+                let close = Box::new(move || connection.close(0_u32.into(), b"done"));
+                (Some(endpoint), Arc::new(quic), close)
+            }
+            Wire::Qmux => {
+                let qmux = connect_qmux(&server).await?;
+                let closing = qmux.clone();
+                (None, Arc::new(qmux), Box::new(move || closing.close()))
+            }
+        };
+    let call = tokio::spawn(async move {
+        greeter::GreeterClient::new(transport)
+            .say_hello(&name(0))
+            .await
+            .map(drop)
+    });
+    tokio::time::timeout(TEST_TIMEOUT, entered.notified())
+        .await
+        .map_err(|_| "the call never reached the interceptor")?;
+
+    let ended = || async {
+        tokio::time::timeout(TEST_TIMEOUT, dropped.notified())
+            .await
+            .map_err(|_| format!("{ending:?}: the server kept waiting on the interceptor"))
+    };
+    match ending {
+        Ending::ClientCancels | Ending::ConnectionCloses => {
+            if matches!(ending, Ending::ClientCancels) {
+                call.abort();
+            } else {
+                close();
+            }
+            ended().await?;
+            if let Some(endpoint) = endpoint {
+                endpoint.close(0_u32.into(), b"done");
+            }
+            server.stop().await
+        }
+        Ending::ServerShutsDown => {
+            server.stop().await?;
+            ended().await?;
+            let status = tokio::time::timeout(TEST_TIMEOUT, call)
+                .await??
+                .err()
+                .ok_or("a call the server shut down on should fail")?
+                .into_status();
+            ensure!(
+                matches!(status.code(), Code::Cancelled | Code::Unavailable),
+                "status {status:?}"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Defines a test of [`interceptor_wait_ends`] over each transport.
+macro_rules! interceptor_wait_ends_over_each_transport {
+    ($name:ident, $ending:expr) => {
+        mod $name {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn quic() -> TestResult {
+                interceptor_wait_ends(Wire::Quic, $ending).await
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn qmux() -> TestResult {
+                interceptor_wait_ends(Wire::Qmux, $ending).await
+            }
+        }
+    };
+}
+
+interceptor_wait_ends_over_each_transport!(
+    an_interceptor_wait_ends_when_the_client_cancels,
+    Ending::ClientCancels
+);
+interceptor_wait_ends_over_each_transport!(
+    an_interceptor_wait_ends_when_the_connection_closes,
+    Ending::ConnectionCloses
+);
+interceptor_wait_ends_over_each_transport!(
+    an_interceptor_wait_ends_when_the_server_shuts_down,
+    Ending::ServerShutsDown
+);

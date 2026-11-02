@@ -77,6 +77,9 @@ type Listener struct {
 	// observe it through their contexts.
 	ctx    context.Context
 	cancel context.CancelFunc
+	// serveCtx is the context passed to Serve, whose values calls carry. Serve
+	// sets it before it accepts a connection, so every call reads it after.
+	serveCtx context.Context
 
 	// workers run the RPC streams of every connection.
 	workers *streamWorkers
@@ -207,10 +210,15 @@ func (l *Listener) stopAccepting() error {
 // Serve accepts connections until ctx is cancelled or the listener is closed,
 // then cancels in-flight RPCs and waits up to GracefulShutdownTimeout for
 // handlers to finish. It returns nil after a requested shutdown.
+//
+// The contexts of handlers, interceptors and authorizers carry the values of
+// ctx, such as a logger, but not its cancellation: cancelling ctx shuts the
+// listener down gracefully as described above.
 func (l *Listener) Serve(ctx context.Context) error {
 	if !l.serving.CompareAndSwap(false, true) {
 		return FailedPrecondition("listener is already serving")
 	}
+	l.serveCtx = ctx
 	defer l.teardown()
 	stopOnCancel := context.AfterFunc(ctx, func() { _ = l.Close() })
 	defer stopOnCancel()
@@ -336,7 +344,7 @@ func (l *Listener) serveStreams(ctx context.Context, acceptor streamAcceptor) {
 			defer streamTasks.Done()
 			streamCtx, cancel := contextWithAdditionalCancel(streamCtx, ctx)
 			defer cancel()
-			handleRPCStream(streamCtx, l.server, stream, slot, l.workers)
+			handleRPCStream(streamCtx, l.serveCtx, l.server, stream, slot, l.workers)
 		})
 	}
 
