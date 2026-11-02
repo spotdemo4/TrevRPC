@@ -187,7 +187,9 @@ buildNpmPackage (final: {
       "aarch64-darwin"
     ];
     homepage = "https://trev.zip/llc/TrevRPC";
-    changelog = "https://trev.zip/llc/TrevRPC/releases";
-    downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/v${final.version}";
+    downloadPage = "https://trev.zip/llc/TrevRPC/releases";
+    changelog = "https://trev.zip/llc/TrevRPC/releases/tag/trevrpc-js/v${final.version}";
+    sourceProvenance = [ lib.sourceTypes.fromSource ];
+    maintainers = [ lib.maintainers.spotdemo4 ];
   };
 })

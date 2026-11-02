@@ -1,6 +1,5 @@
 {
   lib,
-  stdenv,
   mkGoModule,
   protobuf,
   wireGolden,
@@ -9,9 +8,6 @@
   interopProto,
   trevrpcProto,
 }:
-let
-  canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
-in
 mkGoModule (final: {
   pname = "trevrpc-go";
   version = "1.2.0";
@@ -47,7 +43,7 @@ mkGoModule (final: {
     mv "$out/bin/trevrpc-interop" "$out/bin/trevrpc-interop-go"
   '';
 
-  doCheck = canExecute;
+  doCheck = true;
   # The bindings tests regenerate code from the interop and option protos.
   nativeCheckInputs = [ protobuf ];
   checkPhase = ''
@@ -63,7 +59,7 @@ mkGoModule (final: {
     runHook postCheck
   '';
 
-  doInstallCheck = canExecute;
+  doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
     test "$(go list -m)" = 'trev.zip/llc/trevrpc/trevrpc-go'
@@ -83,7 +79,9 @@ mkGoModule (final: {
     license = lib.licenses.mit;
     platforms = lib.platforms.all;
     homepage = "https://trev.zip/llc/TrevRPC";
-    changelog = "https://trev.zip/llc/TrevRPC/releases";
-    downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/trevrpc-go/v${final.version}";
+    downloadPage = "https://trev.zip/llc/TrevRPC/releases";
+    changelog = "https://trev.zip/llc/TrevRPC/releases/tag/trevrpc-go/v${final.version}";
+    sourceProvenance = [ lib.sourceTypes.fromSource ];
+    maintainers = [ lib.maintainers.spotdemo4 ];
   };
 })

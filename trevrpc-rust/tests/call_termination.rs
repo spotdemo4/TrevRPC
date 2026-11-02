@@ -403,7 +403,6 @@ fn large_message() -> greeter::HelloRequest {
 
 /// Sends until a send fails, and returns that failure. A send that is still succeeding or
 /// blocked after `SEND_FAILURE_BOUND` fails the test.
-#[allow(clippy::future_not_send)] // Calls borrow response streams, which are not `Sync`.
 async fn send_until_failure<F, Fut>(send: F) -> TestResult<trevrpc::Error>
 where
     F: Fn() -> Fut,

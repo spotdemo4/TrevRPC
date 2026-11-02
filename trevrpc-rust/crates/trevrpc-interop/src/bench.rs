@@ -516,7 +516,6 @@ where
 
     // `&mut self` because the bidi call makes `Worker` not `Sync`, and a shared reference held
     // across an await would make the spawned worker not `Send`.
-    #[allow(clippy::needless_pass_by_ref_mut)]
     async fn server_stream(&mut self) -> Result<Outcome, Error> {
         use futures_util::StreamExt as _;
 
@@ -538,7 +537,7 @@ where
         Ok(Outcome::delivered(count_of(received)))
     }
 
-    #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
+    // `&mut self`: see `server_stream`.
     async fn client_stream(&mut self) -> Result<Outcome, Error> {
         let call = if self.streams {
             self.compressed.client_stream()
@@ -561,7 +560,7 @@ where
 
     /// One request asks for `messages` responses; the operation ends with the status, and the
     /// responses that did not arrive are lost.
-    #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
+    // `&mut self`: see `server_stream`.
     async fn unreliable_server_stream(&mut self) -> Result<Outcome, Error> {
         use futures_util::StreamExt as _;
 
@@ -589,7 +588,7 @@ where
 
     /// `messages` requests ask for no responses; the server counts the ones that arrived, and
     /// the rest are lost.
-    #[allow(clippy::needless_pass_by_ref_mut)] // see `server_stream`
+    // `&mut self`: see `server_stream`.
     async fn unreliable_client_stream(&mut self) -> Result<Outcome, Error> {
         use futures_util::StreamExt as _;
 

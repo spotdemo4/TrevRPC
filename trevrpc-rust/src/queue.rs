@@ -228,19 +228,13 @@ pub struct Receiver<T> {
 
 impl<T> Receiver<T> {
     /// Takes the oldest value, `None` once every sender is gone and the queue is empty.
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "one consumer polls at a time: the queue keeps a single receiver waker"
-    )]
+    // `&mut self`: one consumer polls at a time, the queue keeps a single receiver waker.
     pub fn poll_recv(&mut self, cx: &Context<'_>) -> Poll<Option<T>> {
         self.poll_pop(Some(cx))
     }
 
     /// Takes the oldest value if one is queued, without waiting.
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "one consumer takes values at a time, like `poll_recv`"
-    )]
+    // `&mut self`: one consumer takes values at a time, like `poll_recv`.
     pub fn try_recv(&mut self) -> Option<T> {
         match self.poll_pop(None) {
             Poll::Ready(value) => value,

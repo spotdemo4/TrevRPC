@@ -1,13 +1,9 @@
 {
   lib,
-  stdenv,
   mkGoModule,
   protobuf,
   interopProto,
 }:
-let
-  canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
-in
 mkGoModule (final: {
   pname = "trevrpc-bench-baseline";
   version = "0.0.0";
@@ -31,7 +27,7 @@ mkGoModule (final: {
 
   subPackages = [ "." ];
 
-  doCheck = canExecute;
+  doCheck = true;
   # The echopb drift test regenerates code from interop.proto.
   nativeCheckInputs = [ protobuf ];
   checkPhase = ''
@@ -41,7 +37,7 @@ mkGoModule (final: {
     runHook postCheck
   '';
 
-  doInstallCheck = canExecute;
+  doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
     test "$(go list -m)" = 'trev.zip/llc/trevrpc/bench/baseline'

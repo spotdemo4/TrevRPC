@@ -195,5 +195,8 @@ stdenvNoCC.mkDerivation (final: {
     mainProgram = "protoc-gen-trevrpc-kotlin";
     description = "Kotlin TrevRPC client runtime, Cronet HTTP/3 transport, and protobuf generator";
     homepage = "https://trev.zip/llc/TrevRPC";
+    downloadPage = "https://trev.zip/llc/TrevRPC/releases";
+    changelog = "https://trev.zip/llc/TrevRPC/releases/tag/trevrpc-kotlin/v${final.version}";
+    maintainers = [ lib.maintainers.spotdemo4 ];
   };
 })

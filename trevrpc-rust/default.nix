@@ -1,6 +1,5 @@
 {
   lib,
-  stdenv,
   mkRustPackage,
   rustfmt,
   clippy,
@@ -11,9 +10,6 @@
   interopProto,
   trevrpcProto,
 }:
-let
-  canExecute = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
-in
 mkRustPackage (final: {
   pname = "trevrpc-rust";
   version = "1.2.0";
@@ -33,7 +29,7 @@ mkRustPackage (final: {
   cargoLock.lockFile = ./Cargo.lock;
   cargoBuildFlags = [ "--workspace" ];
 
-  doCheck = canExecute;
+  doCheck = true;
   # The tests and benchmarks bind loopback UDP sockets and run the interop executable against itself.
   __darwinAllowLocalNetworking = true;
   # The generator tests format its output to compare against the checked-in bindings.
@@ -70,7 +66,7 @@ mkRustPackage (final: {
     runHook postInstall
   '';
 
-  doInstallCheck = canExecute;
+  doInstallCheck = true;
   nativeInstallCheckInputs = [ gnugrep ];
   installCheckPhase = ''
     runHook preInstallCheck
@@ -86,7 +82,9 @@ mkRustPackage (final: {
     license = lib.licenses.mit;
     platforms = lib.platforms.all;
     homepage = "https://trev.zip/llc/TrevRPC";
-    changelog = "https://trev.zip/llc/TrevRPC/releases";
-    downloadPage = "https://trev.zip/llc/TrevRPC/releases/tag/trevrpc-rust/v${final.version}";
+    downloadPage = "https://trev.zip/llc/TrevRPC/releases";
+    changelog = "https://trev.zip/llc/TrevRPC/releases/tag/trevrpc-rust/v${final.version}";
+    sourceProvenance = [ lib.sourceTypes.fromSource ];
+    maintainers = [ lib.maintainers.spotdemo4 ];
   };
 })

@@ -121,6 +121,7 @@
     // update go deps
     {
       "matchManagers": ["gomod"],
+      "postUpdateOptions": ["gomodUpdateImportPaths"],
       "postUpgradeTasks": {
         "commands": ["nix run .#update-go-deps"],
         "fileFilters": ["**/go.mod", "**/go.sum", "**/gomod2nix.toml"],
