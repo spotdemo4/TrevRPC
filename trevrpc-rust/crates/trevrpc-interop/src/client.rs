@@ -671,21 +671,12 @@ async fn unreliable(client: &UnreliableEcho, channel: &Channel) -> Scenario {
         .map(|index| index.to_string())
         .collect();
     sent.push(incompressible(UNRELIABLE_LARGE));
-    for part in &sent {
-        let request = EchoRequest {
-            count: 1,
-            ..message(part)
-        };
-        sender.send(request).await.map_err(rpc)?;
-    }
-    sender.finish().map_err(rpc)?;
 
     // Every response is one that was sent, at most once.
     let mut unseen: HashSet<&str> = sent.iter().map(String::as_str).collect();
     let mut delivered = 0_usize;
     let mut large_echoed = false;
-    while let Some(response) = responses.next().await {
-        let response = response.map_err(rpc)?;
+    let mut take = |response: EchoResponse| {
         if !unseen.remove(response.message.as_str()) {
             return Err(format!(
                 "response {:?} was not sent or arrived twice",
@@ -694,6 +685,28 @@ async fn unreliable(client: &UnreliableEcho, channel: &Channel) -> Scenario {
         }
         large_echoed |= response.message.len() == UNRELIABLE_LARGE;
         delivered = delivered.saturating_add(1);
+        Ok(())
+    };
+
+    for (index, part) in sent.iter().enumerate() {
+        if index == UNRELIABLE_REQUESTS {
+            // The stream may overtake the datagrams still queued, and the server drops those
+            // that arrive after the requests end: send the rest once one came back.
+            let first = responses
+                .next()
+                .await
+                .ok_or("the stream ended before the first response")?;
+            take(first.map_err(rpc)?)?;
+        }
+        let request = EchoRequest {
+            count: 1,
+            ..message(part)
+        };
+        sender.send(request).await.map_err(rpc)?;
+    }
+    sender.finish().map_err(rpc)?;
+    while let Some(response) = responses.next().await {
+        take(response.map_err(rpc)?)?;
     }
     if !large_echoed {
         return Err("the 4096-byte echo is missing".to_owned());

@@ -650,28 +650,54 @@ func runUnreliable(ctx context.Context, env *scenarioEnv) error {
 	messages = append(messages, large)
 	for _, message := range messages {
 		pending[message] = true
-		if err := call.Send(&interoppb.EchoRequest{Message: message, Count: 1}); err != nil {
+	}
+	send := func(message string) error {
+		return call.Send(&interoppb.EchoRequest{Message: message, Count: 1})
+	}
+	responses := 0
+	// recv takes the next response, and reports false at the end of the stream.
+	recv := func() (bool, error) {
+		response, err := call.Recv()
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("response %d: %w", responses, err)
+		}
+		if !pending[response.Message] || response.Index != 0 {
+			return false, fmt.Errorf("unexpected or repeated response (%.32q, %d)", response.Message, response.Index)
+		}
+		delete(pending, response.Message)
+		responses++
+		return true, nil
+	}
+
+	for _, message := range messages[:unreliableRequests] {
+		if err := send(message); err != nil {
 			return err
 		}
+	}
+	// The stream may overtake the datagrams still queued, and the server drops
+	// those that arrive after the requests end: send the rest once one came back.
+	if more, err := recv(); err != nil {
+		return err
+	} else if !more {
+		return errors.New("the stream ended before the first response")
+	}
+	if err := send(large); err != nil {
+		return err
 	}
 	if err := call.CloseSend(); err != nil {
 		return err
 	}
-
-	responses := 0
 	for {
-		response, err := call.Recv()
-		if errors.Is(err, io.EOF) {
+		more, err := recv()
+		if err != nil {
+			return err
+		}
+		if !more {
 			break
 		}
-		if err != nil {
-			return fmt.Errorf("response %d: %w", responses, err)
-		}
-		if !pending[response.Message] || response.Index != 0 {
-			return fmt.Errorf("unexpected or repeated response (%.32q, %d)", response.Message, response.Index)
-		}
-		delete(pending, response.Message)
-		responses++
 	}
 	if pending[large] {
 		return errors.New("the 4096-byte echo, which cannot be a datagram, is missing")

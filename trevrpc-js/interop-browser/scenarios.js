@@ -197,18 +197,26 @@ const scenarios = {
     requests.push(incompressible(UnreliableLargeSize));
 
     // Responses are read while the requests go out, so they are not dropped for a full queue.
+    let responded;
+    const firstResponse = new Promise((resolve) => (responded = resolve));
     const reading = (async () => {
       const received = [];
       for await (const response of call) {
         received.push(response.message);
+        responded();
       }
       return received;
     })();
     // A failed send is reported through the responses too; do not leave that rejection unhandled.
     reading.catch(() => {});
-    for (const message of requests) {
+    for (const message of requests.slice(0, -1)) {
       await call.send({ message, count: 1 });
     }
+    // The stream may overtake the datagrams still queued, and the server drops those that arrive
+    // after the requests end: send the rest once one came back. A stream that ends first fails
+    // below.
+    await Promise.race([firstResponse, reading.catch(() => {})]);
+    await call.send({ message: requests.at(-1), count: 1 });
     await call.closeSend();
     const received = await reading;
     const status = await call.status;
