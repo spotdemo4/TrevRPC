@@ -1,0 +1,57 @@
+// Covers what the JavaScript generator declares: enums, the decoded and input shapes of messages,
+// 64-bit integers in each representation, and the well-known types the runtime declares.
+syntax = "proto3";
+
+package types.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+enum TimeInterval {
+  TIME_INTERVAL_UNSPECIFIED = 0;
+  TIME_INTERVAL_HOUR = 1;
+  TIME_INTERVAL_DAY = 2;
+}
+
+// Its values do not share the enum's prefix, so they keep their names.
+enum Mixed {
+  MIXED_A = 0;
+  OTHER_B = 1;
+}
+
+message Sample {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_GAUGE = 1;
+  }
+
+  string name = 1;
+  int64 count = 2;
+  uint64 total = 3;
+  int64 exact = 4 [jstype = JS_STRING];
+  int64 small = 5 [jstype = JS_NUMBER];
+  repeated sint64 history = 6;
+  map<int64, string> labels = 7;
+  map<string, fixed64> sums = 8;
+  optional int64 maybe = 9;
+  TimeInterval interval = 10;
+  Kind kind = 11;
+  google.protobuf.Timestamp at = 12;
+  google.protobuf.Duration window = 13;
+  google.protobuf.Struct attributes = 14;
+  Sample parent = 15;
+  repeated Sample children = 16;
+  oneof value {
+    double gauge = 17;
+    int64 counter = 18;
+  }
+  Mixed mixed = 19;
+}
+
+service Samples {
+  rpc Get(google.protobuf.Empty) returns (Sample);
+  rpc Put(Sample) returns (google.protobuf.Empty);
+  rpc List(Sample) returns (stream Sample);
+}

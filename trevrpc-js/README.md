@@ -36,11 +36,39 @@ protoc \
 
 This writes `greeter.trevrpc.js` and `greeter.trevrpc.d.ts`. Plugin parameters (`--trevrpc-js_out=key=value,key=value:dir`):
 
-| Parameter             | Default                  | Meaning                                                                            |
-| --------------------- | ------------------------ | ---------------------------------------------------------------------------------- |
-| `runtime_import`      | `@trevrpc/trevrpc-js`    | Module specifier the generated JavaScript imports.                                 |
-| `runtime_type_import` | same as `runtime_import` | Module specifier the declarations import; required when `runtime_import` is a URL. |
-| `file_suffix`         | `.trevrpc.js`            | Suffix of the generated files.                                                     |
+| Parameter             | Default                  | Meaning                                                                              |
+| --------------------- | ------------------------ | ------------------------------------------------------------------------------------ |
+| `runtime_import`      | `@trevrpc/trevrpc-js`    | Module specifier the generated JavaScript imports.                                   |
+| `runtime_type_import` | same as `runtime_import` | Module specifier the declarations import; required when `runtime_import` is a URL.   |
+| `file_suffix`         | `.trevrpc.js`            | Suffix of the generated files.                                                       |
+| `int64`               | `bigint`                 | How decoded 64-bit integers are represented: `bigint`, `number`, `string` or `long`. |
+
+### Generated types
+
+The declarations cover the file's own messages and enums and every type they and its services use, including those of imported files. Each message has two shapes:
+
+- `Foo`, a decoded message, which calls return and streams yield. Every field reads a value: scalars and enums their default when unset, repeated fields and maps an empty array and object, and message and `optional` fields `null` when unset.
+- `FooInit`, a message to send, in which every field may be left out. Requests take it, and a decoded `Foo` can be sent as one.
+
+Each enum is exported as a frozen object of its values and as the type of those values. When every value starts with the enum's name in upper snake case, the prefix is dropped, as protobuf-es does: `TIME_INTERVAL_HOUR` of `TimeInterval` is `TimeInterval.HOUR`.
+
+```ts
+import { TimeInterval, type Sample } from "./gen/metrics.trevrpc.js";
+
+const sample: Sample = await client.get({ interval: TimeInterval.HOUR });
+sample.count; // bigint, never undefined
+```
+
+64-bit integers decode as `bigint` by default; requests take a `bigint`, a `number` or a decimal `string`. The `int64` plugin option picks `number` (exact up to 2^53), `string`, or `long` (protobuf.js `Long` objects, without the conversion) instead, and a field's `jstype` option (`[jstype = JS_STRING]` or `JS_NUMBER`) overrides it for that field. 64-bit map keys are decimal strings. `JSON.stringify` throws on a `bigint`, so a decoded message with a 64-bit field needs a replacer to serialize, such as `(key, value) => (typeof value === "bigint" ? value.toString() : value)`, or generate with `int64=string`.
+
+`google.protobuf.Timestamp`, `Duration`, `Empty`, `Struct`, `Value`, `ListValue` and `NullValue` are declared once by the runtime, which generated files import (Timestamp and Duration only with `bigint`, since the runtime declares their seconds as one). The runtime has helpers for them: `timestampFromDate`, `timestampFromMs`, `timestampDate`, `timestampMs`, `durationFromMs`, `durationMs`, `structFromJson`, `structToJson`, `valueFromJson` and `valueToJson`. The Timestamp and Duration readers take seconds in any representation.
+
+```ts
+import { timestampDate, timestampFromDate } from "@trevrpc/trevrpc-js";
+
+await client.put({ at: timestampFromDate(new Date()) });
+const at = sample.at === null ? undefined : timestampDate(sample.at);
+```
 
 ## Client
 

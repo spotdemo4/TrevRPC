@@ -9,12 +9,13 @@ import { promisify } from "node:util";
 
 import { rolldown } from "rolldown";
 
+import { generateClients } from "../tools/generate-clients.js";
+
 const run = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const protoDir = fileURLToPath(new URL("../../interop/proto", import.meta.url));
 // The shared schema options (trevrpc/options.proto) that unreliable.proto imports.
 const optionsProtoDir = fileURLToPath(new URL("../../proto", import.meta.url));
-const plugin = fileURLToPath(new URL("../bin/protoc-gen-trevrpc-js.js", import.meta.url));
 const esPlugin = fileURLToPath(
   new URL("../node_modules/@bufbuild/protoc-gen-es/bin/protoc-gen-es", import.meta.url),
 );
@@ -31,17 +32,11 @@ export async function buildInterop() {
   await mkdir(genDir, { recursive: true });
   await mkdir(esGenDir, { recursive: true });
 
-  // The generated client imports the runtime straight from this checkout.
-  const runtime = "../../../src/index.js";
-  await run("protoc", [
-    `--plugin=protoc-gen-trevrpc-js=${plugin}`,
-    `--trevrpc-js_out=runtime_import=${runtime},runtime_type_import=${runtime}:${genDir}`,
-    `--proto_path=${protoDir}`,
-    `--proto_path=${optionsProtoDir}`,
-    "interop.proto",
-    "unreliable.proto",
-    "compressed.proto",
-  ]);
+  await generateClients({
+    protoDirs: [protoDir, optionsProtoDir],
+    files: ["interop.proto", "unreliable.proto", "compressed.proto"],
+    outDir: genDir,
+  });
 
   // protoc runs plugins directly; this one runs with the node running the build, whatever the
   // shebang of the package's script says.

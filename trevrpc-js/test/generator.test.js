@@ -35,21 +35,23 @@ test("the generator emits a JavaScript client and its declarations, nothing else
 test("generated declarations type every call shape", () => {
   const types = fileContent(generate(greeterRequest()), "hello/v1/greeter.trevrpc.d.ts");
 
-  assert.match(types, /export interface HelloRequest \{\s*name\?: string;\s*\}/);
-  assert.match(types, /export interface HelloReply/);
+  // The decoded shape reads every field; the input shape may leave any out.
+  assert.match(types, /export interface HelloRequest \{\s*name: string;\s*\}/);
+  assert.match(types, /export interface HelloRequestInit \{\s*name\?: string;\s*\}/);
+  assert.match(types, /export interface HelloReply \{/);
   assert.match(
     types,
-    /sayHello\(request: HelloRequest, options\?: CallOptions\): Promise<HelloReply>;/,
+    /sayHello\(request: HelloRequestInit, options\?: CallOptions\): Promise<HelloReply>;/,
   );
   assert.doesNotMatch(types, /WithResponse|UnaryResponse/);
   assert.match(types, /lotsOfReplies\([\s\S]*Promise<ResponseStream<HelloReply>>;/);
   assert.match(
     types,
-    /lotsOfGreetings\(options\?: CallOptions\): Promise<ClientStreamingCall<HelloRequest, HelloReply>>;/,
+    /lotsOfGreetings\(options\?: CallOptions\): Promise<ClientStreamingCall<HelloRequestInit, HelloReply>>;/,
   );
   assert.match(
     types,
-    /bidiHello\(options\?: CallOptions\): Promise<BidirectionalStreamingCall<HelloRequest, HelloReply>>;/,
+    /bidiHello\(options\?: CallOptions\): Promise<BidirectionalStreamingCall<HelloRequestInit, HelloReply>>;/,
   );
   assert.match(
     types,
@@ -61,27 +63,159 @@ test("generated declarations type every call shape", () => {
 test("declarations import only the types they use", () => {
   const types = fileContent(generate(longAndMapRequest()), "types/v1/values.trevrpc.d.ts");
 
-  assert.match(types, /import type \{ Long, Root \} from "protobufjs";/);
-  assert.match(types, /count\?: number \| string \| Long;/);
+  assert.match(types, /import type \{ Root \} from "protobufjs";/);
+  assert.match(types, /count: bigint;/);
+  assert.match(types, /count\?: bigint \| number \| string;/);
+  assert.match(types, /labels: Record<string, string>;/);
   assert.match(types, /labels\?: Record<string, string>;/);
   assert.match(
     types,
     /import type \{ CallOptions, ClientOptions, RpcServiceDescriptor, Transport \} from/,
   );
-  assert.match(types, /getValues\(request: Values, options\?: CallOptions\): Promise<Values>;/);
+  assert.match(types, /getValues\(request: ValuesInit, options\?: CallOptions\): Promise<Values>;/);
+
+  const long = fileContent(
+    generate(longAndMapRequest("int64=long")),
+    "types/v1/values.trevrpc.d.ts",
+  );
+  assert.match(long, /import type \{ Long, Root \} from "protobufjs";/);
+  assert.match(long, /count: Long;/);
+  assert.match(long, /count\?: bigint \| number \| string \| Long;/);
 });
 
-test("declarations include message types from imported files", () => {
-  const types = fileContent(generate(importedTypeRequest()), "hello/v1/greeter.trevrpc.d.ts");
+test("declarations include the types of imported files that the file uses, and no others", () => {
+  const request = importedTypeRequest();
+  request.protoFile[0].messageType.push({ name: "Unused", field: [field("x", 1, 9)] });
+  const types = fileContent(generate(request), "hello/v1/greeter.trevrpc.d.ts");
 
-  assert.match(types, /export interface SharedRequest/);
-  assert.match(types, /sayHello\(request: SharedRequest/);
+  assert.match(types, /export interface SharedRequest \{/);
+  assert.match(types, /sayHello\(request: SharedRequestInit/);
+  assert.doesNotMatch(types, /Unused/);
+});
+
+test("enums are exported with their values, without the enum's prefix when every value has it", () => {
+  const request = greeterRequest();
+  const file = request.protoFile[0];
+  file.enumType = [
+    {
+      name: "TimeInterval",
+      value: [
+        { name: "TIME_INTERVAL_UNSPECIFIED", number: 0 },
+        { name: "TIME_INTERVAL_HOUR", number: 1 },
+      ],
+    },
+    // The remainder would start with a digit, so the names stay whole.
+    { name: "Size", value: [{ name: "SIZE_UNSPECIFIED" }, { name: "SIZE_2X", number: 2 }] },
+  ];
+  file.messageType[0].enumType = [
+    {
+      name: "Mood",
+      value: [
+        { name: "HAPPY", number: 0 },
+        { name: "SAD", number: 1 },
+      ],
+    },
+  ];
+  file.messageType[0].field.push(
+    field("interval", 2, 14, { typeName: ".hello.v1.TimeInterval" }),
+    field("mood", 3, 14, { typeName: ".hello.v1.HelloRequest.Mood" }),
+  );
+  const response = generate(request);
+  const js = fileContent(response, "hello/v1/greeter.trevrpc.js");
+  const types = fileContent(response, "hello/v1/greeter.trevrpc.d.ts");
+
+  assert.match(
+    js,
+    /export const TimeInterval = Object\.freeze\(\{\n  UNSPECIFIED: 0,\n  HOUR: 1,\n\}\);/,
+  );
+  assert.match(
+    js,
+    /export const Size = Object\.freeze\(\{\n  SIZE_UNSPECIFIED: 0,\n  SIZE_2X: 2,\n\}\);/,
+  );
+  assert.match(js, /export const Mood = Object\.freeze\(\{\n  HAPPY: 0,\n  SAD: 1,\n\}\);/);
+  assert.match(
+    types,
+    /export declare const TimeInterval: Readonly<\{ UNSPECIFIED: 0; HOUR: 1 \}>;\n.*\nexport type TimeInterval = \(typeof TimeInterval\)\[keyof typeof TimeInterval\];/,
+  );
+  assert.match(types, /interval: TimeInterval;/);
+  assert.match(types, /interval\?: TimeInterval;/);
+  assert.match(types, /mood: Mood;/);
+});
+
+test("the int64 option and the jstype field option choose how 64-bit integers decode", () => {
+  const request = longAndMapRequest();
+  const [values] = request.protoFile[0].messageType;
+  values.field.push(
+    field("exact", 3, 4, { options: { jstype: 1 } }),
+    field("small", 4, 18, { options: { jstype: 2 } }),
+    field("history", 5, 6, { label: 3 }),
+  );
+  const response = generate(request);
+  const js = fileContent(response, "types/v1/values.trevrpc.js");
+  const types = fileContent(response, "types/v1/values.trevrpc.d.ts");
+
+  assert.match(js, /\}, \{ int64: "bigint" \}\);/);
+  const fields = rootJson(js).nested.types.nested.v1.nested.Values.fields;
+  assert.deepEqual(fields.exact.options, { jstype: "JS_STRING" });
+  assert.deepEqual(fields.small.options, { jstype: "JS_NUMBER" });
+  assert.match(types, /exact: string;/);
+  assert.match(types, /small: number;/);
+  assert.match(types, /history: bigint\[\];/);
+  assert.match(types, /history\?: \(bigint \| number \| string\)\[\];/);
+
+  for (const representation of ["number", "string", "long"]) {
+    const option = `int64=${representation}`;
+    const generated = fileContent(
+      generate(longAndMapRequest(option)),
+      "types/v1/values.trevrpc.js",
+    );
+    assert.match(generated, new RegExp(`\\{ int64: "${representation}" \\}`), option);
+  }
+  assert.match(generate(longAndMapRequest("int64=double")).error, /invalid trevrpc-js int64/);
+});
+
+test("well-known types the runtime declares are imported, not declared", () => {
+  const request = longAndMapRequest();
+  request.protoFile.unshift(
+    {
+      name: "google/protobuf/timestamp.proto",
+      package: "google.protobuf",
+      messageType: [{ name: "Timestamp", field: [field("seconds", 1, 3), field("nanos", 2, 5)] }],
+    },
+    {
+      name: "google/protobuf/empty.proto",
+      package: "google.protobuf",
+      messageType: [{ name: "Empty" }],
+    },
+  );
+  const file = request.protoFile[2];
+  file.messageType[0].field.push(field("at", 3, 11, { typeName: ".google.protobuf.Timestamp" }));
+  file.service[0].method.push({
+    name: "Ping",
+    inputType: ".google.protobuf.Empty",
+    outputType: ".google.protobuf.Empty",
+  });
+
+  const types = fileContent(generate(request), "types/v1/values.trevrpc.d.ts");
+  assert.match(
+    types,
+    /import type \{ CallOptions, ClientOptions, Empty, EmptyInit, RpcServiceDescriptor, Timestamp, TimestampInit, Transport \} from/,
+  );
+  assert.doesNotMatch(types, /interface Timestamp|interface Empty/);
+  assert.match(types, /at: Timestamp \| null;/);
+  assert.match(types, /at\?: TimestampInit \| null;/);
+  assert.match(types, /ping\(request: EmptyInit, options\?: CallOptions\): Promise<Empty>;/);
+
+  // The runtime declares Timestamp's seconds as a bigint, so other representations declare their own.
+  request.parameter = "int64=number";
+  const numbers = fileContent(generate(request), "types/v1/values.trevrpc.d.ts");
+  assert.match(numbers, /export interface Timestamp \{\n  seconds: number;\n  nanos: number;\n\}/);
+  assert.doesNotMatch(numbers, /interface Empty/);
 });
 
 test("the generated protobuf root describes nested messages, enums, maps and oneofs", () => {
   const js = fileContent(generate(longAndMapRequest()), "types/v1/values.trevrpc.js");
-  const json = JSON.parse(js.slice(js.indexOf("createRoot(") + 11, js.indexOf(");\n")));
-  const root = protobuf.Root.fromJSON(json);
+  const root = protobuf.Root.fromJSON(rootJson(js));
   const Values = root.lookupType("types.v1.Values");
 
   assert.equal(Values.fields.count.type, "int64");
@@ -197,8 +331,7 @@ service OptionalService { rpc Get(Values) returns (Values); }
   ]);
 
   const js = await readFile(new URL("optional.trevrpc.js", output), "utf8");
-  const json = JSON.parse(js.slice(js.indexOf("createRoot(") + 11, js.indexOf(");\n")));
-  const Values = protobuf.Root.fromJSON(json).lookupType("optional.v1.Values");
+  const Values = protobuf.Root.fromJSON(rootJson(js)).lookupType("optional.v1.Values");
   // Fields outside a oneof stay out of every oneof, including synthetic ones.
   assert.deepEqual(
     Object.fromEntries(Values.oneofsArray.map((oneof) => [oneof.name, oneof.oneof])),
@@ -212,9 +345,12 @@ service OptionalService { rpc Get(Values) returns (Values); }
   assert.equal(decoded.a, 1);
 
   const types = await readFile(new URL("optional.trevrpc.d.ts", output), "utf8");
+  assert.match(types, /name: string \| null;/);
   assert.match(types, /name\?: string \| null;/);
+  assert.match(types, /plain: string;/);
   assert.match(types, /plain\?: string;/);
-  assert.match(types, /sub\?: Sub \| null;/);
+  assert.match(types, /sub: Sub \| null;/);
+  assert.match(types, /sub\?: SubInit \| null;/);
 });
 
 test("the response declares proto3 optional support, with or without an error", () => {
@@ -428,6 +564,12 @@ test("runGenerator reports errors in the plugin response", () => {
   assert.throws(() => runGenerator(new Uint8Array([0xff])));
 });
 
+/** The JSON namespace a generated file passes to createRoot. */
+function rootJson(js) {
+  const start = js.indexOf("createRoot(") + "createRoot(".length;
+  return JSON.parse(js.slice(start, js.indexOf(", { int64: ", start)));
+}
+
 function fileContent(response, name) {
   assert.equal(response.error, undefined);
   const file = response.file.find((candidate) => candidate.name === name);
@@ -474,8 +616,9 @@ function greeterRequest(parameter = "") {
   };
 }
 
-function longAndMapRequest() {
+function longAndMapRequest(parameter = "") {
   return {
+    parameter,
     fileToGenerate: ["types/v1/values.proto"],
     protoFile: [
       {

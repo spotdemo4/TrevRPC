@@ -1,6 +1,7 @@
 import protobuf from "protobufjs";
 
 import { byteView } from "./bytes.js";
+import { setInt64Representation } from "./int64.js";
 
 export { protobuf };
 
@@ -102,9 +103,16 @@ export function preflightWireMessage(messageType, body) {
   scanMessage(messageType, byteView(body), 0);
 }
 
-/** Creates a protobuf root from a JSON namespace definition. */
-export function createRoot(json) {
-  return protobuf.Root.fromJSON(json);
+/**
+ * Creates a protobuf root from a JSON namespace definition. `options.int64` sets how calls decode
+ * its messages' 64-bit integers (see `setInt64Representation`); without it they stay Long objects.
+ */
+export function createRoot(json, options = {}) {
+  const root = protobuf.Root.fromJSON(json);
+  if (options.int64 !== undefined) {
+    setInt64Representation(root, options.int64);
+  }
+  return root;
 }
 
 function scanMessage(messageType, bytes, depth) {
@@ -183,15 +191,25 @@ function scanMapEntry(field, bytes, depth) {
     if (fieldNumber === 1) {
       scanSyntheticField(field.keyType, `${field.name}.key`, bytes, cursor, wireType, depth);
     } else if (fieldNumber === 2) {
-      scanSyntheticField(field.type, `${field.name}.value`, bytes, cursor, wireType, depth);
+      const messageType = field.resolvedType?.fieldsById != null ? field.resolvedType : undefined;
+      scanSyntheticField(
+        field.type,
+        `${field.name}.value`,
+        bytes,
+        cursor,
+        wireType,
+        depth,
+        messageType,
+      );
     } else {
       skipUnknownField(bytes, cursor, fieldNumber, wireType, depth);
     }
   }
 }
 
-function scanSyntheticField(type, name, bytes, cursor, wireType, depth) {
-  const expected = scalarWireType(type);
+/** Scans a map key or value: a scalar of `type`, or a message of `messageType` when it is set. */
+function scanSyntheticField(type, name, bytes, cursor, wireType, depth, messageType) {
+  const expected = messageType === undefined ? scalarWireType(type) : 2;
   if (wireType !== expected) {
     throw malformedWire(`field ${name} used incompatible protobuf wire type ${wireType}`);
   }
@@ -206,7 +224,9 @@ function scanSyntheticField(type, name, bytes, cursor, wireType, depth) {
     skipFixed(bytes, cursor, 4, name);
   } else if (wireType === 2) {
     const value = readLengthDelimited(bytes, cursor, `truncated protobuf field ${name}`);
-    if (type === "string") {
+    if (messageType !== undefined) {
+      scanMessage(messageType, value, depth + 1);
+    } else if (type === "string") {
       validateUtf8(value, name);
     }
   } else {
@@ -234,6 +254,10 @@ function scanPackedField(field, bytes) {
 }
 
 function acceptedWireTypes(field) {
+  // A map entry is a length-delimited message, whatever its value type.
+  if (field.map) {
+    return [2];
+  }
   const expected = field.resolvedType?.fieldsById != null ? 2 : scalarWireType(field.type);
   return field.repeated && isPackableField(field) ? [expected, 2] : [expected];
 }

@@ -140,8 +140,10 @@ buildNpmPackage (final: {
         import assert from "node:assert/strict";
         const runtime = await import("@trevrpc/trevrpc-js");
         assert.deepEqual(Object.keys(runtime).sort(), [
-          "Channel", "Code", "TrevRpcError", "codeName", "connect", "createChannel",
-          "createRoot", "createServiceClient", "protobuf",
+          "Channel", "Code", "NullValue", "TrevRpcError", "codeName", "connect",
+          "createChannel", "createRoot", "createServiceClient", "durationFromMs", "durationMs",
+          "protobuf", "structFromJson", "structToJson", "timestampDate", "timestampFromDate",
+          "timestampFromMs", "timestampMs", "valueFromJson", "valueToJson",
         ]);
         const zstd = await import("@trevrpc/trevrpc-js/zstd");
         assert.deepEqual(Object.keys(zstd), ["createCompression"]);

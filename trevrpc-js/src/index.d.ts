@@ -2,8 +2,138 @@ import type { INamespace, Root } from "protobufjs";
 
 export const protobuf: typeof import("protobufjs");
 
+/**
+ * How decoded messages represent 64-bit integer fields: `bigint`, `number` (exact up to 2^53),
+ * decimal `string`, or protobuf.js's `long` (a Long object). 64-bit map keys are decimal strings
+ * in every representation.
+ */
+export type Int64Representation = "bigint" | "number" | "string" | "long";
+
+export interface CreateRootOptions {
+  /**
+   * How calls decode the 64-bit integers of the root's messages; a field's `jstype` option
+   * (`JS_STRING` or `JS_NUMBER`) overrides it. Without it they stay Long objects. Generated code
+   * passes the generator's `int64` option.
+   */
+  int64?: Int64Representation;
+}
+
 /** Creates a protobuf root from a JSON namespace definition. */
-export function createRoot(json: INamespace): Root;
+export function createRoot(json: INamespace, options?: CreateRootOptions): Root;
+
+/** A 64-bit integer in any representation, including a Long. */
+type Int64Value = bigint | number | string | { low: number; high: number; unsigned?: boolean };
+
+/** A decoded google.protobuf.Timestamp message. */
+export interface Timestamp {
+  seconds: bigint;
+  nanos: number;
+}
+
+/** A google.protobuf.Timestamp message to send. */
+export interface TimestampInit {
+  seconds?: bigint | number | string;
+  nanos?: number;
+}
+
+/** A decoded google.protobuf.Duration message. */
+export interface Duration {
+  seconds: bigint;
+  nanos: number;
+}
+
+/** A google.protobuf.Duration message to send. */
+export interface DurationInit {
+  seconds?: bigint | number | string;
+  nanos?: number;
+}
+
+/** A decoded google.protobuf.Empty message. */
+export interface Empty {}
+
+/** A google.protobuf.Empty message to send. */
+export interface EmptyInit {}
+
+/** Values of the google.protobuf.NullValue enum. */
+export const NullValue: Readonly<{ NULL_VALUE: 0 }>;
+/** A value of the google.protobuf.NullValue enum. */
+export type NullValue = (typeof NullValue)[keyof typeof NullValue];
+
+/** A decoded google.protobuf.Struct message: a JSON object; see `structToJson`. */
+export interface Struct {
+  fields: Record<string, Value>;
+}
+
+/** A google.protobuf.Struct message to send; see `structFromJson`. */
+export interface StructInit {
+  fields?: Record<string, ValueInit>;
+}
+
+/**
+ * A decoded google.protobuf.Value message: a JSON value, which sets one member of the `kind`
+ * oneof; see `valueToJson`.
+ */
+export interface Value {
+  nullValue: NullValue;
+  numberValue: number;
+  stringValue: string;
+  boolValue: boolean;
+  structValue: Struct | null;
+  listValue: ListValue | null;
+}
+
+/** A google.protobuf.Value message to send; see `valueFromJson`. */
+export interface ValueInit {
+  nullValue?: NullValue;
+  numberValue?: number;
+  stringValue?: string;
+  boolValue?: boolean;
+  structValue?: StructInit | null;
+  listValue?: ListValueInit | null;
+}
+
+/** A decoded google.protobuf.ListValue message: a JSON array. */
+export interface ListValue {
+  values: Value[];
+}
+
+/** A google.protobuf.ListValue message to send. */
+export interface ListValueInit {
+  values?: ValueInit[];
+}
+
+export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
+export type JsonObject = { [key: string]: JsonValue };
+
+/** Returns the Timestamp of a Date, to the millisecond. */
+export function timestampFromDate(date: Date): Timestamp;
+/** Returns the Timestamp of milliseconds since the Unix epoch. */
+export function timestampFromMs(ms: number): Timestamp;
+/** Returns the Date of a Timestamp, whatever the representation of its seconds. */
+export function timestampDate(timestamp: {
+  seconds?: Int64Value | null;
+  nanos?: number | null;
+}): Date;
+/** Returns the milliseconds since the Unix epoch of a Timestamp, rounded down. */
+export function timestampMs(timestamp: {
+  seconds?: Int64Value | null;
+  nanos?: number | null;
+}): number;
+/** Returns the Duration of a number of milliseconds. */
+export function durationFromMs(ms: number): Duration;
+/** Returns the milliseconds of a Duration, rounded towards zero. */
+export function durationMs(duration: {
+  seconds?: Int64Value | null;
+  nanos?: number | null;
+}): number;
+/** Returns the Struct of a JSON object. */
+export function structFromJson(json: JsonObject): StructInit;
+/** Returns the JSON object of a Struct. */
+export function structToJson(struct: StructInit): JsonObject;
+/** Returns the Value of a JSON value. */
+export function valueFromJson(json: JsonValue): ValueInit;
+/** Returns the JSON value of a Value; one with no member of `kind` set is null. */
+export function valueToJson(value: ValueInit): JsonValue;
 
 export const Code: Readonly<{
   Ok: 0;

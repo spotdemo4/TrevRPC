@@ -1,5 +1,6 @@
 import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
 import { FrameType, marshalMessage, unmarshalMessage } from "./framing.js";
+import { int64Converter } from "./int64.js";
 import { interceptCall, interceptorList } from "./interceptor.js";
 import { validateMetadata } from "./metadata.js";
 import { Code, cancelled, internal, statusError } from "./status.js";
@@ -26,6 +27,8 @@ export function createServiceClient(transport, service, root, options = {}) {
       path: `/${service.fullName}/${method.name}`,
       requestType,
       responseType,
+      // Converts the 64-bit integers of decoded responses, or undefined when they need nothing.
+      convertResponse: int64Converter(responseType),
       // Full protobuf names, which pick the compression dictionaries.
       types: { request: fullName(requestType), response: fullName(responseType) },
       datagrams: datagramUse(method),
@@ -415,7 +418,8 @@ export class BidirectionalStreamingCall {
     const item = await this.#take();
     if (item.payload !== undefined) {
       try {
-        return unmarshalMessage(this.#rpc.responseType, item.payload);
+        const message = unmarshalMessage(this.#rpc.responseType, item.payload);
+        return this.#rpc.convertResponse?.(message) ?? message;
       } catch (error) {
         throw this.#settleFailure(this.#call.fail(error));
       }

@@ -9,5 +9,10 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": []
   },
-  "include": ["src/**/*.d.ts", "build/interop/gen/*.d.ts", "test/types/*.ts"]
+  "include": [
+    "src/**/*.d.ts",
+    "build/interop/gen/*.d.ts",
+    "build/test/**/*.d.ts",
+    "test/types/*.ts"
+  ]
 }
