@@ -22,7 +22,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The wiki diff needs the merge base with the base branch.
+          fetch-depth: 0
           persist-credentials: false
+
+      # Without a shell, pi can't diff the wiki submodule itself. Write the diff
+      # inside .git, where pi can read it but pi-action won't commit it. A diff
+      # that fails, such as for a wiki commit that can't be fetched, becomes a
+      # note for pi to report instead of failing the run before pi can comment.
+      - name: Diff wiki
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if ! {
+            base=$(git merge-base "origin/$BASE_REF" HEAD) &&
+              git submodule update --init wiki &&
+              git diff --submodule=diff --no-color --no-ext-diff --no-textconv "$base" HEAD -- wiki >.git/wiki.diff
+          }; then
+            echo "The wiki changes could not be diffed; the wiki commit $(git rev-parse HEAD:wiki) may not be pushed to the wiki's main branch." >.git/wiki.diff
+          fi
 
       - name: Review pull request
         uses: trev-zip/pi-action@19f064a6269bd5e4d7315730968b15c491ba948b # v0.5.1
