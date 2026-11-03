@@ -148,3 +148,15 @@ jobs:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-rust
+
+      # After trevrpc, which cargo publish builds the crate against. Bumper gives the crate the
+      # same version, tagged in its directory.
+      - name: Release trevrpc-opentelemetry to Forgejo and crates.io
+        run: TAG="trevrpc-rust/crates/trevrpc-opentelemetry/${GITHUB_REF_NAME#trevrpc-rust/}" flake-release
+        env:
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-rust-otel

@@ -189,6 +189,20 @@ WebTransport policy: a session must use the shared path, then pass the authority
 
 For local development, `server::DevelopmentCertificate::new()` (feature `dev-certificate`) generates a self-signed ECDSA certificate for `localhost`, `127.0.0.1` and `::1` that rotates itself within the 14-day limit browsers place on certificates they trust by hash. Pass its `server_config()` to `quic_config` and `tcp_tls_config`. As a `tower_service::Service` it answers its current and next SHA-256 hashes as JSON, which the browser client's `serverCertificateHashesUrl` reads, and `pem()` returns both certificates for native clients to trust. See [Development certificates](https://trev.zip/llc/TrevRPC/wiki/WebTransport#development-certificates).
 
+Interceptors run the rest of a call in a `tracing` span with `RequestContext::set_span`. The separate crate [`trevrpc-opentelemetry`](crates/trevrpc-opentelemetry) builds OpenTelemetry metrics, server spans and trace propagation on the interceptor and metrics hooks:
+
+```rust
+server.set_metrics(trevrpc_opentelemetry::Metrics::global());
+server.add_interceptor(trevrpc_opentelemetry::Interceptor::new());
+
+let reply = client
+    .say_hello(&request)
+    .options(trevrpc_opentelemetry::propagate)
+    .await?;
+```
+
+See [Observability](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#observability).
+
 `Server::serve_with_shutdown` drains in-flight RPCs for up to `ServerOptions::graceful_shutdown_timeout` before closing the endpoint.
 
 `http3_enabled`, `http3_path`, and `http3_admission` (and their `with_*` builders) were renamed `http_enabled`, `http_path`, and `http_admission`, and `Http3Admission`/`Http3AdmissionRequest` became `HttpAdmission`/`HttpAdmissionRequest`, because the HTTP mapping is now also served over HTTP/2.

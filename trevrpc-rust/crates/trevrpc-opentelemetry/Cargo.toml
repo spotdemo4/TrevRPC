@@ -1,0 +1,32 @@
+[package]
+name = "trevrpc-opentelemetry"
+version = "1.3.2"
+edition = "2024"
+rust-version = "1.95.0"
+description = "OpenTelemetry metrics and tracing for TrevRPC servers and clients"
+readme = "README.md"
+repository = "https://trev.zip/llc/TrevRPC"
+license = "MIT"
+license-file = "../../../LICENSE"
+keywords = ["trevrpc", "opentelemetry", "tracing", "metrics", "rpc"]
+categories = ["network-programming", "development-tools::debugging"]
+# The Nix package of the source, and tests that share the workspace's test support.
+exclude = ["default.nix", "tests"]
+
+[lints]
+workspace = true
+
+[dependencies]
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace"] }
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.34", default-features = false }
+trevrpc = { version = "1.3.2", path = "../.." }
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+  "metrics",
+  "testing",
+  "trace",
+] }
+tokio = { version = "1.48.0", features = ["macros", "rt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

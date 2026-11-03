@@ -289,6 +289,9 @@
                 licenseFile
                 ;
             };
+            trevrpc-rust-otel = pkgs.callPackage ./trevrpc-rust/crates/trevrpc-opentelemetry {
+              inherit licenseFile;
+            };
             trevrpc-rust = pkgs.callPackage ./trevrpc-rust {
               inherit
                 wireGolden

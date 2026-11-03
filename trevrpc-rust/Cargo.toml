@@ -12,7 +12,11 @@ keywords = ["quic", "rpc", "protobuf", "webtransport", "http3"]
 categories = ["network-programming"]
 
 [workspace]
-members = ["crates/protoc-gen-trevrpc-rust", "crates/trevrpc-interop"]
+members = [
+  "crates/protoc-gen-trevrpc-rust",
+  "crates/trevrpc-interop",
+  "crates/trevrpc-opentelemetry",
+]
 resolver = "3"
 
 [workspace.lints.clippy]
@@ -117,6 +121,8 @@ tokio = { version = "1.48.0", features = [
   "signal",
   "test-util",
 ] }
+# The current span in tests of interceptor spans.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 # Test-only WebTransport client; the library itself ships no WebTransport or HTTP/3 client.
 url = "2"
 web-transport-quinn = { version = "0.13.0", default-features = false, features = ["ring"] }

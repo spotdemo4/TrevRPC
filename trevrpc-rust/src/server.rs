@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures_core::Stream;
 use tokio::sync::watch;
+use tracing::Instrument as _;
 
 use crate::client::MessageTypes;
 use crate::compression::{
@@ -317,8 +318,10 @@ pub struct RequestContext {
     remote_addr: Option<SocketAddr>,
     /// The response metadata the handler sets, shared by every clone of the context.
     response: ResponseMetadata,
-    /// Values interceptors pass to the handler, such as a tracing span.
+    /// Values interceptors pass to the handler, such as a database handle.
     extensions: http::Extensions,
+    /// The span later interceptors, the handler and its response stream run in.
+    span: tracing::Span,
 }
 
 impl RequestContext {
@@ -356,6 +359,7 @@ impl RequestContext {
             remote_addr: info.remote_addr,
             response: ResponseMetadata::default(),
             extensions: http::Extensions::new(),
+            span: tracing::Span::none(),
         }
     }
 
@@ -404,8 +408,7 @@ impl RequestContext {
         self.response.set_metadata(key, value.into())
     }
 
-    /// Values an [`Interceptor`] passed to the handler, such as a tracing span or a database
-    /// handle. A clone of the context copies them.
+    /// Values an [`Interceptor`] passed to the handler, such as a database handle. A clone of the context copies them.
     #[must_use]
     pub const fn extensions(&self) -> &http::Extensions {
         &self.extensions
@@ -414,6 +417,21 @@ impl RequestContext {
     /// Values to pass to the handler; see [`RequestContext::extensions`].
     pub const fn extensions_mut(&mut self) -> &mut http::Extensions {
         &mut self.extensions
+    }
+
+    /// The span the call runs in; see [`RequestContext::set_span`]. It is [`tracing::Span::none`]
+    /// until an interceptor sets one.
+    #[must_use]
+    pub const fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    /// Runs the rest of the call in `span`: the interceptors after this one, the handler, and the
+    /// response stream it returns, so the events and spans they record belong to it. An
+    /// [`Interceptor`] sets it to trace each call; a span a later interceptor sets is created
+    /// inside this one, and replaces it for the rest of the call.
+    pub fn set_span(&mut self, span: tracing::Span) {
+        self.span = span;
     }
 
     /// Returns the fully-qualified service name, such as `example.greeter.Greeter`.
@@ -1350,6 +1368,10 @@ pub struct RpcStarted {
     pub service: String,
     pub method: String,
     pub request_body_len: usize,
+    /// Whether `service` and `method` name a method registered on the server. Otherwise they are
+    /// whatever the client sent, unchecked, so metrics should not label measurements with them:
+    /// the authorizer and other checks reject calls before the server looks up their method.
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1360,6 +1382,8 @@ pub struct RpcFinished {
     pub response_body_len: usize,
     pub code: Code,
     pub elapsed: Duration,
+    /// Whether `service` and `method` name a registered method, as for [`RpcStarted`].
+    pub registered: bool,
 }
 
 impl Default for ServerState {
@@ -1694,7 +1718,7 @@ impl Server {
 
         record_rpc_started(
             self.inner.metrics.as_ref(),
-            &request.method,
+            self.metrics_path(&request.method),
             request_body_len,
         );
 
@@ -1760,17 +1784,22 @@ impl Server {
             );
         }
 
-        let result = match invoke_unary_handler(handler, context, body) {
-            Ok(future) => match run_handler_with_deadline(future, deadline, &cancellation).await {
-                Ok(Ok(message)) => {
-                    let headers = response_metadata.take_headers();
-                    Ok(ResponseEnvelope::new(message)
-                        .with_headers(headers)
-                        .with_metadata(response_metadata.take_metadata()))
+        let span = context.span.clone();
+        let result = match span.in_scope(|| invoke_unary_handler(handler, context, body)) {
+            Ok(future) => {
+                match run_handler_with_deadline(future.instrument(span), deadline, &cancellation)
+                    .await
+                {
+                    Ok(Ok(message)) => {
+                        let headers = response_metadata.take_headers();
+                        Ok(ResponseEnvelope::new(message)
+                            .with_headers(headers)
+                            .with_metadata(response_metadata.take_metadata()))
+                    }
+                    Ok(Err(error)) => Err(error.into_status()),
+                    Err(status) => Err(status),
                 }
-                Ok(Err(error)) => Err(error.into_status()),
-                Err(status) => Err(status),
-            },
+            }
             Err(status) => Err(status),
         };
 
@@ -1815,7 +1844,7 @@ impl Server {
 
         record_rpc_started(
             self.inner.metrics.as_ref(),
-            &request.method,
+            self.metrics_path(&request.method),
             request_body_len,
         );
 
@@ -1891,9 +1920,19 @@ impl Server {
         );
         let response_metadata = context.response.clone();
         let (finishes, intercepted) = self.intercept(&mut context, deadline, &cancellation).await;
+        let span = context.span.clone();
         let handler_result = match intercepted {
-            Ok(()) => match invoke_streaming_handler(handler, context, body, request_body) {
-                Ok(future) => run_handler_with_deadline(future, deadline, &cancellation).await,
+            Ok(()) => match span
+                .in_scope(|| invoke_streaming_handler(handler, context, body, request_body))
+            {
+                Ok(future) => {
+                    run_handler_with_deadline(
+                        future.instrument(span.clone()),
+                        deadline,
+                        &cancellation,
+                    )
+                    .await
+                }
                 Err(status) => Err(status),
             },
             Err(status) => Err(status),
@@ -1910,7 +1949,7 @@ impl Server {
             Ok(Ok(response_body)) => {
                 let headers = response_metadata.take_headers();
                 server_response_stream(
-                    response_body,
+                    instrument_stream(response_body, span),
                     headers,
                     response_metadata,
                     StreamingCompletion {
@@ -1947,8 +1986,9 @@ impl Server {
     ) -> (Vec<Finish>, std::result::Result<(), Status>) {
         let mut finishes = Vec::new();
         for interceptor in self.inner.interceptors.iter() {
+            let span = context.span.clone();
             let intercepted = with_deadline(
-                CatchUnwindFuture::new(interceptor.intercept(context)),
+                CatchUnwindFuture::new(interceptor.intercept(context)).instrument(span),
                 deadline,
             )
             .await;
@@ -1968,6 +2008,14 @@ impl Server {
             }
         }
         (finishes, Ok(()))
+    }
+
+    /// `path` for metrics, with whether the server registers it.
+    fn metrics_path<'a>(&self, path: &'a str) -> MetricsPath<'a> {
+        MetricsPath {
+            path,
+            registered: self.inner.routes.contains_key(path),
+        }
     }
 
     /// Validates `request` from the client at `remote_addr` and runs the authorizer.
@@ -2016,7 +2064,7 @@ impl Server {
 
         record_rpc_finished(
             self.inner.metrics.as_ref(),
-            path,
+            self.metrics_path(path),
             request_body_len,
             response_body_len,
             code,
@@ -2048,7 +2096,7 @@ impl Server {
     ) {
         finish_streaming_response(
             self.inner.metrics.as_ref(),
-            path,
+            self.metrics_path(path),
             request_body_len,
             started_at,
             response_body_len,
@@ -2078,7 +2126,7 @@ impl Server {
     ) -> BoxStream<ResponseFrame> {
         finish_streaming_response(
             self.inner.metrics.as_ref(),
-            path,
+            self.metrics_path(path),
             request_body_len,
             started_at,
             0,
@@ -2097,7 +2145,7 @@ impl Server {
         let started_at = Instant::now();
         record_rpc_started(
             self.inner.metrics.as_ref(),
-            &request.method,
+            self.metrics_path(&request.method),
             request_body_len,
         );
         self.finish_streaming_response(
@@ -2120,7 +2168,7 @@ impl Server {
 
     pub(crate) fn record_pre_handler_failure(&self, status: &Status) {
         let started_at = Instant::now();
-        record_rpc_started(self.inner.metrics.as_ref(), "", 0);
+        record_rpc_started(self.inner.metrics.as_ref(), self.metrics_path(""), 0);
         self.finish_streaming_response("", 0, started_at, 0, status.code());
     }
 }
@@ -2549,7 +2597,11 @@ impl StreamingCompletion {
     fn finish(&mut self, response_body_len: usize, code: Code) {
         finish_streaming_response(
             self.metrics.as_ref(),
-            &self.path,
+            // The handler ran, so the server registers the method.
+            MetricsPath {
+                path: &self.path,
+                registered: true,
+            },
             self.request_body_len,
             self.started_at,
             response_body_len,
@@ -2600,6 +2652,34 @@ impl ServerResponseStream {
     fn finish(&mut self, code: Code) {
         self.done = true;
         self.completion.finish(self.response_body_len, code);
+    }
+}
+
+/// Polls `stream` in `span`, unless it is [`tracing::Span::none`].
+fn instrument_stream<T: Send + 'static>(stream: BoxStream<T>, span: tracing::Span) -> BoxStream<T> {
+    if span.is_none() {
+        return stream;
+    }
+    Box::pin(InstrumentedStream { stream, span })
+}
+
+/// A stream polled in a span.
+struct InstrumentedStream<T> {
+    stream: BoxStream<T>,
+    span: tracing::Span,
+}
+
+impl<T> Stream for InstrumentedStream<T> {
+    type Item = Result<T>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let _entered = this.span.enter();
+        this.stream.as_mut().poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
     }
 }
 
@@ -2681,7 +2761,7 @@ impl Drop for ServerResponseStream {
 
 fn finish_streaming_response(
     metrics: &dyn Metrics,
-    path: &str,
+    path: MetricsPath<'_>,
     request_body_len: usize,
     started_at: Instant,
     response_body_len: usize,
@@ -2700,7 +2780,7 @@ fn finish_streaming_response(
         finishes,
     );
 
-    let (service, method) = split_or_empty(path);
+    let (service, method) = split_or_empty(path.path);
     tracing::info!(
         service,
         method,
@@ -2717,16 +2797,24 @@ fn split_or_empty(path: &str) -> (&str, &str) {
     split_method_path(path).unwrap_or_default()
 }
 
-fn record_rpc_started(metrics: &dyn Metrics, path: &str, request_body_len: usize) {
+/// A call's method path, and whether the server registers it, for metrics.
+#[derive(Clone, Copy)]
+struct MetricsPath<'a> {
+    path: &'a str,
+    registered: bool,
+}
+
+fn record_rpc_started(metrics: &dyn Metrics, path: MetricsPath<'_>, request_body_len: usize) {
     if !metrics.enabled() {
         return;
     }
 
-    let (service, method) = split_or_empty(path);
+    let (service, method) = split_or_empty(path.path);
     let event = RpcStarted {
         service: service.to_owned(),
         method: method.to_owned(),
         request_body_len,
+        registered: path.registered,
     };
     let _ = catch_unwind(AssertUnwindSafe(|| metrics.rpc_started(&event)));
 }
@@ -2735,7 +2823,7 @@ fn record_rpc_started(metrics: &dyn Metrics, path: &str, request_body_len: usize
 /// last added first.
 fn record_rpc_finished(
     metrics: &dyn Metrics,
-    path: &str,
+    path: MetricsPath<'_>,
     request_body_len: usize,
     response_body_len: usize,
     code: Code,
@@ -2747,7 +2835,7 @@ fn record_rpc_finished(
         return;
     }
 
-    let (service, method) = split_or_empty(path);
+    let (service, method) = split_or_empty(path.path);
     let event = RpcFinished {
         service: service.to_owned(),
         method: method.to_owned(),
@@ -2755,6 +2843,7 @@ fn record_rpc_finished(
         response_body_len,
         code,
         elapsed,
+        registered: path.registered,
     };
     for finish in finishes.into_iter().rev() {
         if catch_unwind(AssertUnwindSafe(|| finish(&event))).is_err() {
@@ -4190,6 +4279,131 @@ mod tests {
 
         assert_eq!(response.message(), b"outer>inner");
         assert_eq!(log.take(), ["inner SayHello Ok", "outer SayHello Ok"]);
+    }
+
+    /// Logs the span it runs in, then runs the rest of the call in its own span.
+    struct SpanInterceptor {
+        name: &'static str,
+        log: Log,
+    }
+
+    #[crate::async_trait]
+    impl super::Interceptor for SpanInterceptor {
+        async fn intercept(
+            &self,
+            context: &mut RequestContext,
+        ) -> std::result::Result<Option<super::Finish>, Status> {
+            self.log
+                .push(format!("{} in {}", self.name, current_span_name()));
+            context.set_span(if self.name == "outer" {
+                tracing::info_span!("outer")
+            } else {
+                tracing::info_span!("inner")
+            });
+            Ok(None)
+        }
+    }
+
+    fn current_span_name() -> &'static str {
+        tracing::Span::current()
+            .metadata()
+            .map_or("none", |metadata| metadata.name())
+    }
+
+    #[tokio::test]
+    async fn interceptor_spans_wrap_later_interceptors_the_handler_and_its_responses() {
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let log = Log::default();
+        let mut server = Server::new();
+        for name in ["outer", "inner"] {
+            server.add_interceptor(SpanInterceptor {
+                name,
+                log: log.clone(),
+            });
+        }
+        server.route_with_context("/example.Greeter/SayHello", |_context, _body| async move {
+            Ok(current_span_name().as_bytes().to_vec())
+        });
+        server.route_streaming_with_context(
+            "/example.Greeter/Watch",
+            RpcKind::ServerStreaming,
+            |_context, _body, _requests| async move {
+                let handler = current_span_name().as_bytes().to_vec();
+                // The second message is made when the server polls the stream.
+                let polled = futures_util::stream::once(async {
+                    Ok(current_span_name().as_bytes().to_vec())
+                });
+                let responses: crate::BoxStream<Vec<u8>> =
+                    Box::pin(futures_util::stream::iter([Ok(handler)]).chain(polled));
+                Ok(responses)
+            },
+        );
+
+        let response = server
+            .handle_request(RpcRequest::new("/example.Greeter/SayHello"), Vec::new())
+            .await
+            .expect("unary call should succeed");
+        assert_eq!(response.message(), b"inner");
+        assert_eq!(log.take(), ["outer in none", "inner in outer"]);
+
+        let frames: Vec<_> = server
+            .handle_streaming_request(watch_request(), Vec::new(), crate::stream::empty())
+            .await
+            .collect()
+            .await;
+        let messages: Vec<_> = frames
+            .into_iter()
+            .filter_map(|frame| match frame {
+                Ok(ResponseFrame::Message(message)) => Some(message.to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, [b"inner".to_vec(), b"inner".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn metrics_report_whether_the_method_is_registered() {
+        #[derive(Clone, Default)]
+        struct RegisteredMetrics(Arc<Mutex<Vec<(bool, bool)>>>);
+
+        impl Metrics for RegisteredMetrics {
+            fn rpc_finished(&self, event: &RpcFinished) {
+                self.0
+                    .lock()
+                    .expect("metrics lock should not be poisoned")
+                    .push((true, event.registered));
+            }
+
+            fn rpc_started(&self, event: &super::RpcStarted) {
+                self.0
+                    .lock()
+                    .expect("metrics lock should not be poisoned")
+                    .push((false, event.registered));
+            }
+        }
+
+        let metrics = RegisteredMetrics::default();
+        let mut server = Server::new();
+        server.set_metrics(metrics.clone());
+        server.route_with_context("/example.Greeter/SayHello", |_context, _body| async move {
+            Ok(Vec::new())
+        });
+
+        for path in ["/example.Greeter/SayHello", "/example.Greeter/Missing"] {
+            let _ = server
+                .handle_request(RpcRequest::new(path), Vec::new())
+                .await;
+        }
+
+        let events = metrics
+            .0
+            .lock()
+            .expect("metrics lock should not be poisoned")
+            .clone();
+        assert_eq!(
+            events,
+            [(false, true), (true, true), (false, false), (true, false)]
+        );
     }
 
     #[tokio::test]
