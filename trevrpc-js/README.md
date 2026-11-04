@@ -142,6 +142,48 @@ call.
 
 - To find the final status while the caller only sends, a client-streaming or bidirectional call reads the response ahead of `recv()` while its request side is open: at most 32 frames or 1 MiB (plus one frame of at most `maxFrameSize`) are held; beyond that reading pauses and flow control applies until `recv()` takes messages. Responses read ahead are delivered in order, including before an error that ended the stream.
 
+### Rendering long streams
+
+Once response messages are buffered, `for await` hands them over without returning to the event loop: each `next()` resolves as a microtask, as with any async iterator over a `fetch` body. When the network delivers faster than the page consumes, which is always the case on localhost, a loop over a long stream runs to its end before the browser renders anything, timers fire, or input is handled. The client does not yield on its own, because a timer-based yield would slow streams in hidden tabs and add latency for consumers that do not render.
+
+A page that renders a stream should batch messages per animation frame and, after a time budget, yield with a timer so that frame can render:
+
+```js
+let batch = [];
+let frame;
+const flush = () => {
+  frame = undefined;
+  store.append(batch);
+  batch = [];
+};
+
+let sliceStart = performance.now();
+try {
+  for await (const row of stream) {
+    batch.push(row);
+    frame ??= requestAnimationFrame(flush);
+    if (performance.now() - sliceStart > 8) {
+      if (document.hidden) {
+        cancelAnimationFrame(frame);
+        flush();
+      } else {
+        await new Promise((resolve) => setTimeout(resolve));
+      }
+      sliceStart = performance.now();
+    }
+  }
+} finally {
+  if (frame !== undefined) {
+    cancelAnimationFrame(frame);
+    flush();
+  }
+}
+```
+
+- `scheduler.yield()` does not help: Chromium resumes its continuation before rendering, so every message still lands in one frame.
+- Hidden tabs run no animation frames and throttle timers to about one per second, so while `document.hidden` the loop applies the batch itself after each time budget instead of yielding. It holds at most one budget's worth of messages, and a stream in a background tab keeps its speed.
+- If the stream fails or the loop is left early, which cancels the call, the `finally` still applies the messages received before.
+
 ### Connections
 
 `connect()` opens a session and resolves when it is ready; it rejects if no transport can establish one. After that the `Channel` re-establishes the session in the background with exponential backoff whenever it is lost. Calls fail fast with `Unavailable` while `channel.state` is `"reconnecting"` and are never replayed; use `await channel.waitUntilReady()` or the `onStateChange` option to follow the state. `channel.close()` stops reconnecting.

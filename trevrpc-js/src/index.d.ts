@@ -391,6 +391,9 @@ export interface StreamStatus {
 /**
  * Responses of a server-streaming call. Iteration ends after the final OK status and throws a
  * TrevRpcError for any other outcome. Leaving the loop early cancels the call.
+ *
+ * Buffered messages are delivered without returning to the event loop, so a page that renders a
+ * long stream must yield to let the browser render; see "Rendering long streams" in the guide.
  */
 export interface ResponseStream<TResponse> extends AsyncIterable<TResponse> {
   /** Settles with the final status, or rejects with the error that ended the call. */
@@ -443,6 +446,9 @@ export interface ClientStreamingCall<TRequest, TResponse> {
  * Response datagrams are delivered after the response headers, merged with the stream's messages
  * in arrival order, and dropped when the call's queue is full (32 messages or 1 MiB) or the call
  * has ended. Without datagrams, such as over WebSocket, everything stays on the stream.
+ *
+ * Like a `ResponseStream`, iteration delivers buffered messages without returning to the event
+ * loop.
  */
 export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIterable<TResponse> {
   /** Settles with the final status, or rejects with the error that ended the call. */
