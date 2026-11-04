@@ -2,17 +2,10 @@ name: release
 
 on:
   push:
-    tags:
-      [
-        "trevrpc-go/v*",
-        "trevrpc-go/oteltrevrpc/v*",
-        "trevrpc-js/v*",
-        "trevrpc-kotlin/v*",
-        "trevrpc-rust/v*",
-      ]
-  workflow_dispatch:
+    tags: ["v*"]
 
-# each package tag releases independently; a shared group would cancel queued tags
+# Bumper tags every package with the same version, so one base tag releases them all; each job
+# names its package tag in TAG. A shared group would cancel queued versions.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -23,7 +16,6 @@ enable-openid-connect: true
 jobs:
   go:
     # zizmor: ignore[excessive-permissions]
-    if: startsWith(github.ref, 'refs/tags/trevrpc-go/v')
     name: trevrpc-go
     runs-on: ubuntu-26.04
     steps:
@@ -39,6 +31,7 @@ jobs:
       - name: Release to Forgejo and pkg.go.dev
         run: flake-release
         env:
+          TAG: trevrpc-go/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
@@ -46,24 +39,12 @@ jobs:
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-go
 
-  oteltrevrpc:
-    # zizmor: ignore[excessive-permissions]
-    if: startsWith(github.ref, 'refs/tags/trevrpc-go/oteltrevrpc/v')
-    name: trevrpc-go-otel
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@51e2e49aaf181feb402ad2bcf9089273f5f4ad85 # v1.74.0
-        with:
-          token: ${{ secrets.DOCTOR_TOKEN }}
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-          fetch_depth: 0
-          shell: release
-
-      - name: Release to Forgejo and pkg.go.dev
+      # After trevrpc-go, which the module requires at the same version. Bumper tags it in its
+      # directory.
+      - name: Release oteltrevrpc to Forgejo and pkg.go.dev
         run: flake-release
         env:
+          TAG: trevrpc-go/oteltrevrpc/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
@@ -73,7 +54,6 @@ jobs:
 
   js:
     # zizmor: ignore[excessive-permissions]
-    if: startsWith(github.ref, 'refs/tags/trevrpc-js/v')
     name: trevrpc-js
     runs-on: ubuntu-26.04
     steps:
@@ -89,6 +69,7 @@ jobs:
       - name: Release to Forgejo and npm
         run: flake-release
         env:
+          TAG: trevrpc-js/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
@@ -98,7 +79,6 @@ jobs:
 
   kotlin:
     # zizmor: ignore[excessive-permissions]
-    if: startsWith(github.ref, 'refs/tags/trevrpc-kotlin/v')
     name: trevrpc-kotlin
     runs-on: ubuntu-26.04
     steps:
@@ -114,6 +94,7 @@ jobs:
       - name: Release to Forgejo and Maven Central
         run: flake-release
         env:
+          TAG: trevrpc-kotlin/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
@@ -126,7 +107,6 @@ jobs:
 
   rust:
     # zizmor: ignore[excessive-permissions]
-    if: startsWith(github.ref, 'refs/tags/trevrpc-rust/v')
     name: trevrpc-rust
     runs-on: ubuntu-26.04
     steps:
@@ -142,6 +122,7 @@ jobs:
       - name: Release to Forgejo and crates.io
         run: flake-release
         env:
+          TAG: trevrpc-rust/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
@@ -152,8 +133,9 @@ jobs:
       # After trevrpc, which cargo publish builds the crate against. Bumper gives the crate the
       # same version, tagged in its directory.
       - name: Release trevrpc-opentelemetry to Forgejo and crates.io
-        run: TAG="trevrpc-rust/crates/trevrpc-opentelemetry/${GITHUB_REF_NAME#trevrpc-rust/}" flake-release
+        run: flake-release
         env:
+          TAG: trevrpc-rust/crates/trevrpc-opentelemetry/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
