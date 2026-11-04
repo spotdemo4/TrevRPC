@@ -4,7 +4,7 @@
 }:
 mkGoModule (final: {
   pname = "trevrpc-go-otel";
-  version = "1.4.0";
+  version = "1.5.0";
 
   # The module itself plus the TrevRPC module its go.mod replaces with ../.
   src = lib.fileset.toSource {
