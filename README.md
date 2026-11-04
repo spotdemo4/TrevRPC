@@ -137,6 +137,12 @@ the package includes `protoc-gen-trevrpc-js`, which runs on Node.js:
 npm install @trevrpc/trevrpc-js
 ```
 
+for [Effect](https://effect.website), [`@trevrpc/effect`](trevrpc-js/effect) wraps generated clients in effects and streams:
+
+```sh
+npm install @trevrpc/effect effect
+```
+
 ### kotlin
 
 ```kotlin

@@ -177,6 +177,13 @@ test("aborting the signal cancels a call and keeps the reason as cause", async (
   await transport.settled();
 });
 
+test("status errors are tagged without an own property", () => {
+  const error = new TrevRpcError(Code.NotFound, "missing");
+  assert.equal(error._tag, "TrevRpcError");
+  assert.equal(Object.hasOwn(error, "_tag"), false);
+  assert.deepEqual(Object.keys(error).sort(), ["code", "metadata", "name", "statusMessage"]);
+});
+
 test("an abort reason that is a status error is reported as is", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();

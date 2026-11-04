@@ -37,6 +37,10 @@ export class TrevRpcError extends Error {
   }
 }
 
+// A discriminant for libraries that match errors by tag, such as Effect's `catchTag`. It is on the
+// prototype, so errors carry no extra own property.
+Object.defineProperty(TrevRpcError.prototype, "_tag", { value: "TrevRpcError" });
+
 /** Converts a number into a known status code, defaulting unknown values to Unknown. */
 export function codeFromNumber(code) {
   return Number.isInteger(code) && code >= 0 && code < CodeNames.length ? code : Code.Unknown;

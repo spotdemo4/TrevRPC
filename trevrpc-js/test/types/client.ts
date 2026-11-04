@@ -136,6 +136,7 @@ try {
     error.code satisfies number;
     error.statusMessage satisfies string;
     error.metadata satisfies Record<string, Uint8Array>;
+    error._tag satisfies "TrevRpcError";
   }
 }
 

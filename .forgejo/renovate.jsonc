@@ -10,6 +10,7 @@
   "allowedCommands": [
     "^nix run \\.#update-go-deps$",
     "^npm audit fix --prefix trevrpc-js$",
+    "^npm audit fix --prefix trevrpc-js/effect$",
     "^nix run \\.#update-kotlin-deps$",
     "^nix run \\.#sync-playwright$"
   ],
@@ -42,6 +43,7 @@
       "commands": [
         "nix run .#update-go-deps",
         "npm audit fix --prefix trevrpc-js",
+        "npm audit fix --prefix trevrpc-js/effect",
         "nix run .#sync-playwright"
       ],
       "fileFilters": [
@@ -52,7 +54,9 @@
         "bench/baseline/go.sum",
         "bench/baseline/gomod2nix.toml",
         "trevrpc-js/package.json",
-        "trevrpc-js/package-lock.json"
+        "trevrpc-js/package-lock.json",
+        "trevrpc-js/effect/package.json",
+        "trevrpc-js/effect/package-lock.json"
       ],
       "executionMode": "branch"
     }
@@ -74,6 +78,13 @@
     {
       "matchManagers": ["npm"],
       "matchDepTypes": ["engines"],
+      "enabled": false
+    },
+
+    // keep peer ranges as wide as a package supports; raise them by hand when it needs newer peers
+    {
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["peerDependencies"],
       "enabled": false
     },
 

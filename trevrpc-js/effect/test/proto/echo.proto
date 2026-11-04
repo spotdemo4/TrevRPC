@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package effect.v1;
+
+// One method of each kind, for the adapter's runtime and type tests.
+service Echo {
+  rpc Unary(EchoRequest) returns (EchoResponse);
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  rpc Bidi(stream EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoResponse {
+  string message = 1;
+}

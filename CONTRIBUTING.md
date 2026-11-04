@@ -17,15 +17,16 @@ ln -s .envrc.project .envrc
 direnv allow
 ```
 
-| directory         | contents                                                        |
-| ----------------- | --------------------------------------------------------------- |
-| `trevrpc-go/`     | Go runtime, `protoc-gen-trevrpc-go`, examples                   |
-| `trevrpc-rust/`   | Rust crate, `protoc-gen-trevrpc-rust`, examples                 |
-| `trevrpc-js/`     | browser client, `protoc-gen-trevrpc-js`, browser interop runner |
-| `trevrpc-kotlin/` | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`   |
-| `interop/`        | cross-runtime test suite                                        |
-| `bench/`          | load benchmarks and the grpc-go and connect-go baselines        |
-| `testdata/`       | wire, QMux, and zstd golden vectors shared by the runtimes      |
+| directory            | contents                                                        |
+| -------------------- | --------------------------------------------------------------- |
+| `trevrpc-go/`        | Go runtime, `protoc-gen-trevrpc-go`, examples                   |
+| `trevrpc-rust/`      | Rust crate, `protoc-gen-trevrpc-rust`, examples                 |
+| `trevrpc-js/`        | browser client, `protoc-gen-trevrpc-js`, browser interop runner |
+| `trevrpc-js/effect/` | Effect adapter for the browser client                           |
+| `trevrpc-kotlin/`    | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`   |
+| `interop/`           | cross-runtime test suite                                        |
+| `bench/`             | load benchmarks and the grpc-go and connect-go baselines        |
+| `testdata/`          | wire, QMux, and zstd golden vectors shared by the runtimes      |
 
 ### run
 
@@ -71,7 +72,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-with [npm](https://docs.npmjs.com/) and [oxlint](https://oxc.rs/), in `trevrpc-js/`:
+with [npm](https://docs.npmjs.com/) and [oxlint](https://oxc.rs/), in `trevrpc-js/`, then in `trevrpc-js/effect/`:
 
 ```sh
 npm ci
@@ -97,6 +98,7 @@ nix run .#trevrpc-interop
 nix build .#trevrpc-go
 nix build .#trevrpc-rust
 nix build .#trevrpc-js
+nix build .#trevrpc-js-effect
 nix build .#trevrpc-kotlin
 ```
 

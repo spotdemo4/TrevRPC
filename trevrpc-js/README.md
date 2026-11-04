@@ -244,6 +244,10 @@ const client = new GreeterClient(channel, { interceptors: [logCalls] });
 - An interceptor that throws fails the call with what it threw before it starts; the finish functions of earlier interceptors still run.
 - A client-streaming call has a `status` promise too, like the other streaming calls.
 
+### Effect
+
+The separate package [`@trevrpc/effect`](effect) wraps a generated client for [Effect](https://effect.website): `createEffectClient(GreeterService, new GreeterClient(channel))` returns a client whose unary calls are effects, whose server-streaming calls are streams, and whose client-streaming and bidirectional calls take their requests as a stream. Interrupting an effect or stream cancels its call. `TrevRpcError` has a `_tag` of `"TrevRpcError"`, so `Effect.catchTag` matches it.
+
 ### Compression
 
 Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). The codec lives in a separate entry point, `@trevrpc/trevrpc-js/zstd`, which loads libzstd as WebAssembly (about 85 KB gzipped), so applications without compression never load it:

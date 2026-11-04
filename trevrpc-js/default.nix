@@ -44,7 +44,8 @@ buildNpmPackage (final: {
   # The interop clients are generated from the shared interop protos, which import the TrevRPC
   # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
   # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
-  # module is built on its own; only the script that embeds it is needed here.
+  # module is built on its own; only the script that embeds it is needed here. The Effect adapter
+  # in effect/ is a package of its own.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -54,7 +55,12 @@ buildNpmPackage (final: {
       zstdGolden
       interopProto
       trevrpcProto
-      (lib.fileset.difference ./. ./zstd-wasm)
+      (lib.fileset.difference ./. (
+        lib.fileset.unions [
+          ./zstd-wasm
+          ./effect
+        ]
+      ))
       ./zstd-wasm/embed.js
     ];
   };

@@ -77,6 +77,19 @@ jobs:
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-js
 
+      # After trevrpc-js, which the adapter requires as a peer at the same version. Bumper tags it
+      # in its directory.
+      - name: Release @trevrpc/effect to Forgejo and npm
+        run: flake-release
+        env:
+          TAG: trevrpc-js/effect/${{ github.ref_name }}
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          NPMJS_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-js-effect
+
   kotlin:
     # zizmor: ignore[excessive-permissions]
     name: trevrpc-kotlin

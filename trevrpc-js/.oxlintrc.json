@@ -1,5 +1,11 @@
 {
   "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/refs/heads/main/npm/oxlint/configuration_schema.json",
   "extends": ["../.oxlintrc.json"],
-  "ignorePatterns": ["build/**", "node_modules/**", "src/zstd-wasm.js", "zstd-wasm/target/**"]
+  "ignorePatterns": [
+    "build/**",
+    "node_modules/**",
+    "src/zstd-wasm.js",
+    "zstd-wasm/target/**",
+    "effect/**"
+  ]
 }

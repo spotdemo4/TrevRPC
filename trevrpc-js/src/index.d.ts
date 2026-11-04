@@ -166,6 +166,8 @@ export type Metadata = Record<string, Uint8Array>;
 
 /** Error carrying a TrevRPC status code, message, and metadata. */
 export class TrevRpcError extends Error {
+  /** Always `"TrevRpcError"`, for matching errors by tag, as Effect's `catchTag` does. */
+  readonly _tag: "TrevRpcError";
   readonly code: StatusCode;
   readonly statusMessage: string;
   readonly metadata: Metadata;
