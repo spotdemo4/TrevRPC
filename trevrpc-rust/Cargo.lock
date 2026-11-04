@@ -2309,6 +2309,7 @@ dependencies = [
  "ring",
  "tokio",
  "tower-http",
+ "tracing-subscriber",
  "trevrpc",
 ]
 

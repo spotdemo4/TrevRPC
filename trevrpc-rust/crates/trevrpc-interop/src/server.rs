@@ -9,6 +9,7 @@ use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
 use tower_http::services::ServeDir;
+use tracing_subscriber::filter::LevelFilter;
 use trevrpc::fallback::HttpFallback;
 use trevrpc::server::{
     RequestContext, RouteOptions, Server, ServerOptions, WebTransportAdmission,
@@ -324,8 +325,12 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
         CertificateDer::pem_file_iter(flags.require("cert")?)?.collect::<Result<Vec<_>, _>>()?;
     let key = PrivateKeyDer::from_pem_file(flags.require("key")?)?;
 
-    // No `tracing` subscriber is installed, so the per-RPC logs are not emitted and cannot skew
-    // the load benchmarks.
+    // Warnings and errors go to stderr, where the runners repeat them when a cell fails. The
+    // per-RPC logs are below WARN, so they are not emitted and cannot skew the load benchmarks.
+    tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::WARN)
+        .with_writer(std::io::stderr)
+        .init();
     // `--web-root` serves a directory, such as the browser interop page, through the HTTP
     // fallback on the same ports.
     let mut server = Server::new();

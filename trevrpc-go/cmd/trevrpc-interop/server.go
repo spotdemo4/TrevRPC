@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -40,8 +41,9 @@ type listeningLine struct {
 }
 
 // runServer serves Echo over every transport until ctx is cancelled. It writes
-// the listening line to out once the sockets are bound.
-func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
+// the listening line to out once the sockets are bound, and logs the server's
+// warnings and errors to log.
+func runServer(ctx context.Context, config serverConfig, out, log io.Writer) error {
 	certificate, err := tls.LoadX509KeyPair(config.certFile, config.keyFile)
 	if err != nil {
 		return fmt.Errorf("load certificate: %w", err)
@@ -50,7 +52,8 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	listener, err := newServer(net.JoinHostPort(config.host, config.port), &tls.Config{Certificates: []tls.Certificate{certificate}}, config.webRoot, compression)
+	logger := slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	listener, err := newServer(net.JoinHostPort(config.host, config.port), &tls.Config{Certificates: []tls.Certificate{certificate}}, config.webRoot, compression, logger)
 	if err != nil {
 		return err
 	}
@@ -67,9 +70,11 @@ func runServer(ctx context.Context, config serverConfig, out io.Writer) error {
 
 // newServer binds a listener for the Echo and UnreliableEcho services. Every browser session is
 // admitted because browsers connect from arbitrary origins. A non-empty webRoot
-// is served through the HTTP fallback on the same ports.
-func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *trevrpc.Compression) (*trevrpc.Listener, error) {
+// is served through the HTTP fallback on the same ports. The server's
+// diagnostics go to logger.
+func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *trevrpc.Compression, logger *slog.Logger) (*trevrpc.Listener, error) {
 	server := trevrpc.NewServer()
+	server.SetDiagnostics(trevrpc.LogDiagnostics(logger))
 	options := server.Options()
 	options.EnableHTTP = true
 	options.EnableWebTransport = true

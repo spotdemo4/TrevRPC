@@ -270,7 +270,7 @@ class MatrixTest(unittest.TestCase):
     def test_deadline_allows_for_warmup_and_draining(self) -> None:
         matrix = run.Matrix(["unary"], [64], [0], [1], 0.2, 0, 10)
 
-        self.assertEqual(60, matrix.deadline)
+        self.assertEqual(80, matrix.deadline)
 
     def test_paced_cells_run_once_per_rate(self) -> None:
         matrix = run.Matrix(
@@ -442,6 +442,30 @@ class FailureTest(unittest.TestCase):
                                       "call failed: reset"])],
                 runner.failures,
             )  # fmt: skip
+
+    def test_a_failed_run_keeps_what_the_server_logged_meanwhile(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            runner = run.Runner(run.Matrix(["unary"], [64], [0], [1], 0.2, 0, 10), Path(out))
+            server = FakeServer(Path(out) / "server-go.log")
+            _ = server.log.write_text("level=WARN msg=earlier\n")
+            runner.server = server
+            command = ["sh", "-c", f"echo 'level=ERROR msg=stuck' >>{server.log}; exit 1"]
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(runner.run_once("cell", "go", "go", None, command))
+
+            self.assertEqual(
+                [run.Failure("cell", [f"exited 1 (see {out}/cell.log)",
+                                      "server go: level=ERROR msg=stuck"])],
+                runner.failures,
+            )  # fmt: skip
+
+
+class FakeServer(run.Server):
+    """A Server with only a log, which a cell's command appends to."""
+
+    def __init__(self, log: Path) -> None:  # pyright: ignore[reportMissingSuperCall]
+        self.name = "go"
+        self.log = log
 
 
 if __name__ == "__main__":

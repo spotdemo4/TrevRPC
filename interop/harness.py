@@ -16,6 +16,7 @@ import shlex
 import signal
 import ssl
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,11 @@ DEFAULTS_VARIABLE = "TREVRPC_RUNNER_DEFAULTS"
 SERVER_TIMEOUT = 30
 SHUTDOWN_TIMEOUT = 10
 KILL_GRACE = 5
+# How long a server that did not exit gets, after SIGQUIT, to print its state. A Go server prints
+# the stack of every goroutine and exits.
+DUMP_GRACE = 5
+# How many lines from the end of a server's log a server that did not stop cleanly prints.
+SERVER_LOG_LINES = 2000
 
 
 class RunnerError(RuntimeError):
@@ -340,7 +346,9 @@ class Server:
             raise RunnerError(f"server {self.name} did not report a {name!r} port") from None
 
     def stop(self) -> str | None:
-        """Closes stdin and waits for the server to exit, killing it after SHUTDOWN_TIMEOUT.
+        """Closes stdin and waits for the server to exit. After SHUTDOWN_TIMEOUT, it sends
+        SIGQUIT, on which a Go server logs every goroutine's stack, and kills the server
+        DUMP_GRACE later.
 
         Returns a description of the problem unless the server exited cleanly by itself.
         """
@@ -353,13 +361,59 @@ class Server:
             if status != 0:
                 problem = f"server {self.name} exited with {status}; see {self.log}"
         except subprocess.TimeoutExpired:
-            problem = f"server {self.name} did not exit within {SHUTDOWN_TIMEOUT}s; killed it"
+            problem = (
+                f"server {self.name} did not exit within {SHUTDOWN_TIMEOUT}s; "
+                "sent SIGQUIT and killed it"
+            )
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self.process.pid, signal.SIGQUIT)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                _ = self.process.wait(timeout=DUMP_GRACE)
             stop_group(self.process, grace=0)
         return problem
+
+    def log_size(self) -> int:
+        """How many bytes the server has logged so far, for log_since."""
+        try:
+            return self.log.stat().st_size
+        except OSError:
+            return 0
+
+    def log_since(self, offset: int) -> list[str]:
+        """The non-empty lines the server logged after log_size returned OFFSET."""
+        try:
+            with self.log.open("rb") as log:
+                _ = log.seek(offset)
+                text = log.read().decode("utf-8", errors="replace")
+        except OSError:
+            return []
+        return [line for line in text.splitlines() if line.strip()]
 
     def _log_tail(self) -> str:
         lines = self.log.read_text(encoding="utf-8", errors="replace").splitlines()
         return "; log:\n" + "\n".join(lines[-40:]) if lines else ""
+
+
+def server_details(server: Server, offset: int, limit: int = FAILURE_LINES) -> list[str]:
+    """The last `limit` lines the server logged while a cell ran, from the log_size OFFSET
+    taken before it, to add to the cell's failure."""
+    return [f"server {server.name}: {line}" for line in server.log_since(offset)[-limit:]]
+
+
+def stop_server(server: Server) -> Failure | None:
+    """Stops the server. Unless it exited cleanly by itself, it prints why and the end of the
+    server's log, which holds a Go server's goroutines if it hung, and returns the failure, with
+    the last lines of the log, for the closing summary."""
+    problem = server.stop()
+    if problem is None:
+        return None
+    lines = server.log_since(0)
+    print(problem, file=sys.stderr)
+    if lines:
+        print(f"--- {server.log}, at most its last {SERVER_LOG_LINES} lines", file=sys.stderr)
+        print("\n".join(lines[-SERVER_LOG_LINES:]), file=sys.stderr)
+        print(f"--- end of {server.log}", file=sys.stderr, flush=True)
+    return Failure(f"server-{server.name}", [problem, *lines[-FAILURE_LINES:]])
 
 
 def _drain(stdout: IO[str], lines: queue.Queue[str]) -> None:

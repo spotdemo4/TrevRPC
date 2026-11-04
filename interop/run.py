@@ -40,6 +40,8 @@ from harness import (
     parse_with_defaults,
     run_checked,
     run_with_deadline,
+    server_details,
+    stop_server,
     write_vectors_dictionary,
 )
 
@@ -149,11 +151,12 @@ def browser_cells(
     ]
 
 
-def run_cell(cell: Cell, out: Path) -> Failure | None:
+def run_cell(cell: Cell, server: Server, out: Path) -> Failure | None:
     """Runs one cell, logging to OUT/CELL.log, prints the log, and returns why it failed, if
-    it did."""
+    it did, with what the server logged meanwhile."""
     print(f"== {cell.name}", flush=True)
     log = out / f"{cell.name}.log"
+    offset = server.log_size()
     with log.open("w", encoding="utf-8") as output:
         result = run_with_deadline(cell.command, CELL_TIMEOUT, stdout=output, stderr=output)
         if result.returncode is None:
@@ -164,7 +167,7 @@ def run_cell(cell: Cell, out: Path) -> Failure | None:
     if result.returncode == 0:
         return None
     details = failure_details(text) or [f"exited {result.returncode} without output"]
-    return Failure(cell.name, details)
+    return Failure(cell.name, [*details, *server_details(server, offset)])
 
 
 class Keychain:
@@ -267,11 +270,10 @@ def execute(args: argparse.Namespace, work: Path) -> list[Failure]:
                     for browser in browsers
                     for cell in browser_cells(browser, server, certificate, lanes, dictionary)
                 ]
-                failures += [failure for cell in cells if (failure := run_cell(cell, out))]
+                failures += [failure for cell in cells if (failure := run_cell(cell, server, out))]
             finally:
-                if (problem := server.stop()) is not None:
-                    print(problem, file=sys.stderr)
-                    failures.append(Failure(f"server-{spec.name}", [problem]))
+                if (failure := stop_server(server)) is not None:
+                    failures.append(failure)
     finally:
         keychain.untrust()
     return failures

@@ -7,12 +7,16 @@ import { readFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 
-import { chromium, firefox } from "playwright";
+import { chromium, errors, firefox } from "playwright";
 
 import { openSafari } from "./safari.js";
 
 export const LaunchTimeoutMs = 20_000;
-export const SetupTimeoutMs = 30_000;
+/** How many times a Playwright browser that does not start within LaunchTimeoutMs is launched: on
+ * a busy machine, such as a CI runner building other packages, a start can stall. */
+export const LaunchAttempts = 2;
+/** Every launch attempt, and loading the page. */
+export const SetupTimeoutMs = LaunchAttempts * LaunchTimeoutMs + 10_000;
 export const CloseTimeoutMs = 5_000;
 
 /** The page that loads bundle, a script beside it: the path is relative, so the page also works
@@ -124,7 +128,7 @@ function playwrightBrowser(type, executableVariable, launchOptions) {
   return {
     name: type.name(),
     async open(url, extra = {}, timeoutMs = SetupTimeoutMs) {
-      const instance = await type.launch({
+      const instance = await launchPlaywright(type, {
         ...launchOptions,
         ...(extra.args && { args: [...(launchOptions.args ?? []), ...extra.args] }),
         ...(extra.firefoxUserPrefs && {
@@ -152,6 +156,23 @@ function playwrightBrowser(type, executableVariable, launchOptions) {
       return { close };
     },
   };
+}
+
+/**
+ * Launches a Playwright browser of type with options, launching it again when it does not start in
+ * time, up to LaunchAttempts times. Playwright kills a browser whose launch timed out.
+ */
+export async function launchPlaywright(type, options) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await type.launch(options);
+    } catch (error) {
+      if (attempt >= LaunchAttempts || !(error instanceof errors.TimeoutError)) {
+        throw error;
+      }
+      console.error(`[browser] ${type.name()} did not start in time; launching it again`);
+    }
+  }
 }
 
 /** The base64 SHA-256 of the certificate's public key, as Chromium's SPKI allowlist takes it. */

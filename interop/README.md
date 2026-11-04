@@ -201,8 +201,13 @@ have their own entry points but follow the same output contract.
   (`/` serves `index.html`).
 - Runs until stdin reaches EOF or it receives `SIGTERM`/`SIGINT`, then shuts
   down gracefully and exits `0`. `run.py` closes stdin after the server's cells
-  and fails the run unless the server exits `0` within 10 seconds.
-- Diagnostics go to stderr.
+  and fails the run unless the server exits `0` within 10 seconds. A server that
+  has not exited by then gets `SIGQUIT`, on which a Go server prints every
+  goroutine's stack, and is killed 5 seconds later.
+- Diagnostics go to stderr: at least the server's warnings and errors, such as
+  handlers that outlive their calls. A failed cell lists what the server logged
+  while it ran, and a server that does not exit cleanly prints the end of its
+  log.
 
 ### Client
 

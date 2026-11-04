@@ -67,7 +67,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			_, _ = io.Copy(io.Discard, stdin)
 			cancel()
 		}()
-		if err := runServer(ctx, config, stdout); err != nil {
+		if err := runServer(ctx, config, stdout, stderr); err != nil {
 			printf(stderr, "server: %v\n", err)
 			return 1
 		}

@@ -239,6 +239,33 @@ async function trevrpcTarget(input, signal) {
   };
 }
 
+/**
+ * The resource timing entry of the last request to a URL under url, or undefined after timeoutMs.
+ * Chromium can add the entry of a fetch after the fetch has resolved, so it waits for one.
+ */
+function resourceTiming(url, timeoutMs) {
+  const matches = (entry) => entry.name.startsWith(url);
+  const queued = performance.getEntriesByType("resource").findLast(matches);
+  if (queued) {
+    return Promise.resolve(queued);
+  }
+  return new Promise((resolve) => {
+    const finish = (entry) => {
+      clearTimeout(timer);
+      observer.disconnect();
+      resolve(entry);
+    };
+    const observer = new PerformanceObserver((list) => {
+      const entry = list.getEntries().findLast(matches);
+      if (entry) {
+        finish(entry);
+      }
+    });
+    const timer = setTimeout(() => finish(undefined), timeoutMs);
+    observer.observe({ type: "resource", buffered: true });
+  });
+}
+
 /** A connect-web or gRPC-Web client over the lane's HTTP version, checked with a first call. */
 async function fetchTarget(input, lane, signal) {
   const createTransport =
@@ -248,12 +275,13 @@ async function fetchTarget(input, lane, signal) {
   const options = { signal, ...(pad && { headers: { [PadKey]: pad } }) };
 
   await client.unary({ message: "probe" }, { signal: AbortSignal.timeout(ConnectTimeoutMs) });
-  const probe = performance
-    .getEntriesByType("resource")
-    .findLast((entry) => entry.name.startsWith(input.url));
-  if (probe?.nextHopProtocol !== lane.http) {
+  const probe = await resourceTiming(input.url, ConnectTimeoutMs);
+  if (!probe) {
+    throw new Error(`the probe call left no resource timing entry within ${ConnectTimeoutMs} ms`);
+  }
+  if (probe.nextHopProtocol !== lane.http) {
     throw new Error(
-      `called over ${probe?.nextHopProtocol || "an unknown protocol"}, want ${lane.http}`,
+      `called over ${probe.nextHopProtocol || "an unknown protocol"}, want ${lane.http}`,
     );
   }
   // Every call would add an entry to the resource timeline.

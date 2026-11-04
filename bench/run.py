@@ -49,6 +49,8 @@ from harness import (
     named_command,
     parse_with_defaults,
     run_with_deadline,
+    server_details,
+    stop_server,
 )
 
 SCENARIOS = (
@@ -99,8 +101,9 @@ COMPRESSIONS = {
 DICTIONARY_COMPRESSIONS = ("dictionary", "stream-dictionary")
 # The scenarios that compression modes other than none run: every message differs in them.
 COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
-# Room on top of warmup and duration for connecting and draining.
-DEADLINE_SLACK = 60
+# Room on top of warmup and duration for connecting and draining, which for a browser includes
+# launching it again when it does not start in time.
+DEADLINE_SLACK = 80
 COLUMNS = (
     "scenario", "size", "md", "conc", "conns", "rate", "transport", "compression", "client",
     "server", "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%", "spread%",
@@ -400,12 +403,15 @@ class Runner:
     out: Path
     results: list[Result]
     failures: list[Failure]
+    # The server the cells run against, whose log a failed cell repeats.
+    server: Server | None
 
     def __init__(self, matrix: Matrix, out: Path) -> None:
         self.matrix = matrix
         self.out = out
         self.results = []
         self.failures = []
+        self.server = None
 
     def run_matrix(
         self,
@@ -480,37 +486,42 @@ class Runner:
         """Runs the cell once, logging to CELL.log, and returns its result, or None after
         recording why it failed."""
         log = self.out / f"{cell}.log"
+        offset = 0 if self.server is None else self.server.log_size()
         with log.open("w", encoding="utf-8") as stderr:
             completed = run_with_deadline(
                 command, self.matrix.deadline, stdout=subprocess.PIPE, stderr=stderr
             )
         line = completed.stdout.strip()
         if completed.returncode is None:
-            self.fail(cell, f"timed out after {self.matrix.deadline}s (see {log})", log)
+            self.fail(cell, f"timed out after {self.matrix.deadline}s (see {log})", log, offset)
             return None
         if completed.returncode != 0:
-            self.fail(cell, f"exited {completed.returncode} (see {log})", log)
+            self.fail(cell, f"exited {completed.returncode} (see {log})", log, offset)
             return None
         try:
             result = parse_result(client, server, line, netem)
         except ValueError as error:
-            self.fail(cell, f"printed an invalid result ({error}): {line}", log)
+            self.fail(cell, f"printed an invalid result ({error}): {line}", log, offset)
             return None
         if result.errors != 0:
-            self.fail(cell, f"reported errors: {line}", log)
+            self.fail(cell, f"reported errors: {line}", log, offset)
         return result
 
-    def fail(self, cell: str, reason: str, log: Path) -> None:
-        """Reports the failure now and keeps it, with the end of the cell's log, for the closing
-        summary, which survives a log cut to its last lines, as CI and Nix print them."""
+    def fail(self, cell: str, reason: str, log: Path, offset: int) -> None:
+        """Reports the failure now and keeps it, with the end of the cell's log and what the
+        server logged after OFFSET, for the closing summary, which survives a log cut to its
+        last lines, as CI and Nix print them."""
         print(f"failed: {cell} {reason}", file=sys.stderr, flush=True)
         text = log.read_text(encoding="utf-8", errors="replace")
-        self.failures.append(Failure(cell, [reason, *failure_details(text)]))
+        details = [reason, *failure_details(text)]
+        if self.server is not None:
+            details += server_details(self.server, offset)
+        self.failures.append(Failure(cell, details))
 
     def stop(self, server: Server) -> None:
-        if (problem := server.stop()) is not None:
-            print(problem, file=sys.stderr)
-            self.failures.append(Failure(f"server-{server.name}", [problem]))
+        self.server = None
+        if (failure := stop_server(server)) is not None:
+            self.failures.append(failure)
 
 
 def summary(results: list[Result]) -> str:
@@ -747,6 +758,7 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
     server_arguments = [] if dictionary is None else ["--dictionary", str(dictionary)]
     for spec in servers:
         server = Server(spec.name, spec.command, certificate, out, server_arguments)
+        runner.server = server
         try:
             native = f"127.0.0.1:{server.port('native')}"
             qmux = f"127.0.0.1:{server.port('qmux')}"
@@ -781,6 +793,7 @@ def execute(args: argparse.Namespace, work: Path, out: Path) -> Runner:
 
     if baseline is not None:
         server = Server("baseline", baseline, certificate, out)
+        runner.server = server
         try:
             for profile in profiles:
                 apply(profile)

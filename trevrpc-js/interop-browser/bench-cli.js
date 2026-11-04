@@ -21,7 +21,15 @@
 import { parseArgs } from "node:util";
 
 import { BenchLanes, Compressions, Payloads } from "./bench-lanes.js";
-import { Browsers, describe, pageHtml, readDictionary, runPage } from "./driver.js";
+import {
+  Browsers,
+  describe,
+  LaunchAttempts,
+  LaunchTimeoutMs,
+  pageHtml,
+  readDictionary,
+  runPage,
+} from "./driver.js";
 
 const Usage =
   "usage: trevrpc-interop-browser bench --browser chromium|firefox --transport <lane> --url <url>" +
@@ -31,11 +39,12 @@ const Usage =
 const BenchBundle = new URL("../build/interop/bench.js", import.meta.url);
 /**
  * How long the page may take to open, and the room on top of the warmup and the window for
- * connecting and for the last operations. Under an emulated lossy link the page loads over it too,
- * and one connection that loses its first packets backs off for seconds. Together they stay
- * within the minute run.py allows on top of the warmup and the window.
+ * connecting and for the last operations. Opening covers every launch attempt, and under an
+ * emulated lossy link the page loads over it too, and one connection that loses its first packets
+ * backs off for seconds. Together they stay within the 80 seconds run.py allows on top of the
+ * warmup and the window.
  */
-const SetupTimeoutMs = 40_000;
+const SetupTimeoutMs = LaunchAttempts * LaunchTimeoutMs + 20_000;
 const SlackMs = 15_000;
 
 /** Runs the bench subcommand with args, printing its result line; resolves with the exit code. */

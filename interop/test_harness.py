@@ -1,6 +1,8 @@
 """Unit tests for the runner harness. Run with `python3 -I -m unittest discover -s interop`."""
 
 import argparse
+import contextlib
+import io
 import os
 import stat
 import subprocess
@@ -142,6 +144,65 @@ class ServerTest(unittest.TestCase):
             server = harness.Server("fake", command, certificate, root)
 
             self.assertRegex(server.stop() or "", "exited with 1")
+
+    def test_a_server_that_does_not_exit_gets_sigquit_and_its_log_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = fake_server(
+                root,
+                "trap 'echo goroutine 1 [select]: >&2; exit 2' QUIT",
+                "echo '{\"native\":1}'",
+                "while :; do sleep 0.05; done",
+            )
+            certificate = harness.Certificate(root / "cert.pem", root / "key.pem")
+            server = harness.Server("fake", command, certificate, root)
+
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(harness, "SHUTDOWN_TIMEOUT", 0.2),
+                contextlib.redirect_stderr(stderr),
+            ):
+                failure = harness.stop_server(server)
+
+            problem = "server fake did not exit within 0.2s; sent SIGQUIT and killed it"
+            self.assertEqual(
+                harness.Failure("server-fake", [problem, "goroutine 1 [select]:"]), failure
+            )
+            self.assertIn(f"{problem}\n--- {server.log}", stderr.getvalue())
+            self.assertIn("goroutine 1 [select]:\n--- end of", stderr.getvalue())
+
+    def test_a_clean_stop_reports_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = fake_server(root, "echo '{\"native\":1}'", "cat >/dev/null")
+            certificate = harness.Certificate(root / "cert.pem", root / "key.pem")
+            server = harness.Server("fake", command, certificate, root)
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertIsNone(harness.stop_server(server))
+            self.assertEqual("", stderr.getvalue())
+
+    def test_server_details_are_the_lines_logged_after_an_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = fake_server(root, "echo before >&2", "echo '{\"native\":1}'", "cat")
+            certificate = harness.Certificate(root / "cert.pem", root / "key.pem")
+            server = harness.Server("fake", command, certificate, root)
+            self.assertIsNone(server.stop())
+
+            offset = server.log_size()
+            with server.log.open("a", encoding="utf-8") as log:
+                _ = log.write("level=WARN msg=one\n\nlevel=ERROR msg=two\n")
+
+            self.assertEqual(
+                ["server fake: level=WARN msg=one", "server fake: level=ERROR msg=two"],
+                harness.server_details(server, offset),
+            )
+            self.assertEqual(
+                ["server fake: level=ERROR msg=two"], harness.server_details(server, offset, 1)
+            )
+            self.assertEqual(["before"], server.log_since(0)[:1])
 
 
 class FailureSummaryTest(unittest.TestCase):

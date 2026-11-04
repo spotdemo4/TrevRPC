@@ -7,7 +7,9 @@ import test from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-import { runPage } from "../interop-browser/driver.js";
+import { errors } from "playwright";
+
+import { LaunchAttempts, launchPlaywright, runPage } from "../interop-browser/driver.js";
 import { ScenarioNames } from "../interop-browser/names.js";
 import { runScenarios } from "../interop-browser/scenarios.js";
 import { encodeMessageFrame } from "../src/framing.js";
@@ -239,6 +241,39 @@ test("a browser's own setup timeout bounds opening the page, and a late browser 
   );
   assert.ok(closed);
   assert.ok(Date.now() - started < 1_000);
+});
+
+test("a Playwright browser that does not start in time is launched again, up to LaunchAttempts times", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const fakeType = (failures) => {
+    let launches = 0;
+    return {
+      name: () => "fake",
+      launches: () => launches,
+      launch: async (options) => {
+        launches++;
+        if (launches <= failures.length) {
+          throw failures[launches - 1];
+        }
+        return { options };
+      },
+    };
+  };
+  const timeout = () => new errors.TimeoutError("browserType.launch: Timeout 20000ms exceeded.");
+
+  const slow = fakeType([timeout()]);
+  assert.deepEqual(await launchPlaywright(slow, { headless: true }), {
+    options: { headless: true },
+  });
+  assert.equal(slow.launches(), 2);
+
+  const stuck = fakeType(Array.from({ length: LaunchAttempts }, timeout));
+  await assert.rejects(launchPlaywright(stuck, {}), errors.TimeoutError);
+  assert.equal(stuck.launches(), LaunchAttempts);
+
+  const broken = fakeType([new Error("executable doesn't exist")]);
+  await assert.rejects(launchPlaywright(broken, {}), /executable doesn't exist/);
+  assert.equal(broken.launches(), 1);
 });
 
 test("the CLI fails every scenario cleanly when safaridriver cannot start", () => {
