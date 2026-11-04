@@ -153,10 +153,14 @@ interface RpcClientStream {
  * Client-streaming and bidirectional calls read their response in a coroutine of [responseContext]
  * (a `Job` in it is ignored) from the moment they open until STATUS arrives or the call closes, so
  * the server's terminal status reaches a caller that is only sending. See [ClientStreamingCall.send].
+ *
+ * Call deadlines ([CallOptions.timeout]) are measured on [timeSource]. Tests on a virtual clock pass
+ * theirs, such as `testScheduler.timeSource`.
  */
 class Client(
     private val transport: RpcTransport,
     private val responseContext: CoroutineContext = Dispatchers.Default,
+    private val timeSource: TimeSource = TimeSource.Monotonic,
 ) {
     /**
      * Calls a unary RPC and returns its response. [compressMessages] is the method's compression
@@ -355,7 +359,7 @@ class Client(
         val directions = compressStream.effective(kind)
         val streams = configured?.let { CallStreams.open(it, budget, directions, compression) }
         val request = request(path, kind, options, compression, streams, transport.connectionMetadata)
-        val deadline = options.timeout?.let { TimeSource.Monotonic.markNow() + it }
+        val deadline = options.timeout?.let { timeSource.markNow() + it }
         val stream =
             try {
                 callWithDeadline(deadline, null) { transport.openStream(request, firstMessage, finishSend) }

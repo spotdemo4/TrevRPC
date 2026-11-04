@@ -691,14 +691,13 @@ class Http3RpcTransportTest {
             val transport = Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext)
             val call =
                 openCall(fake) {
-                    Client(transport, coroutineContext)
+                    Client(transport, coroutineContext, testScheduler.timeSource)
                         .openClientStreaming("/svc/m", strings, strings, CallOptions(timeout = 100.milliseconds))
                 }
             fake.headers(validHeaders())
             fake.deliverRead(messageFrame("reply".encodeToByteArray()) + statusFrame(Status.ok()))
             runCurrent()
-            // The deadline is measured on the real clock.
-            Thread.sleep(250)
+            advanceTimeBy(250.milliseconds)
 
             assertEquals("reply", call.receive())
         }
