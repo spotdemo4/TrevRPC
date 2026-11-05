@@ -26,7 +26,15 @@ import {
 } from "../src/metadata.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
-import { RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus, createRoot } from "../src/wire.js";
+import {
+  RpcAnswer,
+  RpcHeaders,
+  RpcKind,
+  RpcRequest,
+  RpcStatus,
+  createRoot,
+  protobuf,
+} from "../src/wire.js";
 import { chunked, concatBytes, hex, readGoldenVectors, readerOf } from "./support.js";
 
 const bytes = (text) => new TextEncoder().encode(text);
@@ -315,34 +323,168 @@ test("varints round trip, including values beyond 2^53", () => {
   assert.equal(readVarint(encoded, 0).value, max);
 });
 
-test("malformed protobuf maps to invalid argument", () => {
-  const Message = createRoot({
-    nested: {
-      t: {
-        nested: {
-          M: { fields: { text: { type: "string", id: 1 }, n: { type: "uint32", id: 2 } } },
+/** A message type with every kind of field the decode preflight checks. */
+const Checked = createRoot({
+  nested: {
+    t: {
+      nested: {
+        E: { values: { ZERO: 0, ONE: 1, NEGATIVE: -1 } },
+        M: {
+          fields: {
+            text: { type: "string", id: 1 },
+            n: { type: "uint32", id: 2 },
+            counts: { keyType: "string", type: "uint32", id: 3 },
+            sub: { type: "M", id: 4 },
+            ids: { rule: "repeated", type: "uint32", id: 5 },
+            fixed: { rule: "repeated", type: "fixed64", id: 6 },
+            e: { type: "E", id: 7 },
+            children: { keyType: "uint32", type: "M", id: 8 },
+            d: { type: "double", id: 9 },
+            names: { rule: "repeated", type: "string", id: 10 },
+            big: { type: "uint64", id: 11 },
+          },
         },
       },
     },
-  }).lookupType("t.M");
+  },
+}).lookupType("t.M");
+
+/** The protobuf (not QUIC) varint encoding of value. */
+function protobufVarint(value) {
+  const bytes = [];
+  for (; value >= 0x80; value >>>= 7) {
+    bytes.push((value & 0x7f) | 0x80);
+  }
+  bytes.push(value);
+  return bytes;
+}
+
+/** `levels` levels of `sub` nesting. */
+function nested(levels) {
+  let body = [];
+  for (let level = 0; level < levels; level += 1) {
+    body = [0x22, ...protobufVarint(body.length), ...body];
+  }
+  return body;
+}
+
+test("malformed protobuf maps to invalid argument", () => {
   const malformed = [
-    [0xff],
-    [0x0a],
-    [0x0a, 0x05, 0x61],
+    [0xff], // truncated tag
+    [0x0a], // truncated length
+    [0x0a, 0x05, 0x61], // truncated string
     [0x0a, 0x02, 0xc3, 0x28], // invalid UTF-8 in a string
+    [0x1a, 0x04, 0x0a, 0x02, 0xc3, 0x28], // invalid UTF-8 in a map key
+    [0x52, 0x02, 0xc3, 0x28], // invalid UTF-8 in a repeated string
     [0x12, 0x01, 0x00], // wrong wire type for a uint32
+    [0x20, 0x00], // wrong wire type for a message
+    [0x18, 0x00], // wrong wire type for a map
+    [0x1a, 0x02, 0x08, 0x00], // wrong wire type for a map key
+    [0x22, 0x02, 0x0a, 0x05, 0x61, 0x61, 0x61, 0x61, 0x61], // a field past its message's end
+    [0x22, 0x03, 0x12, 0x01, 0x00], // wrong wire type inside a nested message
+    [0x42, 0x04, 0x12, 0x02, 0x12, 0x00], // wrong wire type inside a map value message
     [0x10, 0xff, 0xff, 0xff, 0xff, 0x1f], // varint above uint32
+    [0x2a, 0x05, 0xff, 0xff, 0xff, 0xff, 0x1f], // packed varint above uint32
+    [0x1a, 0x06, 0x10, 0xff, 0xff, 0xff, 0xff, 0x1f], // map value above uint32
+    [0x32, 0x03, 0x00, 0x00, 0x00], // packed fixed64 cut short
+    [0x58, ...Array(10).fill(0xff), 0x01], // varint longer than 10 bytes
+    [0x58, ...Array(9).fill(0xff), 0x02], // 10-byte varint above 64 bits
     [0x00, 0x01], // field number zero
+    [0x80, 0x80, 0x80, 0x80, 0x10, 0x00], // tag above 32 bits
+    [0xfe, 0x01], // wire type 6
+    [0xfc, 0x01], // a stray end-group tag
+    [0xfb, 0x01], // unterminated group
+    [0xfb, 0x01, 0x84, 0x02], // group end tag for another field
+    [0xfb, 0x01, 0x00, 0x00, 0xfc, 0x01], // field number zero inside a group
+    nested(65),
   ];
 
   for (const bytes of malformed) {
     assert.throws(
-      () => unmarshalMessage(Message, new Uint8Array(bytes)),
+      () => unmarshalMessage(Checked, new Uint8Array(bytes)),
       (error) => error.code === Code.InvalidArgument,
       hex(bytes),
     );
   }
-  assert.equal(unmarshalMessage(Message, new Uint8Array([0x0a, 0x01, 0x61])).text, "a");
+});
+
+test("well-formed protobuf decodes, including unknown fields of every wire type", () => {
+  const decode = (bytes) => unmarshalMessage(Checked, new Uint8Array(bytes));
+
+  assert.equal(decode([0x0a, 0x01, 0x61]).text, "a");
+  assert.equal(decode([0x10, 0xff, 0xff, 0xff, 0xff, 0x0f]).n, 0xffffffff);
+  assert.equal(decode([0x10, 0x81, 0x80, 0x80, 0x80, 0x00]).n, 1); // padded but within uint32
+  // Enums are int32, and negative ones take 10 bytes.
+  const negative = marshalMessage(Checked, { e: "NEGATIVE" });
+  assert.equal(negative.byteLength, 11);
+  assert.equal(decode(negative).e, -1);
+  assert.deepEqual(decode([0x2a, 0x02, 0x01, 0x02, 0x28, 0x03]).ids, [1, 2, 3]); // packed and not
+  assert.equal(decode([0x58, ...Array(9).fill(0xff), 0x01]).big.toString(), "18446744073709551615");
+  assert.ok(decode(nested(64)).sub);
+
+  const unknown = [
+    [0x98, 0x01, 0x96, 0x01], // varint
+    [0x99, 0x01, 1, 2, 3, 4, 5, 6, 7, 8], // fixed64
+    [0x9a, 0x01, 0x02, 0xc3, 0x28], // length-delimited, not checked as UTF-8
+    [0x9b, 0x01, 0x08, 0x01, 0xa3, 0x01, 0xa4, 0x01, 0x9c, 0x01], // group holding a group
+    [0x9d, 0x01, 1, 2, 3, 4], // fixed32
+  ].flat();
+  assert.equal(decode([...unknown, 0x0a, 0x01, 0x62]).text, "b");
+
+  const full = {
+    text: "héllo",
+    n: 7,
+    counts: { a: 1, b: 0xffffffff },
+    sub: { text: "inner", children: { 3: { n: 4 } } },
+    ids: [1, 2 ** 31],
+    fixed: [1, 2],
+    e: "ONE",
+    children: { 1: { names: ["x"] } },
+    d: 1.5,
+    names: ["a", "b"],
+    big: 2 ** 40,
+  };
+  const encoded = marshalMessage(Checked, full);
+  assert.equal(hex(marshalMessage(Checked, unmarshalMessage(Checked, encoded))), hex(encoded));
+});
+
+test("decoding checks fields added to a type after it first decoded", () => {
+  const Growing = createRoot({ nested: { t: { nested: { M: { fields: {} } } } } }).lookupType(
+    "t.M",
+  );
+  const body = new Uint8Array([0x0a, 0x00]);
+  unmarshalMessage(Growing, body);
+  Growing.add(new protobuf.Field("n", 1, "uint32"));
+  assert.throws(
+    () => unmarshalMessage(Growing, body),
+    (error) => error.code === Code.InvalidArgument,
+  );
+});
+
+test("arbitrary bytes either decode or fail with invalid argument", () => {
+  let seed = 1;
+  const random = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32;
+  const valid = marshalMessage(Checked, {
+    text: "hi",
+    n: 300,
+    counts: { a: 1 },
+    sub: { ids: [1, 2], children: { 5: { d: 2 } } },
+    fixed: [1],
+    e: "NEGATIVE",
+    names: ["x"],
+  });
+  for (let iteration = 0; iteration < 20_000; iteration += 1) {
+    const bytes = valid.slice();
+    for (let mutation = Math.floor(random() * 4); mutation > 0; mutation -= 1) {
+      bytes[Math.floor(random() * bytes.length)] = Math.floor(random() * 256);
+    }
+    const input = random() < 0.2 ? bytes.subarray(0, Math.floor(random() * bytes.length)) : bytes;
+    try {
+      unmarshalMessage(Checked, input);
+    } catch (error) {
+      assert.equal(error.code, Code.InvalidArgument, hex(input));
+    }
+  }
 });
 
 test("marshalling rejects values that do not fit the schema", () => {
