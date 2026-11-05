@@ -171,6 +171,15 @@
       "separateMajorMinor": false
     },
 
+    // group h3, whose crates release in lockstep; match the Cargo.toml names
+    // so the rule covers both the trev-h3 fork and upstream
+    {
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["h3", "h3-*"],
+      "groupName": "h3",
+      "separateMajorMinor": false
+    },
+
     // group connectrpc (go & js)
     {
       "matchManagers": ["gomod", "npm"],
