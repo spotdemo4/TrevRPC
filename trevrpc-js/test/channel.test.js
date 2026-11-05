@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
+import { Echo } from "../build/interop/gen/interop_pb.js";
 import { Channel, connect, createChannel } from "../src/channel.js";
+import { createClient } from "../src/client.js";
 import { Code } from "../src/status.js";
 import { echoHandler } from "./echo-server.js";
 import { deferred, fakeTransport, isPending, turn } from "./support.js";
@@ -78,7 +79,7 @@ test("connect resolves with a channel once the session is ready", async () => {
   assert.equal(channel.state, "ready");
   await channel.waitUntilReady();
 
-  const echo = new EchoClient(channel);
+  const echo = createClient(Echo, channel);
   assert.equal((await echo.unary({ message: "hi" })).message, "hi");
   channel.close({ closeCode: 7, reason: "bye" });
   assert.deepEqual(sessions[0].closeCalls, [{ closeCode: 7, reason: "bye" }]);
@@ -297,7 +298,7 @@ test("the channel reconnects after its session is lost", async () => {
   assert.ok(changes[1].delayMs >= 80 && changes[1].delayMs <= 120);
 
   // Calls fail fast while there is no session, and are not queued.
-  await assert.rejects(new EchoClient(channel).unary({}), (error) => {
+  await assert.rejects(createClient(Echo, channel).unary({}), (error) => {
     return error.code === Code.Unavailable && /reconnecting/.test(error.statusMessage);
   });
   const ready = channel.waitUntilReady();
@@ -309,7 +310,7 @@ test("the channel reconnects after its session is lost", async () => {
 
   assert.equal(channel.state, "ready");
   assert.deepEqual(changes.at(-1).state, "ready");
-  assert.equal((await new EchoClient(channel).unary({ message: "back" })).message, "back");
+  assert.equal((await createClient(Echo, channel).unary({ message: "back" })).message, "back");
   channel.close();
 });
 
@@ -435,7 +436,7 @@ test("createChannel returns at once, and calls wait for the first session", asyn
   assert.equal(channel.transport, undefined);
   assert.equal(sessions.length, 1, "the first attempt starts right away");
 
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
   const first = client.unary({ message: "early" });
   const ready = channel.waitUntilReady();
   assert.equal(await isPending(first), true);
@@ -460,7 +461,7 @@ test("calls waiting for the first session fail with its error, and the channel r
     WebTransport,
     onStateChange: (change) => changes.push(change),
   });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
   const waiting = client.unary({ message: "early" });
   const ready = channel.waitUntilReady();
 
@@ -492,7 +493,7 @@ test("a call waiting for the first session ends at its deadline or signal", asyn
     transports: WebTransportOnly,
     WebTransport,
   });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
   await assert.rejects(
     client.unary({}, { timeoutMs: 10 }),
     (error) => error.code === Code.DeadlineExceeded,
@@ -515,7 +516,7 @@ test("closing a connecting channel abandons the attempt and fails waiting calls"
     transports: WebTransportOnly,
     WebTransport,
   });
-  const waiting = new EchoClient(channel).unary({});
+  const waiting = createClient(Echo, channel).unary({});
   const ready = channel.waitUntilReady();
   channel.close();
 
@@ -547,8 +548,8 @@ test("a channel's interceptors run around the calls of every client on it", asyn
   await waitFor(() => sessions.length === 1);
   sessions[0].becomeReady();
 
-  const plain = new EchoClient(channel);
-  const intercepted = new EchoClient(channel, { interceptors: [intercept("client")] });
+  const plain = createClient(Echo, channel);
+  const intercepted = createClient(Echo, channel, { interceptors: [intercept("client")] });
   assert.equal((await plain.unary({ message: "a" })).message, "a+channel");
   assert.equal((await intercepted.unary({ message: "b" })).message, "b+client");
   assert.deepEqual(events, [

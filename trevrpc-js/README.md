@@ -2,7 +2,7 @@
 
 TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients, and call Go or Rust servers over WebTransport, falling back to QMux over WebSocket where WebTransport is missing or UDP is blocked.
 
-`trevrpc-js` is the **browser client**: a WebTransport runtime with a QMux over WebSocket fallback, plus `protoc-gen-trevrpc-js`, which generates typed clients (no server code). It has no Node.js runtime; servers are written in Go or Rust, native QUIC clients in Go or Rust, and HTTP/3 clients in Kotlin.
+`trevrpc-js` is the **browser client**: a WebTransport runtime with a QMux over WebSocket fallback, for the messages and service descriptors that [protobuf-es](https://github.com/bufbuild/protobuf-es) generates. It has no Node.js runtime; servers are written in Go or Rust, native QUIC clients in Go or Rust, and HTTP/3 clients in Kotlin.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
@@ -24,61 +24,52 @@ message HelloRequest { string name = 1; }
 message HelloReply { string message = 1; }
 ```
 
-Generate a client with the protoc plugin (it needs Node.js to run):
+TrevRPC has no code generator of its own for JavaScript: generate the messages and the service descriptor with protobuf-es's `protoc-gen-es`, and pass the descriptor to `createClient()`.
 
 ```sh
-npm install @trevrpc/trevrpc-js
+npm install @trevrpc/trevrpc-js @bufbuild/protobuf
+npm install --save-dev @bufbuild/protoc-gen-es
 protoc \
-  --plugin=protoc-gen-trevrpc-js=node_modules/.bin/protoc-gen-trevrpc-js \
-  --trevrpc-js_out=src/gen \
+  --plugin=protoc-gen-es=node_modules/.bin/protoc-gen-es \
+  --es_out=src/gen --es_opt=target=ts \
   greeter.proto
 ```
 
-This writes `greeter.trevrpc.js` and `greeter.trevrpc.d.ts`. Plugin parameters (`--trevrpc-js_out=key=value,key=value:dir`):
+This writes `greeter_pb.ts` with `HelloRequestSchema`, `HelloReplySchema` and the `Greeter` service descriptor ([`buf generate`](https://buf.build/docs/generate/overview/) with the `buf.build/bufbuild/es` plugin works the same). `@bufbuild/protobuf` is a peer dependency, so the generated code and the client share one copy.
 
-| Parameter             | Default                  | Meaning                                                                              |
-| --------------------- | ------------------------ | ------------------------------------------------------------------------------------ |
-| `runtime_import`      | `@trevrpc/trevrpc-js`    | Module specifier the generated JavaScript imports.                                   |
-| `runtime_type_import` | same as `runtime_import` | Module specifier the declarations import; required when `runtime_import` is a URL.   |
-| `file_suffix`         | `.trevrpc.js`            | Suffix of the generated files.                                                       |
-| `int64`               | `bigint`                 | How decoded 64-bit integers are represented: `bigint`, `number`, `string` or `long`. |
+### Messages
 
-### Generated types
-
-The declarations cover the file's own messages and enums and every type they and its services use, including those of imported files. Each message has two shapes:
-
-- `Foo`, a decoded message, which calls return and streams yield. Every field reads a value: scalars and enums their default when unset, repeated fields and maps an empty array and object, and message and `optional` fields `null` when unset.
-- `FooInit`, a message to send, in which every field may be left out. Requests take it, and a decoded `Foo` can be sent as one.
-
-Each enum is exported as a frozen object of its values and as the type of those values. When every value starts with the enum's name in upper snake case, the prefix is dropped, as protobuf-es does: `TIME_INTERVAL_HOUR` of `TimeInterval` is `TimeInterval.HOUR`.
+Messages are protobuf-es messages; see its [manual](https://github.com/bufbuild/protobuf-es/blob/main/MANUAL.md) for the details. Requests take a message or the init object `create()` takes, in which every field may be left out; calls return and streams yield messages, in which scalars, repeated fields and maps always have a value and message fields are `undefined` when unset. Oneofs are `{ case, value }`, 64-bit integers are `bigint` (or `string` with `[jstype = JS_STRING]`), `google.protobuf.Struct` is a JSON object, and `@bufbuild/protobuf/wkt` has helpers for the well-known types, such as `timestampFromDate` and `timestampDate`.
 
 ```ts
-import { TimeInterval, type Sample } from "./gen/metrics.trevrpc.js";
+import { timestampDate, timestampFromDate } from "@bufbuild/protobuf/wkt";
 
-const sample: Sample = await client.get({ interval: TimeInterval.HOUR });
+import { Metrics, TimeInterval } from "./gen/metrics_pb.js";
+
+const metrics = createClient(Metrics, channel);
+const sample = await metrics.get({
+  interval: TimeInterval.HOUR,
+  at: timestampFromDate(new Date()),
+});
 sample.count; // bigint, never undefined
+const at = sample.at && timestampDate(sample.at);
 ```
 
-64-bit integers decode as `bigint` by default; requests take a `bigint`, a `number` or a decimal `string`. The `int64` plugin option picks `number` (exact up to 2^53), `string`, or `long` (protobuf.js `Long` objects, without the conversion) instead, and a field's `jstype` option (`[jstype = JS_STRING]` or `JS_NUMBER`) overrides it for that field. 64-bit map keys are decimal strings. `JSON.stringify` throws on a `bigint`, so a decoded message with a 64-bit field needs a replacer to serialize, such as `(key, value) => (typeof value === "bigint" ? value.toString() : value)`, or generate with `int64=string`.
+`JSON.stringify` throws on a `bigint`; use protobuf-es's `toJson()` or `toJsonString()` to serialize a message.
 
-`google.protobuf.Timestamp`, `Duration`, `Empty`, `Struct`, `Value`, `ListValue` and `NullValue` are declared once by the runtime, which generated files import (Timestamp and Duration only with `bigint`, since the runtime declares their seconds as one). The runtime has helpers for them: `timestampFromDate`, `timestampFromMs`, `timestampDate`, `timestampMs`, `durationFromMs`, `durationMs`, `structFromJson`, `structToJson`, `valueFromJson` and `valueToJson`. The Timestamp and Duration readers take seconds in any representation.
+### Method options
 
-```ts
-import { timestampDate, timestampFromDate } from "@trevrpc/trevrpc-js";
-
-await client.put({ at: timestampFromDate(new Date()) });
-const at = sample.at === null ? undefined : timestampDate(sample.at);
-```
+`createClient()` reads the `trevrpc.method` option of each method (from [`trevrpc/options.proto`](https://trev.zip/llc/TrevRPC/wiki/Getting-Started#schema-options)) from the descriptor, which protoc-gen-es keeps: `unreliable_requests` and `unreliable_responses` mark directions whose messages may travel as WebTransport datagrams ([Datagram Messages](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages)), and `compression` lets messages be compressed without a dictionary or a stream be compressed ([Compression](#compression)). An option the method's kind cannot use, such as `unreliable_requests` on a unary method or `COMPRESSION_STREAM` on one that streams nothing, makes `createClient()` throw `InvalidArgument`. Message types with a field marked `debug_redact` are never compressed that way.
 
 ## Client
 
 ```js
-import { connect } from "@trevrpc/trevrpc-js";
+import { connect, createClient } from "@trevrpc/trevrpc-js";
 
-import { GreeterClient } from "./gen/greeter.trevrpc.js";
+import { Greeter } from "./gen/greeter_pb.js";
 
 const channel = await connect("https://example.com:4433/trevrpc");
-const client = new GreeterClient(channel, { timeoutMs: 5_000 });
+const client = createClient(Greeter, channel, { timeoutMs: 5_000 });
 
 // Unary
 const reply = await client.sayHello({ name: "TrevRPC" });
@@ -110,7 +101,7 @@ channel.close();
 
 ### Call options
 
-Every method takes `CallOptions` as its last argument; the same options can be given to the client constructor as defaults, and per-call `metadata` is merged over the defaults per key. The constructor also takes `interceptors` ([below](#interceptors)).
+A client has one function per method, named by the method's `localName` (`SayHello` is `sayHello`). Every method takes `CallOptions` as its last argument; the same options can be given to `createClient()` as defaults, and per-call `metadata` is merged over the defaults per key. `createClient()` also takes `interceptors` ([below](#interceptors)).
 
 | Option               | Meaning                                                                                       |
 | -------------------- | --------------------------------------------------------------------------------------------- |
@@ -188,7 +179,7 @@ try {
 
 `connect()` opens a session and resolves when it is ready; it rejects if no transport can establish one. After that the `Channel` re-establishes the session in the background with exponential backoff whenever it is lost. Calls fail fast with `Unavailable` while `channel.state` is `"reconnecting"` and are never replayed; use `await channel.waitUntilReady()` or the `onStateChange` option to follow the state. `channel.close()` stops reconnecting.
 
-`createChannel(url, options)` takes the same options but returns the channel right away, in the `"connecting"` state, so generated clients can be created before it is connected. Calls started while it connects wait for that first attempt, within their own deadline and signal; if it fails they fail with its error, and the channel goes on reconnecting with backoff like after a lost session. The `signal` option does not apply to it; close the channel to give up.
+`createChannel(url, options)` takes the same options but returns the channel right away, in the `"connecting"` state, so clients can be created before it is connected. Calls started while it connects wait for that first attempt, within their own deadline and signal; if it fails they fail with its error, and the channel goes on reconnecting with backoff like after a lost session. The `signal` option does not apply to it; close the channel to give up.
 
 ```js
 const channel = await connect(url, {
@@ -202,7 +193,7 @@ const channel = await connect(url, {
 
 `connect()` always offers the WebTransport protocol `trevrpc-1` (wire version 1) through the `protocols` constructor option; it cannot be changed. If the server selects any other protocol, that connection attempt fails with `Code.FailedPrecondition` and the channel carries on as after any failed dial: the WebSocket fallback starts, or a reconnect is retried with backoff. An empty or missing selection means version 1, because older browsers cannot negotiate protocols.
 
-Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a generated client. A transport that wraps a `Channel` should forward its `createBidirectionalStreamWithSession()`, `compression`, `connectionMetadata`, `streamCompressionBudget` and `interceptors`; without them its calls carry no connection metadata, get a stream compression budget of their own, and skip the channel's interceptors. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which the generated clients build from the service and method names.
+Any object with `createBidirectionalStream()`, including a plain `WebTransport` session, can be used as the transport of a client. A transport that wraps a `Channel` should forward its `createBidirectionalStreamWithSession()`, `compression`, `connectionMetadata`, `streamCompressionBudget` and `interceptors`; without them its calls carry no connection metadata, get a stream compression budget of their own, and skip the channel's interceptors. Create such a session with `new WebTransport(url, { protocols: ["trevrpc-1"] })` so the server knows the wire version. Requests name the method by its full path, `/<package.Service>/<Method>` (for example `/example.greeter.Greeter/SayHello`), which clients build from the service and method names.
 
 ### Connection metadata
 
@@ -236,7 +227,7 @@ const channel = createChannel(url, {
     },
   ],
 });
-const client = new GreeterClient(channel, { interceptors: [logCalls] });
+const client = createClient(Greeter, channel, { interceptors: [logCalls] });
 ```
 
 - An interceptor runs before the call starts, in order with the others, and may wait. It may add, replace and delete entries of `call.metadata`, which is validated after the last interceptor. The call's deadline starts after the interceptors; an interceptor that waits can watch `call.signal`.
@@ -246,7 +237,7 @@ const client = new GreeterClient(channel, { interceptors: [logCalls] });
 
 ### Effect
 
-The separate package [`@trevrpc/effect`](effect) wraps a generated client for [Effect](https://effect.website): `createEffectClient(GreeterService, new GreeterClient(channel))` returns a client whose unary calls are effects, whose server-streaming calls are streams, and whose client-streaming and bidirectional calls take their requests as a stream. Interrupting an effect or stream cancels its call. `TrevRpcError` has a `_tag` of `"TrevRpcError"`, so `Effect.catchTag` matches it.
+The separate package [`@trevrpc/effect`](effect) makes clients for [Effect](https://effect.website): `createEffectClient(Greeter, channel)` returns a client whose unary calls are effects, whose server-streaming calls are streams, and whose client-streaming and bidirectional calls take their requests as a stream. Interrupting an effect or stream cancels its call. `TrevRpcError` has a `_tag` of `"TrevRpcError"`, so `Effect.catchTag` matches it.
 
 ### Compression
 
@@ -284,7 +275,7 @@ console.log(channel.transport); // "webtransport" or "websocket"
 
 ## Interop client
 
-`trevrpc-interop-browser` runs the cross-runtime interop scenarios from [`interop/README.md`](../interop/README.md) in a real browser over WebTransport, QMux over WebSocket, or the fallback between them. It is built from `interop/proto/interop.proto` with the generator in this package, so it also serves as a complete example of generated client code.
+`trevrpc-interop-browser` runs the cross-runtime interop scenarios from [`interop/README.md`](../interop/README.md) in a real browser over WebTransport, QMux over WebSocket, or the fallback between them. It is built from `interop/proto/interop.proto` with protoc-gen-es, so it also serves as a complete example of a client.
 
 ```sh
 trevrpc-interop-browser --browser chromium|firefox|safari \
@@ -301,10 +292,10 @@ It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only i
 ```sh
 npm ci
 npm run check      # format check, lint, typecheck, tests
-npm run build      # generate the interop clients and bundle the interop and benchmark pages into build/interop/
+npm run build      # generate the interop and test descriptors and bundle the interop and benchmark pages into build/interop/
 npm run interop -- --browser chromium --url ... --cert-hash ...
 ```
 
-`nix build .#trevrpc-js` runs the same checks and installs the library, the plugin and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
+`nix build .#trevrpc-js` runs the same checks and installs the library and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
 
-Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt` (frame bytes, and the frame reader against the shared byte streams), the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the generator, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.
+Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt` (frame bytes, and the frame reader against the shared byte streams), the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the `trevrpc.method` option, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.

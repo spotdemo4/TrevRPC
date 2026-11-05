@@ -70,13 +70,11 @@ buildNpmPackage (final: {
     )}
     chmod -R u+w ..
     ln -s ${trevrpcModule}/node_modules ../node_modules
-    mkdir -p node_modules/@trevrpc node_modules/.bin
+    mkdir -p node_modules/@trevrpc
     ln -s ../../.. node_modules/@trevrpc/trevrpc-js
-    ln -s ../@trevrpc/trevrpc-js/bin/protoc-gen-trevrpc-js.js node_modules/.bin/protoc-gen-trevrpc-js
-    patchShebangs ../bin/protoc-gen-trevrpc-js.js
   '';
 
-  # Generates the Echo client of the runtime and type tests.
+  # Generates the Echo service descriptor of the runtime and type tests with protoc-gen-es.
   npmBuildScript = "build";
 
   doCheck = true;
@@ -112,7 +110,7 @@ buildNpmPackage (final: {
 
   # The installed package is the adapter alone; the links to the checkout are not part of it.
   preInstall = ''
-    rm node_modules/@trevrpc/trevrpc-js node_modules/.bin/protoc-gen-trevrpc-js
+    rm node_modules/@trevrpc/trevrpc-js
   '';
 
   meta = {

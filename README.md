@@ -131,13 +131,14 @@ cargo install --git https://trev.zip/llc/TrevRPC.git protoc-gen-trevrpc-rust
 
 ### javascript
 
-the package includes `protoc-gen-trevrpc-js`, which runs on Node.js:
+the client takes the messages and service descriptors that [protobuf-es](https://github.com/bufbuild/protobuf-es) generates with `protoc-gen-es`:
 
 ```sh
-npm install @trevrpc/trevrpc-js
+npm install @trevrpc/trevrpc-js @bufbuild/protobuf
+npm install --save-dev @bufbuild/protoc-gen-es
 ```
 
-for [Effect](https://effect.website), [`@trevrpc/effect`](trevrpc-js/effect) wraps generated clients in effects and streams:
+for [Effect](https://effect.website), [`@trevrpc/effect`](trevrpc-js/effect) makes clients whose calls are effects and streams:
 
 ```sh
 npm install @trevrpc/effect effect

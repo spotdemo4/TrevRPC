@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { EchoRequestSchema } from "../build/interop/gen/interop_pb.js";
+import { SampleSchema } from "../build/test/gen/types_pb.js";
 import { encodeMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import {
@@ -13,6 +15,8 @@ import {
   encodeOutgoingFrame,
   encodeRequestFrame,
   encodeStatusFrame,
+  encodeWireMessage,
+  decodeWireMessage,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
@@ -26,15 +30,7 @@ import {
 } from "../src/metadata.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
-import {
-  RpcAnswer,
-  RpcHeaders,
-  RpcKind,
-  RpcRequest,
-  RpcStatus,
-  createRoot,
-  protobuf,
-} from "../src/wire.js";
+import { RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus } from "../src/wire.js";
 import { chunked, concatBytes, hex, readGoldenVectors, readerOf } from "./support.js";
 
 const bytes = (text) => new TextEncoder().encode(text);
@@ -42,7 +38,7 @@ const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));
 
 const request = { method: "/svc/m" };
 
-/** The documented logical value of every golden vector: [frame type, message type, fields]. */
+/** The documented logical value of every golden vector: [frame type, payload codec, fields]. */
 const goldenCases = {
   "request.unary": [FrameType.Request, RpcRequest, request],
   "request.bidi_timeout": [
@@ -121,8 +117,8 @@ test("every golden vector has a documented logical value", async () => {
 
 test("wire encodings match the shared golden vectors and decode back", async () => {
   const vectors = await readGoldenVectors("wire-golden-vectors.txt");
-  for (const [name, [type, messageType, fields]] of Object.entries(goldenCases)) {
-    const payload = messageType === undefined ? fields : marshalMessage(messageType, fields);
+  for (const [name, [type, codec, fields]] of Object.entries(goldenCases)) {
+    const payload = codec === undefined ? fields : encodeWireMessage(codec, fields);
     assert.equal(hex(payload), vectors.get(`${name}.payload`), `${name} payload`);
     const frame = encodeFrame(type, payload);
     assert.equal(hex(frame), vectors.get(`${name}.frame`), `${name} frame`);
@@ -135,25 +131,25 @@ test("wire encodings match the shared golden vectors and decode back", async () 
     }
     assert.equal(read.type, type, name);
     assert.equal(hex(read.payload), vectors.get(`${name}.payload`), name);
-    if (messageType !== undefined) {
-      const decoded = unmarshalMessage(messageType, read.payload);
-      assert.equal(hex(marshalMessage(messageType, decoded)), hex(payload), `${name} round trip`);
+    if (codec !== undefined) {
+      const decoded = decodeWireMessage(codec, read.payload);
+      assert.equal(hex(encodeWireMessage(codec, decoded)), hex(payload), `${name} round trip`);
     }
   }
 });
 
 test("golden payloads decode to their logical fields", async () => {
   const vectors = await readGoldenVectors("wire-golden-vectors.txt");
-  const decode = (name, type) => unmarshalMessage(type, fromHex(vectors.get(`${name}.payload`)));
+  const decode = (name, codec) => decodeWireMessage(codec, fromHex(vectors.get(`${name}.payload`)));
 
   const timeout = decode("request.bidi_timeout", RpcRequest);
   assert.equal(timeout.kind, RpcKind.BidirectionalStreaming);
-  assert.equal(Number(timeout.timeoutNanos), 123456);
+  assert.equal(timeout.timeoutNanos, 123456n);
 
   const flow = decode("request.datagram_flow", RpcRequest);
   assert.equal(flow.kind, RpcKind.BidirectionalStreaming);
-  assert.equal(Number(flow.datagramFlow), 1);
-  assert.equal(Number(decode("request.unary", RpcRequest).datagramFlow), 0);
+  assert.equal(flow.datagramFlow, 1n);
+  assert.equal(decode("request.unary", RpcRequest).datagramFlow, 0n);
 
   assert.equal(
     Buffer.from(decode("request.metadata", RpcRequest).metadata.authorization) + "",
@@ -166,7 +162,7 @@ test("golden payloads decode to their logical fields", async () => {
   assert.equal(reference.connectionMetadata.id, 1);
   assert.deepEqual(Object.keys(reference.connectionMetadata.metadata), []);
   assert.deepEqual(Object.keys(reference.metadata), ["x-a"]);
-  assert.equal(decode("request.unary", RpcRequest).connectionMetadata, null);
+  assert.equal(decode("request.unary", RpcRequest).connectionMetadata, undefined);
   assert.equal(decode("answer.connection_metadata", RpcAnswer).connectionMetadata, 1);
   assert.equal(decode("answer.empty", RpcAnswer).connectionMetadata, 0);
   assert.equal(decode("answer.empty", RpcAnswer).streamCompression, false);
@@ -274,9 +270,9 @@ test("request frames carry the request message in the same buffer", () => {
 test("unknown request fields are ignored when decoding", () => {
   // Fields 10 (varint) and 16 (bytes), which a later peer may send.
   const payload = fromHex("0a062f7376632f6d" + "5001" + "820101" + "6d");
-  const decoded = unmarshalMessage(RpcRequest, payload);
+  const decoded = decodeWireMessage(RpcRequest, payload);
   assert.equal(decoded.method, "/svc/m");
-  assert.equal(hex(marshalMessage(RpcRequest, decoded)), "0a062f7376632f6d");
+  assert.equal(hex(encodeWireMessage(RpcRequest, decoded)), "0a062f7376632f6d");
 });
 
 test("status, headers and answer encoders match the golden frames", async () => {
@@ -323,72 +319,29 @@ test("varints round trip, including values beyond 2^53", () => {
   assert.equal(readVarint(encoded, 0).value, max);
 });
 
-/** A message type with every kind of field the decode preflight checks. */
-const Checked = createRoot({
-  nested: {
-    t: {
-      nested: {
-        E: { values: { ZERO: 0, ONE: 1, NEGATIVE: -1 } },
-        M: {
-          fields: {
-            text: { type: "string", id: 1 },
-            n: { type: "uint32", id: 2 },
-            counts: { keyType: "string", type: "uint32", id: 3 },
-            sub: { type: "M", id: 4 },
-            ids: { rule: "repeated", type: "uint32", id: 5 },
-            fixed: { rule: "repeated", type: "fixed64", id: 6 },
-            e: { type: "E", id: 7 },
-            children: { keyType: "uint32", type: "M", id: 8 },
-            d: { type: "double", id: 9 },
-            names: { rule: "repeated", type: "string", id: 10 },
-            big: { type: "uint64", id: 11 },
-          },
-        },
-      },
-    },
-  },
-}).lookupType("t.M");
-
-/** The protobuf (not QUIC) varint encoding of value. */
-function protobufVarint(value) {
-  const bytes = [];
-  for (; value >= 0x80; value >>>= 7) {
-    bytes.push((value & 0x7f) | 0x80);
-  }
-  bytes.push(value);
-  return bytes;
+/** `levels` unknown groups (field 19), each inside the last. */
+function nestedGroups(levels) {
+  return [...Array(levels).fill([0x9b, 0x01]).flat(), ...Array(levels).fill([0x9c, 0x01]).flat()];
 }
 
-/** `levels` levels of `sub` nesting. */
-function nested(levels) {
-  let body = [];
-  for (let level = 0; level < levels; level += 1) {
-    body = [0x22, ...protobufVarint(body.length), ...body];
-  }
-  return body;
-}
+const isInvalidArgument = (error) => error.code === Code.InvalidArgument;
 
-test("malformed protobuf maps to invalid argument", () => {
-  const malformed = [
+test("malformed wire payloads map to invalid argument", () => {
+  // RpcStatus is { uint32 code = 1; string message = 2; map<string, bytes> metadata = 3; ... }.
+  const status = [
     [0xff], // truncated tag
-    [0x0a], // truncated length
-    [0x0a, 0x05, 0x61], // truncated string
-    [0x0a, 0x02, 0xc3, 0x28], // invalid UTF-8 in a string
+    [0x12], // truncated length
+    [0x12, 0x05, 0x61], // truncated string
+    [0x12, 0x02, 0xc3, 0x28], // invalid UTF-8 in a string
     [0x1a, 0x04, 0x0a, 0x02, 0xc3, 0x28], // invalid UTF-8 in a map key
-    [0x52, 0x02, 0xc3, 0x28], // invalid UTF-8 in a repeated string
-    [0x12, 0x01, 0x00], // wrong wire type for a uint32
-    [0x20, 0x00], // wrong wire type for a message
+    [0x0a, 0x01, 0x00], // wrong wire type for a uint32
     [0x18, 0x00], // wrong wire type for a map
     [0x1a, 0x02, 0x08, 0x00], // wrong wire type for a map key
-    [0x22, 0x02, 0x0a, 0x05, 0x61, 0x61, 0x61, 0x61, 0x61], // a field past its message's end
-    [0x22, 0x03, 0x12, 0x01, 0x00], // wrong wire type inside a nested message
-    [0x42, 0x04, 0x12, 0x02, 0x12, 0x00], // wrong wire type inside a map value message
-    [0x10, 0xff, 0xff, 0xff, 0xff, 0x1f], // varint above uint32
-    [0x2a, 0x05, 0xff, 0xff, 0xff, 0xff, 0x1f], // packed varint above uint32
-    [0x1a, 0x06, 0x10, 0xff, 0xff, 0xff, 0xff, 0x1f], // map value above uint32
-    [0x32, 0x03, 0x00, 0x00, 0x00], // packed fixed64 cut short
-    [0x58, ...Array(10).fill(0xff), 0x01], // varint longer than 10 bytes
-    [0x58, ...Array(9).fill(0xff), 0x02], // 10-byte varint above 64 bits
+    [0x1a, 0x02, 0x0a, 0x05, 0x61, 0x61, 0x61, 0x61, 0x61], // a field past its entry's end
+    [0x08, 0xff, 0xff, 0xff, 0xff, 0x1f], // varint above uint32
+    [0x08, ...Array(10).fill(0xff), 0x01], // varint longer than 10 bytes
+    [0x98, 0x01, ...Array(9).fill(0xff), 0x02], // unknown 10-byte varint above 64 bits
+    [0x98, 0x01, 0xff], // truncated unknown varint
     [0x00, 0x01], // field number zero
     [0x80, 0x80, 0x80, 0x80, 0x10, 0x00], // tag above 32 bits
     [0xfe, 0x01], // wire type 6
@@ -396,31 +349,36 @@ test("malformed protobuf maps to invalid argument", () => {
     [0xfb, 0x01], // unterminated group
     [0xfb, 0x01, 0x84, 0x02], // group end tag for another field
     [0xfb, 0x01, 0x00, 0x00, 0xfc, 0x01], // field number zero inside a group
-    nested(65),
+    nestedGroups(65),
   ];
-
-  for (const bytes of malformed) {
-    assert.throws(
-      () => unmarshalMessage(Checked, new Uint8Array(bytes)),
-      (error) => error.code === Code.InvalidArgument,
-      hex(bytes),
-    );
+  // RpcRequest adds packed uint32s (6), DictionaryInfo (7) and ConnectionMetadata (9) messages.
+  const request = [
+    [0x32, 0x05, 0xff, 0xff, 0xff, 0xff, 0x1f], // packed varint above uint32
+    [0x32, 0x02, 0x01], // packed run past its field's end
+    [0x22, 0x00], // wrong wire type for a uint64
+    [0x38, 0x00], // wrong wire type for a message
+    [0x3a, 0x03, 0x0a, 0x01, 0x00], // wrong wire type inside a nested message
+    [0x4a, 0x02, 0x10, 0x00], // wrong wire type for a map inside a nested message
+  ];
+  for (const [codec, payloads] of [
+    [RpcStatus, status],
+    [RpcRequest, request],
+  ]) {
+    for (const payload of payloads) {
+      assert.throws(
+        () => decodeWireMessage(codec, new Uint8Array(payload)),
+        isInvalidArgument,
+        `${codec.name} ${hex(payload)}`,
+      );
+    }
   }
 });
 
-test("well-formed protobuf decodes, including unknown fields of every wire type", () => {
-  const decode = (bytes) => unmarshalMessage(Checked, new Uint8Array(bytes));
-
-  assert.equal(decode([0x0a, 0x01, 0x61]).text, "a");
-  assert.equal(decode([0x10, 0xff, 0xff, 0xff, 0xff, 0x0f]).n, 0xffffffff);
-  assert.equal(decode([0x10, 0x81, 0x80, 0x80, 0x80, 0x00]).n, 1); // padded but within uint32
-  // Enums are int32, and negative ones take 10 bytes.
-  const negative = marshalMessage(Checked, { e: "NEGATIVE" });
-  assert.equal(negative.byteLength, 11);
-  assert.equal(decode(negative).e, -1);
-  assert.deepEqual(decode([0x2a, 0x02, 0x01, 0x02, 0x28, 0x03]).ids, [1, 2, 3]); // packed and not
-  assert.equal(decode([0x58, ...Array(9).fill(0xff), 0x01]).big.toString(), "18446744073709551615");
-  assert.ok(decode(nested(64)).sub);
+test("well-formed wire payloads decode, including unknown fields of every wire type", () => {
+  const status = (payload) => decodeWireMessage(RpcStatus, new Uint8Array(payload));
+  assert.equal(status([0x08, 0xff, 0xff, 0xff, 0xff, 0x0f]).code, 0xffffffff);
+  assert.equal(status([0x08, 0x81, 0x80, 0x80, 0x80, 0x00]).code, 1); // padded but within uint32
+  assert.equal(status(nestedGroups(64)).code, 0);
 
   const unknown = [
     [0x98, 0x01, 0x96, 0x01], // varint
@@ -429,81 +387,101 @@ test("well-formed protobuf decodes, including unknown fields of every wire type"
     [0x9b, 0x01, 0x08, 0x01, 0xa3, 0x01, 0xa4, 0x01, 0x9c, 0x01], // group holding a group
     [0x9d, 0x01, 1, 2, 3, 4], // fixed32
   ].flat();
-  assert.equal(decode([...unknown, 0x0a, 0x01, 0x62]).text, "b");
+  assert.equal(status([...unknown, 0x12, 0x01, 0x62]).message, "b");
 
-  const full = {
-    text: "héllo",
-    n: 7,
-    counts: { a: 1, b: 0xffffffff },
-    sub: { text: "inner", children: { 3: { n: 4 } } },
-    ids: [1, 2 ** 31],
-    fixed: [1, 2],
-    e: "ONE",
-    children: { 1: { names: ["x"] } },
-    d: 1.5,
-    names: ["a", "b"],
-    big: 2 ** 40,
-  };
-  const encoded = marshalMessage(Checked, full);
-  assert.equal(hex(marshalMessage(Checked, unmarshalMessage(Checked, encoded))), hex(encoded));
+  // Packed and unpacked uint32s mix; a later map entry for a key replaces the earlier one.
+  const request = decodeWireMessage(
+    RpcRequest,
+    new Uint8Array(
+      [
+        [0x32, 0x02, 0x01, 0x02, 0x30, 0x03],
+        [0x12, 0x06, 0x0a, 0x01, 0x6b, 0x12, 0x01, 0x31],
+        [0x12, 0x06, 0x0a, 0x01, 0x6b, 0x12, 0x01, 0x32],
+        [0x20, ...Array(9).fill(0xff), 0x01],
+      ].flat(),
+    ),
+  );
+  assert.deepEqual(request.acceptDictionaries, [1, 2, 3]);
+  assert.deepEqual(Object.keys(request.metadata), ["k"]);
+  assert.equal(hex(request.metadata.k), "32");
+  assert.equal(request.timeoutNanos, 2n ** 64n - 1n);
 });
 
-test("decoding checks fields added to a type after it first decoded", () => {
-  const Growing = createRoot({ nested: { t: { nested: { M: { fields: {} } } } } }).lookupType(
-    "t.M",
-  );
-  const body = new Uint8Array([0x0a, 0x00]);
-  unmarshalMessage(Growing, body);
-  Growing.add(new protobuf.Field("n", 1, "uint32"));
-  assert.throws(
-    () => unmarshalMessage(Growing, body),
-    (error) => error.code === Code.InvalidArgument,
-  );
+test("a metadata key named like an object property stays an entry", () => {
+  // A computed key is an own property, unlike `__proto__: value`.
+  const metadata = { ["__proto__"]: bytes("x"), constructor: bytes("y") };
+  const decoded = decodeWireMessage(
+    RpcHeaders,
+    encodeWireMessage(RpcHeaders, { metadata }),
+  ).metadata;
+  assert.deepEqual(Object.keys(decoded).sort(), ["__proto__", "constructor"]);
+  assert.equal(Object.getPrototypeOf(decoded), Object.prototype);
+  assert.equal(hex(decoded.constructor), hex(bytes("y")));
 });
 
 test("arbitrary bytes either decode or fail with invalid argument", () => {
   let seed = 1;
   const random = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32;
-  const valid = marshalMessage(Checked, {
-    text: "hi",
-    n: 300,
-    counts: { a: 1 },
-    sub: { ids: [1, 2], children: { 5: { d: 2 } } },
-    fixed: [1],
-    e: "NEGATIVE",
-    names: ["x"],
-  });
-  for (let iteration = 0; iteration < 20_000; iteration += 1) {
-    const bytes = valid.slice();
-    for (let mutation = Math.floor(random() * 4); mutation > 0; mutation -= 1) {
-      bytes[Math.floor(random() * bytes.length)] = Math.floor(random() * 256);
-    }
-    const input = random() < 0.2 ? bytes.subarray(0, Math.floor(random() * bytes.length)) : bytes;
-    try {
-      unmarshalMessage(Checked, input);
-    } catch (error) {
-      assert.equal(error.code, Code.InvalidArgument, hex(input));
+  const cases = [
+    [
+      (input) => decodeWireMessage(RpcRequest, input),
+      encodeWireMessage(RpcRequest, {
+        method: "/svc/m",
+        metadata: { a: bytes("1") },
+        kind: RpcKind.BidirectionalStreaming,
+        timeoutNanos: 300n,
+        acceptDictionaries: [1, 300],
+        dictionaryQuery: [{ id: 1, fingerprint: bytes("fp") }],
+        connectionMetadata: { id: 2, metadata: { b: bytes("2") } },
+      }),
+    ],
+    [
+      (input) => unmarshalMessage(SampleSchema, input),
+      marshalMessage(SampleSchema, {
+        name: "hi",
+        count: 300n,
+        labels: { 5: "x" },
+        parent: { history: [1n, -2n], children: [{ gauge: 2 }] },
+        attributes: { a: [1, "b"] },
+      }),
+    ],
+  ];
+  for (const [decode, valid] of cases) {
+    for (let iteration = 0; iteration < 10_000; iteration += 1) {
+      const input = valid.slice();
+      for (let mutation = Math.floor(random() * 4); mutation > 0; mutation -= 1) {
+        input[Math.floor(random() * input.length)] = Math.floor(random() * 256);
+      }
+      const cut = random() < 0.2 ? input.subarray(0, Math.floor(random() * input.length)) : input;
+      try {
+        decode(cut);
+      } catch (error) {
+        assert.equal(error.code, Code.InvalidArgument, hex(cut));
+      }
     }
   }
 });
 
-test("marshalling rejects values that do not fit the schema", () => {
-  const Outer = createRoot({
-    nested: {
-      t: {
-        nested: {
-          Inner: { fields: { id: { type: "uint32", id: 1 } } },
-          Outer: { fields: { inner: { type: "Inner", id: 1 } } },
-        },
-      },
-    },
-  }).lookupType("t.Outer");
+test("malformed messages map to invalid argument", () => {
+  // types.v1.Sample: string name = 1; ... Sample parent = 15.
+  for (const payload of [
+    [0x0a, 0x05, 0x61], // truncated string
+    [0x0a, 0x02, 0xc3, 0x28], // invalid UTF-8
+    [0x7a, 0x05, 0x0a], // a nested message past the end
+    [0x00, 0x01], // field number zero
+  ]) {
+    assert.throws(
+      () => unmarshalMessage(SampleSchema, new Uint8Array(payload)),
+      isInvalidArgument,
+      hex(payload),
+    );
+  }
+});
 
-  assert.deepEqual([...marshalMessage(Outer, { inner: { id: 7 } })], [0x0a, 0x02, 0x08, 0x07]);
-  assert.throws(
-    () => marshalMessage(Outer, { inner: 5 }),
-    (error) => error.code === Code.InvalidArgument && /object expected/.test(error.statusMessage),
-  );
+test("marshalling rejects values that do not fit the schema", () => {
+  assert.equal(hex(marshalMessage(SampleSchema, { parent: { name: "a" } })), "7a030a0161");
+  assert.throws(() => marshalMessage(SampleSchema, { small: "x" }), isInvalidArgument);
+  assert.throws(() => marshalMessage(EchoRequestSchema, { count: -1 }), isInvalidArgument);
 });
 
 test("frame reader reassembles frames from arbitrary chunking", async () => {

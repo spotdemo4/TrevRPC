@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
-import { createServiceClient } from "../src/client.js";
+import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/interop/gen/interop_pb.js";
+import { createClient } from "../src/client.js";
 import { encodeMessage } from "../src/compression.js";
 import {
   FrameType,
@@ -12,20 +12,19 @@ import {
   encodeMessageFrame,
   encodeRequestFrame,
   encodeStatusFrame,
+  marshalMessage,
 } from "../src/framing.js";
 import { Code, TrevRpcError } from "../src/status.js";
-import { RpcKind, createRoot } from "../src/wire.js";
+import { RpcKind } from "../src/wire.js";
 import { echoHandler } from "./echo-server.js";
 import { concatBytes, deferred, fakeTransport, turn } from "./support.js";
 
-const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
-const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
 const text = new TextDecoder();
 
 /** An Echo client whose streams are served by handler; returns the client and the transport. */
 function setup(handler, options) {
   const transport = fakeTransport(handler);
-  return { transport, echo: new EchoClient(transport, options) };
+  return { transport, echo: createClient(Echo, transport, options) };
 }
 
 /** Call options whose response callbacks record the headers and trailing metadata into seen. */
@@ -47,7 +46,7 @@ const isStatus = (code, message) => (error) =>
 
 /** Answers a unary call: one response message and an OK status. */
 async function reply(stream, fields, trailers) {
-  await stream.writeMessage(EchoResponse, fields);
+  await stream.writeMessage(EchoResponseSchema, fields);
   await stream.writeStatus(Code.Ok, "", trailers);
 }
 
@@ -61,7 +60,7 @@ test("unary calls send the request header and decode the response", async () => 
     assert.equal(request.method, "/trevrpc.interop.v1.Echo/Unary");
     assert.equal(request.kind, RpcKind.Unary);
     assert.equal(text.decode(request.metadata.trace), "abc");
-    assert.equal((await stream.readMessage(EchoRequest)).message, "hi");
+    assert.equal((await stream.readMessage(EchoRequestSchema)).message, "hi");
     assert.equal(await stream.readFrame(), null, "request side is finished after the request");
     await stream.writeHeaders({ hdr: new Uint8Array([2]) });
     await reply(stream, { message: "hello", index: 3 }, { served: new Uint8Array([1]) });
@@ -107,7 +106,7 @@ test("unary calls return as soon as the response arrives", async () => {
 
 test("invalid requests fail before a stream is opened", async () => {
   const transport = fakeTransport(() => assert.fail("no stream expected"));
-  const echo = new EchoClient(transport);
+  const echo = createClient(Echo, transport);
 
   await assert.rejects(
     echo.unary({}, { metadata: { "trevrpc-reserved": "x" } }),
@@ -199,7 +198,7 @@ test("an abort reason that is a status error is reported as is", async () => {
 
 test("an already aborted signal never opens a stream", async () => {
   const transport = fakeTransport(() => assert.fail("no stream expected"));
-  const echo = new EchoClient(transport);
+  const echo = createClient(Echo, transport);
   await assert.rejects(echo.unary({}, { signal: AbortSignal.abort() }), isStatus(Code.Cancelled));
   assert.equal(transport.opened, 0);
 });
@@ -209,7 +208,7 @@ test("a stream that finishes opening after the call was cancelled is reset", asy
   const requests = new TransformStream();
   const responses = new TransformStream();
   const controller = new AbortController();
-  const call = new EchoClient({ createBidirectionalStream: () => opening.promise }).unary(
+  const call = createClient(Echo, { createBidirectionalStream: () => opening.promise }).unary(
     {},
     { signal: controller.signal },
   );
@@ -233,7 +232,7 @@ test("failures to open a stream are unavailable", async () => {
     },
   ];
   for (const transport of failing) {
-    await assert.rejects(new EchoClient(transport).unary({}), isStatus(Code.Unavailable));
+    await assert.rejects(createClient(Echo, transport).unary({}), isStatus(Code.Unavailable));
   }
 });
 
@@ -253,7 +252,7 @@ test("a stream that ends before the final status is an internal error", async ()
   for (const write of [
     async () => {},
     (stream) => stream.writeHeaders(),
-    (stream) => stream.writeMessage(EchoResponse, { message: "m" }),
+    (stream) => stream.writeMessage(EchoResponseSchema, { message: "m" }),
   ]) {
     const { echo } = setup(async (stream) => {
       await stream.readRequest();
@@ -305,7 +304,7 @@ test("a response with invalid metadata is an internal error", async () => {
   const invalid = { "trevrpc-x": new Uint8Array() };
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, {});
+    await stream.writeMessage(EchoResponseSchema, {});
     await stream.writeStatus(Code.Ok, "", invalid);
   });
   await assert.rejects(echo.unary({}), isStatus(Code.Internal));
@@ -341,7 +340,7 @@ test("unary and server-streaming calls send the request message with the REQUEST
         method: `/trevrpc.interop.v1.Echo/${method === "unary" ? "Unary" : "ServerStream"}`,
         kind,
       },
-      encodeMessage(EchoRequest.encode({ message: "hi" }).finish()),
+      encodeMessage(marshalMessage(EchoRequestSchema, { message: "hi" })),
     );
     assert.deepEqual(await first.promise, expected, method);
   }
@@ -351,7 +350,7 @@ test("streaming-request calls send REQUEST alone and their messages later", asyn
   const first = deferred();
   const { echo } = setup(async (stream) => {
     first.resolve((await stream.reader.read()).value);
-    await stream.readMessage(EchoRequest);
+    await stream.readMessage(EchoRequestSchema);
     await stream.writeStatus();
   });
   const call = await echo.bidi();
@@ -367,7 +366,7 @@ test("a unary call needs exactly one response message", async () => {
     const { echo } = setup(async (stream) => {
       await stream.readRequest();
       for (let index = 0; index < count; index += 1) {
-        await stream.writeMessage(EchoResponse, { index });
+        await stream.writeMessage(EchoResponseSchema, { index });
       }
       await stream.writeStatus();
     });
@@ -401,7 +400,7 @@ test("unary response headers and trailing metadata reach the call's callbacks", 
 test("response callbacks of the client's options apply to every call", async () => {
   const { transport } = setup(echoHandler);
   const seen = {};
-  const echo = new EchoClient(transport, captureResponse(seen));
+  const echo = createClient(Echo, transport, captureResponse(seen));
   const stream = await echo.serverStream(
     { message: "s", count: 1 },
     { metadata: { "interop-header": "s" } },
@@ -434,7 +433,7 @@ test("headers are visible before the first streamed message", async () => {
     await stream.readRequest();
     await stream.writeHeaders({ early: bytes("yes") });
     await release.promise;
-    await stream.writeMessage(EchoResponse, { message: "late" });
+    await stream.writeMessage(EchoResponseSchema, { message: "late" });
     await stream.writeStatus();
   });
   const stream = await echo.serverStream({});
@@ -562,7 +561,7 @@ test("an unobserved rejected headers promise causes no unhandled rejection", asy
 
 test("unknown frames are skipped everywhere in a response", async () => {
   const unknown = (type) => encodeFrame(type, bytes("zz"));
-  const message = (index) => encodeMessageFrame(EchoResponse.encode({ index }).finish());
+  const message = (index) => encodeMessageFrame(marshalMessage(EchoResponseSchema, { index }));
   const wire = concatBytes([
     unknown(0x21),
     encodeHeadersFrame({ metadata: { h: bytes("1") } }),
@@ -621,7 +620,7 @@ test("a second HEADERS frame fails the call", async () => {
     await stream.readRequest();
     await stream.writeHeaders({});
     await stream.writeHeaders({});
-    await stream.writeMessage(EchoResponse, {});
+    await stream.writeMessage(EchoResponseSchema, {});
     await stream.writeStatus();
   });
   await assert.rejects(unary.echo.unary({}), isStatus(Code.Internal));
@@ -630,7 +629,7 @@ test("a second HEADERS frame fails the call", async () => {
 test("HEADERS after a MESSAGE fails the call", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, { message: "m" });
+    await stream.writeMessage(EchoResponseSchema, { message: "m" });
     await stream.writeHeaders({});
   });
   const stream = await echo.serverStream({});
@@ -641,7 +640,7 @@ test("HEADERS after a MESSAGE fails the call", async () => {
 
   const unary = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, { message: "m" });
+    await stream.writeMessage(EchoResponseSchema, { message: "m" });
     await stream.writeHeaders({});
     await stream.writeStatus();
   });
@@ -654,7 +653,7 @@ test("ANSWER is not the headers: they settle with the frame after it", async () 
     await stream.readRequest();
     await stream.writeAnswer({ connectionMetadata: 1 });
     await stream.writeHeaders({ h: bytes("1") });
-    await stream.writeMessage(EchoResponse, { index: 3 });
+    await stream.writeMessage(EchoResponseSchema, { index: 3 });
     await stream.writeStatus();
     await stream.finish();
   });
@@ -677,7 +676,7 @@ test("ANSWER twice, or after HEADERS or a MESSAGE, fails the call", async () => 
   for (const wire of [
     [answer, answer],
     [encodeHeadersFrame({}), answer],
-    [encodeMessageFrame(EchoResponse.encode({}).finish()), answer],
+    [encodeMessageFrame(marshalMessage(EchoResponseSchema, {})), answer],
   ]) {
     const { echo } = setup(async (stream) => {
       await stream.readRequest();
@@ -747,7 +746,7 @@ test("leaving a response loop early cancels the call", async () => {
   const { echo } = setup(async (stream) => {
     server = stream;
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, { message: "first" });
+    await stream.writeMessage(EchoResponseSchema, { message: "first" });
   });
   const stream = await echo.serverStream({});
   for await (const _ of stream) {
@@ -806,7 +805,7 @@ test("aborting cancels a pending receive", async () => {
 test("a stream that ends without a final status is an internal error", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, { message: "only" });
+    await stream.writeMessage(EchoResponseSchema, { message: "only" });
     await stream.finish();
   });
   const stream = await echo.serverStream({});
@@ -820,7 +819,7 @@ test("misplaced frames and undecodable messages fail the stream", async () => {
   const frames = [
     [Code.InvalidArgument, encodeFrame(FrameType.Status, new Uint8Array([0x0a, 0xff]))],
     [Code.InvalidArgument, encodeMessageFrame(new Uint8Array([0x0a, 0xff]))],
-    [Code.Internal, encodeStatusFrame({ metadata: { "trevrpc-x": [] } })],
+    [Code.Internal, encodeStatusFrame({ metadata: { "trevrpc-x": new Uint8Array(0) } })],
     [Code.Internal, encodeRequestFrame({ method: "/s/m" })],
   ];
   for (const [code, bytes] of frames) {
@@ -838,7 +837,7 @@ test("a failure while draining after the final status does not change the outcom
   const finished = deferred();
   const { echo, transport } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, { message: "m" });
+    await stream.writeMessage(EchoResponseSchema, { message: "m" });
     await stream.writeStatus();
     await finished.promise;
     await stream.reset();
@@ -916,7 +915,7 @@ test("client streaming requires exactly one response message", async () => {
     const { echo } = setup(async (stream) => {
       await stream.readRequest();
       for (let index = 0; index < count; index += 1) {
-        await stream.writeMessage(EchoResponse, { index });
+        await stream.writeMessage(EchoResponseSchema, { index });
       }
       await stream.writeStatus();
     });
@@ -961,39 +960,13 @@ test("sending after the request stream was closed is a failed precondition", asy
 });
 
 test("a message that cannot be encoded does not break the call", async () => {
-  const Nested = createRoot({
-    nested: {
-      t: {
-        nested: {
-          Inner: { fields: { id: { type: "uint32", id: 1 } } },
-          Outer: { fields: { inner: { type: "Inner", id: 1 } } },
-        },
-      },
-    },
-  });
-  const service = {
-    fullName: "t.Service",
-    methods: {
-      put: {
-        name: "Put",
-        kind: "bidirectionalStreaming",
-        inputType: "t.Outer",
-        outputType: "t.Outer",
-      },
-    },
-  };
-  const transport = fakeTransport(async (stream) => {
-    await stream.readRequest();
-    for (let frame; (frame = await stream.readFrame()) !== null;) {
-      await stream.write(encodeMessageFrame(frame.payload));
-    }
-    await stream.writeStatus();
-  });
-  const call = await createServiceClient(transport, service, Nested).put();
+  const { echo } = setup(echoHandler);
+  const call = await echo.bidi();
 
-  await assert.rejects(call.send({ inner: 5 }), isStatus(Code.InvalidArgument));
-  await call.send({ inner: { id: 7 } });
-  assert.equal((await call.recv()).inner.id, 7);
+  // A uint32 field cannot hold a negative number.
+  await assert.rejects(call.send({ count: -1 }), isStatus(Code.InvalidArgument));
+  await call.send({ message: "after" });
+  assert.equal((await call.recv()).message, "after");
   await call.closeSend();
   assert.equal(await call.recv(), undefined);
 });
@@ -1016,7 +989,7 @@ test("the response decides when the server stops reading the request", async () 
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
     await stream.stopSending(new Error("not interested"));
-    await stream.writeMessage(EchoResponse, { message: "answer" });
+    await stream.writeMessage(EchoResponseSchema, { message: "answer" });
     await stream.writeStatus(Code.ResourceExhausted, "enough");
     await stream.finish();
   });
@@ -1064,7 +1037,7 @@ test("service clients merge default and per-call options", async () => {
     seen.push(metadataText(request.metadata));
     await reply(stream, {});
   });
-  const echo = new EchoClient(transport, { metadata: { Authorization: "base", trace: "t" } });
+  const echo = createClient(Echo, transport, { metadata: { Authorization: "base", trace: "t" } });
 
   await echo.unary({});
   await echo.unary(
@@ -1083,15 +1056,13 @@ test("service clients merge default and per-call options", async () => {
   ]);
 });
 
-test("createServiceClient rejects unknown method kinds", () => {
-  const service = {
-    fullName: "trevrpc.interop.v1.Echo",
-    methods: { odd: { name: "Unary", kind: "weird", inputType: "x", outputType: "y" } },
-  };
-  assert.throws(
-    () => createServiceClient({}, service, { lookupType: (name) => ({ fullName: `.${name}` }) }),
-    isStatus(Code.Internal),
-  );
+test("createClient takes only protobuf-es service descriptors", () => {
+  for (const service of [undefined, {}, EchoRequestSchema, { kind: "service" }]) {
+    assert.throws(
+      () => createClient(service, fakeTransport(echoHandler)),
+      isStatus(Code.InvalidArgument),
+    );
+  }
 });
 
 test("the whole Echo service works against a fake server", async () => {
@@ -1109,16 +1080,17 @@ test("the whole Echo service works against a fake server", async () => {
 });
 
 test("the client sends the full method path and the Echo fake server routes on it", async () => {
-  const unaryOf = (service) =>
-    createServiceClient(fakeTransport(echoHandler), service, root).unary({ message: "hi" });
-  const method = (name) => ({
-    unary: {
-      name,
-      kind: "unary",
-      inputType: "trevrpc.interop.v1.EchoRequest",
-      outputType: "trevrpc.interop.v1.EchoResponse",
-    },
-  });
+  // Echo's Unary method under another service and method name.
+  const unaryOf = ({ fullName, methods }) =>
+    createClient(
+      {
+        kind: "service",
+        typeName: fullName,
+        methods: [{ ...Echo.method.unary, name: methods.unary.name, parent: undefined }],
+      },
+      fakeTransport(echoHandler),
+    ).unary({ message: "hi" });
+  const method = (name) => ({ unary: { name } });
 
   const echoService = { fullName: "trevrpc.interop.v1.Echo", methods: method("Unary") };
   assert.equal((await unaryOf(echoService)).message, "hi");
@@ -1319,7 +1291,7 @@ test("a send blocked on backpressure fails promptly when the call is cancelled",
 test("a send after an early OK status reports that the call is already over", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, { message: "enough", index: 7 });
+    await stream.writeMessage(EchoResponseSchema, { message: "enough", index: 7 });
     await stream.writeStatus(Code.Ok, "done", { t: new Uint8Array([3]) });
   });
   const seen = {};
@@ -1355,7 +1327,7 @@ test("a completed call leaves the request side it closed to finish instead of re
     };
     return stream;
   };
-  const echo = new EchoClient(transport);
+  const echo = createClient(Echo, transport);
 
   assert.equal((await echo.unary({ message: "hi" })).message, "done");
   const responses = [];
@@ -1459,8 +1431,8 @@ test("send reports the status that follows the server stopping the request side"
 test("responses before a transport error are delivered in order", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
-    await stream.writeMessage(EchoResponse, { message: "a" });
-    await stream.writeMessage(EchoResponse, { message: "b" });
+    await stream.writeMessage(EchoResponseSchema, { message: "a" });
+    await stream.writeMessage(EchoResponseSchema, { message: "b" });
     await turn();
     await stream.reset(new Error("connection lost"));
   });
@@ -1479,7 +1451,7 @@ test("responses are read ahead only up to a bound while the upload runs", async 
   const { echo, transport } = setup(async (stream) => {
     await stream.readRequest();
     for (let index = 0; index < total; index += 1) {
-      await stream.writeMessage(EchoResponse, { message: "r", index });
+      await stream.writeMessage(EchoResponseSchema, { message: "r", index });
       written += 1;
     }
     await stream.writeStatus();

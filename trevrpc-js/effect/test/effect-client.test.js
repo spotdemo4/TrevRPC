@@ -6,11 +6,11 @@ import { Cause, Effect, Exit, Stream } from "effect";
 
 // The in-memory server of trevrpc-js's own tests, which runs the real client end to end.
 import { deferred, fakeTransport } from "../../test/support.js";
-import { EchoClient, EchoService, root } from "../build/test/gen/echo.trevrpc.js";
+import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/test/gen/echo_pb.js";
 import { createEffectClient, toTrevRpcError } from "../src/index.js";
 
-const EchoRequest = root.lookupType("effect.v1.EchoRequest");
-const EchoResponse = root.lookupType("effect.v1.EchoResponse");
+const EchoRequest = EchoRequestSchema;
+const EchoResponse = EchoResponseSchema;
 
 /** An Effect client whose calls handler(serverStream) serves after reading the REQUEST frame. */
 function setup(handler) {
@@ -18,7 +18,7 @@ function setup(handler) {
     await stream.readRequest();
     await handler(stream);
   });
-  return { transport, echo: createEffectClient(EchoService, new EchoClient(transport)) };
+  return { transport, echo: createEffectClient(Echo, transport) };
 }
 
 /** Ends a call with `code`, as servers do: STATUS, then the end of both directions. */
@@ -345,25 +345,32 @@ test("taking part of a bidirectional stream cancels the call", async () => {
   assert.equal(await cancelled.promise, true);
 });
 
-test("a client without a method of the service is rejected", () => {
-  const client = new EchoClient(fakeTransport(() => {}));
-  const partial = { unary: client.unary.bind(client) };
-  assert.throws(() => createEffectClient(EchoService, partial), TypeError);
+test("anything but a service descriptor is rejected, as createClient rejects it", () => {
+  assert.throws(
+    () =>
+      createEffectClient(
+        EchoRequestSchema,
+        fakeTransport(() => {}),
+      ),
+    (error) => error instanceof TrevRpcError && error.code === Code.InvalidArgument,
+  );
 });
 
 test("other failures become TrevRpcErrors with Code.Unknown", async () => {
   const cause = new Error("boom");
-  const client = {
-    unary: async () => {
-      throw cause;
+  // An interceptor that throws fails the call with what it threw.
+  const echo = createEffectClient(
+    Echo,
+    fakeTransport(() => {}),
+    {
+      interceptors: [
+        () => {
+          throw cause;
+        },
+      ],
     },
-    serverStream: async () => {},
-    clientStream: async () => {},
-    bidi: async () => {},
-  };
-  const error = failure(
-    await Effect.runPromiseExit(createEffectClient(EchoService, client).unary({})),
   );
+  const error = failure(await Effect.runPromiseExit(echo.unary({})));
   assertStatus(error, Code.Unknown);
   assert.equal(error.statusMessage, "boom");
   assert.equal(error.cause, cause);

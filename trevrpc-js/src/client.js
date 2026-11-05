@@ -1,16 +1,20 @@
 import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
-import { FrameType, marshalMessage, unmarshalMessage } from "./framing.js";
-import { int64Converter } from "./int64.js";
+import { FrameType, decodeWireMessage, marshalMessage, unmarshalMessage } from "./framing.js";
 import { interceptCall, interceptorList } from "./interceptor.js";
 import { validateMetadata } from "./metadata.js";
-import { Code, cancelled, internal, statusError } from "./status.js";
+import { methodSettings } from "./method-options.js";
+import { Code, cancelled, internal, invalidArgument, statusError } from "./status.js";
 import { RpcAnswer, RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
 
 /**
- * Creates a service client from a generated service descriptor. Its calls run the interceptors of
- * the transport, then those of `options.interceptors`.
+ * Creates a client for `service`, a service descriptor that protoc-gen-es generates, with one
+ * function per method, named by the method's `localName`. Its calls run the interceptors of the
+ * transport, then those of `options.interceptors`.
  */
-export function createServiceClient(transport, service, root, options = {}) {
+export function createClient(service, transport, options = {}) {
+  if (service?.kind !== "service" || !Array.isArray(service.methods)) {
+    throw invalidArgument("createClient needs a protobuf-es service descriptor");
+  }
   const { interceptors: clientInterceptors, ...callOptions } = options;
   const defaults = mergeCallOptions(defaultCallOptions(), callOptions);
   const interceptors = [
@@ -19,32 +23,26 @@ export function createServiceClient(transport, service, root, options = {}) {
   ];
   const client = {};
 
-  for (const [jsName, method] of Object.entries(service.methods)) {
-    const requestType = root.lookupType(method.inputType);
-    const responseType = root.lookupType(method.outputType);
+  for (const method of service.methods) {
+    const settings = methodSettings(method);
     const rpc = {
       // The wire method path, computed once per method rather than per call.
-      path: `/${service.fullName}/${method.name}`,
-      requestType,
-      responseType,
-      // Converts the 64-bit integers of decoded responses, or undefined when they need nothing.
-      convertResponse: int64Converter(responseType),
+      path: `/${service.typeName}/${method.name}`,
+      requestType: method.input,
+      responseType: method.output,
       // Full protobuf names, which pick the compression dictionaries.
-      types: { request: fullName(requestType), response: fullName(responseType) },
-      datagrams: datagramUse(method),
-      compressStream: streamCompressionUse(method),
-      compress: plainCompressionUse(method),
+      types: { request: method.input.typeName, response: method.output.typeName },
+      datagrams: datagramUse(settings),
+      compressStream: streamCompressionUse(settings),
+      compress: plainCompressionUse(settings),
     };
     const resolve = (override) => mergeCallOptions(defaults, override);
-    const shape = MethodShapes[method.kind];
-    if (shape === undefined) {
-      throw internal(`unsupported generated RPC kind ${JSON.stringify(method.kind)}`);
-    }
+    const shape = MethodShapes[settings.kind];
     const info = {
       method: rpc.path,
-      service: service.fullName,
+      service: service.typeName,
       name: method.name,
-      kind: method.kind,
+      kind: settings.kind,
     };
     const call =
       interceptors.length === 0
@@ -57,7 +55,7 @@ export function createServiceClient(transport, service, root, options = {}) {
               (options) => shape.start(transport, rpc, request, options),
               shape.ended,
             );
-    client[jsName] = shape.takesRequest ? call : (override) => call(undefined, override);
+    client[method.localName] = shape.takesRequest ? call : (override) => call(undefined, override);
   }
 
   return client;
@@ -183,7 +181,7 @@ const ReadAheadBytes = 1 << 20;
  * How a method uses datagrams, or undefined if it does not: `send` for request messages, which
  * needs a streaming request and `unreliableRequests`, and `receive` for response messages, which
  * every call with a streaming response accepts. A method needs a flow if it marks either
- * direction unreliable; the generator rejects marks on a direction that does not stream.
+ * direction unreliable; methodSettings rejects marks on a direction that does not stream.
  */
 function datagramUse({ kind, unreliableRequests, unreliableResponses }) {
   const streamsRequest = kind === "clientStreaming" || kind === "bidirectionalStreaming";
@@ -196,7 +194,7 @@ function datagramUse({ kind, unreliableRequests, unreliableResponses }) {
 
 /**
  * The directions a method may stream-compress, `{ requests, responses }`, or undefined for none:
- * those its descriptor marks (the generator leaves out directions that do not stream and message
+ * those its settings mark (methodSettings leaves out directions that do not stream and message
  * types with redacted fields), except directions marked unreliable, whose messages mostly travel
  * as datagrams.
  */
@@ -208,7 +206,7 @@ function streamCompressionUse({ compressStreamRequests, compressStreamResponses,
 
 /**
  * The directions whose messages a method may compress without a dictionary, `{ requests,
- * responses }`, or undefined for none: those its descriptor marks (the generator marks both for
+ * responses }`, or undefined for none: those its settings mark (methodSettings marks both for
  * `COMPRESSION_MESSAGE` and `COMPRESSION_STREAM`, except message types with redacted fields).
  */
 function plainCompressionUse({ compressRequests, compressResponses }) {
@@ -418,8 +416,7 @@ export class BidirectionalStreamingCall {
     const item = await this.#take();
     if (item.payload !== undefined) {
       try {
-        const message = unmarshalMessage(this.#rpc.responseType, item.payload);
-        return this.#rpc.convertResponse?.(message) ?? message;
+        return unmarshalMessage(this.#rpc.responseType, item.payload);
       } catch (error) {
         throw this.#settleFailure(this.#call.fail(error));
       }
@@ -594,7 +591,7 @@ export class BidirectionalStreamingCall {
             );
           }
           this.#sawAnswer = true;
-          this.#call.learnAnswers(unmarshalMessage(RpcAnswer, frame.payload));
+          this.#call.learnAnswers(decodeWireMessage(RpcAnswer, frame.payload));
           continue;
         }
         case FrameType.Headers: {
@@ -603,7 +600,7 @@ export class BidirectionalStreamingCall {
               this.#sawHeaders ? "duplicate HEADERS frame" : "HEADERS frame after MESSAGE",
             );
           }
-          const headers = unmarshalMessage(RpcHeaders, frame.payload);
+          const headers = decodeWireMessage(RpcHeaders, frame.payload);
           validateResponseMetadata(headers.metadata, "headers");
           this.#sawHeaders = true;
           this.#settleHeaders(headers.metadata);
@@ -620,7 +617,7 @@ export class BidirectionalStreamingCall {
           return { type: FrameType.Message, payload };
         }
         case FrameType.Status: {
-          const status = unmarshalMessage(RpcStatus, frame.payload);
+          const status = decodeWireMessage(RpcStatus, frame.payload);
           if (status.refusedStreamCompression && this.#call.replayable) {
             // The server refused the optimistic call before running anything for it: the call
             // continues on a replay, and its response is read from there.
@@ -789,11 +786,6 @@ function deferred() {
 
 function requestFields(rpc, kind) {
   return { method: rpc.path, kind };
-}
-
-/** The full name of a protobuf.js message type, without the leading dot. */
-function fullName(type) {
-  return type.fullName.replace(/^\./u, "");
 }
 
 function validateResponseMetadata(metadata, what) {

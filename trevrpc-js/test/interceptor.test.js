@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
+import { Echo } from "../build/interop/gen/interop_pb.js";
+import { createClient } from "../src/client.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { echoHandler } from "./echo-server.js";
 import { fakeTransport, isPending, turn } from "./support.js";
@@ -34,7 +35,7 @@ test("interceptors run in order, change metadata and finish innermost first", as
       call.metadata["interop-suffix"] = "?";
     }),
   ];
-  const echo = new EchoClient(transport, {
+  const echo = createClient(Echo, transport, {
     metadata: { removed: "x" },
     interceptors: [
       interceptor("client", async (call) => {
@@ -67,7 +68,7 @@ test("interceptors run in order, change metadata and finish innermost first", as
 
 test("a failed call finishes with its status", async () => {
   let finished;
-  const echo = new EchoClient(fakeTransport(echoHandler), {
+  const echo = createClient(Echo, fakeTransport(echoHandler), {
     interceptors: [() => (end) => (finished = end)],
   });
 
@@ -82,7 +83,7 @@ test("a failed call finishes with its status", async () => {
 
 test("a streaming call finishes when its final status arrives", async () => {
   const { events, interceptor } = recorder();
-  const echo = new EchoClient(fakeTransport(echoHandler), { interceptors: [interceptor("a")] });
+  const echo = createClient(Echo, fakeTransport(echoHandler), { interceptors: [interceptor("a")] });
 
   const stream = await echo.serverStream({ message: "m", count: 2 });
   assert.deepEqual(events, ["a ServerStream"], "the call has not ended yet");
@@ -111,7 +112,7 @@ test("a streaming call finishes when its final status arrives", async () => {
 
 test("client-streaming and bidirectional calls finish when they end", async () => {
   const { events, interceptor } = recorder();
-  const echo = new EchoClient(fakeTransport(echoHandler), { interceptors: [interceptor("a")] });
+  const echo = createClient(Echo, fakeTransport(echoHandler), { interceptors: [interceptor("a")] });
 
   const upload = await echo.clientStream();
   await upload.send({ message: "a" });
@@ -136,7 +137,7 @@ test("an interceptor that throws fails the call before it starts", async () => {
   const transport = fakeTransport(() => assert.fail("no stream expected"));
   const { events, interceptor } = recorder();
   const refusal = new TrevRpcError(Code.Unauthenticated, "signed out");
-  const echo = new EchoClient(transport, {
+  const echo = createClient(Echo, transport, {
     interceptors: [
       interceptor("outer"),
       () => {
@@ -160,7 +161,7 @@ test("an interceptor that throws fails the call before it starts", async () => {
 test("invalid metadata from an interceptor fails the call before it starts", async () => {
   const transport = fakeTransport(() => assert.fail("no stream expected"));
   let finished;
-  const echo = new EchoClient(transport, {
+  const echo = createClient(Echo, transport, {
     interceptors: [
       (call) => {
         call.metadata["trevrpc-reserved"] = "x";
@@ -181,7 +182,7 @@ test("a finish function that throws does not affect the call or other finishes",
   t.mock.method(console, "error", (error) => reported.push(error));
   const failure = new Error("finish bug");
   let outerFinished = false;
-  const echo = new EchoClient(fakeTransport(echoHandler), {
+  const echo = createClient(Echo, fakeTransport(echoHandler), {
     interceptors: [
       () => () => {
         outerFinished = true;
@@ -197,18 +198,18 @@ test("a finish function that throws does not affect the call or other finishes",
 });
 
 test("an interceptor must return a function or nothing", async () => {
-  const echo = new EchoClient(fakeTransport(echoHandler), { interceptors: [() => 1] });
+  const echo = createClient(Echo, fakeTransport(echoHandler), { interceptors: [() => 1] });
   await assert.rejects(echo.unary({ message: "x" }), TypeError);
 });
 
 test("invalid interceptor lists are rejected when the client is created", () => {
   for (const interceptors of [1, "x", [1], [() => {}, null]]) {
     assert.throws(
-      () => new EchoClient(fakeTransport(echoHandler), { interceptors }),
+      () => createClient(Echo, fakeTransport(echoHandler), { interceptors }),
       (error) => error instanceof TrevRpcError && error.code === Code.InvalidArgument,
     );
   }
   const transport = fakeTransport(echoHandler);
   transport.interceptors = {};
-  assert.throws(() => new EchoClient(transport), TrevRpcError);
+  assert.throws(() => createClient(Echo, transport), TrevRpcError);
 });

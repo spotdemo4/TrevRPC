@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  CompressedEchoClient,
-  root as compressedRoot,
-} from "../build/interop/gen/compressed.trevrpc.js";
-import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
-import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
+import { CompressedEcho, PlainMessageSchema } from "../build/interop/gen/compressed_pb.js";
+import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/interop/gen/interop_pb.js";
+import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
+import { createClient } from "../src/client.js";
 import {
   PlainMinSize,
   encodeMessage,
@@ -17,8 +15,10 @@ import { encodeDatagram } from "../src/datagram.js";
 import {
   DefaultMaxFrameSize,
   FrameType,
+  decodeWireMessage,
   encodeAnswerFrame,
   encodeOutgoingFrame,
+  encodeWireMessage,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
@@ -27,10 +27,7 @@ import { RpcAnswer, RpcRequest } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import { fakeDatagrams, fakeTransport, hex, readGoldenVectors, turn } from "./support.js";
 
-const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
-const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
 const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
-const PlainMessage = compressedRoot.lookupType("trevrpc.interop.v1.PlainMessage");
 
 const vectors = await readGoldenVectors("zstd-golden-vectors.txt");
 const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));
@@ -170,17 +167,20 @@ test("the negotiation fields match the golden vectors", async () => {
     dictionaryQuery: [{ id: 1, fingerprint }],
   };
   assert.equal(
-    hex(marshalMessage(RpcRequest, request)),
+    hex(encodeWireMessage(RpcRequest, request)),
     vectors.get("request.dictionaries.payload"),
   );
-  const decoded = unmarshalMessage(
+  const decoded = decodeWireMessage(
     RpcRequest,
     fromHex(vectors.get("request.dictionaries.payload")),
   );
   assert.deepEqual(decoded.acceptDictionaries, [1, 300]);
   assert.equal(hex(decoded.dictionaryQuery[0].fingerprint), hex(fingerprint));
 
-  const answered = unmarshalMessage(RpcAnswer, fromHex(vectors.get("answer.dictionaries.payload")));
+  const answered = decodeWireMessage(
+    RpcAnswer,
+    fromHex(vectors.get("answer.dictionaries.payload")),
+  );
   assert.equal(answered.dictionaries[0].id, 1);
   assert.equal(hex(answered.dictionaries[0].fingerprint), hex(fingerprint));
   assert.equal(
@@ -192,10 +192,10 @@ test("the negotiation fields match the golden vectors", async () => {
   const withoutDictionaries = await plainOnly;
   const prepared = sessionCompression(withoutDictionaries, {}).prepare("svc.Response", true);
   assert.equal(
-    hex(marshalMessage(RpcRequest, { method: "/svc/m", ...prepared.fields })),
+    hex(encodeWireMessage(RpcRequest, { method: "/svc/m", ...prepared.fields })),
     vectors.get("request.plain.payload"),
   );
-  const answer = unmarshalMessage(RpcAnswer, fromHex(vectors.get("answer.plain.payload")));
+  const answer = decodeWireMessage(RpcAnswer, fromHex(vectors.get("answer.plain.payload")));
   assert.equal(answer.dictionaries.length, 1);
   assert.equal(answer.dictionaries[0].id, 0);
 });
@@ -256,9 +256,9 @@ function compressingEcho(calls, { confirm = true } = {}) {
         frame.type === FrameType.ZstdMessage
           ? inflateMessage(accepting(dictionary), frame.payload, DefaultMaxFrameSize)
           : frame.payload;
-      const { message } = EchoRequest.decode(payload);
+      const { message } = unmarshalMessage(EchoRequestSchema, payload);
       const response = encodeMessage(
-        marshalMessage(EchoResponse, { message, index }),
+        marshalMessage(EchoResponseSchema, { message, index }),
         accepted ? dictionary : undefined,
       );
       call.responseFrames.push(response.type);
@@ -277,7 +277,7 @@ function compressedTransport(handler) {
 
 test("a session queries once, then compresses requests and accepts compressed responses", async () => {
   const calls = [];
-  const echo = new EchoClient(compressedTransport(compressingEcho(calls)));
+  const echo = createClient(Echo, compressedTransport(compressingEcho(calls)));
 
   assert.equal((await echo.unary({ message: compressible(0) })).message, compressible(0));
   assert.equal(calls[0].request.dictionaryQuery.length, 2);
@@ -301,7 +301,7 @@ test("a session queries once, then compresses requests and accepts compressed re
 
 test("a request stream starts compressing as soon as its ANSWER arrives", async () => {
   const calls = [];
-  const echo = new EchoClient(compressedTransport(compressingEcho(calls)));
+  const echo = createClient(Echo, compressedTransport(compressingEcho(calls)));
   const call = await echo.bidi();
   await call.send({ message: compressible(0) });
   assert.equal((await call.recv()).message, compressible(0));
@@ -315,7 +315,7 @@ test("a request stream starts compressing as soon as its ANSWER arrives", async 
 
 test("an answer without the dictionary turns it off for the session", async () => {
   const calls = [];
-  const echo = new EchoClient(compressedTransport(compressingEcho(calls, { confirm: false })));
+  const echo = createClient(Echo, compressedTransport(compressingEcho(calls, { confirm: false })));
   await echo.unary({ message: compressible(0) });
   await echo.unary({ message: compressible(1) });
   assert.deepEqual(calls[1].request.dictionaryQuery, []);
@@ -332,7 +332,7 @@ test("each session negotiates on its own", async () => {
     compressedTransport(compressingEcho(calls)),
     compressedTransport(compressingEcho(calls)),
   ]) {
-    await new EchoClient(transport).unary({ message: compressible(0) });
+    await createClient(Echo, transport).unary({ message: compressible(0) });
   }
   assert.deepEqual(
     calls.map((call) => call.request.dictionaryQuery.length),
@@ -344,7 +344,8 @@ test("a lone STATUS leaves the query unanswered, so the next call asks again", a
   const calls = [];
   const answer = compressingEcho(calls);
   let first = true;
-  const echo = new EchoClient(
+  const echo = createClient(
+    Echo,
     compressedTransport(async (stream) => {
       if (first) {
         first = false;
@@ -376,17 +377,17 @@ function respondingWith(frame) {
 }
 
 const compressedResponse = encodeOutgoingFrame(
-  encodeMessage(marshalMessage(EchoResponse, { message: compressible(0) }), dictionary),
+  encodeMessage(marshalMessage(EchoResponseSchema, { message: compressible(0) }), dictionary),
 );
 
 test("a compressed response the call did not accept fails with Internal", async () => {
   // No compression on the client, so it accepts nothing.
-  const echo = new EchoClient(fakeTransport(respondingWith(compressedResponse)));
+  const echo = createClient(Echo, fakeTransport(respondingWith(compressedResponse)));
   await assert.rejects(echo.unary({ message: "a" }), isStatus(Code.Internal));
 });
 
 test("a compressed response above the frame size limit fails with ResourceExhausted", async () => {
-  const echo = new EchoClient(compressedTransport(respondingWith(compressedResponse)), {
+  const echo = createClient(Echo, compressedTransport(respondingWith(compressedResponse)), {
     maxFrameSize: 64,
   });
   assert.ok(compressedResponse.byteLength < 64);
@@ -399,14 +400,14 @@ test("an invalid compressed response fails with Internal", async () => {
     payload: fromHex(vectors.get("bad.trailing_bytes.payload")),
     size: 0,
   });
-  const echo = new EchoClient(compressedTransport(respondingWith(frame)));
+  const echo = createClient(Echo, compressedTransport(respondingWith(frame)));
   await assert.rejects(echo.unary({ message: "a" }), isStatus(Code.Internal));
 });
 
 test("compressed response datagrams are decompressed, and an invalid one drops its datagram", async () => {
   const datagrams = fakeDatagrams();
   const response = (message) =>
-    encodeMessage(marshalMessage(EchoResponse, { message, index: 0 }), dictionary);
+    encodeMessage(marshalMessage(EchoResponseSchema, { message, index: 0 }), dictionary);
   const transport = compressedTransport(async (stream) => {
     const request = await stream.readRequest();
     const flow = Number(request.datagramFlow);
@@ -419,12 +420,12 @@ test("compressed response datagrams are decompressed, and an invalid one drops i
     };
     datagrams.push(encodeDatagram(flow, [response(compressible(1)), invalid]));
     await turn();
-    await stream.writeMessage(EchoResponse, { message: "end", index: 0 });
+    await stream.writeMessage(EchoResponseSchema, { message: "end", index: 0 });
     await stream.writeStatus();
     await stream.finish();
   });
   transport.datagrams = datagrams;
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   await call.closeSend();
   const received = [];
   for await (const { message } of call) {
@@ -456,7 +457,7 @@ function plainEcho(calls, { decodes = true } = {}) {
         ? inflateMessage(accepting(plain), frame.payload, DefaultMaxFrameSize)
         : frame.payload;
     const response = encodeMessage(
-      marshalMessage(PlainMessage, PlainMessage.decode(payload)),
+      marshalMessage(PlainMessageSchema, unmarshalMessage(PlainMessageSchema, payload)),
       accepted ? plain : undefined,
     );
     call.responseFrames.push(response.type);
@@ -470,7 +471,7 @@ test("large messages travel compressed without a dictionary once the server deco
   const calls = [];
   const transport = fakeTransport(plainEcho(calls));
   transport.compression = await plainOnly;
-  const echo = new CompressedEchoClient(transport);
+  const echo = createClient(CompressedEcho, transport);
   const text = record + record;
 
   assert.equal((await echo.plain({ text })).text, text);
@@ -494,7 +495,7 @@ test("large messages travel compressed without a dictionary once the server deco
   const echoCalls = [];
   const plainTransport = fakeTransport(compressingEcho(echoCalls, { confirm: false }));
   plainTransport.compression = await plainOnly;
-  await new EchoClient(plainTransport).unary({ message: record });
+  await createClient(Echo, plainTransport).unary({ message: record });
   assert.deepEqual(echoCalls[0].request.acceptDictionaries, []);
 });
 
@@ -502,7 +503,7 @@ test("a server that does not answer ID 0 keeps receiving MESSAGE frames", async 
   const calls = [];
   const transport = fakeTransport(plainEcho(calls, { decodes: false }));
   transport.compression = await plainOnly;
-  const echo = new CompressedEchoClient(transport);
+  const echo = createClient(CompressedEcho, transport);
   const text = record + record;
   await echo.plain({ text });
   await echo.plain({ text });

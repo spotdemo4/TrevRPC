@@ -11,6 +11,7 @@ import {
   encodeAnswerFrame,
   encodeHeadersFrame,
   encodeMessageFrame,
+  decodeWireMessage,
   encodeStatusFrame,
   marshalMessage,
   unmarshalMessage,
@@ -50,7 +51,7 @@ export class ServerStream {
     if (frame?.type !== FrameType.Request) {
       throw new Error(`expected a REQUEST frame, got ${frame?.type}`);
     }
-    return unmarshalMessage(RpcRequest, frame.payload);
+    return decodeWireMessage(RpcRequest, frame.payload);
   }
 
   /** Reads the next known frame from the client as `{ type, payload }`, null at the end. */
@@ -67,7 +68,7 @@ export class ServerStream {
     if (frame.type !== FrameType.Message) {
       throw new Error(`client sent a frame of type ${frame.type} instead of a message`);
     }
-    return messageType.decode(frame.payload);
+    return unmarshalMessage(messageType, frame.payload);
   }
 
   writeHeaders(metadata = {}) {

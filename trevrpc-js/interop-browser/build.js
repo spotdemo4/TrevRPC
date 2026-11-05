@@ -1,59 +1,28 @@
-// Generates the Echo, UnreliableEcho and CompressedEcho clients from the shared interop protos
-// with protoc-gen-trevrpc-js, and the Echo service for connect-web with protoc-gen-es, and bundles
-// the browser pages that run the interop scenarios and the load benchmark. Output goes to
-// build/interop/.
-import { execFile } from "node:child_process";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+// Generates the Echo, UnreliableEcho and CompressedEcho services from the shared interop protos
+// with protoc-gen-es, for the TrevRPC client and connect-web alike, and bundles the browser pages
+// that run the interop scenarios and the load benchmark. Output goes to build/interop/.
+import { mkdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
 import { rolldown } from "rolldown";
 
-import { generateClients } from "../tools/generate-clients.js";
+import { generateEs } from "../tools/generate-es.js";
 
-const run = promisify(execFile);
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const protoDir = fileURLToPath(new URL("../../interop/proto", import.meta.url));
 // The shared schema options (trevrpc/options.proto) that unreliable.proto imports.
 const optionsProtoDir = fileURLToPath(new URL("../../proto", import.meta.url));
-const esPlugin = fileURLToPath(
-  new URL("../node_modules/@bufbuild/protoc-gen-es/bin/protoc-gen-es", import.meta.url),
-);
 const outDir = fileURLToPath(new URL("../build/interop", import.meta.url));
 
-/**
- * Generates build/interop/gen/ and build/interop/gen-es/, and bundles build/interop/page.js and
- * build/interop/bench.js.
- */
+/** Generates build/interop/gen/, and bundles build/interop/page.js and build/interop/bench.js. */
 export async function buildInterop() {
-  const genDir = `${outDir}/gen`;
-  const esGenDir = `${outDir}/gen-es`;
   await rm(outDir, { recursive: true, force: true });
-  await mkdir(genDir, { recursive: true });
-  await mkdir(esGenDir, { recursive: true });
-
-  await generateClients({
+  await mkdir(outDir, { recursive: true });
+  await generateEs({
     protoDirs: [protoDir, optionsProtoDir],
-    files: ["interop.proto", "unreliable.proto", "compressed.proto"],
-    outDir: genDir,
+    files: ["interop.proto", "unreliable.proto", "compressed.proto", "trevrpc/options.proto"],
+    outDir: `${outDir}/gen`,
   });
-
-  // protoc runs plugins directly; this one runs with the node running the build, whatever the
-  // shebang of the package's script says.
-  const esLauncher = `${outDir}/protoc-gen-es`;
-  await writeFile(
-    esLauncher,
-    `#!${process.execPath}\nawait import(${JSON.stringify(esPlugin)});\n`,
-  );
-  await chmod(esLauncher, 0o755);
-  await run("protoc", [
-    `--plugin=protoc-gen-es=${esLauncher}`,
-    `--es_out=${esGenDir}`,
-    "--es_opt=target=js+dts,import_extension=js",
-    `--proto_path=${protoDir}`,
-    "interop.proto",
-  ]);
-  await rm(esLauncher);
 
   // The bench page also loads over the benchmark's emulated links, so it is minified.
   for (const [page, minify] of [

@@ -1,7 +1,9 @@
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+
 import { byteView } from "./bytes.js";
 import { internal, invalidArgument, resourceExhausted, unavailable } from "./status.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
-import { RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, preflightWireMessage } from "./wire.js";
+import { RpcAnswer, RpcHeaders, RpcRequest, RpcStatus } from "./wire.js";
 
 export const DefaultMaxFrameSize = 4 * 1024 * 1024;
 
@@ -19,10 +21,13 @@ export const FrameType = Object.freeze({
 const KnownFrameTypes = new Set(Object.values(FrameType));
 const EmptyBytes = new Uint8Array(0);
 
-/** Encodes a protobuf message body. */
-export function marshalMessage(messageType, message) {
+/**
+ * Encodes a protobuf message body: `message` is a message of `schema` (a protobuf-es message
+ * descriptor) or the init object `create()` takes.
+ */
+export function marshalMessage(schema, message) {
   try {
-    return messageType.encode(messageType.fromObject(message)).finish();
+    return toBinary(schema, create(schema, message));
   } catch (error) {
     throw invalidArgument(
       `failed to encode protobuf message: ${error?.message ?? String(error)}`,
@@ -31,14 +36,37 @@ export function marshalMessage(messageType, message) {
   }
 }
 
-/** Decodes a protobuf message body, rejecting malformed wire data. */
-export function unmarshalMessage(messageType, body) {
+/** Decodes a protobuf message body of `schema`, rejecting malformed wire data. */
+export function unmarshalMessage(schema, body) {
   try {
-    preflightWireMessage(messageType, body);
-    return messageType.decode(body);
+    return fromBinary(schema, byteView(body));
   } catch (error) {
     throw invalidArgument(
       `failed to decode protobuf message: ${error?.message ?? String(error)}`,
+      error,
+    );
+  }
+}
+
+/** Encodes a wire payload with its codec from wire.js, such as RpcStatus. */
+export function encodeWireMessage(codec, fields) {
+  try {
+    return codec.encode(fields);
+  } catch (error) {
+    throw invalidArgument(
+      `failed to encode ${codec.name}: ${error?.message ?? String(error)}`,
+      error,
+    );
+  }
+}
+
+/** Decodes a wire payload with its codec from wire.js, rejecting malformed wire data. */
+export function decodeWireMessage(codec, payload) {
+  try {
+    return codec.decode(byteView(payload));
+  } catch (error) {
+    throw invalidArgument(
+      `failed to decode ${codec.name}: ${error?.message ?? String(error)}`,
       error,
     );
   }
@@ -71,7 +99,7 @@ export function encodeOutgoingFrame(message, maxFrameSize = DefaultMaxFrameSize)
  * encodeMessage, when it is given, in one buffer so both go out in a single write.
  */
 export function encodeRequestFrame(request, message, maxFrameSize = DefaultMaxFrameSize) {
-  const payload = marshalMessage(RpcRequest, request);
+  const payload = encodeWireMessage(RpcRequest, request);
   checkFrameLength(payload.byteLength, maxFrameSize);
   if (message === undefined) {
     return encodeFrame(FrameType.Request, payload, maxFrameSize);
@@ -86,17 +114,17 @@ export function encodeRequestFrame(request, message, maxFrameSize = DefaultMaxFr
 
 /** Encodes a HEADERS frame from RpcHeaders fields. */
 export function encodeHeadersFrame(headers, maxFrameSize = DefaultMaxFrameSize) {
-  return encodeFrame(FrameType.Headers, marshalMessage(RpcHeaders, headers), maxFrameSize);
+  return encodeFrame(FrameType.Headers, encodeWireMessage(RpcHeaders, headers), maxFrameSize);
 }
 
 /** Encodes an ANSWER frame from RpcAnswer fields. */
 export function encodeAnswerFrame(answer, maxFrameSize = DefaultMaxFrameSize) {
-  return encodeFrame(FrameType.Answer, marshalMessage(RpcAnswer, answer), maxFrameSize);
+  return encodeFrame(FrameType.Answer, encodeWireMessage(RpcAnswer, answer), maxFrameSize);
 }
 
 /** Encodes a STATUS frame from RpcStatus fields. */
 export function encodeStatusFrame(status, maxFrameSize = DefaultMaxFrameSize) {
-  return encodeFrame(FrameType.Status, marshalMessage(RpcStatus, status), maxFrameSize);
+  return encodeFrame(FrameType.Status, encodeWireMessage(RpcStatus, status), maxFrameSize);
 }
 
 /**

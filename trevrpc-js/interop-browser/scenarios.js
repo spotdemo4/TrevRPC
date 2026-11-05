@@ -1,12 +1,9 @@
-import {
-  CompressedEchoClient,
-  RefusingEchoClient,
-} from "../build/interop/gen/compressed.trevrpc.js";
-import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
-import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
 // only needs the web platform, so it runs unchanged in a browser bundle and under Node tests.
-import { Code, TrevRpcError, codeName } from "../src/index.js";
+import { CompressedEcho, RefusingEcho } from "../build/interop/gen/compressed_pb.js";
+import { Echo } from "../build/interop/gen/interop_pb.js";
+import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
+import { Code, TrevRpcError, codeName, createClient } from "../src/index.js";
 import { interopCompression } from "./compression.js";
 import { connectLane } from "./lane.js";
 import { ScenarioNames } from "./names.js";
@@ -331,7 +328,7 @@ const scenarios = {
   async "connection-metadata"(_echo, { open }) {
     const channel = await open({ connectionMetadata: { "interop-suffix": "!" } });
     try {
-      const echo = new EchoClient(channel, { timeoutMs: DeadlineMs });
+      const echo = createClient(Echo, channel, { timeoutMs: DeadlineMs });
       for (const message of ["a", "b", "c"]) {
         expectEcho(await echo.unary({ message }), `${message}!`, 0);
       }
@@ -475,11 +472,11 @@ export async function runScenarios({
   }
 
   try {
-    const echo = new EchoClient(channel, { timeoutMs: DeadlineMs });
+    const echo = createClient(Echo, channel, { timeoutMs: DeadlineMs });
     const context = {
-      unreliable: new UnreliableEchoClient(channel, { timeoutMs: DeadlineMs }),
-      compressed: new CompressedEchoClient(channel, { timeoutMs: DeadlineMs }),
-      refusing: new RefusingEchoClient(channel, { timeoutMs: DeadlineMs }),
+      unreliable: createClient(UnreliableEcho, channel, { timeoutMs: DeadlineMs }),
+      compressed: createClient(CompressedEcho, channel, { timeoutMs: DeadlineMs }),
+      refusing: createClient(RefusingEcho, channel, { timeoutMs: DeadlineMs }),
       open,
       get transport() {
         return channel.transport;

@@ -1,139 +1,4 @@
-import type { INamespace, Root } from "protobufjs";
-
-export const protobuf: typeof import("protobufjs");
-
-/**
- * How decoded messages represent 64-bit integer fields: `bigint`, `number` (exact up to 2^53),
- * decimal `string`, or protobuf.js's `long` (a Long object). 64-bit map keys are decimal strings
- * in every representation.
- */
-export type Int64Representation = "bigint" | "number" | "string" | "long";
-
-export interface CreateRootOptions {
-  /**
-   * How calls decode the 64-bit integers of the root's messages; a field's `jstype` option
-   * (`JS_STRING` or `JS_NUMBER`) overrides it. Without it they stay Long objects. Generated code
-   * passes the generator's `int64` option.
-   */
-  int64?: Int64Representation;
-}
-
-/** Creates a protobuf root from a JSON namespace definition. */
-export function createRoot(json: INamespace, options?: CreateRootOptions): Root;
-
-/** A 64-bit integer in any representation, including a Long. */
-type Int64Value = bigint | number | string | { low: number; high: number; unsigned?: boolean };
-
-/** A decoded google.protobuf.Timestamp message. */
-export interface Timestamp {
-  seconds: bigint;
-  nanos: number;
-}
-
-/** A google.protobuf.Timestamp message to send. */
-export interface TimestampInit {
-  seconds?: bigint | number | string;
-  nanos?: number;
-}
-
-/** A decoded google.protobuf.Duration message. */
-export interface Duration {
-  seconds: bigint;
-  nanos: number;
-}
-
-/** A google.protobuf.Duration message to send. */
-export interface DurationInit {
-  seconds?: bigint | number | string;
-  nanos?: number;
-}
-
-/** A decoded google.protobuf.Empty message. */
-export interface Empty {}
-
-/** A google.protobuf.Empty message to send. */
-export interface EmptyInit {}
-
-/** Values of the google.protobuf.NullValue enum. */
-export const NullValue: Readonly<{ NULL_VALUE: 0 }>;
-/** A value of the google.protobuf.NullValue enum. */
-export type NullValue = (typeof NullValue)[keyof typeof NullValue];
-
-/** A decoded google.protobuf.Struct message: a JSON object; see `structToJson`. */
-export interface Struct {
-  fields: Record<string, Value>;
-}
-
-/** A google.protobuf.Struct message to send; see `structFromJson`. */
-export interface StructInit {
-  fields?: Record<string, ValueInit>;
-}
-
-/**
- * A decoded google.protobuf.Value message: a JSON value, which sets one member of the `kind`
- * oneof; see `valueToJson`.
- */
-export interface Value {
-  nullValue: NullValue;
-  numberValue: number;
-  stringValue: string;
-  boolValue: boolean;
-  structValue: Struct | null;
-  listValue: ListValue | null;
-}
-
-/** A google.protobuf.Value message to send; see `valueFromJson`. */
-export interface ValueInit {
-  nullValue?: NullValue;
-  numberValue?: number;
-  stringValue?: string;
-  boolValue?: boolean;
-  structValue?: StructInit | null;
-  listValue?: ListValueInit | null;
-}
-
-/** A decoded google.protobuf.ListValue message: a JSON array. */
-export interface ListValue {
-  values: Value[];
-}
-
-/** A google.protobuf.ListValue message to send. */
-export interface ListValueInit {
-  values?: ValueInit[];
-}
-
-export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
-export type JsonObject = { [key: string]: JsonValue };
-
-/** Returns the Timestamp of a Date, to the millisecond. */
-export function timestampFromDate(date: Date): Timestamp;
-/** Returns the Timestamp of milliseconds since the Unix epoch. */
-export function timestampFromMs(ms: number): Timestamp;
-/** Returns the Date of a Timestamp, whatever the representation of its seconds. */
-export function timestampDate(timestamp: {
-  seconds?: Int64Value | null;
-  nanos?: number | null;
-}): Date;
-/** Returns the milliseconds since the Unix epoch of a Timestamp, rounded down. */
-export function timestampMs(timestamp: {
-  seconds?: Int64Value | null;
-  nanos?: number | null;
-}): number;
-/** Returns the Duration of a number of milliseconds. */
-export function durationFromMs(ms: number): Duration;
-/** Returns the milliseconds of a Duration, rounded towards zero. */
-export function durationMs(duration: {
-  seconds?: Int64Value | null;
-  nanos?: number | null;
-}): number;
-/** Returns the Struct of a JSON object. */
-export function structFromJson(json: JsonObject): StructInit;
-/** Returns the JSON object of a Struct. */
-export function structToJson(struct: StructInit): JsonObject;
-/** Returns the Value of a JSON value. */
-export function valueFromJson(json: JsonValue): ValueInit;
-/** Returns the JSON value of a Value; one with no member of `kind` set is null. */
-export function valueToJson(value: ValueInit): JsonValue;
+import type { DescMessage, DescService, MessageInitShape, MessageShape } from "@bufbuild/protobuf";
 
 export const Code: Readonly<{
   Ok: 0;
@@ -197,7 +62,7 @@ export interface CallOptions {
   onResponseMetadata?(metadata: Metadata): void;
 }
 
-/** The kind of an RPC, as in its generated descriptor. */
+/** The kind of an RPC. */
 export type CallKind = "unary" | "serverStreaming" | "clientStreaming" | "bidirectionalStreaming";
 
 /** What a call interceptor sees of a call before it starts. */
@@ -334,55 +199,6 @@ export interface Transport {
   }>;
 }
 
-export type RpcMethodKind =
-  | "unary"
-  | "clientStreaming"
-  | "serverStreaming"
-  | "bidirectionalStreaming";
-
-export interface RpcMethodDescriptor {
-  name: string;
-  kind: RpcMethodKind;
-  inputType: string;
-  outputType: string;
-  /**
-   * The method marks its streamed request messages unreliable (`unreliable_requests` in the
-   * `trevrpc.method` option). They are sent as WebTransport datagrams when they fit and the
-   * session has datagrams, and may be lost or reordered; otherwise they travel on the stream.
-   */
-  unreliableRequests?: boolean;
-  /**
-   * The method marks its streamed response messages unreliable (`unreliable_responses`). The
-   * client accepts them as datagrams on any session that has them.
-   */
-  unreliableResponses?: boolean;
-  /**
-   * The method's request messages may be stream-compressed (`compression: COMPRESSION_STREAM` in
-   * the `trevrpc.method` option, on a method that streams requests, whose request type has no
-   * field marked `debug_redact`). Calls on a transport with compression then compress them with one zstd
-   * context per call, once the server agrees.
-   */
-  compressStreamRequests?: boolean;
-  /** The method's response messages may be stream-compressed; see `compressStreamRequests`. */
-  compressStreamResponses?: boolean;
-  /**
-   * The method's request messages may be compressed without a dictionary: one at a time, from 256
-   * bytes, where no dictionary applies to their type and the server decodes it. The generator
-   * sets it for `COMPRESSION_MESSAGE` and `COMPRESSION_STREAM`, except for message types with a
-   * field marked `debug_redact`.
-   */
-  compressRequests?: boolean;
-  /** The method's response messages may be compressed without a dictionary; see `compressRequests`. */
-  compressResponses?: boolean;
-}
-
-export interface RpcServiceDescriptor {
-  name: string;
-  fullName: string;
-  exportName: string;
-  methods: Record<string, RpcMethodDescriptor>;
-}
-
 /** The final status of a call that ended with OK. */
 export interface StreamStatus {
   readonly code: StatusCode;
@@ -442,8 +258,8 @@ export interface ClientStreamingCall<TRequest, TResponse> {
 }
 
 /**
- * On a method that marks a direction unreliable (`RpcMethodDescriptor.unreliableRequests` or
- * `unreliableResponses`), a call on a session with datagrams may send its request messages, and
+ * On a method whose `trevrpc.method` option marks a direction unreliable (`unreliable_requests` or
+ * `unreliable_responses`), a call on a session with datagrams may send its request messages, and
  * receive its response messages, as datagrams: they can be lost or reordered, never duplicated.
  * Response datagrams are delivered after the response headers, merged with the stream's messages
  * in arrival order, and dropped when the call's queue is full (32 messages or 1 MiB) or the call
@@ -498,21 +314,62 @@ export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIt
   close(reason?: unknown): Promise<void>;
 }
 
-export type ServiceClient = Record<
-  string,
-  (requestOrOptions?: unknown, options?: CallOptions) => Promise<unknown>
->;
+/** A unary method of a client: sends one request and resolves with the response. */
+export type UnaryMethod<I extends DescMessage, O extends DescMessage> = (
+  request: MessageInitShape<I>,
+  options?: CallOptions,
+) => Promise<MessageShape<O>>;
+
+/** A server-streaming method of a client: sends one request and resolves with the responses. */
+export type ServerStreamingMethod<I extends DescMessage, O extends DescMessage> = (
+  request: MessageInitShape<I>,
+  options?: CallOptions,
+) => Promise<ResponseStream<MessageShape<O>>>;
+
+/** A client-streaming method of a client: starts a call to send requests on. */
+export type ClientStreamingMethod<I extends DescMessage, O extends DescMessage> = (
+  options?: CallOptions,
+) => Promise<ClientStreamingCall<MessageInitShape<I>, MessageShape<O>>>;
+
+/** A bidirectional-streaming method of a client: starts a call to send and receive on. */
+export type BidirectionalStreamingMethod<I extends DescMessage, O extends DescMessage> = (
+  options?: CallOptions,
+) => Promise<BidirectionalStreamingCall<MessageInitShape<I>, MessageShape<O>>>;
 
 /**
- * Creates a service client from a generated service descriptor. Its calls run the transport's
- * interceptors, then those of `options.interceptors`.
+ * The client of a protobuf-es service descriptor: one function per method, named by its
+ * `localName`. Requests take a message or the init object `create()` takes; responses are
+ * messages.
  */
-export function createServiceClient<TClient extends ServiceClient = ServiceClient>(
+export type Client<S extends DescService> = {
+  [K in keyof S["method"]]: S["method"][K] extends {
+    methodKind: infer Kind;
+    input: infer I extends DescMessage;
+    output: infer O extends DescMessage;
+  }
+    ? Kind extends "unary"
+      ? UnaryMethod<I, O>
+      : Kind extends "server_streaming"
+        ? ServerStreamingMethod<I, O>
+        : Kind extends "client_streaming"
+          ? ClientStreamingMethod<I, O>
+          : Kind extends "bidi_streaming"
+            ? BidirectionalStreamingMethod<I, O>
+            : never
+    : never;
+};
+
+/**
+ * Creates a client for `service`, a service descriptor that protoc-gen-es generates (such as
+ * `GreeterService` from `greeter_pb.js`). The `trevrpc.method` option of each method decides
+ * what its calls send as datagrams and compress; one the method's kind cannot use throws
+ * InvalidArgument. Calls run the transport's interceptors, then those of `options.interceptors`.
+ */
+export function createClient<S extends DescService>(
+  service: S,
   transport: Transport,
-  service: RpcServiceDescriptor,
-  root: Root,
   options?: ClientOptions,
-): TClient;
+): Client<S>;
 
 export interface WebTransportCertificateHash {
   algorithm: string;

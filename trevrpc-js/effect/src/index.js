@@ -1,4 +1,4 @@
-import { Code, TrevRpcError } from "@trevrpc/trevrpc-js";
+import { Code, TrevRpcError, createClient } from "@trevrpc/trevrpc-js";
 import { Effect, Stream } from "effect";
 
 /** Returns a `TrevRpcError` as is, and wraps anything else in one with `Code.Unknown`. */
@@ -11,38 +11,29 @@ export function toTrevRpcError(error) {
 }
 
 /**
- * Wraps a generated client's methods in Effect: unary calls return an `Effect`, server-streaming
- * calls a `Stream`, and client-streaming and bidirectional calls take their requests as a
- * `Stream`. Interrupting the effect or stream cancels the call.
+ * Creates a client for `service`, a service descriptor that protoc-gen-es generates, whose calls
+ * are Effect values: unary calls return an `Effect`, server-streaming calls a `Stream`, and
+ * client-streaming and bidirectional calls take their requests as a `Stream`. Interrupting the
+ * effect or stream cancels the call. `transport` and `options` are those of `createClient`.
  */
-export function createEffectClient(service, client) {
+export function createEffectClient(service, transport, options) {
+  const client = createClient(service, transport, options);
   const result = {};
-  for (const [name, method] of Object.entries(service.methods)) {
-    if (typeof client[name] !== "function") {
-      throw new TypeError(`client has no ${name} method for ${service.fullName}/${method.name}`);
-    }
-    const call = client[name].bind(client);
-    switch (method.kind) {
-      case "unary":
-        result[name] = liftUnary(call);
-        break;
-      case "serverStreaming":
-        result[name] = liftServerStreaming(call);
-        break;
-      case "clientStreaming":
-        result[name] = liftClientStreaming(call);
-        break;
-      case "bidirectionalStreaming":
-        result[name] = liftBidirectionalStreaming(call);
-        break;
-      default:
-        throw new TypeError(
-          `unknown kind ${String(method.kind)} of ${service.fullName}/${method.name}`,
-        );
-    }
+  for (const method of service.methods) {
+    const call = client[method.localName];
+    result[method.localName] = Lifts[method.methodKind](call);
   }
   return result;
 }
+
+/** How each protobuf-es method kind's calls become Effect values. */
+const Lifts = Object.freeze({
+  __proto__: null,
+  unary: liftUnary,
+  server_streaming: liftServerStreaming,
+  client_streaming: liftClientStreaming,
+  bidi_streaming: liftBidirectionalStreaming,
+});
 
 function liftUnary(call) {
   return (request, options) =>

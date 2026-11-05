@@ -1,11 +1,13 @@
+import { create } from "@bufbuild/protobuf";
 import {
   Channel,
   Code,
   TrevRpcError,
   connect,
   createChannel,
-  createServiceClient,
+  createClient,
   fetchServerCertificateHashes,
+  type Client,
   type BidirectionalStreamingCall,
   type CallEnd,
   type CallInterceptor,
@@ -17,13 +19,7 @@ import {
 } from "@trevrpc/trevrpc-js";
 import { createCompression } from "@trevrpc/trevrpc-js/zstd";
 
-import {
-  EchoClient,
-  EchoService,
-  createEchoClient,
-  root,
-  type EchoResponse,
-} from "../../build/interop/gen/interop.trevrpc.js";
+import { Echo, EchoRequestSchema, type EchoResponse } from "../../build/interop/gen/interop_pb.js";
 
 const channel = await connect("https://localhost:4433/trevrpc", {
   serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(32) }],
@@ -68,7 +64,7 @@ const lazy: Channel = createChannel("https://localhost:4433/trevrpc", {
   interceptors: [authenticate, () => {}],
 });
 lazy.interceptors satisfies readonly CallInterceptor[];
-new EchoClient(lazy);
+createClient(Echo, lazy);
 const wrapper: Transport = {
   createBidirectionalStream: () => lazy.createBidirectionalStream(),
   createBidirectionalStreamWithSession: () => lazy.createBidirectionalStreamWithSession(),
@@ -77,9 +73,9 @@ const wrapper: Transport = {
   streamCompressionBudget: lazy.streamCompressionBudget,
   interceptors: lazy.interceptors,
 };
-new EchoClient(wrapper, { interceptors: [authenticate], timeoutMs: 1_000 });
+createClient(Echo, wrapper, { interceptors: [authenticate], timeoutMs: 1_000 });
 // @ts-expect-error An interceptor returns a finish function or nothing.
-new EchoClient(wrapper, { interceptors: [() => 1] });
+createClient(Echo, wrapper, { interceptors: [() => 1] });
 ({
   createBidirectionalStream: () => lazy.createBidirectionalStream(),
   // @ts-expect-error connection metadata is set through the channel, not built by hand
@@ -87,12 +83,14 @@ new EchoClient(wrapper, { interceptors: [() => 1] });
 }) satisfies Transport;
 lazy.close();
 
-const echo = new EchoClient(channel, { timeoutMs: 10_000, metadata: { trace: "abc" } });
-createEchoClient(channel) satisfies EchoClient;
-createServiceClient(channel, EchoService, root);
+const echo = createClient(Echo, channel, { timeoutMs: 10_000, metadata: { trace: "abc" } });
+echo satisfies Client<typeof Echo>;
 
+// Requests take an init object or a message; responses are messages.
 const unary: EchoResponse = await echo.unary({ message: "hi", failCode: Code.NotFound });
-unary.message satisfies string | undefined;
+unary.message satisfies string;
+unary.$typeName satisfies "trevrpc.interop.v1.EchoResponse";
+await echo.unary(create(EchoRequestSchema, { message: "hi" }));
 await echo.unary(
   { message: "hi" },
   {
@@ -104,7 +102,7 @@ await echo.unary(
 const stream = await echo.serverStream({ count: 2 });
 stream satisfies ResponseStream<EchoResponse>;
 for await (const response of stream) {
-  response.index satisfies number | undefined;
+  response.index satisfies number;
 }
 (await stream.status) satisfies StreamStatus;
 (await stream.headers)["x"] satisfies Uint8Array;
@@ -158,7 +156,11 @@ await connect("https://example.test/trevrpc", { compression: { query: [] } });
 
 // @ts-expect-error The Channel constructor is internal; use connect().
 new Channel();
-// @ts-expect-error Server code generation is gone; there is no server runtime.
+// @ts-expect-error Clients have the service's methods only.
 void echo.registerServer;
-// @ts-expect-error Request messages must match the generated interface.
+// @ts-expect-error Request messages must match the generated message.
 await echo.unary({ message: 1 });
+// @ts-expect-error Streaming requests are sent on the call, not passed to the method.
+await echo.clientStream({ message: "a" });
+// @ts-expect-error createClient takes a service descriptor.
+createClient(EchoRequestSchema, channel);

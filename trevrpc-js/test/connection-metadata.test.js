@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
+import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/interop/gen/interop_pb.js";
 import { connect, createChannel } from "../src/channel.js";
+import { createClient } from "../src/client.js";
 import {
   FrameReader,
   FrameType,
+  decodeWireMessage,
   encodeAnswerFrame,
   encodeMessageFrame,
   encodeRequestFrame,
-  unmarshalMessage,
 } from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { RpcStatus } from "../src/wire.js";
@@ -18,8 +19,6 @@ import { fakeTransport } from "./support.js";
 
 const url = "https://example.test/trevrpc";
 const decoder = new TextDecoder();
-const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
-const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
 
 /** Metadata as text, for comparisons. */
 const texts = (metadata) =>
@@ -83,7 +82,7 @@ async function echo(client, message, metadata) {
 test("a session offers the set until an ANSWER confirms it, then refers to it", async () => {
   const fake = fakeWebTransport();
   const channel = await channelTo(fake, { connectionMetadata: { "Interop-Suffix": "!" } });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
 
   assert.equal(await echo(client, "a"), "a!");
   assert.equal(await echo(client, "b"), "b!");
@@ -102,7 +101,7 @@ test("a session offers the set until an ANSWER confirms it, then refers to it", 
 test("the value of a call wins over the connection metadata", async () => {
   const fake = fakeWebTransport();
   const channel = await channelTo(fake, { connectionMetadata: { "interop-suffix": "!" } });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
 
   assert.equal(await echo(client, "a", { "interop-suffix": "?" }), "a?");
   assert.equal(await echo(client, "b", { "interop-suffix": "?" }), "b?");
@@ -122,7 +121,7 @@ test("the value of a call wins over the connection metadata", async () => {
 test("changing the set offers the new one, and removing it sends none", async () => {
   const fake = fakeWebTransport();
   const channel = await channelTo(fake, { connectionMetadata: { "interop-suffix": "!" } });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
 
   assert.equal(await echo(client, "a"), "a!");
   channel.setConnectionMetadata({ "interop-suffix": "#" });
@@ -138,7 +137,7 @@ test("changing the set offers the new one, and removing it sends none", async ()
       { id: 1, metadata: { "interop-suffix": "!" } },
       { id: 2, metadata: { "interop-suffix": "#" } },
       { id: 2, metadata: {} },
-      null,
+      undefined,
       { id: 3, metadata: { "interop-suffix": "$" } },
     ],
   );
@@ -148,14 +147,14 @@ test("changing the set offers the new one, and removing it sends none", async ()
 test("a channel without connection metadata can set it later", async () => {
   const fake = fakeWebTransport();
   const channel = await channelTo(fake);
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
 
   assert.equal(await echo(client, "a"), "a");
   channel.setConnectionMetadata({ "interop-suffix": "!" });
   assert.equal(await echo(client, "b"), "b!");
   assert.deepEqual(
     fake.requests.map((request) => request.connection),
-    [null, { id: 1, metadata: { "interop-suffix": "!" } }],
+    [undefined, { id: 1, metadata: { "interop-suffix": "!" } }],
   );
   channel.close();
 });
@@ -163,7 +162,7 @@ test("a channel without connection metadata can set it later", async () => {
 test("calls started before the confirmation all offer the set", async () => {
   const fake = fakeWebTransport();
   const channel = await channelTo(fake, { connectionMetadata: { "interop-suffix": "!" } });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
 
   assert.deepEqual(await Promise.all(["a", "b", "c"].map((message) => echo(client, message))), [
     "a!",
@@ -182,7 +181,7 @@ test("calls started before the confirmation all offer the set", async () => {
 test("a new session starts unconfirmed and offers the set again", async () => {
   const fake = fakeWebTransport();
   const channel = await channelTo(fake, { connectionMetadata: { "interop-suffix": "!" } });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
 
   assert.equal(await echo(client, "a"), "a!");
   assert.equal(await echo(client, "b"), "b!");
@@ -211,13 +210,13 @@ test("only an ANSWER that confirms the offered ID confirms the set", async () =>
     await stream.write(
       encodeAnswerFrame({ connectionMetadata: confirm ?? request.connectionMetadata.id }),
     );
-    await stream.readMessage(EchoRequest);
-    await stream.writeMessage(EchoResponse, { message: "x" });
+    await stream.readMessage(EchoRequestSchema);
+    await stream.writeMessage(EchoResponseSchema, { message: "x" });
     await stream.writeStatus();
     await stream.finish();
   });
   const channel = await channelTo(fake, { connectionMetadata: { "interop-suffix": "!" } });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
 
   await echo(client, "a");
   await echo(client, "b");
@@ -244,7 +243,7 @@ test("invalid connection metadata is rejected before and after connecting", asyn
     () => channel.setConnectionMetadata({ "Bad Key": "1" }),
     (error) => error.code === Code.InvalidArgument,
   );
-  assert.equal(await echo(new EchoClient(channel), "a"), "a!");
+  assert.equal(await echo(createClient(Echo, channel), "a"), "a!");
   channel.close();
 });
 
@@ -258,7 +257,7 @@ async function statusOf(transport, fields) {
   const frames = new FrameReader(stream.readable.getReader());
   for (let frame; (frame = await frames.readFrame()) !== null;) {
     if (frame.type === FrameType.Status) {
-      return unmarshalMessage(RpcStatus, frame.payload).code;
+      return decodeWireMessage(RpcStatus, frame.payload).code;
     }
   }
   throw new Error("the response ended without a STATUS");
@@ -306,7 +305,7 @@ test("clients created on a connecting channel carry its connection metadata", as
     WebTransport: fake.WebTransport,
     connectionMetadata: { "interop-suffix": "!" },
   });
-  const client = new EchoClient(channel);
+  const client = createClient(Echo, channel);
   assert.equal(await echo(client, "a"), "a!");
   assert.deepEqual(fake.requests[0].connection, { id: 1, metadata: { "interop-suffix": "!" } });
   channel.close();
@@ -328,11 +327,11 @@ test("a transport that wraps a channel forwards its connection metadata", async 
       return channel.streamCompressionBudget;
     },
   };
-  const client = new EchoClient(wrapper);
+  const client = createClient(Echo, wrapper);
   assert.equal(await echo(client, "a"), "a!");
   assert.equal(await echo(client, "b"), "b!");
   // The wrapper and the channel share what each session confirmed.
-  assert.equal(await echo(new EchoClient(channel), "c"), "c!");
+  assert.equal(await echo(createClient(Echo, channel), "c"), "c!");
   assert.deepEqual(
     fake.requests.map((request) => request.connection),
     [

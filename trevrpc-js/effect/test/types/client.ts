@@ -1,12 +1,8 @@
+import type { MessageInitShape } from "@bufbuild/protobuf";
 import { TrevRpcError, type CallOptions, type Transport } from "@trevrpc/trevrpc-js";
 import { Context, Effect, Stream } from "effect";
 
-import {
-  EchoClient,
-  EchoService,
-  type EchoRequestInit,
-  type EchoResponse,
-} from "../../build/test/gen/echo.trevrpc.js";
+import { Echo, EchoRequestSchema, type EchoResponse } from "../../build/test/gen/echo_pb.js";
 import { createEffectClient, toTrevRpcError, type EffectClient } from "../../src/index.js";
 
 /** Accepts a value only if its type is exactly `Expected`. */
@@ -20,8 +16,10 @@ function exact<Expected>() {
 }
 
 declare const transport: Transport;
-const echo = createEffectClient(EchoService, new EchoClient(transport));
-echo satisfies EffectClient<EchoClient>;
+type EchoRequestInit = MessageInitShape<typeof EchoRequestSchema>;
+
+const echo = createEffectClient(Echo, transport, { timeoutMs: 1_000 });
+echo satisfies EffectClient<typeof Echo>;
 
 const options: CallOptions = { timeoutMs: 1_000 };
 
@@ -63,14 +61,10 @@ exact<Stream.Stream<EchoResponse, TrevRpcError, Token>>()(echo.bidi(needsToken))
 // @ts-expect-error A bidirectional call takes its requests, not call options (#320).
 echo.bidi(options);
 
-// Members that are not RPC methods are left out.
-interface ClientWithExtras extends EchoClient {
-  readonly name: string;
-  close(): void;
-}
-declare const extras: EffectClient<ClientWithExtras>;
-exact<"unary" | "serverStream" | "clientStream" | "bidi">()("unary" as keyof typeof extras);
-exact<Effect.Effect<EchoResponse, TrevRpcError>>()(extras.unary({}));
+// Clients have the service's methods only.
+exact<"unary" | "serverStream" | "clientStream" | "bidi">()("unary" as keyof typeof echo);
+// @ts-expect-error createEffectClient takes a service descriptor.
+createEffectClient(EchoRequestSchema, transport);
 
 // Errors can be matched by tag.
 echo

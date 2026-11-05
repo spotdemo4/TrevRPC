@@ -1,27 +1,34 @@
 // The Echo service of interop/README.md, served over fake streams. Behavior must match what the
 // Go and Rust interop servers do.
-import { root as compressedRoot } from "../build/interop/gen/compressed.trevrpc.js";
-import { root } from "../build/interop/gen/interop.trevrpc.js";
+import {
+  CompressedEcho,
+  PlainMessageSchema,
+  RefusingEcho,
+} from "../build/interop/gen/compressed_pb.js";
+import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/interop/gen/interop_pb.js";
+import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
 import { encodeMessage, inflateMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
-import { FrameType, encodeOutgoingFrame, marshalMessage } from "../src/framing.js";
+import {
+  FrameType,
+  encodeOutgoingFrame,
+  marshalMessage,
+  unmarshalMessage,
+} from "../src/framing.js";
 import { validateMetadata } from "../src/metadata.js";
 import { Code, TrevRpcError, invalidArgument } from "../src/status.js";
 import { StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import { ServerStreams, parseMethodPath } from "./support.js";
 
-const EchoService = "trevrpc.interop.v1.Echo";
-const UnreliableEchoService = "trevrpc.interop.v1.UnreliableEcho";
-const CompressedEchoService = "trevrpc.interop.v1.CompressedEcho";
-const RefusingEchoService = "trevrpc.interop.v1.RefusingEcho";
+const EchoService = Echo.typeName;
+const UnreliableEchoService = UnreliableEcho.typeName;
+const CompressedEchoService = CompressedEcho.typeName;
+const RefusingEchoService = RefusingEcho.typeName;
 /** The server's stream compression; it holds no dictionaries. */
 const compression = await createCompression();
 /** Responses up to this size are sent as datagrams when the call has a flow. */
 const MaxDatagramResponse = 1000;
-const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
-const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
-const PlainMessage = compressedRoot.lookupType("trevrpc.interop.v1.PlainMessage");
 
 /**
  * Serves Echo streams. Tests can replace the unary implementation to simulate a faulty server.
@@ -167,13 +174,13 @@ async function serve(stream, request, unary, session) {
   } else {
     switch (path.service === EchoService ? path.method : undefined) {
       case "Unary":
-        await unary(stream, request, await stream.readMessage(EchoRequest), done);
+        await unary(stream, request, await stream.readMessage(EchoRequestSchema), done);
         break;
       case "ClientStream":
         await clientStream(stream, done);
         break;
       case "ServerStream":
-        await serverStream(stream, await stream.readMessage(EchoRequest), done);
+        await serverStream(stream, await stream.readMessage(EchoRequestSchema), done);
         break;
       case "Bidi":
         await bidi(stream, done);
@@ -192,27 +199,27 @@ async function echoUnary(stream, request, message, done) {
     return;
   }
   const suffix = text.decode(request.metadata["interop-suffix"] ?? new Uint8Array());
-  await stream.writeMessage(EchoResponse, { message: message.message + suffix, index: 0 });
+  await stream.writeMessage(EchoResponseSchema, { message: message.message + suffix, index: 0 });
   await done();
 }
 
 async function clientStream(stream, done) {
   let message = "";
   let count = 0;
-  for (let request; (request = await stream.readMessage(EchoRequest)) !== null; count += 1) {
+  for (let request; (request = await stream.readMessage(EchoRequestSchema)) !== null; count += 1) {
     if (request.failCode !== 0) {
       await done(request.failCode, request.failMessage);
       return;
     }
     message += request.message;
   }
-  await stream.writeMessage(EchoResponse, { message, index: count });
+  await stream.writeMessage(EchoResponseSchema, { message, index: count });
   await done();
 }
 
 async function serverStream(stream, request, done) {
   for (let index = 0; index < request.count; index += 1) {
-    await stream.writeMessage(EchoResponse, { message: request.message, index });
+    await stream.writeMessage(EchoResponseSchema, { message: request.message, index });
   }
   await done(request.failCode, request.failMessage);
 }
@@ -220,14 +227,14 @@ async function serverStream(stream, request, done) {
 async function bidi(stream, done) {
   for (
     let index = 0, request;
-    (request = await stream.readMessage(EchoRequest)) !== null;
+    (request = await stream.readMessage(EchoRequestSchema)) !== null;
     index += 1
   ) {
     if (request.failCode !== 0) {
       await done(request.failCode, request.failMessage);
       return;
     }
-    await stream.writeMessage(EchoResponse, { message: request.message, index });
+    await stream.writeMessage(EchoResponseSchema, { message: request.message, index });
   }
   await done();
 }
@@ -239,12 +246,12 @@ async function bidi(stream, done) {
 async function compressedBidi(stream, streams, done) {
   try {
     for (let index = 0, frame; (frame = await stream.readFrame()) !== null; index += 1) {
-      const message = EchoRequest.decode(streams.receive(frame));
+      const message = unmarshalMessage(EchoRequestSchema, streams.receive(frame));
       if (message.failCode !== 0) {
         await stream.writeStatus(message.failCode, message.failMessage);
         return;
       }
-      const response = marshalMessage(EchoResponse, { message: message.message, index });
+      const response = marshalMessage(EchoResponseSchema, { message: message.message, index });
       await stream.write(encodeOutgoingFrame(streams.encode(response)));
     }
     await done(Code.Ok, "", {
@@ -265,9 +272,9 @@ async function compressedPlain(stream, request) {
   const plain = new Map([[0, compression.plain]]);
   const compressed = frame.type === FrameType.ZstdMessage;
   const payload = compressed ? inflateMessage(plain, frame.payload, 1 << 22) : frame.payload;
-  const { text: echoed } = PlainMessage.decode(payload);
+  const { text: echoed } = unmarshalMessage(PlainMessageSchema, payload);
   const accepted = (request.acceptDictionaries ?? []).includes(0);
-  const response = marshalMessage(PlainMessage, { text: echoed });
+  const response = marshalMessage(PlainMessageSchema, { text: echoed });
   await stream.write(
     encodeOutgoingFrame(encodeMessage(response, accepted ? compression.plain : undefined)),
   );
@@ -285,9 +292,9 @@ async function compressedClientStream(stream, streams, done) {
     let message = "";
     let count = 0;
     for (let frame; (frame = await stream.readFrame()) !== null; count += 1) {
-      message += EchoRequest.decode(streams.receive(frame)).message;
+      message += unmarshalMessage(EchoRequestSchema, streams.receive(frame)).message;
     }
-    const response = marshalMessage(EchoResponse, { message, index: count });
+    const response = marshalMessage(EchoResponseSchema, { message, index: count });
     await stream.write(encodeOutgoingFrame(streams.encode(response)));
     await done(Code.Ok, "", {
       "interop-stream-compressed-received": new TextEncoder().encode(String(streams.received)),
@@ -321,13 +328,15 @@ async function unreliableBidi(stream, request, session) {
         datagrams.push(
           encodeDatagram(
             flow,
-            responses.map((response) => encodeMessage(marshalMessage(EchoResponse, response))),
+            responses.map((response) =>
+              encodeMessage(marshalMessage(EchoResponseSchema, response)),
+            ),
           ),
         );
         return;
       }
       for (const response of responses) {
-        await stream.writeMessage(EchoResponse, response);
+        await stream.writeMessage(EchoResponseSchema, response);
       }
     });
   };
@@ -338,12 +347,12 @@ async function unreliableBidi(stream, request, session) {
       const decoded = decodeDatagram(datagram);
       if (decoded?.flow === flow) {
         for (const { payload } of decoded.messages) {
-          handle(EchoRequest.decode(payload), true);
+          handle(unmarshalMessage(EchoRequestSchema, payload), true);
         }
       }
     };
   }
-  for (let message; (message = await stream.readMessage(EchoRequest)) !== null;) {
+  for (let message; (message = await stream.readMessage(EchoRequestSchema)) !== null;) {
     handle(message, false);
   }
   if (datagrams !== undefined) {

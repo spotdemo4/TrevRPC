@@ -1,0 +1,158 @@
+// Services that set the trevrpc.method option in every way createClient checks: each direction
+// unreliable, each compression mode, message types with redacted fields, and misuses it rejects.
+// The Echo-shaped ones combine options for tests whose fake servers echo Echo messages.
+syntax = "proto3";
+
+package methods.v1;
+
+import "interop.proto";
+import "trevrpc/options.proto";
+
+message Plain {
+  string text = 1;
+}
+
+// Secret is redacted; Wrapper holds one two levels down; Loop refers to itself; the list and the
+// map hold Secrets as elements and values.
+message Secret {
+  string token = 1 [debug_redact = true];
+}
+
+message Middle {
+  Secret secret = 1;
+}
+
+message Wrapper {
+  Middle middle = 1;
+}
+
+message Loop {
+  Loop next = 1;
+  string text = 2;
+}
+
+message SecretList {
+  repeated Secret secrets = 1;
+}
+
+message SecretMap {
+  map<string, Secret> secrets = 1;
+}
+
+service Unreliable {
+  rpc Unary(Plain) returns (Plain);
+  rpc Server(Plain) returns (stream Plain) {
+    option (trevrpc.method) = {unreliable_responses: true};
+  }
+  rpc Client(stream Plain) returns (Plain) {
+    option (trevrpc.method) = {unreliable_requests: true};
+  }
+  rpc Bidi(stream Plain) returns (stream Plain) {
+    option (trevrpc.method) = {
+      unreliable_requests: true
+      unreliable_responses: true
+    };
+  }
+}
+
+service StreamCompressed {
+  rpc Bidi(stream Plain) returns (stream Plain) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+  rpc Server(Plain) returns (stream Plain) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+  rpc Client(stream Plain) returns (Plain) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+  rpc Redacted(stream Wrapper) returns (stream Loop) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+  rpc UnreliableBidi(stream Plain) returns (stream Plain) {
+    option (trevrpc.method) = {
+      compression: COMPRESSION_STREAM
+      unreliable_responses: true
+    };
+  }
+  rpc Unmarked(stream Plain) returns (stream Plain);
+}
+
+service MessageCompressed {
+  rpc Unary(Plain) returns (Plain) {
+    option (trevrpc.method) = {compression: COMPRESSION_MESSAGE};
+  }
+  rpc Redacted(Secret) returns (Plain) {
+    option (trevrpc.method) = {compression: COMPRESSION_MESSAGE};
+  }
+  rpc RedactedElements(SecretList) returns (SecretMap) {
+    option (trevrpc.method) = {compression: COMPRESSION_MESSAGE};
+  }
+  rpc Unmarked(Plain) returns (Plain);
+}
+
+service UnaryUnreliableRequests {
+  rpc Unary(Plain) returns (Plain) {
+    option (trevrpc.method) = {unreliable_requests: true};
+  }
+}
+
+service UnaryUnreliableResponses {
+  rpc Unary(Plain) returns (Plain) {
+    option (trevrpc.method) = {unreliable_responses: true};
+  }
+}
+
+service ServerUnreliableRequests {
+  rpc Server(Plain) returns (stream Plain) {
+    option (trevrpc.method) = {unreliable_requests: true};
+  }
+}
+
+service ClientUnreliableResponses {
+  rpc Client(stream Plain) returns (Plain) {
+    option (trevrpc.method) = {unreliable_responses: true};
+  }
+}
+
+service UnaryStreamCompression {
+  rpc Unary(Plain) returns (Plain) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+}
+
+service UnknownCompression {
+  rpc Client(stream Plain) returns (Plain) {
+    option (trevrpc.method) = {compression: 7};
+  }
+}
+
+// Bidi streams both directions unreliable and compressed.
+service UnreliableCompressedEcho {
+  rpc Bidi(stream trevrpc.interop.v1.EchoRequest) returns (stream trevrpc.interop.v1.EchoResponse) {
+    option (trevrpc.method) = {
+      unreliable_requests: true
+      unreliable_responses: true
+      compression: COMPRESSION_STREAM
+    };
+  }
+}
+
+// Bidi streams responses unreliable, and both directions compressed.
+service UnreliableResponsesCompressedEcho {
+  rpc Bidi(stream trevrpc.interop.v1.EchoRequest) returns (stream trevrpc.interop.v1.EchoResponse) {
+    option (trevrpc.method) = {
+      unreliable_responses: true
+      compression: COMPRESSION_STREAM
+    };
+  }
+}
+
+// Each method marks the one direction it streams unreliable.
+service OneWayUnreliableEcho {
+  rpc Upload(stream trevrpc.interop.v1.EchoRequest) returns (trevrpc.interop.v1.EchoResponse) {
+    option (trevrpc.method) = {unreliable_requests: true};
+  }
+  rpc Watch(trevrpc.interop.v1.EchoRequest) returns (stream trevrpc.interop.v1.EchoResponse) {
+    option (trevrpc.method) = {unreliable_responses: true};
+  }
+}

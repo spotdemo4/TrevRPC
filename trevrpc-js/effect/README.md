@@ -1,9 +1,9 @@
 # @trevrpc/effect
 
-[Effect](https://effect.website) adapter for the TrevRPC browser client, [`@trevrpc/trevrpc-js`](https://www.npmjs.com/package/@trevrpc/trevrpc-js): it wraps a generated client so that its calls are effects and streams.
+[Effect](https://effect.website) adapter for the TrevRPC browser client, [`@trevrpc/trevrpc-js`](https://www.npmjs.com/package/@trevrpc/trevrpc-js): it makes clients whose calls are effects and streams.
 
 ```sh
-npm install @trevrpc/effect @trevrpc/trevrpc-js effect
+npm install @trevrpc/effect @trevrpc/trevrpc-js @bufbuild/protobuf effect
 ```
 
 ```ts
@@ -11,10 +11,10 @@ import { createChannel } from "@trevrpc/trevrpc-js";
 import { createEffectClient } from "@trevrpc/effect";
 import { Stream } from "effect";
 
-import { GreeterClient, GreeterService } from "./gen/greeter/v1/greeter.trevrpc.js";
+import { Greeter } from "./gen/greeter/v1/greeter_pb.js";
 
 const channel = createChannel("https://example.com/trevrpc");
-const greeter = createEffectClient(GreeterService, new GreeterClient(channel));
+const greeter = createEffectClient(Greeter, channel);
 
 // Effect<HelloReply, TrevRpcError>
 const reply = greeter.sayHello({ name: "Ada" });
@@ -28,7 +28,7 @@ const replies = greeter.chat(
 );
 ```
 
-`createEffectClient(service, client)` takes the generated descriptor and client, and returns a client with the same method names:
+`createEffectClient(service, transport, options?)` takes what `createClient` of `@trevrpc/trevrpc-js` takes: a service descriptor that [protobuf-es](https://github.com/bufbuild/protobuf-es)'s `protoc-gen-es` generates, a transport such as a channel, and default call options and interceptors. It returns a client with one method per RPC, named by its `localName`:
 
 | RPC kind                | Effect method                                                                           |
 | ----------------------- | --------------------------------------------------------------------------------------- |

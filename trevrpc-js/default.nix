@@ -41,7 +41,7 @@ buildNpmPackage (final: {
   pname = "trevrpc-js";
   inherit (jsPackage) version;
 
-  # The interop clients are generated from the shared interop protos, which import the TrevRPC
+  # The interop descriptors are generated from the shared interop protos, which import the TrevRPC
   # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
   # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
   # module is built on its own; only the script that embeds it is needed here. The Effect adapter
@@ -72,8 +72,8 @@ buildNpmPackage (final: {
     npmRoot = ./.;
   };
 
-  # Embeds the libzstd module into src/zstd-wasm.js, generates the Echo, UnreliableEcho and
-  # CompressedEcho clients with protoc, and bundles the interop page into build/interop/.
+  # Embeds the libzstd module into src/zstd-wasm.js, generates the protobuf-es descriptors of the
+  # interop and test protos with protoc, and bundles the interop page into build/interop/.
   npmBuildScript = "build";
   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
   TREVRPC_ZSTD_WASM = "${zstdWasm}/libzstd.wasm";
@@ -83,11 +83,6 @@ buildNpmPackage (final: {
     protobuf
   ];
 
-  # protoc runs the plugin directly, so it needs a shebang that exists in the sandbox.
-  postPatch = ''
-    patchShebangs bin/protoc-gen-trevrpc-js.js
-  '';
-
   doCheck = true;
   checkPhase = ''
     runHook preCheck
@@ -95,13 +90,20 @@ buildNpmPackage (final: {
     runHook postCheck
   '';
 
-  # The pruned install drops devDependencies; the interop CLI needs playwright at runtime.
+  # The pruned install drops devDependencies; the interop CLI needs playwright at runtime, and the
+  # library its peer dependency @bufbuild/protobuf, which the installed package carries so that it
+  # loads on its own, as the Effect adapter's build and the checks below load it.
   preInstall = ''
-    mkdir -p "$TMPDIR/interop-node_modules"
+    mkdir -p "$TMPDIR/interop-node_modules" "$TMPDIR/peer-node_modules/@bufbuild"
     cp -R node_modules/playwright node_modules/playwright-core "$TMPDIR/interop-node_modules/"
+    cp -R node_modules/@bufbuild/protobuf "$TMPDIR/peer-node_modules/@bufbuild/"
   '';
 
   postInstall = ''
+    library="$out/lib/node_modules/@trevrpc/trevrpc-js"
+    mkdir -p "$library/node_modules"
+    cp -R "$TMPDIR/peer-node_modules/@bufbuild" "$library/node_modules/"
+
     interop="$out/lib/trevrpc-interop-browser"
     mkdir -p "$interop/interop-browser" "$interop/build/interop"
     cp interop-browser/cli.js interop-browser/driver.js interop-browser/names.js \
@@ -121,12 +123,10 @@ buildNpmPackage (final: {
     runHook preInstallCheck
     library="$out/lib/node_modules/@trevrpc/trevrpc-js"
 
-    IFS= read -r installed_shebang < "$library/bin/protoc-gen-trevrpc-js.js"
-    test "$installed_shebang" = "#!${nodejs_26}/bin/node"
-    test -x "$out/bin/protoc-gen-trevrpc-js"
     test -x "$out/bin/trevrpc-interop-browser"
+    test ! -e "$out/bin/protoc-gen-trevrpc-js"
 
-    # The published package is the browser client and the generator, nothing else.
+    # The published package is the browser client, nothing else.
     export HOME="$TMPDIR/home"
     mkdir -p "$HOME"
     tarball="$(npm pack . --silent --pack-destination "$TMPDIR")"
@@ -137,8 +137,7 @@ buildNpmPackage (final: {
     grep -qx 'package/src/zstd.js' tarball.list
     grep -qx 'package/src/zstd.d.ts' tarball.list
     grep -qx 'package/src/zstd-wasm.js' tarball.list
-    grep -qx 'package/bin/protoc-gen-trevrpc-js.js' tarball.list
-    ! grep -E 'interop|test/|build/|native|node_modules|\.rs$|Cargo' tarball.list
+    ! grep -E 'interop|test/|build/|bin/|tools/|native|node_modules|\.rs$|Cargo' tarball.list
 
     (
       cd "$out/lib"
@@ -146,10 +145,8 @@ buildNpmPackage (final: {
         import assert from "node:assert/strict";
         const runtime = await import("@trevrpc/trevrpc-js");
         assert.deepEqual(Object.keys(runtime).sort(), [
-          "Channel", "Code", "NullValue", "TrevRpcError", "codeName", "connect",
-          "createChannel", "createRoot", "createServiceClient", "durationFromMs", "durationMs",
-          "fetchServerCertificateHashes", "protobuf", "structFromJson", "structToJson", "timestampDate", "timestampFromDate",
-          "timestampFromMs", "timestampMs", "valueFromJson", "valueToJson",
+          "Channel", "Code", "TrevRpcError", "codeName", "connect", "createChannel", "createClient",
+          "fetchServerCertificateHashes",
         ]);
         const zstd = await import("@trevrpc/trevrpc-js/zstd");
         assert.deepEqual(Object.keys(zstd), ["createCompression"]);
@@ -185,8 +182,8 @@ buildNpmPackage (final: {
   passthru = { inherit zstdWasm; };
 
   meta = {
-    mainProgram = "protoc-gen-trevrpc-js";
-    description = "Browser WebTransport client and protobuf.js code generator for TrevRPC";
+    mainProgram = "trevrpc-interop-browser";
+    description = "Browser WebTransport client for TrevRPC, on protobuf-es";
     license = lib.licenses.mit;
     # The interop CLI needs the Playwright browsers from nixpkgs.
     platforms = [

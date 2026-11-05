@@ -1,12 +1,12 @@
 // The load benchmark's browser client: runs one scenario of bench/README.md over one lane for a
 // warmup and a measured window, and summarizes it as the native clients do. It only needs the web
 // platform, so the measuring also runs under Node tests.
-import { createClient } from "@connectrpc/connect";
+import { createClient as createConnectClient } from "@connectrpc/connect";
 import { createConnectTransport, createGrpcWebTransport } from "@connectrpc/connect-web";
 
-import { Echo } from "../build/interop/gen-es/interop_pb.js";
-import { CompressedEchoClient } from "../build/interop/gen/compressed.trevrpc.js";
-import { EchoClient } from "../build/interop/gen/interop.trevrpc.js";
+import { CompressedEcho } from "../build/interop/gen/compressed_pb.js";
+import { Echo } from "../build/interop/gen/interop_pb.js";
+import { createClient } from "../src/index.js";
 import { BenchLanes, Compressions } from "./bench-lanes.js";
 import { interopCompression } from "./compression.js";
 import { connectLane } from "./lane.js";
@@ -174,7 +174,7 @@ async function trevrpcTarget(input, signal) {
     channel.close();
     throw new Error(`connected over ${channel.transport}, want ${input.transport}`);
   }
-  const echo = mode.stream ? new CompressedEchoClient(channel) : new EchoClient(channel);
+  const echo = createClient(mode.stream ? CompressedEcho : Echo, channel);
   const pad = padValue(input);
   const options = { signal, ...(pad && { metadata: { [PadKey]: pad } }) };
   const operations = {
@@ -270,7 +270,10 @@ function resourceTiming(url, timeoutMs) {
 async function fetchTarget(input, lane, signal) {
   const createTransport =
     lane.protocol === "connect" ? createConnectTransport : createGrpcWebTransport;
-  const client = createClient(Echo, createTransport({ baseUrl: input.url, useBinaryFormat: true }));
+  const client = createConnectClient(
+    Echo,
+    createTransport({ baseUrl: input.url, useBinaryFormat: true }),
+  );
   const pad = padValue(input);
   const options = { signal, ...(pad && { headers: { [PadKey]: pad } }) };
 

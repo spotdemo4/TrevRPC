@@ -859,5 +859,5 @@ function timeoutField({ timeoutMs }) {
   if (nanos > MaxUint64) {
     throw invalidArgument("RPC timeout does not fit in 64-bit nanoseconds");
   }
-  return { timeoutNanos: String(nanos === 0n ? 1n : nanos) };
+  return { timeoutNanos: nanos === 0n ? 1n : nanos };
 }

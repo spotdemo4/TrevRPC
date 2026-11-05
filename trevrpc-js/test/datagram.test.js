@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { EchoClient, root } from "../build/interop/gen/interop.trevrpc.js";
-import { UnreliableEchoClient } from "../build/interop/gen/unreliable.trevrpc.js";
+import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/interop/gen/interop_pb.js";
+import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
+import { OneWayUnreliableEcho } from "../build/test/gen/methods_pb.js";
 import { Channel } from "../src/channel.js";
+import { createClient } from "../src/client.js";
 import { encodeMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import { FrameType, marshalMessage, unmarshalMessage } from "../src/framing.js";
@@ -11,16 +13,15 @@ import { Code } from "../src/status.js";
 import { RpcKind } from "../src/wire.js";
 import { deferred, fakeDatagrams, fakeTransport, isPending, turn } from "./support.js";
 
-const EchoRequest = root.lookupType("trevrpc.interop.v1.EchoRequest");
-const EchoResponse = root.lookupType("trevrpc.interop.v1.EchoResponse");
-
 const ownFlow = (request) => Number(request.datagramFlow);
 
 /** A response datagram for a flow with one message per name, as the server sends it. */
 const responseDatagram = (flow, ...messages) =>
   encodeDatagram(
     flow,
-    messages.map((message) => encodeMessage(marshalMessage(EchoResponse, { message, index: 0 }))),
+    messages.map((message) =>
+      encodeMessage(marshalMessage(EchoResponseSchema, { message, index: 0 })),
+    ),
   );
 
 /** The request messages carried by a datagram the client sent, and its flow. */
@@ -28,7 +29,7 @@ function decodeRequestDatagram(datagram) {
   const { flow, messages } = decodeDatagram(datagram);
   return {
     flow,
-    messages: messages.map(({ payload }) => unmarshalMessage(EchoRequest, payload).message),
+    messages: messages.map(({ payload }) => unmarshalMessage(EchoRequestSchema, payload).message),
   };
 }
 
@@ -60,7 +61,7 @@ test("a call to an unreliable method gets a flow per call, counted per session",
   const first = sessionWith(fakeDatagrams(), serving(requests));
   const calls = [];
   for (let index = 0; index < 3; index += 1) {
-    calls.push(await new UnreliableEchoClient(first).bidi());
+    calls.push(await createClient(UnreliableEcho, first).bidi());
   }
   await turn();
   assert.deepEqual(requests.map(ownFlow), [1, 2, 3]);
@@ -69,7 +70,7 @@ test("a call to an unreliable method gets a flow per call, counted per session",
 
   // Another session has its own allocator.
   const second = sessionWith(fakeDatagrams(), serving(requests));
-  calls.push(await new UnreliableEchoClient(second).bidi());
+  calls.push(await createClient(UnreliableEcho, second).bidi());
   await turn();
   assert.equal(ownFlow(requests[3]), 1);
   await Promise.all(calls.map((call) => call.close()));
@@ -78,7 +79,7 @@ test("a call to an unreliable method gets a flow per call, counted per session",
 test("methods that are not unreliable, and sessions without datagrams, get no flow", async () => {
   const requests = [];
   const withDatagrams = sessionWith(fakeDatagrams(), serving(requests));
-  const echo = new EchoClient(withDatagrams);
+  const echo = createClient(Echo, withDatagrams);
   await (await echo.bidi()).close();
   await (await echo.clientStream()).close();
   await turn();
@@ -86,13 +87,13 @@ test("methods that are not unreliable, and sessions without datagrams, get no fl
 
   // A session like QMux over WebSocket, which has no datagrams at all.
   const noDatagrams = fakeTransport(serving(requests));
-  await (await new UnreliableEchoClient(noDatagrams).bidi()).close();
+  await (await createClient(UnreliableEcho, noDatagrams).bidi()).close();
   await turn();
   assert.equal(ownFlow(requests[2]), 0);
 
   // Datagrams that cannot be read are as good as none.
   const unreadable = sessionWith({ readable: undefined }, serving(requests));
-  await (await new UnreliableEchoClient(unreadable).bidi()).close();
+  await (await createClient(UnreliableEcho, unreadable).bidi()).close();
   await turn();
   assert.equal(ownFlow(requests[3]), 0);
 });
@@ -101,28 +102,7 @@ test("only the directions a method marks unreliable use datagrams", async () => 
   const requests = [];
   const datagrams = fakeDatagrams();
   const transport = sessionWith(datagrams, serving(requests));
-  const service = {
-    name: "S",
-    fullName: "trevrpc.interop.v1.S",
-    methods: {
-      upload: {
-        name: "Upload",
-        kind: "clientStreaming",
-        inputType: "trevrpc.interop.v1.EchoRequest",
-        outputType: "trevrpc.interop.v1.EchoResponse",
-        unreliableRequests: true,
-      },
-      watch: {
-        name: "Watch",
-        kind: "serverStreaming",
-        inputType: "trevrpc.interop.v1.EchoRequest",
-        outputType: "trevrpc.interop.v1.EchoResponse",
-        unreliableResponses: true,
-      },
-    },
-  };
-  const { createServiceClient } = await import("../src/client.js");
-  const client = createServiceClient(transport, service, root);
+  const client = createClient(OneWayUnreliableEcho, transport);
 
   const upload = await client.upload();
   await upload.send({ message: "u" });
@@ -144,7 +124,7 @@ test("request messages that fit go out as datagrams after REQUEST, others on the
     }
     served.resolve();
   });
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
 
   await call.send({ message: "small" });
   assert.equal(datagrams.sent.length, 1);
@@ -153,7 +133,7 @@ test("request messages that fit go out as datagrams after REQUEST, others on the
   // The largest message that fits: flow ID (1 byte), frame header (2 bytes), and 37 bytes of
   // message, which is a 35 character string.
   const fits = "x".repeat(35);
-  const exact = marshalMessage(EchoRequest, { message: fits });
+  const exact = marshalMessage(EchoRequestSchema, { message: fits });
   assert.equal(exact.byteLength, 37);
   await call.send({ message: fits });
   assert.equal(datagrams.sent.length, 2);
@@ -168,7 +148,7 @@ test("request messages that fit go out as datagrams after REQUEST, others on the
     frames.map((frame) => frame.type),
     [FrameType.Message],
   );
-  assert.equal(unmarshalMessage(EchoRequest, frames[0].payload).message, fits + "x");
+  assert.equal(unmarshalMessage(EchoRequestSchema, frames[0].payload).message, fits + "x");
   assert.equal(datagrams.writables, 1, "all calls share one writer");
   await call.close();
 });
@@ -182,7 +162,7 @@ test("without maxDatagramSize the limit is 1100 bytes", async () => {
       frames.push(frame);
     }
   });
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   // 1100 bytes in total: 1 flow byte, 3 bytes of frame header, 1096 bytes of message, which is a
   // 1093 character string.
   await call.send({ message: "x".repeat(1093) });
@@ -198,7 +178,7 @@ test("without maxDatagramSize the limit is 1100 bytes", async () => {
 test("messages sent together share a datagram, in order, within the size limit", async () => {
   const datagrams = fakeDatagrams({ maxDatagramSize: 40 });
   const transport = sessionWith(datagrams, serving([]));
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
 
   // Each message is a 15 byte frame payload plus 2 bytes of header: two fit with the flow ID.
   const names = ["a", "b", "c", "d", "e"].map((name) => name.repeat(13));
@@ -216,7 +196,7 @@ test("messages queued while a datagram waits for buffer space join the next data
   const release = deferred();
   datagrams.gate = release.promise;
   const transport = sessionWith(datagrams, serving([]));
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
 
   const sends = [call.send({ message: "first" })];
   await turn();
@@ -237,11 +217,11 @@ test("a message that cannot be a datagram goes on the stream without reordering 
   const messages = [];
   const transport = sessionWith(datagrams, async (stream) => {
     await stream.readRequest();
-    for (let message; (message = await stream.readMessage(EchoRequest)) !== null;) {
+    for (let message; (message = await stream.readMessage(EchoRequestSchema)) !== null;) {
       messages.push(message.message);
     }
   });
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   const big = "B".repeat(100);
   await Promise.all(["a", big, "c", "d"].map((message) => call.send({ message })));
   await call.closeSend();
@@ -260,11 +240,11 @@ test("a failed datagram write sends every message of that datagram on the stream
   const messages = [];
   const transport = sessionWith(datagrams, async (stream) => {
     await stream.readRequest();
-    for (let message; (message = await stream.readMessage(EchoRequest)) !== null;) {
+    for (let message; (message = await stream.readMessage(EchoRequestSchema)) !== null;) {
       messages.push(message.message);
     }
   });
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   await Promise.all(["a", "b", "c"].map((message) => call.send({ message })));
   await call.closeSend();
   await turn();
@@ -279,10 +259,10 @@ test("a failed datagram write sends that message on the stream instead", async (
   const transport = sessionWith(datagrams, async (stream) => {
     await stream.readRequest();
     for (let frame; (frame = await stream.readFrame()) !== null;) {
-      frames.push(unmarshalMessage(EchoRequest, frame.payload).message);
+      frames.push(unmarshalMessage(EchoRequestSchema, frame.payload).message);
     }
   });
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   await call.send({ message: "a" });
   await call.send({ message: "b" });
   await call.closeSend();
@@ -302,7 +282,7 @@ test("a session without a datagram writer sends everything on the stream", async
       frames.push(frame);
     }
   });
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   await call.send({ message: "a" });
   await call.closeSend();
   await turn();
@@ -315,7 +295,7 @@ test("waiting for send-buffer space honours the call's cancellation", async () =
   datagrams.gate = new Promise(() => {}); // the transport accepts no datagram
   const transport = sessionWith(datagrams, serving([]));
   const controller = new AbortController();
-  const call = await new UnreliableEchoClient(transport).bidi({ signal: controller.signal });
+  const call = await createClient(UnreliableEcho, transport).bidi({ signal: controller.signal });
 
   const sending = call.send({ message: "stuck" });
   sending.catch(() => {});
@@ -325,7 +305,7 @@ test("waiting for send-buffer space honours the call's cancellation", async () =
 
   // Another call of the session is not blocked by the cancelled one: its message waits for the
   // transport too, and it is released by its own deadline.
-  const other = await new UnreliableEchoClient(transport).bidi({ timeoutMs: 20 });
+  const other = await createClient(UnreliableEcho, transport).bidi({ timeoutMs: 20 });
   await assert.rejects(
     other.send({ message: "x" }),
     (error) => error.code === Code.DeadlineExceeded,
@@ -338,7 +318,7 @@ test("closeSend comes after the datagram sends in flight", async () => {
   datagrams.gate = release.promise;
   const requests = [];
   const transport = sessionWith(datagrams, serving(requests));
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
 
   const sending = call.send({ message: "a" });
   const closing = call.closeSend();
@@ -363,15 +343,15 @@ test("response datagrams merge with stream messages in arrival order", async () 
       flows.resolve(ownFlow(request));
       await written.promise;
       await stream.writeHeaders();
-      await stream.writeMessage(EchoResponse, { message: "stream-1", index: 0 });
+      await stream.writeMessage(EchoResponseSchema, { message: "stream-1", index: 0 });
       await turn();
       datagrams.push(responseDatagram(ownFlow(request), "dgram-1"));
       await turn();
-      await stream.writeMessage(EchoResponse, { message: "stream-2", index: 1 });
+      await stream.writeMessage(EchoResponseSchema, { message: "stream-2", index: 1 });
       await finishCall(stream);
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   written.resolve();
   await flows.promise;
 
@@ -394,7 +374,7 @@ test("a datagram of several messages delivers them in order; malformed ones are 
       const truncated = responseDatagram(flow, "lost-1", "lost-2");
       datagrams.push(truncated.subarray(0, truncated.byteLength - 1));
       // Frames of other types are skipped, with any varint form of type and length.
-      const hi = marshalMessage(EchoResponse, { message: "four", index: 0 });
+      const hi = marshalMessage(EchoResponseSchema, { message: "four", index: 0 });
       datagrams.push(
         Uint8Array.of(
           flow,
@@ -416,7 +396,7 @@ test("a datagram of several messages delivers them in order; malformed ones are 
       await finishCall(stream);
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   const received = [];
   for await (const response of call) {
     received.push(response.message);
@@ -433,11 +413,11 @@ test("datagrams wait for HEADERS", async () => {
       datagrams.push(responseDatagram(ownFlow(request), "early"));
       await release.promise;
       await stream.writeHeaders();
-      await stream.writeMessage(EchoResponse, { message: "late", index: 0 });
+      await stream.writeMessage(EchoResponseSchema, { message: "late", index: 0 });
       await finishCall(stream);
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
 
   const receiving = call.recv();
   assert.equal(await isPending(receiving), true, "the datagram is held until HEADERS");
@@ -460,7 +440,7 @@ test("a pending recv wakes on a datagram without any stream frame", async () => 
       await finishCall(stream);
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   const flow = await ready.promise;
   const receiving = call.recv();
   await turn();
@@ -485,7 +465,7 @@ test("datagram messages queued before STATUS are delivered, later ones dropped",
       await finishCall(stream);
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   const flow = await flowOf.promise;
   await turn(5);
   status.resolve();
@@ -508,7 +488,7 @@ test("datagrams for unknown or ended flows are dropped without disturbing other 
       }
     }),
   );
-  const client = new UnreliableEchoClient(transport);
+  const client = createClient(UnreliableEcho, transport);
   const first = await client.bidi();
   assert.equal(await first.recv(), undefined);
 
@@ -533,7 +513,7 @@ test("a datagram that is not a valid message fails the call like a stream messag
       );
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   await assert.rejects(call.recv(), (error) => error.code === Code.InvalidArgument);
 });
 
@@ -555,7 +535,7 @@ test("a full receive queue drops datagrams instead of blocking the reader", asyn
       await finishCall(stream);
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi();
+  const call = await createClient(UnreliableEcho, transport).bidi();
   await pushed.promise;
   await call.status;
 
@@ -581,7 +561,7 @@ test("an oversized datagram message is dropped", async () => {
       await finishCall(stream);
     }),
   );
-  const call = await new UnreliableEchoClient(transport).bidi({ maxFrameSize: 64 });
+  const call = await createClient(UnreliableEcho, transport).bidi({ maxFrameSize: 64 });
   assert.equal((await call.recv()).message, "ok");
   assert.equal(await call.recv(), undefined);
 });
@@ -595,7 +575,7 @@ test("a cancelled call releases its flow", async () => {
       await stream.writeHeaders();
     }),
   );
-  const client = new UnreliableEchoClient(transport);
+  const client = createClient(UnreliableEcho, transport);
   const call = await client.bidi();
   await call.headers;
   await call.close();
@@ -644,7 +624,7 @@ test("a channel gives calls the datagrams of the session that carries them", asy
     WebTransport,
   });
   const [first] = sessions;
-  const client = new UnreliableEchoClient(channel);
+  const client = createClient(UnreliableEcho, channel);
   await (await client.bidi()).close();
   await turn();
   assert.deepEqual(first.requests.map(ownFlow), [1]);
@@ -688,7 +668,7 @@ test("a channel without datagrams, like QMux over WebSocket, sends no flow", asy
     transports: ["webtransport"],
     WebTransport,
   });
-  const call = await new UnreliableEchoClient(channel).bidi();
+  const call = await createClient(UnreliableEcho, channel).bidi();
   await call.send({ message: "stream" });
   await turn();
   assert.deepEqual(sessions[0].requests.map(ownFlow), [0]);
