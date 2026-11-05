@@ -27,8 +27,9 @@ mkGoModule (final: {
     export HOME=$(mktemp -d)
     go test ./...
     # int is 32 bits wide on 386 and arm. A cgo build would need a 32-bit C
-    # toolchain, and PIE needs cgo there.
-    CGO_ENABLED=0 GOARCH=386 go vet -buildmode=default ./...
+    # toolchain, and PIE needs cgo there. GOOS is pinned because the host's
+    # may have no 32-bit port (darwin/386 does not exist).
+    CGO_ENABLED=0 GOOS=linux GOARCH=386 go vet -buildmode=default ./...
     runHook postCheck
   '';
 
