@@ -204,7 +204,7 @@ func TestServerRejectsOversizedAndTruncatedRequestFrames(t *testing.T) {
 		input []byte
 		code  Code
 	}{
-		{name: "oversized REQUEST", input: appendFrameHeader(nil, frameTypeRequest, 1<<40), code: CodeResourceExhausted},
+		{name: "oversized REQUEST", input: appendFrameHeader(nil, frameTypeRequest, 1<<30), code: CodeResourceExhausted},
 		{name: "oversized MESSAGE", input: concat(request, appendFrameHeader(nil, frameTypeMessage, 65)), code: CodeResourceExhausted},
 		{name: "oversized grease", input: concat(appendFrameHeader(nil, 0x21, 65), request), code: CodeResourceExhausted},
 		{name: "MESSAGE at the limit", input: concat(request, rawMessage(bytes.Repeat([]byte{0x0a, 0x00}, 32)).frame), code: CodeOK},

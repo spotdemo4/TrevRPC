@@ -17,10 +17,13 @@ func TestStreamLimitsLeaveRoomForReturningCreditOnlyWhereItLags(t *testing.T) {
 
 func TestStreamLimitsSaturate(t *testing.T) {
 	options := ServerOptions{MaxConcurrentStreamsPerConnection: math.MaxInt}
-	if got := serverStreamLimit(options); got != maxStreamCount {
-		t.Errorf("serverStreamLimit = %d, want the QUIC maximum %d", got, int64(maxStreamCount))
+	// A 32-bit int stays below the QUIC maximum even with spare credit.
+	wantStreams := int64(min(uint64(math.MaxInt)*streamCreditFactor, maxStreamCount))
+	if got := serverStreamLimit(options); got != wantStreams {
+		t.Errorf("serverStreamLimit = %d, want %d, at most the QUIC maximum", got, wantStreams)
 	}
-	if got := http2StreamLimit(options); got != math.MaxUint32 {
-		t.Errorf("http2StreamLimit = %d, want the HTTP/2 maximum %d", got, uint32(math.MaxUint32))
+	wantHTTP2 := int(min(uint64(math.MaxUint32), math.MaxInt))
+	if got := http2StreamLimit(options); got != wantHTTP2 {
+		t.Errorf("http2StreamLimit = %d, want the HTTP/2 maximum %d that fits in int", got, wantHTTP2)
 	}
 }

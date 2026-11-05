@@ -118,11 +118,13 @@ func TestReadFrameLargePartialBodyDoesNotAllocateAdvertisedLength(t *testing.T) 
 func TestOversizedFrameLengthIsRejectedBeforeAllocation(t *testing.T) {
 	for _, typ := range []frameType{frameTypeMessage, frameTypeRequest, frameTypeHeaders, frameTypeStatus, 0x21, 0x40} {
 		t.Run(typ.String(), func(t *testing.T) {
-			header := appendFrameHeader(nil, typ, 1<<40)
+			// A length beyond int on 32-bit platforms is reported as math.MaxInt.
+			const length = uint64(1 << 40)
+			header := quicvarint.Append(quicvarint.Append(nil, uint64(typ)), length)
 			allocated := measureAllocation(func() {
 				_, err := newFrameReader(bytes.NewReader(header), DefaultMaxFrameSize, -1).next()
 				tooLarge, ok := errors.AsType[*FrameTooLargeError](err)
-				if !ok || tooLarge.Len != 1<<40 || tooLarge.Max != DefaultMaxFrameSize {
+				if !ok || uint64(tooLarge.Len) != min(length, math.MaxInt) || tooLarge.Max != DefaultMaxFrameSize {
 					t.Fatalf("oversized frame error = %v, want FrameTooLargeError", err)
 				}
 				if status := StatusFromError(err); status.Code != CodeResourceExhausted {
@@ -1664,7 +1666,6 @@ func TestServerOptionsCanonicalizeSafePartialValues(t *testing.T) {
 func TestServerOptionsRejectInvalidValues(t *testing.T) {
 	tests := []ServerOptions{
 		{MaxFrameSize: -1},
-		{MaxFrameSize: int(uint64(quicvarint.Max) + 1)},
 		{MaxConcurrentConnections: -1},
 		{MaxConcurrentStreamsPerConnection: -1},
 		{MaxConcurrentRequests: -1},
@@ -1676,6 +1677,10 @@ func TestServerOptionsRejectInvalidValues(t *testing.T) {
 		{ConnectionIdleTimeout: -time.Nanosecond},
 		{GracefulShutdownTimeout: -time.Nanosecond},
 		{HTTPPath: "relative"},
+	}
+	// Only a 64-bit int can exceed the frame length limit.
+	if overLimit := uint64(quicvarint.Max) + 1; overLimit <= math.MaxInt {
+		tests = append(tests, ServerOptions{MaxFrameSize: int(overLimit)})
 	}
 	for index, options := range tests {
 		func() {

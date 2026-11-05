@@ -65,9 +65,11 @@ func serverStreamLimit(options ServerOptions) int64 {
 
 // http2StreamLimit is SETTINGS_MAX_CONCURRENT_STREAMS. HTTP/2 frees a stream
 // as soon as both ends finish it, so one spare stream is enough: it lets an
-// over-limit RPC receive a TrevRPC status instead of waiting for a stream.
+// over-limit RPC receive a TrevRPC status instead of waiting for a stream. The
+// setting is a 32-bit value, and int is only 32 bits wide on some platforms.
 func http2StreamLimit(options ServerOptions) int {
-	return min(options.MaxConcurrentStreamsPerConnection, math.MaxUint32-1) + 1
+	limit := saturatingAddUint64(uint64(options.MaxConcurrentStreamsPerConnection), 1)
+	return int(min(limit, math.MaxUint32, math.MaxInt))
 }
 
 func saturatingAddUint64(left, right uint64) uint64 {

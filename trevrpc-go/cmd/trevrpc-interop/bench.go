@@ -130,7 +130,7 @@ func (c *benchConfig) validate() error {
 		return errors.New("bench: --concurrency must be at least 1")
 	case c.connections < 1 || c.connections > c.concurrency:
 		return errors.New("bench: --connections must be between 1 and --concurrency")
-	case c.messages < 1 || c.messages > math.MaxUint32:
+	case c.messages < 1 || uint64(c.messages) > math.MaxUint32:
 		return errors.New("bench: --messages must be between 1 and 2^32-1")
 	case !(c.rate > 0) || time.Duration(float64(time.Second)/c.rate) < 1:
 		return errors.New("bench: --rate must be positive and at most 10^9")
