@@ -65,6 +65,10 @@ func (l *Listener) handleWebTransport(w http.ResponseWriter, r *http.Request) {
 		datagramOverhead = quicvarint.Len(uint64(streamer.HTTPStream().StreamID()) / 4)
 	}
 
+	peer := l.newQUICPeer(session)
+	if state, ok := r.Context().Value(httpConnStateKey{}).(*httpConnState); ok && state.quic != nil {
+		peer = state.quic
+	}
 	datagrams := l.newDatagramMux(session, datagramOverhead)
 	defer datagrams.close()
 	connectionMetadata := new(connectionMetadataStore)
@@ -78,7 +82,7 @@ func (l *Listener) handleWebTransport(w http.ResponseWriter, r *http.Request) {
 			draining.datagrams = datagrams
 			draining.connectionMetadata = connectionMetadata
 			// Read per stream: the client may have migrated to a new address.
-			draining.remoteAddr = addrPortOf(session.RemoteAddr())
+			draining.remoteAddr = peer.remoteAddr()
 			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = session.CloseWithError(0, message) },

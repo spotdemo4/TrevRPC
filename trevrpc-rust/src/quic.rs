@@ -2,7 +2,9 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::FutureExt as _;
@@ -12,6 +14,7 @@ use crate::framed::Chunked;
 use crate::mux::{MuxConnection, MuxRecvStream, MuxSendStream};
 use crate::request_pump::{RESET_PROBE_INTERVAL, RequestTransportEvent};
 use crate::server::canonical_addr;
+use crate::udp::{ProxiedClients, ProxiedPeer};
 use crate::{Error, Result};
 
 /// The longest `TrevRPC` frame header: a type and a length, each a QUIC variable-length integer
@@ -69,6 +72,78 @@ impl MuxConnection for quinn::Connection {
 
     fn datagrams(&self) -> Option<Self> {
         Some(self.clone())
+    }
+}
+
+/// A connection the server accepted, which knows the clients that the trusted proxies in front of
+/// its endpoint name.
+#[derive(Clone)]
+pub struct ServerConnection {
+    connection: quinn::Connection,
+    /// The client behind a trusted proxy, or `None` when the endpoint trusts none.
+    proxied: Option<Arc<ProxiedPeer>>,
+}
+
+impl ServerConnection {
+    /// Wraps `connection`, which has completed its handshake, and looks up its client among
+    /// `clients`.
+    pub fn new(connection: quinn::Connection, clients: Option<Arc<ProxiedClients>>) -> Self {
+        let proxied = clients.map(|clients| Arc::new(ProxiedPeer::new(clients, &connection)));
+        Self {
+            connection,
+            proxied,
+        }
+    }
+
+    /// The client's address (see [`crate::server::RequestContext::remote_addr`]). Read it for
+    /// every call: the client may have migrated since the connection was accepted.
+    pub fn client_addr(&self) -> SocketAddr {
+        match &self.proxied {
+            Some(proxied) => proxied.client_addr(&self.connection),
+            None => canonical_addr(self.connection.remote_address()),
+        }
+    }
+}
+
+impl Deref for ServerConnection {
+    type Target = quinn::Connection;
+
+    fn deref(&self) -> &quinn::Connection {
+        &self.connection
+    }
+}
+
+impl MuxConnection for ServerConnection {
+    type SendStream = QuicSendStream;
+    type RecvStream = Chunked<quinn::RecvStream>;
+    type Datagrams = quinn::Connection;
+
+    fn accept_stream(
+        &self,
+    ) -> impl Future<Output = Option<(QuicSendStream, Chunked<quinn::RecvStream>)>> + Send {
+        MuxConnection::accept_stream(&self.connection)
+    }
+
+    fn open_stream(
+        &self,
+    ) -> impl Future<Output = Result<(QuicSendStream, Chunked<quinn::RecvStream>)>> + Send {
+        MuxConnection::open_stream(&self.connection)
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        Some(self.client_addr())
+    }
+
+    fn close_connection(&self, reason: &'static [u8]) {
+        MuxConnection::close_connection(&self.connection, reason);
+    }
+
+    fn connection_lost(&self) -> impl Future<Output = Error> + Send {
+        MuxConnection::connection_lost(&self.connection)
+    }
+
+    fn datagrams(&self) -> Option<quinn::Connection> {
+        Some(self.connection.clone())
     }
 }
 

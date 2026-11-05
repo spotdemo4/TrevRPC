@@ -3,6 +3,8 @@ package trevrpc
 import (
 	"context"
 	"net"
+	"net/netip"
+	"sync/atomic"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -23,7 +25,13 @@ func (l *Listener) listenQUIC(addr string, options ListenOptions) (connSource, e
 	if err != nil {
 		return connSource{}, Unavailable("listen: " + err.Error())
 	}
-	tr := &quic.Transport{Conn: udp}
+	var conn net.PacketConn = udp
+	l.udpClients = nil
+	if len(l.trustedUDPProxies) > 0 {
+		proxied := newProxiedUDPConn(udp, l.trustedUDPProxies, l.runtime.emitDiagnostic)
+		conn, l.udpClients = proxied, proxied.clients
+	}
+	tr := &quic.Transport{Conn: conn, VerifySourceAddress: addressValidator(l.runtime.options)}
 	ql, err := tr.Listen(tlsConfig, serverQUICConfig(options.QUICConfig, l.runtime.options))
 	if err != nil {
 		_ = udp.Close()
@@ -68,6 +76,7 @@ func (l *Listener) serveQUICConn(conn *quic.Conn) {
 }
 
 func (l *Listener) serveNative(conn *quic.Conn) {
+	peer := l.newQUICPeer(conn)
 	datagrams := l.newDatagramMux(conn, 0)
 	defer datagrams.close()
 	connectionMetadata := new(connectionMetadataStore)
@@ -81,7 +90,7 @@ func (l *Listener) serveNative(conn *quic.Conn) {
 			draining.datagrams = datagrams
 			draining.connectionMetadata = connectionMetadata
 			// Read per stream: the client may have migrated to a new address.
-			draining.remoteAddr = addrPortOf(conn.RemoteAddr())
+			draining.remoteAddr = peer.remoteAddr()
 			return draining, stream.Context(), nil
 		},
 		close:               func(message string) { _ = conn.CloseWithError(0, message) },
@@ -97,4 +106,51 @@ func (l *Listener) serveNative(conn *quic.Conn) {
 // streams.
 func (l *Listener) newDatagramMux(conn datagramConn, overhead int) *datagramMux {
 	return newDatagramMux(conn, overhead, true, 2*l.runtime.options.MaxConcurrentStreamsPerConnection)
+}
+
+// quicPeer resolves the client address of one QUIC connection.
+type quicPeer struct {
+	conn interface{ RemoteAddr() net.Addr }
+	// clients names the clients of trusted UDP proxies, or is nil when there
+	// are none.
+	clients *proxiedClients
+	last    atomic.Pointer[quicPeerAddrs]
+}
+
+// quicPeerAddrs is a connection's remote address and the client it stands
+// for.
+type quicPeerAddrs struct {
+	peer, client netip.AddrPort
+}
+
+// newQUICPeer resolves the client address of conn, which has completed its
+// handshake.
+func (l *Listener) newQUICPeer(conn interface{ RemoteAddr() net.Addr }) *quicPeer {
+	peer := &quicPeer{conn: conn, clients: l.udpClients}
+	peer.remoteAddr()
+	return peer
+}
+
+// proxied reports whether p is behind trusted UDP proxies.
+func (p *quicPeer) proxied() bool {
+	return p != nil && p.clients != nil
+}
+
+// remoteAddr returns the client address of the connection: the client the
+// PROXY headers of a trusted UDP proxy at its remote address name, or that
+// address itself. The client is looked up when the connection has completed
+// its handshake, and again only when its remote address changes, so a header
+// forged later in the name of the proxy does not move a connection to another
+// client.
+func (p *quicPeer) remoteAddr() netip.AddrPort {
+	peer := addrPortOf(p.conn.RemoteAddr())
+	if p.clients == nil {
+		return peer
+	}
+	if last := p.last.Load(); last != nil && last.peer == peer {
+		return last.client
+	}
+	client := p.clients.clientOf(peer)
+	p.last.Store(&quicPeerAddrs{peer: peer, client: client})
+	return client
 }

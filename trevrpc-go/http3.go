@@ -16,8 +16,8 @@ func (l *Listener) setupHTTP3() {
 	options := l.runtime.options
 	l.h3 = &http3.Server{
 		Handler: http.HandlerFunc(l.handleHTTP3),
-		ConnContext: func(ctx context.Context, _ *quic.Conn) context.Context {
-			state := &httpConnState{streamLimit: newSemaphore(options.MaxConcurrentStreamsPerConnection)}
+		ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
+			state := &httpConnState{streamLimit: newSemaphore(options.MaxConcurrentStreamsPerConnection), quic: l.newQUICPeer(conn)}
 			return context.WithValue(ctx, httpConnStateKey{}, state)
 		},
 	}
@@ -73,6 +73,11 @@ func (l *Listener) closeHTTP3() {
 }
 
 func (l *Listener) handleHTTP3(w http.ResponseWriter, r *http.Request) {
+	if state, ok := r.Context().Value(httpConnStateKey{}).(*httpConnState); ok && state.quic.proxied() {
+		// Behind a trusted UDP proxy, the request is from the client its
+		// PROXY headers name, for admission, handlers and the fallback alike.
+		r.RemoteAddr = state.quic.remoteAddr().String()
+	}
 	if !l.runtime.options.claimsPath(r.URL.Path) {
 		l.serveFallback(w, r)
 		return

@@ -27,11 +27,18 @@ import (
 // POST /trevrpc request over HTTP/3.
 func newHTTP3TestClient(t testing.TB, pki testPKI, listener *Listener) Transport {
 	t.Helper()
+	return newHTTP3TestClientAt(t, pki, listener.Addr().String())
+}
+
+// newHTTP3TestClientAt returns a Transport that sends every RPC as one
+// HTTP/3 request to addr.
+func newHTTP3TestClientAt(t testing.TB, pki testPKI, addr string) Transport {
+	t.Helper()
 	roundTripper := &http3.Transport{TLSClientConfig: pki.client.Clone()}
 	t.Cleanup(func() { _ = roundTripper.Close() })
 	opener := httpTestOpener{
 		roundTripper: roundTripper,
-		url:          "https://" + listener.Addr().String() + DefaultHTTPPath,
+		url:          "https://" + addr + DefaultHTTPPath,
 	}
 	return newStreamClient(opener, DefaultMaxFrameSize)
 }
@@ -215,7 +222,14 @@ func newWebTransportTestClient(t testing.TB, pki testPKI, listener *Listener, or
 // WT_INITIAL_* SETTINGS, as Safari does, which enables session flow control.
 func newWebTransportTestOpener(t testing.TB, pki testPKI, listener *Listener, origin string, config *webtransport.Config) streamOpener {
 	t.Helper()
-	response, session, err := dialWebTransportTest(pki, listener, webTransportTestDial{origin: origin, config: config})
+	return dialWebTransportTestOpener(t, pki, listener, webTransportTestDial{origin: origin, config: config})
+}
+
+// dialWebTransportTestOpener opens the WebTransport session dial describes and
+// returns an opener for raw streams on it.
+func dialWebTransportTestOpener(t testing.TB, pki testPKI, listener *Listener, dial webTransportTestDial) streamOpener {
+	t.Helper()
+	response, session, err := dialWebTransportTest(pki, listener, dial)
 	if err != nil {
 		t.Fatalf("WebTransport dial: %v", err)
 	}
@@ -238,6 +252,8 @@ type webTransportTestDial struct {
 	// available, if set, is sent as WT-Available-Protocols verbatim and takes
 	// precedence over protocols, which lets tests send malformed fields.
 	available string
+	// addr, if set, is dialed instead of the listener's UDP address.
+	addr string
 }
 
 // dialWebTransportTest opens one WebTransport session to /trevrpc. Like
@@ -259,7 +275,11 @@ func dialWebTransportTest(pki testPKI, listener *Listener, dial webTransportTest
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	return wt.Dial(ctx, "https://"+listener.Addr().String()+DefaultHTTPPath, header)
+	addr := dial.addr
+	if addr == "" {
+		addr = listener.Addr().String()
+	}
+	return wt.Dial(ctx, "https://"+addr+DefaultHTTPPath, header)
 }
 
 type webTransportTestOpener struct{ session *webtransport.Session }

@@ -26,6 +26,8 @@ type httpConnState struct {
 	streamLimit semaphore
 	// conn is the TCP listener's connection; it is nil over HTTP/3.
 	conn net.Conn
+	// quic is the client of an HTTP/3 connection; it is nil over TCP.
+	quic *quicPeer
 }
 
 type httpConnStateKey struct{}

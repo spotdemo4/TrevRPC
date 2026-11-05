@@ -33,15 +33,28 @@ type ListenOptions struct {
 	TCPAddr string
 	// DisableTCP serves QUIC only.
 	DisableTCP bool
-	// TrustedProxies lists the networks of TCP load balancers that forward
-	// client connections with a PROXY protocol header, version 1 or 2, in
-	// front of the TLS handshake. A connection from one of them must begin
-	// with the header, whose source address becomes the client's
-	// RemoteAddr; one from anywhere else is never read for a header. QUIC
-	// connections always report their UDP source address, so load balancers
-	// in front of the UDP socket must preserve it. IPv4 networks match IPv4
-	// clients however the socket reports them.
-	TrustedProxies []netip.Prefix
+	// TrustedTCPProxies lists the networks of TCP load balancers that
+	// forward client connections with a PROXY protocol header, version 1 or
+	// 2, in front of the TLS handshake. A connection from one of them must
+	// begin with the header, whose source address becomes the client's
+	// RemoteAddr; one from anywhere else is never read for a header. IPv4
+	// networks match IPv4 clients however the socket reports them.
+	TrustedTCPProxies []netip.Prefix
+	// TrustedUDPProxies lists the networks of UDP load balancers that
+	// forward every datagram with a PROXY protocol version 2 header in front
+	// of it, which the socket strips. The source address of the headers from
+	// a load balancer's address when the QUIC connection on it completes its
+	// handshake becomes its RemoteAddr, looked up again only when the
+	// connection's address changes, while QUIC keeps talking to the load
+	// balancer. A
+	// datagram from one of them without a valid header is dropped and
+	// reported as a ServerDiagnosticProxyHeaderFailed diagnostic, at most
+	// once every 10 seconds; one from anywhere else is never read for a
+	// header. A LOCAL header, or one for another address family than UDP
+	// over IPv4 or IPv6, leaves the load balancer's own address. The header
+	// takes up to 52 bytes of every datagram, plus any extensions, which the
+	// path between the load balancer and the socket must have room for.
+	TrustedUDPProxies []netip.Prefix
 	// AltSvcPort is the UDP port number that HTTP/2 and HTTP/1.1 responses
 	// advertise for HTTP/3 in their Alt-Svc header. It defaults to the port
 	// number of the UDP socket; set it when clients reach that socket on
@@ -74,9 +87,13 @@ type Listener struct {
 	h3   *http3.Server        // nil unless HTTP/3 or WebTransport is enabled
 	wt   *webtransport.Server // nil unless WebTransport is enabled
 
-	tcp              net.Listener // nil when TCP is disabled
-	tcpTLS           *tls.Config
-	trustedProxies   []netip.Prefix
+	tcp               net.Listener // nil when TCP is disabled
+	tcpTLS            *tls.Config
+	trustedTCPProxies []netip.Prefix
+	trustedUDPProxies []netip.Prefix
+	// udpClients names the clients of trusted UDP proxies, or is nil when
+	// there are none.
+	udpClients       *proxiedClients
 	handshakeTimeout time.Duration
 	httpTCP          *httpTCPServer // nil unless HTTP or WebTransport is enabled
 
@@ -127,7 +144,11 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 	if err := server.compressionError(); err != nil {
 		return nil, err
 	}
-	trustedProxies, err := trustedProxyPrefixes(options.TrustedProxies)
+	trustedTCPProxies, err := trustedProxyPrefixes(options.TrustedTCPProxies)
+	if err != nil {
+		return nil, err
+	}
+	trustedUDPProxies, err := trustedProxyPrefixes(options.TrustedUDPProxies)
 	if err != nil {
 		return nil, err
 	}
@@ -136,12 +157,13 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{
-		server:         server,
-		runtime:        server.freeze(),
-		trustedProxies: trustedProxies,
-		ctx:            ctx,
-		cancel:         cancel,
-		workers:        newStreamWorkers(ctx, streamWorkerIdle),
+		server:            server,
+		runtime:           server.freeze(),
+		trustedTCPProxies: trustedTCPProxies,
+		trustedUDPProxies: trustedUDPProxies,
+		ctx:               ctx,
+		cancel:            cancel,
+		workers:           newStreamWorkers(ctx, streamWorkerIdle),
 	}
 	if err := l.bind(addr, options); err != nil {
 		cancel()

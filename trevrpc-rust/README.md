@@ -244,10 +244,22 @@ let tcp = trevrpc::tcp::TcpFallback::new(
 server.serve_with_tcp(endpoint, tcp, shutdown_signal()).await?;
 ```
 
-Behind a TCP load balancer, `with_trusted_proxies` names its networks. A connection from one of them must start with a PROXY protocol header, version 1 or 2, and the client it names becomes the calls' `remote_addr`; a connection without one is closed. A version 2 `LOCAL` header (a health check), version 1 `UNKNOWN`, or an address family other than TCP over IPv4 or IPv6 leaves the proxy's own address. Connections from anywhere else are never read for a header. The header must arrive within the TLS handshake timeout (10 s). QUIC is not affected: a UDP load balancer must preserve the client's source address.
+Behind a TCP load balancer, `with_trusted_proxies` names its networks. A connection from one of them must start with a PROXY protocol header, version 1 or 2, and the client it names becomes the calls' `remote_addr`; a connection without one is closed. A version 2 `LOCAL` header (a health check), version 1 `UNKNOWN`, or an address family other than TCP over IPv4 or IPv6 leaves the proxy's own address. Connections from anywhere else are never read for a header. The header must arrive within the TLS handshake timeout (10 s).
 
 ```rust
 let tcp = tcp.with_trusted_proxies(["10.0.0.0/8".parse::<trevrpc::tcp::IpPrefix>()?]);
+```
+
+Behind a UDP load balancer that puts a PROXY protocol version 2 header in front of every datagram, bind the endpoint with `trevrpc::udp::QuicEndpoint::server`, which every `serve` method takes in place of a `quinn::Endpoint`. Its socket strips the header of every datagram from the trusted networks, and the client a load balancer's address names when the connection on it completes its handshake becomes the connection's `remote_addr` (looked up again only when the connection's address changes), while QUIC keeps talking to the load balancer. A datagram from a trusted network without a valid header is dropped and logged as a `tracing` warning, at most once every 10 seconds; a `LOCAL` header, or an address family other than UDP over IPv4 or IPv6, leaves the load balancer's own address. Datagrams from anywhere else are never read for a header. The header takes up to 52 bytes of every datagram, plus any extensions.
+
+`ServerOptions::with_address_validation(AddressValidation::AboveRate(n))` makes clients prove their address with a QUIC Retry, which costs them a round trip, once more than `n` connection attempts from unvalidated addresses arrive a second; `AddressValidation::Always` asks every one.
+
+```rust
+let endpoint = trevrpc::udp::QuicEndpoint::server(
+    server.quic_config(tls.clone())?,
+    "[::]:50051".parse()?,
+    ["10.0.0.0/8".parse::<trevrpc::tcp::IpPrefix>()?],
+)?;
 ```
 
 HTTP/2 and HTTP/1.1 responses advertise HTTP/3 on the endpoint's port in `Alt-Svc`. When clients reach the endpoint on another port, such as through a reverse proxy, load balancer or NAT, `with_alt_svc_port(NonZeroU16::new(443))` advertises that port instead.

@@ -5,18 +5,21 @@ use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::HeaderValue;
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinError, JoinSet};
 
-use crate::quic::{frame_receive_window, negotiated_protocol, saturating_usize_to_u64, varint};
+use crate::quic::{
+    ServerConnection, frame_receive_window, negotiated_protocol, saturating_usize_to_u64, varint,
+};
 use crate::server::{Server, ServerOptions};
 use crate::server_transport::try_acquire_permit;
 use crate::shards::Shards;
 use crate::tcp::TcpFallback;
+use crate::udp::{QuicEndpoint, RetryPolicy};
 use crate::{Error, Result};
 use crate::{http3, native, tcp};
 
@@ -79,22 +82,29 @@ impl Server {
 
     /// Serves `TrevRPC` on a Quinn endpoint until the endpoint stops accepting connections.
     ///
+    /// The endpoint is a [`quinn::Endpoint`], or a [`QuicEndpoint`] behind trusted UDP load
+    /// balancers.
+    ///
     /// Fails at once when the configured [`Compression`](crate::Compression) is invalid.
     ///
     /// Connections are dispatched on their negotiated ALPN: [`crate::ALPN`] runs native `TrevRPC`,
     /// and [`crate::HTTP3_ALPN`] runs the enabled HTTP/3 `POST` RPCs and `WebTransport` sessions,
     /// and the HTTP fallback.
-    pub async fn serve(self, endpoint: quinn::Endpoint) -> Result<()> {
+    pub async fn serve(self, endpoint: impl Into<QuicEndpoint>) -> Result<()> {
         self.serve_with_shutdown(endpoint, pending::<()>()).await
     }
 
     /// Serves `TrevRPC` on a Quinn endpoint until the shutdown future completes, then drains
     /// in-flight RPCs for up to the configured graceful shutdown timeout.
-    pub async fn serve_with_shutdown<S>(self, endpoint: quinn::Endpoint, shutdown: S) -> Result<()>
+    pub async fn serve_with_shutdown<S>(
+        self,
+        endpoint: impl Into<QuicEndpoint>,
+        shutdown: S,
+    ) -> Result<()>
     where
         S: Future<Output = ()> + Send,
     {
-        self.serve_sources(endpoint, None, shutdown).await
+        self.serve_sources(endpoint.into(), None, shutdown).await
     }
 
     /// Serves `TrevRPC` on a Quinn endpoint and a TCP listener until the shutdown future
@@ -106,20 +116,21 @@ impl Server {
     /// when one is set. Both share the connection and request limits.
     pub async fn serve_with_tcp<S>(
         self,
-        endpoint: quinn::Endpoint,
+        endpoint: impl Into<QuicEndpoint>,
         tcp: TcpFallback,
         shutdown: S,
     ) -> Result<()>
     where
         S: Future<Output = ()> + Send,
     {
-        self.serve_sources(endpoint, Some(tcp), shutdown).await
+        self.serve_sources(endpoint.into(), Some(tcp), shutdown)
+            .await
     }
 
     #[allow(clippy::too_many_lines)]
     async fn serve_sources<S>(
         self,
-        endpoint: quinn::Endpoint,
+        endpoint: QuicEndpoint,
         mut tcp: Option<TcpFallback>,
         shutdown: S,
     ) -> Result<()>
@@ -127,6 +138,7 @@ impl Server {
         S: Future<Output = ()> + Send,
     {
         self.check_compression()?;
+        let (endpoint, clients) = endpoint.into_parts();
         // HTTP/2 RPC and HTTP fallback responses advertise HTTP/3 on the endpoint's port, unless
         // the TCP fallback names another.
         let alt_svc = if self.options().serves_http2() {
@@ -146,6 +158,7 @@ impl Server {
             .options()
             .max_concurrent_requests()
             .map(|limit| Arc::new(Semaphore::new(limit)));
+        let mut retry = RetryPolicy::new(self.options().address_validation(), Instant::now());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut connection_tasks = JoinSet::new();
         let shards = Shards::start(self.options().connection_threads())?;
@@ -158,6 +171,16 @@ impl Server {
                     let Some(incoming) = incoming else {
                         break;
                     };
+                    let incoming = if !incoming.remote_address_validated()
+                        && retry.should_retry(Instant::now())
+                    {
+                        match incoming.retry() {
+                            Ok(()) => continue,
+                            Err(error) => error.into_incoming(),
+                        }
+                    } else {
+                        incoming
+                    };
 
                     let Some(connection_permit) = try_acquire_permit(connection_limit.as_ref()) else {
                         incoming.refuse();
@@ -167,6 +190,7 @@ impl Server {
                     let server = self.clone();
                     let request_limit = request_limit.clone();
                     let shutdown = shutdown_rx.clone();
+                    let clients = clients.clone();
                     // Accepting creates the connection's driver on the runtime that accepts it.
                     let shard = shards.pick();
                     let (shard_handle, shard_guard) = shard.unzip();
@@ -175,6 +199,7 @@ impl Server {
                         let Ok(connection) = incoming.await else {
                             return;
                         };
+                        let connection = ServerConnection::new(connection, clients);
                         let _connection_permit = connection_permit;
                         match negotiated_protocol(&connection).as_deref() {
                             Some(crate::ALPN) => {

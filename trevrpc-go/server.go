@@ -102,6 +102,17 @@ type Server struct {
 // StreamCompression): about 350 KiB for a direction the server decodes and
 // 585 KiB for one it compresses. Calls beyond it are compressed per message.
 // Zero means 256 MiB, and a negative value turns stream compression off.
+//
+// AddressValidationRate makes the QUIC socket ask a client to prove its
+// address with a Retry packet before the server keeps any state for its
+// connection, which costs the client a round trip, once more connection
+// attempts from addresses QUIC has not validated arrive than that many a
+// second, as in a flood of handshakes from spoofed addresses. Bursts of up to
+// a second's worth pass. ValidateAllAddresses asks every such attempt. A
+// client that kept an address validation token from an earlier connection
+// skips it. Zero and false, the defaults, never ask. Once a connection
+// completes its handshake its address is proven either way, so RemoteAddr is
+// a sound key for per-client limits.
 type ServerOptions struct {
 	MaxFrameSize                      int
 	MaxConcurrentConnections          int
@@ -125,6 +136,8 @@ type ServerOptions struct {
 	HTTPFallback                      http.Handler
 	Compression                       *Compression
 	StreamCompressionMemory           int64
+	AddressValidationRate             int
+	ValidateAllAddresses              bool
 }
 
 // servesHTTP reports whether the listener serves HTTP: HTTP/3 on the UDP
@@ -519,6 +532,7 @@ func canonicalServerOptions(options ServerOptions) ServerOptions {
 	canonical.MaxConcurrentStreamsPerConnection = canonicalPositiveLimit("MaxConcurrentStreamsPerConnection", options.MaxConcurrentStreamsPerConnection, defaults.MaxConcurrentStreamsPerConnection)
 	canonical.MaxConcurrentRequests = canonicalPositiveLimit("MaxConcurrentRequests", options.MaxConcurrentRequests, defaults.MaxConcurrentRequests)
 	canonical.MaxConcurrentAdmissionCallbacks = canonicalPositiveLimit("MaxConcurrentAdmissionCallbacks", options.MaxConcurrentAdmissionCallbacks, defaults.MaxConcurrentAdmissionCallbacks)
+	canonical.AddressValidationRate = canonicalPositiveLimit("AddressValidationRate", options.AddressValidationRate, 0)
 	canonical.MaxStreamMessages = canonicalStreamLimit("MaxStreamMessages", options.MaxStreamMessages, defaults.MaxStreamMessages)
 	canonical.MaxStreamBodySize = canonicalStreamLimit("MaxStreamBodySize", options.MaxStreamBodySize, defaults.MaxStreamBodySize)
 	canonical.GracefulShutdownTimeout = canonicalDuration("GracefulShutdownTimeout", options.GracefulShutdownTimeout, defaults.GracefulShutdownTimeout, options.DisableGracefulShutdownTimeout)

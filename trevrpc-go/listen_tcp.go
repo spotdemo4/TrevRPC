@@ -105,7 +105,7 @@ func acceptWithBackoff(ctx context.Context, ln net.Listener) (net.Conn, error) {
 func (l *Listener) serveTCPConn(raw net.Conn) {
 	ctx, cancel := context.WithTimeout(l.ctx, l.handshakeTimeout)
 	defer cancel()
-	if trustedProxy(l.trustedProxies, raw.RemoteAddr()) {
+	if trustedProxy(l.trustedTCPProxies, raw.RemoteAddr()) {
 		proxied, err := readProxyHeaderBefore(ctx, raw)
 		if err != nil {
 			l.runtime.emitDiagnostic(ServerDiagnostic{

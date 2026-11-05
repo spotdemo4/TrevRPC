@@ -38,9 +38,9 @@ type HandlerContext struct {
 	Kind       RPCKind
 	Metadata   Metadata
 	// RemoteAddr is the address of the client: the source address of a QUIC
-	// connection, or of a TCP connection unless it came from a trusted proxy
-	// (see ListenOptions.TrustedProxies), whose PROXY header then names the
-	// client. IPv4 clients have IPv4 addresses on every transport. It is the
+	// or TCP connection, unless it came from a trusted proxy (see
+	// ListenOptions.TrustedTCPProxies and TrustedUDPProxies), whose PROXY
+	// header then names the client. IPv4 clients have IPv4 addresses on every transport. It is the
 	// zero AddrPort when the transport does not know it.
 	RemoteAddr netip.AddrPort
 

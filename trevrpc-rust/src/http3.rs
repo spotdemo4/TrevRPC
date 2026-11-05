@@ -20,13 +20,13 @@ use crate::http_admission::{
     admission_headers, rejection_head, rpc_response_head, validate_http_request,
     validate_webtransport_admission,
 };
-use crate::quic::SessionDatagrams;
+use crate::quic::{ServerConnection, SessionDatagrams};
 use crate::request_pump::{RequestTransportEvent, poll_peer_reset};
 use crate::rpc_body::{
     BodySink, BodySource, WebTransportSessionState, handle_rpc_stream, reject_rpc_stream,
 };
 use crate::serve::{drain_streams, drain_tasks, log_task_error};
-use crate::server::{Server, canonical_addr};
+use crate::server::Server;
 use crate::server_transport::{Permit, try_acquire_permit};
 use crate::{Error, Result, Status};
 // RFC WebTransport reserves this error-code range for application protocol errors. Code 1 maps
@@ -51,7 +51,7 @@ type WebTransportRecvStream = h3_webtransport::stream::RecvStream<h3_quinn::Recv
 #[allow(clippy::too_many_lines)]
 pub async fn handle_connection(
     server: Server,
-    connection: quinn::Connection,
+    connection: ServerConnection,
     request_limit: Option<Arc<Semaphore>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -64,7 +64,11 @@ pub async fn handle_connection(
             .enable_datagram(true)
             .enable_webtransport(true);
     }
-    let h3_connection = builder.build(h3_quinn::Connection::new(connection)).await;
+    let h3_connection = builder
+        .build(h3_quinn::Connection::new(quinn::Connection::clone(
+            &connection,
+        )))
+        .await;
     let Ok(mut h3_connection) = h3_connection else {
         raw_connection.close(0_u32.into(), b"failed to initialize HTTP/3");
         return;
@@ -102,7 +106,7 @@ pub async fn handle_connection(
                     continue;
                 };
                 if is_webtransport_request(&request) {
-                    let remote_addr = canonical_addr(raw_connection.remote_address());
+                    let remote_addr = raw_connection.client_addr();
                     let response_headers = match validate_webtransport_request(&server, &request, remote_addr) {
                         Ok(headers) => headers,
                         Err(status) => {
@@ -189,7 +193,7 @@ fn spawn_http_request(
     request_limit: Option<&Arc<Semaphore>>,
     stream_limit: Option<&Arc<Semaphore>>,
     shutdown: watch::Receiver<bool>,
-    connection: quinn::Connection,
+    connection: ServerConnection,
     stream_tasks: &mut JoinSet<()>,
 ) {
     let Some(stream_permit) = try_acquire_permit(stream_limit) else {
@@ -215,7 +219,7 @@ async fn handle_http_request(
     mut stream_permit: Permit,
     request: Request<()>,
     mut stream: H3RequestStream,
-    connection: quinn::Connection,
+    connection: ServerConnection,
     shutdown: watch::Receiver<bool>,
 ) {
     if let Some(fallback) = server.options().http_fallback()
@@ -225,7 +229,7 @@ async fn handle_http_request(
         serve_fallback(fallback, request, stream).await;
         return;
     }
-    let remote_addr = canonical_addr(connection.remote_address());
+    let remote_addr = connection.client_addr();
     if let Some(status) = validate_http_request(&server, &request, remote_addr) {
         stream_permit.release();
         reject_h3(stream, status).await;
@@ -363,7 +367,7 @@ async fn handle_webtransport_session(
     session: WebTransportSession,
     request_limit: Option<Arc<Semaphore>>,
     stream_limit: Option<Arc<Semaphore>>,
-    connection: quinn::Connection,
+    connection: ServerConnection,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let session_id = session.session_id();
@@ -376,7 +380,7 @@ async fn handle_webtransport_session(
     // Nothing may call `session.datagram_reader()` or `session.datagram_sender()`: quinn's
     // `read_datagram` has a single consumer.
     let demux = SessionDatagrams::new(
-        connection.clone(),
+        quinn::Connection::clone(&connection),
         h3::quic::StreamId::from(session_id).into_inner(),
     )
     .map(|datagrams| {
@@ -557,7 +561,7 @@ where
     }
 }
 
-struct H3Source(H3RecvStream, quinn::Connection);
+struct H3Source(H3RecvStream, ServerConnection);
 
 impl BodySource for H3Source {
     async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
@@ -579,7 +583,7 @@ impl BodySource for H3Source {
     }
 
     fn remote_addr(&self) -> SocketAddr {
-        canonical_addr(self.1.remote_address())
+        self.1.client_addr()
     }
 
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {
@@ -630,7 +634,7 @@ impl BodySink for WebTransportSink {
     }
 }
 
-struct WebTransportSource(WebTransportRecvStream, quinn::Connection);
+struct WebTransportSource(WebTransportRecvStream, ServerConnection);
 
 impl BodySource for WebTransportSource {
     async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
@@ -650,7 +654,7 @@ impl BodySource for WebTransportSource {
     }
 
     fn remote_addr(&self) -> SocketAddr {
-        canonical_addr(self.1.remote_address())
+        self.1.client_addr()
     }
 
     async fn transport_event(&mut self) -> Option<RequestTransportEvent> {

@@ -39,8 +39,8 @@ pub struct TcpFallback {
     /// connection that does not is closed. Connections from anywhere else are never read for a
     /// header. Empty by default.
     ///
-    /// QUIC is not affected: a UDP load balancer in front of the endpoint must preserve the
-    /// client's source address.
+    /// QUIC is not affected: UDP load balancers in front of the endpoint are trusted by
+    /// [`QuicEndpoint::server`](crate::udp::QuicEndpoint::server).
     pub trusted_proxies: Vec<IpPrefix>,
     /// The UDP port number that HTTP/2 and HTTP/1.1 responses advertise for HTTP/3 in their
     /// `Alt-Svc` header. `None`, the default, advertises the port of the Quinn endpoint; set it
@@ -80,11 +80,14 @@ impl TcpFallback {
 
     /// Whether a connection from `peer` must start with a PROXY header.
     pub(crate) fn trusts(&self, peer: IpAddr) -> bool {
-        let peer = canonical_addr(SocketAddr::new(peer, 0)).ip();
-        self.trusted_proxies
-            .iter()
-            .any(|prefix| prefix.contains(peer))
+        trusts(&self.trusted_proxies, peer)
     }
+}
+
+/// Whether `peer`, IPv4-mapped IPv6 addresses taken as IPv4, belongs to one of `trusted_proxies`.
+pub(crate) fn trusts(trusted_proxies: &[IpPrefix], peer: IpAddr) -> bool {
+    let peer = canonical_addr(SocketAddr::new(peer, 0)).ip();
+    trusted_proxies.iter().any(|prefix| prefix.contains(peer))
 }
 
 /// An IP network: an address and the length of its routing prefix, such as `10.0.0.0/8` or

@@ -723,6 +723,26 @@ pub struct ServerOptions {
     compression: Compression,
     stream_compression_memory: usize,
     connection_threads: usize,
+    address_validation: AddressValidation,
+}
+
+/// When the QUIC endpoint asks a client to prove its address with a Retry packet before the
+/// server keeps any state for its connection, which costs the client a round trip.
+///
+/// Only attempts from addresses QUIC has not validated are asked: a client that kept an address
+/// validation token from an earlier connection skips it. Once a connection completes its handshake
+/// its address is proven either way, so [`RequestContext::remote_addr`] is a sound key for
+/// per-client limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AddressValidation {
+    /// Never ask. The default.
+    #[default]
+    Off,
+    /// Ask every attempt.
+    Always,
+    /// Ask once more attempts arrive than this many a second, as in a flood of handshakes from
+    /// spoofed addresses. Bursts of up to a second's worth pass.
+    AboveRate(std::num::NonZeroU32),
 }
 
 impl Default for ServerOptions {
@@ -749,6 +769,7 @@ impl Default for ServerOptions {
             compression: Compression::new(),
             stream_compression_memory: DEFAULT_SERVER_MEMORY,
             connection_threads: 0,
+            address_validation: AddressValidation::Off,
         }
     }
 }
@@ -959,6 +980,19 @@ impl ServerOptions {
     #[must_use]
     pub const fn connection_threads(&self) -> usize {
         self.connection_threads
+    }
+
+    /// Returns when the QUIC endpoint validates client addresses; see [`AddressValidation`].
+    #[must_use]
+    pub const fn address_validation(&self) -> AddressValidation {
+        self.address_validation
+    }
+
+    /// Sets when the QUIC endpoint validates client addresses; see [`AddressValidation`].
+    #[must_use]
+    pub const fn with_address_validation(mut self, address_validation: AddressValidation) -> Self {
+        self.address_validation = address_validation;
+        self
     }
 
     /// Sets the maximum number of concurrent transport connections.

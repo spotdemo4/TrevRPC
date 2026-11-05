@@ -14,9 +14,10 @@ import (
 )
 
 // PROXY protocol (https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt)
-// lets a TCP load balancer that does not terminate TLS tell the server the
-// address of the client it forwards. Only connections from trusted proxies
-// are read for a header; see ListenOptions.TrustedProxies.
+// lets a load balancer that does not terminate TLS tell the server the address
+// of the client it forwards. Only connections from trusted TCP proxies are read
+// for a header; see ListenOptions.TrustedTCPProxies. The UDP socket's version
+// of it is in proxy_protocol_udp.go.
 
 const (
 	// proxyV1MaxLength is the longest version 1 header, its CRLF included.
@@ -82,7 +83,7 @@ func readProxyHeader(conn net.Conn) (net.Conn, error) {
 	}
 	proxied := &proxiedConn{Conn: conn, remote: conn.RemoteAddr()}
 	if source.IsValid() {
-		proxied.remote = net.TCPAddrFromAddrPort(unmapAddrPort(source))
+		proxied.remote = net.TCPAddrFromAddrPort(source)
 	}
 	if buffered := reader.Buffered(); buffered > 0 {
 		rest, _ := reader.Peek(buffered)
@@ -123,7 +124,7 @@ func readProxyV1(reader *bufio.Reader) (netip.AddrPort, error) {
 		source.Is4() != (fields[1] == "TCP4") || destination.Is4() != source.Is4() {
 		return netip.AddrPort{}, errProxyHeader
 	}
-	return netip.AddrPortFrom(source, sourcePort), nil
+	return unmapAddrPort(netip.AddrPortFrom(source, sourcePort)), nil
 }
 
 // parseProxyPort parses a version 1 port number: decimal, without a sign or
@@ -144,22 +145,9 @@ func readProxyV2(reader *bufio.Reader) (netip.AddrPort, error) {
 	if err != nil {
 		return netip.AddrPort{}, err
 	}
-	if !bytes.Equal(header[:len(proxyV2Signature)], proxyV2Signature) || header[12]>>4 != 2 {
-		return netip.AddrPort{}, errProxyHeader
-	}
-	command, family := header[12]&0x0f, header[13]
-	length := int(binary.BigEndian.Uint16(header[14:16]))
-	var addressLength int
-	switch {
-	case command > 1:
-		return netip.AddrPort{}, errProxyHeader
-	case command == 1 && family == 0x11: // PROXY, TCP over IPv4
-		addressLength = 12
-	case command == 1 && family == 0x21: // PROXY, TCP over IPv6
-		addressLength = 36
-	}
-	if length < addressLength {
-		return netip.AddrPort{}, errProxyHeader
+	addressLength, length, err := parseProxyV2Fixed(header, proxyV2Stream)
+	if err != nil {
+		return netip.AddrPort{}, err
 	}
 	var source netip.AddrPort
 	if addressLength > 0 {
@@ -167,16 +155,54 @@ func readProxyV2(reader *bufio.Reader) (netip.AddrPort, error) {
 		if err != nil {
 			return netip.AddrPort{}, err
 		}
-		addresses := block[proxyV2HeaderLength:]
-		ipLength := (addressLength - 4) / 2
-		ip, _ := netip.AddrFromSlice(addresses[:ipLength])
-		port := binary.BigEndian.Uint16(addresses[2*ipLength:])
-		source = netip.AddrPortFrom(ip, port)
+		source = proxyV2Source(block[proxyV2HeaderLength:])
 	}
-	if _, err := reader.Discard(proxyV2HeaderLength + length); err != nil {
+	if _, err := reader.Discard(length); err != nil {
 		return netip.AddrPort{}, err
 	}
 	return source, nil
+}
+
+// The transports of a version 2 header's address family byte.
+const (
+	proxyV2Stream   = 1
+	proxyV2Datagram = 2
+)
+
+// parseProxyV2Fixed checks header, the fixed part of a version 2 header, and
+// returns the length of its address block for a PROXY command over transport
+// on IPv4 or IPv6, or 0 when the header carries no client address for it (a
+// LOCAL command or another family), and the length of the whole header.
+func parseProxyV2Fixed(header []byte, transport byte) (addressLength, length int, err error) {
+	if len(header) < proxyV2HeaderLength || !bytes.Equal(header[:len(proxyV2Signature)], proxyV2Signature) || header[12]>>4 != 2 {
+		return 0, 0, errProxyHeader
+	}
+	command, family := header[12]&0x0f, header[13]
+	length = proxyV2HeaderLength + int(binary.BigEndian.Uint16(header[14:16]))
+	switch {
+	case command > 1:
+		return 0, 0, errProxyHeader
+	case command == 1 && family == 0x10|transport: // PROXY over IPv4
+		addressLength = 12
+	case command == 1 && family == 0x20|transport: // PROXY over IPv6
+		addressLength = 36
+	}
+	if length < proxyV2HeaderLength+addressLength {
+		return 0, 0, errProxyHeader
+	}
+	return addressLength, length, nil
+}
+
+// proxyV2Source returns the source address of a version 2 address block of
+// 12 (IPv4) or 36 (IPv6) bytes, IPv4-mapped IPv6 addresses as IPv4.
+func proxyV2Source(addresses []byte) netip.AddrPort {
+	ipLength := 4
+	if len(addresses) >= 36 {
+		ipLength = 16
+	}
+	ip, _ := netip.AddrFromSlice(addresses[:ipLength])
+	port := binary.BigEndian.Uint16(addresses[2*ipLength:])
+	return unmapAddrPort(netip.AddrPortFrom(ip, port))
 }
 
 // proxiedConn is a TCP connection from a trusted proxy, whose remote address
@@ -211,10 +237,12 @@ func (c *proxiedConn) CloseWrite() error {
 // trustedProxy reports whether addr, the remote address of a TCP connection,
 // belongs to one of the trusted proxies.
 func trustedProxy(trusted []netip.Prefix, addr net.Addr) bool {
-	if len(trusted) == 0 {
-		return false
-	}
-	ip := addrPortOf(addr).Addr()
+	return len(trusted) > 0 && trustedProxyIP(trusted, addrPortOf(addr).Addr())
+}
+
+// trustedProxyIP reports whether ip, an IPv4 address unmapped from IPv6,
+// belongs to one of the trusted proxies.
+func trustedProxyIP(trusted []netip.Prefix, ip netip.Addr) bool {
 	for _, prefix := range trusted {
 		if prefix.Contains(ip) {
 			return true

@@ -1,7 +1,9 @@
 //! The PROXY protocol, versions 1 and 2 (<https://www.haproxy.org/download/3.0/doc/proxy-protocol.txt>),
-//! with which a TCP load balancer passes on the address of the client it accepted the connection
-//! from. The TCP listener reads it only from the trusted proxies of
-//! [`TcpFallback`](crate::tcp::TcpFallback), and requires it from them.
+//! with which a load balancer passes on the address of the client it forwards. The TCP listener
+//! reads it at the start of the connections from the trusted proxies of
+//! [`TcpFallback`](crate::tcp::TcpFallback), and the socket of a
+//! [`QuicEndpoint`](crate::udp::QuicEndpoint) at the start of every datagram from its trusted
+//! proxies; both require it from them.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -23,6 +25,24 @@ const V1_MAX_LEN: usize = 107;
 /// How much is read at a time while looking for the end of a header.
 const READ_CHUNK: usize = 256;
 
+/// The transport a version 2 header's address family names, which must be the one it arrived on
+/// for its addresses to be the client's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Stream,
+    Datagram,
+}
+
+impl Transport {
+    /// The transport's code in the low four bits of the address family byte.
+    const fn code(self) -> u8 {
+        match self {
+            Self::Stream => 1,
+            Self::Datagram => 2,
+        }
+    }
+}
+
 /// The result of parsing the start of a connection.
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed {
@@ -30,7 +50,7 @@ enum Parsed {
     Incomplete { at_least: usize },
     /// A whole header of `len` bytes. `source` is the client's address, or `None` when the
     /// header does not carry one (version 2 `LOCAL`, version 1 `UNKNOWN`, or an address family
-    /// other than TCP over IPv4 or IPv6) and the proxy's own address stands for it.
+    /// other than the transport's over IPv4 or IPv6) and the proxy's own address stands for it.
     Complete {
         source: Option<SocketAddr>,
         len: usize,
@@ -67,10 +87,24 @@ where
     }
 }
 
-/// Parses the header at the start of `buf`.
+/// Parses the version 2 header that must start `datagram`, which arrived over UDP.
+///
+/// Returns the client's address the header carries, `None` when it carries none, and the
+/// header's length.
+pub(crate) fn parse_datagram(datagram: &[u8]) -> Result<(Option<SocketAddr>, usize), &'static str> {
+    if !datagram.starts_with(V2_SIGNATURE) {
+        return Err("datagram from a trusted proxy does not start with a PROXY v2 header");
+    }
+    match parse_v2(datagram, Transport::Datagram)? {
+        Parsed::Complete { source, len } => Ok((source, len)),
+        Parsed::Incomplete { .. } => Err("PROXY v2 header is longer than its datagram"),
+    }
+}
+
+/// Parses the header at the start of `buf`, the start of a TCP connection.
 fn parse(buf: &[u8]) -> Result<Parsed, &'static str> {
     if buf.starts_with(V2_SIGNATURE) {
-        return parse_v2(buf);
+        return parse_v2(buf, Transport::Stream);
     }
     if buf.starts_with(V1_PREFIX) {
         return parse_v1(buf);
@@ -147,8 +181,8 @@ where
     Ok(SocketAddr::new(source.into(), source_port))
 }
 
-/// Parses a version 2 header. Its TLVs are skipped.
-fn parse_v2(buf: &[u8]) -> Result<Parsed, &'static str> {
+/// Parses a version 2 header that arrived over `transport`. Its TLVs are skipped.
+fn parse_v2(buf: &[u8], transport: Transport) -> Result<Parsed, &'static str> {
     let Some(&[version_command, family, len_high, len_low]) = buf.get(12..V2_HEADER_LEN) else {
         return Ok(Parsed::Incomplete {
             at_least: V2_HEADER_LEN,
@@ -169,9 +203,13 @@ fn parse_v2(buf: &[u8]) -> Result<Parsed, &'static str> {
     if local {
         return Ok(Parsed::Complete { source: None, len });
     }
-    let source = match family {
-        // TCP over IPv4: source and destination addresses, then ports.
-        0x11 => {
+    if family & 0x0f != transport.code() {
+        // Another transport, or unspecified: the proxy's own address stands for the client.
+        return Ok(Parsed::Complete { source: None, len });
+    }
+    let source = match family >> 4 {
+        // IPv4: source and destination addresses, then ports.
+        1 => {
             let Some(&[a, b, c, d, _, _, _, _, port_high, port_low, _, _]) = addresses.get(..12)
             else {
                 return Err("PROXY v2 IPv4 address block is too short");
@@ -181,8 +219,8 @@ fn parse_v2(buf: &[u8]) -> Result<Parsed, &'static str> {
                 u16::from_be_bytes([port_high, port_low]),
             ))
         }
-        // TCP over IPv6.
-        0x21 => {
+        // IPv6.
+        2 => {
             let Some(block) = addresses.get(..36) else {
                 return Err("PROXY v2 IPv6 address block is too short");
             };
@@ -197,7 +235,7 @@ fn parse_v2(buf: &[u8]) -> Result<Parsed, &'static str> {
                 u16::from_be_bytes([port_high, port_low]),
             ))
         }
-        // Unspecified, UDP, or Unix sockets: the proxy's own address stands for the client.
+        // Unix sockets or unspecified: the proxy's own address stands for the client.
         _ => None,
     };
     Ok(Parsed::Complete { source, len })
@@ -266,7 +304,7 @@ mod tests {
 
     use tokio::io::AsyncReadExt as _;
 
-    use super::{Parsed, Rewound, V2_SIGNATURE, parse, read_header};
+    use super::{Parsed, Rewound, V2_SIGNATURE, parse, parse_datagram, read_header};
 
     fn addr(text: &str) -> SocketAddr {
         text.parse().unwrap()
@@ -422,6 +460,48 @@ mod tests {
         assert!(parse(b"GET / HTTP/1.1\r\n").is_err());
         assert!(matches!(parse(b"PRO"), Ok(Parsed::Incomplete { .. })));
         assert!(matches!(parse(b""), Ok(Parsed::Incomplete { .. })));
+    }
+
+    #[test]
+    fn datagrams_carry_udp_addresses() {
+        let mut datagram = v2(1, 0x12, &v2_ipv4_block());
+        datagram.extend_from_slice(b"quic");
+        assert_eq!(
+            parse_datagram(&datagram),
+            Ok((Some(addr("203.0.113.7:51000")), 28))
+        );
+        let mut block = vec![0; 36];
+        block[15] = 7;
+        block[32..34].copy_from_slice(&51_000_u16.to_be_bytes());
+        assert_eq!(
+            parse_datagram(&v2(1, 0x22, &block)),
+            Ok((Some(addr("[::7]:51000")), 52))
+        );
+        // TCP families, LOCAL, and extensions.
+        assert_eq!(
+            parse_datagram(&v2(1, 0x11, &v2_ipv4_block())),
+            Ok((None, 28))
+        );
+        assert_eq!(parse_datagram(&v2(0, 0x00, &[])), Ok((None, 16)));
+        let mut rest = v2_ipv4_block();
+        rest.extend_from_slice(&[0x04, 0, 2, 0, 0]);
+        assert_eq!(
+            parse_datagram(&v2(1, 0x12, &rest)),
+            Ok((Some(addr("203.0.113.7:51000")), 33))
+        );
+        // And the TCP listener ignores UDP families, as before.
+        assert_eq!(complete(&v2(1, 0x12, &v2_ipv4_block())), (None, 28));
+    }
+
+    #[test]
+    fn datagrams_must_hold_a_whole_v2_header() {
+        let header = v2(1, 0x12, &v2_ipv4_block());
+        assert!(parse_datagram(&header[..27]).is_err());
+        assert!(parse_datagram(&header[..10]).is_err());
+        assert!(parse_datagram(b"PROXY TCP4 203.0.113.7 10.0.0.1 51000 443\r\n").is_err());
+        assert!(parse_datagram(&[0xc0, 0, 0, 0, 1]).is_err());
+        assert!(parse_datagram(&v2(1, 0x12, &[0; 11])).is_err());
+        assert!(parse_datagram(&v2(2, 0x12, &v2_ipv4_block())).is_err());
     }
 
     #[tokio::test]

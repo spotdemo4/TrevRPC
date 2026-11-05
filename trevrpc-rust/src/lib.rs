@@ -50,6 +50,7 @@ pub mod tcp;
 #[cfg(test)]
 mod test_io;
 mod transport_error;
+pub mod udp;
 pub mod varint;
 mod wake_gate;
 mod websocket;

@@ -194,7 +194,7 @@ func TestTrustedProxyHeaderNamesTheClient(t *testing.T) {
 	pki := newTestPKI(t)
 	recorder := &remoteAddrRecorder{}
 	listener := startRemoteAddrListener(t, pki, recorder, ListenOptions{
-		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
+		TrustedTCPProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
 	})
 	target := listener.TCPAddr().String()
 	v1 := startProxyForwarder(t, target, []byte("PROXY TCP4 203.0.113.7 198.51.100.1 4242 443\r\n"))
@@ -249,8 +249,8 @@ func TestTrustedProxyMustSendAHeader(t *testing.T) {
 	})
 	registerTestService(server)
 	listener := serveTestListener(t, server, ListenOptions{
-		TLSConfig:      pki.server,
-		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
+		TLSConfig:         pki.server,
+		TrustedTCPProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
 	})
 	if _, err := newQMuxTestClientAt(t, pki, listener.TCPAddr().String()); err == nil {
 		t.Fatal("a trusted peer connected without a PROXY header")
@@ -265,7 +265,7 @@ func TestUntrustedPeersAreNotReadForAHeader(t *testing.T) {
 	pki := newTestPKI(t)
 	recorder := &remoteAddrRecorder{}
 	listener := startRemoteAddrListener(t, pki, recorder, ListenOptions{
-		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		TrustedTCPProxies: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
 	})
 	channel, err := newQMuxTestClientAt(t, pki, listener.TCPAddr().String())
 	if err != nil {
@@ -282,9 +282,9 @@ func TestUntrustedPeersAreNotReadForAHeader(t *testing.T) {
 	}
 }
 
-func TestListenRejectsInvalidTrustedProxies(t *testing.T) {
+func TestListenRejectsInvalidTrustedTCPProxies(t *testing.T) {
 	pki := newTestPKI(t)
-	_, err := Listen("127.0.0.1:0", NewServer(), ListenOptions{TLSConfig: pki.server, TrustedProxies: []netip.Prefix{{}}})
+	_, err := Listen("127.0.0.1:0", NewServer(), ListenOptions{TLSConfig: pki.server, TrustedTCPProxies: []netip.Prefix{{}}})
 	if StatusFromError(err).Code != CodeInvalidArgument {
 		t.Fatalf("Listen error %v, want InvalidArgument", err)
 	}
