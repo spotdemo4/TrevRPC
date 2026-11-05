@@ -46,7 +46,7 @@ func (l *Listener) listenTCP(addr string, options ListenOptions) (connSource, er
 		l.handshakeTimeout = defaultTLSHandshakeTimeout
 	}
 	if l.runtime.options.servesHTTP() {
-		l.httpTCP = newHTTPTCPServer(l)
+		l.httpTCP = newHTTPTCPServer(l, options.AltSvcPort)
 	}
 
 	return connSource{

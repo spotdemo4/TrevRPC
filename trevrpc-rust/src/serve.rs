@@ -3,6 +3,7 @@
 
 use std::future::{Future, pending};
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,11 +127,14 @@ impl Server {
         S: Future<Output = ()> + Send,
     {
         self.check_compression()?;
-        // HTTP/2 RPC and HTTP fallback responses advertise HTTP/3 on the endpoint's port.
+        // HTTP/2 RPC and HTTP fallback responses advertise HTTP/3 on the endpoint's port, unless
+        // the TCP fallback names another.
         let alt_svc = if self.options().serves_http2() {
-            endpoint.local_addr().ok().and_then(|addr| {
-                HeaderValue::try_from(format!("h3=\":{}\"; ma=86400", addr.port())).ok()
-            })
+            tcp.as_ref()
+                .and_then(|tcp| tcp.alt_svc_port)
+                .map(NonZeroU16::get)
+                .or_else(|| endpoint.local_addr().ok().map(|addr| addr.port()))
+                .and_then(|port| HeaderValue::try_from(format!("h3=\":{port}\"; ma=86400")).ok())
         } else {
             None
         };

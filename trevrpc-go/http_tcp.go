@@ -19,18 +19,23 @@ type httpTCPServer struct {
 	listener *Listener
 	server   *http.Server
 	queue    *connQueue
-	// altSvc advertises HTTP/3 on the UDP socket to HTTP/2 and fallback
-	// clients.
+	// altSvc advertises HTTP/3 on the UDP socket, or on ListenOptions.AltSvcPort,
+	// to HTTP/2 and fallback clients.
 	altSvc       string
 	conns        sync.Map // net.Conn -> chan struct{} closed when the connection ends
 	shutdownOnce sync.Once
 }
 
-func newHTTPTCPServer(l *Listener) *httpTCPServer {
+// newHTTPTCPServer serves l's HTTP connections, advertising HTTP/3 on
+// altSvcPort, or on the UDP socket's port when it is 0.
+func newHTTPTCPServer(l *Listener, altSvcPort int) *httpTCPServer {
 	options := l.runtime.options
 	h := &httpTCPServer{listener: l, queue: newConnQueue(l.tcp.Addr())}
 	if options.servesHTTP2() {
-		h.altSvc = fmt.Sprintf(`h3=":%d"; ma=86400`, l.udp.LocalAddr().(*net.UDPAddr).Port)
+		if altSvcPort == 0 {
+			altSvcPort = l.udp.LocalAddr().(*net.UDPAddr).Port
+		}
+		h.altSvc = fmt.Sprintf(`h3=":%d"; ma=86400`, altSvcPort)
 	}
 	streamWindow := frameReceiveWindow(options.MaxFrameSize)
 	h.server = &http.Server{

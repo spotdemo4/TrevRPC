@@ -80,7 +80,7 @@ Requests use `Content-Type: application/trevrpc`, which names wire version 1; fr
 
 A generated client has one function per RPC, in the shape of the RPC: a unary call is a `suspend` function that returns the response, a server-streaming call returns a `Flow` of responses, a client-streaming call takes a `Flow` of requests and returns the response, and a bidirectional call takes a `Flow` of requests and returns a `Flow` of responses. A flow makes its call when it is collected, and cancelling the collection cancels the call. The last parameter, `options`, changes the client's default `CallOptions` for one call, as in `client.sayHello(request) { copy(timeout = 2.seconds) }`. `Client` also has `openServerStreaming`, `openClientStreaming`, and `openBidirectionalStreaming`, which return call objects for sending and receiving one message at a time.
 
-Cronet decides between HTTP/3 and HTTP/2, so the wire format and the channel API are identical on both. Servers must keep their TCP port reachable for the fallback (Go uses the same port number for TCP and UDP). Their HTTP/2 responses carry an `Alt-Svc` header pointing at the UDP port, so Cronet can move to HTTP/3 when it is available.
+Cronet decides between HTTP/3 and HTTP/2, so the wire format and the channel API are identical on both. Servers must keep their TCP port reachable for the fallback (Go uses the same port number for TCP and UDP). Their HTTP/2 responses carry an `Alt-Svc` header pointing at the UDP port (or the port configured for it behind a proxy), so Cronet can move to HTTP/3 when it is available.
 
 ### Headers and metadata
 

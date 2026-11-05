@@ -3,6 +3,7 @@
 
 use std::error::Error;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -137,22 +138,29 @@ async fn spawn_server_with(
     options: ServerOptions,
     configure: impl FnOnce(&mut Server),
 ) -> TestResult<RunningServer> {
+    let (tls, cert_der) = localhost_tls()?;
+    spawn_server_with_tls(options, configure, tls, cert_der, |tcp| tcp).await
+}
+
+/// A TLS configuration with a self-signed certificate for `localhost`, and that certificate.
+fn localhost_tls() -> TestResult<(quinn::rustls::ServerConfig, CertificateDer<'static>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
     let cert_der = CertificateDer::from(cert.cert);
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
     let tls = quinn::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key)?;
-    spawn_server_with_tls(options, configure, tls, cert_der).await
+    Ok((tls, cert_der))
 }
 
 /// Spawns a server like [`spawn_server_with`] that presents `tls`, which clients trust through
-/// `cert`.
+/// `cert`, with its TCP fallback adjusted by `configure_tcp`.
 async fn spawn_server_with_tls(
     options: ServerOptions,
     configure: impl FnOnce(&mut Server),
     tls: quinn::rustls::ServerConfig,
     cert_der: CertificateDer<'static>,
+    configure_tcp: impl FnOnce(TcpFallback) -> TcpFallback,
 ) -> TestResult<RunningServer> {
     let mut server = Server::new();
     server.set_options(options);
@@ -165,7 +173,7 @@ async fn spawn_server_with_tls(
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let udp = endpoint.local_addr()?;
     let tcp = listener.local_addr()?;
-    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
+    let fallback = configure_tcp(TcpFallback::new(listener, server.tcp_tls_config(tls)));
     let (shutdown, stopped) = oneshot::channel();
     let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
         let _ = stopped.await;
@@ -606,8 +614,14 @@ async fn development_certificate_serves_every_transport_and_its_hashes() -> Test
         .next()
         .ok_or("no certificate in the PEM")??;
     let options = test_options().with_http_fallback(Some(HttpFallback::new(certificate.clone())));
-    let server =
-        spawn_server_with_tls(options, |_| {}, certificate.server_config(), current).await?;
+    let server = spawn_server_with_tls(
+        options,
+        |_| {},
+        certificate.server_config(),
+        current,
+        |tcp| tcp,
+    )
+    .await?;
 
     let quic = channel(&server, server.udp, ChannelConfig::new()).await?;
     ensure_eq!(quic.transport(), Some(TransportKind::Quic));
@@ -1377,6 +1391,43 @@ async fn http_fallback_serves_every_http_version_alongside_rpcs() -> TestResult 
     let (status, _, reply) = http2_request(&sender, rpc, Bytes::from(unary_frame("h2")?)).await?;
     ensure_eq!(status, http::StatusCode::OK);
     ensure_eq!(decode_hello(&reply)?, "hello, h2");
+    server.stop().await
+}
+
+/// Behind a proxy that exposes the endpoint on another port, `Alt-Svc` advertises that port.
+#[tokio::test]
+async fn http2_responses_advertise_alt_svc_port() -> TestResult {
+    let fallback = EchoFallback::default();
+    let (tls, cert_der) = localhost_tls()?;
+    let server = spawn_server_with_tls(
+        fallback_options(test_options(), &fallback),
+        |_| {},
+        tls,
+        cert_der,
+        |tcp| tcp.with_alt_svc_port(NonZeroU16::new(443)),
+    )
+    .await?;
+    let advertised = Some("h3=\":443\"; ma=86400".to_owned());
+    let sender = http2_sender(&server).await?;
+
+    let rpc = http::Request::post(format!("https://localhost:{}/trevrpc", server.tcp.port()))
+        .header(http::header::CONTENT_TYPE, "application/trevrpc")
+        .body(())?;
+    let (status, alt_svc, _) = http2_request(&sender, rpc, Bytes::from(unary_frame("h2")?)).await?;
+    ensure_eq!(
+        (status, alt_svc),
+        (http::StatusCode::OK, advertised.clone())
+    );
+    ensure_eq!(
+        http2_fallback_request(&server, &sender, "GET", "/app", "")
+            .await?
+            .1,
+        advertised.clone()
+    );
+    ensure_eq!(
+        http1_request(&server, "GET", "/app", "").await?.1,
+        advertised
+    );
     server.stop().await
 }
 

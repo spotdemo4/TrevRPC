@@ -96,6 +96,41 @@ func TestHTTP2DoesNotAdvertiseExtendedConnect(t *testing.T) {
 func TestHTTP2ResponsesAdvertiseHTTP3(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
+	want := `h3=":` + strings.TrimPrefix(listener.Addr().String(), "127.0.0.1:") + `"; ma=86400`
+	if got := http2TestAltSvc(t, pki, listener); got != want {
+		t.Fatalf("Alt-Svc = %q, want %q", got, want)
+	}
+}
+
+// Behind a proxy that exposes the UDP socket on another port, Alt-Svc
+// advertises that port.
+func TestHTTP2ResponsesAdvertiseAltSvcPort(t *testing.T) {
+	pki := newTestPKI(t)
+	server := NewServer()
+	options := server.Options()
+	options.EnableHTTP = true
+	server.SetOptions(options)
+	registerTestService(server)
+	listener := serveTestListener(t, server, ListenOptions{TLSConfig: pki.server, AltSvcPort: 443})
+	if got, want := http2TestAltSvc(t, pki, listener), `h3=":443"; ma=86400`; got != want {
+		t.Fatalf("Alt-Svc = %q, want %q", got, want)
+	}
+}
+
+func TestListenRejectsInvalidAltSvcPort(t *testing.T) {
+	pki := newTestPKI(t)
+	for _, port := range []int{-1, 65536} {
+		_, err := Listen("127.0.0.1:0", NewServer(), ListenOptions{TLSConfig: pki.server, AltSvcPort: port})
+		if StatusFromError(err).Code != CodeInvalidArgument {
+			t.Fatalf("Listen with AltSvcPort %d: error %v, want InvalidArgument", port, err)
+		}
+	}
+}
+
+// http2TestAltSvc sends a unary RPC to listener over HTTP/2 and returns the
+// Alt-Svc header of its response.
+func http2TestAltSvc(t *testing.T, pki testPKI, listener *Listener) string {
+	t.Helper()
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: pki.client.Clone(), ForceAttemptHTTP2: true}}
 	defer client.CloseIdleConnections()
 	body := encodeHTTP3TestRequest(t, newWireRequest(testPath("Echo")), "")
@@ -112,10 +147,7 @@ func TestHTTP2ResponsesAdvertiseHTTP3(t *testing.T) {
 	if response.ProtoMajor != 2 || response.StatusCode != http.StatusOK {
 		t.Fatalf("response %s %d, want HTTP/2 200", response.Proto, response.StatusCode)
 	}
-	want := `h3=":` + strings.TrimPrefix(listener.Addr().String(), "127.0.0.1:") + `"; ma=86400`
-	if got := response.Header.Get("Alt-Svc"); got != want {
-		t.Fatalf("Alt-Svc = %q, want %q", got, want)
-	}
+	return response.Header.Get("Alt-Svc")
 }
 
 func TestHTTP1RequestsAreRefused(t *testing.T) {

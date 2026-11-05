@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +28,8 @@ const H2_ALPN: &[u8] = b"h2";
 const HTTP1_ALPN: &[u8] = b"http/1.1";
 
 /// The TCP side of a server: a bound listener, the TLS configuration from
-/// [`Server::tcp_tls_config`], and the load balancers trusted to name the client.
+/// [`Server::tcp_tls_config`], the load balancers trusted to name the client, and the port its
+/// HTTP responses advertise for HTTP/3.
 pub struct TcpFallback {
     pub listener: tokio::net::TcpListener,
     pub tls: Arc<quinn::rustls::ServerConfig>,
@@ -40,6 +42,11 @@ pub struct TcpFallback {
     /// QUIC is not affected: a UDP load balancer in front of the endpoint must preserve the
     /// client's source address.
     pub trusted_proxies: Vec<IpPrefix>,
+    /// The UDP port number that HTTP/2 and HTTP/1.1 responses advertise for HTTP/3 in their
+    /// `Alt-Svc` header. `None`, the default, advertises the port of the Quinn endpoint; set it
+    /// when clients reach the endpoint on another port, such as through a reverse proxy, load
+    /// balancer or NAT.
+    pub alt_svc_port: Option<NonZeroU16>,
 }
 
 impl TcpFallback {
@@ -53,6 +60,7 @@ impl TcpFallback {
             listener,
             tls,
             trusted_proxies: Vec::new(),
+            alt_svc_port: None,
         }
     }
 
@@ -60,6 +68,13 @@ impl TcpFallback {
     #[must_use]
     pub fn with_trusted_proxies(mut self, proxies: impl IntoIterator<Item = IpPrefix>) -> Self {
         self.trusted_proxies = proxies.into_iter().collect();
+        self
+    }
+
+    /// Sets [`TcpFallback::alt_svc_port`].
+    #[must_use]
+    pub const fn with_alt_svc_port(mut self, port: Option<NonZeroU16>) -> Self {
+        self.alt_svc_port = port;
         self
     }
 

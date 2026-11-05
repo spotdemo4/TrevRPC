@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,6 +42,11 @@ type ListenOptions struct {
 	// in front of the UDP socket must preserve it. IPv4 networks match IPv4
 	// clients however the socket reports them.
 	TrustedProxies []netip.Prefix
+	// AltSvcPort is the UDP port number that HTTP/2 and HTTP/1.1 responses
+	// advertise for HTTP/3 in their Alt-Svc header. It defaults to the port
+	// number of the UDP socket; set it when clients reach that socket on
+	// another port, such as through a reverse proxy, load balancer or NAT.
+	AltSvcPort int
 	// TLSHandshakeTimeout bounds the TLS handshake of TCP connections and the
 	// QMux handshake or HTTP request headers that follow it. It defaults to
 	// 10 seconds.
@@ -123,6 +130,9 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 	trustedProxies, err := trustedProxyPrefixes(options.TrustedProxies)
 	if err != nil {
 		return nil, err
+	}
+	if options.AltSvcPort < 0 || options.AltSvcPort > math.MaxUint16 {
+		return nil, InvalidArgument("AltSvcPort " + strconv.Itoa(options.AltSvcPort) + " is not a port number")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &Listener{

@@ -250,6 +250,8 @@ Behind a TCP load balancer, `with_trusted_proxies` names its networks. A connect
 let tcp = tcp.with_trusted_proxies(["10.0.0.0/8".parse::<trevrpc::tcp::IpPrefix>()?]);
 ```
 
+HTTP/2 and HTTP/1.1 responses advertise HTTP/3 on the endpoint's port in `Alt-Svc`. When clients reach the endpoint on another port, such as through a reverse proxy, load balancer or NAT, `with_alt_svc_port(NonZeroU16::new(443))` advertises that port instead.
+
 The channel falls back to QMux over TLS when given a rustls client configuration for it. QUIC starts first; QMux starts after the fallback delay (300 ms) or immediately if QUIC fails, and the first to connect wins. After QMux wins, reconnects use it until the reprobe interval (5 minutes) has passed since QUIC was lost.
 
 ```rust
