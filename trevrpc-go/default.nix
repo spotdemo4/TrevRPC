@@ -2,6 +2,7 @@
   lib,
   mkGoModule,
   protobuf,
+  pebble,
   wireGolden,
   qmuxGolden,
   zstdGolden,
@@ -46,8 +47,12 @@ mkGoModule (final: {
   '';
 
   doCheck = true;
-  # The bindings tests regenerate code from the interop and option protos.
-  nativeCheckInputs = [ protobuf ];
+  # The bindings tests regenerate code from the interop and option protos, and
+  # the ACME test gets a certificate from Pebble.
+  nativeCheckInputs = [
+    protobuf
+    pebble
+  ];
   checkPhase = ''
     runHook preCheck
     export HOME=$(mktemp -d)

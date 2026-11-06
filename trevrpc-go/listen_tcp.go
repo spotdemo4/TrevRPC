@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"slices"
 	"strconv"
 	"time"
 
@@ -17,6 +18,10 @@ const (
 	// HTTP/1.1, which carries WebSocket upgrades.
 	http2ALPN = "h2"
 	http1ALPN = "http/1.1"
+	// acmeTLSALPN is the TLS application protocol of the ACME TLS-ALPN-01
+	// challenge (RFC 8737), which a certificate authority validates over TCP
+	// only.
+	acmeTLSALPN = "acme-tls/1"
 	// Accept failures that are not caused by closing the listener, such as
 	// running out of file descriptors, are retried with backoff.
 	minAcceptBackoff = 5 * time.Millisecond
@@ -141,12 +146,17 @@ func (l *Listener) serveTCPConn(raw net.Conn) {
 		cancel()
 		l.httpTCP.serveConn(conn)
 	default:
+		// This ends an acmeTLSALPN connection too: the certificate authority
+		// validates the challenge certificate the handshake presented and
+		// sends nothing after it.
 		_ = conn.Close()
 	}
 }
 
 // serverTCPTLSConfig clones base and restricts it to the ALPN protocols the TCP
-// listener serves.
+// listener serves, keeping acme-tls/1 when base lists it so that an ACME
+// client's GetCertificate, such as autocert's, can answer TLS-ALPN-01
+// challenges.
 func serverTCPTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, error) {
 	config, err := serverTLSConfig(base, options)
 	if err != nil {
@@ -158,6 +168,9 @@ func serverTCPTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, e
 	}
 	if options.servesHTTP1() {
 		config.NextProtos = append(config.NextProtos, http1ALPN)
+	}
+	if slices.Contains(base.NextProtos, acmeTLSALPN) {
+		config.NextProtos = append(config.NextProtos, acmeTLSALPN)
 	}
 	return config, nil
 }

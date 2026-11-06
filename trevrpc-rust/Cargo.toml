@@ -114,6 +114,8 @@ zstd-safe = { version = "8.2", default-features = false, features = ["std", "exp
 [dev-dependencies]
 divan = "0.1.21"
 rcgen = "0.14"
+# The ACME client of the TLS-ALPN-01 test, which gets a certificate from Pebble.
+rustls-acme = { version = "0.15.4", default-features = false, features = ["ring"] }
 tokio = { version = "1.48.0", features = [
   "macros",
   "net",

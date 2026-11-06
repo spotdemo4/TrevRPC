@@ -104,6 +104,9 @@
               # protobuf
               buf
 
+              # acme (the TLS-ALPN-01 tests)
+              pebble
+
               # util
               treefmt
               bumper

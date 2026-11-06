@@ -4,6 +4,7 @@
   rustfmt,
   clippy,
   gnugrep,
+  pebble,
   licenseFile,
   wireGolden,
   zstdGolden,
@@ -32,8 +33,12 @@ mkRustPackage (final: {
   doCheck = true;
   # The tests and benchmarks bind loopback UDP sockets and run the interop executable against itself.
   __darwinAllowLocalNetworking = true;
-  # The generator tests format its output to compare against the checked-in bindings.
-  nativeCheckInputs = [ rustfmt ];
+  # The generator tests format its output to compare against the checked-in bindings, and the ACME
+  # test gets a certificate from Pebble.
+  nativeCheckInputs = [
+    rustfmt
+    pebble
+  ];
   checkPhase = ''
     runHook preCheck
     cargo test --workspace --all-features --offline
@@ -47,6 +52,7 @@ mkRustPackage (final: {
     nativeCheckInputs = [
       rustfmt
       clippy
+      pebble
     ];
     checkPhase = ''
       runHook preCheck

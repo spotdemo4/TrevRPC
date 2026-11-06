@@ -189,6 +189,8 @@ WebTransport policy: a session must use the shared path, then pass the authority
 
 For local development, `server::DevelopmentCertificate::new()` (feature `dev-certificate`) generates a self-signed ECDSA certificate for `localhost`, `127.0.0.1` and `::1` that rotates itself within the 14-day limit browsers place on certificates they trust by hash. Pass its `server_config()` to `quic_config` and `tcp_tls_config`. As a `tower_service::Service` it answers its current and next SHA-256 hashes as JSON, which the browser client's `serverCertificateHashesUrl` reads, and `pem()` returns both certificates for native clients to trust. See [Development certificates](https://trev.zip/llc/TrevRPC/wiki/WebTransport#development-certificates).
 
+In production, [`rustls-acme`](https://crates.io/crates/rustls-acme) (with its `ring` feature) can get certificates from Let's Encrypt: pass its `AcmeState::challenge_rustls_config()` to `quic_config` and `tcp_tls_config`, and poll the state. `tcp_tls_config` keeps the `acme-tls/1` that configuration lists, so `rustls-acme` can answer TLS-ALPN-01 challenges when the TCP listener is on port 443. See [Certificates from ACME](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#certificates-from-acme).
+
 Interceptors run the rest of a call in a `tracing` span with `RequestContext::set_span`. The separate crate [`trevrpc-opentelemetry`](crates/trevrpc-opentelemetry) builds OpenTelemetry metrics, server spans and trace propagation on the interceptor and metrics hooks:
 
 ```rust

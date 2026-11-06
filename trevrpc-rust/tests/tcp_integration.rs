@@ -564,6 +564,62 @@ async fn tcp_offers_only_enabled_protocols() -> TestResult {
     server.stop().await
 }
 
+const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+
+#[tokio::test]
+async fn tcp_keeps_acme_tls_alpn_from_the_tls_config() -> TestResult {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut tls, cert) = localhost_tls()?;
+    tls.alpn_protocols = vec![ACME_TLS_ALPN.to_vec()];
+    let server = spawn_server_with_tls(ServerOptions::new(), |_| {}, tls, cert, |tcp| tcp).await?;
+
+    let mut stream = connect_tls(&server, ACME_TLS_ALPN).await?;
+    ensure_eq!(stream.get_ref().1.alpn_protocol(), Some(ACME_TLS_ALPN));
+    // The certificate authority only needs the handshake.
+    let read = tokio::time::timeout(TEST_TIMEOUT, stream.read(&mut [0; 1])).await?;
+    ensure!(
+        matches!(read, Ok(0)),
+        "read after the acme-tls/1 handshake: {read:?}, want EOF"
+    );
+
+    // Certificate authorities validate TLS-ALPN-01 over TCP only.
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(
+            &server.cert,
+            ACME_TLS_ALPN,
+        )?)?,
+    )));
+    let quic =
+        tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.udp, "localhost")?).await?;
+    ensure!(quic.is_err(), "QUIC offered acme-tls/1");
+
+    let transport = QmuxTransport::connect(
+        server.tcp,
+        "localhost",
+        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+    )
+    .await?;
+    let reply = greeter::GreeterClient::new(transport)
+        .say_hello(&greeter::HelloRequest {
+            name: "native".to_owned(),
+        })
+        .await?;
+    ensure_eq!(reply.message, "hello, native");
+    server.stop().await
+}
+
+#[tokio::test]
+async fn tcp_offers_acme_tls_alpn_only_when_configured() -> TestResult {
+    let server = spawn_server(test_options()).await?;
+    ensure!(
+        connect_tls(&server, ACME_TLS_ALPN).await.is_err(),
+        "acme-tls/1 negotiated without it in the TLS configuration"
+    );
+    server.stop().await
+}
+
 async fn channel(
     server: &RunningServer,
     remote_addr: SocketAddr,

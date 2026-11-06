@@ -21,7 +21,12 @@ import (
 // ListenOptions configures Listen.
 type ListenOptions struct {
 	// TLSConfig supplies the server certificate. It is cloned; NextProtos is
-	// always set to the protocols the Server enables.
+	// always set to the protocols the Server enables. The TCP listener also
+	// keeps acme-tls/1 when NextProtos lists it, as autocert.Manager.TLSConfig
+	// does, so that the GetCertificate of an ACME client can answer
+	// TLS-ALPN-01 challenges (RFC 8737) and the certificate authority's
+	// connection is closed after the handshake. QUIC never offers it, as
+	// certificate authorities validate that challenge over TCP only.
 	TLSConfig *tls.Config
 	// QUICConfig optionally tunes the QUIC connections. It is cloned. Flow
 	// control windows and stream limits are capped by the Server's limits, and

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use http::HeaderValue;
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
 
@@ -26,6 +27,9 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const H2_ALPN: &[u8] = b"h2";
 const HTTP1_ALPN: &[u8] = b"http/1.1";
+/// The TLS application protocol of the ACME TLS-ALPN-01 challenge (RFC 8737), which a
+/// certificate authority validates over TCP only.
+const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
 /// The TCP side of a server: a bound listener, the TLS configuration from
 /// [`Server::tcp_tls_config`], the load balancers trusted to name the client, and the port its
@@ -206,17 +210,30 @@ impl Server {
     /// [`crate::server::ServerOptions::http_enabled`] is set, and `http/1.1` (WebSocket) when
     /// [`crate::server::ServerOptions::webtransport_enabled`] is set, replacing any ALPN list
     /// already on `tls`. An [`crate::server::ServerOptions::http_fallback`] advertises both.
+    ///
+    /// It keeps `acme-tls/1` when `tls` lists it, so that the certificate resolver of an ACME
+    /// client, such as `rustls-acme`'s, can answer TLS-ALPN-01 challenges (RFC 8737). The
+    /// certificate authority's connection is closed after the handshake.
+    /// [`Server::quic_config`] never offers it, as certificate authorities validate that
+    /// challenge over TCP only.
     #[must_use]
     pub fn tcp_tls_config(
         &self,
         mut tls: quinn::rustls::ServerConfig,
     ) -> Arc<quinn::rustls::ServerConfig> {
+        let acme = tls
+            .alpn_protocols
+            .iter()
+            .any(|protocol| protocol == ACME_TLS_ALPN);
         tls.alpn_protocols = vec![crate::QMUX_ALPN.to_vec()];
         if self.options().serves_http2() {
             tls.alpn_protocols.push(H2_ALPN.to_vec());
         }
         if self.options().serves_http1() {
             tls.alpn_protocols.push(HTTP1_ALPN.to_vec());
+        }
+        if acme {
+            tls.alpn_protocols.push(ACME_TLS_ALPN.to_vec());
         }
         Arc::new(tls)
     }
@@ -302,6 +319,12 @@ pub(crate) async fn handle_connection(
                 shutdown,
             )
             .await;
+        }
+        Some(ACME_TLS_ALPN) => {
+            // The certificate authority validates the challenge certificate the handshake
+            // presented and sends nothing after it.
+            let mut stream = stream;
+            let _ = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.shutdown()).await;
         }
         _ => {}
     }
