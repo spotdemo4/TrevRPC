@@ -41,8 +41,11 @@ type listeningLine struct {
 }
 
 // runServer serves Echo over every transport until ctx is cancelled. It writes
-// the listening line to out once the sockets are bound, and logs the server's
-// warnings and errors to log.
+// the listening line to out once the sockets are bound, and logs every server
+// diagnostic to log: warnings and errors, and the debug ones that follow each
+// connection and browser session (TLS handshake failures, session admission,
+// upgrades and closes), so that a browser that cannot connect shows how far it
+// got. None is logged per RPC, so they cannot skew the load benchmarks.
 func runServer(ctx context.Context, config serverConfig, out, log io.Writer) error {
 	certificate, err := tls.LoadX509KeyPair(config.certFile, config.keyFile)
 	if err != nil {
@@ -52,7 +55,7 @@ func runServer(ctx context.Context, config serverConfig, out, log io.Writer) err
 	if err != nil {
 		return err
 	}
-	logger := slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	logger := slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	listener, err := newServer(net.JoinHostPort(config.host, config.port), &tls.Config{Certificates: []tls.Certificate{certificate}}, config.webRoot, compression, logger)
 	if err != nil {
 		return err

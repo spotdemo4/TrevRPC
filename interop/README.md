@@ -205,7 +205,9 @@ have their own entry points but follow the same output contract.
   has not exited by then gets `SIGQUIT`, on which a Go server prints every
   goroutine's stack, and is killed 5 seconds later.
 - Diagnostics go to stderr: at least the server's warnings and errors, such as
-  handlers that outlive their calls. A failed cell lists what the server logged
+  handlers that outlive their calls, and a line for each failed TLS handshake
+  on the TCP listener and each WebSocket upgrade, so that a browser that cannot
+  connect shows how far it got. A failed cell lists what the server logged
   while it ran, and a server that does not exit cleanly prints the end of its
   log.
 

@@ -145,7 +145,12 @@ const ServerParameters = {
  * A WebSocket whose server side is a scripted QMux peer: it answers the client's transport
  * parameters, echoes every stream's data back with the FIN, and records the frames it receives.
  */
-function fakeServer({ parameters = ServerParameters, protocol = QMuxProtocol, onFrame } = {}) {
+function fakeServer({
+  parameters = ServerParameters,
+  protocol = QMuxProtocol,
+  onFrame,
+  opens = true,
+} = {}) {
   const sockets = [];
   class FakeWebSocket {
     binaryType = "blob";
@@ -159,6 +164,9 @@ function fakeServer({ parameters = ServerParameters, protocol = QMuxProtocol, on
       this.url = url;
       this.protocols = protocols;
       sockets.push(this);
+      if (!opens) {
+        return;
+      }
       queueMicrotask(() => {
         this.readyState = 1;
         this.protocol = protocol;
@@ -546,4 +554,31 @@ test("both transports failing reports both", async () => {
       /webtransport: .*UDP blocked/.test(error.statusMessage) &&
       /websocket: .*1006/.test(error.statusMessage),
   );
+});
+
+test("a cancelled connection says how far the WebSocket session got", async () => {
+  const stalls = {
+    "the WebSocket was still opening": fakeServer({ opens: false }),
+    "the server had not sent its QMux transport parameters": fakeServer({
+      onFrame: (_socket, frame) => frame.type === FrameType.TransportParameters,
+    }),
+  };
+  for (const [progress, server] of Object.entries(stalls)) {
+    const controller = new AbortController();
+    const connecting = connect("https://example.test/trevrpc", {
+      transports: ["websocket"],
+      WebSocket: server.WebSocket,
+      signal: controller.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort(new Error("gave up"));
+    await assert.rejects(connecting, (error) => {
+      assert.equal(error.code, Code.Cancelled, progress);
+      assert.match(error.statusMessage, /^connection cancelled after \d+ ms: /, progress);
+      assert.ok(error.statusMessage.endsWith(progress), error.statusMessage);
+      assert.equal(error.cause.message, "gave up", progress);
+      return true;
+    });
+    assert.equal(server.sockets[0].readyState, 3, `${progress}: the WebSocket is closed`);
+  }
 });

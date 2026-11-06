@@ -69,6 +69,8 @@ export class QMuxWebSocketSession {
   /** The highest QX_PING request sequence received, -1 before the first: a peer may start at 0. */
   #pingReceived = -1;
   #closedError = null;
+  /** Whether the WebSocket opened with the QMux subprotocol. */
+  #open = false;
   #lastActivity = Date.now();
   #idleTimer;
   #handshakeTimer;
@@ -108,6 +110,20 @@ export class QMuxWebSocketSession {
       () => this.#finish(transportError("QMux handshake timed out"), false),
       options.handshakeTimeoutMs ?? HandshakeTimeoutMs,
     );
+  }
+
+  /**
+   * How far the session got: "opening" until the WebSocket opens, "handshaking" until the server's
+   * transport parameters arrive, "ready" after them, and "closed" once the session ended.
+   */
+  get stage() {
+    if (this.#closedError) {
+      return "closed";
+    }
+    if (this.#peer !== null) {
+      return "ready";
+    }
+    return this.#open ? "handshaking" : "opening";
   }
 
   /** Opens a bidirectional stream, waiting for the server's stream limit. */
@@ -154,6 +170,7 @@ export class QMuxWebSocketSession {
       );
       return;
     }
+    this.#open = true;
     // The transport parameters must be the first frame on the wire.
     writeTransportParameters(this.#pending, {
       initialMaxData: this.#window,

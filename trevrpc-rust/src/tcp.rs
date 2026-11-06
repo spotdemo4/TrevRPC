@@ -268,15 +268,21 @@ pub(crate) async fn handle_connection(
         } else {
             (peer, BytesMut::new())
         };
-        let stream = acceptor
-            .accept(Rewound::new(read_ahead, stream))
-            .await
-            .ok()?;
-        Some((stream, remote_addr))
+        match acceptor.accept(Rewound::new(read_ahead, stream)).await {
+            Ok(stream) => Some((stream, remote_addr)),
+            Err(error) => {
+                tracing::debug!(%error, %remote_addr, "TLS handshake failed");
+                None
+            }
+        }
     };
-    let Ok(Some((stream, remote_addr))) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await
-    else {
-        return;
+    let (stream, remote_addr) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Some(accepted)) => accepted,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::debug!(%peer, "TLS handshake timed out");
+            return;
+        }
     };
     let protocol = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
     let options = server.options();

@@ -40,8 +40,26 @@ fn header_has_token(headers: &HeaderMap, name: &header::HeaderName, token: &str)
 
 /// Answers a WebSocket upgrade request. An admitted upgrade is answered with 101 and handed to
 /// `upgrades`, to run once hyper releases the connection; any other is answered with its
-/// rejection.
+/// rejection. Both are logged at debug level.
 pub fn accept(
+    server: &Server,
+    request: Request<Incoming>,
+    remote_addr: SocketAddr,
+    upgrades: &mpsc::Sender<OnUpgrade>,
+) -> Response<ResponseBody> {
+    let response = upgrade_response(server, request, remote_addr, upgrades);
+    let status = response.status();
+    if status == StatusCode::SWITCHING_PROTOCOLS {
+        tracing::debug!(%remote_addr, "WebSocket upgrade accepted");
+    } else {
+        tracing::debug!(%remote_addr, %status, "WebSocket upgrade rejected");
+    }
+    response
+}
+
+/// The response to a WebSocket upgrade request: `101 Switching Protocols`, with the upgrade
+/// queued on `upgrades`, or the status that rejects it.
+fn upgrade_response(
     server: &Server,
     mut request: Request<Incoming>,
     remote_addr: SocketAddr,
@@ -118,8 +136,12 @@ pub async fn serve_session(
     request_limit: Option<Arc<Semaphore>>,
     shutdown: watch::Receiver<bool>,
 ) {
-    let Ok(upgraded) = upgrade.await else {
-        return;
+    let upgraded = match upgrade.await {
+        Ok(upgraded) => upgraded,
+        Err(error) => {
+            tracing::debug!(%error, %remote_addr, "WebSocket upgrade failed");
+            return;
+        }
     };
     let record_size = usize::try_from(MAX_RECORD_SIZE).unwrap_or(usize::MAX);
     let config = WebSocketConfig::default()

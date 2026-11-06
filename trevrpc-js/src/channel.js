@@ -3,7 +3,14 @@ import { ConnectionMetadataSource } from "./connection-metadata.js";
 import { interceptorList } from "./interceptor.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
 import { dialRace } from "./race.js";
-import { cancelled, failedPrecondition, statusFromTransportError, unavailable } from "./status.js";
+import {
+  Code,
+  TrevRpcError,
+  cancelled,
+  failedPrecondition,
+  statusFromTransportError,
+  unavailable,
+} from "./status.js";
 import { StreamBudget } from "./stream-compression.js";
 
 /**
@@ -63,7 +70,7 @@ export class Channel {
     try {
       const failure = await channel.#connecting;
       if (signal?.aborted) {
-        throw abortError(signal);
+        throw abortError(signal, failure);
       }
       if (failure !== undefined) {
         throw failure;
@@ -433,7 +440,13 @@ function dialWebSocket(url, options, signal) {
  * may reject the ready session by throwing.
  */
 async function establish(session, name, signal, verify) {
-  const abandon = () => closeQuietly(session);
+  const startedAt = Date.now();
+  let abandoned;
+  const abandon = () => {
+    // Closing ends the session, so how far it got is recorded first.
+    abandoned = abandonedMessage(session, name, startedAt);
+    closeQuietly(session);
+  };
   signal?.addEventListener("abort", abandon, { once: true });
   try {
     // A session that fails to connect settles both promises; one that closes first never becomes
@@ -447,7 +460,10 @@ async function establish(session, name, signal, verify) {
     verify?.(session);
   } catch (error) {
     closeQuietly(session);
-    throw signal?.aborted ? abortError(signal) : statusFromTransportError(error);
+    if (signal?.aborted) {
+      throw cancelled(abandoned ?? abandonedMessage(session, name, startedAt), signal.reason);
+    }
+    throw statusFromTransportError(error);
   } finally {
     signal?.removeEventListener("abort", abandon);
   }
@@ -468,8 +484,30 @@ function transportOptions(options) {
   return picked;
 }
 
-function abortError(signal) {
-  return cancelled("connection cancelled", signal.reason);
+/**
+ * The Cancelled error of a connection attempt that `signal` aborted. It keeps the message of
+ * `failure`, the attempt's own Cancelled error, which says how far the attempt got.
+ */
+function abortError(signal, failure) {
+  const message =
+    failure instanceof TrevRpcError && failure.code === Code.Cancelled
+      ? failure.statusMessage
+      : "connection cancelled";
+  return cancelled(message, signal.reason);
+}
+
+/**
+ * Says how far a session abandoned `startedAt` (from Date.now()) got: a QMux over WebSocket
+ * session tells the WebSocket opening from the QMux handshake; a WebTransport session cannot.
+ */
+function abandonedMessage(session, name, startedAt) {
+  const progress =
+    {
+      opening: "the WebSocket was still opening",
+      handshaking:
+        "the WebSocket was open, but the server had not sent its QMux transport parameters",
+    }[session.stage] ?? `the ${name} session was not ready`;
+  return `connection cancelled after ${Date.now() - startedAt} ms: ${progress}`;
 }
 
 /** Exponential backoff with jitter, capped at maxDelayMs. */

@@ -9,7 +9,9 @@ use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncReadExt;
 use tower_http::services::ServeDir;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use trevrpc::fallback::HttpFallback;
 use trevrpc::server::{
     RequestContext, RouteOptions, Server, ServerOptions, WebTransportAdmission,
@@ -325,11 +327,18 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
         CertificateDer::pem_file_iter(flags.require("cert")?)?.collect::<Result<Vec<_>, _>>()?;
     let key = PrivateKeyDer::from_pem_file(flags.require("key")?)?;
 
-    // Warnings and errors go to stderr, where the runners repeat them when a cell fails. The
-    // per-RPC logs are below WARN, so they are not emitted and cannot skew the load benchmarks.
-    tracing_subscriber::fmt()
-        .with_max_level(LevelFilter::WARN)
-        .with_writer(std::io::stderr)
+    // Warnings and errors go to stderr, where the runners repeat them when a cell fails. So do
+    // the TCP listener's TLS handshake failures and WebSocket upgrades, one line per connection,
+    // so that a browser that cannot connect shows how far it got. The per-RPC logs are below
+    // WARN, so they are not emitted and cannot skew the load benchmarks.
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            Targets::new()
+                .with_default(LevelFilter::WARN)
+                .with_target("trevrpc::tcp", LevelFilter::DEBUG)
+                .with_target("trevrpc::websocket", LevelFilter::DEBUG),
+        )
         .init();
     // `--web-root` serves a directory, such as the browser interop page, through the HTTP
     // fallback on the same ports.

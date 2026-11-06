@@ -260,7 +260,13 @@ test("aborting the signal abandons the initial connection", async () => {
   controller.abort(new Error("gave up"));
 
   await assert.rejects(connecting, (error) => {
-    return error.code === Code.Cancelled && error.cause.message === "gave up";
+    return (
+      error.code === Code.Cancelled &&
+      error.cause.message === "gave up" &&
+      /^connection cancelled after \d+ ms: the WebTransport session was not ready$/.test(
+        error.statusMessage,
+      )
+    );
   });
   assert.ok(sessions[0].closeCalls.length >= 1, "the abandoned session is closed");
 
