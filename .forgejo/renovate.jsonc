@@ -21,6 +21,10 @@
 
   // repository
   "extends": ["config:recommended"],
+  // Renovate runs once a day, so the default of 2 PRs per hour caps creation
+  // at 2 PRs per run. Keep the default cap of 10 open PRs to limit CI load
+  // and rebase churn.
+  "prHourlyLimit": 0,
   "addLabels": ["dep"],
   "ignoreDeps": ["@trevrpc/trevrpc-js"],
   "nix": {
