@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
@@ -2336,6 +2337,28 @@ func TestMalformedAndUnknownPathsOverTheWire(t *testing.T) {
 		_, err := Unary(ctx, channel, path, &testMessage{}, newTestMessage)
 		if code := StatusFromError(err).Code; code != CodeUnimplemented {
 			t.Errorf("Unary(%q) = %v, want Unimplemented", path, err)
+		}
+	}
+}
+
+// A failed initial request read is the client's fault only when the frame is
+// malformed. A shutdown or a failed transport leaves the call retryable.
+func TestRequestFrameStatus(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		code Code
+	}{
+		{"server shutdown", errServerShutdown, CodeUnavailable},
+		{"malformed frame", &frameDecodeError{Err: errors.New("bad")}, CodeInvalidArgument},
+		{"frame too large", &FrameTooLargeError{Len: 2, Max: 1}, CodeResourceExhausted},
+		{"connection closed", &quic.ApplicationError{Remote: true, ErrorMessage: "server shutdown"}, CodeUnavailable},
+		{"stream ended", io.ErrUnexpectedEOF, CodeUnavailable},
+		{"cancelled", context.Canceled, CodeCancelled},
+		{"read deadline", os.ErrDeadlineExceeded, CodeDeadlineExceeded},
+	} {
+		if code := requestFrameStatus(test.err).Code; code != test.code {
+			t.Errorf("%s: code = %s, want %s", test.name, code, test.code)
 		}
 	}
 }

@@ -338,17 +338,23 @@ func requestFrameStatus(err error) *Status {
 	if frameTooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
 		return ResourceExhausted(frameTooLarge.Error())
 	}
+	// No handler has run, so the client may retry the call elsewhere.
+	if errors.Is(err, errServerShutdown) {
+		return Unavailable(errServerShutdown.Error())
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return statusFromContextError(err)
 	}
 	if isTimeoutError(err) {
 		return DeadlineExceeded("initial request frame timeout")
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return Unavailable("transport unavailable: " + err.Error())
+	if _, ok := errors.AsType[*frameDecodeError](err); ok {
+		return InvalidArgument("invalid RPC request frame: " + err.Error())
 	}
 
-	return InvalidArgument("invalid RPC request frame: " + err.Error())
+	// Anything else failed the transport, such as a connection that a shutdown
+	// closed before the stream's context saw it.
+	return Unavailable("transport unavailable: " + err.Error())
 }
 
 func isTimeoutError(err error) bool {
@@ -404,8 +410,9 @@ func readRequestFrame(ctx context.Context, options ServerOptions, startedAt time
 	if err == nil {
 		err = decodeRequest(first.payload, request)
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+	if ctx.Err() != nil {
+		// errServerShutdown when the listener is shutting down.
+		return nil, context.Cause(ctx)
 	}
 	if err != nil {
 		return nil, err

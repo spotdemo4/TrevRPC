@@ -18,7 +18,7 @@ use crate::fallback::{FallbackBody, HttpFallback, ResponseSink, multiplexed_head
 use crate::http_admission::{rejection_head, rpc_response_head, validate_http_request};
 use crate::request_pump::RequestTransportEvent;
 use crate::rpc_body::{BodySink, BodySource, handle_rpc_stream};
-use crate::serve::{drain_tasks, log_task_error, transport_limits};
+use crate::serve::{drain_tasks, log_task_error, transport_limits, unless_shutting_down};
 use crate::server::Server;
 use crate::server_transport::{Permit, try_acquire_permit};
 use crate::{Error, Result, Status};
@@ -47,9 +47,9 @@ pub async fn handle_connection<T>(
         builder
             .max_concurrent_streams(u32::try_from(streams.saturating_add(1)).unwrap_or(u32::MAX));
     }
-    let Ok(Ok(mut connection)) =
-        tokio::time::timeout(handshake_timeout, builder.handshake::<_, Bytes>(io)).await
-    else {
+    // The client's preface may never come, so shutdown ends the wait for it.
+    let handshake = tokio::time::timeout(handshake_timeout, builder.handshake::<_, Bytes>(io));
+    let Some(Ok(Ok(mut connection))) = unless_shutting_down(&mut shutdown, handshake).await else {
         return;
     };
     let stream_limit = options

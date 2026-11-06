@@ -328,14 +328,17 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     let key = PrivateKeyDer::from_pem_file(flags.require("key")?)?;
 
     // Warnings and errors go to stderr, where the runners repeat them when a cell fails. So do
-    // the TCP listener's TLS handshake failures and WebSocket upgrades, one line per connection,
-    // so that a browser that cannot connect shows how far it got. The per-RPC logs are below
-    // WARN, so they are not emitted and cannot skew the load benchmarks.
+    // a few lines per connection: when it opens, what it negotiates and when it closes, and the
+    // TCP listener's TLS handshake failures and WebSocket upgrades, so that a browser that cannot
+    // connect shows how far it got, and a connection that holds up a shutdown shows as one that
+    // never closed. The per-RPC logs are below WARN, so they are not emitted and cannot skew the
+    // load benchmarks.
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(
             Targets::new()
                 .with_default(LevelFilter::WARN)
+                .with_target("trevrpc::connections", LevelFilter::DEBUG)
                 .with_target("trevrpc::tcp", LevelFilter::DEBUG)
                 .with_target("trevrpc::websocket", LevelFilter::DEBUG),
         )

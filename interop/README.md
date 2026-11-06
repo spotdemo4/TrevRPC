@@ -207,9 +207,11 @@ have their own entry points but follow the same output contract.
 - Diagnostics go to stderr: at least the server's warnings and errors, such as
   handlers that outlive their calls, and a line for each failed TLS handshake
   on the TCP listener and each WebSocket upgrade, so that a browser that cannot
-  connect shows how far it got. A failed cell lists what the server logged
-  while it ran, and a server that does not exit cleanly prints the end of its
-  log.
+  connect shows how far it got. The Rust server also logs when each connection
+  opens, what it negotiates, when it closes, and when shutdown starts and
+  finishes draining. A connection that held up a shutdown shows as one that
+  never closed. A failed cell lists what the server logged while it ran, and a
+  server that does not exit cleanly prints the end of its log.
 
 ### Client
 

@@ -147,6 +147,7 @@ async fn read_request<K, S>(
     demux: Option<&Demux>,
     sink: K,
     source: S,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Option<(BodyWriter<K>, BodyReader<S>, IncomingRequest)>
 where
     K: BodySink,
@@ -162,7 +163,7 @@ where
         source,
         chunk: Bytes::new(),
     };
-    let incoming = server_transport::read_initial_request(server, &mut reader)
+    let incoming = server_transport::read_initial_request(server, &mut reader, shutdown)
         .await
         .and_then(|mut incoming| {
             incoming.remote_addr = Some(remote_addr);
@@ -190,7 +191,7 @@ pub async fn handle_rpc_stream<K, S>(
     session: Option<Arc<WebTransportSessionState>>,
     sink: K,
     source: S,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) where
     K: BodySink,
     S: BodySource,
@@ -207,6 +208,7 @@ pub async fn handle_rpc_stream<K, S>(
                 .and_then(|session| session.demux.as_deref()),
             sink,
             source,
+            &mut shutdown,
         )
         .await
         else {
@@ -231,6 +233,7 @@ pub async fn reject_rpc_stream<K, S>(
     session: Option<Arc<WebTransportSessionState>>,
     sink: K,
     source: S,
+    mut shutdown: watch::Receiver<bool>,
 ) where
     K: BodySink,
     S: BodySource,
@@ -243,6 +246,7 @@ pub async fn reject_rpc_stream<K, S>(
         None,
         sink,
         source,
+        &mut shutdown,
     )
     .await
     {

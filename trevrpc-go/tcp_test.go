@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/quic-go/quic-go"
 	"golang.org/x/net/http2"
 )
 
@@ -272,5 +273,166 @@ func TestWebSocketAdmissionPathAndSubprotocol(t *testing.T) {
 		if got, err := dial(test.path, test.origin, test.subprotocols...); got != test.want {
 			t.Errorf("%s: status %d (%v), want %d", name, got, err, test.want)
 		}
+	}
+}
+
+// serveForShutdownTest serves the test service with an unbounded graceful
+// shutdown, so that only the waits before an RPC, never the drain timeout, can
+// end a shutdown promptly. configure, if not nil, adjusts the server. stop shuts
+// the listener down and fails the test unless Serve returns within 2 s, well
+// within the 10 s timeouts those waits used to run to.
+func serveForShutdownTest(t *testing.T, pki testPKI, configure func(*Server)) (listener *Listener, stop func()) {
+	t.Helper()
+	server := NewServer()
+	options := server.Options()
+	options.EnableHTTP = true
+	options.EnableWebTransport = true
+	options.WebTransportAdmission = func(request AdmissionRequest) bool { return request.Origin == testOrigin }
+	options.GracefulShutdownTimeout = time.Hour
+	server.SetOptions(options)
+	registerTestService(server)
+	if configure != nil {
+		configure(server)
+	}
+	listener, err := Listen("127.0.0.1:0", server, ListenOptions{TLSConfig: pki.server})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- listener.Serve(ctx) }()
+	for !listener.serving.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	return listener, func() {
+		t.Helper()
+		cancel()
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Fatalf("Serve: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			logGoroutines(t)
+			t.Fatal("Serve did not stop promptly")
+		}
+	}
+}
+
+// Connections that have not started an RPC end as soon as the listener shuts
+// down. The HTTP server would otherwise wait up to 10 s for an HTTP/2 preface,
+// and keep a connection without an HTTP/1.1 request for up to 5 s.
+func TestShutdownEndsConnectionsThatHaveNotStarted(t *testing.T) {
+	pki := newTestPKI(t)
+	listener, stop := serveForShutdownTest(t, pki, nil)
+
+	addr := listener.TCPAddr().String()
+	noClientHello, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := []net.Conn{noClientHello}
+	for _, protocol := range []string{http2ALPN, http1ALPN, QMuxALPN} {
+		config := pki.client.Clone()
+		config.NextProtos = []string{protocol}
+		conn, err := (&tls.Dialer{Config: config}).DialContext(t.Context(), "tcp", addr)
+		if err != nil {
+			t.Fatalf("%s handshake: %v", protocol, err)
+		}
+		conns = append(conns, conn)
+	}
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	// The HTTP/2 and HTTP/1.1 connections reach the HTTP server.
+	waitFor(t, "the HTTP server to take both HTTP connections", func() bool {
+		listener.httpTCP.mu.Lock()
+		defer listener.httpTCP.mu.Unlock()
+		return len(listener.httpTCP.unstarted) == 2
+	})
+
+	stop()
+	for _, conn := range conns {
+		// Closed, with or without close_notify, or reset; not timed out.
+		_ = conn.SetReadDeadline(time.Now().Add(rpcTestTimeout))
+		if _, err := io.Copy(io.Discard, conn); isTimeoutError(err) {
+			t.Errorf("connection from %s was not closed", conn.LocalAddr())
+		}
+	}
+}
+
+// A stream whose REQUEST frame has not arrived when the listener begins
+// shutting down fails with Unavailable at once: no handler has run, so the
+// client may retry the call elsewhere. The connection's close usually overtakes
+// the answer, so the metrics show the status.
+func TestShutdownRefusesStreamsStillAwaitingTheirRequest(t *testing.T) {
+	for _, transport := range []string{"native", "webtransport"} {
+		t.Run(transport, func(t *testing.T) {
+			pki := newTestPKI(t)
+			metrics := &recordingMetrics{}
+			listener, stop := serveForShutdownTest(t, pki, func(server *Server) { server.SetMetrics(metrics) })
+			var opener streamOpener
+			if transport == "native" {
+				conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), clientQUICConfig(nil, DefaultMaxFrameSize))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+				opener = connOpener{conn}
+			} else {
+				opener = newWebTransportTestOpener(t, pki, listener, testOrigin, nil)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+			defer cancel()
+
+			waiting, err := opener.openStream(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A REQUEST frame whose last byte never follows.
+			request := testRequestBytes(t, requestFor("Echo", RPCKindUnary))
+			if _, err := waiting.Write(request[:len(request)-1]); err != nil {
+				t.Fatal(err)
+			}
+			// Streams are accepted in order, so once a later call completes,
+			// the server is reading this one.
+			call, err := opener.openStream(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := call.Write(testRequestBytes(t, requestFor("Echo", RPCKindUnary), encodedTestMessage(t, "x"))); err != nil {
+				t.Fatal(err)
+			}
+			_ = call.Close()
+			_ = call.SetReadDeadline(time.Now().Add(rpcTestTimeout))
+			if _, err := io.ReadAll(call); err != nil {
+				t.Fatalf("read the later call: %v", err)
+			}
+
+			stop()
+			_, finished := metrics.snapshot()
+			if len(finished) != 2 || finished[0].Code != CodeOK || finished[1].Code != CodeUnavailable {
+				t.Fatalf("finished RPCs = %+v, want the later call OK, then the waiting one Unavailable", finished)
+			}
+			// The connection's close may cut the answer short.
+			_ = waiting.SetReadDeadline(time.Now().Add(rpcTestTimeout))
+			next, err := newFrameReader(waiting, DefaultMaxFrameSize, -1).next()
+			if isTimeoutError(err) {
+				t.Fatal("stream was neither answered nor closed")
+			}
+			if err != nil {
+				return
+			}
+			frame, err := decodeTestFrame(next)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status := frame.statusValue(); frame.Kind != frameTypeStatus || status.Code != CodeUnavailable || status.Message != errServerShutdown.Error() {
+				t.Fatalf("frame = %+v, want an Unavailable %q status", frame, errServerShutdown)
+			}
+		})
 	}
 }

@@ -374,6 +374,39 @@ async fn shutdown_closes_qmux_connections() -> TestResult {
     Ok(())
 }
 
+/// Connections that have not started an RPC end as soon as the server shuts down. They used to
+/// hold the shutdown until their 10 s handshake timeout, longer than the interop runner waits.
+#[tokio::test]
+async fn shutdown_ends_connections_that_have_not_started() -> TestResult {
+    use tokio::io::AsyncReadExt as _;
+
+    // Only the waits before an RPC, never the drain timeout, can end this shutdown promptly.
+    let server = spawn_server(test_options().with_graceful_shutdown_timeout(None)).await?;
+    // Accepted in order, so the TLS connections below are not accepted before this one.
+    let mut no_client_hello = TcpStream::connect(server.tcp).await?;
+    let mut no_preface = connect_tls(&server, b"h2").await?;
+    let mut no_qmux_handshake = connect_tls(&server, trevrpc::QMUX_ALPN).await?;
+    let mut no_request = connect_tls(&server, b"http/1.1").await?;
+
+    within!(Duration::from_secs(2), server.stop())??;
+    let mut buffer = [0_u8; 64];
+    // Closed, by a FIN or a reset.
+    let _ = within!(TEST_TIMEOUT, no_client_hello.read(&mut buffer))?;
+    within!(TEST_TIMEOUT, read_to_close(&mut no_preface))?;
+    within!(TEST_TIMEOUT, read_to_close(&mut no_qmux_handshake))?;
+    within!(TEST_TIMEOUT, read_to_close(&mut no_request))?;
+    Ok(())
+}
+
+/// Reads whatever the server sends until it closes the connection, with or without
+/// `close_notify`.
+async fn read_to_close(stream: &mut tokio_rustls::client::TlsStream<TcpStream>) {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut buffer = [0_u8; 1024];
+    while matches!(stream.read(&mut buffer).await, Ok(read) if read > 0) {}
+}
+
 #[tokio::test]
 async fn http2_serves_post_rpcs_and_advertises_http3() -> TestResult {
     let server = spawn_server(test_options()).await?;

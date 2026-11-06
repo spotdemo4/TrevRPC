@@ -13,6 +13,7 @@ use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, ResponseCodec};
 use crate::request_pump::{
     RequestInputKind, RequestPumpReader, RequestPumpSettle, UnaryRequestEnd, start_request_pump,
 };
+use crate::serve::unless_shutting_down;
 use crate::server::{
     Admitted, CallInfo, CancellationSource, CancellationToken, RequestBudget, Server,
 };
@@ -116,22 +117,33 @@ pub fn open_flow(demux: Option<&Demux>, incoming: &mut IncomingRequest) -> Resul
 }
 
 /// Reads the REQUEST frame and, for calls with a single request message, that message, bounded by
-/// the server's initial request timeout.
+/// the server's initial request timeout and by `shutdown`.
 ///
 /// Unknown frames are skipped. Failures here are protocol errors the caller answers with a lone
-/// STATUS frame.
-pub async fn read_initial_request<R>(server: &Server, recv: &mut R) -> Result<IncomingRequest>
+/// STATUS frame. A request that has not arrived when the server begins shutting down fails as
+/// unavailable: no handler has run, so there is nothing to drain, and the client may retry the
+/// call elsewhere.
+pub async fn read_initial_request<R>(
+    server: &Server,
+    recv: &mut R,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<IncomingRequest>
 where
     R: FrameRead,
 {
-    let read = read_request_and_message(server, recv);
-    if let Some(timeout) = server.options().initial_request_timeout() {
-        tokio::time::timeout(timeout, read)
-            .await
-            .map_err(|_| Error::from(Status::deadline_exceeded("initial request frame timeout")))?
-    } else {
-        read.await
-    }
+    let read = async {
+        let read = read_request_and_message(server, recv);
+        if let Some(timeout) = server.options().initial_request_timeout() {
+            tokio::time::timeout(timeout, read).await.map_err(|_| {
+                Error::from(Status::deadline_exceeded("initial request frame timeout"))
+            })?
+        } else {
+            read.await
+        }
+    };
+    unless_shutting_down(shutdown, read)
+        .await
+        .unwrap_or_else(|| Err(Error::from(Status::unavailable("server is shutting down"))))
 }
 
 async fn read_request_and_message<R>(server: &Server, recv: &mut R) -> Result<IncomingRequest>
@@ -872,7 +884,7 @@ mod tests {
     use crate::test_io::Script;
     use crate::{Code, Metadata, ResponseEnvelope, ResponseFrame, RpcKind, RpcRequest, Status};
     use std::sync::Arc;
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Semaphore, watch};
 
     #[test]
     fn permit_admission_preserves_unlimited_and_bounded_behavior() {
@@ -920,7 +932,8 @@ mod tests {
     }
 
     async fn read(server: &Server, wire: Vec<Vec<u8>>) -> crate::Result<super::IncomingRequest> {
-        read_initial_request(server, &mut Script::new(wire.concat())).await
+        let (_shutdown, mut shutting_down) = watch::channel(false);
+        read_initial_request(server, &mut Script::new(wire.concat()), &mut shutting_down).await
     }
 
     #[tokio::test]

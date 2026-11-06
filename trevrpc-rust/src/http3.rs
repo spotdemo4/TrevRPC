@@ -432,6 +432,7 @@ async fn handle_webtransport_session(
                                 Some(Arc::clone(&session_state)),
                                 WebTransportSink(send),
                                 WebTransportSource(recv, stream_connection),
+                                shutdown.clone(),
                             ));
                             continue;
                         };

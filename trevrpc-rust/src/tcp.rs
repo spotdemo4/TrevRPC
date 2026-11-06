@@ -18,6 +18,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::proxy_protocol::{self, Rewound};
 use crate::qmux_conn::{MAX_RECORD_SIZE, QmuxConnection, server_config};
+use crate::serve::{ConnectionLog, unless_shutting_down};
 use crate::server::{Server, canonical_addr};
 use crate::{http1, http2, native};
 
@@ -251,10 +252,11 @@ pub(crate) async fn handle_connection(
     tls: Arc<quinn::rustls::ServerConfig>,
     alt_svc: Option<HeaderValue>,
     request_limit: Option<Arc<Semaphore>>,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let _ = stream.set_nodelay(true);
     let peer = canonical_addr(peer);
+    let log = ConnectionLog::opened("tcp", peer);
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let handshake = async {
         let (remote_addr, read_ahead) = if proxied {
@@ -276,15 +278,21 @@ pub(crate) async fn handle_connection(
             }
         }
     };
-    let (stream, remote_addr) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
-        Ok(Some(accepted)) => accepted,
-        Ok(None) => return,
-        Err(_) => {
+    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake);
+    let (stream, remote_addr) = match unless_shutting_down(&mut shutdown, handshake).await {
+        Some(Ok(Some(accepted))) => accepted,
+        Some(Ok(None)) => return,
+        Some(Err(_)) => {
             tracing::debug!(%peer, "TLS handshake timed out");
+            return;
+        }
+        None => {
+            tracing::debug!(%peer, "TLS handshake abandoned at shutdown");
             return;
         }
     };
     let protocol = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    log.negotiated(remote_addr, protocol.as_deref());
     let options = server.options();
     match protocol.as_deref() {
         Some(crate::QMUX_ALPN) => {
@@ -292,7 +300,9 @@ pub(crate) async fn handle_connection(
                 qmux::transport::Stream::new(stream, qmux::Version::QMux02, MAX_RECORD_SIZE);
             let mut config = server_config(options);
             config.handshake_timeout = HANDSHAKE_TIMEOUT;
-            let Ok(session) = qmux::Session::accept(transport, config).await else {
+            let Some(Ok(session)) =
+                unless_shutting_down(&mut shutdown, qmux::Session::accept(transport, config)).await
+            else {
                 return;
             };
             native::handle_connection(

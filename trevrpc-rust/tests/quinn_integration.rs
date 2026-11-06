@@ -2899,6 +2899,60 @@ async fn quinn_shutdown_closes_active_connections() -> TestResult {
     Ok(())
 }
 
+/// Waits for nothing but a shutdown that ends at once, and well within the 10 s initial request
+/// timeout that streams still awaiting their request used to wait out.
+const PROMPT_SHUTDOWN: Duration = Duration::from_secs(2);
+
+/// Options under which only the waits before an RPC, never the drain timeout, can end a shutdown
+/// promptly.
+fn unbounded_drain_options() -> ServerOptions {
+    fast_server_options()
+        .with_http_enabled(true)
+        .with_graceful_shutdown_timeout(None)
+}
+
+/// A stream that was answered at shutdown, or that the connection's close cut short. The answer
+/// is `Unavailable`: no handler ran, so the client may retry the call elsewhere.
+fn ensure_unavailable_at_shutdown(status: TestResult<Status>) -> TestResult {
+    if let Ok(status) = status {
+        ensure_eq!(status.code(), Code::Unavailable);
+        ensure_eq!(status.message(), "server is shutting down");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn quinn_shutdown_refuses_streams_still_awaiting_their_request() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(unbounded_drain_options());
+    })?;
+    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    // A REQUEST frame header whose payload never follows.
+    support::write_raw(&mut send, &large_request_header(64)?).await?;
+    // Streams are accepted in order, so once a later call completes, the server is reading this one.
+    assert_greeter_ready(&client).await?;
+
+    within!(PROMPT_SHUTDOWN, server.shutdown())??;
+    ensure_unavailable_at_shutdown(read_raw_quinn_status(&mut recv).await)?;
+    close_client(endpoint, connection).await
+}
+
+#[tokio::test]
+async fn webtransport_shutdown_refuses_streams_still_awaiting_their_request() -> TestResult {
+    let server = spawn_greeter_server(|server| {
+        server.set_options(unbounded_drain_options());
+    })?;
+    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+    let (mut send, mut recv) = session.open_bi().await?;
+    support::write_raw(&mut send, &large_request_header(64)?).await?;
+    assert_greeter_ready(&greeter_client).await?;
+
+    within!(PROMPT_SHUTDOWN, server.shutdown())??;
+    ensure_unavailable_at_shutdown(read_raw_webtransport_status(&mut recv).await)?;
+    close_webtransport_client(client, session).await
+}
+
 #[tokio::test]
 async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;

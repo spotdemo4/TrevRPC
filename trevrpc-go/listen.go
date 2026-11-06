@@ -102,8 +102,8 @@ type Listener struct {
 	handshakeTimeout time.Duration
 	httpTCP          *httpTCPServer // nil unless HTTP or WebTransport is enabled
 
-	// ctx is cancelled when the listener begins shutting down. In-flight RPCs
-	// observe it through their contexts.
+	// ctx is cancelled, with the cause errServerShutdown, when the listener
+	// begins shutting down. In-flight RPCs observe it through their contexts.
 	ctx    context.Context
 	cancel context.CancelFunc
 	// serveCtx is the context passed to Serve, whose values calls carry. Serve
@@ -160,7 +160,8 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 	if options.AltSvcPort < 0 || options.AltSvcPort > math.MaxUint16 {
 		return nil, InvalidArgument("AltSvcPort " + strconv.Itoa(options.AltSvcPort) + " is not a port number")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	cancel := func() { cancelCause(errServerShutdown) }
 	l := &Listener{
 		server:            server,
 		runtime:           server.freeze(),
@@ -280,6 +281,10 @@ func (l *Listener) Serve(ctx context.Context) error {
 	return nil
 }
 
+// errServerShutdown is the cancellation cause of the listener's context, and of
+// the stream contexts derived from it, once the listener begins shutting down.
+var errServerShutdown = errors.New("server is shutting down")
+
 // acceptStopping reports whether an accept error comes from the listener
 // shutting down rather than from a failure.
 func (l *Listener) acceptStopping(ctx context.Context, err error) bool {
@@ -394,15 +399,17 @@ func (l *Listener) serveStreams(ctx context.Context, acceptor streamAcceptor) {
 	}
 }
 
+// contextWithAdditionalCancel returns a context that is also cancelled when
+// cancelOn is, with cancelOn's cause.
 func contextWithAdditionalCancel(ctx context.Context, cancelOn context.Context) (context.Context, context.CancelFunc) {
 	if cancelOn.Done() == nil {
 		return ctx, func() {}
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(cancelOn, cancel)
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(cancelOn, func() { cancel(context.Cause(cancelOn)) })
 	return ctx, func() {
 		stop()
-		cancel()
+		cancel(nil)
 	}
 }

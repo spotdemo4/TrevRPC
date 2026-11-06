@@ -1,7 +1,7 @@
 //! The server accept loop: one Quinn endpoint serving native QUIC, HTTP/3 and `WebTransport`, and
 //! optionally one TCP listener serving the fallbacks.
 
-use std::future::{Future, pending};
+use std::future::{Future, IntoFuture, pending};
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::sync::Arc;
@@ -194,14 +194,21 @@ impl Server {
                     // Accepting creates the connection's driver on the runtime that accepts it.
                     let shard = shards.pick();
                     let (shard_handle, shard_guard) = shard.unzip();
+                    let mut shutdown = shutdown;
                     let connection_task = async move {
                         let _shard_guard = shard_guard;
-                        let Ok(connection) = incoming.await else {
+                        let log = ConnectionLog::opened("quic", incoming.remote_address());
+                        // A handshake abandoned at shutdown closes its connection when dropped.
+                        let Some(Ok(connection)) =
+                            unless_shutting_down(&mut shutdown, incoming).await
+                        else {
                             return;
                         };
                         let connection = ServerConnection::new(connection, clients);
                         let _connection_permit = connection_permit;
-                        match negotiated_protocol(&connection).as_deref() {
+                        let protocol = negotiated_protocol(&connection);
+                        log.negotiated(connection.client_addr(), protocol.as_deref());
+                        match protocol.as_deref() {
                             Some(crate::ALPN) => {
                                 native::handle_connection(server, connection, request_limit, shutdown)
                                     .await;
@@ -267,6 +274,11 @@ impl Server {
 
         // Stop accepting TCP connections; the endpoint keeps refusing QUIC ones while draining.
         drop(tcp.take());
+        tracing::debug!(
+            target: CONNECTIONS_TARGET,
+            connections = connection_tasks.len(),
+            "shutting down; draining connections"
+        );
         let _ = shutdown_tx.send(true);
         drain_connections(
             &mut connection_tasks,
@@ -410,9 +422,69 @@ async fn drain_connections(
         never = refuse_new_connections => never,
     };
     if finished {
+        tracing::debug!(target: CONNECTIONS_TARGET, "connections drained");
         endpoint.close(0_u32.into(), b"server shutdown complete");
     } else {
+        tracing::warn!("graceful shutdown timed out; closed the connections still open");
         endpoint.close(0_u32.into(), b"server graceful shutdown timed out");
+    }
+}
+
+/// The `tracing` target of connection lifecycle events. No module path starts with it, so a
+/// subscriber can enable it alone, without the per-RPC events of `trevrpc::server`.
+const CONNECTIONS_TARGET: &str = "trevrpc::connections";
+
+/// Logs at DEBUG when a connection opens, what it negotiates, and when its task ends, however it
+/// ends, so that a connection that holds up a shutdown shows in the log as one that never closed.
+pub struct ConnectionLog {
+    transport: &'static str,
+    peer: SocketAddr,
+}
+
+impl ConnectionLog {
+    pub fn opened(transport: &'static str, peer: SocketAddr) -> Self {
+        tracing::debug!(target: CONNECTIONS_TARGET, transport, %peer, "connection opened");
+        Self { transport, peer }
+    }
+
+    /// Logs the application protocol of the handshake, and the client a proxy named, if any.
+    pub fn negotiated(&self, remote_addr: SocketAddr, alpn: Option<&[u8]>) {
+        tracing::debug!(
+            target: CONNECTIONS_TARGET,
+            transport = self.transport,
+            peer = %self.peer,
+            %remote_addr,
+            alpn = ?String::from_utf8_lossy(alpn.unwrap_or_default()),
+            "connection negotiated"
+        );
+    }
+}
+
+impl Drop for ConnectionLog {
+    fn drop(&mut self) {
+        tracing::debug!(
+            target: CONNECTIONS_TARGET,
+            transport = self.transport,
+            peer = %self.peer,
+            "connection closed"
+        );
+    }
+}
+
+/// Runs `future` until it completes or the server begins shutting down, whichever comes first,
+/// and returns `None` on shutdown, including one that began before the call.
+///
+/// For the waits before a connection or stream carries an RPC, such as handshakes and the initial
+/// request frame: they have nothing to drain, so they must not hold a shutdown until they time out.
+pub async fn unless_shutting_down<F: IntoFuture>(
+    shutdown: &mut watch::Receiver<bool>,
+    future: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        output = future => Some(output),
+        // A dropped sender means the server is gone, as after a shutdown.
+        _ = shutdown.wait_for(|&shutting_down| shutting_down) => None,
     }
 }
 

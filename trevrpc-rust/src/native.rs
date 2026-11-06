@@ -137,6 +137,7 @@ pub async fn handle_connection<C: MuxConnection>(
                         Arc::clone(&connection_metadata),
                         send,
                         recv,
+                        shutdown.clone(),
                     ));
                     continue;
                 };
@@ -183,6 +184,7 @@ pub async fn handle_connection<C: MuxConnection>(
 /// Reads the initial request frame, resolves its connection metadata against the connection's
 /// `connection_metadata` and opens its datagram flow on `demux`, replying with the failure status
 /// when any of them fails. The stream slot is released before that reply.
+#[allow(clippy::too_many_arguments)]
 async fn read_request<C: MuxConnection>(
     server: &Server,
     stream_permit: &mut Permit,
@@ -191,6 +193,7 @@ async fn read_request<C: MuxConnection>(
     connection_metadata: &ConnectionMetadataStore,
     send: C::SendStream,
     recv: C::RecvStream,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Option<(
     NativeResponseWriter<C::SendStream>,
     NativePumpReader<C>,
@@ -199,7 +202,7 @@ async fn read_request<C: MuxConnection>(
     let max_frame_size = server.max_frame_size();
     let remote_addr = connection.remote_addr();
     let mut recv = NativePumpReader::new(recv, connection);
-    let incoming = server_transport::read_initial_request(server, &mut recv.recv)
+    let incoming = server_transport::read_initial_request(server, &mut recv.recv, shutdown)
         .await
         .and_then(|mut incoming| {
             incoming.remote_addr = remote_addr;
@@ -238,7 +241,7 @@ async fn handle_stream<C: MuxConnection>(
     mut stream_permit: Permit,
     send: C::SendStream,
     recv: C::RecvStream,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     // The call's future is made in a block, so that what `read_request` returned is not kept
     // beside it in this future.
@@ -251,6 +254,7 @@ async fn handle_stream<C: MuxConnection>(
             &connection_metadata,
             send,
             recv,
+            &mut shutdown,
         )
         .await
         else {
@@ -275,6 +279,7 @@ async fn reject_stream<C: MuxConnection>(
     connection_metadata: Arc<ConnectionMetadataStore>,
     send: C::SendStream,
     recv: C::RecvStream,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut no_permit = Permit::none();
     if let Some((send, recv, incoming)) = read_request(
@@ -285,6 +290,7 @@ async fn reject_stream<C: MuxConnection>(
         &connection_metadata,
         send,
         recv,
+        &mut shutdown,
     )
     .await
     {
