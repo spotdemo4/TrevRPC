@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "protoc-gen-trevrpc-rust"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "heck",
  "prost",
@@ -2551,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2589,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-interop"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "futures-util",
  "prost",
@@ -2608,7 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-opentelemetry"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
