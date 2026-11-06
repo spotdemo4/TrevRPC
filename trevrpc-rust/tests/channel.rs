@@ -5,10 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::task::JoinHandle;
 use trevrpc::client::{
     Channel, ChannelConfig, ChannelEvent, ChannelPhase, ReconnectBackoff, RpcTransport,
+    StreamingRpcTransport,
 };
 use trevrpc::{Code, RpcRequest, Status};
 
@@ -352,6 +354,40 @@ async fn slow_calls_keep_one_connection_however_many_are_in_flight() -> TestResu
     }
     ensure_eq!(client.quic_connections().len(), 1);
     ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 1);
+
+    client.close();
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn streams_opened_together_spread_over_added_connections() -> TestResult {
+    // Streams start no further calls, so the call rate never sees them. A few in flight crowd a
+    // connection when they could outrun the call rate, here any two, and later streams wait for
+    // the next connection instead of piling onto a crowded one.
+    let server = RawServer::spawn_with_delay(false, Duration::from_millis(300))?;
+    let client = connect_pooled(
+        &server,
+        fast(ChannelConfig::new().with_max_quic_connections(3)),
+    )
+    .await?;
+
+    let calls: Vec<_> = (0..12)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let mut responses = client
+                    .streaming_call(request(), trevrpc::stream::from_iter([b"pool".to_vec()]))
+                    .await?;
+                while responses.next().await.transpose()?.is_some() {}
+                Ok::<_, trevrpc::Error>(())
+            })
+        })
+        .collect();
+    for call in calls {
+        within!(TEST_TIMEOUT, call)???;
+    }
+    ensure_eq!(server.accepted_connections.load(Ordering::SeqCst), 3);
+    ensure_eq!(client.quic_connections().len(), 3);
 
     client.close();
     server.shutdown().await

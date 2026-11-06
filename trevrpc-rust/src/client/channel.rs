@@ -201,9 +201,13 @@ impl ChannelConfig {
     /// core. The channel starts with one. While it starts calls faster than
     /// [`Self::with_quic_connection_call_rate`] or moves bytes faster than
     /// [`Self::with_quic_connection_byte_rate`], it places each call on the connection with the
-    /// fewest in flight, and dials another when every connection carries one of those rates. A call stays on the connection it started on, so streams opened all at once share
-    /// the first connection unless [`Self::with_min_quic_connections`] opened more first. The default is half the available parallelism, from one to four; one
-    /// disables it. `QMux` over TLS always uses one connection.
+    /// fewest in flight, and dials another when every connection carries one of those rates. It
+    /// does the same while streaming calls crowd its connections: while they could each make a
+    /// round trip faster than the call rate allows, at the connection's round trip time, as a few
+    /// do over loopback but even 64 over a 20 ms round trip do not. A call stays on the connection
+    /// it started on, so a streaming call that finds every connection crowded waits up to 100 ms
+    /// for the one the channel dials. The default is half the available parallelism, from one to
+    /// four; one disables it. `QMux` over TLS always uses one connection.
     #[must_use]
     pub const fn with_max_quic_connections(mut self, connections: usize) -> Self {
         self.max_quic_connections = if connections == 0 { 1 } else { connections };
@@ -217,18 +221,16 @@ impl ChannelConfig {
     }
 
     /// Sets how many QUIC connections the channel keeps open and spreads every call over from the
-    /// start, for clients that open many busy, long-lived streams at once. The default is one.
+    /// start, for clients whose many busy streams the channel would not count as crowding one, such
+    /// as streams on a slow link that still need more than one connection's share of it (see
+    /// [`Self::with_max_quic_connections`]). The default is one.
     ///
-    /// A call never moves to another connection, so streams opened together before the channel
-    /// grows (see [`Self::with_max_quic_connections`]) all share the first connection and wait on
-    /// each other inside Quinn: on the bench host, 64 `bidi` streams opened at once carried 114k
-    /// round trips per second over one connection and 169k over four. With more than one, the
-    /// channel dials them all in parallel when it connects, is ready once they are up (a failed
-    /// extra one does not hold it up), places each call on the one with the fewest in flight,
-    /// never closes them for being idle, and dials again when one is lost. It still grows beyond
-    /// them, up to the maximum, as the call and byte rates ask. Every connection has its own
-    /// congestion controller, so over a slow or lossy link they take a larger share than one would.
-    /// `QMux` over TLS always uses one connection.
+    /// With more than one, the channel dials them all in parallel when it connects, is ready once
+    /// they are up (a failed extra one does not hold it up), places each call on the one with the
+    /// fewest in flight, never closes them for being idle, and dials again when one is lost. It
+    /// still grows beyond them, up to the maximum, as the call and byte rates and crowding streams
+    /// ask. Every connection has its own congestion controller, so over a slow or lossy link they
+    /// take a larger share than one would. `QMux` over TLS always uses one connection.
     #[must_use]
     pub const fn with_min_quic_connections(mut self, connections: usize) -> Self {
         self.min_quic_connections = if connections == 0 { 1 } else { connections };
