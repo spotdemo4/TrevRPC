@@ -2498,9 +2498,9 @@ dependencies = [
 
 [[package]]
 name = "trev-h3"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6a732055601c18d5dad3bd093f375fa8e4220260bf1bef9b55624c227c4030d"
+checksum = "00f1c3d9d6ccc434463d9ffdd966e26038cab5c7fb55da580f09a4ff4d841ce2"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2512,9 +2512,9 @@ dependencies = [
 
 [[package]]
 name = "trev-h3-datagram"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7db9aa83303c9d832d6b61f5f73140de5fbbbea7e918a6d90e59e73e660354c8"
+checksum = "a23541bd5068a07cc7fb7fbc542793f882b2b051d1a6818f93863b4dae32563c"
 dependencies = [
  "bytes",
  "trev-h3",
@@ -2522,9 +2522,9 @@ dependencies = [
 
 [[package]]
 name = "trev-h3-quinn"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e70c3f081c4dbf931a5ce426e009aa1e5cfa87582f867c71894a17b7c9bb474"
+checksum = "a6b12d4581749f1e757e277cc74df8eabc0dad3ae92db22549e1796502a9e86a"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2535,9 +2535,9 @@ dependencies = [
 
 [[package]]
 name = "trev-h3-webtransport"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec57be0263923f13e969eff524592b82651d86357c8374c791fdb4926c7ce270"
+checksum = "21b032179b555801a59566bce80ebb191358098ac1fcbe69e3e7d5b29365c4b9"
 dependencies = [
  "bytes",
  "futures-util",
