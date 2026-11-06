@@ -40,6 +40,11 @@ const (
 // each value is at most 8 KiB, and keys and values total at most 64 KiB.
 type Metadata map[string][]byte
 
+// Clone returns a copy of m that shares nothing with it, never nil.
+func (m Metadata) Clone() Metadata {
+	return cloneMetadata(m)
+}
+
 // RPCKind identifies the shape of an RPC.
 type RPCKind int32
 

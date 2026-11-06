@@ -36,7 +36,11 @@ type HandlerContext struct {
 	// FullMethod is the method path "/<Service>/<Method>".
 	FullMethod string
 	Kind       RPCKind
-	Metadata   Metadata
+	// Metadata is the request metadata, connection metadata included. The map
+	// is the call's own, but the values that came from connection metadata are
+	// shared with the connection's other calls: replace such a value instead
+	// of changing its bytes in place, or work on a copy from Metadata.Clone.
+	Metadata Metadata
 	// RemoteAddr is the address of the client: the source address of a QUIC
 	// or TCP connection, unless it came from a trusted proxy (see
 	// ListenOptions.TrustedTCPProxies and TrustedUDPProxies), whose PROXY
@@ -72,7 +76,8 @@ func responseMetadataFromContext(ctx context.Context) *responseMetadata {
 	return &state.response
 }
 
-// RequestMetadataFromContext returns normalized request metadata attached to ctx.
+// RequestMetadataFromContext returns normalized request metadata attached to ctx,
+// whose values may be shared as HandlerContext.Metadata describes.
 func RequestMetadataFromContext(ctx context.Context) Metadata {
 	info, ok := HandlerContextFromContext(ctx)
 	if !ok || info.Metadata == nil {

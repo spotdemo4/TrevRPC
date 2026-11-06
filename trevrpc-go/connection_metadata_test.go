@@ -2,6 +2,8 @@ package trevrpc
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -245,13 +247,18 @@ func TestConnectionMetadataStore(t *testing.T) {
 func TestHandlersCannotChangeTheConnectionMetadataOfLaterCalls(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, func(server *Server) {
-		// Answers with the suffix it got, then overwrites it in place.
+		// Answers with the suffix it got, then changes its metadata every way
+		// the contract allows: appending to a shared value, replacing one, and
+		// deleting one. The map is the call's own and shared values are capped,
+		// so none of it reaches later calls.
 		RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(ctx context.Context, request *testMessage) (*testMessage, error) {
-			suffix := RequestMetadataFromContext(ctx)["suffix"]
+			metadata := RequestMetadataFromContext(ctx)
+			suffix := metadata["suffix"]
 			reply := &testMessage{Value: request.Value + string(suffix)}
-			for i := range suffix {
-				suffix[i] = 'x'
-			}
+			_ = append(suffix, 'x')
+			metadata["suffix"] = []byte("x")
+			delete(metadata, "suffix")
+			metadata["added"] = []byte("x")
 			return reply, nil
 		})
 	})
@@ -267,10 +274,27 @@ func TestHandlersCannotChangeTheConnectionMetadataOfLaterCalls(t *testing.T) {
 	}
 	defer func() { _ = channel.Close() }()
 	// The first call offers the set and the later ones refer to it: each still
-	// gets the stored value, not what an earlier handler wrote.
-	for range 3 {
-		if got := echoSuffix(t, channel); got != "v!" {
-			t.Fatalf("call = %q, want v!", got)
+	// gets the stored value, not what an earlier handler wrote. The later ones
+	// run at once, so that the race detector sees handlers sharing the values.
+	if got := echoSuffix(t, channel); got != "v!" {
+		t.Fatalf("call = %q, want v!", got)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for range cap(errs) {
+		wg.Go(func() {
+			reply, err := Unary(ctx, channel, "/example.Greeter/Echo", &testMessage{Value: "v"}, newTestMessage)
+			if err == nil && reply.Value != "v!" {
+				err = fmt.Errorf("call = %q, want v!", reply.Value)
+			}
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -291,5 +315,41 @@ func TestALateConfirmationOfAReplacedSetIsIgnored(t *testing.T) {
 	client.learn(first, wireAnswer{ConnectionMetadata: first})
 	if got := client.confirmed.Load(); got != second {
 		t.Fatalf("confirmed set = %d after a late confirmation of %d, want %d", got, first, second)
+	}
+}
+
+func TestStoredConnectionMetadataValuesAreCappedAndNormalized(t *testing.T) {
+	value := make([]byte, 1, 8)
+	value[0] = 'v'
+	var store connectionMetadataStore
+	shared := store.store(connectionMetadataSet{id: 1, metadata: Metadata{"k": value, "empty": []byte{}}})
+	if got := shared["k"]; len(got) != 1 || cap(got) != 1 {
+		t.Fatalf("stored value has len %d, cap %d; want both 1", len(got), cap(got))
+	}
+	if got, ok := shared["empty"]; !ok || got != nil {
+		t.Fatalf("stored empty value = %#v, %v; want nil, true", got, ok)
+	}
+	// Appending to a value a call got copies it instead of writing into the
+	// backing array other calls share.
+	grown := append(shared["k"], 'x')
+	grown[0] = 'y'
+	if string(shared["k"]) != "v" {
+		t.Fatalf("stored value = %q after a call appended to it, want v", shared["k"])
+	}
+	if stored, ok := store.lookup(1); !ok || string(stored["k"]) != "v" {
+		t.Fatalf("lookup = %q, %v; want v, true", stored["k"], ok)
+	}
+}
+
+func TestMetadataCloneSharesNothing(t *testing.T) {
+	original := Metadata{"k": []byte("v")}
+	clone := original.Clone()
+	clone["k"][0] = 'x'
+	clone["added"] = nil
+	if string(original["k"]) != "v" || len(original) != 1 {
+		t.Fatalf("original = %q after changing its clone", original)
+	}
+	if got := Metadata(nil).Clone(); got == nil || len(got) != 0 {
+		t.Fatalf("Metadata(nil).Clone() = %#v, want an empty map", got)
 	}
 }

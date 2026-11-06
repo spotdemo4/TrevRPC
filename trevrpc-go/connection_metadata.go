@@ -2,7 +2,7 @@ package trevrpc
 
 import (
 	"fmt"
-	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -151,7 +151,7 @@ func (s *connectionMetadataStore) resolve(request *wireRequest) error {
 			return err
 		}
 		if s != nil {
-			s.store(connectionMetadataSet{id: info.ID, metadata: set})
+			set = s.store(connectionMetadataSet{id: info.ID, metadata: set})
 			request.connectionMetadataConfirmed = info.ID
 		}
 	} else {
@@ -160,22 +160,24 @@ func (s *connectionMetadataStore) resolve(request *wireRequest) error {
 			return InvalidArgument(fmt.Sprintf("unknown connection metadata set %d", info.ID))
 		}
 	}
+	// The map is the call's own, so a handler can change its entries, but the
+	// values are the stored set's, shared with the connection's other calls
+	// (see HandlerContext.Metadata): copying them cost Go over QMux about a
+	// tenth of its unary calls with 1 KiB of connection metadata.
 	if request.Metadata == nil {
 		request.Metadata = make(Metadata, len(set))
 	}
 	for key, value := range set {
 		if _, ok := request.Metadata[key]; !ok {
-			// A copy: the connection's later calls share the stored values,
-			// and the handler owns its request metadata.
-			request.Metadata[key] = append([]byte(nil), value...)
+			request.Metadata[key] = value
 		}
 	}
 	return nil
 }
 
-// store keeps set, replacing one with the same ID and dropping the oldest
-// beyond maxConnectionMetadataSets.
-func (s *connectionMetadataStore) store(set connectionMetadataSet) {
+// store keeps a shared copy of set, replacing one with the same ID and
+// dropping the oldest beyond maxConnectionMetadataSets, and returns the copy.
+func (s *connectionMetadataStore) store(set connectionMetadataSet) Metadata {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, stored := range s.sets {
@@ -187,7 +189,26 @@ func (s *connectionMetadataStore) store(set connectionMetadataSet) {
 	if len(s.sets) == maxConnectionMetadataSets {
 		s.sets = append(s.sets[:0], s.sets[1:]...)
 	}
-	s.sets = append(s.sets, connectionMetadataSet{id: set.id, metadata: maps.Clone(set.metadata)})
+	shared := sharedMetadata(set.metadata)
+	s.sets = append(s.sets, connectionMetadataSet{id: set.id, metadata: shared})
+	return shared
+}
+
+// sharedMetadata returns a copy of metadata whose values calls share: each
+// value is capped at its length, so that appending to it in one call copies
+// it instead of writing past it into memory other calls read, and an empty
+// value is nil, as ownedMetadata makes it.
+func sharedMetadata(metadata Metadata) Metadata {
+	shared := make(Metadata, len(metadata))
+	for key, value := range metadata {
+		if len(value) == 0 {
+			value = nil
+		} else {
+			value = slices.Clip(value)
+		}
+		shared[key] = value
+	}
+	return shared
 }
 
 // lookup returns the stored set id.
