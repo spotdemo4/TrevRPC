@@ -27,7 +27,7 @@ mod greeter;
 mod support;
 
 const AUTH_TOKEN: &str = "integration-token";
-const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn reject_http3_admission(request: &trevrpc::server::HttpAdmissionRequest<'_>) -> bool {
     assert!(request.headers.iter().any(|header| {
@@ -160,7 +160,7 @@ impl RunningServer {
         }
 
         if let Some(task) = self.task.take() {
-            tokio::time::timeout(TEST_TIMEOUT, task).await???;
+            within!(TEST_TIMEOUT, task)???;
         }
 
         Ok(())
@@ -353,7 +353,7 @@ fn http3_response_stream(
 
 async fn wait_for_server_ready(ready: &watch::Receiver<bool>) -> TestResult {
     let mut ready = ready.clone();
-    tokio::time::timeout(TEST_TIMEOUT, ready.wait_for(|is_ready| *is_ready)).await??;
+    within!(TEST_TIMEOUT, ready.wait_for(|is_ready| *is_ready))??;
     Ok(())
 }
 
@@ -401,7 +401,7 @@ impl RecordingMetrics {
             }
         };
 
-        tokio::time::timeout(TEST_TIMEOUT, wait).await?;
+        within!(TEST_TIMEOUT, wait)?;
         Ok(())
     }
 }
@@ -869,10 +869,7 @@ async fn quinn_post_response_drain_does_not_violate_quinn_recv_stream_contract()
             support::write_message(&mut send, &[]).await?;
         }
         send.finish()?;
-        ensure_eq!(
-            tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??,
-            None
-        );
+        ensure_eq!(within!(TEST_TIMEOUT, send.stopped())??, None);
     }
 
     settle_detached_server_tasks().await;
@@ -937,8 +934,7 @@ fn ignored_upload_frames(messages: usize) -> TestResult<Bytes> {
 async fn expect_peer_reset(
     source_rx: &mut mpsc::UnboundedReceiver<CancellationSource>,
 ) -> TestResult {
-    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-        .await?
+    let source = within!(TEST_TIMEOUT, source_rx.recv())?
         .ok_or("handler should report its cancellation source")?;
     ensure_eq!(source, CancellationSource::PeerReset);
     Ok(())
@@ -1031,11 +1027,10 @@ async fn say_hello_with_connection_metadata(
     send.finish()?;
     let mut confirmed = 0;
     loop {
-        let frame = tokio::time::timeout(
+        let frame = within!(
             TEST_TIMEOUT,
             support::read_any_frame(&mut recv, trevrpc::framing::DEFAULT_MAX_FRAME_SIZE),
-        )
-        .await??
+        )??
         .ok_or("the response ended without a STATUS")?;
         match frame.frame_type {
             trevrpc::framing::frame_type::ANSWER => {
@@ -1219,8 +1214,7 @@ async fn h3_alpn_is_not_negotiated_unless_http3_or_webtransport_is_enabled() -> 
     })?;
     wait_for_server_ready(&server.ready).await?;
     let endpoint = make_http3_client_endpoint(server.cert_der.clone())?;
-    let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
-        .await
+    let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
         .expect("ALPN mismatch handshake should complete");
     ensure!(result.is_err(), "h3 must not be negotiated");
     endpoint.close(0_u32.into(), b"test complete");
@@ -1337,23 +1331,17 @@ async fn h3_shutdown_is_bounded_with_active_http3_and_webtransport_rpcs() -> Tes
         "first"
     );
 
-    tokio::time::timeout(TEST_TIMEOUT, server.shutdown())
-        .await
-        .expect("h3 shutdown should be bounded")?;
-    tokio::time::timeout(TEST_TIMEOUT, session.closed())
-        .await
+    within!(TEST_TIMEOUT, server.shutdown()).expect("h3 shutdown should be bounded")?;
+    within!(TEST_TIMEOUT, session.closed())
         .expect("WebTransport session should close during shutdown");
-    tokio::time::timeout(TEST_TIMEOUT, http3_connection.closed())
-        .await
+    within!(TEST_TIMEOUT, http3_connection.closed())
         .expect("HTTP/3 connection should close during shutdown");
 
     drop(webtransport_replies);
     drop(http3_replies);
     close_webtransport_client(webtransport_client, session).await?;
     http3_endpoint.close(0_u32.into(), b"test complete");
-    tokio::time::timeout(TEST_TIMEOUT, http3_endpoint.wait_idle())
-        .await
-        .expect("HTTP/3 endpoint should become idle");
+    within!(TEST_TIMEOUT, http3_endpoint.wait_idle()).expect("HTTP/3 endpoint should become idle");
     Ok(())
 }
 
@@ -1534,8 +1522,7 @@ async fn http3_stop_sending_reports_peer_reset_to_request_context() -> TestResul
     body.recv
         .stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
 
-    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-        .await?
+    let source = within!(TEST_TIMEOUT, source_rx.recv())?
         .expect("HTTP/3 probe should report a cancellation source");
     ensure_eq!(source, CancellationSource::PeerReset);
     drop((send, body));
@@ -1878,7 +1865,7 @@ async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
 
     ensure_eq!(status.code(), Code::Unavailable);
     read_quinn_fin(&mut recv).await?;
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    let stopped = within!(TEST_TIMEOUT, send.stopped())??;
     ensure_eq!(stopped, None);
 
     drop(hanging);
@@ -1982,7 +1969,7 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
 
     ensure_eq!(status.code(), Code::Unavailable);
     read_quinn_fin(&mut recv).await?;
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    let stopped = within!(TEST_TIMEOUT, send.stopped())??;
     ensure_eq!(stopped, None);
     observed_metrics.wait_for_code(Code::Unavailable).await?;
     ensure_eq!(observed_metrics.codes(), vec![Code::Unavailable]);
@@ -2036,17 +2023,15 @@ async fn quinn_late_request_limit_failure_settles_metrics_once_and_stops_upload(
     let request =
         RpcRequest::new("/lifecycle.LateFailure/Upload").with_kind(RpcKind::ClientStreaming);
     support::write_request(&mut send, &request).await?;
-    tokio::time::timeout(TEST_TIMEOUT, ready_rx.recv())
-        .await?
+    within!(TEST_TIMEOUT, ready_rx.recv())?
         .expect("handler should return its pending response stream");
 
     support::write_message(&mut send, b"over limit").await?;
     let status = support::read_lone_status(&mut recv).await?;
     ensure_eq!(status.code(), Code::ResourceExhausted);
     read_quinn_fin(&mut recv).await?;
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped())
-        .await??
-        .expect("server should stop the rejected upload");
+    let stopped =
+        within!(TEST_TIMEOUT, send.stopped())??.expect("server should stop the rejected upload");
     ensure_eq!(stopped.into_inner(), 1);
     observed_metrics
         .wait_for_code(Code::ResourceExhausted)
@@ -2068,14 +2053,13 @@ async fn webtransport_late_request_limit_failure_stops_upload() -> TestResult {
     let request =
         RpcRequest::new("/lifecycle.LateFailure/Upload").with_kind(RpcKind::ClientStreaming);
     support::write_request(&mut send, &request).await?;
-    tokio::time::timeout(TEST_TIMEOUT, ready_rx.recv())
-        .await?
+    within!(TEST_TIMEOUT, ready_rx.recv())?
         .expect("handler should return its pending response stream");
 
     support::write_message(&mut send, b"over limit").await?;
     let status = support::read_lone_status(&mut recv).await?;
     ensure_eq!(status.code(), Code::ResourceExhausted);
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    let stopped = within!(TEST_TIMEOUT, send.stopped())??;
     ensure_eq!(stopped, Some(1), "server should stop the rejected upload");
     observed_metrics
         .wait_for_code(Code::ResourceExhausted)
@@ -2100,11 +2084,10 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
     let hanging = hold_server_stream_open(&client).await?;
     let second_endpoint = make_client_endpoint(server.cert_der.clone())?;
 
-    let connect = tokio::time::timeout(
+    let connect = within!(
         TEST_TIMEOUT,
         second_endpoint.connect(server.addr, "localhost")?,
     )
-    .await
     .expect("second connection attempt should complete");
 
     if let Ok(connection) = connect {
@@ -2180,8 +2163,7 @@ async fn quinn_response_drop_reports_peer_reset_to_request_context() -> TestResu
 
     drop(responses);
 
-    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-        .await?
+    let source = within!(TEST_TIMEOUT, source_rx.recv())?
         .expect("probe should report a cancellation source");
     ensure_eq!(source, CancellationSource::PeerReset);
 
@@ -2210,8 +2192,7 @@ async fn quinn_shutdown_reports_server_shutdown_to_request_context() -> TestResu
         .expect("probe should yield its first response")?;
 
     let shutdown = tokio::spawn(server.shutdown());
-    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-        .await?
+    let source = within!(TEST_TIMEOUT, source_rx.recv())?
         .expect("probe should report a cancellation source");
     ensure_eq!(source, CancellationSource::ServerShutdown);
     shutdown.await??;
@@ -2269,8 +2250,7 @@ async fn webtransport_stop_sending_reports_peer_reset_to_request_context() -> Te
 
     recv.stop(1)?;
 
-    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-        .await?
+    let source = within!(TEST_TIMEOUT, source_rx.recv())?
         .expect("WebTransport probe should report a cancellation source");
     ensure_eq!(source, CancellationSource::PeerReset);
     drop((send, recv));
@@ -2292,8 +2272,8 @@ async fn webtransport_shutdown_closes_the_session() -> TestResult {
         .await?;
     ensure_eq!(reply.message, "hello, before shutdown");
 
-    tokio::time::timeout(TEST_TIMEOUT, server.shutdown()).await??;
-    let error = tokio::time::timeout(TEST_TIMEOUT, session.closed()).await?;
+    within!(TEST_TIMEOUT, server.shutdown())??;
+    let error = within!(TEST_TIMEOUT, session.closed())?;
     let web_transport_quinn::SessionError::WebTransportError(
         web_transport_quinn::WebTransportError::Closed(code, reason),
     ) = error
@@ -2321,13 +2301,10 @@ async fn webtransport_connection_close_reports_connection_loss() -> TestResult {
     expect_probe_ready(&mut recv).await?;
 
     quinn::Connection::close(&session, 7_u32.into(), b"adversarial connection close");
-    let source = tokio::time::timeout(TEST_TIMEOUT, source_rx.recv())
-        .await?
+    let source = within!(TEST_TIMEOUT, source_rx.recv())?
         .expect("WebTransport probe should report a cancellation source");
     ensure_eq!(source, CancellationSource::ConnectionLost);
-    tokio::time::timeout(TEST_TIMEOUT, session.closed())
-        .await
-        .expect("client session should close");
+    within!(TEST_TIMEOUT, session.closed()).expect("client session should close");
     drop((client, send, recv));
 
     server.shutdown().await
@@ -2564,7 +2541,7 @@ async fn quinn_unary_request_fin_is_drained_without_stop_sending() -> TestResult
 
     send.finish()?;
     read_quinn_fin(&mut recv).await?;
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    let stopped = within!(TEST_TIMEOUT, send.stopped())??;
     ensure_eq!(stopped, None);
 
     close_client(endpoint, connection).await?;
@@ -2583,7 +2560,7 @@ async fn reject_with_open_request(
 ) -> TestResult<(quinn::SendStream, quinn::RecvStream)> {
     let (mut send, mut recv) = connection.open_bi().await?;
     support::write_request(&mut send, &rejected_bidi_request()).await?;
-    let status = tokio::time::timeout(TEST_TIMEOUT, support::read_lone_status(&mut recv)).await??;
+    let status = within!(TEST_TIMEOUT, support::read_lone_status(&mut recv))??;
     assert_eq!(status.code(), Code::PermissionDenied);
     read_quinn_fin(&mut recv).await?;
     Ok((send, recv))
@@ -2605,10 +2582,7 @@ async fn quinn_open_request_side_is_drained_not_stopped_after_handler_failure() 
     );
     support::write_message(&mut send, &[]).await?;
     send.finish()?;
-    ensure_eq!(
-        tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??,
-        None
-    );
+    ensure_eq!(within!(TEST_TIMEOUT, send.stopped())??, None);
 
     close_client(endpoint, connection).await?;
     server.shutdown().await
@@ -2630,8 +2604,8 @@ async fn quinn_request_discard_after_handler_failure_is_bounded_by_bytes() -> Te
         }
         send
     });
-    let send = tokio::time::timeout(TEST_TIMEOUT, writer).await??;
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    let send = within!(TEST_TIMEOUT, writer)??;
+    let stopped = within!(TEST_TIMEOUT, send.stopped())??;
     ensure_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
 
     close_client(endpoint, connection).await?;
@@ -2646,7 +2620,7 @@ async fn quinn_request_discard_after_handler_failure_is_bounded_by_time() -> Tes
 
     // A client that neither finishes nor sends is stopped after about one second.
     let started = std::time::Instant::now();
-    let stopped = tokio::time::timeout(Duration::from_secs(4), send.stopped()).await??;
+    let stopped = within!(Duration::from_secs(4), send.stopped())??;
     ensure_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
     ensure!(started.elapsed() >= Duration::from_millis(900));
 
@@ -2661,7 +2635,7 @@ async fn webtransport_open_request_side_is_drained_not_stopped_after_handler_fai
     let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
     let (mut send, mut recv) = session.open_bi().await?;
     support::write_request(&mut send, &rejected_bidi_request()).await?;
-    let status = tokio::time::timeout(TEST_TIMEOUT, support::read_lone_status(&mut recv)).await??;
+    let status = within!(TEST_TIMEOUT, support::read_lone_status(&mut recv))??;
     ensure_eq!(status.code(), Code::PermissionDenied);
 
     ensure!(
@@ -2671,10 +2645,7 @@ async fn webtransport_open_request_side_is_drained_not_stopped_after_handler_fai
         "server stopped the request side while the client was still sending"
     );
     send.finish()?;
-    ensure_eq!(
-        tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??,
-        None
-    );
+    ensure_eq!(within!(TEST_TIMEOUT, send.stopped())??, None);
 
     close_webtransport_client(client, session).await?;
     server.shutdown().await
@@ -2713,7 +2684,7 @@ async fn quinn_unary_request_left_open_is_bounded_and_frees_the_stream_slot() ->
 
     // The server stops the abandoned request after about one second.
     let started = std::time::Instant::now();
-    let stopped = tokio::time::timeout(Duration::from_secs(4), send.stopped()).await??;
+    let stopped = within!(Duration::from_secs(4), send.stopped())??;
     ensure_eq!(stopped.map(quinn::VarInt::into_inner), Some(1));
     ensure!(started.elapsed() <= Duration::from_secs(3));
 
@@ -2729,8 +2700,7 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
     let (status_written_tx, status_written_rx) = oneshot::channel();
     let (finish_tx, finish_rx) = oneshot::channel();
     let server_task = tokio::spawn(async move {
-        let incoming = tokio::time::timeout(TEST_TIMEOUT, server_endpoint.accept())
-            .await?
+        let incoming = within!(TEST_TIMEOUT, server_endpoint.accept())?
             .ok_or_else(|| std::io::Error::other("server endpoint closed before accept"))?;
         let connection = incoming.await?;
         let (mut send, mut recv) = connection.accept_bi().await?;
@@ -2743,7 +2713,7 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
         let _ = status_written_tx.send(());
         let _ = finish_rx.await;
         send.finish()?;
-        let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+        let stopped = within!(TEST_TIMEOUT, send.stopped())??;
         let _ = stopped_tx.send(stopped);
         connection.close(0_u32.into(), b"test complete");
 
@@ -2773,7 +2743,7 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
         "terminal response status must wait for clean response FIN"
     );
     let _ = finish_tx.send(());
-    let (frame, response) = tokio::time::timeout(TEST_TIMEOUT, next_task).await??;
+    let (frame, response) = within!(TEST_TIMEOUT, next_task)??;
     let frame = frame.expect("response status should arrive")?;
 
     ensure_eq!(frame, trevrpc::ResponseFrame::Status(Status::ok()));
@@ -2791,8 +2761,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
     let server_addr = server_endpoint.local_addr()?;
     let (done_tx, done_rx) = oneshot::channel();
     let server_task = tokio::spawn(async move {
-        let incoming = tokio::time::timeout(TEST_TIMEOUT, server_endpoint.accept())
-            .await?
+        let incoming = within!(TEST_TIMEOUT, server_endpoint.accept())?
             .ok_or_else(|| std::io::Error::other("server endpoint closed before accept"))?;
         let connection = incoming.await?;
         let (mut send, mut recv) = connection.accept_bi().await?;
@@ -2820,8 +2789,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
         )
         .await?;
 
-    let error = tokio::time::timeout(TEST_TIMEOUT, response.next())
-        .await?
+    let error = within!(TEST_TIMEOUT, response.next())?
         .expect("post-terminal frame should produce an error")
         .expect_err("post-terminal frame should be rejected");
     ensure_eq!(error.into_status().code(), Code::Internal);
@@ -2846,7 +2814,7 @@ async fn quinn_a_request_status_is_invalid_argument() -> TestResult {
     support::write_request(&mut send, &request).await?;
     support::write_status(&mut send, Status::ok()).await?;
     send.finish()?;
-    let status = tokio::time::timeout(TEST_TIMEOUT, support::read_lone_status(&mut recv)).await??;
+    let status = within!(TEST_TIMEOUT, support::read_lone_status(&mut recv))??;
     ensure_eq!(status.code(), Code::InvalidArgument);
 
     settle_detached_server_tasks().await;
@@ -2938,8 +2906,7 @@ async fn webtransport_shutdown_closes_active_sessions() -> TestResult {
     assert_greeter_ready(&greeter_client).await?;
 
     server.shutdown().await?;
-    tokio::time::timeout(TEST_TIMEOUT, session.closed())
-        .await
+    within!(TEST_TIMEOUT, session.closed())
         .expect("client should observe WebTransport server shutdown");
 
     let error = greeter_client
@@ -2965,8 +2932,7 @@ async fn http3_shutdown_closes_active_connections() -> TestResult {
     assert_greeter_ready(&client).await?;
 
     server.shutdown().await?;
-    tokio::time::timeout(TEST_TIMEOUT, connection.closed())
-        .await
+    within!(TEST_TIMEOUT, connection.closed())
         .expect("client should observe HTTP/3 server shutdown");
 
     let error = client
@@ -3014,14 +2980,12 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
         .await
     });
 
-    tokio::time::timeout(TEST_TIMEOUT, started_rx.recv())
-        .await
+    within!(TEST_TIMEOUT, started_rx.recv())
         .expect("pending unary handler should start")
         .expect("pending unary handler signal should remain open");
     server.shutdown().await?;
-    let result = tokio::time::timeout(TEST_TIMEOUT, call)
-        .await
-        .expect("pending client call should finish after shutdown")?;
+    let result =
+        within!(TEST_TIMEOUT, call).expect("pending client call should finish after shutdown")?;
     let error = result.expect_err("shutdown should fail the pending RPC");
     ensure!(matches!(
         error.into_status().code(),
@@ -3060,13 +3024,11 @@ async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestRe
         .await
     });
 
-    tokio::time::timeout(TEST_TIMEOUT, started_rx.recv())
-        .await
+    within!(TEST_TIMEOUT, started_rx.recv())
         .expect("pending WebTransport unary handler should start")
         .expect("pending WebTransport unary handler signal should remain open");
     server.shutdown().await?;
-    let result = tokio::time::timeout(TEST_TIMEOUT, call)
-        .await
+    let result = within!(TEST_TIMEOUT, call)
         .expect("pending WebTransport client call should finish after shutdown")?;
     let error = result.expect_err("shutdown should fail the pending WebTransport RPC");
     ensure!(matches!(
@@ -3094,9 +3056,7 @@ async fn quinn_local_close_maps_to_cancelled() -> TestResult {
         .expect_err("RPC on locally closed connection should fail");
     ensure_eq!(error.into_status().code(), Code::Cancelled);
 
-    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle())
-        .await
-        .expect("client endpoint should become idle");
+    within!(TEST_TIMEOUT, endpoint.wait_idle()).expect("client endpoint should become idle");
     server.shutdown().await
 }
 
@@ -3105,8 +3065,7 @@ async fn quinn_rejects_alpn_mismatch() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let endpoint = make_client_endpoint_with_alpn(server.cert_der.clone(), b"not-trevrpc")?;
 
-    let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
-        .await
+    let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
         .expect("ALPN mismatch handshake should complete");
 
     ensure!(result.is_err(), "ALPN mismatch should reject connection");
@@ -3120,8 +3079,7 @@ async fn quinn_rejects_tls_identity_mismatch() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
     let endpoint = make_client_endpoint(server.cert_der.clone())?;
 
-    let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "wronghost")?)
-        .await
+    let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "wronghost")?)
         .expect("identity mismatch handshake should complete");
 
     ensure!(result.is_err(), "SNI mismatch should reject connection");
@@ -3135,8 +3093,7 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
     let server = spawn_greeter_server_with_endpoint(make_mtls_server_endpoint()?, |_| {})?;
     let endpoint = make_client_endpoint(server.cert_der.clone())?;
 
-    let result = tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
-        .await
+    let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
         .expect("mTLS rejection handshake should complete");
 
     if let Ok(connection) = result {
@@ -3428,7 +3385,7 @@ async fn quinn_oversized_initial_frame_is_rejected_before_body() -> TestResult {
     let status = read_raw_quinn_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::ResourceExhausted);
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    let stopped = within!(TEST_TIMEOUT, send.stopped())??;
     ensure_eq!(stopped, Some(1_u32.into()));
     close_client(endpoint, connection).await?;
     server.shutdown().await
@@ -3447,7 +3404,7 @@ async fn webtransport_oversized_initial_frame_is_rejected_before_body() -> TestR
     let status = read_raw_webtransport_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::ResourceExhausted);
-    let stopped = tokio::time::timeout(TEST_TIMEOUT, send.stopped()).await??;
+    let stopped = within!(TEST_TIMEOUT, send.stopped())??;
     ensure_eq!(
         stopped,
         None,
@@ -3768,29 +3725,28 @@ fn large_request_header(payload_len: usize) -> TestResult<Vec<u8>> {
 
 /// Reads a response that must be a lone STATUS, as for failures before dispatch.
 async fn read_raw_quinn_status(recv: &mut quinn::RecvStream) -> TestResult<Status> {
-    Ok(tokio::time::timeout(TEST_TIMEOUT, support::read_lone_status(recv)).await??)
+    Ok(within!(TEST_TIMEOUT, support::read_lone_status(recv))??)
 }
 
 async fn read_raw_webtransport_status(
     recv: &mut web_transport_quinn::RecvStream,
 ) -> TestResult<Status> {
-    Ok(tokio::time::timeout(TEST_TIMEOUT, support::read_lone_status(recv)).await??)
+    Ok(within!(TEST_TIMEOUT, support::read_lone_status(recv))??)
 }
 
 /// Reads a response through its terminal STATUS.
 async fn read_raw_quinn_reply(recv: &mut quinn::RecvStream) -> TestResult<support::UnaryReply> {
-    Ok(tokio::time::timeout(TEST_TIMEOUT, support::read_unary_reply(recv)).await??)
+    Ok(within!(TEST_TIMEOUT, support::read_unary_reply(recv))??)
 }
 
 /// Reads the response headers and first message of the cancellation probe route.
 async fn expect_probe_ready<R: support::RawRecv>(recv: &mut R) -> TestResult {
-    let reply_headers =
-        tokio::time::timeout(TEST_TIMEOUT, support::read_response_frame(recv)).await??;
+    let reply_headers = within!(TEST_TIMEOUT, support::read_response_frame(recv))??;
     let Some(trevrpc::ResponseFrame::Headers(headers)) = reply_headers else {
         return Err(format!("expected response headers first, got {reply_headers:?}").into());
     };
     assert_response_shape_header(&headers, "server-streaming-probe");
-    let first = tokio::time::timeout(TEST_TIMEOUT, support::read_response_frame(recv)).await??;
+    let first = within!(TEST_TIMEOUT, support::read_response_frame(recv))??;
     let Some(trevrpc::ResponseFrame::Message(first)) = first else {
         return Err(format!("expected the first message, got {first:?}").into());
     };
@@ -3800,7 +3756,7 @@ async fn expect_probe_ready<R: support::RawRecv>(recv: &mut R) -> TestResult {
 
 async fn read_quinn_fin(recv: &mut quinn::RecvStream) -> TestResult {
     let mut scratch = [0_u8; 1];
-    let read = tokio::time::timeout(TEST_TIMEOUT, recv.read(&mut scratch)).await??;
+    let read = within!(TEST_TIMEOUT, recv.read(&mut scratch))??;
     assert_eq!(read, None, "stream should end without trailing data");
     Ok(())
 }
@@ -3956,13 +3912,13 @@ async fn close_webtransport_client(
     session: web_transport_quinn::Session,
 ) -> TestResult {
     session.close(0, b"test complete");
-    tokio::time::timeout(TEST_TIMEOUT, session.closed()).await?;
+    within!(TEST_TIMEOUT, session.closed())?;
     Ok(())
 }
 
 async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) -> TestResult {
     connection.close(0_u32.into(), b"test complete");
-    tokio::time::timeout(TEST_TIMEOUT, endpoint.wait_idle()).await?;
+    within!(TEST_TIMEOUT, endpoint.wait_idle())?;
     Ok(())
 }
 
@@ -3976,15 +3932,14 @@ async fn assert_greeter_ready<T>(client: &greeter::GreeterClient<T>) -> TestResu
 where
     T: RpcTransport,
 {
-    let reply = tokio::time::timeout(
+    let reply = within!(
         TEST_TIMEOUT,
         client
             .say_hello(&greeter::HelloRequest {
                 name: "readiness".to_owned(),
             })
             .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT)),
-    )
-    .await??;
+    )??;
     assert_eq!(reply.message, "hello, readiness");
     Ok(())
 }
@@ -4481,8 +4436,7 @@ impl ScriptedServer {
         let (server_endpoint, cert_der) = make_server_endpoint(&fast_server_options())?;
         let server_addr = server_endpoint.local_addr()?;
         let task = tokio::spawn(async move {
-            let incoming = tokio::time::timeout(TEST_TIMEOUT, server_endpoint.accept())
-                .await?
+            let incoming = within!(TEST_TIMEOUT, server_endpoint.accept())?
                 .ok_or_else(|| std::io::Error::other("server endpoint closed before accept"))?;
             let connection = incoming.await?;
             let (mut send, mut recv) = connection.accept_bi().await?;

@@ -111,7 +111,7 @@ impl RunningServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        tokio::time::timeout(TEST_TIMEOUT, &mut self.task).await???;
+        within!(TEST_TIMEOUT, &mut self.task)???;
         Ok(())
     }
 
@@ -232,15 +232,14 @@ fn proxy_v2_header() -> Vec<u8> {
 
 /// Says hello over `QMux` over TLS to `addr` and returns the address the server reports.
 async fn qmux_remote_addr(server: &RunningServer, addr: SocketAddr) -> TestResult<String> {
-    let transport = tokio::time::timeout(
+    let transport = within!(
         TEST_TIMEOUT,
         QmuxTransport::connect(
             addr,
             "localhost",
             client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
         ),
-    )
-    .await??;
+    )??;
     let reply = greeter::GreeterClient::new(transport.clone())
         .say_hello(&greeter::HelloRequest::default())
         .await;
@@ -256,11 +255,10 @@ async fn native_quic_calls_see_the_client_address() -> TestResult {
     let config = ChannelConfig::new();
     endpoint
         .set_default_client_config(config.quic_config(client_tls(&server.cert, trevrpc::ALPN)?)?);
-    let channel = tokio::time::timeout(
+    let channel = within!(
         TEST_TIMEOUT,
         Channel::connect_with_config(endpoint, server.udp, "localhost", config),
-    )
-    .await??;
+    )??;
     let reply = greeter::GreeterClient::new(channel.clone())
         .say_hello(&greeter::HelloRequest::default())
         .await?;
@@ -335,9 +333,7 @@ async fn http2_status(server: &RunningServer, addr: SocketAddr) -> TestResult<ht
         trevrpc::framing::DEFAULT_MAX_FRAME_SIZE,
     )?);
     body.send_data(Bytes::from(frames), true)?;
-    Ok(tokio::time::timeout(TEST_TIMEOUT, response)
-        .await??
-        .status())
+    Ok(within!(TEST_TIMEOUT, response)??.status())
 }
 
 #[tokio::test]
@@ -423,11 +419,10 @@ async fn native_remote_addr(server: &RunningServer, addr: SocketAddr) -> TestRes
     let config = ChannelConfig::new();
     endpoint
         .set_default_client_config(config.quic_config(client_tls(&server.cert, trevrpc::ALPN)?)?);
-    let channel = tokio::time::timeout(
+    let channel = within!(
         Duration::from_secs(1),
         Channel::connect_with_config(endpoint, addr, "localhost", config),
-    )
-    .await??;
+    )??;
     let reply = greeter::GreeterClient::new(channel.clone())
         .say_hello(&greeter::HelloRequest::default())
         .await;
@@ -464,7 +459,7 @@ async fn http3_status(server: &RunningServer, addr: SocketAddr) -> TestResult<ht
     )?);
     stream.send_data(Bytes::from(frames)).await?;
     stream.finish().await?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, stream.recv_response()).await??;
+    let response = within!(TEST_TIMEOUT, stream.recv_response())??;
     Ok(response.status())
 }
 
@@ -532,11 +527,10 @@ async fn udp_proxy_clients_are_looked_up_at_the_handshake() -> TestResult {
     let config = ChannelConfig::new();
     endpoint
         .set_default_client_config(config.quic_config(client_tls(&server.cert, trevrpc::ALPN)?)?);
-    let channel = tokio::time::timeout(
+    let channel = within!(
         TEST_TIMEOUT,
         Channel::connect_with_config(endpoint, proxy, "localhost", config),
-    )
-    .await??;
+    )??;
     let client = greeter::GreeterClient::new(channel.clone());
     let before: SocketAddr = client
         .say_hello(&greeter::HelloRequest::default())

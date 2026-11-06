@@ -187,7 +187,7 @@ impl RunningServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        tokio::time::timeout(TEST_TIMEOUT, &mut self.task).await???;
+        within!(TEST_TIMEOUT, &mut self.task)???;
         Ok(())
     }
 }
@@ -367,7 +367,7 @@ async fn the_server_answers_and_compresses_its_responses() -> TestResult {
     )?);
     send.write_all(&bytes).await?;
     send.finish()?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
     let frames = parse_frames(&response)?;
     ensure_eq!(
         types(&frames),
@@ -391,7 +391,7 @@ async fn the_server_answers_and_compresses_its_responses() -> TestResult {
     )?);
     send.write_all(&bytes).await?;
     send.finish()?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
     let frames = parse_frames(&response)?;
     ensure_eq!(
         types(&frames),
@@ -409,7 +409,7 @@ async fn the_server_answers_and_compresses_its_responses() -> TestResult {
     bytes.extend(payload);
     send.write_all(&bytes).await?;
     send.finish()?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
     let frames = parse_frames(&response)?;
     let status: RpcStatus = decode_payload(&frames.last().unwrap().payload)?;
     ensure_eq!(
@@ -475,9 +475,7 @@ async fn compressed_calls_work_over_quic_and_qmux() -> TestResult {
         }
         sender.finish()?;
         for i in 0..3 {
-            let reply = tokio::time::timeout(TEST_TIMEOUT, replies.next())
-                .await?
-                .unwrap()?;
+            let reply = within!(TEST_TIMEOUT, replies.next())?.unwrap()?;
             ensure!(reply == sample(i), "{policy:?}: {reply:?}");
         }
         ensure!(replies.next().await.is_none());
@@ -707,7 +705,7 @@ async fn raw_stream_call(
     bytes.extend_from_slice(messages);
     send.write_all(&bytes).await?;
     send.finish()?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
     parse_frames(&response)
 }
 
@@ -853,9 +851,7 @@ async fn stream_compressed_calls_work_over_quic_and_qmux() -> TestResult {
             // third request, where stream compression starts.
             for i in 0..6 {
                 sender.send(sample(i)).await?;
-                let reply = tokio::time::timeout(TEST_TIMEOUT, replies.next())
-                    .await?
-                    .ok_or("stream ended")??;
+                let reply = within!(TEST_TIMEOUT, replies.next())?.ok_or("stream ended")??;
                 ensure!(reply == sample(i), "{policy:?}: {reply:?}");
             }
             sender.finish()?;
@@ -913,7 +909,7 @@ async fn the_server_answers_before_reading_a_request_message() -> TestResult {
         .await?;
         if offer {
             // No request message has been sent, and the request stream is still open.
-            let answer = tokio::time::timeout(TEST_TIMEOUT, read_frame(&mut recv)).await??;
+            let answer = within!(TEST_TIMEOUT, read_frame(&mut recv))??;
             ensure_eq!(answer.frame_type, frame_type::ANSWER);
             ensure_eq!(
                 decode_payload::<RpcAnswer>(&answer.payload)?,
@@ -932,7 +928,7 @@ async fn the_server_answers_before_reading_a_request_message() -> TestResult {
         send.write_all(&messages).await?;
         send.finish()?;
         // Without an offer there is nothing to answer.
-        let rest = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+        let rest = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
         let frames = parse_frames(&rest)?;
         ensure_eq!(types(&frames), [frame_type::MESSAGE, frame_type::STATUS]);
         let reply: Echo = decode_payload(&frames[0].payload)?;
@@ -962,8 +958,7 @@ async fn client_streaming_uploads_are_stream_compressed_from_the_third_message()
         for i in 0..8 {
             upload.send(sample(i)).await?;
         }
-        let response =
-            tokio::time::timeout(TEST_TIMEOUT, upload.close_and_recv_with_response()).await??;
+        let response = within!(TEST_TIMEOUT, upload.close_and_recv_with_response())??;
         let expected: String = (0..8).map(|i| sample(i).value).collect();
         ensure_eq!(response.message().value, expected, "{policy:?}");
         // Messages 3 to 8 travel in the stream's context: [MESSAGE, MESSAGE,
@@ -993,7 +988,7 @@ async fn client_streaming_uploads_are_stream_compressed_from_the_third_message()
         .compress_stream(CompressStream::REQUESTS)
         .send_all(requests)
         .with_response();
-        let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+        let response = within!(TEST_TIMEOUT, response)??;
         ensure_eq!(
             response
                 .metadata()
@@ -1033,7 +1028,7 @@ async fn optimistic_raw_call_with(
     bytes.extend_from_slice(messages);
     let _ = send.write_all(&bytes).await;
     let _ = send.finish();
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
     parse_frames(&response)
 }
 
@@ -1163,9 +1158,7 @@ async fn ping_pong(channel: &trevrpc::client::Channel, method: &str) -> TestResu
     let (sender, mut replies) = chat.split();
     for i in 0..6 {
         sender.send(sample(i)).await?;
-        let reply = tokio::time::timeout(TEST_TIMEOUT, replies.next())
-            .await?
-            .ok_or("stream ended")??;
+        let reply = within!(TEST_TIMEOUT, replies.next())?.ok_or("stream ended")??;
         ensure_eq!(reply, sample(i));
     }
     sender.finish()?;
@@ -1197,7 +1190,7 @@ async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
         let response = upload()
             .send_all(futures_util::stream::iter((0..8).map(|i| Ok(sample(i)))))
             .with_response();
-        let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+        let response = within!(TEST_TIMEOUT, response)??;
         ensure_eq!(response.message().value, expected, "{policy:?}");
         ensure_eq!(
             response
@@ -1217,8 +1210,7 @@ async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
         for i in 2..8 {
             call.send(sample(i)).await?;
         }
-        let response =
-            tokio::time::timeout(TEST_TIMEOUT, call.close_and_recv_with_response()).await??;
+        let response = within!(TEST_TIMEOUT, call.close_and_recv_with_response())??;
         ensure_eq!(response.message().value, expected, "{policy:?}");
         ensure_eq!(ping_pong(&channel, STREAM).await?.as_slice(), b"4");
 
@@ -1420,7 +1412,7 @@ async fn a_refused_call_is_replayed_with_the_rest_of_its_deadline() -> TestResul
     let (_endpoint, connection) = quic_connection(addr, &cert).await?;
     let transport = QuicTransport::new(connection);
     let options = trevrpc::client::CallOptions::new().with_timeout(Duration::from_secs(5));
-    let response = tokio::time::timeout(TEST_TIMEOUT, burst(&transport, 8, options)).await??;
+    let response = within!(TEST_TIMEOUT, burst(&transport, 8, options))??;
     let expected: String = (0..8).map(|i| sample(i).value).collect();
     ensure_eq!(response.value, expected);
 
@@ -1470,11 +1462,10 @@ async fn the_client_stops_being_optimistic_after_a_refusal_until_an_answer() -> 
     let transport = QuicTransport::new(connection);
     let mut optimistic = Vec::new();
     for _ in 0..3 {
-        tokio::time::timeout(
+        within!(
             TEST_TIMEOUT,
             burst(&transport, 4, trevrpc::client::CallOptions::new()),
-        )
-        .await??;
+        )??;
     }
     for _ in 0..4 {
         let call = calls.recv().await.ok_or("missing call")?;
@@ -1505,7 +1496,7 @@ async fn an_optimistic_call_keeps_at_most_a_mebibyte_until_the_answer() -> TestR
     .send_all(futures_util::stream::iter(
         (0..40).map(move |i| Ok(large(i))),
     ));
-    let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+    let response = within!(TEST_TIMEOUT, response)??;
     let expected: String = (0..40).map(|i| large(i).value).collect();
     ensure_eq!(response.value.len(), expected.len());
     ensure!(response.value == expected);
@@ -1526,8 +1517,7 @@ async fn cancelling_a_replay_cancels_the_call() -> TestResult {
     let (_endpoint, connection) = quic_connection(addr, &cert).await?;
     let transport = QuicTransport::new(connection);
     let options = trevrpc::client::CallOptions::new().with_timeout(Duration::from_millis(500));
-    let error = tokio::time::timeout(TEST_TIMEOUT, burst(&transport, 4, options))
-        .await?
+    let error = within!(TEST_TIMEOUT, burst(&transport, 4, options))?
         .err()
         .ok_or("the call should fail")?;
     ensure_eq!(error.into_status().code(), trevrpc::Code::DeadlineExceeded);
@@ -1569,7 +1559,7 @@ async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_i
     bytes.extend(encode_message_frame(&message, 1 << 20)?);
     send.write_all(&bytes).await?;
     send.finish()?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
     let frames = parse_frames(&response)?;
     ensure_eq!(
         types(&frames),
@@ -1593,7 +1583,7 @@ async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_i
     )?;
     send.write_all(&bytes).await?;
     send.finish()?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
     let frames = parse_frames(&response)?;
     ensure_eq!(types(&frames), [frame_type::MESSAGE, frame_type::STATUS]);
     ensure_eq!(frames[0].payload, vector("plain.records.message")?);

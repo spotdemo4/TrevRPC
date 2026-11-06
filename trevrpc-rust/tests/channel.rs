@@ -69,7 +69,7 @@ impl RawServer {
 
     async fn shutdown(self) -> TestResult {
         self.endpoint.close(0_u32.into(), b"test complete");
-        tokio::time::timeout(TEST_TIMEOUT, self.task).await??;
+        within!(TEST_TIMEOUT, self.task)??;
         Ok(())
     }
 }
@@ -153,15 +153,14 @@ async fn connect_channel(server: &RawServer, delay: Duration) -> TestResult<Chan
 
 async fn wait_for_phase(client: &Channel, phase: ChannelPhase) -> TestResult {
     let mut states = client.subscribe_state();
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    within!(TEST_TIMEOUT, async {
         loop {
             if states.borrow_and_update().phase() == phase {
                 return Ok::<_, tokio::sync::watch::error::RecvError>(());
             }
             states.changed().await?;
         }
-    })
-    .await??;
+    })??;
     Ok(())
 }
 
@@ -188,19 +187,15 @@ async fn lost_generation_is_not_replayed_and_future_calls_recover() -> TestResul
     assert_unavailable(first_error);
     wait_for_phase(&client, ChannelPhase::Reconnecting).await?;
 
-    let reconnecting_error = tokio::time::timeout(
+    let reconnecting_error = within!(
         Duration::from_millis(20),
         client.call(request(), b"must fail fast".to_vec()),
-    )
-    .await?
+    )?
     .expect_err("calls during reconnection must fail");
     assert_unavailable(reconnecting_error);
     ensure_eq!(server.received_requests.load(Ordering::SeqCst), 1);
 
-    ensure_eq!(
-        tokio::time::timeout(TEST_TIMEOUT, client.wait_until_ready()).await??,
-        2
-    );
+    ensure_eq!(within!(TEST_TIMEOUT, client.wait_until_ready())??, 2);
     ensure_eq!(
         events.recv().await?,
         ChannelEvent::ConnectionLost { generation: 1 }
@@ -279,7 +274,7 @@ async fn concurrent_calls(client: &Channel, count: usize) -> TestResult {
         })
         .collect();
     for call in calls {
-        let response = tokio::time::timeout(TEST_TIMEOUT, call).await???;
+        let response = within!(TEST_TIMEOUT, call)???;
         ensure_eq!(response.message().as_ref(), b"pool");
     }
     Ok(())
@@ -293,23 +288,21 @@ const fn fast(config: ChannelConfig) -> ChannelConfig {
 /// Keeps making bursts of calls until the channel spreads them over `count` connections. Each
 /// burst that finds every connection busy dials one more.
 async fn grow_to(client: &Channel, count: usize) -> TestResult {
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    within!(TEST_TIMEOUT, async {
         while client.quic_connections().len() < count {
             concurrent_calls(client, 8).await?;
         }
         Ok::<_, Box<dyn Error + Send + Sync>>(())
-    })
-    .await??;
+    })??;
     Ok(())
 }
 
 async fn wait_for_connections(client: &Channel, count: usize) -> TestResult {
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    within!(TEST_TIMEOUT, async {
         while client.quic_connections().len() != count {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    })
-    .await?;
+    })?;
     Ok(())
 }
 
@@ -411,12 +404,11 @@ async fn the_minimum_connections_are_open_from_the_start_and_share_every_call() 
     let client = connect_pooled(&server, config).await?;
     ensure_eq!(client.quic_connections().len(), 3);
     // The server finishes its handshakes one at a time, after the client.
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    within!(TEST_TIMEOUT, async {
         while server.accepted_connections.load(Ordering::SeqCst) < 3 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?;
+    })?;
 
     // Six calls opened at once go two to a connection.
     let calls: Vec<_> = (0..6)
@@ -432,7 +424,7 @@ async fn the_minimum_connections_are_open_from_the_start_and_share_every_call() 
         .map(|connection| connection.stats().frame_tx.stream)
         .collect();
     for call in calls {
-        tokio::time::timeout(TEST_TIMEOUT, call).await???;
+        within!(TEST_TIMEOUT, call)???;
     }
     ensure!(
         busy.iter().all(|&frames| frames > 0),
@@ -475,7 +467,7 @@ async fn losing_the_first_connection_drains_the_added_ones() -> TestResult {
     primary.close(0_u32.into(), b"test");
     let mut succeeded = 0;
     for call in calls {
-        if tokio::time::timeout(TEST_TIMEOUT, call).await??.is_ok() {
+        if within!(TEST_TIMEOUT, call)??.is_ok() {
             succeeded += 1;
         }
     }
@@ -484,7 +476,7 @@ async fn losing_the_first_connection_drains_the_added_ones() -> TestResult {
         succeeded < 4,
         "every call finished despite the lost connection"
     );
-    tokio::time::timeout(TEST_TIMEOUT, added.closed()).await?;
+    within!(TEST_TIMEOUT, added.closed())?;
 
     wait_for_phase(&client, ChannelPhase::Ready).await?;
     concurrent_calls(&client, 1).await?;
@@ -540,7 +532,7 @@ impl ConnectionMetadataServer {
 
     async fn shutdown(self) -> TestResult {
         self.endpoint.close(0_u32.into(), b"test complete");
-        tokio::time::timeout(TEST_TIMEOUT, self.task).await??;
+        within!(TEST_TIMEOUT, self.task)??;
         Ok(())
     }
 }
@@ -623,16 +615,15 @@ async fn connect_with_connection_metadata(
     config: ChannelConfig,
 ) -> TestResult<Channel> {
     let endpoint = make_client_endpoint(server.cert.clone())?;
-    Ok(tokio::time::timeout(
+    Ok(within!(
         TEST_TIMEOUT,
         Channel::connect_with_config(endpoint, server.addr, "localhost", config),
-    )
-    .await??)
+    )??)
 }
 
 async fn sequential_calls(client: &Channel, count: usize) -> TestResult {
     for _ in 0..count {
-        tokio::time::timeout(TEST_TIMEOUT, client.call(request(), b"set".to_vec())).await??;
+        within!(TEST_TIMEOUT, client.call(request(), b"set".to_vec()))??;
     }
     Ok(())
 }
@@ -657,12 +648,11 @@ async fn connection_metadata_is_offered_until_each_connection_confirms_it() -> T
         .lock()
         .unwrap_or_else(PoisonError::into_inner)[0]
         .close(0_u32.into(), b"test");
-    tokio::time::timeout(TEST_TIMEOUT, async {
+    within!(TEST_TIMEOUT, async {
         while !(client.is_ready() && client.state().generation() == 2) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await?;
+    })?;
     sequential_calls(&client, 2).await?;
 
     // Removing it stops sending it.

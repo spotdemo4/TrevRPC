@@ -136,7 +136,7 @@ impl RunningServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        tokio::time::timeout(TEST_TIMEOUT, &mut self.task).await???;
+        within!(TEST_TIMEOUT, &mut self.task)???;
         Ok(())
     }
 }
@@ -921,8 +921,7 @@ async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
         Ending::ServerShutsDown => {
             server.stop().await?;
             ended().await?;
-            let status = tokio::time::timeout(TEST_TIMEOUT, call)
-                .await??
+            let status = within!(TEST_TIMEOUT, call)??
                 .err()
                 .ok_or("a call the server shut down on should fail")?
                 .into_status();

@@ -124,7 +124,7 @@ async fn rustls_acme_answers_tls_alpn_01_on_the_tcp_listener() -> TestResult {
             }
         }
     });
-    tokio::time::timeout(ISSUE_TIMEOUT, issued).await???;
+    within!(ISSUE_TIMEOUT, issued)???;
 
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let roots = pebble.roots.clone();
@@ -136,30 +136,28 @@ async fn rustls_acme_answers_tls_alpn_01_on_the_tcp_listener() -> TestResult {
         endpoint.set_default_client_config(
             config.quic_config(client_tls_with_roots(roots, trevrpc::ALPN))?,
         );
-        let channel = tokio::time::timeout(
+        let channel = within!(
             TEST_TIMEOUT,
             Channel::connect_with_config(endpoint, udp, DOMAIN, config),
-        )
-        .await??;
+        )??;
         let expected = match policy {
             TransportPolicy::TcpOnly => TransportKind::Qmux,
             _ => TransportKind::Quic,
         };
         ensure_eq!(channel.transport(), Some(expected));
-        let reply = tokio::time::timeout(
+        let reply = within!(
             TEST_TIMEOUT,
             greeter::GreeterClient::new(channel.clone()).say_hello(&greeter::HelloRequest {
                 name: "acme".to_owned(),
             }),
-        )
-        .await??;
+        )??;
         ensure_eq!(reply.message, "hello, acme");
         channel.close();
     }
 
     ordering.abort();
     let _ = shutdown.send(());
-    tokio::time::timeout(TEST_TIMEOUT, serving).await???;
+    within!(TEST_TIMEOUT, serving)???;
     Ok(())
 }
 
@@ -349,7 +347,7 @@ async fn resolves_to_loopback(addr: SocketAddr) -> TestResult {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     socket.send_to(&query, addr).await?;
     let mut response = [0; 512];
-    let len = tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut response)).await??;
+    let len = within!(Duration::from_secs(1), socket.recv(&mut response))??;
     let response = response.get(..len).ok_or("oversized DNS response")?;
     ensure!(
         response.get(6..8) == Some(&[0, 1][..]),

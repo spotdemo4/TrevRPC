@@ -124,7 +124,7 @@ impl RunningServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        tokio::time::timeout(TEST_TIMEOUT, &mut self.task).await???;
+        within!(TEST_TIMEOUT, &mut self.task)???;
         Ok(())
     }
 }
@@ -340,7 +340,7 @@ async fn qmux_over_tls_round_trips_every_rpc_shape() -> TestResult {
     )
     .await?;
     let client = greeter::GreeterClient::new(transport.clone());
-    tokio::time::timeout(TEST_TIMEOUT, exercise_greeter(&client)).await??;
+    within!(TEST_TIMEOUT, exercise_greeter(&client))??;
 
     // Large messages cross many records and flow-control updates.
     let large = "x".repeat(1 << 20);
@@ -370,7 +370,7 @@ async fn shutdown_closes_qmux_connections() -> TestResult {
         })
         .await?;
     server.stop().await?;
-    tokio::time::timeout(TEST_TIMEOUT, transport.closed()).await?;
+    within!(TEST_TIMEOUT, transport.closed())?;
     Ok(())
 }
 
@@ -386,7 +386,7 @@ async fn http2_serves_post_rpcs_and_advertises_http3() -> TestResult {
         .body(())?;
     let (response, mut body) = sender.send_request(request, false)?;
     body.send_data(Bytes::from(unary_frame("h2")?), true)?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+    let response = within!(TEST_TIMEOUT, response)??;
     ensure_eq!(response.status(), http::StatusCode::OK);
     ensure_eq!(
         response.headers().get(http::header::ALT_SVC),
@@ -439,7 +439,7 @@ async fn http2_rejects_requests_that_are_not_trevrpc() -> TestResult {
             .header(http::header::CONTENT_TYPE, content_type)
             .body(())?;
         let (response, _) = sender.send_request(request, true)?;
-        let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+        let response = within!(TEST_TIMEOUT, response)??;
         ensure_eq!(
             response.status(),
             expected,
@@ -494,7 +494,7 @@ async fn qmux_over_websocket_serves_rpcs() -> TestResult {
     let (mut send, mut recv) = session.open_bi().await?;
     send.write_all(&unary_frame("websocket")?).await?;
     send.finish()?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_all()).await??;
+    let response = within!(TEST_TIMEOUT, recv.read_all())??;
     ensure_eq!(decode_hello(&response)?, "hello, websocket");
     session.close(0, "done");
     server.stop().await
@@ -577,7 +577,7 @@ async fn tcp_keeps_acme_tls_alpn_from_the_tls_config() -> TestResult {
     let mut stream = connect_tls(&server, ACME_TLS_ALPN).await?;
     ensure_eq!(stream.get_ref().1.alpn_protocol(), Some(ACME_TLS_ALPN));
     // The certificate authority only needs the handshake.
-    let read = tokio::time::timeout(TEST_TIMEOUT, stream.read(&mut [0; 1])).await?;
+    let read = within!(TEST_TIMEOUT, stream.read(&mut [0; 1]))?;
     ensure!(
         matches!(read, Ok(0)),
         "read after the acme-tls/1 handshake: {read:?}, want EOF"
@@ -591,8 +591,7 @@ async fn tcp_keeps_acme_tls_alpn_from_the_tls_config() -> TestResult {
             ACME_TLS_ALPN,
         )?)?,
     )));
-    let quic =
-        tokio::time::timeout(TEST_TIMEOUT, endpoint.connect(server.udp, "localhost")?).await?;
+    let quic = within!(TEST_TIMEOUT, endpoint.connect(server.udp, "localhost")?)?;
     ensure!(quic.is_err(), "QUIC offered acme-tls/1");
 
     let transport = QmuxTransport::connect(
@@ -631,11 +630,10 @@ async fn channel(
         .with_tcp_addr(server.tcp);
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(config.quic_config(quic_tls)?);
-    Ok(tokio::time::timeout(
+    Ok(within!(
         TEST_TIMEOUT,
         Channel::connect_with_config(endpoint, remote_addr, "localhost", config),
-    )
-    .await??)
+    )??)
 }
 
 #[tokio::test]
@@ -650,11 +648,10 @@ async fn channel_falls_back_to_qmux_when_udp_is_unreachable() -> TestResult {
     )
     .await?;
     ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
-    tokio::time::timeout(
+    within!(
         TEST_TIMEOUT,
         exercise_greeter(&greeter::GreeterClient::new(channel.clone())),
-    )
-    .await??;
+    )??;
     channel.close();
     server.stop().await
 }
@@ -681,11 +678,10 @@ async fn development_certificate_serves_every_transport_and_its_hashes() -> Test
 
     let quic = channel(&server, server.udp, ChannelConfig::new()).await?;
     ensure_eq!(quic.transport(), Some(TransportKind::Quic));
-    tokio::time::timeout(
+    within!(
         TEST_TIMEOUT,
         exercise_greeter(&greeter::GreeterClient::new(quic.clone())),
-    )
-    .await??;
+    )??;
     quic.close();
     let qmux = channel(
         &server,
@@ -752,7 +748,7 @@ async fn channel_can_use_tcp_only() -> TestResult {
 #[tokio::test]
 async fn channel_builder_connects_to_a_url() -> TestResult {
     let server = spawn_server(test_options()).await?;
-    let channel = tokio::time::timeout(
+    let channel = within!(
         TEST_TIMEOUT,
         Channel::builder(&format!("https://{}", server.udp))?
             .server_name("localhost")
@@ -760,20 +756,18 @@ async fn channel_builder_connects_to_a_url() -> TestResult {
             .config(ChannelConfig::new().with_tcp_addr(server.tcp))
             .connect_timeout(TEST_TIMEOUT)
             .connect(),
-    )
-    .await??;
+    )??;
     ensure_eq!(channel.transport(), Some(TransportKind::Quic));
     ensure_eq!(channel.remote_addr(), server.udp);
     ensure!(channel.local_addr()?.is_ipv4());
-    tokio::time::timeout(
+    within!(
         TEST_TIMEOUT,
         exercise_greeter(&greeter::GreeterClient::new(channel.clone())),
-    )
-    .await??;
+    )??;
     channel.close();
 
     // The builder's TLS configuration also verifies the TCP fallback.
-    let channel = tokio::time::timeout(
+    let channel = within!(
         TEST_TIMEOUT,
         Channel::builder(&format!("https://{}", server.udp))?
             .server_name("localhost")
@@ -784,8 +778,7 @@ async fn channel_builder_connects_to_a_url() -> TestResult {
                     .with_tcp_addr(server.tcp),
             )
             .connect(),
-    )
-    .await??;
+    )??;
     ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
     ensure_eq!(channel.remote_addr(), server.tcp);
     ensure!(channel.local_addr().is_err());
@@ -798,7 +791,7 @@ async fn channel_builder_connects_to_a_url() -> TestResult {
     channel.close();
 
     // The configuration's own TCP fallback still applies without the builder's.
-    let channel = tokio::time::timeout(
+    let channel = within!(
         TEST_TIMEOUT,
         Channel::builder(&format!("https://{}", server.udp))?
             .server_name("localhost")
@@ -811,8 +804,7 @@ async fn channel_builder_connects_to_a_url() -> TestResult {
                     .with_tcp_addr(server.tcp),
             )
             .connect(),
-    )
-    .await??;
+    )??;
     ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
     channel.close();
     server.stop().await
@@ -825,14 +817,13 @@ async fn channel_builder_tries_every_address_of_a_host() -> TestResult {
     let server = spawn_server(test_options()).await?;
     let mut roots = quinn::rustls::RootCertStore::empty();
     roots.add(server.cert.clone())?;
-    let channel = tokio::time::timeout(
+    let channel = within!(
         TEST_TIMEOUT,
         Channel::builder(&format!("localhost:{}", server.udp.port()))?
             .roots(roots)
             .tcp_fallback(false)
             .connect(),
-    )
-    .await??;
+    )??;
     ensure_eq!(channel.transport(), Some(TransportKind::Quic));
     ensure_eq!(channel.remote_addr(), server.udp);
     channel.close();
@@ -886,8 +877,7 @@ struct HandlerEvents {
 impl HandlerEvents {
     async fn all_started(&mut self) -> TestResult {
         for _ in 0..HANGING_ROUTES {
-            tokio::time::timeout(TEST_TIMEOUT, self.started.recv())
-                .await?
+            within!(TEST_TIMEOUT, self.started.recv())?
                 .ok_or("server dropped its handler events")?;
         }
         Ok(())
@@ -1255,7 +1245,7 @@ async fn http1_request(
     );
     tls.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
-    tokio::time::timeout(TEST_TIMEOUT, tls.read_to_end(&mut response)).await??;
+    within!(TEST_TIMEOUT, tls.read_to_end(&mut response))??;
     let response = String::from_utf8(response)?;
     let (head, body) = response
         .split_once("\r\n\r\n")
@@ -1294,7 +1284,7 @@ async fn http2_request(
     if !body.is_empty() {
         send.send_data(body, true)?;
     }
-    let response = tokio::time::timeout(TEST_TIMEOUT, response).await??;
+    let response = within!(TEST_TIMEOUT, response)??;
     let status = response.status();
     let alt_svc = alt_svc(response.headers());
     let mut body = response.into_body();
@@ -1364,7 +1354,7 @@ async fn http3_exchange(
         stream.send_data(body).await?;
     }
     stream.finish().await?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, stream.recv_response()).await??;
+    let response = within!(TEST_TIMEOUT, stream.recv_response())??;
     let mut bytes = Vec::new();
     while let Some(mut chunk) = stream.recv_data().await? {
         bytes.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
@@ -1526,7 +1516,7 @@ async fn http_fallback_requests_hold_a_stream_slot() -> TestResult {
             http2_request(&sender, request, Bytes::new()).await
         })
     };
-    tokio::time::timeout(TEST_TIMEOUT, fallback.held.notified()).await?;
+    within!(TEST_TIMEOUT, fallback.held.notified())?;
     ensure_eq!(
         http2_fallback_request(&server, &sender, "GET", "/other", "")
             .await?
@@ -1535,7 +1525,7 @@ async fn http_fallback_requests_hold_a_stream_slot() -> TestResult {
     );
 
     fallback.release.notify_one();
-    let (status, _, _) = tokio::time::timeout(TEST_TIMEOUT, held).await???;
+    let (status, _, _) = within!(TEST_TIMEOUT, held)???;
     ensure_eq!(status, http::StatusCode::OK);
     // The held request released its slot when its response ended.
     ensure_eq!(
@@ -1562,7 +1552,7 @@ async fn http3_serves_requests_alongside_a_webtransport_session() -> TestResult 
             .body(())
     };
     let mut session = sender.send_request(connect()?).await?;
-    let response = tokio::time::timeout(TEST_TIMEOUT, session.recv_response()).await??;
+    let response = within!(TEST_TIMEOUT, session.recv_response())??;
     ensure_eq!(response.status(), http::StatusCode::OK);
 
     // While the session runs, the connection still serves the fallback and HTTP RPCs.
@@ -1583,7 +1573,7 @@ async fn http3_serves_requests_alongside_a_webtransport_session() -> TestResult 
 
     // A connection carries one session, so another CONNECT is reset.
     let mut second = sender.send_request(connect()?).await?;
-    match tokio::time::timeout(TEST_TIMEOUT, second.recv_response()).await? {
+    match within!(TEST_TIMEOUT, second.recv_response())? {
         Ok(response) => {
             return Err(format!("a second session was answered {}", response.status()).into());
         }
@@ -1749,7 +1739,7 @@ async fn servers_confirm_connection_metadata_on_connections_only() -> TestResult
             let (mut send, mut recv) = connection.open_bi().await?;
             send.write_all(&frames).await?;
             send.finish()?;
-            let response = tokio::time::timeout(TEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
+            let response = within!(TEST_TIMEOUT, recv.read_to_end(1 << 20))??;
             decode_connection_metadata_reply(&response)
         }
     };

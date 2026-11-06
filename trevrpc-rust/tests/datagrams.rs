@@ -103,7 +103,7 @@ impl RunningServer {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        tokio::time::timeout(TEST_TIMEOUT, &mut self.task).await???;
+        within!(TEST_TIMEOUT, &mut self.task)???;
         Ok(())
     }
 }
@@ -200,9 +200,8 @@ async fn run_call<T: StreamingRpcTransport>(
         .await?;
     let mut messages = Vec::new();
     loop {
-        let frame = tokio::time::timeout(TEST_TIMEOUT, frames.next())
-            .await?
-            .ok_or("response ended without a STATUS")??;
+        let frame =
+            within!(TEST_TIMEOUT, frames.next())?.ok_or("response ended without a STATUS")??;
         match frame {
             ResponseFrame::Headers(_) => {}
             ResponseFrame::Message(body) => messages.push(body.to_vec()),
@@ -400,8 +399,7 @@ fn unframe(datagram: &[u8]) -> TestResult<(u8, Vec<Vec<u8>>)> {
 }
 
 async fn read_frame(recv: &mut quinn::RecvStream) -> TestResult<ResponseFrame> {
-    tokio::time::timeout(TEST_TIMEOUT, support::read_response_frame(recv))
-        .await?
+    within!(TEST_TIMEOUT, support::read_response_frame(recv))?
         .map_err(|error| format!("reading a frame failed: {error}"))?
         .ok_or_else(|| "the response ended early".into())
 }
@@ -525,8 +523,7 @@ async fn a_request_for_a_live_flow_fails_with_invalid_argument() -> TestResult {
     // Give the server time to register the first call before the second names its flow.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut second = open_raw(&connection, HOLD, 3).await?;
-    let status =
-        tokio::time::timeout(TEST_TIMEOUT, support::read_lone_status(&mut second.recv)).await??;
+    let status = within!(TEST_TIMEOUT, support::read_lone_status(&mut second.recv))??;
     ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
     ensure!(
         status.message().contains("already in use"),
@@ -606,7 +603,7 @@ async fn request_datagrams_count_toward_the_message_limit() -> TestResult {
         )
         .await?;
     let status = loop {
-        match tokio::time::timeout(TEST_TIMEOUT, frames.next()).await? {
+        match within!(TEST_TIMEOUT, frames.next())? {
             Some(Ok(ResponseFrame::Status(status))) => break status,
             Some(Ok(_)) => {}
             Some(Err(error)) => break error.into_status(),
@@ -686,8 +683,7 @@ async fn webtransport_carries_unreliable_messages_in_session_datagrams_both_ways
 
     let mut status = None;
     while status.is_none() {
-        let frame = tokio::time::timeout(TEST_TIMEOUT, support::read_response_frame(&mut recv))
-            .await??
+        let frame = within!(TEST_TIMEOUT, support::read_response_frame(&mut recv))??
             .ok_or("the response ended early")?;
         if let ResponseFrame::Status(received) = frame {
             status = Some(received);

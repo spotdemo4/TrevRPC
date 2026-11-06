@@ -8,8 +8,11 @@
 
 #[macro_use]
 mod ensure;
+#[macro_use]
+mod within;
 
 pub use ensure::AssertionFailed;
+pub use within::TimedOut;
 
 use std::future::Future;
 
