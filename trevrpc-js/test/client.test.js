@@ -1472,3 +1472,88 @@ test("responses are read ahead only up to a bound while the upload runs", async 
   assert.equal(received, total);
   await transport.settled();
 });
+
+/** Chromium's refusal of a new WebTransport stream while the server's stream credit is used up. */
+function streamRefusal() {
+  return new DOMException("Failed to create bidirectional stream.", "NetworkError");
+}
+
+/** A transport that refuses its first `refusals` streams with `error`, then serves Echo. */
+function refusingTransport(refusals, error = streamRefusal) {
+  const inner = fakeTransport(echoHandler);
+  const transport = {
+    attempts: 0,
+    createBidirectionalStream() {
+      transport.attempts += 1;
+      if (transport.attempts <= refusals) {
+        return Promise.reject(error());
+      }
+      return inner.createBidirectionalStream();
+    },
+  };
+  return transport;
+}
+
+test("a stream the browser refuses for want of stream credit is opened again", async () => {
+  const transport = refusingTransport(3);
+  const echo = createClient(Echo, transport);
+  const response = await echo.unary({ message: "hi" });
+  assert.equal(response.message, "hi");
+  assert.equal(transport.attempts, 4);
+});
+
+test("other failures to open a stream fail the call at once", async () => {
+  const transport = refusingTransport(1, () => new Error("boom"));
+  const echo = createClient(Echo, transport);
+  await assert.rejects(
+    echo.unary({ message: "hi" }),
+    isStatus(Code.Unavailable, "transport unavailable: boom"),
+  );
+  assert.equal(transport.attempts, 1);
+});
+
+test("a refusal that lasts fails the call with Unavailable", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const transport = refusingTransport(Infinity);
+  const echo = createClient(Echo, transport);
+  const call = echo.unary({ message: "hi" });
+  let settled = false;
+  call.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  for (let elapsed = 0; elapsed <= 3000 && !settled; elapsed += 16) {
+    await turn();
+    t.mock.timers.tick(16);
+  }
+  await assert.rejects(
+    call,
+    isStatus(Code.Unavailable, "transport unavailable: Failed to create bidirectional stream."),
+  );
+  const attempts = transport.attempts;
+  // Doubling from 1 ms to at most 64 ms, it gave up after about 2 s.
+  assert.ok(attempts > 20 && attempts < 50, `${attempts} attempts`);
+  t.mock.timers.tick(1000);
+  await turn();
+  assert.equal(transport.attempts, attempts, "no attempts after giving up");
+});
+
+test("cancelling a call stops opening a refused stream again", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const transport = refusingTransport(Infinity);
+  const echo = createClient(Echo, transport);
+  const controller = new AbortController();
+  const call = echo.unary({ message: "hi" }, { signal: controller.signal });
+  await turn();
+  t.mock.timers.tick(10);
+  await turn();
+  controller.abort();
+  await assert.rejects(
+    call,
+    (error) => error instanceof TrevRpcError && error.code === Code.Cancelled,
+  );
+  const attempts = transport.attempts;
+  t.mock.timers.tick(1000);
+  await turn();
+  assert.equal(transport.attempts, attempts, "no attempts after cancelling");
+});

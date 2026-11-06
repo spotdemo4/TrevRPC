@@ -769,7 +769,8 @@ export class Call {
 /**
  * Opens a bidirectional stream. A call whose setup depends on its session passes `session`, which
  * receives that session's `key` and `datagrams` object, so the compression state and datagram flow
- * belong to the connection that carries the call and not to one a reconnect swapped in later.
+ * belong to the connection that carries the call and not to one a reconnect swapped in later. A
+ * stream the browser refuses for want of stream credit is opened again (see StreamRefusalRetryMs).
  */
 function openStream(transport, signal, session) {
   return new Promise((resolve, reject) => {
@@ -777,32 +778,70 @@ function openStream(transport, signal, session) {
       reject(signal.reason);
       return;
     }
-    const onAbort = () => reject(signal.reason);
+    let retryTimer;
+    const onAbort = () => {
+      clearTimeout(retryTimer);
+      reject(signal.reason);
+    };
     signal.addEventListener("abort", onAbort, { once: true });
+    const giveUpAt = Date.now() + StreamRefusalRetryMs;
 
-    let opening;
-    try {
-      opening = Promise.resolve(startStream(transport, session));
-    } catch (error) {
-      opening = Promise.reject(error);
-    }
-    opening.then(
-      (stream) => {
-        signal.removeEventListener("abort", onAbort);
-        if (signal.aborted) {
-          // The caller gave up while the stream was opening; do not leak it.
-          stream.writable.abort(signal.reason).catch(() => {});
-          stream.readable.cancel(signal.reason).catch(() => {});
-        } else {
-          resolve(stream);
-        }
-      },
-      (error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(statusFromTransportError(error));
-      },
-    );
+    const attempt = (delay) => {
+      let opening;
+      try {
+        opening = Promise.resolve(startStream(transport, session));
+      } catch (error) {
+        opening = Promise.reject(error);
+      }
+      opening.then(
+        (stream) => {
+          signal.removeEventListener("abort", onAbort);
+          if (signal.aborted) {
+            // The caller gave up while the stream was opening; do not leak it.
+            stream.writable.abort(signal.reason).catch(() => {});
+            stream.readable.cancel(signal.reason).catch(() => {});
+          } else {
+            resolve(stream);
+          }
+        },
+        (error) => {
+          if (signal.aborted) {
+            return;
+          }
+          if (isStreamRefusal(error) && Date.now() + delay <= giveUpAt) {
+            // Nothing reached the server, so opening the stream again is safe.
+            retryTimer = setTimeout(
+              () => attempt(Math.min(delay * 2, StreamRefusalMaxDelayMs)),
+              delay,
+            );
+            return;
+          }
+          signal.removeEventListener("abort", onAbort);
+          reject(statusFromTransportError(error));
+        },
+      );
+    };
+    attempt(StreamRefusalFirstDelayMs);
   });
+}
+
+/**
+ * How long a call keeps opening a stream the browser refused, and how long it waits between
+ * attempts. Chromium refuses a new WebTransport stream at once while the server's stream credit is
+ * used up, where the WebTransport spec has it wait for more. Credit comes back about two round
+ * trips after a stream opens, so the call waits for it itself, doubling the delay from 1 ms.
+ */
+const StreamRefusalRetryMs = 2000;
+const StreamRefusalFirstDelayMs = 1;
+const StreamRefusalMaxDelayMs = 64;
+
+/**
+ * Whether opening a stream failed because the browser refused it for now: Chromium's NetworkError
+ * "Failed to create bidirectional stream". A closed session fails differently, and a channel
+ * without a session fails with a status.
+ */
+function isStreamRefusal(error) {
+  return !(error instanceof TrevRpcError) && error?.name === "NetworkError";
 }
 
 function messageOf(item) {
