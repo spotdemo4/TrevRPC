@@ -249,7 +249,7 @@ mod tests {
     #[test]
     fn server_streams_match_the_quic_credit() {
         let limited = ServerOptions::new().with_max_concurrent_streams_per_connection(Some(10));
-        assert_eq!(server_config(&limited).max_streams_bidi, 20);
+        assert_eq!(server_config(&limited).max_streams_bidi, 40);
 
         let unlimited = ServerOptions::new().with_max_concurrent_streams_per_connection(None);
         assert_eq!(server_config(&unlimited).max_streams_bidi, 1 << 60);

@@ -44,14 +44,19 @@ func connectionReceiveWindow(options ServerOptions, streamWindow uint64) uint64 
 
 // streamCreditFactor is how many times MaxConcurrentStreamsPerConnection a
 // peer may open as QUIC, WebTransport, or QMux streams. These transports grant
-// stream credit cumulatively and return a closed stream's credit only once its
-// last data is acknowledged, about a round trip after the call ends, so a
-// stream limit equal to the RPC limit would let a client with that many short
-// calls in flight start only about half of them per round trip. The spare
-// streams cost per-stream state only: the connection receive window still
-// bounds buffered data, and the per-connection RPC limit still rejects an RPC
-// beyond it with a status.
-const streamCreditFactor = 2
+// stream credit cumulatively, and a stream's credit comes back to the client
+// about two round trips after it opened the stream: the call takes one, the
+// server frees the stream once the client acknowledges its last data, half a
+// round trip later, and the MAX_STREAMS frame takes another half to arrive.
+// A client with as many one-round-trip calls in flight as the RPC limit
+// therefore needs more than twice the limit; with exactly twice, Quinn, which
+// also announces credit in batches, held 64 unary calls over a 20 ms round
+// trip up to another 17 ms. Four times, as the Rust server allows, leaves room
+// for that and for an acknowledgement that a loss delays. The spare streams
+// cost per-stream state only: the connection receive window still bounds
+// buffered data, and the per-connection RPC limit still rejects an RPC beyond
+// it with a status.
+const streamCreditFactor = 4
 
 // maxStreamCount is the largest stream count QUIC and QMux can express.
 const maxStreamCount = 1 << 60
