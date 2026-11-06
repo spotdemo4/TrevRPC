@@ -4,7 +4,7 @@ android-test = "1.7.0"
 android-test-junit = "1.3.0"
 coroutines = "1.11.0"
 cronet = "500.1.0"
-dokka = "2.2.0"
+dokka = "2.3.0"
 junit = "6.1.3"
 kotlin = "2.4.21"
 # Oldest Kotlin that can compile against the published libraries: their language and API
