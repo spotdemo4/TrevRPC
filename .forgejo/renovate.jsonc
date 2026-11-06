@@ -9,8 +9,6 @@
   "repositories": ["llc/TrevRPC"],
   "allowedCommands": [
     "^nix run \\.#update-go-deps$",
-    "^npm audit fix --prefix trevrpc-js$",
-    "^npm audit fix --prefix trevrpc-js/effect$",
     "^nix run \\.#update-kotlin-deps$",
     "^nix run \\.#sync-playwright$"
   ],
@@ -34,18 +32,22 @@
   "git-submodules": {
     "enabled": true
   },
+  // fix PRs for vulnerable dependencies, from osv.dev: direct and indirect go
+  // modules, and direct dependencies elsewhere. transitive vulnerabilities
+  // are reported by the vulnerable workflow
+  "osvVulnerabilityAlerts": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "vulnerabilityAlerts": {
+    "addLabels": ["security"],
+    "automerge": true
+  },
   "lockFileMaintenance": {
     "enabled": true,
     "automerge": true,
     "schedule": ["* * * * 0"], // sunday
     "skipInstalls": false,
     "postUpgradeTasks": {
-      "commands": [
-        "nix run .#update-go-deps",
-        "npm audit fix --prefix trevrpc-js",
-        "npm audit fix --prefix trevrpc-js/effect",
-        "nix run .#sync-playwright"
-      ],
+      "commands": ["nix run .#update-go-deps", "nix run .#sync-playwright"],
       "fileFilters": [
         "trevrpc-go/go.mod",
         "trevrpc-go/go.sum",
@@ -54,9 +56,7 @@
         "bench/baseline/go.sum",
         "bench/baseline/gomod2nix.toml",
         "trevrpc-js/package.json",
-        "trevrpc-js/package-lock.json",
-        "trevrpc-js/effect/package.json",
-        "trevrpc-js/effect/package-lock.json"
+        "trevrpc-js/package-lock.json"
       ],
       "executionMode": "branch"
     }

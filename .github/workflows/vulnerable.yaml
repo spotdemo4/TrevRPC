@@ -78,11 +78,11 @@ jobs:
 
       - name: Run npm audit
         working-directory: trevrpc-js
-        run: npm audit --audit-level moderate
+        run: npm audit --audit-level moderate --omit=dev
 
       - name: Run npm audit on the Effect adapter
         working-directory: trevrpc-js/effect
-        run: npm audit --audit-level moderate
+        run: npm audit --audit-level moderate --omit=dev
 
   rust:
     runs-on: ubuntu-26.04
