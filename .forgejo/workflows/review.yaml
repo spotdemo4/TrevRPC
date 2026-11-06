@@ -43,7 +43,7 @@ jobs:
           fi
 
       - name: Review pull request
-        uses: trev-zip/pi-action@19f064a6269bd5e4d7315730968b15c491ba948b # v0.5.1
+        uses: trev-zip/pi-action@710274d3492c95042fa6da2f5b162212312d26c7 # v0.6.0
         with:
           token: ${{ secrets.PI_TOKEN }}
           base-url: ${{ secrets.PI_ACTION_BASE_URL }}
