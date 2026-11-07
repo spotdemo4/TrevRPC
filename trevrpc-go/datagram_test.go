@@ -965,21 +965,29 @@ func TestServerCountsRequestDatagramsAgainstTheCallsLimitsAndIdleTimer(t *testin
 	})
 }
 
-// polledConn hides its datagrams from the reader goroutine, which blocks, and
-// hands them to whoever polls with a context that is already done.
+// polledConn hides its datagrams from the reader goroutine, which blocks as if
+// it had not got round to them, and hands them to a poll. Like quic-go, it
+// first returns the error of a context that is done, so a poll with a context
+// that is already done gets nothing.
 type polledConn struct {
 	fakeDatagramConn
 	pending chan []byte
 }
 
 func (c *polledConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
-	if ctx.Err() != nil {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		// A poll: done, but it reported no error at first.
 		select {
 		case datagram := <-c.pending:
 			return datagram, nil
 		default:
 			return nil, context.Cause(ctx)
 		}
+	default:
 	}
 	select {
 	case <-ctx.Done():
@@ -1101,5 +1109,107 @@ func TestBufferedMessagePipeYieldsWhatIsReadyAndDrainsOnClose(t *testing.T) {
 	}
 	if err := pipe.Send(9); err == nil {
 		t.Fatal("Send after Close succeeded")
+	}
+}
+
+// TestPollDatagramTakesWhatIsQueuedWithoutWaiting polls a real quic-go
+// connection. quic-go returns the error of a context that is already done
+// before it looks at its queue, so polling with such a context, as flush once
+// did, never got a datagram, and a call whose stream ended dropped the
+// messages the reader had not taken yet.
+func TestPollDatagramTakesWhatIsQueuedWithoutWaiting(t *testing.T) {
+	pki := newTestPKI(t)
+	serverTLS := pki.server.Clone()
+	serverTLS.NextProtos = []string{"poll-test"}
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	clientTLS := pki.client.Clone()
+	clientTLS.NextProtos = []string{"poll-test"}
+	client, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.CloseWithError(0, "") })
+	server, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.CloseWithError(0, "") })
+
+	// Nothing is queued: the poll returns at once.
+	start := time.Now()
+	if datagram, ok := pollDatagram(client); ok {
+		t.Fatalf("poll of an empty queue = %q, want none", datagram)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("poll of an empty queue waited %v", waited)
+	}
+
+	if err := server.SendDatagram([]byte("queued")); err != nil {
+		t.Fatal(err)
+	}
+	// Once the datagram arrives, nothing but the poll takes it from the queue.
+	for {
+		if datagram, ok := pollDatagram(client); ok {
+			if string(datagram) != "queued" {
+				t.Fatalf("poll = %q, want queued", datagram)
+			}
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("the queued datagram was never polled")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if datagram, ok := pollDatagram(client); ok {
+		t.Fatalf("second poll = %q, want none", datagram)
+	}
+}
+
+// pollSemanticsConn queues datagrams and receives them as quic-go does,
+// checking the context first when checkFirst is set, as quic-go v0.64 does,
+// and only after the queue otherwise, as earlier versions did.
+type pollSemanticsConn struct {
+	checkFirst bool
+	queue      [][]byte
+}
+
+func (c *pollSemanticsConn) SendDatagram([]byte) error { return nil }
+
+func (c *pollSemanticsConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	if c.checkFirst {
+		if err := context.Cause(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if len(c.queue) > 0 {
+		datagram := c.queue[0]
+		c.queue = c.queue[1:]
+		return datagram, nil
+	}
+	<-ctx.Done()
+	return nil, context.Cause(ctx)
+}
+
+func TestPollDatagramUnderEitherContextCheck(t *testing.T) {
+	for _, checkFirst := range []bool{true, false} {
+		conn := &pollSemanticsConn{checkFirst: checkFirst, queue: [][]byte{[]byte("a"), {}}}
+		var got []string
+		for {
+			datagram, ok := pollDatagram(conn)
+			if !ok {
+				break
+			}
+			got = append(got, string(datagram))
+		}
+		// The empty datagram is one too: only a nil result means none.
+		if len(got) != 2 || got[0] != "a" || got[1] != "" {
+			t.Fatalf("checkFirst=%v: polled %q, want \"a\" and an empty datagram", checkFirst, got)
+		}
 	}
 }

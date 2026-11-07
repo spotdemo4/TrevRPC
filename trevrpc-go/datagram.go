@@ -398,14 +398,42 @@ func (f *datagramFlow) release() {
 	})
 }
 
-// endedContext is a context that is already done. ReceiveDatagram of both
-// quic-go and webtransport-go returns what is queued before it looks at the
-// context, so passing it polls for datagrams without waiting.
-var endedContext = func() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	return ctx
+// pollContext makes one ReceiveDatagram call return a queued datagram without
+// waiting for one. quic-go's ReceiveDatagram, and webtransport-go's through
+// quic-go's HTTP/3 streams, first return the error of a context that is done,
+// then take a queued datagram, and only then wait on the context. A context
+// that is already done therefore never gets a datagram, which is how flush
+// once missed every datagram the reader had not taken yet. pollContext reports
+// no error the first time it is asked, which gets the call past that check,
+// and is done from the start, so the call does not wait.
+type pollContext struct {
+	context.Context
+	asked atomic.Bool
+}
+
+// closedDone is the Done channel of every pollContext.
+var closedDone = func() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
 }()
+
+func (*pollContext) Done() <-chan struct{} { return closedDone }
+
+func (c *pollContext) Err() error {
+	if c.asked.Swap(true) {
+		return context.Canceled
+	}
+	return nil
+}
+
+// pollDatagram returns a datagram conn has queued, if it has one, without
+// waiting. A nil datagram counts as none, in case a ReceiveDatagram returns
+// without an error when the context is done.
+func pollDatagram(conn datagramConn) ([]byte, bool) {
+	datagram, err := conn.ReceiveDatagram(&pollContext{Context: context.Background()})
+	return datagram, err == nil && datagram != nil
+}
 
 // flush dispatches every datagram the connection received so far, including
 // the one the reader may hold at this moment.
@@ -427,8 +455,8 @@ func (m *datagramMux) flush() {
 
 	m.rx.Lock()
 	for {
-		datagram, err := m.conn.ReceiveDatagram(endedContext)
-		if err != nil {
+		datagram, ok := pollDatagram(m.conn)
+		if !ok {
 			break
 		}
 		m.dispatch(datagram)
