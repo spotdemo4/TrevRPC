@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	connectrpc.com/connect/v2 v2.0.2
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/quic-go/quic-go v0.65.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
