@@ -5,8 +5,8 @@ TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport)
 Kotlin is client-only and targets Android: calls are `POST /trevrpc` over HTTP/3 through [Cronet](https://developer.android.com/develop/connectivity/cronet). When UDP is blocked, Cronet falls back to HTTP/2 over TCP on its own; Go and Rust servers serve the same HTTP mapping over HTTP/2 on their TCP listener, so there is nothing to configure. Servers are written in Go or Rust.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.6.0 works with `trevrpc-go` 1.6.0, `trevrpc-js` 1.6.0, and `trevrpc-kotlin`
-> 1.6.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.7.0 works with `trevrpc-go` 1.7.0, `trevrpc-js` 1.7.0, and `trevrpc-kotlin`
+> 1.7.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
