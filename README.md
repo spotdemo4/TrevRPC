@@ -32,13 +32,25 @@ messages as QUIC datagrams.
 ## features
 
 - unary, client-streaming, server-streaming, and bidirectional-streaming RPCs
-- per-call deadlines, request and response metadata, and canonical status codes
+- per-call deadlines and cancellation, request metadata, response headers and trailing metadata, and canonical
+  status codes
+- [connection metadata](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#connection-metadata):
+  metadata such as a bearer token is set once on a channel, then sent in full once per connection and by ID
+  after that
 - [unreliable methods](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages)
   that send messages as QUIC datagrams, and fall back to the stream wherever datagrams are unavailable
+- [zstd compression](https://trev.zip/llc/TrevRPC/wiki/Compression) with dictionaries trained on your own
+  messages, and stream compression that compresses each message of a stream against the ones before it, both
+  negotiated per connection
 - one UDP port for native QUIC, HTTP/3, and WebTransport, and one TCP port for every fallback
-- reconnecting client channels that fall back to TCP when UDP is blocked; RPCs are never retried, and a handler
-  never runs twice for one call
-- server limits, authorization hooks, metrics, and graceful shutdown
+- reconnecting client channels that race QUIC against TCP and fall back when UDP is blocked; RPCs are never
+  retried, and a handler never runs twice for one call
+- server limits, authorization hooks, interceptors, metrics, diagnostics, and graceful shutdown
+- OpenTelemetry metrics and tracing for Go ([`oteltrevrpc`](trevrpc-go/oteltrevrpc)) and Rust
+  ([`trevrpc-opentelemetry`](trevrpc-rust/crates/trevrpc-opentelemetry))
+- built for deployment: certificates from ACME (TLS-ALPN-01 on the TCP port), PROXY protocol from TCP and UDP
+  load balancers, QUIC address validation with Retry, and other HTTP content served from the same ports
+- development certificates that browsers trust by hash, so local WebTransport needs no trusted CA
 - a shared wire format pinned by golden vectors, and an [interop](interop) suite that tests every client
   against every server over every transport it speaks
 
@@ -74,7 +86,11 @@ message HelloRequest { string name = 1; }
 message HelloReply { string message = 1; }
 ```
 
-Serve it from Go:
+Serve it from Go or Rust, over native QUIC, HTTP/3, and WebTransport on UDP port 50051, and every fallback on
+TCP port 50051:
+
+<details open>
+<summary>Go</summary>
 
 ```go
 type greeterService struct{}
@@ -84,8 +100,14 @@ func (greeterService) SayHello(_ context.Context, r *greeter.HelloRequest) (*gre
 }
 
 server := trevrpc.NewServer()
+options := server.Options()
+options.EnableHTTP = true         // HTTP/3 and HTTP/2, for Android
+options.EnableWebTransport = true // WebTransport and QMux over WebSocket, for browsers
+options.WebTransportAdmission = trevrpc.SameOriginAdmission("https://example.com")
+server.SetOptions(options)
 greeter.RegisterGreeterServer(server, greeterService{})
 
+// Binds the UDP port and, by default, the TCP port of the same number.
 listener, err := trevrpc.Listen("0.0.0.0:50051", server, trevrpc.ListenOptions{
 	TLSConfig: &tls.Config{Certificates: []tls.Certificate{certificate}},
 })
@@ -96,9 +118,59 @@ defer listener.Close()
 return listener.Serve(ctx)
 ```
 
-And call it:
+</details>
+
+<details>
+<summary>Rust</summary>
+
+```rust
+struct GreeterService;
+
+#[trevrpc::async_trait]
+impl greeter::Greeter for GreeterService {
+    async fn say_hello(
+        &self,
+        _ctx: trevrpc::server::RequestContext,
+        request: greeter::HelloRequest,
+    ) -> Result<greeter::HelloReply, trevrpc::Status> {
+        Ok(greeter::HelloReply { message: format!("hello, {}", request.name) })
+    }
+}
+
+let mut server = trevrpc::server::Server::new();
+server.set_options(
+    trevrpc::server::ServerOptions::new()
+        .with_http_enabled(true) // HTTP/3 and HTTP/2, for Android
+        .with_webtransport_enabled(true) // WebTransport and QMux over WebSocket, for browsers
+        .with_webtransport_allowed_origins(["https://example.com"]),
+);
+greeter::register_greeter(&mut server, GreeterService);
+
+let tls = quinn::rustls::ServerConfig::builder()
+    .with_no_client_auth()
+    .with_single_cert(certs, key)?;
+let addr = "[::]:50051".parse()?;
+let endpoint = quinn::Endpoint::server(server.quic_config(tls.clone())?, addr)?;
+// TCP is opt-in in Rust.
+let tcp = trevrpc::tcp::TcpFallback::new(
+    tokio::net::TcpListener::bind(addr).await?,
+    server.tcp_tls_config(tls),
+);
+let shutdown = async {
+    let _ = tokio::signal::ctrl_c().await;
+};
+server.serve_with_tcp(endpoint, tcp, shutdown).await?;
+```
+
+</details>
+
+And call it from any client:
+
+<details open>
+<summary>Go</summary>
 
 ```go
+// Native QUIC, falling back to QMux over TLS.
 channel, err := trevrpc.Dial(ctx, "example.com:50051", trevrpc.DialOptions{TLSConfig: tlsConfig})
 if err != nil {
 	return err
@@ -109,9 +181,61 @@ client := greeter.NewGreeterClient(channel, trevrpc.WithTimeout(5*time.Second))
 reply, err := client.SayHello(ctx, &greeter.HelloRequest{Name: "TrevRPC"})
 ```
 
+</details>
+
+<details>
+<summary>Rust</summary>
+
+```rust
+// Native QUIC, falling back to QMux over TLS.
+let channel = trevrpc::client::Channel::builder("https://example.com:50051")?
+    .connect()
+    .await?;
+
+let client = greeter::GreeterClient::with_default_call_options(
+    channel.clone(),
+    trevrpc::client::CallOptions::new().with_timeout(Duration::from_secs(5)),
+);
+let reply = client
+    .say_hello(&greeter::HelloRequest { name: "TrevRPC".into() })
+    .await?;
+```
+
+</details>
+
+<details>
+<summary>JavaScript (browser)</summary>
+
+```ts
+import { connect, createClient } from "@trevrpc/trevrpc-js";
+import { Greeter } from "./gen/greeter_pb.js";
+
+// WebTransport, falling back to QMux over WebSocket.
+const channel = await connect("https://example.com:50051/trevrpc");
+
+const client = createClient(Greeter, channel, { timeoutMs: 5_000 });
+const reply = await client.sayHello({ name: "TrevRPC" });
+```
+
+</details>
+
+<details>
+<summary>Kotlin (Android)</summary>
+
+```kotlin
+// HTTP/3 through Cronet, falling back to HTTP/2.
+val engine = CronetEngine.Builder(context).enableQuic(true).build()
+val channel = CronetRpcChannel.create(engine, "https://example.com:50051", Executors.newSingleThreadExecutor())
+
+val client = GreeterClient(channel, CallOptions(timeout = 5.seconds))
+val reply = client.sayHello(HelloRequest.newBuilder().setName("TrevRPC").build())
+```
+
+</details>
+
 Runnable greeter servers and clients are in [`trevrpc-go/examples`](trevrpc-go/examples) and
 [`trevrpc-rust/examples`](trevrpc-rust/examples). [Getting started](https://trev.zip/llc/TrevRPC/wiki/Getting-Started)
-covers code generation and the JavaScript and Kotlin clients.
+covers code generation, and the runtime guides cover streaming calls.
 
 ## using
 
