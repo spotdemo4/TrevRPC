@@ -23,9 +23,11 @@ typed clients and servers, and call it from native apps, browsers, and Android. 
 stream, so a lost packet stalls only the call it belongs to, and methods marked unreliable can send their
 messages as QUIC datagrams.
 
-> [!WARNING]
-> TrevRPC is a very early work in progress with no stability guarantees. It speaks its own protocol and is not
-> wire-compatible with gRPC, gRPC-Web, or Connect. See [current limitations](https://trev.zip/llc/TrevRPC/wiki/Current-Limitations).
+> [!NOTE]
+> Every TrevRPC package shares one version, and packages of the same version are compatible with each other:
+> `trevrpc-rust` 1.6.0 works with `trevrpc-go` 1.6.0, `trevrpc-js` 1.6.0, and `trevrpc-kotlin` 1.6.0. Compatibility
+> across different versions isn't guaranteed yet; that's a milestone for 2.0. TrevRPC speaks its own protocol and is
+> not wire-compatible with gRPC, gRPC-Web, or Connect. See [current limitations](https://trev.zip/llc/TrevRPC/wiki/Current-Limitations).
 
 ## features
 
