@@ -113,7 +113,8 @@ covers code generation and the JavaScript and Kotlin clients.
 
 ## using
 
-Each runtime has a library and a `protoc` plugin that generates code from your services.
+Each runtime has a library. Go, Rust, and Kotlin also have a `protoc` plugin that generates code from your
+services; JavaScript uses the service descriptors that protobuf-es generates.
 
 ### go
 
@@ -158,12 +159,11 @@ dependencies {
 
 ### nix
 
-each runtime's package provides its `protoc` plugin:
+the Go, Rust, and Kotlin packages provide their `protoc` plugins:
 
 ```sh
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
-nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
 ```
 
