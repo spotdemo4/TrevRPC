@@ -28,4 +28,6 @@ deps:
   - buf.build/trevrpc/trevrpc
 ```
 
+Each release labels the module with its version tag and moves `main`, the label unpinned deps resolve, to it. Pin a release with `buf.build/trevrpc/trevrpc:<version>`.
+
 Go code for these options ships in `trev.zip/llc/trevrpc/trevrpc-go/trevrpcpb`, so Go users generate only their own files. See the [Getting Started](https://trev.zip/llc/TrevRPC/wiki/Getting-Started) guide for `buf.gen.yaml` examples with the TrevRPC generators.

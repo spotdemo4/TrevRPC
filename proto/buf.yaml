@@ -1,5 +1,5 @@
 # The TrevRPC schema options, published to the Buf Schema Registry as
-# buf.build/trevrpc/trevrpc by the buf workflow.
+# buf.build/trevrpc/trevrpc by the release workflow.
 version: v2
 modules:
   - path: .

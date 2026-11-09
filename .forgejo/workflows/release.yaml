@@ -155,3 +155,26 @@ jobs:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-rust-otel
+
+  buf:
+    # zizmor: ignore[excessive-permissions]
+    name: buf.build/trevrpc/trevrpc
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Initialize
+        uses: spotdemo4/nix-init@392955b6ae2230bd7cbb0d8d90051ddd9b8d537e # v1.75.0
+        with:
+          github_token: ${{ secrets.GH_TOKEN }}
+          niks3_url: https://niks3.trev.zip
+          shell: release
+
+      # Labels the module with the version and moves main, the default label unpinned deps
+      # resolve, to it; an unchanged module reuses its existing commit. buf's --git-metadata would
+      # derive the labels and source link, but it only knows GitHub, GitLab, and Bitbucket remotes.
+      - name: Release to the Buf Schema Registry
+        working-directory: proto
+        run: buf push --label "$VERSION" --label main --source-control-url "$SOURCE_URL"
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
