@@ -351,7 +351,8 @@ func (s *Server) Options() ServerOptions {
 }
 
 // SetAuthorizer installs an authorizer that runs before route lookup. A nil
-// authorizer removes it.
+// authorizer removes it. A ContextAuthorizer also sets the context that
+// interceptors and the handler get.
 func (s *Server) SetAuthorizer(authorizer Authorizer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -606,7 +607,7 @@ func isNilRegisteredValue(value any) bool {
 type serverRuntime struct {
 	options         ServerOptions
 	routes          map[string]route
-	authorizer      Authorizer
+	authorizer      ContextAuthorizer
 	interceptors    []Interceptor
 	metrics         Metrics
 	requestLimit    semaphore
@@ -736,7 +737,7 @@ func (s *Server) freeze() *serverRuntime {
 	runtime := &serverRuntime{
 		options:         options,
 		routes:          routes,
-		authorizer:      s.authorizer,
+		authorizer:      asContextAuthorizer(s.authorizer),
 		interceptors:    s.interceptors,
 		metrics:         metrics,
 		requestLimit:    newSemaphore(options.MaxConcurrentRequests),
@@ -1421,41 +1422,58 @@ func (r *serverRuntime) prepareRequest(ctx context.Context, request *wireRequest
 		// must not touch what the handler reads.
 		info := newHandlerContext(request)
 		info.Metadata = maps.Clone(info.Metadata)
-		if err := invokeAuthorizer(ctx, r.authorizer, info, handlerNeedsDeadlineRace(ctx), lease); err != nil {
+		next, err := invokeAuthorizer(ctx, r.authorizer, info, handlerNeedsDeadlineRace(ctx), lease)
+		if err == nil && next != ctx {
+			if state, _ := ctx.Value(handlerContextKey{}).(*callState); !carriesCall(next, state) {
+				err = foreignContextStatus("authorizer")
+			}
+		}
+		if err != nil {
 			cancel()
 			return ctx, func() {}, err
 		}
+		ctx = next
 	}
 	return ctx, cancel, nil
 }
 
-func invokeAuthorizer(ctx context.Context, authorizer Authorizer, info HandlerContext, raceContext bool, lease *requestExecutionLease) (err error) {
-	invoke := func() (err error) {
+// authorizerResult is what an authorizer returned.
+type authorizerResult struct {
+	ctx context.Context
+	err error
+}
+
+// invokeAuthorizer runs authorizer on ctx and returns the context the call
+// continues with.
+func invokeAuthorizer(ctx context.Context, authorizer ContextAuthorizer, info HandlerContext, raceContext bool, lease *requestExecutionLease) (context.Context, error) {
+	invoke := func() (result authorizerResult) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				err = &serverPanicError{phase: ServerDiagnosticAuthorizerPanic, recovered: recovered, stack: debug.Stack()}
+				result = authorizerResult{err: &serverPanicError{phase: ServerDiagnosticAuthorizerPanic, recovered: recovered, stack: debug.Stack()}}
 			}
 		}()
-		return authorizer.Authorize(ctx, info)
+		result.ctx, result.err = authorizer.AuthorizeContext(ctx, info)
+		return result
 	}
 	if !raceContext {
-		return invoke()
+		result := invoke()
+		return result.ctx, result.err
 	}
 	if err := ctx.Err(); err != nil {
-		return statusFromContextError(err)
+		return ctx, statusFromContextError(err)
 	}
-	result := make(chan error, 1)
+	results := make(chan authorizerResult, 1)
 	execution := lease.retain(ServerDiagnosticAuthorizerPanic)
-	lease.goRun(func() { defer execution.finish(); result <- invoke() })
+	lease.goRun(func() { defer execution.finish(); results <- invoke() })
 	select {
-	case err := <-result:
+	case result := <-results:
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return statusFromContextError(ctxErr)
+			return ctx, statusFromContextError(ctxErr)
 		}
-		return err
+		return result.ctx, result.err
 	case <-ctx.Done():
 		execution.detach()
-		return statusFromContextError(ctx.Err())
+		return ctx, statusFromContextError(ctx.Err())
 	}
 }
 

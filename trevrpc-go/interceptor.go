@@ -114,8 +114,8 @@ func (r *serverRuntime) intercept(ctx context.Context, request *wireRequest) (co
 		// The handler's response metadata and stream compression live in
 		// the call's state, which a context that does not derive from ctx
 		// would lose.
-		if next == nil || next.Value(handlerContextKey{}) != state {
-			return ctx, Internal("interceptor returned a context that does not derive from the call's")
+		if !carriesCall(next, state) {
+			return ctx, foreignContextStatus("interceptor")
 		}
 		ctx = next
 	}

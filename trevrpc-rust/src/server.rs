@@ -318,7 +318,7 @@ pub struct RequestContext {
     remote_addr: Option<SocketAddr>,
     /// The response metadata the handler sets, shared by every clone of the context.
     response: ResponseMetadata,
-    /// Values interceptors pass to the handler, such as a database handle.
+    /// Values the authorizer and interceptors pass to the handler, such as a database handle.
     extensions: http::Extensions,
     /// The span later interceptors, the handler and its response stream run in.
     span: tracing::Span,
@@ -429,7 +429,9 @@ impl RequestContext {
         self.response.metadata()
     }
 
-    /// Values an [`Interceptor`] passed to the handler, such as a database handle. A clone of the context copies them.
+    /// Values the [`Authorizer`] (see [`Authorizer::authorize_with_extensions`]) and the
+    /// [`Interceptor`]s passed to the handler, such as the authenticated user or a database
+    /// handle. A clone of the context copies them.
     #[must_use]
     pub const fn extensions(&self) -> &http::Extensions {
         &self.extensions
@@ -1225,6 +1227,29 @@ pub trait Authorizer: Send + Sync + 'static {
         &self,
         request: &AuthorizationRequest<'_>,
     ) -> std::result::Result<(), Status>;
+
+    /// Authorizes a request like [`Authorizer::authorize`], and may add values for interceptors
+    /// and the handler to `extensions`, which become the call's [`RequestContext::extensions`]:
+    /// such as the user that verifying the request's session found, so that the handler need not
+    /// look the session up again. The server calls this method, and by default it calls
+    /// [`Authorizer::authorize`]. An authorizer that overrides it can implement `authorize` by
+    /// calling it with empty extensions.
+    ///
+    /// A call the client replays after a refusal of optimistic stream compression is authorized
+    /// again, with empty extensions, and its handler gets the extensions of that second
+    /// authorization.
+    ///
+    /// # Errors
+    ///
+    /// A returned status rejects the call, and the server discards `extensions`.
+    async fn authorize_with_extensions(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        extensions: &mut http::Extensions,
+    ) -> std::result::Result<(), Status> {
+        let _ = extensions;
+        self.authorize(request).await
+    }
 }
 
 /// Called once when a call that reached an [`Interceptor`] ends, with how it ended.
@@ -1305,7 +1330,8 @@ impl Authorizer for MetadataValueAuthorizer {
 }
 
 /// Runs authorizers in order, and authorizes a call only when every one of them does: the first
-/// error ends the chain.
+/// error ends the chain. [`Authorizer::authorize_with_extensions`] passes the same extensions to
+/// each of them, so an authorizer sees the values the ones before it added.
 #[derive(Clone, Default)]
 pub struct AuthorizerChain(Vec<Arc<dyn Authorizer>>);
 
@@ -1339,8 +1365,19 @@ impl Authorizer for AuthorizerChain {
         &self,
         request: &AuthorizationRequest<'_>,
     ) -> std::result::Result<(), Status> {
+        self.authorize_with_extensions(request, &mut http::Extensions::new())
+            .await
+    }
+
+    async fn authorize_with_extensions(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        extensions: &mut http::Extensions,
+    ) -> std::result::Result<(), Status> {
         for authorizer in &self.0 {
-            authorizer.authorize(request).await?;
+            authorizer
+                .authorize_with_extensions(request, extensions)
+                .await?;
         }
         Ok(())
     }
@@ -1786,18 +1823,22 @@ impl Server {
             "rpc started"
         );
 
-        let deadline = match self.admit(&request, info.remote_addr, &cancellation).await {
-            Ok(Admitted { deadline }) => deadline,
-            Err(status) => {
-                return self.finish_response(
-                    &request.method,
-                    request_body_len,
-                    started_at,
-                    Err(status),
-                    Vec::new(),
-                );
-            }
-        };
+        let (deadline, extensions) =
+            match self.admit(&request, info.remote_addr, &cancellation).await {
+                Ok(Admitted {
+                    deadline,
+                    extensions,
+                }) => (deadline, extensions),
+                Err(status) => {
+                    return self.finish_response(
+                        &request.method,
+                        request_body_len,
+                        started_at,
+                        Err(status),
+                        Vec::new(),
+                    );
+                }
+            };
 
         let Some(Route::Unary { handler, .. }) = self.inner.routes.get(request.method.as_str())
         else {
@@ -1827,6 +1868,7 @@ impl Server {
             cancellation.clone(),
             info,
         );
+        context.extensions = extensions;
         let response_metadata = context.response.clone();
         let (finishes, intercepted) = self.intercept(&mut context, deadline, &cancellation).await;
         if let Err(status) = intercepted {
@@ -1917,8 +1959,11 @@ impl Server {
             Some(admitted) => Ok(admitted),
             None => self.admit(&request, info.remote_addr, &cancellation).await,
         };
-        let deadline = match admission {
-            Ok(Admitted { deadline }) => deadline,
+        let (deadline, extensions) = match admission {
+            Ok(Admitted {
+                deadline,
+                extensions,
+            }) => (deadline, extensions),
             Err(status) => {
                 return self.finish_streaming_status(
                     &request.method,
@@ -1973,6 +2018,7 @@ impl Server {
             cancellation.clone(),
             info,
         );
+        context.extensions = extensions;
         let response_metadata = context.response.clone();
         let (finishes, intercepted) = self.intercept(&mut context, deadline, &cancellation).await;
         let span = context.span.clone();
@@ -2084,12 +2130,14 @@ impl Server {
         request.validate_protocol()?;
         let deadline = request_deadline(request)?;
 
+        let mut extensions = http::Extensions::new();
         if let Some(authorizer) = &self.inner.authorizer {
             let authorization = AuthorizationRequest {
                 request,
                 remote_addr,
             };
-            match with_deadline(authorizer.authorize(&authorization), deadline).await {
+            let authorized = authorizer.authorize_with_extensions(&authorization, &mut extensions);
+            match with_deadline(authorized, deadline).await {
                 Ok(result) => result?,
                 Err(status) => {
                     if status.code() == Code::DeadlineExceeded {
@@ -2100,7 +2148,10 @@ impl Server {
             }
         }
 
-        Ok(Admitted { deadline })
+        Ok(Admitted {
+            deadline,
+            extensions,
+        })
     }
 
     fn finish_response(
@@ -2229,10 +2280,13 @@ impl Server {
 }
 
 /// A call that [`Server::admit`] validated and authorized.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Admitted {
     /// The call's deadline, from its timeout.
     pub(crate) deadline: Option<Instant>,
+    /// The values the authorizer passed to the handler; see
+    /// [`Authorizer::authorize_with_extensions`].
+    pub(crate) extensions: http::Extensions,
 }
 
 async fn with_deadline<T, F>(future: F, deadline: Option<Instant>) -> std::result::Result<T, Status>
@@ -4699,6 +4753,82 @@ mod tests {
         assert_eq!(
             super::AuthorizerChain::new().authorize(&request).await,
             Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn authorizer_extensions_pass_along_the_chain_to_the_handler() {
+        /// Appends its name to the [`Trail`] it finds.
+        struct Appending(&'static str);
+
+        #[crate::async_trait]
+        impl Authorizer for Appending {
+            async fn authorize(
+                &self,
+                request: &super::AuthorizationRequest<'_>,
+            ) -> Result<(), Status> {
+                self.authorize_with_extensions(request, &mut http::Extensions::new())
+                    .await
+            }
+
+            async fn authorize_with_extensions(
+                &self,
+                _request: &super::AuthorizationRequest<'_>,
+                extensions: &mut http::Extensions,
+            ) -> Result<(), Status> {
+                let trail = match extensions.get::<Trail>() {
+                    Some(Trail(before)) => format!("{before}>{}", self.0),
+                    None => self.0.to_owned(),
+                };
+                extensions.insert(Trail(trail));
+                Ok(())
+            }
+        }
+
+        // A plain authorizer in the chain leaves the extensions as they are.
+        let chain = super::AuthorizerChain::new()
+            .with(Appending("session"))
+            .with(MetadataValueAuthorizer::bearer("token"))
+            .with(Appending("user"));
+        let mut server = Server::new();
+        server.set_authorizer(chain);
+        let log = Log::default();
+        server.add_interceptor(named("interceptor", &log));
+        server.route_with_context("/example.Greeter/SayHello", |context, _body| async move {
+            Ok(trail(&context))
+        });
+        server.route_streaming_with_context(
+            "/example.Greeter/Watch",
+            RpcKind::ServerStreaming,
+            |context, _body, _requests| async move {
+                Ok(crate::stream::from_iter([trail(&context)]))
+            },
+        );
+
+        let mut request = RpcRequest::new("/example.Greeter/SayHello");
+        request
+            .metadata
+            .insert("authorization".to_owned(), b"Bearer token".to_vec());
+        let response = server
+            .handle_request(request, Vec::new())
+            .await
+            .expect("authorized request should succeed");
+        assert_eq!(response.message(), b"session>user>interceptor");
+
+        let mut request = watch_request();
+        request
+            .metadata
+            .insert("authorization".to_owned(), b"Bearer token".to_vec());
+        let first = server
+            .handle_streaming_request(request, Vec::new(), crate::stream::empty())
+            .await
+            .next()
+            .await
+            .expect("a frame")
+            .expect("frame should be ok");
+        assert_eq!(
+            first,
+            ResponseFrame::message(b"session>user>interceptor".to_vec())
         );
     }
 

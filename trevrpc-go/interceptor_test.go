@@ -16,6 +16,8 @@ type serveValueKey struct{}
 
 type interceptorValueKey struct{}
 
+type authorizerValueKey struct{}
+
 // finishRecorder records the finish events of a server's interceptors.
 type finishRecorder struct {
 	mu     sync.Mutex
@@ -66,11 +68,13 @@ func valuesInterceptor(name string, recorder *finishRecorder) Interceptor {
 }
 
 // contextValues is what a handler of the inspect service answers: the values
-// the context passed to Serve and the interceptors gave its context.
+// the context passed to Serve, the authorizer and the interceptors gave its
+// context.
 func contextValues(ctx context.Context) string {
 	serve, _ := ctx.Value(serveValueKey{}).(string)
+	authorized, _ := ctx.Value(authorizerValueKey{}).(string)
 	intercepted, _ := ctx.Value(interceptorValueKey{}).(string)
-	return serve + "|" + intercepted
+	return serve + "|" + authorized + "|" + intercepted
 }
 
 func registerInspectService(server *Server) {
@@ -157,6 +161,9 @@ func TestInterceptorsAndServeValuesReachEveryHandlerOverEveryTransport(t *testin
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(request AdmissionRequest) bool { return request.Origin == testOrigin }
 	server.SetOptions(options)
+	server.SetAuthorizer(ContextAuthorizerFunc(func(ctx context.Context, info HandlerContext) (context.Context, error) {
+		return context.WithValue(ctx, authorizerValueKey{}, "authorized "+info.Method), nil
+	}))
 	server.SetInterceptors(valuesInterceptor("outer", recorder), valuesInterceptor("inner", recorder))
 	registerInspectService(server)
 	serveCtx := context.WithValue(context.Background(), serveValueKey{}, "served")
@@ -177,8 +184,8 @@ func TestInterceptorsAndServeValuesReachEveryHandlerOverEveryTransport(t *testin
 			defer cancel()
 			answers := inspectAll(ctx, t, transport)
 			for _, method := range methods {
-				if got := answers[method]; got != "served|outer>inner" {
-					t.Errorf("%s handler saw %q, want served|outer>inner", method, got)
+				if got, want := answers[method], "served|authorized "+method+"|outer>inner"; got != want {
+					t.Errorf("%s handler saw %q, want %q", method, got, want)
 				}
 			}
 			var want []string

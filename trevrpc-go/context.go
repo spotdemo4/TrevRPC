@@ -173,6 +173,21 @@ func (c *handlerCallContext) Value(key any) any {
 	return c.serveCtx.Value(key)
 }
 
+// carriesCall reports whether ctx, a context an authorizer or interceptor
+// returned, carries the call state of the context it was given, as one that
+// is that context or derives from it does. The handler's response metadata
+// and stream compression live in that state, which another context would
+// lose.
+func carriesCall(ctx context.Context, state *callState) bool {
+	return ctx != nil && ctx.Value(handlerContextKey{}) == state
+}
+
+// foreignContextStatus is the status of a call whose authorizer or
+// interceptor, named by who, returned a context that does not carry the call.
+func foreignContextStatus(who string) *Status {
+	return Internal(who + " returned a context that does not derive from the call's")
+}
+
 // carriedCall returns the cancel func of ctx when it already carries the
 // handler context of request, which requestLifetimeContext attaches with its
 // deadline.

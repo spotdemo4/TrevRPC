@@ -114,7 +114,12 @@ struct RunningServer {
 /// Request metadata that makes [`CountingAuthorizer`] reject the call.
 const DENY_KEY: &str = "deny";
 
-/// Counts the calls it sees, and rejects those with [`DENY_KEY`] metadata.
+/// The extension [`CountingAuthorizer`] passes to the handler.
+#[derive(Clone)]
+struct Authorized;
+
+/// Counts the calls it sees, rejects those with [`DENY_KEY`] metadata, and passes [`Authorized`]
+/// to the handlers of the others.
 struct CountingAuthorizer(Arc<AtomicUsize>);
 
 #[trevrpc::async_trait]
@@ -123,24 +128,38 @@ impl trevrpc::server::Authorizer for CountingAuthorizer {
         &self,
         request: &trevrpc::server::AuthorizationRequest<'_>,
     ) -> Result<(), trevrpc::Status> {
+        self.authorize_with_extensions(request, &mut http::Extensions::new())
+            .await
+    }
+
+    async fn authorize_with_extensions(
+        &self,
+        request: &trevrpc::server::AuthorizationRequest<'_>,
+        extensions: &mut http::Extensions,
+    ) -> Result<(), trevrpc::Status> {
         self.0.fetch_add(1, Ordering::SeqCst);
         if request.request.metadata.contains_key(DENY_KEY) {
             return Err(trevrpc::Status::unauthenticated("denied"));
         }
+        extensions.insert(Authorized);
         Ok(())
     }
 }
 
-/// Counts the calls it sees.
+/// Counts the calls it sees, and fails those without the authorizer's [`Authorized`], which
+/// every call, streaming or not, refused and replayed or not, must carry.
 struct CountingInterceptor(Arc<AtomicUsize>);
 
 #[trevrpc::async_trait]
 impl trevrpc::server::Interceptor for CountingInterceptor {
     async fn intercept(
         &self,
-        _context: &mut trevrpc::server::RequestContext,
+        context: &mut trevrpc::server::RequestContext,
     ) -> Result<Option<trevrpc::server::Finish>, trevrpc::Status> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        if context.extensions().get::<Authorized>().is_none() {
+            return Err(trevrpc::Status::internal("no authorizer extension"));
+        }
         Ok(None)
     }
 }
