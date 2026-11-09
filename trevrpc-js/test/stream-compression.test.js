@@ -9,6 +9,7 @@ import {
 } from "../build/test/gen/methods_pb.js";
 import { createClient } from "../src/client.js";
 import { parseStreamChunk } from "../src/compression.js";
+import { ConnectionMetadataSource } from "../src/connection-metadata.js";
 import {
   DefaultMaxFrameSize,
   FrameType,
@@ -512,6 +513,30 @@ test("a replayed call keeps its metadata and the time left before its deadline",
   assert.equal(replay.method, first.method);
   assert.ok(BigInt(replay.timeoutNanos) > 0n);
   assert.ok(BigInt(replay.timeoutNanos) < BigInt(first.timeoutNanos));
+});
+
+test("a replayed call keeps the connection metadata it started with", async () => {
+  const calls = [];
+  const transport = compressedTransport(
+    uploadEcho(calls, { behavior: (i) => (i === 0 ? "after" : "answer") }),
+  );
+  transport.connectionMetadata = new ConnectionMetadataSource({ "x-set": "first" });
+  const call = await createClient(CompressedEcho, transport).clientStream();
+  await call.send({ message: compressible(0) });
+  transport.connectionMetadata.set({ "x-set": "second" });
+  assert.equal((await call.closeAndRecv()).message, compressible(0));
+  await transport.settled();
+  assert.deepEqual(
+    calls.map(({ refused, request: { connectionMetadata } }) => [
+      refused,
+      connectionMetadata.id,
+      new TextDecoder().decode(connectionMetadata.metadata["x-set"]),
+    ]),
+    [
+      [true, 1, "first"],
+      [false, 1, "first"],
+    ],
+  );
 });
 
 test("a bidirectional call refused at dispatch is replayed and echoes each request once", async () => {

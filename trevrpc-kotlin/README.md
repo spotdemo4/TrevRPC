@@ -103,7 +103,7 @@ println(trailers["x-cost"]?.decodeToString())        // trailing metadata
 
 ### Connection metadata
 
-Request metadata that every call of a channel carries, such as a bearer token, is set once on the channel instead of in each call's options. The server merges it into each call's metadata before validation and authorization, and the call's own entries win. Pass it in `CronetTransportOptions` and replace it at any time with `setConnectionMetadata` (empty metadata removes it); calls opened afterwards use the new set.
+Request metadata that every call of a channel carries, such as a bearer token, is set once on the channel instead of in each call's options. The server merges it into each call's metadata before validation and authorization, and the call's own entries win. Pass it in `CronetTransportOptions` and replace it at any time with `setConnectionMetadata` (empty metadata removes it); calls opened afterwards use the new set, and calls in flight keep theirs.
 
 ```kotlin
 val channel =

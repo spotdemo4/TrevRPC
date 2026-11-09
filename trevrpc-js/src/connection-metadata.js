@@ -5,7 +5,9 @@
 // in any order, so a reference only follows a confirmation. The server merges the set into each
 // call's metadata, the call's own entries winning, so the client just sends both; see the wiki's
 // Connection Metadata section. This module holds the channel's set and what each session
-// confirmed; call.js puts them on the REQUEST and learns the confirmation from the ANSWER.
+// confirmed; call.js puts them on the REQUEST and learns the confirmation from the ANSWER. A call
+// carries the set that was current when it started for its whole life, replays included, so a
+// change applies to the calls that start after it.
 import { normalizeMetadata } from "./metadata.js";
 
 /**
@@ -15,9 +17,6 @@ import { normalizeMetadata } from "./metadata.js";
 export function transportConnectionMetadata(transport) {
   return transport.connectionMetadata ?? undefined;
 }
-
-/** A request that carries no connection metadata. */
-const NoConnectionMetadata = Object.freeze({ field: undefined, offered: 0 });
 
 /**
  * A channel's connection metadata, shared by its sessions: the current set, whose ID changes with
@@ -83,17 +82,15 @@ class SessionConnectionMetadata {
   }
 
   /**
-   * The connection metadata of one REQUEST as `{ field, offered }`: `field` is the value of
-   * `connectionMetadata`, a reference to the current set once the session confirmed it and an
-   * offer of it otherwise, or undefined without a set; `offered` is the ID the REQUEST offers,
-   * which `learn` checks the ANSWER against, or zero.
+   * The connection metadata of a REQUEST that carries `set`, the current set when its call
+   * started, as `{ field, offered }`: `field` is the value of `connectionMetadata`, a reference to
+   * the set if this session confirmed it and it is still current, and an offer of it otherwise;
+   * `offered` is the ID the REQUEST offers, which `learn` checks the ANSWER against, or zero.
    */
-  prepare() {
-    const set = this.#source.current;
-    if (set === undefined) {
-      return NoConnectionMetadata;
-    }
-    if (this.#confirmed === set.id) {
+  prepare(set) {
+    // The server keeps the newest few sets the session offered, so one replaced since its call
+    // started may be gone: only the current set is referred to.
+    if (this.#confirmed === set.id && this.#source.current === set) {
       return { field: { id: set.id }, offered: 0 };
     }
     return { field: { id: set.id, metadata: set.metadata }, offered: set.id };

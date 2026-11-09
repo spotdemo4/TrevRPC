@@ -20,8 +20,8 @@ use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::wire::DictionaryInfo;
 use trevrpc::{
-    CompressMessages, CompressStream, Compression, Dictionary, RpcAnswer, RpcKind, RpcRequest,
-    RpcStatus,
+    CompressMessages, CompressStream, Compression, Dictionary, Metadata, RpcAnswer, RpcKind,
+    RpcRequest, RpcStatus,
 };
 
 #[macro_use]
@@ -1384,8 +1384,8 @@ async fn scripted_call(
 
 /// Uploads `count` samples in one burst on a client-streaming call that may stream-compress its
 /// requests, over `transport`.
-async fn burst(
-    transport: &QuicTransport,
+async fn burst<T: StreamingRpcTransport>(
+    transport: &T,
     count: u32,
     options: trevrpc::client::CallOptions,
 ) -> trevrpc::Result<Echo> {
@@ -1438,6 +1438,48 @@ async fn a_refused_call_is_replayed_with_the_rest_of_its_deadline() -> TestResul
         replayed.request.timeout_nanos,
         refused.request.timeout_nanos
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replayed_call_keeps_the_connection_metadata_it_started_with() -> TestResult {
+    let (addr, cert, mut calls) = scripted_server(vec![
+        Script::Refuse {
+            after: Duration::from_millis(200),
+        },
+        Script::Answer {
+            answer: false,
+            answer_after: Duration::ZERO,
+        },
+    ])?;
+    let set = |value: &str| Metadata::from([("x-set".to_owned(), value.as_bytes().to_vec())]);
+    let config = ChannelConfig::new().with_connection_metadata(set("first"));
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    endpoint.set_default_client_config(config.quic_config(client_tls(&cert)?)?);
+    let channel = within!(
+        TEST_TIMEOUT,
+        trevrpc::client::Channel::connect_with_config(endpoint, addr, "localhost", config),
+    )??;
+    let call = burst(&channel, 4, trevrpc::client::CallOptions::new());
+    let change = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        channel.set_connection_metadata(set("second"))
+    };
+    let (response, changed) = within!(TEST_TIMEOUT, async { tokio::join!(call, change) })?;
+    changed?;
+    response?;
+
+    let refused = calls.recv().await.ok_or("no first call")?;
+    let replayed = calls.recv().await.ok_or("no replay")?;
+    ensure_eq!(refused.request.stream_compression, stream_offer(true));
+    // Nothing confirmed the set, so the replay offers it again: the one the call started with.
+    for call in [refused, replayed] {
+        let carried = call
+            .request
+            .connection_metadata
+            .ok_or("no connection metadata")?;
+        ensure_eq!((carried.id, carried.metadata), (1, set("first")));
+    }
     Ok(())
 }
 

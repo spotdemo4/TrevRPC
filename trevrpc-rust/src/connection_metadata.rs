@@ -5,7 +5,9 @@
 //! ANSWER confirms that the server stored it for the connection, then refers to it by ID. Calls
 //! on different streams reach the server in any order, so a reference only follows a
 //! confirmation. The server merges the set into each call's metadata before validation and
-//! authorization, the call's own entries winning; see the wiki's Connection Metadata section.
+//! authorization, the call's own entries winning; see the wiki's Connection Metadata section. A
+//! call carries the set that was current when it started for its whole life, replays included, so
+//! a change applies to the calls that start after it.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -21,7 +23,7 @@ use crate::{Result, Status};
 const MAX_SETS: usize = 4;
 
 /// One version of a channel's connection metadata.
-struct Set {
+pub(crate) struct ConnectionMetadataSet {
     id: u32,
     metadata: Metadata,
 }
@@ -30,7 +32,7 @@ struct Set {
 /// changes with it.
 #[derive(Default)]
 pub struct ConnectionMetadataSource {
-    current: RwLock<Option<Arc<Set>>>,
+    current: RwLock<Option<Arc<ConnectionMetadataSet>>>,
     ids: AtomicU32,
 }
 
@@ -57,13 +59,13 @@ impl ConnectionMetadataSource {
                 // IDs wrap after 2^32 sets, past 0, which means none.
                 id = self.ids.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             }
-            Some(Arc::new(Set { id, metadata }))
+            Some(Arc::new(ConnectionMetadataSet { id, metadata }))
         };
         *self.current.write_unpoisoned() = set;
         Ok(())
     }
 
-    fn current(&self) -> Option<Arc<Set>> {
+    fn current(&self) -> Option<Arc<ConnectionMetadataSet>> {
         self.current.read_unpoisoned().clone()
     }
 }
@@ -99,14 +101,32 @@ impl ClientConnectionMetadata {
         })
     }
 
-    /// Sets the connection metadata of `request`: a reference to the current set once the
-    /// connection confirmed it, an offer of it otherwise, which the call's ANSWER may confirm.
-    pub(crate) fn prepare(self: &Arc<Self>, request: &mut RpcRequest) -> Option<OfferedSet> {
-        let Some(set) = self.source.current() else {
+    /// The set a call that starts now carries for its whole life, replays included: the
+    /// channel's current one, or `None`.
+    pub(crate) fn current(&self) -> Option<Arc<ConnectionMetadataSet>> {
+        self.source.current()
+    }
+
+    /// Sets the connection metadata of `request`, whose call carries `set` (see
+    /// [`Self::current`]): a reference to it if the connection confirmed it and it is still
+    /// current, an offer of it otherwise, which the call's ANSWER may confirm.
+    pub(crate) fn prepare(
+        self: &Arc<Self>,
+        request: &mut RpcRequest,
+        set: Option<&ConnectionMetadataSet>,
+    ) -> Option<OfferedSet> {
+        let Some(set) = set else {
             request.connection_metadata = None;
             return None;
         };
-        if self.confirmed.load(Ordering::Relaxed) == set.id {
+        // The server keeps the newest few sets the connection offered, so one replaced since its
+        // call started may be gone: only the current set is referred to.
+        if self.confirmed.load(Ordering::Relaxed) == set.id
+            && self
+                .source
+                .current()
+                .is_some_and(|current| current.id == set.id)
+        {
             request.connection_metadata = Some(ConnectionMetadata {
                 id: set.id,
                 metadata: Metadata::new(),
@@ -285,8 +305,12 @@ mod tests {
             ConnectionMetadataSource::new(Metadata::from([("Suffix".to_owned(), b"!".to_vec())]))
                 .unwrap();
         let connection = ClientConnectionMetadata::new(Arc::clone(&source));
+        let prepare = |request: &mut RpcRequest| {
+            let set = connection.current();
+            connection.prepare(request, set.as_deref())
+        };
         let mut request = RpcRequest::new("/svc/m");
-        let offered = connection.prepare(&mut request).unwrap();
+        let offered = prepare(&mut request).unwrap();
         let sent = request.connection_metadata.clone().unwrap();
         assert_eq!(
             (sent.id, sent.metadata["suffix"].as_slice()),
@@ -294,22 +318,66 @@ mod tests {
         );
         offered.learn(1);
         assert_eq!(connection.confirmed(), 1);
-        assert!(connection.prepare(&mut request).is_none());
+        assert!(prepare(&mut request).is_none());
         assert!(request.connection_metadata.unwrap().metadata.is_empty());
 
         source
             .set(Metadata::from([("suffix".to_owned(), b"#".to_vec())]))
             .unwrap();
         let mut request = RpcRequest::new("/svc/m");
-        let offered = connection.prepare(&mut request).unwrap();
+        let offered = prepare(&mut request).unwrap();
         assert_eq!(request.connection_metadata.unwrap().id, 2);
         // A confirmation of a replaced set does not count.
         offered.learn(1);
         assert_eq!(connection.confirmed(), 1);
-        assert!(connection.prepare(&mut RpcRequest::new("/svc/m")).is_some());
+        assert!(prepare(&mut RpcRequest::new("/svc/m")).is_some());
         source.set(Metadata::new()).unwrap();
         let mut request = RpcRequest::new("/svc/m");
-        assert!(connection.prepare(&mut request).is_none());
+        assert!(prepare(&mut request).is_none());
         assert!(request.connection_metadata.is_none());
+    }
+
+    #[test]
+    fn a_call_keeps_its_set_and_offers_it_once_replaced() {
+        let source =
+            ConnectionMetadataSource::new(Metadata::from([("k".to_owned(), b"1".to_vec())]))
+                .unwrap();
+        let connection = ClientConnectionMetadata::new(Arc::clone(&source));
+        let started = connection.current();
+        let mut request = RpcRequest::new("/svc/m");
+        connection
+            .prepare(&mut request, started.as_deref())
+            .unwrap()
+            .learn(1);
+        assert!(
+            connection
+                .prepare(&mut request, started.as_deref())
+                .is_none()
+        );
+        assert!(request.connection_metadata.unwrap().metadata.is_empty());
+
+        source
+            .set(Metadata::from([("k".to_owned(), b"2".to_vec())]))
+            .unwrap();
+        // The call still carries the set it started with, offered in full since the server may
+        // have dropped it, and its confirmation does not count.
+        let mut request = RpcRequest::new("/svc/m");
+        let offered = connection
+            .prepare(&mut request, started.as_deref())
+            .unwrap();
+        let carried = request.connection_metadata.unwrap();
+        assert_eq!(
+            (carried.id, carried.metadata["k"].as_slice()),
+            (1, &b"1"[..])
+        );
+        offered.learn(1);
+        let current = connection.current();
+        let mut request = RpcRequest::new("/svc/m");
+        assert!(
+            connection
+                .prepare(&mut request, current.as_deref())
+                .is_some()
+        );
+        assert_eq!(request.connection_metadata.unwrap().id, 2);
     }
 }

@@ -117,8 +117,9 @@ type Channel struct {
 
 // SetConnectionMetadata replaces the channel's connection metadata (see
 // DialOptions.ConnectionMetadata), for example when a token is refreshed.
-// Calls that start afterwards carry the new metadata; each connection offers
-// it until the server confirms it. Empty metadata removes it.
+// Calls that start afterwards carry the new metadata, and calls in flight keep
+// theirs; each connection offers it until the server confirms it. Empty
+// metadata removes it.
 func (c *Channel) SetConnectionMetadata(metadata Metadata) error {
 	if c.connectionMetadata == nil {
 		return FailedPrecondition("the channel has no connection metadata source")

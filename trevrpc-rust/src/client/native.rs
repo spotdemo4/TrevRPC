@@ -11,7 +11,9 @@ use crate::compression::{
     ClientCall, ClientCompression, CompressionConfig, DEFAULT_CLIENT_MEMORY, MessageEncoder,
     StreamBudget, offer_stream,
 };
-use crate::connection_metadata::{ClientConnectionMetadata, ConnectionMetadataSource, OfferedSet};
+use crate::connection_metadata::{
+    ClientConnectionMetadata, ConnectionMetadataSet, ConnectionMetadataSource, OfferedSet,
+};
 use crate::datagram::{ClientFlow, Demux, FlowSender, MergedResponses};
 use crate::framed::{self, ResponseReading};
 use crate::mux::{CANCELLED_STREAM_CODE, MuxConnection, MuxRecvStream, MuxSendStream};
@@ -84,17 +86,26 @@ impl<C: MuxConnection> NativeTransport<C> {
         self.connection_metadata = Some(ClientConnectionMetadata::new(source));
     }
 
-    /// Fills the negotiation fields of `request` for a call described by `info`, returning the
-    /// call's compression and the connection metadata set it offered.
+    /// The connection metadata set a call that starts now carries for its whole life, replays
+    /// included, or `None`.
+    fn connection_metadata_set(&self) -> Option<Arc<ConnectionMetadataSet>> {
+        self.connection_metadata
+            .as_ref()
+            .and_then(|connection| connection.current())
+    }
+
+    /// Fills the negotiation fields of `request` for a call described by `info` that carries the
+    /// connection metadata `set`, returning the call's compression and the set it offered.
     fn prepare(
         &self,
         request: &mut RpcRequest,
         info: &CallInfo,
+        set: Option<&ConnectionMetadataSet>,
     ) -> (ClientCall, Option<OfferedSet>) {
         let offered = self
             .connection_metadata
             .as_ref()
-            .and_then(|connection| connection.prepare(request));
+            .and_then(|connection| connection.prepare(request, set));
         let call = self
             .compression
             .prepare(request, info.message_types, info.compress);
@@ -122,6 +133,7 @@ impl<C: MuxConnection> NativeTransport<C> {
         request_body: BoxStream<Vec<u8>>,
         info: CallInfo,
     ) -> Result<BoxStream<ResponseFrame>> {
+        let set = self.connection_metadata_set();
         let directions = info
             .compress_stream
             .effective(request.rpc_kind())
@@ -131,26 +143,40 @@ impl<C: MuxConnection> NativeTransport<C> {
             .as_ref()
             .filter(|_| directions.requests && !info.unreliable.any() && self.optimism.get());
         let Some(budget) = budget else {
-            return self.open_stream(request, request_body, info, None).await;
+            return self
+                .open_stream(request, request_body, info, set.as_deref(), None)
+                .await;
         };
         let (replay, requests) = Replay::new(request_body, Arc::clone(budget));
         let transport = self.clone();
         let original = request.clone();
         let started = Instant::now();
+        let replayed_set = set.clone();
         let retry: Retry = Box::new(move |requests| {
-            Box::pin(async move { transport.replay(original, requests, info, started).await })
+            Box::pin(async move {
+                transport
+                    .replay(original, requests, info, replayed_set.as_deref(), started)
+                    .await
+            })
         });
-        self.open_stream(request, requests, info, Some((replay, retry)))
-            .await
+        self.open_stream(
+            request,
+            requests,
+            info,
+            set.as_deref(),
+            Some((replay, retry)),
+        )
+        .await
     }
 
     /// Opens the replay of a refused optimistic call, not optimistic, with the time left of the
-    /// original deadline.
+    /// original deadline and the connection metadata `set` the call started with.
     async fn replay(
         &self,
         mut request: RpcRequest,
         requests: BoxStream<Vec<u8>>,
         info: CallInfo,
+        set: Option<&ConnectionMetadataSet>,
         started: Instant,
     ) -> Result<BoxStream<ResponseFrame>> {
         if request.timeout_nanos != 0 {
@@ -163,20 +189,22 @@ impl<C: MuxConnection> NativeTransport<C> {
                 })));
             }
         }
-        self.open_stream(request, requests, info, None).await
+        self.open_stream(request, requests, info, set, None).await
     }
 
     /// Opens the call's stream, giving it a datagram flow first if it is unreliable and this
     /// connection supports datagrams. The decision is made here, on the connection that carries
-    /// the call. `optimistic` is the replay of an optimistic call and how to open it again.
+    /// the call. `set` is the connection metadata the call carries, and `optimistic` the replay of
+    /// an optimistic call and how to open it again.
     async fn open_stream(
         &self,
         mut request: RpcRequest,
         request_body: BoxStream<Vec<u8>>,
         info: CallInfo,
+        set: Option<&ConnectionMetadataSet>,
         optimistic: Option<(Replay, Retry)>,
     ) -> Result<BoxStream<ResponseFrame>> {
-        let (call, offered) = self.prepare(&mut request, &info);
+        let (call, offered) = self.prepare(&mut request, &info, set);
         let directions = info
             .compress_stream
             .effective(request.rpc_kind())
@@ -274,7 +302,8 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
         body: Vec<u8>,
         info: CallInfo,
     ) -> Result<ResponseEnvelope<Bytes>> {
-        let (negotiated, offered) = self.prepare(&mut request, &info);
+        let set = self.connection_metadata_set();
+        let (negotiated, offered) = self.prepare(&mut request, &info, set.as_deref());
         let (send, recv) = self.connection.open_stream().await?;
         let mut call = UnaryCall {
             send,

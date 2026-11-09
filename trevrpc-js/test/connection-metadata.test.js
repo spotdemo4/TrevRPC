@@ -287,15 +287,71 @@ test("a late confirmation of a replaced set does not undo the current one's", as
   const { ConnectionMetadataSource } = await import("../src/connection-metadata.js");
   const source = new ConnectionMetadataSource({ k: "1" });
   const session = source.session({});
-  const first = session.prepare().offered;
+  const first = session.prepare(source.current).offered;
   source.set({ k: "2" });
-  const second = session.prepare().offered;
+  const second = session.prepare(source.current).offered;
   session.learn(second, { connectionMetadata: second });
   // The first call's ANSWER arrives last.
   session.learn(first, { connectionMetadata: first });
-  const { field, offered } = session.prepare();
+  const { field, offered } = session.prepare(source.current);
   assert.equal(offered, 0, "the current set is still confirmed");
   assert.deepEqual(field, { id: second });
+});
+
+test("a call whose set was replaced offers it in full, even if the session confirmed it", async () => {
+  const { ConnectionMetadataSource } = await import("../src/connection-metadata.js");
+  const source = new ConnectionMetadataSource({ k: "1" });
+  const session = source.session({});
+  const set = source.current;
+  const { offered } = session.prepare(set);
+  session.learn(offered, { connectionMetadata: offered });
+  assert.deepEqual(session.prepare(set).field, { id: set.id });
+  source.set({ k: "2" });
+  // The server may have dropped a replaced set, so a call that started with it offers it again,
+  // and its confirmation does not count.
+  const stale = session.prepare(set);
+  assert.equal(stale.offered, set.id);
+  assert.deepEqual(texts(stale.field.metadata), { k: "1" });
+  session.learn(stale.offered, { connectionMetadata: stale.offered });
+  assert.equal(session.prepare(source.current).offered, source.current.id);
+});
+
+test("a call keeps the set that was current when it started", async () => {
+  const fake = fakeWebTransport();
+  const channel = createChannel(url, {
+    transports: ["webtransport"],
+    WebTransport: fake.WebTransport,
+    connectionMetadata: { "interop-suffix": "!" },
+  });
+  const client = createClient(Echo, channel);
+  // The call waits for the channel to connect, and the set changes meanwhile.
+  const first = echo(client, "a");
+  channel.setConnectionMetadata({ "interop-suffix": "#" });
+  const second = echo(client, "b");
+  assert.deepEqual(await Promise.all([first, second]), ["a!", "b#"]);
+  assert.deepEqual(
+    fake.requests.map((request) => request.connection),
+    [
+      { id: 1, metadata: { "interop-suffix": "!" } },
+      { id: 2, metadata: { "interop-suffix": "#" } },
+    ],
+  );
+  channel.close();
+});
+
+test("a call starts, and takes the current set, once its interceptors ran", async () => {
+  const fake = fakeWebTransport();
+  const channel = await channelTo(fake, { connectionMetadata: { "interop-suffix": "!" } });
+  const client = createClient(Echo, channel, {
+    interceptors: [
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        channel.setConnectionMetadata({ "interop-suffix": "#" });
+      },
+    ],
+  });
+  assert.equal(await echo(client, "a"), "a#");
+  channel.close();
 });
 
 test("clients created on a connecting channel carry its connection metadata", async () => {

@@ -167,8 +167,9 @@ export class Call {
   #flushing = false;
   /**
    * What the call needs to open itself again, for the replay of a refused optimistic call:
-   * `{ transport, request, rpc, deadline }`, where `deadline` is the `performance.now()` time the
-   * call's timeout ends, or undefined.
+   * `{ transport, request, rpc, deadline, connectionMetadata }`, where `deadline` is the
+   * `performance.now()` time the call's timeout ends, or undefined, and `connectionMetadata` is
+   * the connection metadata set the call carries, or undefined.
    */
   #setup;
   /**
@@ -201,12 +202,14 @@ export class Call {
   static async open(transport, request, message, options, rpc = {}) {
     const fields = { ...request, metadata: options.metadata, ...timeoutField(options) };
     const compression = transportCompression(transport);
+    // The call carries the connection metadata that is current as it starts, like its own
+    // metadata, until it ends: a change while its stream opens or before a replay is for later
+    // calls.
+    const connectionMetadata = transportConnectionMetadata(transport)?.current;
     // The REQUEST depends on the session that carries the call if it negotiates compression, opens
     // a datagram flow or carries connection metadata.
     const perSession =
-      rpc.datagrams !== undefined ||
-      compression !== undefined ||
-      transportConnectionMetadata(transport)?.current !== undefined;
+      rpc.datagrams !== undefined || compression !== undefined || connectionMetadata !== undefined;
     const header = perSession
       ? null
       : encodeRequestFrame(fields, outgoing(message), options.maxFrameSize);
@@ -221,6 +224,7 @@ export class Call {
         request: { ...request, metadata: options.metadata },
         rpc,
         deadline: options.timeoutMs == null ? undefined : performance.now() + options.timeoutMs,
+        connectionMetadata,
       };
       await call.#write(
         header ?? call.#requestOnSession(fields, message, session, compression, transport, rpc),
@@ -236,7 +240,8 @@ export class Call {
 
   /**
    * Sets the call up on the session that carries it, negotiating compression and opening its
-   * datagram flow as the method needs, and encodes the REQUEST. A call whose requests may be
+   * datagram flow as the method needs, and encodes the REQUEST with the connection metadata the
+   * call carries, offered or referred to as the session needs. A call whose requests may be
    * stream-compressed offers optimistically while the session allows it, unless `replay` says this
    * is the replay of a refused call or the call has a datagram flow, which a replay would need to
    * open again.
@@ -277,13 +282,12 @@ export class Call {
         }
       }
     }
-    this.#connectionMetadata = transportConnectionMetadata(transport)?.session(session.key);
-    if (this.#connectionMetadata !== undefined) {
-      const { field, offered } = this.#connectionMetadata.prepare();
+    const set = this.#setup.connectionMetadata;
+    if (set !== undefined) {
+      this.#connectionMetadata = transportConnectionMetadata(transport).session(session.key);
+      const { field, offered } = this.#connectionMetadata.prepare(set);
       this.#offeredMetadata = offered;
-      if (field !== undefined) {
-        request.connectionMetadata = field;
-      }
+      request.connectionMetadata = field;
     }
     return encodeRequestFrame(
       request,

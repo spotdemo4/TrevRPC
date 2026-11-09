@@ -548,9 +548,11 @@ export class Channel implements Transport {
   readonly interceptors: readonly CallInterceptor[];
   /**
    * Replaces the channel's connection metadata (see `ConnectOptions.connectionMetadata`); empty or
-   * missing metadata removes it. Calls started after this use the new metadata, and each
-   * connection sends it again before referring to it. Throws if it is invalid, and then keeps the
-   * old.
+   * missing metadata removes it. A call carries the connection metadata that is current when it
+   * starts, once its interceptors have run, until it ends: calls started after this use the new
+   * metadata, and calls in flight keep theirs, even if they are still connecting. Each connection
+   * sends the new metadata again before referring to it. Throws if it is invalid, and then keeps
+   * the old.
    */
   setConnectionMetadata(metadata?: MetadataInput): void;
   createBidirectionalStream(): Promise<TransportStream>;

@@ -209,7 +209,7 @@ channel.setConnectionMetadata({ authorization: `Bearer ${refreshed}` }); // call
 channel.setConnectionMetadata(); // removes it
 ```
 
-A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. Other transports carry it when they forward a channel's `connectionMetadata`.
+A call carries the set that is current when it starts, once its interceptors have run, until it ends, like its own `metadata`: a change applies to calls that start after it, and a call still waiting for the channel to connect keeps the set it started with. A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. Other transports carry it when they forward a channel's `connectionMetadata`.
 
 ### Interceptors
 

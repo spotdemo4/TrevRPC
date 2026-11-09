@@ -574,7 +574,8 @@ impl Channel {
     }
 
     /// Replaces the connection metadata (see [`ChannelConfig::with_connection_metadata`]) for the
-    /// calls that start from now on; empty metadata removes it.
+    /// calls that start from now on; empty metadata removes it. Calls in flight keep the set they
+    /// started with, replays included.
     ///
     /// # Errors
     ///
