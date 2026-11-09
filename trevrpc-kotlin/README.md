@@ -136,7 +136,7 @@ If the call's own deadline passes while the client waits for the end of the stre
 
 ### Compression
 
-Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). Compression calls [zstd-jni](https://github.com/luben/zstd-jni), which `core` compiles against but does not ship, so the application adds it: `com.github.luben:zstd-jni:1.5.7-25@aar` on Android (its AAR needs `compileSdk` 37), or the plain JAR on the JVM. Configure it on the channel:
+Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). Compression calls [zstd-jni](https://github.com/luben/zstd-jni), which `core` compiles against but does not ship, so the application adds it: `com.github.luben:zstd-jni` as an `aar` on Android (its AAR needs `compileSdk` 37), or the plain JAR on the JVM, at the version TrevRPC is tested with in [`gradle/libs.versions.toml`](gradle/libs.versions.toml). Configure it on the channel:
 
 ```kotlin
 val compression =
