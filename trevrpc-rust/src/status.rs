@@ -78,6 +78,7 @@ pub struct Status {
     code: Code,
     message: String,
     metadata: Metadata,
+    details: Vec<Detail>,
     /// Set only on the STATUS that refuses an optimistic call, which the runtime writes itself:
     /// application code cannot set it, and a decoded STATUS never carries it, so a handler that
     /// forwards another call's status can never make its client replay a call.
@@ -92,6 +93,7 @@ impl Status {
             code,
             message: message.into(),
             metadata: Metadata::new(),
+            details: Vec::new(),
             refused_stream_compression: false,
         }
     }
@@ -233,6 +235,29 @@ impl Status {
         self
     }
 
+    /// Returns the details of this status: protobuf messages that describe a failure in more
+    /// depth, such as the `buf.validate.Violations` of a request that broke its validation rules.
+    #[must_use]
+    pub fn details(&self) -> &[Detail] {
+        &self.details
+    }
+
+    /// Attaches details to this status in place of any it had.
+    #[must_use]
+    pub fn with_details(mut self, details: impl IntoIterator<Item = Detail>) -> Self {
+        self.details = details.into_iter().collect();
+        self
+    }
+
+    /// Returns the first detail whose message type is `type_name`, a full name such as
+    /// `buf.validate.Violations`.
+    #[must_use]
+    pub fn find_detail(&self, type_name: &str) -> Option<&Detail> {
+        self.details
+            .iter()
+            .find(|detail| detail.type_name == type_name)
+    }
+
     /// Splits the status into its code and message.
     #[must_use]
     pub fn into_parts(self) -> (Code, String) {
@@ -253,13 +278,66 @@ impl From<Status> for RpcStatus {
             message: status.message,
             metadata: status.metadata,
             refused_stream_compression: status.refused_stream_compression,
+            details: status.details,
         }
     }
 }
 
 impl From<RpcStatus> for Status {
     fn from(status: RpcStatus) -> Self {
-        Self::new(Code::from_u32(status.code), status.message).with_metadata(status.metadata)
+        Self::new(Code::from_u32(status.code), status.message)
+            .with_metadata(status.metadata)
+            .with_details(status.details)
+    }
+}
+
+/// One detail of a [`Status`]: a protobuf message, carried as its full name and its encoding so
+/// that a receiver decodes only the details it reads.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct Detail {
+    #[prost(string, tag = "1")]
+    type_name: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
+}
+
+impl Detail {
+    /// Creates a detail from a message's full name, such as `buf.validate.Violations`, and its
+    /// protobuf encoding.
+    #[must_use]
+    pub fn new(type_name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            type_name: type_name.into(),
+            value: value.into(),
+        }
+    }
+
+    /// Creates a detail that carries `message`.
+    #[must_use]
+    pub fn from_message<M: prost::Name>(message: &M) -> Self {
+        Self::new(M::full_name(), message.encode_to_vec())
+    }
+
+    /// Returns the full name of the message the detail carries.
+    #[must_use]
+    pub fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    /// Returns the protobuf encoding of the message the detail carries.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Decodes the message the detail carries. The caller picks `M` by the detail's
+    /// [`type_name`](Self::type_name).
+    ///
+    /// # Errors
+    ///
+    /// Returns the decode error if the value is not a valid encoding of `M`.
+    pub fn decode<M: prost::Message + Default>(&self) -> Result<M, prost::DecodeError> {
+        M::decode(self.value.as_slice())
     }
 }
 

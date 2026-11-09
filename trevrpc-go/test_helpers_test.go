@@ -374,10 +374,12 @@ type testFrame struct {
 	Message string
 	// Metadata is the trailing metadata of a STATUS frame.
 	Metadata Metadata
+	// Details are the details of a STATUS frame.
+	Details []Detail
 }
 
 func (f testFrame) statusValue() *Status {
-	return NewStatus(CodeFromUint32(f.Status), f.Message).WithMetadata(f.Metadata)
+	return NewStatus(CodeFromUint32(f.Status), f.Message).WithMetadata(f.Metadata).WithDetails(f.Details...)
 }
 
 // decodeTestFrame decodes a known frame.
@@ -408,7 +410,7 @@ func decodeTestFrame(next frame) (testFrame, error) {
 		if err := decodePayload(next.payload, &status); err != nil {
 			return testFrame{}, err
 		}
-		decoded.Status, decoded.Message, decoded.Metadata = status.Code, status.Message, status.Metadata
+		decoded.Status, decoded.Message, decoded.Metadata, decoded.Details = status.Code, status.Message, status.Metadata, detailsFromWire(status.Details)
 	}
 	return decoded, nil
 }

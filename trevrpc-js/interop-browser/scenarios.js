@@ -1,8 +1,10 @@
+import { ViolationsSchema } from "../build/interop/gen/buf/validate/validate_pb.js";
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
 // only needs the web platform, so it runs unchanged in a browser bundle and under Node tests.
 import { CompressedEcho, RefusingEcho } from "../build/interop/gen/compressed_pb.js";
 import { Echo } from "../build/interop/gen/interop_pb.js";
 import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
+import { ValidatedEcho } from "../build/interop/gen/validated_pb.js";
 import { Code, TrevRpcError, codeName, createClient } from "../src/index.js";
 import { interopCompression } from "./compression.js";
 import { connectLane } from "./lane.js";
@@ -57,7 +59,7 @@ function incompressible(n) {
 
 /**
  * Scenarios take the Echo client and a context: `unreliable` is the UnreliableEcho client,
- * `compressed` the CompressedEcho client, `transport` the transport ("webtransport" or
+ * `compressed` the CompressedEcho client, `validated` the ValidatedEcho client, `transport` the transport ("webtransport" or
  * "websocket") the channel connected over, and `open(options)` connects another channel to the
  * same server, which the scenario closes.
  */
@@ -343,7 +345,57 @@ const scenarios = {
       channel.close();
     }
   },
+
+  // ValidatedEcho calls that keep and break its standard and CEL rules.
+  async validation(_echo, { validated }) {
+    expectEcho(await validated.unary({ message: "hello" }), "hello", 0);
+    await expectViolation("empty message", "string.min_len", "message", () =>
+      validated.unary({ message: "" }),
+    );
+    await expectViolation("forbidden message", "message.not_forbidden", "", () =>
+      validated.unary({ message: "forbidden" }),
+    );
+    await expectViolation("streamed empty message", "string.min_len", "message", async () => {
+      const call = await validated.clientStream();
+      // The server may fail the call before the second message is sent; the response reports it
+      // either way.
+      try {
+        await call.send({ message: "a" });
+        await call.send({ message: "" });
+      } catch {}
+      return call.closeAndRecv();
+    });
+  },
 };
+
+/**
+ * Runs an operation that must fail with InvalidArgument and a buf.validate.Violations detail
+ * holding one violation of `rule`, on the field named `field`, or on the message itself when
+ * `field` is empty.
+ */
+async function expectViolation(what, rule, field, operation) {
+  try {
+    await operation();
+  } catch (error) {
+    expect(
+      error instanceof TrevRpcError && error.code === Code.InvalidArgument,
+      `${what}: expected InvalidArgument, got ${describe(error)}`,
+    );
+    const violations = error.findDetails(ViolationsSchema).flatMap((detail) => detail.violations);
+    expect(
+      violations.length === 1,
+      `${what}: expected one violation, got ${violations.length} in ${error.details.length} details`,
+    );
+    const [violation] = violations;
+    const path = (violation.field?.elements ?? []).map((element) => element.fieldName).join(".");
+    expect(
+      violation.ruleId === rule && path === field,
+      `${what}: got rule ${JSON.stringify(violation.ruleId)} on field ${JSON.stringify(path)}, want ${JSON.stringify(rule)} on ${JSON.stringify(field)}`,
+    );
+    return;
+  }
+  throw new Error(`${what}: expected InvalidArgument, got OK`);
+}
 
 /**
  * CompressedEcho.Plain echoing the `compressed-plain` text; returns whether the server received
@@ -477,6 +529,7 @@ export async function runScenarios({
       unreliable: createClient(UnreliableEcho, channel, { timeoutMs: DeadlineMs }),
       compressed: createClient(CompressedEcho, channel, { timeoutMs: DeadlineMs }),
       refusing: createClient(RefusingEcho, channel, { timeoutMs: DeadlineMs }),
+      validated: createClient(ValidatedEcho, channel, { timeoutMs: DeadlineMs }),
       open,
       get transport() {
         return channel.transport;

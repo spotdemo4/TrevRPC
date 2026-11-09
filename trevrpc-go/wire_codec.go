@@ -38,6 +38,9 @@ const (
 	statusMessageField     protowire.Number = 2
 	statusMetadataField    protowire.Number = 3
 	statusRefusedField     protowire.Number = 4
+	statusDetailsField     protowire.Number = 5
+	detailTypeField        protowire.Number = 1
+	detailValueField       protowire.Number = 2
 	mapEntryKeyField       protowire.Number = 1
 	mapEntryValueField     protowire.Number = 2
 )
@@ -312,8 +315,93 @@ func (m *wireAnswer) appendPayload(b []byte) []byte {
 	return b
 }
 
+// detailSize is the encoded size of a Detail message.
+func detailSize(detail *wireDetail) int {
+	size := 0
+	if detail.Type != "" {
+		size += protowire.SizeTag(detailTypeField) + protowire.SizeBytes(len(detail.Type))
+	}
+	if len(detail.Value) > 0 {
+		size += protowire.SizeTag(detailValueField) + protowire.SizeBytes(len(detail.Value))
+	}
+	return size
+}
+
+// detailsValid reports whether every detail type is valid UTF-8, which a
+// protobuf string requires.
+func detailsValid(details []*wireDetail) bool {
+	for _, detail := range details {
+		if !utf8.ValidString(detail.Type) {
+			return false
+		}
+	}
+	return true
+}
+
+func detailsFieldSize(num protowire.Number, details []*wireDetail) int {
+	size := 0
+	for _, detail := range details {
+		size += protowire.SizeTag(num) + protowire.SizeBytes(detailSize(detail))
+	}
+	return size
+}
+
+func appendDetails(b []byte, num protowire.Number, details []*wireDetail) []byte {
+	for _, detail := range details {
+		b = protowire.AppendTag(b, num, protowire.BytesType)
+		b = protowire.AppendVarint(b, uint64(detailSize(detail)))
+		if detail.Type != "" {
+			b = protowire.AppendTag(b, detailTypeField, protowire.BytesType)
+			b = protowire.AppendString(b, detail.Type)
+		}
+		if len(detail.Value) > 0 {
+			b = protowire.AppendTag(b, detailValueField, protowire.BytesType)
+			b = protowire.AppendBytes(b, detail.Value)
+		}
+	}
+	return b
+}
+
+// consumeDetail decodes a Detail message, skipping unknown fields. Its value
+// aliases data.
+func consumeDetail(data []byte) (*wireDetail, bool) {
+	detail := &wireDetail{}
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 || num > protowire.MaxValidNumber {
+			return nil, false
+		}
+		data = data[n:]
+		switch {
+		case num == detailTypeField && typ == protowire.BytesType:
+			value, n := protowire.ConsumeBytes(data)
+			if n < 0 || !utf8.Valid(value) {
+				return nil, false
+			}
+			detail.Type = string(value)
+			data = data[n:]
+		case num == detailValueField && typ == protowire.BytesType:
+			value, n := protowire.ConsumeBytes(data)
+			if n < 0 {
+				return nil, false
+			}
+			detail.Value = value
+			data = data[n:]
+		case num == detailTypeField || num == detailValueField:
+			return nil, false
+		default:
+			n, ok := skipField(num, typ, data)
+			if !ok {
+				return nil, false
+			}
+			data = data[n:]
+		}
+	}
+	return detail, true
+}
+
 func (m *wireStatus) payloadSize() (int, bool) {
-	if !utf8.ValidString(m.Message) || !metadataValid(m.Metadata) {
+	if !utf8.ValidString(m.Message) || !metadataValid(m.Metadata) || !detailsValid(m.Details) {
 		return 0, false
 	}
 	size := metadataFieldSize(statusMetadataField, m.Metadata)
@@ -326,7 +414,7 @@ func (m *wireStatus) payloadSize() (int, bool) {
 	if m.RefusedStreamCompression {
 		size += protowire.SizeTag(statusRefusedField) + 1
 	}
-	return size, true
+	return size + detailsFieldSize(statusDetailsField, m.Details), true
 }
 
 func (m *wireStatus) appendPayload(b []byte) []byte {
@@ -343,7 +431,7 @@ func (m *wireStatus) appendPayload(b []byte) []byte {
 		b = protowire.AppendTag(b, statusRefusedField, protowire.VarintType)
 		b = protowire.AppendVarint(b, 1)
 	}
-	return b
+	return appendDetails(b, statusDetailsField, m.Details)
 }
 
 // --- Decoding ---
@@ -565,7 +653,8 @@ func (m *wireAnswer) decodeFast(b []byte) bool {
 	return true
 }
 
-// decodeFast decodes a STATUS payload into m, which must be empty.
+// decodeFast decodes a STATUS payload into m, which must be empty. Detail
+// values alias b.
 func (m *wireStatus) decodeFast(b []byte) bool {
 	for len(b) > 0 {
 		num, typ, n := protowire.ConsumeTag(b)
@@ -605,7 +694,18 @@ func (m *wireStatus) decodeFast(b []byte) bool {
 			}
 			m.RefusedStreamCompression = protowire.DecodeBool(value)
 			b = b[n:]
-		case num == statusCodeField || num == statusMessageField || num == statusMetadataField || num == statusRefusedField:
+		case num == statusDetailsField && typ == protowire.BytesType:
+			data, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return false
+			}
+			detail, ok := consumeDetail(data)
+			if !ok {
+				return false
+			}
+			m.Details = append(m.Details, detail)
+			b = b[n:]
+		case num == statusCodeField || num == statusMessageField || num == statusMetadataField || num == statusRefusedField || num == statusDetailsField:
 			return false
 		default:
 			n, ok := skipField(num, typ, b)

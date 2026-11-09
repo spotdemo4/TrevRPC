@@ -377,7 +377,7 @@ func TestClientStreamingClientServer(t *testing.T) {
 func TestBidirectionalStreamingClientServer(t *testing.T) {
 	server := NewServer()
 	server.routeStreaming("/example.Greeter/BidiHello", RPCKindBidirectionalStreaming, func(_ context.Context, _ []byte, requests byteStream) (encodedStream, error) {
-		return newEncodeStream[*testMessage](&echoTestMessages{requests: newDecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} })}), nil
+		return newEncodeStream[*testMessage](&echoTestMessages{requests: newDecodeStream[*testMessage](requests, func() *testMessage { return &testMessage{} }, nil)}), nil
 	})
 
 	stream, err := runTestBidiStreaming(context.Background(), localTransport{server: server}, "/example.Greeter/BidiHello", []string{"left", "right"})

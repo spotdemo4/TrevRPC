@@ -2,7 +2,7 @@
   lib,
   stdenv,
   callPackage,
-  trevrpc-go,
+  trevrpc-go-interop,
   trevrpc-js,
   trevrpc-rust,
 }:
@@ -15,11 +15,11 @@ callPackage ./runner.nix {
   # Linux. Safari needs its certificate trusted through sudo, so it runs only when asked for.
   defaults = {
     server = [
-      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
     ];
     client = [
-      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
     ];
     browser = lib.optionals stdenv.hostPlatform.isLinux [

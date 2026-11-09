@@ -23,8 +23,8 @@ includes = ["*.kt", "*.kts"]
 command = "buf"
 options = ["format", "--write"]
 includes = ["*.proto"]
-# buf parses "#" in a path as input options
-excludes = ["**/trailing_hash#.proto"]
+# buf parses "#" in a path as input options, and validate.proto is a vendored copy kept as published.
+excludes = ["**/trailing_hash#.proto", "interop/proto/buf/validate/validate.proto"]
 no-positional-arg-support = true
 
 [formatter.ruff]

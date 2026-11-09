@@ -52,6 +52,19 @@ jobs:
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-go-otel
 
+      # After trevrpc-go, which the module requires at the same version. Bumper tags it in its
+      # directory.
+      - name: Release protovalidatetrevrpc to Forgejo and pkg.go.dev
+        run: flake-release
+        env:
+          TAG: trevrpc-go/protovalidatetrevrpc/${{ github.ref_name }}
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          PKG_GO_DEV_PUBLISHING: true
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-go-protovalidate
+
   js:
     # zizmor: ignore[excessive-permissions]
     name: trevrpc-js
@@ -155,6 +168,19 @@ jobs:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-rust-otel
+
+      # After trevrpc, which cargo publish builds the crate against. Bumper gives the crate the
+      # same version, tagged in its directory.
+      - name: Release trevrpc-protovalidate to Forgejo and crates.io
+        run: flake-release
+        env:
+          TAG: trevrpc-rust/crates/trevrpc-protovalidate/${{ github.ref_name }}
+          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          DELETE_OLD_RELEASE_ARTIFACTS: 2
+          PACKAGES: packages.x86_64-linux.trevrpc-rust-protovalidate
 
   buf:
     # zizmor: ignore[excessive-permissions]

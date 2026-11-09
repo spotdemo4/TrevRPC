@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package trevrpc.interop.v1;
+
+import "buf/validate/validate.proto";
+import "interop.proto";
+
+// ValidatedEcho checks its requests against buf.validate rules, a standard
+// rule and a CEL rule, so every client sees the same violations from every
+// server (see interop/README.md). It is a separate file for the same reason as
+// unreliable.proto: the gRPC baseline compiles only interop.proto.
+service ValidatedEcho {
+  rpc Unary(ValidatedRequest) returns (EchoResponse);
+  rpc ClientStream(stream ValidatedRequest) returns (EchoResponse);
+}
+
+message ValidatedRequest {
+  option (buf.validate.message).cel = {
+    id: "message.not_forbidden"
+    message: "message must not be \"forbidden\""
+    expression: "this.message != 'forbidden'"
+  };
+
+  string message = 1 [(buf.validate.field).string.min_len = 1];
+}

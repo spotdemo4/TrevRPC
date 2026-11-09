@@ -316,6 +316,36 @@ pub struct RpcStatus {
     /// replay it without stream compression. Meaningless on any other STATUS.
     #[prost(bool, tag = "4")]
     pub refused_stream_compression: bool,
+    /// The status details.
+    #[prost(message, repeated, tag = "5")]
+    pub details: Vec<crate::status::Detail>,
+}
+
+/// Bounds the bytes of a STATUS payload other than its message when it has no metadata or
+/// details: the code, the refusal flag, and the message's tag and length.
+const STATUS_OVERHEAD: usize = 16;
+
+impl RpcStatus {
+    /// Returns the status as it is if its payload fits `max_frame_size`. A larger one, such as a
+    /// status whose details list many violations, loses its details, and if it still does not
+    /// fit, its trailing metadata and the end of its message, so a call always ends with its
+    /// code.
+    #[must_use]
+    pub(crate) fn fit_frame(mut self, max_frame_size: usize) -> Self {
+        if prost::Message::encoded_len(&self) <= max_frame_size {
+            return self;
+        }
+        self.details.clear();
+        if prost::Message::encoded_len(&self) <= max_frame_size {
+            return self;
+        }
+        self.metadata.clear();
+        let end = self
+            .message
+            .floor_char_boundary(max_frame_size.saturating_sub(STATUS_OVERHEAD));
+        self.message.truncate(end);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -330,7 +360,7 @@ mod tests {
         DEFAULT_MAX_FRAME_SIZE, decode_payload, encode_frame, encode_protobuf_frame, frame_type,
     };
     use crate::test_io::Script;
-    use crate::{Code, Metadata, Status};
+    use crate::{Code, Detail, Metadata, Status};
 
     use super::{
         ConnectionMetadata, MAX_METADATA_ENTRIES, MAX_METADATA_TOTAL_SIZE, MAX_METADATA_VALUE_LEN,
@@ -471,14 +501,57 @@ mod tests {
     }
 
     #[test]
+    fn a_status_too_large_for_a_frame_keeps_its_code() {
+        let small = vec![b'x'; 64];
+        let fits = RpcStatus::from(
+            Status::invalid_argument("bad").with_details([Detail::new("x.Y", small.clone())]),
+        );
+        assert_eq!(fits.clone().fit_frame(1024), fits);
+
+        let detailed = RpcStatus::from(
+            Status::invalid_argument("bad")
+                .with_metadata(metadata("x-t", &small))
+                .with_details([Detail::new("x.Y", vec![1; 4096])]),
+        )
+        .fit_frame(1024);
+        assert_eq!(
+            (
+                detailed.message.as_str(),
+                detailed.details.len(),
+                detailed.metadata.len()
+            ),
+            ("bad", 0, 1)
+        );
+
+        let long = RpcStatus::from(
+            Status::invalid_argument("é".repeat(2048)).with_metadata(metadata("x-t", &small)),
+        )
+        .fit_frame(1024);
+        assert!(long.metadata.is_empty());
+        assert_eq!(
+            long.message,
+            "é".repeat((1024 - super::STATUS_OVERHEAD) / 2)
+        );
+        assert!(prost::Message::encoded_len(&long) <= 1024);
+        assert_eq!(long.code, Code::InvalidArgument.as_u32());
+    }
+
+    #[test]
     fn rpc_status_round_trips_through_status() {
         let mut metadata = Metadata::new();
         metadata.insert("x-t".to_owned(), b"2".to_vec());
-        let status = Status::new(Code::FailedPrecondition, "stop").with_metadata(metadata);
+        let status = Status::new(Code::FailedPrecondition, "stop")
+            .with_metadata(metadata)
+            .with_details([Detail::new("x.Y", [0x08, 0x01])]);
 
         let wire = RpcStatus::from(status.clone());
         assert_eq!(wire.code, 9);
         assert_eq!(Status::from(wire), status);
+        assert_eq!(
+            status.find_detail("x.Y").map(Detail::value),
+            Some([0x08, 0x01].as_slice())
+        );
+        assert_eq!(status.find_detail("x.Z"), None);
         assert_eq!(
             Status::from(RpcStatus {
                 code: 9999,
@@ -796,6 +869,16 @@ mod tests {
             frame_type::STATUS,
             &RpcStatus::from(
                 Status::new(Code::FailedPrecondition, "stop").with_metadata(metadata("x-t", b"2")),
+            ),
+        )
+        .await;
+        check_protobuf_frame(
+            &vectors,
+            &mut checked,
+            "status.details",
+            frame_type::STATUS,
+            &RpcStatus::from(
+                Status::invalid_argument("bad").with_details([Detail::new("x.Y", [0x08, 0x01])]),
             ),
         )
         .await;

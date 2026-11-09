@@ -79,6 +79,15 @@ const goldenCases = {
     RpcStatus,
     { code: Code.FailedPrecondition, message: "stop", metadata: { "x-t": bytes("2") } },
   ],
+  "status.details": [
+    FrameType.Status,
+    RpcStatus,
+    {
+      code: Code.InvalidArgument,
+      message: "bad",
+      details: [{ type: "x.Y", value: Uint8Array.of(0x08, 0x01) }],
+    },
+  ],
   "grease.two_byte_type": [0x40, undefined, new Uint8Array([0, 1, 2])],
 };
 
@@ -174,6 +183,11 @@ test("golden payloads decode to their logical fields", async () => {
   assert.equal(status.message, "stop");
   assert.equal(Buffer.from(status.metadata["x-t"]) + "", "2");
   assert.equal(decode("status.ok", RpcStatus).code, Code.Ok);
+  assert.deepEqual(decode("status.ok", RpcStatus).details, []);
+  const details = decode("status.details", RpcStatus).details;
+  assert.equal(details.length, 1);
+  assert.equal(details[0].type, "x.Y");
+  assert.deepEqual([...details[0].value], [0x08, 0x01]);
 });
 
 test("datagram payloads match the golden vectors and decode back", async () => {

@@ -6,7 +6,7 @@
   util-linux,
   zstd,
   trevrpc-bench-baseline,
-  trevrpc-go,
+  trevrpc-go-interop,
   trevrpc-js,
   trevrpc-rust,
 }:
@@ -29,11 +29,11 @@ callPackage ../interop/runner.nix {
   # from the browsers playwright-driver ships.
   defaults = {
     server = [
-      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
     ];
     client = [
-      "go=${lib.getExe' trevrpc-go "trevrpc-interop-go"}"
+      "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
     ];
     baseline = lib.getExe trevrpc-bench-baseline;

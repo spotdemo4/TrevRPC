@@ -5,7 +5,7 @@
     clippy::module_name_repetitions
 )]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Read, Write};
 
 use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
@@ -18,6 +18,11 @@ use prost_types::{
 /// The extension number of `(trevrpc.method)` in `google.protobuf.MethodOptions`; see
 /// `proto/trevrpc/options.proto`.
 const METHOD_OPTION_FIELD: u32 = 58247;
+
+/// The extension number of `(buf.validate.field)`, `(buf.validate.message)` and
+/// `(buf.validate.oneof)` in `google.protobuf.FieldOptions`, `MessageOptions` and `OneofOptions`;
+/// see `buf/validate/validate.proto`.
+const VALIDATE_OPTION_FIELD: u32 = 1159;
 
 /// The marks of the `(trevrpc.method)` option of one method.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -50,7 +55,10 @@ struct CompressedDirections {
 /// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2, `compression` 5).
 /// It also reads `FieldOptions.debug_redact` (16), which `prost-types` does not know, through
 /// `FileDescriptorProto.message_type` (4) -> `DescriptorProto` (`name` 1, `field` 2,
-/// `nested_type` 3) -> `FieldDescriptorProto` (`type_name` 6, `options` 8).
+/// `nested_type` 3) -> `FieldDescriptorProto` (`type_name` 6, `options` 8), and whether the
+/// `buf.validate` extensions (1159) are set on `FieldOptions`, on `DescriptorProto.options` (7)
+/// and on `OneofDescriptorProto.options` (`DescriptorProto.oneof_decl` 8, `options` 2), and each
+/// file's `dependency` (3).
 mod mirror {
     #[derive(Clone, PartialEq, Eq, prost::Message)]
     pub struct Request {
@@ -64,6 +72,8 @@ mod mirror {
         pub name: Option<String>,
         #[prost(string, optional, tag = "2")]
         pub package: Option<String>,
+        #[prost(string, repeated, tag = "3")]
+        pub dependency: Vec<String>,
         #[prost(message, repeated, tag = "4")]
         pub message_type: Vec<MessageType>,
         #[prost(message, repeated, tag = "6")]
@@ -78,6 +88,23 @@ mod mirror {
         pub field: Vec<Field>,
         #[prost(message, repeated, tag = "3")]
         pub nested_type: Vec<Self>,
+        #[prost(message, optional, tag = "7")]
+        pub options: Option<RuleOptions>,
+        #[prost(message, repeated, tag = "8")]
+        pub oneof_decl: Vec<Oneof>,
+    }
+
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct Oneof {
+        #[prost(message, optional, tag = "2")]
+        pub options: Option<RuleOptions>,
+    }
+
+    /// `MessageOptions` or `OneofOptions`, of which only the `buf.validate` extension matters.
+    #[derive(Clone, PartialEq, Eq, prost::Message)]
+    pub struct RuleOptions {
+        #[prost(bytes = "vec", optional, tag = "1159")]
+        pub rules: Option<Vec<u8>>,
     }
 
     #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -92,6 +119,8 @@ mod mirror {
     pub struct FieldOptions {
         #[prost(bool, tag = "16")]
         pub debug_redact: bool,
+        #[prost(bytes = "vec", optional, tag = "1159")]
+        pub rules: Option<Vec<u8>>,
     }
 
     #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -146,30 +175,61 @@ mod mirror {
 }
 
 /// The `(trevrpc.method)` marks of every method of a request, by file, service and method name,
-/// and the message types that hold a field marked `debug_redact`.
+/// the message types that hold a field marked `debug_redact` or carry `buf.validate` rules, and
+/// the encoded files that define them.
 #[derive(Debug, Default)]
 struct MethodOptionIndex {
     marks: HashMap<(String, String, String), MethodMarks>,
     /// Full names, without a leading dot, of the messages that hold a redacted field, directly or
     /// in a nested message field.
     redacted: HashSet<String>,
+    /// Full names, without a leading dot, of the messages that carry `buf.validate` rules,
+    /// directly or in a nested message field.
+    validated: HashSet<String>,
+    /// The file that defines each message, by full name without a leading dot.
+    message_files: HashMap<String, String>,
+    /// Every file of the request, encoded as it arrived, and the files it imports, by name.
+    files: HashMap<String, EncodedFile>,
+}
+
+/// One file of a request, encoded as it arrived, so its extension options survive.
+#[derive(Debug, Default)]
+struct EncodedFile {
+    dependency: Vec<String>,
+    encoded: Vec<u8>,
 }
 
 impl MethodOptionIndex {
     /// Reads the marks from the encoded `CodeGeneratorRequest`.
-    fn from_request_bytes(request: &[u8]) -> Result<Self, prost::DecodeError> {
+    fn from_request_bytes(request_bytes: &[u8]) -> Result<Self, prost::DecodeError> {
         debug_assert_eq!(METHOD_OPTION_FIELD, 58247);
-        let request = mirror::Request::decode(request)?;
+        debug_assert_eq!(VALIDATE_OPTION_FIELD, 1159);
+        let request = mirror::Request::decode(request_bytes)?;
+        let encoded = mirror::EncodedRequest::decode(request_bytes)?.proto_file;
         let mut marks = HashMap::new();
         let mut messages = HashMap::new();
-        for file in &request.proto_file {
+        let mut message_files = HashMap::new();
+        let mut files = HashMap::new();
+        for (file, encoded) in request.proto_file.iter().zip(encoded) {
+            let file_name = file.name.clone().unwrap_or_default();
+            let mut defined = HashMap::new();
             index_messages(
                 file.package.as_deref().unwrap_or_default(),
                 &file.message_type,
-                &mut messages,
+                &mut defined,
+            );
+            message_files.extend(defined.keys().map(|name| (name.clone(), file_name.clone())));
+            messages.extend(defined);
+            files.insert(
+                file_name,
+                EncodedFile {
+                    dependency: file.dependency.clone(),
+                    encoded,
+                },
             );
         }
-        let redacted = redacted_messages(&messages);
+        let redacted = messages_holding(&messages, |fields| fields.redacted);
+        let validated = messages_holding(&messages, |fields| fields.validated);
         for file in request.proto_file {
             let file_name = file.name.unwrap_or_default();
             for service in file.service {
@@ -193,12 +253,63 @@ impl MethodOptionIndex {
                 }
             }
         }
-        Ok(Self { marks, redacted })
+        Ok(Self {
+            marks,
+            redacted,
+            validated,
+            message_files,
+            files,
+        })
     }
 
     /// Whether the message `full_name` (with or without a leading dot) holds a redacted field.
     fn is_redacted(&self, full_name: &str) -> bool {
         self.redacted.contains(full_name.trim_start_matches('.'))
+    }
+
+    /// Whether the message `full_name` (with or without a leading dot) carries `buf.validate`
+    /// rules, directly or in a message it holds.
+    fn is_validated(&self, full_name: &str) -> bool {
+        self.validated.contains(full_name.trim_start_matches('.'))
+    }
+
+    /// The encoded `FileDescriptorSet` of the files that define `messages` (full names with or
+    /// without a leading dot) and every file they import, each after the files it imports.
+    fn descriptor_set<'a>(&self, messages: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+        for message in messages {
+            if let Some(file) = self.message_files.get(message.trim_start_matches('.')) {
+                self.add_file(file, &mut seen, &mut ordered);
+            }
+        }
+        mirror::DescriptorSet {
+            file: ordered
+                .into_iter()
+                .filter_map(|name| self.files.get(name))
+                .map(|file| file.encoded.clone())
+                .collect(),
+        }
+        .encode_to_vec()
+    }
+
+    /// Appends `name` to `ordered` after the files it imports, unless it is there already.
+    fn add_file<'a>(
+        &'a self,
+        name: &'a str,
+        seen: &mut HashSet<&'a str>,
+        ordered: &mut Vec<&'a str>,
+    ) {
+        let Some(file) = self.files.get(name) else {
+            return;
+        };
+        if !seen.insert(name) {
+            return;
+        }
+        for dependency in &file.dependency {
+            self.add_file(dependency, seen, ordered);
+        }
+        ordered.push(name);
     }
 
     fn get(&self, file: &str, service: &str, method: &str) -> MethodMarks {
@@ -209,11 +320,13 @@ impl MethodOptionIndex {
     }
 }
 
-/// What one message type says about redaction: whether one of its own fields is marked
-/// `debug_redact`, and the message types of its fields.
+/// What one message type says about redaction and validation: whether one of its own fields is
+/// marked `debug_redact`, whether it, one of its fields or one of its oneofs carries
+/// `buf.validate` rules, and the message types of its fields.
 #[derive(Debug, Default)]
 struct MessageFields {
     redacted: bool,
+    validated: bool,
     field_types: Vec<String>,
 }
 
@@ -241,6 +354,17 @@ fn index_messages(
                         .as_ref()
                         .is_some_and(|options| options.debug_redact)
                 }),
+                validated: has_rules(message.options.as_ref())
+                    || message
+                        .oneof_decl
+                        .iter()
+                        .any(|oneof| has_rules(oneof.options.as_ref()))
+                    || message.field.iter().any(|field| {
+                        field
+                            .options
+                            .as_ref()
+                            .is_some_and(|options| options.rules.is_some())
+                    }),
                 field_types: message
                     .field
                     .iter()
@@ -252,31 +376,40 @@ fn index_messages(
     }
 }
 
-/// The messages that hold a redacted field directly or through message fields, however deep.
-fn redacted_messages(messages: &HashMap<String, MessageFields>) -> HashSet<String> {
-    let mut redacted: HashSet<String> = messages
+/// Whether message or oneof options set the `buf.validate` extension.
+fn has_rules(options: Option<&mirror::RuleOptions>) -> bool {
+    options.is_some_and(|options| options.rules.is_some())
+}
+
+/// The messages that `pick` selects, and those that hold one directly or through message fields,
+/// however deep.
+fn messages_holding(
+    messages: &HashMap<String, MessageFields>,
+    pick: impl Fn(&MessageFields) -> bool,
+) -> HashSet<String> {
+    let mut holding: HashSet<String> = messages
         .iter()
-        .filter(|(_, fields)| fields.redacted)
+        .filter(|(_, fields)| pick(fields))
         .map(|(name, _)| name.clone())
         .collect();
-    // Spread to the messages that hold a redacted one until nothing changes; recursive types end
+    // Spread to the messages that hold a picked one until nothing changes; recursive types end
     // the loop because the set only grows.
     loop {
         let more: Vec<String> = messages
             .iter()
             .filter(|(name, fields)| {
-                !redacted.contains(*name)
+                !holding.contains(*name)
                     && fields
                         .field_types
                         .iter()
-                        .any(|field| redacted.contains(field))
+                        .any(|field| holding.contains(field))
             })
             .map(|(name, _)| name.clone())
             .collect();
         if more.is_empty() {
-            return redacted;
+            return holding;
         }
-        redacted.extend(more);
+        holding.extend(more);
     }
 }
 
@@ -310,6 +443,9 @@ struct PluginOptions {
     file_suffix: String,
     package_root: String,
     extern_paths: Vec<(String, String)>,
+    /// Check the request messages of methods whose request type carries `buf.validate` rules
+    /// with `trevrpc-protovalidate`.
+    validate: bool,
 }
 
 impl Default for PluginOptions {
@@ -319,6 +455,7 @@ impl Default for PluginOptions {
             file_suffix: ".trevrpc.rs".to_owned(),
             package_root: "crate".to_owned(),
             extern_paths: Vec::new(),
+            validate: false,
         }
     }
 }
@@ -451,6 +588,7 @@ fn generate_plugin_response_with(
                 "// This file is @generated by protoc-gen-trevrpc-rust. DO NOT EDIT.\n\n"
                     .to_owned();
 
+            generate_validator(&services, method_options, &mut content);
             for service in &services {
                 generate_service(&options.runtime_path, service, &mut content);
                 content.push('\n');
@@ -501,6 +639,17 @@ fn parse_plugin_options(parameter: Option<&str>) -> Result<PluginOptions, String
             "runtime_path" => value.clone_into(&mut options.runtime_path),
             "file_suffix" => value.clone_into(&mut options.file_suffix),
             "package_root" => value.clone_into(&mut options.package_root),
+            "validate" => {
+                options.validate = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(format!(
+                            "invalid validate {value:?}; expected true or false"
+                        ));
+                    }
+                };
+            }
             "extern_path" => {
                 let Some((proto_path, rust_path)) = value.split_once('=') else {
                     return Err(format!(
@@ -556,6 +705,9 @@ struct Method {
     /// `COMPRESSION_MESSAGE` or `COMPRESSION_STREAM`, whose message type has no field marked
     /// `debug_redact`.
     plain: CompressedDirections,
+    /// The request messages are checked against their `buf.validate` rules: the generator runs
+    /// with `validate=true` and the request type carries rules.
+    validated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -900,6 +1052,8 @@ fn descriptor_service(
                     requests: generated.plain.requests && requests,
                     responses: generated.plain.responses && responses,
                 };
+                generated.validated =
+                    options.validate && method_options.is_validated(&generated.input_proto_type);
                 generated
             })
         })
@@ -988,6 +1142,7 @@ fn descriptor_method(
             requests: plain,
             responses: plain,
         },
+        validated: false,
     })
 }
 
@@ -1135,6 +1290,52 @@ fn unreliable_docs(method: &Method) -> String {
     format!(
         "    ///\n    /// The schema marks the {directions} messages of this method as unreliable: where the\n    /// connection has datagrams they may be lost or reordered, but never duplicated.\n"
     )
+}
+
+/// The name of the static holding the validator of a generated file's request messages.
+const VALIDATOR_STATIC: &str = "TREVRPC_VALIDATOR";
+
+/// Emits the validator shared by the services of a generated file, built from the descriptors of
+/// the request types it validates, if it validates any.
+fn generate_validator(services: &[Service], method_options: &MethodOptionIndex, buf: &mut String) {
+    let validated: BTreeSet<&str> = services
+        .iter()
+        .flat_map(|service| &service.methods)
+        .filter(|method| method.validated)
+        .map(|method| method.input_proto_type.as_str())
+        .collect();
+    if validated.is_empty() {
+        return;
+    }
+    let descriptor_set = method_options.descriptor_set(validated.iter().copied());
+    buf.push_str(&format!(
+        "/// Checks request messages against their `buf.validate` rules. It holds the descriptors of\n/// the request types that carry rules and of every file they import.\nstatic {VALIDATOR_STATIC}: ::std::sync::LazyLock<::trevrpc_protovalidate::Validator> =\n    ::std::sync::LazyLock::new(|| {{\n        ::trevrpc_protovalidate::Validator::from_descriptor_set({})\n    }});\n\n",
+        byte_string_literal(&descriptor_set)
+    ));
+}
+
+/// Writes `bytes` as a Rust byte string literal broken into lines. Every byte that is not a
+/// printable ASCII character other than a space, `"` or `\` is escaped, so each line break,
+/// which a backslash ends, skips only the indentation that follows it.
+fn byte_string_literal(bytes: &[u8]) -> String {
+    const LINE: usize = 96;
+    let mut literal = String::from("b\"");
+    let mut line = 0;
+    for &byte in bytes {
+        if line >= LINE {
+            literal.push_str("\\\n            ");
+            line = 0;
+        }
+        if byte.is_ascii_graphic() && byte != b'"' && byte != b'\\' {
+            literal.push(char::from(byte));
+            line = line.saturating_add(1);
+        } else {
+            literal.push_str(&format!("\\x{byte:02x}"));
+            line = line.saturating_add(4);
+        }
+    }
+    literal.push('"');
+    literal
 }
 
 fn generate_service(runtime_path: &str, service: &Service, buf: &mut String) {
@@ -1322,10 +1523,19 @@ fn generate_registration(runtime_path: &str, service: &Service, buf: &mut String
     let register_name = format!("register_{}", to_snake_case(&service.name));
     let service_name = service_path(service);
 
+    let validated = service.methods.iter().any(|method| method.validated);
+    let panics = if validated {
+        "///\n/// # Panics\n///\n/// Panics when the `buf.validate` rules of a request type cannot compile.\n"
+    } else {
+        ""
+    };
     buf.push_str(&format!(
-        "/// Registers routes for the `{service_name}` service.\npub fn {register_name}<S>(server: &mut {runtime_path}::server::Server, service: S)\nwhere\n    S: {},\n{{\n    let service = ::std::sync::Arc::new(service);\n",
+        "/// Registers routes for the `{service_name}` service.\n{panics}pub fn {register_name}<S>(server: &mut {runtime_path}::server::Server, service: S)\nwhere\n    S: {},\n{{\n    let service = ::std::sync::Arc::new(service);\n",
         service.name
     ));
+    if validated {
+        buf.push_str(&format!("    let validator = &*{VALIDATOR_STATIC};\n"));
+    }
 
     for method in &service.methods {
         generate_registration_method(runtime_path, service, method, buf);
@@ -1358,7 +1568,10 @@ fn generate_registration_method(
     if let Some(directions) = compress_expr(runtime_path, method) {
         options.push_str(&format!(".with_compress({directions})"));
     }
-    let emitted = buf.split_off(start);
+    let mut emitted = buf.split_off(start);
+    if method.validated {
+        emitted = validate_requests(runtime_path, method, &emitted);
+    }
     buf.push_str(
         &emitted
             .replace(
@@ -1368,6 +1581,47 @@ fn generate_registration_method(
             .replace("route_with_context(", "route_with_options(")
             .replace(", move |context,", &format!(", {options}, move |context,")),
     );
+}
+
+/// Makes an emitted registration check each request message against its `buf.validate` rules
+/// with the generated file's validator: after the request of a unary or server-streaming method
+/// decodes, and as each request of a client-streaming or bidirectional one does.
+fn validate_requests(runtime_path: &str, method: &Method, emitted: &str) -> String {
+    let decode = format!(
+        "let request = <{} as ::prost::Message>::decode(body.as_slice())?;\n",
+        method.input_type
+    );
+    let stream = format!(
+        "{runtime_path}::stream::decode::<{}>(request_stream)",
+        method.input_type
+    );
+    emitted
+        .replacen(
+            "        let service = ::std::sync::Arc::clone(&service);\n        server.",
+            &format!(
+                "        let service = ::std::sync::Arc::clone(&service);\n        let validate = validator.message({:?});\n        server.",
+                method.input_proto_type
+            ),
+            1,
+        )
+        .replacen(
+            "            let service = ::std::sync::Arc::clone(&service);\n            async move",
+            "            let service = ::std::sync::Arc::clone(&service);\n            let validate = validate.clone();\n            async move",
+            1,
+        )
+        .replacen(
+            &decode,
+            &format!("{decode}                validate.validate(&body)?;\n"),
+            1,
+        )
+        .replacen(
+            &stream,
+            &format!(
+                "{runtime_path}::stream::decode_validated::<{}, _>(request_stream, move |body| validate.validate(body))",
+                method.input_type
+            ),
+            1,
+        )
 }
 
 fn emit_registration_method(
@@ -1540,6 +1794,7 @@ mod tests {
                 unreliable: MethodMarks::default(),
                 compressed: CompressedDirections::default(),
                 plain: CompressedDirections::default(),
+                validated: false,
             }],
         };
         let mut generated = String::new();
@@ -1571,6 +1826,7 @@ mod tests {
                 unreliable: MethodMarks::default(),
                 compressed: CompressedDirections::default(),
                 plain: CompressedDirections::default(),
+                validated: false,
             }],
         };
         let mut generated = String::new();
@@ -1621,6 +1877,7 @@ mod tests {
                 unreliable: MethodMarks::default(),
                 compressed: CompressedDirections::default(),
                 plain: CompressedDirections::default(),
+                validated: false,
             }],
         };
         let mut generated = String::new();
@@ -1649,6 +1906,7 @@ mod tests {
                     unreliable: MethodMarks::default(),
                     compressed: CompressedDirections::default(),
                     plain: CompressedDirections::default(),
+                    validated: false,
                 },
                 Method {
                     name: "lots_of_greetings".to_owned(),
@@ -1662,6 +1920,7 @@ mod tests {
                     unreliable: MethodMarks::default(),
                     compressed: CompressedDirections::default(),
                     plain: CompressedDirections::default(),
+                    validated: false,
                 },
                 Method {
                     name: "bidi_hello".to_owned(),
@@ -1675,6 +1934,7 @@ mod tests {
                     unreliable: MethodMarks::default(),
                     compressed: CompressedDirections::default(),
                     plain: CompressedDirections::default(),
+                    validated: false,
                 },
             ],
         };

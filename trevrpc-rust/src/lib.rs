@@ -71,7 +71,7 @@ pub use error::{Error, Result};
 pub use framing::ResponseFrame;
 pub use futures_core::Stream;
 pub use response::ResponseEnvelope;
-pub use status::{Code, Status};
+pub use status::{Code, Detail, Status};
 pub use stream::BoxStream;
 pub use wire::{
     ConnectionMetadata, Metadata, RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus,

@@ -1,9 +1,11 @@
 package trevrpc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -107,5 +109,76 @@ func TestStreamingResponseMetadataIsTakenWhenItIsSent(t *testing.T) {
 	}
 	if err := <-errs; !errors.Is(err, ErrResponseMetadataSent) {
 		t.Fatalf("metadata set after the stream ended = %v, want ErrResponseMetadataSent", err)
+	}
+}
+
+func TestFailedCallSendsTheDetailsOfItsStatus(t *testing.T) {
+	detail, err := NewDetail(&testMessage{Value: "why"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer()
+	RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(context.Context, *testMessage) (*testMessage, error) {
+		return nil, InvalidArgument("bad").WithDetails(detail)
+	})
+
+	_, frames := serveTestStream(t, server, testRequestBytes(t, requestFor("Echo", RPCKindUnary), encodedTestMessage(t, "")))
+	status := requireStatusFrame(t, frames, CodeInvalidArgument).statusValue()
+	var got testMessage
+	if found, err := status.FindDetail(&got); !found || err != nil || got.Value != "why" {
+		t.Fatalf("FindDetail = %v, %v, %q; want the handler's detail", found, err, got.Value)
+	}
+}
+
+func TestStatusDetails(t *testing.T) {
+	detail, err := NewDetail(&testMessage{Value: "why"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := InvalidArgument("bad").WithMetadata(Metadata{"x-t": []byte("1")}).WithDetails(detail)
+	detail.Value[0] ^= 0xff
+	if got := status.WithMetadata(nil); len(got.Details) != 1 || got.Details[0].Value[0] == detail.Value[0] {
+		t.Fatalf("WithMetadata details = %+v, want an unchanged copy", got.Details)
+	}
+	if len(status.Metadata) != 1 {
+		t.Fatalf("WithDetails metadata = %v, want it kept", status.Metadata)
+	}
+	var none testMessage
+	if found, err := OK().FindDetail(&none); found || err != nil {
+		t.Fatalf("FindDetail without details = %v, %v", found, err)
+	}
+	if err := (Detail{Type: "other.Type"}).UnmarshalTo(&none); err == nil {
+		t.Fatal("UnmarshalTo of another type succeeded")
+	}
+}
+
+func TestStatusTooLargeForAFrameKeepsItsCode(t *testing.T) {
+	small := bytes.Repeat([]byte{'x'}, 64)
+	for _, tc := range []struct {
+		name        string
+		status      *Status
+		wantMessage string
+		wantDetails int
+		wantMeta    bool
+	}{
+		{"details dropped", InvalidArgument("bad").WithMetadata(Metadata{"x-t": small}).WithDetails(Detail{Type: "x.Y", Value: bytes.Repeat([]byte{1}, 4096)}), "bad", 0, true},
+		{"message cut", InvalidArgument(strings.Repeat("é", 2048)).WithMetadata(Metadata{"x-t": small}), strings.Repeat("é", (1024-statusOverhead)/2), 0, false},
+		{"fits", InvalidArgument("bad").WithDetails(Detail{Type: "x.Y", Value: small}), "bad", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := NewServer()
+			options := server.Options()
+			options.MaxFrameSize = 1024
+			server.SetOptions(options)
+			RegisterUnary(server, "/example.Greeter/Echo", newTestMessage, func(context.Context, *testMessage) (*testMessage, error) {
+				return nil, tc.status
+			})
+
+			_, frames := serveTestStream(t, server, testRequestBytes(t, requestFor("Echo", RPCKindUnary), encodedTestMessage(t, "")))
+			status := requireStatusFrame(t, frames, CodeInvalidArgument).statusValue()
+			if status.Message != tc.wantMessage || len(status.Details) != tc.wantDetails || (len(status.Metadata) > 0) != tc.wantMeta {
+				t.Fatalf("status = %q with %d details and metadata %v", status.Message, len(status.Details), status.Metadata)
+			}
+		})
 	}
 }

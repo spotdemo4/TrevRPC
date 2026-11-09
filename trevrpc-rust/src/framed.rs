@@ -201,9 +201,10 @@ impl FrameChunks {
             ResponseFrame::Headers(metadata) => {
                 self.protobuf(frame_type::HEADERS, &RpcHeaders { metadata })
             }
-            ResponseFrame::Status(status) => {
-                self.protobuf(frame_type::STATUS, &RpcStatus::from(status))
-            }
+            ResponseFrame::Status(status) => self.protobuf(
+                frame_type::STATUS,
+                &RpcStatus::from(status).fit_frame(self.max_frame_size),
+            ),
         }
     }
 

@@ -11,8 +11,9 @@ import org.gradle.process.ExecOperations
 import javax.inject.Inject
 
 /**
- * Generates the Echo, UnreliableEcho and CompressedEcho clients from the shared interop schemas with `protoc` from
- * `PATH`. The schemas are the single source of truth for every runtime, so this module references
+ * Generates the Echo, UnreliableEcho, CompressedEcho and ValidatedEcho clients from the shared interop schemas with
+ * `protoc` from `PATH`, and the `buf.validate` messages of ValidatedEcho's violations from the copy of
+ * `buf/validate/validate.proto` beside them. The schemas are the single source of truth for every runtime, so this module references
  * them instead of keeping copies. The task is not cacheable because its output depends on the
  * `protoc` binary.
  *
@@ -24,7 +25,7 @@ abstract class GenerateInteropClient
     constructor(
         private val exec: ExecOperations,
     ) : DefaultTask() {
-        /** Directory holding `interop.proto`, `unreliable.proto` and `compressed.proto`. */
+        /** Directory holding `interop.proto`, `unreliable.proto`, `compressed.proto` and `validated.proto`. */
         @get:InputDirectory
         @get:PathSensitive(PathSensitivity.RELATIVE)
         abstract val schemaRoot: DirectoryProperty
@@ -105,7 +106,7 @@ val generateInteropClient =
     tasks.register<GenerateInteropClient>("generateInteropClient") {
         schemaRoot.set(rootProject.layout.projectDirectory.dir("../interop/proto"))
         optionsRoot.set(rootProject.layout.projectDirectory.dir("../proto"))
-        schemas.set(listOf("interop.proto", "unreliable.proto", "compressed.proto"))
+        schemas.set(listOf("interop.proto", "unreliable.proto", "compressed.proto", "validated.proto", "buf/validate/validate.proto"))
         generatorInstall.set(project(":protoc-gen-trevrpc-kotlin").layout.buildDirectory.dir("install/protoc-gen-trevrpc-kotlin"))
         javaOutput.set(layout.buildDirectory.dir("generated/interop/java"))
         kotlinOutput.set(layout.buildDirectory.dir("generated/interop/kotlin"))

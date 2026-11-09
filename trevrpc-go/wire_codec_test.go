@@ -3,6 +3,7 @@ package trevrpc
 import (
 	"bytes"
 	"math/rand/v2"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -72,7 +73,7 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 		}
 		if err == nil {
 			wantDecoded := statusFromWire(&wantStatus)
-			if status.Code != wantDecoded.Code || status.Message != wantDecoded.Message || !metadataEqual(status.Metadata, wantDecoded.Metadata) {
+			if status.Code != wantDecoded.Code || status.Message != wantDecoded.Message || !metadataEqual(status.Metadata, wantDecoded.Metadata) || !reflect.DeepEqual(status.Details, wantDecoded.Details) {
 				t.Fatalf("status %x: got %+v, want %+v", payload, status, wantDecoded)
 			}
 		}
@@ -115,7 +116,10 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 		checkEncoding(t, frameTypeAnswer, func(dst []byte) ([]byte, error) { return appendAnswerFrame(dst, answer, DefaultMaxFrameSize) }, answer, false)
 
 		status := &Status{Code: Code(rng.IntN(20)), Message: string(prefix(randomWireBytes(rng), rng.IntN(5))), Metadata: randomMetadata(rng)}
-		if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 {
+		for range rng.IntN(3) {
+			status.Details = append(status.Details, Detail{Type: string(prefix(randomWireBytes(rng), rng.IntN(5))), Value: prefix(randomWireBytes(rng), rng.IntN(5))})
+		}
+		if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 && len(status.Details) == 0 {
 			continue
 		}
 		checkEncoding(t, frameTypeStatus, func(dst []byte) ([]byte, error) { return appendStatusFrame(dst, status, DefaultMaxFrameSize) }, status.wire(), len(status.Metadata) > 1)

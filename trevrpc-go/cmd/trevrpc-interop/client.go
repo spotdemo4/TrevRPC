@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-interop/interoppb"
 )
@@ -111,6 +112,7 @@ type scenarioEnv struct {
 	unreliable *interoppb.UnreliableEchoClient
 	compressed *interoppb.CompressedEchoClient
 	refusing   *interoppb.RefusingEchoClient
+	validated  *interoppb.ValidatedEchoClient
 	// transport is the transport of the connection.
 	transport trevrpc.TransportKind
 	// datagramFrames reports how many QUIC DATAGRAM frames the connection has
@@ -156,6 +158,7 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 		unreliable: interoppb.NewUnreliableEchoClient(channel),
 		compressed: interoppb.NewCompressedEchoClient(channel),
 		refusing:   interoppb.NewRefusingEchoClient(channel),
+		validated:  interoppb.NewValidatedEchoClient(channel),
 		transport:  channel.Transport(),
 		dial: func(ctx context.Context, options trevrpc.DialOptions) (*trevrpc.Channel, error) {
 			options.Compression = compression
@@ -362,6 +365,73 @@ var scenarios = []scenario{
 	{"refused-stream", runRefusedStream},
 	{"compressed-plain", runCompressedPlain},
 	{"connection-metadata", runConnectionMetadata},
+	{"validation", runValidation},
+}
+
+// runValidation is the validation scenario: ValidatedEcho calls that keep and
+// break its standard and CEL rules.
+func runValidation(ctx context.Context, env *scenarioEnv) error {
+	c := env.validated
+	response, err := c.Unary(ctx, &interoppb.ValidatedRequest{Message: "hello"})
+	if err != nil {
+		return err
+	}
+	if err := expectResponse(response, "hello", 0); err != nil {
+		return err
+	}
+	_, err = c.Unary(ctx, &interoppb.ValidatedRequest{Message: ""})
+	if err := expectViolation("empty message", err, "string.min_len", "message"); err != nil {
+		return err
+	}
+	_, err = c.Unary(ctx, &interoppb.ValidatedRequest{Message: "forbidden"})
+	if err := expectViolation("forbidden message", err, "message.not_forbidden", ""); err != nil {
+		return err
+	}
+	call, err := c.ClientStream(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeQuietly(call)
+	// The server may fail the call before the second message is sent; the
+	// response reports it either way.
+	if err := call.Send(&interoppb.ValidatedRequest{Message: "a"}); err == nil {
+		_ = call.Send(&interoppb.ValidatedRequest{Message: ""})
+	}
+	_, err = call.CloseAndRecv()
+	return expectViolation("streamed empty message", err, "string.min_len", "message")
+}
+
+// expectViolation checks that err is an InvalidArgument status whose
+// buf.validate.Violations detail holds one violation of rule, on the field
+// named field, or on the message itself when field is empty.
+func expectViolation(what string, err error, rule, field string) error {
+	if err == nil {
+		return fmt.Errorf("%s: got success, want InvalidArgument", what)
+	}
+	status := trevrpc.StatusFromError(err)
+	if status.Code != trevrpc.CodeInvalidArgument {
+		return fmt.Errorf("%s: got status %s %q, want InvalidArgument", what, status.Code, status.Message)
+	}
+	violations := &validate.Violations{}
+	found, err := status.FindDetail(violations)
+	if err != nil {
+		return fmt.Errorf("%s: buf.validate.Violations does not decode: %w", what, err)
+	}
+	if !found {
+		return fmt.Errorf("%s: no buf.validate.Violations detail in %+v", what, status.Details)
+	}
+	if len(violations.GetViolations()) != 1 {
+		return fmt.Errorf("%s: got %d violations, want 1: %v", what, len(violations.GetViolations()), violations)
+	}
+	violation := violations.GetViolations()[0]
+	var path []string
+	for _, element := range violation.GetField().GetElements() {
+		path = append(path, element.GetFieldName())
+	}
+	if violation.GetRuleId() != rule || strings.Join(path, ".") != field {
+		return fmt.Errorf("%s: got rule %q on field %q, want %q on %q", what, violation.GetRuleId(), strings.Join(path, "."), rule, field)
+	}
+	return nil
 }
 
 // runConnectionMetadata is the connection-metadata scenario, on a channel of

@@ -1,6 +1,7 @@
 {
   lib,
   mkRustPackage,
+  protobuf,
   rustfmt,
   clippy,
   gnugrep,
@@ -29,6 +30,8 @@ mkRustPackage (final: {
   sourceRoot = "${final.src.name}/trevrpc-rust";
   cargoLock.lockFile = ./Cargo.lock;
   cargoBuildFlags = [ "--workspace" ];
+  # The build script of prost-protovalidate-types, which trevrpc-protovalidate needs, runs protoc.
+  nativeBuildInputs = [ protobuf ];
 
   doCheck = true;
   # The tests and benchmarks bind loopback UDP sockets and run the interop executable against itself.

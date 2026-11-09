@@ -92,6 +92,34 @@ test("unary calls fail with the status of a non-OK response", async () => {
   });
 });
 
+test("status errors carry the details of the status and decode them on request", async () => {
+  const detail = marshalMessage(EchoResponseSchema, { message: "why" });
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.write(
+      encodeStatusFrame({
+        code: Code.InvalidArgument,
+        message: "bad",
+        details: [
+          { type: "other.Type", value: Uint8Array.of(1) },
+          { type: EchoResponseSchema.typeName, value: detail },
+        ],
+      }),
+    );
+  });
+
+  await assert.rejects(echo.unary({ message: "x" }), (error) => {
+    assert.ok(isStatus(Code.InvalidArgument, "bad")(error));
+    assert.equal(error.details.length, 2);
+    assert.deepEqual(
+      error.findDetails(EchoResponseSchema).map((response) => response.message),
+      ["why"],
+    );
+    assert.deepEqual(error.findDetails(EchoRequestSchema), []);
+    return true;
+  });
+});
+
 test("unary calls return as soon as the response arrives", async () => {
   // The server never reads the request or finishes the stream; the final status alone decides.
   const { echo } = setup(async (stream) => {
@@ -180,7 +208,13 @@ test("status errors are tagged without an own property", () => {
   const error = new TrevRpcError(Code.NotFound, "missing");
   assert.equal(error._tag, "TrevRpcError");
   assert.equal(Object.hasOwn(error, "_tag"), false);
-  assert.deepEqual(Object.keys(error).sort(), ["code", "metadata", "name", "statusMessage"]);
+  assert.deepEqual(Object.keys(error).sort(), [
+    "code",
+    "details",
+    "metadata",
+    "name",
+    "statusMessage",
+  ]);
 });
 
 test("an abort reason that is a status error is reported as is", async () => {

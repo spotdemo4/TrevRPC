@@ -11,9 +11,10 @@ use futures_util::future::BoxFuture;
 use trevrpc::client::{CallOptions, Channel, TransportKind};
 use trevrpc::{Code, Error, Metadata};
 
+use crate::proto::validate::{FieldPathElement, Violations};
 use crate::proto::{
     CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, PlainMessage, RefusingEchoClient,
-    UnreliableEchoClient,
+    UnreliableEchoClient, ValidatedEchoClient, ValidatedRequest,
 };
 use crate::{BoxError, Flags, connect};
 
@@ -26,6 +27,7 @@ type Echo = EchoClient<Channel>;
 type UnreliableEcho = UnreliableEchoClient<Channel>;
 type CompressedEcho = CompressedEchoClient<Channel>;
 type RefusingEcho = RefusingEchoClient<Channel>;
+type ValidatedEcho = ValidatedEchoClient<Channel>;
 
 /// Runs every scenario and returns whether all of them passed.
 pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
@@ -51,6 +53,8 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
         passed &= report(name, scenario).await;
     }
     passed &= report("connection-metadata", connection_metadata(flags)).await;
+    let validated = ValidatedEchoClient::new(channel.clone());
+    passed &= report("validation", validation(&validated)).await;
 
     channel.close();
     endpoint.wait_idle().await;
@@ -397,6 +401,89 @@ fn expect_response(actual: &EchoResponse, message: &str, index: u32) -> Scenario
             "expected ({message:?}, {index}), got ({:?}, {})",
             short(&actual.message),
             actual.index
+        ))
+    }
+}
+
+/// The `validation` scenario: `ValidatedEcho` calls that keep and break its standard and CEL
+/// rules.
+async fn validation(client: &ValidatedEcho) -> Scenario {
+    let validated = |message: &str| ValidatedRequest {
+        message: message.to_owned(),
+    };
+    let response = client
+        .unary(&validated("hello"))
+        .options(|_| options())
+        .await
+        .map_err(rpc)?;
+    expect_response(&response, "hello", 0)?;
+    let empty = client.unary(&validated("")).options(|_| options()).await;
+    expect_violation("empty message", empty, "string.min_len", "message")?;
+    let forbidden = client
+        .unary(&validated("forbidden"))
+        .options(|_| options())
+        .await;
+    expect_violation("forbidden message", forbidden, "message.not_forbidden", "")?;
+    let call = client
+        .client_stream()
+        .options(|_| options())
+        .await
+        .map_err(rpc)?;
+    // The server may fail the call before the second message is sent; the response reports it
+    // either way.
+    if call.send(validated("a")).await.is_ok() {
+        let _ = call.send(validated("")).await;
+    }
+    let streamed = call.close_and_recv().await;
+    expect_violation(
+        "streamed empty message",
+        streamed,
+        "string.min_len",
+        "message",
+    )
+}
+
+/// Checks that `outcome` failed with `InvalidArgument` and a `buf.validate.Violations` detail
+/// holding one violation of `rule`, on the field named `field`, or on the message itself when
+/// `field` is empty.
+fn expect_violation(
+    what: &str,
+    outcome: Result<EchoResponse, Error>,
+    rule: &str,
+    field: &str,
+) -> Scenario {
+    let status = match outcome {
+        Ok(_) => return Err(format!("{what}: got success, want InvalidArgument")),
+        Err(error) => error.into_status(),
+    };
+    if status.code() != Code::InvalidArgument {
+        return Err(format!(
+            "{what}: got {:?} {:?}, want InvalidArgument",
+            status.code(),
+            status.message()
+        ));
+    }
+    let violations = status
+        .find_detail(trevrpc_protovalidate::VIOLATIONS_TYPE)
+        .ok_or_else(|| format!("{what}: no buf.validate.Violations detail in {status:?}"))?
+        .decode::<Violations>()
+        .map_err(|error| format!("{what}: buf.validate.Violations does not decode: {error}"))?;
+    let [violation] = violations.violations.as_slice() else {
+        return Err(format!("{what}: want one violation, got {violations:?}"));
+    };
+    let path = violation
+        .field
+        .iter()
+        .flat_map(|path| &path.elements)
+        .map(FieldPathElement::field_name)
+        .collect::<Vec<_>>()
+        .join(".");
+    if violation.rule_id() == rule && path == field {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what}: got rule {:?} on field {path:?}, want {rule:?} on {field:?}",
+            violation.rule_id()
         ))
     }
 }

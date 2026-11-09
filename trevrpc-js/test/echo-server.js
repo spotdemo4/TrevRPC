@@ -1,3 +1,4 @@
+import { ViolationsSchema } from "../build/interop/gen/buf/validate/validate_pb.js";
 // The Echo service of interop/README.md, served over fake streams. Behavior must match what the
 // Go and Rust interop servers do.
 import {
@@ -7,11 +8,13 @@ import {
 } from "../build/interop/gen/compressed_pb.js";
 import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/interop/gen/interop_pb.js";
 import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
+import { ValidatedEcho, ValidatedRequestSchema } from "../build/interop/gen/validated_pb.js";
 import { encodeMessage, inflateMessage } from "../src/compression.js";
 import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import {
   FrameType,
   encodeOutgoingFrame,
+  encodeStatusFrame,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
@@ -25,6 +28,7 @@ const EchoService = Echo.typeName;
 const UnreliableEchoService = UnreliableEcho.typeName;
 const CompressedEchoService = CompressedEcho.typeName;
 const RefusingEchoService = RefusingEcho.typeName;
+const ValidatedEchoService = ValidatedEcho.typeName;
 /** The server's stream compression; it holds no dictionaries. */
 const compression = await createCompression();
 /** Responses up to this size are sent as datagrams when the call has a flow. */
@@ -171,6 +175,10 @@ async function serve(stream, request, unary, session) {
     await clientStream(stream, done);
   } else if (path.service === UnreliableEchoService && path.method === "Bidi") {
     await unreliableBidi(stream, request, session);
+  } else if (path.service === ValidatedEchoService && path.method === "Unary") {
+    await validatedUnary(stream, done);
+  } else if (path.service === ValidatedEchoService && path.method === "ClientStream") {
+    await validatedClientStream(stream, done);
   } else {
     switch (path.service === EchoService ? path.method : undefined) {
       case "Unary":
@@ -191,6 +199,70 @@ async function serve(stream, request, unary, session) {
   }
   await stream.finish();
   await stream.stopSending();
+}
+
+/**
+ * The violation of ValidatedRequest's rules, as protovalidate reports it, or undefined: its
+ * standard rule on the `message` field, or its CEL rule on the message itself.
+ */
+function violation(request) {
+  if (request.message === "") {
+    return {
+      field: { elements: [{ fieldNumber: 1, fieldName: "message", fieldType: 9 }] },
+      ruleId: "string.min_len",
+      message: "value length must be at least 1 characters",
+    };
+  }
+  if (request.message === "forbidden") {
+    return { ruleId: "message.not_forbidden", message: 'message must not be "forbidden"' };
+  }
+  return undefined;
+}
+
+/** Fails the call with InvalidArgument and a buf.validate.Violations detail, as servers do. */
+async function rejectRequest(stream, broken) {
+  await stream.write(
+    encodeStatusFrame({
+      code: Code.InvalidArgument,
+      message: `validation error: ${broken.ruleId}`,
+      details: [
+        {
+          type: ViolationsSchema.typeName,
+          value: marshalMessage(ViolationsSchema, { violations: [broken] }),
+        },
+      ],
+    }),
+  );
+}
+
+async function validatedUnary(stream, done) {
+  const request = await stream.readMessage(ValidatedRequestSchema);
+  const broken = violation(request);
+  if (broken !== undefined) {
+    await rejectRequest(stream, broken);
+    return;
+  }
+  await stream.writeMessage(EchoResponseSchema, { message: request.message, index: 0 });
+  await done();
+}
+
+async function validatedClientStream(stream, done) {
+  let message = "";
+  let count = 0;
+  for (
+    let request;
+    (request = await stream.readMessage(ValidatedRequestSchema)) !== null;
+    count += 1
+  ) {
+    const broken = violation(request);
+    if (broken !== undefined) {
+      await rejectRequest(stream, broken);
+      return;
+    }
+    message += request.message;
+  }
+  await stream.writeMessage(EchoResponseSchema, { message, index: count });
+  await done();
 }
 
 async function echoUnary(stream, request, message, done) {

@@ -22,11 +22,16 @@ var update = flag.Bool("update", false, "rewrite the generated files from intero
 // protoFiles are the sources of the bindings, in interop/proto, and
 // generatedFiles what they generate.
 var (
-	protoFiles     = []string{"interop.proto", "unreliable.proto", "compressed.proto"}
+	protoFiles     = []string{"interop.proto", "unreliable.proto", "compressed.proto", "validated.proto"}
 	generatedFiles = []string{
 		"interop.pb.go", "interop.trevrpc.go", "unreliable.pb.go", "unreliable.trevrpc.go", "compressed.pb.go", "compressed.trevrpc.go",
+		"validated.pb.go", "validated.trevrpc.go",
 	}
 )
+
+// validatePackage is the Go package of buf/validate/validate.proto, vendored
+// in interop/proto, whose bindings protovalidate's module provides.
+const validatePackage = "buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
 
 // modernize is applied to generated code, so the committed files carry the
 // rewrite that `modernize` would otherwise demand of protoc-gen-go's output.
@@ -38,10 +43,10 @@ func modernized(generated []byte) []byte {
 // installed protoc binary; every other line is fixed by this module's versions.
 var protocVersionLine = regexp.MustCompile(`(?m)^// \tprotoc +v.*\n`)
 
-// TestGeneratedCodeMatchesProto regenerates the Echo, UnreliableEcho and
-// CompressedEcho bindings from the shared interop/proto files with protoc-gen-go and this
+// TestGeneratedCodeMatchesProto regenerates the Echo, UnreliableEcho,
+// CompressedEcho and ValidatedEcho bindings from the shared interop/proto files with protoc-gen-go and this
 // repository's protoc-gen-trevrpc-go, and fails when the committed files have
-// drifted. Run `go test ./cmd/trevrpc-interop/interoppb -update` to rewrite
+// drifted. Run `go test ./interoppb -update` to rewrite
 // them.
 //
 // The proto directories default to the repository checkout and can be
@@ -87,6 +92,7 @@ func TestGeneratedCodeMatchesProto(t *testing.T) {
 	for _, name := range protoFiles {
 		args = append(args, "--go_opt=M"+name+"="+goPackage, "--trevrpc-go_opt=M"+name+"="+goPackage)
 	}
+	args = append(args, "--go_opt=Mbuf/validate/validate.proto="+validatePackage, "--trevrpc-go_opt=Mbuf/validate/validate.proto="+validatePackage)
 	run(t, "", protoc, append(args, sources...)...)
 
 	for _, name := range generatedFiles {
@@ -106,7 +112,7 @@ func TestGeneratedCodeMatchesProto(t *testing.T) {
 			t.Fatalf("read committed %s: %v", name, err)
 		}
 		if !bytes.Equal(protocVersionLine.ReplaceAll(committed, nil), protocVersionLine.ReplaceAll(generated, nil)) {
-			t.Errorf("%s is out of date with %s; run: go test ./cmd/trevrpc-interop/interoppb -update", name, protoDir)
+			t.Errorf("%s is out of date with %s; run: go test ./interoppb -update", name, protoDir)
 		}
 	}
 }

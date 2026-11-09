@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // Code is a TrevRPC status code.
@@ -40,11 +43,17 @@ func CodeFromUint32(code uint32) Code {
 	}
 }
 
-// Status is an RPC status with a code, message, and optional metadata.
+// Status is an RPC status with a code, message, and optional metadata and
+// details.
 type Status struct {
 	Code     Code
 	Message  string
 	Metadata Metadata
+	// Details are protobuf messages that describe a failure in more depth,
+	// such as the buf.validate.Violations of a request that broke its
+	// validation rules. Unlike Metadata they belong to the error, not to the
+	// application's headers; see Detail.
+	Details []Detail
 
 	// refusedStreamCompression marks the STATUS of a server that refused an
 	// optimistic call before any application code ran; see
@@ -63,7 +72,80 @@ func (s *Status) WithMetadata(metadata Metadata) *Status {
 		s = OK()
 	}
 
-	return &Status{Code: s.Code, Message: s.Message, Metadata: cloneMetadata(metadata)}
+	return &Status{Code: s.Code, Message: s.Message, Metadata: cloneMetadata(metadata), Details: cloneDetails(s.Details)}
+}
+
+// WithDetails returns a copy of the status carrying details in place of any
+// it had.
+func (s *Status) WithDetails(details ...Detail) *Status {
+	if s == nil {
+		s = OK()
+	}
+
+	return &Status{Code: s.Code, Message: s.Message, Metadata: cloneMetadata(s.Metadata), Details: cloneDetails(details)}
+}
+
+// FindDetail decodes into message the first detail whose type is message's
+// full name. It reports false when there is none, and an error when that
+// detail does not decode.
+func (s *Status) FindDetail(message ProtoMessage) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	name := string(protoMessageV2(message).ProtoReflect().Descriptor().FullName())
+	for _, detail := range s.Details {
+		if detail.Type == name {
+			return true, detail.UnmarshalTo(message)
+		}
+	}
+	return false, nil
+}
+
+// clone returns a deep copy of the status that application code may hold or
+// change without affecting s. It drops refusedStreamCompression, which only
+// the runtime sets on the STATUS it writes itself.
+func (s *Status) clone() *Status {
+	return &Status{Code: s.Code, Message: s.Message, Metadata: cloneMetadata(s.Metadata), Details: cloneDetails(s.Details)}
+}
+
+// Detail is one detail of a Status: a protobuf message, carried as its full
+// name and its encoding so that a receiver decodes only the details it reads.
+type Detail struct {
+	// Type is the message's full name, such as "buf.validate.Violations".
+	Type string
+	// Value is the message's protobuf encoding.
+	Value []byte
+}
+
+// NewDetail encodes message as a status detail.
+func NewDetail(message ProtoMessage) (Detail, error) {
+	protoMessage := protoMessageV2(message)
+	value, err := proto.MarshalOptions{Deterministic: true}.Marshal(protoMessage)
+	if err != nil {
+		return Detail{}, err
+	}
+	return Detail{Type: string(protoMessage.ProtoReflect().Descriptor().FullName()), Value: value}, nil
+}
+
+// UnmarshalTo decodes the detail into message, whose full name must be the
+// detail's Type.
+func (d Detail) UnmarshalTo(message ProtoMessage) error {
+	protoMessage := protoMessageV2(message)
+	if name := string(protoMessage.ProtoReflect().Descriptor().FullName()); name != d.Type {
+		return fmt.Errorf("trevrpc: detail is a %s, not a %s", d.Type, name)
+	}
+	return proto.Unmarshal(d.Value, protoMessage)
+}
+
+func cloneDetails(details []Detail) []Detail {
+	if len(details) == 0 {
+		return nil
+	}
+	cloned := make([]Detail, len(details))
+	for i, detail := range details {
+		cloned[i] = Detail{Type: detail.Type, Value: slices.Clone(detail.Value)}
+	}
+	return cloned
 }
 
 // OK creates an OK status.
@@ -145,12 +227,36 @@ func (s *Status) IsOK() bool {
 
 // wire returns the STATUS frame payload for s.
 func (s *Status) wire() *wireStatus {
-	return &wireStatus{Code: uint32(s.Code), Message: s.Message, Metadata: s.Metadata, RefusedStreamCompression: s.refusedStreamCompression}
+	return &wireStatus{Code: uint32(s.Code), Message: s.Message, Metadata: s.Metadata, Details: wireDetails(s.Details), RefusedStreamCompression: s.refusedStreamCompression}
 }
 
 // statusFromWire builds a status from a STATUS frame payload.
 func statusFromWire(status *wireStatus) *Status {
-	return NewStatus(CodeFromUint32(status.Code), status.Message).WithMetadata(status.Metadata)
+	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: cloneMetadata(status.Metadata), Details: detailsFromWire(status.Details)}
+}
+
+// wireDetails converts status details to their wire form, which aliases them.
+func wireDetails(details []Detail) []*wireDetail {
+	if len(details) == 0 {
+		return nil
+	}
+	wire := make([]*wireDetail, len(details))
+	for i, detail := range details {
+		wire[i] = &wireDetail{Type: detail.Type, Value: detail.Value}
+	}
+	return wire
+}
+
+// detailsFromWire converts wire details to status details, copying them.
+func detailsFromWire(wire []*wireDetail) []Detail {
+	if len(wire) == 0 {
+		return nil
+	}
+	details := make([]Detail, len(wire))
+	for i, detail := range wire {
+		details[i] = Detail{Type: detail.Type, Value: slices.Clone(detail.Value)}
+	}
+	return details
 }
 
 // StatusFromError converts an error into the status returned to RPC callers.

@@ -164,7 +164,10 @@ export const RpcAnswer = Object.freeze({
   },
 });
 
-/** The STATUS payload: `{ code, message, metadata, refusedStreamCompression }`. */
+/**
+ * The STATUS payload: `{ code, message, metadata, refusedStreamCompression, details }`, where each
+ * detail is `{ type, value }`.
+ */
 export const RpcStatus = Object.freeze({
   name: "RpcStatus",
   encode(status) {
@@ -173,6 +176,14 @@ export const RpcStatus = Object.freeze({
     writeString(writer, 2, status.message);
     writeMetadata(writer, 3, status.metadata);
     writeBool(writer, 4, status.refusedStreamCompression);
+    for (const detail of status.details ?? []) {
+      writer.tag(5, WireType.LengthDelimited).fork();
+      writeString(writer, 1, detail.type);
+      if (detail.value != null && detail.value.byteLength > 0) {
+        writer.tag(2, WireType.LengthDelimited).bytes(detail.value);
+      }
+      writer.join();
+    }
     return writer.finish();
   },
   decode(bytes) {
@@ -181,6 +192,7 @@ export const RpcStatus = Object.freeze({
       message: "",
       metadata: emptyMetadata(),
       refusedStreamCompression: false,
+      details: [],
     };
     const reader = new WireReader(bytes);
     while (reader.more()) {
@@ -197,6 +209,9 @@ export const RpcStatus = Object.freeze({
           break;
         case 4:
           status.refusedStreamCompression = reader.bool(wireType, "refused_stream_compression");
+          break;
+        case 5:
+          status.details.push(reader.detail(wireType, "details"));
           break;
         default:
           reader.skip(field, wireType);
@@ -364,6 +379,23 @@ class WireReader {
       }
     }
     return info;
+  }
+
+  /** A status Detail message, `{ type, value }`. */
+  detail(wireType, name) {
+    const reader = this.#nested(wireType, name);
+    const detail = { type: "", value: new Uint8Array(0) };
+    while (reader.more()) {
+      const [field, fieldWireType] = reader.tag();
+      if (field === 1) {
+        detail.type = reader.string(fieldWireType, `${name}.type`);
+      } else if (field === 2) {
+        detail.value = reader.bytes(fieldWireType, `${name}.value`);
+      } else {
+        reader.skip(field, fieldWireType);
+      }
+    }
+    return detail;
   }
 
   /** A ConnectionMetadata message, `{ id, metadata }`. */

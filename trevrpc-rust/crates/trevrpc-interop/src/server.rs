@@ -22,6 +22,7 @@ use trevrpc::{BoxStream, Code, Error, RpcKind, Status};
 
 use crate::proto::{
     self, CompressedEcho, Echo, EchoRequest, EchoResponse, PlainMessage, UnreliableEcho,
+    ValidatedEcho, ValidatedRequest,
 };
 use crate::{BoxError, Flags, connect};
 
@@ -160,6 +161,41 @@ fn echo_each(
             }
         },
     )
+}
+
+/// `ValidatedEcho`, whose requests the generated registration checks against their
+/// `buf.validate` rules before they reach it.
+struct ValidatedEchoService;
+
+#[trevrpc::async_trait]
+impl ValidatedEcho for ValidatedEchoService {
+    async fn unary(
+        &self,
+        _context: RequestContext,
+        request: ValidatedRequest,
+    ) -> Result<EchoResponse, Status> {
+        Ok(EchoResponse {
+            message: request.message,
+            index: 0,
+        })
+    }
+
+    async fn client_stream(
+        &self,
+        _context: RequestContext,
+        mut requests: BoxStream<ValidatedRequest>,
+    ) -> Result<EchoResponse, Status> {
+        let mut message = String::new();
+        let mut count = 0_u32;
+        while let Some(request) = requests.next().await {
+            message.push_str(&request?.message);
+            count = count.saturating_add(1);
+        }
+        Ok(EchoResponse {
+            message,
+            index: count,
+        })
+    }
 }
 
 const STREAM_COMPRESSED_RECEIVED_METADATA_KEY: &str = "interop-stream-compressed-received";
@@ -362,6 +398,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     proto::register_echo(&mut server, EchoService);
     proto::register_unreliable_echo(&mut server, UnreliableEchoService);
     proto::register_compressed_echo(&mut server, CompressedEchoService);
+    proto::register_validated_echo(&mut server, ValidatedEchoService);
     register_refusing_echo(&mut server);
 
     let tls = quinn::rustls::ServerConfig::builder()

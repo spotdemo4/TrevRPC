@@ -7,10 +7,17 @@ use prost::Message;
 use prost_types::compiler::CodeGeneratorResponse;
 
 /// The interop services, shared by every runtime. `interop.proto` has the reliable `Echo`,
-/// `unreliable.proto` the `UnreliableEcho` service with datagram messages, and `compressed.proto`
-/// the `CompressedEcho` service with stream compression and compression without a dictionary.
+/// `unreliable.proto` the `UnreliableEcho` service with datagram messages, `compressed.proto`
+/// the `CompressedEcho` service with stream compression and compression without a dictionary,
+/// and `validated.proto` the `ValidatedEcho` service, whose requests carry `buf.validate` rules
+/// from `buf/validate/validate.proto`, vendored in the same directory.
 const INTEROP_PROTO_DIR: &str = "../../../interop/proto";
-const INTEROP_PROTOS: [&str; 3] = ["interop.proto", "unreliable.proto", "compressed.proto"];
+const INTEROP_PROTOS: [&str; 4] = [
+    "interop.proto",
+    "unreliable.proto",
+    "compressed.proto",
+    "validated.proto",
+];
 /// The directory holding `trevrpc/options.proto`, which the other files import.
 const TREVRPC_PROTO_DIR: &str = "../../../proto";
 const OPTIONS_PROTO: &str = "trevrpc/options.proto";
@@ -44,7 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let request = protoc_gen_trevrpc_rust::code_generator_request(
         &compiler.encode_file_descriptor_set(),
         &INTEROP_PROTOS,
-        "runtime_path=::trevrpc",
+        "runtime_path=::trevrpc,validate=true",
     )?;
     let mut output = Vec::new();
     protoc_gen_trevrpc_rust::run_plugin(request.as_slice(), &mut output)?;

@@ -1,5 +1,9 @@
 package zip.trev.trevrpc
 
+import com.google.protobuf.Message
+import com.google.protobuf.MessageLite
+import com.google.protobuf.Parser
+
 enum class Code(
     val value: UInt,
 ) {
@@ -27,15 +31,36 @@ enum class Code(
     }
 }
 
+/**
+ * An RPC status. [details] are protobuf messages that describe a failure in more depth, such as the
+ * `buf.validate.Violations` of a request that broke its validation rules; [findDetails] decodes
+ * those of one message type.
+ */
 data class Status(
     val code: Code,
     val message: String = "",
     val metadata: Metadata = Metadata.EMPTY,
+    val details: List<StatusDetail> = emptyList(),
 ) {
     val isOk: Boolean
         get() = code == Code.OK
 
     fun withMetadata(metadata: Metadata): Status = copy(metadata = metadata)
+
+    fun withDetails(details: List<StatusDetail>): Status = copy(details = details.toList())
+
+    /** Decodes the details whose type is [typeName], a full name such as `buf.validate.Violations`. */
+    fun <T : MessageLite> findDetails(
+        typeName: String,
+        parser: Parser<T>,
+    ): List<T> = details.filter { it.type == typeName }.map { parser.parseFrom(it.value) }
+
+    /** Decodes the details of the message type of [defaultInstance]. */
+    fun <T : Message> findDetails(defaultInstance: T): List<T> {
+        @Suppress("UNCHECKED_CAST")
+        val parser = defaultInstance.parserForType as Parser<T>
+        return findDetails(defaultInstance.descriptorForType.fullName, parser)
+    }
 
     companion object {
         fun ok(metadata: Metadata = Metadata.EMPTY): Status = Status(Code.OK, metadata = metadata)
@@ -66,3 +91,29 @@ class TrevRpcException(
     val status: Status,
     cause: Throwable? = null,
 ) : Exception(status.toString(), cause)
+
+/**
+ * One detail of a [Status]: a protobuf message, carried as its full name [type] and its encoding so
+ * that a receiver decodes only the details it reads.
+ */
+class StatusDetail(
+    val type: String,
+    value: ByteArray,
+) {
+    private val valueBytes = value.copyOf()
+
+    /** The protobuf encoding of the message. */
+    val value: ByteArray
+        get() = valueBytes.copyOf()
+
+    override fun equals(other: Any?): Boolean = other is StatusDetail && type == other.type && valueBytes.contentEquals(other.valueBytes)
+
+    override fun hashCode(): Int = 31 * type.hashCode() + valueBytes.contentHashCode()
+
+    override fun toString(): String = "StatusDetail(type=$type, value=${valueBytes.joinToString("") { "%02x".format(it) }})"
+
+    companion object {
+        /** Encodes [message] as a detail. */
+        fun of(message: Message): StatusDetail = StatusDetail(message.descriptorForType.fullName, message.toByteArray())
+    }
+}

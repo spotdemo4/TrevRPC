@@ -1,0 +1,25 @@
+[package]
+name = "trevrpc-protovalidate"
+version = "1.7.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "buf.validate request validation for TrevRPC servers"
+readme = "README.md"
+repository = "https://trev.zip/llc/TrevRPC"
+license = "MIT"
+license-file = "../../../LICENSE"
+keywords = ["trevrpc", "protovalidate", "validation", "protobuf", "rpc"]
+categories = ["network-programming", "encoding"]
+# The Nix package of the source, and tests that read the repository's protos.
+exclude = ["default.nix", "tests"]
+
+[lints]
+workspace = true
+
+[dependencies]
+prost = "0.14.4"
+prost-protovalidate = "0.6.0"
+trevrpc = { version = "1.7.0", path = "../.." }
+
+[dev-dependencies]
+protox = "0.10.0"

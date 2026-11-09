@@ -327,6 +327,8 @@ type wireStatus struct {
 	// RefusedStreamCompression says the server refused an optimistic call
 	// before any application code ran (field 4), so the client may replay it.
 	RefusedStreamCompression bool `protobuf:"varint,4,opt,name=refused_stream_compression,json=refusedStreamCompression,proto3" json:"refused_stream_compression,omitempty"`
+	// Details are the status details (field 5); see Detail.
+	Details []*wireDetail `protobuf:"bytes,5,rep,name=details,proto3" json:"details,omitempty"`
 }
 
 // Reset clears the status for protobuf compatibility.
@@ -337,6 +339,21 @@ func (m *wireStatus) String() string { return fmt.Sprintf("%+v", *m) }
 
 // ProtoMessage marks wireStatus as a protobuf message.
 func (*wireStatus) ProtoMessage() {}
+
+// wireDetail is one status detail: a message's full name and its encoding.
+type wireDetail struct {
+	Type  string `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
+	Value []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+}
+
+// Reset clears the detail for protobuf compatibility.
+func (m *wireDetail) Reset() { *m = wireDetail{} }
+
+// String returns the detail as a debug string for protobuf compatibility.
+func (m *wireDetail) String() string { return fmt.Sprintf("%+v", *m) }
+
+// ProtoMessage marks wireDetail as a protobuf message.
+func (*wireDetail) ProtoMessage() {}
 
 // NormalizeMetadataKey lowercases a metadata key, as the runtime requires of
 // keys in Metadata maps it receives.

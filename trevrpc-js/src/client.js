@@ -515,7 +515,7 @@ export class BidirectionalStreamingCall {
   }
 
   /** The final status arrived: it is the outcome, and it ends the upload. */
-  #endWithStatus({ code, message, metadata }) {
+  #endWithStatus({ code, message, metadata, details }) {
     if (code === Code.Ok && this.#onResponseMetadata !== undefined) {
       try {
         this.#onResponseMetadata(metadata);
@@ -524,7 +524,8 @@ export class BidirectionalStreamingCall {
         return;
       }
     }
-    const error = code === Code.Ok ? undefined : statusError(code, message, metadata);
+    const error =
+      code === Code.Ok ? undefined : statusError(code, message, metadata, undefined, details);
     this.#terminal = { status: { code, message, metadata }, error };
     this.#call.finish(error);
     if (error === undefined) {

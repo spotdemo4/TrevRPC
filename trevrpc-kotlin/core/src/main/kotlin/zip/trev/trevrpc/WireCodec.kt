@@ -105,6 +105,7 @@ object WireCodec {
                 string(2, status.message)
                 metadata(3, status.metadata)
                 bool(4, status.refusedStreamCompression)
+                details(5, status.details)
             }.toByteArray()
 
     fun decodeStatus(bytes: ByteArray): RpcStatus {
@@ -113,6 +114,7 @@ object WireCodec {
         var message = ""
         val metadata = linkedMapOf<String, ByteArray>()
         var refusedStreamCompression = false
+        val details = mutableListOf<StatusDetail>()
         while (reader.hasRemaining) {
             val tag = reader.tag()
             when (tag.field) {
@@ -120,10 +122,11 @@ object WireCodec {
                 2 -> message = reader.string(tag, "status message")
                 3 -> reader.mapEntry(tag, metadata)
                 4 -> refusedStreamCompression = reader.bool(tag)
+                5 -> details += reader.detail(tag)
                 else -> reader.skip(tag)
             }
         }
-        return RpcStatus(code, message, Metadata.fromWire(metadata), refusedStreamCompression)
+        return RpcStatus(code, message, Metadata.fromWire(metadata), refusedStreamCompression, details)
     }
 
     /**
@@ -258,6 +261,23 @@ private class Writer {
                     .apply {
                         uint32(1, info.id)
                         bytes(2, info.fingerprint)
+                    }.toByteArray()
+            tag(field, 2)
+            varint(entry.size.toULong())
+            output.write(entry)
+        }
+    }
+
+    fun details(
+        field: Int,
+        details: List<StatusDetail>,
+    ) {
+        details.forEach { detail ->
+            val entry =
+                Writer()
+                    .apply {
+                        string(1, detail.type)
+                        bytes(2, detail.value)
                     }.toByteArray()
             tag(field, 2)
             varint(entry.size.toULong())
@@ -420,6 +440,21 @@ private class Reader(
             }
         }
         return DictionaryInfo(id, fingerprint)
+    }
+
+    fun detail(tag: Tag): StatusDetail {
+        val entry = Reader(bytes(tag))
+        var type = ""
+        var value = byteArrayOf()
+        while (entry.hasRemaining) {
+            val entryTag = entry.tag()
+            when (entryTag.field) {
+                1 -> type = entry.string(entryTag, "status detail type")
+                2 -> value = entry.bytes(entryTag)
+                else -> entry.skip(entryTag)
+            }
+        }
+        return StatusDetail(type, value)
     }
 
     fun streamCompression(tag: Tag): StreamCompression {

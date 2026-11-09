@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_trevrpc-interop-rust");
-const SCENARIOS: [&str; 17] = [
+const SCENARIOS: [&str; 18] = [
     "unary",
     "unary-metadata",
     "unary-error",
@@ -27,6 +27,7 @@ const SCENARIOS: [&str; 17] = [
     "refused-stream",
     "compressed-plain",
     "connection-metadata",
+    "validation",
 ];
 
 /// Writes the compression dictionary of the shared golden vectors into `dir`, as `interop/run.py`

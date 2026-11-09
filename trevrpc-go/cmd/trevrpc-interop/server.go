@@ -15,6 +15,7 @@ import (
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-interop/interoppb"
+	"trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc"
 )
 
 type serverConfig struct {
@@ -87,7 +88,11 @@ func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *
 		options.HTTPFallback = http.FileServer(http.Dir(webRoot))
 	}
 	server.SetOptions(options)
+	// Only ValidatedEcho's request type has rules; the other routes skip
+	// validation.
+	server.SetValidator(protovalidatetrevrpc.New(nil))
 	interoppb.RegisterEchoServer(server, echoServer{})
+	interoppb.RegisterValidatedEchoServer(server, validatedEchoServer{})
 	interoppb.RegisterUnreliableEchoServer(server, unreliableEchoServer{})
 	interoppb.RegisterCompressedEchoServer(server, compressedEchoServer{})
 	// RefusingEcho is registered by hand, without the stream compression its
@@ -99,6 +104,27 @@ func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *
 
 // echoServer implements the behavior table in interop/README.md.
 type echoServer struct{}
+
+// validatedEchoServer implements ValidatedEcho, whose requests the server's
+// validator checks before they reach it.
+type validatedEchoServer struct{}
+
+func (validatedEchoServer) Unary(_ context.Context, request *interoppb.ValidatedRequest) (*interoppb.EchoResponse, error) {
+	return &interoppb.EchoResponse{Message: request.Message}, nil
+}
+
+func (validatedEchoServer) ClientStream(_ context.Context, requests trevrpc.MessageStream[*interoppb.ValidatedRequest]) (*interoppb.EchoResponse, error) {
+	var message strings.Builder
+	var count uint32
+	for request, err := range trevrpc.Messages(requests) {
+		if err != nil {
+			return nil, err
+		}
+		message.WriteString(request.Message)
+		count++
+	}
+	return &interoppb.EchoResponse{Message: message.String(), Index: count}, nil
+}
 
 func failure(request *interoppb.EchoRequest) error {
 	return trevrpc.NewStatus(trevrpc.CodeFromUint32(request.FailCode), request.FailMessage)

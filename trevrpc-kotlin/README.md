@@ -159,7 +159,7 @@ Streaming methods marked `option (trevrpc.method) = {compression: COMPRESSION_ST
 `interop-android` generates its client from the shared [`interop/proto/interop.proto`](../interop/proto/interop.proto) and runs every scenario in [`interop/README.md`](../interop/README.md) from an emulator against a Go or Rust server on the host. It needs KVM, so it is built only with `-PtrevrpcAndroidInterop=true` and exposed as `trevrpc-kotlin.interopAndroid` in the flake:
 
 ```shell
-nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go --command \
+nix shell .#trevrpc-kotlin.interopAndroid .#trevrpc-go-interop --command \
   trevrpc-interop-android \
   --server-command trevrpc-interop-go \
   --output out/interop --work-dir /var/tmp/interop

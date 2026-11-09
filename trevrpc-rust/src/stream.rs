@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use futures_core::Stream;
 use prost::Message;
 
-use crate::{Error, Result};
+use crate::{Error, Result, Status};
 
 /// A sendable, heap-allocated asynchronous message stream.
 ///
@@ -109,8 +109,12 @@ where
     Box::pin(EncodeStream::new(inner))
 }
 
+/// Checks the encoded body of a request message before it is decoded; see [`decode_validated`].
+type ValidateBody = Box<dyn Fn(&[u8]) -> std::result::Result<(), Status> + Send>;
+
 pub struct DecodeStream<T> {
     inner: BoxStream<Vec<u8>>,
+    validate: Option<ValidateBody>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -120,6 +124,21 @@ impl<T> DecodeStream<T> {
     pub fn new(inner: BoxStream<Vec<u8>>) -> Self {
         Self {
             inner,
+            validate: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Creates a stream that decodes byte bodies into protobuf messages that `validate` accepts;
+    /// see [`decode_validated`].
+    #[must_use]
+    pub fn validated<F>(inner: BoxStream<Vec<u8>>, validate: F) -> Self
+    where
+        F: Fn(&[u8]) -> std::result::Result<(), Status> + Send + 'static,
+    {
+        Self {
+            inner,
+            validate: Some(Box::new(validate)),
             _marker: PhantomData,
         }
     }
@@ -134,7 +153,14 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(body))) => {
-                Poll::Ready(Some(T::decode(body.as_slice()).map_err(Error::from)))
+                let message = T::decode(body.as_slice()).map_err(Error::from);
+                let checked = match (&self.validate, message) {
+                    (Some(validate), Ok(message)) => {
+                        validate(&body).map(|()| message).map_err(Error::from)
+                    }
+                    (_, message) => message,
+                };
+                Poll::Ready(Some(checked))
             }
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
             Poll::Ready(None) => Poll::Ready(None),
@@ -151,11 +177,24 @@ where
     Box::pin(DecodeStream::new(inner))
 }
 
+/// Wraps a byte stream and decodes each body into a protobuf message, which `validate` checks in
+/// its encoded form. A body `validate` rejects ends the stream with the status it returns, as a
+/// body that does not decode does. Code generated with `validate=true` checks request messages
+/// with it.
+pub fn decode_validated<T, F>(inner: BoxStream<Vec<u8>>, validate: F) -> BoxStream<T>
+where
+    T: Message + Default + Send + 'static,
+    F: Fn(&[u8]) -> std::result::Result<(), Status> + Send + 'static,
+{
+    Box::pin(DecodeStream::validated(inner, validate))
+}
+
 #[cfg(test)]
 mod tests {
     use futures_util::StreamExt;
 
-    use super::{decode, encode, from_iter};
+    use super::{decode, decode_validated, encode, from_iter};
+    use crate::{Code, Status};
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct TestMessage {
@@ -178,6 +217,38 @@ mod tests {
             }
         );
         assert!(decoded.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn validated_decode_stream_fails_the_message_its_check_rejects() {
+        let messages = from_iter(["a", "bad", "c"].map(|value| TestMessage {
+            value: value.to_owned(),
+        }));
+        let bad = TestMessage {
+            value: "bad".to_owned(),
+        };
+        let mut decoded = decode_validated::<TestMessage, _>(encode(messages), move |body| {
+            if body == prost::Message::encode_to_vec(&bad) {
+                Err(Status::invalid_argument("bad value"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(
+            decoded.next().await.expect("first message").unwrap().value,
+            "a"
+        );
+        let status = decoded
+            .next()
+            .await
+            .expect("second message")
+            .expect_err("the check rejects it")
+            .into_status();
+        assert_eq!(
+            (status.code(), status.message()),
+            (Code::InvalidArgument, "bad value")
+        );
     }
 
     #[tokio::test]

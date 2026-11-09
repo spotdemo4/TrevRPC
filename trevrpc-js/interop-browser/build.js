@@ -1,5 +1,6 @@
-// Generates the Echo, UnreliableEcho and CompressedEcho services from the shared interop protos
-// with protoc-gen-es, for the TrevRPC client and connect-web alike, and bundles the browser pages
+// Generates the Echo, UnreliableEcho, CompressedEcho and ValidatedEcho services, and the
+// buf.validate messages of ValidatedEcho's violations, from the shared interop protos with
+// protoc-gen-es, for the TrevRPC client and connect-web alike, and bundles the browser pages
 // that run the interop scenarios and the load benchmark. Output goes to build/interop/.
 import { mkdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -20,7 +21,14 @@ export async function buildInterop() {
   await mkdir(outDir, { recursive: true });
   await generateEs({
     protoDirs: [protoDir, optionsProtoDir],
-    files: ["interop.proto", "unreliable.proto", "compressed.proto", "trevrpc/options.proto"],
+    files: [
+      "interop.proto",
+      "unreliable.proto",
+      "compressed.proto",
+      "validated.proto",
+      "buf/validate/validate.proto",
+      "trevrpc/options.proto",
+    ],
     outDir: `${outDir}/gen`,
   });
 

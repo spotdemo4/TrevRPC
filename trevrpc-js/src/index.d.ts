@@ -29,15 +29,36 @@ export type MetadataValue = string | Uint8Array | ArrayBuffer | ArrayBufferView 
 export type MetadataInput = Record<string, MetadataValue> | ReadonlyMap<string, MetadataValue>;
 export type Metadata = Record<string, Uint8Array>;
 
-/** Error carrying a TrevRPC status code, message, and metadata. */
+/**
+ * One detail of a status: a protobuf message, carried as its full name, such as
+ * `"buf.validate.Violations"`, and its encoding.
+ */
+export interface StatusDetail {
+  readonly type: string;
+  readonly value: Uint8Array;
+}
+
+export interface TrevRpcErrorOptions extends ErrorOptions {
+  details?: readonly StatusDetail[];
+}
+
+/** Error carrying a TrevRPC status code, message, metadata, and details. */
 export class TrevRpcError extends Error {
   /** Always `"TrevRpcError"`, for matching errors by tag, as Effect's `catchTag` does. */
   readonly _tag: "TrevRpcError";
   readonly code: StatusCode;
   readonly statusMessage: string;
   readonly metadata: Metadata;
+  /** The status details, still encoded; `findDetails` decodes those of one message type. */
+  readonly details: readonly StatusDetail[];
 
-  constructor(code: number, message?: string, metadata?: Metadata, options?: ErrorOptions);
+  constructor(code: number, message?: string, metadata?: Metadata, options?: TrevRpcErrorOptions);
+
+  /**
+   * Decodes the details whose type is the full name of `schema`, such as `ViolationsSchema` for
+   * `buf.validate.Violations`.
+   */
+  findDetails<Desc extends DescMessage>(schema: Desc): MessageShape<Desc>[];
 }
 
 export interface CallOptions {

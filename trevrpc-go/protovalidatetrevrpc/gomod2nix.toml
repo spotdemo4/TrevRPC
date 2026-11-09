@@ -1,0 +1,172 @@
+schema = 3
+cachePackages = [
+  'buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate',
+  'buf.build/go/protovalidate',
+  'buf.build/go/protovalidate/cel',
+  'cel.dev/cel-go/cel',
+  'cel.dev/cel-go/cel/async',
+  'cel.dev/cel-go/checker',
+  'cel.dev/cel-go/checker/decls',
+  'cel.dev/cel-go/common',
+  'cel.dev/cel-go/common/ast',
+  'cel.dev/cel-go/common/containers',
+  'cel.dev/cel-go/common/cost',
+  'cel.dev/cel-go/common/debug',
+  'cel.dev/cel-go/common/decls',
+  'cel.dev/cel-go/common/env',
+  'cel.dev/cel-go/common/functions',
+  'cel.dev/cel-go/common/operators',
+  'cel.dev/cel-go/common/overloads',
+  'cel.dev/cel-go/common/runes',
+  'cel.dev/cel-go/common/stdlib',
+  'cel.dev/cel-go/common/types',
+  'cel.dev/cel-go/common/types/pb',
+  'cel.dev/cel-go/common/types/ref',
+  'cel.dev/cel-go/common/types/traits',
+  'cel.dev/cel-go/ext',
+  'cel.dev/cel-go/interpreter',
+  'cel.dev/cel-go/parser',
+  'cel.dev/cel-go/parser/gen',
+  'cel.dev/expr',
+  'github.com/DataDog/zstd',
+  'github.com/antlr4-go/antlr/v4',
+  'github.com/coder/websocket',
+  'github.com/dunglas/httpsfv',
+  'github.com/quic-go/qpack',
+  'github.com/quic-go/quic-go',
+  'github.com/quic-go/quic-go/http3',
+  'github.com/quic-go/quic-go/http3/qlog',
+  'github.com/quic-go/quic-go/qlog',
+  'github.com/quic-go/quic-go/qlogwriter',
+  'github.com/quic-go/quic-go/qlogwriter/jsontext',
+  'github.com/quic-go/quic-go/quicvarint',
+  'github.com/quic-go/webtransport-go',
+  'go.yaml.in/yaml/v3',
+  'golang.org/x/crypto/chacha20',
+  'golang.org/x/crypto/chacha20poly1305',
+  'golang.org/x/exp/slices',
+  'golang.org/x/net/bpf',
+  'golang.org/x/net/http/httpguts',
+  'golang.org/x/net/http2/hpack',
+  'golang.org/x/net/idna',
+  'golang.org/x/net/ipv4',
+  'golang.org/x/net/ipv6',
+  'golang.org/x/sys/cpu',
+  'golang.org/x/sys/unix',
+  'golang.org/x/text/feature/plural',
+  'golang.org/x/text/language',
+  'golang.org/x/text/message',
+  'golang.org/x/text/message/catalog',
+  'golang.org/x/text/secure/bidirule',
+  'golang.org/x/text/transform',
+  'golang.org/x/text/unicode/bidi',
+  'golang.org/x/text/unicode/norm',
+  'google.golang.org/genproto/googleapis/api/expr/v1alpha1',
+  'google.golang.org/genproto/googleapis/rpc/status',
+  'google.golang.org/protobuf/encoding/protojson',
+  'google.golang.org/protobuf/encoding/prototext',
+  'google.golang.org/protobuf/encoding/protowire',
+  'google.golang.org/protobuf/proto',
+  'google.golang.org/protobuf/protoadapt',
+  'google.golang.org/protobuf/reflect/protodesc',
+  'google.golang.org/protobuf/reflect/protoreflect',
+  'google.golang.org/protobuf/reflect/protoregistry',
+  'google.golang.org/protobuf/runtime/protoiface',
+  'google.golang.org/protobuf/runtime/protoimpl',
+  'google.golang.org/protobuf/types/descriptorpb',
+  'google.golang.org/protobuf/types/dynamicpb',
+  'google.golang.org/protobuf/types/gofeaturespb',
+  'google.golang.org/protobuf/types/known/anypb',
+  'google.golang.org/protobuf/types/known/durationpb',
+  'google.golang.org/protobuf/types/known/emptypb',
+  'google.golang.org/protobuf/types/known/fieldmaskpb',
+  'google.golang.org/protobuf/types/known/structpb',
+  'google.golang.org/protobuf/types/known/timestamppb',
+  'google.golang.org/protobuf/types/known/wrapperspb',
+  'trev.zip/llc/trevrpc/trevrpc-go'
+]
+
+[mod]
+  [mod.'buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go']
+    version = 'v1.36.12-20260825204119-511051f7f437.1'
+    hash = 'sha256-cGvYVbSb48YRnEnmciuAjeu8MiFam9eztwPbOi+aXn8='
+
+  [mod.'buf.build/go/protovalidate']
+    version = 'v1.4.0'
+    hash = 'sha256-pTln8e58LYfFnG9lGVODJb4dAetKDtAVdmYPEEzGgnM='
+
+  [mod.'cel.dev/cel-go']
+    version = 'v0.32.0'
+    hash = 'sha256-V8qevQLL6dFtCsQaFGqoCmWkMTbLoYZjeYNKKkh6URM='
+
+  [mod.'cel.dev/expr']
+    version = 'v0.25.3'
+    hash = 'sha256-W17jP8I+4zsPEUMahiOp94WxihvZVnbmGTofF+LL9C8='
+
+  [mod.'github.com/DataDog/zstd']
+    version = 'v1.5.7'
+    hash = 'sha256-GlSZOyix7Ct7tOKmSKpGckDjMhTtiYPBTpoWdwGLx5M='
+
+  [mod.'github.com/antlr4-go/antlr/v4']
+    version = 'v4.13.1'
+    hash = 'sha256-beAuxHNRUuhzcSJUh/8ztVf1zCUiaT72fg2Jvx0AuNQ='
+
+  [mod.'github.com/coder/websocket']
+    version = 'v1.8.15'
+    hash = 'sha256-6QnIQMMUSzrDXaUfO+9cl4uDh0SHizFUf4GpHmJedtk='
+
+  [mod.'github.com/dunglas/httpsfv']
+    version = 'v1.1.1'
+    hash = 'sha256-MwE5SaqcGD5RxpQqSpbydi6cMriyeT/FrvJoBB9KoE4='
+
+  [mod.'github.com/klauspost/compress']
+    version = 'v1.20.4'
+    hash = 'sha256-KYm39Vrg8cR7bU0aqK2KTdth8UhHnH17Vcl9FB0Hf/E='
+
+  [mod.'github.com/quic-go/qpack']
+    version = 'v0.6.0'
+    hash = 'sha256-xaxHnTKIZt1cHK5ZqTuSTOt5RNSjQB37GlrIgEGBskM='
+
+  [mod.'github.com/quic-go/quic-go']
+    version = 'v0.64.1'
+    hash = 'sha256-lbt3F0zedf5iGYOTkNknGsrSQClxWy+/1i5GnmWgCI4='
+
+  [mod.'github.com/quic-go/webtransport-go']
+    version = 'v0.13.0'
+    hash = 'sha256-fl+X0Vy7SqCximk9bv63sr8KWdARxSgtQNV6K0d8Q2c='
+
+  [mod.'go.yaml.in/yaml/v3']
+    version = 'v3.0.5'
+    hash = 'sha256-ygho+GU5kE7vPMx+dZYyNfCaeMjNxj66XmrcVf3afFE='
+
+  [mod.'golang.org/x/crypto']
+    version = 'v0.58.0'
+    hash = 'sha256-33ioL7suoYfgBIEQDAeqy+lwhbCgy885BkcXavowffo='
+
+  [mod.'golang.org/x/exp']
+    version = 'v0.0.0-20260820142414-ca536658362e'
+    hash = 'sha256-1XYX6CymrUCUHBy43cQHof4/YXfuY8bpTxHf79YPblM='
+
+  [mod.'golang.org/x/net']
+    version = 'v0.62.0'
+    hash = 'sha256-BX+i/MyhVigz/sDRJNGydfkimaeAHAFtrRN//eXuZFY='
+
+  [mod.'golang.org/x/sys']
+    version = 'v0.49.0'
+    hash = 'sha256-/1S3yy3in72ygZT1CKymvOzJZqCMYiGSqZDfvSyB3LI='
+
+  [mod.'golang.org/x/text']
+    version = 'v0.43.0'
+    hash = 'sha256-gykmMKFe61Tc4tblLPd3IyMKCqL0MSTQpgb6yE5EnDA='
+
+  [mod.'google.golang.org/genproto/googleapis/api']
+    version = 'v0.0.0-20260819154853-08b0e4226688'
+    hash = 'sha256-x471Es3eGzAXtx3AsSze2J7P2ys2jpQI8oStVNzIMRw='
+
+  [mod.'google.golang.org/genproto/googleapis/rpc']
+    version = 'v0.0.0-20260819154853-08b0e4226688'
+    hash = 'sha256-CQdjYGIrgAnEDfWW3DIJF9Orf7oJdhx3G9rGg6fow88='
+
+  [mod.'google.golang.org/protobuf']
+    version = 'v1.36.12'
+    hash = 'sha256-MKd0AdkWEe2A79mGPzOY5I76nMqTsGJKQNPJOKyOwkQ='

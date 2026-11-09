@@ -16,6 +16,7 @@ members = [
   "crates/protoc-gen-trevrpc-rust",
   "crates/trevrpc-interop",
   "crates/trevrpc-opentelemetry",
+  "crates/trevrpc-protovalidate",
 ]
 resolver = "3"
 

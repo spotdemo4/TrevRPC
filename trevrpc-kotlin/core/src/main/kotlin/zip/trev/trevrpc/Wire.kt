@@ -127,12 +127,13 @@ data class RpcStatus(
     val message: String = "",
     val metadata: Metadata = Metadata.EMPTY,
     val refusedStreamCompression: Boolean = false,
+    val details: List<StatusDetail> = emptyList(),
 ) {
     val status: Status
-        get() = Status(Code.fromValue(statusValue), message, metadata)
+        get() = Status(Code.fromValue(statusValue), message, metadata, details)
 
     companion object {
-        fun fromStatus(status: Status): RpcStatus = RpcStatus(status.code.value, status.message, status.metadata)
+        fun fromStatus(status: Status): RpcStatus = RpcStatus(status.code.value, status.message, status.metadata, details = status.details)
     }
 }
 

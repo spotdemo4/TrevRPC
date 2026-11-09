@@ -1,6 +1,7 @@
 package zip.trev.trevrpc.interop
 
 import androidx.test.platform.app.InstrumentationRegistry
+import build.buf.validate.Violations
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asFlow
@@ -22,6 +23,8 @@ import trevrpc.interop.v1.Interop.EchoRequest
 import trevrpc.interop.v1.Interop.EchoResponse
 import trevrpc.interop.v1.RefusingEchoClient
 import trevrpc.interop.v1.UnreliableEchoClient
+import trevrpc.interop.v1.Validated.ValidatedRequest
+import trevrpc.interop.v1.ValidatedEchoClient
 import zip.trev.trevrpc.CallOptions
 import zip.trev.trevrpc.Code
 import zip.trev.trevrpc.Compression
@@ -57,6 +60,7 @@ class EchoScenarioTest(
                         UnreliableEchoClient(channel, options),
                         CompressedEchoClient(channel, options),
                         RefusingEchoClient(channel, options),
+                        ValidatedEchoClient(channel, options),
                         { connectionMetadata -> newChannel(connectionMetadata) },
                     ),
                 )
@@ -145,6 +149,7 @@ private data class Clients(
     val unreliable: UnreliableEchoClient,
     val compressed: CompressedEchoClient,
     val refusing: RefusingEchoClient,
+    val validated: ValidatedEchoClient,
     /** Opens a channel of its own, with the given connection metadata, which the scenario closes. */
     val newChannel: (Metadata) -> RpcChannel,
 )
@@ -173,6 +178,16 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
                 expectEcho(echo.unary(request("e")), "e#", 0)
             } finally {
                 channel.close()
+            }
+        },
+        // ValidatedEcho calls that keep and break its standard and CEL rules.
+        "validation" to { clients ->
+            val validated = clients.validated
+            expectEcho(validated.unary(validatedRequest("hello")), "hello", 0)
+            expectViolation("empty message", "string.min_len", "message") { validated.unary(validatedRequest("")) }
+            expectViolation("forbidden message", "message.not_forbidden", "") { validated.unary(validatedRequest("forbidden")) }
+            expectViolation("streamed empty message", "string.min_len", "message") {
+                validated.clientStream(flowOf(validatedRequest("a"), validatedRequest("")))
             }
         },
         "unary-error" to { (client) ->
@@ -428,5 +443,37 @@ private suspend fun expectStatus(
         } ?: throw AssertionError("expected status $code \"$message\", but the call succeeded")
     expect(failure.status.code == code && failure.status.message == message) {
         "expected status $code \"$message\", got ${failure.status.code} \"${failure.status.message}\""
+    }
+}
+
+private fun validatedRequest(message: String): ValidatedRequest = ValidatedRequest.newBuilder().setMessage(message).build()
+
+/**
+ * Runs a call that must fail with `INVALID_ARGUMENT` and a `buf.validate.Violations` detail
+ * holding one violation of [rule], on the field named [field], or on the message itself when
+ * [field] is empty.
+ */
+private suspend fun expectViolation(
+    what: String,
+    rule: String,
+    field: String,
+    call: suspend () -> Unit,
+) {
+    val failure =
+        try {
+            call()
+            null
+        } catch (error: TrevRpcException) {
+            error
+        } ?: throw AssertionError("$what: expected INVALID_ARGUMENT, but the call succeeded")
+    expect(failure.status.code == Code.INVALID_ARGUMENT) {
+        "$what: expected INVALID_ARGUMENT, got ${failure.status.code} \"${failure.status.message}\""
+    }
+    val violations = failure.status.findDetails(Violations.getDefaultInstance()).flatMap { it.violationsList }
+    expect(violations.size == 1) { "$what: expected one violation, got ${violations.size} in ${failure.status.details}" }
+    val violation = violations.single()
+    val path = violation.field.elementsList.joinToString(".") { it.fieldName }
+    expect(violation.ruleId == rule && path == field) {
+        "$what: got rule \"${violation.ruleId}\" on field \"$path\", want \"$rule\" on \"$field\""
     }
 }

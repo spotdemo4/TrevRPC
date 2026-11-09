@@ -139,5 +139,5 @@ func cloneStatus(status *Status) *Status {
 	if status == nil {
 		return nil
 	}
-	return NewStatus(status.Code, status.Message).WithMetadata(status.Metadata)
+	return status.clone()
 }

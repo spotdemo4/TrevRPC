@@ -441,11 +441,13 @@ func (s *encodeStream[T]) abortUpload(err error) {
 type decodeStream[T ProtoMessage] struct {
 	inner      byteStream
 	newMessage func() T
+	validate   validateFunc
 }
 
-// newDecodeStream wraps a byte stream and yields decoded protobuf messages.
-func newDecodeStream[T ProtoMessage](inner byteStream, newMessage func() T) MessageStream[T] {
-	return &decodeStream[T]{inner: inner, newMessage: newMessage}
+// newDecodeStream wraps a byte stream and yields decoded protobuf messages,
+// checked with validate when there is one.
+func newDecodeStream[T ProtoMessage](inner byteStream, newMessage func() T, validate validateFunc) MessageStream[T] {
+	return &decodeStream[T]{inner: inner, newMessage: newMessage, validate: validate}
 }
 
 func (s *decodeStream[T]) Recv() (T, error) {
@@ -459,6 +461,10 @@ func (s *decodeStream[T]) Recv() (T, error) {
 	if err := unmarshalMessage(body, message); err != nil {
 		var zero T
 		return zero, InvalidArgument("failed to decode message: " + err.Error())
+	}
+	if err := checkRequest(s.validate, message); err != nil {
+		var zero T
+		return zero, err
 	}
 
 	return message, nil

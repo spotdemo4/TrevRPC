@@ -116,6 +116,21 @@ call to it, and clients must replay the call.
 | `CompressedEcho.Plain`        | Echo `{text}` back, ending with `OK` and trailing metadata `interop-plain-compressed-received`: `1` if the request arrived as a ZSTD_MESSAGE without a dictionary, `0` otherwise. |
 | `RefusingEcho.ClientStream`   | As `Echo.ClientStream`, registered without stream compression.                                                                                                                    |
 
+[`proto/validated.proto`](proto/validated.proto) defines
+`trevrpc.interop.v1.ValidatedEcho`, whose request type carries
+[`buf.validate`](https://github.com/bufbuild/protovalidate) rules: `message` must not be empty
+(`string.min_len`), and a CEL rule, `message.not_forbidden`, rejects the message `"forbidden"`. It
+imports `buf/validate/validate.proto`, of which `proto/buf/validate` holds a copy (protovalidate
+v1.2.2). Servers check its requests with protovalidate before the handler runs (see
+[Request Validation](../wiki/Go-Guide.md#request-validation)), so a request that breaks a rule
+fails with `InvalidArgument` and a `buf.validate.Violations` status detail. It is a separate file
+for the same reason as `unreliable.proto`.
+
+| Method                       | Behavior                                                                                                              |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `ValidatedEcho.Unary`        | Respond `{message: request.message, index: 0}`.                                                                       |
+| `ValidatedEcho.ClientStream` | Read requests until EOF, then respond `{message: concatenation of every request.message, index: number of requests}`. |
+
 Every method also handles headers: when request metadata key `interop-header`
 is present with value `v`, the server sends response headers
 `{interop-header: v}` before its first response message, and its `OK` status
@@ -145,6 +160,7 @@ Clients run these in order, each with a 10 second deadline.
 | `refused-stream`        | `RefusingEcho.ClientStream` sending the eight messages of `compressed-stream` without waiting and closing the send side; then `compressed-stream`'s `CompressedEcho.Bidi` call; then its `CompressedEcho.ClientStream` call                                                                                              | `{message: <the eight messages concatenated>, index: 8}` and `OK`, each message received once: the server refused the optimistic call and the client replayed it. Then the bidi messages echoed with index 0 … 7 and `OK` with `interop-stream-compressed-received` of at least 1, since that call is not optimistic and compresses once the answer arrives; then the client-stream echo and `OK` with `interop-stream-compressed-received` of at least 6, since the answer made the client optimistic again |
 | `compressed-plain`      | `CompressedEcho.Plain` twice with `text` the 315-byte JSON record of `plain.records` in [`zstd-golden-vectors.txt`](../testdata/zstd-golden-vectors.txt), twice over (630 characters)                                                                                                                                    | `{text}` echoed and `OK` both times. The second call's `interop-plain-compressed-received` is `1`: the first call's answer let the client compress without a dictionary. The Kotlin client, which never compresses unary requests, sees `0`                                                                                                                                                                                                                                                                  |
 | `connection-metadata`   | On a new channel whose connection metadata is `interop-suffix: "!"`: `Unary` with messages `"a"`, `"b"`, `"c"`, awaiting each before the next; then `"d"` with call metadata `interop-suffix: "?"`; then, after replacing the connection metadata with `interop-suffix: "#"`, `"e"`                                      | `{message: "a!"}`, `{message: "b!"}`, `{message: "c!"}`, `{message: "d?"}`, `{message: "e#"}`: the server merges the connection metadata into every call, the later ones referring to the set it confirmed (a client that cannot tell which calls share a connection, such as Kotlin over Cronet, offers it on every call), and the call's own entry wins                                                                                                                                                    |
+| `validation`            | `ValidatedEcho.Unary {message: "hello"}`, then `{message: ""}`, then `{message: "forbidden"}`; then `ValidatedEcho.ClientStream` sending `"a"`, then `""`, and closing the send side (the second send may fail with the call's status)                                                                                   | `{message: "hello", index: 0}`; then each of the three calls fails with `InvalidArgument` and a `buf.validate.Violations` detail holding one violation: rule `string.min_len` on the field path `message`, rule `message.not_forbidden` with an empty field path, and rule `string.min_len` on `message`. Go and Rust servers report the same violations, CEL ones included                                                                                                                                  |
 
 Every client runs `compressed-stream`, `refused-stream`, and `compressed-plain`
 and holds compression settings for them, so it stream-compresses, and compresses

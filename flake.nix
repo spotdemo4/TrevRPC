@@ -127,7 +127,7 @@
           android = pkgs.mkShell {
             packages = with self.packages.${system}; [
               trevrpc-kotlin.interopAndroid
-              trevrpc-go
+              trevrpc-go-interop
               trevrpc-rust
             ];
             meta.platforms = self.packages.${system}.trevrpc-kotlin.interopAndroid.meta.platforms;
@@ -136,7 +136,7 @@
           # The interop runner and both servers, for the safari workflow.
           safari = pkgs.mkShell {
             packages = with self.packages.${system}; [
-              trevrpc-go
+              trevrpc-go-interop
               trevrpc-interop
               trevrpc-rust
             ];
@@ -205,7 +205,7 @@
               gomod2nix.packages.${system}.default
             ];
             script = ''
-              for module in trevrpc-go trevrpc-go/oteltrevrpc bench/baseline; do
+              for module in trevrpc-go trevrpc-go/oteltrevrpc trevrpc-go/protovalidatetrevrpc trevrpc-go/cmd/trevrpc-interop bench/baseline; do
                 go -C "$module" mod tidy
                 gomod2nix generate --with-deps --dir "$module"
               done
@@ -268,11 +268,20 @@
                 wireGolden
                 qmuxGolden
                 zstdGolden
-                interopProto
                 trevrpcProto
                 ;
             };
             trevrpc-go-otel = pkgs.callPackage ./trevrpc-go/oteltrevrpc { };
+            trevrpc-go-protovalidate = pkgs.callPackage ./trevrpc-go/protovalidatetrevrpc { };
+            # The Go interop and load benchmark executable, a module of its own so that the
+            # TrevRPC module does not depend on protovalidate.
+            trevrpc-go-interop = pkgs.callPackage ./trevrpc-go/cmd/trevrpc-interop {
+              inherit
+                zstdGolden
+                interopProto
+                trevrpcProto
+                ;
+            };
             trevrpc-js = pkgs.callPackage ./trevrpc-js {
               inherit
                 wireGolden
@@ -298,6 +307,9 @@
             trevrpc-rust-otel = pkgs.callPackage ./trevrpc-rust/crates/trevrpc-opentelemetry {
               inherit licenseFile;
             };
+            trevrpc-rust-protovalidate = pkgs.callPackage ./trevrpc-rust/crates/trevrpc-protovalidate {
+              inherit licenseFile;
+            };
             trevrpc-rust = pkgs.callPackage ./trevrpc-rust {
               inherit
                 wireGolden
@@ -309,13 +321,13 @@
             };
             # nix run .#trevrpc-interop: the interop matrix; see interop/README.md.
             trevrpc-interop = pkgs.callPackage ./interop {
-              inherit (self.packages.${system}) trevrpc-go trevrpc-js trevrpc-rust;
+              inherit (self.packages.${system}) trevrpc-go-interop trevrpc-js trevrpc-rust;
             };
             # nix run .#trevrpc-bench: the load benchmarks; see bench/README.md.
             trevrpc-bench = pkgs.callPackage ./bench {
               inherit (self.packages.${system})
                 trevrpc-bench-baseline
-                trevrpc-go
+                trevrpc-go-interop
                 trevrpc-js
                 trevrpc-rust
                 ;
@@ -345,6 +357,8 @@
           inherit (self.packages.${system})
             trevrpc-go
             trevrpc-go-otel
+            trevrpc-go-protovalidate
+            trevrpc-go-interop
             trevrpc-js
             trevrpc-js-effect
             trevrpc-kotlin
@@ -371,6 +385,22 @@
 
           trevrpc-go-otel-lint = {
             src = self.packages.${system}.trevrpc-go-otel;
+            packages = with pkgs; [ golangci-lint ];
+            script = ''
+              golangci-lint run ./...
+            '';
+          };
+
+          trevrpc-go-interop-lint = {
+            src = self.packages.${system}.trevrpc-go-interop;
+            packages = with pkgs; [ golangci-lint ];
+            script = ''
+              golangci-lint run ./...
+            '';
+          };
+
+          trevrpc-go-protovalidate-lint = {
+            src = self.packages.${system}.trevrpc-go-protovalidate;
             packages = with pkgs; [ golangci-lint ];
             script = ''
               golangci-lint run ./...

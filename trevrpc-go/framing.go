@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"slices"
+	"unicode/utf8"
 
 	"github.com/quic-go/quic-go/quicvarint"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -149,7 +150,7 @@ func decodeStatus(payload []byte) (*Status, error) {
 			return nil, err
 		}
 	}
-	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata), refusedStreamCompression: status.RefusedStreamCompression}, nil
+	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: ownedMetadata(status.Metadata), Details: detailsFromWire(status.Details), refusedStreamCompression: status.RefusedStreamCompression}, nil
 }
 
 // decodeHeaders decodes the payload of a HEADERS frame into its metadata.
@@ -299,14 +300,52 @@ func appendHeadersFrame(dst []byte, metadata Metadata, maxFrameSize int) ([]byte
 
 // appendStatusFrame appends a STATUS frame. An OK status without message or
 // metadata is the two bytes 03 00.
+//
+// A status too large for maxFrameSize, such as one whose details list many
+// violations, is sent without its details, and if it still does not fit,
+// without its trailing metadata and with its message cut to fit, so a call
+// always ends with its code.
 func appendStatusFrame(dst []byte, status *Status, maxFrameSize int) ([]byte, error) {
+	frames, err := appendExactStatusFrame(dst, status, maxFrameSize)
+	if _, tooLarge := errors.AsType[*FrameTooLargeError](err); !tooLarge {
+		return frames, err
+	}
+	withoutDetails := &Status{Code: status.Code, Message: status.Message, Metadata: status.Metadata, refusedStreamCompression: status.refusedStreamCompression}
+	if frames, err = appendExactStatusFrame(dst, withoutDetails, maxFrameSize); err == nil {
+		return frames, nil
+	}
+	return appendExactStatusFrame(dst, &Status{Code: status.Code, Message: truncateUTF8(status.Message, maxFrameSize-statusOverhead), refusedStreamCompression: status.refusedStreamCompression}, maxFrameSize)
+}
+
+// statusOverhead bounds the bytes of a STATUS payload other than its message
+// when it has no metadata or details: the code, the refusal flag, and the
+// message's tag and length.
+const statusOverhead = 16
+
+// truncateUTF8 returns the longest prefix of s of at most n bytes that does
+// not split a UTF-8 sequence.
+func truncateUTF8(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// appendExactStatusFrame appends a STATUS frame of status as it is.
+func appendExactStatusFrame(dst []byte, status *Status, maxFrameSize int) ([]byte, error) {
 	if status == nil {
 		status = OK()
 	}
-	if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 && !status.refusedStreamCompression {
+	if status.Code == CodeOK && status.Message == "" && len(status.Metadata) == 0 && len(status.Details) == 0 && !status.refusedStreamCompression {
 		return appendFrameHeader(dst, frameTypeStatus, 0), nil
 	}
-	wire := wireStatus{Code: uint32(status.Code), Message: status.Message, Metadata: status.Metadata, RefusedStreamCompression: status.refusedStreamCompression}
+	wire := wireStatus{Code: uint32(status.Code), Message: status.Message, Metadata: status.Metadata, Details: wireDetails(status.Details), RefusedStreamCompression: status.refusedStreamCompression}
 	size, ok := wire.payloadSize()
 	if !ok {
 		return appendLimitedProtoFrame(dst, frameTypeStatus, &wire, maxFrameSize)

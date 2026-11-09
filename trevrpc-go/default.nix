@@ -6,7 +6,6 @@
   wireGolden,
   qmuxGolden,
   zstdGolden,
-  interopProto,
   trevrpcProto,
 }:
 mkGoModule (final: {
@@ -14,22 +13,23 @@ mkGoModule (final: {
   version = "1.7.0";
 
   # The module itself plus the shared files its tests read: the wire, QMux and
-  # compression golden vectors, and the interop and TrevRPC option protos the
-  # generated bindings must match.
+  # compression golden vectors, and the TrevRPC option protos the generated
+  # bindings must match.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
       wireGolden
       qmuxGolden
       zstdGolden
-      interopProto
       trevrpcProto
       (lib.fileset.difference ./. (
         lib.fileset.unions [
           ./default.nix
           ./gomod2nix.toml
-          # a separate module, with its own package
+          # separate modules, with their own packages
           ./oteltrevrpc
+          ./protovalidatetrevrpc
+          ./cmd/trevrpc-interop
         ]
       ))
     ];
@@ -37,18 +37,11 @@ mkGoModule (final: {
   sourceRoot = "${final.src.name}/trevrpc-go";
   modules = ./gomod2nix.toml;
 
-  subPackages = [
-    "cmd/protoc-gen-trevrpc-go"
-    "cmd/trevrpc-interop"
-  ];
-
-  postInstall = ''
-    mv "$out/bin/trevrpc-interop" "$out/bin/trevrpc-interop-go"
-  '';
+  subPackages = [ "cmd/protoc-gen-trevrpc-go" ];
 
   doCheck = true;
-  # The bindings tests regenerate code from the interop and option protos, and
-  # the ACME test gets a certificate from Pebble.
+  # The bindings tests regenerate code from the option protos, and the ACME
+  # test gets a certificate from Pebble.
   nativeCheckInputs = [
     protobuf
     pebble
@@ -75,12 +68,6 @@ mkGoModule (final: {
     runHook preInstallCheck
     test "$(go list -m)" = 'trev.zip/llc/trevrpc/trevrpc-go'
     test -x "$out/bin/protoc-gen-trevrpc-go"
-    test -x "$out/bin/trevrpc-interop-go"
-    if "$out/bin/trevrpc-interop-go" 2> usage.out; then
-      echo "trevrpc-interop-go without a subcommand must fail" >&2
-      exit 1
-    fi
-    grep -q 'server|client' usage.out
     runHook postInstallCheck
   '';
 

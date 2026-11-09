@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/quicvarint"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // unaryHandler handles an encoded unary request message and returns the
@@ -43,6 +44,31 @@ type route struct {
 	// plainCompression says which directions may be compressed without a
 	// dictionary.
 	plainCompression PlainCompression
+	// request is the request message type of a route registered with
+	// Register*, and nil for a route registered with a raw handler. Its
+	// bindUnary or bindStreaming builds the handler for a validation function,
+	// which freeze calls when the server has a validator.
+	request       protoreflect.MessageDescriptor
+	bindUnary     func(validateFunc) unaryHandler
+	bindStreaming func(validateFunc) streamingHandler
+}
+
+// typedRoute is the request type and handler builder of a route registered
+// with Register*; see route.request.
+type typedRoute struct {
+	request       protoreflect.MessageDescriptor
+	bindUnary     func(validateFunc) unaryHandler
+	bindStreaming func(validateFunc) streamingHandler
+}
+
+// requestDescriptor returns the message type newRequest makes, or nil when it
+// makes nil, which the route reports on every call.
+func requestDescriptor[Req ProtoMessage](newRequest func() Req) protoreflect.MessageDescriptor {
+	request := newRequest()
+	if isNilRegisteredValue(request) {
+		return nil
+	}
+	return protoMessageV2(request).ProtoReflect().Descriptor()
 }
 
 // ErrServerFrozen is the panic value used when a server is mutated after first use.
@@ -57,6 +83,7 @@ type Server struct {
 	interceptors []Interceptor
 	metrics      Metrics
 	diagnostics  ServerDiagnosticHandler
+	validator    Validator
 	runtime      *serverRuntime
 	// frozen is runtime, once set, for lock-free reads on the request path.
 	frozen atomic.Pointer[serverRuntime]
@@ -353,16 +380,36 @@ func (s *Server) SetDiagnostics(handler ServerDiagnosticHandler) {
 
 // routeUnary registers a unary route handler for a method path.
 func (s *Server) routeUnary(method string, handler unaryHandler, options ...RouteOption) {
+	s.addUnaryRoute(method, handler, typedRoute{}, options)
+}
+
+// routeTypedUnary registers a unary route of Register*, whose handler
+// typed.bindUnary builds.
+func (s *Server) routeTypedUnary(method string, typed typedRoute, options []RouteOption) {
+	s.addUnaryRoute(method, typed.bindUnary(nil), typed, options)
+}
+
+func (s *Server) addUnaryRoute(method string, handler unaryHandler, typed typedRoute, options []RouteOption) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
 	validateRoute(method, handler != nil)
 	config := applyRouteOptions(options)
-	s.routes[method] = route{kind: RPCKindUnary, unary: handler, plainCompression: config.plainCompression}
+	s.routes[method] = route{kind: RPCKindUnary, unary: handler, plainCompression: config.plainCompression, request: typed.request, bindUnary: typed.bindUnary}
 }
 
 // routeStreaming registers a streaming route handler for a method path and RPC kind.
 func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHandler, options ...RouteOption) {
+	s.addStreamingRoute(method, kind, handler, typedRoute{}, options)
+}
+
+// routeTypedStreaming registers a streaming route of Register*, whose handler
+// typed.bindStreaming builds.
+func (s *Server) routeTypedStreaming(method string, kind RPCKind, typed typedRoute, options []RouteOption) {
+	s.addStreamingRoute(method, kind, typed.bindStreaming(nil), typed, options)
+}
+
+func (s *Server) addStreamingRoute(method string, kind RPCKind, handler streamingHandler, typed typedRoute, options []RouteOption) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requireMutableLocked()
@@ -377,7 +424,37 @@ func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHa
 		unreliable:        config.unreliable.effective(kind),
 		streamCompression: config.streamCompression.effective(kind),
 		plainCompression:  config.plainCompression,
+		request:           typed.request,
+		bindStreaming:     typed.bindStreaming,
 	}
+}
+
+// bindValidators rebuilds the handlers of routes whose request messages
+// validator checks, and returns the first route it could not bind.
+func bindValidators(routes map[string]route, validator Validator) error {
+	if validator == nil {
+		return nil
+	}
+	var bindErr error
+	for method, route := range routes {
+		if route.request == nil {
+			continue
+		}
+		validate, err := bindValidator(validator, method, route.request)
+		if bindErr == nil {
+			bindErr = err
+		}
+		if validate == nil {
+			continue
+		}
+		if route.bindUnary != nil {
+			route.unary = route.bindUnary(validate)
+		} else {
+			route.streaming = route.bindStreaming(validate)
+		}
+		routes[method] = route
+	}
+	return bindErr
 }
 
 // RegisterUnary registers a unary handler for method, the full method path
@@ -387,21 +464,27 @@ func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHa
 // method's schema options as RouteOptions; RoutePlainCompression is the only
 // one that applies to a unary route.
 func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error), options ...RouteOption) {
-	s.routeUnary(method, func(ctx context.Context, body []byte) (encodedMessage, error) {
-		request, err := decodeRegisteredRequest(body, newRequest)
-		if err != nil {
-			return encodedMessage{}, err
-		}
+	validateRoute(method, handler != nil)
+	s.routeTypedUnary(method, typedRoute{
+		request: requestDescriptor(newRequest),
+		bindUnary: func(validate validateFunc) unaryHandler {
+			return func(ctx context.Context, body []byte) (encodedMessage, error) {
+				request, err := decodeRegisteredRequest(body, newRequest, validate)
+				if err != nil {
+					return encodedMessage{}, err
+				}
 
-		response, err := handler(ctx, request)
-		if err != nil {
-			return encodedMessage{}, err
-		}
-		if isNilRegisteredValue(response) {
-			return encodedMessage{}, Internal("handler returned nil response message")
-		}
-		return responseCompressorFromContext(ctx).encode(response)
-	}, options...)
+				response, err := handler(ctx, request)
+				if err != nil {
+					return encodedMessage{}, err
+				}
+				if isNilRegisteredValue(response) {
+					return encodedMessage{}, Internal("handler returned nil response message")
+				}
+				return responseCompressorFromContext(ctx).encode(response)
+			}
+		},
+	}, options)
 }
 
 // RegisterClientStreaming registers a client-streaming handler for method, the
@@ -413,16 +496,22 @@ func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string,
 // datagrams are delivered with the others; RouteUnreliable has no effect on a
 // method whose response is a single message.
 func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (Res, error), options ...RouteOption) {
-	s.routeStreaming(method, RPCKindClientStreaming, func(ctx context.Context, _ []byte, requests byteStream) (encodedStream, error) {
-		response, err := handler(ctx, newDecodeStream(requests, newRequest))
-		if err != nil {
-			return nil, err
-		}
-		if isNilRegisteredValue(response) {
-			return nil, Internal("handler returned nil response message")
-		}
-		return newCompressedEncodeStream(StreamOf(response), responseCompressorFromContext(ctx)), nil
-	}, options...)
+	validateRoute(method, handler != nil)
+	s.routeTypedStreaming(method, RPCKindClientStreaming, typedRoute{
+		request: requestDescriptor(newRequest),
+		bindStreaming: func(validate validateFunc) streamingHandler {
+			return func(ctx context.Context, _ []byte, requests byteStream) (encodedStream, error) {
+				response, err := handler(ctx, newDecodeStream(requests, newRequest, validate))
+				if err != nil {
+					return nil, err
+				}
+				if isNilRegisteredValue(response) {
+					return nil, Internal("handler returned nil response message")
+				}
+				return newCompressedEncodeStream(StreamOf(response), responseCompressorFromContext(ctx)), nil
+			}
+		},
+	}, options)
 }
 
 // RegisterServerStreaming registers a server-streaming handler for method, the
@@ -432,21 +521,27 @@ func RegisterClientStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 // returned stream ends. RouteUnreliable lets the response messages travel as
 // datagrams.
 func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (MessageStream[Res], error), options ...RouteOption) {
-	s.routeStreaming(method, RPCKindServerStreaming, func(ctx context.Context, body []byte, _ byteStream) (encodedStream, error) {
-		request, err := decodeRegisteredRequest(body, newRequest)
-		if err != nil {
-			return nil, err
-		}
+	validateRoute(method, handler != nil)
+	s.routeTypedStreaming(method, RPCKindServerStreaming, typedRoute{
+		request: requestDescriptor(newRequest),
+		bindStreaming: func(validate validateFunc) streamingHandler {
+			return func(ctx context.Context, body []byte, _ byteStream) (encodedStream, error) {
+				request, err := decodeRegisteredRequest(body, newRequest, validate)
+				if err != nil {
+					return nil, err
+				}
 
-		responses, err := handler(ctx, request)
-		if err != nil {
-			return nil, err
-		}
-		if isNilRegisteredValue(responses) {
-			return nil, Internal("handler returned nil response stream")
-		}
-		return newResponseEncodeStream(ctx, responses), nil
-	}, options...)
+				responses, err := handler(ctx, request)
+				if err != nil {
+					return nil, err
+				}
+				if isNilRegisteredValue(responses) {
+					return nil, Internal("handler returned nil response stream")
+				}
+				return newResponseEncodeStream(ctx, responses), nil
+			}
+		},
+	}, options)
 }
 
 // RegisterBidirectionalStreaming registers a bidirectional-streaming handler
@@ -458,19 +553,27 @@ func RegisterServerStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, meth
 // response messages travel as datagrams; request messages that arrive as
 // datagrams are always accepted.
 func RegisterBidirectionalStreaming[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, MessageStream[Req]) (MessageStream[Res], error), options ...RouteOption) {
-	s.routeStreaming(method, RPCKindBidirectionalStreaming, func(ctx context.Context, _ []byte, requests byteStream) (encodedStream, error) {
-		responses, err := handler(ctx, newDecodeStream(requests, newRequest))
-		if err != nil {
-			return nil, err
-		}
-		if isNilRegisteredValue(responses) {
-			return nil, Internal("handler returned nil response stream")
-		}
-		return newResponseEncodeStream(ctx, responses), nil
-	}, options...)
+	validateRoute(method, handler != nil)
+	s.routeTypedStreaming(method, RPCKindBidirectionalStreaming, typedRoute{
+		request: requestDescriptor(newRequest),
+		bindStreaming: func(validate validateFunc) streamingHandler {
+			return func(ctx context.Context, _ []byte, requests byteStream) (encodedStream, error) {
+				responses, err := handler(ctx, newDecodeStream(requests, newRequest, validate))
+				if err != nil {
+					return nil, err
+				}
+				if isNilRegisteredValue(responses) {
+					return nil, Internal("handler returned nil response stream")
+				}
+				return newResponseEncodeStream(ctx, responses), nil
+			}
+		},
+	}, options)
 }
 
-func decodeRegisteredRequest[Req ProtoMessage](body []byte, newRequest func() Req) (Req, error) {
+// decodeRegisteredRequest decodes a request message, and checks it with
+// validate when there is one.
+func decodeRegisteredRequest[Req ProtoMessage](body []byte, newRequest func() Req, validate validateFunc) (Req, error) {
 	request := newRequest()
 	if isNilRegisteredValue(request) {
 		var zero Req
@@ -479,6 +582,10 @@ func decodeRegisteredRequest[Req ProtoMessage](body []byte, newRequest func() Re
 	if err := unmarshalMessage(body, request); err != nil {
 		var zero Req
 		return zero, InvalidArgument("failed to decode request: " + err.Error())
+	}
+	if err := checkRequest(validate, request); err != nil {
+		var zero Req
+		return zero, err
 	}
 	return request, nil
 }
@@ -515,6 +622,9 @@ type serverRuntime struct {
 	// when an execution starts or finishes with a waiter present.
 	executionMu        sync.Mutex
 	executionChangedCh chan struct{}
+	// validatorErr is why the validator could not check a route's requests;
+	// Listen reports it.
+	validatorErr error
 	// compression holds the server's dictionaries, nil without any.
 	compression *compressionConfig
 	// streams is the stream compression budget, nil when it is off.
@@ -618,6 +728,7 @@ func (s *Server) freeze() *serverRuntime {
 	}
 	options := canonicalServerOptions(s.options)
 	routes := maps.Clone(s.routes)
+	validatorErr := bindValidators(routes, s.validator)
 	metrics := s.metrics
 	if metrics == nil {
 		metrics = NoopMetrics{}
@@ -633,6 +744,7 @@ func (s *Server) freeze() *serverRuntime {
 		admissionLimit:  newSemaphore(options.MaxConcurrentAdmissionCallbacks),
 		compression:     s.compression,
 		streams:         s.streams,
+		validatorErr:    validatorErr,
 	}
 	runtime.diagnostics = newServerDiagnosticDispatcher(s.diagnostics, runtime)
 	s.options = options
@@ -874,7 +986,7 @@ func (r *serverRuntime) wireStatus(err error, phase ServerDiagnosticPhase, reque
 	}
 	if status, ok := errors.AsType[*Status](err); ok && status.Code != CodeInternal {
 		if validateMetadata(status.Metadata) == nil {
-			return NewStatus(status.Code, status.Message).WithMetadata(status.Metadata)
+			return status.clone()
 		}
 	}
 	r.emitDiagnostic(ServerDiagnostic{Phase: phase, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})

@@ -71,6 +71,12 @@ class WireCodecTest {
                             Status(Code.FAILED_PRECONDITION, "stop", Metadata.of("x-t" to "2".encodeToByteArray())),
                         ),
                     ),
+                "status.details" to
+                    statusEntry(
+                        RpcStatus.fromStatus(
+                            Status.invalidArgument("bad").withDetails(listOf(StatusDetail("x.Y", byteArrayOf(0x08, 0x01)))),
+                        ),
+                    ),
                 "message.hi" to messageEntry("hi".encodeToByteArray()),
                 "message.empty" to messageEntry(byteArrayOf()),
             )

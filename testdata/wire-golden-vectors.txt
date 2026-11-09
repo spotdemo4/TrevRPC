@@ -42,6 +42,7 @@
 #   status.ok              RpcStatus{code:0}
 #   status.unavailable     RpcStatus{code:14, message:"down"}
 #   status.metadata        RpcStatus{code:9, message:"stop", metadata:{"x-t":"2"}}
+#   status.details         RpcStatus{code:3, message:"bad", details:[{type:"x.Y", value:0801}]}
 #   grease.two_byte_type   grease frame of type 0x40 (two-byte varint) with payload 000102
 #   stream.unknown_frames  grease, HEADERS, an unknown 4-byte type, a MESSAGE with a
 #                          non-minimal 2-byte length, grease, STATUS with an 8-byte length,
@@ -94,6 +95,9 @@ status.unavailable.frame = 0308080e1204646f776e
 
 status.metadata.payload = 0809120473746f701a080a03782d74120132
 status.metadata.frame = 03120809120473746f701a080a03782d74120132
+
+status.details.payload = 080312036261642a090a03782e5912020801
+status.details.frame = 0312080312036261642a090a03782e5912020801
 
 grease.two_byte_type.payload = 000102
 grease.two_byte_type.frame = 404003000102

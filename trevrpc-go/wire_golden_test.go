@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -115,7 +116,7 @@ func TestWireGoldenVectors(t *testing.T) {
 					t.Fatalf("frame type = %v, want STATUS", got.Kind)
 				}
 				decoded := got.statusValue()
-				if decoded.Code != status.Code || decoded.Message != status.Message || !metadataEqual(decoded.Metadata, status.Metadata) {
+				if decoded.Code != status.Code || decoded.Message != status.Message || !metadataEqual(decoded.Metadata, status.Metadata) || !reflect.DeepEqual(decoded.Details, status.Details) {
 					t.Fatalf("decoded status = %#v, want %#v", decoded, status)
 				}
 			},
@@ -184,6 +185,7 @@ func TestWireGoldenVectors(t *testing.T) {
 		statusVector("status.ok", OK()),
 		statusVector("status.unavailable", Unavailable("down")),
 		statusVector("status.metadata", NewStatus(CodeFailedPrecondition, "stop").WithMetadata(Metadata{"x-t": []byte("2")})),
+		statusVector("status.details", InvalidArgument("bad").WithDetails(Detail{Type: "x.Y", Value: []byte{0x08, 0x01}})),
 	}
 
 	for _, tt := range tests {

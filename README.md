@@ -48,6 +48,10 @@ messages as QUIC datagrams.
 - server limits, authorization hooks, interceptors, metrics, diagnostics, and graceful shutdown
 - OpenTelemetry metrics and tracing for Go ([`oteltrevrpc`](trevrpc-go/oteltrevrpc)) and Rust
   ([`trevrpc-opentelemetry`](trevrpc-rust/crates/trevrpc-opentelemetry))
+- [protovalidate](https://github.com/bufbuild/protovalidate) request validation for Go
+  ([`protovalidatetrevrpc`](trevrpc-go/protovalidatetrevrpc)) and Rust
+  ([`trevrpc-protovalidate`](trevrpc-rust/crates/trevrpc-protovalidate)) servers, with CEL rules, whose
+  violations every client reads from the status's details
 - built for deployment: certificates from ACME (TLS-ALPN-01 on the TCP port), PROXY protocol from TCP and UDP
   load balancers, QUIC address validation with Retry, and other HTTP content served from the same ports
 - development certificates that browsers trust by hash, so local WebTransport needs no trusted CA

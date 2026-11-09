@@ -171,6 +171,10 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 		cancel:            cancel,
 		workers:           newStreamWorkers(ctx, streamWorkerIdle),
 	}
+	if err := l.runtime.validatorErr; err != nil {
+		cancel()
+		return nil, err
+	}
 	if err := l.bind(addr, options); err != nil {
 		cancel()
 		return nil, err

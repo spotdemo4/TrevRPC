@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package example.validated;
+
+import "buf/validate/validate.proto";
+
+// Checked holds rules for each RPC shape; Unchecked's request has none.
+service Checked {
+  rpc Unary(Request) returns (Reply);
+  rpc ServerStream(Wrapper) returns (stream Reply);
+  rpc ClientStream(stream Request) returns (Reply);
+  rpc Bidi(stream Request) returns (stream Reply);
+  rpc Unchecked(Plain) returns (Reply);
+}
+
+message Request {
+  string name = 1 [(buf.validate.field).string.min_len = 3];
+}
+
+// Wrapper carries rules only through the message it holds.
+message Wrapper {
+  map<string, Request> requests = 1;
+}
+
+message Plain {
+  string name = 1;
+  Plain next = 2;
+}
+
+message Reply {
+  string name = 1;
+}
