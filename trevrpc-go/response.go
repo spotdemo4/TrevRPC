@@ -58,6 +58,23 @@ func SetResponseMetadata(ctx context.Context, key string, value []byte) error {
 	return response.set(&response.metadata, &response.metadataSent, ErrResponseMetadataSent, key, value)
 }
 
+// ResponseHeadersFromContext returns a copy of the response headers set so far
+// with SetResponseHeader on the call that ctx belongs to, which stay readable
+// after they are sent. It is empty outside a handler. Tests read it from a
+// context made with NewHandlerContext after calling a handler.
+func ResponseHeadersFromContext(ctx context.Context) Metadata {
+	return responseMetadataFromContext(ctx).snapshot(func(r *responseMetadata) Metadata { return r.headers })
+}
+
+// ResponseMetadataFromContext returns a copy of the trailing metadata set so
+// far with SetResponseMetadata on the call that ctx belongs to, which stays
+// readable after it is sent. It is empty outside a handler, and does not
+// include the Metadata of a failed call's Status. Tests read it from a context
+// made with NewHandlerContext after calling a handler.
+func ResponseMetadataFromContext(ctx context.Context) Metadata {
+	return responseMetadataFromContext(ctx).snapshot(func(r *responseMetadata) Metadata { return r.metadata })
+}
+
 // responseMetadata is the response headers and trailing metadata a handler
 // sets through its context. The server takes the headers when the handler
 // returns and the trailing metadata when the response ends; setting either
@@ -99,6 +116,16 @@ func (r *responseMetadata) set(target *Metadata, sent *bool, sentErr error, key 
 		return err
 	}
 	return nil
+}
+
+// snapshot returns a copy of the metadata field selects, empty for a nil r.
+func (r *responseMetadata) snapshot(field func(*responseMetadata) Metadata) Metadata {
+	if r == nil {
+		return Metadata{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return cloneMetadata(field(r))
 }
 
 // takeHeaders returns the headers to send and makes later ones fail.

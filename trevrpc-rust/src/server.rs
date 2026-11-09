@@ -325,6 +325,9 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    /// Builds the context of a call of `request`, with its method path and metadata, for calling a
+    /// handler directly, as a test does. The response metadata the handler sets is readable with
+    /// [`RequestContext::response_headers`] and [`RequestContext::response_metadata`].
     #[must_use]
     pub fn new(request: &RpcRequest, deadline: Option<Instant>) -> Self {
         Self::from_parts(
@@ -406,6 +409,24 @@ impl RequestContext {
         value: impl Into<Vec<u8>>,
     ) -> std::result::Result<(), Status> {
         self.response.set_metadata(key, value.into())
+    }
+
+    /// Returns a copy of the response headers set with [`RequestContext::set_response_header`]
+    /// that the server has not sent yet, which is all of them until the handler returns. A test
+    /// that calls a handler directly with a context from [`RequestContext::new`] reads them back
+    /// with it.
+    #[must_use]
+    pub fn response_headers(&self) -> Metadata {
+        self.response.headers()
+    }
+
+    /// Returns a copy of the trailing metadata set with [`RequestContext::set_response_metadata`]
+    /// that the server has not sent yet, which is all of it until the response ends. It does not
+    /// include the metadata of a failed call's [`Status`]. A test that calls a handler directly
+    /// with a context from [`RequestContext::new`] reads it back with it.
+    #[must_use]
+    pub fn response_metadata(&self) -> Metadata {
+        self.response.metadata()
     }
 
     /// Values an [`Interceptor`] passed to the handler, such as a database handle. A clone of the context copies them.
@@ -3363,6 +3384,31 @@ mod tests {
         assert_eq!(context.service(), "");
         assert_eq!(context.method(), "");
         assert_eq!(context.full_method(), "no-slash");
+    }
+
+    #[test]
+    fn request_contexts_built_for_tests_record_response_metadata() {
+        let request = RpcRequest::new("/example.Auth/Logout")
+            .with_metadata(headers_of("authorization", b"Bearer abc"));
+        let context = RequestContext::new(&request, None);
+        assert_eq!(
+            context.metadata(),
+            &headers_of("authorization", b"Bearer abc")
+        );
+        assert!(context.response_headers().is_empty());
+        assert!(context.response_metadata().is_empty());
+
+        // A clone the handler keeps sets the metadata of the same call.
+        let clone = context.clone();
+        clone
+            .set_response_header("X-Header", b"h".to_vec())
+            .expect("the header is valid");
+        clone
+            .set_response_metadata("x-trailer", b"t".to_vec())
+            .expect("the metadata is valid");
+
+        assert_eq!(context.response_headers(), headers_of("x-header", b"h"));
+        assert_eq!(context.response_metadata(), headers_of("x-trailer", b"t"));
     }
 
     #[test]

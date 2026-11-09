@@ -154,6 +154,16 @@ impl ResponseMetadata {
         self.state.lock_unpoisoned().set(kind, key, value)
     }
 
+    /// Returns a copy of the headers set and not yet sent.
+    pub(crate) fn headers(&self) -> Metadata {
+        self.state.lock_unpoisoned().headers.clone()
+    }
+
+    /// Returns a copy of the trailing metadata set and not yet sent.
+    pub(crate) fn metadata(&self) -> Metadata {
+        self.state.lock_unpoisoned().metadata.clone()
+    }
+
     /// Returns the headers to send and makes later headers fail.
     pub(crate) fn take_headers(&self) -> Metadata {
         let mut state = self.state.lock_unpoisoned();

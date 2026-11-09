@@ -87,6 +87,43 @@ func RequestMetadataFromContext(ctx context.Context) Metadata {
 	return info.Metadata
 }
 
+// NewHandlerContext returns a copy of ctx that carries info the way the
+// context of a handler serving that call does, so a test or an in-process
+// caller can call a handler method directly. HandlerContextFromContext returns
+// info and RequestMetadataFromContext its Metadata, with the keys normalized
+// with NormalizeMetadataKey and the values copied; keys that differ only in
+// case keep one of their values. FullMethod is derived from Service and Method
+// when it is empty, and they from it when both are empty. The call has no
+// datagrams or compression, so the counters of HandlerContext report zero.
+//
+// SetResponseHeader and SetResponseMetadata on the returned context, or on
+// contexts derived from it, record what the handler sets, which
+// ResponseHeadersFromContext and ResponseMetadataFromContext read back.
+func NewHandlerContext(ctx context.Context, info HandlerContext) context.Context {
+	metadata := make(Metadata, len(info.Metadata))
+	for key, value := range info.Metadata {
+		var owned []byte
+		if len(value) > 0 {
+			owned = append([]byte(nil), value...)
+		}
+		metadata[NormalizeMetadataKey(key)] = owned
+	}
+	switch {
+	case info.FullMethod == "" && info.Service != "" && info.Method != "":
+		info.FullMethod = "/" + info.Service + "/" + info.Method
+	case info.Service == "" && info.Method == "":
+		info.Service, info.Method, _ = splitMethodPath(info.FullMethod)
+	}
+	return &handlerCallContext{Context: ctx, state: &callState{info: HandlerContext{
+		Service:    info.Service,
+		Method:     info.Method,
+		FullMethod: info.FullMethod,
+		Kind:       info.Kind,
+		Metadata:   metadata,
+		RemoteAddr: info.RemoteAddr,
+	}}}
+}
+
 func newHandlerContext(request *wireRequest) HandlerContext {
 	service, method := request.serviceAndMethod()
 	return HandlerContext{
