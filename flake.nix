@@ -150,6 +150,9 @@
               # rust
               rustc
               cargo
+              # protoc, for the build script of prost-protovalidate-types, which cargo publish runs
+              # when it verifies trevrpc-protovalidate
+              protobuf
               # go
               go
               # javascript
