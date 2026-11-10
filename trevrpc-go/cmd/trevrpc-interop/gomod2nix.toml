@@ -95,7 +95,7 @@ cachePackages = [
 
 [mod]
   [mod.'buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go']
-    version = 'v1.36.12-20260825204119-511051f7f437.1'
+    version = 'v1.36.12-20260825204119-511051f7f437.2'
     hash = 'sha256-cGvYVbSb48YRnEnmciuAjeu8MiFam9eztwPbOi+aXn8='
 
   [mod.'buf.build/go/protovalidate']

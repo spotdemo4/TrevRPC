@@ -3,13 +3,13 @@ module trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc
 go 1.26.0
 
 require (
+	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2
 	buf.build/go/protovalidate v1.4.0
 	google.golang.org/protobuf v1.36.12
 	trev.zip/llc/trevrpc/trevrpc-go v1.7.0
 )
 
 require (
-	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.1 // indirect
 	cel.dev/cel-go v0.32.0 // indirect
 	cel.dev/expr v0.25.3 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect

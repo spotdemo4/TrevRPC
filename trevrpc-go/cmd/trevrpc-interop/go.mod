@@ -3,7 +3,7 @@ module trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-interop
 go 1.26.0
 
 require (
-	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.1
+	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2
 	github.com/quic-go/quic-go v0.64.1
 	google.golang.org/protobuf v1.36.12
 	trev.zip/llc/trevrpc/trevrpc-go v1.7.0
