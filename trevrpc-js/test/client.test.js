@@ -144,6 +144,127 @@ test("invalid requests fail before a stream is opened", async () => {
   assert.equal(transport.opened, 0);
 });
 
+/**
+ * A request validator that records the types it is asked about and rejects request messages whose
+ * `message` is "bad" with what `reject` returns.
+ */
+function rejectBad(reject = () => new TrevRpcError(Code.InvalidArgument, "bad request")) {
+  const asked = [];
+  const validator = {
+    asked,
+    validateFunc(schema) {
+      asked.push(schema.typeName);
+      if (schema.typeName !== EchoRequestSchema.typeName) {
+        return undefined;
+      }
+      return (message) => {
+        assert.equal(message.$typeName, EchoRequestSchema.typeName);
+        if (message.message === "bad") {
+          throw reject();
+        }
+      };
+    },
+  };
+  return validator;
+}
+
+test("the validator is asked once per method for its request type", () => {
+  const validator = rejectBad();
+  createClient(
+    Echo,
+    fakeTransport(() => {}),
+    { validator },
+  );
+  assert.deepEqual(
+    validator.asked,
+    Echo.methods.map((method) => method.input.typeName),
+  );
+});
+
+test("requests the validator rejects fail with its error before a stream is opened", async () => {
+  const transport = fakeTransport(() => assert.fail("no stream expected"));
+  const ends = [];
+  const echo = createClient(Echo, transport, {
+    validator: rejectBad(),
+    interceptors: [() => (end) => ends.push(end.code)],
+  });
+
+  await assert.rejects(
+    echo.unary({ message: "bad" }),
+    isStatus(Code.InvalidArgument, "bad request"),
+  );
+  await assert.rejects(echo.serverStream({ message: "bad" }), isStatus(Code.InvalidArgument));
+  assert.equal(transport.opened, 0);
+  // The interceptors ran and saw the call fail.
+  assert.deepEqual(ends, [Code.InvalidArgument, Code.InvalidArgument]);
+});
+
+test("requests the validator accepts are sent", async () => {
+  const { echo, transport } = setup(echoHandler, { validator: rejectBad() });
+  assert.equal((await echo.unary({ message: "good" })).message, "good");
+  await transport.settled();
+});
+
+test("a validator's other errors fail requests with InvalidArgument", async () => {
+  const thrown = new RangeError("out of range");
+  const transport = fakeTransport(() => assert.fail("no stream expected"));
+  const echo = createClient(Echo, transport, { validator: rejectBad(() => thrown) });
+  await assert.rejects(echo.unary({ message: "bad" }), (error) => {
+    assert.ok(isStatus(Code.InvalidArgument, "out of range")(error));
+    assert.equal(error.cause, thrown);
+    return true;
+  });
+});
+
+test("requests that cannot be encoded fail before the validator sees them", async () => {
+  const validator = {
+    validateFunc: () => () => assert.fail("the validator must not see it"),
+  };
+  const echo = createClient(
+    Echo,
+    fakeTransport(() => {}),
+    { validator },
+  );
+  await assert.rejects(echo.unary({ count: -1 }), isStatus(Code.InvalidArgument));
+});
+
+test("a rejected send is not sent and the call goes on", async () => {
+  const { echo, transport } = setup(echoHandler, { validator: rejectBad() });
+  const call = await echo.clientStream();
+  await call.send({ message: "a" });
+  await assert.rejects(
+    call.send({ message: "bad" }),
+    isStatus(Code.InvalidArgument, "bad request"),
+  );
+  await call.send({ message: "b" });
+  const response = await call.closeAndRecv();
+  assert.equal(response.message, "ab");
+  assert.equal(response.index, 2);
+  await transport.settled();
+});
+
+test("createClient rejects validators that are not request validators", () => {
+  const transport = fakeTransport(() => {});
+  for (const validator of [{}, () => {}, { validateFunc: () => 1 }]) {
+    assert.throws(
+      () => createClient(Echo, transport, { validator }),
+      isStatus(Code.InvalidArgument),
+    );
+  }
+  const broken = new Error("broken rules");
+  assert.throws(
+    () =>
+      createClient(Echo, transport, {
+        validator: {
+          validateFunc() {
+            throw broken;
+          },
+        },
+      }),
+    (error) => error === broken,
+  );
+});
+
 test("timeouts are sent on the wire", async () => {
   const seen = [];
   const { echo } = setup(async (stream) => {

@@ -239,6 +239,18 @@ const client = createClient(Greeter, channel, { interceptors: [logCalls] });
 - An interceptor that throws fails the call with what it threw before it starts; the finish functions of earlier interceptors still run.
 - A client-streaming call has a `status` promise too, like the other streaming calls.
 
+### Request validation
+
+The separate package [`@trevrpc/protovalidate`](protovalidate) checks request messages against their [`buf.validate`](https://buf.build/bufbuild/protovalidate) rules before they are sent, with [protovalidate](https://github.com/bufbuild/protovalidate-es):
+
+```js
+import { createRequestValidator } from "@trevrpc/protovalidate";
+
+const client = createClient(Greeter, channel, { validator: createRequestValidator() });
+```
+
+A request that breaks its rules fails with `Code.InvalidArgument` and a `buf.validate.Violations` detail, which `error.findDetails(ViolationsSchema)` decodes, as a Go or Rust server that validates requests reports it. The request of a unary or server-streaming call fails the call after its interceptors ran; a message passed to `send()` rejects that send, and the call goes on. Methods whose request type has no rules are not checked. The `validator` option takes any object with a `validateFunc(schema)` method that returns the check of that request type, or nothing to skip it; see `RequestValidator`.
+
 ### Effect
 
 The separate package [`@trevrpc/effect`](effect) makes clients for [Effect](https://effect.website): `createEffectClient(Greeter, channel)` returns a client whose unary calls are effects, whose server-streaming calls are streams, and whose client-streaming and bidirectional calls take their requests as a stream. Interrupting an effect or stream cancels its call. `TrevRpcError` has a `_tag` of `"TrevRpcError"`, so `Effect.catchTag` matches it.

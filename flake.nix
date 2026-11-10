@@ -294,6 +294,10 @@
             trevrpc-js-effect = pkgs.callPackage ./trevrpc-js/effect {
               inherit (self.packages.${system}) trevrpc-js;
             };
+            trevrpc-js-protovalidate = pkgs.callPackage ./trevrpc-js/protovalidate {
+              inherit (self.packages.${system}) trevrpc-js;
+              inherit interopProto;
+            };
             trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
               inherit
                 wireGolden
@@ -361,6 +365,7 @@
             trevrpc-go-interop
             trevrpc-js
             trevrpc-js-effect
+            trevrpc-js-protovalidate
             trevrpc-kotlin
             trevrpc-rust
             trevrpc-bench-baseline
@@ -445,6 +450,22 @@
 
           trevrpc-js-effect-lint = {
             src = self.packages.${system}.trevrpc-js-effect;
+            packages = with pkgs; [
+              oxfmt
+              oxlint
+            ];
+            script = ''
+              oxfmt --check
+              # oxlint's type-aware rules and tsc read the generated test client. oxlint is given
+              # the package's own directories, so it doesn't follow the link to trevrpc-js.
+              npm run build
+              npm run lint
+              npm exec -- tsc -p tsconfig.json
+            '';
+          };
+
+          trevrpc-js-protovalidate-lint = {
+            src = self.packages.${system}.trevrpc-js-protovalidate;
             packages = with pkgs; [
               oxfmt
               oxlint

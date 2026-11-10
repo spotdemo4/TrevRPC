@@ -51,7 +51,8 @@ messages as QUIC datagrams.
 - [protovalidate](https://github.com/bufbuild/protovalidate) request validation for Go
   ([`protovalidatetrevrpc`](trevrpc-go/protovalidatetrevrpc)) and Rust
   ([`trevrpc-protovalidate`](trevrpc-rust/crates/trevrpc-protovalidate)) servers, with CEL rules, whose
-  violations every client reads from the status's details
+  violations every client reads from the status's details, and for browser clients
+  ([`@trevrpc/protovalidate`](trevrpc-js/protovalidate)), which check requests before sending them
 - built for deployment: certificates from ACME (TLS-ALPN-01 on the TCP port), PROXY protocol from TCP and UDP
   load balancers, QUIC address validation with Retry, and other HTTP content served from the same ports
 - development certificates that browsers trust by hash, so local WebTransport needs no trusted CA
@@ -273,6 +274,12 @@ for [Effect](https://effect.website), [`@trevrpc/effect`](trevrpc-js/effect) mak
 
 ```sh
 npm install @trevrpc/effect effect
+```
+
+[`@trevrpc/protovalidate`](trevrpc-js/protovalidate) checks requests against their protovalidate rules before they are sent:
+
+```sh
+npm install @trevrpc/protovalidate @bufbuild/protovalidate
 ```
 
 ### kotlin

@@ -325,6 +325,57 @@ test("a failing request stream fails a bidirectional stream and cancels the call
   assert.equal(await cancelled.promise, true);
 });
 
+/** A request validator that rejects request messages whose `message` is "bad". */
+const rejectBad = {
+  validateFunc: () => (request) => {
+    if (request.message === "bad") {
+      throw new TrevRpcError(Code.InvalidArgument, "bad request");
+    }
+  },
+};
+
+test("a request the validator rejects fails a client stream and cancels the call", async () => {
+  const cancelled = deferred();
+  const received = [];
+  const transport = fakeTransport(async (stream) => {
+    watchCancellation(stream, cancelled);
+    await stream.readRequest();
+    try {
+      for (let request; (request = await stream.readMessage(EchoRequest)) !== null;) {
+        received.push(request.message);
+      }
+    } catch {
+      // The client cancelled the call.
+    }
+  });
+  const echo = createEffectClient(Echo, transport, { validator: rejectBad });
+  const exit = await Effect.runPromiseExit(echo.clientStream(thenIdle("a", "bad", "b")));
+  assertStatus(failure(exit), Code.InvalidArgument);
+  assert.equal(await cancelled.promise, true);
+  // Nothing after the rejected request is sent; the cancellation may discard what was.
+  assert.ok(
+    received.every((message) => message === "a"),
+    `received ${received.join(",")}`,
+  );
+});
+
+test("a request the validator rejects fails a bidirectional stream and cancels the call", async () => {
+  const cancelled = deferred();
+  const transport = fakeTransport(async (stream) => {
+    watchCancellation(stream, cancelled);
+    await stream.readRequest();
+    try {
+      await echoAll(stream);
+    } catch {
+      // The client cancelled the call.
+    }
+  });
+  const echo = createEffectClient(Echo, transport, { validator: rejectBad });
+  const exit = await Effect.runPromiseExit(Stream.runDrain(echo.bidi(thenIdle("a", "bad"))));
+  assertStatus(failure(exit), Code.InvalidArgument);
+  assert.equal(await cancelled.promise, true);
+});
+
 test("taking part of a bidirectional stream cancels the call", async () => {
   const cancelled = deferred();
   const { echo } = setup(async (stream) => {

@@ -6,6 +6,7 @@
     "node_modules/**",
     "src/zstd-wasm.js",
     "zstd-wasm/target/**",
-    "effect/**"
+    "effect/**",
+    "protovalidate/**"
   ]
 }

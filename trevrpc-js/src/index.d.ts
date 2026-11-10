@@ -130,10 +130,39 @@ export type CallInterceptor = (
   call: InterceptedCall,
 ) => void | CallFinish | Promise<void | CallFinish>;
 
-/** Options of a service client: defaults for its calls, and interceptors that run around them. */
+/**
+ * Checks the request messages of a client before they are sent; see `ClientOptions.validator`.
+ * `@trevrpc/protovalidate` implements it with `buf.validate` rules.
+ */
+export interface RequestValidator {
+  /**
+   * Returns the function that checks request messages of type `schema`, or nothing when messages
+   * of that type never need checking, which costs their methods nothing. `createClient` calls it
+   * once for each method, and throws what it throws.
+   *
+   * The returned function throws to reject a message, which is then not sent: a TrevRpcError
+   * fails the request as it is, normally InvalidArgument with details that say why, and any other
+   * error fails it with InvalidArgument and the error as `cause`. It only sees messages that
+   * encode.
+   */
+  validateFunc<Desc extends DescMessage>(
+    schema: Desc,
+  ): ((message: MessageShape<Desc>) => void) | undefined | void;
+}
+
+/**
+ * Options of a service client: defaults for its calls, the interceptors that run around them, and
+ * the validator of their request messages.
+ */
 export interface ClientOptions extends CallOptions {
   /** Interceptors for the client's calls, after those of its transport, such as a Channel's. */
   interceptors?: readonly CallInterceptor[];
+  /**
+   * Checks every request message before it is sent: the request of a unary or server-streaming
+   * call, which fails the call after its interceptors ran, and each message passed to `send()`,
+   * which rejects that send and leaves the call open. Without one, requests are not checked.
+   */
+  validator?: RequestValidator;
 }
 
 export interface TransportStream {
@@ -260,7 +289,9 @@ export interface ClientStreamingCall<TRequest, TResponse> {
    * error. A failed send is not retried or reported twice: later sends fail the same way, and
    * `closeAndRecv()` returns the call's outcome.
    *
-   * Pending sends are rejected too when the call is cancelled or its deadline expires.
+   * Pending sends are rejected too when the call is cancelled or its deadline expires. A
+   * message that cannot be encoded, or that the client's `validator` rejects, is not sent: the
+   * send rejects with InvalidArgument (or the validator's status) and the call goes on.
    */
   send(request: TRequest): Promise<void>;
   /**
@@ -314,7 +345,9 @@ export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIt
    * status: at most 32 frames or 1 MiB (plus one frame of at most `maxFrameSize`), after which
    * reading pauses until `recv()` takes messages. Responses read ahead are delivered in order.
    *
-   * Pending sends are rejected too when the call is cancelled or its deadline expires.
+   * Pending sends are rejected too when the call is cancelled or its deadline expires. A
+   * message that cannot be encoded, or that the client's `validator` rejects, is not sent: the
+   * send rejects with InvalidArgument (or the validator's status) and the call goes on.
    */
   send(request: TRequest): Promise<void>;
   /**
@@ -384,7 +417,8 @@ export type Client<S extends DescService> = {
  * Creates a client for `service`, a service descriptor that protoc-gen-es generates (such as
  * `GreeterService` from `greeter_pb.js`). The `trevrpc.method` option of each method decides
  * what its calls send as datagrams and compress; one the method's kind cannot use throws
- * InvalidArgument. Calls run the transport's interceptors, then those of `options.interceptors`.
+ * InvalidArgument. Calls run the transport's interceptors, then those of `options.interceptors`,
+ * and `options.validator` checks the request messages they send.
  */
 export function createClient<S extends DescService>(
   service: S,

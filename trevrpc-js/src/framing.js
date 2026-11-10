@@ -23,17 +23,24 @@ const EmptyBytes = new Uint8Array(0);
 
 /**
  * Encodes a protobuf message body: `message` is a message of `schema` (a protobuf-es message
- * descriptor) or the init object `create()` takes.
+ * descriptor) or the init object `create()` takes. A message that cannot be encoded fails with
+ * InvalidArgument. Once it is encoded, `validate`, if given, checks it and throws to reject it,
+ * so that it sees only well-formed messages.
  */
-export function marshalMessage(schema, message) {
+export function marshalMessage(schema, message, validate) {
+  let value;
+  let body;
   try {
-    return toBinary(schema, create(schema, message));
+    value = create(schema, message);
+    body = toBinary(schema, value);
   } catch (error) {
     throw invalidArgument(
       `failed to encode protobuf message: ${error?.message ?? String(error)}`,
       error,
     );
   }
+  validate?.(value);
+  return body;
 }
 
 /** Decodes a protobuf message body of `schema`, rejecting malformed wire data. */

@@ -42,6 +42,7 @@ buildNpmPackage (final: {
       (lib.fileset.difference ../. (
         lib.fileset.unions [
           ../zstd-wasm
+          ../protovalidate
           ../default.nix
           ./default.nix
         ]

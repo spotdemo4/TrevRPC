@@ -4,18 +4,20 @@ import { interceptCall, interceptorList } from "./interceptor.js";
 import { validateMetadata } from "./metadata.js";
 import { methodSettings } from "./method-options.js";
 import { Code, cancelled, internal, invalidArgument, statusError } from "./status.js";
+import { requestValidation } from "./validator.js";
 import { RpcAnswer, RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
 
 /**
  * Creates a client for `service`, a service descriptor that protoc-gen-es generates, with one
  * function per method, named by the method's `localName`. Its calls run the interceptors of the
- * transport, then those of `options.interceptors`.
+ * transport, then those of `options.interceptors`, and `options.validator` checks the request
+ * messages they send.
  */
 export function createClient(service, transport, options = {}) {
   if (service?.kind !== "service" || !Array.isArray(service.methods)) {
     throw invalidArgument("createClient needs a protobuf-es service descriptor");
   }
-  const { interceptors: clientInterceptors, ...callOptions } = options;
+  const { interceptors: clientInterceptors, validator, ...callOptions } = options;
   const defaults = mergeCallOptions(defaultCallOptions(), callOptions);
   const interceptors = [
     ...interceptorList(transport.interceptors, "transport interceptors"),
@@ -30,6 +32,8 @@ export function createClient(service, transport, options = {}) {
       path: `/${service.typeName}/${method.name}`,
       requestType: method.input,
       responseType: method.output,
+      // Checks each request message once it is encoded, or undefined to send them unchecked.
+      validate: requestValidation(validator, method.input),
       // Full protobuf names, which pick the compression dictionaries.
       types: { request: method.input.typeName, response: method.output.typeName },
       datagrams: datagramUse(settings),
@@ -91,7 +95,7 @@ const MethodShapes = Object.freeze({
 
 /** Calls a unary RPC and returns the decoded response. */
 export async function unaryCall(transport, rpc, request, options) {
-  const body = marshalMessage(rpc.requestType, request);
+  const body = marshalMessage(rpc.requestType, request, rpc.validate);
   const call = await Call.open(transport, requestFields(rpc, RpcKind.Unary), body, options, rpc);
   const stream = new BidirectionalStreamingCall(call, rpc, { options });
   // The response decides the outcome, so the request side finishes in the background.
@@ -101,7 +105,7 @@ export async function unaryCall(transport, rpc, request, options) {
 
 /** Calls a server-streaming RPC and returns its response stream. */
 export async function serverStreamingCall(transport, rpc, request, options) {
-  const body = marshalMessage(rpc.requestType, request);
+  const body = marshalMessage(rpc.requestType, request, rpc.validate);
   const call = await Call.open(
     transport,
     requestFields(rpc, RpcKind.ServerStreaming),
@@ -329,10 +333,12 @@ export class BidirectionalStreamingCall {
   /**
    * Sends one request message. Fails with the server's final status if the server ended the
    * call, as soon as it is known; with Cancelled if that status is OK; and with the error that
-   * ended the call otherwise.
+   * ended the call otherwise. A message that cannot be encoded, or that the client's validator
+   * rejects, fails with InvalidArgument (or the validator's status) and is not sent; the call
+   * goes on.
    */
   async send(message) {
-    const body = marshalMessage(this.#rpc.requestType, message);
+    const body = marshalMessage(this.#rpc.requestType, message, this.#rpc.validate);
     try {
       await this.#call.sendMessage(body);
     } catch (error) {

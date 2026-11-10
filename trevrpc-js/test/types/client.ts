@@ -13,6 +13,7 @@ import {
   type CallInterceptor,
   type ChannelStateChange,
   type ClientStreamingCall,
+  type RequestValidator,
   type ResponseStream,
   type StreamStatus,
   type Transport,
@@ -76,6 +77,21 @@ const wrapper: Transport = {
 createClient(Echo, wrapper, { interceptors: [authenticate], timeoutMs: 1_000 });
 // @ts-expect-error An interceptor returns a finish function or nothing.
 createClient(Echo, wrapper, { interceptors: [() => 1] });
+const rejectEmpty: RequestValidator = {
+  validateFunc(schema) {
+    if (schema.typeName !== EchoRequestSchema.typeName) {
+      return undefined;
+    }
+    return (message) => {
+      if (Object.keys(message).length === 0) {
+        throw new TrevRpcError(Code.InvalidArgument, "empty request");
+      }
+    };
+  },
+};
+createClient(Echo, wrapper, { validator: rejectEmpty });
+// @ts-expect-error A validator's validateFunc returns a function or nothing.
+createClient(Echo, wrapper, { validator: { validateFunc: () => 1 } });
 ({
   createBidirectionalStream: () => lazy.createBidirectionalStream(),
   // @ts-expect-error connection metadata is set through the channel, not built by hand

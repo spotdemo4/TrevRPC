@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package protovalidate.v1;
+
+import "buf/validate/validate.proto";
+
+// Methods whose request types have rules in every way the validator looks for them, and none.
+service Users {
+  rpc Create(CreateUserRequest) returns (User);
+  rpc Watch(CreateUserRequest) returns (stream User);
+  rpc Upload(stream CreateUserRequest) returns (User);
+  rpc Chat(stream CreateUserRequest) returns (stream User);
+  rpc Lookup(LookupRequest) returns (User);
+}
+
+message CreateUserRequest {
+  string name = 1 [(buf.validate.field).string.min_len = 1];
+  string email = 2 [(buf.validate.field).string.email = true];
+}
+
+message User {
+  string name = 1;
+}
+
+// No rules anywhere, in a recursive type.
+message LookupRequest {
+  string id = 1;
+  Tree tree = 2;
+}
+
+message Tree {
+  repeated Tree children = 1;
+  map<string, Tree> named = 2;
+}
+
+// Rules only in the values of a map.
+message BatchRequest {
+  map<string, CreateUserRequest> users = 1;
+}
+
+// Rules only in the elements of a list, two levels down.
+message NestedRequest {
+  Batch batch = 1;
+}
+
+message Batch {
+  repeated CreateUserRequest users = 1;
+}
+
+// A message rule.
+message RangeRequest {
+  option (buf.validate.message).cel = {
+    id: "range"
+    message: "start must not be after end"
+    expression: "this.start <= this.end"
+  };
+  int32 start = 1;
+  int32 end = 2;
+}
+
+// A oneof rule.
+message ChoiceRequest {
+  oneof kind {
+    option (buf.validate.oneof).required = true;
+    string a = 1;
+    string b = 2;
+  }
+}
+
+// A rule that cannot compile.
+message BrokenRequest {
+  option (buf.validate.message).cel = {
+    id: "broken"
+    expression: "this.missing == 1"
+  };
+  string name = 1;
+}
+
+// A rule that compiles but fails to evaluate for some values: int() of a non-number.
+message FragileRequest {
+  string number = 1 [(buf.validate.field).cel = {
+    id: "number"
+    message: "must be positive"
+    expression: "this == '' || int(this) > 0"
+  }];
+}

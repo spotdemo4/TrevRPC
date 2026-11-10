@@ -118,12 +118,29 @@ function withSignal(options, signal) {
 
 /**
  * Sends each request of `requests`, waiting for the transport to accept it. Stops without an error
- * at the first rejected send, which means the call has ended; the call reports its outcome. A
- * failing request stream fails with its error, and the caller's scope then cancels the call.
+ * at the first send rejected because the call ended; the call reports its outcome. A send rejected
+ * while the call goes on, for a request that does not encode or that the client's validator
+ * rejects, fails with its error, as a failing request stream does with its own; the caller's scope
+ * then cancels the call.
  */
 function upload(stream, requests) {
+  // The call settles its status as it ends, before the sends that its end rejects fail.
+  let ended = false;
+  const end = () => {
+    ended = true;
+  };
+  stream.status.then(end, end);
   return Stream.runForEachWhile(requests, (request) =>
-    Effect.promise(() => stream.send(request).then(accepted, rejected)),
+    Effect.tryPromise({
+      try: () =>
+        stream.send(request).then(accepted, (error) => {
+          if (ended) {
+            return false;
+          }
+          throw error;
+        }),
+      catch: toTrevRpcError,
+    }),
   );
 }
 
@@ -133,5 +150,4 @@ function settled(promise) {
 }
 
 const accepted = () => true;
-const rejected = () => false;
 const ignore = () => {};
