@@ -10,7 +10,7 @@
 }:
 mkGoModule (final: {
   pname = "trevrpc-go";
-  version = "1.7.0";
+  version = "1.8.0";
 
   # The module itself plus the shared files its tests read: the wire, QMux and
   # compression golden vectors, and the TrevRPC option protos the generated

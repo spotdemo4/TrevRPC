@@ -1,6 +1,6 @@
 {
   "name": "@trevrpc/protovalidate",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "protovalidate request validation for TrevRPC browser clients",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {

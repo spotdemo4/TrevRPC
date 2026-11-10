@@ -3,8 +3,8 @@
 OpenTelemetry instrumentation for [TrevRPC](https://trev.zip/llc/TrevRPC) Go servers and clients, following the semantic conventions for RPC with `rpc.system.name` `trevrpc`. It is a separate module so that TrevRPC itself does not depend on OpenTelemetry.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.7.0 works with `trevrpc-go` 1.7.0, `trevrpc-js` 1.7.0, and `trevrpc-kotlin`
-> 1.7.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.8.0 works with `trevrpc-go` 1.8.0, `trevrpc-js` 1.8.0, and `trevrpc-kotlin`
+> 1.8.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 ```sh
 go get trev.zip/llc/trevrpc/trevrpc-go/oteltrevrpc

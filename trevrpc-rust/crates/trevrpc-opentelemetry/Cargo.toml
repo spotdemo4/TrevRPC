@@ -1,6 +1,6 @@
 [package]
 name = "trevrpc-opentelemetry"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "OpenTelemetry metrics and tracing for TrevRPC servers and clients"
@@ -20,7 +20,7 @@ workspace = true
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "0.34", default-features = false }
-trevrpc = { version = "1.7.0", path = "../.." }
+trevrpc = { version = "1.8.0", path = "../.." }
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.33", default-features = false, features = [

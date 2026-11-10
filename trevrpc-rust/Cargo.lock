@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "protoc-gen-trevrpc-rust"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "heck",
  "prost",
@@ -2781,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-interop"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "divan",
  "futures-util",
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-opentelemetry"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "trevrpc-protovalidate"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "prost",
  "prost-protovalidate",

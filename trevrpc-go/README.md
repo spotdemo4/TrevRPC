@@ -3,8 +3,8 @@
 TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport) instead of HTTP/2. Define services in protobuf, generate typed clients and servers, and run them over QUIC, with TCP fallbacks for networks that block UDP.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.7.0 works with `trevrpc-go` 1.7.0, `trevrpc-js` 1.7.0, and `trevrpc-kotlin`
-> 1.7.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.8.0 works with `trevrpc-go` 1.8.0, `trevrpc-js` 1.8.0, and `trevrpc-kotlin`
+> 1.8.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
