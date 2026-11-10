@@ -665,7 +665,7 @@ func (s *Server) handleUnaryRequest(ctx context.Context, request *wireRequest, b
 		startedAt := time.Now()
 		service, method := requestService(request), requestMethod(request)
 		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: len(body)}, request)
-		return runtime.finishResponse(service, method, len(body), startedAt, failedUnaryResponse(Unavailable("too many concurrent RPCs")), request)
+		return runtime.finishResponse(service, method, len(body), startedAt, failedUnaryResponse(Unavailable("too many concurrent RPCs")), nil, request)
 	}
 	defer lease.release()
 	return runtime.handleRequest(ctx, request, body, lease)
@@ -691,7 +691,7 @@ func (s *Server) handleStreamingWriter(ctx context.Context, request *wireRequest
 		startedAt := time.Now()
 		service, method := requestService(request), requestMethod(request)
 		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: len(body)}, request)
-		return runtime.finishStreamingStatus(service, method, len(body), startedAt, Unavailable("too many concurrent RPCs"), request)
+		return runtime.finishStreamingStatus(service, method, len(body), startedAt, Unavailable("too many concurrent RPCs"), nil, request)
 	}
 	var dispatched bytes.Buffer
 	response := runtime.handleStreamingRequest(ctx, request, body, requestBody, lease, &dispatched)

@@ -21,7 +21,12 @@ import (
 // ends it gets rpc.response.status_code, and an error status and error.type
 // when the code means the server failed: UNKNOWN, DEADLINE_EXCEEDED,
 // UNIMPLEMENTED, INTERNAL, UNAVAILABLE, DATA_LOSS or a code TrevRPC does not
-// define. A streaming call ends when its response stream does.
+// define; the error the call ended with, as trevrpc.RPCFinished.Err has it,
+// before the server redacts it for the caller, is recorded on the span as an
+// exception event then, so the trace says why the call failed even when the
+// caller was only told "internal server error". The span's status description
+// is the status code, which is all the caller learns. A streaming call ends
+// when its response stream does.
 //
 // A client's trace context is extracted from the request metadata with the
 // propagator of WithPropagator, or the global one, and only continued with
@@ -83,6 +88,9 @@ func (i *Interceptor) Intercept(ctx context.Context, info trevrpc.HandlerContext
 		if serverError(event.Code) {
 			span.SetAttributes(semconv.ErrorTypeKey.String(code))
 			span.SetStatus(codes.Error, code)
+			if event.Err != nil {
+				span.RecordError(event.Err)
+			}
 		}
 		span.End()
 	}, nil

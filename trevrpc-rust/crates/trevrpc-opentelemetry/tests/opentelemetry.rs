@@ -309,6 +309,56 @@ async fn a_trusted_client_span_is_the_parent() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_server_error_records_its_cause_on_the_span() -> TestResult {
+    let (exporter, _provider, _guard) = trace();
+    let mut server = server();
+    server.add_interceptor(Interceptor::new());
+
+    server
+        .handle_request(
+            request("/example.Greeter/SayHello", Metadata::new()),
+            Vec::new(),
+        )
+        .await?;
+    let Err(status) = server
+        .handle_request(
+            request("/example.Greeter/Fail", Metadata::new()),
+            Vec::new(),
+        )
+        .await
+    else {
+        return Err("the call should fail".into());
+    };
+    // The caller learns nothing of the cause.
+    ensure_eq!(
+        status,
+        Status::internal(trevrpc::server::INTERNAL_SERVER_ERROR)
+    );
+
+    let spans = exporter.get_finished_spans()?;
+    let causes = |name| -> Result<Vec<String>, String> {
+        Ok(span(&spans, name)?
+            .events
+            .iter()
+            .filter(|event| event.name == "exception")
+            .flat_map(|event| event.attributes.iter())
+            .filter(|attribute| attribute.key.as_str() == "exception.message")
+            .map(|attribute| attribute.value.to_string())
+            .collect())
+    };
+    ensure_eq!(
+        causes("example.Greeter/Fail")?,
+        ["Internal: handler failed"]
+    );
+    ensure_eq!(
+        span(&spans, "example.Greeter/Fail")?.status,
+        SpanStatus::error("INTERNAL")
+    );
+    ensure!(causes("example.Greeter/SayHello")?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_propagating_client_continues_its_trace_on_a_trusting_server() -> TestResult {
     let (exporter, provider, _guard) = trace();
     let mut server = server();

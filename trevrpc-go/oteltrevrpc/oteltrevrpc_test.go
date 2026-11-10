@@ -127,6 +127,54 @@ func TestInterceptorLeavesClientErrorsUnset(t *testing.T) {
 	}
 }
 
+func TestInterceptorRecordsTheCauseOfAServerError(t *testing.T) {
+	cause := errors.New("load user: connection refused")
+	for _, tt := range []struct {
+		name       string
+		event      trevrpc.RPCFinished
+		wantRecord bool
+	}{
+		{"internal", trevrpc.RPCFinished{Code: trevrpc.CodeInternal, Err: cause}, true},
+		{"internal without a cause", trevrpc.RPCFinished{Code: trevrpc.CodeInternal}, false},
+		{"client error", trevrpc.RPCFinished{Code: trevrpc.CodeNotFound, Err: trevrpc.NotFound("no such user")}, false},
+		{"success", trevrpc.RPCFinished{Code: trevrpc.CodeOK}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := tracetest.NewSpanRecorder()
+			interceptor := NewInterceptor(WithTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))))
+			_, finish, err := interceptor.Intercept(context.Background(), trevrpc.HandlerContext{FullMethod: echoMethod})
+			if err != nil {
+				t.Fatal(err)
+			}
+			finish(tt.event)
+
+			span := onlySpan(t, recorder)
+			var recorded []string
+			for _, event := range span.Events() {
+				if event.Name != "exception" {
+					continue
+				}
+				for _, kv := range event.Attributes {
+					if kv.Key == "exception.message" {
+						recorded = append(recorded, kv.Value.AsString())
+					}
+				}
+			}
+			if tt.wantRecord {
+				if len(recorded) != 1 || recorded[0] != cause.Error() {
+					t.Fatalf("recorded exceptions %v, want %q", recorded, cause)
+				}
+				// The status description is all the caller learns.
+				if span.Status().Code != codes.Error || span.Status().Description != "INTERNAL" {
+					t.Fatalf("status = %v, want an INTERNAL error", span.Status())
+				}
+			} else if len(recorded) != 0 {
+				t.Fatalf("recorded exceptions %v, want none", recorded)
+			}
+		})
+	}
+}
+
 func TestInterceptorLinksToAnUntrustedClientSpan(t *testing.T) {
 	for _, trust := range []bool{false, true} {
 		recorder := tracetest.NewSpanRecorder()

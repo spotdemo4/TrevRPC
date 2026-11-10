@@ -1501,8 +1501,37 @@ pub struct RpcFinished {
     pub response_body_len: usize,
     pub code: Code,
     pub elapsed: Duration,
+    /// The status the call ended with, `None` when it succeeded: what the handler, an
+    /// interceptor, the authorizer or a request or response stream failed with, or the status of
+    /// a handler panic, before the server redacts it for the caller.
+    ///
+    /// Any `Internal` status, whether the handler returned it or the server made it of an error,
+    /// reaches the caller as `Internal` with the message [`INTERNAL_SERVER_ERROR`]; this is the
+    /// original, so a logging or tracing interceptor can say why the call failed. It stays on the
+    /// server and is never sent, but it may contain what the caller must not see, so log it
+    /// rather than return it. A status of another code is what the caller gets, and so is a call
+    /// the server ends for another reason, such as an unknown method or a deadline.
+    /// [`RpcFinished::code`] is its code.
+    pub error: Option<Status>,
     /// Whether `service` and `method` name a registered method, as for [`RpcStarted`].
     pub registered: bool,
+}
+
+/// The message of the `Internal` status a caller gets in place of every `Internal` status a call
+/// ends with, whatever its message. The server keeps the original in [`RpcFinished::error`] and
+/// logs it. Return the error that caused the failure with context, such as
+/// `Status::unavailable(format!("load user: {error}"))` or a status of another code, rather than
+/// an `Internal` status with a message for the caller.
+pub const INTERNAL_SERVER_ERROR: &str = "internal server error";
+
+/// The status to send a caller for a call that ended with `status`: an `Internal` status is
+/// replaced by one that says nothing of its cause, as the Go server does.
+fn wire_status(status: Status) -> Status {
+    if status.code() == Code::Internal {
+        Status::internal(INTERNAL_SERVER_ERROR)
+    } else {
+        status
+    }
 }
 
 impl Default for ServerState {
@@ -1899,20 +1928,20 @@ impl Server {
         let response_metadata = context.response.clone();
         let (finishes, intercepted) = self.intercept(&mut context, deadline, &cancellation).await;
         if let Err(status) = intercepted {
-            return self.finish_response(
-                &path,
-                request_body_len,
-                started_at,
-                Err(status),
-                finishes,
-            );
+            return context.span.in_scope(|| {
+                self.finish_response(&path, request_body_len, started_at, Err(status), finishes)
+            });
         }
 
         let span = context.span.clone();
         let result = match span.in_scope(|| invoke_unary_handler(handler, context, body)) {
             Ok(future) => {
-                match run_handler_with_deadline(future.instrument(span), deadline, &cancellation)
-                    .await
+                match run_handler_with_deadline(
+                    future.instrument(span.clone()),
+                    deadline,
+                    &cancellation,
+                )
+                .await
                 {
                     Ok(Ok(message)) => {
                         let headers = response_metadata.take_headers();
@@ -1927,7 +1956,9 @@ impl Server {
             Err(status) => Err(status),
         };
 
-        self.finish_response(&path, request_body_len, started_at, result, finishes)
+        span.in_scope(|| {
+            self.finish_response(&path, request_body_len, started_at, result, finishes)
+        })
     }
 
     /// Handles a streaming RPC request and returns response frames.
@@ -2067,15 +2098,18 @@ impl Server {
         };
 
         match handler_result {
-            Err(status) => self.finish_intercepted_status(
-                &path,
-                request_body_len,
-                started_at,
-                status,
-                finishes,
-            ),
+            Err(status) => span.in_scope(|| {
+                self.finish_intercepted_status(
+                    &path,
+                    request_body_len,
+                    started_at,
+                    status,
+                    finishes,
+                )
+            }),
             Ok(Ok(response_body)) => {
                 let headers = response_metadata.take_headers();
+                let completion_span = span.clone();
                 server_response_stream(
                     instrument_stream(response_body, span),
                     headers,
@@ -2086,6 +2120,7 @@ impl Server {
                         request_body_len,
                         started_at,
                         finishes,
+                        span: completion_span,
                     },
                     stream_limits,
                     cancellation,
@@ -2093,13 +2128,15 @@ impl Server {
             }
             Ok(Err(error)) => {
                 let status = error.into_status();
-                self.finish_intercepted_status(
-                    &path,
-                    request_body_len,
-                    started_at,
-                    status,
-                    finishes,
-                )
+                span.in_scope(|| {
+                    self.finish_intercepted_status(
+                        &path,
+                        request_body_len,
+                        started_at,
+                        status,
+                        finishes,
+                    )
+                })
             }
         }
     }
@@ -2190,33 +2227,30 @@ impl Server {
         finishes: Vec<Finish>,
     ) -> std::result::Result<ResponseEnvelope<Vec<u8>>, Status> {
         let elapsed = started_at.elapsed();
-        let (code, response_body_len) = match &result {
-            Ok(response) => (Code::Ok, response.message().len()),
-            Err(status) => (status.code(), 0),
-        };
+        let response_body_len = result
+            .as_ref()
+            .map_or(0, |response| response.message().len());
+        let error = result.as_ref().err();
 
         record_rpc_finished(
             self.inner.metrics.as_ref(),
             self.metrics_path(path),
             request_body_len,
             response_body_len,
-            code,
+            error,
             elapsed,
             finishes,
         );
-
-        let (service, method) = split_or_empty(path);
-        tracing::info!(
-            service,
-            method,
+        log_rpc_finished(
+            path,
             request_body_len,
             response_body_len,
-            status = ?code,
-            elapsed_ms = elapsed.as_millis(),
-            "rpc finished"
+            error,
+            elapsed,
+            false,
         );
 
-        result
+        result.map_err(wire_status)
     }
 
     fn finish_streaming_response(
@@ -2224,16 +2258,15 @@ impl Server {
         path: &str,
         request_body_len: usize,
         started_at: Instant,
-        response_body_len: usize,
-        code: Code,
+        error: &Status,
     ) {
         finish_streaming_response(
             self.inner.metrics.as_ref(),
             self.metrics_path(path),
             request_body_len,
             started_at,
-            response_body_len,
-            code,
+            0,
+            Some(error),
             Vec::new(),
         );
     }
@@ -2263,10 +2296,10 @@ impl Server {
             request_body_len,
             started_at,
             0,
-            status.code(),
+            Some(&status),
             finishes,
         );
-        status_stream(status)
+        status_stream(wire_status(status))
     }
 
     pub(crate) fn record_rejected_request(
@@ -2281,13 +2314,7 @@ impl Server {
             self.metrics_path(&request.method),
             request_body_len,
         );
-        self.finish_streaming_response(
-            &request.method,
-            request_body_len,
-            started_at,
-            0,
-            status.code(),
-        );
+        self.finish_streaming_response(&request.method, request_body_len, started_at, status);
     }
 
     pub(crate) fn record_active_request_failure(
@@ -2296,13 +2323,13 @@ impl Server {
         request_body_len: usize,
         status: &Status,
     ) {
-        self.finish_streaming_response(method, request_body_len, Instant::now(), 0, status.code());
+        self.finish_streaming_response(method, request_body_len, Instant::now(), status);
     }
 
     pub(crate) fn record_pre_handler_failure(&self, status: &Status) {
         let started_at = Instant::now();
         record_rpc_started(self.inner.metrics.as_ref(), self.metrics_path(""), 0);
-        self.finish_streaming_response("", 0, started_at, 0, status.code());
+        self.finish_streaming_response("", 0, started_at, status);
     }
 }
 
@@ -2727,23 +2754,28 @@ struct StreamingCompletion {
     started_at: Instant,
     /// The finish functions of the call's interceptors.
     finishes: Vec<Finish>,
+    /// The span the call runs in, which the log events of its end belong to.
+    span: tracing::Span,
 }
 
 impl StreamingCompletion {
-    fn finish(&mut self, response_body_len: usize, code: Code) {
-        finish_streaming_response(
-            self.metrics.as_ref(),
-            // The handler ran, so the server registers the method.
-            MetricsPath {
-                path: &self.path,
-                registered: true,
-            },
-            self.request_body_len,
-            self.started_at,
-            response_body_len,
-            code,
-            std::mem::take(&mut self.finishes),
-        );
+    /// Ends the call, which failed with `error` unless it is `None`.
+    fn finish(&mut self, response_body_len: usize, error: Option<&Status>) {
+        self.span.in_scope(|| {
+            finish_streaming_response(
+                self.metrics.as_ref(),
+                // The handler ran, so the server registers the method.
+                MetricsPath {
+                    path: &self.path,
+                    registered: true,
+                },
+                self.request_body_len,
+                self.started_at,
+                response_body_len,
+                error,
+                std::mem::take(&mut self.finishes),
+            );
+        });
     }
 }
 
@@ -2785,9 +2817,10 @@ impl ServerResponseStream {
         }
     }
 
-    fn finish(&mut self, code: Code) {
+    /// Ends the response, which failed with `error` unless it is `None`.
+    fn finish(&mut self, error: Option<&Status>) {
         self.done = true;
-        self.completion.finish(self.response_body_len, code);
+        self.completion.finish(self.response_body_len, error);
     }
 }
 
@@ -2863,19 +2896,19 @@ impl Stream for ServerResponseStream {
                     body.len(),
                 ) {
                     let status = error.into_status();
-                    this.finish(status.code());
-                    ResponseFrame::Status(status)
+                    this.finish(Some(&status));
+                    ResponseFrame::Status(wire_status(status))
                 } else {
                     ResponseFrame::message(body)
                 }
             }
             Err(error) => {
                 let status = error.into_status();
-                this.finish(status.code());
-                ResponseFrame::Status(status)
+                this.finish(Some(&status));
+                ResponseFrame::Status(wire_status(status))
             }
             Ok(None) => {
-                this.finish(Code::Ok);
+                this.finish(None);
                 ResponseFrame::Status(Status::ok().with_metadata(this.metadata.take_metadata()))
             }
         };
@@ -2886,22 +2919,24 @@ impl Stream for ServerResponseStream {
 impl Drop for ServerResponseStream {
     fn drop(&mut self) {
         if !self.done {
-            self.finish(
-                self.cancellation
-                    .completion_code()
-                    .unwrap_or(Code::Cancelled),
-            );
+            let code = self
+                .cancellation
+                .completion_code()
+                .unwrap_or(Code::Cancelled);
+            // No message: the call ended because the peer, the deadline or the server did.
+            self.finish((code != Code::Ok).then(|| Status::new(code, "")).as_ref());
         }
     }
 }
 
+/// Ends a streaming call that failed with `error` unless it is `None`.
 fn finish_streaming_response(
     metrics: &dyn Metrics,
     path: MetricsPath<'_>,
     request_body_len: usize,
     started_at: Instant,
     response_body_len: usize,
-    code: Code,
+    error: Option<&Status>,
     finishes: Vec<Finish>,
 ) {
     let elapsed = started_at.elapsed();
@@ -2911,21 +2946,60 @@ fn finish_streaming_response(
         path,
         request_body_len,
         response_body_len,
-        code,
+        error,
         elapsed,
         finishes,
     );
-
-    let (service, method) = split_or_empty(path.path);
-    tracing::info!(
-        service,
-        method,
+    log_rpc_finished(
+        path.path,
         request_body_len,
         response_body_len,
-        status = ?code,
-        elapsed_ms = elapsed.as_millis(),
-        "streaming rpc finished"
+        error,
+        elapsed,
+        true,
     );
+}
+
+/// Logs the end of a call, with the status that failed it, if any, and reports a failure with an
+/// `Internal` status as an error: the caller is told only that the server failed, so this is
+/// where its cause is recorded, in the span of the call if the caller is in it.
+fn log_rpc_finished(
+    path: &str,
+    request_body_len: usize,
+    response_body_len: usize,
+    error: Option<&Status>,
+    elapsed: Duration,
+    streaming: bool,
+) {
+    let (service, method) = split_or_empty(path);
+    let code = error.map_or(Code::Ok, Status::code);
+    let cause = error.map(tracing::field::display);
+    if streaming {
+        tracing::info!(
+            service,
+            method,
+            request_body_len,
+            response_body_len,
+            status = ?code,
+            error = cause,
+            elapsed_ms = elapsed.as_millis(),
+            "streaming rpc finished"
+        );
+    } else {
+        tracing::info!(
+            service,
+            method,
+            request_body_len,
+            response_body_len,
+            status = ?code,
+            error = cause,
+            elapsed_ms = elapsed.as_millis(),
+            "rpc finished"
+        );
+    }
+    if let Some(error) = error.filter(|error| error.code() == Code::Internal) {
+        tracing::error!(service, method, %error, "RPC failed with an internal error");
+    }
 }
 
 /// Splits a method path for metrics and logs, yielding empty names for a malformed path.
@@ -2962,7 +3036,7 @@ fn record_rpc_finished(
     path: MetricsPath<'_>,
     request_body_len: usize,
     response_body_len: usize,
-    code: Code,
+    error: Option<&Status>,
     elapsed: Duration,
     finishes: Vec<Finish>,
 ) {
@@ -2977,8 +3051,9 @@ fn record_rpc_finished(
         method: method.to_owned(),
         request_body_len,
         response_body_len,
-        code,
+        code: error.map_or(Code::Ok, Status::code),
         elapsed,
+        error: error.cloned(),
         registered: path.registered,
     };
     for finish in finishes.into_iter().rev() {
@@ -4760,6 +4835,164 @@ mod tests {
         assert_eq!(status.code(), Code::Internal);
         assert!(!status.message().contains("bug"), "{status:?}");
         assert_eq!(log.take(), ["outer SayHello Internal"]);
+    }
+
+    /// Records the status each finished call ended with, as the metrics and an interceptor's
+    /// finish function got it.
+    #[derive(Clone, Default)]
+    struct FinishedErrors {
+        metrics: Arc<Mutex<Vec<Option<Status>>>>,
+        interceptor: Arc<Mutex<Vec<Option<Status>>>>,
+    }
+
+    impl FinishedErrors {
+        /// The errors both observers recorded, which must agree.
+        fn take(&self) -> Vec<Option<Status>> {
+            let metrics = std::mem::take(&mut *self.metrics.lock().expect("lock"));
+            let interceptor = std::mem::take(&mut *self.interceptor.lock().expect("lock"));
+            assert_eq!(metrics, interceptor, "metrics and interceptors disagree");
+            metrics
+        }
+    }
+
+    impl Metrics for FinishedErrors {
+        fn rpc_finished(&self, event: &RpcFinished) {
+            assert_eq!(
+                event.code,
+                event.error.as_ref().map_or(Code::Ok, Status::code)
+            );
+            self.metrics.lock().expect("lock").push(event.error.clone());
+        }
+    }
+
+    #[crate::async_trait]
+    impl super::Interceptor for FinishedErrors {
+        async fn intercept(
+            &self,
+            _context: &mut RequestContext,
+        ) -> std::result::Result<Option<super::Finish>, Status> {
+            let errors = Arc::clone(&self.interceptor);
+            Ok(Some(Box::new(move |event: &RpcFinished| {
+                errors.lock().expect("lock").push(event.error.clone());
+            })))
+        }
+    }
+
+    fn finished_errors_server() -> (Server, FinishedErrors) {
+        let errors = FinishedErrors::default();
+        let mut server = Server::new();
+        server.set_metrics(errors.clone());
+        server.add_interceptor(errors.clone());
+        (server, errors)
+    }
+
+    #[tokio::test]
+    async fn an_internal_status_reaches_the_caller_redacted_and_rpc_finished_keeps_it() {
+        let (mut server, errors) = finished_errors_server();
+        server.route("/example.Errors/Ok", |_body| async { Ok(Vec::new()) });
+        server.route("/example.Errors/Internal", |_body| async {
+            Err(Status::internal("load user: connection refused").into())
+        });
+        server.route("/example.Errors/NotFound", |_body| async {
+            Err(Status::not_found("no such user").into())
+        });
+        server.route("/example.Errors/Panic", |_body| async { panic!("boom") });
+
+        let call = |method: &'static str| {
+            let server = server.clone();
+            async move {
+                server
+                    .handle_request(
+                        RpcRequest::new(format!("/example.Errors/{method}")),
+                        Vec::new(),
+                    )
+                    .await
+            }
+        };
+
+        call("Ok").await.expect("the call should succeed");
+        assert_eq!(errors.take(), [None]);
+
+        for (method, original) in [
+            ("Internal", "load user: connection refused"),
+            ("Panic", "RPC handler panicked"),
+        ] {
+            let status = call(method).await.expect_err("the call should fail");
+            assert_eq!(
+                status,
+                Status::internal(super::INTERNAL_SERVER_ERROR),
+                "{method}"
+            );
+            assert_eq!(
+                errors.take(),
+                [Some(Status::internal(original))],
+                "{method}"
+            );
+        }
+
+        // A status of another code is what the caller gets.
+        let status = call("NotFound").await.expect_err("the call should fail");
+        assert_eq!(status, Status::not_found("no such user"));
+        assert_eq!(errors.take(), [Some(Status::not_found("no such user"))]);
+
+        // So is one the server ends the call with.
+        let status = call("Missing").await.expect_err("the call should fail");
+        assert_eq!(status.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn an_internal_status_of_a_streaming_call_reaches_the_caller_redacted() {
+        let (mut server, errors) = finished_errors_server();
+        server.route_streaming(
+            "/example.Errors/Before",
+            RpcKind::ServerStreaming,
+            |_body, _requests| async {
+                Err(Status::internal("load user: connection refused").into())
+            },
+        );
+        server.route_streaming(
+            "/example.Errors/During",
+            RpcKind::ServerStreaming,
+            |_body, _requests| async {
+                let response: super::BoxStream<Vec<u8>> = Box::pin(futures_util::stream::iter([
+                    Ok(b"first".to_vec()),
+                    Err(Error::from(Status::internal("stream broke"))),
+                ]));
+                Ok(response)
+            },
+        );
+
+        let request = |method: &str| {
+            RpcRequest::new(format!("/example.Errors/{method}")).with_kind(RpcKind::ServerStreaming)
+        };
+        let redacted = Status::internal(super::INTERNAL_SERVER_ERROR);
+
+        let frames: Vec<_> = server
+            .handle_streaming_request(request("Before"), Vec::new(), crate::stream::empty())
+            .await
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            *frames[0].as_ref().expect("a frame"),
+            ResponseFrame::Status(redacted.clone())
+        );
+        assert_eq!(
+            errors.take(),
+            [Some(Status::internal("load user: connection refused"))]
+        );
+
+        let frames: Vec<_> = server
+            .handle_streaming_request(request("During"), Vec::new(), crate::stream::empty())
+            .await
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            *frames[1].as_ref().expect("a frame"),
+            ResponseFrame::Status(redacted)
+        );
+        assert_eq!(errors.take(), [Some(Status::internal("stream broke"))]);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry::trace::{Status as SpanStatus, TraceContextExt as _};
-use opentelemetry::{Context, global};
+use opentelemetry::{Context, KeyValue, global};
 use tracing::field::{Empty, display};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use trevrpc::server::{Finish, RequestContext, RpcFinished};
@@ -20,8 +20,11 @@ use crate::status::{server_error, status_code};
 /// (`trevrpc`), `rpc.method` and, when the transport knows the client's address, `client.address`
 /// and `client.port`. When the call ends it gets `rpc.response.status_code`, and an error status
 /// and `error.type` when the code means the server failed: `UNKNOWN`, `DEADLINE_EXCEEDED`,
-/// `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE` or `DATA_LOSS`. A streaming call ends when its
-/// response stream does.
+/// `UNIMPLEMENTED`, `INTERNAL`, `UNAVAILABLE` or `DATA_LOSS`; the status the call failed with, as
+/// [`RpcFinished::error`] has it, before the server redacts it for the caller, is recorded as an
+/// `exception` event then, so the trace says why the call failed even when the caller was only
+/// told `internal server error`. The span's status description is the status code, which is all
+/// the caller learns. A streaming call ends when its response stream does.
 ///
 /// A client's trace context is extracted from the request metadata with the propagator of
 /// [`Interceptor::with_propagator`], or the global one, and only continued with
@@ -115,6 +118,15 @@ impl trevrpc::server::Interceptor for Interceptor {
             if server_error(event.code) {
                 span.record("error.type", code);
                 span.set_status(SpanStatus::error(code));
+                if let Some(error) = &event.error {
+                    span.add_event(
+                        "exception",
+                        vec![
+                            KeyValue::new("exception.type", "trevrpc.Status"),
+                            KeyValue::new("exception.message", error.to_string()),
+                        ],
+                    );
+                }
             }
         })))
     }

@@ -54,7 +54,24 @@ type interceptedCall struct {
 	mu       sync.Mutex
 	finished bool
 	event    RPCFinished
+	// ctx is the context the last interceptor that ran returned, nil before
+	// the first, for the diagnostics about the call.
+	ctx      context.Context
 	finishes []func(RPCFinished)
+}
+
+// setContext records the context the interceptors have derived so far.
+func (c *interceptedCall) setContext(ctx context.Context) {
+	c.mu.Lock()
+	c.ctx = ctx
+	c.mu.Unlock()
+}
+
+// context returns the context recorded by setContext, or nil.
+func (c *interceptedCall) context() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ctx
 }
 
 // add records finish, or runs it if the call already ended.
@@ -91,7 +108,7 @@ func (c *interceptedCall) finish(r *serverRuntime, request *wireRequest, event R
 func (r *serverRuntime) runFinish(request *wireRequest, finish func(RPCFinished), event RPCFinished) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInterceptorPanic, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
+			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInterceptorPanic, Context: interceptedContext(request), Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
 		}
 	}()
 	finish(event)
@@ -109,16 +126,19 @@ func (r *serverRuntime) intercept(ctx context.Context, request *wireRequest) (co
 			call.add(r, request, finish)
 		}
 		if err != nil {
+			call.setContext(ctx)
 			return ctx, err
 		}
 		// The handler's response metadata and stream compression live in
 		// the call's state, which a context that does not derive from ctx
 		// would lose.
 		if !carriesCall(next, state) {
+			call.setContext(ctx)
 			return ctx, foreignContextStatus("interceptor")
 		}
 		ctx = next
 	}
+	call.setContext(ctx)
 	return ctx, nil
 }
 

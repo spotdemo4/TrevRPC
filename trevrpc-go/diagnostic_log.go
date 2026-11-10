@@ -49,14 +49,21 @@ func (p ServerDiagnosticPhase) Level() slog.Level {
 // LogDiagnostics returns a ServerDiagnosticHandler that logs each diagnostic
 // to logger, or slog.Default() when logger is nil, at the level of its phase
 // (see ServerDiagnosticPhase.Level). The message is "trevrpc: " and the phase;
-// the diagnostic's other fields that are set become attributes.
+// the diagnostic's other fields that are set become attributes. A diagnostic
+// about a call is logged with the call's context, ServerDiagnostic.Context, so
+// a handler of logger that reads trace IDs or other values from the context
+// can tie the record to the call; the context may already be done. Any other
+// is logged with context.Background().
 func LogDiagnostics(logger *slog.Logger) ServerDiagnosticHandler {
 	return func(diagnostic ServerDiagnostic) {
 		logger := logger
 		if logger == nil {
 			logger = slog.Default()
 		}
-		ctx := context.Background()
+		ctx := diagnostic.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		level := diagnostic.Phase.Level()
 		if !logger.Enabled(ctx, level) {
 			return

@@ -210,8 +210,7 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 		err = validateRequest(request)
 	}
 	if err != nil {
-		status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
-		runtime.recordRequestFailure(startedAt, request, 0, status)
+		status := runtime.failRequest(ctx, startedAt, request, 0, err)
 		writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 		return
 	}
@@ -230,8 +229,7 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 			if mux := datagrams.trevrpcDatagrams(); mux != nil {
 				flow, err := mux.register(request.DatagramFlow, request.rpcKind().streamsRequests(), options.MaxFrameSize, inflate)
 				if err != nil {
-					status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
-					runtime.recordRequestFailure(startedAt, request, 0, status)
+					status := runtime.failRequest(ctx, startedAt, request, 0, err)
 					writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 					return
 				}
@@ -250,8 +248,7 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 	if requestEndsAfterMessage(request.rpcKind()) {
 		body, err = readRequestMessage(requestCtx, options, startedAt, stream, reader)
 		if err != nil {
-			status := runtime.wireStatus(err, ServerDiagnosticInternalError, request)
-			runtime.recordRequestFailure(startedAt, request, 0, status)
+			status := runtime.failRequest(requestCtx, startedAt, request, 0, err)
 			writeStatusAndAbort(stream, status, options.MaxFrameSize, slot)
 			return
 		}

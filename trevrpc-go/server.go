@@ -269,7 +269,17 @@ const (
 
 // ServerDiagnostic describes a local server failure. Request bodies and metadata are never included.
 type ServerDiagnostic struct {
-	Phase                  ServerDiagnosticPhase
+	Phase ServerDiagnosticPhase
+	// Context is the context of the call the diagnostic is about, for the
+	// phases that belong to one call, such as a panic in a handler or an
+	// interceptor, an invalid handler response and an error that became
+	// Internal; it is nil for the others. It is the context the call's last
+	// interceptor returned, so it carries what interceptors put there, such as
+	// a tracing span, which lets a handler of the diagnostic log it with the
+	// call's trace. Diagnostics are delivered asynchronously, after the call
+	// has usually ended, so the context may already be done: use it for its
+	// values, not for its deadline or cancellation.
+	Context                context.Context
 	Message                string
 	RemoteAddr             string
 	Service                string
@@ -342,6 +352,17 @@ type RPCFinished struct {
 	ResponseBodyLen int
 	Code            Code
 	Elapsed         time.Duration
+	// Err is the error the call ended with, nil when it succeeded: what the
+	// handler, an interceptor, the authorizer or a request or response stream
+	// returned, or the panic that ended the call, as the server saw it. It is
+	// not what the caller sees: an error that is not a *Status, and a *Status
+	// with code Internal, reach the caller as Internal with the message
+	// "internal server error", and Err is the original, so it can say why the
+	// call failed. A call the server ends for another reason, such as an
+	// unknown method or a deadline, has a *Status as Err. Err stays on the
+	// server and is never sent, but it may contain what the caller must not
+	// see, so log it rather than return it.
+	Err error
 	// Registered reports whether Service and Method name a registered method,
 	// as for RPCStarted.
 	Registered bool
@@ -1004,12 +1025,18 @@ func (e *serverPanicError) Error() string {
 
 func internalServerStatus() *Status { return Internal("internal server error") }
 
-func (r *serverRuntime) wireStatus(err error, phase ServerDiagnosticPhase, request *wireRequest) *Status {
+// wireStatus returns the STATUS to send for err, the error a call ended with.
+// An error that is not a *Status with a code other than Internal, or whose
+// metadata is invalid, becomes Internal with a message that says nothing of
+// it, and is reported as a diagnostic of phase (or of the phase of the panic
+// that caused it), with the context of the call, ctx or what its
+// interceptors derived from it.
+func (r *serverRuntime) wireStatus(ctx context.Context, err error, phase ServerDiagnosticPhase, request *wireRequest) *Status {
 	if err == nil {
 		return OK()
 	}
 	if panicErr, ok := errors.AsType[*serverPanicError](err); ok {
-		r.emitDiagnostic(ServerDiagnostic{Phase: panicErr.phase, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err, Panic: panicErr.recovered, Stack: panicErr.stack})
+		r.emitDiagnostic(ServerDiagnostic{Phase: panicErr.phase, Context: diagnosticContext(ctx, request), Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err, Panic: panicErr.recovered, Stack: panicErr.stack})
 		return internalServerStatus()
 	}
 	if status, ok := errors.AsType[*Status](err); ok && status.Code != CodeInternal {
@@ -1017,8 +1044,28 @@ func (r *serverRuntime) wireStatus(err error, phase ServerDiagnosticPhase, reque
 			return status.clone()
 		}
 	}
-	r.emitDiagnostic(ServerDiagnostic{Phase: phase, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})
+	r.emitDiagnostic(ServerDiagnostic{Phase: phase, Context: diagnosticContext(ctx, request), Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})
 	return internalServerStatus()
+}
+
+// diagnosticContext returns the context to report a diagnostic of request
+// with: the context its last interceptor returned, which carries what the
+// interceptors added to ctx, or else ctx, the context the call's handler would
+// otherwise get, which may be nil.
+func diagnosticContext(ctx context.Context, request *wireRequest) context.Context {
+	if intercepted := interceptedContext(request); intercepted != nil {
+		return intercepted
+	}
+	return ctx
+}
+
+// interceptedContext returns the context the last interceptor of request
+// returned, or nil if none ran.
+func interceptedContext(request *wireRequest) context.Context {
+	if request == nil || request.intercepted == nil {
+		return nil
+	}
+	return request.intercepted.context()
 }
 
 func requestService(request *wireRequest) string {
@@ -1139,7 +1186,7 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 	startedAt := time.Now()
 	if request == nil {
 		r.recordStarted(RPCStarted{}, nil)
-		return r.finishResponse("", "", 0, startedAt, failedUnaryResponse(InvalidArgument("RPC request is nil")), nil)
+		return r.finishResponse("", "", 0, startedAt, failedUnaryResponse(InvalidArgument("RPC request is nil")), nil, nil)
 	}
 	service, method := request.serviceAndMethod()
 	requestBodyLen := len(body)
@@ -1147,19 +1194,19 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 
 	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
 	if err != nil {
-		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(err, ServerDiagnosticInternalError, request)), request)
+		return r.finishFailedResponse(ctx, service, method, requestBodyLen, startedAt, err, request)
 	}
 	defer cancel()
 
 	route, ok := r.routes[request.Method]
 	if !ok || route.unary == nil {
-		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(Unimplemented(fmt.Sprintf("unknown RPC method %s", request.Method))), request)
+		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(Unimplemented(fmt.Sprintf("unknown RPC method %s", request.Method))), nil, request)
 	}
 	message, err := invokeUnaryHandler(ctx, r.interceptUnary(route.unary, request), body, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
-		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(err, ServerDiagnosticInternalError, request)), request)
+		return r.finishFailedResponse(ctx, service, method, requestBodyLen, startedAt, err, request)
 	}
-	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message, request), request)
+	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message, request), nil, request)
 }
 
 func failedUnaryResponse(status *Status) *unaryResponse {
@@ -1238,7 +1285,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if request == nil {
 		r.recordStarted(RPCStarted{}, nil)
 		lease.release()
-		return r.finishStreamingStatus("", "", 0, startedAt, InvalidArgument("RPC request is nil"), nil)
+		return r.finishStreamingStatus("", "", 0, startedAt, InvalidArgument("RPC request is nil"), nil, nil)
 	}
 	service, method := request.serviceAndMethod()
 	requestBodyLen := len(body)
@@ -1248,7 +1295,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if err != nil {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request), request)
+		return r.finishFailedStreaming(ctx, service, method, requestBodyLen, startedAt, err, request)
 	}
 
 	limits := streamLimitsFromOptions(r.options)
@@ -1258,12 +1305,12 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if !ok || route.streaming == nil {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown streaming RPC method %s", request.Method)), request)
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown streaming RPC method %s", request.Method)), nil, request)
 	}
 	if route.kind != request.rpcKind() {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s: expected %d, got %d", request.Method, route.kind, request.rpcKind())), request)
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s: expected %d, got %d", request.Method, route.kind, request.rpcKind())), nil, request)
 	}
 	// Stream compression is negotiated once the call is authorized and
 	// routed, so that an unauthorized caller can neither probe routes nor
@@ -1274,7 +1321,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if refused {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, refusedStreamCompression(), request)
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, refusedStreamCompression(), nil, request)
 	}
 	request.streams = streams
 	setCallStreams(ctx, streams)
@@ -1287,7 +1334,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		if err := r.sendAnswerAtDispatch(writer, request); err != nil {
 			cancel()
 			lease.release()
-			return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request), request)
+			return r.finishFailedStreaming(ctx, service, method, requestBodyLen, startedAt, err, request)
 		}
 	}
 
@@ -1295,13 +1342,14 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if err != nil {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(err, ServerDiagnosticInternalError, request), request)
+		return r.finishFailedStreaming(ctx, service, method, requestBodyLen, startedAt, err, request)
 	}
 	if responses == nil {
 		cancel()
 		lease.release()
-		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Service: service, Method: method, Kind: request.rpcKind(), Err: errors.New("handler returned nil response stream")})
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), request)
+		err := errors.New("handler returned nil response stream")
+		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Context: diagnosticContext(ctx, request), Service: service, Method: method, Kind: request.rpcKind(), Err: err})
+		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), err, request)
 	}
 	responses = closeStreamOnContext(ctx, responses)
 	metadata := responseMetadataFromContext(ctx)
@@ -1543,39 +1591,78 @@ func requestContext(ctx context.Context, request *wireRequest) (context.Context,
 	return contextWithHandlerContext(ctx, request), cancel, nil
 }
 
-func (r *serverRuntime) finishResponse(service, method string, requestBodyLen int, startedAt time.Time, response *unaryResponse, request *wireRequest) *unaryResponse {
-	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: response.message.size, Code: response.status.Code, Elapsed: time.Since(startedAt)}, request)
+// failureCause returns err, the error a call ended with, or else status, the
+// STATUS it ends with, for a failure the server decided on itself, such as an
+// unknown method. It is nil for a call that succeeded.
+func failureCause(err error, status *Status) error {
+	if err != nil {
+		return err
+	}
+	if status != nil && status.Code != CodeOK {
+		return status
+	}
+	return nil
+}
+
+// finishResponse records the end of a unary call that ended with response, and
+// with err if it failed.
+func (r *serverRuntime) finishResponse(service, method string, requestBodyLen int, startedAt time.Time, response *unaryResponse, err error, request *wireRequest) *unaryResponse {
+	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: response.message.size, Code: response.status.Code, Err: failureCause(err, response.status), Elapsed: time.Since(startedAt)}, request)
 	return response
 }
 
-func (r *serverRuntime) finishStreamingStatus(service, method string, requestBodyLen int, startedAt time.Time, status *Status, request *wireRequest) responseWriter {
-	r.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code, request)
+// finishFailedResponse is finishResponse for a unary call that ended with err,
+// whose STATUS wireStatus decides.
+func (r *serverRuntime) finishFailedResponse(ctx context.Context, service, method string, requestBodyLen int, startedAt time.Time, err error, request *wireRequest) *unaryResponse {
+	return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request)), err, request)
+}
+
+// finishStreamingStatus records the end of a streaming call that ended with
+// status before it had a response, and with err if it failed.
+func (r *serverRuntime) finishStreamingStatus(service, method string, requestBodyLen int, startedAt time.Time, status *Status, err error, request *wireRequest) responseWriter {
+	r.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code, failureCause(err, status), request)
 	return statusResponse{status: status}
 }
 
-func (r *serverRuntime) recordRejectedRequest(startedAt time.Time, request *wireRequest, requestBodyLen int, status *Status) {
-	r.recordRequestFailure(startedAt, request, requestBodyLen, status)
+// finishFailedStreaming is finishStreamingStatus for a call that ended with
+// err, whose STATUS wireStatus decides.
+func (r *serverRuntime) finishFailedStreaming(ctx context.Context, service, method string, requestBodyLen int, startedAt time.Time, err error, request *wireRequest) responseWriter {
+	return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err, request)
 }
 
-func (r *serverRuntime) recordRequestFailure(startedAt time.Time, request *wireRequest, requestBodyLen int, status *Status) {
+func (r *serverRuntime) recordRejectedRequest(startedAt time.Time, request *wireRequest, requestBodyLen int, status *Status) {
+	r.recordRequestFailure(startedAt, request, requestBodyLen, status, nil)
+}
+
+// recordRequestFailure records the start and the end of a call that failed
+// with status, and err if it has one, before reaching a handler.
+func (r *serverRuntime) recordRequestFailure(startedAt time.Time, request *wireRequest, requestBodyLen int, status *Status, err error) {
 	r.recordStarted(RPCStarted{Service: requestService(request), Method: requestMethod(request), RequestBodyLen: requestBodyLen}, request)
-	r.finishStreamingResponse(requestService(request), requestMethod(request), requestBodyLen, 0, startedAt, status.Code, request)
+	r.finishStreamingResponse(requestService(request), requestMethod(request), requestBodyLen, 0, startedAt, status.Code, failureCause(err, status), request)
+}
+
+// failRequest is recordRequestFailure for a call that failed with err, whose
+// STATUS wireStatus decides and failRequest returns.
+func (r *serverRuntime) failRequest(ctx context.Context, startedAt time.Time, request *wireRequest, requestBodyLen int, err error) *Status {
+	status := r.wireStatus(ctx, err, ServerDiagnosticInternalError, request)
+	r.recordRequestFailure(startedAt, request, requestBodyLen, status, err)
+	return status
 }
 
 func (r *serverRuntime) recordPreHandlerFailure(startedAt time.Time, status *Status) {
 	r.recordStarted(RPCStarted{}, nil)
-	r.finishStreamingResponse("", "", 0, 0, startedAt, status.Code, nil)
+	r.finishStreamingResponse("", "", 0, 0, startedAt, status.Code, status, nil)
 }
 
-func (r *serverRuntime) finishStreamingResponse(service, method string, requestBodyLen, responseBodyLen int, startedAt time.Time, code Code, request *wireRequest) {
-	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: responseBodyLen, Code: code, Elapsed: time.Since(startedAt)}, request)
+func (r *serverRuntime) finishStreamingResponse(service, method string, requestBodyLen, responseBodyLen int, startedAt time.Time, code Code, err error, request *wireRequest) {
+	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: responseBodyLen, Code: code, Err: err, Elapsed: time.Since(startedAt)}, request)
 }
 
 func (r *serverRuntime) recordStarted(event RPCStarted, request *wireRequest) {
 	event.Registered = r.registered(request)
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
+			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Context: interceptedContext(request), Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
 		}
 	}()
 	r.metrics.RPCStarted(event)
@@ -1588,7 +1675,7 @@ func (r *serverRuntime) recordFinished(event RPCFinished, request *wireRequest) 
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
+			r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticMetricsPanic, Context: interceptedContext(request), Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Panic: recovered, Stack: debug.Stack()})
 		}
 	}()
 	r.metrics.RPCFinished(event)
@@ -1765,7 +1852,10 @@ type serverResponseStream struct {
 
 type responseStreamItem struct {
 	message encodedMessage
-	status  *Status
+	// status is the terminal STATUS, once the response ends, and err the error
+	// it ends with, if it is a failure the response stream returned.
+	status *Status
+	err    error
 }
 
 // headersFrames returns the ANSWER, if the call has one it did not send at
@@ -1813,7 +1903,7 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 		}
 		var err error
 		if headers, err = s.headersFrames(maxFrameSize); err != nil {
-			return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request), beforeStatus)
+			return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(s.ctx, err, ServerDiagnosticInternalError, s.request), err, beforeStatus)
 		}
 		if headers != nil && (s.readAhead != nil || s.flow != nil) {
 			if _, err := writer.Write(headers); err != nil {
@@ -1831,6 +1921,7 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 	size := len(headers)
 	batchByteLimit := responseFrameBatchByteLimit(maxFrameSize)
 	var final *Status
+	var finalErr error
 	for len(batch) < handlerReadAheadMessages {
 		if len(batch) > 0 && s.readAhead == nil {
 			// A stream read ahead checks the call where it hands out a message.
@@ -1853,7 +1944,7 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 			item.status = s.acceptResponseMessage(item.message)
 		}
 		if item.status != nil {
-			final = item.status
+			final, finalErr = item.status, item.err
 			break
 		}
 		if item.message.size > maxFrameSize {
@@ -1874,7 +1965,7 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 	}
 
 	if final != nil {
-		return s.writeFinalFrames(writer, maxFrameSize, headers, batch, final, beforeStatus)
+		return s.writeFinalFrames(writer, maxFrameSize, headers, batch, final, finalErr, beforeStatus)
 	}
 	switch {
 	case len(batch) == 0 && len(headers) == 0:
@@ -1888,9 +1979,9 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 }
 
 // writeFinalFrames writes headers and messages followed by the terminal STATUS
-// and finishes the response.
-func (s *serverResponseStream) writeFinalFrames(writer io.Writer, maxFrameSize int, headers []byte, messages []encodedMessage, status *Status, beforeStatus func()) (bool, error) {
-	s.finish(status.Code)
+// and finishes the response, which ended with err if it failed.
+func (s *serverResponseStream) writeFinalFrames(writer io.Writer, maxFrameSize int, headers []byte, messages []encodedMessage, status *Status, err error, beforeStatus func()) (bool, error) {
+	s.finish(status.Code, failureCause(err, status))
 	return true, s.writeJoined(writer, headers, messages, status, maxFrameSize, beforeStatus)
 }
 
@@ -1938,14 +2029,23 @@ func (s *serverResponseStream) trevrpcContextCancelsRecv() bool {
 
 func (s *serverResponseStream) Close() error {
 	if !s.done {
-		s.finish(CodeCancelled)
+		cause := s.ctx.Err()
+		if cause == nil {
+			cause = errResponseClosed
+		}
+		s.finish(CodeCancelled, cause)
 	}
 	s.buffer = nil
 
 	return nil
 }
 
-func (s *serverResponseStream) finish(code Code) {
+// errResponseClosed is the error of a response that was closed before it
+// finished while its call was still live, such as after a failed write.
+var errResponseClosed = errors.New("response closed before it finished")
+
+// finish ends the response, which ended with code, and err if it failed.
+func (s *serverResponseStream) finish(code Code, err error) {
 	s.finishOnce.Do(func() {
 		s.done = true
 		// The receiver goes first, so it can tell a call the peer or a
@@ -1953,7 +2053,7 @@ func (s *serverResponseStream) finish(code Code) {
 		s.closeReceiver()
 		s.cancel()
 		discardMessageStream(s.responses)
-		s.runtime.recordFinished(RPCFinished{Service: s.service, Method: s.method, RequestBodyLen: s.requestBodyLen, ResponseBodyLen: s.responseBodyLen, Code: code, Elapsed: time.Since(s.startedAt)}, s.request)
+		s.runtime.recordFinished(RPCFinished{Service: s.service, Method: s.method, RequestBodyLen: s.requestBodyLen, ResponseBodyLen: s.responseBodyLen, Code: code, Err: err, Elapsed: time.Since(s.startedAt)}, s.request)
 		s.lease.release()
 	})
 }
@@ -1982,7 +2082,7 @@ func (s *serverResponseStream) readNextResponseItem(wait bool) (responseStreamIt
 	if s.readAhead != nil {
 		item, ok, waitErr := s.readAhead.next(wait)
 		if waitErr != nil {
-			return responseStreamItem{status: s.runtime.wireStatus(waitErr, ServerDiagnosticInternalError, s.request)}, true
+			return responseStreamItem{status: s.runtime.wireStatus(s.ctx, waitErr, ServerDiagnosticInternalError, s.request), err: waitErr}, true
 		}
 		if !ok {
 			return responseStreamItem{}, false
@@ -1995,7 +2095,7 @@ func (s *serverResponseStream) readNextResponseItem(wait bool) (responseStreamIt
 		return responseStreamItem{status: s.terminalResponseStatus()}, true
 	}
 	if err != nil {
-		return responseStreamItem{status: s.runtime.wireStatus(err, ServerDiagnosticInternalError, s.request)}, true
+		return responseStreamItem{status: s.runtime.wireStatus(s.ctx, err, ServerDiagnosticInternalError, s.request), err: err}, true
 	}
 
 	return responseStreamItem{message: message}, true
