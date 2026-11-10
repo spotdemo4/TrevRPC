@@ -1,5 +1,5 @@
 import { Code, TrevRpcError, createClient } from "@trevrpc/trevrpc-js";
-import { Effect, Stream } from "effect";
+import { Cause, Effect, Stream } from "effect";
 
 /** Returns a `TrevRpcError` as is, and wraps anything else in one with `Code.Unknown`. */
 export function toTrevRpcError(error) {
@@ -49,7 +49,7 @@ function liftServerStreaming(call) {
       Effect.gen(function* () {
         const signal = yield* abortOnClose;
         const responses = yield* open(() => call(request, withSignal(options, signal)));
-        return Stream.fromAsyncIterable(responses, toTrevRpcError);
+        return responseStream(responses);
       }),
     );
 }
@@ -84,13 +84,25 @@ function liftBidirectionalStreaming(call) {
         );
         // The responses decide when the stream ends: their end stops an unfinished upload,
         // while a failed request stream fails the whole stream.
-        return Stream.merge(
-          Stream.fromAsyncIterable(stream, toTrevRpcError),
-          Stream.drain(Stream.fromEffect(sending)),
-          { haltStrategy: "left" },
-        );
+        return Stream.merge(responseStream(stream), Stream.drain(Stream.fromEffect(sending)), {
+          haltStrategy: "left",
+        });
       }),
     );
+}
+
+/**
+ * The stream of a call's response messages, in which each chunk holds the messages that
+ * `recvAvailable()` returns together: those that arrived in the same network reads. Pulling a
+ * chunk costs one promise turn however many messages it holds. Ending the stream does not cancel
+ * the call; the signal that `abortOnClose` provides does.
+ */
+function responseStream(call) {
+  const pull = Effect.tryPromise({
+    try: () => call.recvAvailable(),
+    catch: toTrevRpcError,
+  }).pipe(Effect.flatMap((batch) => (batch === undefined ? Cause.done() : Effect.succeed(batch))));
+  return Stream.fromPull(Effect.succeed(pull));
 }
 
 /**

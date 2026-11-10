@@ -154,6 +154,44 @@ export class FrameReader {
    * against maxFrameSize before any payload is read or allocated.
    */
   async readFrame(maxFrameSize = DefaultMaxFrameSize) {
+    // Frames already buffered in full cost no await.
+    return this.tryReadFrame(maxFrameSize) ?? (await this.#readSplitFrame(maxFrameSize));
+  }
+
+  /**
+   * Reads the next known frame like readFrame() if all of its bytes were received already, and
+   * returns undefined, consuming nothing of it, if the reader has to wait for more. It never reads
+   * from the underlying reader, so it neither learns of the end of the stream nor cancels a read
+   * in flight: call it only while no readFrame() is pending. Unknown frames received in full
+   * before it are skipped. A frame whose declared length exceeds maxFrameSize throws, as in
+   * readFrame(), and stays unread.
+   */
+  tryReadFrame(maxFrameSize = DefaultMaxFrameSize) {
+    for (;;) {
+      const pending = this.#pending;
+      const type = readVarint(pending, 0);
+      const length = type === null ? null : readVarint(pending, type.next);
+      if (length === null) {
+        return undefined;
+      }
+      checkFrameLength(length.value, maxFrameSize);
+      const end = length.next + length.value;
+      if (pending.byteLength < end) {
+        return undefined;
+      }
+      this.#pending = pending.subarray(end);
+      // Types of 2^53 and above are bigints, which are never known.
+      if (KnownFrameTypes.has(type.value)) {
+        return { type: type.value, payload: pending.subarray(length.next, end) };
+      }
+    }
+  }
+
+  /**
+   * Reads the next known frame when it is not buffered in full, waiting for the chunks that
+   * complete it; null at a clean end between frames.
+   */
+  async #readSplitFrame(maxFrameSize) {
     for (;;) {
       const type = await this.#readVarint(true);
       if (type === null) {

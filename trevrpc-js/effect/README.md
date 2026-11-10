@@ -46,7 +46,8 @@ const replies = greeter.chat(
 - **Cancellation.** Interrupting an effect or stream cancels its call, which the server sees as `CANCELLED`; so does taking part of a response stream (`Stream.take`) or a failure elsewhere in the program. A `signal` in the call options also cancels the call.
 - **Request streams.** Client-streaming and bidirectional calls pull their requests from the stream as the transport accepts them, so a request stream is only consumed as fast as the server reads it. When the server ends the call first, the rest of the stream is not pulled, and the server's outcome is the result: its response or response stream if it succeeded, or its `TrevRpcError`. A request stream that fails cancels the call, and the call fails with the request stream's error. So does a request that does not encode or that the client's [validator](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide#request-validation) rejects: the call fails with its `TrevRpcError`.
 - **Errors.** Calls fail with the `TrevRpcError` of the [client](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide#errors-cancellation-and-streams), whose `_tag` is `"TrevRpcError"`, so `Effect.catchTag("TrevRpcError", ...)` handles it. Anything else a call rejects with becomes a `TrevRpcError` with `Code.Unknown` and the original as `cause`, as `toTrevRpcError(error)` does.
-- **Rendering.** Response streams deliver buffered messages without returning to the event loop, as the client does; see [Rendering long streams](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide#rendering-long-streams) before rendering a long stream message by message.
+- **Chunks.** Each chunk of a response stream holds the messages that arrived together, those of the [client's](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide#errors-cancellation-and-streams) `batches()`, so chunk boundaries follow the network: `Stream.runForEachArray(responses, (chunk) => ...)` handles every message that has arrived in one go, and costs one effect per chunk rather than one per message. A chunk is never empty, and a failure comes after the chunk of the messages before it.
+- **Rendering.** Response streams deliver buffered messages without returning to the event loop, as the client does; see [Rendering long streams](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide#rendering-long-streams) before rendering a long stream, and update a view once per chunk.
 
 ## Development
 
@@ -57,5 +58,7 @@ npm ci --prefix ..
 npm ci
 npm run check      # format check, lint, typecheck, tests
 ```
+
+`npm run bench` measures what a server stream costs per message and how many chunks it arrives in, over the same in-memory server (options: `--messages`, `--size`, `--chunk`, `--runs`).
 
 The tests run the real client against the in-memory server of trevrpc-js's own tests. `nix build .#trevrpc-js-effect` runs them against the built trevrpc-js, and checks the published files.

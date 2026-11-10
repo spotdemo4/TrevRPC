@@ -5,7 +5,8 @@ import { Code, TrevRpcError } from "@trevrpc/trevrpc-js";
 import { Cause, Effect, Exit, Stream } from "effect";
 
 // The in-memory server of trevrpc-js's own tests, which runs the real client end to end.
-import { deferred, fakeTransport } from "../../test/support.js";
+import { encodeMessageFrame, encodeStatusFrame, marshalMessage } from "../../src/framing.js";
+import { concatBytes, deferred, fakeTransport } from "../../test/support.js";
 import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/test/gen/echo_pb.js";
 import { createEffectClient, toTrevRpcError } from "../src/index.js";
 
@@ -39,6 +40,11 @@ async function echoAll(stream) {
 /** Resolves with true once the client cancels the call's response stream. */
 function watchCancellation(stream, cancelled) {
   stream.responseCancelled.then(cancelled.resolve);
+}
+
+/** The OK STATUS frame that ends a call. */
+function encodeStatusOk() {
+  return encodeStatusFrame({ code: Code.Ok, message: "", metadata: {} });
 }
 
 /** The typed error a failed exit carries. */
@@ -393,6 +399,110 @@ test("taking part of a bidirectional stream cancels the call", async () => {
     Array.from(responses, (response) => response.message),
     ["0", "1", "2"],
   );
+  assert.equal(await cancelled.promise, true);
+});
+
+/** The frames of responses with the messages `names`, in one buffer, to write in one go. */
+function responseFrames(...names) {
+  return concatBytes(
+    names.map((message) => encodeMessageFrame(marshalMessage(EchoResponse, { message }))),
+  );
+}
+
+/** Runs `stream` to its end, recording the messages of each chunk; the exit comes last. */
+async function chunksOf(stream) {
+  const chunks = [];
+  const exit = await Effect.runPromiseExit(
+    Stream.runForEachArray(stream, (chunk) =>
+      Effect.sync(() => chunks.push(chunk.map((response) => response.message))),
+    ),
+  );
+  return { chunks, exit };
+}
+
+test("a server stream emits the messages that arrive together as one chunk", async () => {
+  const { echo, transport } = setup(async (stream) => {
+    await stream.write(concatBytes([responseFrames("a", "b", "c"), encodeStatusOk()]));
+    await stream.finish();
+  });
+  const { chunks, exit } = await chunksOf(echo.serverStream({}));
+  assert.ok(Exit.isSuccess(exit));
+  assert.deepEqual(chunks, [["a", "b", "c"]]);
+  await transport.settled();
+});
+
+test("chunk boundaries of a server stream follow the network reads", async () => {
+  const seen = deferred();
+  const { echo, transport } = setup(async (stream) => {
+    await stream.write(responseFrames("a", "b"));
+    await seen.promise;
+    await stream.write(concatBytes([responseFrames("c", "d", "e"), encodeStatusOk()]));
+    await stream.finish();
+  });
+  const chunks = [];
+  const exit = await Effect.runPromiseExit(
+    Stream.runForEachArray(echo.serverStream({}), (chunk) =>
+      Effect.sync(() => {
+        chunks.push(chunk.map((response) => response.message));
+        seen.resolve();
+      }),
+    ),
+  );
+  assert.ok(Exit.isSuccess(exit));
+  assert.deepEqual(chunks, [
+    ["a", "b"],
+    ["c", "d", "e"],
+  ]);
+  await transport.settled();
+});
+
+test("a server stream fails with the final status after the chunk of its messages", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.write(
+      concatBytes([
+        responseFrames("a", "b"),
+        encodeStatusFrame({ code: Code.Aborted, message: "stop", metadata: {} }),
+      ]),
+    );
+    await stream.finish();
+  });
+  const { chunks, exit } = await chunksOf(echo.serverStream({}));
+  assert.deepEqual(chunks, [["a", "b"]]);
+  assertStatus(failure(exit), Code.Aborted);
+});
+
+test("a bidirectional stream emits the responses that arrive together as one chunk", async () => {
+  const { echo, transport } = setup(async (stream) => {
+    const requests = [];
+    for (let request; (request = await stream.readMessage(EchoRequest)) !== null;) {
+      requests.push(request.message);
+    }
+    await stream.write(concatBytes([responseFrames(...requests), encodeStatusOk()]));
+    await stream.finish();
+  });
+  const requests = Stream.fromIterable(["1", "2", "3", "4"]).pipe(
+    Stream.map((message) => ({ message })),
+  );
+  const { chunks, exit } = await chunksOf(echo.bidi(requests));
+  assert.ok(Exit.isSuccess(exit));
+  assert.deepEqual(chunks, [["1", "2", "3", "4"]]);
+  await transport.settled();
+});
+
+test("interrupting a server stream that waits for its next chunk cancels the call", async () => {
+  const cancelled = deferred();
+  const { echo } = setup(async (stream) => {
+    watchCancellation(stream, cancelled);
+    await stream.write(responseFrames("a", "b"));
+  });
+  const seen = [];
+  const exit = await Effect.runPromiseExit(
+    Stream.runForEachArray(echo.serverStream({}), (chunk) =>
+      Effect.sync(() => seen.push(chunk.length)),
+    ).pipe(Effect.timeout("50 millis")),
+  );
+  assert.ok(Exit.isFailure(exit));
+  assert.deepEqual(seen, [2]);
   assert.equal(await cancelled.promise, true);
 });
 

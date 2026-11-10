@@ -549,6 +549,51 @@ test("unknown frames are skipped wherever they appear", async () => {
   }
 });
 
+test("tryReadFrame returns the frames received in full without reading, and keeps the rest", async () => {
+  const frames = ["a", "b", "c", "d"].map((text) => encodeMessageFrame(bytes(text)));
+  const unknown = encodeFrame(0x21, new Uint8Array(9));
+  const first = concatBytes([frames[0], frames[1], unknown, frames[2], frames[3].subarray(0, 1)]);
+  const reader = new FrameReader(readerOf([first, frames[3].subarray(1)]));
+  assert.equal(reader.tryReadFrame(), undefined, "nothing was received yet");
+
+  assert.deepEqual((await reader.readFrame()).payload, bytes("a"));
+  assert.deepEqual(reader.tryReadFrame().payload, bytes("b"));
+  assert.deepEqual(reader.tryReadFrame().payload, bytes("c"), "the unknown frame is skipped");
+  assert.equal(reader.tryReadFrame(), undefined, "d is cut off");
+  assert.equal(reader.tryReadFrame(), undefined, "and stays so");
+  assert.deepEqual((await reader.readFrame()).payload, bytes("d"));
+  assert.equal(reader.tryReadFrame(), undefined);
+  assert.equal(await reader.readFrame(), null);
+});
+
+test("tryReadFrame sees a header split inside a varint as incomplete", async () => {
+  const wire = encodeFrame(0x3fff, new Uint8Array(0)); // a 2-byte type
+  const message = encodeMessageFrame(bytes("x"));
+  const reader = new FrameReader(
+    readerOf([concatBytes([message, wire.subarray(0, 1)]), wire.subarray(1)]),
+  );
+  assert.deepEqual((await reader.readFrame()).payload, bytes("x"));
+  assert.equal(reader.tryReadFrame(), undefined);
+  assert.equal(await reader.readFrame(), null);
+});
+
+test("tryReadFrame rejects oversized frames, as readFrame does, and leaves them unread", async () => {
+  const wire = concatBytes([
+    encodeMessageFrame(bytes("ok")),
+    encodeFrame(0x21, new Uint8Array(17)),
+  ]);
+  const reader = new FrameReader(readerOf([wire]));
+  assert.deepEqual((await reader.readFrame()).payload, bytes("ok"));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    assert.throws(
+      () => reader.tryReadFrame(16),
+      (error) => error.code === Code.ResourceExhausted,
+    );
+  }
+  await assert.rejects(reader.readFrame(16), (error) => error.code === Code.ResourceExhausted);
+  assert.equal(await reader.readFrame(17), null);
+});
+
 test("unknown frames count toward the frame size limit", async () => {
   const wire = encodeFrame(0x21, new Uint8Array(17));
   await assert.rejects(

@@ -650,6 +650,20 @@ export class Call {
   }
 
   /**
+   * Reads the next known response frame like readFrame() if it was received in full already, and
+   * returns undefined without waiting otherwise; see FrameReader.tryReadFrame. Call it only while
+   * no readFrame() is pending.
+   */
+  tryReadFrame() {
+    throwIfAborted(this.signal);
+    try {
+      return this.#frames.tryReadFrame(this.#maxFrameSize);
+    } catch (error) {
+      throw statusFromTransportError(error);
+    }
+  }
+
+  /**
    * Ends the call after its final status was received: `error` for a failed call, undefined for
    * an OK one. An unfinished upload stops: pending and later sends fail with `error`, or with a
    * Cancelled status saying the server completed the call early, and the request side is reset.

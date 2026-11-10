@@ -262,6 +262,7 @@ export interface StreamStatus {
  *
  * Buffered messages are delivered without returning to the event loop, so a page that renders a
  * long stream must yield to let the browser render; see "Rendering long streams" in the guide.
+ * `batches()` hands over the messages that arrived together as one array instead.
  */
 export interface ResponseStream<TResponse> extends AsyncIterable<TResponse> {
   /** Settles with the final status, or rejects with the error that ended the call. */
@@ -272,6 +273,17 @@ export interface ResponseStream<TResponse> extends AsyncIterable<TResponse> {
    * ended the call.
    */
   readonly headers: Promise<Metadata>;
+  /**
+   * Receives every response message that is available without waiting, in one array, or
+   * `undefined` after the final OK status; see `BidirectionalStreamingCall.recvAvailable()`.
+   */
+  recvAvailable(): Promise<TResponse[] | undefined>;
+  /**
+   * Iterates over the arrays `recvAvailable()` returns, which end after the final OK status and
+   * throw a TrevRpcError for any other outcome, after the batch of the messages before it. Leaving
+   * the loop early cancels the call.
+   */
+  batches(): AsyncIterableIterator<TResponse[]>;
   /** Cancels the call unless it already finished. */
   close(reason?: unknown): Promise<void>;
 }
@@ -359,6 +371,26 @@ export interface BidirectionalStreamingCall<TRequest, TResponse> extends AsyncIt
   sendAll(requests: Iterable<TRequest> | AsyncIterable<TRequest>): Promise<void>;
   /** Receives the next response message, or undefined after the final OK status. */
   recv(): Promise<TResponse | undefined>;
+  /**
+   * Receives every response message that is available without waiting, in one array, or
+   * `undefined` after the final OK status. It waits for the first message if there is none, so an
+   * array is never empty. The array holds the messages that were read ahead and queued, and
+   * those whose frames the transport has delivered in full by the time the first message is
+   * there, up to about 1 MiB of messages (plus one frame of at most `maxFrameSize`; it takes
+   * messages that arrived as datagrams as well). Messages come in the order that `recv()` returns
+   * them, and the two may be mixed.
+   *
+   * A final status that is not OK, or a stream that failed, is thrown by the call after the batch
+   * of the messages before it, as `recv()` does after those messages. A message that does not
+   * decode fails the call the same way. This costs one promise turn per batch rather than per
+   * message, and hands a UI the messages that belong to one network read together.
+   */
+  recvAvailable(): Promise<TResponse[] | undefined>;
+  /**
+   * Iterates over the arrays `recvAvailable()` returns, until the final OK status. Leaving the
+   * loop early cancels the call.
+   */
+  batches(): AsyncIterableIterator<TResponse[]>;
   /**
    * Closes the request stream while keeping the response stream readable. Resolves if the server
    * already ended the call; its final status is reported by `recv()` and `status`.

@@ -31,6 +31,7 @@
   },
   "scripts": {
     "build": "node test/generate.js",
+    "bench": "npm run build && node bench/stream-batches.js",
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings src test",

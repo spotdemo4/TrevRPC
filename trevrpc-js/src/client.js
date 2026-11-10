@@ -181,6 +181,9 @@ async function receiveSingleResponse(stream, kind) {
 const ReadAheadFrames = 32;
 const ReadAheadBytes = 1 << 20;
 
+/** What acceptFrame() returns for the refusal of an optimistic call, which the caller replays. */
+const Replay = Symbol("replay");
+
 /**
  * How a method uses datagrams, or undefined if it does not: `send` for request messages, which
  * needs a streaming request and `unreliableRequests`, and `receive` for response messages, which
@@ -234,6 +237,10 @@ function plainCompressionUse({ compressRequests, compressResponses }) {
  * The final status settles the outcome as soon as it is read. Responses read before it are still
  * delivered in order, and the call's deadline and abort signal no longer apply to it.
  *
+ * recvAvailable() and batches() receive in batches: every response message that is available
+ * without waiting, in one array. They are for callers that process messages in bulk, such as a
+ * view that renders a stream, and avoid the promise turns that receiving each message costs.
+ *
  * The call options' `onResponseHeaders` is called with the headers when the first frame after
  * ANSWER is read, and `onResponseMetadata` with the trailing metadata when the final status is
  * OK. A callback that throws fails the call.
@@ -273,6 +280,8 @@ export class BidirectionalStreamingCall {
   #sawAnswer = false;
   #sawHeaders = false;
   #sawMessage = false;
+  /** Receivers of a batch waiting for messages, for which the pump reads all it has buffered. */
+  #batching = 0;
   /** Settles on every change a waiter may care about. */
   #changed = deferred();
   #resolveStatus;
@@ -392,7 +401,31 @@ export class BidirectionalStreamingCall {
 
   /** Receives the next response message, or undefined after the final OK status. */
   recv() {
-    const next = this.#reads.then(() => this.#recv());
+    return this.#receive(() => this.#recv());
+  }
+
+  /**
+   * Receives every response message available without waiting as an array, in order, or
+   * undefined after the final OK status. It waits for the first message if there is none, so an
+   * array is never empty. The array holds the messages queued by read-ahead or as datagrams, and
+   * those whose frames the transport has delivered in full by the time the first is there, up to
+   * ReadAheadBytes (plus one frame). The messages come out in the order that recv() returns
+   * them, and the two may be mixed.
+   *
+   * The final status, and the error of a stream that failed, are reported by the call after the
+   * array of the messages before them, so that no message is lost: a message that cannot be
+   * decoded fails the call, and the messages before it come in an array first.
+   */
+  recvAvailable() {
+    return this.#receive(() => this.#recvBatch());
+  }
+
+  /**
+   * Serializes receives and waits for the one before; a receive that fails does not fail those
+   * behind it, which find the same failure themselves.
+   */
+  #receive(receive) {
+    const next = this.#reads.then(receive);
     this.#reads = next.catch(() => {});
     return next;
   }
@@ -406,14 +439,30 @@ export class BidirectionalStreamingCall {
   }
 
   [Symbol.asyncIterator]() {
+    return this.#iterator(() => this.recv());
+  }
+
+  /**
+   * Iterates over the arrays that recvAvailable() returns, until the final OK status. Leaving the
+   * loop early cancels the call.
+   */
+  batches() {
+    return this.#iterator(() => this.recvAvailable());
+  }
+
+  /** An async iterator over what `receive` returns until it returns undefined. */
+  #iterator(receive) {
     return {
       next: async () => {
-        const value = await this.recv();
+        const value = await receive();
         return value === undefined ? { done: true, value: undefined } : { done: false, value };
       },
       return: async () => {
         await this.close();
         return { done: true, value: undefined };
+      },
+      [Symbol.asyncIterator]() {
+        return this;
       },
     };
   }
@@ -421,11 +470,7 @@ export class BidirectionalStreamingCall {
   async #recv() {
     const item = await this.#take();
     if (item.payload !== undefined) {
-      try {
-        return unmarshalMessage(this.#rpc.responseType, item.payload);
-      } catch (error) {
-        throw this.#settleFailure(this.#call.fail(error));
-      }
+      return this.#decode(item.payload);
     }
     if (item.error !== undefined) {
       throw item.error;
@@ -433,11 +478,70 @@ export class BidirectionalStreamingCall {
     return undefined;
   }
 
-  /** Takes the next queued message, or the end of the response once the queue is empty. */
-  async #take() {
+  async #recvBatch() {
+    this.#batching += 1;
+    try {
+      if (!this.#pumping) {
+        // Nobody is reading the response, so its buffered frames can be read right here.
+        this.#readBuffered();
+      }
+      const item = await this.#take(true);
+      if (item.payloads !== undefined) {
+        return this.#decodeBatch(item.payloads);
+      }
+      if (item.error !== undefined) {
+        throw item.error;
+      }
+      return undefined;
+    } finally {
+      this.#batching -= 1;
+    }
+  }
+
+  /** Decodes a response message; one that does not decode fails the call. */
+  #decode(payload) {
+    try {
+      return unmarshalMessage(this.#rpc.responseType, payload);
+    } catch (error) {
+      throw this.#settleFailure(this.#call.fail(error));
+    }
+  }
+
+  /**
+   * Decodes a batch of response messages. A message that does not decode fails the call, and the
+   * messages before it are the batch, as the failure is reported by the next receive.
+   */
+  #decodeBatch(payloads) {
+    const messages = [];
+    for (const payload of payloads) {
+      try {
+        messages.push(this.#decode(payload));
+      } catch (error) {
+        if (messages.length === 0) {
+          throw error;
+        }
+        break;
+      }
+    }
+    return messages;
+  }
+
+  /**
+   * Takes the next queued message, or the end of the response once the queue is empty. With
+   * `batch`, takes all queued messages at once, as `payloads`.
+   */
+  async #take(batch = false) {
     for (;;) {
       if (this.#failure !== undefined) {
         throw this.#failure;
+      }
+      if (batch && this.#queue.length > 0) {
+        const payloads = this.#queue;
+        this.#queue = [];
+        this.#queuedBytes = 0;
+        // Room for more read-ahead.
+        this.#kick();
+        return { payloads };
       }
       const payload = this.#queue.shift();
       if (payload !== undefined) {
@@ -506,17 +610,55 @@ export class BidirectionalStreamingCall {
         if (this.#failure !== undefined) {
           return;
         }
-        if (event.type === FrameType.Message) {
-          this.#queue.push(event.payload);
-          this.#queuedBytes += event.payload.byteLength;
-        } else {
-          this.#endWithStatus(event.status);
+        this.#enqueue(event);
+        if (this.#batching > 0) {
+          this.#readBuffered();
         }
         this.#notify();
       }
     } finally {
       this.#pumping = false;
       this.#notify();
+    }
+  }
+
+  /** Queues a message event, or ends the response with a status event. */
+  #enqueue(event) {
+    if (event.type === FrameType.Message) {
+      this.#queue.push(event.payload);
+      this.#queuedBytes += event.payload.byteLength;
+    } else {
+      this.#endWithStatus(event.status);
+    }
+  }
+
+  /**
+   * Reads the events whose frames were received in full already, without waiting, and queues
+   * them as the pump does, up to ReadAheadBytes: the bytes are in memory anyway, and a receiver
+   * of batches takes them all at once, so the number of frames is not limited. A frame that is
+   * not valid ends the response with its error after the events before it, as when the pump
+   * reaches it. Must not run while the pump reads.
+   */
+  #readBuffered() {
+    try {
+      while (
+        this.#terminal === undefined &&
+        this.#failure === undefined &&
+        this.#queuedBytes < ReadAheadBytes &&
+        // The server's decision on an optimistic call may be a replay, which waits.
+        !this.#call.replayable
+      ) {
+        const frame = this.#call.tryReadFrame();
+        if (frame === undefined) {
+          return;
+        }
+        const event = this.#acceptFrame(frame);
+        if (event !== undefined) {
+          this.#enqueue(event);
+        }
+      }
+    } catch (error) {
+      this.#endWithError(error);
     }
   }
 
@@ -569,10 +711,9 @@ export class BidirectionalStreamingCall {
   }
 
   /**
-   * Reads the next MESSAGE or STATUS event, consuming ANSWER and HEADERS on the way. Enforces the
-   * response grammar `[ANSWER] [HEADERS] MESSAGE* STATUS`, and that an optimistic call's response
-   * starts with ANSWER or STATUS. A ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE is a MESSAGE,
-   * decompressed. ANSWER is not the headers: they settle with the first frame after it.
+   * Reads the next MESSAGE or STATUS event, consuming ANSWER and HEADERS on the way. Frames follow
+   * the grammar that acceptFrame() enforces; a refusal of an optimistic call is replayed here,
+   * and the response is read from the replay.
    */
   async #readEvent() {
     for (;;) {
@@ -580,68 +721,83 @@ export class BidirectionalStreamingCall {
       if (frame === null) {
         throw this.#call.uploadFailure ?? internal("response stream ended before final status");
       }
+      const event = this.#acceptFrame(frame);
+      if (event === Replay) {
+        await this.#call.replay();
+        // A call with a datagram flow is never optimistic, but its replay, on a session that may
+        // differ after a reconnect, can get one.
+        this.#flow = this.#rpc.datagrams?.receive ? this.#call.flow : undefined;
+      } else if (event !== undefined) {
+        return event;
+      }
+    }
+  }
 
-      if (
-        frame.type !== FrameType.Status &&
-        frame.type !== FrameType.Answer &&
-        this.#call.replayable
-      ) {
-        throw internal("optimistic call answered without an ANSWER frame");
+  /**
+   * Applies a response frame. Enforces the response grammar `[ANSWER] [HEADERS] MESSAGE* STATUS`,
+   * and that an optimistic call's response starts with ANSWER or STATUS. A ZSTD_MESSAGE or
+   * ZSTD_STREAM_MESSAGE is a MESSAGE, decompressed. ANSWER is not the headers: they settle with
+   * the first frame after it. Returns the MESSAGE or STATUS event the frame is, `Replay` for the
+   * refusal of an optimistic call, which the caller replays before it reads on, and undefined for
+   * frames that carry no event.
+   */
+  #acceptFrame(frame) {
+    if (
+      frame.type !== FrameType.Status &&
+      frame.type !== FrameType.Answer &&
+      this.#call.replayable
+    ) {
+      throw internal("optimistic call answered without an ANSWER frame");
+    }
+    switch (frame.type) {
+      case FrameType.Answer: {
+        if (this.#sawAnswer || this.#sawHeaders || this.#sawMessage) {
+          throw internal(
+            this.#sawAnswer
+              ? "duplicate ANSWER frame"
+              : `ANSWER frame after ${this.#sawMessage ? "MESSAGE" : "HEADERS"}`,
+          );
+        }
+        this.#sawAnswer = true;
+        this.#call.learnAnswers(decodeWireMessage(RpcAnswer, frame.payload));
+        return undefined;
       }
-      switch (frame.type) {
-        case FrameType.Answer: {
-          if (this.#sawAnswer || this.#sawHeaders || this.#sawMessage) {
-            throw internal(
-              this.#sawAnswer
-                ? "duplicate ANSWER frame"
-                : `ANSWER frame after ${this.#sawMessage ? "MESSAGE" : "HEADERS"}`,
-            );
-          }
-          this.#sawAnswer = true;
-          this.#call.learnAnswers(decodeWireMessage(RpcAnswer, frame.payload));
-          continue;
+      case FrameType.Headers: {
+        if (this.#sawHeaders || this.#sawMessage) {
+          throw internal(
+            this.#sawHeaders ? "duplicate HEADERS frame" : "HEADERS frame after MESSAGE",
+          );
         }
-        case FrameType.Headers: {
-          if (this.#sawHeaders || this.#sawMessage) {
-            throw internal(
-              this.#sawHeaders ? "duplicate HEADERS frame" : "HEADERS frame after MESSAGE",
-            );
-          }
-          const headers = decodeWireMessage(RpcHeaders, frame.payload);
-          validateResponseMetadata(headers.metadata, "headers");
-          this.#sawHeaders = true;
-          this.#settleHeaders(headers.metadata);
-          this.#flow?.connect(this.#onDatagram);
-          continue;
-        }
-        case FrameType.Message:
-        case FrameType.ZstdMessage:
-        case FrameType.ZstdStreamMessage: {
-          const payload = this.#call.receivedMessage(frame);
-          this.#sawMessage = true;
-          this.#settleHeaders({});
-          this.#flow?.connect(this.#onDatagram);
-          return { type: FrameType.Message, payload };
-        }
-        case FrameType.Status: {
-          const status = decodeWireMessage(RpcStatus, frame.payload);
-          if (status.refusedStreamCompression && this.#call.replayable) {
-            // The server refused the optimistic call before running anything for it: the call
-            // continues on a replay, and its response is read from there.
-            // A call with a datagram flow is never optimistic, but its replay, on a session
-            // that may differ after a reconnect, can get one.
-            await this.#call.replay();
-            this.#flow = this.#rpc.datagrams?.receive ? this.#call.flow : undefined;
-            continue;
-          }
-          validateResponseMetadata(status.metadata, "trailing metadata");
-          this.#settleHeaders({});
-          this.#flow?.connect(this.#onDatagram);
-          return { type: FrameType.Status, status };
-        }
-        default:
-          throw internal(`unexpected frame type ${frame.type} on a response stream`);
+        const headers = decodeWireMessage(RpcHeaders, frame.payload);
+        validateResponseMetadata(headers.metadata, "headers");
+        this.#sawHeaders = true;
+        this.#settleHeaders(headers.metadata);
+        this.#flow?.connect(this.#onDatagram);
+        return undefined;
       }
+      case FrameType.Message:
+      case FrameType.ZstdMessage:
+      case FrameType.ZstdStreamMessage: {
+        const payload = this.#call.receivedMessage(frame);
+        this.#sawMessage = true;
+        this.#settleHeaders({});
+        this.#flow?.connect(this.#onDatagram);
+        return { type: FrameType.Message, payload };
+      }
+      case FrameType.Status: {
+        const status = decodeWireMessage(RpcStatus, frame.payload);
+        if (status.refusedStreamCompression && this.#call.replayable) {
+          // The server refused the optimistic call before running anything for it: the call
+          // continues on a replay, and its response is read from there.
+          return Replay;
+        }
+        validateResponseMetadata(status.metadata, "trailing metadata");
+        this.#settleHeaders({});
+        this.#flow?.connect(this.#onDatagram);
+        return { type: FrameType.Status, status };
+      }
+      default:
+        throw internal(`unexpected frame type ${frame.type} on a response stream`);
     }
   }
 
@@ -780,6 +936,22 @@ export class ResponseStream {
 
   [Symbol.asyncIterator]() {
     return this.#call[Symbol.asyncIterator]();
+  }
+
+  /**
+   * Receives every response message available without waiting as an array, or undefined after
+   * the final OK status; see BidirectionalStreamingCall.recvAvailable().
+   */
+  recvAvailable() {
+    return this.#call.recvAvailable();
+  }
+
+  /**
+   * Iterates over the arrays that recvAvailable() returns, until the final OK status. Leaving the
+   * loop early cancels the call.
+   */
+  batches() {
+    return this.#call.batches();
   }
 }
 
