@@ -8,6 +8,10 @@
 //! streaming route, the request message that breaks them fails the stream's item. Routes whose
 //! request type has no rules are generated without validation and cost nothing.
 //!
+//! Generated clients can check the requests they send the same way, without a round trip, when
+//! they opt in with `with_validation()`. [`MessageValidator::validate_message`] checks one message
+//! as the server does, for handler tests.
+//!
 //! Validation runs on the request's encoded bytes with prost-protovalidate's runtime engine,
 //! which enforces CEL rules like every other protovalidate implementation, so the request types
 //! need no `prost-reflect` support. It runs inline on the task that serves the call, as decoding
@@ -20,6 +24,7 @@ use prost::Message;
 use prost_protovalidate::bridge::RuntimeBridge;
 use prost_protovalidate::types::Violations;
 use prost_protovalidate::{Error, Violation};
+use trevrpc::client::RequestCheck;
 use trevrpc::{Detail, Status};
 
 /// The status detail type of a request's rule violations.
@@ -90,6 +95,25 @@ impl MessageValidator {
         self.bridge
             .validate_wire(self.full_name, message)
             .map_err(status_from_error)
+    }
+
+    /// Checks a request message as the server checks one of its type, for handler tests:
+    /// [`validate`](Self::validate) on its encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns the status the call would fail with; see [`validate`](Self::validate).
+    pub fn validate_message(&self, message: &impl Message) -> Result<(), Status> {
+        self.validate(&message.encode_to_vec())
+    }
+
+    /// Returns the check that has a client reject the request messages of this type that break
+    /// their rules before it sends them, with the status the server would fail the call with;
+    /// see `Call::request_check` and the generated clients' `with_validation`.
+    #[must_use]
+    pub fn request_check(&self) -> RequestCheck {
+        let validator = self.clone();
+        RequestCheck::new(move |message| validator.validate(message))
     }
 }
 

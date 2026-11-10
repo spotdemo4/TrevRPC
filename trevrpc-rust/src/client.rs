@@ -32,6 +32,7 @@ mod qmux;
 mod quic;
 mod race;
 pub(crate) mod replay;
+mod request_check;
 mod resolve;
 mod upload;
 
@@ -44,6 +45,7 @@ pub use channel::{
 pub use qmux::QmuxTransport;
 pub use quic::QuicTransport;
 pub use race::{TransportKind, TransportPolicy};
+pub use request_check::RequestCheck;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
@@ -64,6 +66,9 @@ pub struct CallOptions {
     /// The directions that may be compressed without a dictionary, which the call sets from
     /// [`Call::compress`].
     compress: CompressMessages,
+    /// Checks the request messages before they are sent, which the call sets from
+    /// [`Call::request_check`].
+    request_check: Option<RequestCheck>,
 }
 
 /// The full protobuf names of a method's request and response message types.
@@ -141,6 +146,7 @@ impl Default for CallOptions {
             message_types: None,
             compress_stream: CompressStream::NONE,
             compress: CompressMessages::NONE,
+            request_check: None,
         }
     }
 }
@@ -429,9 +435,13 @@ where
         message_types,
         compress_stream: _,
         compress,
+        request_check,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
+    if let Some(check) = &request_check {
+        check.check(&body)?;
+    }
 
     let rpc_request = RpcRequest::new(method)
         .with_metadata(metadata)
@@ -473,6 +483,9 @@ where
     Res: Message + Default + Send + 'static,
 {
     let prepared = prepare_streaming_request(method, RpcKind::ServerStreaming, options)?;
+    if let Some(check) = &prepared.request_check {
+        check.check(&request)?;
+    }
     open_response_stream(
         transport,
         prepared,
@@ -494,7 +507,8 @@ where
     Res: Message + Default + Send + 'static,
 {
     let prepared = prepare_streaming_request(method, RpcKind::ClientStreaming, options)?;
-    let (sender, requests, call_end) = request_channel(prepared.deadline);
+    let (sender, requests, call_end) =
+        request_channel(prepared.deadline, prepared.request_check.clone());
     let response = open_response_stream(transport, prepared, requests, Some(call_end)).await?;
 
     Ok(ClientStreamingCall::new(sender, response))
@@ -514,8 +528,8 @@ where
     Res: Message + Default + Send + 'static,
 {
     let prepared = prepare_streaming_request(method, RpcKind::ClientStreaming, options)?;
-    let mut response =
-        open_response_stream(transport, prepared, crate::stream::encode(requests), None).await?;
+    let requests = crate::stream::encode_checked(requests, prepared.request_check.clone());
+    let mut response = open_response_stream(transport, prepared, requests, None).await?;
 
     read_unary_response_envelope_from_message_stream(&mut response).await
 }
@@ -532,7 +546,8 @@ where
     Res: Message + Default + Send + 'static,
 {
     let prepared = prepare_streaming_request(method, RpcKind::BidirectionalStreaming, options)?;
-    let (sender, requests, call_end) = request_channel(prepared.deadline);
+    let (sender, requests, call_end) =
+        request_channel(prepared.deadline, prepared.request_check.clone());
     let response = open_response_stream(transport, prepared, requests, Some(call_end)).await?;
 
     Ok(BidirectionalCall::new(sender, response))
@@ -551,7 +566,8 @@ where
     Res: Message + Default + Send + 'static,
 {
     let prepared = prepare_streaming_request(method, RpcKind::BidirectionalStreaming, options)?;
-    open_response_stream(transport, prepared, crate::stream::encode(requests), None).await
+    let requests = crate::stream::encode_checked(requests, prepared.request_check.clone());
+    open_response_stream(transport, prepared, requests, None).await
 }
 
 #[derive(Clone, Copy)]
@@ -589,9 +605,11 @@ impl Stream for RequestMessageStream {
 
 /// Creates the request half of a streaming call: the sender, and the stream of encoded messages
 /// the transport uploads. The returned [`call_end::EndSender`] belongs to whoever reads the
-/// response; it lets sends fail with the call's terminal status.
+/// response; it lets sends fail with the call's terminal status. A send of a message that
+/// `request_check` rejects fails with the status it returns, without ending the call.
 fn request_channel<T>(
     deadline: Option<Instant>,
+    request_check: Option<RequestCheck>,
 ) -> (RequestSender<T>, BoxStream<Vec<u8>>, call_end::EndSender) {
     let (sender, receiver) = queue::channel(queue::MESSAGES);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -601,6 +619,7 @@ fn request_channel<T>(
             state: Arc::new(RequestSenderState {
                 sender: Mutex::new(Some(sender)),
                 call_end: call_end_watch,
+                request_check,
             }),
             control,
             finished: false,
@@ -618,6 +637,8 @@ fn request_channel<T>(
 struct RequestSenderState {
     sender: Mutex<Option<queue::Sender<Vec<u8>>>>,
     call_end: call_end::EndWatch,
+    /// Rejects the messages that break the rules of the request type before they are queued.
+    request_check: Option<RequestCheck>,
 }
 
 /// The independently movable request half of a streaming call.
@@ -642,6 +663,9 @@ where
     /// on a closed stream also fails with `Cancelled`. The status is known as soon as the server
     /// sends it, unless the caller is not reading a response that has more than a couple of
     /// messages queued ahead of it; sends then fail with `Cancelled` once the upload stops.
+    ///
+    /// On a call with a [`RequestCheck`], a message the check rejects is not sent: the send fails
+    /// with the status the check returns, and the call stays open for the next message.
     pub fn send(
         &self,
         request: T,
@@ -707,6 +731,10 @@ fn send_message<T: Message>(
 }
 
 async fn send_encoded(state: Arc<RequestSenderState>, body: Vec<u8>) -> Result<()> {
+    // A message the check rejects is not sent, and the call goes on.
+    if let Some(check) = &state.request_check {
+        check.check(&body)?;
+    }
     let (body, sender) = match state.try_send(body) {
         Attempt::Queued => return Ok(()),
         Attempt::Ended(error) => return Err(error),
@@ -862,6 +890,7 @@ struct PreparedStreamingCall {
     max_response_stream_body_size: Option<usize>,
     stream_idle_timeout: Option<Duration>,
     info: CallInfo,
+    request_check: Option<RequestCheck>,
 }
 
 fn prepare_streaming_request(
@@ -880,6 +909,7 @@ fn prepare_streaming_request(
         message_types,
         compress_stream,
         compress,
+        request_check,
     } = options;
     validate_metadata(&metadata).map_err(Error::from)?;
     let timeout_nanos = timeout_nanos(timeout)?;
@@ -898,6 +928,7 @@ fn prepare_streaming_request(
         max_response_stream_body_size,
         stream_idle_timeout,
         info,
+        request_check,
     })
 }
 
@@ -959,6 +990,7 @@ where
         max_response_stream_body_size,
         stream_idle_timeout,
         info,
+        request_check: _,
     } = prepared;
     let response =
         streaming_call_with_deadline(transport, request, request_body, info, deadline).await?;
@@ -1464,7 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_sender_finish_gracefully_drains_accepted_messages() {
-        let (sender, mut requests, _end) = request_channel(None);
+        let (sender, mut requests, _end) = request_channel(None, None);
         let message = TestMessage {
             value: "accepted".to_owned(),
         };
@@ -1483,7 +1515,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_unfinished_request_sender_emits_cancellation() {
-        let (sender, mut requests, _end) = request_channel::<TestMessage>(None);
+        let (sender, mut requests, _end) = request_channel::<TestMessage>(None, None);
         drop(sender);
 
         let error = requests
@@ -1497,7 +1529,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_send_future_cannot_outlive_graceful_finish() {
-        let (sender, mut requests, _end) = request_channel::<TestMessage>(None);
+        let (sender, mut requests, _end) = request_channel::<TestMessage>(None, None);
         let send = sender.send(TestMessage::default());
         sender.finish().expect("request sender should finish");
 
@@ -1516,7 +1548,7 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_halves_move_to_independent_tasks() {
-        let (sender, _requests, _end) = request_channel::<TestMessage>(None);
+        let (sender, _requests, _end) = request_channel::<TestMessage>(None, None);
         let response = ResponseStream::<TestMessage>::new(
             crate::stream::from_iter([ResponseFrame::Status(Status::ok())]),
             crate::framing::DEFAULT_MAX_FRAME_SIZE,
@@ -2185,7 +2217,7 @@ mod tests {
 
     #[tokio::test]
     async fn bidirectional_call_delegates_headers() {
-        let (sender, _requests, _end) = request_channel::<TestMessage>(None);
+        let (sender, _requests, _end) = request_channel::<TestMessage>(None, None);
         let mut call = BidirectionalCall::new(
             sender,
             response_stream_of([
@@ -2203,7 +2235,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_streaming_call_delegates_headers_and_fills_the_envelope() {
-        let (sender, _requests, _end) = request_channel::<TestMessage>(None);
+        let (sender, _requests, _end) = request_channel::<TestMessage>(None, None);
         let trailers = header_map("x-t", b"2");
         let mut call = super::ClientStreamingCall::new(
             sender,

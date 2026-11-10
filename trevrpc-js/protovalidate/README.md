@@ -37,6 +37,8 @@ try {
 - Methods whose request type has no rules, directly or in a message it holds, are not checked and cost nothing.
 - `createRequestValidator(validator?)` takes a protovalidate validator, by default one from `createValidator()`. Pass `createValidator({ registry })`, with a registry that holds their extensions, to enforce predefined rules, or `createValidator({ failFast: true })` to stop at the first violation.
 
+To check one message as the server would, for a test, call the function that `validateFunc` returns for its schema: `createRequestValidator().validateFunc(CreateRequestSchema)?.(message)` throws the error the call would fail with.
+
 Checking requests on the client saves a round trip and shows the violations at once. It does not replace checking them on the server, with [`protovalidatetrevrpc`](https://trev.zip/llc/TrevRPC/src/branch/main/trevrpc-go/protovalidatetrevrpc) or [`trevrpc-protovalidate`](https://trev.zip/llc/TrevRPC/src/branch/main/trevrpc-rust/crates/trevrpc-protovalidate), since clients can skip it.
 
 See [Request Validation](https://trev.zip/llc/TrevRPC/wiki/JavaScript-Guide#request-validation).

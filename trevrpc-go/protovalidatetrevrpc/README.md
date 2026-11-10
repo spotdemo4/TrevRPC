@@ -18,5 +18,7 @@ server.SetValidator(protovalidatetrevrpc.New(nil))
 - A request that breaks its rules fails with `InvalidArgument` and a `buf.validate.Violations` status detail, which every client runtime can decode field by field. The detail lists at most `MaxDetailViolations` (100) violations, and the message names the first and counts the rest, so a request that breaks a rule on each of many items still gets a status that fits a frame. On a streaming route, the request message that breaks them fails the `Recv` that returned it.
 - Rules are compiled when the server starts, and a rule that cannot compile makes `Listen` fail. The route it belongs to fails every call with `Internal` instead of skipping validation.
 - Routes whose request type has no rules, directly or in a message it holds, skip validation and cost nothing.
+- Clients can check the requests they send with the same validator, without a round trip: `trevrpc.DialOptions{Validator: protovalidatetrevrpc.New(nil)}`. A request that breaks its rules fails locally with the same status, and a streamed message fails its `Send` and leaves the call open.
+- `protovalidatetrevrpc.Validate(msg)` checks one message as the server checks a request of its type, and returns the `*trevrpc.Status` the call would fail with, or nil, for handler tests. Rules compile once per message type.
 
 See [Request Validation](https://trev.zip/llc/TrevRPC/wiki/Go-Guide#request-validation).

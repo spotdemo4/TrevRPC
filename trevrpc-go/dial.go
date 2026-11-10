@@ -58,6 +58,16 @@ type DialOptions struct {
 	// held to the limits of request metadata, and so is each call's merged
 	// metadata.
 	ConnectionMetadata Metadata
+	// Validator checks every request message the channel's clients send, a
+	// unary or server-streaming request and each message of a client or
+	// bidirectional stream, before it is encoded, and fails the call locally
+	// with the status the server would reply with, normally InvalidArgument
+	// with details that say why, without contacting the server. The rules
+	// compile once per message type. A message that breaks them fails the
+	// unary or server-streaming call, or the Send of that message, which
+	// leaves the stream open. With nil, requests are not checked and calls
+	// pay nothing for it. See Validator and Server.SetValidator.
+	Validator Validator
 }
 
 // TransportPolicy selects the transports a Channel connects with.
@@ -149,6 +159,9 @@ func Dial(ctx context.Context, addr string, options DialOptions) (*Channel, erro
 		return nil, err
 	}
 	channel.connectionMetadata = connectionMetadata
+	if options.Validator != nil {
+		channel.validator = NewMessageValidator(options.Validator)
+	}
 	return channel, nil
 }
 

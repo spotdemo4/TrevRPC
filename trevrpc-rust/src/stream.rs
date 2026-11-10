@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 use futures_core::Stream;
 use prost::Message;
 
+use crate::client::RequestCheck;
 use crate::{Error, Result, Status};
 
 /// A sendable, heap-allocated asynchronous message stream.
@@ -75,13 +76,14 @@ where
 
 pub struct EncodeStream<T> {
     inner: BoxStream<T>,
+    check: Option<RequestCheck>,
 }
 
 impl<T> EncodeStream<T> {
     /// Creates a stream that encodes protobuf messages into byte bodies.
     #[must_use]
     pub fn new(inner: BoxStream<T>) -> Self {
-        Self { inner }
+        Self { inner, check: None }
     }
 }
 
@@ -93,7 +95,14 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(message))) => Poll::Ready(Some(Ok(message.encode_to_vec()))),
+            Poll::Ready(Some(Ok(message))) => {
+                let body = message.encode_to_vec();
+                let checked = match &self.check {
+                    Some(check) => check.check(&body).map(|()| body),
+                    None => Ok(body),
+                };
+                Poll::Ready(Some(checked))
+            }
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -107,6 +116,19 @@ where
     T: Message + Send + 'static,
 {
     Box::pin(EncodeStream::new(inner))
+}
+
+/// [`encode`] for the request messages of a client call, which `check` vets in their encoded form
+/// when there is one. A message it rejects ends the stream with the status it returns, as an
+/// error of the wrapped stream does, which cancels the call.
+pub(crate) fn encode_checked<T>(
+    inner: BoxStream<T>,
+    check: Option<RequestCheck>,
+) -> BoxStream<Vec<u8>>
+where
+    T: Message + Send + 'static,
+{
+    Box::pin(EncodeStream { inner, check })
 }
 
 /// Checks the encoded body of a request message before it is decoded; see [`decode_validated`].
@@ -193,7 +215,8 @@ where
 mod tests {
     use futures_util::StreamExt;
 
-    use super::{decode, decode_validated, encode, from_iter};
+    use super::{decode, decode_validated, encode, encode_checked, from_iter};
+    use crate::client::RequestCheck;
     use crate::{Code, Status};
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -240,6 +263,41 @@ mod tests {
             "a"
         );
         let status = decoded
+            .next()
+            .await
+            .expect("second message")
+            .expect_err("the check rejects it")
+            .into_status();
+        assert_eq!(
+            (status.code(), status.message()),
+            (Code::InvalidArgument, "bad value")
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_encode_stream_fails_the_message_its_check_rejects() {
+        let messages = from_iter(["a", "bad", "c"].map(|value| TestMessage {
+            value: value.to_owned(),
+        }));
+        let bad = TestMessage {
+            value: "bad".to_owned(),
+        };
+        let check = RequestCheck::new(move |body| {
+            if body == prost::Message::encode_to_vec(&bad) {
+                Err(Status::invalid_argument("bad value"))
+            } else {
+                Ok(())
+            }
+        });
+        let mut encoded = encode_checked(messages, Some(check));
+
+        assert_eq!(
+            encoded.next().await.expect("first message").unwrap(),
+            prost::Message::encode_to_vec(&TestMessage {
+                value: "a".to_owned(),
+            })
+        );
+        let status = encoded
             .next()
             .await
             .expect("second message")

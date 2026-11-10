@@ -9,6 +9,14 @@
 // streamed request message that breaks them fails the Recv that returned it.
 // Routes whose request type has no rules, directly or in a message it holds,
 // skip validation entirely.
+//
+// Validate checks one message the same way, for handler tests and for tools
+// that want the status a call would fail with:
+//
+//	err := protovalidatetrevrpc.Validate(&pb.AddRequest{})
+//
+// Clients check the requests they send, without a round trip, with
+// trevrpc.DialOptions.Validator.
 package protovalidatetrevrpc
 
 import (
@@ -29,6 +37,23 @@ func New(validator protovalidate.Validator) trevrpc.Validator {
 		validator = protovalidate.GlobalValidator
 	}
 	return requestValidator{validator: validator}
+}
+
+// global validates with protovalidate.GlobalValidator, keeping the rules it
+// compiled for each message type.
+var global = trevrpc.NewMessageValidator(New(nil))
+
+// Validate checks message as the server checks a request of its type with
+// protovalidate.GlobalValidator, and returns the *trevrpc.Status the call
+// would fail with, or nil: InvalidArgument with a buf.validate.Violations
+// detail for a message that breaks its rules, Internal for rules that cannot
+// be evaluated. A message of a type without rules is never invalid. The rules
+// of each message type are compiled once. It is safe for concurrent use.
+//
+// To check with another protovalidate.Validator, wrap New(validator) with
+// trevrpc.NewMessageValidator.
+func Validate(message proto.Message) error {
+	return global.Validate(message)
 }
 
 type requestValidator struct {

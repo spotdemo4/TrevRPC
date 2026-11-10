@@ -495,7 +495,7 @@ func bindValidators(routes map[string]route, validator Validator) error {
 		if route.request == nil {
 			continue
 		}
-		validate, err := bindValidator(validator, method, route.request)
+		validate, err := bindValidator(validator, "route "+method, route.request)
 		if bindErr == nil {
 			bindErr = err
 		}

@@ -1199,11 +1199,15 @@ fn validate_generated_names(
 
         for service in services {
             let service_path = service_path(service);
-            for declaration in [
+            let mut declarations = vec![
                 service.name.clone(),
                 format!("{}Client", service.name),
                 paths_module_name(service),
-            ] {
+            ];
+            if service.methods.iter().any(|method| method.validated) {
+                declarations.push(format!("{}ClientRequestChecks", service.name));
+            }
+            for declaration in declarations {
                 let key = semantic_rust_identifier(&declaration).to_owned();
                 if let Some(owner) = type_owners.insert(key.clone(), service_path.clone()) {
                     return Err(format!(
@@ -1238,6 +1242,12 @@ fn validate_generated_method_names(service: &Service) -> Result<(), String> {
         "into_transport",
     ] {
         owners.insert(fixed.to_owned(), "generated client support".to_owned());
+    }
+    if service.methods.iter().any(|method| method.validated) {
+        owners.insert(
+            "with_validation".to_owned(),
+            "generated client support".to_owned(),
+        );
     }
 
     for method in &service.methods {
@@ -1456,13 +1466,29 @@ fn generate_trait(runtime_path: &str, service: &Service, buf: &mut String) {
 
 fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
     let client_name = format!("{}Client", service.name);
+    let validated = service.methods.iter().any(|method| method.validated);
+
+    // A client that can check its requests holds the checks of the methods whose request types
+    // carry rules, once `with_validation` builds them.
+    let (checks_field, checks_init, with_validation) = if validated {
+        buf.push_str(&request_checks_struct(runtime_path, service, &client_name));
+        (
+            format!(
+                "    request_checks: ::std::option::Option<::std::sync::Arc<{client_name}RequestChecks>>,\n"
+            ),
+            ", request_checks: None",
+            with_validation_method(service, &client_name),
+        )
+    } else {
+        (String::new(), "", String::new())
+    };
 
     buf.push_str(&format!(
-        "#[derive(Clone)]\npub struct {client_name}<T> {{\n    transport: T,\n    default_options: {runtime_path}::client::CallOptions,\n}}\n\n"
+        "#[derive(Clone)]\npub struct {client_name}<T> {{\n    transport: T,\n    default_options: {runtime_path}::client::CallOptions,\n{checks_field}}}\n\n"
     ));
 
     buf.push_str(&format!(
-        "impl<T> {client_name}<T> {{\n    /// Creates a client backed by the provided transport.\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport, default_options: {runtime_path}::client::CallOptions::new() }}\n    }}\n\n    /// Creates a client with default call options applied to every RPC.\n    #[must_use]\n    pub const fn with_default_call_options(transport: T, default_options: {runtime_path}::client::CallOptions) -> Self {{\n        Self {{ transport, default_options }}\n    }}\n\n    /// Returns the default call options.\n    #[must_use]\n    pub const fn default_call_options(&self) -> &{runtime_path}::client::CallOptions {{\n        &self.default_options\n    }}\n\n    /// Returns the underlying transport.\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    /// Consumes the client and returns the underlying transport.\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
+        "impl<T> {client_name}<T> {{\n    /// Creates a client backed by the provided transport.\n    #[must_use]\n    pub fn new(transport: T) -> Self {{\n        Self {{ transport, default_options: {runtime_path}::client::CallOptions::new(){checks_init} }}\n    }}\n\n    /// Creates a client with default call options applied to every RPC.\n    #[must_use]\n    pub const fn with_default_call_options(transport: T, default_options: {runtime_path}::client::CallOptions) -> Self {{\n        Self {{ transport, default_options{checks_init} }}\n    }}\n\n{with_validation}    /// Returns the default call options.\n    #[must_use]\n    pub const fn default_call_options(&self) -> &{runtime_path}::client::CallOptions {{\n        &self.default_options\n    }}\n\n    /// Returns the underlying transport.\n    #[must_use]\n    pub const fn transport(&self) -> &T {{\n        &self.transport\n    }}\n\n    /// Consumes the client and returns the underlying transport.\n    #[must_use]\n    pub fn into_transport(self) -> T {{\n        self.transport\n    }}\n}}\n\n"
     ));
 
     buf.push_str(&format!(
@@ -1493,6 +1519,44 @@ fn generate_client(runtime_path: &str, service: &Service, buf: &mut String) {
     buf.push_str("}\n\n");
 }
 
+/// Emits the type that holds the request checks of a client's validated methods, one per method.
+fn request_checks_struct(runtime_path: &str, service: &Service, client_name: &str) -> String {
+    let fields = service
+        .methods
+        .iter()
+        .filter(|method| method.validated)
+        .map(|method| {
+            format!(
+                "    {}: {runtime_path}::client::RequestCheck,\n",
+                method.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    format!(
+        "/// The checks of the request messages of the methods of `{client_name}` whose request types\n/// carry `buf.validate` rules.\nstruct {client_name}RequestChecks {{\n{fields}}}\n\n"
+    )
+}
+
+/// Emits `with_validation`, which makes a generated client check its requests before sending them.
+fn with_validation_method(service: &Service, client_name: &str) -> String {
+    let checks = service
+        .methods
+        .iter()
+        .filter(|method| method.validated)
+        .map(|method| {
+            format!(
+                "            {}: validator.message({:?}).request_check(),\n",
+                method.name, method.input_proto_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    format!(
+        "    /// Makes the client check the request messages of the methods whose request types carry\n    /// `buf.validate` rules before it sends them. A message that breaks its rules fails the call\n    /// locally with the status the server would fail it with, `InvalidArgument` with a\n    /// `buf.validate.Violations` detail, without a round trip. A streamed message that breaks them\n    /// fails its send, and the call stays open. Methods whose request types have no rules are not\n    /// checked and cost nothing. Clones of the client share the checks.\n    ///\n    /// # Panics\n    ///\n    /// Panics when the `buf.validate` rules of a request type cannot compile.\n    #[must_use]\n    pub fn with_validation(mut self) -> Self {{\n        let validator = &*{VALIDATOR_STATIC};\n        self.request_checks = ::std::option::Option::Some(::std::sync::Arc::new({client_name}RequestChecks {{\n{checks}        }}));\n        self\n    }}\n\n"
+    )
+}
+
 /// Emits the client method of `method`, which returns the call to make: awaiting it makes the
 /// call, and its builder methods change the call's options or shape first.
 fn generate_client_method(
@@ -1513,8 +1577,16 @@ fn generate_client_method(
     let compress = compress_expr(runtime_path, method)
         .map(|directions| format!(".compress({directions})"))
         .unwrap_or_default();
+    let request_check = if method.validated {
+        format!(
+            ".request_check(self.request_checks.as_ref().map(|checks| checks.{}.clone()))",
+            method.name
+        )
+    } else {
+        String::new()
+    };
     let marks = format!(
-        ".message_types({:?}, {:?}){marks}{compress_stream}{compress}",
+        ".message_types({:?}, {:?}){marks}{compress_stream}{compress}{request_check}",
         method.input_proto_type, method.output_proto_type
     );
     let (shape, constructor, request_param, request_arg) =

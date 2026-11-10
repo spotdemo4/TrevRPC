@@ -137,3 +137,59 @@ fn unescape(literal: &str) -> Vec<u8> {
     }
     bytes
 }
+
+/// The generated client method `method`, from its signature to the end of its body.
+fn client_method<'a>(content: &'a str, method: &str) -> &'a str {
+    let start = content
+        .find(&format!("    pub fn {method}(&self"))
+        .unwrap_or_else(|| panic!("no client method {method}"));
+    let end = content[start..].find("\n    }\n").unwrap();
+    &content[start..start + end]
+}
+
+/// The generated client checks nothing until `with_validation` builds the checks of the methods
+/// whose request types carry rules, and the methods without rules never carry one.
+#[test]
+fn validated_clients_check_requests_behind_with_validation() {
+    let content = generate("validate=true");
+
+    assert!(content.contains("struct CheckedClientRequestChecks {"));
+    assert!(content.contains(
+        "request_checks: ::std::option::Option<::std::sync::Arc<CheckedClientRequestChecks>>,"
+    ));
+    assert!(content.contains("pub fn with_validation(mut self) -> Self {"));
+    for (method, request) in [
+        ("unary", "Request"),
+        ("server_stream", "Wrapper"),
+        ("client_stream", "Request"),
+        ("bidi", "Request"),
+    ] {
+        assert!(
+            content.contains(&format!(
+                "{method}: validator.message(\"example.validated.{request}\").request_check(),"
+            )),
+            "no check built for {method}"
+        );
+        let call = client_method(&content, method);
+        assert!(
+            call.contains(&format!(
+                ".request_check(self.request_checks.as_ref().map(|checks| checks.{method}.clone()))"
+            )),
+            "{call}"
+        );
+    }
+    assert!(!content.contains("unchecked: validator.message"));
+    let unchecked = client_method(&content, "unchecked");
+    assert!(!unchecked.contains("request_check"), "{unchecked}");
+}
+
+/// Without the option the clients are generated as before: no checks, no `with_validation`.
+#[test]
+fn clients_without_the_option_have_no_validation() {
+    for parameter in ["", "validate=false"] {
+        let content = generate(parameter);
+        assert!(!content.contains("with_validation"), "{parameter}");
+        assert!(!content.contains("request_check"), "{parameter}");
+        assert!(!content.contains("RequestChecks"), "{parameter}");
+    }
+}

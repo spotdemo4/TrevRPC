@@ -1,6 +1,7 @@
 package protovalidatetrevrpc
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -144,5 +145,48 @@ func TestManyViolationsFailWithAStatusThatFitsAFrame(t *testing.T) {
 	violations := &validate.Violations{}
 	if found, err := status.FindDetail(violations); !found || err != nil || len(violations.GetViolations()) != MaxDetailViolations {
 		t.Fatalf("detail: found %v, %v, %d violations; want %d", found, err, len(violations.GetViolations()), MaxDetailViolations)
+	}
+}
+
+func TestValidateReturnsTheStatusTheServerSends(t *testing.T) {
+	desc := testFile(t).Messages().ByName("Request")
+	validateRequest, err := New(nil).ValidateFunc(desc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := dynamicpb.NewMessage(desc)
+	request.Set(desc.Fields().ByName("name"), protoreflect.ValueOfString("ok!"))
+	for range 2 {
+		if err := Validate(request); err != nil {
+			t.Fatalf("valid request: %v", err)
+		}
+	}
+
+	request.Set(desc.Fields().ByName("name"), protoreflect.ValueOfString("no"))
+	err = Validate(request)
+	status, ok := errors.AsType[*trevrpc.Status](err)
+	if !ok || status.Code != trevrpc.CodeInvalidArgument {
+		t.Fatalf("Validate = %v, want an InvalidArgument status", err)
+	}
+	violations := &validate.Violations{}
+	if found, err := status.FindDetail(violations); !found || err != nil || len(violations.GetViolations()) != 1 {
+		t.Fatalf("FindDetail = %v, %v, %d violations; want the buf.validate.Violations detail", found, err, len(violations.GetViolations()))
+	}
+	if want := validateRequest(request); err.Error() != want.Error() {
+		t.Fatalf("Validate = %v, want the status the server sends: %v", err, want)
+	}
+}
+
+func TestValidatePassesTypesWithoutRules(t *testing.T) {
+	desc := testFile(t).Messages().ByName("Plain")
+	if err := Validate(dynamicpb.NewMessage(desc)); err != nil {
+		t.Fatalf("Validate = %v, want nil for a type without rules", err)
+	}
+}
+
+func TestValidateFailsWithInternalWhenRulesCannotCompile(t *testing.T) {
+	desc := testFile(t).Messages().ByName("BadRule")
+	if status := trevrpc.StatusFromError(Validate(dynamicpb.NewMessage(desc))); status.Code != trevrpc.CodeInternal {
+		t.Fatalf("status = %v, want Internal", status)
 	}
 }

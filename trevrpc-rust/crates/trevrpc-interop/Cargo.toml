@@ -48,6 +48,7 @@ protoc-gen-trevrpc-rust = { path = "../protoc-gen-trevrpc-rust" }
 protox = "0.10.0"
 
 [dev-dependencies]
+bytes = "1"
 divan = "0.1.21"
 # The validation microbenchmarks time decoding into a DynamicMessage, as validation does.
 prost-reflect = "0.16.5"

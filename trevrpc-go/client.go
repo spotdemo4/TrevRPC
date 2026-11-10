@@ -24,6 +24,22 @@ type Transport interface {
 	streamingCall(context.Context, *wireRequest, encodedStream) (frameStream, error)
 }
 
+// requestValidating is implemented by the transports that check the requests
+// of their clients before sending them; see DialOptions.Validator. The others
+// send them unchecked.
+type requestValidating interface {
+	requestValidator() *MessageValidator
+}
+
+// transportValidator returns the validator that checks the requests sent over
+// transport, or nil.
+func transportValidator(transport Transport) *MessageValidator {
+	if validating, ok := transport.(requestValidating); ok {
+		return validating.requestValidator()
+	}
+	return nil
+}
+
 // ServerStreamingCall is the response stream of a server-streaming RPC.
 type ServerStreamingCall[Res ProtoMessage] interface {
 	ResponseStream[Res]
@@ -194,6 +210,9 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 		return zero, err
 	}
 	rpcRequest.responseType = messageTypeName[Res]()
+	if err := transportValidator(transport).check(request); err != nil {
+		return zero, err
+	}
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
 	defer cancel()
@@ -223,6 +242,9 @@ func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, tr
 		return nil, err
 	}
 	rpcRequest.responseType = messageTypeName[Res]()
+	if err := transportValidator(transport).check(request); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := callContextWithoutLocalCancel(ctx, deadline)
 	frames, err := transport.call(ctx, rpcRequest, request)
@@ -273,6 +295,9 @@ func startStreamingCall[Req ProtoMessage, Res ProtoMessage](ctx context.Context,
 
 	ctx, cancel := callContext(ctx, deadline)
 	requests := newMessagePipe[Req](ctx)
+	if validator := transportValidator(transport); validator != nil {
+		requests.check = func(request Req) error { return validator.check(request) }
+	}
 	if config.unreliable.effective(kind).Requests {
 		// Unreliable requests may share datagrams, which needs several of them
 		// ready at once; see writeRequestFrames.

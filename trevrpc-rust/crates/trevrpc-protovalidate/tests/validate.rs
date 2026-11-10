@@ -138,3 +138,39 @@ fn many_violations_fail_with_a_status_that_fits_a_frame() {
         .unwrap();
     assert_eq!(violations.violations.len(), MAX_DETAIL_VIOLATIONS);
 }
+
+#[test]
+fn validate_message_checks_a_message_as_the_server_does() {
+    let validate = validator().message("test.rules.Request");
+    let valid = Request {
+        name: "alice".to_owned(),
+        inner: Some(Inner {
+            label: "a".to_owned(),
+        }),
+    };
+    assert_eq!(validate.validate_message(&valid), Ok(()));
+
+    let status = validate
+        .validate_message(&Request {
+            name: "al".to_owned(),
+            ..valid
+        })
+        .expect_err("the name is too short");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status.find_detail(VIOLATIONS_TYPE).is_some());
+}
+
+#[test]
+fn request_checks_fail_with_the_status_the_server_sends() {
+    let validate = validator().message("test.rules.Request");
+    let check = validate.request_check();
+
+    check.check(&request("alice", "a")).unwrap();
+    let error = check
+        .check(&request("al", "label"))
+        .expect_err("both standard rules are broken");
+    assert_eq!(
+        error.into_status(),
+        validate.validate(&request("al", "label")).unwrap_err()
+    );
+}

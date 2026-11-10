@@ -113,7 +113,13 @@ type Channel struct {
 	// connectionMetadata is the channel's connection metadata, nil for a
 	// channel built without Dial.
 	connectionMetadata *connectionMetadataSource
+	// validator checks the requests the channel sends, nil to send them
+	// unchecked; see DialOptions.Validator. It is set before Dial returns.
+	validator *MessageValidator
 }
+
+// requestValidator implements requestValidating.
+func (c *Channel) requestValidator() *MessageValidator { return c.validator }
 
 // SetConnectionMetadata replaces the channel's connection metadata (see
 // DialOptions.ConnectionMetadata), for example when a token is refreshed.

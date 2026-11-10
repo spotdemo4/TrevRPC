@@ -79,6 +79,9 @@ type messagePipe[T any] struct {
 	err       error
 	// uploadErr is why the receiving side ended the upload, if it did.
 	uploadErr error
+	// check, when set, vets each message before Send queues it; a message
+	// it reports on is not sent, and the pipe stays open.
+	check func(T) error
 }
 
 // newMessagePipe returns a stream that yields messages sent with Send until closed.
@@ -126,6 +129,11 @@ func (s *messagePipe[T]) Send(message T) error {
 	case <-s.done:
 		return s.closedError()
 	default:
+	}
+	if s.check != nil {
+		if err := s.check(message); err != nil {
+			return err
+		}
 	}
 
 	select {

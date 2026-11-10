@@ -22,8 +22,8 @@ use futures_core::Stream;
 use prost::Message;
 
 use super::{
-    BidirectionalCall, CallOptions, ClientStreamingCall, MessageTypes, ResponseStream,
-    RpcTransport, StreamingRpcTransport,
+    BidirectionalCall, CallOptions, ClientStreamingCall, MessageTypes, RequestCheck,
+    ResponseStream, RpcTransport, StreamingRpcTransport,
 };
 use crate::{BoxStream, CompressMessages, CompressStream, ResponseEnvelope, Result, Unreliable};
 
@@ -44,6 +44,8 @@ pub struct Call<'a, T: ?Sized, S> {
     compress_stream: CompressStream,
     /// The directions that may be compressed without a dictionary, from generated code.
     compress: CompressMessages,
+    /// Checks the request messages before they are sent, from generated code.
+    request_check: Option<RequestCheck>,
     shape: S,
 }
 
@@ -65,6 +67,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
             message_types: None,
             compress_stream: CompressStream::NONE,
             compress: CompressMessages::NONE,
+            request_check: None,
             shape,
         }
     }
@@ -78,6 +81,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
             message_types: self.message_types,
             compress_stream: self.compress_stream,
             compress: self.compress,
+            request_check: self.request_check,
             shape: reshape(self.shape),
         }
     }
@@ -90,6 +94,7 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
         options.message_types = self.message_types;
         options.compress_stream = self.compress_stream;
         options.compress = self.compress;
+        options.request_check = self.request_check;
         Parts {
             transport: self.transport,
             method: self.method,
@@ -142,6 +147,19 @@ impl<'a, T: ?Sized, S> Call<'a, T, S> {
     /// `COMPRESSION_STREAM`.
     pub const fn compress(mut self, directions: CompressMessages) -> Self {
         self.compress = directions;
+        self
+    }
+
+    /// Has `check` vet the encoded request messages of the call before they are sent, or none
+    /// with `None`. A message it rejects is not sent, and the server never sees it: a unary or
+    /// server-streaming call fails with the status the check returns, as does the
+    /// [`send`](ClientStreamingCall::send) of a streamed message, which leaves the call open for
+    /// the next message. Messages of [`send_all`](Self::send_all) are checked as they are taken
+    /// from the stream, and a rejected one fails the stream, which cancels the call. Generated
+    /// clients with request validation pass a check for each method whose request type carries
+    /// `buf.validate` rules.
+    pub fn request_check(mut self, check: Option<RequestCheck>) -> Self {
+        self.request_check = check;
         self
     }
 
