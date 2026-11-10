@@ -49,6 +49,7 @@ type fallbackTestResponse struct {
 	status int
 	proto  string
 	altSvc string
+	header http.Header
 	body   string
 }
 
@@ -71,6 +72,7 @@ func getFallbackTest(t *testing.T, client *http.Client, url string) fallbackTest
 		status: response.StatusCode,
 		proto:  response.Proto,
 		altSvc: response.Header.Get("Alt-Svc"),
+		header: response.Header,
 		body:   string(body),
 	}
 }

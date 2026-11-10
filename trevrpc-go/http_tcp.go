@@ -123,7 +123,7 @@ func (h *httpTCPServer) handle(w http.ResponseWriter, r *http.Request) {
 	l := h.listener
 	if !l.runtime.options.claimsPath(r.URL.Path) {
 		h.setAltSvc(w)
-		l.serveFallback(w, r)
+		l.serveUnclaimed(w, r)
 		return
 	}
 	if r.ProtoMajor == 1 {

@@ -2,13 +2,14 @@ package trevrpc
 
 import "net/http"
 
-// serveFallback serves an HTTP request that TrevRPC does not claim with
-// ServerOptions.HTTPFallback, or answers 404 without one. The request holds a
-// stream slot of its connection, so an overloaded connection answers 503
-// rather than exceeding the transport's stream limit.
-func (l *Listener) serveFallback(w http.ResponseWriter, r *http.Request) {
-	fallback := l.runtime.options.HTTPFallback
-	if fallback == nil {
+// serveUnclaimed serves an HTTP request that TrevRPC does not claim with
+// ServerOptions.unclaimedHandler: the development certificate's hashes, or
+// ServerOptions.HTTPFallback, or a 404 without one. The request holds a stream
+// slot of its connection, so an overloaded connection answers 503 rather than
+// exceeding the transport's stream limit.
+func (l *Listener) serveUnclaimed(w http.ResponseWriter, r *http.Request) {
+	handler := l.runtime.options.unclaimedHandler(r.URL.Path)
+	if handler == nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -18,5 +19,5 @@ func (l *Listener) serveFallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer slot.release()
-	fallback.ServeHTTP(w, r)
+	handler.ServeHTTP(w, r)
 }

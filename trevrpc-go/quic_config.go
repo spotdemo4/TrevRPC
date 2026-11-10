@@ -111,11 +111,24 @@ func capWindow(value *uint64, limit uint64) {
 	}
 }
 
+// listenTLSConfig returns the TLS configuration that Listen serves: base, or
+// the configuration of ServerOptions.DevelopmentCertificate, which excludes
+// base because the hashes it publishes would not match another certificate.
+func listenTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, error) {
+	if options.DevelopmentCertificate == nil {
+		return base, nil
+	}
+	if base != nil {
+		return nil, InvalidArgument("ListenOptions.TLSConfig must be nil with ServerOptions.DevelopmentCertificate, which supplies the server certificate")
+	}
+	return options.DevelopmentCertificate.TLSConfig(), nil
+}
+
 // serverTLSConfig clones base and restricts it to the ALPN protocols the
 // listener serves.
 func serverTLSConfig(base *tls.Config, options ServerOptions) (*tls.Config, error) {
 	if base == nil || (len(base.Certificates) == 0 && base.GetCertificate == nil && base.GetConfigForClient == nil) {
-		return nil, InvalidArgument("ListenOptions.TLSConfig must provide a server certificate")
+		return nil, InvalidArgument("ListenOptions.TLSConfig or ServerOptions.DevelopmentCertificate must provide a server certificate")
 	}
 	config := base.Clone()
 	config.NextProtos = []string{ALPN}

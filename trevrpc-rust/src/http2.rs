@@ -7,14 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderValue, Request, StatusCode};
+use http::{HeaderValue, Request, Response, StatusCode};
 use http_body::Body as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::fallback::{FallbackBody, HttpFallback, ResponseSink, multiplexed_head, write_body};
+use crate::fallback::{
+    FallbackBody, ResponseBody, ResponseSink, advertise_http3, multiplexed_head, write_body,
+};
 use crate::http_admission::{rejection_head, rpc_response_head, validate_http_request};
 use crate::request_pump::RequestTransportEvent;
 use crate::rpc_body::{BodySink, BodySource, handle_rpc_stream};
@@ -130,11 +132,23 @@ async fn handle_request(
     closed: watch::Receiver<bool>,
     shutdown: watch::Receiver<bool>,
 ) {
+    if let Some(mut response) = server
+        .options()
+        .certificate_hashes_response(request.method(), request.uri().path())
+    {
+        advertise_http3(&mut response, alt_svc);
+        // The stream permit is held until the response ends.
+        send_response(response, respond).await;
+        return;
+    }
     if let Some(fallback) = server.options().http_fallback()
         && !server.options().claims_path(request.uri().path())
     {
         // The stream permit is held until the response ends.
-        serve_fallback(fallback, request, respond, alt_svc).await;
+        let response = fallback
+            .call(request.map(FallbackBody::http2), alt_svc)
+            .await;
+        send_response(response, respond).await;
         return;
     }
     let (parts, body) = request.into_parts();
@@ -164,15 +178,11 @@ async fn handle_request(
     .await;
 }
 
-async fn serve_fallback(
-    fallback: &HttpFallback,
-    request: Request<h2::RecvStream>,
+/// Writes a fallback or certificate hashes `response` to the request stream.
+async fn send_response(
+    response: Response<ResponseBody>,
     mut respond: h2::server::SendResponse<Bytes>,
-    alt_svc: Option<HeaderValue>,
 ) {
-    let response = fallback
-        .call(request.map(FallbackBody::http2), alt_svc)
-        .await;
     let (parts, body) = response.into_parts();
     let end = body.is_end_stream();
     let Ok(send) = respond.send_response(multiplexed_head(parts), end) else {

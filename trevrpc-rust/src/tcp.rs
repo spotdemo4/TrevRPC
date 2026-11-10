@@ -210,7 +210,9 @@ impl Server {
     /// It advertises [`crate::QMUX_ALPN`] for native clients, `h2` when
     /// [`crate::server::ServerOptions::http_enabled`] is set, and `http/1.1` (WebSocket) when
     /// [`crate::server::ServerOptions::webtransport_enabled`] is set, replacing any ALPN list
-    /// already on `tls`. An [`crate::server::ServerOptions::http_fallback`] advertises both.
+    /// already on `tls`. An [`crate::server::ServerOptions::http_fallback`] advertises both. When
+    /// the development certificate option is set, it replaces the certificate resolver on `tls`
+    /// while keeping its other settings.
     ///
     /// It keeps `acme-tls/1` when `tls` lists it, so that the certificate resolver of an ACME
     /// client, such as `rustls-acme`'s, can answer TLS-ALPN-01 challenges (RFC 8737). The
@@ -222,6 +224,10 @@ impl Server {
         &self,
         mut tls: quinn::rustls::ServerConfig,
     ) -> Arc<quinn::rustls::ServerConfig> {
+        #[cfg(feature = "dev-certificate")]
+        if let Some(certificate) = self.options().development_certificate() {
+            tls.cert_resolver = Arc::new(certificate.clone());
+        }
         let acme = tls
             .alpn_protocols
             .iter()

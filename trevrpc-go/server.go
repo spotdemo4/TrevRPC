@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"reflect"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -121,6 +122,17 @@ type Server struct {
 // answering and sends keepalives at half of it, so quiet streams on a live
 // connection are not affected; DisableConnectionIdleTimeout turns it off.
 //
+// DevelopmentCertificate is the certificate of a local development server.
+// Listen presents it, so ListenOptions.TLSConfig must be nil, and the server
+// answers GET and HEAD requests for HTTPPath + "/certificate-hashes" with its
+// hashes over every HTTP version the server speaks, for the JavaScript
+// client's fetchServerCertificateHashes option: a web app mounts and proxies
+// nothing. The hashes path is claimed whenever the server speaks HTTP.
+// Without a DevelopmentCertificate it answers 404,
+// which tells the client that the browser trusts the certificate already,
+// instead of passing the request to HTTPFallback. Both responses allow any
+// origin to read them.
+//
 // Compression lets messages travel compressed with the dictionaries it
 // holds; see Compression. Listen fails when it is invalid.
 //
@@ -161,6 +173,7 @@ type ServerOptions struct {
 	EnableWebTransport                bool
 	WebTransportAdmission             Admission
 	HTTPFallback                      http.Handler
+	DevelopmentCertificate            *DevelopmentCertificate
 	Compression                       *Compression
 	StreamCompressionMemory           int64
 	AddressValidationRate             int
@@ -185,6 +198,20 @@ func (o ServerOptions) servesHTTP1() bool { return o.EnableWebTransport || o.HTT
 // requests for path.
 func (o ServerOptions) claimsPath(path string) bool {
 	return (o.EnableHTTP || o.EnableWebTransport) && path == o.HTTPPath
+}
+
+// unclaimedHandler returns the handler of an HTTP request for path that TrevRPC
+// does not serve as an RPC or a browser session: the certificate hashes, or a
+// 404 for them when there is no DevelopmentCertificate, or HTTPFallback, which
+// is nil when there is none.
+func (o ServerOptions) unclaimedHandler(path string) http.Handler {
+	if base, ok := strings.CutSuffix(path, certificateHashesSuffix); ok && base == strings.TrimSuffix(o.HTTPPath, "/") {
+		if o.DevelopmentCertificate == nil {
+			return certificateHashesNotFound
+		}
+		return o.DevelopmentCertificate
+	}
+	return o.HTTPFallback
 }
 
 // AdmissionRequest describes an HTTP RPC request or a browser session request

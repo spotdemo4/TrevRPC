@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,10 +82,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Browsers trust the certificate by its hashes, which a development web
-	// server fetches from here and hands to the page.
-	fallback := http.NewServeMux()
-	fallback.Handle("GET /certificate-hashes", certificate)
 
 	server := trevrpc.NewServer()
 	server.SetAuthorizer(trevrpc.BearerAuthorizer(authToken))
@@ -94,11 +89,13 @@ func main() {
 	options.EnableHTTP = true
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = allowBrowserExampleSession
-	options.HTTPFallback = fallback
+	// The server presents the certificate and publishes its hashes, which
+	// browsers trust it by, at /trevrpc/certificate-hashes.
+	options.DevelopmentCertificate = certificate
 	server.SetOptions(options)
 	greeter.RegisterGreeterServer(server, greeterService{})
 
-	listener, err := trevrpc.Listen(listenAddr, server, trevrpc.ListenOptions{TLSConfig: certificate.TLSConfig()})
+	listener, err := trevrpc.Listen(listenAddr, server, trevrpc.ListenOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -112,7 +109,7 @@ func main() {
 	log.Printf("HTTP/3 URL: https://%s/trevrpc", listener.Addr())
 	log.Printf("WebTransport URL: https://%s/trevrpc", listener.Addr())
 	log.Printf("bearer token: %s", authToken)
-	log.Printf("certificate hashes: https://%s/certificate-hashes", listener.Addr())
+	log.Printf("certificate hashes: https://%s/trevrpc/certificate-hashes", listener.Addr())
 	log.Printf("wrote client trust certificate to %s", certPath)
 	if err := listener.Serve(context.Background()); err != nil {
 		log.Fatal(err)

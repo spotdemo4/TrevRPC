@@ -9,13 +9,15 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use h3::quic::BidiStream as _;
 use h3_webtransport::server::{Accepted, AcceptedBi, is_webtransport_request};
-use http::{HeaderMap, HeaderValue, Request, StatusCode, header};
+use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::Demux;
-use crate::fallback::{FallbackBody, HttpFallback, ResponseSink, multiplexed_head, write_body};
+use crate::fallback::{
+    FallbackBody, HttpFallback, ResponseBody, ResponseSink, multiplexed_head, write_body,
+};
 use crate::http_admission::{
     admission_headers, rejection_head, rpc_response_head, validate_http_request,
     validate_webtransport_admission,
@@ -222,6 +224,14 @@ async fn handle_http_request(
     connection: ServerConnection,
     shutdown: watch::Receiver<bool>,
 ) {
+    if let Some(response) = server
+        .options()
+        .certificate_hashes_response(request.method(), request.uri().path())
+    {
+        // The stream permit is held until the response ends.
+        send_response(response, stream.split().0).await;
+        return;
+    }
     if let Some(fallback) = server.options().http_fallback()
         && !server.options().claims_path(request.uri().path())
     {
@@ -253,10 +263,15 @@ async fn handle_http_request(
 }
 
 async fn serve_fallback(fallback: &HttpFallback, request: Request<()>, stream: H3RequestStream) {
-    let (mut send, recv) = stream.split();
+    let (send, recv) = stream.split();
     let response = fallback
         .call(request.map(|()| FallbackBody::http3(recv)), None)
         .await;
+    send_response(response, send).await;
+}
+
+/// Writes a fallback or certificate hashes `response` to the request stream.
+async fn send_response(response: Response<ResponseBody>, mut send: H3SendStream) {
     let (parts, body) = response.into_parts();
     if send.send_response(multiplexed_head(parts)).await.is_ok() {
         write_body(body, H3Sink(send)).await;

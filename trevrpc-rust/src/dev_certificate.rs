@@ -16,6 +16,7 @@ use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer
 use quinn::rustls::server::{ClientHello, ResolvesServerCert};
 use quinn::rustls::sign::CertifiedKey;
 
+use crate::fallback::allow_any_origin;
 use crate::sync::MutexExt as _;
 use crate::{Result, Status};
 
@@ -44,11 +45,15 @@ const DEFAULT_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 /// trusts the certificate presented after it. Production servers use a certificate from a
 /// certificate authority instead.
 ///
-/// Clones share the certificates. As a service it answers `GET` and `HEAD` requests with the
-/// hashes as JSON, such as `[{"algorithm":"sha-256","value":"<hex>"}]`, which the JavaScript
-/// client's `serverCertificateHashesUrl` option reads: route a path of the
-/// [`HttpFallback`](crate::fallback::HttpFallback), or of the server that serves the web app, to
-/// it.
+/// Clones share the certificates. [`ServerOptions::with_development_certificate`] makes a server
+/// publish the hashes itself, at the `TrevRPC` HTTP path followed by `/certificate-hashes`. As a
+/// service the certificate answers `GET` and `HEAD` requests with the hashes as JSON, such as
+/// `[{"algorithm":"sha-256","value":"<hex>"}]`, which the JavaScript client reads with
+/// `fetchServerCertificateHashes`, and allows any origin to read them: route a path of the
+/// server that serves the web app to it only to publish the hashes elsewhere, and point the
+/// client's `serverCertificateHashesUrl` option at it.
+///
+/// [`ServerOptions::with_development_certificate`]: crate::server::ServerOptions::with_development_certificate
 #[derive(Clone)]
 pub struct DevelopmentCertificate(Arc<Inner>);
 
@@ -196,13 +201,22 @@ impl<B> tower_service::Service<Request<B>> for DevelopmentCertificate {
     }
 
     fn call(&mut self, request: Request<B>) -> Self::Future {
+        ready(Ok(self.hashes_response(request.method())))
+    }
+}
+
+impl DevelopmentCertificate {
+    /// The answer to a request with `method` for the hashes, which the service and a server with
+    /// a development certificate both give.
+    pub(crate) fn hashes_response(&self, method: &Method) -> Response<Full<Bytes>> {
         let mut response = Response::new(Full::default());
-        if request.method() != Method::GET && request.method() != Method::HEAD {
+        allow_any_origin(response.headers_mut());
+        if method != Method::GET && method != Method::HEAD {
             *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
             response
                 .headers_mut()
                 .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-            return ready(Ok(response));
+            return response;
         }
         match self.hashes_json() {
             Ok(json) => {
@@ -216,7 +230,7 @@ impl<B> tower_service::Service<Request<B>> for DevelopmentCertificate {
             }
             Err(_) => *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR,
         }
-        ready(Ok(response))
+        response
     }
 }
 
@@ -354,6 +368,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
         let hex = |hash: &[u8; 32]| {
             let mut hex = String::new();
             push_hex(&mut hex, hash);

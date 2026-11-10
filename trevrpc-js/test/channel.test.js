@@ -216,6 +216,87 @@ test("a 404 from serverCertificateHashesUrl adds no hashes, and a failed fetch f
   assert.equal(sessions.length, 1, "no session is opened without the hashes");
 });
 
+test("fetchServerCertificateHashes derives the hashes URL from the channel URL", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () =>
+    Response.json([{ algorithm: "sha-256", value: "33".repeat(32) }]),
+  );
+  const { WebTransport, sessions } = fakeWebTransport();
+  const requested = [];
+  for (const [url, expected] of [
+    ["https://localhost:4433/trevrpc", "https://localhost:4433/trevrpc/certificate-hashes"],
+    ["https://localhost:4433/trevrpc/", "https://localhost:4433/trevrpc/certificate-hashes"],
+    ["https://localhost:4433", "https://localhost:4433/certificate-hashes"],
+    ["https://localhost:4433/", "https://localhost:4433/certificate-hashes"],
+    ["https://localhost:4433/a/b?token=1#x", "https://localhost:4433/a/b/certificate-hashes"],
+    [new URL("https://[::1]:4433/trevrpc"), "https://[::1]:4433/trevrpc/certificate-hashes"],
+  ]) {
+    const connecting = connect(url, {
+      transports: WebTransportOnly,
+      WebTransport,
+      fetchServerCertificateHashes: true,
+    });
+    requested.push(expected);
+    await waitFor(() => sessions.length === requested.length);
+    assert.equal(fetch.mock.calls.at(-1).arguments[0], expected);
+    assert.deepEqual(sessions.at(-1).options.serverCertificateHashes, [
+      { algorithm: "sha-256", value: new Uint8Array(32).fill(0x33) },
+    ]);
+    sessions.at(-1).becomeReady();
+    (await connecting).close();
+  }
+});
+
+test("a 404 from the derived hashes URL adds no hashes", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response("", { status: 404 }));
+  const { WebTransport, sessions } = fakeWebTransport();
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    fetchServerCertificateHashes: true,
+  });
+  await waitFor(() => sessions.length === 1);
+  assert.deepEqual(sessions[0].options, { protocols: ["trevrpc-1"] });
+  sessions[0].becomeReady();
+  (await connecting).close();
+});
+
+test("fetchServerCertificateHashes is off by default and excludes serverCertificateHashesUrl", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => new Response("", { status: 404 }));
+  const { WebTransport, sessions } = fakeWebTransport();
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    fetchServerCertificateHashes: false,
+  });
+  await waitFor(() => sessions.length === 1);
+  assert.equal(fetch.mock.callCount(), 0);
+  sessions[0].becomeReady();
+  (await connecting).close();
+
+  await assert.rejects(
+    connect("https://example.test/trevrpc", {
+      transports: WebTransportOnly,
+      WebTransport,
+      fetchServerCertificateHashes: true,
+      serverCertificateHashesUrl: "/certificate-hashes",
+    }),
+    (error) => error instanceof TypeError && /mutually exclusive/.test(error.message),
+  );
+  assert.equal(sessions.length, 1);
+
+  // Turned off explicitly, it leaves a custom URL in effect.
+  const custom = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    fetchServerCertificateHashes: false,
+    serverCertificateHashesUrl: "https://example.test/hashes",
+  });
+  await waitFor(() => sessions.length === 2);
+  assert.equal(fetch.mock.calls.at(-1).arguments[0], "https://example.test/hashes");
+  sessions[1].becomeReady();
+  (await custom).close();
+});
+
 test("connect fails when the session cannot be established", async () => {
   const { WebTransport, sessions } = fakeWebTransport();
   const connecting = connect("https://example.test/trevrpc", {

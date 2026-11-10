@@ -91,7 +91,9 @@ func newDevelopmentCertificate(now func() time.Time, hosts ...string) (*Developm
 }
 
 // TLSConfig returns a TLS configuration that presents the current
-// certificate, for ListenOptions.TLSConfig.
+// certificate. Listen uses it for a server with
+// ServerOptions.DevelopmentCertificate, so ListenOptions.TLSConfig is only
+// needed to present the certificate elsewhere.
 func (c *DevelopmentCertificate) TLSConfig() *tls.Config {
 	return &tls.Config{GetCertificate: c.GetCertificate}
 }
@@ -134,11 +136,38 @@ type developmentCertificateHash struct {
 	Value     string `json:"value"`
 }
 
+// certificateHashesSuffix follows ServerOptions.HTTPPath in the path where a
+// server publishes the hashes of its DevelopmentCertificate.
+const certificateHashesSuffix = "/certificate-hashes"
+
+// setCertificateHashesCORS lets pages of any origin read a response with the
+// certificate hashes, as a development web server such as Vite serves the page
+// from another origin than the TrevRPC server. The hashes are no secret: any
+// client that connects sees the certificate. The header is on every response,
+// 404 included, which tells the page that the browser trusts the certificate
+// already.
+func setCertificateHashesCORS(header http.Header) {
+	header.Set("Access-Control-Allow-Origin", "*")
+}
+
+// certificateHashesNotFound answers the hashes path of a server without a
+// DevelopmentCertificate.
+var certificateHashesNotFound = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	setCertificateHashesCORS(w.Header())
+	http.NotFound(w, r)
+})
+
 // ServeHTTP answers GET and HEAD requests with the certificate hashes as JSON,
 // such as [{"algorithm":"sha-256","value":"<hex>"}], which the JavaScript
-// client's serverCertificateHashesUrl option reads. Mount it on a path of
-// ServerOptions.HTTPFallback, or of the server that serves the web app.
+// client reads with fetchServerCertificateHashes. Responses allow any origin
+// to read them.
+//
+// A server with ServerOptions.DevelopmentCertificate answers this itself at
+// HTTPPath + "/certificate-hashes". Mount the certificate as a handler only to
+// publish the hashes elsewhere, such as on the server that serves the web app,
+// and point the client's serverCertificateHashesUrl option at it.
 func (c *DevelopmentCertificate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setCertificateHashesCORS(w.Header())
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

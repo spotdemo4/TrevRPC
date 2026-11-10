@@ -25,7 +25,7 @@ import { Echo, EchoRequestSchema, type EchoResponse } from "../../build/interop/
 
 const channel = await connect("https://localhost:4433/trevrpc", {
   serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(32) }],
-  serverCertificateHashesUrl: "/certificate-hashes",
+  fetchServerCertificateHashes: true,
   signal: AbortSignal.timeout(5_000),
   transports: ["webtransport", "websocket"],
   webSocketUrl: "wss://localhost:4433/trevrpc",
@@ -37,6 +37,9 @@ const channel = await connect("https://localhost:4433/trevrpc", {
   },
 });
 channel satisfies Channel satisfies Transport;
+createChannel("https://localhost:4433/trevrpc", {
+  serverCertificateHashesUrl: new URL("https://localhost:5173/certificate-hashes"),
+}).close();
 (
   await fetchServerCertificateHashes(new URL("https://localhost:5173/certificate-hashes"), {
     signal: AbortSignal.timeout(5_000),

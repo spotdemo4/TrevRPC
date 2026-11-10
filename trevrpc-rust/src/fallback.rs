@@ -97,14 +97,41 @@ impl HttpFallback {
                 empty_response(StatusCode::INTERNAL_SERVER_ERROR)
             }
         };
-        if let Some(alt_svc) = alt_svc {
-            response
-                .headers_mut()
-                .entry(header::ALT_SVC)
-                .or_insert(alt_svc);
-        }
+        advertise_http3(&mut response, alt_svc);
         response
     }
+}
+
+/// Advertises HTTP/3 on `response` through `alt_svc`, when given, unless it sets `Alt-Svc` itself.
+pub(crate) fn advertise_http3(response: &mut Response<ResponseBody>, alt_svc: Option<HeaderValue>) {
+    if let Some(alt_svc) = alt_svc {
+        response
+            .headers_mut()
+            .entry(header::ALT_SVC)
+            .or_insert(alt_svc);
+    }
+}
+
+/// The path that follows the `TrevRPC` HTTP path where a server publishes the hashes of its
+/// development certificate.
+pub(crate) const CERTIFICATE_HASHES_SUFFIX: &str = "/certificate-hashes";
+
+/// Lets pages of any origin read a response with the certificate hashes, as a development web
+/// server such as Vite serves the page from another origin than the `TrevRPC` server. The hashes
+/// are no secret: any client that connects sees the certificate. The header is on every response,
+/// 404 included, which tells the page that the browser trusts the certificate already.
+pub(crate) fn allow_any_origin(headers: &mut HeaderMap) {
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+}
+
+/// The answer for the certificate hashes path of a server without a development certificate.
+pub(crate) fn certificate_hashes_not_found() -> Response<ResponseBody> {
+    let mut response = empty_response(StatusCode::NOT_FOUND);
+    allow_any_origin(response.headers_mut());
+    response
 }
 
 impl fmt::Debug for HttpFallback {

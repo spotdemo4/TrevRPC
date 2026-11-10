@@ -528,11 +528,22 @@ export interface ConnectOptions {
    */
   serverCertificateHashes?: readonly WebTransportCertificateHash[];
   /**
-   * A URL that publishes the server's development certificate hashes, such as a path that the
-   * development web server proxies to the TrevRPC server's DevelopmentCertificate. Every
+   * Fetches the development certificate hashes from the server itself, at the channel URL followed
+   * by `/certificate-hashes` (`https://localhost:4433/trevrpc` becomes
+   * `https://localhost:4433/trevrpc/certificate-hashes`), which a TrevRPC server with a
+   * development certificate publishes at its endpoint, allowing any origin to read it. Every
    * WebTransport attempt fetches it, so reconnects follow a rotated certificate, and adds its
    * hashes to `serverCertificateHashes`; a 404 adds none, so the same build works against a server
-   * with a trusted certificate. A failed fetch fails the WebTransport attempt.
+   * with a trusted certificate. A failed fetch fails the WebTransport attempt. Off by default, so
+   * that production builds make no extra request; enable it only for development. Mutually
+   * exclusive with `serverCertificateHashesUrl`.
+   */
+  fetchServerCertificateHashes?: boolean;
+  /**
+   * A URL that publishes the server's development certificate hashes elsewhere than the server's
+   * own endpoint, such as a path that the web server of the app serves from the TrevRPC server's
+   * DevelopmentCertificate. It is fetched like `fetchServerCertificateHashes` does, and is mutually
+   * exclusive with it.
    */
   serverCertificateHashesUrl?: string | URL;
   /**

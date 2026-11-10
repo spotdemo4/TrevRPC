@@ -20,7 +20,8 @@ import (
 
 // ListenOptions configures Listen.
 type ListenOptions struct {
-	// TLSConfig supplies the server certificate. It is cloned; NextProtos is
+	// TLSConfig supplies the server certificate, and must be nil when
+	// ServerOptions.DevelopmentCertificate does. It is cloned; NextProtos is
 	// always set to the protocols the Server enables. The TCP listener also
 	// keeps acme-tls/1 when NextProtos lists it, as autocert.Manager.TLSConfig
 	// does, so that the GetCertificate of an ACME client can answer
@@ -172,6 +173,10 @@ func Listen(addr string, server *Server, options ListenOptions) (*Listener, erro
 		workers:           newStreamWorkers(ctx, streamWorkerIdle),
 	}
 	if err := l.runtime.validatorErr; err != nil {
+		cancel()
+		return nil, err
+	}
+	if options.TLSConfig, err = listenTLSConfig(options.TLSConfig, l.runtime.options); err != nil {
 		cancel()
 		return nil, err
 	}

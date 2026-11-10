@@ -744,6 +744,8 @@ pub struct ServerOptions {
     webtransport_allowed_origins: Vec<String>,
     webtransport_admission: Option<WebTransportAdmission>,
     http_fallback: Option<HttpFallback>,
+    #[cfg(feature = "dev-certificate")]
+    development_certificate: Option<DevelopmentCertificate>,
     compression: Compression,
     stream_compression_memory: usize,
     connection_threads: usize,
@@ -790,6 +792,8 @@ impl Default for ServerOptions {
             webtransport_allowed_origins: Vec::new(),
             webtransport_admission: None,
             http_fallback: None,
+            #[cfg(feature = "dev-certificate")]
+            development_certificate: None,
             compression: Compression::new(),
             stream_compression_memory: DEFAULT_SERVER_MEMORY,
             connection_threads: 0,
@@ -948,6 +952,13 @@ impl ServerOptions {
         self.http_fallback.as_ref()
     }
 
+    /// Returns the development certificate whose hashes the server publishes, if configured.
+    #[cfg(feature = "dev-certificate")]
+    #[must_use]
+    pub const fn development_certificate(&self) -> Option<&DevelopmentCertificate> {
+        self.development_certificate.as_ref()
+    }
+
     /// Returns whether the server speaks HTTP: HTTP/3 on the endpoint and HTTP/2 or HTTP/1.1 on
     /// the TCP listener.
     pub(crate) const fn serves_http(&self) -> bool {
@@ -967,6 +978,31 @@ impl ServerOptions {
     /// Returns whether `TrevRPC`, rather than the HTTP fallback, serves HTTP requests for `path`.
     pub(crate) fn claims_path(&self, path: &str) -> bool {
         (self.http_enabled || self.webtransport_enabled) && path == self.http_path
+    }
+
+    /// Answers a request with `method` for `path` when it is for the certificate hashes: the
+    /// hashes of the development certificate, or a 404 without one, instead of passing the request
+    /// to the HTTP fallback. `None` for every other path.
+    pub(crate) fn certificate_hashes_response(
+        &self,
+        method: &http::Method,
+        path: &str,
+    ) -> Option<http::Response<crate::fallback::ResponseBody>> {
+        let base = path.strip_suffix(crate::fallback::CERTIFICATE_HASHES_SUFFIX)?;
+        if base != self.http_path.trim_end_matches('/') {
+            return None;
+        }
+        #[cfg(feature = "dev-certificate")]
+        if let Some(certificate) = &self.development_certificate {
+            use http_body_util::BodyExt as _;
+            return Some(
+                certificate
+                    .hashes_response(method)
+                    .map(|body| body.map_err(|never| match never {}).boxed_unsync()),
+            );
+        }
+        let _ = method;
+        Some(crate::fallback::certificate_hashes_not_found())
     }
 
     /// Sets the maximum `TrevRPC` frame size in bytes.
@@ -1202,6 +1238,30 @@ impl ServerOptions {
     #[must_use]
     pub fn with_http_fallback(mut self, http_fallback: Option<HttpFallback>) -> Self {
         self.http_fallback = http_fallback;
+        self
+    }
+
+    /// Sets the certificate of a local development server, whose hashes the server publishes for
+    /// the JavaScript client's `fetchServerCertificateHashes` option: a web app mounts and proxies
+    /// nothing.
+    ///
+    /// The server answers `GET` and `HEAD` requests for the HTTP path followed by
+    /// `/certificate-hashes` with the hashes as JSON, over every HTTP version it speaks. The path
+    /// is claimed whenever the server speaks HTTP. Without a certificate it answers 404, which tells the client that the browser trusts the
+    /// certificate already, instead of passing the request to the HTTP fallback. Both responses
+    /// allow any origin to read them.
+    ///
+    /// [`Server::quic_config`] and [`Server::tcp_tls_config`] replace the certificate resolver of
+    /// their TLS configuration with this certificate, so that the server presents the certificate
+    /// it publishes. The other TLS settings, such as client authentication and key logging, are
+    /// left in place.
+    #[cfg(feature = "dev-certificate")]
+    #[must_use]
+    pub fn with_development_certificate(
+        mut self,
+        development_certificate: Option<DevelopmentCertificate>,
+    ) -> Self {
+        self.development_certificate = development_certificate;
         self
     }
 }
@@ -3580,6 +3640,75 @@ mod tests {
         assert_eq!(
             context.cancellation_source(),
             Some(CancellationSource::Deadline)
+        );
+    }
+
+    #[test]
+    fn certificate_hashes_path_follows_the_http_path() {
+        let hashes_path = |options: &ServerOptions, path: &str| {
+            options
+                .certificate_hashes_response(&http::Method::GET, path)
+                .map(|response| response.status())
+        };
+        let http = ServerOptions::new().with_http_enabled(true);
+        // Without a development certificate, the path stays `TrevRPC`'s and answers 404 with CORS.
+        assert_eq!(
+            hashes_path(&http, "/trevrpc/certificate-hashes"),
+            Some(http::StatusCode::NOT_FOUND)
+        );
+        let response = http
+            .certificate_hashes_response(&http::Method::GET, "/trevrpc/certificate-hashes")
+            .unwrap();
+        assert_eq!(
+            response.headers()[http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "*"
+        );
+        for path in [
+            "/certificate-hashes",
+            "/other/certificate-hashes",
+            "/trevrpc/x-certificate-hashes",
+            "/trevrpc",
+        ] {
+            assert_eq!(hashes_path(&http, path), None, "{path}");
+        }
+        // Even when HTTP RPCs and WebTransport are disabled, the hashes path is reserved.
+        assert_eq!(
+            hashes_path(&ServerOptions::new(), "/trevrpc/certificate-hashes"),
+            Some(http::StatusCode::NOT_FOUND)
+        );
+        let webtransport = ServerOptions::new()
+            .with_webtransport_enabled(true)
+            .with_http_path("/api/rpc/");
+        assert!(hashes_path(&webtransport, "/api/rpc/certificate-hashes").is_some());
+        let root = ServerOptions::new()
+            .with_http_enabled(true)
+            .with_http_path("/");
+        assert!(hashes_path(&root, "/certificate-hashes").is_some());
+    }
+
+    #[cfg(feature = "dev-certificate")]
+    #[test]
+    fn development_certificate_answers_the_hashes_path() {
+        let certificate = crate::dev_certificate::DevelopmentCertificate::new().unwrap();
+        let options = ServerOptions::new()
+            .with_http_enabled(true)
+            .with_development_certificate(Some(certificate));
+        let response = options
+            .certificate_hashes_response(&http::Method::GET, "/trevrpc/certificate-hashes")
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.headers()[http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "*"
+        );
+        let response = options
+            .certificate_hashes_response(&http::Method::POST, "/trevrpc/certificate-hashes")
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            options
+                .certificate_hashes_response(&http::Method::GET, "/certificate-hashes")
+                .is_none()
         );
     }
 

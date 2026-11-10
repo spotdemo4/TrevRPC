@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::Instant;
 
-use crate::fallback::{FallbackBody, ResponseBody, empty_response};
+use crate::fallback::{FallbackBody, ResponseBody, advertise_http3, empty_response};
 use crate::server::Server;
 use crate::websocket;
 
@@ -93,6 +93,12 @@ async fn handle_request(
     upgrades: &mpsc::Sender<OnUpgrade>,
 ) -> Response<ResponseBody> {
     let options = server.options();
+    if let Some(mut response) =
+        options.certificate_hashes_response(request.method(), request.uri().path())
+    {
+        advertise_http3(&mut response, alt_svc);
+        return response;
+    }
     if !options.claims_path(request.uri().path()) {
         // HTTP/1.1 serves one request at a time, so it needs no stream slot.
         return match options.http_fallback() {

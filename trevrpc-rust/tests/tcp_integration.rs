@@ -699,15 +699,13 @@ async fn development_certificate_serves_every_transport_and_its_hashes() -> Test
     let current = CertificateDer::pem_slice_iter(pem.as_bytes())
         .next()
         .ok_or("no certificate in the PEM")??;
-    let options = test_options().with_http_fallback(Some(HttpFallback::new(certificate.clone())));
-    let server = spawn_server_with_tls(
-        options,
-        |_| {},
-        certificate.server_config(),
-        current,
-        |tcp| tcp,
-    )
-    .await?;
+    let fallback = EchoFallback::default();
+    let options = fallback_options(test_options(), &fallback)
+        .with_development_certificate(Some(certificate.clone()));
+    // Both listeners replace the resolver of the supplied TLS configuration with the one whose
+    // hashes they serve.
+    let (unrelated_tls, _) = localhost_tls()?;
+    let server = spawn_server_with_tls(options, |_| {}, unrelated_tls, current, |tcp| tcp).await?;
 
     let quic = channel(&server, server.udp, ChannelConfig::new()).await?;
     ensure_eq!(quic.transport(), Some(TransportKind::Quic));
@@ -735,17 +733,49 @@ async fn development_certificate_serves_every_transport_and_its_hashes() -> Test
         hex(hash),
         hex(next),
     );
+    let advertised = Some(format!("h3=\":{}\"; ma=86400", server.udp.port()));
     let sender = http2_sender(&server).await?;
-    let (status, _, body) =
-        http2_fallback_request(&server, &sender, "GET", "/certificate-hashes", "").await?;
-    ensure_eq!(status, http::StatusCode::OK);
-    ensure_eq!(body, expected);
+    ensure_eq!(
+        http1_request(&server, "GET", "/trevrpc/certificate-hashes", "").await?,
+        (http::StatusCode::OK, advertised.clone(), expected.clone())
+    );
+    ensure_eq!(
+        http2_fallback_request(&server, &sender, "GET", "/trevrpc/certificate-hashes", "").await?,
+        (http::StatusCode::OK, advertised, expected.clone())
+    );
+    ensure_eq!(
+        http3_request(&server, "GET", "/trevrpc/certificate-hashes", "").await?,
+        (http::StatusCode::OK, None, expected)
+    );
+
+    // Other paths still reach the fallback, even the hashes path outside the `TrevRPC` path.
     ensure_eq!(
         http3_request(&server, "GET", "/certificate-hashes", "")
             .await?
             .2,
-        expected
+        "fallback HTTP/3.0 GET /certificate-hashes\n"
     );
+    server.stop().await
+}
+
+#[tokio::test]
+async fn certificate_hashes_path_answers_404_without_a_development_certificate() -> TestResult {
+    let fallback = EchoFallback::default();
+    let server = spawn_server(fallback_options(test_options(), &fallback)).await?;
+    let sender = http2_sender(&server).await?;
+    let path = "/trevrpc/certificate-hashes";
+    let replies = [
+        http1_request(&server, "GET", path, "").await?,
+        http2_fallback_request(&server, &sender, "GET", path, "").await?,
+        http3_request(&server, "GET", path, "").await?,
+    ];
+    for (status, _, body) in replies {
+        ensure_eq!(status, http::StatusCode::NOT_FOUND);
+        ensure!(
+            !body.starts_with("fallback"),
+            "the fallback answered: {body}"
+        );
+    }
     server.stop().await
 }
 

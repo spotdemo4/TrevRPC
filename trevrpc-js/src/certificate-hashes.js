@@ -1,5 +1,33 @@
 import { unavailable } from "./status.js";
 
+/** The path that follows the `TrevRPC` endpoint's path where a development server publishes hashes. */
+const CertificateHashesPath = "/certificate-hashes";
+
+/**
+ * Where a channel fetches certificate hashes from before each WebTransport attempt, or `undefined`
+ * when it does not. `fetchServerCertificateHashes: true` derives the URL from the channel's own,
+ * which is where a server with a development certificate publishes them, so the page needs no
+ * proxy or route of its own; `serverCertificateHashesUrl` names another location. Setting both is
+ * ambiguous and throws a TypeError; `fetchServerCertificateHashes: false` leaves the custom URL in
+ * effect.
+ */
+export function certificateHashesUrl(channelUrl, options) {
+  const { fetchServerCertificateHashes: derive, serverCertificateHashesUrl: custom } = options;
+  if (derive === true && custom !== undefined) {
+    throw new TypeError(
+      "fetchServerCertificateHashes and serverCertificateHashesUrl are mutually exclusive",
+    );
+  }
+  if (derive !== true) {
+    return custom;
+  }
+  const url = new URL(channelUrl);
+  url.pathname = url.pathname.replace(/\/+$/u, "") + CertificateHashesPath;
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
 /**
  * Fetches the certificate hashes a TrevRPC development server publishes, as WebTransport
  * `serverCertificateHashes`. The server answers JSON such as

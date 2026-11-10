@@ -107,11 +107,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_webtransport_enabled(true)
         .with_webtransport_allowed_authorities(webtransport_authorities)
         .with_webtransport_allowed_origins([browser_example_origin])
-        // Browsers trust the certificate by its hashes, which a development web server fetches
-        // from here and hands to the page. The certificate answers every path it is routed.
-        .with_http_fallback(Some(trevrpc::fallback::HttpFallback::new(
-            certificate.clone(),
-        )));
+        // Browsers trust the certificate by its hashes, which the server publishes at
+        // `/trevrpc/certificate-hashes`.
+        .with_development_certificate(Some(certificate.clone()));
     server.set_options(options);
     server.set_authorizer(trevrpc::server::MetadataValueAuthorizer::bearer(
         &auth_token,
@@ -133,7 +131,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         endpoint.local_addr()?
     );
     println!(
-        "certificate hashes at https://{}/certificate-hashes",
+        "certificate hashes at https://{}/trevrpc/certificate-hashes",
         endpoint.local_addr()?
     );
     println!("certificate written to {}", certificate_path.display());

@@ -60,7 +60,9 @@ impl Server {
     ///
     /// The configuration advertises [`crate::ALPN`] for native `TrevRPC`, and [`crate::HTTP3_ALPN`]
     /// only when [`ServerOptions::http_enabled`], [`ServerOptions::webtransport_enabled`] or
-    /// [`ServerOptions::http_fallback`] is set, replacing any ALPN list already on `tls`. It also sizes the QUIC stream and connection
+    /// [`ServerOptions::http_fallback`] is set, replacing any ALPN list already on `tls`. When the
+    /// development certificate option is set, it also replaces the certificate resolver on `tls`
+    /// while keeping its other settings. It sizes the QUIC stream and connection
     /// windows from the server's [`ServerOptions`], so call it after the options are final.
     ///
     /// Datagrams ([`crate::Unreliable`] methods) are not flow controlled, so the configuration
@@ -70,6 +72,10 @@ impl Server {
     /// it holds for calls whose request has not arrived yet.
     pub fn quic_config(&self, mut tls: quinn::rustls::ServerConfig) -> Result<quinn::ServerConfig> {
         self.check_compression()?;
+        #[cfg(feature = "dev-certificate")]
+        if let Some(certificate) = self.options().development_certificate() {
+            tls.cert_resolver = Arc::new(certificate.clone());
+        }
         tls.alpn_protocols = vec![crate::ALPN.to_vec()];
         if self.options().serves_http() {
             tls.alpn_protocols.push(crate::HTTP3_ALPN.to_vec());

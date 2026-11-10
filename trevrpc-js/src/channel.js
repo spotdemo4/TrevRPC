@@ -1,4 +1,4 @@
-import { fetchServerCertificateHashes } from "./certificate-hashes.js";
+import { certificateHashesUrl, fetchServerCertificateHashes } from "./certificate-hashes.js";
 import { ConnectionMetadataSource } from "./connection-metadata.js";
 import { interceptorList } from "./interceptor.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
@@ -319,10 +319,11 @@ export function createChannel(url, options = {}) {
  */
 function sessionDialer(url, options) {
   const webSocketUrl = options.webSocketUrl ?? defaultWebSocketUrl(url);
+  const hashesUrl = certificateHashesUrl(url, options);
   const candidates = {
     webtransport: {
       transport: "webtransport",
-      dial: (signal) => dialWebTransport(url, options, signal),
+      dial: (signal) => dialWebTransport(url, hashesUrl, options, signal),
     },
     websocket: {
       transport: "websocket",
@@ -368,11 +369,11 @@ function defaultWebSocketUrl(url) {
 }
 
 /**
- * Establishes a ready WebTransport session; aborting the signal abandons the attempt. With
- * `serverCertificateHashesUrl`, each attempt first fetches the hashes, so that reconnects trust a
- * development certificate that rotated meanwhile.
+ * Establishes a ready WebTransport session; aborting the signal abandons the attempt. With a
+ * `hashesUrl`, each attempt first fetches the hashes, so that reconnects trust a development
+ * certificate that rotated meanwhile.
  */
-function dialWebTransport(url, options, signal) {
+function dialWebTransport(url, hashesUrl, options, signal) {
   const WebTransportConstructor = options.WebTransport ?? globalThis.WebTransport;
   if (typeof WebTransportConstructor !== "function") {
     throw unavailable("WebTransport is not available in this JavaScript runtime");
@@ -387,22 +388,20 @@ function dialWebTransport(url, options, signal) {
       signal,
       requireWireVersion,
     );
-  if (options.serverCertificateHashesUrl === undefined) {
+  if (hashesUrl === undefined) {
     return open(transportOptions(options));
   }
-  return fetchServerCertificateHashes(options.serverCertificateHashesUrl, { signal }).then(
-    (fetched) => {
-      if (signal?.aborted) {
-        throw abortError(signal);
-      }
-      const transport = transportOptions(options);
-      const hashes = [...(transport.serverCertificateHashes ?? []), ...fetched];
-      if (hashes.length > 0) {
-        transport.serverCertificateHashes = hashes;
-      }
-      return open(transport);
-    },
-  );
+  return fetchServerCertificateHashes(hashesUrl, { signal }).then((fetched) => {
+    if (signal?.aborted) {
+      throw abortError(signal);
+    }
+    const transport = transportOptions(options);
+    const hashes = [...(transport.serverCertificateHashes ?? []), ...fetched];
+    if (hashes.length > 0) {
+      transport.serverCertificateHashes = hashes;
+    }
+    return open(transport);
+  });
 }
 
 /**

@@ -79,7 +79,7 @@ func (l *Listener) handleHTTP3(w http.ResponseWriter, r *http.Request) {
 		r.RemoteAddr = state.quic.remoteAddr().String()
 	}
 	if !l.runtime.options.claimsPath(r.URL.Path) {
-		l.serveFallback(w, r)
+		l.serveUnclaimed(w, r)
 		return
 	}
 	if r.Method == http.MethodConnect && l.wt != nil {
