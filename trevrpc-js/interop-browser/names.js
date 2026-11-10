@@ -3,6 +3,7 @@ export const ScenarioNames = Object.freeze([
   "unary",
   "unary-metadata",
   "unary-error",
+  "unary-retry-delay",
   "unary-large",
   "client-stream",
   "server-stream",

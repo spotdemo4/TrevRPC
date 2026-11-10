@@ -108,6 +108,15 @@ function negotiationAnswer(request) {
   return answer;
 }
 
+/**
+ * The detail every ResourceExhausted failure of the interop servers carries: a
+ * google.rpc.RetryInfo of 1.5 seconds.
+ */
+const RetryInfo1500ms = {
+  type: "google.rpc.RetryInfo",
+  value: Uint8Array.of(0x0a, 0x08, 0x08, 0x01, 0x10, 0x80, 0xca, 0xb5, 0xee, 0x01),
+};
+
 async function serve(stream, request, unary, session) {
   try {
     resolveConnectionMetadata(request, session);
@@ -161,7 +170,9 @@ async function serve(stream, request, unary, session) {
     );
   }
   const done = (code = Code.Ok, message = "", metadata = {}) =>
-    stream.writeStatus(code, message, code === Code.Ok ? { ...trailers, ...metadata } : {});
+    code === Code.ResourceExhausted
+      ? stream.write(encodeStatusFrame({ code, message, metadata: {}, details: [RetryInfo1500ms] }))
+      : stream.writeStatus(code, message, code === Code.Ok ? { ...trailers, ...metadata } : {});
 
   if (path.service === CompressedEchoService && path.method === "Plain") {
     await compressedPlain(stream, request);

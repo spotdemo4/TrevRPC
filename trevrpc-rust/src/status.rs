@@ -1,5 +1,7 @@
 use std::fmt;
+use std::time::Duration;
 
+use crate::retry_info::{self, RETRY_INFO_TYPE};
 use crate::{Metadata, RpcStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -249,6 +251,30 @@ impl Status {
         self
     }
 
+    /// Tells the client to wait `delay` before it retries, with a `google.rpc.RetryInfo` detail.
+    /// The detail replaces any `RetryInfo` the status had and leaves its other details alone.
+    /// Clients read the delay with [`Status::retry_delay`], or the equivalent in their language.
+    #[must_use]
+    pub fn with_retry_delay(mut self, delay: Duration) -> Self {
+        self.details
+            .retain(|detail| detail.type_name != RETRY_INFO_TYPE);
+        self.details
+            .push(Detail::new(RETRY_INFO_TYPE, retry_info::encode(delay)));
+        self
+    }
+
+    /// Returns how long the status tells the client to wait before it retries, from its first
+    /// well-formed `google.rpc.RetryInfo` detail, such as that of a call a server's rate limit
+    /// rejected. `None` when it has none. A detail that does not decode, or whose delay is
+    /// negative or not a valid `google.protobuf.Duration`, is ignored.
+    #[must_use]
+    pub fn retry_delay(&self) -> Option<Duration> {
+        self.details
+            .iter()
+            .filter(|detail| detail.type_name == RETRY_INFO_TYPE)
+            .find_map(|detail| retry_info::decode(&detail.value))
+    }
+
     /// Returns the first detail whose message type is `type_name`, a full name such as
     /// `buf.validate.Violations`.
     #[must_use]
@@ -352,3 +378,69 @@ impl fmt::Display for Status {
 }
 
 impl std::error::Error for Status {}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{Code, Detail, Status};
+    use crate::{Error, RpcStatus};
+
+    #[test]
+    fn with_retry_delay_keeps_other_details_and_replaces_itself() {
+        let other = Detail::new("x.Y", vec![1]);
+        let first = Status::resource_exhausted("slow down")
+            .with_details([other.clone()])
+            .with_retry_delay(Duration::from_secs(1));
+        let second = first.clone().with_retry_delay(Duration::from_secs(5));
+
+        assert_eq!(first.retry_delay(), Some(Duration::from_secs(1)));
+        assert_eq!(second.retry_delay(), Some(Duration::from_secs(5)));
+        assert_eq!(second.details().len(), 2);
+        assert_eq!(second.details().first(), Some(&other));
+        assert_eq!(
+            second.details().get(1).map(Detail::type_name),
+            Some("google.rpc.RetryInfo")
+        );
+        assert_eq!(second.code(), Code::ResourceExhausted);
+        assert_eq!(second.message(), "slow down");
+    }
+
+    #[test]
+    fn the_retry_delay_is_the_golden_encoding() {
+        let status = Status::resource_exhausted("slow down").with_retry_delay(Duration::new(1, 2));
+
+        assert_eq!(
+            status
+                .find_detail("google.rpc.RetryInfo")
+                .map(Detail::value),
+            Some([0x0a, 0x04, 0x08, 0x01, 0x10, 0x02].as_slice())
+        );
+    }
+
+    #[test]
+    fn retry_delay_ignores_malformed_details() {
+        let status = Status::resource_exhausted("slow down").with_details([
+            Detail::new("google.rpc.RetryInfo", vec![0x0a, 0x09]),
+            Detail::new("other.Type", vec![0x0a, 0x02, 0x08, 0x09]),
+            Detail::new("google.rpc.RetryInfo", vec![0x0a, 0x02, 0x08, 0x03]),
+        ]);
+
+        assert_eq!(status.retry_delay(), Some(Duration::from_secs(3)));
+        assert_eq!(status.with_details([]).retry_delay(), None);
+    }
+
+    #[test]
+    fn the_retry_delay_survives_the_wire_and_is_read_from_errors() {
+        let status =
+            Status::resource_exhausted("slow down").with_retry_delay(Duration::from_millis(1500));
+        let decoded = Status::from(RpcStatus::from(status));
+
+        assert_eq!(decoded.retry_delay(), Some(Duration::from_millis(1500)));
+        assert_eq!(
+            Error::from(decoded).retry_delay(),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(Error::from(Status::internal("x")).retry_delay(), None);
+    }
+}

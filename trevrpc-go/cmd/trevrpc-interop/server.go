@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 	"trev.zip/llc/trevrpc/trevrpc-go/cmd/trevrpc-interop/interoppb"
@@ -170,8 +171,16 @@ func concatenateMessages[T messageRequest](requests trevrpc.MessageStream[T]) (*
 	return &interoppb.EchoResponse{Message: message.String(), Index: count}, nil
 }
 
+// retryDelay is the delay of the RetryInfo that a ResourceExhausted failure
+// carries.
+const retryDelay = 1500 * time.Millisecond
+
 func failure(request *interoppb.EchoRequest) error {
-	return trevrpc.NewStatus(trevrpc.CodeFromUint32(request.FailCode), request.FailMessage)
+	status := trevrpc.NewStatus(trevrpc.CodeFromUint32(request.FailCode), request.FailMessage)
+	if status.Code == trevrpc.CodeResourceExhausted {
+		status = status.WithRetryDelay(retryDelay)
+	}
+	return status
 }
 
 // headerKey is the request metadata key that asks for response headers.

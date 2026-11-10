@@ -33,6 +33,9 @@ use crate::{
 pub use crate::bearer::bearer_token;
 #[cfg(feature = "dev-certificate")]
 pub use crate::dev_certificate::DevelopmentCertificate;
+pub use crate::rate_limit::{
+    DEFAULT_IPV6_PREFIX, DEFAULT_MAX_BUCKETS, RateLimit, RateLimitOptions, RatePolicy,
+};
 
 type UnaryHandlerFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'static>>;
 type UnaryHandler =

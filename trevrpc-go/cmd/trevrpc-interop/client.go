@@ -211,6 +211,7 @@ var scenarios = []scenario{
 		_, err := c.Unary(ctx, &interoppb.EchoRequest{FailCode: 5, FailMessage: "missing"})
 		return expectStatus(err, trevrpc.CodeNotFound, "missing")
 	}},
+	{"unary-retry-delay", runUnaryRetryDelay},
 	{"unary-large", func(ctx context.Context, env *scenarioEnv) error {
 		c := env.echo
 		message := strings.Repeat("x", 1<<20)
@@ -366,6 +367,24 @@ var scenarios = []scenario{
 	{"compressed-plain", runCompressedPlain},
 	{"connection-metadata", runConnectionMetadata},
 	{"validation", runValidation},
+}
+
+// runUnaryRetryDelay is the unary-retry-delay scenario: a ResourceExhausted
+// failure that carries a google.rpc.RetryInfo, and one that does not.
+func runUnaryRetryDelay(ctx context.Context, env *scenarioEnv) error {
+	c := env.echo
+	_, err := c.Unary(ctx, &interoppb.EchoRequest{FailCode: 8, FailMessage: "slow down"})
+	if err := expectStatus(err, trevrpc.CodeResourceExhausted, "slow down"); err != nil {
+		return err
+	}
+	if delay, ok := trevrpc.RetryDelay(err); !ok || delay != 1500*time.Millisecond {
+		return fmt.Errorf("retry delay = %v, %v, want 1.5s", delay, ok)
+	}
+	_, err = c.Unary(ctx, &interoppb.EchoRequest{FailCode: 5, FailMessage: "missing"})
+	if delay, ok := trevrpc.RetryDelay(err); ok {
+		return fmt.Errorf("a NotFound failure has retry delay %v", delay)
+	}
+	return nil
 }
 
 // runValidation is the validation scenario: ValidatedEcho calls that keep and

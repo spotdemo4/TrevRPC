@@ -21,6 +21,16 @@ impl Error {
         Self::Transport(Box::new(error))
     }
 
+    /// How long the server told the client to wait before it retries, if this error is a status
+    /// that carries a `google.rpc.RetryInfo`; see [`Status::retry_delay`].
+    #[must_use]
+    pub fn retry_delay(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Status(status) => status.retry_delay(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn transport_code(&self) -> Option<crate::Code> {
         match self {
             Self::Transport(error) => Some(transport_status(error.as_ref()).code()),

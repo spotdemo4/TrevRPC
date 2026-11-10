@@ -68,6 +68,13 @@ export class TrevRpcError extends Error {
   readonly metadata: Metadata;
   /** The status details, still encoded; `findDetails` decodes those of one message type. */
   readonly details: readonly StatusDetail[];
+  /**
+   * How long the server told the client to wait before it retries, in milliseconds, from the
+   * status's `google.rpc.RetryInfo` detail, such as that of a call a server's rate limit
+   * rejected; `undefined` when the status has none. A detail that is malformed or holds a
+   * negative delay is ignored. The delay can have a fraction of a millisecond.
+   */
+  readonly retryDelayMs: number | undefined;
 
   constructor(code: number, message?: string, metadata?: Metadata, options?: TrevRpcErrorOptions);
 

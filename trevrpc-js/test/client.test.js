@@ -120,6 +120,70 @@ test("status errors carry the details of the status and decode them on request",
   });
 });
 
+test("status errors read the retry delay of a google.rpc.RetryInfo detail", async () => {
+  const retryInfo = (...bytes) => ({ type: "google.rpc.RetryInfo", value: Uint8Array.from(bytes) });
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.write(
+      encodeStatusFrame({
+        code: Code.ResourceExhausted,
+        message: "slow down",
+        // The golden RetryInfo{retry_delay: Duration{seconds: 1, nanos: 2}} of every runtime,
+        // after details to ignore.
+        details: [
+          { type: "other.Type", value: Uint8Array.of(0x0a, 0x02, 0x08, 0x09) },
+          retryInfo(0x0a, 0x09),
+          retryInfo(0x0a, 0x04, 0x08, 0x01, 0x10, 0x02),
+        ],
+      }),
+    );
+  });
+
+  await assert.rejects(echo.unary({ message: "x" }), (error) => {
+    assert.ok(isStatus(Code.ResourceExhausted, "slow down")(error));
+    assert.equal(error.retryDelayMs, 1000.000002);
+    return true;
+  });
+});
+
+test("retry delays follow the protobuf rules of google.rpc.RetryInfo", () => {
+  const delay = (...bytes) =>
+    new TrevRpcError(
+      Code.ResourceExhausted,
+      "",
+      {},
+      {
+        details: [{ type: "google.rpc.RetryInfo", value: Uint8Array.from(bytes) }],
+      },
+    ).retryDelayMs;
+  const hex = (text) => text.match(/../g)?.map((pair) => Number.parseInt(pair, 16)) ?? [];
+  const cases = [
+    ["0a02081e", 30_000],
+    ["0a061080cab5ee01", 500],
+    ["0a0808011080cab5ee01", 1500],
+    ["0a00", 0],
+    // Unknown fields are skipped, at either level, and the last value wins.
+    ["1a036162630a04080110022000", 1000.000002],
+    ["0a061a0008011002", 1000.000002],
+    ["0a02080a0a02080b", 11_000],
+    // No delay, a malformed one, or an invalid one.
+    ["", undefined],
+    ["1a03616263", undefined],
+    ["0a", undefined],
+    ["0a040801", undefined],
+    ["0a0108", undefined],
+    ["0801", undefined],
+    ["0a050d00000000", undefined],
+    ["0a0b08ffffffffffffffffff01", undefined],
+    ["0a0d080110ffffffffffffffffff01", undefined],
+    ["0a080801108094ebdc03", undefined],
+  ];
+  for (const [text, expected] of cases) {
+    assert.equal(delay(...hex(text)), expected, text);
+  }
+  assert.equal(new TrevRpcError(Code.NotFound, "missing").retryDelayMs, undefined);
+});
+
 test("unary calls return as soon as the response arrives", async () => {
   // The server never reads the request or finishes the stream; the final status alone decides.
   const { echo } = setup(async (stream) => {

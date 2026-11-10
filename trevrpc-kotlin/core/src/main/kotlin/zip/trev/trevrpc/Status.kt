@@ -1,8 +1,14 @@
 package zip.trev.trevrpc
 
+import com.google.protobuf.CodedInputStream
+import com.google.protobuf.InvalidProtocolBufferException
 import com.google.protobuf.Message
 import com.google.protobuf.MessageLite
 import com.google.protobuf.Parser
+import com.google.protobuf.WireFormat
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.nanoseconds
+import kotlin.time.Duration.Companion.seconds
 
 enum class Code(
     val value: UInt,
@@ -49,6 +55,15 @@ data class Status(
 
     fun withDetails(details: List<StatusDetail>): Status = copy(details = details.toList())
 
+    /**
+     * How long the server told the client to wait before it retries, from the first well-formed
+     * `google.rpc.RetryInfo` detail, such as that of a call a server's rate limit rejected; null when
+     * the status has none. A detail that does not decode, or whose delay is negative or not a valid
+     * `google.protobuf.Duration`, is ignored.
+     */
+    val retryDelay: Duration?
+        get() = details.firstNotNullOfOrNull { if (it.type == RETRY_INFO_TYPE) decodeRetryInfo(it.bytes) else null }
+
     /** Decodes the details whose type is [typeName], a full name such as `buf.validate.Violations`. */
     fun <T : MessageLite> findDetails(
         typeName: String,
@@ -90,7 +105,61 @@ data class Status(
 class TrevRpcException(
     val status: Status,
     cause: Throwable? = null,
-) : Exception(status.toString(), cause)
+) : Exception(status.toString(), cause) {
+    /** How long the server told the client to wait before it retries; see [Status.retryDelay]. */
+    val retryDelay: Duration?
+        get() = status.retryDelay
+}
+
+/** The full name of `google.rpc.RetryInfo`, the standard detail that tells a client when to retry. */
+private const val RETRY_INFO_TYPE = "google.rpc.RetryInfo"
+
+/**
+ * Decodes a `google.rpc.RetryInfo` into its delay. TrevRPC does this itself, so that it does not
+ * depend on googleapis. Returns null when the message is malformed, has no `retry_delay`, or holds a
+ * delay that is not a valid non-negative `Duration`: its nanos must be below a second. Fields it
+ * does not know are skipped, and a repeated field takes its last value, as protobuf decoders do.
+ */
+internal fun decodeRetryInfo(value: ByteArray): Duration? {
+    try {
+        var duration: ByteArray? = null
+        val message = CodedInputStream.newInstance(value)
+        while (true) {
+            val tag = message.readTag()
+            if (tag == 0) break
+            if (WireFormat.getTagFieldNumber(tag) != 1) {
+                if (!message.skipField(tag)) return null
+            } else if (WireFormat.getTagWireType(tag) != WireFormat.WIRETYPE_LENGTH_DELIMITED) {
+                return null
+            } else {
+                duration = message.readByteArray()
+            }
+        }
+        if (duration == null) return null
+
+        var seconds = 0L
+        var nanos = 0
+        val fields = CodedInputStream.newInstance(duration)
+        while (true) {
+            val tag = fields.readTag()
+            if (tag == 0) break
+            val field = WireFormat.getTagFieldNumber(tag)
+            if (field != 1 && field != 2) {
+                if (!fields.skipField(tag)) return null
+            } else if (WireFormat.getTagWireType(tag) != WireFormat.WIRETYPE_VARINT) {
+                return null
+            } else if (field == 1) {
+                seconds = fields.readInt64()
+            } else {
+                nanos = fields.readInt32()
+            }
+        }
+        if (seconds < 0 || nanos < 0 || nanos >= 1_000_000_000) return null
+        return seconds.seconds + nanos.nanoseconds
+    } catch (_: InvalidProtocolBufferException) {
+        return null
+    }
+}
 
 /**
  * One detail of a [Status]: a protobuf message, carried as its full name [type] and its encoding so
@@ -101,6 +170,10 @@ class StatusDetail(
     value: ByteArray,
 ) {
     private val valueBytes = value.copyOf()
+
+    /** The encoding without a copy, for decoding inside the module. */
+    internal val bytes: ByteArray
+        get() = valueBytes
 
     /** The protobuf encoding of the message. */
     val value: ByteArray

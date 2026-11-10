@@ -82,6 +82,26 @@ const scenarios = {
     );
   },
 
+  async "unary-retry-delay"(echo) {
+    // A ResourceExhausted failure carries a google.rpc.RetryInfo of 1.5 s, a NotFound one none.
+    const delays = [];
+    for (const [code, message] of [
+      [Code.ResourceExhausted, "slow down"],
+      [Code.NotFound, "missing"],
+    ]) {
+      await expectStatus(code, message, async () => {
+        try {
+          await echo.unary({ failCode: code, failMessage: message });
+        } catch (error) {
+          delays.push(error.retryDelayMs);
+          throw error;
+        }
+      });
+    }
+    expect(delays[0] === 1500, `retry delay ${delays[0]} ms, want 1500 ms`);
+    expect(delays[1] === undefined, `a NotFound failure has retry delay ${delays[1]} ms`);
+  },
+
   async "unary-large"(echo) {
     const message = "x".repeat(1 << 20);
     expectEcho(await echo.unary({ message }), message, 0);

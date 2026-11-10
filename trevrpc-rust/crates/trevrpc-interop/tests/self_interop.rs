@@ -9,10 +9,11 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_trevrpc-interop-rust");
-const SCENARIOS: [&str; 18] = [
+const SCENARIOS: [&str; 19] = [
     "unary",
     "unary-metadata",
     "unary-error",
+    "unary-retry-delay",
     "unary-large",
     "client-stream",
     "server-stream",

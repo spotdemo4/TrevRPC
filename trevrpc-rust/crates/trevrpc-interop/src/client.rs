@@ -88,6 +88,7 @@ fn scenarios<'a>(
         ("unary", Box::pin(unary(client))),
         ("unary-metadata", Box::pin(unary_metadata(client))),
         ("unary-error", Box::pin(unary_error(client))),
+        ("unary-retry-delay", Box::pin(unary_retry_delay(client))),
         ("unary-large", Box::pin(unary_large(client))),
         ("client-stream", Box::pin(client_stream(client))),
         ("server-stream", Box::pin(server_stream(client))),
@@ -533,6 +534,32 @@ async fn unary_error(client: &Echo) -> Scenario {
     {
         Ok(_) => Err("expected NotFound, got a response".to_owned()),
         Err(error) => expect_status(error, Code::NotFound, "missing"),
+    }
+}
+
+/// The `unary-retry-delay` scenario: a `ResourceExhausted` failure that carries a
+/// `google.rpc.RetryInfo`, and one that does not.
+async fn unary_retry_delay(client: &Echo) -> Scenario {
+    let exhausted = client
+        .unary(&failing(Code::ResourceExhausted, "slow down"))
+        .options(|_| options())
+        .await
+        .err()
+        .ok_or("expected ResourceExhausted, got a response")?;
+    let delay = exhausted.retry_delay();
+    expect_status(exhausted, Code::ResourceExhausted, "slow down")?;
+    if delay != Some(Duration::from_millis(1500)) {
+        return Err(format!("retry delay {delay:?}, want 1.5s"));
+    }
+    let missing = client
+        .unary(&failing(Code::NotFound, "missing"))
+        .options(|_| options())
+        .await
+        .err()
+        .ok_or("expected NotFound, got a response")?;
+    match missing.retry_delay() {
+        None => Ok(()),
+        delay => Err(format!("a NotFound failure has retry delay {delay:?}")),
     }
 }
 

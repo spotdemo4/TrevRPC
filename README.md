@@ -46,6 +46,9 @@ messages as QUIC datagrams.
 - reconnecting client channels that race QUIC against TCP and fall back when UDP is blocked; RPCs are never
   retried, and a handler never runs twice for one call
 - server limits, authorization hooks, interceptors, metrics, diagnostics, and graceful shutdown
+- a [rate-limit interceptor](https://trev.zip/llc/TrevRPC/wiki/Operations-Limits-and-Security#rate-limiting)
+  for Go ([`ratelimit`](trevrpc-go/ratelimit)) and Rust (`trevrpc::server::RateLimit`) servers, with IPv6
+  clients grouped by prefix, whose rejections carry a `google.rpc.RetryInfo` delay that every client reads
 - OpenTelemetry metrics and tracing for Go ([`oteltrevrpc`](trevrpc-go/oteltrevrpc)) and Rust
   ([`trevrpc-opentelemetry`](trevrpc-rust/crates/trevrpc-opentelemetry))
 - [protovalidate](https://github.com/bufbuild/protovalidate) request validation for Go

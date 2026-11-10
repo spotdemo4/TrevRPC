@@ -87,6 +87,7 @@ test("scenarios fail individually when the server misbehaves", () =>
       assert.deepEqual(Object.keys(failed), [
         "unary-metadata",
         "unary-error",
+        "unary-retry-delay",
         "unary-large",
         "unary-headers",
         "compressed",
@@ -94,6 +95,10 @@ test("scenarios fail individually when the server misbehaves", () =>
       ]);
       assert.match(failed["unary-metadata"], /expected \(hello!, 0\), got \(hello, 0\)/);
       assert.match(failed["unary-error"], /expected status NotFound "missing", got OK/);
+      assert.match(
+        failed["unary-retry-delay"],
+        /expected status ResourceExhausted "slow down", got OK/,
+      );
       assert.match(failed["unary-large"], /\[1048576 chars\]/);
       assert.match(failed["unary-headers"], /expected trailing metadata .*, got \{\}/);
       assert.match(failed.compressed, /expected \(\{"service".*, 0\), got \(hello, 0\)/);

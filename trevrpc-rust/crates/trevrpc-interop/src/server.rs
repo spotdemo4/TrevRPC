@@ -2,6 +2,7 @@
 
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::{Either, ready};
@@ -46,13 +47,21 @@ fn answer_header(context: &RequestContext) -> Result<(), Status> {
     context.set_response_metadata(TRAILER_METADATA_KEY, value.clone())
 }
 
+/// The delay of the `google.rpc.RetryInfo` that a `ResourceExhausted` failure carries.
+const RETRY_DELAY: Duration = Duration::from_millis(1500);
+
 /// The status a request asks to fail with, if any.
 fn requested_failure(request: &EchoRequest) -> Option<Status> {
     (request.fail_code != 0).then(|| {
-        Status::new(
+        let status = Status::new(
             Code::from_u32(request.fail_code),
             request.fail_message.clone(),
-        )
+        );
+        if status.code() == Code::ResourceExhausted {
+            status.with_retry_delay(RETRY_DELAY)
+        } else {
+            status
+        }
     })
 }
 

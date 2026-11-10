@@ -23,7 +23,7 @@ import (
 )
 
 var wantScenarios = []string{
-	"unary", "unary-metadata", "unary-error", "unary-large", "client-stream",
+	"unary", "unary-metadata", "unary-error", "unary-retry-delay", "unary-large", "client-stream",
 	"server-stream", "server-stream-error", "bidi", "bidi-error",
 	"unary-headers", "server-stream-headers", "unreliable", "compressed", "compressed-stream",
 	"refused-stream", "compressed-plain", "connection-metadata", "validation",

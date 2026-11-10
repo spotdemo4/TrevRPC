@@ -37,6 +37,7 @@ import zip.trev.trevrpc.cronet.CronetTransportOptions
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -192,6 +193,14 @@ private val SCENARIOS: Map<String, suspend (Clients) -> Unit> =
         },
         "unary-error" to { (client) ->
             expectStatus(Code.NOT_FOUND, "missing") { client.unary(request("", failCode = 5, failMessage = "missing")) }
+        },
+        // A ResourceExhausted failure carries a google.rpc.RetryInfo of 1.5 seconds, a NotFound one none.
+        "unary-retry-delay" to { (client) ->
+            val exhausted =
+                expectStatus(Code.RESOURCE_EXHAUSTED, "slow down") { client.unary(request("", failCode = 8, failMessage = "slow down")) }
+            expect(exhausted.retryDelay == 1500.milliseconds) { "expected retry delay 1.5s, got ${exhausted.retryDelay}" }
+            val missing = expectStatus(Code.NOT_FOUND, "missing") { client.unary(request("", failCode = 5, failMessage = "missing")) }
+            expect(missing.retryDelay == null) { "a NOT_FOUND failure has retry delay ${missing.retryDelay}" }
         },
         "unary-large" to { (client) ->
             val message = "x".repeat(1 shl 20)
@@ -433,7 +442,7 @@ private suspend fun expectStatus(
     code: Code,
     message: String,
     call: suspend () -> Unit,
-) {
+): TrevRpcException {
     val failure =
         try {
             call()
@@ -444,6 +453,7 @@ private suspend fun expectStatus(
     expect(failure.status.code == code && failure.status.message == message) {
         "expected status $code \"$message\", got ${failure.status.code} \"${failure.status.message}\""
     }
+    return failure
 }
 
 private fun validatedRequest(message: String): ValidatedRequest = ValidatedRequest.newBuilder().setMessage(message).build()

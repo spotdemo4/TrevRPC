@@ -1,4 +1,5 @@
 import { fromBinary } from "@bufbuild/protobuf";
+import { BinaryReader, WireType } from "@bufbuild/protobuf/wire";
 
 export const Code = Object.freeze({
   Ok: 0,
@@ -48,6 +49,81 @@ export class TrevRpcError extends Error {
       .filter((detail) => detail.type === schema.typeName)
       .map((detail) => fromBinary(schema, detail.value));
   }
+}
+
+/** The full name of google.rpc.RetryInfo, the standard detail that tells a client when to retry. */
+const RETRY_INFO_TYPE = "google.rpc.RetryInfo";
+
+/**
+ * How long the status tells the client to wait before it retries, in milliseconds, from its first
+ * well-formed google.rpc.RetryInfo detail, such as that of a call a server's rate limit rejected;
+ * `undefined` when it has none. A detail that does not decode, or whose delay is negative or not a
+ * valid google.protobuf.Duration, is ignored. The delay can have a fraction of a millisecond.
+ */
+Object.defineProperty(TrevRpcError.prototype, "retryDelayMs", {
+  get() {
+    for (const detail of this.details) {
+      if (detail.type === RETRY_INFO_TYPE) {
+        const delay = decodeRetryInfo(detail.value);
+        if (delay !== undefined) {
+          return delay;
+        }
+      }
+    }
+    return undefined;
+  },
+});
+
+/**
+ * Decodes a google.rpc.RetryInfo into its delay in milliseconds. TrevRPC does this itself, so that
+ * it does not depend on googleapis. Returns `undefined` when the message is malformed, has no
+ * retry_delay, or holds a delay that is not a valid non-negative Duration: its nanos must be below
+ * a second. Fields it does not know are skipped, and a repeated field takes its last value, as
+ * protobuf decoders do.
+ */
+export function decodeRetryInfo(value) {
+  let duration;
+  let seconds = 0n;
+  let nanos = 0;
+  try {
+    for (const reader = new BinaryReader(value); reader.pos < reader.len;) {
+      const [field, wireType] = reader.tag();
+      if (field === 1) {
+        duration = lengthDelimited(reader, wireType);
+      } else {
+        reader.skip(wireType);
+      }
+    }
+    if (duration === undefined) {
+      return undefined;
+    }
+    for (const reader = new BinaryReader(duration); reader.pos < reader.len;) {
+      const [field, wireType] = reader.tag();
+      if (field !== 1 && field !== 2) {
+        reader.skip(wireType);
+      } else if (wireType !== WireType.Varint) {
+        return undefined;
+      } else if (field === 1) {
+        seconds = BigInt(reader.int64());
+      } else {
+        nanos = reader.int32();
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  if (seconds < 0n || nanos < 0 || nanos >= 1_000_000_000) {
+    return undefined;
+  }
+  return Number(seconds) * 1000 + nanos / 1e6;
+}
+
+/** Reads the bytes of a length-delimited field, or throws when the field has another wire type. */
+function lengthDelimited(reader, wireType) {
+  if (wireType !== WireType.LengthDelimited) {
+    throw new Error("unexpected wire type");
+  }
+  return reader.bytes();
 }
 
 // A discriminant for libraries that match errors by tag, such as Effect's `catchTag`. It is on the
