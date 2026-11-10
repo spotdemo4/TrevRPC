@@ -2821,9 +2821,11 @@ dependencies = [
 name = "trevrpc-interop"
 version = "1.7.0"
 dependencies = [
+ "divan",
  "futures-util",
  "prost",
  "prost-build",
+ "prost-reflect",
  "prost-types",
  "protoc-gen-trevrpc-rust",
  "protox",

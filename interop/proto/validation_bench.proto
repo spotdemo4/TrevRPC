@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package trevrpc.interop.v1;
+
+import "buf/validate/validate.proto";
+import "interop.proto";
+
+// ValidationBench measures what buf.validate request validation costs; see
+// the validation scenarios of bench/README.md. Its three request types have
+// the same fields and differ only in their rules: BenchRequest has none,
+// StandardBenchRequest has standard rules only, and CelBenchRequest the same
+// standard rules and two CEL rules. Each method answers as the Echo method of
+// its shape does. It is a separate file for the same reason as
+// unreliable.proto: the gRPC baseline compiles only interop.proto.
+service ValidationBench {
+  rpc Unary(BenchRequest) returns (EchoResponse);
+  rpc ClientStream(stream BenchRequest) returns (EchoResponse);
+  rpc StandardUnary(StandardBenchRequest) returns (EchoResponse);
+  rpc StandardClientStream(stream StandardBenchRequest) returns (EchoResponse);
+  rpc CelUnary(CelBenchRequest) returns (EchoResponse);
+  rpc CelClientStream(stream CelBenchRequest) returns (EchoResponse);
+}
+
+// BenchRequest is a request of the kind an API takes: an idempotency key, the
+// caller, an enumerated and a bounded value, labels, a time window, and the
+// benchmark's payload in message.
+message BenchRequest {
+  string request_id = 1;
+  string email = 2;
+  string region = 3;
+  uint32 quantity = 4;
+  repeated string tags = 5;
+  int64 start_ms = 6;
+  int64 end_ms = 7;
+  string message = 8;
+}
+
+// StandardBenchRequest is BenchRequest with standard rules on every field.
+message StandardBenchRequest {
+  string request_id = 1 [(buf.validate.field).string.uuid = true];
+  string email = 2 [(buf.validate.field).string.email = true];
+  string region = 3 [(buf.validate.field).string = {
+    in: [
+      "us-east-1",
+      "us-west-2",
+      "eu-west-1",
+      "eu-central-1",
+      "ap-southeast-1"
+    ]
+  }];
+  uint32 quantity = 4 [(buf.validate.field).uint32 = {
+    gte: 1
+    lte: 1000
+  }];
+  repeated string tags = 5 [(buf.validate.field).repeated = {
+    max_items: 16
+    items: {
+      string: {
+        min_len: 1
+        max_len: 32
+      }
+    }
+  }];
+  int64 start_ms = 6 [(buf.validate.field).int64.gt = 0];
+  int64 end_ms = 7 [(buf.validate.field).int64.gt = 0];
+  string message = 8 [(buf.validate.field).string.max_len = 1048576];
+}
+
+// CelBenchRequest is StandardBenchRequest with two CEL rules: one that
+// compares two fields, and one that iterates over a repeated field.
+message CelBenchRequest {
+  option (buf.validate.message).cel = {
+    id: "window.ordered"
+    message: "end_ms must be after start_ms"
+    expression: "this.end_ms > this.start_ms"
+  };
+  option (buf.validate.message).cel = {
+    id: "tags.not_region"
+    message: "tags must not repeat the region"
+    expression: "this.tags.all(tag, tag != this.region)"
+  };
+
+  string request_id = 1 [(buf.validate.field).string.uuid = true];
+  string email = 2 [(buf.validate.field).string.email = true];
+  string region = 3 [(buf.validate.field).string = {
+    in: [
+      "us-east-1",
+      "us-west-2",
+      "eu-west-1",
+      "eu-central-1",
+      "ap-southeast-1"
+    ]
+  }];
+  uint32 quantity = 4 [(buf.validate.field).uint32 = {
+    gte: 1
+    lte: 1000
+  }];
+  repeated string tags = 5 [(buf.validate.field).repeated = {
+    max_items: 16
+    items: {
+      string: {
+        min_len: 1
+        max_len: 32
+      }
+    }
+  }];
+  int64 start_ms = 6 [(buf.validate.field).int64.gt = 0];
+  int64 end_ms = 7 [(buf.validate.field).int64.gt = 0];
+  string message = 8 [(buf.validate.field).string.max_len = 1048576];
+}

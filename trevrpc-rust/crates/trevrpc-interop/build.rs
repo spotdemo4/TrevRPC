@@ -9,19 +9,24 @@ use prost_types::compiler::CodeGeneratorResponse;
 /// The interop services, shared by every runtime. `interop.proto` has the reliable `Echo`,
 /// `unreliable.proto` the `UnreliableEcho` service with datagram messages, `compressed.proto`
 /// the `CompressedEcho` service with stream compression and compression without a dictionary,
-/// and `validated.proto` the `ValidatedEcho` service, whose requests carry `buf.validate` rules
-/// from `buf/validate/validate.proto`, vendored in the same directory.
+/// `validated.proto` the `ValidatedEcho` service, whose requests carry `buf.validate` rules
+/// from `buf/validate/validate.proto`, vendored in the same directory, and
+/// `validation_bench.proto` the `ValidationBench` service of the validation benchmarks.
 const INTEROP_PROTO_DIR: &str = "../../../interop/proto";
-const INTEROP_PROTOS: [&str; 4] = [
+const INTEROP_PROTOS: [&str; 5] = [
     "interop.proto",
     "unreliable.proto",
     "compressed.proto",
     "validated.proto",
+    "validation_bench.proto",
 ];
 /// The directory holding `trevrpc/options.proto`, which the other files import.
 const TREVRPC_PROTO_DIR: &str = "../../../proto";
 const OPTIONS_PROTO: &str = "trevrpc/options.proto";
 const GENERATED_SERVICE: &str = "trevrpc.interop.v1.trevrpc.rs";
+/// The encoded descriptors of the interop protos and their imports, from which the validation
+/// microbenchmarks build their validator.
+const DESCRIPTOR_SET: &str = "interop.fds";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir =
@@ -48,8 +53,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // The `(trevrpc.method)` options are extensions that `prost_types` drops, so the plugin gets
     // the encoded descriptors, which keep them.
+    let descriptor_set = compiler.encode_file_descriptor_set();
     let request = protoc_gen_trevrpc_rust::code_generator_request(
-        &compiler.encode_file_descriptor_set(),
+        &descriptor_set,
         &INTEROP_PROTOS,
         "runtime_path=::trevrpc,validate=true",
     )?;
@@ -67,6 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("TrevRPC generator did not produce the interop services")?;
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
     fs::write(out_dir.join(GENERATED_SERVICE), generated)?;
+    fs::write(out_dir.join(DESCRIPTOR_SET), descriptor_set)?;
 
     Ok(())
 }

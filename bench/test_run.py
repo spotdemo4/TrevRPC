@@ -65,11 +65,13 @@ class SummaryTest(unittest.TestCase):
 
         self.assertTrue(lines[0].startswith("scenario" + " " * 18 + "size"))
         bidi, unary = (line.split() for line in lines[1:])
-        self.assertEqual(["bidi", "64", "0", "4", "1", "-", "quic", "none", "go", "go"], bidi[:10])
+        self.assertEqual(
+            ["bidi", "64", "0", "4", "1", "-", "-", "quic", "none", "go", "go"], bidi[:11]
+        )
         # ops/s, msgs/s, MB/s, p50us, p99us, wire_B/msg, lost%, spread%
-        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[10:])
-        self.assertEqual(["unary", "rust", "go"], [unary[0], unary[8], unary[9]])
-        self.assertEqual(["80", "33.33", "-"], unary[15:])
+        self.assertEqual(["1234", "1234", "12.34", "10", "30", "-", "0", "-"], bidi[11:])
+        self.assertEqual(["unary", "rust", "go"], [unary[0], unary[9], unary[10]])
+        self.assertEqual(["80", "33.33", "-"], unary[16:])
 
     def test_shows_the_rate_of_paced_runs_in_rate_order(self) -> None:
         paced = {**RESULT, "scenario": "unreliable-paced"}
@@ -83,6 +85,21 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual("rate", lines[0].split()[5])
         self.assertEqual(["100", "1000"], [line.split()[5] for line in lines[1:]])
         self.assertIsNone(run.parse_result("go", "go", json.dumps(RESULT)).rate)
+
+    def test_shows_the_rules_of_validation_runs_in_rule_order(self) -> None:
+        validated = {**RESULT, "scenario": "validation-unary"}
+        results = [
+            run.parse_result("go", "go", json.dumps({**validated, "validation": validation}))
+            for validation in ("cel", "none", "standard")
+        ]
+
+        lines = run.summary(results).splitlines()
+
+        self.assertEqual("rules", lines[0].split()[6])
+        self.assertEqual(["none", "standard", "cel"], [line.split()[6] for line in lines[1:]])
+        self.assertIsNone(run.parse_result("go", "go", json.dumps(RESULT)).validation)
+        with self.assertRaises(ValueError):
+            _ = run.parse_result("go", "go", json.dumps({**validated, "validation": "all"}))
 
     def test_marks_connection_metadata(self) -> None:
         results = [
@@ -119,11 +136,11 @@ class SummaryTest(unittest.TestCase):
         )
 
         self.assertEqual("stream", result.compression)
-        self.assertEqual("stream", run.summary([result]).splitlines()[1].split()[7])
+        self.assertEqual("stream", run.summary([result]).splitlines()[1].split()[8])
         # A mode longer than its column still stands apart from the client.
         longer = replace(result, compression="stream-dictionary")
         self.assertEqual(
-            ["stream-dictionary", "go"], run.summary([longer]).splitlines()[1].split()[7:9]
+            ["stream-dictionary", "go"], run.summary([longer]).splitlines()[1].split()[8:10]
         )
 
     def test_groups_rows_by_netem_profile_in_run_order(self) -> None:
@@ -137,7 +154,7 @@ class SummaryTest(unittest.TestCase):
 
         self.assertEqual("netem delay 10ms loss 1%", lines[0])
         self.assertTrue(lines[1].startswith("scenario"))
-        self.assertEqual(["go", "rust"], [line.split()[8] for line in lines[2:4]])
+        self.assertEqual(["go", "rust"], [line.split()[9] for line in lines[2:4]])
         self.assertEqual(["", "netem delay 10ms"], lines[4:6])
         self.assertEqual(8, len(lines))
         self.assertEqual("delay 10ms", results[1].record["netem"])
@@ -285,6 +302,42 @@ class MatrixTest(unittest.TestCase):
         )
         self.assertEqual([], matrix.cells("grpc", "grpc", "grpc", None)[1:])
 
+    def test_validation_cells_run_once_per_rule_set_on_trevrpc_only(self) -> None:
+        matrix = run.Matrix(
+            ["unary", "validation-unary"], [64], [0], [1], 0.2, 0, 10,
+            validations=("none", "cel"),
+        )  # fmt: skip
+
+        cells = matrix.cells("go", "go", "tcp", None)
+
+        self.assertEqual(
+            [("unary", None), ("validation-unary", "none"), ("validation-unary", "cel")],
+            [(cell.scenario, cell.validation) for cell in cells],
+        )
+        self.assertEqual(1, len(matrix.cells("grpc", "grpc", "grpc", None)))
+        self.assertEqual(1, len(matrix.cells("chromium", "go", "webtransport", None)))
+
+    def test_validations_must_be_known(self) -> None:
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            _ = run.parse_args(["--baseline", "b", "--validations", "none,all"])
+
+    def test_a_validation_cell_passes_its_rules(self) -> None:
+        matrix = run.Matrix(
+            ["validation-client-stream"], [64], [0], [1], 1, 0.5, 10, validations=("standard",)
+        )
+        runner = run.Runner(matrix, Path("/"))
+        cells: list[tuple[object, ...]] = []
+
+        def run_one(*cell: object) -> None:
+            cells.append(cell)
+
+        runner.run_one = run_one  # pyright: ignore[reportAttributeAccessIssue]
+        runner.run_matrix("go", "go", ["go"], "quic", [], None)
+
+        self.assertEqual(1, len(cells))
+        self.assertEqual("go-quic-to-go-validation-client-stream-standard-64-md0-c1", cells[0][0])
+        self.assertEqual(["--validation", "standard"], cast(list[str], cells[0][-1])[-2:])
+
     def test_rates_must_be_positive(self) -> None:
         for rates in ("0", "10,-1", "fast"):
             with (
@@ -370,6 +423,8 @@ class TableTest(unittest.TestCase):
         )  # fmt: skip
         self.assertEqual(8, self.cells("browser-lossy")[("chromium", "webtransport")])
         self.assertEqual(2, self.cells("browser-lossy")[("chromium", "grpc-web")])
+        # Validation runs each native client against its own server over QUIC.
+        self.assertEqual({("go", "quic"): 24, ("rust", "quic"): 24}, self.cells("validation"))
         # Connection metadata runs with metadata, on TrevRPC only.
         self.assertEqual(
             {("go", "quic"): 12, ("go", "tcp"): 12, ("rust", "quic"): 12, ("rust", "tcp"): 12,

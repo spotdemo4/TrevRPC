@@ -298,6 +298,40 @@ func BenchmarkUnary(b *testing.B) {
 	})
 }
 
+// BenchmarkUnaryValidator measures 16-byte unary calls over QUIC on a route
+// whose request type has no rules, on a server without a validator and on one
+// with a validator. A validator that has no check for the type leaves the
+// route's handler as it is, so the two should not differ. protovalidatetrevrpc
+// has no check for a type without buf.validate rules; valueValidator with skip
+// set stands in for it, so that this module needs no protovalidate.
+func BenchmarkUnaryValidator(b *testing.B) {
+	for _, tc := range []struct {
+		name      string
+		validator Validator
+	}{
+		{"none", nil},
+		{"without-rules", &valueValidator{skip: true}},
+	} {
+		b.Run("validator="+tc.name, func(b *testing.B) {
+			pki := newTestPKI(b)
+			listener := startTestListenerWith(b, pki, nil, func(server *Server) {
+				server.SetValidator(tc.validator)
+				registerBenchService(server)
+			})
+			transport := dialNative(b, pki, listener)
+			ctx, cancel := context.WithTimeout(context.Background(), benchTimeout)
+			b.Cleanup(cancel)
+			request := &testMessage{Value: strings.Repeat("x", 16)}
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := Unary(ctx, transport, "/bench.Echo/Unary", request, newTestMessage); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // benchWorkers is how many calls BenchmarkUnaryParallel keeps in flight on
 // its one connection, which is the server's default stream limit.
 const benchWorkers = 64

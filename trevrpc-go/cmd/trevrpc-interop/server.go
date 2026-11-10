@@ -88,11 +88,12 @@ func newServer(addr string, tlsConfig *tls.Config, webRoot string, compression *
 		options.HTTPFallback = http.FileServer(http.Dir(webRoot))
 	}
 	server.SetOptions(options)
-	// Only ValidatedEcho's request type has rules; the other routes skip
-	// validation.
+	// Only the request types of ValidatedEcho and of ValidationBench's
+	// Standard and Cel methods have rules; the other routes skip validation.
 	server.SetValidator(protovalidatetrevrpc.New(nil))
 	interoppb.RegisterEchoServer(server, echoServer{})
 	interoppb.RegisterValidatedEchoServer(server, validatedEchoServer{})
+	interoppb.RegisterValidationBenchServer(server, validationBenchServer{})
 	interoppb.RegisterUnreliableEchoServer(server, unreliableEchoServer{})
 	interoppb.RegisterCompressedEchoServer(server, compressedEchoServer{})
 	// RefusingEcho is registered by hand, without the stream compression its
@@ -110,17 +111,60 @@ type echoServer struct{}
 type validatedEchoServer struct{}
 
 func (validatedEchoServer) Unary(_ context.Context, request *interoppb.ValidatedRequest) (*interoppb.EchoResponse, error) {
-	return &interoppb.EchoResponse{Message: request.Message}, nil
+	return echoMessage(request), nil
 }
 
 func (validatedEchoServer) ClientStream(_ context.Context, requests trevrpc.MessageStream[*interoppb.ValidatedRequest]) (*interoppb.EchoResponse, error) {
+	return concatenateMessages(requests)
+}
+
+// validationBenchServer implements ValidationBench, whose methods differ only
+// in the rules of their request types, which the server's validator checks
+// before they reach it.
+type validationBenchServer struct{}
+
+func (validationBenchServer) Unary(_ context.Context, request *interoppb.BenchRequest) (*interoppb.EchoResponse, error) {
+	return echoMessage(request), nil
+}
+
+func (validationBenchServer) ClientStream(_ context.Context, requests trevrpc.MessageStream[*interoppb.BenchRequest]) (*interoppb.EchoResponse, error) {
+	return concatenateMessages(requests)
+}
+
+func (validationBenchServer) StandardUnary(_ context.Context, request *interoppb.StandardBenchRequest) (*interoppb.EchoResponse, error) {
+	return echoMessage(request), nil
+}
+
+func (validationBenchServer) StandardClientStream(_ context.Context, requests trevrpc.MessageStream[*interoppb.StandardBenchRequest]) (*interoppb.EchoResponse, error) {
+	return concatenateMessages(requests)
+}
+
+func (validationBenchServer) CelUnary(_ context.Context, request *interoppb.CelBenchRequest) (*interoppb.EchoResponse, error) {
+	return echoMessage(request), nil
+}
+
+func (validationBenchServer) CelClientStream(_ context.Context, requests trevrpc.MessageStream[*interoppb.CelBenchRequest]) (*interoppb.EchoResponse, error) {
+	return concatenateMessages(requests)
+}
+
+// messageRequest is a request type with a message field to echo.
+type messageRequest interface{ GetMessage() string }
+
+// echoMessage answers a unary request as Echo.Unary does: {message, index 0}.
+func echoMessage(request messageRequest) *interoppb.EchoResponse {
+	return &interoppb.EchoResponse{Message: request.GetMessage()}
+}
+
+// concatenateMessages answers a client stream as Echo.ClientStream does: the
+// concatenation of every request's message, and how many there were.
+func concatenateMessages[T messageRequest](requests trevrpc.MessageStream[T]) (*interoppb.EchoResponse, error) {
 	var message strings.Builder
 	var count uint32
 	for request, err := range trevrpc.Messages(requests) {
 		if err != nil {
 			return nil, err
 		}
-		message.WriteString(request.Message)
+		message.WriteString(request.GetMessage())
 		count++
 	}
 	return &interoppb.EchoResponse{Message: message.String(), Index: count}, nil

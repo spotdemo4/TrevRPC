@@ -446,7 +446,7 @@ async fn validation(client: &ValidatedEcho) -> Scenario {
 /// Checks that `outcome` failed with `InvalidArgument` and a `buf.validate.Violations` detail
 /// holding one violation of `rule`, on the field named `field`, or on the message itself when
 /// `field` is empty.
-fn expect_violation(
+pub(crate) fn expect_violation(
     what: &str,
     outcome: Result<EchoResponse, Error>,
     rule: &str,

@@ -62,11 +62,14 @@ type benchConfig struct {
 	payload     string
 	compression string
 	dictionary  string
+	// validation is which ValidationBench request type the validation
+	// scenarios send: none, standard or cel.
+	validation string
 }
 
 func (c *benchConfig) register(flags *flag.FlagSet) {
 	c.connectionConfig.register(flags, "transport: quic or tcp (QMux over TLS)")
-	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream, unreliable-client-stream, paced or unreliable-paced")
+	flags.StringVar(&c.scenario, "scenario", "", "unary, server-stream, client-stream, bidi, unreliable-server-stream, unreliable-client-stream, paced, unreliable-paced, validation-unary or validation-client-stream")
 	flags.IntVar(&c.size, "size", 64, "length of EchoRequest.message in bytes")
 	flags.IntVar(&c.metadata, "metadata-size", 0, "bytes of the bench-pad request metadata entry sent with every call; 0 sends none")
 	flags.StringVar(&c.metadataScope, "metadata-scope", "call", "call (the bench-pad entry goes with every call) or connection (as connection metadata)")
@@ -79,6 +82,7 @@ func (c *benchConfig) register(flags *flag.FlagSet) {
 	flags.StringVar(&c.payload, "payload", "repeat", "EchoRequest.message: repeat (x repeated) or records (a new log-records message per request)")
 	flags.StringVar(&c.compression, "compression", "none", "none, dictionary, stream or stream-dictionary")
 	flags.StringVar(&c.dictionary, "dictionary", "", "zstd dictionary file for the dictionary and stream-dictionary compression modes")
+	flags.StringVar(&c.validation, "validation", "none", "rules the validation scenarios' requests carry: none, standard or cel")
 }
 
 // benchCompressions are the --compression modes and the scenarios each runs.
@@ -121,6 +125,12 @@ func (c *benchConfig) validate() error {
 	case c.metadataScope != "call" && c.metadataScope != "connection":
 		return fmt.Errorf("bench: unknown --metadata-scope %q", c.metadataScope)
 	}
+	if _, ok := benchValidations[c.validation]; !ok {
+		return fmt.Errorf("bench: unknown --validation %q", c.validation)
+	}
+	if c.validation != "none" && !c.validated() {
+		return fmt.Errorf("bench: --validation %s runs the validation scenarios only", c.validation)
+	}
 	switch {
 	case c.size < 0:
 		return errors.New("bench: --size must not be negative")
@@ -145,6 +155,11 @@ func (c *benchConfig) validate() error {
 // paced reports whether the scenario sends at --rate.
 func (c *benchConfig) paced() bool {
 	return c.scenario == "paced" || c.scenario == "unreliable-paced"
+}
+
+// validated reports whether the scenario calls ValidationBench.
+func (c *benchConfig) validated() bool {
+	return c.scenario == "validation-unary" || c.scenario == "validation-client-stream"
 }
 
 // interval is the time between the messages of a paced worker.
@@ -196,20 +211,24 @@ type lossyOperation interface {
 
 // benchClients are the clients of the services the scenarios call.
 type benchClients struct {
+	// channel is the connection the clients share, on which the validation
+	// scenarios call ValidationBench by method path.
+	channel    trevrpc.Transport
 	echo       *interoppb.EchoClient
 	unreliable *interoppb.UnreliableEchoClient
 	compressed *interoppb.CompressedEchoClient
 }
 
-// The calls of Echo and CompressedEcho, which have the same messages.
+// The calls of Echo and CompressedEcho, which have the same messages, and of
+// ValidationBench, whose request types have the same encoding as BenchRequest.
 type (
-	unaryCall        func(context.Context, *interoppb.EchoRequest, ...trevrpc.CallOption) (*interoppb.EchoResponse, error)
-	openClientStream func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error)
-	openBidi         func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error)
+	unaryCall[Req trevrpc.ProtoMessage]        func(context.Context, Req, ...trevrpc.CallOption) (*interoppb.EchoResponse, error)
+	openClientStream[Req trevrpc.ProtoMessage] func(context.Context, ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[Req, *interoppb.EchoResponse], error)
+	openBidi                                   func(context.Context, ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error)
 )
 
 // unary returns the Unary call the compression mode uses.
-func (c benchClients) unary(config benchConfig) unaryCall {
+func (c benchClients) unary(config benchConfig) unaryCall[*interoppb.EchoRequest] {
 	if config.streamCompressed() {
 		return c.compressed.Unary
 	}
@@ -217,11 +236,36 @@ func (c benchClients) unary(config benchConfig) unaryCall {
 }
 
 // clientStream returns the ClientStream call the compression mode uses.
-func (c benchClients) clientStream(config benchConfig) openClientStream {
+func (c benchClients) clientStream(config benchConfig) openClientStream[*interoppb.EchoRequest] {
 	if config.streamCompressed() {
 		return c.compressed.ClientStream
 	}
 	return c.echo.ClientStream
+}
+
+// validationUnary returns the ValidationBench unary call whose request type
+// carries the rules of --validation. Every request type has BenchRequest's
+// encoding, so each call sends a BenchRequest, and only the server's work
+// differs between them.
+func (c benchClients) validationUnary(config benchConfig) unaryCall[*interoppb.BenchRequest] {
+	path := benchValidations[config.validation].unary
+	return func(ctx context.Context, request *interoppb.BenchRequest, options ...trevrpc.CallOption) (*interoppb.EchoResponse, error) {
+		return trevrpc.Unary(ctx, c.channel, path, request, newEchoResponse, options...)
+	}
+}
+
+// validationClientStream is validationUnary for ClientStream.
+func (c benchClients) validationClientStream(config benchConfig) openClientStream[*interoppb.BenchRequest] {
+	path := benchValidations[config.validation].clientStream
+	return func(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.ClientStreamingCall[*interoppb.BenchRequest, *interoppb.EchoResponse], error) {
+		return trevrpc.ClientStreaming[*interoppb.BenchRequest](ctx, c.channel, path, newEchoResponse, options...)
+	}
+}
+
+func newEchoResponse() *interoppb.EchoResponse { return &interoppb.EchoResponse{} }
+
+func newEchoRequest(message string) *interoppb.EchoRequest {
+	return &interoppb.EchoRequest{Message: message}
 }
 
 // bidi returns the Bidi call the compression mode uses.
@@ -237,13 +281,13 @@ func (c benchClients) bidi(config benchConfig) openBidi {
 // --size bytes.
 var benchScenarios = map[string]func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload{
 	"unary": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
-		return operationLoop{&unaryOperation{call: clients.unary(config), options: config.callOptions(), payload: payload}}
+		return operationLoop{&unaryOperation[*interoppb.EchoRequest]{call: clients.unary(config), request: newEchoRequest, options: config.callOptions(), payload: payload}}
 	},
 	"server-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
 		return operationLoop{&serverStreamOperation{client: clients.echo, options: config.callOptions(), payload: payload, count: config.messages}}
 	},
 	"client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
-		return operationLoop{&clientStreamOperation{open: clients.clientStream(config), options: config.callOptions(), payload: payload, count: config.messages}}
+		return operationLoop{&clientStreamOperation[*interoppb.EchoRequest]{open: clients.clientStream(config), request: newEchoRequest, options: config.callOptions(), payload: payload, count: config.messages}}
 	},
 	"bidi": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
 		return operationLoop{&bidiOperation{open: clients.bidi(config), options: config.callOptions(), payload: payload}}
@@ -260,17 +304,26 @@ var benchScenarios = map[string]func(clients benchClients, config benchConfig, p
 	"unreliable-paced": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
 		return &pacedWorkload{open: clients.unreliable.Bidi, options: config.callOptions(), payload: payload, interval: config.interval()}
 	},
+	"validation-unary": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&unaryOperation[*interoppb.BenchRequest]{call: clients.validationUnary(config), request: newBenchRequest, options: config.callOptions(), payload: payload}}
+	},
+	"validation-client-stream": func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		return operationLoop{&clientStreamOperation[*interoppb.BenchRequest]{open: clients.validationClientStream(config), request: newBenchRequest, options: config.callOptions(), payload: payload, count: config.messages}}
+	},
 }
 
-type unaryOperation struct {
-	call    unaryCall
+// unaryOperation makes one unary call with a request that request builds
+// around the next message.
+type unaryOperation[Req trevrpc.ProtoMessage] struct {
+	call    unaryCall[Req]
+	request func(message string) Req
 	options []trevrpc.CallOption
 	payload benchPayload
 }
 
-func (o *unaryOperation) run(ctx context.Context) (int, error) {
+func (o *unaryOperation[Req]) run(ctx context.Context) (int, error) {
 	message := o.payload.next()
-	response, err := o.call(ctx, &interoppb.EchoRequest{Message: message}, o.options...)
+	response, err := o.call(ctx, o.request(message), o.options...)
 	if err != nil {
 		return 0, err
 	}
@@ -280,7 +333,7 @@ func (o *unaryOperation) run(ctx context.Context) (int, error) {
 	return 1, nil
 }
 
-func (*unaryOperation) close() {}
+func (*unaryOperation[Req]) close() {}
 
 type serverStreamOperation struct {
 	client  *interoppb.EchoClient
@@ -318,14 +371,17 @@ func (o *serverStreamOperation) run(ctx context.Context) (int, error) {
 
 func (*serverStreamOperation) close() {}
 
-type clientStreamOperation struct {
-	open    openClientStream
+// clientStreamOperation sends count requests that request builds around the
+// next messages on one client stream.
+type clientStreamOperation[Req trevrpc.ProtoMessage] struct {
+	open    openClientStream[Req]
+	request func(message string) Req
 	options []trevrpc.CallOption
 	payload benchPayload
 	count   int
 }
 
-func (o *clientStreamOperation) run(ctx context.Context) (int, error) {
+func (o *clientStreamOperation[Req]) run(ctx context.Context) (int, error) {
 	call, err := o.open(ctx, o.options...)
 	if err != nil {
 		return 0, err
@@ -335,7 +391,7 @@ func (o *clientStreamOperation) run(ctx context.Context) (int, error) {
 	for range o.count {
 		message := o.payload.next()
 		sent += len(message)
-		if err := call.Send(&interoppb.EchoRequest{Message: message}); err != nil {
+		if err := call.Send(o.request(message)); err != nil {
 			return 0, err
 		}
 	}
@@ -350,7 +406,7 @@ func (o *clientStreamOperation) run(ctx context.Context) (int, error) {
 	return o.count, nil
 }
 
-func (*clientStreamOperation) close() {}
+func (*clientStreamOperation[Req]) close() {}
 
 // unreliableServerStreamOperation sends one request that asks for count
 // responses on an UnreliableEcho.Bidi stream and reads the responses that
@@ -755,6 +811,9 @@ type benchResult struct {
 	Rate        float64 `json:"rate,omitempty"`
 	Payload     string  `json:"payload"`
 	Compression string  `json:"compression"`
+	// Validation is the rules the requests carried, which only the
+	// validation scenarios have.
+	Validation string `json:"validation,omitempty"`
 }
 
 // runBench connects, runs the scenario for the warmup and the measured window
@@ -788,6 +847,7 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		defer closeQuietly(channel)
 		channels[i] = channel
 		clients[i] = benchClients{
+			channel:    channel,
 			echo:       interoppb.NewEchoClient(channel),
 			unreliable: interoppb.NewUnreliableEchoClient(channel),
 			compressed: interoppb.NewCompressedEchoClient(channel),
@@ -869,6 +929,10 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 	if config.paced() {
 		rate = config.rate
 	}
+	var validation string
+	if config.validated() {
+		validation = config.validation
+	}
 	return benchResult{
 		Scenario:      config.scenario,
 		Transport:     string(transport),
@@ -884,6 +948,7 @@ func summarize(config benchConfig, transport trevrpc.TransportKind, window time.
 		Rate:          rate,
 		Payload:       config.payload,
 		Compression:   config.compression,
+		Validation:    validation,
 		Errors:        failures,
 		OpsPerSec:     float64(ops) / seconds,
 		MsgsPerSec:    float64(messages) / seconds,

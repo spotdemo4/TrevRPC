@@ -21,8 +21,9 @@ use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, Code, Error, RpcKind, Status};
 
 use crate::proto::{
-    self, CompressedEcho, Echo, EchoRequest, EchoResponse, PlainMessage, UnreliableEcho,
-    ValidatedEcho, ValidatedRequest,
+    self, BenchRequest, CelBenchRequest, CompressedEcho, Echo, EchoRequest, EchoResponse,
+    PlainMessage, StandardBenchRequest, UnreliableEcho, ValidatedEcho, ValidatedRequest,
+    ValidationBench,
 };
 use crate::{BoxError, Flags, connect};
 
@@ -174,28 +175,94 @@ impl ValidatedEcho for ValidatedEchoService {
         _context: RequestContext,
         request: ValidatedRequest,
     ) -> Result<EchoResponse, Status> {
-        Ok(EchoResponse {
-            message: request.message,
-            index: 0,
-        })
+        Ok(echo_message(request.message))
     }
 
     async fn client_stream(
         &self,
         _context: RequestContext,
-        mut requests: BoxStream<ValidatedRequest>,
+        requests: BoxStream<ValidatedRequest>,
     ) -> Result<EchoResponse, Status> {
-        let mut message = String::new();
-        let mut count = 0_u32;
-        while let Some(request) = requests.next().await {
-            message.push_str(&request?.message);
-            count = count.saturating_add(1);
-        }
-        Ok(EchoResponse {
-            message,
-            index: count,
-        })
+        concatenate_messages(requests, |request| request.message).await
     }
+}
+
+/// `ValidationBench`, whose methods differ only in the rules of their request types, which the
+/// generated registration checks before they reach it.
+struct ValidationBenchService;
+
+#[trevrpc::async_trait]
+impl ValidationBench for ValidationBenchService {
+    async fn unary(
+        &self,
+        _context: RequestContext,
+        request: BenchRequest,
+    ) -> Result<EchoResponse, Status> {
+        Ok(echo_message(request.message))
+    }
+
+    async fn client_stream(
+        &self,
+        _context: RequestContext,
+        requests: BoxStream<BenchRequest>,
+    ) -> Result<EchoResponse, Status> {
+        concatenate_messages(requests, |request| request.message).await
+    }
+
+    async fn standard_unary(
+        &self,
+        _context: RequestContext,
+        request: StandardBenchRequest,
+    ) -> Result<EchoResponse, Status> {
+        Ok(echo_message(request.message))
+    }
+
+    async fn standard_client_stream(
+        &self,
+        _context: RequestContext,
+        requests: BoxStream<StandardBenchRequest>,
+    ) -> Result<EchoResponse, Status> {
+        concatenate_messages(requests, |request| request.message).await
+    }
+
+    async fn cel_unary(
+        &self,
+        _context: RequestContext,
+        request: CelBenchRequest,
+    ) -> Result<EchoResponse, Status> {
+        Ok(echo_message(request.message))
+    }
+
+    async fn cel_client_stream(
+        &self,
+        _context: RequestContext,
+        requests: BoxStream<CelBenchRequest>,
+    ) -> Result<EchoResponse, Status> {
+        concatenate_messages(requests, |request| request.message).await
+    }
+}
+
+/// Answers a unary request as `Echo.Unary` does: `{message, index: 0}`.
+const fn echo_message(message: String) -> EchoResponse {
+    EchoResponse { message, index: 0 }
+}
+
+/// Answers a client stream as `Echo.ClientStream` does: the concatenation of every request's
+/// message, which `message` takes out of it, and how many there were.
+async fn concatenate_messages<M>(
+    mut requests: BoxStream<M>,
+    message: impl Fn(M) -> String,
+) -> Result<EchoResponse, Status> {
+    let mut concatenated = String::new();
+    let mut count = 0_u32;
+    while let Some(request) = requests.next().await {
+        concatenated.push_str(&message(request?));
+        count = count.saturating_add(1);
+    }
+    Ok(EchoResponse {
+        message: concatenated,
+        index: count,
+    })
 }
 
 const STREAM_COMPRESSED_RECEIVED_METADATA_KEY: &str = "interop-stream-compressed-received";
@@ -399,6 +466,7 @@ pub async fn run(flags: &Flags) -> Result<(), BoxError> {
     proto::register_unreliable_echo(&mut server, UnreliableEchoService);
     proto::register_compressed_echo(&mut server, CompressedEchoService);
     proto::register_validated_echo(&mut server, ValidatedEchoService);
+    proto::register_validation_bench(&mut server, ValidationBenchService);
     register_refusing_echo(&mut server);
 
     let tls = quinn::rustls::ServerConfig::builder()

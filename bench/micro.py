@@ -3,7 +3,8 @@
 
     micro.py [--runtime go|rust]... [--count N] [--bench REGEX] [--baseline DIR] [--out DIR]
 
-Go results land in DIR/go.txt and Rust results in DIR/rust.txt. With `--baseline`, benchstat
+Go results land in DIR/go.txt and Rust results in DIR/rust.txt. Both cover the runtime and the
+interop executable, whose benchmarks time request validation. With `--baseline`, benchstat
 compares the baseline's go.txt with this run's into DIR/benchstat.txt. divan has no comparison
 tool, so compare the two rust.txt files side by side.
 """
@@ -24,6 +25,11 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "interop"))
 from harness import RunnerError
 
 RUNTIMES = ("go", "rust")
+# The Go modules with benchmarks: the runtime, and the interop executable, which times
+# protovalidate request validation. Each is a module of its own, so `./...` covers one.
+GO_MODULES = ("trevrpc-go", "trevrpc-go/cmd/trevrpc-interop")
+# Every benchmark target of the Rust workspace, which includes the interop executable's.
+RUST_COMMAND = ["cargo", "bench", "--workspace", "--bench", "*"]
 
 
 def find_root(start: Path) -> Path:
@@ -36,13 +42,14 @@ def find_root(start: Path) -> Path:
     raise RunnerError(f"{start} is not inside a TrevRPC checkout; run from one or pass --root")
 
 
-def tee(command: list[str], output: Path, cwd: Path | None = None) -> None:
-    """Runs a command, copying its stdout to the terminal and to `output`; stderr passes through.
+def tee(command: list[str], output: Path, cwd: Path | None = None, append: bool = False) -> None:
+    """Runs a command, copying its stdout to the terminal and to `output`, or to its end with
+    `append`; stderr passes through.
 
     Raises RunnerError unless the command exits 0.
     """
     print(f"== {shlex.join(command)}", flush=True)
-    with output.open("w", encoding="utf-8") as file:
+    with output.open("a" if append else "w", encoding="utf-8") as file:
         try:
             process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, text=True)
         except OSError as error:
@@ -56,11 +63,10 @@ def tee(command: list[str], output: Path, cwd: Path | None = None) -> None:
         raise RunnerError(f"exited {process.returncode}: {shlex.join(command)}")
 
 
-def go_command(root: Path, pattern: str, count: int) -> list[str]:
-    trevrpc_go = str(root / "trevrpc-go")
+def go_command(root: Path, module: str, pattern: str, count: int) -> list[str]:
     return [
-        "go", "-C", trevrpc_go, "test", "-run", "^$", "-bench", pattern, "-count", str(count),
-        "./...",
+        "go", "-C", str(root / module), "test", "-run", "^$", "-bench", pattern,
+        "-count", str(count), "./...",
     ]  # fmt: skip
 
 
@@ -115,9 +121,10 @@ def execute(args: argparse.Namespace) -> Path:
     out.mkdir(parents=True, exist_ok=True)
 
     if "go" in runtimes:
-        tee(go_command(root, args.bench, args.count), out / "go.txt")
+        for index, module in enumerate(GO_MODULES):
+            tee(go_command(root, module, args.bench, args.count), out / "go.txt", append=index > 0)
     if "rust" in runtimes:
-        tee(["cargo", "bench"], out / "rust.txt", cwd=root / "trevrpc-rust")
+        tee(RUST_COMMAND, out / "rust.txt", cwd=root / "trevrpc-rust")
     if baseline is not None:
         tee(benchstat_command(baseline / "go.txt", out / "go.txt"), out / "benchstat.txt")
     return out

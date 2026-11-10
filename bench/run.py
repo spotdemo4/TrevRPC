@@ -8,7 +8,7 @@ grpc-go and connect-go baselines and the browsers' lanes; see README.md.
            [--concurrency LIST] [--connections LIST]
            [--payload repeat|records] [--compressions LIST]
            [--duration SECONDS] [--warmup SECONDS] [--messages N] [--rates LIST]
-           [--repeat N] [--tolerance PERCENT] [--netem PROFILE...] [--out DIR]
+           [--validations LIST] [--repeat N] [--tolerance PERCENT] [--netem PROFILE...] [--out DIR]
 """
 
 from __future__ import annotations
@@ -62,9 +62,16 @@ SCENARIOS = (
     "unreliable-client-stream",
     "paced",
     "unreliable-paced",
+    "validation-unary",
+    "validation-client-stream",
 )
 # The scenarios that send at a fixed rate per worker, once per rate in --rates.
 PACED_SCENARIOS = ("paced", "unreliable-paced")
+# The scenarios that call ValidationBench, once per rule set in --validations. Only the TrevRPC
+# native clients run them.
+VALIDATION_SCENARIOS = ("validation-unary", "validation-client-stream")
+# The rules of the validation scenarios' request types: none, standard rules, standard and CEL.
+VALIDATIONS = ("none", "standard", "cel")
 # The baseline's transports, each served on the port of the same name. They have no datagram
 # messages, so they skip the unreliable-* scenarios, and no paced client.
 BASELINE_TRANSPORTS = ("grpc", "connect")
@@ -105,8 +112,9 @@ COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
 # launching it again when it does not start in time.
 DEADLINE_SLACK = 80
 COLUMNS = (
-    "scenario", "size", "md", "conc", "conns", "rate", "transport", "compression", "client",
-    "server", "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%", "spread%",
+    "scenario", "size", "md", "conc", "conns", "rate", "rules", "transport", "compression",
+    "client", "server", "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%",
+    "spread%",
 )  # fmt: skip
 
 
@@ -121,6 +129,8 @@ class Matrix:
     messages: int
     # The messages per second each paced worker sends, one cell per rate.
     rates: tuple[int, ...] = (1000,)
+    # The rules of the validation scenarios' requests, one cell per rule set.
+    validations: tuple[str, ...] = ("none",)
     # Where the metadata goes, one cell per scope: "call" or "connection".
     metadata_scopes: tuple[str, ...] = ("call",)
     # How many channels the workers spread over, one cell per count.
@@ -158,6 +168,7 @@ class Matrix:
             for conns in self.connections
             if conns == 1 or (transport in NATIVE_TRANSPORTS and conns <= workers)
             for rate in (self.rates if scenario in PACED_SCENARIOS else (None,))
+            for validation in (self.validations if scenario in VALIDATION_SCENARIOS else (None,))
             if self.keep(
                 cell := tables.Cell(
                     client=client,
@@ -171,6 +182,7 @@ class Matrix:
                     concurrency=workers,
                     connections=conns,
                     rate=rate,
+                    validation=validation,
                     netem=netem,
                 )
             )
@@ -193,6 +205,8 @@ class Result:
     connections: int
     # Messages per second per worker, for the paced scenarios.
     rate: float | None
+    # The rules of the requests, for the validation scenarios.
+    validation: str | None
     errors: float
     msgs: float
     lost: float
@@ -221,6 +235,7 @@ class Result:
             str(self.concurrency),
             str(self.connections),
             "-" if self.rate is None else plain(self.rate),
+            self.validation or "-",
             self.transport,
             self.compression,
             self.client,
@@ -235,7 +250,7 @@ class Result:
             "-" if spread is None else hundredths(spread),
         ]
 
-    def sort_key(self) -> tuple[str, int, int, str, int, int, float, str, str, str, str]:
+    def sort_key(self) -> tuple[str, int, int, str, int, int, float, int, str, str, str, str]:
         return (
             self.scenario,
             self.size,
@@ -244,6 +259,7 @@ class Result:
             self.concurrency,
             self.connections,
             0 if self.rate is None else self.rate,
+            -1 if self.validation is None else VALIDATIONS.index(self.validation),
             self.transport,
             self.compression,
             self.client,
@@ -313,6 +329,7 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         concurrency=int_field(record, "concurrency"),
         connections=int_field(record, "connections", 1),
         rate=None if record.get("rate") is None else number_field(record, "rate"),
+        validation=None if record.get("validation") is None else validation_field(record),
         errors=number_field(record, "errors"),
         msgs=number_field(record, "msgs"),
         lost=number_field(record, "lost", 0),
@@ -329,6 +346,13 @@ def parse_result(client: str, server: str, line: str, netem: str | None = None) 
         netem=netem,
         record=record,
     )
+
+
+def validation_field(record: dict[str, object]) -> str:
+    validation = text_field(record, "validation")
+    if validation not in VALIDATIONS:
+        raise ValueError(f"unknown 'validation' {validation!r}")
+    return validation
 
 
 def spread(results: list[Result]) -> float:
@@ -368,6 +392,8 @@ def runs(compression: str, transport: str, scenario: str) -> bool:
     if transport in BASELINE_TRANSPORTS and (
         scenario.startswith("unreliable-") or scenario in PACED_SCENARIOS
     ):
+        return False
+    if scenario in VALIDATION_SCENARIOS and transport not in NATIVE_TRANSPORTS:
         return False
     if transport in BROWSER_TRANSPORTS and scenario not in BROWSER_SCENARIOS[transport]:
         return False
@@ -433,14 +459,17 @@ class Runner:
                 mode += ["--dictionary", str(m.dictionary)]
             if cell.rate is not None:
                 mode += ["--rate", str(cell.rate)]
+            if cell.validation is not None:
+                mode += ["--validation", cell.validation]
             if cell.metadata_scope != "call":
                 mode += ["--metadata-scope", cell.metadata_scope]
             if cell.connections != 1:
                 mode += ["--connections", str(cell.connections)]
             suffix = "" if cell.compression == "none" else f"-{cell.compression}"
             rate = "" if cell.rate is None else f"-r{cell.rate}"
+            validation = "" if cell.validation is None else f"-{cell.validation}"
             name = (
-                f"{client}-{transport}-to-{server}-{cell.scenario}{suffix}-{cell.size}"
+                f"{client}-{transport}-to-{server}-{cell.scenario}{validation}{suffix}-{cell.size}"
                 f"-md{metadata_column(cell.metadata_size, cell.metadata_scope)}"
                 f"-c{cell.concurrency}{'' if cell.connections == 1 else f'x{cell.connections}'}"
                 f"{rate}{profile}"
@@ -650,6 +679,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="messages per second each paced worker sends, one cell per rate",
     )
     _ = parser.add_argument(
+        "--validations",
+        type=comma_list,
+        default=["none"],
+        metavar="LIST",
+        help="rules of the validation scenarios' requests, one cell per rule set, from "
+        + ", ".join(VALIDATIONS),
+    )
+    _ = parser.add_argument(
         "--repeat",
         type=positive_int,
         default=1,
@@ -705,6 +742,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("need at least one --server and one --client or --browser, or --baseline")
     if unknown := set(args.metadata_scopes) - {"call", "connection"}:
         parser.error(f"unknown metadata scopes: {', '.join(sorted(unknown))}")
+    if unknown := set(args.validations) - set(VALIDATIONS):
+        parser.error(f"unknown validations: {', '.join(sorted(unknown))}")
     if unknown := set(args.compressions) - set(COMPRESSIONS):
         parser.error(f"unknown compression modes: {', '.join(sorted(unknown))}")
     if args.payload == "repeat" and set(args.compressions) != {"none"}:
@@ -722,6 +761,7 @@ def build_matrix(args: argparse.Namespace, dictionary: Path | None = None) -> Ma
         warmup=args.warmup,
         messages=args.messages,
         rates=tuple(args.rates),
+        validations=tuple(args.validations),
         metadata_scopes=tuple(args.metadata_scopes),
         connections=tuple(args.connections),
         repeat=args.repeat,

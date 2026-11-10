@@ -131,6 +131,16 @@ for the same reason as `unreliable.proto`.
 | `ValidatedEcho.Unary`        | Respond `{message: request.message, index: 0}`.                                                                       |
 | `ValidatedEcho.ClientStream` | Read requests until EOF, then respond `{message: concatenation of every request.message, index: number of requests}`. |
 
+[`proto/validation_bench.proto`](proto/validation_bench.proto) defines
+`trevrpc.interop.v1.ValidationBench`, which the load benchmarks call to measure what validation
+costs (see [`bench/README.md`](../bench/README.md#validation)). Its request types `BenchRequest`,
+`StandardBenchRequest` and `CelBenchRequest` have the same fields; the first has no rules, the
+second standard rules, and the third the same standard rules and two CEL rules. Servers check
+them as they check `ValidatedEcho`'s, and answer every method as the `ValidatedEcho` method of
+its shape: its unary methods (`Unary`, `StandardUnary`, `CelUnary`) as `ValidatedEcho.Unary`, and
+its client-streaming methods (`ClientStream`, `StandardClientStream`, `CelClientStream`) as
+`ValidatedEcho.ClientStream`. No interop scenario calls it.
+
 Every method also handles headers: when request metadata key `interop-header`
 is present with value `v`, the server sends response headers
 `{interop-header: v}` before its first response message, and its `OK` status

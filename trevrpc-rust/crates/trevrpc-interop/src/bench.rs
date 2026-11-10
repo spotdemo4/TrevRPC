@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use tokio::time::{Instant, timeout_at};
 use trevrpc::client::{
-    BidirectionalCall, CallOptions, Channel, StreamingRpcTransport, TransportKind,
+    BidirectionalCall, CallOptions, Channel, ClientStreamingCall, StreamingRpcTransport,
+    TransportKind,
 };
 use trevrpc::wire::MAX_METADATA_VALUE_LEN;
 use trevrpc::{Error, Metadata};
@@ -20,6 +21,7 @@ use crate::proto::{
     CompressedEchoClient, EchoClient, EchoRequest, EchoResponse, UnreliableEchoClient,
 };
 use crate::records::{Records, WORKER_SEED};
+use crate::validation::{Validation, bench_request};
 use crate::{BoxError, Flags, connect};
 
 /// The trailing metadata key that counts the requests the server received.
@@ -53,6 +55,10 @@ enum Scenario {
     Paced,
     /// `Paced` on a method whose requests and echoes may travel as datagrams.
     UnreliablePaced,
+    /// `Unary` on the `ValidationBench` method of `--validation`.
+    ValidationUnary,
+    /// `ClientStream` on the `ValidationBench` method of `--validation`.
+    ValidationClientStream,
 }
 
 impl Scenario {
@@ -66,6 +72,8 @@ impl Scenario {
             "unreliable-client-stream" => Ok(Self::UnreliableClientStream),
             "paced" => Ok(Self::Paced),
             "unreliable-paced" => Ok(Self::UnreliablePaced),
+            "validation-unary" => Ok(Self::ValidationUnary),
+            "validation-client-stream" => Ok(Self::ValidationClientStream),
             other => Err(format!("unknown --scenario {other:?}").into()),
         }
     }
@@ -80,7 +88,14 @@ impl Scenario {
             Self::UnreliableClientStream => "unreliable-client-stream",
             Self::Paced => "paced",
             Self::UnreliablePaced => "unreliable-paced",
+            Self::ValidationUnary => "validation-unary",
+            Self::ValidationClientStream => "validation-client-stream",
         }
+    }
+
+    /// Whether the scenario calls `ValidationBench`.
+    const fn validated(self) -> bool {
+        matches!(self, Self::ValidationUnary | Self::ValidationClientStream)
     }
 }
 
@@ -211,6 +226,8 @@ struct Params {
     interval: Duration,
     payload: Payload,
     compression: CompressionMode,
+    /// The rules of the requests of the validation scenarios.
+    validation: Validation,
 }
 
 impl Params {
@@ -231,6 +248,14 @@ impl Params {
                 "--dictionary is required by, and only used with, --compression dictionary and stream-dictionary"
                     .into(),
             );
+        }
+        let validation = Validation::parse(flags.get("validation").unwrap_or("none"))?;
+        if validation != Validation::None && !scenario.validated() {
+            return Err(format!(
+                "--validation {} runs the validation scenarios only",
+                validation.name()
+            )
+            .into());
         }
         let size = number(flags, "size", 64)?;
         let metadata_size = number(flags, "metadata-size", 0)?;
@@ -281,6 +306,7 @@ impl Params {
             interval,
             payload,
             compression,
+            validation,
         })
     }
 }
@@ -463,6 +489,10 @@ impl Messages {
 
 /// One load worker: its clients and, for `bidi`, the stream it keeps open.
 struct Worker<T> {
+    /// The channel the clients share, on which the validation scenarios call `ValidationBench` by
+    /// method path.
+    transport: T,
+    validation: Validation,
     client: EchoClient<T>,
     unreliable: UnreliableEchoClient<T>,
     /// The `CompressedEcho` client, which the stream compression modes call instead of `client`.
@@ -506,6 +536,18 @@ where
             Scenario::Bidi => self.bidi().await,
             Scenario::UnreliableServerStream => self.unreliable_server_stream().await,
             Scenario::UnreliableClientStream => self.unreliable_client_stream().await,
+            Scenario::ValidationUnary => {
+                let request = bench_request(self.messages_source.next());
+                trevrpc::client::unary::<_, _, EchoResponse>(
+                    &self.transport,
+                    self.validation.unary_path(),
+                    &request,
+                    self.options.clone(),
+                )
+                .await?;
+                Ok(Outcome::delivered(1))
+            }
+            Scenario::ValidationClientStream => self.validation_client_stream().await,
             Scenario::Paced | Scenario::UnreliablePaced => {
                 Err(Error::from(trevrpc::Status::internal(
                     "the paced scenarios run on a schedule, not in operations",
@@ -546,9 +588,33 @@ where
         }
         .options(|_| self.options.clone())
         .await?;
+        self.send_client_stream(call, Self::request).await
+    }
+
+    // `&mut self`: see `server_stream`.
+    async fn validation_client_stream(&mut self) -> Result<Outcome, Error> {
+        let call = trevrpc::client::client_streaming(
+            &self.transport,
+            self.validation.client_stream_path(),
+            self.options.clone(),
+        )
+        .await?;
+        self.send_client_stream(call, |worker| bench_request(worker.messages_source.next()))
+            .await
+    }
+
+    /// Sends `messages` requests that `request` builds on a client stream, then checks that the
+    /// response counts them.
+    async fn send_client_stream<Req>(
+        &mut self,
+        call: ClientStreamingCall<Req, EchoResponse>,
+        request: impl Fn(&mut Self) -> Req,
+    ) -> Result<Outcome, Error>
+    where
+        Req: prost::Message + Send + 'static,
+    {
         for _ in 0..self.messages {
-            let request = self.request();
-            call.send(request).await?;
+            call.send(request(self)).await?;
         }
         let response = call.close_and_recv().await?;
         short_stream_check(
@@ -907,6 +973,8 @@ where
         .map(|(index, transport)| {
             tokio::spawn(work(
                 Worker {
+                    transport: transport.clone(),
+                    validation: params.validation,
                     client: EchoClient::new(transport.clone()),
                     unreliable: UnreliableEchoClient::new(transport.clone()),
                     compressed: CompressedEchoClient::new(transport.clone()),
@@ -969,6 +1037,8 @@ struct Report {
     rate: Option<f64>,
     payload: Payload,
     compression: CompressionMode,
+    /// The rules the requests carried, for the validation scenarios.
+    validation: Option<Validation>,
     transport: &'static str,
     size: usize,
     metadata_size: usize,
@@ -1024,6 +1094,7 @@ impl Report {
                 .then_some(params.rate),
             payload: params.payload,
             compression: params.compression,
+            validation: params.scenario.validated().then_some(params.validation),
             transport,
             size: params.size,
             metadata_size: params.metadata_size,
@@ -1067,13 +1138,16 @@ impl Report {
         let rate = self
             .rate
             .map_or_else(String::new, |rate| format!(r#","rate":{rate:?}"#));
+        let validation = self.validation.map_or_else(String::new, |validation| {
+            format!(r#","validation":"{}""#, validation.name())
+        });
         format!(
             concat!(
                 r#"{{"scenario":"{}","transport":"{}","size":{},"metadata_size":{},"metadata_scope":"{}","#,
                 r#""concurrency":{},"connections":{},"duration_s":{:?},"#,
                 r#""ops":{},"msgs":{},"errors":{},"ops_per_sec":{:.1},"msgs_per_sec":{:.1},"#,
                 r#""bytes_per_sec":{:.1},"latency_us":{{"p50":{:.1},"p90":{:.1},"p99":{:.1},"p999":{:.1}}}{},"lost":{}{},"#,
-                r#""payload":"{}","compression":"{}"}}"#,
+                r#""payload":"{}","compression":"{}"{}}}"#,
             ),
             self.scenario.name(),
             self.transport,
@@ -1102,6 +1176,7 @@ impl Report {
             rate,
             self.payload.name(),
             self.compression.name(),
+            validation,
         )
     }
 }

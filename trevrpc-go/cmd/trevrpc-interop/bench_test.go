@@ -99,6 +99,43 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 	}
 }
 
+// TestBenchValidationScenariosCallEveryRequestType runs the validation
+// scenarios with each --validation value and checks that the result names it.
+func TestBenchValidationScenariosCallEveryRequestType(t *testing.T) {
+	certFile, ports := startBenchServer(t)
+	const size, messages = 100, 5
+	for _, scenario := range []string{"validation-unary", "validation-client-stream"} {
+		for _, validation := range []string{"none", "standard", "cel"} {
+			t.Run(scenario+"/"+validation, func(t *testing.T) {
+				var stdout, stderr bytes.Buffer
+				args := []string{
+					"bench",
+					"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+					"--ca", certFile,
+					"--scenario", scenario,
+					"--validation", validation,
+					"--size", strconv.Itoa(size),
+					"--messages", strconv.Itoa(messages),
+					"--concurrency", "2",
+					"--duration", "0.2",
+					"--warmup", "0.05",
+				}
+				if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+					t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+				}
+				checkBenchLine(t, stdout.String(), scenario, "quic", size, 0, messages, true, false)
+				var got struct{ Validation string }
+				if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.Validation != validation {
+					t.Errorf("validation = %q, want %q", got.Validation, validation)
+				}
+			})
+		}
+	}
+}
+
 // TestBenchSendsConnectionMetadata checks --metadata-scope connection, which
 // sends the bench-pad entry as connection metadata.
 func TestBenchSendsConnectionMetadata(t *testing.T) {
@@ -226,6 +263,9 @@ func checkBenchLine(t *testing.T, output, scenario, transport string, size, meta
 	if number("errors") != 0 {
 		t.Errorf("errors = %v, want 0", got["errors"])
 	}
+	if _, has := got["validation"]; has != strings.HasPrefix(scenario, "validation-") {
+		t.Errorf("validation = %v, want it in the validation scenarios only", got["validation"])
+	}
 	if want := ops / 0.2; number("ops_per_sec") != want {
 		t.Errorf("ops_per_sec = %v, want %v", got["ops_per_sec"], want)
 	}
@@ -343,6 +383,9 @@ func TestBenchCommandLineErrors(t *testing.T) {
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unreliable-paced", "--rate", "0"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "bidi", "--compression", "dictionary"},
 		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "bidi", "--dictionary", "d"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "validation-unary", "--validation", "bogus"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "unary", "--validation", "cel"},
+		{"bench", "--addr", "127.0.0.1:1", "--ca", "ca.pem", "--scenario", "validation-client-stream", "--compression", "stream"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 {

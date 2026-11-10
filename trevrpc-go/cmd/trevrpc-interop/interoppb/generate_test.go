@@ -22,10 +22,10 @@ var update = flag.Bool("update", false, "rewrite the generated files from intero
 // protoFiles are the sources of the bindings, in interop/proto, and
 // generatedFiles what they generate.
 var (
-	protoFiles     = []string{"interop.proto", "unreliable.proto", "compressed.proto", "validated.proto"}
+	protoFiles     = []string{"interop.proto", "unreliable.proto", "compressed.proto", "validated.proto", "validation_bench.proto"}
 	generatedFiles = []string{
 		"interop.pb.go", "interop.trevrpc.go", "unreliable.pb.go", "unreliable.trevrpc.go", "compressed.pb.go", "compressed.trevrpc.go",
-		"validated.pb.go", "validated.trevrpc.go",
+		"validated.pb.go", "validated.trevrpc.go", "validation_bench.pb.go", "validation_bench.trevrpc.go",
 	}
 )
 
@@ -44,7 +44,7 @@ func modernized(generated []byte) []byte {
 var protocVersionLine = regexp.MustCompile(`(?m)^// \tprotoc +v.*\n`)
 
 // TestGeneratedCodeMatchesProto regenerates the Echo, UnreliableEcho,
-// CompressedEcho and ValidatedEcho bindings from the shared interop/proto files with protoc-gen-go and this
+// CompressedEcho, ValidatedEcho and ValidationBench bindings from the shared interop/proto files with protoc-gen-go and this
 // repository's protoc-gen-trevrpc-go, and fails when the committed files have
 // drifted. Run `go test ./interoppb -update` to rewrite
 // them.

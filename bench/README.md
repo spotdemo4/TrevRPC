@@ -17,13 +17,14 @@ nix run .#trevrpc-bench -- --payload records --compressions none,gzip,zstd,dicti
 nix run .#trevrpc-bench -- --table comparison --repeat 3 --tolerance 3
 nix run .#trevrpc-bench -- --scenarios unreliable-paced --concurrency 64 --rates 100,1000,10000
 nix run .#trevrpc-bench -- --table browser --repeat 3 --tolerance 3
+nix run .#trevrpc-bench -- --table validation --repeat 3 --tolerance 3
 bench/run.py --server NAME=CMD... --client NAME=CMD... [--baseline CMD] [--browser NAME...]
              [--table NAME]
              [--scenarios LIST] [--sizes LIST] [--concurrency LIST] [--connections LIST]
              [--metadata-sizes LIST] [--metadata-scopes LIST] [--payload repeat|records]
              [--compressions LIST] [--duration SECONDS] [--warmup SECONDS]
-             [--messages N] [--rates LIST] [--repeat N] [--tolerance PERCENT]
-             [--netem PROFILE...] [--out DIR]
+             [--messages N] [--rates LIST] [--validations LIST] [--repeat N]
+             [--tolerance PERCENT] [--netem PROFILE...] [--out DIR]
 ```
 
 The packaged `trevrpc-bench` runs the packaged Go and Rust servers and clients,
@@ -32,7 +33,8 @@ the baselines, and on Linux Chromium's lanes, unless the command line names any
 against its gRPC server and its Connect client against its Connect server.
 `run.py` starts each server once, then runs every client over every transport
 for every combination of scenario, size, metadata size and scope, and concurrency, and
-runs `paced` and `unreliable-paced` once per rate in `--rates` (default 1000). It prints a summary
+runs `paced` and `unreliable-paced` once per rate in `--rates` (default 1000), and the
+[validation scenarios](#validation) once per rule set in `--validations` (default `none`). It prints a summary
 table and writes one JSON object per run to `DIR/results.jsonl`; without
 `--out`, `DIR` is a new `trevrpc-bench.*` directory under `$TMPDIR`. A run fails
 when its client exits non-zero or reports errors. Each run's client stderr is kept in
@@ -57,7 +59,7 @@ reads, with that table's options (scenarios, sizes, concurrency, payload,
 compression modes, netem profiles, messages, duration) as defaults; explicit
 flags still override them. The tables are in [`tables.py`](tables.py):
 `comparison`, `compression`, `link`, `lossy`, `metadata`, `datagrams`,
-`browser`, `browser-compression`, and `browser-lossy`. They refer to the packaged servers and clients
+`validation`, `browser`, `browser-compression`, and `browser-lossy`. They refer to the packaged servers and clients
 by name (`go`, `rust`, the baseline's `grpc` and `connect`, and `chromium`) and
 run each native TrevRPC client against its own runtime's server only. Nothing in CI gates on these numbers: the flake
 check runs a very short matrix only to keep the tool working.
@@ -93,6 +95,31 @@ is the same on every run), starts every TrevRPC server with `--dictionary`, and
 passes it to the `dictionary` modes' clients. `wire_bytes_per_msg` is the
 number to compare across modes: it counts what the client's connection actually
 carried, framing and TLS included.
+
+## Validation
+
+`validation-unary` and `validation-client-stream` measure what
+[request validation](../wiki/Go-Guide.md#request-validation) with `buf.validate` rules costs.
+They are `unary` and `client-stream` against `trevrpc.interop.v1.ValidationBench`
+([`validation_bench.proto`](../interop/proto/validation_bench.proto)), whose three request types
+have the same fields and differ only in their rules. `--validations LIST` (default `none`) runs
+each cell once per rule set:
+
+| Rule set   | Request type           | Rules                                                                                                                                  |
+| ---------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`     | `BenchRequest`         | none, so the route is the same as on a server without a validator                                                                      |
+| `standard` | `StandardBenchRequest` | standard rules on every field: a UUID, an email address, a value from a list, a range, labels with a length each, and a maximum length |
+| `cel`      | `CelBenchRequest`      | the same standard rules and two CEL rules: one compares two fields, the other iterates over the labels                                 |
+
+- Every request is the same realistic request around a `--size`-byte `message`, which keeps
+  every rule; `--payload` fills `message` as it fills `EchoRequest.message`. The three request
+  types have the same encoding, so every client sends a `BenchRequest` on the method of its rule
+  set, and only the server's work differs between them.
+- The Go server checks each decoded request with `protovalidatetrevrpc`. The Rust server checks
+  the encoded request with `trevrpc-protovalidate`, which decodes it a second time, into a
+  dynamic message, to evaluate the rules.
+- Only the TrevRPC native clients run them, over `quic` and `tcp`, without compression; the
+  baselines have no validation and the browsers' lanes do not run them.
 
 ## Network emulation
 
@@ -177,7 +204,7 @@ result line. Its lanes, as the `transport` column names them:
 ## Server
 
 Servers are the interop executables' `server` subcommand (see
-[`interop/README.md`](../interop/README.md)) serving `trevrpc.interop.v1.Echo`, `trevrpc.interop.v1.UnreliableEcho` and `trevrpc.interop.v1.CompressedEcho`,
+[`interop/README.md`](../interop/README.md)) serving `trevrpc.interop.v1.Echo`, `trevrpc.interop.v1.UnreliableEcho`, `trevrpc.interop.v1.CompressedEcho` and `trevrpc.interop.v1.ValidationBench`,
 started with `--dictionary` and the [trained dictionary](#compression).
 The baseline ([`bench/baseline`](baseline/README.md)) follows the same
 contract: it serves the same `Echo` service over gRPC with grpc-go and over the
@@ -196,10 +223,11 @@ for the whole run.
 ```text
 <binary> bench --addr <host:port> [--tcp-addr <host:port>] --ca <cert.pem>
                [--server-name localhost] --transport quic|tcp|grpc|connect
-               --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream|paced|unreliable-paced
+               --scenario unary|server-stream|client-stream|bidi|unreliable-server-stream|unreliable-client-stream|paced|unreliable-paced|validation-unary|validation-client-stream
                [--size BYTES] [--concurrency N] [--connections N] [--duration SECONDS]
                [--warmup SECONDS] [--messages N] [--rate N] [--metadata-size BYTES]
                [--metadata-scope call|connection] [--payload repeat|records] [--compression MODE] [--dictionary FILE]
+               [--validation none|standard|cel]
 ```
 
 - `--transport quic` dials native QUIC at `--addr`. `--transport tcp` dials
@@ -244,6 +272,9 @@ for the whole run.
   its runtime's timers allow: tokio's tick every millisecond, so faster rates
   leave in bursts. A worker that falls behind sends the messages it owes at
   once.
+- `--validation` (default `none`) is the rule set of the
+  [validation scenarios](#validation): which `ValidationBench` methods they call. A client exits
+  non-zero for a value other than `none` with any other scenario.
 - `--payload` (default `repeat`) is what `EchoRequest.message` holds: `repeat`
   is `size` times the letter `x`, the same in every request; `records` is a
   new [records](#payload) message for every request.
@@ -265,6 +296,8 @@ for the whole run.
 | `unreliable-client-stream` | `UnreliableEcho.Bidi` sending `messages` requests `{message, count: 0}`, closing the send side, and reading the status         | `interop-received`     |
 | `paced`                    | One message on a `Bidi` stream that each worker keeps open: send `{message, count: 1}` on schedule, read its echo              | 1 if echoed in time    |
 | `unreliable-paced`         | `paced` on `UnreliableEcho.Bidi`                                                                                               | 1 if echoed in time    |
+| `validation-unary`         | `unary` on the `ValidationBench` unary method of `--validation`, with a `BenchRequest`                                         | 1                      |
+| `validation-client-stream` | `client-stream` on the `ValidationBench` client-streaming method of `--validation`, sending `BenchRequest`s                    | `messages`             |
 
 The `unreliable-*` scenarios measure [datagram messages](../wiki/Protocol-and-Wire-Format.md#datagram-messages): over `quic` the streamed messages travel as datagrams and may be lost, while over `tcp` they stay on the QMux stream. The baselines have no equivalent and do not run them.
 
@@ -344,6 +377,7 @@ non-zero if it could not connect or measure:
   scenarios it includes echoes that arrived too late, so even a reliable stream
   can lose messages.
 - `rate` echoes `--rate`, for the paced scenarios only.
+- `validation` echoes `--validation`, for the validation scenarios only.
 
 ## Payload
 

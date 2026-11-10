@@ -15,4 +15,6 @@ runCommand "trevrpc-bench-check"
     trevrpc-bench --out "$out/compression" --duration 0.2 --warmup 0 --concurrency 1 --messages 10 \
       --scenarios unary,client-stream,bidi --payload records \
       --compressions none,gzip,zstd,dictionary,stream,stream-dictionary
+    trevrpc-bench --out "$out/validation" --duration 0.2 --warmup 0 --concurrency 1 --messages 10 \
+      --scenarios validation-unary,validation-client-stream --validations none,standard,cel
   ''

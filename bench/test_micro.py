@@ -42,6 +42,16 @@ class TeeTest(unittest.TestCase):
             self.assertEqual("one\ntwo\n", output.read_text(encoding="utf-8"))
             self.assertTrue(terminal.getvalue().endswith("one\ntwo\n"))
 
+    def test_appends_to_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "out.txt"
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                micro.tee(["sh", "-c", "echo one"], output)
+                micro.tee(["sh", "-c", "echo two"], output, append=True)
+
+            self.assertEqual("one\ntwo\n", output.read_text(encoding="utf-8"))
+
     def test_raises_when_the_command_fails(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temporary,
@@ -53,13 +63,16 @@ class TeeTest(unittest.TestCase):
 
 class CommandsTest(unittest.TestCase):
     def test_go_runs_only_benchmarks_in_every_package(self) -> None:
-        command = micro.go_command(Path("/src"), "BenchmarkUnary", 10)
+        command = micro.go_command(Path("/src"), "trevrpc-go", "BenchmarkUnary", 10)
 
         self.assertEqual(
             ["go", "-C", "/src/trevrpc-go", "test", "-run", "^$", "-bench", "BenchmarkUnary"],
             command[:8],
         )
         self.assertEqual(["-count", "10", "./..."], command[8:])
+
+    def test_go_covers_the_interop_module(self) -> None:
+        self.assertIn("trevrpc-go/cmd/trevrpc-interop", micro.GO_MODULES)
 
     def test_benchstat_compares_the_baseline_with_the_new_run(self) -> None:
         command = micro.benchstat_command(Path("old/go.txt"), Path("new/go.txt"))

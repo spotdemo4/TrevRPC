@@ -14,6 +14,10 @@ workspace = true
 name = "trevrpc-interop-rust"
 path = "src/main.rs"
 
+[[bench]]
+name = "validation"
+harness = false
+
 [dependencies]
 futures-util = "0.3"
 prost = "0.14.4"
@@ -44,5 +48,8 @@ protoc-gen-trevrpc-rust = { path = "../protoc-gen-trevrpc-rust" }
 protox = "0.10.0"
 
 [dev-dependencies]
+divan = "0.1.21"
+# The validation microbenchmarks time decoding into a DynamicMessage, as validation does.
+prost-reflect = "0.16.5"
 rcgen = "0.14"
 ring = "0.17"

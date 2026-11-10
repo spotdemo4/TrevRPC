@@ -31,6 +31,8 @@ class Cell:
     connections: int
     # Messages per second per worker, for the paced scenarios only.
     rate: int | None
+    # The rules of the requests, for the validation scenarios only: none, standard or cel.
+    validation: str | None
     netem: str | None
 
 
@@ -95,6 +97,12 @@ def datagrams(cell: Cell) -> bool:
     if cell.transport != "quic":
         return False
     return cell.scenario.startswith("unreliable-") or cell.concurrency == 1
+
+
+def validation(cell: Cell) -> bool:
+    """Each runtime's client against its own server over QUIC: what validation costs next to the
+    transport does not depend on it."""
+    return own_server(cell) and cell.transport == "quic"
 
 
 def browser(cell: Cell) -> bool:
@@ -245,6 +253,17 @@ TABLES: dict[str, Table] = {
             "concurrency": [1, 64],
         },
         own_server,
+    ),
+    "validation": Table(
+        "Request validation",
+        {
+            **LOOPBACK,
+            "scenarios": ["validation-unary", "validation-client-stream"],
+            "sizes": [64, 4096],
+            "concurrency": [1, 64],
+            "validations": ["none", "standard", "cel"],
+        },
+        validation,
     ),
     "datagrams": Table(
         "Datagram messages",

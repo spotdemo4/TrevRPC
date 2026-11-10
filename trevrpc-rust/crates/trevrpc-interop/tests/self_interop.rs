@@ -276,6 +276,8 @@ fn bench_reports_every_scenario_over_both_transports() {
                 assert_close(number(json, "rate"), 1000.0, 1e-9, json);
             } else if json.contains("\"rate\"") {
                 panic!("only the paced scenarios report a rate: {json}");
+            } else if json.contains("\"validation\"") {
+                panic!("only the validation scenarios report a validation: {json}");
             } else if scenario.starts_with("unreliable") && transport == "quic" {
                 // Datagram messages may be lost, but each is either delivered or counted as lost.
                 assert_close(number(json, "msgs") + lost, ops * per_op, 1e-9, json);
@@ -446,10 +448,52 @@ fn bench_rejects_unusable_flags() {
         // The dictionary modes need --dictionary, and only they take it.
         &["--scenario", "bidi", "--compression", "dictionary"],
         &["--scenario", "bidi", "--dictionary", "none.dict"],
+        &["--scenario", "validation-unary", "--validation", "nope"],
+        // --validation picks the request type of the validation scenarios only.
+        &["--scenario", "unary", "--validation", "cel"],
+        &[
+            "--scenario",
+            "validation-client-stream",
+            "--compression",
+            "stream",
+        ],
     ] {
         let output = server.run("bench", flags);
         assert!(!output.status.success(), "{flags:?} should fail");
         assert!(output.stdout.is_empty(), "{flags:?} printed to stdout");
+    }
+    server.finish();
+}
+
+#[test]
+fn bench_validation_scenarios_call_every_request_type() {
+    let server = Server::start("bench-validation");
+    for scenario in ["validation-unary", "validation-client-stream"] {
+        for validation in ["none", "standard", "cel"] {
+            let json = bench_json(
+                &server,
+                &["--scenario", scenario, "--validation", validation],
+            );
+            assert!(
+                json.contains(&format!("\"scenario\":\"{scenario}\"")),
+                "{json}"
+            );
+            assert!(
+                json.contains(&format!("\"validation\":\"{validation}\"")),
+                "{json}"
+            );
+            let per_op = if scenario.ends_with("stream") {
+                5.0
+            } else {
+                1.0
+            };
+            assert_close(
+                number(&json, "msgs"),
+                number(&json, "ops") * per_op,
+                1e-9,
+                &json,
+            );
+        }
     }
     server.finish();
 }

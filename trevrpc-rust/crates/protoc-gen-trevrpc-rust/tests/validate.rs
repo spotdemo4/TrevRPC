@@ -74,6 +74,18 @@ fn validated_methods_check_requests_that_carry_rules() {
     );
 }
 
+/// A route whose request type has no rules costs nothing with the option: its registration is
+/// the same code as without it.
+#[test]
+fn routes_without_rules_are_generated_as_without_the_option() {
+    let validated = generate("validate=true");
+    let plain = generate("validate=false");
+    assert_eq!(
+        registration(&validated, "UNCHECKED"),
+        registration(&plain, "UNCHECKED")
+    );
+}
+
 #[test]
 fn the_validator_holds_the_files_of_the_validated_types_after_their_imports() {
     let content = generate("validate=true");

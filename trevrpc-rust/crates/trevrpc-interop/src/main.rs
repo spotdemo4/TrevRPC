@@ -10,7 +10,8 @@
 //!                            [--server-name localhost] --transport quic|tcp
 //!                            --scenario unary|server-stream|client-stream|bidi|
 //!                                       unreliable-server-stream|unreliable-client-stream|
-//!                                       paced|unreliable-paced
+//!                                       paced|unreliable-paced|validation-unary|
+//!                                       validation-client-stream
 //!                            [--size 64] [--concurrency 1] [--connections 1]
 //!                            [--duration 5] [--warmup 1]
 //!                            [--messages 100] [--rate 100] [--metadata-size 0]
@@ -18,6 +19,7 @@
 //!                            [--payload repeat|records]
 //!                            [--compression none|dictionary|stream|stream-dictionary]
 //!                            [--dictionary <file>] [--min-quic-connections 1]
+//!                            [--validation none|standard|cel]
 //! ```
 //!
 //! The `bench` subcommand follows `bench/README.md`.
@@ -30,6 +32,9 @@ mod connect;
 mod proto;
 mod records;
 mod server;
+mod validation;
+#[cfg(test)]
+mod validation_tests;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -89,6 +94,7 @@ async fn main() -> ExitCode {
                 "compression",
                 "dictionary",
                 "min-quic-connections",
+                "validation",
             ],
         )
         .map(Command::Bench),
