@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@392955b6ae2230bd7cbb0d8d90051ddd9b8d537e # v1.75.0
+        uses: spotdemo4/nix-init@c184156b02706754274a295bca8418e75ccc0ef7 # v1.76.0
         with:
           token: ${{ secrets.DOCTOR_TOKEN }}
           github_token: ${{ secrets.GH_TOKEN }}
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@392955b6ae2230bd7cbb0d8d90051ddd9b8d537e # v1.75.0
+        uses: spotdemo4/nix-init@c184156b02706754274a295bca8418e75ccc0ef7 # v1.76.0
         with:
           token: ${{ secrets.DOCTOR_TOKEN }}
           github_token: ${{ secrets.GH_TOKEN }}
@@ -109,7 +109,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@392955b6ae2230bd7cbb0d8d90051ddd9b8d537e # v1.75.0
+        uses: spotdemo4/nix-init@c184156b02706754274a295bca8418e75ccc0ef7 # v1.76.0
         with:
           token: ${{ secrets.DOCTOR_TOKEN }}
           github_token: ${{ secrets.GH_TOKEN }}
@@ -137,7 +137,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@392955b6ae2230bd7cbb0d8d90051ddd9b8d537e # v1.75.0
+        uses: spotdemo4/nix-init@c184156b02706754274a295bca8418e75ccc0ef7 # v1.76.0
         with:
           token: ${{ secrets.DOCTOR_TOKEN }}
           github_token: ${{ secrets.GH_TOKEN }}
@@ -188,7 +188,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@392955b6ae2230bd7cbb0d8d90051ddd9b8d537e # v1.75.0
+        uses: spotdemo4/nix-init@c184156b02706754274a295bca8418e75ccc0ef7 # v1.76.0
         with:
           github_token: ${{ secrets.GH_TOKEN }}
           niks3_url: https://niks3.trev.zip
