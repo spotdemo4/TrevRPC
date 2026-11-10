@@ -77,10 +77,11 @@ func (c *CompressedEchoClient) Plain(ctx context.Context, request *PlainMessage,
 
 // RegisterCompressedEchoServer registers handlers for the CompressedEcho service.
 func RegisterCompressedEchoServer(server *trevrpc_go.Server, implementation CompressedEchoServer) {
-	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
-	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
-	trevrpc_go.RegisterUnary[*EchoRequest, *EchoResponse](server, CompressedEcho_Unary_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Unary, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
-	trevrpc_go.RegisterUnary[*PlainMessage, *PlainMessage](server, CompressedEcho_Plain_FullMethodName, func() *PlainMessage { return &PlainMessage{} }, implementation.Plain, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
+	methods := File_compressed_proto.Services().ByName("CompressedEcho").Methods()
+	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName("Bidi")))
+	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, CompressedEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName("ClientStream")))
+	trevrpc_go.RegisterUnary[*EchoRequest, *EchoResponse](server, CompressedEcho_Unary_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Unary, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName("Unary")))
+	trevrpc_go.RegisterUnary[*PlainMessage, *PlainMessage](server, CompressedEcho_Plain_FullMethodName, func() *PlainMessage { return &PlainMessage{} }, implementation.Plain, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName("Plain")))
 }
 
 // Full method paths ("/package.Service/Method") of the RefusingEcho service.
@@ -129,5 +130,6 @@ func (c *RefusingEchoClient) ClientStream(ctx context.Context, options ...trevrp
 
 // RegisterRefusingEchoServer registers handlers for the RefusingEcho service.
 func RegisterRefusingEchoServer(server *trevrpc_go.Server, implementation RefusingEchoServer) {
-	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, RefusingEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))
+	methods := File_compressed_proto.Services().ByName("RefusingEcho").Methods()
+	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, RefusingEcho_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: false}), trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName("ClientStream")))
 }

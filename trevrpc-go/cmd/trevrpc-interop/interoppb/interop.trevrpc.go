@@ -77,8 +77,9 @@ func (c *EchoClient) Bidi(ctx context.Context, options ...trevrpc_go.CallOption)
 
 // RegisterEchoServer registers handlers for the Echo service.
 func RegisterEchoServer(server *trevrpc_go.Server, implementation EchoServer) {
-	trevrpc_go.RegisterUnary[*EchoRequest, *EchoResponse](server, Echo_Unary_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Unary)
-	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, Echo_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream)
-	trevrpc_go.RegisterServerStreaming[*EchoRequest, *EchoResponse](server, Echo_ServerStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ServerStream)
-	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, Echo_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi)
+	methods := File_interop_proto.Services().ByName("Echo").Methods()
+	trevrpc_go.RegisterUnary[*EchoRequest, *EchoResponse](server, Echo_Unary_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Unary, trevrpc_go.RouteMethodDescriptor(methods.ByName("Unary")))
+	trevrpc_go.RegisterClientStreaming[*EchoRequest, *EchoResponse](server, Echo_ClientStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ClientStream, trevrpc_go.RouteMethodDescriptor(methods.ByName("ClientStream")))
+	trevrpc_go.RegisterServerStreaming[*EchoRequest, *EchoResponse](server, Echo_ServerStream_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.ServerStream, trevrpc_go.RouteMethodDescriptor(methods.ByName("ServerStream")))
+	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, Echo_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteMethodDescriptor(methods.ByName("Bidi")))
 }

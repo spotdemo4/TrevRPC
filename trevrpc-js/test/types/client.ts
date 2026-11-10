@@ -1,4 +1,4 @@
-import { create } from "@bufbuild/protobuf";
+import { create, type DescMethod } from "@bufbuild/protobuf";
 import {
   Channel,
   Code,
@@ -55,6 +55,7 @@ const authenticate: CallInterceptor = async (call) => {
   call.service satisfies string;
   call.name satisfies string;
   call.kind satisfies "unary" | "serverStreaming" | "clientStreaming" | "bidirectionalStreaming";
+  call.descriptor satisfies DescMethod;
   call.timeoutMs satisfies number | undefined;
   call.signal satisfies AbortSignal | undefined;
   call.metadata["authorization"] = "Bearer refreshed";

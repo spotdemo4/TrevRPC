@@ -53,5 +53,6 @@ func (c *UnreliableEchoClient) Bidi(ctx context.Context, options ...trevrpc_go.C
 
 // RegisterUnreliableEchoServer registers handlers for the UnreliableEcho service.
 func RegisterUnreliableEchoServer(server *trevrpc_go.Server, implementation UnreliableEchoServer) {
-	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, UnreliableEcho_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: true}))
+	methods := File_unreliable_proto.Services().ByName("UnreliableEcho").Methods()
+	trevrpc_go.RegisterBidirectionalStreaming[*EchoRequest, *EchoResponse](server, UnreliableEcho_Bidi_FullMethodName, func() *EchoRequest { return &EchoRequest{} }, implementation.Bidi, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName("Bidi")))
 }

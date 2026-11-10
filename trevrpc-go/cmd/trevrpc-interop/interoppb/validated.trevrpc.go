@@ -61,6 +61,7 @@ func (c *ValidatedEchoClient) ClientStream(ctx context.Context, options ...trevr
 
 // RegisterValidatedEchoServer registers handlers for the ValidatedEcho service.
 func RegisterValidatedEchoServer(server *trevrpc_go.Server, implementation ValidatedEchoServer) {
-	trevrpc_go.RegisterUnary[*ValidatedRequest, *EchoResponse](server, ValidatedEcho_Unary_FullMethodName, func() *ValidatedRequest { return &ValidatedRequest{} }, implementation.Unary)
-	trevrpc_go.RegisterClientStreaming[*ValidatedRequest, *EchoResponse](server, ValidatedEcho_ClientStream_FullMethodName, func() *ValidatedRequest { return &ValidatedRequest{} }, implementation.ClientStream)
+	methods := File_validated_proto.Services().ByName("ValidatedEcho").Methods()
+	trevrpc_go.RegisterUnary[*ValidatedRequest, *EchoResponse](server, ValidatedEcho_Unary_FullMethodName, func() *ValidatedRequest { return &ValidatedRequest{} }, implementation.Unary, trevrpc_go.RouteMethodDescriptor(methods.ByName("Unary")))
+	trevrpc_go.RegisterClientStreaming[*ValidatedRequest, *EchoResponse](server, ValidatedEcho_ClientStream_FullMethodName, func() *ValidatedRequest { return &ValidatedRequest{} }, implementation.ClientStream, trevrpc_go.RouteMethodDescriptor(methods.ByName("ClientStream")))
 }

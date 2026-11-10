@@ -221,7 +221,7 @@ Interceptors run around every call of a client, for what each call needs, such a
 const channel = createChannel(url, {
   interceptors: [
     async (call) => {
-      // call.method, .service, .name, .kind, .timeoutMs and .signal describe the call.
+      // call.method, .service, .name, .kind, .descriptor, .timeoutMs and .signal describe the call.
       Object.assign(call.metadata, bearerMetadata(await session.token()));
       const started = session.id;
       return ({ code }) => {
@@ -240,6 +240,7 @@ const client = createClient(Greeter, channel, { interceptors: [logCalls] });
 - It may return a finish function, which is called once with `{ code, error }` when the call ends: when a unary call settles, and when a streaming call receives its final status or fails, including when it is cancelled, so nothing has to wrap a stream's iterator. `code` is `Code.Ok` on success. Finish functions run innermost first; one that throws is reported and does not affect the call. A streaming call that is neither read to its end nor closed does not end.
 - An interceptor that throws fails the call with what it threw before it starts; the finish functions of earlier interceptors still run.
 - A client-streaming call has a `status` promise too, like the other streaming calls.
+- `call.descriptor` is the method's protobuf-es `DescMethod`: an interceptor reads the options an application defines on its methods, such as a `public` option that marks the methods that need no session, with `getOption(call.descriptor, ext)` from `@bufbuild/protobuf`, instead of keeping a list of full method names.
 
 ### Request validation
 

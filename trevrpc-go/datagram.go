@@ -10,6 +10,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // This file is the datagram half of the runtime (see "Datagram Messages" in
@@ -76,6 +77,7 @@ type routeConfig struct {
 	unreliable        Unreliable
 	streamCompression StreamCompression
 	plainCompression  PlainCompression
+	method            protoreflect.MethodDescriptor
 }
 
 // RouteOption customizes a route registered with Register*.

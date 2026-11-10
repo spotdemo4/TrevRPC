@@ -45,6 +45,9 @@ type route struct {
 	// plainCompression says which directions may be compressed without a
 	// dictionary.
 	plainCompression PlainCompression
+	// method is the descriptor of the route's method, nil for a route
+	// registered without one (see RouteMethodDescriptor).
+	method protoreflect.MethodDescriptor
 	// request is the request message type of a route registered with
 	// Register*, and nil for a route registered with a raw handler. Its
 	// bindUnary or bindStreaming builds the handler for a validation function,
@@ -444,7 +447,8 @@ func (s *Server) addUnaryRoute(method string, handler unaryHandler, typed typedR
 	s.requireMutableLocked()
 	validateRoute(method, handler != nil)
 	config := applyRouteOptions(options)
-	s.routes[method] = route{kind: RPCKindUnary, unary: handler, plainCompression: config.plainCompression, request: typed.request, bindUnary: typed.bindUnary}
+	validateRouteMethod(method, RPCKindUnary, config.method)
+	s.routes[method] = route{kind: RPCKindUnary, unary: handler, plainCompression: config.plainCompression, method: config.method, request: typed.request, bindUnary: typed.bindUnary}
 }
 
 // routeStreaming registers a streaming route handler for a method path and RPC kind.
@@ -467,12 +471,14 @@ func (s *Server) addStreamingRoute(method string, kind RPCKind, handler streamin
 	}
 	validateRoute(method, handler != nil)
 	config := applyRouteOptions(options)
+	validateRouteMethod(method, kind, config.method)
 	s.routes[method] = route{
 		kind:              kind,
 		streaming:         handler,
 		unreliable:        config.unreliable.effective(kind),
 		streamCompression: config.streamCompression.effective(kind),
 		plainCompression:  config.plainCompression,
+		method:            config.method,
 		request:           typed.request,
 		bindStreaming:     typed.bindStreaming,
 	}
@@ -510,8 +516,9 @@ func bindValidators(routes map[string]route, validator Validator) error {
 // "/package.Service/Method". It panics if method is not of that form. The
 // handler may set response headers and trailing metadata with
 // SetResponseHeader and SetResponseMetadata. Generated registration passes the
-// method's schema options as RouteOptions; RoutePlainCompression is the only
-// one that applies to a unary route.
+// method's schema options as RouteOptions, and its descriptor as
+// RouteMethodDescriptor; RoutePlainCompression is the only schema option that
+// applies to a unary route.
 func RegisterUnary[Req ProtoMessage, Res ProtoMessage](s *Server, method string, newRequest func() Req, handler func(context.Context, Req) (Res, error), options ...RouteOption) {
 	validateRoute(method, handler != nil)
 	s.routeTypedUnary(method, typedRoute{
@@ -1473,6 +1480,17 @@ func validateRequest(request *wireRequest) error {
 	return err
 }
 
+// resolveRoute returns the route registered for request, the zero route when
+// there is none, and records the route's method descriptor on request, which
+// the call's HandlerContext reports. It runs before the call's handler context
+// is built, so the authorizer, the interceptors and the handler all see the
+// descriptor, and the lookup is the one the call needs anyway.
+func (r *serverRuntime) resolveRoute(request *wireRequest) route {
+	route := r.routes[request.Method]
+	request.methodDescriptor = route.method
+	return route
+}
+
 func (r *serverRuntime) prepareRequest(ctx context.Context, request *wireRequest, lease *requestExecutionLease) (context.Context, context.CancelFunc, error) {
 	// A request served from a stream was validated, and ctx already carries
 	// its deadline and handler context: building them again cost each call a
@@ -1485,6 +1503,9 @@ func (r *serverRuntime) prepareRequest(ctx context.Context, request *wireRequest
 		if err := validateRequest(request); err != nil {
 			return ctx, func() {}, err
 		}
+		// Served from a stream, the call resolved its route before building
+		// its handler context.
+		r.resolveRoute(request)
 		var err error
 		ctx, cancel, err = requestContext(ctx, request)
 		if err != nil {

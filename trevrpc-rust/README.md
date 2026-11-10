@@ -122,7 +122,7 @@ let reply: greeter::HelloReply =
 server.route(greeter::greeter_paths::SAY_HELLO, |body| async move { Ok(body) });
 ```
 
-`Server::route*` panic when the path is not exactly `/<service>/<method>` with both parts non-empty. A request with a malformed path is rejected with `InvalidArgument`, and a well-formed path with no handler with `Unimplemented`. `RequestContext::service()`, `method()` and `full_method()` return the parts and the whole path.
+`Server::route*` panic when the path is not exactly `/<service>/<method>` with both parts non-empty. A request with a malformed path is rejected with `InvalidArgument`, and a well-formed path with no handler with `Unimplemented`. `RequestContext::service()`, `method()` and `full_method()` return the parts and the whole path, and `method_options()` the encoded `MethodOptions` of the method (`None` for a route registered without `RouteOptions::with_method_options`, which generated code passes), which an authorizer receives too in `AuthorizationRequest::method_options`. An application decodes the options it defines on its methods, such as a `public` option, from those bytes with a prost message that mirrors `MethodOptions`; see the [Rust Guide](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide).
 
 ## Server
 

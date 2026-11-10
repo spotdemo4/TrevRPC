@@ -58,11 +58,13 @@ export async function interceptCall(interceptors, info, options, start, ended) {
 
 /** What an interceptor sees of a call before it starts, and may change. */
 class InterceptedCall {
-  constructor({ method, service, name, kind }, { metadata, timeoutMs, signal }) {
+  constructor({ method, service, name, kind, descriptor }, { metadata, timeoutMs, signal }) {
     this.method = method;
     this.service = service;
     this.name = name;
     this.kind = kind;
+    /** The protobuf-es DescMethod, to read the options an application defines on its methods. */
+    this.descriptor = descriptor;
     /** The request metadata; interceptors may add, replace and delete entries. */
     this.metadata = { ...metadata };
     this.timeoutMs = timeoutMs;

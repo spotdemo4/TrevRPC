@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { getOption, hasOption } from "@bufbuild/protobuf";
+
 import { Echo } from "../build/interop/gen/interop_pb.js";
+import * as methods from "../build/test/gen/methods_pb.js";
+import { method as trevrpcMethod } from "../build/test/gen/trevrpc/options_pb.js";
 import { createClient } from "../src/client.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { echoHandler } from "./echo-server.js";
@@ -64,6 +68,50 @@ test("interceptors run in order, change metadata and finish innermost first", as
   assert.equal(seen[0].kind, "unary");
   assert.equal(seen[0].timeoutMs, 5000);
   await transport.settled();
+});
+
+test("interceptors of channels and clients see the method's descriptor and can read its options", async () => {
+  const stop = new Error("stop before the call starts");
+  const transport = fakeTransport(() => assert.fail("no stream expected"));
+  const seen = [];
+  const record = (who) => (call) => {
+    const options = hasOption(call.descriptor, trevrpcMethod)
+      ? getOption(call.descriptor, trevrpcMethod)
+      : undefined;
+    seen.push({
+      who,
+      descriptor: call.descriptor,
+      unreliableResponses: options?.unreliableResponses,
+    });
+  };
+  transport.interceptors = [record("channel")];
+  const client = createClient(methods.Unreliable, transport, {
+    interceptors: [
+      record("client"),
+      () => {
+        throw stop;
+      },
+    ],
+  });
+
+  // The descriptor is the service's own, the one a custom option of the application is read from
+  // with getOption, here `(trevrpc.method)`.
+  await assert.rejects(client.server({ text: "x" }), stop);
+  await assert.rejects(client.unary({ text: "x" }), stop);
+  assert.deepEqual(
+    seen.map(({ who, descriptor, unreliableResponses }) => [
+      who,
+      descriptor === methods.Unreliable.method.server,
+      descriptor === methods.Unreliable.method.unary,
+      unreliableResponses,
+    ]),
+    [
+      ["channel", true, false, true],
+      ["client", true, false, true],
+      ["channel", false, true, undefined],
+      ["client", false, true, undefined],
+    ],
+  );
 });
 
 test("a failed call finishes with its status", async () => {

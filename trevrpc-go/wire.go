@@ -109,6 +109,10 @@ type wireRequest struct {
 	// responseType is the full name of the response message type, which picks
 	// the dictionary the client accepts; empty when it is not known.
 	responseType protoreflect.FullName
+	// method is the descriptor of the registered method the call names, on the
+	// server; nil for an unknown method and for a route registered without
+	// a descriptor.
+	methodDescriptor protoreflect.MethodDescriptor
 	// compression is the server's negotiation result for the call.
 	compression *callCompression
 	// streamCompression is the directions the client may stream-compress.

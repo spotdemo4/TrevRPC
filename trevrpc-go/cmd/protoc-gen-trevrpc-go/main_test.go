@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"go/parser"
 	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -52,6 +54,11 @@ func TestGenerateAllRPCShapes(t *testing.T) {
 		"RegisterClientStreaming[*HelloRequest, *HelloReply]",
 		"RegisterServerStreaming[*HelloRequest, *HelloReply]",
 		"RegisterBidirectionalStreaming[*HelloRequest, *HelloReply]",
+		// The descriptors are looked up once per registration, from the
+		// variable protoc-gen-go declares.
+		`methods := File_hello_v1_greeter_proto.Services().ByName("Greeter").Methods()`,
+		`implementation.SayHello, trevrpc_go.RouteMethodDescriptor(methods.ByName("SayHello")))`,
+		`implementation.BidiHello, trevrpc_go.RouteMethodDescriptor(methods.ByName("BidiHello")))`,
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("generated content missing %q:\n%s", want, content)
@@ -92,7 +99,8 @@ func TestGeneratorSupportsProto3Optional(t *testing.T) {
 
 func TestGeneratedAllRPCShapesCompileAndRoundTripMetadata(t *testing.T) {
 	runtimeRoot, root, relativeRoot, importPrefix := newInModuleFixture(t)
-	response := generate(greeterRequestWithPackage("", importPrefix+"/hello/v1;hellov1"))
+	request := greeterRequestWithPackage("", importPrefix+"/hello/v1;hellov1")
+	response := generate(request)
 	if response.GetError() != "" {
 		t.Fatalf("generator returned error: %s", response.GetError())
 	}
@@ -114,7 +122,7 @@ func (m *HelloReply) Reset() { *m = HelloReply{} }
 func (m *HelloReply) String() string { return m.Value }
 func (*HelloReply) ProtoMessage() {}
 `)
-	writeFile(t, filepath.Join(root, response.File[0].GetName()), response.File[0].GetContent())
+	writeGenerated(t, root, request, response)
 	writeFile(t, filepath.Join(packageDir, "service_test.go"), `package hellov1
 
 import (
@@ -343,9 +351,7 @@ func TestGeneratedMultiFilePackageAndImportIdentityCompiles(t *testing.T) {
 	writeFile(t, filepath.Join(root, "a", "shared", "messages.go"), legacyMessages("shared", "Outer_Nested", "Outer_Other"))
 	writeFile(t, filepath.Join(root, "b", "shared", "messages.go"), legacyMessages("shared", "Item"))
 	writeFile(t, filepath.Join(root, "external", "api", "messages.go"), legacyMessages("apipb", "External"))
-	for _, file := range response.File {
-		writeFile(t, filepath.Join(root, file.GetName()), file.GetContent())
-	}
+	writeGenerated(t, root, request, response)
 	runFixtureTests(t, runtimeRoot, relativeRoot)
 }
 
@@ -543,6 +549,61 @@ func runFixtureTests(t *testing.T, runtimeRoot, relativeRoot string) {
 	}
 }
 
+var (
+	goPackageClause   = regexp.MustCompile(`(?m)^package (\w+)$`)
+	fileDescriptorVar = regexp.MustCompile(`\bFile_\w+_proto\b`)
+)
+
+// writeGenerated writes the files of response under root, each with the
+// declaration of the file descriptor variable it refers to, which protoc-gen-go
+// emits in the real build: the fixtures' hand-written messages have none.
+func writeGenerated(t *testing.T, root string, request *plugin.CodeGeneratorRequest, response *plugin.CodeGeneratorResponse) {
+	t.Helper()
+	for _, file := range response.File {
+		writeFile(t, filepath.Join(root, file.GetName()), file.GetContent())
+		variable := fileDescriptorVar.FindString(file.GetContent())
+		packageName := goPackageClause.FindStringSubmatch(file.GetContent())
+		if variable == "" || packageName == nil {
+			t.Fatalf("%s has no file descriptor variable or package:\n%s", file.GetName(), file.GetContent())
+		}
+		protoName := strings.TrimSuffix(file.GetName(), ".trevrpc.go") + ".proto"
+		var encoded []byte
+		for _, proto_ := range request.ProtoFile {
+			if proto_.GetName() == protoName {
+				var err error
+				if encoded, err = proto.Marshal(proto_); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if encoded == nil {
+			t.Fatalf("request has no %s", protoName)
+		}
+		writeFile(t, filepath.Join(root, strings.TrimSuffix(file.GetName(), ".trevrpc.go")+".descriptor.go"), fmt.Sprintf(`package %s
+
+import (
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+)
+
+// %s describes the file the way protoc-gen-go's variable of that name does.
+var %[2]s = func() protoreflect.FileDescriptor {
+	var proto_ descriptorpb.FileDescriptorProto
+	if err := proto.Unmarshal([]byte(%[3]q), &proto_); err != nil {
+		panic(err)
+	}
+	file, err := protodesc.FileOptions{AllowUnresolvable: true}.New(&proto_, nil)
+	if err != nil {
+		panic(err)
+	}
+	return file
+}()
+`, packageName[1], variable, string(encoded)))
+	}
+}
+
 func legacyMessages(packageName string, names ...string) string {
 	var source strings.Builder
 	source.WriteString("package ")
@@ -684,12 +745,12 @@ func TestGeneratorEmitsStreamCompressionOptions(t *testing.T) {
 		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.WithPlainCompression(" + plainBoth + "))...)",
 		// A request type with a redacted field keeps its direction out.
 		"c.mergedCallOptions(options, trevrpc_go.WithStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.WithPlainCompression(" + plainResponses + "))...)",
-		"implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainBoth + "))",
-		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainBoth + "))",
-		"implementation.Leaky, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainResponses + "))",
+		"implementation.Bidi, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: true, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainBoth + "), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Bidi\")))",
+		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainBoth + "), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Download\")))",
+		"implementation.Leaky, trevrpc_go.RouteStreamCompression(trevrpc_go.StreamCompression{Requests: false, Responses: true}), trevrpc_go.RoutePlainCompression(" + plainResponses + "), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Leaky\")))",
 		// Only the unredacted response is left for a client-streaming method
 		// of a redacted request type.
-		"implementation.SecretUpload, trevrpc_go.RoutePlainCompression(" + plainResponses + "))",
+		"implementation.SecretUpload, trevrpc_go.RoutePlainCompression(" + plainResponses + "), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"SecretUpload\")))",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("generated content missing %q:\n%s", want, content)
@@ -713,10 +774,10 @@ func TestGeneratorEmitsPlainCompressionOptions(t *testing.T) {
 	content := response.File[0].GetContent()
 	for _, want := range []string{
 		"c.mergedCallOptions(options, trevrpc_go.WithPlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))...)",
-		"implementation.Call, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}))",
+		"implementation.Call, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Call\")))",
 		"c.mergedCallOptions(options, trevrpc_go.WithPlainCompression(trevrpc_go.PlainCompression{Requests: false, Responses: true}))...)",
-		"implementation.SecretCall, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: false, Responses: true}))",
-		"implementation.Bare)",
+		"implementation.SecretCall, trevrpc_go.RoutePlainCompression(trevrpc_go.PlainCompression{Requests: false, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"SecretCall\")))",
+		"implementation.Bare, trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Bare\")))",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("generated content missing %q:\n%s", want, content)
@@ -754,11 +815,11 @@ func TestGeneratorEmitsUnreliableOptions(t *testing.T) {
 		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: true}))...)",
 		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: false}))...)",
 		"c.mergedCallOptions(options, trevrpc_go.WithUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}))...)",
-		"implementation.Bidi, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: true}))",
-		"implementation.Upload, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: false}))",
-		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}))",
+		"implementation.Bidi, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Bidi\")))",
+		"implementation.Upload, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: true, Responses: false}), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Upload\")))",
+		"implementation.Download, trevrpc_go.RouteUnreliable(trevrpc_go.Unreliable{Requests: false, Responses: true}), trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Download\")))",
 		"c.mergedCallOptions(options)...)",
-		"implementation.Plain)",
+		"implementation.Plain, trevrpc_go.RouteMethodDescriptor(methods.ByName(\"Plain\")))",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("generated content missing %q:\n%s", want, content)
@@ -794,17 +855,18 @@ func TestGeneratorRejectsUnreliableDirectionsThatDoNotStream(t *testing.T) {
 
 func TestGeneratedUnreliableOptionsCompile(t *testing.T) {
 	runtimeRoot, root, relativeRoot, importPrefix := newInModuleFixture(t)
-	response := generate(unreliableRequest(t, importPrefix+"/hello/v1;hellov1",
+	request := unreliableRequest(t, importPrefix+"/hello/v1;hellov1",
 		unreliableMethod{name: "Bidi", clientStreaming: true, serverStreaming: true, requests: true, responses: true, compression: stream},
 		unreliableMethod{name: "Upload", clientStreaming: true, requests: true},
 		unreliableMethod{name: "Download", serverStreaming: true, responses: true, compression: stream},
-	))
+	)
+	response := generate(request)
 	if response.GetError() != "" {
 		t.Fatalf("generator returned error: %s", response.GetError())
 	}
 	packageDir := filepath.Join(root, "hello", "v1")
 	writeFile(t, filepath.Join(packageDir, "messages.go"), legacyMessages("hellov1", "HelloRequest", "HelloReply"))
-	writeFile(t, filepath.Join(root, response.File[0].GetName()), response.File[0].GetContent())
+	writeGenerated(t, root, request, response)
 	writeFile(t, filepath.Join(packageDir, "service_test.go"), `package hellov1
 
 import (

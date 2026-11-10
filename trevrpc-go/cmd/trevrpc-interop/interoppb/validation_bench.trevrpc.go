@@ -93,10 +93,11 @@ func (c *ValidationBenchClient) CelClientStream(ctx context.Context, options ...
 
 // RegisterValidationBenchServer registers handlers for the ValidationBench service.
 func RegisterValidationBenchServer(server *trevrpc_go.Server, implementation ValidationBenchServer) {
-	trevrpc_go.RegisterUnary[*BenchRequest, *EchoResponse](server, ValidationBench_Unary_FullMethodName, func() *BenchRequest { return &BenchRequest{} }, implementation.Unary)
-	trevrpc_go.RegisterClientStreaming[*BenchRequest, *EchoResponse](server, ValidationBench_ClientStream_FullMethodName, func() *BenchRequest { return &BenchRequest{} }, implementation.ClientStream)
-	trevrpc_go.RegisterUnary[*StandardBenchRequest, *EchoResponse](server, ValidationBench_StandardUnary_FullMethodName, func() *StandardBenchRequest { return &StandardBenchRequest{} }, implementation.StandardUnary)
-	trevrpc_go.RegisterClientStreaming[*StandardBenchRequest, *EchoResponse](server, ValidationBench_StandardClientStream_FullMethodName, func() *StandardBenchRequest { return &StandardBenchRequest{} }, implementation.StandardClientStream)
-	trevrpc_go.RegisterUnary[*CelBenchRequest, *EchoResponse](server, ValidationBench_CelUnary_FullMethodName, func() *CelBenchRequest { return &CelBenchRequest{} }, implementation.CelUnary)
-	trevrpc_go.RegisterClientStreaming[*CelBenchRequest, *EchoResponse](server, ValidationBench_CelClientStream_FullMethodName, func() *CelBenchRequest { return &CelBenchRequest{} }, implementation.CelClientStream)
+	methods := File_validation_bench_proto.Services().ByName("ValidationBench").Methods()
+	trevrpc_go.RegisterUnary[*BenchRequest, *EchoResponse](server, ValidationBench_Unary_FullMethodName, func() *BenchRequest { return &BenchRequest{} }, implementation.Unary, trevrpc_go.RouteMethodDescriptor(methods.ByName("Unary")))
+	trevrpc_go.RegisterClientStreaming[*BenchRequest, *EchoResponse](server, ValidationBench_ClientStream_FullMethodName, func() *BenchRequest { return &BenchRequest{} }, implementation.ClientStream, trevrpc_go.RouteMethodDescriptor(methods.ByName("ClientStream")))
+	trevrpc_go.RegisterUnary[*StandardBenchRequest, *EchoResponse](server, ValidationBench_StandardUnary_FullMethodName, func() *StandardBenchRequest { return &StandardBenchRequest{} }, implementation.StandardUnary, trevrpc_go.RouteMethodDescriptor(methods.ByName("StandardUnary")))
+	trevrpc_go.RegisterClientStreaming[*StandardBenchRequest, *EchoResponse](server, ValidationBench_StandardClientStream_FullMethodName, func() *StandardBenchRequest { return &StandardBenchRequest{} }, implementation.StandardClientStream, trevrpc_go.RouteMethodDescriptor(methods.ByName("StandardClientStream")))
+	trevrpc_go.RegisterUnary[*CelBenchRequest, *EchoResponse](server, ValidationBench_CelUnary_FullMethodName, func() *CelBenchRequest { return &CelBenchRequest{} }, implementation.CelUnary, trevrpc_go.RouteMethodDescriptor(methods.ByName("CelUnary")))
+	trevrpc_go.RegisterClientStreaming[*CelBenchRequest, *EchoResponse](server, ValidationBench_CelClientStream_FullMethodName, func() *CelBenchRequest { return &CelBenchRequest{} }, implementation.CelClientStream, trevrpc_go.RouteMethodDescriptor(methods.ByName("CelClientStream")))
 }

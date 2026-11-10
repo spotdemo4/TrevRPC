@@ -187,7 +187,8 @@ where
         server.route_with_options(
             greeter_paths::SAY_HELLO,
             ::trevrpc::server::RouteOptions::new()
-                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
+                .with_method_options(b""),
             move |context, body| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
@@ -205,7 +206,8 @@ where
             greeter_paths::LOTS_OF_REPLIES,
             ::trevrpc::RpcKind::ServerStreaming,
             ::trevrpc::server::RouteOptions::new()
-                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
+                .with_method_options(b""),
             move |context, body, _request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
@@ -223,7 +225,8 @@ where
             greeter_paths::LOTS_OF_GREETINGS,
             ::trevrpc::RpcKind::ClientStreaming,
             ::trevrpc::server::RouteOptions::new()
-                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
+                .with_method_options(b""),
             move |context, _body, request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {
@@ -243,7 +246,8 @@ where
             greeter_paths::BIDI_HELLO,
             ::trevrpc::RpcKind::BidirectionalStreaming,
             ::trevrpc::server::RouteOptions::new()
-                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply"),
+                .with_message_types("example.greeter.HelloRequest", "example.greeter.HelloReply")
+                .with_method_options(b""),
             move |context, _body, request_stream| {
                 let service = ::std::sync::Arc::clone(&service);
                 async move {

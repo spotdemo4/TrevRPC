@@ -53,6 +53,8 @@ struct CompressedDirections {
 /// (`name` 1, `service` 6) -> `ServiceDescriptorProto` (`name` 1, `method` 2) ->
 /// `MethodDescriptorProto` (`name` 1, `options` 4) -> `MethodOptions` (extension 58247) ->
 /// `trevrpc.MethodOptions` (`unreliable_requests` 1, `unreliable_responses` 2, `compression` 5).
+/// The encoded `MethodOptions` themselves are kept as they arrived, for routes to hand to
+/// authorizers, interceptors and handlers.
 /// It also reads `FieldOptions.debug_redact` (16), which `prost-types` does not know, through
 /// `FileDescriptorProto.message_type` (4) -> `DescriptorProto` (`name` 1, `field` 2,
 /// `nested_type` 3) -> `FieldDescriptorProto` (`type_name` 6, `options` 8), and whether the
@@ -135,8 +137,9 @@ mod mirror {
     pub struct Method {
         #[prost(string, optional, tag = "1")]
         pub name: Option<String>,
-        #[prost(message, optional, tag = "4")]
-        pub options: Option<MethodOptions>,
+        /// The encoded `MethodOptions`, as they appeared in the descriptor.
+        #[prost(bytes = "vec", optional, tag = "4")]
+        pub options: Option<Vec<u8>>,
     }
 
     #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -174,12 +177,14 @@ mod mirror {
     }
 }
 
-/// The `(trevrpc.method)` marks of every method of a request, by file, service and method name,
-/// the message types that hold a field marked `debug_redact` or carry `buf.validate` rules, and
-/// the encoded files that define them.
+/// The `(trevrpc.method)` marks and the encoded options of every method of a request, by file,
+/// service and method name, the message types that hold a field marked `debug_redact` or carry
+/// `buf.validate` rules, and the encoded files that define them.
 #[derive(Debug, Default)]
 struct MethodOptionIndex {
     marks: HashMap<(String, String, String), MethodMarks>,
+    /// The encoded `MethodOptions` of the methods that have any, extensions included.
+    encoded_options: HashMap<(String, String, String), Vec<u8>>,
     /// Full names, without a leading dot, of the messages that hold a redacted field, directly or
     /// in a nested message field.
     redacted: HashSet<String>,
@@ -207,6 +212,7 @@ impl MethodOptionIndex {
         let request = mirror::Request::decode(request_bytes)?;
         let encoded = mirror::EncodedRequest::decode(request_bytes)?.proto_file;
         let mut marks = HashMap::new();
+        let mut encoded_options = HashMap::new();
         let mut messages = HashMap::new();
         let mut message_files = HashMap::new();
         let mut files = HashMap::new();
@@ -235,26 +241,33 @@ impl MethodOptionIndex {
             for service in file.service {
                 let service_name = service.name.unwrap_or_default();
                 for method in service.method {
-                    let Some(options) = method.options.and_then(|options| options.trevrpc) else {
+                    let Some(options) = method.options else {
                         continue;
                     };
-                    marks.insert(
-                        (
-                            file_name.clone(),
-                            service_name.clone(),
-                            method.name.unwrap_or_default(),
-                        ),
-                        MethodMarks {
-                            unreliable_requests: options.unreliable_requests,
-                            unreliable_responses: options.unreliable_responses,
-                            compression: options.compression,
-                        },
+                    let key = (
+                        file_name.clone(),
+                        service_name.clone(),
+                        method.name.unwrap_or_default(),
                     );
+                    if let Some(options) =
+                        mirror::MethodOptions::decode(options.as_slice())?.trevrpc
+                    {
+                        marks.insert(
+                            key.clone(),
+                            MethodMarks {
+                                unreliable_requests: options.unreliable_requests,
+                                unreliable_responses: options.unreliable_responses,
+                                compression: options.compression,
+                            },
+                        );
+                    }
+                    encoded_options.insert(key, options);
                 }
             }
         }
         Ok(Self {
             marks,
+            encoded_options,
             redacted,
             validated,
             message_files,
@@ -316,6 +329,14 @@ impl MethodOptionIndex {
         self.marks
             .get(&(file.to_owned(), service.to_owned(), method.to_owned()))
             .copied()
+            .unwrap_or_default()
+    }
+
+    /// The encoded `MethodOptions` of a method, empty when it has none.
+    fn options(&self, file: &str, service: &str, method: &str) -> Vec<u8> {
+        self.encoded_options
+            .get(&(file.to_owned(), service.to_owned(), method.to_owned()))
+            .cloned()
             .unwrap_or_default()
     }
 }
@@ -708,6 +729,9 @@ struct Method {
     /// The request messages are checked against their `buf.validate` rules: the generator runs
     /// with `validate=true` and the request type carries rules.
     validated: bool,
+    /// The encoded `MethodOptions` of the method as the descriptor has them, extensions included,
+    /// which its route hands to authorizers, interceptors and the handler.
+    options: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1054,6 +1078,11 @@ fn descriptor_service(
                 };
                 generated.validated =
                     options.validate && method_options.is_validated(&generated.input_proto_type);
+                generated.options = method_options.options(
+                    file_name,
+                    &proto_name,
+                    method.name.as_deref().unwrap_or_default(),
+                );
                 generated
             })
         })
@@ -1143,6 +1172,7 @@ fn descriptor_method(
             responses: plain,
         },
         validated: false,
+        options: Vec::new(),
     })
 }
 
@@ -1553,8 +1583,8 @@ fn generate_registration_method(
     let start = buf.len();
     emit_registration_method(runtime_path, service, method, buf);
     // Routes register through the options variants of `route_with_context` and
-    // `route_streaming_with_context`, which take the route's message types, and its unreliable
-    // marks, as one more argument before the handler.
+    // `route_streaming_with_context`, which take the route's message types, its marks and the
+    // encoded options of its method as one more argument before the handler.
     let mut options = format!(
         "{runtime_path}::server::RouteOptions::new().with_message_types({:?}, {:?})",
         method.input_proto_type, method.output_proto_type
@@ -1568,6 +1598,10 @@ fn generate_registration_method(
     if let Some(directions) = compress_expr(runtime_path, method) {
         options.push_str(&format!(".with_compress({directions})"));
     }
+    options.push_str(&format!(
+        ".with_method_options({})",
+        byte_string_literal(&method.options)
+    ));
     let mut emitted = buf.split_off(start);
     if method.validated {
         emitted = validate_requests(runtime_path, method, &emitted);
@@ -1795,6 +1829,7 @@ mod tests {
                 compressed: CompressedDirections::default(),
                 plain: CompressedDirections::default(),
                 validated: false,
+                options: Vec::new(),
             }],
         };
         let mut generated = String::new();
@@ -1827,6 +1862,7 @@ mod tests {
                 compressed: CompressedDirections::default(),
                 plain: CompressedDirections::default(),
                 validated: false,
+                options: Vec::new(),
             }],
         };
         let mut generated = String::new();
@@ -1850,7 +1886,7 @@ mod tests {
         }
         // Routes carry their message types, which pick compression dictionaries.
         assert!(generated.contains(
-            "server.route_with_options(greeter_paths::SAY_HELLO, ::trevrpc::server::RouteOptions::new().with_message_types(\"example.HelloRequest\", \"example.HelloReply\"), move |context,"
+            "server.route_with_options(greeter_paths::SAY_HELLO, ::trevrpc::server::RouteOptions::new().with_message_types(\"example.HelloRequest\", \"example.HelloReply\").with_method_options(b\"\"), move |context,"
         ));
         // Handlers return plain messages and set response metadata through their context.
         assert!(generated.contains(
@@ -1878,6 +1914,7 @@ mod tests {
                 compressed: CompressedDirections::default(),
                 plain: CompressedDirections::default(),
                 validated: false,
+                options: Vec::new(),
             }],
         };
         let mut generated = String::new();
@@ -1907,6 +1944,7 @@ mod tests {
                     compressed: CompressedDirections::default(),
                     plain: CompressedDirections::default(),
                     validated: false,
+                    options: Vec::new(),
                 },
                 Method {
                     name: "lots_of_greetings".to_owned(),
@@ -1921,6 +1959,7 @@ mod tests {
                     compressed: CompressedDirections::default(),
                     plain: CompressedDirections::default(),
                     validated: false,
+                    options: Vec::new(),
                 },
                 Method {
                     name: "bidi_hello".to_owned(),
@@ -1935,6 +1974,7 @@ mod tests {
                     compressed: CompressedDirections::default(),
                     plain: CompressedDirections::default(),
                     validated: false,
+                    options: Vec::new(),
                 },
             ],
         };

@@ -1,5 +1,6 @@
 //! The `(trevrpc.method)` option: how the generator reads it from descriptors, emits it, and
-//! rejects it on methods whose direction does not stream.
+//! rejects it on methods whose direction does not stream; and how the encoded options of every
+//! method reach its route.
 
 // Helpers outside `#[test]` functions fail by panicking, like the tests themselves.
 #![allow(clippy::expect_used)]
@@ -110,13 +111,13 @@ fn the_option_is_read_from_descriptors_and_emitted_for_clients_and_servers() {
     // Servers register every route with route options carrying its message types, and the
     // marked routes with their marks.
     assert!(content.contains(
-        "server.route_streaming_with_options(telemetry_paths::TRACK, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_unreliable(::trevrpc::Unreliable::BOTH), move |context,"
+        "server.route_streaming_with_options(telemetry_paths::TRACK, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_unreliable(::trevrpc::Unreliable::BOTH).with_method_options(b\"\\xba\\xb8\\x1c"
     ));
     assert!(content.contains(
-        "server.route_streaming_with_options(telemetry_paths::UPLOAD, ::trevrpc::RpcKind::ClientStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_unreliable(::trevrpc::Unreliable::REQUESTS), move |context,"
+        "server.route_streaming_with_options(telemetry_paths::UPLOAD, ::trevrpc::RpcKind::ClientStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_unreliable(::trevrpc::Unreliable::REQUESTS).with_method_options(b\"\\xba\\xb8\\x1c"
     ));
     assert!(content.contains(
-        "server.route_streaming_with_options(telemetry_paths::RELIABLE, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\"), move |context,"
+        "server.route_streaming_with_options(telemetry_paths::RELIABLE, ::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_method_options(b\"\"), move |context,"
     ));
 }
 
@@ -217,10 +218,10 @@ service Telemetry {
         "server_streaming(&self.transport, telemetry_paths::HIDDEN, request, self.default_options.clone()).message_types(\"demo.v1.Secret\", \"demo.v1.Secret\")\n"
     ));
     assert!(content.contains(
-        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress_stream(::trevrpc::CompressStream::BOTH).with_compress(::trevrpc::CompressMessages::BOTH), move |context,"
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress_stream(::trevrpc::CompressStream::BOTH).with_compress(::trevrpc::CompressMessages::BOTH).with_method_options(b\"\\xba\\xb8\\x1c"
     ));
     assert!(content.contains(
-        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Holder\").with_compress_stream(::trevrpc::CompressStream::REQUESTS).with_compress(::trevrpc::CompressMessages::REQUESTS), move |context,"
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Holder\").with_compress_stream(::trevrpc::CompressStream::REQUESTS).with_compress(::trevrpc::CompressMessages::REQUESTS).with_method_options(b\"\\xba\\xb8\\x1c"
     ));
 }
 
@@ -256,7 +257,7 @@ service Telemetry {
         "unary(&self.transport, telemetry_paths::PLAIN, request, self.default_options.clone()).message_types(\"demo.v1.Position\", \"demo.v1.Position\")\n"
     ));
     assert!(content.contains(
-        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress(::trevrpc::CompressMessages::BOTH), move |context,"
+        "RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_compress(::trevrpc::CompressMessages::BOTH).with_method_options(b\"\\xba\\xb8\\x1c"
     ));
 }
 
@@ -280,4 +281,40 @@ fn an_unknown_compression_is_an_error() {
         response.error.as_deref(),
         Some("demo.v1.Telemetry.Call: unknown compression 7")
     );
+}
+
+/// An option the application defines on its methods travels, encoded as the descriptor has it,
+/// to the route of its method, next to the generator's own marks.
+#[test]
+fn the_encoded_options_of_every_method_reach_its_route() {
+    let content = generated(
+        r#"syntax = "proto3";
+package demo.v1;
+import "google/protobuf/descriptor.proto";
+import "trevrpc/options.proto";
+extend google.protobuf.MethodOptions { bool public = 50001; }
+message Position { int32 x = 1; }
+service Telemetry {
+    rpc Open(Position) returns (Position) { option (public) = true; }
+    rpc Track(stream Position) returns (stream Position) {
+        option (public) = true;
+        option (trevrpc.method).unreliable_requests = true;
+    }
+    rpc Closed(Position) returns (Position);
+}
+"#,
+    );
+
+    // `public` is field 50001: the tag is the varint 0x88 0xb5 0x18, and the value 1.
+    assert!(content.contains(
+        "server.route_with_options(telemetry_paths::OPEN, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_method_options(b\"\\x88\\xb5\\x18\\x01\"), move |context,"
+    ), "{content}");
+    // The option comes with the one the generator reads, which stays in the bytes.
+    assert!(content.contains(
+        "::trevrpc::RpcKind::BidirectionalStreaming, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_unreliable(::trevrpc::Unreliable::REQUESTS).with_method_options(b\"\\x88\\xb5\\x18\\x01"
+    ), "{content}");
+    // A method without options has empty ones, which still say the route has a descriptor.
+    assert!(content.contains(
+        "server.route_with_options(telemetry_paths::CLOSED, ::trevrpc::server::RouteOptions::new().with_message_types(\"demo.v1.Position\", \"demo.v1.Position\").with_method_options(b\"\"), move |context,"
+    ), "{content}");
 }

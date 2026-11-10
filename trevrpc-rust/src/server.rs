@@ -65,6 +65,7 @@ pub struct RouteOptions {
     message_types: Option<MessageTypes>,
     compress_stream: CompressStream,
     compress: CompressMessages,
+    method_options: Option<&'static [u8]>,
 }
 
 impl RouteOptions {
@@ -77,7 +78,25 @@ impl RouteOptions {
             message_types: None,
             compress_stream: CompressStream::NONE,
             compress: CompressMessages::NONE,
+            method_options: None,
         }
+    }
+
+    /// Gives the route the encoded `google.protobuf.MethodOptions` of its method, which
+    /// authorizers, interceptors and the handler read as [`AuthorizationRequest::method_options`]
+    /// and [`RequestContext::method_options`], for example to read the options an application
+    /// defines on its methods. Generated code passes them exactly as they appear in the
+    /// descriptor, extensions included, empty for a method without options.
+    #[must_use]
+    pub const fn with_method_options(mut self, options: &'static [u8]) -> Self {
+        self.method_options = Some(options);
+        self
+    }
+
+    /// Returns the encoded options of the route's method, if it was given them.
+    #[must_use]
+    pub const fn method_options(&self) -> Option<&'static [u8]> {
+        self.method_options
     }
 
     /// Lets the route's messages be compressed without a dictionary in the directions
@@ -317,6 +336,8 @@ pub struct RequestContext {
     /// Counts the request messages that arrived compressed without a dictionary.
     plain_compressed: MessageCount,
     remote_addr: Option<SocketAddr>,
+    /// The encoded options of the method, if its route was registered with them.
+    method_options: Option<&'static [u8]>,
     /// The response metadata the handler sets, shared by every clone of the context.
     response: ResponseMetadata,
     /// Values the authorizer and interceptors pass to the handler, such as a database handle.
@@ -338,6 +359,7 @@ impl RequestContext {
             deadline,
             CancellationToken::new(),
             CallInfo::default(),
+            None,
         )
     }
 
@@ -348,6 +370,7 @@ impl RequestContext {
         deadline: Option<Instant>,
         cancellation: CancellationToken,
         info: CallInfo,
+        method_options: Option<&'static [u8]>,
     ) -> Self {
         let service_len = split_method_path(&path).map(|(service, _)| service.len());
         Self {
@@ -361,6 +384,7 @@ impl RequestContext {
             stream_compressed: info.stream_compressed,
             plain_compressed: info.plain_compressed,
             remote_addr: info.remote_addr,
+            method_options,
             response: ResponseMetadata::default(),
             extensions: http::Extensions::new(),
             span: tracing::Span::none(),
@@ -372,6 +396,26 @@ impl RequestContext {
     pub const fn with_remote_addr(mut self, remote_addr: SocketAddr) -> Self {
         self.remote_addr = Some(remote_addr);
         self
+    }
+
+    /// Sets the options [`RequestContext::method_options`] returns, for tests of handlers.
+    #[must_use]
+    pub const fn with_method_options(mut self, options: &'static [u8]) -> Self {
+        self.method_options = Some(options);
+        self
+    }
+
+    /// Returns the encoded `google.protobuf.MethodOptions` of the method, as they appear in the
+    /// descriptor of its `.proto` file, extensions included, so the options an application
+    /// defines on its methods can be read from them (see the wiki's Rust Guide for an example).
+    /// An empty slice is a method without options.
+    ///
+    /// `None` for a route registered by hand without
+    /// [`RouteOptions::with_method_options`]; generated registration always gives them. An
+    /// [`Authorizer`] gets them too, as [`AuthorizationRequest::method_options`].
+    #[must_use]
+    pub const fn method_options(&self) -> Option<&'static [u8]> {
+        self.method_options
     }
 
     /// Sets a response header of the call, sent in a HEADERS frame ahead of the first response
@@ -1272,6 +1316,12 @@ pub struct AuthorizationRequest<'a> {
     pub request: &'a RpcRequest,
     /// The client's address; see [`RequestContext::remote_addr`].
     pub remote_addr: Option<SocketAddr>,
+    /// The encoded `google.protobuf.MethodOptions` of the method the call names; see
+    /// [`RequestContext::method_options`]. `None` for a method the server does not have, and for
+    /// a route registered by hand without options, so an authorizer that requires a session
+    /// unless the options say otherwise treats unknown methods like every other method and does
+    /// not tell callers which exist.
+    pub method_options: Option<&'static [u8]>,
 }
 
 /// Authorizes calls before route lookup.
@@ -1819,6 +1869,16 @@ impl Server {
         }
     }
 
+    /// The encoded method options of the route at `path`, if it has them. Only an authorizer
+    /// needs this lookup: the handler's route lookup yields the options of the call's context.
+    fn route_method_options(&self, path: &str) -> Option<&'static [u8]> {
+        match self.inner.routes.get(path)? {
+            Route::Unary { options, .. } | Route::Streaming { options, .. } => {
+                options.method_options()
+            }
+        }
+    }
+
     /// The message types of the route at `path`, if it named them.
     pub(crate) fn route_message_types(&self, path: &str) -> Option<MessageTypes> {
         match self.inner.routes.get(path)? {
@@ -1896,7 +1956,8 @@ impl Server {
                 }
             };
 
-        let Some(Route::Unary { handler, .. }) = self.inner.routes.get(request.method.as_str())
+        let Some(Route::Unary { handler, options }) =
+            self.inner.routes.get(request.method.as_str())
         else {
             return self.finish_response(
                 &request.method,
@@ -1923,6 +1984,7 @@ impl Server {
             deadline,
             cancellation.clone(),
             info,
+            options.method_options(),
         );
         context.extensions = extensions;
         let response_metadata = context.response.clone();
@@ -2035,8 +2097,11 @@ impl Server {
         let request_body =
             limit_stream(request_body, stream_limits, "request", cancellation.clone());
 
-        let Some(Route::Streaming { kind, handler, .. }) =
-            self.inner.routes.get(request.method.as_str())
+        let Some(Route::Streaming {
+            kind,
+            handler,
+            options,
+        }) = self.inner.routes.get(request.method.as_str())
         else {
             let status =
                 Status::unimplemented(format!("unknown streaming RPC method {}", request.method));
@@ -2075,6 +2140,7 @@ impl Server {
             deadline,
             cancellation.clone(),
             info,
+            options.method_options(),
         );
         context.extensions = extensions;
         let response_metadata = context.response.clone();
@@ -2199,6 +2265,7 @@ impl Server {
             let authorization = AuthorizationRequest {
                 request,
                 remote_addr,
+                method_options: self.route_method_options(&request.method),
             };
             let authorized = authorizer.authorize_with_extensions(&authorization, &mut extensions);
             match with_deadline(authorized, deadline).await {
@@ -5063,6 +5130,7 @@ mod tests {
         let request = super::AuthorizationRequest {
             request: &request,
             remote_addr: None,
+            method_options: None,
         };
 
         let chain = super::AuthorizerChain::new()
@@ -5159,6 +5227,156 @@ mod tests {
             first,
             ResponseFrame::message(b"session>user>interceptor".to_vec())
         );
+    }
+
+    /// The option an application defines on its methods, in a message that mirrors
+    /// `google.protobuf.MethodOptions` with the option's field number as an ordinary field:
+    /// `extend google.protobuf.MethodOptions { bool public = 50001; }`.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct AppMethodOptions {
+        #[prost(bool, tag = "50001")]
+        public: bool,
+    }
+
+    /// `option (public) = true;` encoded as the generated code hands it to the route.
+    const PUBLIC: &[u8] = b"\x88\xb5\x18\x01";
+
+    /// What an authorizer, an interceptor and a handler saw of a call: its full method, and
+    /// whether its options said `public`, or `None` for a call without options.
+    type SeenOptions = Arc<Mutex<Vec<(String, Option<bool>)>>>;
+
+    fn is_public(options: Option<&'static [u8]>) -> Option<bool> {
+        options.map(|options| {
+            <AppMethodOptions as prost::Message>::decode(options)
+                .expect("the options should decode")
+                .public
+        })
+    }
+
+    /// Records the options the authorizer is given.
+    struct OptionsAuthorizer(SeenOptions);
+
+    #[crate::async_trait]
+    impl Authorizer for OptionsAuthorizer {
+        async fn authorize(&self, request: &super::AuthorizationRequest<'_>) -> Result<(), Status> {
+            self.0.lock().unwrap().push((
+                request.request.method.clone(),
+                is_public(request.method_options),
+            ));
+            Ok(())
+        }
+    }
+
+    /// Records the options the interceptor finds in the context.
+    struct OptionsInterceptor(SeenOptions);
+
+    #[crate::async_trait]
+    impl super::Interceptor for OptionsInterceptor {
+        async fn intercept(
+            &self,
+            context: &mut RequestContext,
+        ) -> std::result::Result<Option<super::Finish>, Status> {
+            self.0.lock().unwrap().push((
+                context.full_method().to_owned(),
+                is_public(context.method_options()),
+            ));
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn method_options_reach_the_authorizer_the_interceptors_and_the_handler() {
+        let authorized = SeenOptions::default();
+        let intercepted = SeenOptions::default();
+        let handled = SeenOptions::default();
+        let mut server = Server::new();
+        server.set_authorizer(OptionsAuthorizer(Arc::clone(&authorized)));
+        server.add_interceptor(OptionsInterceptor(Arc::clone(&intercepted)));
+        let record = |handled: &SeenOptions| {
+            let handled = Arc::clone(handled);
+            move |context: RequestContext| {
+                handled.lock().unwrap().push((
+                    context.full_method().to_owned(),
+                    is_public(context.method_options()),
+                ));
+            }
+        };
+        for (path, options) in [
+            ("/example.Auth/Login", PUBLIC),
+            ("/example.Auth/Account", b""),
+        ] {
+            let record = record(&handled);
+            server.route_with_options(
+                path,
+                super::RouteOptions::new().with_method_options(options),
+                move |context, _body| {
+                    record(context);
+                    async { Ok(Vec::new()) }
+                },
+            );
+        }
+        let streaming = record(&handled);
+        server.route_streaming_with_options(
+            "/example.Auth/Watch",
+            RpcKind::ServerStreaming,
+            super::RouteOptions::new().with_method_options(PUBLIC),
+            move |context, _body, _requests| {
+                streaming(context);
+                async { Ok(crate::stream::empty()) }
+            },
+        );
+        // A route registered by hand has no options.
+        let by_hand = record(&handled);
+        server.route_with_context("/example.Auth/ByHand", move |context, _body| {
+            by_hand(context);
+            async { Ok(Vec::new()) }
+        });
+
+        for path in [
+            "/example.Auth/Login",
+            "/example.Auth/Account",
+            "/example.Auth/ByHand",
+        ] {
+            server
+                .handle_request(RpcRequest::new(path), Vec::new())
+                .await
+                .expect("the call should succeed");
+        }
+        let mut watch = RpcRequest::new("/example.Auth/Watch");
+        watch.kind = RpcKind::ServerStreaming.into();
+        let frames: Vec<_> = server
+            .handle_streaming_request(watch, Vec::new(), crate::stream::empty())
+            .await
+            .collect()
+            .await;
+        assert!(frames.iter().all(Result::is_ok), "{frames:?}");
+        // The authorizer runs before the route lookup, so it sees an unknown method too, without
+        // options, and the caller gets the usual status.
+        let status = server
+            .handle_request(RpcRequest::new("/example.Auth/Missing"), Vec::new())
+            .await
+            .expect_err("an unknown method should fail");
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let expected = vec![
+            ("/example.Auth/Login".to_owned(), Some(true)),
+            ("/example.Auth/Account".to_owned(), Some(false)),
+            ("/example.Auth/ByHand".to_owned(), None),
+            ("/example.Auth/Watch".to_owned(), Some(true)),
+        ];
+        assert_eq!(*handled.lock().unwrap(), expected);
+        assert_eq!(*intercepted.lock().unwrap(), expected);
+        let mut expected = expected;
+        expected.push(("/example.Auth/Missing".to_owned(), None));
+        assert_eq!(*authorized.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn a_context_built_for_a_test_has_the_options_it_was_given() {
+        let request = RpcRequest::new("/example.Auth/Login");
+        assert_eq!(RequestContext::new(&request, None).method_options(), None);
+        let context = RequestContext::new(&request, None).with_method_options(PUBLIC);
+        assert_eq!(is_public(context.method_options()), Some(true));
     }
 
     #[test]

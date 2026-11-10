@@ -47,6 +47,7 @@ export function createClient(service, transport, options = {}) {
       service: service.typeName,
       name: method.name,
       kind: settings.kind,
+      descriptor: method,
     };
     const call =
       interceptors.length === 0

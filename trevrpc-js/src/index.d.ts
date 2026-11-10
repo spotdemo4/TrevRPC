@@ -1,4 +1,10 @@
-import type { DescMessage, DescService, MessageInitShape, MessageShape } from "@bufbuild/protobuf";
+import type {
+  DescMessage,
+  DescMethod,
+  DescService,
+  MessageInitShape,
+  MessageShape,
+} from "@bufbuild/protobuf";
 
 export const Code: Readonly<{
   Ok: 0;
@@ -106,6 +112,12 @@ export interface InterceptedCall {
   /** The method's name, such as `SayHello`. */
   readonly name: string;
   readonly kind: CallKind;
+  /**
+   * The method's protobuf-es descriptor, to read the options an application defines on its
+   * methods with `getOption(call.descriptor, ext)` from `@bufbuild/protobuf`, such as a custom
+   * option that marks the methods that need no session.
+   */
+  readonly descriptor: DescMethod;
   /**
    * The call's request metadata. An interceptor may add, replace and delete entries, such as a
    * refreshed token; the result is validated after the last interceptor, and invalid metadata

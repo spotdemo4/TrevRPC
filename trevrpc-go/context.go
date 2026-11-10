@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/netip"
 	"sync/atomic"
+
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 type handlerContextKey struct{}
@@ -36,6 +38,21 @@ type HandlerContext struct {
 	// FullMethod is the method path "/<Service>/<Method>".
 	FullMethod string
 	Kind       RPCKind
+	// MethodDescriptor is the protobuf descriptor of the method, for reading
+	// the options an application defines on its methods, such as a custom
+	// option that marks the methods that need no session:
+	//
+	//	public, _ := proto.GetExtension(info.MethodDescriptor.Options(), authpb.E_Public).(bool)
+	//
+	// It is set for the methods that generated code registered, whichever
+	// kind the caller claimed, and nil for a method registered by hand
+	// without RouteMethodDescriptor and for a method the server does not
+	// have, so check for nil before using it. Authorizers get it too, before
+	// the server answers a call to an unknown method, so an authorizer that
+	// requires a session unless the descriptor says otherwise treats unknown
+	// methods like every other method and does not tell callers which exist.
+	// The descriptor is shared by all calls and must not be changed.
+	MethodDescriptor protoreflect.MethodDescriptor
 	// Metadata is the request metadata, connection metadata included. The map
 	// is the call's own, but the values that came from connection metadata are
 	// shared with the connection's other calls: replace such a value instead
@@ -121,6 +138,8 @@ func NewHandlerContext(ctx context.Context, info HandlerContext) context.Context
 		Kind:       info.Kind,
 		Metadata:   metadata,
 		RemoteAddr: info.RemoteAddr,
+
+		MethodDescriptor: info.MethodDescriptor,
 	}}}
 }
 
@@ -131,6 +150,8 @@ func newHandlerContext(request *wireRequest) HandlerContext {
 		Method:     method,
 		FullMethod: request.Method,
 		Kind:       request.rpcKind(),
+		// Resolved from the route by serverRuntime.resolveRoute.
+		MethodDescriptor: request.methodDescriptor,
 		// Decoded for this call, connection metadata included, so not copied.
 		Metadata:      ownedMetadata(request.Metadata),
 		RemoteAddr:    request.remoteAddr,

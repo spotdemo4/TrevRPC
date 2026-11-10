@@ -217,7 +217,7 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 	// The server accepts every dictionary it holds on request messages, and
 	// messages without a dictionary. Routes are fixed once the server runs,
 	// so the call's own decides whether its responses may go without one.
-	request.compression = runtime.compression.negotiate(request, runtime.routes[request.Method].plainCompression.Responses)
+	request.compression = runtime.compression.negotiate(request, runtime.resolveRoute(request).plainCompression.Responses)
 	inflate := runtime.compression.requestLookup(request)
 	reader.inflate = inflate
 	// Stream compression, negotiated once the call is authorized and routed,
