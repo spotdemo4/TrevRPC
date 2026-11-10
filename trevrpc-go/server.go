@@ -351,7 +351,7 @@ func (s *Server) Options() ServerOptions {
 }
 
 // SetAuthorizer installs an authorizer that runs before route lookup. A nil
-// authorizer removes it. A ContextAuthorizer also sets the context that
+// authorizer removes it. The context the authorizer returns is the one that
 // interceptors and the handler get.
 func (s *Server) SetAuthorizer(authorizer Authorizer) {
 	s.mu.Lock()
@@ -607,7 +607,7 @@ func isNilRegisteredValue(value any) bool {
 type serverRuntime struct {
 	options         ServerOptions
 	routes          map[string]route
-	authorizer      ContextAuthorizer
+	authorizer      Authorizer
 	interceptors    []Interceptor
 	metrics         Metrics
 	requestLimit    semaphore
@@ -737,7 +737,7 @@ func (s *Server) freeze() *serverRuntime {
 	runtime := &serverRuntime{
 		options:         options,
 		routes:          routes,
-		authorizer:      asContextAuthorizer(s.authorizer),
+		authorizer:      s.authorizer,
 		interceptors:    s.interceptors,
 		metrics:         metrics,
 		requestLimit:    newSemaphore(options.MaxConcurrentRequests),
@@ -1445,14 +1445,14 @@ type authorizerResult struct {
 
 // invokeAuthorizer runs authorizer on ctx and returns the context the call
 // continues with.
-func invokeAuthorizer(ctx context.Context, authorizer ContextAuthorizer, info HandlerContext, raceContext bool, lease *requestExecutionLease) (context.Context, error) {
+func invokeAuthorizer(ctx context.Context, authorizer Authorizer, info HandlerContext, raceContext bool, lease *requestExecutionLease) (context.Context, error) {
 	invoke := func() (result authorizerResult) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				result = authorizerResult{err: &serverPanicError{phase: ServerDiagnosticAuthorizerPanic, recovered: recovered, stack: debug.Stack()}}
 			}
 		}()
-		result.ctx, result.err = authorizer.AuthorizeContext(ctx, info)
+		result.ctx, result.err = authorizer.Authorize(ctx, info)
 		return result
 	}
 	if !raceContext {

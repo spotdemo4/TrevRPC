@@ -15,8 +15,8 @@ var sessions = map[string]string{"abc": "ada"}
 
 // An authorizer looks the request's session up to verify it, and passes the
 // user it found on to the handler, which need not look the session up again.
-func ExampleContextAuthorizerFunc() {
-	authorizer := trevrpc.ContextAuthorizerFunc(func(ctx context.Context, info trevrpc.HandlerContext) (context.Context, error) {
+func ExampleAuthorizerFunc() {
+	authorizer := trevrpc.AuthorizerFunc(func(ctx context.Context, info trevrpc.HandlerContext) (context.Context, error) {
 		token, err := trevrpc.BearerToken(info.Metadata)
 		if err != nil {
 			return nil, err
@@ -36,7 +36,7 @@ func ExampleContextAuthorizerFunc() {
 		Metadata:   trevrpc.Metadata{"authorization": []byte("Bearer abc")},
 	})
 	info, _ := trevrpc.HandlerContextFromContext(ctx)
-	ctx, err := authorizer.AuthorizeContext(ctx, info)
+	ctx, err := authorizer.Authorize(ctx, info)
 	if err != nil {
 		panic(err)
 	}

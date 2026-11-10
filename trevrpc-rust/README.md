@@ -94,6 +94,8 @@ let channel = trevrpc::client::Channel::connect_with_config(endpoint, "127.0.0.1
 
 A client method returns a `trevrpc::client::Call`, and awaiting it makes the call. Its options start from the client's default call options (`GreeterClient::with_default_call_options`); `.timeout(d)`, `.metadata(key, value)` and `.options(|options| ...)` change them for that call only. `.with_response()` also returns the response headers and trailing metadata, and `.send_all(requests)` sends a stream of requests and finishes it.
 
+`trevrpc::bearer_metadata(token)` returns the `authorization` entry of a bearer token (`let (key, value) = trevrpc::bearer_metadata(&token)?;` for `.metadata(key, value)`, or `Metadata::from([trevrpc::bearer_metadata(&token)?])` for the connection metadata below), and fails with `InvalidArgument` for a token that `trevrpc::server::bearer_token` would reject as malformed (anything but an RFC 6750 `b64token`).
+
 Metadata that every call carries, such as a bearer token, can instead be set once with `ChannelConfig::with_connection_metadata` and replaced with `Channel::set_connection_metadata`. Each connection then sends it in its first calls only, and the server merges it into every call's metadata, a call's own entry winning; see [Connection Metadata](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#connection-metadata).
 
 ### Response headers and trailing metadata

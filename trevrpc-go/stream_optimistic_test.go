@@ -44,12 +44,12 @@ type recordingAuthorizer struct {
 	deny  bool
 }
 
-func (a *recordingAuthorizer) Authorize(context.Context, HandlerContext) error {
+func (a *recordingAuthorizer) Authorize(ctx context.Context, _ HandlerContext) (context.Context, error) {
 	a.calls.Add(1)
 	if a.deny {
-		return Unauthenticated("denied")
+		return ctx, Unauthenticated("denied")
 	}
-	return nil
+	return ctx, nil
 }
 
 // TestServerRefusesOptimisticCallsAfterAuthorization checks that a server

@@ -146,8 +146,8 @@ buildNpmPackage (final: {
         import assert from "node:assert/strict";
         const runtime = await import("@trevrpc/trevrpc-js");
         assert.deepEqual(Object.keys(runtime).sort(), [
-          "Channel", "Code", "TrevRpcError", "codeName", "connect", "createChannel", "createClient",
-          "fetchServerCertificateHashes",
+          "Channel", "Code", "TrevRpcError", "bearerMetadata", "codeName", "connect", "createChannel",
+          "createClient", "fetchServerCertificateHashes",
         ]);
         const zstd = await import("@trevrpc/trevrpc-js/zstd");
         assert.deepEqual(Object.keys(zstd), ["createCompression"]);

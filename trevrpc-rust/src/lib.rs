@@ -12,6 +12,7 @@
 
 extern crate self as trevrpc;
 
+mod bearer;
 pub mod client;
 pub mod compression;
 mod congestion;
@@ -65,6 +66,7 @@ pub const HTTP3_ALPN: &[u8] = b"h3";
 pub const QMUX_ALPN: &[u8] = b"qmux-02.trevrpc-1";
 
 pub use async_trait::async_trait;
+pub use bearer::bearer_metadata;
 pub use compression::{CompressMessages, CompressStream, Compression, Dictionary};
 pub use datagram::Unreliable;
 pub use error::{Error, Result};

@@ -21,11 +21,11 @@ type remoteAddrRecorder struct {
 	admitted   []netip.AddrPort
 }
 
-func (r *remoteAddrRecorder) Authorize(_ context.Context, info HandlerContext) error {
+func (r *remoteAddrRecorder) Authorize(ctx context.Context, info HandlerContext) (context.Context, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.authorized = append(r.authorized, info.RemoteAddr)
-	return nil
+	return ctx, nil
 }
 
 func (r *remoteAddrRecorder) admit(request AdmissionRequest) bool {

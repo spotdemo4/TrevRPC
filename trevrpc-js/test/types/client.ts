@@ -3,6 +3,7 @@ import {
   Channel,
   Code,
   TrevRpcError,
+  bearerMetadata,
   connect,
   createChannel,
   createClient,
@@ -61,7 +62,7 @@ const authenticate: CallInterceptor = async (call) => {
   };
 };
 const lazy: Channel = createChannel("https://localhost:4433/trevrpc", {
-  connectionMetadata: { authorization: "Bearer token" },
+  connectionMetadata: bearerMetadata("token"),
   interceptors: [authenticate, () => {}],
 });
 lazy.interceptors satisfies readonly CallInterceptor[];

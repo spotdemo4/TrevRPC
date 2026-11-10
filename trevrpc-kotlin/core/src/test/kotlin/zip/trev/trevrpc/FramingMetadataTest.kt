@@ -156,6 +156,24 @@ class FramingMetadataTest {
     }
 
     @Test
+    fun `bearer metadata carries a b64token as bearer credentials`() {
+        listOf("abc", "abc.DEF-123_~+/", "abc.DEF-123_~+/==", "a=", "a").forEach { token ->
+            val metadata = Metadata.bearer(token)
+            assertEquals(1, metadata.size)
+            assertEquals("Bearer $token", metadata["authorization"]!!.decodeToString())
+            assertEquals(Metadata.of("authorization" to "Bearer $token".encodeToByteArray()), metadata)
+        }
+    }
+
+    @Test
+    fun `bearer metadata rejects what is not a b64token`() {
+        listOf("", "==", " token", "token ", "to ken", "token\n", "tökén", "١", "a=b", "a,b").forEach { token ->
+            val error = assertThrows(TrevRpcException::class.java, { Metadata.bearer(token) }, token)
+            assertEquals(Code.INVALID_ARGUMENT, error.status.code)
+        }
+    }
+
+    @Test
     fun `kinds and all status values are stable`() {
         assertEquals(listOf(0, 1, 2, 3), RpcKind.entries.map(RpcKind::value))
         assertEquals((0u..16u).toList(), Code.entries.map(Code::value))

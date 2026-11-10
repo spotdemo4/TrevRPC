@@ -204,10 +204,12 @@ Any object with `createBidirectionalStream()`, including a plain `WebTransport` 
 Metadata every call of a channel carries, such as a bearer token, can be set once on the channel instead of on each call. The channel sends it in full on the first calls of each session, until the server confirms that it stored it for the session, and refers to it by ID after that, so it crosses the connection once. The server merges it into each call's metadata, and a call's own `metadata` wins over an entry with the same key.
 
 ```js
-const channel = await connect(url, { connectionMetadata: { authorization: `Bearer ${token}` } });
-channel.setConnectionMetadata({ authorization: `Bearer ${refreshed}` }); // calls started from now on
+const channel = await connect(url, { connectionMetadata: bearerMetadata(token) });
+channel.setConnectionMetadata(bearerMetadata(refreshed)); // calls started from now on
 channel.setConnectionMetadata(); // removes it
 ```
+
+`bearerMetadata(token)` returns `{ authorization: "Bearer <token>" }`, and throws a `TrevRpcError` with `Code.InvalidArgument` for a token that the servers' bearer token parsers would reject as malformed (anything but an RFC 6750 `b64token`), so that a client bug is not mistaken for an expired session. It works in a call's `metadata` too.
 
 A call carries the set that is current when it starts, once its interceptors have run, until it ends, like its own `metadata`: a change applies to calls that start after it, and a call still waiting for the channel to connect keeps the set it started with. A changed set is sent in full again on every session, and so is the set on a session after a reconnect. Keys follow the rules of call metadata. Other transports carry it when they forward a channel's `connectionMetadata`.
 
@@ -220,7 +222,7 @@ const channel = createChannel(url, {
   interceptors: [
     async (call) => {
       // call.method, .service, .name, .kind, .timeoutMs and .signal describe the call.
-      call.metadata.authorization = `Bearer ${await session.token()}`;
+      Object.assign(call.metadata, bearerMetadata(await session.token()));
       const started = session.id;
       return ({ code }) => {
         if (code === Code.Unauthenticated && session.id === started) {

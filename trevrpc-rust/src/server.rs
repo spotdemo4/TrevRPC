@@ -30,6 +30,7 @@ use crate::{
     Status, Unreliable,
 };
 
+pub use crate::bearer::bearer_token;
 #[cfg(feature = "dev-certificate")]
 pub use crate::dev_certificate::DevelopmentCertificate;
 
@@ -1300,7 +1301,10 @@ impl MetadataValueAuthorizer {
         }
     }
 
-    /// Creates an authorizer that checks the `authorization` metadata for a bearer token.
+    /// Creates an authorizer that checks the `authorization` metadata for a bearer token. The token
+    /// should be a `b64token`, so that a client can send it with [`bearer_metadata`].
+    ///
+    /// [`bearer_metadata`]: crate::bearer_metadata
     #[must_use]
     pub fn bearer(token: impl AsRef<str>) -> Self {
         Self::new(
@@ -1381,43 +1385,6 @@ impl Authorizer for AuthorizerChain {
         }
         Ok(())
     }
-}
-
-/// Returns the token of the `authorization` metadata, which must hold bearer credentials as RFC
-/// 6750 defines them: the case-insensitive scheme `Bearer`, one or more spaces, and the token.
-///
-/// # Errors
-///
-/// An unauthenticated status when the metadata is missing or holds anything else, with a message
-/// that tells the two apart.
-pub fn bearer_token(metadata: &Metadata) -> std::result::Result<&str, Status> {
-    const SCHEME: &[u8] = b"bearer ";
-    let malformed = || Status::unauthenticated("malformed bearer token");
-    let value = metadata
-        .get("authorization")
-        .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
-    let (_, credentials) = value
-        .split_at_checked(SCHEME.len())
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case(SCHEME))
-        .ok_or_else(malformed)?;
-    let token = credentials
-        .iter()
-        .position(|&byte| byte != b' ')
-        .and_then(|start| credentials.get(start..))
-        .unwrap_or_default();
-    // RFC 6750's b64token: 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"=".
-    let mut unpadded = token;
-    while let [rest @ .., b'='] = unpadded {
-        unpadded = rest;
-    }
-    if unpadded.is_empty()
-        || !unpadded
-            .iter()
-            .all(|&byte| byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte))
-    {
-        return Err(malformed());
-    }
-    std::str::from_utf8(token).map_err(|_| malformed())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -4830,50 +4797,6 @@ mod tests {
             first,
             ResponseFrame::message(b"session>user>interceptor".to_vec())
         );
-    }
-
-    #[test]
-    fn bearer_token_parses_rfc_6750_credentials() {
-        let token = |value: Option<&str>| {
-            let mut metadata = Metadata::new();
-            if let Some(value) = value {
-                metadata.insert("authorization".to_owned(), value.as_bytes().to_vec());
-            }
-            super::bearer_token(&metadata)
-                .map(str::to_owned)
-                .map_err(|status| (status.code(), status.message().to_owned()))
-        };
-        for (value, want) in [
-            (Some("Bearer abc.DEF-123_~+/=="), "abc.DEF-123_~+/=="),
-            (Some("bEaReR token"), "token"),
-            (Some("Bearer   token"), "token"),
-        ] {
-            assert_eq!(token(value), Ok(want.to_owned()), "{value:?}");
-        }
-        assert_eq!(
-            token(None),
-            Err((Code::Unauthenticated, "missing bearer token".to_owned()))
-        );
-        for value in [
-            "",
-            "token",
-            "Bearer",
-            "Bearer ",
-            "Basic dXNlcjpwYXNz",
-            "Bearertoken",
-            "Bearer\ttoken",
-            "Bearer token ",
-            "Bearer to ken",
-            "Bearer ==",
-            "Bearer a=b",
-            "Bearer a,b",
-        ] {
-            assert_eq!(
-                token(Some(value)),
-                Err((Code::Unauthenticated, "malformed bearer token".to_owned())),
-                "{value:?}"
-            );
-        }
     }
 
     #[test]

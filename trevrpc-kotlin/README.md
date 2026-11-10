@@ -109,10 +109,12 @@ Request metadata that every call of a channel carries, such as a bearer token, i
 val channel =
     CronetRpcChannel.create(
         engine, "https://rpc.example.com", executor,
-        CronetTransportOptions(connectionMetadata = Metadata.of("authorization" to "Bearer $token".encodeToByteArray())),
+        CronetTransportOptions(connectionMetadata = Metadata.bearer(token)),
     )
-channel.setConnectionMetadata(Metadata.of("authorization" to "Bearer $refreshed".encodeToByteArray()))
+channel.setConnectionMetadata(Metadata.bearer(refreshed))
 ```
+
+`Metadata.bearer(token)` builds the `authorization` metadata of a bearer token, and throws `TrevRpcException` with `Code.INVALID_ARGUMENT` for a token that the servers' bearer token parsers would reject as malformed (anything but an RFC 6750 `b64token`), so that a client bug is not mistaken for an expired session. It works in `CallOptions(metadata = ...)` too.
 
 Cronet does not say which calls share a connection, and servers do not confirm a set over the ordinary HTTP mapping, so every call carries the whole set in its `REQUEST`.
 

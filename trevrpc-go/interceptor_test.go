@@ -161,7 +161,7 @@ func TestInterceptorsAndServeValuesReachEveryHandlerOverEveryTransport(t *testin
 	options.EnableWebTransport = true
 	options.WebTransportAdmission = func(request AdmissionRequest) bool { return request.Origin == testOrigin }
 	server.SetOptions(options)
-	server.SetAuthorizer(ContextAuthorizerFunc(func(ctx context.Context, info HandlerContext) (context.Context, error) {
+	server.SetAuthorizer(AuthorizerFunc(func(ctx context.Context, info HandlerContext) (context.Context, error) {
 		return context.WithValue(ctx, authorizerValueKey{}, "authorized "+info.Method), nil
 	}))
 	server.SetInterceptors(valuesInterceptor("outer", recorder), valuesInterceptor("inner", recorder))

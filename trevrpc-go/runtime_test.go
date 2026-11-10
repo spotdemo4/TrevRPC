@@ -1780,7 +1780,7 @@ func TestMetadataValueAuthorizerSnapshotsExpectedValue(t *testing.T) {
 	value[0] = 'X'
 
 	request := HandlerContext{Service: "service", Method: "method", Metadata: Metadata{"authorization": expected}}
-	if err := authorizer.Authorize(context.Background(), request); err != nil {
+	if _, err := authorizer.Authorize(context.Background(), request); err != nil {
 		t.Fatalf("authorization changed after source mutation: %v", err)
 	}
 
@@ -1798,7 +1798,7 @@ func TestMetadataValueAuthorizerSnapshotsExpectedValue(t *testing.T) {
 		}
 	}()
 	for range 1000 {
-		if err := authorizer.Authorize(context.Background(), request); err != nil {
+		if _, err := authorizer.Authorize(context.Background(), request); err != nil {
 			close(stop)
 			<-mutated
 			t.Fatalf("authorization changed during source mutation: %v", err)
@@ -1842,9 +1842,9 @@ func TestServerDeadlineWinsCooperativeCallbackResults(t *testing.T) {
 
 	t.Run("authorizer", func(t *testing.T) {
 		server := NewServer()
-		server.SetAuthorizer(authorizerFunc(func(ctx context.Context, _ HandlerContext) error {
+		server.SetAuthorizer(AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
 			<-ctx.Done()
-			return nil
+			return ctx, nil
 		}))
 		routeBytes(server, "/service/method", func(context.Context, []byte) ([]byte, error) { return nil, nil })
 		response := server.handleRequest(context.Background(), deadlineRequest("method", RPCKindUnary))
@@ -2053,11 +2053,11 @@ func TestServerAuthorizerAndDiagnosticPanicsAreContained(t *testing.T) {
 	var authorizerCalls atomic.Int64
 	var diagnosticCalls atomic.Int64
 	server := NewServer()
-	server.SetAuthorizer(authorizerFunc(func(context.Context, HandlerContext) error {
+	server.SetAuthorizer(AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
 		if authorizerCalls.Add(1) == 1 {
 			panic("auth boom")
 		}
-		return nil
+		return ctx, nil
 	}))
 	server.SetDiagnostics(func(ServerDiagnostic) {
 		if diagnosticCalls.Add(1) == 1 {
@@ -2085,12 +2085,6 @@ func waitForServerExecutionCount(t *testing.T, server *Server, want int64) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("active server executions = %d, want %d", server.freeze().active.Load(), want)
-}
-
-type authorizerFunc func(context.Context, HandlerContext) error
-
-func (f authorizerFunc) Authorize(ctx context.Context, info HandlerContext) error {
-	return f(ctx, info)
 }
 
 func waitForAtomicCount(t *testing.T, count *atomic.Int64, want int64, description string) {
@@ -2280,9 +2274,9 @@ func TestHandlerContextAndEventsDeriveServiceAndMethodFromThePath(t *testing.T) 
 	metrics := &recordingMetrics{}
 	server.SetMetrics(metrics)
 	var authorized HandlerContext
-	server.SetAuthorizer(authorizerFunc(func(_ context.Context, info HandlerContext) error {
+	server.SetAuthorizer(AuthorizerFunc(func(ctx context.Context, info HandlerContext) (context.Context, error) {
 		authorized = info
-		return nil
+		return ctx, nil
 	}))
 	var handled HandlerContext
 	routeBytes(server, "/example.Greeter/SayHello", func(ctx context.Context, _ []byte) ([]byte, error) {
@@ -2311,9 +2305,9 @@ func TestHandlerContextAndEventsDeriveServiceAndMethodFromThePath(t *testing.T) 
 func TestMalformedMethodPathIsRejectedBeforeTheAuthorizer(t *testing.T) {
 	server := NewServer()
 	called := false
-	server.SetAuthorizer(authorizerFunc(func(context.Context, HandlerContext) error {
+	server.SetAuthorizer(AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
 		called = true
-		return nil
+		return ctx, nil
 	}))
 	response := server.handleRequest(context.Background(), newWireRequest("/example.Greeter"))
 	if CodeFromUint32(response.Status) != CodeInvalidArgument || called {

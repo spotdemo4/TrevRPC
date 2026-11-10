@@ -12,14 +12,14 @@ import (
 func TestChainAuthorizersRunsInOrderUntilOneFails(t *testing.T) {
 	var ran []string
 	authorizer := func(name string, err error) Authorizer {
-		return AuthorizerFunc(func(context.Context, HandlerContext) error {
+		return AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
 			ran = append(ran, name)
-			return err
+			return ctx, err
 		})
 	}
 
 	chain := ChainAuthorizers(authorizer("limiter", nil), nil, authorizer("session", PermissionDenied("no")), authorizer("later", nil))
-	err := chain.Authorize(context.Background(), HandlerContext{})
+	_, err := chain.Authorize(context.Background(), HandlerContext{})
 	if status, ok := errors.AsType[*Status](err); !ok || status.Code != CodePermissionDenied {
 		t.Fatalf("chain returned %v, want the session authorizer's status", err)
 	}
@@ -28,69 +28,63 @@ func TestChainAuthorizersRunsInOrderUntilOneFails(t *testing.T) {
 	}
 
 	ran = nil
-	if err := ChainAuthorizers(authorizer("a", nil), authorizer("b", nil)).Authorize(context.Background(), HandlerContext{}); err != nil {
+	if _, err := ChainAuthorizers(authorizer("a", nil), authorizer("b", nil)).Authorize(context.Background(), HandlerContext{}); err != nil {
 		t.Fatalf("chain of authorizing authorizers returned %v", err)
 	}
 	if want := []string{"a", "b"}; !slices.Equal(ran, want) {
 		t.Fatalf("ran %v, want %v", ran, want)
 	}
-	if err := ChainAuthorizers().Authorize(context.Background(), HandlerContext{}); err != nil {
+	if _, err := ChainAuthorizers().Authorize(context.Background(), HandlerContext{}); err != nil {
 		t.Fatalf("empty chain returned %v", err)
 	}
 }
 
 type chainValueKey struct{}
 
-// appendingAuthorizer is a ContextAuthorizer that appends name to the
-// chainValueKey value of the context.
-func appendingAuthorizer(name string) ContextAuthorizer {
-	return ContextAuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
+// appendingAuthorizer is an Authorizer that appends name to the chainValueKey
+// value of the context.
+func appendingAuthorizer(name string) Authorizer {
+	return AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
 		value, _ := ctx.Value(chainValueKey{}).(string)
 		return context.WithValue(ctx, chainValueKey{}, value+name), nil
 	})
 }
 
 func TestChainAuthorizersPassesEachContextOnToTheNext(t *testing.T) {
-	var sawB bool
-	plain := AuthorizerFunc(func(ctx context.Context, _ HandlerContext) error {
-		sawB = ctx.Value(chainValueKey{}) == "ab"
-		return nil
+	var sawAB bool
+	inspecting := AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
+		sawAB = ctx.Value(chainValueKey{}) == "ab"
+		return ctx, nil
 	})
-	chain, ok := ChainAuthorizers(appendingAuthorizer("a"), nil, appendingAuthorizer("b"), plain, appendingAuthorizer("c")).(ContextAuthorizer)
-	if !ok {
-		t.Fatal("ChainAuthorizers did not return a ContextAuthorizer")
-	}
-	ctx, err := chain.AuthorizeContext(context.Background(), HandlerContext{})
+	chain := ChainAuthorizers(appendingAuthorizer("a"), nil, appendingAuthorizer("b"), inspecting, appendingAuthorizer("c"))
+	ctx, err := chain.Authorize(context.Background(), HandlerContext{})
 	if err != nil || ctx.Value(chainValueKey{}) != "abc" {
 		t.Fatalf("chain returned a context with %v, %v; want abc", ctx.Value(chainValueKey{}), err)
 	}
-	if !sawB {
-		t.Fatal("the plain authorizer did not get the context of the one before it")
-	}
-	if err := chain.Authorize(context.Background(), HandlerContext{}); err != nil {
-		t.Fatalf("Authorize = %v", err)
+	if !sawAB {
+		t.Fatal("the inspecting authorizer did not get the context of the one before it")
 	}
 
-	denied, err := ChainAuthorizers(appendingAuthorizer("a"), AuthorizerFunc(func(context.Context, HandlerContext) error {
-		return PermissionDenied("no")
-	}), appendingAuthorizer("b")).(ContextAuthorizer).AuthorizeContext(context.Background(), HandlerContext{})
+	denied, err := ChainAuthorizers(appendingAuthorizer("a"), AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
+		return ctx, PermissionDenied("no")
+	}), appendingAuthorizer("b")).Authorize(context.Background(), HandlerContext{})
 	if status, ok := errors.AsType[*Status](err); !ok || status.Code != CodePermissionDenied || denied.Value(chainValueKey{}) != nil {
 		t.Fatalf("denying chain returned %v with %v, want PermissionDenied with the context it was given", err, denied.Value(chainValueKey{}))
 	}
 
 	var reached bool
-	err = ChainAuthorizers(ContextAuthorizerFunc(func(context.Context, HandlerContext) (context.Context, error) {
+	_, err = ChainAuthorizers(AuthorizerFunc(func(context.Context, HandlerContext) (context.Context, error) {
 		return nil, nil
-	}), AuthorizerFunc(func(context.Context, HandlerContext) error {
+	}), AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
 		reached = true
-		return nil
+		return ctx, nil
 	})).Authorize(context.Background(), HandlerContext{})
 	if status, ok := errors.AsType[*Status](err); !ok || status.Code != CodeInternal || reached {
 		t.Fatalf("chain with a nil context returned %v and reached the next authorizer: %v; want Internal before it", err, reached)
 	}
 }
 
-func TestContextAuthorizerContextReachesTheHandler(t *testing.T) {
+func TestAuthorizerContextReachesTheHandler(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		timeout time.Duration
@@ -122,7 +116,7 @@ func TestContextAuthorizerContextReachesTheHandler(t *testing.T) {
 	}
 }
 
-func TestContextAuthorizerMustDeriveTheCallContext(t *testing.T) {
+func TestAuthorizerMustDeriveTheCallContext(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		ctx  context.Context
@@ -132,7 +126,7 @@ func TestContextAuthorizerMustDeriveTheCallContext(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := NewServer()
-			server.SetAuthorizer(ContextAuthorizerFunc(func(context.Context, HandlerContext) (context.Context, error) {
+			server.SetAuthorizer(AuthorizerFunc(func(context.Context, HandlerContext) (context.Context, error) {
 				return test.ctx, nil
 			}))
 			var handled atomic.Int64
@@ -143,50 +137,6 @@ func TestContextAuthorizerMustDeriveTheCallContext(t *testing.T) {
 			response := server.handleRequest(context.Background(), newWireRequest("/service/method"))
 			if CodeFromUint32(response.Status) != CodeInternal || handled.Load() != 0 {
 				t.Fatalf("response = %#v, handled %d times; want Internal before the handler", response, handled.Load())
-			}
-		})
-	}
-}
-
-func TestBearerToken(t *testing.T) {
-	for _, test := range []struct {
-		name    string
-		value   *string
-		token   string
-		message string
-	}{
-		{name: "missing", message: "missing bearer token"},
-		{name: "token", value: new("Bearer abc.DEF-123_~+/=="), token: "abc.DEF-123_~+/=="},
-		{name: "scheme case", value: new("bEaReR token"), token: "token"},
-		{name: "several spaces", value: new("Bearer   token"), token: "token"},
-		{name: "empty", value: new(""), message: "malformed bearer token"},
-		{name: "no scheme", value: new("token"), message: "malformed bearer token"},
-		{name: "scheme only", value: new("Bearer"), message: "malformed bearer token"},
-		{name: "empty token", value: new("Bearer "), message: "malformed bearer token"},
-		{name: "other scheme", value: new("Basic dXNlcjpwYXNz"), message: "malformed bearer token"},
-		{name: "scheme prefix", value: new("Bearertoken"), message: "malformed bearer token"},
-		{name: "tab", value: new("Bearer\ttoken"), message: "malformed bearer token"},
-		{name: "trailing space", value: new("Bearer token "), message: "malformed bearer token"},
-		{name: "inner space", value: new("Bearer to ken"), message: "malformed bearer token"},
-		{name: "padding only", value: new("Bearer =="), message: "malformed bearer token"},
-		{name: "padding inside", value: new("Bearer a=b"), message: "malformed bearer token"},
-		{name: "comma", value: new("Bearer a,b"), message: "malformed bearer token"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			metadata := Metadata{}
-			if test.value != nil {
-				metadata["authorization"] = []byte(*test.value)
-			}
-			token, err := BearerToken(metadata)
-			if test.message == "" {
-				if err != nil || token != test.token {
-					t.Fatalf("BearerToken = %q, %v; want %q", token, err, test.token)
-				}
-				return
-			}
-			status, ok := errors.AsType[*Status](err)
-			if !ok || status.Code != CodeUnauthenticated || status.Message != test.message || token != "" {
-				t.Fatalf("BearerToken = %q, %v; want Unauthenticated %q", token, err, test.message)
 			}
 		})
 	}

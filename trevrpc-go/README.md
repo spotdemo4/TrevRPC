@@ -97,6 +97,8 @@ reply, _ := client.SayHello(ctx, request,
 
 A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the headers, the first message or the final status arrives, returns empty metadata if the server sent none, and does not consume a message. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
 
+`trevrpc.BearerMetadata(token)` builds the `authorization` metadata of a bearer token, for `WithMetadataEntries` and the connection metadata below, and returns an `InvalidArgument` status for a token that the server's `BearerToken` would reject as malformed (anything but an RFC 6750 `b64token`).
+
 Metadata that every call carries, such as a bearer token, can instead be set once with `DialOptions.ConnectionMetadata` and replaced with `channel.SetConnectionMetadata`. Each connection then sends it in its first calls only, and the server merges it into every call's metadata, a call's own entry winning; see [Connection Metadata](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#connection-metadata).
 
 `Dial` returns a `*Channel` that reconnects with backoff after connection loss. Each RPC uses exactly one connection and is never retried or replayed; calls fail fast with `Unavailable` while the channel is reconnecting. `DialOptions.TLSConfig` and `DialOptions.QUICConfig` are cloned before use.

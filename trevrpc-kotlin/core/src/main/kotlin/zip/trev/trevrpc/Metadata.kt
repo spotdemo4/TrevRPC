@@ -71,9 +71,30 @@ class Metadata private constructor(
 
         fun from(entries: Map<String, ByteArray>): Metadata = create(entries, normalize = true)
 
+        /**
+         * Returns the request metadata that carries [token] as bearer credentials: the `authorization`
+         * key with the value `Bearer <token>`. It accepts the tokens that the servers' bearer token
+         * parsers do, the RFC 6750 `b64token` syntax: one or more ASCII letters, digits and the
+         * characters `-._~+/`, followed by any number of `=`.
+         *
+         * @throws TrevRpcException with [Code.INVALID_ARGUMENT] for any other token, such as an empty
+         * one or one with whitespace, which a server would reject as unauthenticated, and which a
+         * client could not tell from an expired session.
+         */
+        fun bearer(token: String): Metadata {
+            val unpadded = token.trimEnd('=')
+            invalidIf(unpadded.isEmpty() || unpadded.any { !isB64TokenCharacter(it) }) {
+                "bearer token is not a b64token"
+            }
+            return of("authorization" to "Bearer $token".encodeToByteArray())
+        }
+
         internal fun fromWire(entries: Map<String, ByteArray>): Metadata = create(entries, normalize = false)
 
         fun normalizeKey(key: String): String = key.lowercase(Locale.ROOT)
+
+        private fun isB64TokenCharacter(character: Char): Boolean =
+            character in 'a'..'z' || character in 'A'..'Z' || character in '0'..'9' || character in "-._~+/"
 
         private fun create(
             entries: Map<String, ByteArray>,

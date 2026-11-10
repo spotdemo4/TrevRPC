@@ -30,6 +30,17 @@ export type MetadataInput = Record<string, MetadataValue> | ReadonlyMap<string, 
 export type Metadata = Record<string, Uint8Array>;
 
 /**
+ * Returns the request metadata that carries `token` as bearer credentials: the `authorization` key
+ * with the value `Bearer <token>`, for a call's `metadata`, `connectionMetadata` and
+ * `Channel.setConnectionMetadata()`. It accepts the tokens that the servers' bearer token parsers
+ * do, the RFC 6750 `b64token` syntax: one or more ASCII letters, digits and the characters
+ * `-._~+/`, followed by any number of `=`. It throws a `TrevRpcError` with `Code.InvalidArgument`
+ * for any other token, such as an empty one or one with whitespace, which a server would reject
+ * as `Unauthenticated`, and which a client could not tell from an expired session.
+ */
+export function bearerMetadata(token: string): { authorization: string };
+
+/**
  * One detail of a status: a protobuf message, carried as its full name, such as
  * `"buf.validate.Violations"`, and its encoding.
  */
