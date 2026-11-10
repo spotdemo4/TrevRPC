@@ -14,7 +14,7 @@ import {
   encodeStatusFrame,
   marshalMessage,
 } from "../src/framing.js";
-import { Code, TrevRpcError } from "../src/status.js";
+import { CancelledStreamErrorCode, Code, TrevRpcError } from "../src/status.js";
 import { RpcKind } from "../src/wire.js";
 import { echoHandler } from "./echo-server.js";
 import { concatBytes, deferred, fakeTransport, turn } from "./support.js";
@@ -437,8 +437,43 @@ test("a stream that finishes opening after the call was cancelled is reset", asy
 
   opening.resolve({ readable: responses.readable, writable: requests.writable });
   await turn();
-  await assert.rejects(requests.readable.getReader().read()); // request side reset
-  await assert.rejects(responses.writable.getWriter().write(new Uint8Array(1))); // reads stopped
+  // Both directions reset with the cancel code: the request side, and reads stopped.
+  const reset = (error) => error.streamErrorCode === CancelledStreamErrorCode;
+  await assert.rejects(requests.readable.getReader().read(), reset);
+  await assert.rejects(responses.writable.getWriter().write(new Uint8Array(1)), reset);
+});
+
+test("a cancelled call resets both directions with the cancel code", async () => {
+  // A plain abort reason would reset a WebTransport stream with code 0, which servers took for a
+  // transport failure rather than a cancelled call.
+  const events = [];
+  const received = deferred();
+  const { echo, transport } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.readFrame();
+    received.resolve();
+    const response = stream.writer.closed.catch((error) => {
+      events.push(["response", error.streamErrorCode]);
+    });
+    const request = stream.readFrame().catch((error) => {
+      events.push(["request", error.streamErrorCode]);
+    });
+    await Promise.all([response, request]);
+  });
+  const controller = new AbortController();
+  const call = await echo.clientStream({ signal: controller.signal });
+  await call.send({ message: "first" });
+  await received.promise;
+  controller.abort();
+  await assert.rejects(call.closeAndRecv(), isStatus(Code.Cancelled));
+  await transport.settled();
+  assert.deepEqual(
+    events.toSorted(([a], [b]) => a.localeCompare(b)),
+    [
+      ["request", CancelledStreamErrorCode],
+      ["response", CancelledStreamErrorCode],
+    ],
+  );
 });
 
 test("failures to open a stream are unavailable", async () => {

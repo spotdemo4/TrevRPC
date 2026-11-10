@@ -279,7 +279,7 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 	} else {
 		reader.chargeMessages = true
 		reader.readAhead = true
-		requests := &rpcRequestStream{reader: reader}
+		requests := &rpcRequestStream{ctx: requestCtx, reader: reader}
 		if request.flow != nil && request.flow.sink != nil {
 			requests.merge = newRequestMerge(request.flow)
 		}
@@ -451,16 +451,10 @@ func readRequestMessage(ctx context.Context, options ServerOptions, startedAt ti
 
 	body, err := readSingleMessage(reader)
 	if err != nil {
-		if _, ok := errors.AsType[*Status](err); ok {
-			return nil, err
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, statusFromContextError(ctxErr)
-		}
-		if errors.Is(err, os.ErrDeadlineExceeded) {
+		if _, ok := errors.AsType[*Status](err); !ok && ctx.Err() == nil && errors.Is(err, os.ErrDeadlineExceeded) {
 			return nil, DeadlineExceeded("initial request completion timeout")
 		}
-		return nil, transportStatus(err)
+		return nil, requestReadStatus(ctx, err)
 	}
 	return body, nil
 }
@@ -520,6 +514,9 @@ func writeStatusAndAbort(stream rpcStream, status *Status, maxFrameSize int, slo
 // bidirectional request, until the request side ends. Any other known frame is
 // InvalidArgument.
 type rpcRequestStream struct {
+	// ctx is the call's context, which decides how a failed read ends the
+	// call; see requestReadStatus.
+	ctx                 context.Context
 	reader              *frameReader
 	cancelReadOnContext func(context.Context) func()
 	cancelRead          func()
@@ -576,7 +573,7 @@ func (s *rpcRequestStream) receive(next frame, err error) ([]byte, error) {
 			s.ended.Store(true)
 			return nil, io.EOF
 		}
-		return nil, transportStatus(err)
+		return nil, requestReadStatus(s.ctx, err)
 	}
 
 	if next.typ != frameTypeMessage {

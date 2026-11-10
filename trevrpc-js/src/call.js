@@ -17,6 +17,7 @@ import { normalizeMetadata, validateMetadata } from "./metadata.js";
 import {
   Code,
   TrevRpcError,
+  cancelStreamReason,
   cancelled,
   deadlineExceeded,
   failedPrecondition,
@@ -377,8 +378,9 @@ export class Call {
   async #reopen(bodies) {
     const { transport, request, rpc, deadline } = this.#setup;
     // The old stream's failures belong to the refused call, not to this one.
-    this.#writer.abort(cancelled("RPC replayed")).catch(() => {});
-    this.#cancelReader(cancelled("RPC replayed")).catch(() => {});
+    const replayed = cancelStreamReason("RPC replayed");
+    this.#cancelReader(replayed).catch(() => {});
+    this.#writer.abort(replayed).catch(() => {});
     this.#releaseSessionState();
     const session = {};
     const stream = await openStream(transport, this.signal, session);
@@ -677,9 +679,11 @@ export class Call {
     this.#scope.settle();
     this.#releaseSessionState();
     if (!this.#sendClosed || this.#uploadEnded !== undefined) {
-      this.#endUpload(error ?? cancelled(EarlyOk), cancelled("RPC completed"));
+      this.#endUpload(error ?? cancelled(EarlyOk), cancelStreamReason("RPC completed"));
     }
-    this.#frames.expectEnd(this.#maxFrameSize).catch(() => this.#cancelReader().catch(() => {}));
+    this.#frames
+      .expectEnd(this.#maxFrameSize)
+      .catch(() => this.#cancelReader(cancelStreamReason("RPC completed")).catch(() => {}));
   }
 
   /** Cancels the call on behalf of the caller; any reason becomes a Cancelled status. */
@@ -776,11 +780,16 @@ export class Call {
     this.#settleCopies("ended");
   }
 
+  /**
+   * Abandons the call's stream: both directions reset with the cancel code, so that the server
+   * ends the call as Cancelled. The response side goes first, which cancels the call on the server,
+   * before the reset of the request side reaches a handler waiting for the next request.
+   */
   #teardown() {
     this.#releaseSessionState();
-    const reason = this.signal.reason;
-    this.#endUpload(reason);
-    this.#cancelReader(reason).catch(() => {});
+    const streamReason = cancelStreamReason("RPC cancelled");
+    this.#cancelReader(streamReason).catch(() => {});
+    this.#endUpload(this.signal.reason, streamReason);
   }
 }
 
@@ -816,8 +825,9 @@ function openStream(transport, signal, session) {
           signal.removeEventListener("abort", onAbort);
           if (signal.aborted) {
             // The caller gave up while the stream was opening; do not leak it.
-            stream.writable.abort(signal.reason).catch(() => {});
-            stream.readable.cancel(signal.reason).catch(() => {});
+            const reason = cancelStreamReason("RPC cancelled");
+            stream.readable.cancel(reason).catch(() => {});
+            stream.writable.abort(reason).catch(() => {});
           } else {
             resolve(stream);
           }

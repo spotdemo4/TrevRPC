@@ -2,6 +2,7 @@
 // the browser fallback when WebTransport is unavailable or blocked. A session exposes the part of
 // the WebTransport API that the channel uses, so calls run on it unchanged.
 import { DefaultMaxFrameSize } from "../framing.js";
+import { CancelledStreamErrorCode } from "../status.js";
 import {
   FrameParser,
   FrameType,
@@ -25,7 +26,7 @@ export const QMuxProtocol = "qmux-02.trevrpc-1";
 /** The largest record this endpoint accepts and sends. */
 const MaxRecordSize = 64 * 1024;
 /** Stream error code for streams abandoned locally. */
-const CancelledCode = 1;
+const CancelledCode = CancelledStreamErrorCode;
 /** Writes wait while the WebSocket buffers more than this many bytes. */
 const SendBufferLimit = 1024 * 1024;
 const SendBufferPollMs = 5;

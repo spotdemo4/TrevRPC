@@ -160,6 +160,29 @@ export function failedPrecondition(message) {
   return statusError(Code.FailedPrecondition, message);
 }
 
+/**
+ * The stream error code that resets the streams of a call the client abandons, on WebTransport and
+ * QMux alike, as the Go and Rust clients do. Servers end a call whose request stream the client
+ * reset as Cancelled.
+ */
+export const CancelledStreamErrorCode = 1;
+
+/**
+ * The reason to abort or cancel a stream of an abandoned call with, so that the transport resets
+ * it with CancelledStreamErrorCode. A WebTransport stream is reset with code 0 unless the reason is
+ * a WebTransportError that carries a stream error code; where the runtime has no WebTransportError,
+ * an error of the same shape stands in.
+ */
+export function cancelStreamReason(message) {
+  if (typeof globalThis.WebTransportError === "function") {
+    // Browsers take one WebTransportErrorInit dictionary; its source is always "stream".
+    return new globalThis.WebTransportError({ message, streamErrorCode: CancelledStreamErrorCode });
+  }
+  const error = new Error(message);
+  error.name = "WebTransportError";
+  return Object.assign(error, { source: "stream", streamErrorCode: CancelledStreamErrorCode });
+}
+
 /** Creates a deadline-exceeded status. */
 export function deadlineExceeded(message) {
   return statusError(Code.DeadlineExceeded, message);
