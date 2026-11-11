@@ -1,24 +1,29 @@
 use std::error::Error as StdError;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::Status;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
+/// An error from a call.
+///
+/// Cloning is cheap for the transport variant (the source is shared), so a failure can be
+/// reported more than once with its variant intact.
+#[derive(Debug, Clone)]
 pub enum Error {
     Status(Status),
     Encode(prost::EncodeError),
     Decode(prost::DecodeError),
     FrameTooLarge { len: usize, max: usize },
-    Transport(Box<dyn StdError + Send + Sync>),
+    Transport(Arc<dyn StdError + Send + Sync>),
 }
 
 impl Error {
     /// Wraps a transport-layer error.
     #[must_use]
     pub fn transport(error: impl StdError + Send + Sync + 'static) -> Self {
-        Self::Transport(Box::new(error))
+        Self::Transport(Arc::new(error))
     }
 
     /// How long the server told the client to wait before it retries, if this error is a status

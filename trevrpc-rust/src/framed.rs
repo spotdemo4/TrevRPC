@@ -15,6 +15,7 @@ use crate::connection_metadata::OfferedSet;
 use crate::framing::{
     self, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_payload, frame_type, is_known_frame_type,
 };
+use crate::response_state::require_end;
 use crate::{
     BoxStream, Error, Result, RpcAnswer, RpcHeaders, RpcRequest, RpcStatus, Status, varint,
 };
@@ -757,21 +758,17 @@ where
 }
 
 /// Requires the response stream to end after its terminal status, skipping unknown frames.
+///
+/// What follows STATUS is classified by [`require_end`], like on every other path.
 pub async fn drain_fin_after_terminal_status<R: FrameRead>(
     recv: &mut R,
     max_frame_size: usize,
-    stream_name: &'static str,
 ) -> Result<()> {
-    if next_known_header(recv, max_frame_size, &mut |_| Ok(()))
-        .await?
-        .is_some()
-    {
-        return Err(Error::from(Status::internal(format!(
-            "{stream_name} continued after terminal status"
-        ))));
-    }
-
-    Ok(())
+    require_end(
+        next_known_header(recv, max_frame_size, &mut |_| Ok(()))
+            .await
+            .transpose(),
+    )
 }
 
 fn invalid_argument(message: &'static str) -> Error {
@@ -1384,15 +1381,39 @@ mod tests {
     #[tokio::test]
     async fn only_unknown_frames_may_follow_a_terminal_status() {
         let mut recv = Script::new([grease(3), grease(0)].concat());
-        drain_fin_after_terminal_status(&mut recv, 1024, "response stream")
+        drain_fin_after_terminal_status(&mut recv, 1024)
             .await
             .expect("unknown frames after STATUS are accepted");
 
         let mut recv = Script::new(encode_message_frame(b"late", 1024).unwrap());
-        let error = drain_fin_after_terminal_status(&mut recv, 1024, "response stream")
+        let error = drain_fin_after_terminal_status(&mut recv, 1024)
             .await
             .expect_err("a known frame after STATUS is a protocol error");
-        assert_eq!(error.into_status().code(), Code::Internal);
+        let status = error.into_status();
+        assert_eq!(status.code(), Code::Internal);
+        assert_eq!(
+            status.message(),
+            "response stream continued after terminal status"
+        );
+    }
+
+    /// A frame cut off after STATUS is malformed trailing data, as on the generic stream path,
+    /// not a retryable transport failure (see `data_after_the_terminal_status_is_classified_alike_everywhere`
+    /// in `client`).
+    #[tokio::test]
+    async fn a_truncated_frame_after_a_terminal_status_is_malformed_trailing_data() {
+        // One stray byte, then the end of the stream: half a frame header.
+        let mut recv = Script::new(vec![0x00]);
+        let status = drain_fin_after_terminal_status(&mut recv, 1024)
+            .await
+            .expect_err("a truncated frame must fail")
+            .into_status();
+
+        assert_eq!(status.code(), Code::Internal);
+        assert_eq!(
+            status.message(),
+            "response stream contained malformed trailing data after terminal status"
+        );
     }
 
     #[tokio::test]

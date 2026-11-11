@@ -1,4 +1,3 @@
-use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -10,12 +9,14 @@ use futures_util::StreamExt;
 
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::queue;
-use crate::response_state::{ResponseEvent, ResponseState, ResponseStateFailure, UnaryResponse};
+use crate::response_state::{
+    ResponseEvent, ResponseState, ResponseStateFailure, UnaryResponse, require_end,
+};
 use crate::sync::MutexExt as _;
 use crate::wire::{normalize_metadata_key, validate_metadata};
 use crate::{
-    BoxStream, Code, CompressMessages, CompressStream, Error, Metadata, ResponseEnvelope,
-    ResponseFrame, Result, RpcKind, RpcRequest, Status, Unreliable,
+    BoxStream, CompressMessages, CompressStream, Error, Metadata, ResponseEnvelope, ResponseFrame,
+    Result, RpcKind, RpcRequest, Status, Unreliable,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -401,11 +402,7 @@ pub async fn collect_unary_response(
     let mut response = UnaryResponse::default();
     while let Some(frame) = frames.next().await.transpose()? {
         if response.accept(frame).map_err(Error::from)? {
-            if frames.next().await.transpose()?.is_some() {
-                return Err(Error::from(Status::internal(
-                    "response stream continued after terminal status",
-                )));
-            }
+            require_end(frames.next().await)?;
             break;
         }
     }
@@ -1072,7 +1069,7 @@ where
     };
 
     Ok(ResponseEnvelope::new(first)
-        .with_headers(std::mem::take(&mut response.headers))
+        .with_headers(response.headers.take().unwrap_or_default())
         .with_metadata(
             response
                 .terminal_status()
@@ -1082,6 +1079,11 @@ where
 
 /// A decoded response stream that retains the response headers and the clean terminal status and
 /// metadata.
+///
+/// A single `ResponseState` says where the response stands in the grammar. The stream adds only
+/// what the caller can observe: the headers once known, the message that `headers()` read ahead,
+/// and the failure that ended the call before the headers were known, which `headers()` keeps
+/// reporting. None of them costs anything per message.
 pub struct ResponseStream<T> {
     inner: BoxStream<ResponseFrame>,
     max_body_size: usize,
@@ -1092,16 +1094,22 @@ pub struct ResponseStream<T> {
     stream_body_size: usize,
     deadline: Option<Instant>,
     wait: Option<(Pin<Box<tokio::time::Sleep>>, TimeoutReason)>,
-    pending_terminal: bool,
-    done: bool,
     state: ResponseState,
-    /// The response headers, once [`Self::headers_ready`].
-    headers: Metadata,
-    /// Whether the headers are known: a HEADERS frame arrived, or the first message or the status
-    /// proved there are none.
-    headers_ready: bool,
-    /// An item read ahead while waiting for the headers, returned by the next poll.
-    stashed: Option<Result<T>>,
+    /// The response headers, once known: a HEADERS frame arrived, or the first message or the
+    /// clean end of the call proved there are none.
+    headers: Option<Metadata>,
+    /// A message read ahead while waiting for the headers, returned by the next poll.
+    ahead: Option<T>,
+    /// The failure that ended the call before its headers were known, which [`Self::headers`]
+    /// keeps reporting.
+    failure: Option<EarlyFailure>,
+}
+
+/// A failure before the response headers were known.
+struct EarlyFailure {
+    error: Error,
+    /// Whether the stream has returned it yet. Reading ahead through `headers()` does not count.
+    returned: bool,
 }
 
 impl<T> Unpin for ResponseStream<T> {}
@@ -1134,12 +1142,10 @@ where
             stream_body_size: 0,
             deadline,
             wait: None,
-            pending_terminal: false,
-            done: false,
             state: ResponseState::default(),
-            headers: Metadata::new(),
-            headers_ready: false,
-            stashed: None,
+            headers: None,
+            ahead: None,
+            failure: None,
         }
     }
 
@@ -1157,38 +1163,37 @@ where
 
     /// Waits for the server's response headers.
     ///
-    /// Resolves as soon as the first response frame arrives: the HEADERS frame, or, when the
-    /// server sent none, the first message or the terminal status, in which case the headers are
-    /// empty. A message read while waiting is not lost; the next poll of the stream returns it.
-    /// If the call fails before any headers arrive, the error is returned here and again by the
-    /// stream.
+    /// Resolves as soon as the HEADERS frame arrives, or, when the server sent none, at the first
+    /// message, or at the clean end of a call that sent only a status, in which case the headers
+    /// are empty. A message read while waiting is not lost; the next poll of the stream returns it.
+    ///
+    /// A call that fails before its headers are known (a failed status, a malformed or oversized
+    /// first message, a transport failure) fails here, and keeps failing here with the same error
+    /// however often this is called, even after the stream has returned it. The stream returns it
+    /// once as well, so reading ahead through this method never changes what the stream yields.
+    /// A call that fails after its headers arrived still returns them.
     pub async fn headers(&mut self) -> Result<&Metadata> {
         std::future::poll_fn(|cx| self.poll_headers(cx)).await?;
-        Ok(&self.headers)
+        Ok(self.headers.get_or_insert_with(Metadata::new))
     }
 
     fn poll_headers(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         loop {
-            if self.headers_ready {
+            if self.headers.is_some() {
                 return Poll::Ready(Ok(()));
             }
-            if let Some(Err(Error::Status(status))) = &self.stashed {
-                return Poll::Ready(Err(Error::from(status.clone())));
+            if let Some(failure) = &self.failure {
+                return Poll::Ready(Err(failure.error.clone()));
             }
 
             match self.poll_step(cx) {
                 Poll::Pending => return Poll::Pending,
-                // `headers_ready` is now set.
-                Poll::Ready(Some(Ok(Step::Headers))) => {}
-                Poll::Ready(Some(Ok(Step::Message(message)))) => {
-                    self.stashed = Some(Ok(message));
+                // The step settled the headers or kept its failure; the next turn reports it.
+                Poll::Ready(Some(Ok(Step::Headers) | Err(_))) => {}
+                Poll::Ready(Some(Ok(Step::Message(message)))) => self.ahead = Some(message),
+                Poll::Ready(None) => {
+                    self.headers.get_or_insert_with(Metadata::new);
                 }
-                Poll::Ready(Some(Err(error))) => {
-                    let status = error.into_status();
-                    self.stashed = Some(Err(Error::from(status.clone())));
-                    return Poll::Ready(Err(Error::from(status)));
-                }
-                Poll::Ready(None) => self.headers_ready = true,
             }
         }
     }
@@ -1229,17 +1234,16 @@ where
         }
     }
 
-    fn finish(&mut self) -> Option<Result<Step<T>>> {
-        self.done = true;
-        self.headers_ready = true;
-        self.state
-            .finish()
-            .err()
-            .map(|failure| Err(Error::from(failure.into_status())))
-    }
-
-    const fn fail(&mut self, error: Error) -> Poll<Option<Result<Step<T>>>> {
-        self.done = true;
+    /// Ends the call with `error`, which the caller returns. A call that never learned its
+    /// headers keeps the error so [`Self::headers`] can report it again.
+    fn fail(&mut self, error: Error) -> Poll<Option<Result<Step<T>>>> {
+        self.state.abort();
+        if self.headers.is_none() {
+            self.failure = Some(EarlyFailure {
+                error: error.clone(),
+                returned: false,
+            });
+        }
         Poll::Ready(Some(Err(error)))
     }
 
@@ -1249,7 +1253,7 @@ where
 
     /// Reads response frames until one yields headers or a message, or the call ends.
     fn poll_step(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Step<T>>>> {
-        if self.done {
+        if self.state.is_done() {
             return Poll::Ready(None);
         }
 
@@ -1257,22 +1261,23 @@ where
             let frame = match self.poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(Some(frame))) => frame,
-                Poll::Ready(Ok(None)) => return Poll::Ready(self.finish()),
+                Poll::Ready(Ok(None)) => {
+                    return match self.state.finish() {
+                        Ok(()) => {
+                            self.headers.get_or_insert_with(Metadata::new);
+                            Poll::Ready(None)
+                        }
+                        Err(failure) => self.fail_state(failure),
+                    };
+                }
                 Poll::Ready(Err(error)) => {
-                    self.done = true;
-                    if self.pending_terminal {
-                        self.state.abort();
-                        return Poll::Ready(Some(Err(post_terminal_error(error))));
-                    }
-                    return Poll::Ready(Some(Err(error)));
+                    let error = self.state.read_failed(error);
+                    return self.fail(error);
                 }
             };
 
-            if self.pending_terminal {
-                self.state.abort();
-                return self.fail(Error::from(Status::internal(
-                    "response stream continued after terminal status",
-                )));
+            if let Err(failure) = self.state.ensure_open() {
+                return self.fail_state(failure);
             }
 
             if let ResponseFrame::Message(body) = &frame {
@@ -1305,49 +1310,22 @@ where
 
             match self.state.accept(frame) {
                 Ok(ResponseEvent::Headers(headers)) => {
-                    self.headers = headers;
-                    self.headers_ready = true;
+                    self.headers = Some(headers);
                     return Poll::Ready(Some(Ok(Step::Headers)));
                 }
                 Ok(ResponseEvent::Message(body)) => {
-                    self.headers_ready = true;
                     let Ok(message) = T::decode(body) else {
                         return self.fail_state(ResponseStateFailure::malformed_protobuf());
                     };
+                    if self.headers.is_none() {
+                        self.headers = Some(Metadata::new());
+                    }
                     return Poll::Ready(Some(Ok(Step::Message(message))));
                 }
-                Ok(ResponseEvent::Terminal) => {
-                    self.headers_ready = true;
-                    self.pending_terminal = true;
-                }
+                Ok(ResponseEvent::Terminal) => {}
                 Err(failure) => return self.fail_state(failure),
             }
         }
-    }
-}
-
-fn post_terminal_error(error: Error) -> Error {
-    let malformed_trailing = match &error {
-        Error::Decode(_) | Error::FrameTooLarge { .. } => true,
-        Error::Status(status) => matches!(
-            status.code(),
-            Code::InvalidArgument | Code::ResourceExhausted | Code::Internal | Code::DataLoss
-        ),
-        Error::Transport(error) => error.downcast_ref::<io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
-            )
-        }),
-        Error::Encode(_) => false,
-    };
-
-    if malformed_trailing {
-        Error::from(Status::internal(
-            "response stream contained malformed trailing data after terminal status",
-        ))
-    } else {
-        error
     }
 }
 
@@ -1358,8 +1336,16 @@ where
     type Item = Result<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(item) = self.stashed.take() {
-            return Poll::Ready(Some(item));
+        if let Some(message) = self.ahead.take() {
+            return Poll::Ready(Some(Ok(message)));
+        }
+        if let Some(failure) = &mut self.failure {
+            // Read ahead by `headers()`; the stream still returns it, once.
+            if failure.returned {
+                return Poll::Ready(None);
+            }
+            failure.returned = true;
+            return Poll::Ready(Some(Err(failure.error.clone())));
         }
 
         loop {
@@ -1369,7 +1355,12 @@ where
                 Poll::Ready(Some(Ok(Step::Message(message)))) => {
                     return Poll::Ready(Some(Ok(message)));
                 }
-                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(Some(Err(error))) => {
+                    if let Some(failure) = &mut self.failure {
+                        failure.returned = true;
+                    }
+                    return Poll::Ready(Some(Err(error)));
+                }
                 Poll::Ready(None) => return Poll::Ready(None),
             }
         }
@@ -2545,5 +2536,633 @@ mod tests {
 
         assert_eq!(error.into_status().code(), Code::DeadlineExceeded);
         assert!(response.next().await.is_none());
+    }
+
+    /// What a `headers()` call answered, comparable across calls.
+    async fn headers_outcome(
+        response: &mut ResponseStream<TestMessage>,
+    ) -> std::result::Result<Metadata, String> {
+        response
+            .headers()
+            .await
+            .cloned()
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    #[tokio::test]
+    async fn headers_repeat_the_failure_of_a_status_only_call() {
+        let mut response =
+            response_stream_of([ResponseFrame::Status(Status::new(Code::NotFound, "gone"))]);
+
+        let first = headers_outcome(&mut response).await;
+        assert!(first.as_ref().is_err_and(|error| error.contains("gone")));
+        assert_eq!(headers_outcome(&mut response).await, first);
+
+        let error = response.next().await.unwrap().expect_err("call failed");
+        assert_eq!(error.into_status().code(), Code::NotFound);
+        assert!(response.next().await.is_none());
+        assert_eq!(headers_outcome(&mut response).await, first);
+    }
+
+    #[tokio::test]
+    async fn headers_repeat_the_failure_of_a_malformed_first_message() {
+        let mut response = response_stream_of([
+            ResponseFrame::message(&[0x0a_u8, 0xff][..]),
+            ResponseFrame::Status(Status::ok()),
+        ]);
+
+        let first = headers_outcome(&mut response).await;
+        assert!(first.is_err(), "a malformed first message fails the call");
+        assert_eq!(headers_outcome(&mut response).await, first);
+
+        let error = response.next().await.unwrap().expect_err("call failed");
+        assert_eq!(error.into_status().code(), Code::Internal);
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn headers_repeat_the_failure_of_an_oversized_first_message() {
+        let mut response = ResponseStream::<TestMessage>::new(
+            crate::stream::from_iter([
+                test_message("too long"),
+                ResponseFrame::Status(Status::ok()),
+            ]),
+            4,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let first = headers_outcome(&mut response).await;
+        assert!(first.is_err());
+        assert_eq!(headers_outcome(&mut response).await, first);
+        let error = response.next().await.unwrap().expect_err("call failed");
+        assert!(matches!(error, Error::FrameTooLarge { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn headers_report_a_failure_the_stream_already_returned() {
+        let mut response = ResponseStream::<TestMessage>::new(
+            error_frame_stream(),
+            crate::framing::DEFAULT_MAX_FRAME_SIZE,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(response.next().await.unwrap().is_err());
+        assert!(response.next().await.is_none());
+        let error = response
+            .headers()
+            .await
+            .expect_err("the call failed before any headers");
+        assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn headers_stay_available_when_the_call_fails_after_them() {
+        let mut response = response_stream_of([
+            ResponseFrame::Headers(header_map("x-a", b"1")),
+            ResponseFrame::Status(Status::new(Code::NotFound, "gone")),
+        ]);
+
+        assert_eq!(
+            response
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err()
+                .into_status()
+                .code(),
+            Code::NotFound
+        );
+        assert_eq!(
+            response.headers().await.expect("headers arrived"),
+            &header_map("x-a", b"1")
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_headers_ahead_keeps_the_error_variant() {
+        type Variant = fn(&Error) -> bool;
+        let cases: [(fn() -> Error, Variant); 4] = [
+            (
+                || {
+                    Error::transport(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "reset",
+                    ))
+                },
+                |error| matches!(error, Error::Transport(_)),
+            ),
+            (
+                || {
+                    Error::from(
+                        <TestMessage as prost::Message>::decode(&[0x0a_u8, 0xff][..])
+                            .expect_err("test payload should be malformed"),
+                    )
+                },
+                |error| matches!(error, Error::Decode(_)),
+            ),
+            (
+                || Error::FrameTooLarge { len: 9, max: 4 },
+                |error| matches!(error, Error::FrameTooLarge { len: 9, max: 4 }),
+            ),
+            (
+                || Error::from(Status::unavailable("busy")),
+                |error| matches!(error, Error::Status(_)),
+            ),
+        ];
+
+        for (error, is_variant) in cases {
+            let mut response = ResponseStream::<TestMessage>::new(
+                Box::pin(futures_util::stream::iter([Err(error())])),
+                crate::framing::DEFAULT_MAX_FRAME_SIZE,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            for _ in 0..2 {
+                let ahead = response.headers().await.expect_err("the call failed");
+                assert!(is_variant(&ahead), "headers() lost the variant: {ahead:?}");
+            }
+            let returned = response.next().await.unwrap().expect_err("same failure");
+            assert!(
+                is_variant(&returned),
+                "the stream lost the variant: {returned:?}"
+            );
+            assert!(response.next().await.is_none());
+        }
+    }
+
+    /// A timeout that fires while a terminal status is pending never commits it, and a message
+    /// read ahead by `headers()` survives a later timeout.
+    #[tokio::test(start_paused = true)]
+    async fn timeouts_never_commit_a_pending_status_or_lose_a_message_read_ahead() {
+        let idle = |frames: Vec<ResponseFrame>| {
+            ResponseStream::<TestMessage>::new(
+                Box::pin(crate::stream::from_iter(frames).chain(futures_util::stream::pending())),
+                crate::framing::DEFAULT_MAX_FRAME_SIZE,
+                None,
+                None,
+                Some(Duration::from_secs(1)),
+                None,
+            )
+        };
+
+        let mut response = idle(vec![ResponseFrame::Status(Status::ok())]);
+        let error = response.next().await.unwrap().unwrap_err().into_status();
+        assert_eq!(error.code(), Code::Unavailable);
+        assert!(response.terminal_status().is_none());
+        assert!(response.next().await.is_none());
+
+        let mut response = idle(vec![test_message("kept")]);
+        assert!(response.headers().await.expect("headers").is_empty());
+        assert_eq!(response.next().await.unwrap().unwrap().value, "kept");
+        let error = response.next().await.unwrap().unwrap_err().into_status();
+        assert_eq!(error.code(), Code::Unavailable);
+        assert!(response.next().await.is_none());
+
+        // A timeout inside `headers()` is returned by the stream once.
+        let mut response = idle(vec![]);
+        assert!(response.headers().await.is_err());
+        let error = response.next().await.unwrap().unwrap_err().into_status();
+        assert_eq!(error.code(), Code::Unavailable);
+        assert!(response.next().await.is_none());
+    }
+
+    /// What follows STATUS is classified the same by the stream and by `collect_unary_response`
+    /// (and by the native reader, see `framed`): a known frame is a protocol error, malformed
+    /// trailing data is `Internal`, and a transport failure stays `Unavailable`.
+    #[tokio::test]
+    async fn data_after_the_terminal_status_is_classified_alike_everywhere() {
+        const MALFORMED: &str =
+            "response stream contained malformed trailing data after terminal status";
+        type Trailing = fn() -> Result<ResponseFrame>;
+        let cases: [(&str, Trailing, Code, &str); 5] = [
+            (
+                "a known frame",
+                || Ok(test_message("late")),
+                Code::Internal,
+                "response stream continued after terminal status",
+            ),
+            (
+                "a truncated frame",
+                || Err(crate::framed::unexpected_eof()),
+                Code::Internal,
+                MALFORMED,
+            ),
+            (
+                "an oversized frame",
+                || Err(Error::FrameTooLarge { len: 9, max: 4 }),
+                Code::Internal,
+                MALFORMED,
+            ),
+            (
+                "a failing read",
+                || Err(Error::from(Status::data_loss("corrupt"))),
+                Code::Internal,
+                MALFORMED,
+            ),
+            (
+                "a connection reset",
+                || {
+                    Err(Error::transport(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "reset",
+                    )))
+                },
+                Code::Unavailable,
+                "transport unavailable: reset",
+            ),
+        ];
+
+        for (name, trailing, code, message) in cases {
+            let frames = || -> crate::BoxStream<ResponseFrame> {
+                Box::pin(futures_util::stream::iter([
+                    Ok(test_message("m")),
+                    Ok(ResponseFrame::Status(Status::ok())),
+                    trailing(),
+                ]))
+            };
+
+            let mut stream = ResponseStream::<TestMessage>::new(
+                frames(),
+                crate::framing::DEFAULT_MAX_FRAME_SIZE,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(stream.next().await.unwrap().is_ok());
+            let status = stream.next().await.unwrap().unwrap_err().into_status();
+            assert_eq!(
+                (status.code(), status.message()),
+                (code, message),
+                "stream: {name}"
+            );
+            assert!(stream.terminal_status().is_none(), "stream: {name}");
+            assert!(stream.next().await.is_none(), "stream: {name}");
+
+            let status = super::collect_unary_response(frames())
+                .await
+                .expect_err("trailing data fails the call")
+                .into_status();
+            assert_eq!(
+                (status.code(), status.message()),
+                (code, message),
+                "collect_unary_response: {name}"
+            );
+        }
+    }
+
+    /// Exhaustive check of `ResponseStream` against the response grammar: every script of a few
+    /// inner-stream events, read through `next()` alone or interleaved with `headers()`.
+    mod grammar {
+        use std::collections::VecDeque;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        use futures_core::Stream as _;
+        use futures_util::task::noop_waker;
+
+        use super::super::ResponseStream;
+        use super::TestMessage;
+        use crate::{BoxStream, Code, Error, Metadata, ResponseFrame, Result, Status};
+
+        /// One event of a scripted inner stream.
+        #[derive(Clone, Copy, Debug)]
+        enum Item {
+            Headers,
+            Message,
+            BadMessage,
+            StatusOk,
+            StatusErr,
+            TransportErr,
+            InternalErr,
+            End,
+        }
+
+        const ITEMS: [Item; 8] = [
+            Item::Headers,
+            Item::Message,
+            Item::BadMessage,
+            Item::StatusOk,
+            Item::StatusErr,
+            Item::TransportErr,
+            Item::InternalErr,
+            Item::End,
+        ];
+
+        fn event(item: Item) -> Option<Result<ResponseFrame>> {
+            Some(match item {
+                Item::Headers => Ok(ResponseFrame::Headers(Metadata::new())),
+                Item::Message => Ok(ResponseFrame::message(&b""[..])),
+                Item::BadMessage => Ok(ResponseFrame::message(&[0x0a_u8, 0xff][..])),
+                Item::StatusOk => Ok(ResponseFrame::Status(Status::ok())),
+                Item::StatusErr => Ok(ResponseFrame::Status(Status::new(Code::NotFound, "nf"))),
+                Item::TransportErr => Err(Error::transport(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "reset",
+                ))),
+                Item::InternalErr => Err(Error::from(Status::internal("boom"))),
+                Item::End => return None,
+            })
+        }
+
+        /// Plays the script, then ends if it ended with `End`, else stays pending. Panics if
+        /// polled after it ended, as a real transport stream may not be.
+        struct Script {
+            items: VecDeque<Item>,
+            ended: bool,
+        }
+
+        impl futures_core::Stream for Script {
+            type Item = Result<ResponseFrame>;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                assert!(!self.ended, "inner stream polled after it returned None");
+                let Some(item) = self.items.pop_front() else {
+                    return Poll::Pending;
+                };
+                let out = event(item);
+                self.ended = out.is_none();
+                Poll::Ready(out)
+            }
+        }
+
+        fn response(items: &[Item]) -> ResponseStream<TestMessage> {
+            let script: BoxStream<ResponseFrame> = Box::pin(Script {
+                items: items.iter().copied().collect(),
+                ended: false,
+            });
+            ResponseStream::new(
+                script,
+                crate::framing::DEFAULT_MAX_FRAME_SIZE,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Out {
+            Message,
+            Status(Code, String),
+            End,
+            Pending,
+        }
+
+        fn out(poll: Poll<Option<Result<TestMessage>>>) -> Out {
+            match poll {
+                Poll::Pending => Out::Pending,
+                Poll::Ready(None) => Out::End,
+                Poll::Ready(Some(Ok(_))) => Out::Message,
+                Poll::Ready(Some(Err(error))) => {
+                    let status = error.into_status();
+                    Out::Status(status.code(), status.message().to_owned())
+                }
+            }
+        }
+
+        fn internal(message: &str) -> Out {
+            Out::Status(Code::Internal, message.to_owned())
+        }
+
+        /// The grammar applied to a script: what `next()` must produce, up to its first output
+        /// that is not a message.
+        fn expected_stream(items: &[Item]) -> Vec<Out> {
+            let mut outs = Vec::new();
+            let mut first_seen = false;
+            let mut status: Option<Code> = None;
+            for item in items {
+                let first = !first_seen;
+                match item {
+                    Item::Headers
+                    | Item::Message
+                    | Item::BadMessage
+                    | Item::StatusOk
+                    | Item::StatusErr
+                        if status.is_some() =>
+                    {
+                        outs.push(internal("response stream continued after terminal status"));
+                        return outs;
+                    }
+                    Item::Headers => {
+                        first_seen = true;
+                        if !first {
+                            outs.push(internal(
+                                "response stream sent HEADERS after another response frame",
+                            ));
+                            return outs;
+                        }
+                    }
+                    Item::Message => {
+                        first_seen = true;
+                        outs.push(Out::Message);
+                    }
+                    Item::BadMessage => {
+                        outs.push(internal(
+                            "response stream contained a malformed protobuf payload",
+                        ));
+                        return outs;
+                    }
+                    Item::StatusOk => {
+                        first_seen = true;
+                        status = Some(Code::Ok);
+                    }
+                    Item::StatusErr => {
+                        first_seen = true;
+                        status = Some(Code::NotFound);
+                    }
+                    Item::TransportErr => {
+                        outs.push(Out::Status(
+                            Code::Unavailable,
+                            "transport unavailable: reset".to_owned(),
+                        ));
+                        return outs;
+                    }
+                    Item::InternalErr => {
+                        outs.push(if status.is_some() {
+                            internal(
+                                "response stream contained malformed trailing data after terminal status",
+                            )
+                        } else {
+                            internal("boom")
+                        });
+                        return outs;
+                    }
+                    Item::End => {
+                        outs.push(match status {
+                            None => internal("response stream ended before final status"),
+                            Some(Code::Ok) => Out::End,
+                            Some(code) => Out::Status(code, "nf".to_owned()),
+                        });
+                        return outs;
+                    }
+                }
+            }
+            outs.push(Out::Pending);
+            outs
+        }
+
+        type Headers = Option<std::result::Result<(), Out>>;
+
+        /// What `headers()` must settle on once the stream has been read as far as it can be:
+        /// `None` while it waits, else the headers or the failure of the call.
+        fn expected_headers(items: &[Item]) -> Headers {
+            match items.first() {
+                None => None,
+                Some(Item::Headers | Item::Message) => Some(Ok(())),
+                Some(_) => match expected_stream(items).swap_remove(0) {
+                    Out::Pending => None,
+                    Out::End | Out::Message => Some(Ok(())),
+                    failure @ Out::Status(..) => Some(Err(failure)),
+                },
+            }
+        }
+
+        fn scripts(max_len: usize) -> Vec<Vec<Item>> {
+            let mut all = vec![vec![]];
+            let mut frontier = vec![vec![]];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for prefix in &frontier {
+                    if matches!(prefix.last(), Some(Item::End)) {
+                        continue;
+                    }
+                    for item in ITEMS {
+                        let mut script = prefix.clone();
+                        script.push(item);
+                        next.push(script);
+                    }
+                }
+                all.extend(next.iter().cloned());
+                frontier = next;
+            }
+            all
+        }
+
+        /// The state, the headers and the kept failure never contradict each other.
+        fn check_consistent(response: &ResponseStream<TestMessage>, context: &str) {
+            let done = response.state.is_done();
+            if done {
+                assert!(
+                    response.headers.is_some() != response.failure.is_some(),
+                    "a finished call has either headers or the failure that preceded them: {context}"
+                );
+            } else {
+                assert!(
+                    response.failure.is_none(),
+                    "failure kept while live: {context}"
+                );
+            }
+            assert!(
+                response.terminal_status().is_none() || done,
+                "terminal status while live: {context}"
+            );
+        }
+
+        /// Settles `headers()` as far as the script allows.
+        fn headers_now(
+            response: &mut ResponseStream<TestMessage>,
+            cx: &mut Context<'_>,
+        ) -> Headers {
+            match response.poll_headers(cx) {
+                Poll::Pending => None,
+                Poll::Ready(Ok(())) => Some(Ok(())),
+                Poll::Ready(Err(error)) => {
+                    let status = error.into_status();
+                    Some(Err(Out::Status(status.code(), status.message().to_owned())))
+                }
+            }
+        }
+
+        #[test]
+        fn next_alone_follows_the_response_grammar() {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            for script in scripts(5) {
+                let want = expected_stream(&script);
+                let mut response = response(&script);
+                let mut got = Vec::new();
+                loop {
+                    let item = out(Pin::new(&mut response).poll_next(&mut cx));
+                    check_consistent(&response, &format!("{script:?} {got:?}"));
+                    let last = item != Out::Message;
+                    got.push(item);
+                    if last {
+                        break;
+                    }
+                }
+                assert_eq!(got, want, "script {script:?}");
+
+                // A failure is followed by the end, and nothing comes after the end.
+                match got.last() {
+                    Some(Out::Pending | Out::End) => {}
+                    _ => assert_eq!(out(Pin::new(&mut response).poll_next(&mut cx)), Out::End),
+                }
+                if got.last() != Some(&Out::Pending) {
+                    for _ in 0..3 {
+                        assert_eq!(
+                            out(Pin::new(&mut response).poll_next(&mut cx)),
+                            Out::End,
+                            "item after the end: {script:?} {got:?}"
+                        );
+                        check_consistent(&response, &format!("after the end: {script:?}"));
+                    }
+                }
+            }
+        }
+
+        /// Interleaving `headers()` polls, which read ahead, must not change what the stream
+        /// returns, and `headers()` must settle once on what the grammar says and not change.
+        #[test]
+        fn headers_read_ahead_does_not_change_the_stream_or_flip_its_own_answer() {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            for script in scripts(4) {
+                let want = expected_stream(&script);
+                for mask in 0_u32..(1 << 6) {
+                    let context = format!("{script:?} mask {mask:b}");
+                    let mut response = response(&script);
+                    let mut got = Vec::new();
+                    let mut settled: Headers = None;
+                    for step in 0..6 {
+                        if mask & (1 << step) != 0 {
+                            let now = headers_now(&mut response, &mut cx);
+                            if settled.is_some() {
+                                assert_eq!(now, settled, "headers() changed its answer: {context}");
+                            }
+                            settled = settled.or(now);
+                            check_consistent(&response, &context);
+                        }
+                        if got.last().is_some_and(|item| *item != Out::Message) {
+                            break;
+                        }
+                        got.push(out(Pin::new(&mut response).poll_next(&mut cx)));
+                        check_consistent(&response, &context);
+                    }
+                    let seen = got.len().min(want.len());
+                    assert_eq!(got.get(..seen), want.get(..seen), "stream of {context}");
+
+                    // Once the stream is read as far as the script goes, `headers()` has the
+                    // answer the grammar gives, and it is the one it settled on.
+                    let answer = headers_now(&mut response, &mut cx);
+                    assert_eq!(answer, expected_headers(&script), "headers() of {context}");
+                    if settled.is_some() {
+                        assert_eq!(answer, settled, "headers() changed: {context}");
+                    }
+                }
+            }
+        }
     }
 }

@@ -304,7 +304,10 @@ async fn write_frames<K: ResponseSink>(mut body: ResponseBody, sink: &mut K) -> 
         let Some(frame) = frame else {
             return sink.finish().await;
         };
-        match frame.map_err(Error::Transport)?.into_data() {
+        match frame
+            .map_err(|error| Error::Transport(error.into()))?
+            .into_data()
+        {
             Ok(data) => sink.write(data).await?,
             Err(frame) => {
                 if let Ok(trailers) = frame.into_trailers() {

@@ -332,12 +332,8 @@ impl<C: MuxConnection> RpcTransport for NativeTransport<C> {
             framed::read_response_frame(&mut call.recv, self.max_frame_size, &mut reading).await?
         {
             if response.accept(frame).map_err(Error::from)? {
-                framed::drain_fin_after_terminal_status(
-                    &mut call.recv,
-                    self.max_frame_size,
-                    "unary response stream",
-                )
-                .await?;
+                framed::drain_fin_after_terminal_status(&mut call.recv, self.max_frame_size)
+                    .await?;
                 break;
             }
         }
@@ -514,12 +510,8 @@ async fn next_response<R: MuxRecvStream>(
                 };
             }
             let upload_result = call.upload.abort_and_settle().await;
-            let drain_result = framed::drain_fin_after_terminal_status(
-                &mut call.recv,
-                max_frame_size,
-                "response stream",
-            )
-            .await;
+            let drain_result =
+                framed::drain_fin_after_terminal_status(&mut call.recv, max_frame_size).await;
             call.complete = true;
 
             if let Err(error) = drain_result {
