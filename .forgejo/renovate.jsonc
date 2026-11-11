@@ -166,10 +166,11 @@
       "postUpdateOptions": ["npmInstallTwice"]
     },
 
-    // group quic-go
+    // group quic-go across every trevrpc-go module that requires it directly,
+    // so the library and the modules built against it update together
     {
       "matchManagers": ["gomod"],
-      "matchFileNames": ["trevrpc-go/go.mod"],
+      "matchFileNames": ["trevrpc-go/**/go.mod"],
       "matchPackageNames": ["github.com/quic-go/**"],
       "groupName": "quic-go",
       "separateMajorMinor": false
