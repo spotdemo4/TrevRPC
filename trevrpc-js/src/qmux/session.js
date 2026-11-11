@@ -33,6 +33,12 @@ const SendBufferPollMs = 5;
 /** Bounds opening the WebSocket and receiving the server's transport parameters. */
 const HandshakeTimeoutMs = 10_000;
 
+/**
+ * The send side of a stream (RFC 9000 section 3.1): `Send` until the FIN or RESET_STREAM is queued
+ * (`DataSent`, `ResetSent`) or the session ends (`SessionClosed`). Only `Send` accepts writes.
+ */
+const SendState = Object.freeze({ Send: 0, DataSent: 1, ResetSent: 2, SessionClosed: 3 });
+
 /** An error shaped like WebTransportError, so callers treat both transports alike. */
 function transportError(message, { source = "session", streamErrorCode = null, cause } = {}) {
   const error = new Error(message, cause === undefined ? undefined : { cause });
@@ -295,7 +301,19 @@ export class QMuxWebSocketSession {
         );
       default:
         if (frame.data !== undefined) {
-          this.#stream(frame)?.onData(frame.offset, frame.data, frame.fin);
+          const stream = this.#stream(frame);
+          if (stream) {
+            stream.onData(frame.offset, frame.data, frame.fin);
+          } else if (frame.data.length > 0) {
+            // A released stream received its final size and every byte up to it, so more data
+            // lies beyond it. It would also skip the flow control checks, letting a peer send
+            // without limit. An empty frame is ignored: it carries nothing to account for.
+            throw protocolError(
+              TransportError.FinalSizeError,
+              `stream ${frame.streamId} data beyond its final size`,
+              frame.type,
+            );
+          }
         }
     }
   }
@@ -326,7 +344,7 @@ export class QMuxWebSocketSession {
     this.#settleReady.resolve();
   }
 
-  /** The stream a frame refers to, or undefined once it has completed. */
+  /** The stream a frame refers to, or undefined once it was released. */
   #stream(frame) {
     const id = frame.streamId;
     if (id % 4 !== 0) {
@@ -444,6 +462,9 @@ export class QMuxWebSocketSession {
   }
 
   #wake() {
+    if (this.#waiters.size === 0) {
+      return;
+    }
     const waiters = [...this.#waiters];
     this.#waiters.clear();
     for (const resolve of waiters) {
@@ -517,7 +538,7 @@ class QMuxStream {
   #finReceived = false;
   #readError = null;
   #readCancelled = false;
-  #sendDone = false;
+  #sendState = SendState.Send;
   #pullWaiter = null;
   #writeController;
 
@@ -536,17 +557,24 @@ class QMuxStream {
         this.#writeController = controller;
         // An abort waits for the write in flight, which may be waiting for credit that never
         // comes; the controller's signal fires at once, so the stream is reset and the write fails.
+        // That is the whole abort, so the sink needs no abort callback.
         controller.signal.addEventListener(
           "abort",
-          () => this.#abortSend(controller.signal.reason),
-          {
-            once: true,
+          () => {
+            const reason = controller.signal.reason;
+            this.#endSend(
+              SendState.ResetSent,
+              transportError(`stream aborted: ${reason?.message ?? reason}`, {
+                source: "stream",
+                streamErrorCode: CancelledCode,
+              }),
+            );
           },
+          { once: true },
         );
       },
       write: (chunk) => this.#write(chunk),
-      close: () => this.#finishSend(),
-      abort: () => this.#resetSend(CancelledCode),
+      close: () => this.#endSend(SendState.DataSent),
     });
   }
 
@@ -624,34 +652,20 @@ class QMuxStream {
   }
 
   onStopSending(code) {
-    if (this.#sendDone) {
+    if (this.#sendState !== SendState.Send) {
       return;
     }
-    this.writeError = transportError(`stream stopped by peer with code ${code}`, {
+    const error = transportError(`stream stopped by peer with code ${code}`, {
       source: "stream",
       streamErrorCode: code,
     });
-    this.#resetSend(code);
-    this.#writeController.error(this.writeError);
-  }
-
-  /** Resets the send side because the writer was aborted, failing a write waiting for credit. */
-  #abortSend(reason) {
-    if (this.#sendDone) {
-      return;
-    }
-    this.writeError ??= transportError(`stream aborted: ${reason?.message ?? reason}`, {
-      source: "stream",
-      streamErrorCode: CancelledCode,
-    });
-    this.#resetSend(CancelledCode);
-    this.#session.wakeSenders();
+    this.#endSend(SendState.ResetSent, error, code);
+    this.#writeController.error(error);
   }
 
   onSessionClosed(error) {
     this.#readError ??= error;
-    this.writeError ??= error;
-    this.#sendDone = true;
+    this.#endSend(SendState.SessionClosed, error);
     this.#wakePull();
     try {
       this.#writeController.error(error);
@@ -721,37 +735,47 @@ class QMuxStream {
     let data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
     while (data.length > 0) {
       const allowed = await this.#session.sendCredit(this);
+      // The stream may have been reset or the session closed while this write resumed; STREAM
+      // data must not follow a RESET_STREAM, whose final size ends the stream.
+      if (this.#sendState !== SendState.Send) {
+        throw this.writeError;
+      }
       const piece = data.subarray(0, allowed);
       this.#session.sendStream(this, piece, false);
       data = data.subarray(piece.length);
     }
   }
 
-  #finishSend() {
-    if (this.#sendDone) {
-      return;
+  /**
+   * The one transition out of `Send`, to `DataSent` (queue the FIN), `ResetSent` (queue
+   * RESET_STREAM with `code`) or `SessionClosed`. The failing states record `error` as the write
+   * error and wake writes parked in `sendCredit`, which see it and fail. Returns false when the
+   * send side had already ended.
+   */
+  #endSend(next, error = null, code = CancelledCode) {
+    if (this.#sendState !== SendState.Send) {
+      return false;
     }
-    if (this.#session.closedError) {
-      throw this.#session.closedError;
+    this.#sendState = next;
+    if (next === SendState.DataSent) {
+      this.#session.sendStream(this, new Uint8Array(0), true);
+    } else {
+      this.writeError ??= error;
+      if (next === SendState.ResetSent) {
+        this.#session.resetStream(this, code);
+      }
+      this.#session.wakeSenders();
     }
-    this.#sendDone = true;
-    this.#session.sendStream(this, new Uint8Array(0), true);
     this.#maybeComplete();
-  }
-
-  #resetSend(code) {
-    if (this.#sendDone) {
-      return;
-    }
-    this.#sendDone = true;
-    if (!this.#session.closedError) {
-      this.#session.resetStream(this, code);
-    }
-    this.#maybeComplete();
+    return true;
   }
 
   #maybeComplete() {
-    if (this.#sendDone && this.#finalSize !== null && this.#read === this.#finalSize) {
+    if (
+      this.#sendState !== SendState.Send &&
+      this.#finalSize !== null &&
+      this.#read === this.#finalSize
+    ) {
       this.#session.completed(this);
     }
   }

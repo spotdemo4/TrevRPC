@@ -467,7 +467,7 @@ func (s *Session) handleConnectionCloseLocked(f *frame) {
 func (s *Session) isLocal(id uint64) bool { return id&1 == uint64(s.role) }
 
 // streamLocked returns the stream a frame refers to, opening peer streams up
-// to it. It returns nil for a stream that has already completed.
+// to it. It returns nil for a stream that was opened and has been released.
 func (s *Session) streamLocked(id uint64, frameType uint64) (*Stream, *TransportError) {
 	num := id >> 2
 	if id&2 != 0 {
@@ -500,8 +500,18 @@ func (s *Session) streamLocked(id uint64, frameType uint64) (*Stream, *Transport
 
 func (s *Session) handleStreamLocked(f *frame) *TransportError {
 	stream, err := s.streamLocked(f.streamID, f.typ)
-	if err != nil || stream == nil {
+	if err != nil {
 		return err
+	}
+	if stream == nil {
+		// The stream was released, so its final size is known and every byte up
+		// to it was received: a conforming peer sends nothing more. Data would
+		// lie beyond the final size and skip the flow control checks below, so
+		// it ends the connection, while an empty frame costs nothing to ignore.
+		if len(f.data) > 0 {
+			return protocolError(FinalSizeError, f.typ, "stream %d data beyond its final size", f.streamID)
+		}
+		return nil
 	}
 	end := f.offset + uint64(len(f.data))
 	if stream.finalKnown && (end > stream.finalSize || (f.fin && end != stream.finalSize)) {

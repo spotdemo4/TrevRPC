@@ -323,6 +323,148 @@ test("aborting the writer resets a stream whose write is blocked on flow control
   session.close();
 });
 
+const tick = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** "fulfilled" or "rejected" once `promise` settles, or "pending" if it has not within `ms`. */
+function settlesWithin(promise, ms) {
+  return Promise.race([
+    promise.then(
+      () => "fulfilled",
+      () => "rejected",
+    ),
+    tick(ms).then(() => "pending"),
+  ]);
+}
+
+/** A server that records frames but never echoes stream data. */
+function silentServer(parameters = ServerParameters) {
+  return fakeServer({ parameters, onFrame: (_socket, frame) => frame.data !== undefined });
+}
+
+/** Parameters whose 4-byte stream window leaves a larger write blocked on flow control. */
+const BlockedParameters = { ...ServerParameters, initialMaxStreamDataBidiRemote: 4 };
+
+test("STOP_SENDING fails a write blocked on flow control", async () => {
+  const server = silentServer(BlockedParameters);
+  const session = await openSession(server);
+  const stream = await session.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  const blocked = writer.write(new Uint8Array(100));
+  await tick();
+  const [socket] = server.sockets;
+  socket.deliver(frames((w) => writeStopSending(w, 0, 7)));
+  assert.equal(await settlesWithin(blocked, 500), "rejected");
+  assert.ok(
+    socket.received.some(
+      (frame) => frame.type === FrameType.ResetStream && frame.code === 7 && frame.finalSize === 4,
+    ),
+  );
+  session.close();
+});
+
+test("abort() settles a write that STOP_SENDING left blocked on flow control", async () => {
+  const server = silentServer(BlockedParameters);
+  const session = await openSession(server);
+  const stream = await session.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  const blocked = writer.write(new Uint8Array(100)).catch(() => {});
+  await tick();
+  server.sockets[0].deliver(frames((w) => writeStopSending(w, 0, 7)));
+  await tick();
+  assert.equal(await settlesWithin(writer.abort(new Error("done")), 500), "fulfilled");
+  assert.equal(await settlesWithin(blocked, 100), "fulfilled");
+  session.close();
+});
+
+// RESET_STREAM fixes the final size, so no STREAM frame may follow it on that stream.
+test("a write followed at once by abort() sends no STREAM data after RESET_STREAM", async () => {
+  const server = silentServer();
+  const session = await openSession(server);
+  const stream = await session.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  await tick();
+  const written = writer.write(Uint8Array.of(1, 2, 3)).catch(() => {});
+  const aborted = writer.abort(new Error("done")).catch(() => {});
+  await Promise.all([written, aborted]);
+  await tick();
+  const onWire = server.sockets[0].received.filter(
+    (frame) => frame.type === FrameType.ResetStream || frame.data !== undefined,
+  );
+  const resetAt = onWire.findIndex((frame) => frame.type === FrameType.ResetStream);
+  assert.notEqual(resetAt, -1, "RESET_STREAM was sent");
+  assert.deepEqual(
+    onWire
+      .slice(resetAt + 1)
+      .filter((frame) => frame.data !== undefined)
+      .map((frame) => [frame.offset, frame.data.length]),
+    [],
+    "STREAM frames after RESET_STREAM",
+  );
+  session.close();
+});
+
+test("a peer cannot move the final size of a stream", async () => {
+  for (const second of [
+    (w) => writeStreamFrame(w, 0, 3, Uint8Array.of(9), false),
+    (w) => writeResetStream(w, 0, 1, 4),
+  ]) {
+    const server = silentServer();
+    const session = await openSession(server);
+    const stream = await session.createBidirectionalStream();
+    const reading = stream.readable
+      .getReader()
+      .read()
+      .catch(() => {});
+    const [socket] = server.sockets;
+    socket.deliver(frames((w) => writeStreamFrame(w, 0, 0, Uint8Array.of(1, 2, 3), false)));
+    await tick();
+    socket.deliver(frames((w) => writeResetStream(w, 0, 1, 3)));
+    await tick();
+    socket.deliver(frames(second));
+    await tick();
+    await reading;
+    assert.equal(session.stage, "closed");
+    assert.ok(socket.received.some((frame) => frame.type === FrameType.ConnectionClose));
+  }
+});
+
+/** Sends a FIN and reads the peer's, so the stream is complete and its slot released. */
+async function releaseStream(session, socket) {
+  const stream = await session.createBidirectionalStream();
+  await stream.writable.getWriter().close();
+  socket.deliver(frames((w) => writeStreamFrame(w, 0, 0, Uint8Array.of(1), true)));
+  await readAll(stream.readable);
+}
+
+test("STREAM data for a released stream is a FINAL_SIZE_ERROR", async () => {
+  const server = silentServer();
+  const session = await openSession(server);
+  const [socket] = server.sockets;
+  await releaseStream(session, socket);
+  socket.deliver(frames((w) => writeStreamFrame(w, 0, 1, Uint8Array.of(2), false)));
+  await tick();
+  assert.equal(session.stage, "closed", "the session was closed for the protocol error");
+  const close = socket.received.find((frame) => frame.type === FrameType.ConnectionClose);
+  assert.equal(close?.code, TransportError.FinalSizeError);
+});
+
+test("an empty frame for a released stream is ignored", async () => {
+  const server = silentServer();
+  const session = await openSession(server);
+  const [socket] = server.sockets;
+  await releaseStream(session, socket);
+  socket.deliver(
+    frames((w) => {
+      writeStreamFrame(w, 0, 1, new Uint8Array(0), true);
+      writeResetStream(w, 0, 7, 1);
+      writeStopSending(w, 0, 7);
+    }),
+  );
+  await tick();
+  assert.equal(session.stage, "ready");
+  session.close();
+});
+
 test("a connection that drops fails every pending read, write and stream open", async () => {
   const server = fakeServer({
     parameters: {
