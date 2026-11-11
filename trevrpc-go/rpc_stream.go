@@ -192,9 +192,11 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 	reader := newFrameReader(stream, options.MaxFrameSize, options.MaxStreamBodySize)
 	// One watcher cancels the request's reads, REQUEST and single MESSAGE,
 	// when ctx is: a context.AfterFunc per read cost each call several
-	// allocations. Their read deadlines cover the call's deadline.
-	stopCancelRead := cancelReadOnContext(ctx, stream)
-	defer stopCancelRead()
+	// allocations. Their read deadlines cover the call's deadline. It stays
+	// until the call ends, and also interrupts a write of the response that
+	// waits for the client when ctx ends, such as by a shutdown.
+	stopAbort := abortOnContext(ctx, stream)
+	defer stopAbort()
 	request, err := readRequestFrame(ctx, options, startedAt, stream, reader)
 	if err != nil {
 		status := requestFrameStatus(err)
@@ -241,6 +243,7 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 	}
 	requestCtx, cancelRequest := requestLifetimeContext(ctx, request)
 	defer cancelRequest()
+	boundResponseWrites(ctx, requestCtx, stream)
 	// The rest of a call that ends after its message is read in any case.
 	reader.readAhead = requestEndsAfterMessage(request.rpcKind())
 
@@ -253,9 +256,6 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 			return
 		}
 	}
-	// The request stream reads the rest of a streaming request with
-	// watchers of its own.
-	stopCancelRead()
 
 	lease, ok := runtime.tryRequestLease(request)
 	if !ok {
@@ -337,7 +337,7 @@ func requestFrameStatus(err error) *Status {
 	}
 	// No handler has run, so the client may retry the call elsewhere.
 	if errors.Is(err, errServerShutdown) {
-		return Unavailable(errServerShutdown.Error())
+		return serverShutdownStatus()
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return statusFromContextError(err)
@@ -529,6 +529,11 @@ type rpcRequestStream struct {
 	// ended is set once the client finished its request side: the stream
 	// reached its end.
 	ended atomic.Bool
+	// err is how the request ended, once it did before the stream was closed:
+	// every Recv after that returns it, so a failure is not mistaken for a
+	// clean end. Only Recv, which does not run concurrently with itself, reads
+	// and writes it.
+	err error
 }
 
 // finished reports whether the client finished its upload, so that nothing is
@@ -554,6 +559,9 @@ func (s *rpcRequestStream) trevrpcCancelRead() {
 }
 
 func (s *rpcRequestStream) Recv() ([]byte, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	if s.done.Load() {
 		return nil, io.EOF
 	}
@@ -567,20 +575,23 @@ func (s *rpcRequestStream) Recv() ([]byte, error) {
 
 // receive turns the frame the reader returned into the result of Recv.
 func (s *rpcRequestStream) receive(next frame, err error) ([]byte, error) {
-	if err != nil {
-		s.done.Store(true)
-		if errors.Is(err, io.EOF) {
-			s.ended.Store(true)
-			return nil, io.EOF
-		}
-		return nil, requestReadStatus(s.ctx, err)
-	}
-
-	if next.typ != frameTypeMessage {
-		s.done.Store(true)
-		return nil, InvalidArgument(fmt.Sprintf("request stream carried %s after REQUEST", next.typ))
+	switch {
+	case errors.Is(err, io.EOF):
+		s.ended.Store(true)
+		return nil, s.end(io.EOF)
+	case err != nil:
+		return nil, s.end(requestReadStatus(s.ctx, err))
+	case next.typ != frameTypeMessage:
+		return nil, s.end(InvalidArgument(fmt.Sprintf("request stream carried %s after REQUEST", next.typ)))
 	}
 	return next.payload, nil
+}
+
+// end ends the request with err, which every later Recv returns.
+func (s *rpcRequestStream) end(err error) error {
+	s.err = err
+	s.done.Store(true)
+	return err
 }
 
 func (s *rpcRequestStream) Close() error {

@@ -661,14 +661,18 @@ func payloadOf(message encodedMessage) []byte {
 func (s *Server) handleUnaryRequest(ctx context.Context, request *wireRequest, body []byte) *unaryResponse {
 	runtime := s.freeze()
 	lease, ok := runtime.tryRequestLease(request)
+	var response *unaryResponse
 	if !ok {
-		startedAt := time.Now()
-		service, method := requestService(request), requestMethod(request)
-		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: len(body)}, request)
-		return runtime.finishResponse(service, method, len(body), startedAt, failedUnaryResponse(Unavailable("too many concurrent RPCs")), nil, request)
+		call := callRecord{runtime: runtime, request: request, service: requestService(request), method: requestMethod(request), requestBodyLen: len(body), startedAt: time.Now()}
+		runtime.recordStarted(RPCStarted{Service: call.service, Method: call.method, RequestBodyLen: call.requestBodyLen}, request)
+		response = call.failedUnary(Unavailable("too many concurrent RPCs"), nil)
+	} else {
+		response = runtime.handleRequest(ctx, request, body, lease)
+		lease.release()
 	}
-	defer lease.release()
-	return runtime.handleRequest(ctx, request, body, lease)
+	// The call is reported once its response was written.
+	_, _ = response.writeNext(context.Background(), io.Discard, runtime.options.MaxFrameSize, nil)
+	return response
 }
 
 // handleStreamingRequest runs a streaming request through the server as the
@@ -688,10 +692,9 @@ func (s *Server) handleStreamingWriter(ctx context.Context, request *wireRequest
 	runtime := s.freeze()
 	lease, ok := runtime.tryRequestLease(request)
 	if !ok {
-		startedAt := time.Now()
-		service, method := requestService(request), requestMethod(request)
-		runtime.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: len(body)}, request)
-		return runtime.finishStreamingStatus(service, method, len(body), startedAt, Unavailable("too many concurrent RPCs"), nil, request)
+		call := callRecord{runtime: runtime, request: request, service: requestService(request), method: requestMethod(request), requestBodyLen: len(body), startedAt: time.Now()}
+		runtime.recordStarted(RPCStarted{Service: call.service, Method: call.method, RequestBodyLen: call.requestBodyLen}, request)
+		return call.failedStatus(Unavailable("too many concurrent RPCs"), nil)
 	}
 	var dispatched bytes.Buffer
 	response := runtime.handleStreamingRequest(ctx, request, body, requestBody, lease, &dispatched)

@@ -262,13 +262,7 @@ func (q *responseReadAhead) next(wait bool) (readAheadItem, bool, error) {
 		select {
 		case item := <-q.items:
 			q.blocked = false
-			q.take(item)
-			if err := q.ctx.Err(); err != nil {
-				// Whatever is queued is dropped with the call.
-				q.abandon(statusFromContextError(err))
-				return readAheadItem{}, false, q.abandoned
-			}
-			return item, true, nil
+			return q.deliver(item)
 		default:
 		}
 	}
@@ -276,6 +270,20 @@ func (q *responseReadAhead) next(wait bool) (readAheadItem, bool, error) {
 		return readAheadItem{}, false, nil
 	}
 	return q.await()
+}
+
+// deliver hands out an item the writer took from the queue, unless the call
+// has ended: whatever is queued is dropped with the call, however the stream
+// ended, for a stream that ends as the call does is not a response that
+// finished. This is the one place that checks, for every way the writer takes
+// an item.
+func (q *responseReadAhead) deliver(item readAheadItem) (readAheadItem, bool, error) {
+	q.take(item)
+	if q.ctx.Err() != nil {
+		q.abandon(contextStatus(q.ctx))
+		return readAheadItem{}, false, q.abandoned
+	}
+	return item, true, nil
 }
 
 // take makes room for the goroutine, which may wait for it.
@@ -307,12 +315,11 @@ func (q *responseReadAhead) await() (readAheadItem, bool, error) {
 			q.timer.Stop()
 		}
 		q.blocked = true
-		q.take(item)
-		return item, true, nil
+		return q.deliver(item)
 	case <-q.done:
 		err = statusFromContextError(context.Canceled)
 	case <-q.ctx.Done():
-		err = statusFromContextError(q.ctx.Err())
+		err = contextStatus(q.ctx)
 	case <-idle:
 		err = Unavailable("response stream idle timeout")
 	}

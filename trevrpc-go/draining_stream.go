@@ -168,6 +168,22 @@ func (s *drainingStream) trevrpcCancelRead() {
 	s.maybeDrainLocked()
 }
 
+// SetWriteDeadline bounds the writes to the stream, as far as the stream it
+// wraps can.
+func (s *drainingStream) SetWriteDeadline(deadline time.Time) error {
+	if bounded, ok := s.rw.(writeDeadlineStream); ok {
+		return bounded.SetWriteDeadline(deadline)
+	}
+	return nil
+}
+
+func (s *drainingStream) trevrpcAbortOnContext(ctx context.Context) func() {
+	return watchContextCancellation(ctx, func() {
+		s.trevrpcCancelRead()
+		_ = s.SetWriteDeadline(time.Now())
+	})
+}
+
 func (s *drainingStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
 	return watchContextCancellation(ctx, s.trevrpcCancelRead)
 }

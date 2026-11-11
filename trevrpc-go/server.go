@@ -1112,22 +1112,35 @@ type responseWriter interface {
 // every failure before a handler produced a response.
 type statusResponse struct {
 	status *Status
+	// cause is the error the call failed with, if it has one.
+	cause error
+	call  callRecord
 }
 
-func (r statusResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return true, err
-	}
-	frames, err := appendStatusFrame(nil, r.status, maxFrameSize)
-	if err != nil {
-		return true, err
-	}
-	callBeforeStatus(beforeStatus)
-	_, err = writer.Write(frames)
+func (r *statusResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
+	err := r.write(ctx, writer, maxFrameSize, beforeStatus)
+	r.call.finishWritten(ctx, r.status, r.cause, err)
 	return true, err
 }
 
-func (statusResponse) Close() error { return nil }
+func (r *statusResponse) write(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	frames, err := appendStatusFrame(nil, r.status, maxFrameSize)
+	if err != nil {
+		return err
+	}
+	callBeforeStatus(beforeStatus)
+	_, err = writer.Write(frames)
+	return err
+}
+
+// Close reports a call whose response was never written.
+func (r *statusResponse) Close() error {
+	r.call.finish(callOutcome{code: CodeCancelled, err: errResponseClosed})
+	return nil
+}
 
 // callBeforeStatus runs the beforeStatus hook of writeNext, if there is one.
 func callBeforeStatus(beforeStatus func()) {
@@ -1147,82 +1160,111 @@ type unaryResponse struct {
 	message    encodedMessage
 	hasMessage bool
 	status     *Status
+	// cause is the error the call failed with, if it has one.
+	cause error
+	call  callRecord
 }
 
 func (r *unaryResponse) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
+	err := r.write(ctx, writer, maxFrameSize, beforeStatus)
+	r.call.responseBodyLen = r.message.size
+	r.call.finishWritten(ctx, r.status, r.cause, err)
+	return true, err
+}
+
+func (r *unaryResponse) write(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) error {
 	if err := ctx.Err(); err != nil {
-		return true, err
+		return err
 	}
+	frames, err := r.frames(maxFrameSize)
+	if tooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
+		// The call fails with a lone STATUS instead. The client gets its
+		// code, and the call is reported as the failure it is.
+		r.status, r.cause = r.call.oversizedResponseStatus(ctx, tooLarge), tooLarge
+		r.headers, r.answered, r.message, r.hasMessage = nil, false, encodedMessage{}, false
+		frames, err = r.frames(maxFrameSize)
+	}
+	if err != nil {
+		return err
+	}
+	callBeforeStatus(beforeStatus)
+	_, err = writer.Write(frames)
+	return err
+}
+
+// frames returns the frames of the response, which are the same however often
+// it is asked for.
+func (r *unaryResponse) frames(maxFrameSize int) ([]byte, error) {
 	var frames []byte
 	var err error
 	if len(r.headers) == 0 && !r.answered && r.hasMessage {
 		// The message frame has room for the STATUS behind it.
 		if r.message.size > maxFrameSize {
-			return true, &FrameTooLargeError{Len: r.message.size, Max: maxFrameSize}
+			return nil, &FrameTooLargeError{Len: r.message.size, Max: maxFrameSize}
 		}
 		frames = r.message.frame
 	} else {
 		frames = make([]byte, 0, len(r.message.frame)+frameTailSlack)
 		if r.answered {
 			if frames, err = appendAnswerFrame(frames, &r.answer, maxFrameSize); err != nil {
-				return true, err
+				return nil, err
 			}
 		}
 		if len(r.headers) > 0 {
 			if frames, err = appendHeadersFrame(frames, r.headers, maxFrameSize); err != nil {
-				return true, err
+				return nil, err
 			}
 		}
 		if r.hasMessage {
 			if frames, err = appendEncodedMessage(frames, r.message, maxFrameSize); err != nil {
-				return true, err
+				return nil, err
 			}
 		}
 	}
-	if frames, err = appendStatusFrame(frames, r.status, maxFrameSize); err != nil {
-		return true, err
-	}
-	callBeforeStatus(beforeStatus)
-	_, err = writer.Write(frames)
-	return true, err
+	return appendStatusFrame(frames, r.status, maxFrameSize)
 }
 
-func (*unaryResponse) Close() error { return nil }
+// Close reports a call whose response was never written.
+func (r *unaryResponse) Close() error {
+	r.call.finish(callOutcome{code: CodeCancelled, err: errResponseClosed})
+	return nil
+}
 
 func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest, body []byte, lease *requestExecutionLease) *unaryResponse {
-	startedAt := time.Now()
+	call := callRecord{runtime: r, request: request, requestBodyLen: len(body), startedAt: time.Now()}
 	if request == nil {
 		r.recordStarted(RPCStarted{}, nil)
-		return r.finishResponse("", "", 0, startedAt, failedUnaryResponse(InvalidArgument("RPC request is nil")), nil, nil)
+		return call.failedUnary(InvalidArgument("RPC request is nil"), nil)
 	}
-	service, method := request.serviceAndMethod()
-	requestBodyLen := len(body)
-	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen}, request)
+	call.service, call.method = request.serviceAndMethod()
+	r.recordStarted(RPCStarted{Service: call.service, Method: call.method, RequestBodyLen: call.requestBodyLen}, request)
 
 	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
 	if err != nil {
-		return r.finishFailedResponse(ctx, service, method, requestBodyLen, startedAt, err, request)
+		return call.failedUnary(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
 	}
 	defer cancel()
 
 	route, ok := r.routes[request.Method]
 	if !ok || route.unary == nil {
-		return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(Unimplemented(fmt.Sprintf("unknown RPC method %s", request.Method))), nil, request)
+		return call.failedUnary(Unimplemented(fmt.Sprintf("unknown RPC method %s", request.Method)), nil)
 	}
 	message, err := invokeUnaryHandler(ctx, r.interceptUnary(route.unary, request), body, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
-		return r.finishFailedResponse(ctx, service, method, requestBodyLen, startedAt, err, request)
+		return call.failedUnary(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
 	}
-	return r.finishResponse(service, method, requestBodyLen, startedAt, successfulUnaryResponse(ctx, message, request), nil, request)
+	return call.successfulUnary(ctx, message)
 }
 
-func failedUnaryResponse(status *Status) *unaryResponse {
-	return &unaryResponse{status: status}
+// failedUnary is the response of a unary call that failed with status, and
+// with err if it has one.
+func (c callRecord) failedUnary(status *Status, err error) *unaryResponse {
+	return &unaryResponse{status: status, cause: failureCause(err, status), call: c}
 }
 
-// successfulUnaryResponse is the response of a unary handler that returned
-// message, with the response metadata it set through ctx.
-func successfulUnaryResponse(ctx context.Context, message encodedMessage, request *wireRequest) *unaryResponse {
+// successfulUnary is the response of a unary handler that returned message,
+// with the response metadata it set through ctx.
+func (c callRecord) successfulUnary(ctx context.Context, message encodedMessage) *unaryResponse {
 	response := responseMetadataFromContext(ctx)
 	headers := response.takeHeaders()
 	unary := &unaryResponse{
@@ -1230,29 +1272,51 @@ func successfulUnaryResponse(ctx context.Context, message encodedMessage, reques
 		message:    message,
 		hasMessage: true,
 		status:     okStatus(response.takeMetadata()),
+		call:       c,
 	}
-	unary.answer, unary.answered = request.answer()
+	unary.answer, unary.answered = c.request.answer()
 	return unary
 }
 
+// invokeUnaryHandler runs handler, racing it against ctx when raceContext is
+// set, so that a call that ends is not held up by a handler that does not
+// return.
 func invokeUnaryHandler(
 	ctx context.Context,
 	handler unaryHandler,
 	body []byte,
 	raceContext bool,
 	lease *requestExecutionLease,
-) (message encodedMessage, err error) {
-	if !raceContext {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				message = encodedMessage{}
-				err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
-			}
-		}()
-		return handler(ctx, body)
+) (encodedMessage, error) {
+	var message encodedMessage
+	var err error
+	if raceContext {
+		message, err = raceUnaryHandler(ctx, handler, body, lease)
+	} else {
+		message, err = callUnaryHandler(ctx, handler, body)
 	}
+	if err = afterHandler(ctx, err); err != nil {
+		return encodedMessage{}, err
+	}
+	return message, nil
+}
+
+// callUnaryHandler runs handler on the calling goroutine.
+func callUnaryHandler(ctx context.Context, handler unaryHandler, body []byte) (message encodedMessage, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			message = encodedMessage{}
+			err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
+		}
+	}()
+	return handler(ctx, body)
+}
+
+// raceUnaryHandler runs handler on a goroutine of its own and stops waiting
+// for it when ctx ends.
+func raceUnaryHandler(ctx context.Context, handler unaryHandler, body []byte, lease *requestExecutionLease) (encodedMessage, error) {
 	if err := ctx.Err(); err != nil {
-		return encodedMessage{}, statusFromContextError(err)
+		return encodedMessage{}, err
 	}
 
 	type unaryResult struct {
@@ -1263,24 +1327,16 @@ func invokeUnaryHandler(
 	execution := lease.retain(ServerDiagnosticHandlerPanic)
 	lease.goRun(func() {
 		defer execution.finish()
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				result <- unaryResult{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
-			}
-		}()
-		message, err := handler(ctx, body)
+		message, err := callUnaryHandler(ctx, handler, body)
 		result <- unaryResult{message: message, err: err}
 	})
 
 	select {
 	case result := <-result:
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return encodedMessage{}, statusFromContextError(ctxErr)
-		}
 		return result.message, result.err
 	case <-ctx.Done():
 		execution.detach()
-		return encodedMessage{}, statusFromContextError(ctx.Err())
+		return encodedMessage{}, ctx.Err()
 	}
 }
 
@@ -1288,21 +1344,20 @@ func invokeUnaryHandler(
 // message of a server-streaming call. On routes whose requests may be
 // stream-compressed, HEADERS go to writer before the handler runs.
 func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wireRequest, body []byte, requestBody byteStream, lease *requestExecutionLease, writer io.Writer) responseWriter {
-	startedAt := time.Now()
+	call := callRecord{runtime: r, request: request, requestBodyLen: len(body), startedAt: time.Now()}
 	if request == nil {
 		r.recordStarted(RPCStarted{}, nil)
 		lease.release()
-		return r.finishStreamingStatus("", "", 0, startedAt, InvalidArgument("RPC request is nil"), nil, nil)
+		return call.failedStatus(InvalidArgument("RPC request is nil"), nil)
 	}
-	service, method := request.serviceAndMethod()
-	requestBodyLen := len(body)
-	r.recordStarted(RPCStarted{Service: service, Method: method, RequestBodyLen: requestBodyLen}, request)
+	call.service, call.method = request.serviceAndMethod()
+	r.recordStarted(RPCStarted{Service: call.service, Method: call.method, RequestBodyLen: call.requestBodyLen}, request)
 
 	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
 	if err != nil {
 		cancel()
 		lease.release()
-		return r.finishFailedStreaming(ctx, service, method, requestBodyLen, startedAt, err, request)
+		return call.failedStatus(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
 	}
 
 	limits := streamLimitsFromOptions(r.options)
@@ -1312,12 +1367,12 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if !ok || route.streaming == nil {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, Unimplemented(fmt.Sprintf("unknown streaming RPC method %s", request.Method)), nil, request)
+		return call.failedStatus(Unimplemented(fmt.Sprintf("unknown streaming RPC method %s", request.Method)), nil)
 	}
 	if route.kind != request.rpcKind() {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s: expected %d, got %d", request.Method, route.kind, request.rpcKind())), nil, request)
+		return call.failedStatus(InvalidArgument(fmt.Sprintf("streaming RPC kind mismatch for %s: expected %d, got %d", request.Method, route.kind, request.rpcKind())), nil)
 	}
 	// Stream compression is negotiated once the call is authorized and
 	// routed, so that an unauthorized caller can neither probe routes nor
@@ -1328,7 +1383,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if refused {
 		cancel()
 		lease.release()
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, refusedStreamCompression(), nil, request)
+		return call.failedStatus(refusedStreamCompression(), nil)
 	}
 	request.streams = streams
 	setCallStreams(ctx, streams)
@@ -1341,7 +1396,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		if err := r.sendAnswerAtDispatch(writer, request); err != nil {
 			cancel()
 			lease.release()
-			return r.finishFailedStreaming(ctx, service, method, requestBodyLen, startedAt, err, request)
+			return call.failedStatus(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
 		}
 	}
 
@@ -1349,18 +1404,18 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if err != nil {
 		cancel()
 		lease.release()
-		return r.finishFailedStreaming(ctx, service, method, requestBodyLen, startedAt, err, request)
+		return call.failedStatus(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
 	}
 	if responses == nil {
 		cancel()
 		lease.release()
 		err := errors.New("handler returned nil response stream")
-		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Context: diagnosticContext(ctx, request), Service: service, Method: method, Kind: request.rpcKind(), Err: err})
-		return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, internalServerStatus(), err, request)
+		r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInvalidResponse, Context: diagnosticContext(ctx, request), Service: call.service, Method: call.method, Kind: request.rpcKind(), Err: err})
+		return call.failedStatus(internalServerStatus(), err)
 	}
 	responses = closeStreamOnContext(ctx, responses)
 	metadata := responseMetadataFromContext(ctx)
-	stream := &serverResponseStream{responses: responses, headers: metadata.takeHeaders(), answerDispatched: dispatched, metadata: metadata, runtime: r, request: request, flow: responseFlow(request, route), lease: lease, service: service, method: method, requestBodyLen: requestBodyLen, startedAt: startedAt, ctx: ctx, limits: limits, cancel: cancel}
+	stream := &serverResponseStream{callRecord: call, responses: responses, headers: metadata.takeHeaders(), answerDispatched: dispatched, metadata: metadata, flow: responseFlow(request, route), lease: lease, ctx: ctx, limits: limits, cancel: cancel}
 	if isNonBlockingStream(responses) {
 		// Such a stream is read where it is written, and drained in batches.
 		stream.receiver = newStreamReceiver(ctx, responses, limits.idleTimeout, "response", lease)
@@ -1368,6 +1423,12 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		stream.readAhead = newResponseReadAhead(ctx, responses, limits.idleTimeout, lease)
 	}
 	return stream
+}
+
+// failedStatus is the response of a streaming call that failed with status,
+// and with err if it has one, before it had a response.
+func (c callRecord) failedStatus(status *Status, err error) *statusResponse {
+	return &statusResponse{status: status, cause: failureCause(err, status), call: c}
 }
 
 // sendAnswerAtDispatch writes the ANSWER of a call whose requests may be
@@ -1409,18 +1470,36 @@ func invokeStreamingHandler(
 	requestBody byteStream,
 	raceContext bool,
 	lease *requestExecutionLease,
-) (responses encodedStream, err error) {
-	if !raceContext {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				responses = nil
-				err = &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}
-			}
-		}()
-		return handler(ctx, body, requestBody)
+) (encodedStream, error) {
+	var result streamingHandlerResult
+	if raceContext {
+		result = raceStreamingHandler(ctx, handler, body, requestBody, lease)
+	} else {
+		result = callStreamingHandler(ctx, handler, body, requestBody)
 	}
+	if err := afterHandler(ctx, result.err); err != nil {
+		discardMessageStream(result.responses)
+		return nil, err
+	}
+	return result.responses, nil
+}
+
+// callStreamingHandler runs handler on the calling goroutine.
+func callStreamingHandler(ctx context.Context, handler streamingHandler, body []byte, requestBody byteStream) (result streamingHandlerResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = streamingHandlerResult{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
+		}
+	}()
+	result.responses, result.err = handler(ctx, body, requestBody)
+	return result
+}
+
+// raceStreamingHandler runs handler on a goroutine of its own and stops
+// waiting for it when ctx ends.
+func raceStreamingHandler(ctx context.Context, handler streamingHandler, body []byte, requestBody byteStream, lease *requestExecutionLease) streamingHandlerResult {
 	if err := ctx.Err(); err != nil {
-		return nil, statusFromContextError(err)
+		return streamingHandlerResult{err: err}
 	}
 
 	result := make(chan streamingHandlerResult)
@@ -1431,15 +1510,7 @@ func invokeStreamingHandler(
 	// long-lived enough that a fresh stack costs it little.
 	go func() {
 		defer execution.finish()
-		resultValue := func() (result streamingHandlerResult) {
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					result = streamingHandlerResult{err: &serverPanicError{phase: ServerDiagnosticHandlerPanic, recovered: recovered, stack: debug.Stack()}}
-				}
-			}()
-			result.responses, result.err = handler(ctx, body, requestBody)
-			return result
-		}()
+		resultValue := callStreamingHandler(ctx, handler, body, requestBody)
 		select {
 		case result <- resultValue:
 		case <-abandoned:
@@ -1449,15 +1520,11 @@ func invokeStreamingHandler(
 
 	select {
 	case result := <-result:
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			discardMessageStream(result.responses)
-			return nil, statusFromContextError(ctxErr)
-		}
-		return result.responses, result.err
+		return result
 	case <-ctx.Done():
 		execution.detach()
 		close(abandoned)
-		return nil, statusFromContextError(ctx.Err())
+		return streamingHandlerResult{err: ctx.Err()}
 	}
 }
 
@@ -1555,21 +1622,21 @@ func invokeAuthorizer(ctx context.Context, authorizer Authorizer, info HandlerCo
 		result := invoke()
 		return result.ctx, result.err
 	}
-	if err := ctx.Err(); err != nil {
-		return ctx, statusFromContextError(err)
+	if ctx.Err() != nil {
+		return ctx, contextStatus(ctx)
 	}
 	results := make(chan authorizerResult, 1)
 	execution := lease.retain(ServerDiagnosticAuthorizerPanic)
 	lease.goRun(func() { defer execution.finish(); results <- invoke() })
 	select {
 	case result := <-results:
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctx, statusFromContextError(ctxErr)
+		if ctx.Err() != nil {
+			return ctx, contextStatus(ctx)
 		}
 		return result.ctx, result.err
 	case <-ctx.Done():
 		execution.detach()
-		return ctx, statusFromContextError(ctx.Err())
+		return ctx, contextStatus(ctx)
 	}
 }
 
@@ -1625,32 +1692,6 @@ func failureCause(err error, status *Status) error {
 	return nil
 }
 
-// finishResponse records the end of a unary call that ended with response, and
-// with err if it failed.
-func (r *serverRuntime) finishResponse(service, method string, requestBodyLen int, startedAt time.Time, response *unaryResponse, err error, request *wireRequest) *unaryResponse {
-	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: response.message.size, Code: response.status.Code, Err: failureCause(err, response.status), Elapsed: time.Since(startedAt)}, request)
-	return response
-}
-
-// finishFailedResponse is finishResponse for a unary call that ended with err,
-// whose STATUS wireStatus decides.
-func (r *serverRuntime) finishFailedResponse(ctx context.Context, service, method string, requestBodyLen int, startedAt time.Time, err error, request *wireRequest) *unaryResponse {
-	return r.finishResponse(service, method, requestBodyLen, startedAt, failedUnaryResponse(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request)), err, request)
-}
-
-// finishStreamingStatus records the end of a streaming call that ended with
-// status before it had a response, and with err if it failed.
-func (r *serverRuntime) finishStreamingStatus(service, method string, requestBodyLen int, startedAt time.Time, status *Status, err error, request *wireRequest) responseWriter {
-	r.finishStreamingResponse(service, method, requestBodyLen, 0, startedAt, status.Code, failureCause(err, status), request)
-	return statusResponse{status: status}
-}
-
-// finishFailedStreaming is finishStreamingStatus for a call that ended with
-// err, whose STATUS wireStatus decides.
-func (r *serverRuntime) finishFailedStreaming(ctx context.Context, service, method string, requestBodyLen int, startedAt time.Time, err error, request *wireRequest) responseWriter {
-	return r.finishStreamingStatus(service, method, requestBodyLen, startedAt, r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err, request)
-}
-
 func (r *serverRuntime) recordRejectedRequest(startedAt time.Time, request *wireRequest, requestBodyLen int, status *Status) {
 	r.recordRequestFailure(startedAt, request, requestBodyLen, status, nil)
 }
@@ -1659,7 +1700,8 @@ func (r *serverRuntime) recordRejectedRequest(startedAt time.Time, request *wire
 // with status, and err if it has one, before reaching a handler.
 func (r *serverRuntime) recordRequestFailure(startedAt time.Time, request *wireRequest, requestBodyLen int, status *Status, err error) {
 	r.recordStarted(RPCStarted{Service: requestService(request), Method: requestMethod(request), RequestBodyLen: requestBodyLen}, request)
-	r.finishStreamingResponse(requestService(request), requestMethod(request), requestBodyLen, 0, startedAt, status.Code, failureCause(err, status), request)
+	call := callRecord{runtime: r, request: request, service: requestService(request), method: requestMethod(request), requestBodyLen: requestBodyLen, startedAt: startedAt}
+	call.finish(callOutcome{code: status.Code, err: failureCause(err, status)})
 }
 
 // failRequest is recordRequestFailure for a call that failed with err, whose
@@ -1672,11 +1714,8 @@ func (r *serverRuntime) failRequest(ctx context.Context, startedAt time.Time, re
 
 func (r *serverRuntime) recordPreHandlerFailure(startedAt time.Time, status *Status) {
 	r.recordStarted(RPCStarted{}, nil)
-	r.finishStreamingResponse("", "", 0, 0, startedAt, status.Code, status, nil)
-}
-
-func (r *serverRuntime) finishStreamingResponse(service, method string, requestBodyLen, responseBodyLen int, startedAt time.Time, code Code, err error, request *wireRequest) {
-	r.recordFinished(RPCFinished{Service: service, Method: method, RequestBodyLen: requestBodyLen, ResponseBodyLen: responseBodyLen, Code: code, Err: err, Elapsed: time.Since(startedAt)}, request)
+	call := callRecord{runtime: r, startedAt: startedAt}
+	call.finish(callOutcome{code: status.Code, err: status})
 }
 
 func (r *serverRuntime) recordStarted(event RPCStarted, request *wireRequest) {
@@ -1742,11 +1781,14 @@ type limitedByteStream struct {
 	messages  int
 	bodySize  int
 	receiver  *streamReceiver[[]byte]
-	// mu guards done and stopCancelRead: Close may run on another goroutine
-	// than Recv, such as the one that closes the stream when ctx ends.
+	// mu guards done, err and stopCancelRead: Close may run on another
+	// goroutine than Recv, such as the one that closes the stream when ctx ends.
 	mu             sync.Mutex
 	stopCancelRead func()
 	done           bool
+	// err is how the stream ended, if it did before it was closed: every Recv
+	// after that returns it, so a failure is not mistaken for a clean end.
+	err error
 }
 
 func limitByteStream(ctx context.Context, inner byteStream, limits streamLimits, direction string, lease *requestExecutionLease, request *wireRequest) byteStream {
@@ -1760,18 +1802,18 @@ func limitByteStream(ctx context.Context, inner byteStream, limits streamLimits,
 }
 
 func (s *limitedByteStream) Recv() ([]byte, error) {
-	if s.isDone() {
-		return nil, io.EOF
+	if done, err := s.ended(); done {
+		return nil, err
 	}
 
 	body, err := s.receiver.recv()
 	if err != nil {
-		s.finish()
+		s.fail(err)
 		return nil, err
 	}
 
 	if err := checkStreamLimits(s.direction, s.limits, &s.messages, &s.bodySize, len(body)); err != nil {
-		s.finish()
+		s.fail(err)
 		return nil, err
 	}
 
@@ -1790,10 +1832,28 @@ func (s *limitedByteStream) trevrpcContextCancelsRecv() bool {
 	return s.limits.idleTimeout <= 0 && streamContextCancelsRecv(s.inner)
 }
 
-func (s *limitedByteStream) isDone() bool {
+// ended reports whether the stream ended, and the error Recv returns from then
+// on: how it ended, or io.EOF for a stream that was closed.
+func (s *limitedByteStream) ended() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.done
+	if !s.done {
+		return false, nil
+	}
+	if s.err != nil {
+		return true, s.err
+	}
+	return true, io.EOF
+}
+
+// fail ends the stream with err, which later calls of Recv return.
+func (s *limitedByteStream) fail(err error) {
+	s.mu.Lock()
+	if !s.done {
+		s.err = err
+	}
+	s.mu.Unlock()
+	s.finish()
 }
 
 // finish ends the stream and reports whether this call did.
@@ -1834,23 +1894,18 @@ func checkStreamLimits(direction string, limits streamLimits, messages, bodySize
 // read ahead by a goroutine (see responseReadAhead), and each write carries
 // all the messages that have queued by then.
 type serverResponseStream struct {
+	// callRecord reports the end of the call once its response was written.
+	callRecord
 	responses encodedStream
 	// headers go out before the first message, and metadata is where the
 	// trailing metadata of the final OK status comes from.
-	headers         Metadata
-	metadata        *responseMetadata
-	runtime         *serverRuntime
-	request         *wireRequest
-	lease           *requestExecutionLease
-	service         string
-	method          string
-	requestBodyLen  int
-	responseBodyLen int
-	startedAt       time.Time
-	ctx             context.Context
-	limits          streamLimits
-	messages        int
-	headersSent     bool
+	headers     Metadata
+	metadata    *responseMetadata
+	lease       *requestExecutionLease
+	ctx         context.Context
+	limits      streamLimits
+	messages    int
+	headersSent bool
 	// answerDispatched says the call's ANSWER, if any, went out before the
 	// handler ran.
 	answerDispatched bool
@@ -1907,7 +1962,22 @@ const maxRetainedWriteBuffer = 256 * 1024
 // a write of their own when pulling the first message may block. A write carries every
 // message that is ready, up to the batch limits and without waiting for more,
 // and the terminal STATUS joins the write of the last messages.
+//
+// The end of the call is reported once the write that ends the response
+// returned, or once a write failed.
 func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
+	done, err := s.write(ctx, writer, maxFrameSize, beforeStatus)
+	if err != nil {
+		// The response ends here, without the STATUS it was to have. This
+		// reports nothing if the failed write was the final one.
+		outcome := writeFailure(ctx, err)
+		s.release()
+		s.finish(outcome)
+	}
+	return done, err
+}
+
+func (s *serverResponseStream) write(ctx context.Context, writer io.Writer, maxFrameSize int, beforeStatus func()) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, err
 	}
@@ -1924,7 +1994,8 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 		}
 		var err error
 		if headers, err = s.headersFrames(maxFrameSize); err != nil {
-			return s.writeFinalFrames(writer, maxFrameSize, nil, nil, s.runtime.wireStatus(s.ctx, err, ServerDiagnosticInternalError, s.request), err, beforeStatus)
+			status, cause := s.failureStatus(err)
+			return s.writeFinalFrames(ctx, writer, maxFrameSize, nil, nil, status, cause, beforeStatus)
 		}
 		if headers != nil && (s.readAhead != nil || s.flow != nil) {
 			if _, err := writer.Write(headers); err != nil {
@@ -1969,7 +2040,10 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 			break
 		}
 		if item.message.size > maxFrameSize {
-			return true, &FrameTooLargeError{Len: item.message.size, Max: maxFrameSize}
+			// The messages before it are still sent, and then the call ends
+			// with the failure.
+			final, finalErr = s.failureStatus(&FrameTooLargeError{Len: item.message.size, Max: maxFrameSize})
+			break
 		}
 
 		batch = append(batch, item.message)
@@ -1986,7 +2060,7 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 	}
 
 	if final != nil {
-		return s.writeFinalFrames(writer, maxFrameSize, headers, batch, final, finalErr, beforeStatus)
+		return s.writeFinalFrames(ctx, writer, maxFrameSize, headers, batch, final, finalErr, beforeStatus)
 	}
 	switch {
 	case len(batch) == 0 && len(headers) == 0:
@@ -1999,11 +2073,28 @@ func (s *serverResponseStream) writeNext(ctx context.Context, writer io.Writer, 
 	return false, s.writeJoined(writer, headers, batch, nil, maxFrameSize, nil)
 }
 
+// failureStatus returns the STATUS a call ends with when err stopped its
+// response, and the error to report for it. A response that does not fit the
+// frame limit is ResourceExhausted, whatever it was that did not fit; any
+// other error is what wireStatus makes of it.
+func (s *serverResponseStream) failureStatus(err error) (*Status, error) {
+	if tooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
+		return s.oversizedResponseStatus(s.ctx, tooLarge), tooLarge
+	}
+	return s.runtime.wireStatus(s.ctx, err, ServerDiagnosticInternalError, s.request), err
+}
+
 // writeFinalFrames writes headers and messages followed by the terminal STATUS
-// and finishes the response, which ended with err if it failed.
-func (s *serverResponseStream) writeFinalFrames(writer io.Writer, maxFrameSize int, headers []byte, messages []encodedMessage, status *Status, err error, beforeStatus func()) (bool, error) {
-	s.finish(status.Code, failureCause(err, status))
-	return true, s.writeJoined(writer, headers, messages, status, maxFrameSize, beforeStatus)
+// and ends the response, which ended with cause if it failed. The response
+// releases what it holds, such as its lease, before the write, so that a
+// client that sees the call complete finds them free, and reports the end of
+// the call after it, so that a STATUS that did not go out is not reported as
+// one that did.
+func (s *serverResponseStream) writeFinalFrames(ctx context.Context, writer io.Writer, maxFrameSize int, headers []byte, messages []encodedMessage, status *Status, cause error, beforeStatus func()) (bool, error) {
+	s.release()
+	err := s.writeJoined(writer, headers, messages, status, maxFrameSize, beforeStatus)
+	s.finishWritten(ctx, status, cause, err)
+	return true, err
 }
 
 // writeJoined writes headers, messages and then status, if there is one, in
@@ -2048,14 +2139,17 @@ func (s *serverResponseStream) trevrpcContextCancelsRecv() bool {
 	return s.limits.idleTimeout <= 0 && streamContextCancelsRecv(s.responses)
 }
 
+// Close ends a response that was not written to its end, such as after a
+// failed write. The call is reported as the failure that is: the response
+// closed while its call was live, or the call's own end.
 func (s *serverResponseStream) Close() error {
-	if !s.done {
-		cause := s.ctx.Err()
-		if cause == nil {
-			cause = errResponseClosed
-		}
-		s.finish(CodeCancelled, cause)
+	var outcome callOutcome
+	if !s.reported {
+		// Before release cancels the call's context.
+		outcome = writeFailure(s.ctx, errResponseClosed)
 	}
+	s.release()
+	s.finish(outcome)
 	s.buffer = nil
 
 	return nil
@@ -2065,8 +2159,9 @@ func (s *serverResponseStream) Close() error {
 // finished while its call was still live, such as after a failed write.
 var errResponseClosed = errors.New("response closed before it finished")
 
-// finish ends the response, which ended with code, and err if it failed.
-func (s *serverResponseStream) finish(code Code, err error) {
+// release ends the response and frees what it holds: its streams, the call's
+// context and the lease. It is safe to call repeatedly.
+func (s *serverResponseStream) release() {
 	s.finishOnce.Do(func() {
 		s.done = true
 		// The receiver goes first, so it can tell a call the peer or a
@@ -2074,7 +2169,6 @@ func (s *serverResponseStream) finish(code Code, err error) {
 		s.closeReceiver()
 		s.cancel()
 		discardMessageStream(s.responses)
-		s.runtime.recordFinished(RPCFinished{Service: s.service, Method: s.method, RequestBodyLen: s.requestBodyLen, ResponseBodyLen: s.responseBodyLen, Code: code, Err: err, Elapsed: time.Since(s.startedAt)}, s.request)
 		s.lease.release()
 	})
 }

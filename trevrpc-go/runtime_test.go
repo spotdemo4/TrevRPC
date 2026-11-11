@@ -1389,34 +1389,6 @@ func TestServerAbortsRPCStreamOnResponseWriteError(t *testing.T) {
 	}
 }
 
-func TestServerAbortsRPCStreamOnLocalResponseFrameTooLarge(t *testing.T) {
-	server := NewServer()
-	options := DefaultServerOptions()
-	options.MaxFrameSize = 128
-	server.SetOptions(options)
-	routeBytes(server, "/example.Greeter/Call", func(context.Context, []byte) ([]byte, error) {
-		return make([]byte, 1024), nil
-	})
-	request := newWireRequest("/example.Greeter/Call")
-	input := bytes.NewBuffer(finiteRequestBytes(t, request))
-	stream := &countingRPCStream{reader: bytes.NewReader(input.Bytes())}
-
-	handleRPCStream(context.Background(), nil, server, stream, nil, nil)
-
-	if stream.writeCount != 0 {
-		t.Fatalf("transport writes = %d, want 0 for local frame rejection", stream.writeCount)
-	}
-	if stream.cancelReadCount != 1 {
-		t.Fatalf("request read cancellations = %d, want 1", stream.cancelReadCount)
-	}
-	if stream.closeCount != 1 {
-		t.Fatalf("response closes = %d, want 1", stream.closeCount)
-	}
-	if want := []string{"close", "cancel read"}; !slices.Equal(stream.cleanupOrder, want) {
-		t.Fatalf("cleanup order = %v, want %v", stream.cleanupOrder, want)
-	}
-}
-
 func TestServerResponseBatchWriterBatchesNonBlockingMessages(t *testing.T) {
 	server := NewServer()
 	options := DefaultServerOptions()

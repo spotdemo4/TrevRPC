@@ -37,8 +37,8 @@ func requestReadStatus(ctx context.Context, err error) error {
 		return status
 	}
 	if ctx != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return statusFromContextError(ctxErr)
+		if ctx.Err() != nil {
+			return contextStatus(ctx)
 		}
 	}
 	if resetByPeer(err) {

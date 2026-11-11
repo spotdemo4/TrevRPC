@@ -88,13 +88,13 @@ func (r *streamReceiver[T]) phase() ServerDiagnosticPhase {
 // with itself.
 func (r *streamReceiver[T]) recv() (T, error) {
 	var zero T
-	if err := r.ctx.Err(); err != nil {
-		return zero, statusFromContextError(err)
+	if r.ctx.Err() != nil {
+		return zero, contextStatus(r.ctx)
 	}
 	if r.inline {
 		body, err := recvByte(r.stream, r.direction)
-		if ctxErr := r.ctx.Err(); ctxErr != nil {
-			return zero, statusFromContextError(ctxErr)
+		if r.ctx.Err() != nil {
+			return zero, contextStatus(r.ctx)
 		}
 		return body, err
 	}
@@ -115,19 +115,19 @@ func (r *streamReceiver[T]) recv() (T, error) {
 		if idle != nil {
 			r.timer.Stop()
 		}
-		if ctxErr := r.ctx.Err(); ctxErr != nil {
-			return zero, statusFromContextError(ctxErr)
+		if r.ctx.Err() != nil {
+			return zero, contextStatus(r.ctx)
 		}
 		return result.value, result.err
 	case <-r.ctx.Done():
-		return zero, r.abandon(execution, statusFromContextError(r.ctx.Err()))
+		return zero, r.abandon(execution, contextStatus(r.ctx))
 	case <-idle:
 		return zero, r.abandon(execution, Unavailable(fmt.Sprintf("%s stream idle timeout", r.direction)))
 	case <-r.done:
 		// Closed while receiving.
 		r.withdraw(execution)
-		if ctxErr := r.ctx.Err(); ctxErr != nil {
-			return zero, statusFromContextError(ctxErr)
+		if r.ctx.Err() != nil {
+			return zero, contextStatus(r.ctx)
 		}
 		return zero, io.EOF
 	}
