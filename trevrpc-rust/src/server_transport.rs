@@ -1,21 +1,25 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
+use crate::call_completion::CallCompletion;
 use crate::compression::{self, Accept, MessageEncoder, ServerCall, ServerStream};
 use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::{Demux, FlowSender, MergedRequests, MessageCount, ServerFlow};
 use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, ResponseCodec};
 use crate::request_pump::{
-    RequestInputKind, RequestPumpReader, RequestPumpSettle, UnaryRequestEnd, start_request_pump,
+    RequestInputKind, RequestPumpFailure, RequestPumpReader, RequestPumpSettle, UnaryRequestEnd,
+    start_request_pump,
 };
 use crate::serve::unless_shutting_down;
 use crate::server::{
-    Admitted, CallInfo, CancellationSource, CancellationToken, RequestBudget, Server,
+    Admitted, CallInfo, CancellationSource, CancellationToken, RequestBudget, Server, wire_status,
 };
 use crate::{
     Code, Error, Metadata, ResponseEnvelope, ResponseFrame, Result, RpcAnswer, RpcKind, RpcRequest,
@@ -205,6 +209,10 @@ where
 /// keeps its arguments twice in its future, as arguments and as the locals they move into, and
 /// this future is moved into a task for every stream.
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the slots and the call are moved on and end with the call, whichever way it ends"
+)]
 pub fn handle_stream<W, R>(
     server: Server,
     request_limit: Option<Arc<Semaphore>>,
@@ -212,7 +220,7 @@ pub fn handle_stream<W, R>(
     mut send: W,
     mut recv: R,
     incoming: IncomingRequest,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> impl Future<Output = ()>
 where
     W: ResponseWriter,
@@ -308,64 +316,42 @@ where
             return;
         }
 
-        let method_for_failure = request.method.clone();
+        let completion = server.start_call(&request, request_body_len, &cancellation, false);
         let info = CallInfo {
             plain_compressed: budget.accept.plain_count(),
             remote_addr,
             ..CallInfo::default()
         };
         let mut request_end = UnaryRequestEnd::new(recv, server.max_frame_size(), budget);
+        let mut call = Call::new(send, slots, completion, cancellation.clone(), shutdown);
         let response = tokio::select! {
             biased;
-            response = server.handle_request_with_cancellation(request, body, cancellation.clone(), info) => response,
+            response = server.handle_request_with_cancellation(request, body, cancellation, info, &mut call.completion) => response,
             failure = request_end.failure() => {
-                server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
-                if let Some(source) = failure.cancellation_source() {
-                    cancellation.cancel(source);
-                }
-                if !failure.response_writable() {
-                    slots.release();
-                    send.reset();
-                    request_end.settle(RequestPumpSettle::ResponseStopped);
+                if let Some(settle) = call.fail_request(&failure) {
+                    request_end.settle(settle);
                     return;
                 }
                 Err(failure.status().clone())
             },
-            stopped = send.stopped() => {
-                slots.release();
-                cancellation.cancel(if stopped.is_ok() {
-                    CancellationSource::PeerReset
-                } else {
-                    CancellationSource::ConnectionLost
-                });
-                request_end.settle(RequestPumpSettle::ResponseStopped);
-                tracing::debug!("client stopped response stream before RPC completed");
+            stopped = call.send.stopped() => {
+                request_end.settle(call.response_stopped(&stopped));
                 return;
             }
-            changed = shutdown.changed() => {
-                let _ = changed;
-                cancellation.cancel(CancellationSource::ServerShutdown);
-                // Never end a response without its STATUS: the client sees a cancelled call.
-                slots.release();
-                send.reset();
-                request_end.settle(RequestPumpSettle::ServerShutdown);
+            _ = call.shutdown.changed() => {
+                request_end.settle(call.shut_down());
                 return;
             }
         };
 
         let mut frames = unary_response_frames(response);
         // The STATUS ends the call from the client's point of view.
-        drop(slots);
-        match send.write_frames(&mut frames).await {
-            Ok(()) => {
-                let _ = send.finish().await;
-                request_end.settle(RequestPumpSettle::ResponseCommitted);
-            }
-            Err(error) => {
-                cancel_from_transport_error(&cancellation, &error);
-                request_end.settle(RequestPumpSettle::ConnectionLost);
-            }
-        }
+        call.slots.release();
+        let settle = match call.write(&mut frames, None).await {
+            Ok(()) => call.end().await,
+            Err(settle) => settle,
+        };
+        request_end.settle(settle);
     }
 }
 
@@ -384,7 +370,7 @@ fn unary_response_frames(
             frames.push(ResponseFrame::Status(Status::ok().with_metadata(metadata)));
             frames
         }
-        Err(status) => vec![ResponseFrame::Status(status)],
+        Err(status) => vec![ResponseFrame::Status(wire_status(status))],
     }
 }
 
@@ -484,6 +470,270 @@ where
     }
 }
 
+/// Why a write or finish gave up before it completed.
+enum Interruption {
+    /// The call's deadline passed.
+    Deadline,
+    /// The server began shutting down.
+    Shutdown,
+}
+
+/// How a write ended without completing.
+enum Stopped {
+    Failed(Error),
+    Interrupted(Interruption),
+}
+
+/// What serving one call owns, and how every way it can end leaves it.
+///
+/// The call's response is open until it is finished after its STATUS, or reset. Whatever else
+/// ends the call, including a task that is dropped or aborted, resets it: dropping a stream
+/// would finish it cleanly instead, and the client would take the missing STATUS for a protocol
+/// error. Every method that ends the call without writing a STATUS returns how the request side
+/// is to be settled.
+struct Call<W: ResponseWriter> {
+    send: W,
+    slots: StreamSlots,
+    /// Reports the end of the call; it outlives the handler, which the call may end inside.
+    completion: CallCompletion,
+    cancellation: CancellationToken,
+    shutdown: watch::Receiver<bool>,
+    /// The timer of the call's deadline, made the first time a write has to wait for it.
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// The response has been finished or reset.
+    closed: bool,
+}
+
+impl<W: ResponseWriter> Call<W> {
+    fn new(
+        send: W,
+        slots: StreamSlots,
+        mut completion: CallCompletion,
+        cancellation: CancellationToken,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
+        // The call is reported once its response has gone out, or has not.
+        completion.report_after_write();
+        Self {
+            send,
+            slots,
+            completion,
+            cancellation,
+            shutdown,
+            deadline: None,
+            closed: false,
+        }
+    }
+
+    /// Ends a call that `source` cancelled, if one did, without a STATUS: its slots are given
+    /// back first, then its response is reset, and the completion reports the cancellation unless
+    /// the call had ended already.
+    fn abandon(
+        &mut self,
+        source: Option<CancellationSource>,
+        settle: RequestPumpSettle,
+    ) -> RequestPumpSettle {
+        if let Some(source) = source {
+            self.cancellation.cancel(source);
+        }
+        self.slots.release();
+        self.send.reset();
+        self.closed = true;
+        self.completion.cancelled();
+        settle
+    }
+
+    /// Ends the call because the client stopped reading its response, or the connection was lost.
+    fn response_stopped(&mut self, stopped: &Result<()>) -> RequestPumpSettle {
+        tracing::debug!("client stopped the response stream before the RPC completed");
+        let source = if stopped.is_ok() {
+            CancellationSource::PeerReset
+        } else {
+            CancellationSource::ConnectionLost
+        };
+        self.abandon(Some(source), RequestPumpSettle::ResponseStopped)
+    }
+
+    /// Ends the call because the server is shutting down. The client sees a cancelled call: a
+    /// response never ends without its STATUS or a reset.
+    fn shut_down(&mut self) -> RequestPumpSettle {
+        self.abandon(
+            Some(CancellationSource::ServerShutdown),
+            RequestPumpSettle::ServerShutdown,
+        )
+    }
+
+    fn interrupted(&mut self, interruption: &Interruption) -> RequestPumpSettle {
+        match interruption {
+            Interruption::Deadline => {
+                tracing::debug!("RPC deadline passed while the response was being sent");
+                self.abandon(
+                    Some(CancellationSource::Deadline),
+                    RequestPumpSettle::ResponseStopped,
+                )
+            }
+            Interruption::Shutdown => self.shut_down(),
+        }
+    }
+
+    /// Ends the call because its request side failed. Returns how to settle the request side if
+    /// the response can no longer be written, and `None` if the caller is to answer with the
+    /// failure's status.
+    fn fail_request(&mut self, failure: &RequestPumpFailure) -> Option<RequestPumpSettle> {
+        if failure.response_writable() {
+            self.completion.conclude(Some(failure.status()));
+            return None;
+        }
+        self.completion.finish(Some(failure.status()));
+        Some(self.abandon(
+            failure.cancellation_source(),
+            RequestPumpSettle::ResponseStopped,
+        ))
+    }
+
+    async fn select_write(
+        &mut self,
+        frames: &mut Vec<ResponseFrame>,
+        datagrams: Option<&mut ResponseDatagrams>,
+    ) -> std::result::Result<(), Stopped> {
+        let Self {
+            send,
+            completion,
+            cancellation,
+            shutdown,
+            deadline,
+            ..
+        } = self;
+        let write = async {
+            match datagrams {
+                Some(datagrams) => datagrams.write(send, frames, cancellation).await,
+                None => send.write_frames(frames).await,
+            }
+        };
+        match until_interrupted(write, deadline, completion.deadline(), shutdown).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Stopped::Failed(error)),
+            Err(interruption) => Err(Stopped::Interrupted(interruption)),
+        }
+    }
+
+    /// Writes `frames`, draining them. Fails with how to settle the request side once the call
+    /// has ended: the write was interrupted, or the transport failed, or `frames` could not be
+    /// sent and a lone STATUS said so instead.
+    async fn write(
+        &mut self,
+        frames: &mut Vec<ResponseFrame>,
+        datagrams: Option<&mut ResponseDatagrams>,
+    ) -> std::result::Result<(), RequestPumpSettle> {
+        match self.select_write(frames, datagrams).await {
+            Ok(()) => Ok(()),
+            Err(Stopped::Failed(error)) if error.transport_code().is_none() => {
+                Err(self.answer_unsendable(&error).await)
+            }
+            Err(stopped) => Err(self.end_after_failed_write(stopped)),
+        }
+    }
+
+    /// Ends the call after a write that did not complete, which no STATUS follows.
+    fn end_after_failed_write(&mut self, stopped: Stopped) -> RequestPumpSettle {
+        match stopped {
+            Stopped::Failed(error) => {
+                cancel_from_transport_error(&self.cancellation, &error);
+                self.completion.cancelled();
+                RequestPumpSettle::ConnectionLost
+            }
+            Stopped::Interrupted(interruption) => self.interrupted(&interruption),
+        }
+    }
+
+    /// Ends a call whose frames cannot be sent, as an oversized message cannot, with a lone STATUS
+    /// that says why, in place of the clean end of stream that would look to the client like a
+    /// protocol error.
+    ///
+    /// The server checks what it can before it reports the call as ended, so this is for what it
+    /// missed. If the completion has reported the call already, that report stands.
+    async fn answer_unsendable(&mut self, error: &Error) -> RequestPumpSettle {
+        let status = error.status();
+        tracing::error!(%error, "a response frame cannot be sent; ending the call with a lone STATUS");
+        self.completion.finish(Some(&status));
+        let mut frames = vec![ResponseFrame::Status(wire_status(status))];
+        match self.select_write(&mut frames, None).await {
+            Ok(()) => self.end().await,
+            Err(stopped) => self.end_after_failed_write(stopped),
+        }
+    }
+
+    /// Finishes the response after its STATUS, and returns how to settle the request side.
+    async fn end(&mut self) -> RequestPumpSettle {
+        let Self {
+            send,
+            completion,
+            shutdown,
+            deadline,
+            ..
+        } = self;
+        let finish = async {
+            let _ = send.finish().await;
+        };
+        match until_interrupted(finish, deadline, completion.deadline(), shutdown).await {
+            Ok(()) => {
+                self.closed = true;
+                // Only now has the call's outcome gone out.
+                self.completion.commit();
+                RequestPumpSettle::ResponseCommitted
+            }
+            Err(interruption) => self.interrupted(&interruption),
+        }
+    }
+}
+
+impl<W: ResponseWriter> Drop for Call<W> {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.send.reset();
+        }
+    }
+}
+
+/// Runs `operation` on a call's response unless the call's `deadline` passes or the server begins
+/// shutting down first.
+///
+/// The operation is polled first, so the other two cost nothing while it makes progress, and the
+/// deadline's timer is made once, and only for a call that has to wait. A peer that stops reading
+/// fails the operation itself, on every transport, so it needs no arm of its own.
+async fn until_interrupted<T>(
+    operation: impl Future<Output = T>,
+    timer: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    deadline: Option<Instant>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> std::result::Result<T, Interruption> {
+    tokio::select! {
+        biased;
+        output = operation => Ok(output),
+        () = deadline_elapsed(timer, deadline) => Err(Interruption::Deadline),
+        _ = shutdown.changed() => Err(Interruption::Shutdown),
+    }
+}
+
+/// Resolves when `deadline` passes, never without one. The timer lives in `timer`, so a later wait
+/// continues with it.
+async fn deadline_elapsed(
+    timer: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    deadline: Option<Instant>,
+) {
+    let Some(deadline) = deadline else {
+        return std::future::pending().await;
+    };
+    timer
+        .get_or_insert_with(|| {
+            Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline,
+            )))
+        })
+        .as_mut()
+        .await;
+}
+
 /// Frames pulled from a handler's response stream, written together.
 struct ResponseBatch {
     frames: Vec<ResponseFrame>,
@@ -492,14 +742,18 @@ struct ResponseBatch {
 }
 
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the call ends with the function, whichever way it ends"
+)]
 async fn handle_streaming_rpc<W, R>(
     server: Server,
-    mut slots: StreamSlots,
-    mut send: W,
+    slots: StreamSlots,
+    send: W,
     recv: R,
     incoming: IncomingRequest,
     cancellation: CancellationToken,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) where
     W: ResponseWriter,
     R: RequestPumpReader,
@@ -515,18 +769,17 @@ async fn handle_streaming_rpc<W, R>(
         connection_metadata: _,
         remote_addr,
     } = incoming;
+    let completion = server.start_call(&request, body.len(), &cancellation, true);
+    let mut call = Call::new(send, slots, completion, cancellation.clone(), shutdown);
     // Calls whose requests may be stream-compressed get their ANSWER at dispatch, before any
     // request message is read, so the client learns it while it still streams. Other calls get
     // theirs with their first response frames.
     if server.answers_at_dispatch(&request.method)
-        && let Err(error) = send.write_frames(&mut Vec::new()).await
+        && call.write(&mut Vec::new(), None).await.is_err()
     {
-        cancel_from_transport_error(&cancellation, &error);
         return;
     }
     let max_frame_size = server.max_frame_size();
-    let request_body_len = body.len();
-    let method_for_failure = request.method.clone();
     let plain_compressed = budget.accept.plain_count();
     let (request_body, mut request_pump) = start_request_pump(
         recv,
@@ -561,45 +814,30 @@ async fn handle_streaming_rpc<W, R>(
             body,
             request_body,
             admitted,
-            cancellation.clone(),
+            cancellation,
             CallInfo {
                 datagrams: datagram_count,
                 stream_compressed: stream.count,
                 plain_compressed,
                 remote_addr,
             },
+            &mut call.completion,
         ) => response,
         failure = request_pump.failure() => {
-            server.record_active_request_failure(&method_for_failure, request_body_len, failure.status());
-            if let Some(source) = failure.cancellation_source() {
-                cancellation.cancel(source);
-            }
-            if !failure.response_writable() {
-                slots.release();
-                send.reset();
-                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
+            if let Some(settle) = call.fail_request(&failure) {
+                let _ = request_pump.settle(settle).await;
                 return;
             }
             crate::stream::from_iter([ResponseFrame::Status(failure.status().clone())])
         },
-        stopped = send.stopped() => {
-            slots.release();
-            cancellation.cancel(if stopped.is_ok() {
-                CancellationSource::PeerReset
-            } else {
-                CancellationSource::ConnectionLost
-            });
-            let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-            tracing::debug!("client stopped response stream before streaming RPC handler completed");
+        stopped = call.send.stopped() => {
+            let settle = call.response_stopped(&stopped);
+            let _ = request_pump.settle(settle).await;
             return;
         }
-        changed = shutdown.changed() => {
-            let _ = changed;
-            cancellation.cancel(CancellationSource::ServerShutdown);
-            // Never end a response without its STATUS: the client sees a cancelled call.
-            slots.release();
-            send.reset();
-            let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
+        _ = call.shutdown.changed() => {
+            let settle = call.shut_down();
+            let _ = request_pump.settle(settle).await;
             return;
         }
     };
@@ -608,87 +846,52 @@ async fn handle_streaming_rpc<W, R>(
         frames: Vec::with_capacity(MESSAGE_FRAME_BATCH),
         terminal: false,
     };
-    loop {
+    let settle = loop {
         let frame = tokio::select! {
             biased;
             failure = request_pump.failure() => {
-                cancellation.set_completion_code(failure.status().code());
-                if let Some(source) = failure.cancellation_source() {
-                    cancellation.cancel(source);
-                }
-                if !failure.response_writable() {
-                    slots.release();
-                    send.reset();
-                    let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-                    return;
+                if let Some(settle) = call.fail_request(&failure) {
+                    break settle;
                 }
                 Some(Ok(ResponseFrame::Status(failure.status().clone())))
             },
             frame = response.next() => frame,
-            stopped = send.stopped() => {
-                slots.release();
-                cancellation.cancel(if stopped.is_ok() {
-                    CancellationSource::PeerReset
-                } else {
-                    CancellationSource::ConnectionLost
-                });
-                let _ = request_pump.settle(RequestPumpSettle::ResponseStopped).await;
-                tracing::debug!("client stopped response stream before streaming RPC completed");
-                return;
-            }
-            changed = shutdown.changed() => {
-                let _ = changed;
-                cancellation.cancel(CancellationSource::ServerShutdown);
-                // Never end a response without its STATUS: the client sees a cancelled call.
-                slots.release();
-                send.reset();
-                let _ = request_pump.settle(RequestPumpSettle::ServerShutdown).await;
-                return;
-            }
+            stopped = call.send.stopped() => break call.response_stopped(&stopped),
+            _ = call.shutdown.changed() => break call.shut_down(),
         };
 
-        let Some(frame) = frame else {
-            slots.release();
-            break;
-        };
-
+        // A response stream always ends with its STATUS; one that does not still gets one.
+        let frame = frame.unwrap_or_else(|| {
+            Err(Error::from(Status::internal(
+                "response stream ended without a STATUS",
+            )))
+        });
         batch.terminal = false;
-        push_response_frame(&mut batch, frame);
+        push_response_frame(&mut batch, &mut call.completion, frame);
         // Frames that are ready now go out in the same write; a frame that is not ready never
         // delays the ones before it.
         while !batch.terminal && batch.frames.len() < MESSAGE_FRAME_BATCH {
             match response.next().now_or_never() {
-                Some(Some(frame)) => push_response_frame(&mut batch, frame),
+                Some(Some(frame)) => push_response_frame(&mut batch, &mut call.completion, frame),
                 Some(None) | None => break,
             }
         }
 
         if batch.terminal {
             // The STATUS ends the call from the client's point of view.
-            slots.release();
+            call.slots.release();
         }
-        let written = match &mut datagram_responses {
-            Some(datagrams) => {
-                datagrams
-                    .write(&mut send, &mut batch.frames, &cancellation)
-                    .await
-            }
-            None => send.write_frames(&mut batch.frames).await,
-        };
-        if let Err(error) = written {
-            cancel_from_transport_error(&cancellation, &error);
-            let _ = request_pump.settle(RequestPumpSettle::ConnectionLost).await;
-            return;
+        if let Err(settle) = call
+            .write(&mut batch.frames, datagram_responses.as_mut())
+            .await
+        {
+            break settle;
         }
         if batch.terminal {
-            break;
+            break call.end().await;
         }
-    }
-
-    let _ = send.finish().await;
-    let _ = request_pump
-        .settle(RequestPumpSettle::ResponseCommitted)
-        .await;
+    };
+    let _ = request_pump.settle(settle).await;
 }
 
 /// Sends a call's response messages as datagrams where they fit, and the rest on the stream.
@@ -772,9 +975,14 @@ impl ResponseDatagrams {
     }
 }
 
-/// Adds a frame to a batch; a failed response stream becomes the terminal STATUS.
-fn push_response_frame(batch: &mut ResponseBatch, frame: Result<ResponseFrame>) {
-    let frame = frame.unwrap_or_else(|error| ResponseFrame::Status(error.into_status()));
+/// Adds a frame to a batch. The completion takes the frame first: a failed response stream
+/// becomes the terminal STATUS, which ends the call.
+fn push_response_frame(
+    batch: &mut ResponseBatch,
+    completion: &mut CallCompletion,
+    frame: Result<ResponseFrame>,
+) {
+    let frame = completion.frame(frame);
     batch.terminal = frame.is_status();
     batch.frames.push(frame);
 }

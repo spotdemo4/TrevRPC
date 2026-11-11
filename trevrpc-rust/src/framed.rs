@@ -805,10 +805,40 @@ pub async fn read_exact_or_eof<R: FrameRead>(recv: &mut R, buf: &mut [u8]) -> Re
 }
 
 pub fn unexpected_eof() -> Error {
-    Error::transport(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "stream ended in the middle of a frame",
-    ))
+    Error::transport(io::Error::new(io::ErrorKind::UnexpectedEof, TruncatedFrame))
+}
+
+/// The source of the `UnexpectedEof` error of a stream that ended in the middle of a frame, which
+/// tells it from an `UnexpectedEof` of the transport.
+#[derive(Debug)]
+struct TruncatedFrame;
+
+impl std::fmt::Display for TruncatedFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stream ended in the middle of a frame")
+    }
+}
+
+impl std::error::Error for TruncatedFrame {}
+
+/// Reports a request stream that its peer finished in the middle of a frame as what it is, a
+/// protocol error of the client on a connection that is still up, rather than as the transport
+/// failure that [`unexpected_eof`] stands for. Other errors pass.
+pub fn request_read_error(error: Error) -> Error {
+    let truncated = match &error {
+        Error::Transport(source) => source
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .is_some_and(<dyn std::error::Error + Send + Sync>::is::<TruncatedFrame>),
+        _ => false,
+    };
+    if truncated {
+        Error::from(Status::invalid_argument(
+            "request stream ended in the middle of a frame",
+        ))
+    } else {
+        error
+    }
 }
 
 impl FrameWrite for crate::quic::QuicSendStream {

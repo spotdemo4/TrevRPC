@@ -688,6 +688,7 @@ where
 }
 
 fn classify_error(error: Error) -> RequestPumpFailure {
+    let error = framed::request_read_error(error);
     let failure_kind = transport_failure_kind(&error);
     let status = error.into_status();
     match failure_kind {
@@ -1536,14 +1537,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_ending_inside_a_frame_header_is_a_connection_failure() {
+    async fn stream_ending_inside_a_frame_header_is_a_protocol_error() {
         let mut io = test_io(None);
         io.writer.write_all(&[0x00]).await.unwrap();
         io.writer.shutdown().await.unwrap();
         let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
 
+        // The client finished the stream: it broke the protocol on a connection that is up, so
+        // the call can still be answered, and nothing was lost.
         let failure = pump.failure().await;
-        assert_eq!(failure.status().code(), Code::Unavailable);
+        assert!(
+            matches!(failure, RequestPumpFailure::Protocol(_)),
+            "{failure:?}"
+        );
+        assert_eq!(failure.status().code(), Code::InvalidArgument);
+        assert!(failure.cancellation_source().is_none());
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
     }
 }

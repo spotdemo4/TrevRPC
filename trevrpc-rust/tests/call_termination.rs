@@ -12,8 +12,8 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
 use tokio::sync::oneshot;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{
     CallOptions, ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport,
@@ -91,6 +91,9 @@ impl greeter::Greeter for Greeter {
 /// Method of a server-streaming route that sends one reply and then never ends.
 const HOLD: &str = "Hold";
 
+/// Method of a server-streaming route that sends messages for as long as the client takes them.
+const FLOOD: &str = "Flood";
+
 /// Method of a route that ends a call with `PermissionDenied` without reading its requests.
 const REJECT: &str = "Reject";
 
@@ -104,6 +107,18 @@ fn register_routes(server: &mut Server) {
                 trevrpc::stream::from_iter([reply]).chain(futures_util::stream::pending()),
             );
             Ok(replies)
+        },
+    );
+    server.route_streaming(
+        support::greeter_path(FLOOD),
+        RpcKind::ServerStreaming,
+        |_body, _requests| async {
+            let message = prost::Message::encode_to_vec(&greeter::HelloReply {
+                message: "x".repeat(32 * 1024),
+            });
+            Ok(trevrpc::stream::from_iter(std::iter::repeat_with(
+                move || message.clone(),
+            )))
         },
     );
     for (method, kind) in [
@@ -855,6 +870,60 @@ impl Interceptor for PendingInterceptor {
     }
 }
 
+/// What [`connect`] returns: the client endpoint of a QUIC connection, the transport, and a
+/// function that closes the connection.
+type Connected = (
+    Option<quinn::Endpoint>,
+    Arc<dyn StreamingRpcTransport>,
+    Box<dyn FnOnce()>,
+);
+
+/// Connects to `server` over `wire`.
+async fn connect(wire: Wire, server: &RunningServer) -> TestResult<Connected> {
+    Ok(match wire {
+        Wire::Quic => {
+            let (endpoint, quic) = connect_quic(server).await?;
+            let connection = quic.connection().clone();
+            let close = Box::new(move || connection.close(0_u32.into(), b"done"));
+            (Some(endpoint), Arc::new(quic), close)
+        }
+        Wire::Qmux => {
+            let qmux = connect_qmux(server).await?;
+            let closing = qmux.clone();
+            (None, Arc::new(qmux), Box::new(move || closing.close()))
+        }
+    })
+}
+
+/// Sends the code of every call that ended, from the finish function it returns.
+struct RecordingInterceptor {
+    finished: mpsc::UnboundedSender<Code>,
+}
+
+#[trevrpc::async_trait]
+impl Interceptor for RecordingInterceptor {
+    async fn intercept(&self, _context: &mut RequestContext) -> Result<Option<Finish>, Status> {
+        let finished = self.finished.clone();
+        Ok(Some(Box::new(move |event| {
+            let _ = finished.send(event.code);
+        })))
+    }
+}
+
+/// Waits for the next call to be reported as finished, and checks that it ended with one of
+/// `expected`.
+async fn expect_finish(
+    finishes: &mut mpsc::UnboundedReceiver<Code>,
+    expected: &[Code],
+) -> TestResult {
+    let code = tokio::time::timeout(TEST_TIMEOUT, finishes.recv())
+        .await
+        .map_err(|_| "the finish function never ran")?
+        .ok_or("the interceptor was dropped without reporting")?;
+    ensure!(expected.contains(&code), "finished with {code:?}");
+    Ok(())
+}
+
 /// How a call waiting in an interceptor ends.
 #[derive(Clone, Copy, Debug)]
 enum Ending {
@@ -864,7 +933,8 @@ enum Ending {
 }
 
 /// Starts a call without a deadline that waits in an interceptor forever, ends it as `ending`
-/// says, and checks that the server drops the interceptor's future.
+/// says, and checks that the server drops the interceptor's future and that the finish function
+/// of the interceptor before it, which had returned, still hears of the end.
 async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
     let entered = Arc::new(Notify::new());
     let dropped = Arc::new(Notify::new());
@@ -872,24 +942,14 @@ async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
         entered: Arc::clone(&entered),
         dropped: Arc::clone(&dropped),
     };
+    let (report, mut reports) = mpsc::unbounded_channel();
+    let recording = RecordingInterceptor { finished: report };
     let server = spawn_server_with(ServerOptions::new(), |server| {
+        server.add_interceptor(recording);
         server.add_interceptor(interceptor);
     })
     .await?;
-    let (endpoint, transport, close): (_, Arc<dyn StreamingRpcTransport>, Box<dyn FnOnce()>) =
-        match wire {
-            Wire::Quic => {
-                let (endpoint, quic) = connect_quic(&server).await?;
-                let connection = quic.connection().clone();
-                let close = Box::new(move || connection.close(0_u32.into(), b"done"));
-                (Some(endpoint), Arc::new(quic), close)
-            }
-            Wire::Qmux => {
-                let qmux = connect_qmux(&server).await?;
-                let closing = qmux.clone();
-                (None, Arc::new(qmux), Box::new(move || closing.close()))
-            }
-        };
+    let (endpoint, transport, close) = connect(wire, &server).await?;
     let call = tokio::spawn(async move {
         greeter::GreeterClient::new(transport)
             .say_hello(&name(0))
@@ -913,6 +973,8 @@ async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
                 close();
             }
             ended().await?;
+            // The call is reported once, with what ended it, though its handler never ran.
+            expect_finish(&mut reports, &[Code::Cancelled, Code::Unavailable]).await?;
             if let Some(endpoint) = endpoint {
                 endpoint.close(0_u32.into(), b"done");
             }
@@ -921,6 +983,7 @@ async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
         Ending::ServerShutsDown => {
             server.stop().await?;
             ended().await?;
+            expect_finish(&mut reports, &[Code::Unavailable]).await?;
             let status = within!(TEST_TIMEOUT, call)??
                 .err()
                 .ok_or("a call the server shut down on should fail")?
@@ -965,3 +1028,106 @@ interceptor_wait_ends_over_each_transport!(
     an_interceptor_wait_ends_when_the_server_shuts_down,
     Ending::ServerShutsDown
 );
+
+/// Starts a call of the flood route that nothing reads, so that the server's writes run out of
+/// flow control while the connection stays up. The call has a deadline of `timeout`, if any.
+/// Returns its response, which the caller holds.
+async fn stalled_flood(
+    transport: &dyn StreamingRpcTransport,
+    timeout: Duration,
+) -> TestResult<trevrpc::BoxStream<trevrpc::ResponseFrame>> {
+    let request = trevrpc::RpcRequest {
+        timeout_nanos: u64::try_from(timeout.as_nanos())?,
+        ..trevrpc::RpcRequest::new(support::greeter_path(FLOOD)).with_kind(RpcKind::ServerStreaming)
+    };
+    let message = prost::Message::encode_to_vec(&name(0));
+    Ok(transport
+        .streaming_call(request, trevrpc::stream::from_iter([message]))
+        .await?)
+}
+
+/// A client that keeps its connection up but stops reading cannot hold a call's slot past the
+/// call's deadline.
+async fn a_client_that_stops_reading_loses_its_slot_at_the_deadline(wire: Wire) -> TestResult {
+    let (report, mut reports) = mpsc::unbounded_channel();
+    let recording = RecordingInterceptor { finished: report };
+    let options = ServerOptions::new().with_max_concurrent_requests(Some(1));
+    let server = spawn_server_with(options, |server| {
+        server.add_interceptor(recording);
+    })
+    .await?;
+    let (endpoint, transport, close) = connect(wire, &server).await?;
+
+    let held = within!(
+        TEST_TIMEOUT,
+        stalled_flood(transport.as_ref(), Duration::from_millis(500))
+    )??;
+    expect_finish(&mut reports, &[Code::DeadlineExceeded]).await?;
+    // The only request slot is free again: another connection gets its call through. It has to be
+    // another one: over QMux, dropping a response stream that holds unread bytes does not give
+    // the connection back the flow-control credit of those bytes (qmux 0.6.6 only counts bytes
+    // the application reads), so the client's first connection stays wedged by the flood it
+    // never read, though the server ended the call and freed its slot. Reading the response to
+    // its reset frees the connection.
+    let (other_endpoint, other, close_other) = connect(wire, &server).await?;
+    let reply = within!(
+        TEST_TIMEOUT,
+        greeter::GreeterClient::new(other).say_hello(&name(1))
+    )??;
+    ensure_eq!(reply.message, "1");
+
+    drop(held);
+    close_other();
+    close();
+    for endpoint in [endpoint, other_endpoint].into_iter().flatten() {
+        endpoint.close(0_u32.into(), b"done");
+    }
+    server.stop().await
+}
+
+/// Shutdown ends a call whose client stopped reading at once, rather than when the graceful
+/// shutdown timeout, which is far longer than the test, forces it.
+async fn shutdown_ends_a_call_whose_client_stopped_reading(wire: Wire) -> TestResult {
+    let (report, mut reports) = mpsc::unbounded_channel();
+    let recording = RecordingInterceptor { finished: report };
+    let server = spawn_server_with(ServerOptions::new(), |server| {
+        server.add_interceptor(recording);
+    })
+    .await?;
+    let (endpoint, transport, close) = connect(wire, &server).await?;
+
+    let held = stalled_flood(transport.as_ref(), Duration::ZERO).await?;
+    // Let the server fill the windows and stall.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.stop().await?;
+    expect_finish(&mut reports, &[Code::Unavailable]).await?;
+
+    drop(held);
+    close();
+    if let Some(endpoint) = endpoint {
+        endpoint.close(0_u32.into(), b"done");
+    }
+    Ok(())
+}
+
+/// Defines a test of `$scenario` over each transport.
+macro_rules! stalled_reader_over_each_transport {
+    ($scenario:ident) => {
+        mod $scenario {
+            use super::*;
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn quic() -> TestResult {
+                $scenario(Wire::Quic).await
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn qmux() -> TestResult {
+                $scenario(Wire::Qmux).await
+            }
+        }
+    };
+}
+
+stalled_reader_over_each_transport!(a_client_that_stops_reading_loses_its_slot_at_the_deadline);
+stalled_reader_over_each_transport!(shutdown_ends_a_call_whose_client_stopped_reading);

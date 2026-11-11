@@ -211,7 +211,7 @@ let reply = client
 
 See [Observability](https://trev.zip/llc/TrevRPC/wiki/Rust-Guide#observability).
 
-`Server::serve_with_shutdown` drains in-flight RPCs for up to `ServerOptions::graceful_shutdown_timeout` before closing the endpoint.
+`Server::serve_with_shutdown` cancels in-flight RPCs when its future completes: their handler futures are dropped, their streams are reset, and their finish functions and metrics see `Unavailable`. It then waits up to `ServerOptions::graceful_shutdown_timeout` for their tasks before closing the endpoint.
 
 `http3_enabled`, `http3_path`, and `http3_admission` (and their `with_*` builders) were renamed `http_enabled`, `http_path`, and `http_admission`, and `Http3Admission`/`Http3AdmissionRequest` became `HttpAdmission`/`HttpAdmissionRequest`, because the HTTP mapping is now also served over HTTP/2.
 

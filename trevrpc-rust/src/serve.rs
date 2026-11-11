@@ -104,8 +104,10 @@ impl Server {
         self.serve_with_shutdown(endpoint, pending::<()>()).await
     }
 
-    /// Serves `TrevRPC` on a Quinn endpoint until the shutdown future completes, then drains
-    /// in-flight RPCs for up to the configured graceful shutdown timeout.
+    /// Serves `TrevRPC` on a Quinn endpoint until the shutdown future completes, then cancels
+    /// in-flight RPCs: their handler futures are dropped, their streams are reset, and their
+    /// finish functions and metrics see `Unavailable`. The server then waits up to the configured
+    /// graceful shutdown timeout for their tasks before it closes the endpoint.
     pub async fn serve_with_shutdown<S>(
         self,
         endpoint: impl Into<QuicEndpoint>,
@@ -118,7 +120,8 @@ impl Server {
     }
 
     /// Serves `TrevRPC` on a Quinn endpoint and a TCP listener until the shutdown future
-    /// completes, then drains in-flight RPCs for up to the configured graceful shutdown timeout.
+    /// completes, then cancels in-flight RPCs as [`Server::serve_with_shutdown`] does and waits up
+    /// to the configured graceful shutdown timeout for their tasks.
     ///
     /// The TCP listener serves clients that cannot use UDP: `QMux` over TLS ([`crate::QMUX_ALPN`])
     /// always, HTTP/2 `POST` RPCs when HTTP is enabled, and `QMux` over WebSocket browser

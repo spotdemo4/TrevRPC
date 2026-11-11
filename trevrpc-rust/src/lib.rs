@@ -13,6 +13,7 @@
 extern crate self as trevrpc;
 
 mod bearer;
+mod call_completion;
 pub mod client;
 pub mod compression;
 mod congestion;
@@ -43,6 +44,8 @@ mod retry_info;
 mod rpc_body;
 mod serve;
 pub mod server;
+#[cfg(test)]
+mod server_call_lifecycle;
 mod server_transport;
 mod shards;
 pub mod status;
