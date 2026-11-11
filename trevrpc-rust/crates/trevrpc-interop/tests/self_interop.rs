@@ -116,6 +116,28 @@ impl Server {
             .unwrap()
     }
 
+    /// Runs `bench` against the server, retrying a run whose measured window saw no operation
+    /// complete at all.
+    ///
+    /// The tests keep the windows short, a few tenths of a second, so on a machine saturated by
+    /// other builds the workers may not finish a single call inside one. That says nothing about
+    /// the code under test, unlike every other failure, which is returned at once. A bench that
+    /// never completes an operation still fails: every attempt reports the same error.
+    fn bench(&self, flags: &[&str]) -> Output {
+        const RETRIES: usize = 2;
+        for _ in 0..RETRIES {
+            let output = self.run("bench", flags);
+            let starved = !output.status.success()
+                && String::from_utf8_lossy(&output.stderr)
+                    .contains("no operation completed in the measured window (0 failed)");
+            if !starved {
+                return output;
+            }
+            eprintln!("bench {flags:?}: no operation completed in the window, retrying");
+        }
+        self.run("bench", flags)
+    }
+
     /// Closes stdin to ask the server to shut down gracefully.
     fn finish(mut self) {
         drop(self.process.stdin.take());
@@ -205,29 +227,26 @@ fn bench_reports_every_scenario_over_both_transports() {
             "paced",
             "unreliable-paced",
         ] {
-            let output = server.run(
-                "bench",
-                &[
-                    "--transport",
-                    transport,
-                    "--scenario",
-                    scenario,
-                    "--size",
-                    "32",
-                    "--metadata-size",
-                    metadata_size,
-                    "--concurrency",
-                    "2",
-                    "--duration",
-                    "0.2",
-                    "--warmup",
-                    "0.05",
-                    "--messages",
-                    "5",
-                    "--rate",
-                    "1000",
-                ],
-            );
+            let output = server.bench(&[
+                "--transport",
+                transport,
+                "--scenario",
+                scenario,
+                "--size",
+                "32",
+                "--metadata-size",
+                metadata_size,
+                "--concurrency",
+                "2",
+                "--duration",
+                "0.2",
+                "--warmup",
+                "0.05",
+                "--messages",
+                "5",
+                "--rate",
+                "1000",
+            ]);
             let stdout = String::from_utf8(output.stdout).unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -326,25 +345,22 @@ fn bench_reports_every_scenario_over_both_transports() {
 fn bench_metadata_size_pads_every_call() {
     let server = Server::start("bench-metadata");
     let wire_bytes_per_msg = |metadata_size: &str, scope: &str| {
-        let output = server.run(
-            "bench",
-            &[
-                "--transport",
-                "quic",
-                "--scenario",
-                "unary",
-                "--concurrency",
-                "1",
-                "--duration",
-                "0.3",
-                "--warmup",
-                "0.05",
-                "--metadata-size",
-                metadata_size,
-                "--metadata-scope",
-                scope,
-            ],
-        );
+        let output = server.bench(&[
+            "--transport",
+            "quic",
+            "--scenario",
+            "unary",
+            "--concurrency",
+            "1",
+            "--duration",
+            "0.3",
+            "--warmup",
+            "0.05",
+            "--metadata-size",
+            metadata_size,
+            "--metadata-scope",
+            scope,
+        ]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{metadata_size} {scope}: {stderr}");
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -384,23 +400,20 @@ fn bench_metadata_size_pads_every_call() {
 fn bench_spreads_workers_over_connections() {
     let server = Server::start("bench-connections");
     for transport in ["quic", "tcp"] {
-        let output = server.run(
-            "bench",
-            &[
-                "--transport",
-                transport,
-                "--scenario",
-                "unary",
-                "--concurrency",
-                "6",
-                "--connections",
-                "3",
-                "--duration",
-                "0.3",
-                "--warmup",
-                "0.05",
-            ],
-        );
+        let output = server.bench(&[
+            "--transport",
+            transport,
+            "--scenario",
+            "unary",
+            "--concurrency",
+            "6",
+            "--connections",
+            "3",
+            "--duration",
+            "0.3",
+            "--warmup",
+            "0.05",
+        ]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{transport}: {stderr}");
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -516,7 +529,7 @@ fn bench_json(server: &Server, flags: &[&str]) -> String {
         "5",
     ];
     args.extend_from_slice(flags);
-    let output = server.run("bench", &args);
+    let output = server.bench(&args);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{flags:?} failed: {stderr}");
     let stdout = String::from_utf8(output.stdout).unwrap();

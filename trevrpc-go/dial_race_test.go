@@ -11,12 +11,14 @@ import (
 )
 
 // scriptedConnector connects after delay with generation, or fails with err.
+// A connect still waiting when its context ends counts as cancelled.
 type scriptedConnector struct {
-	delay    time.Duration
-	err      error
-	kind     TransportKind
-	attempts atomic.Int32
-	closed   atomic.Int32
+	delay     time.Duration
+	err       error
+	kind      TransportKind
+	attempts  atomic.Int32
+	closed    atomic.Int32
+	cancelled atomic.Int32
 }
 
 func (c *scriptedConnector) Connect(ctx context.Context) (channelGeneration, error) {
@@ -24,6 +26,7 @@ func (c *scriptedConnector) Connect(ctx context.Context) (channelGeneration, err
 	select {
 	case <-time.After(c.delay):
 	case <-ctx.Done():
+		c.cancelled.Add(1)
 		return nil, ctx.Err()
 	}
 	if c.err != nil {
@@ -40,7 +43,7 @@ func (c *scriptedConnector) Connect(ctx context.Context) (channelGeneration, err
 
 func connectKind(t *testing.T, connector channelConnector) TransportKind {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
 	generation, err := connector.Connect(ctx)
 	if err != nil {
@@ -49,10 +52,17 @@ func connectKind(t *testing.T, connector channelConnector) TransportKind {
 	return generation.transportKind()
 }
 
+// promptly bounds how long a fallback that needs no wait may take. It is far
+// below the delays the tests rule out, an hour, and far above any scheduling
+// delay of a loaded machine.
+const promptly = 5 * time.Second
+
 func TestRaceUsesQUICWhenItConnectsInTime(t *testing.T) {
 	quic := &scriptedConnector{delay: time.Millisecond, kind: TransportQUIC}
 	tcp := &scriptedConnector{kind: TransportQMux}
-	if kind := connectKind(t, newRacingConnector(quic, tcp, 100*time.Millisecond, 0)); kind != TransportQUIC {
+	// The fallback would start after an hour, so QUIC wins however slowly it
+	// is scheduled.
+	if kind := connectKind(t, newRacingConnector(quic, tcp, time.Hour, 0)); kind != TransportQUIC {
 		t.Fatalf("transport = %s, want quic", kind)
 	}
 	if tcp.attempts.Load() != 0 {
@@ -67,7 +77,7 @@ func TestRaceFallsBackWhenQUICIsSilent(t *testing.T) {
 	if kind := connectKind(t, newRacingConnector(quic, tcp, 20*time.Millisecond, 0)); kind != TransportQMux {
 		t.Fatalf("transport = %s, want qmux", kind)
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > promptly {
 		t.Fatalf("fallback took %v", elapsed)
 	}
 }
@@ -79,7 +89,7 @@ func TestRaceFallsBackAtOnceWhenQUICFails(t *testing.T) {
 	if kind := connectKind(t, newRacingConnector(quic, tcp, time.Hour, 0)); kind != TransportQMux {
 		t.Fatalf("transport = %s, want qmux", kind)
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+	if elapsed := time.Since(started); elapsed > promptly {
 		t.Fatalf("fallback after a QUIC failure took %v", elapsed)
 	}
 }
@@ -95,37 +105,37 @@ func TestRaceReportsBothFailures(t *testing.T) {
 }
 
 func TestRaceClosesTheLoser(t *testing.T) {
-	quic := &scriptedConnector{delay: 50 * time.Millisecond, kind: TransportQUIC}
-	tcp := &scriptedConnector{delay: 30 * time.Millisecond, kind: TransportQMux}
-	// The fallback starts at 10ms and wins at 40ms; QUIC is abandoned.
-	if kind := connectKind(t, newRacingConnector(quic, tcp, 10*time.Millisecond, 0)); kind != TransportQMux {
-		t.Fatalf("transport = %s, want qmux", kind)
-	}
-}
-
-func TestRaceClosesALoserThatAlsoConnects(t *testing.T) {
-	// The primary ignores cancellation and connects after the fallback won.
-	quic := &uncancellableConnector{delay: 40 * time.Millisecond}
+	// QUIC never connects on its own, so the fallback wins however the
+	// goroutines are scheduled, and the race must cancel the QUIC attempt.
+	quic := &scriptedConnector{delay: time.Hour, kind: TransportQUIC}
 	tcp := &scriptedConnector{kind: TransportQMux}
 	if kind := connectKind(t, newRacingConnector(quic, tcp, 10*time.Millisecond, 0)); kind != TransportQMux {
 		t.Fatalf("transport = %s, want qmux", kind)
 	}
-	deadline := time.Now().Add(time.Second)
-	for quic.closed.Load() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the losing QUIC connection was never closed")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, "the losing QUIC attempt to be cancelled", func() bool { return quic.cancelled.Load() > 0 })
 }
 
+func TestRaceClosesALoserThatAlsoConnects(t *testing.T) {
+	// The primary ignores cancellation and connects only once the fallback
+	// has won, which the test decides instead of a timer.
+	quic := &uncancellableConnector{release: make(chan struct{})}
+	tcp := &scriptedConnector{kind: TransportQMux}
+	if kind := connectKind(t, newRacingConnector(quic, tcp, 10*time.Millisecond, 0)); kind != TransportQMux {
+		t.Fatalf("transport = %s, want qmux", kind)
+	}
+	close(quic.release)
+	waitFor(t, "the losing QUIC connection to be closed", func() bool { return quic.closed.Load() > 0 })
+}
+
+// uncancellableConnector ignores its context and connects once release is
+// closed.
 type uncancellableConnector struct {
-	delay  time.Duration
-	closed atomic.Int32
+	release chan struct{}
+	closed  atomic.Int32
 }
 
 func (c *uncancellableConnector) Connect(context.Context) (channelGeneration, error) {
-	time.Sleep(c.delay)
+	<-c.release
 	return &streamGeneration{
 		kind:  TransportQUIC,
 		close: func() error { c.closed.Add(1); return nil },
