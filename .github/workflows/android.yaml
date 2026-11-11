@@ -25,7 +25,7 @@ jobs:
       # Loading the android shell builds the harness and both servers once, so the interop jobs
       # fetch them from the cache.
       - name: Initialize
-        uses: spotdemo4/nix-init@c184156b02706754274a295bca8418e75ccc0ef7 # v1.76.0
+        uses: spotdemo4/nix-init@b66e42aabfd321ffd40584fb31adbfc3ea9c8f11 # v1.77.0
         with:
           shell: android
 
@@ -50,7 +50,7 @@ jobs:
       CELL: android-${{ matrix.transport }}-to-${{ matrix.server }}
     steps:
       - name: Initialize
-        uses: spotdemo4/nix-init@c184156b02706754274a295bca8418e75ccc0ef7 # v1.76.0
+        uses: spotdemo4/nix-init@b66e42aabfd321ffd40584fb31adbfc3ea9c8f11 # v1.77.0
         with:
           shell: android
 
