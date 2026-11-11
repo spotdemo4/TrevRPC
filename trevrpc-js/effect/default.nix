@@ -44,6 +44,7 @@ buildNpmPackage (final: {
           ../zstd-wasm
           ../protovalidate
           ../default.nix
+          ../release-check.nix
           ./default.nix
         ]
       ))

@@ -382,6 +382,14 @@
             inherit (self.packages.${system}) trevrpc-interop;
           };
           kotlin-interop-android = self.packages.${system}.trevrpc-kotlin.interopAndroid;
+          # The npm tarballs as the release job packs them, from the sources and not the builds.
+          trevrpc-js-release = pkgs.callPackage ./trevrpc-js/release-check.nix {
+            inherit (self.packages.${system})
+              trevrpc-js
+              trevrpc-js-effect
+              trevrpc-js-protovalidate
+              ;
+          };
 
           trevrpc-go-lint = {
             src = self.packages.${system}.trevrpc-go;

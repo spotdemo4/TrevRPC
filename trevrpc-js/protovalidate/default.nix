@@ -46,6 +46,7 @@ buildNpmPackage (final: {
           ../zstd-wasm
           ../effect
           ../default.nix
+          ../release-check.nix
           ./default.nix
         ]
       ))

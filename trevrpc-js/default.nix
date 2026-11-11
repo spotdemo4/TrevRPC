@@ -2,6 +2,7 @@
   lib,
   stdenv,
   callPackage,
+  runCommand,
   buildNpmPackage,
   importNpmLock,
   nodejs_26,
@@ -24,6 +25,32 @@ let
   expectedPlaywrightVersion = playwright-driver.version;
   # The libzstd WebAssembly module that the zstd entry point embeds.
   zstdWasm = callPackage ./zstd-wasm { };
+
+  # The interop descriptors are generated from the shared interop protos, which import the TrevRPC
+  # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
+  # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
+  # module is built on its own; only the script that embeds it is needed here. The Effect adapter
+  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own.
+  sourceTree = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../.oxlintrc.json
+      wireGolden
+      qmuxGolden
+      zstdGolden
+      interopProto
+      trevrpcProto
+      (lib.fileset.difference ./. (
+        lib.fileset.unions [
+          ./zstd-wasm
+          ./effect
+          ./protovalidate
+          ./release-check.nix
+        ]
+      ))
+      ./zstd-wasm/embed.js
+    ];
+  };
 in
 assert lib.assertMsg (playwrightManifestVersion == expectedPlaywrightVersion) ''
   trevrpc-js playwright manifest ${playwrightManifestVersion} must exactly match
@@ -41,30 +68,23 @@ buildNpmPackage (final: {
   pname = "trevrpc-js";
   inherit (jsPackage) version;
 
-  # The interop descriptors are generated from the shared interop protos, which import the TrevRPC
-  # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
-  # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
-  # module is built on its own; only the script that embeds it is needed here. The Effect adapter
-  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own.
-  src = lib.fileset.toSource {
-    root = ../.;
-    fileset = lib.fileset.unions [
-      ../.oxlintrc.json
-      wireGolden
-      qmuxGolden
-      zstdGolden
-      interopProto
-      trevrpcProto
-      (lib.fileset.difference ./. (
-        lib.fileset.unions [
-          ./zstd-wasm
-          ./effect
-          ./protovalidate
-        ]
-      ))
-      ./zstd-wasm/embed.js
-    ];
-  };
+  # The source tree with src/zstd-wasm.js already embedded, which .gitignore keeps out of the
+  # checkout. The release job publishes this source and not the build: flake-release evaluates
+  # `.#trevrpc-js.src`, copies it and runs `npm publish` in its sourceRoot, where the .npmrc
+  # (ignore-scripts) rules out generating the file with a `prepack` script. Without it the
+  # published package cannot load its zstd entry point (#416). The trevrpc-js-release check packs
+  # this source as the release does.
+  src =
+    runCommand "source"
+      {
+        nativeBuildInputs = [ nodejs_26 ];
+        TREVRPC_ZSTD_WASM = "${zstdWasm}/libzstd.wasm";
+      }
+      ''
+        cp -R ${sourceTree} "$out"
+        chmod -R u+w "$out"
+        node "$out/trevrpc-js/zstd-wasm/embed.js"
+      '';
   sourceRoot = "${final.src.name}/trevrpc-js";
   nodejs = nodejs_26;
 
