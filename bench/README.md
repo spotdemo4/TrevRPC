@@ -369,7 +369,10 @@ non-zero if it could not connect or measure:
 - `latency_us` holds percentiles of whole-operation latency in microseconds;
   for the paced scenarios, of each delivered message's round trip.
 - `wire_bytes_per_msg` is the bytes the client's connection sent and received
-  during the measured window (UDP payload for QUIC), divided by `msgs`. It is
+  during the measured window (UDP payload for QUIC), divided by `msgs`. The
+  paced scenarios count a message by when it was scheduled, and a worker that
+  falls behind sends the window's last messages after it, so they divide by
+  the messages sent during the window and echoed in time instead. It is
   omitted where the transport stack does not expose connection statistics.
 - `errors` counts failed operations. Workers carry on after an error.
 - `lost` counts messages sent but not delivered, for the `unreliable-*` and

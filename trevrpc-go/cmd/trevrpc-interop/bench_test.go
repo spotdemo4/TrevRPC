@@ -99,6 +99,66 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 	}
 }
 
+// TestBenchPacedWireBytesCountLateMessagesWhenSent holds back three of four
+// paced workers until the window has ended, so they send its messages in a
+// burst after it, and checks that the wire bytes are still divided by the
+// messages sent while they were counted: the burst counts as delivered, but
+// its bytes are not in the window. It runs paced, whose stream delivers the
+// whole burst; unreliable-paced counts the same way but may drop its datagrams.
+func TestBenchPacedWireBytesCountLateMessagesWhenSent(t *testing.T) {
+	certFile, ports := startBenchServer(t)
+	const size, warmup, duration = 100, 50 * time.Millisecond, 200 * time.Millisecond
+	pace := benchScenarios["paced"]
+	t.Cleanup(func() { benchScenarios["paced"] = pace })
+	workers := 0
+	benchScenarios["paced"] = func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+		workload := pace(clients, config, payload).(*pacedWorkload)
+		if workers++; workers > 1 {
+			open, opened := workload.open, false
+			workload.open = func(ctx context.Context, options ...trevrpc.CallOption) (trevrpc.BidirectionalStreamingCall[*interoppb.EchoRequest, *interoppb.EchoResponse], error) {
+				if !opened {
+					opened = true
+					if err := sleepUntil(ctx, time.Now().Add(warmup+duration+50*time.Millisecond)); err != nil {
+						return nil, err
+					}
+				}
+				return open(ctx, options...)
+			}
+		}
+		return workload
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{
+		"bench",
+		"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+		"--ca", certFile,
+		"--scenario", "paced",
+		"--size", strconv.Itoa(size),
+		"--rate", "1000",
+		"--concurrency", "4",
+		"--duration", strconv.FormatFloat(duration.Seconds(), 'f', -1, 64),
+		"--warmup", strconv.FormatFloat(warmup.Seconds(), 'f', -1, 64),
+	}
+	if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	var got struct {
+		Msgs            uint64
+		WireBytesPerMsg float64 `json:"wire_bytes_per_msg"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout %q is not JSON: %v", stdout.String(), err)
+	}
+	// Each worker schedules about 200 messages in the window, so more than
+	// that means the late workers' burst was delivered and counted.
+	if got.Msgs <= 250 {
+		t.Errorf("msgs = %d, want the late workers' messages delivered too", got.Msgs)
+	}
+	if got.WireBytesPerMsg < size {
+		t.Errorf("wire_bytes_per_msg = %v, want at least the %d payload bytes", got.WireBytesPerMsg, size)
+	}
+}
+
 // TestBenchValidationScenariosCallEveryRequestType runs the validation
 // scenarios with each --validation value and checks that the result names it.
 func TestBenchValidationScenariosCallEveryRequestType(t *testing.T) {

@@ -546,11 +546,16 @@ func (p *pacedWorkload) work(ctx context.Context, w *benchWorker, start, end tim
 		next = max(next, int(time.Since(base)/p.interval)+1)
 	}
 	for i, rtt := range schedule.rtts {
+		delivered := rtt >= 0 && rtt <= pacedDeadline
+		if delivered {
+			// A message is echoed only after its send was recorded.
+			w.deliveredSends = append(w.deliveredSends, base.Add(time.Duration(schedule.sent[i].Load()-1)))
+		}
 		scheduled := base.Add(time.Duration(i) * p.interval)
 		if scheduled.Before(start) || !scheduled.Before(end) {
 			continue
 		}
-		if rtt >= 0 && rtt <= pacedDeadline {
+		if delivered {
 			w.latencies = append(w.latencies, rtt)
 			w.messages++
 		} else {
@@ -703,6 +708,25 @@ type benchWorker struct {
 	messages  uint64
 	lost      uint64
 	errors    uint64
+	// deliveredSends holds when each message a paced worker sent was sent,
+	// for every one echoed in time, in the window or not. A worker that falls
+	// behind its schedule sends a window's messages after it, so the wire
+	// bytes are divided by the messages actually sent while they were counted.
+	deliveredSends []time.Time
+}
+
+// deliveredBetween counts the paced messages sent in [from, to) and echoed in
+// time.
+func deliveredBetween(workers []benchWorker, from, to time.Time) uint64 {
+	var count uint64
+	for _, w := range workers {
+		for _, sent := range w.deliveredSends {
+			if !sent.Before(from) && sent.Before(to) {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 // operationLoop runs its operation back to back until end. It counts only
@@ -867,16 +891,19 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		workload := benchScenarios[config.scenario](clients[i%len(clients)], config, newBenchPayload(config.payload, config.size, i))
 		group.Go(func() { workload.work(opCtx, &workers[i], start, end) })
 	}
+	// The wire bytes are counted between when this goroutine wakes at start
+	// and at end, which a busy machine delays.
 	var wireBefore, wireAfter uint64
+	var wireFrom, wireTo time.Time
 	waitErr := sleepUntil(ctx, start)
 	if wire != nil {
-		wireBefore = wire.total()
+		wireFrom, wireBefore = time.Now(), wire.total()
 	}
 	if waitErr == nil {
 		waitErr = sleepUntil(ctx, end)
 	}
 	if wire != nil {
-		wireAfter = wire.total()
+		wireAfter, wireTo = wire.total(), time.Now()
 	}
 	if waitErr != nil {
 		cancel()
@@ -890,9 +917,18 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if wire != nil && result.Msgs > 0 {
-		perMsg := float64(wireAfter-wireBefore) / float64(result.Msgs)
-		result.WireBytesPerMsg = &perMsg
+	if wire != nil {
+		// A paced message counts by when it was scheduled, which may be long
+		// before it was sent, so the wire bytes are divided by the messages
+		// sent while they were counted instead.
+		wireMsgs := result.Msgs
+		if config.paced() {
+			wireMsgs = deliveredBetween(workers, wireFrom, wireTo)
+		}
+		if wireMsgs > 0 {
+			perMsg := float64(wireAfter-wireBefore) / float64(wireMsgs)
+			result.WireBytesPerMsg = &perMsg
+		}
 	}
 	return json.NewEncoder(out).Encode(result)
 }

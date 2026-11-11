@@ -456,6 +456,17 @@ struct WorkerResult {
     lost: u64,
     /// Failures by message, reported on stderr to explain a non-zero error count.
     errors: BTreeMap<String, u64>,
+    /// When a paced worker sent each message echoed in time, in the window or not. A worker that
+    /// falls behind its schedule sends a window's messages after it, so the wire bytes are divided
+    /// by the messages actually sent while they were counted.
+    delivered_sends: Vec<Instant>,
+}
+
+/// The bytes the client's connections carried between two instants.
+struct WireSample {
+    bytes: u64,
+    from: Instant,
+    to: Instant,
 }
 
 /// Where a worker's request messages come from.
@@ -895,12 +906,20 @@ where
             .unwrap_or(0);
         next = next.max(due.saturating_add(1));
     }
-    for (sequence, rtt) in schedule.rtts.into_iter().enumerate() {
+    for (sequence, (rtt, sent_at)) in schedule.rtts.into_iter().zip(&schedule.sent).enumerate() {
+        let rtt = rtt.filter(|rtt| *rtt <= PACED_DEADLINE);
+        if rtt.is_some() {
+            // A message is echoed only after its send was recorded.
+            let offset = Duration::from_nanos(sent_at.load(Ordering::Relaxed));
+            result
+                .delivered_sends
+                .push(base.checked_add(offset).unwrap_or(base));
+        }
         let sent = scheduled(base, worker.interval, sequence);
         if sent < window.start || sent >= window.end {
             continue;
         }
-        match rtt.filter(|rtt| *rtt <= PACED_DEADLINE) {
+        match rtt {
             Some(rtt) => {
                 result.latencies.push(rtt);
                 result.messages = result.messages.saturating_add(1);
@@ -955,7 +974,7 @@ async fn measure<T>(
     transports: Vec<T>,
     params: &Params,
     link: &Link,
-) -> Result<(Vec<WorkerResult>, Option<u64>), BoxError>
+) -> Result<(Vec<WorkerResult>, Option<WireSample>), BoxError>
 where
     T: StreamingRpcTransport + Clone,
 {
@@ -991,13 +1010,19 @@ where
         })
         .collect();
 
+    // The wire bytes are counted between when this task wakes at the start and at the end of the
+    // window, which a busy machine delays.
     tokio::time::sleep_until(window.start).await;
+    let from = Instant::now();
     let before = link.wire_bytes();
     tokio::time::sleep_until(window.end).await;
     let after = link.wire_bytes();
-    let wire = before
-        .zip(after)
-        .map(|(before, after)| after.saturating_sub(before));
+    let to = Instant::now();
+    let wire = before.zip(after).map(|(before, after)| WireSample {
+        bytes: after.saturating_sub(before),
+        from,
+        to,
+    });
 
     let mut results = Vec::with_capacity(workers.len());
     for worker in workers {
@@ -1053,7 +1078,8 @@ struct Report {
     errors: u64,
     /// Sorted ascending.
     latencies: Vec<Duration>,
-    wire_bytes: Option<u64>,
+    /// The wire bytes and the messages to divide them by.
+    wire: Option<(u64, u64)>,
 }
 
 impl Report {
@@ -1061,8 +1087,9 @@ impl Report {
         params: &Params,
         transport: &'static str,
         results: Vec<WorkerResult>,
-        wire_bytes: Option<u64>,
+        wire: Option<WireSample>,
     ) -> Result<Self, BoxError> {
+        let paced = matches!(params.scenario, Scenario::Paced | Scenario::UnreliablePaced);
         let breakdown = error_breakdown(&results);
         let errors = breakdown.iter().map(|&(_, failures)| failures).sum();
         if errors > 0 {
@@ -1077,6 +1104,20 @@ impl Report {
         let lost = results
             .iter()
             .fold(0_u64, |total, result| total.saturating_add(result.lost));
+        // A paced message counts by when it was scheduled, which may be long before it was sent,
+        // so the wire bytes are divided by the messages sent while they were counted instead.
+        let wire = wire.map(|WireSample { bytes, from, to }| {
+            let wire_msgs = if paced {
+                results
+                    .iter()
+                    .flat_map(|result| &result.delivered_sends)
+                    .filter(|&&sent| sent >= from && sent < to)
+                    .fold(0_u64, |total, _| total.saturating_add(1))
+            } else {
+                msgs
+            };
+            (bytes, wire_msgs)
+        });
         let mut latencies: Vec<Duration> = results
             .into_iter()
             .flat_map(|result| result.latencies)
@@ -1090,8 +1131,7 @@ impl Report {
         }
         Ok(Self {
             scenario: params.scenario,
-            rate: matches!(params.scenario, Scenario::Paced | Scenario::UnreliablePaced)
-                .then_some(params.rate),
+            rate: paced.then_some(params.rate),
             payload: params.payload,
             compression: params.compression,
             validation: params.scenario.validated().then_some(params.validation),
@@ -1107,7 +1147,7 @@ impl Report {
             lost,
             errors,
             latencies,
-            wire_bytes,
+            wire,
         })
     }
 
@@ -1130,10 +1170,13 @@ impl Report {
         let msgs_per_sec = msgs / self.duration;
         // Nothing delivered leaves no message to divide the wire bytes by.
         let wire = self
-            .wire_bytes
-            .filter(|_| self.msgs > 0)
-            .map_or_else(String::new, |bytes| {
-                format!(r#","wire_bytes_per_msg":{:.1}"#, count(bytes) / msgs)
+            .wire
+            .filter(|&(_, wire_msgs)| wire_msgs > 0)
+            .map_or_else(String::new, |(bytes, wire_msgs)| {
+                format!(
+                    r#","wire_bytes_per_msg":{:.1}"#,
+                    count(bytes) / count(wire_msgs)
+                )
             });
         let rate = self
             .rate
