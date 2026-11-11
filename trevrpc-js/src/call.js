@@ -70,6 +70,8 @@ class CallScope {
   #controller = new AbortController();
   #parent;
   #timer;
+  /** The `performance.now()` time the call's timeout ends, or undefined without one. */
+  #deadline;
 
   /** timeoutMs must be validated by the caller. */
   constructor({ signal, timeoutMs }) {
@@ -81,12 +83,26 @@ class CallScope {
       this.#parent = { signal, listener: () => this.abort(signal.reason) };
       signal.addEventListener("abort", this.#parent.listener, { once: true });
     }
-    if (timeoutMs != null && timeoutMs <= MaxTimerDelayMs) {
-      this.#timer = setTimeout(
-        () => this.abort(deadlineExceeded("RPC deadline exceeded")),
-        timeoutMs,
+    if (timeoutMs != null) {
+      this.#deadline = performance.now() + timeoutMs;
+      this.#timer = deadlineTimer(this.#deadline, () =>
+        this.abort(deadlineExceeded("RPC deadline exceeded")),
       );
     }
+  }
+
+  /** The `performance.now()` time the call's timeout ends, or undefined without one. */
+  get deadline() {
+    return this.#deadline;
+  }
+
+  /**
+   * Runs `callback` when the call's deadline passes, whatever the call's outcome by then; the
+   * deadline of a call that has no timeout never passes. Returns a function that stops watching.
+   */
+  watchDeadline(callback) {
+    const timer = deadlineTimer(this.#deadline, callback);
+    return () => clearTimeout(timer);
   }
 
   get signal() {
@@ -110,6 +126,20 @@ class CallScope {
     this.#parent?.signal.removeEventListener("abort", this.#parent.listener);
     this.#parent = undefined;
   }
+}
+
+/**
+ * Starts a timer for `deadline` (a `performance.now()` time), or none if it is unset or too far.
+ *
+ * @param {number | undefined} deadline
+ * @param {() => void} callback
+ */
+function deadlineTimer(deadline, callback) {
+  if (deadline === undefined) {
+    return undefined;
+  }
+  const delay = Math.max(0, deadline - performance.now());
+  return delay <= MaxTimerDelayMs ? setTimeout(callback, delay) : undefined;
 }
 
 /**
@@ -168,9 +198,8 @@ export class Call {
   #flushing = false;
   /**
    * What the call needs to open itself again, for the replay of a refused optimistic call:
-   * `{ transport, request, rpc, deadline, connectionMetadata }`, where `deadline` is the
-   * `performance.now()` time the call's timeout ends, or undefined, and `connectionMetadata` is
-   * the connection metadata set the call carries, or undefined.
+   * `{ transport, request, rpc, connectionMetadata }`, where `connectionMetadata` is the
+   * connection metadata set the call carries, or undefined.
    */
   #setup;
   /**
@@ -184,6 +213,8 @@ export class Call {
   #ordered = Promise.resolve();
   /** The replay of a refused optimistic call, once it started. */
   #replaying;
+  /** Cancels the response stream while finish() waits for its end, undefined otherwise. */
+  #releaseResponse;
 
   /**
    * Opens a stream on the transport and sends the REQUEST frame. The request carries the
@@ -224,7 +255,6 @@ export class Call {
         transport,
         request: { ...request, metadata: options.metadata },
         rpc,
-        deadline: options.timeoutMs == null ? undefined : performance.now() + options.timeoutMs,
         connectionMetadata,
       };
       await call.#write(
@@ -376,7 +406,8 @@ export class Call {
   }
 
   async #reopen(bodies) {
-    const { transport, request, rpc, deadline } = this.#setup;
+    const { transport, request, rpc } = this.#setup;
+    const { deadline } = this.#scope;
     // The old stream's failures belong to the refused call, not to this one.
     const replayed = cancelStreamReason("RPC replayed");
     this.#cancelReader(replayed).catch(() => {});
@@ -681,9 +712,28 @@ export class Call {
     if (!this.#sendClosed || this.#uploadEnded !== undefined) {
       this.#endUpload(error ?? cancelled(EarlyOk), cancelStreamReason("RPC completed"));
     }
-    this.#frames
-      .expectEnd(this.#maxFrameSize)
-      .catch(() => this.#cancelReader(cancelStreamReason("RPC completed")).catch(() => {}));
+    // The outcome is known, but the stream is only free once the server ends it: the call's
+    // deadline and close() bound that wait, and so does a known frame after STATUS.
+    const stopWatching = this.#scope.watchDeadline(() => this.releaseResponse());
+    this.#releaseResponse = () => {
+      this.#cancelReader(cancelStreamReason("RPC completed")).catch(() => {});
+    };
+    const ended = () => {
+      this.#releaseResponse = undefined;
+      stopWatching();
+    };
+    this.#frames.expectEnd(this.#maxFrameSize).then(ended, () => {
+      this.releaseResponse();
+      ended();
+    });
+  }
+
+  /**
+   * Cancels the response stream of a finished call that is still waiting for the server to end
+   * it; pending reads complete as the end of the stream. Does nothing in any other state.
+   */
+  releaseResponse() {
+    this.#releaseResponse?.();
   }
 
   /** Cancels the call on behalf of the caller; any reason becomes a Cancelled status. */
@@ -799,7 +849,25 @@ export class Call {
  * belong to the connection that carries the call and not to one a reconnect swapped in later. A
  * stream the browser refuses for want of stream credit is opened again (see StreamRefusalRetryMs).
  */
-function openStream(transport, signal, session) {
+async function openStream(transport, signal, session) {
+  const stream = await openStreamWhenAvailable(transport, signal, session);
+  // The signal may have aborted after the stream opened but before this continuation ran, when
+  // nothing is attached to the stream yet to tear it down.
+  if (signal.aborted) {
+    discardStream(stream);
+    throw signal.reason;
+  }
+  return stream;
+}
+
+/** Resets a stream nothing uses: both directions, with the cancel code. */
+function discardStream(stream) {
+  const reason = cancelStreamReason("RPC cancelled");
+  stream.readable.cancel(reason).catch(() => {});
+  stream.writable.abort(reason).catch(() => {});
+}
+
+function openStreamWhenAvailable(transport, signal, session) {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
       reject(signal.reason);
@@ -825,9 +893,7 @@ function openStream(transport, signal, session) {
           signal.removeEventListener("abort", onAbort);
           if (signal.aborted) {
             // The caller gave up while the stream was opening; do not leak it.
-            const reason = cancelStreamReason("RPC cancelled");
-            stream.readable.cancel(reason).catch(() => {});
-            stream.writable.abort(reason).catch(() => {});
+            discardStream(stream);
           } else {
             resolve(stream);
           }

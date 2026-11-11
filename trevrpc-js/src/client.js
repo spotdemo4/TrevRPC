@@ -431,11 +431,16 @@ export class BidirectionalStreamingCall {
     return next;
   }
 
-  /** Cancels the call unless it already finished. */
+  /**
+   * Cancels the call unless it already finished. A call that finished releases its response
+   * stream, if the server has not ended it yet, without changing the outcome.
+   */
   async close(reason) {
     if (this.#terminal === undefined || this.#queue.length > 0) {
       this.#call.cancel(reason);
       this.#settleFailure(this.#call.signal.reason);
+    } else {
+      this.#call.releaseResponse();
     }
   }
 
