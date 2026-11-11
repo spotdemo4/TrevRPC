@@ -1,6 +1,5 @@
 package zip.trev.trevrpc.cronet
 
-import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -249,6 +248,19 @@ private class StreamingTransportStream(
     override suspend fun close(cause: Throwable?) = exchange.close(cause)
 }
 
+/**
+ * One RPC over one Cronet bidirectional stream. Two state machines describe it, kept apart because
+ * Cronet's native stream outlives the logical call:
+ *
+ * - [CallStateMachine] is the logical call: [CallState.Open], optionally [CallState.RemoteTerminal]
+ *   once the server's STATUS is decoded, then [CallState.Settled]. Every transition takes the write
+ *   in flight in the same critical section, so a Cronet write completion can never observe a write
+ *   cleared by a transition that has not yet moved the call out of [CallState.Open].
+ * - [NativeStreamLifecycle] is the native stream: start, the single provider cancel and Cronet's
+ *   terminal callback, which decides when the exchange's [ExchangeLease] is released.
+ *
+ * Cronet's callbacks read the call state without a lock and ignore everything once it is not open.
+ */
 internal class Http3Exchange(
     private val factory: DuplexStreamFactory,
     private val options: CronetTransportOptions,
@@ -261,30 +273,20 @@ internal class Http3Exchange(
         CoroutineScope(parentJob + coroutineContext).launch(start = CoroutineStart.LAZY) {
             readResponses()
         }
-    private val completed = AtomicBoolean(false)
-    private val nativeCancelRequested = AtomicBoolean(false)
+    private val call = CallStateMachine()
+    private val native = NativeStreamLifecycle()
     private val headersReceived = AtomicBoolean(false)
     private val responseEndReceived = AtomicBoolean(false)
-    private val remoteTerminalSeen = AtomicBoolean(false)
     private val responseFrames = Channel<ResponseFrame>(options.responseChannelCapacity)
     private val readChunks = Channel<ReadChunk>(1)
     private val writeReady = CompletableDeferred<Unit>()
     private val sendLock = Mutex()
-    private val writeLock = Any()
-    private val nativeLock = Any()
     private var sendFinished = false
-    private var pendingWrite: PendingWrite? = null
 
-    @Volatile
-    private var completionCause: Throwable? = null
-
-    /** The server's terminal status, recorded the moment it is decoded, before it is queued. */
-    @Volatile
-    private var remoteStatus: Status? = null
-    private var startInProgress = false
-    private var nativeStarted = false
-    private var nativeTerminalReceived = false
-    private var cancelAfterStart = false
+    /**
+     * Assigned before [NativeStreamLifecycle.beginStart], so every provider call and callback that
+     * follows sees it: [NativeStreamLifecycle] only lets a cancel through after `start()` returned.
+     */
     private lateinit var stream: DuplexStream
 
     init {
@@ -305,46 +307,28 @@ internal class Http3Exchange(
                 throw error
             }
 
-        val closedBeforeStart =
-            synchronized(nativeLock) {
-                stream = opened
-                if (completed.get()) {
-                    completionCause ?: TrevRpcException(Status.unavailable("RPC channel is closed"))
-                } else {
-                    startInProgress = true
-                    null
-                }
-            }
-        if (closedBeforeStart != null) {
+        stream = opened
+        if (!native.beginStart()) {
+            // The call was settled and its cancel requested before the stream existed.
             lease.nativeDone()
-            throw closedBeforeStart
+            throw (call.state as? CallState.Settled)?.cause ?: TrevRpcException(Status.unavailable("RPC channel is closed"))
         }
 
         try {
             providerInvocations.invoke(opened::start)
         } catch (error: Throwable) {
-            synchronized(nativeLock) {
-                startInProgress = false
-            }
+            native.startFailed()
             val transportError = transportException("Cronet stream start failed", error)
             settleLogical(transportError, requestNativeCancel = false)
             lease.nativeDone()
             throw transportError
         }
 
-        val cancelStartedStream: Boolean
-        val nativeFinishedDuringStart: Boolean
-        synchronized(nativeLock) {
-            startInProgress = false
-            nativeStarted = true
-            nativeFinishedDuringStart = nativeTerminalReceived
-            cancelStartedStream =
-                !nativeFinishedDuringStart &&
-                (cancelAfterStart || completed.get()) &&
-                nativeCancelRequested.compareAndSet(false, true)
+        when (native.startReturned()) {
+            NativeStreamLifecycle.AfterStart.FINISHED -> lease.nativeDone()
+            NativeStreamLifecycle.AfterStart.CANCEL -> requestProviderCancel(opened)
+            NativeStreamLifecycle.AfterStart.RUNNING -> Unit
         }
-        if (nativeFinishedDuringStart) lease.nativeDone()
-        if (cancelStartedStream) requestProviderCancel(opened)
 
         job.start()
         sendFinished = endOfStream
@@ -368,7 +352,7 @@ internal class Http3Exchange(
 
     suspend fun finishSend() {
         sendLock.withLock {
-            if (sendFinished || remoteTerminalSeen.get()) {
+            if (sendFinished || call.state.remoteStatus != null) {
                 sendFinished = true
                 return
             }
@@ -388,7 +372,7 @@ internal class Http3Exchange(
     }
 
     override fun onReady(stream: DuplexStream) {
-        if (stream !== this.stream || completed.get() || remoteTerminalSeen.get()) return
+        if (stream !== this.stream || call.state !is CallState.Open) return
         writeReady.complete(Unit)
     }
 
@@ -396,14 +380,14 @@ internal class Http3Exchange(
         stream: DuplexStream,
         headers: ResponseHeaders,
     ) {
-        if (stream !== this.stream || completed.get() || remoteTerminalSeen.get()) return
+        if (stream !== this.stream || call.state !is CallState.Open) return
         if (!headersReceived.compareAndSet(false, true)) {
-            fail(protocolException("received response headers more than once"))
+            failIfOpen(protocolException("received response headers more than once"))
             return
         }
         val error = validateHeaders(headers)
         if (error != null) {
-            fail(error)
+            failIfOpen(error)
             return
         }
         requestRead()
@@ -414,13 +398,13 @@ internal class Http3Exchange(
         buffer: ByteBuffer,
         endOfStream: Boolean,
     ) {
-        if (stream !== this.stream || completed.get() || remoteTerminalSeen.get()) return
+        if (stream !== this.stream || call.state !is CallState.Open) return
         val bytes = ByteArray(buffer.position())
         buffer.flip()
         buffer.get(bytes)
         if (endOfStream) responseEndReceived.set(true)
         if (readChunks.trySend(ReadChunk(bytes, endOfStream)).isFailure) {
-            fail(protocolException("Cronet delivered overlapping response reads"))
+            failIfOpen(protocolException("Cronet delivered overlapping response reads"))
         }
     }
 
@@ -430,33 +414,25 @@ internal class Http3Exchange(
         endOfStream: Boolean,
     ) {
         if (stream !== this.stream) return
-        val continuation =
-            synchronized(writeLock) {
-                val pending = pendingWrite
-                if (pending == null || pending.buffer !== buffer || pending.endOfStream != endOfStream) {
-                    null
-                } else {
-                    pendingWrite = null
-                    pending.continuation
-                }
-            }
-        if (continuation == null) {
-            if (!completed.get() && !remoteTerminalSeen.get()) {
-                fail(protocolException("Cronet completed an unexpected request write"))
-            }
+        val completed = call.takeCompletedWrite(buffer, endOfStream)
+        if (completed != null) {
+            completed.continuation.resume(Unit)
         } else {
-            continuation.resume(Unit)
+            // A transition that took the write also moved the call out of Open, so this is a no-op
+            // for a write that was canceled, failed or cut short, and an error only for a write
+            // Cronet reports that was never issued.
+            failIfOpen(protocolException("Cronet completed an unexpected request write"))
         }
     }
 
     override fun onSucceeded(stream: DuplexStream) {
         if (stream !== this.stream) return
         try {
-            if (!completed.get() && !remoteTerminalSeen.get()) {
+            if (call.state is CallState.Open) {
                 if (!headersReceived.get()) {
-                    fail(protocolException("Cronet stream succeeded before response headers"))
+                    failIfOpen(protocolException("Cronet stream succeeded before response headers"))
                 } else if (!responseEndReceived.get() && readChunks.trySend(ReadChunk(byteArrayOf(), true)).isFailure) {
-                    fail(protocolException("Cronet succeeded with a response read still pending"))
+                    failIfOpen(protocolException("Cronet succeeded with a response read still pending"))
                 }
             }
         } finally {
@@ -470,10 +446,8 @@ internal class Http3Exchange(
     ) {
         if (stream !== this.stream) return
         try {
-            if (!completed.get() && !remoteTerminalSeen.get()) {
-                // Cronet's message names the network error, such as net::ERR_CONNECTION_RESET.
-                fail(transportException("Cronet stream failed: ${error.message}", error))
-            }
+            // Cronet's message names the network error, such as net::ERR_CONNECTION_RESET.
+            failIfOpen(transportException("Cronet stream failed: ${error.message}", error))
         } finally {
             nativeTerminated()
         }
@@ -482,9 +456,7 @@ internal class Http3Exchange(
     override fun onCanceled(stream: DuplexStream) {
         if (stream !== this.stream) return
         try {
-            if (!completed.get() && !remoteTerminalSeen.get()) {
-                fail(transportException("Cronet stream was canceled"))
-            }
+            failIfOpen(transportException("Cronet stream was canceled"))
         } finally {
             nativeTerminated()
         }
@@ -503,17 +475,13 @@ internal class Http3Exchange(
         bytes: () -> ByteArray,
     ) {
         try {
-            if (remoteTerminalSeen.get()) {
-                if (endOfStream) return
-                throw remoteSendError()
-            }
-            write(bytes(), endOfStream)
+            if (admitWrite(endOfStream)) write(bytes(), endOfStream, failureMessage)
         } catch (error: CancellationException) {
-            if (!completed.get() && !remoteTerminalSeen.get()) fail(error)
+            failIfOpen(error)
             throw error
         } catch (error: Throwable) {
             val transportError = if (error is TrevRpcException) error else transportException(failureMessage, error)
-            if (!remoteTerminalSeen.get()) fail(transportError)
+            failIfOpen(transportError)
             throw transportError
         }
     }
@@ -521,60 +489,34 @@ internal class Http3Exchange(
     private suspend fun write(
         bytes: ByteArray,
         endOfStream: Boolean,
+        failureMessage: String,
     ) {
         writeReady.await()
-        if (remoteTerminalSeen.get()) {
-            if (endOfStream) return
-            throw remoteSendError()
-        }
-        if (completed.get()) throw completedSendError()
+        if (!admitWrite(endOfStream)) return
         val buffer = ByteBuffer.allocateDirect(bytes.size)
         buffer.put(bytes)
         buffer.flip()
         suspendCancellableCoroutine { continuation ->
             val pending = PendingWrite(buffer, endOfStream, continuation)
+            // Taking the write and settling the call are one transition, so a write completion that
+            // lands next finds a settled call instead of a missing write on an open one. A write cut
+            // short after the server's STATUS was already taken by that transition: nothing to settle.
             continuation.invokeOnCancellation {
-                val canceledByCaller =
-                    synchronized(writeLock) {
-                        if (pendingWrite !== pending) {
-                            false
-                        } else {
-                            pendingWrite = null
-                            true
-                        }
-                    }
-                // A write cut short after the server's STATUS has nothing left to cancel: the
-                // remote terminal path already settles the exchange.
-                if (canceledByCaller && !remoteTerminalSeen.get()) fail(CancellationException("request write was canceled"))
+                finishSettle(call.settleWrite(pending, CancellationException("request write was canceled")), requestNativeCancel = true)
             }
-            val installed =
-                synchronized(writeLock) {
-                    if (completed.get() || remoteTerminalSeen.get() || !continuation.isActive) {
-                        false
-                    } else {
-                        check(pendingWrite == null) { "only one Cronet write may be in flight" }
-                        pendingWrite = pending
-                        true
-                    }
-                }
-            if (!installed) {
-                if (continuation.isActive) {
-                    if (endOfStream && remoteTerminalSeen.get()) {
+            val refused = call.installWrite(pending)
+            if (refused != null) {
+                if (continuation.isActive && refused is CallState.Ended) {
+                    if (endOfStream && refused.remoteStatus != null) {
                         continuation.resume(Unit)
-                    } else if (remoteTerminalSeen.get()) {
-                        continuation.resumeWithException(remoteSendError())
                     } else {
-                        continuation.resumeWithException(completedSendError())
+                        continuation.resumeWithException(refused.sendError())
                     }
                 }
                 return@suspendCancellableCoroutine
             }
 
-            val shouldDispatch =
-                synchronized(writeLock) {
-                    pendingWrite === pending && !completed.get() && !remoteTerminalSeen.get()
-                }
-            if (!shouldDispatch) return@suspendCancellableCoroutine
+            if (!call.isPending(pending)) return@suspendCancellableCoroutine
 
             val dispatchError =
                 runCatching {
@@ -582,16 +524,11 @@ internal class Http3Exchange(
                     providerInvocations.invoke(stream::flush)
                 }.exceptionOrNull()
             if (dispatchError != null) {
-                val failedContinuation =
-                    synchronized(writeLock) {
-                        if (pendingWrite !== pending) {
-                            null
-                        } else {
-                            pendingWrite = null
-                            pending.continuation
-                        }
-                    }
-                if (failedContinuation?.isActive == true) failedContinuation.resumeWithException(dispatchError)
+                // A write completion that lands after a failed dispatch finds the call settled.
+                finishSettle(
+                    call.settleWrite(pending, transportException(failureMessage, dispatchError)),
+                    requestNativeCancel = true,
+                )
             }
         }
     }
@@ -608,8 +545,7 @@ internal class Http3Exchange(
                     // reject a known frame after the terminal status.
                     if (frame is ResponseFrame.Status && !statusSeen) {
                         statusSeen = true
-                        remoteStatus = frame.status
-                        beginRemoteStatus()
+                        beginRemoteStatus(frame.status)
                     }
                     responseFrames.send(frame)
                 }
@@ -625,14 +561,14 @@ internal class Http3Exchange(
                 requestRead()
             }
         } catch (error: CancellationException) {
-            if (!completed.get()) fail(transportException("response processing was canceled", error))
+            if (call.state !is CallState.Settled) fail(transportException("response processing was canceled", error))
         } catch (error: Throwable) {
             fail(error)
         }
     }
 
     private fun requestRead() {
-        if (completed.get()) return
+        if (call.state is CallState.Settled) return
         try {
             providerInvocations.invoke { stream.read(ByteBuffer.allocateDirect(options.readBufferSize)) }
         } catch (error: Throwable) {
@@ -644,11 +580,16 @@ internal class Http3Exchange(
         settleLogical(null, requestNativeCancel = true)
     }
 
-    private fun beginRemoteStatus() {
-        if (beginRemoteTerminalOnce()) {
-            settlePendingWriteOnRemoteTerminal()
-            cancelNative()
+    private fun beginRemoteStatus(status: Status) {
+        val transition = call.beginRemoteTerminal(status) ?: return
+        transition.pendingWrite?.let { pending ->
+            if (pending.endOfStream) {
+                pending.continuation.resume(Unit)
+            } else {
+                pending.continuation.resumeWithException(transition.state.sendError())
+            }
         }
+        cancelNative()
     }
 
     private fun finishEndOfResponse() {
@@ -659,6 +600,10 @@ internal class Http3Exchange(
         settleLogical(error, requestNativeCancel = true)
     }
 
+    private fun failIfOpen(error: Throwable) {
+        finishSettle(call.settleIfOpen(error), requestNativeCancel = true)
+    }
+
     private fun cancelFromChannelClose(error: Throwable) {
         settleLogical(error, requestNativeCancel = true)
     }
@@ -667,48 +612,28 @@ internal class Http3Exchange(
         error: Throwable?,
         requestNativeCancel: Boolean,
     ) {
-        if (!completeOnce(error)) return
-        val completionError = error ?: completedSendError()
+        finishSettle(call.settle(error), requestNativeCancel)
+    }
+
+    /** Runs the side effects of a transition into [CallState.Settled]; a `null` transition did not happen. */
+    private fun finishSettle(
+        transition: Transition<CallState.Settled>?,
+        requestNativeCancel: Boolean,
+    ) {
+        if (transition == null) return
+        val error = transition.state.cause
+        val completionError = error ?: transition.state.sendError()
         writeReady.completeExceptionally(completionError)
         responseFrames.close(error)
         readChunks.close(error)
-        cancelPendingWrite(completionError)
+        transition.pendingWrite?.continuation?.resumeWithException(completionError)
         if (requestNativeCancel) cancelNative()
         job.cancel(cancellationException("Cronet exchange completed", error))
         lease.logicalDone()
     }
 
-    private fun settlePendingWriteOnRemoteTerminal() {
-        val pending = takePendingWrite() ?: return
-        if (pending.endOfStream) {
-            pending.continuation.resume(Unit)
-        } else {
-            pending.continuation.resumeWithException(remoteSendError())
-        }
-    }
-
-    private fun cancelPendingWrite(error: Throwable) {
-        takePendingWrite()?.continuation?.resumeWithException(error)
-    }
-
-    private fun takePendingWrite(): PendingWrite? =
-        synchronized(writeLock) {
-            val pending = pendingWrite
-            pendingWrite = null
-            pending
-        }
-
     private fun cancelNative() {
-        val streamToCancel =
-            synchronized(nativeLock) {
-                if (!::stream.isInitialized) return
-                if (startInProgress || !nativeStarted) {
-                    cancelAfterStart = true
-                    return
-                }
-                if (nativeCancelRequested.compareAndSet(false, true)) stream else null
-            }
-        if (streamToCancel != null) requestProviderCancel(streamToCancel)
+        if (native.requestCancel()) requestProviderCancel(stream)
     }
 
     private fun requestProviderCancel(stream: DuplexStream) {
@@ -718,71 +643,29 @@ internal class Http3Exchange(
     }
 
     private fun nativeTerminated() {
-        val markNativeDone =
-            synchronized(nativeLock) {
-                nativeTerminalReceived = true
-                !startInProgress
-            }
-        if (markNativeDone) lease.nativeDone()
+        if (native.terminated()) lease.nativeDone()
     }
 
-    private fun completeOnce(error: Throwable?): Boolean =
-        synchronized(writeLock) {
-            if (completed.get()) {
-                false
-            } else {
-                completionCause = error
-                completed.set(true)
-                true
-            }
-        }
-
-    private fun beginRemoteTerminalOnce(): Boolean =
-        synchronized(writeLock) {
-            remoteTerminalSeen.compareAndSet(false, true)
-        }
+    /**
+     * Whether a write may go out. `false` means it is moot: a half-close after the server's STATUS.
+     * Throws why the call can no longer be written to.
+     */
+    private fun admitWrite(endOfStream: Boolean): Boolean {
+        val current = call.state
+        if (current !is CallState.Ended) return true
+        if (endOfStream && current.remoteStatus != null) return false
+        throw current.sendError()
+    }
 
     private fun checkSendOpen() {
         if (sendFinished) throw TrevRpcException(Status.cancelled("request stream is closed"))
-        if (remoteTerminalSeen.get()) throw remoteSendError()
-        if (completed.get()) throw completedSendError()
-    }
-
-    /**
-     * Why a send fails once the server has ended the call: its status when that is not OK, or a
-     * cancellation when it completed the call successfully before the upload finished.
-     */
-    private fun remoteSendError(): TrevRpcException {
-        val status = remoteStatus
-        return if (status != null && !status.isOk) {
-            TrevRpcException(status)
-        } else {
-            TrevRpcException(Status.cancelled("the server completed the call before the request stream finished"))
-        }
-    }
-
-    /**
-     * Why a send fails on an exchange that completed without a server status: the transport or
-     * protocol error that ended it, or a plain close.
-     */
-    private fun completedSendError(): TrevRpcException {
-        val cause = completionCause
-        return if (cause is TrevRpcException) {
-            TrevRpcException(cause.status, cause)
-        } else {
-            TrevRpcException(Status.cancelled("request stream is closed"), cause)
-        }
+        val current = call.state
+        if (current is CallState.Ended) throw current.sendError()
     }
 
     private data class ReadChunk(
         val bytes: ByteArray,
         val endOfStream: Boolean,
-    )
-
-    private data class PendingWrite(
-        val buffer: ByteBuffer,
-        val endOfStream: Boolean,
-        val continuation: CancellableContinuation<Unit>,
     )
 }
 

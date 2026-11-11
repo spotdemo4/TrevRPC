@@ -279,6 +279,70 @@ class Http3RpcTransportTest {
         }
 
     @Test
+    fun `a write completion that lands after its send was canceled does not replace the cancellation`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    fake,
+                )
+            val send = async { stream.send(byteArrayOf(1)) }
+            runCurrent()
+            send.cancel()
+            runCurrent()
+
+            // Cronet still reports the write it was handed: the canceled call has nothing to fail.
+            fake.completeWrite()
+
+            assertTrue(send.isCancelled)
+            assertInstanceOf(CancellationException::class.java, stream.receiveFailure())
+            assertTrue(fake.awaitCancel())
+            assertEquals(1, fake.cancelCalls)
+        }
+
+    @Test
+    fun `a write completion that lands after a failed flush does not replace the transport error`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    fake,
+                )
+            fake.failFlush(IllegalStateException("flush failed"))
+            val send = async { runCatching { stream.send(byteArrayOf(1)) }.exceptionOrNull() }
+            runCurrent()
+
+            val sendError = send.await() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, sendError.status.code)
+            // write() was accepted before flush() failed, so Cronet may still complete it.
+            fake.completeWrite()
+
+            val receiveError = stream.receiveFailure() as TrevRpcException
+            assertEquals(Code.UNAVAILABLE, receiveError.status.code)
+            assertTrue(fake.awaitCancel())
+            assertEquals(1, fake.cancelCalls)
+        }
+
+    @Test
+    fun `a write completion that was never issued is an internal error`() =
+        runTest {
+            val fake = FakeFactory()
+            val stream =
+                openStreaming(
+                    Http3RpcTransport(fake, coroutineContext = coroutineContext, shutdownContext = coroutineContext),
+                    fake,
+                )
+
+            fake.completeUnissuedWrite()
+
+            val error = stream.receiveFailure() as TrevRpcException
+            assertEquals(Code.INTERNAL, error.status.code)
+            assertTrue(fake.awaitCancel())
+        }
+
+    @Test
     fun `response channel backpressures subsequent Cronet reads`() =
         runTest {
             val fake = FakeFactory()
@@ -1452,6 +1516,13 @@ private class FakeFactory : DuplexStreamFactory {
 
     fun fail(error: Throwable) = callback.onFailed(stream, error)
 
+    /** Completes a write the exchange never issued. */
+    fun completeUnissuedWrite() = callback.onWrite(stream, ByteBuffer.allocateDirect(1), false)
+
+    fun failFlush(error: Throwable) {
+        stream.flushError = error
+    }
+
     fun cancelCallback() = callback.onCanceled(stream)
 
     fun blockWrite(
@@ -1495,6 +1566,7 @@ private class FakeStream : DuplexStream {
     var releaseWrite: CountDownLatch? = null
     var flushEntered: CountDownLatch? = null
     var releaseFlush: CountDownLatch? = null
+    var flushError: Throwable? = null
     var cancelAction: (() -> Unit)? = null
     var cancelEntered: CountDownLatch? = null
     var releaseCancel: CountDownLatch? = null
@@ -1526,6 +1598,7 @@ private class FakeStream : DuplexStream {
     override fun flush() {
         flushEntered?.countDown()
         releaseFlush?.let { check(it.await(5, TimeUnit.SECONDS)) { "flush release timed out" } }
+        flushError?.let { throw it }
     }
 
     override fun cancel() {
