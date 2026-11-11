@@ -34,6 +34,8 @@ func (*failingStream) Close() error { return nil }
 type finishedCapture struct {
 	metrics     recordingMetrics
 	interceptor chan RPCFinished
+	// consumed counts the metrics events next has matched, in order.
+	consumed int
 }
 
 func newFinishedCapture(server *Server) *finishedCapture {
@@ -51,11 +53,23 @@ func (c *finishedCapture) next(t *testing.T) RPCFinished {
 	t.Helper()
 	select {
 	case event := <-c.interceptor:
-		_, finished := c.metrics.snapshot()
-		if len(finished) == 0 {
+		// The interceptors' finish functions run before the metrics hook, so
+		// the metrics event of this call may not have arrived yet.
+		var finished []RPCFinished
+		deadline := time.Now().Add(rpcTestTimeout)
+		for {
+			_, finished = c.metrics.snapshot()
+			if len(finished) > c.consumed || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if len(finished) <= c.consumed {
 			t.Fatal("metrics did not see the call finish")
 		}
-		if got := finished[len(finished)-1]; !errors.Is(got.Err, event.Err) || got.Code != event.Code {
+		got := finished[c.consumed]
+		c.consumed++
+		if !errors.Is(got.Err, event.Err) || got.Code != event.Code {
 			t.Fatalf("metrics saw %v with %v, the interceptor %v with %v", got.Code, got.Err, event.Code, event.Err)
 		}
 		return event

@@ -31,6 +31,10 @@ var errRequestAborted = errors.New("request side aborted")
 //
 // An abort request first only fails and unblocks the handler's reads; the stop
 // is deferred to Close, because the abort usually precedes the final write.
+//
+// The request side moves through requestState. Only a true end of it, EOF or a
+// reset by the peer, leaves nothing to drain. A read that fails on a deadline,
+// including the one the abort itself sets to interrupt it, does not end it.
 type drainingStream struct {
 	rw              io.ReadWriteCloser
 	setReadDeadline func(time.Time) error
@@ -51,12 +55,35 @@ type drainingStream struct {
 	mu         sync.Mutex
 	idle       *sync.Cond // signalled when readers drops to zero; set once a drain waits
 	readers    int
-	aborted    bool // handlers may no longer read
-	unblocked  bool // pending reads were interrupted; a drain may take over
-	sendClosed bool
-	readEnded  bool // the request side reached EOF or failed: nothing to drain
-	draining   bool
+	request    requestState
+	sendClosed bool // the response is finished
 }
+
+// requestState is the lifecycle of a stream's request side:
+// open -> aborted -> draining, or open | aborted -> ended.
+type requestState uint8
+
+const (
+	// requestOpen: handlers read the stream.
+	requestOpen requestState = iota
+	// requestEnded: the stream reached EOF or the peer reset it, so there is
+	// nothing to drain. Reads keep returning that outcome, even after an abort.
+	requestEnded
+	// requestAborted: handlers may no longer read and pending reads were
+	// interrupted. The drain starts once the response is finished.
+	requestAborted
+	// requestDraining: the drain is the only reader. It ends when the peer
+	// finishes the request side or with STOP_SENDING.
+	requestDraining
+)
+
+// handlersMayRead reports whether handler reads still reach the stream.
+func (s requestState) handlersMayRead() bool { return s < requestAborted }
+
+// endsRequestSide reports whether a failed read means the request side is over
+// for good. A read deadline only interrupts one Read and says nothing about
+// what the peer will send.
+func endsRequestSide(err error) bool { return !isTimeoutError(err) }
 
 func newDrainingStream(shutdown context.Context, rw io.ReadWriteCloser, setReadDeadline func(time.Time) error, stopReading func()) *drainingStream {
 	return &drainingStream{
@@ -75,7 +102,7 @@ func (s *drainingStream) trevrpcRemoteAddr() netip.AddrPort { return s.remoteAdd
 
 func (s *drainingStream) Read(data []byte) (int, error) {
 	s.mu.Lock()
-	if s.aborted {
+	if !s.request.handlersMayRead() {
 		s.mu.Unlock()
 		return 0, errRequestAborted
 	}
@@ -87,9 +114,12 @@ func (s *drainingStream) Read(data []byte) (int, error) {
 	s.mu.Lock()
 	s.readers--
 	if err != nil {
-		s.readEnded = true
-		if s.aborted && !errors.Is(err, io.EOF) {
+		ended := endsRequestSide(err)
+		if s.request == requestAborted && !errors.Is(err, io.EOF) {
 			err = errRequestAborted
+		}
+		if ended && (s.request == requestOpen || s.request == requestAborted) {
+			s.request = requestEnded
 		}
 	}
 	if s.readers == 0 && s.idle != nil {
@@ -112,11 +142,13 @@ func (s *drainingStream) Close() error {
 	return err
 }
 
+// SetReadDeadline is ignored once the request side is aborted: the abort's
+// deadline and then the drain's own must stand. It is set under the lock so a
+// handler's deadline cannot overwrite the abort's.
 func (s *drainingStream) SetReadDeadline(deadline time.Time) error {
 	s.mu.Lock()
-	aborted := s.aborted
-	s.mu.Unlock()
-	if aborted {
+	defer s.mu.Unlock()
+	if !s.request.handlersMayRead() {
 		return nil
 	}
 	return s.setReadDeadline(deadline)
@@ -126,20 +158,14 @@ func (s *drainingStream) SetReadDeadline(deadline time.Time) error {
 // the peer is not told to stop sending until the drain bound is hit.
 func (s *drainingStream) trevrpcCancelRead() {
 	s.mu.Lock()
-	first := !s.aborted
-	s.aborted = true
-	s.mu.Unlock()
-	if first {
-		// Unblock a pending Read without sending STOP_SENDING. This must
-		// precede the drain, which sets its own deadline.
+	defer s.mu.Unlock()
+	if s.request == requestOpen {
+		s.request = requestAborted
+		// Unblock a pending Read without sending STOP_SENDING. Held under the
+		// lock, this precedes the drain, which sets its own deadline.
 		_ = s.setReadDeadline(time.Now())
-		s.mu.Lock()
-		s.unblocked = true
-		s.mu.Unlock()
 	}
-	s.mu.Lock()
 	s.maybeDrainLocked()
-	s.mu.Unlock()
 }
 
 func (s *drainingStream) trevrpcCancelReadOnContext(ctx context.Context) func() {
@@ -147,12 +173,12 @@ func (s *drainingStream) trevrpcCancelReadOnContext(ctx context.Context) func() 
 }
 
 // maybeDrainLocked starts the drain once the response is finished and the
-// request side was aborted while still open.
+// request side was aborted before it ended.
 func (s *drainingStream) maybeDrainLocked() {
-	if s.draining || !s.unblocked || !s.sendClosed || s.readEnded {
+	if s.request != requestAborted || !s.sendClosed {
 		return
 	}
-	s.draining = true
+	s.request = requestDraining
 	go s.drain()
 }
 

@@ -1,6 +1,7 @@
 package trevrpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1182,5 +1183,84 @@ func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed < requestDrainTimeout-200*time.Millisecond {
 		t.Fatalf("stopped after %v, before the %v time bound", elapsed, requestDrainTimeout)
+	}
+}
+
+// TestServerStopsTheUploadOfACallWhoseHandlerLeftARecvPending covers a handler
+// that finishes a call while one of its Recv calls still waits on the request
+// stream. The abort interrupts that read with a deadline error, which is not
+// the end of the request side: the server must still drain it and then send
+// STOP_SENDING, or an uploading client stalls on flow control.
+func TestServerStopsTheUploadOfACallWhoseHandlerLeftARecvPending(t *testing.T) {
+	setDrainBounds(t, 100*time.Millisecond, 1<<20)
+	pki := newTestPKI(t)
+	listener := startTestListenerWith(t, pki, nil, func(server *Server) {
+		RegisterBidirectionalStreaming(server, testPath("RecvPending"), newTestMessage, func(_ context.Context, requests MessageStream[*testMessage]) (MessageStream[*testMessage], error) {
+			received := make(chan struct{}, 1)
+			go func() {
+				for {
+					if _, err := requests.Recv(); err != nil {
+						return
+					}
+					select {
+					case received <- struct{}{}:
+					default:
+					}
+				}
+			}()
+			<-received
+			// Give the goroutine time to wait in Recv for the next message.
+			time.Sleep(50 * time.Millisecond)
+			return StreamOf[*testMessage](), nil
+		})
+	})
+	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), clientQUICConfig(nil, DefaultMaxFrameSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	openers := map[string]streamOpener{
+		"native":       connOpener{conn},
+		"webtransport": newWebTransportTestOpener(t, pki, listener, testOrigin, nil),
+	}
+	for name, opener := range openers {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+			defer cancel()
+			stream, err := opener.openStream(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := newWireRequest(testPath("RecvPending"))
+			request.Kind = RPCKindBidirectionalStreaming
+			if _, err := stream.Write(testRequestBytes(t, request, encodedTestMessage(t, "first"))); err != nil {
+				t.Fatal(err)
+			}
+			// The response is finished once the server closes its send
+			// direction. The request side stays open and unread.
+			if readTestFrame(t, stream).Kind != frameTypeStatus {
+				t.Fatal("the call did not end with a status")
+			}
+			if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+				t.Fatalf("read after status = %v, want EOF", err)
+			}
+
+			stopped := make(chan struct{})
+			go func() {
+				chunk := bytes.Repeat(rawMessage(bytes.Repeat([]byte{'x'}, 1024)).frame, 16)
+				for {
+					if _, err := stream.Write(chunk); err != nil {
+						close(stopped)
+						return
+					}
+				}
+			}()
+			select {
+			case <-stopped:
+			case <-ctx.Done():
+				stream.cancelWrite()
+				t.Fatal("the upload stalled: the server never stopped the request side")
+			}
+		})
 	}
 }

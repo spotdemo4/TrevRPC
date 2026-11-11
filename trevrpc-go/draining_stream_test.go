@@ -185,3 +185,68 @@ func TestDrainingStreamWithoutAbortNeverDrains(t *testing.T) {
 	_ = fixture.stream.Close()
 	fixture.expectNotStopped(t, 150*time.Millisecond)
 }
+
+// An abort that interrupts a pending Read makes it fail with a deadline error.
+// That is not the end of the request side, so the drain must still run and
+// stop a client that never finishes.
+func TestDrainingStreamStopsRequestSideAfterAbortInterruptedAPendingRead(t *testing.T) {
+	setDrainBounds(t, 100*time.Millisecond, 1<<20)
+	fixture := newDrainFixture(context.Background(), t)
+
+	readFailed := make(chan error, 1)
+	go func() {
+		_, err := fixture.stream.Read(make([]byte, 8))
+		readFailed <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	fixture.stream.trevrpcCancelRead()
+	if err := <-readFailed; !errors.Is(err, errRequestAborted) {
+		t.Fatalf("pending read = %v, want errRequestAborted", err)
+	}
+	// The Read has returned before Close, the order the race used to lose.
+	_ = fixture.stream.Close()
+	fixture.waitStopped(t, 3*time.Second)
+}
+
+// A read deadline, such as the initial request timeout, fails a Read without
+// ending the request side.
+func TestDrainingStreamStopsRequestSideAfterReadDeadline(t *testing.T) {
+	setDrainBounds(t, 100*time.Millisecond, 1<<20)
+	fixture := newDrainFixture(context.Background(), t)
+
+	_ = fixture.stream.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if _, err := fixture.stream.Read(make([]byte, 8)); !isTimeoutError(err) {
+		t.Fatalf("read = %v, want a deadline error", err)
+	}
+	// The server answers with a status and aborts the request side.
+	_ = fixture.stream.Close()
+	fixture.stream.trevrpcCancelRead()
+	fixture.waitStopped(t, 3*time.Second)
+}
+
+// A reset by the peer ends the request side: there is nothing left to drain
+// or to stop.
+func TestDrainingStreamSkipsDrainWhenPeerResetRequest(t *testing.T) {
+	setDrainBounds(t, 50*time.Millisecond, 1<<20)
+	stopped := make(chan struct{})
+	reset := errors.New("stream reset by peer")
+	stream := newDrainingStream(context.Background(), failingReader{reset}, func(time.Time) error { return nil }, func() { close(stopped) })
+
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, reset) {
+		t.Fatalf("read = %v, want the reset", err)
+	}
+	stream.trevrpcCancelRead()
+	_ = stream.Close()
+	select {
+	case <-stopped:
+		t.Fatal("request side was stopped after the peer reset it")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// failingReader is a stream whose request side fails every Read with err.
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error)     { return 0, r.err }
+func (failingReader) Write(data []byte) (int, error) { return len(data), nil }
+func (failingReader) Close() error                   { return nil }
