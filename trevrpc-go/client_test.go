@@ -872,6 +872,213 @@ func TestResponseMessageStreamHeaders(t *testing.T) {
 	})
 }
 
+// A call that failed before its first frame fails Headers, as it fails Recv,
+// however the failure was first noticed.
+func TestResponseMessageStreamHeadersReplayFailureBeforeFirstFrame(t *testing.T) {
+	t.Run("Recv failed first", func(t *testing.T) {
+		stream := newStreamForFrames() // the stream ends with no STATUS
+		_, err := stream.Recv()
+		if reason, _ := responseStreamFailureReason(err); reason != "missing_terminal_status" {
+			t.Fatalf("Recv() = %v, want missing_terminal_status", err)
+		}
+		headers, headersErr := stream.Headers()
+		if !errors.Is(headersErr, err) {
+			t.Fatalf("Headers() = %v, %v, want the failure Recv returned", headers, headersErr)
+		}
+	})
+
+	t.Run("second Headers call", func(t *testing.T) {
+		failure := Unavailable("transport broke")
+		stream := newResponseMessageStream[*testMessage](context.Background(), &errorAfterFramesStream{finalErr: failure}, func() *testMessage { return &testMessage{} }, defaultCallConfig(), func() {})
+		if _, err := stream.Headers(); !errors.Is(err, failure) {
+			t.Fatalf("first Headers() = %v, want the failure", err)
+		}
+		if headers, err := stream.Headers(); !errors.Is(err, failure) {
+			t.Fatalf("second Headers() = %v, %v, want the failure again", headers, err)
+		}
+	})
+
+	t.Run("Headers waits while Recv reads invalid HEADERS", func(t *testing.T) {
+		frames := make(chan responseFrame)
+		stream := newResponseMessageStream[*testMessage](context.Background(), &channelFrameStream{frames: frames}, func() *testMessage { return &testMessage{} }, defaultCallConfig(), func() {})
+		recvDone := make(chan error, 1)
+		go func() {
+			_, err := stream.Recv()
+			recvDone <- err
+		}()
+		time.Sleep(20 * time.Millisecond) // Recv holds the read lock, blocked on the first frame
+		type result struct {
+			headers Metadata
+			err     error
+		}
+		headersDone := make(chan result, 1)
+		go func() {
+			headers, err := stream.Headers()
+			headersDone <- result{headers, err}
+		}()
+		time.Sleep(20 * time.Millisecond) // Headers waits for the first frame
+		frames <- headersFrame(Metadata{"Bad Key": nil})
+
+		recvErr := <-recvDone
+		if reason, _ := responseStreamFailureReason(recvErr); reason != "invalid_metadata" {
+			t.Fatalf("Recv() = %v, want invalid_metadata", recvErr)
+		}
+		select {
+		case got := <-headersDone:
+			if !errors.Is(got.err, recvErr) {
+				t.Fatalf("Headers() = %v, %v, want the failure Recv returned", got.headers, got.err)
+			}
+		case <-time.After(testTimeout):
+			t.Fatal("Headers() did not wake when the call failed")
+		}
+	})
+}
+
+// A stream that ended reports the same outcome to every later Recv: a failure
+// is never followed by the io.EOF of a clean end.
+func TestResponseMessageStreamRecvReplaysOutcome(t *testing.T) {
+	body, err := marshalMessage(&testMessage{Value: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		frames []responseFrame
+		// status is the terminal status the stream reports, if any.
+		status *Status
+		// clean is set for a stream that ends with io.EOF.
+		clean bool
+	}{
+		{name: "remote status", frames: []responseFrame{statusFrame(Unavailable("down"))}, status: Unavailable("down")},
+		{name: "missing status", frames: []responseFrame{messageFrame(body)}},
+		{name: "trailing frame", frames: []responseFrame{statusFrame(OK()), messageFrame(body)}},
+		{name: "misplaced headers", frames: []responseFrame{messageFrame(body), headersFrame(nil)}},
+		{name: "OK status", frames: []responseFrame{messageFrame(body), statusFrame(OK())}, status: OK(), clean: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stream := newStreamForFrames(test.frames...)
+			var first error
+			for {
+				if _, first = stream.Recv(); first != nil {
+					break
+				}
+			}
+			if errors.Is(first, io.EOF) != test.clean {
+				t.Fatalf("first failing Recv() = %v, clean end = %t", first, test.clean)
+			}
+			for range 2 {
+				if _, again := stream.Recv(); !errors.Is(again, first) {
+					t.Fatalf("later Recv() = %v, want %v again", again, first)
+				}
+			}
+			status, ok := stream.TerminalStatus()
+			if ok != (test.status != nil) || (ok && status.Code != test.status.Code) {
+				t.Fatalf("TerminalStatus() = %v, %t, want %v", status, ok, test.status)
+			}
+		})
+	}
+}
+
+// closeEndsFrameStream yields its frames, then blocks until it is closed and
+// fails the way a transport does when a read is cancelled under it.
+type closeEndsFrameStream struct {
+	frames    []responseFrame
+	entered   chan struct{} // closed when Recv waits after the last frame
+	closed    chan struct{}
+	enterOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newCloseEndsFrameStream(frames ...responseFrame) *closeEndsFrameStream {
+	return &closeEndsFrameStream{frames: frames, entered: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (s *closeEndsFrameStream) Recv() (responseFrame, error) {
+	if len(s.frames) > 0 {
+		frame := s.frames[0]
+		s.frames = s.frames[1:]
+		return frame, nil
+	}
+	s.enterOnce.Do(func() { close(s.entered) })
+	<-s.closed
+	return responseFrame{}, errors.New("read cancelled")
+}
+
+func (s *closeEndsFrameStream) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+// The spec lets a client report the call's outcome as soon as STATUS arrives,
+// so a Close that interrupts the wait for the end of the stream reports the
+// received status, not a protocol error and not a bare io.EOF.
+func TestResponseMessageStreamCloseWhileAwaitingEndReportsStatus(t *testing.T) {
+	for _, status := range []*Status{OK(), Unavailable("down")} {
+		t.Run(status.Code.String(), func(t *testing.T) {
+			inner := newCloseEndsFrameStream(statusFrame(status))
+			stream := newResponseMessageStream[*testMessage](context.Background(), inner, func() *testMessage { return &testMessage{} }, defaultCallConfig(), func() {})
+			result := make(chan error, 1)
+			go func() {
+				_, err := stream.Recv()
+				result <- err
+			}()
+			select {
+			case <-inner.entered:
+			case <-time.After(testTimeout):
+				t.Fatal("Recv() did not wait for the end of the stream")
+			}
+			if err := stream.Close(); err != nil {
+				t.Fatalf("Close() = %v", err)
+			}
+
+			var err error
+			select {
+			case err = <-result:
+			case <-time.After(testTimeout):
+				t.Fatal("Recv() did not return after Close()")
+			}
+			if status.IsOK() {
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("Recv() = %v, want io.EOF", err)
+				}
+			} else if reason, _ := responseStreamFailureReason(err); reason != "remote_status" || StatusFromError(err).Code != status.Code {
+				t.Fatalf("Recv() = %v (reason %q), want the remote status", err, reason)
+			}
+			if _, again := stream.Recv(); !errors.Is(again, err) {
+				t.Fatalf("later Recv() = %v, want %v again", again, err)
+			}
+			if got, ok := stream.TerminalStatus(); !ok || got.Code != status.Code {
+				t.Fatalf("TerminalStatus() = %v, %t, want %v", got, ok, status)
+			}
+		})
+	}
+}
+
+// Close before STATUS is a local close: Recv ends with io.EOF and there is no
+// terminal status.
+func TestResponseMessageStreamCloseBeforeStatusEndsWithoutStatus(t *testing.T) {
+	body, err := marshalMessage(&testMessage{Value: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := newStreamForFrames(messageFrame(body), statusFrame(OK()))
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	for range 2 {
+		if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+			t.Fatalf("Recv() after Close() = %v, want io.EOF", err)
+		}
+	}
+	if status, ok := stream.TerminalStatus(); ok {
+		t.Fatalf("TerminalStatus() = %v, true after a local close before STATUS", status)
+	}
+}
+
 // channelFrameStream yields the frames sent on a channel.
 type channelFrameStream struct {
 	frames chan responseFrame

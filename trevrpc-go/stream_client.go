@@ -402,12 +402,20 @@ type transportResponseStream struct {
 	ctx          context.Context
 	stream       clientStream
 	reader       *frameReader
-	writerDone   <-chan error
 	cancelUpload context.CancelFunc // set while the request is streamed
 	cancel       context.CancelFunc
 	stopCancel   func()
 	maxFrameSize int
-	done         bool
+	// Close may run concurrently with Recv, and with Recv's own end of the
+	// stream. finishOnce makes the teardown run once, and done lets Recv see it.
+	finishOnce sync.Once
+	done       atomic.Bool
+	// writerDone carries the result of the writer goroutine. writerMu lets the
+	// callers that report it, Close and Recv, take it in turn: the first takes
+	// it, and writerDone is nil from then on.
+	writerMu      sync.Mutex
+	writerDone    <-chan error
+	writerIgnored atomic.Bool
 	// compression is the connection's compression state, and queried says
 	// the request asked the server for its dictionaries, so that the ANSWER
 	// of the response answers it.
@@ -724,7 +732,7 @@ func (s *transportResponseStream) nextResponseFrame() (pumpedFrame, error) {
 // frames, so the end of the stream can be told from more data: the next call
 // returns io.EOF when the stream ended cleanly.
 func (s *transportResponseStream) Recv() (responseFrame, error) {
-	if s.done {
+	if s.done.Load() {
 		return responseFrame{}, io.EOF
 	}
 
@@ -792,33 +800,41 @@ func (s *transportResponseStream) Close() error {
 	return s.writerError(true)
 }
 
+// finish tears the call down once. A concurrent caller waits for the teardown
+// the first one runs, so a Close that unblocks a pending Recv and the Recv that
+// then ends the stream cannot run it twice. Only the first caller decides
+// whether the read side is cancelled.
 func (s *transportResponseStream) finish(cancelRead bool) {
-	if s.done {
-		return
-	}
-	s.done = true
-	if s.pumpStop != nil {
-		s.stopPump.Do(func() { close(s.pumpStop) })
-	}
-	if s.stopCancel != nil {
-		s.stopCancel()
-	}
-	s.stopUpload()
-	if s.cancel != nil {
-		s.cancel()
-	}
-	s.flow.release()
-	if s.optimistic != nil {
-		s.optimistic.end()
-	}
-	s.streams.close()
-	if cancelRead {
-		s.currentStream().cancelRead()
-	}
+	s.finishOnce.Do(func() {
+		s.done.Store(true)
+		if s.pumpStop != nil {
+			s.stopPump.Do(func() { close(s.pumpStop) })
+		}
+		if s.stopCancel != nil {
+			s.stopCancel()
+		}
+		s.stopUpload()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.flow.release()
+		if s.optimistic != nil {
+			s.optimistic.end()
+		}
+		s.streams.close()
+		if cancelRead {
+			s.currentStream().cancelRead()
+		}
+	})
 }
 
+// writerError waits for the writer and reports its error to the first caller;
+// later and concurrent callers get nil. A cancelled upload is not an error
+// when ignoreCancelled is set, which is for the callers that stopped it.
 func (s *transportResponseStream) writerError(ignoreCancelled bool) error {
-	if s.writerDone == nil {
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
+	if s.writerDone == nil || s.writerIgnored.Load() {
 		return nil
 	}
 	err := <-s.writerDone
@@ -832,8 +848,10 @@ func (s *transportResponseStream) writerError(ignoreCancelled bool) error {
 	return err
 }
 
+// ignoreWriterError drops the writer's error: the call ended with a status
+// that explains it. It does not wait for a writerError call in progress.
 func (s *transportResponseStream) ignoreWriterError() {
-	s.writerDone = nil
+	s.writerIgnored.Store(true)
 }
 
 func cancelStreamOnContext(ctx context.Context, stream clientStream) func() {

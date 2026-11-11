@@ -1569,8 +1569,8 @@ func TestClientResponseStreamDeadlineReturnsDeadlineExceeded(t *testing.T) {
 	if code := StatusFromError(err).Code; code != CodeDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got %v (%v)", code, err)
 	}
-	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
-		t.Fatalf("expected EOF after deadline, got %v", err)
+	if _, err := stream.Recv(); StatusFromError(err).Code != CodeDeadlineExceeded {
+		t.Fatalf("expected the deadline again after it, got %v", err)
 	}
 }
 

@@ -391,3 +391,89 @@ func TestTransportRejectsOversizedResponseFrameBeforeReadingIt(t *testing.T) {
 		t.Fatalf("an oversized frame header made the client allocate %d bytes", allocated)
 	}
 }
+
+// A Close while Recv waits for the end of the stream after STATUS is not a
+// protocol error: the received status decides the outcome.
+func TestTransportCloseWhileAwaitingEndAfterStatusReportsStatus(t *testing.T) {
+	stream := newUnaryTransportTestStream(encodeUnaryTestResponse(t))
+	client := newStreamClient(unaryTestOpener{stream: stream}, DefaultMaxFrameSize)
+	call, err := ServerStreaming(context.Background(), client, "/service/method", &testMessage{}, func() *testMessage { return &testMessage{} })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := call.Recv(); err != nil {
+		t.Fatalf("message: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := call.Recv()
+		result <- err
+	}()
+	select {
+	case <-stream.waitingForEOF:
+	case <-time.After(testTimeout):
+		t.Fatal("Recv did not wait for the end of the stream")
+	}
+	_ = call.Close()
+	select {
+	case err := <-result:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Recv() racing Close() = %v, want io.EOF after the OK status", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Recv did not return after Close")
+	}
+	if status, ok := call.TerminalStatus(); !ok || !status.IsOK() {
+		t.Fatalf("TerminalStatus() = %v, %t, want the received OK", status, ok)
+	}
+}
+
+// MessageStream.Close is safe concurrently with a blocked Recv: the race
+// detector sees no unordered access to the call's teardown state, and the
+// Recv returns.
+func TestTransportCloseMayRaceBlockedRecv(t *testing.T) {
+	newResponse := func() *testMessage { return &testMessage{} }
+	tests := map[string]func(t *testing.T, client *streamClient) (recv func() error, closeCall func()){
+		"bidirectional streaming": func(t *testing.T, client *streamClient) (func() error, func()) {
+			call, err := BidirectionalStreaming[*testMessage](context.Background(), client, "/service/method", newResponse)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return func() error { _, err := call.Recv(); return err }, func() {
+				_ = call.CloseSend()
+				_ = call.Close()
+			}
+		},
+		"server streaming": func(t *testing.T, client *streamClient) (func() error, func()) {
+			call, err := ServerStreaming(context.Background(), client, "/service/method", &testMessage{}, newResponse)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return func() error { _, err := call.Recv(); return err }, func() { _ = call.Close() }
+		},
+	}
+	for name, start := range tests {
+		t.Run(name, func(t *testing.T) {
+			for range 100 {
+				stream := newUnaryTransportTestStream(nil)
+				recv, closeCall := start(t, newStreamClient(unaryTestOpener{stream: stream}, DefaultMaxFrameSize))
+				result := make(chan error, 1)
+				go func() { result <- recv() }()
+				// Two closers: a Close and the Close of an erroring Recv are alike.
+				var closers sync.WaitGroup
+				for range 2 {
+					closers.Go(closeCall)
+				}
+				closers.Wait()
+				select {
+				case err := <-result:
+					if err == nil {
+						t.Fatal("Recv() returned a message from an empty stream")
+					}
+				case <-time.After(testTimeout):
+					t.Fatal("Recv did not return after Close")
+				}
+			}
+		})
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -46,7 +47,13 @@ type ServerStreamingCall[Res ProtoMessage] interface {
 	// Headers returns the response headers. It blocks until the first response
 	// frame (headers, a message, or the final status) arrives and returns empty
 	// metadata if the server sent no headers. It does not consume a message:
-	// Recv still returns it.
+	// Recv still returns it. If the call failed or was closed before its first
+	// frame, Headers returns that failure, again on every call, and Recv
+	// returns it too.
+	//
+	// Recv returns io.EOF only after the server's OK status, or after Close.
+	// A failed call returns its error from every Recv call, not just the
+	// first.
 	Headers() (Metadata, error)
 }
 
@@ -70,7 +77,8 @@ type ClientStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// empty metadata if the server sent no headers. It does not consume the
 	// response: CloseAndRecv still returns it. It returns while the requests
 	// are still being sent if the server sends headers before reading them
-	// all.
+	// all. If the call failed or was closed before its first frame, Headers
+	// returns that failure, again on every call.
 	Headers() (Metadata, error)
 }
 
@@ -83,7 +91,9 @@ type BidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// server finished the call successfully without reading every message.
 	// The same applies to blocked Send calls.
 	Send(Req) error
-	// Recv receives one response message or io.EOF after the response stream completes.
+	// Recv receives one response message. It returns io.EOF after the server's
+	// OK status, or after Close; any other end is an error, which every later
+	// Recv call returns again.
 	Recv() (Res, error)
 	// CloseSend closes the request stream while keeping the response stream readable.
 	CloseSend() error
@@ -95,7 +105,9 @@ type BidirectionalStreamingCall[Req ProtoMessage, Res ProtoMessage] interface {
 	// Headers returns the response headers. It blocks until the first response
 	// frame (headers, a message, or the final status) arrives and returns empty
 	// metadata if the server sent no headers. It does not consume a message:
-	// Recv still returns it.
+	// Recv still returns it. If the call failed or was closed before its first
+	// frame, Headers returns that failure, again on every call, and Recv
+	// returns it too.
 	Headers() (Metadata, error)
 }
 
@@ -229,7 +241,9 @@ func Unary[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Tr
 // path "/package.Service/Method", and returns its response stream.
 // The terminal status and trailing metadata are available from TerminalStatus
 // after Recv reports io.EOF or the stream's error, and the response headers
-// from Headers.
+// from Headers. Recv keeps returning the error that ended the call, and
+// io.EOF only follows an OK status or Close. A Close that finds the stream
+// waiting for its end after the final status reports that status.
 func ServerStreaming[Req ProtoMessage, Res ProtoMessage](ctx context.Context, transport Transport, method string, request Req, newResponse func() Res, options ...CallOption) (ServerStreamingCall[Res], error) {
 	config := applyCallOptions(options)
 	deadline, err := resolveClientDeadline(ctx, config, time.Now)
@@ -495,9 +509,60 @@ func newResponseStreamFailure(reason string, status *Status, cause error) error 
 	return &responseStreamFailure{reason: reason, status: status, cause: cause}
 }
 
+// responsePhase is how far a response stream has come in the response grammar:
+// optional HEADERS, then messages, then one STATUS, then the end of the stream.
+type responsePhase uint32
+
+const (
+	// phaseAwaitingFirst: no frame has arrived, so HEADERS may still come.
+	phaseAwaitingFirst responsePhase = iota
+	// phaseStreaming: the first frame arrived, so the headers are settled.
+	// Messages and the STATUS follow.
+	phaseStreaming
+	// phaseAwaitingEnd: the STATUS arrived and the transport must end the
+	// stream right after it.
+	phaseAwaitingEnd
+	// phaseEnded: the outcome is known. It never changes, and every later call
+	// reports it.
+	phaseEnded
+)
+
+// responseOutcome is how a response stream ended.
+type responseOutcome struct {
+	// status is the terminal status the server ended the call with. It is nil
+	// when the stream failed, or was closed, before a STATUS arrived.
+	status *Status
+	// err is what Recv returns from then on: io.EOF after an OK status or a
+	// local Close, the failure otherwise. It is never nil.
+	err error
+	// closedLocally is set when Close ended the stream before a STATUS arrived.
+	closedLocally bool
+}
+
+// statusOutcome is the outcome of a call the server ended with status.
+func statusOutcome(status *Status) responseOutcome {
+	if status.IsOK() {
+		return responseOutcome{status: status, err: io.EOF}
+	}
+	return responseOutcome{status: status, err: newResponseStreamFailure("remote_status", status, nil)}
+}
+
+// headersError is why Headers fails when the stream ended before any frame.
+func (o responseOutcome) headersError() error {
+	if o.closedLocally {
+		return Cancelled("response stream closed")
+	}
+	return o.err
+}
+
 // responseMessageStream decodes the response frames of one call and enforces
-// the response grammar: optional HEADERS, then messages, then one STATUS. It
-// implements ServerStreamingCall.
+// the response grammar. It implements ServerStreamingCall.
+//
+// The stream moves through responsePhase forward only. Whatever ends it, a
+// STATUS, a failure or Close, stores the outcome once and every later Headers
+// and Recv call replays it, so a failed call never looks like a clean one. A
+// Close that arrives while the end of the stream is awaited after the STATUS
+// reports that STATUS: the server's status already decided the outcome.
 type responseMessageStream[T ProtoMessage] struct {
 	inner      frameStream
 	newMessage func() T
@@ -506,41 +571,48 @@ type responseMessageStream[T ProtoMessage] struct {
 	cancel     context.CancelFunc
 	finishOnce sync.Once
 
-	// readMu serializes frame reads by Recv and Headers.
+	// readMu serializes frame reads by Recv and Headers, and guards pending.
 	readMu sync.Mutex
-	// ready is closed, once Headers has had to wait on it, when the headers
-	// are known: the first response frame has arrived or the stream finished.
-	// It is guarded by mu.
-	ready chan struct{}
-	// pending is a frame, or the error, that Headers read ahead for Recv.
-	pending    responseFrame
-	hasPending bool
-	pendingErr error
+	// pending is the first frame, when it is not HEADERS, that Headers read
+	// ahead for Recv.
+	pending *responseFrame
 
-	mu            sync.Mutex
-	headers       Metadata
-	headersClosed bool // a frame arrived, so HEADERS may no longer
-	done          bool
-	closedLocally bool
-	closeErr      error
-	closeErrRead  bool
-	terminal      *Status
+	// phase is written under mu and may be loaded without it, which keeps the
+	// per-message path free of mu.
+	phase atomic.Uint32
+
+	mu sync.Mutex
+	// ready is closed, once Headers has had to wait on it, when the headers
+	// are known: the first response frame has arrived or the stream ended.
+	ready   chan struct{}
+	headers Metadata
+	// headersErr is why Headers fails: the stream ended before its first frame.
+	headersErr error
+	// status is the STATUS that waits for the end of the stream.
+	status *Status
+	// outcome is set when the phase becomes phaseEnded.
+	outcome responseOutcome
+	// closeErr is the error of closing the transport, reported once.
+	closeErr error
 }
 
 func newResponseMessageStream[T ProtoMessage](ctx context.Context, inner frameStream, newMessage func() T, config callConfig, cancel context.CancelFunc) *responseMessageStream[T] {
 	return &responseMessageStream[T]{inner: inner, newMessage: newMessage, config: config, ctx: ctx, cancel: cancel}
 }
 
+func (s *responseMessageStream[T]) loadPhase() responsePhase {
+	return responsePhase(s.phase.Load())
+}
+
+// Recv returns the next message. Once the stream ended it returns the same
+// result every time: io.EOF after a clean end or a local Close, the failure
+// after a failed call.
 func (s *responseMessageStream[T]) Recv() (T, error) {
 	var zero T
-	if err := s.takePendingError(); err != nil {
-		return zero, err
-	}
-	s.mu.Lock()
-	done := s.done
-	s.mu.Unlock()
-	if done {
-		return zero, io.EOF
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	if s.loadPhase() == phaseEnded {
+		return zero, s.endedError()
 	}
 
 	for {
@@ -554,96 +626,82 @@ func (s *responseMessageStream[T]) Recv() (T, error) {
 			continue
 		case frameTypeMessage:
 			if len(frame.body) > s.config.maxResponseSize {
-				s.abort()
-				return zero, &FrameTooLargeError{Len: len(frame.body), Max: s.config.maxResponseSize}
+				return zero, s.abort(&FrameTooLargeError{Len: len(frame.body), Max: s.config.maxResponseSize})
 			}
 
 			message, err := invokeResponseFactory(s.newMessage)
 			if err != nil {
-				s.abort()
-				return zero, err
+				return zero, s.abort(err)
 			}
 			if err := unmarshalMessage(frame.body, message); err != nil {
-				s.abort()
-				return zero, newResponseStreamFailure(
+				return zero, s.abort(newResponseStreamFailure(
 					"malformed_protobuf",
 					Internal("failed to decode response: "+err.Error()),
 					err,
-				)
+				))
 			}
 
 			return message, nil
 		case frameTypeStatus:
 			return zero, s.finishWithStatus(frame.status)
 		default:
-			s.abort()
-			return zero, newResponseStreamFailure(
+			return zero, s.abort(newResponseStreamFailure(
 				"unsupported_frame_kind",
 				Internal(fmt.Sprintf("response stream contained %s", frame.kind)),
 				nil,
-			)
+			))
 		}
 	}
 }
 
 // finishWithStatus completes the stream with its terminal status. The
 // transport must end right after it; frames of unknown type are skipped
-// before that.
+// before that. The caller holds readMu.
 func (s *responseMessageStream[T]) finishWithStatus(status *Status) error {
 	if err := validateMetadata(status.Metadata); err != nil {
-		s.abort()
-		return newResponseStreamFailure(
+		return s.abort(newResponseStreamFailure(
 			"invalid_metadata",
 			Internal("invalid response metadata: "+err.Error()),
 			err,
-		)
+		))
 	}
+	if err := s.awaitEnd(status); err != nil {
+		return err
+	}
+
 	_, trailingErr := recvClientFrame(s.ctx, s.inner)
 	if trailingErr == nil {
-		s.abort()
-		return newResponseStreamFailure(
+		return s.abort(newResponseStreamFailure(
 			"trailing_frame",
 			Internal("response stream contained data after final status"),
 			nil,
-		)
+		))
 	}
-	var cleanupErr error
-	switch {
-	case errors.Is(trailingErr, io.EOF):
-		s.mu.Lock()
-		s.terminal = status
-		s.mu.Unlock()
-		cleanupErr = s.finish()
-	case s.ctx.Err() != nil:
-		// The call's own deadline or cancellation cut the wait for the end of
-		// the stream short. The server's status already decided the outcome,
-		// so report it rather than a protocol error.
-		s.mu.Lock()
-		s.terminal = status
-		s.mu.Unlock()
-		s.abort()
-	default:
-		s.abort()
-		return newResponseStreamFailure(
+	cleanEnd := errors.Is(trailingErr, io.EOF)
+	if !cleanEnd && s.ctx.Err() == nil {
+		return s.abort(newResponseStreamFailure(
 			"trailing_frame",
 			Internal("response stream did not end cleanly after final status"),
 			trailingErr,
-		)
+		))
 	}
 
-	if status.IsOK() {
-		if cleanupErr != nil {
-			return cleanupErr
+	// The server's status decides the outcome whether the stream ended or the
+	// call's own deadline, cancellation or Close cut the wait short.
+	outcome, ended := s.end(statusOutcome(status))
+	if ended {
+		closeErr := s.finish()
+		if cleanEnd && closeErr != nil && status.IsOK() {
+			return closeErr
 		}
-		return io.EOF
 	}
-
-	return newResponseStreamFailure("remote_status", status, nil)
+	return outcome.err
 }
 
 // Headers returns the response headers, reading ahead to the first response
 // frame if it has not arrived yet. A message or status read this way is kept
-// for Recv. A failure is returned here and again by Recv.
+// for Recv. If the call failed or was closed before its first frame, Headers
+// returns the failure, which Recv returns as well.
 func (s *responseMessageStream[T]) Headers() (Metadata, error) {
 	for {
 		if headers, resolved, err := s.resolvedHeaders(); resolved {
@@ -655,33 +713,22 @@ func (s *responseMessageStream[T]) Headers() (Metadata, error) {
 			<-s.readySignal()
 			continue
 		}
-		if headers, err := s.readAhead(); headers != nil || err != nil {
-			return headers, err
-		}
+		s.readAhead()
 	}
 }
 
 // readAhead reads the first response frame for Headers. The caller holds
-// readMu; readAhead releases it.
-func (s *responseMessageStream[T]) readAhead() (Metadata, error) {
+// readMu; readAhead releases it. Whether the read worked, the headers are
+// resolved afterwards: it either settled them or ended the stream.
+func (s *responseMessageStream[T]) readAhead() {
 	defer s.readMu.Unlock()
-	if headers, resolved, err := s.resolvedHeaders(); resolved {
-		return headers, err
+	if s.loadPhase() != phaseAwaitingFirst {
+		return
 	}
-
 	frame, err := s.readFrame()
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, Cancelled("response stream closed")
-		}
-		s.pendingErr = err
-		return nil, err
+	if err == nil && frame.kind != frameTypeHeaders {
+		s.pending = &frame
 	}
-	if frame.kind != frameTypeHeaders {
-		s.pending, s.hasPending = frame, true
-	}
-	headers, _, _ := s.resolvedHeaders()
-	return headers, nil
 }
 
 // readySignal returns a channel that is closed once the headers are known.
@@ -690,7 +737,7 @@ func (s *responseMessageStream[T]) readySignal() <-chan struct{} {
 	defer s.mu.Unlock()
 	if s.ready == nil {
 		s.ready = make(chan struct{})
-		if s.headersClosed || s.done {
+		if s.loadPhase() != phaseAwaitingFirst {
 			close(s.ready)
 		}
 	}
@@ -710,40 +757,27 @@ func (s *responseMessageStream[T]) signalReadyLocked() {
 	}
 }
 
-// takePendingError returns the failure Headers read ahead for Recv, once.
-func (s *responseMessageStream[T]) takePendingError() error {
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-	err := s.pendingErr
-	s.pendingErr = nil
-	return err
-}
-
 // resolvedHeaders reports whether the headers are known, either because the
-// first frame arrived or because the stream ended without one.
+// first frame arrived, which gives the headers or none, or because the stream
+// ended without one, which gives the reason.
 func (s *responseMessageStream[T]) resolvedHeaders() (Metadata, bool, error) {
+	if s.loadPhase() == phaseAwaitingFirst {
+		return nil, false, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.headersClosed {
-		return cloneMetadata(s.headers), true, nil
+	if s.headersErr != nil {
+		return nil, true, s.headersErr
 	}
-	if s.done {
-		if s.closedLocally {
-			return nil, true, Cancelled("response stream closed")
-		}
-		return Metadata{}, true, nil
-	}
-	return nil, false, nil
+	return cloneMetadata(s.headers), true, nil
 }
 
 // nextFrame returns the frame to process next: one Headers read ahead, or the
-// next frame of the transport.
+// next frame of the transport. The caller holds readMu.
 func (s *responseMessageStream[T]) nextFrame() (responseFrame, error) {
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-	if s.hasPending {
-		frame := s.pending
-		s.pending, s.hasPending = responseFrame{}, false
+	if s.pending != nil {
+		frame := *s.pending
+		s.pending = nil
 		return frame, nil
 	}
 	return s.readFrame()
@@ -751,64 +785,126 @@ func (s *responseMessageStream[T]) nextFrame() (responseFrame, error) {
 
 // readFrame receives the next frame from the transport. It validates and
 // records HEADERS, and fails the stream when HEADERS comes second or after
-// another frame. On failure the stream has been aborted and the returned error
-// is the one to report; it is io.EOF when the stream was closed locally.
+// another frame. On failure the stream has ended and the returned error is the
+// one to report. The caller holds readMu.
 func (s *responseMessageStream[T]) readFrame() (responseFrame, error) {
 	frame, err := recvClientFrame(s.ctx, s.inner)
 	if err != nil {
-		if s.wasClosedLocally() {
-			return responseFrame{}, io.EOF
-		}
-
-		s.abort()
-		if errors.Is(err, io.EOF) {
-			return responseFrame{}, newResponseStreamFailure(
+		switch {
+		case errors.Is(err, io.EOF):
+			err = newResponseStreamFailure(
 				"missing_terminal_status",
 				Internal("response stream ended before final status"),
 				err,
 			)
+		default:
+			if _, ok := errors.AsType[*frameDecodeError](err); ok {
+				err = newResponseStreamFailure(
+					"malformed_protobuf",
+					Internal("failed to decode response frame: "+err.Error()),
+					err,
+				)
+			}
 		}
-		if _, ok := errors.AsType[*frameDecodeError](err); ok {
-			return responseFrame{}, newResponseStreamFailure(
-				"malformed_protobuf",
-				Internal("failed to decode response frame: "+err.Error()),
-				err,
-			)
-		}
-
-		return responseFrame{}, err
+		// A stream closed locally has ended already, as io.EOF, and abort
+		// reports that instead of the error the close caused.
+		return responseFrame{}, s.abort(err)
 	}
 
-	s.mu.Lock()
-	headersClosed := s.headersClosed
-	s.mu.Unlock()
+	first := s.loadPhase() == phaseAwaitingFirst
 	if frame.kind == frameTypeHeaders {
-		if headersClosed {
-			s.abort()
-			return responseFrame{}, newResponseStreamFailure(
+		if !first {
+			return responseFrame{}, s.abort(newResponseStreamFailure(
 				"unexpected_headers",
 				Internal("response stream contained HEADERS after another frame"),
 				nil,
-			)
+			))
 		}
 		if err := validateMetadata(frame.headers); err != nil {
-			s.abort()
-			return responseFrame{}, newResponseStreamFailure(
+			return responseFrame{}, s.abort(newResponseStreamFailure(
 				"invalid_metadata",
 				Internal("invalid response headers: "+err.Error()),
 				err,
-			)
+			))
 		}
 	}
+	if first {
+		if err := s.settleHeaders(frame); err != nil {
+			return responseFrame{}, err
+		}
+	}
+	return frame, nil
+}
 
+// settleHeaders moves the stream out of phaseAwaitingFirst because frame, its
+// first, arrived, and records its headers. It returns the error to report if
+// the stream ended meanwhile.
+func (s *responseMessageStream[T]) settleHeaders(frame responseFrame) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadPhase() == phaseEnded {
+		return s.outcome.err
+	}
 	if frame.kind == frameTypeHeaders {
 		s.headers = frame.headers
 	}
-	s.headersClosed = true
+	s.phase.Store(uint32(phaseStreaming))
 	s.signalReadyLocked()
-	s.mu.Unlock()
-	return frame, nil
+	return nil
+}
+
+// awaitEnd moves the stream to phaseAwaitingEnd because status arrived. It
+// returns the error to report if the stream ended meanwhile.
+func (s *responseMessageStream[T]) awaitEnd(status *Status) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadPhase() == phaseEnded {
+		return s.outcome.err
+	}
+	s.status = status
+	s.phase.Store(uint32(phaseAwaitingEnd))
+	return nil
+}
+
+// endedError is the error the ended stream reports.
+func (s *responseMessageStream[T]) endedError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.outcome.err
+}
+
+// end ends the stream with outcome unless it has ended already. It returns the
+// outcome that stands and whether this call ended the stream, which makes it
+// the one to tear it down.
+func (s *responseMessageStream[T]) end(outcome responseOutcome) (responseOutcome, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.endLocked(outcome)
+}
+
+func (s *responseMessageStream[T]) endLocked(outcome responseOutcome) (responseOutcome, bool) {
+	switch s.loadPhase() {
+	case phaseEnded:
+		return s.outcome, false
+	case phaseAwaitingFirst:
+		s.headersErr = outcome.headersError()
+	}
+	s.outcome = outcome
+	s.phase.Store(uint32(phaseEnded))
+	s.signalReadyLocked()
+	return outcome, true
+}
+
+// abort ends the stream with failure and tears it down, then returns the error
+// to report: failure, or the outcome that stood already, for instance because
+// Close ended the stream first. The caller discards the cleanup error because
+// it reports a more specific one.
+func (s *responseMessageStream[T]) abort(failure error) error {
+	outcome, ended := s.end(responseOutcome{err: failure})
+	if ended {
+		_ = s.finish()
+	}
+	return outcome.err
 }
 
 func (s *responseMessageStream[T]) TerminalStatus() (*Status, bool) {
@@ -823,18 +919,17 @@ func (s *responseMessageStream[T]) TerminalStatus() (*Status, bool) {
 // terminalStatus returns the terminal status itself, which the caller must not
 // change or keep, or nil if the stream has none yet.
 func (s *responseMessageStream[T]) terminalStatus() *Status {
+	if s.loadPhase() != phaseEnded {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.terminal
+	return s.outcome.status
 }
 
+// finish tears the transport down once, and returns the error of that, once.
 func (s *responseMessageStream[T]) finish() error {
 	s.finishOnce.Do(func() {
-		s.mu.Lock()
-		s.done = true
-		s.signalReadyLocked()
-		s.mu.Unlock()
-
 		s.cancel()
 		err := closeMessageStream(s.inner)
 
@@ -845,28 +940,21 @@ func (s *responseMessageStream[T]) finish() error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closeErrRead {
-		return nil
-	}
-	s.closeErrRead = true
-	return s.closeErr
+	err := s.closeErr
+	s.closeErr = nil
+	return err
 }
 
-// abort finishes the stream on a failure path. The caller already returns a
-// more specific error, so the cleanup error is discarded.
-func (s *responseMessageStream[T]) abort() {
-	_ = s.finish()
-}
-
-func (s *responseMessageStream[T]) wasClosedLocally() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closedLocally
-}
-
+// Close ends the stream. A Recv blocked on it returns the outcome of the
+// stream: io.EOF, or the received status if Close finds the stream waiting for
+// its end after the STATUS.
 func (s *responseMessageStream[T]) Close() error {
 	s.mu.Lock()
-	s.closedLocally = true
+	if s.loadPhase() == phaseAwaitingEnd {
+		s.endLocked(statusOutcome(s.status))
+	} else {
+		s.endLocked(responseOutcome{err: io.EOF, closedLocally: true})
+	}
 	s.mu.Unlock()
 	return s.finish()
 }

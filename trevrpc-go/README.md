@@ -95,7 +95,7 @@ reply, _ := client.SayHello(ctx, request,
 )
 ```
 
-A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the headers, the first message or the final status arrives, returns empty metadata if the server sent none, and does not consume a message. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
+A response has two kinds of metadata. Response headers arrive before the first response message, in a `HEADERS` frame. Trailing metadata ("response metadata") arrives with the final status. Server-streaming calls (`ServerStreamingCall`) and bidirectional calls expose the headers through `Headers()`, which blocks until the headers, the first message or the final status arrives, returns empty metadata if the server sent none, and does not consume a message. A call that failed or was closed before its first frame makes `Headers()` return the failure, as `Recv` does. `Recv` returns `io.EOF` only after the server's OK status or `Close`, and keeps returning the error that ended a failed call. They expose the final status, and the trailing metadata on it, through `TerminalStatus()` once the stream has ended.
 
 `trevrpc.BearerMetadata(token)` builds the `authorization` metadata of a bearer token, for `WithMetadataEntries` and the connection metadata below, and returns an `InvalidArgument` status for a token that the server's `BearerToken` would reject as malformed (anything but an RFC 6750 `b64token`).
 
