@@ -4,15 +4,19 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -510,12 +514,151 @@ class ClientRuntimeTest {
             val call = testClient(StaticStreamTransport()).openServerStreaming("/svc/method", "request", strings, strings)
             assertCode(Code.INTERNAL) { call.headers() }
             assertCode(Code.INTERNAL) { call.receive() }
-            assertNull(call.receive())
+            assertCode(Code.INTERNAL) { call.receive() }
 
             val idle =
                 testClient(SingleStreamTransport(SequenceStream { awaitCancellation() }))
                     .openServerStreaming("/svc/method", "request", strings, strings, CallOptions(streamIdleTimeout = 1.seconds))
             assertCode(Code.UNAVAILABLE) { idle.headers() }
+        }
+
+    @Test
+    fun `headers do not wait for a receive that is pending`() =
+        runTest {
+            val pipe = PipeStream()
+            val reported = CompletableDeferred<Metadata>()
+            val call =
+                testClient(pipe).openServerStreaming(
+                    "/svc/method",
+                    "request",
+                    strings,
+                    strings,
+                    CallOptions(onResponseHeaders = { reported.complete(it) }),
+                )
+            val receiving = async { call.receive() }
+            val waiting = async { call.headers() }
+            repeat(3) { yield() }
+
+            pipe.incoming.send(headers(Metadata.of("x-h" to byteArrayOf(9))))
+            assertEquals(9, reported.await()["x-h"]?.single())
+            val resolved = withTimeoutOrNull(1.seconds) { waiting.await() }
+            assertEquals(9, resolved?.get("x-h")?.single(), "headers() stayed behind the pending receive()")
+            assertTrue(receiving.isActive)
+
+            pipe.incoming.send(message("a"))
+            pipe.incoming.send(status(Status.ok()))
+            pipe.incoming.close()
+            assertEquals("a", receiving.await())
+            assertNull(call.receive())
+        }
+
+    @Test
+    fun `cancelling a headers that only waits for another reader leaves the call alone`() =
+        runTest {
+            val pipe = PipeStream()
+            val call = testClient(pipe).openServerStreaming("/svc/method", "request", strings, strings)
+            val receiving = async { call.receive() }
+            val waiting = launch { call.headers() }
+            repeat(3) { yield() }
+
+            waiting.cancelAndJoin()
+
+            assertEquals(0, pipe.closes.get())
+            pipe.incoming.send(message("a"))
+            pipe.incoming.send(status(Status.ok()))
+            pipe.incoming.close()
+            assertEquals("a", receiving.await())
+            assertNull(call.receive())
+        }
+
+    @Test
+    fun `a receive cancelled by the caller ends the call as Cancelled, never as a clean end of stream`() =
+        runTest {
+            val pipe = PipeStream()
+            val call = testClient(pipe).openServerStreaming("/svc/method", "request", strings, strings)
+
+            assertNull(withTimeoutOrNull(100.milliseconds) { call.receive() })
+            // Whatever the server sends afterwards, the stream was abandoned mid-read.
+            pipe.incoming.trySend(message("late"))
+            pipe.incoming.trySend(status(Status.ok()))
+
+            repeat(2) { assertCode(Code.CANCELLED) { call.receive() } }
+            assertCode(Code.CANCELLED) { call.headers() }
+            assertNull(call.terminalStatus)
+            assertEquals(1, pipe.closes.get())
+        }
+
+    @Test
+    fun `a headers cancelled by the caller while it reads ends the call as Cancelled`() =
+        runTest {
+            val pipe = PipeStream()
+            val call = testClient(pipe).openServerStreaming("/svc/method", "request", strings, strings)
+
+            assertNull(withTimeoutOrNull(100.milliseconds) { call.headers() })
+            pipe.incoming.trySend(message("late"))
+            pipe.incoming.trySend(status(Status.ok()))
+
+            repeat(2) { assertCode(Code.CANCELLED) { call.receive() } }
+            assertCode(Code.CANCELLED) { call.headers() }
+            assertNull(call.terminalStatus)
+            assertEquals(1, pipe.closes.get())
+        }
+
+    @Test
+    fun `closing a call while a receive is pending cancels that receive`() =
+        runTest {
+            val pipe = PipeStream()
+            val call = testClient(pipe).openServerStreaming("/svc/method", "request", strings, strings)
+            val pending = async { runCatching { call.receive() } }
+            val waiting = async { runCatching { call.headers() } }
+            repeat(3) { yield() }
+
+            call.close()
+
+            // Not "response stream ended before final status": the caller closed the call.
+            for (outcome in listOf(pending.await(), waiting.await())) {
+                val error = outcome.exceptionOrNull() as TrevRpcException
+                assertEquals(Code.CANCELLED, error.status.code)
+            }
+            assertCode(Code.CANCELLED) { call.receive() }
+            assertCode(Code.CANCELLED) { call.headers() }
+            assertNull(call.terminalStatus)
+        }
+
+    @Test
+    fun `a failure is replayed by every later receive and headers`() =
+        runTest {
+            val pipe = PipeStream()
+            val call = testClient(pipe).openServerStreaming("/svc/method", "request", strings, strings)
+            val lost = TrevRpcException(Status.unavailable("lost"))
+            pipe.incoming.close(lost)
+
+            repeat(2) { assertSame(lost, runCatching { call.headers() }.exceptionOrNull()) }
+            repeat(3) { assertSame(lost, runCatching { call.receive() }.exceptionOrNull()) }
+            call.close()
+            assertSame(lost, runCatching { call.receive() }.exceptionOrNull())
+        }
+
+    @Test
+    fun `a final status is replayed by every later receive and keeps its outcome after close`() =
+        runTest {
+            val failed =
+                testClient(StaticStreamTransport(message("a"), status(Status.unavailable("down"))))
+                    .openServerStreaming("/svc/method", "request", strings, strings)
+            assertEquals("a", failed.receive())
+            val first = captureTrevRpcException(Code.UNAVAILABLE) { failed.receive() }
+            failed.close()
+            repeat(2) { assertSame(first, captureTrevRpcException(Code.UNAVAILABLE) { failed.receive() }) }
+            assertEquals(Code.UNAVAILABLE, failed.terminalStatus?.code)
+
+            val completed =
+                testClient(StaticStreamTransport(message("a"), status(Status.ok())))
+                    .openServerStreaming("/svc/method", "request", strings, strings)
+            assertEquals("a", completed.receive())
+            assertNull(completed.receive())
+            completed.close()
+            repeat(2) { assertNull(completed.receive()) }
+            assertEquals(Code.OK, completed.terminalStatus?.code)
         }
 
     @Test
@@ -705,6 +848,41 @@ private class LoopbackTransport : RpcTransport {
                 frames.close()
             }
         }
+    }
+}
+
+/**
+ * A stream and its transport, whose response side is [incoming]. Closing the stream ends [incoming]
+ * like a real transport ends a pending read when the call is closed.
+ */
+private class PipeStream :
+    RpcClientStream,
+    RpcTransport {
+    val incoming = Channel<ResponseFrame>(Channel.UNLIMITED)
+    val closes = AtomicInteger()
+
+    override suspend fun openStream(
+        request: RpcRequest,
+        firstMessage: ByteArray?,
+        finishSend: Boolean,
+    ): RpcClientStream = this
+
+    override suspend fun send(
+        body: ByteArray,
+        frameType: Long,
+    ) = Unit
+
+    override suspend fun finishSend() = Unit
+
+    override suspend fun receive(): ResponseFrame? {
+        val result = incoming.receiveCatching()
+        result.exceptionOrNull()?.let { throw it }
+        return result.getOrNull()
+    }
+
+    override suspend fun close(cause: Throwable?) {
+        closes.incrementAndGet()
+        incoming.close(cause)
     }
 }
 

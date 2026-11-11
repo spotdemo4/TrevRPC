@@ -16,7 +16,10 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -355,6 +358,86 @@ class CallTerminationTest {
         }
 
     @Test
+    fun `a first message or status reports empty response headers while the request still uploads`() =
+        bounded {
+            val reportedByMessage = CompletableDeferred<Metadata>()
+            val messageStream = ScriptedStream()
+            val byMessage =
+                Client(OneStream(messageStream)).openClientStreaming<String, String>(
+                    "/svc/m",
+                    strings,
+                    strings,
+                    CallOptions(onResponseHeaders = { reportedByMessage.complete(it) }),
+                )
+            val sendingMessage = async { runCatching { byMessage.send("a") } }
+            messageStream.awaitSend()
+            messageStream.incoming.send(message("early"))
+            // Nobody receives; the pump that watches the upload reports the headers.
+            assertEquals(Metadata.EMPTY, reportedByMessage.await())
+            byMessage.close()
+            sendingMessage.await()
+
+            val reportedByStatus = CompletableDeferred<Metadata>()
+            val statusStream = ScriptedStream()
+            val byStatus =
+                Client(OneStream(statusStream)).openBidirectionalStreaming<String, String>(
+                    "/svc/m",
+                    strings,
+                    strings,
+                    CallOptions(onResponseHeaders = { reportedByStatus.complete(it) }),
+                )
+            val sendingStatus = async { runCatching { byStatus.send("a") } }
+            statusStream.awaitSend()
+            statusStream.incoming.send(status(Status(Code.ABORTED, "stop")))
+            assertEquals(Metadata.EMPTY, reportedByStatus.await())
+            sendingStatus.await()
+        }
+
+    @Test
+    fun `a HEADERS frame after a message is neither reported nor accepted while the request uploads`() =
+        bounded {
+            val stream = ScriptedStream()
+            val reported = ConcurrentLinkedQueue<Metadata>()
+            val call =
+                Client(OneStream(stream)).openBidirectionalStreaming<String, String>(
+                    "/svc/m",
+                    strings,
+                    strings,
+                    CallOptions(onResponseHeaders = { reported.add(it) }),
+                )
+            val sending = async { runCatching { call.send("a") } }
+            stream.awaitSend()
+            stream.incoming.send(message("m"))
+            stream.incoming.send(ResponseFrame.Headers(Metadata.of("late" to byteArrayOf(1))))
+            stream.incoming.send(status(Status.ok()))
+
+            assertEquals("m", call.receive())
+            val error = runCatching { call.receive() }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.INTERNAL, error.status.code)
+            // The first message resolved the headers as absent; the late HEADERS changed nothing.
+            assertEquals(listOf(Metadata.EMPTY), reported.toList())
+            assertEquals(Metadata.EMPTY, call.headers())
+            sending.await()
+        }
+
+    @Test
+    fun `a call that reports an error to sends is already ended`() {
+        // sendAll treats a TrevRpcException as the call ending when isEnded: the two must not differ.
+        repeat(2000) {
+            val end = CallEnd()
+            val violated = AtomicBoolean(false)
+            val observer =
+                thread {
+                    while (end.sendError() == null) Thread.yield()
+                    if (!end.isEnded) violated.set(true)
+                }
+            end.failure(TrevRpcException(Status.unavailable("down")))
+            observer.join()
+            assertTrue(!violated.get(), "sendError() reported the end before isEnded did")
+        }
+    }
+
+    @Test
     fun `cancelling the caller while waiting for the end of the stream keeps the server status`() =
         bounded {
             val waiting = CompletableDeferred<Unit>()
@@ -390,7 +473,9 @@ class CallTerminationTest {
             assertEquals(Code.ABORTED, call.terminalStatus?.code)
             assertEquals(1, closes.get())
             assertTrue(receiving.isCancelled)
-            assertTrue(runCatching { call.receive() }.exceptionOrNull() !is CancellationException)
+            // The status decided the outcome, which later receives replay.
+            val replayed = runCatching { call.receive() }.exceptionOrNull() as TrevRpcException
+            assertEquals(Code.ABORTED, replayed.status.code)
         }
 }
 

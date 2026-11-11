@@ -45,7 +45,9 @@ internal class CallEnd {
             val error: Throwable,
         ) : Reason
 
-        object ByClose : Reason
+        class ByClose(
+            val cause: Throwable?,
+        ) : Reason
     }
 
     private val ended = CompletableDeferred<Unit>()
@@ -53,8 +55,12 @@ internal class CallEnd {
     @Volatile
     private var reason: Reason? = null
 
+    /**
+     * Whether the call has ended. This is the same fact [sendError] reports, so a send that sees an
+     * error there also sees the call as ended; [onEnd] and [await] complete a moment later.
+     */
     val isEnded: Boolean
-        get() = ended.isCompleted
+        get() = reason != null
 
     /**
      * Whether the server's STATUS ended the call. Then the transport settles itself and the
@@ -62,6 +68,14 @@ internal class CallEnd {
      */
     val endedByStatus: Boolean
         get() = reason is Reason.ByStatus
+
+    /** Whether the call was closed locally before the server's STATUS or a failure ended it. */
+    val closedLocally: Boolean
+        get() = reason is Reason.ByClose
+
+    /** The cause [CallStream.close] was given when it closed the call locally, if any. */
+    val closeCause: Throwable?
+        get() = (reason as? Reason.ByClose)?.cause
 
     /** Selectable: completes once the call has ended. */
     val onEnd: SelectClause0
@@ -73,8 +87,8 @@ internal class CallEnd {
     /** The response failed, or ended without a status. */
     fun failure(error: Throwable) = end(Reason.ByFailure(error))
 
-    /** The caller closed the call. */
-    fun closed() = end(Reason.ByClose)
+    /** The call was closed locally, with the [cause] the closer gave, if any. */
+    fun closed(cause: Throwable? = null) = end(Reason.ByClose(cause))
 
     suspend fun await() = ended.join()
 
@@ -106,7 +120,7 @@ internal class CallEnd {
                 }
             }
 
-            Reason.ByClose -> {
+            is Reason.ByClose -> {
                 TrevRpcException(Status.cancelled("request stream is closed"))
             }
         }
@@ -163,11 +177,43 @@ internal class CallStream(
     private var resent: CompletableDeferred<Unit>? = null
     private var resendJob: Job? = null
 
-    /** Whether the first response frame has yet to arrive on an optimistic call. */
+    /**
+     * Whether the first response frame has yet to arrive on an optimistic call. That frame is the
+     * transport's, refusal included, so it is tracked apart from [position].
+     */
     private var awaitingFirstFrame = replay != null
 
-    /** Whether an ANSWER may still arrive: only before every other known frame, and once. */
-    private var answerAllowed = true
+    /** Where the response is in its grammar. Only the one reader of [receive] touches it. */
+    private var position = Position.START
+
+    /** The response grammar is `ANSWER? HEADERS? MESSAGE* STATUS`. */
+    private enum class Position {
+        /** Nothing arrived yet. */
+        START,
+
+        /** The ANSWER arrived, which only a first frame can be. */
+        ANSWERED,
+
+        /** A first known frame (HEADERS, a message or STATUS) arrived, so the headers are resolved. */
+        STREAMING,
+
+        /** STATUS arrived: whatever follows is for the reader to reject. */
+        ENDED,
+    }
+
+    /**
+     * The response headers: HEADERS' metadata, or empty when a message or STATUS came first. Null
+     * until the first known frame arrives, whoever read it, the pump or the caller.
+     */
+    @Volatile
+    var headers: Metadata? = null
+        private set
+
+    /**
+     * Completes when [headers] is resolved or the call closes, which a caller that waits for
+     * headers while another reader holds the stream watches instead of reading.
+     */
+    val headersReady = CompletableDeferred<Unit>()
 
     /**
      * Completes once an optimistic call has handled its first response frame, switching to the
@@ -175,16 +221,6 @@ internal class CallStream(
      * may have failed because the server refused the call, so it waits for this to tell.
      */
     private val firstFrameHandled = CompletableDeferred<Unit>()
-
-    private val headersReported = AtomicBoolean(false)
-
-    /**
-     * Hands the response headers to the call's `onResponseHeaders`, once: from whichever reads them
-     * first, the pump while the call uploads or the caller.
-     */
-    fun reportHeaders(metadata: Metadata) {
-        if (headersReported.compareAndSet(false, true)) onHeaders?.invoke(metadata)
-    }
 
     /** Reads the response while the call uploads; null for calls that do not stream their request. */
     var pump: ResponsePump? = null
@@ -281,7 +317,9 @@ internal class CallStream(
      * Receives the next response frame from the transport. The server's ANSWER is consumed here:
      * it carries the answers to the call's dictionary query and stream compression offer, and
      * never reaches the caller. Compressed messages are decompressed. A refusal of an optimistic
-     * call is replaced by the replayed call's frames.
+     * call is replaced by the replayed call's frames. The response grammar is enforced and the
+     * response [headers] are resolved and reported here; see [admit]. Not safe for concurrent
+     * callers: the response pump or the response reader calls it, never both at once.
      */
     suspend fun receive(): ResponseFrame? {
         while (true) {
@@ -316,19 +354,13 @@ internal class CallStream(
                 }
                 if (refused) continue
             }
-            if (frame is ResponseFrame.Answer) {
-                if (!answerAllowed) {
-                    throw TrevRpcException(Status.internal("response ANSWER must be the first frame and appear at most once"))
-                }
-                answerAllowed = false
-                compression?.learn(frame.dictionaries)
-                streams?.learn(frame.streamCompression)
-                continue
-            }
-            answerAllowed = false
+            if (frame == null) return null
+            admit(frame)
             return when (frame) {
-                is ResponseFrame.Headers -> {
-                    frame.also { reportHeaders(it.metadata) }
+                is ResponseFrame.Answer -> {
+                    compression?.learn(frame.dictionaries)
+                    streams?.learn(frame.streamCompression)
+                    continue
                 }
 
                 is ResponseFrame.Message -> {
@@ -345,6 +377,55 @@ internal class CallStream(
                 }
             }
         }
+    }
+
+    /**
+     * Applies the response grammar to the next [frame] and resolves the response headers: HEADERS
+     * is allowed once, and only as the first known frame after the ANSWER; the first message or
+     * STATUS means the server sent none. The headers are handed to the call's `onResponseHeaders`
+     * here, once, so the pump that reads while the call uploads and the caller that reads
+     * afterwards report the same headers and reject the same frames. What follows STATUS is for the
+     * reader to reject, as the data after the final status it is.
+     */
+    private fun admit(frame: ResponseFrame) {
+        when (frame) {
+            is ResponseFrame.Answer -> {
+                if (position != Position.START) {
+                    throw TrevRpcException(Status.internal("response ANSWER must be the first frame and appear at most once"))
+                }
+                position = Position.ANSWERED
+            }
+
+            is ResponseFrame.Headers -> {
+                when (position) {
+                    Position.START, Position.ANSWERED -> {
+                        resolveHeaders(frame.metadata)
+                    }
+
+                    Position.STREAMING -> {
+                        throw TrevRpcException(Status.internal("response HEADERS must be the first frame and appear at most once"))
+                    }
+
+                    Position.ENDED -> {}
+                }
+            }
+
+            is ResponseFrame.Message -> {
+                if (position == Position.START || position == Position.ANSWERED) resolveHeaders(Metadata.EMPTY)
+            }
+
+            is ResponseFrame.Status -> {
+                if (position == Position.START || position == Position.ANSWERED) resolveHeaders(Metadata.EMPTY)
+                position = Position.ENDED
+            }
+        }
+    }
+
+    private fun resolveHeaders(metadata: Metadata) {
+        position = Position.STREAMING
+        headers = metadata
+        headersReady.complete(Unit)
+        onHeaders?.invoke(metadata)
     }
 
     /**
@@ -418,8 +499,9 @@ internal class CallStream(
 
     /** Closes the transport stream once, releasing the pump, failing blocked sends, and freeing compression contexts. */
     suspend fun close(cause: Throwable? = null) {
-        end.closed()
+        end.closed(cause)
         firstFrameHandled.complete(Unit)
+        headersReady.complete(Unit)
         if (!closed.compareAndSet(false, true)) return
         try {
             pump?.cancel()

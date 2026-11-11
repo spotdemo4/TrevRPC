@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -571,12 +572,33 @@ class ServerStreamingCall<T> internal constructor(
     /**
      * Response header metadata. Suspends until the first known response frame arrives and is empty
      * when the server sent no HEADERS frame. No message is lost: a message read ahead is returned
-     * by the next [receive].
+     * by the next [receive]. It does not wait for a [receive] that is pending: it returns as soon as
+     * the headers arrive. If the call ended before they did, it throws what [receive] throws.
+     *
+     * Cancelling a [headers] that is reading the stream cancels the call; see [receive].
      */
     suspend fun headers(): Metadata = reader.headers()
 
+    /**
+     * Receives the next response message, or null at the end of the stream, which only a final
+     * status OK from the server makes. A call that ends any other way throws, and keeps throwing the
+     * same error from every later [receive] and [headers]: a non-OK status as a [TrevRpcException]
+     * with that status, a failure as itself.
+     *
+     * Cancelling a [receive] that is waiting for the stream (a `withTimeout`, say) cancels the call:
+     * the abandoned read of the transport cannot be resumed without risking a lost message, so the
+     * stream is released and every later [receive] and [headers] throws a [TrevRpcException] with
+     * [Code.CANCELLED], never null. Bound the wait with [CallOptions.streamIdleTimeout] or
+     * [CallOptions.timeout] to keep the call's outcome, or read in a coroutine of your own. A
+     * [close] from another coroutine while a [receive] waits fails that [receive] with the same
+     * [Code.CANCELLED] error.
+     */
     suspend fun receive(): T? = reader.receive()
 
+    /**
+     * Closes the call and releases its stream. A call that has not received the final status ends
+     * as [Code.CANCELLED]; one that has keeps its outcome. Repeated closes have no effect.
+     */
     suspend fun close() = reader.close()
 }
 
@@ -616,7 +638,10 @@ class ClientStreamingCall<Req, Res> internal constructor(
     /** Response header metadata; see [ServerStreamingCall.headers]. */
     suspend fun headers(): Metadata = reader.headers()
 
-    /** Half-closes the request side and returns the response. */
+    /**
+     * Half-closes the request side and returns the response. Cancelling it cancels the call; see
+     * [ServerStreamingCall.receive].
+     */
     suspend fun receive(): Res {
         if (!received.compareAndSet(false, true)) {
             throw TrevRpcException(Status.failedPrecondition("client-streaming response was already received"))
@@ -659,13 +684,76 @@ class BidirectionalStreamingCall<Req, Res> internal constructor(
     /** Half-closes the request side. Does nothing if the call already ended. */
     suspend fun closeSend() = writer.finishSend()
 
+    /** Receives the next response message, or null at the end of the stream; see [ServerStreamingCall.receive]. */
     suspend fun receive(): Res? = reader.receive()
 
+    /** Closes the call; see [ServerStreamingCall.close]. */
     suspend fun close() {
         reader.close()
     }
 }
 
+/**
+ * Where the response of a call stands. "Before the first frame" and "streaming" are not states of
+ * their own: [CallStream] resolves the response headers on the first known frame and enforces the
+ * grammar, whoever reads it, so the reader asks [CallStream.headers].
+ */
+private sealed interface ResponseState {
+    /** No STATUS yet: headers and messages may still arrive. */
+    object Open : ResponseState
+
+    /**
+     * STATUS arrived and the reader that holds the read lock is confirming that the stream ends
+     * there. A [ResponseReader.close] racing it no longer changes the outcome: STATUS decided it.
+     */
+    object StatusReceived : ResponseState
+
+    /**
+     * The outcome of the call, which every later `receive()` and `headers()` replays: returns null
+     * after [Completed], throws [Failed.error] after [Failed].
+     */
+    sealed class Ended(
+        /** The server's terminal status, once the reader has accepted it; null otherwise. */
+        val status: Status?,
+        val error: Throwable?,
+    ) : ResponseState
+
+    /** STATUS OK, and the stream ended there: the only clean end of stream. */
+    class Completed(
+        status: Status,
+    ) : Ended(status, null)
+
+    /**
+     * The call failed: a non-OK status (then [status] is it), a protocol or transport error, a limit
+     * that was exceeded, or a local close or cancellation, whose [error] is `CANCELLED`.
+     */
+    class Failed(
+        error: Throwable,
+        status: Status? = null,
+    ) : Ended(status, error)
+}
+
+/**
+ * Reads the response of one call for its caller. [receive] and [headers] are safe to call from
+ * several coroutines: [readLock] orders who reads the stream, and [headers] waits for the reader
+ * that holds it instead of queueing behind it.
+ *
+ * The outcome is recorded once, as a [ResponseState.Ended], and replayed by every later call: a
+ * call that did not get STATUS never reads as a clean end of stream.
+ *
+ * - A read that fails (transport error, protocol violation, exceeded limit, idle timeout, deadline)
+ *   ends the call with that error, which every later [receive] and [headers] throws again.
+ * - A [receive] or [headers] that is cancelled while it reads the stream abandons a read of the
+ *   transport that cannot be resumed without risking a lost frame. It ends the call as `CANCELLED`
+ *   and releases the stream; the cancelled call itself sees its own `CancellationException`, and
+ *   every later call throws a [TrevRpcException] with [Code.CANCELLED], so the caller's coroutine
+ *   does not look cancelled for something another coroutine did. A [headers] that merely waits for
+ *   another reader stops waiting and leaves the call alone.
+ * - [close] ends a call that has not received STATUS the same way. A `receive()` that is pending
+ *   meanwhile throws that `CANCELLED` error, not a protocol error for the stream ending.
+ * - Once STATUS arrived, it decides the outcome: a later close, or a cancelled wait for the end of
+ *   the stream, does not change it.
+ */
 internal class ResponseReader<T>(
     private val call: CallStream,
     private val codec: MessageCodec<T>,
@@ -673,64 +761,70 @@ internal class ResponseReader<T>(
     private val deadline: TimeMark?,
     private val idleTimeout: Duration? = options.streamIdleTimeout,
 ) {
-    /** Serializes reads from the response, so [headers] and [receive] never race for frames. */
+    /** Serializes reads from the response, so only one coroutine takes frames from the stream. */
     private val readLock = Mutex()
     private val limits = ResponseLimits(options)
 
-    @Volatile
-    private var done = false
+    /** Moves from [ResponseState.Open] to [ResponseState.Ended] at most once, whoever gets there first. */
+    private val state = AtomicReference<ResponseState>(ResponseState.Open)
 
     /** A message or status that [headers] read ahead and [receive] has not consumed yet. */
     private var readAhead: ResponseFrame? = null
-    private var failure: Throwable? = null
-    private var failureDelivered = false
 
-    /** Null until the first known response frame arrives; then the header metadata. */
-    @Volatile
-    var headersMetadata: Metadata? = null
-        private set
-
-    @Volatile
-    var terminalStatus: Status? = null
-        private set
+    /** The server's terminal status, once the call has ended with it; see [ServerStreamingCall.terminalStatus]. */
+    val terminalStatus: Status?
+        get() = (state.get() as? ResponseState.Ended)?.status
 
     val responseMetadata: Metadata
         get() = terminalStatus?.metadata ?: Metadata.EMPTY
 
     suspend fun headers(): Metadata {
-        headersMetadata?.let { return it }
-        return readLock.withLock {
-            headersMetadata?.let { return@withLock it }
-            failure?.let { throw it }
-            if (done) return@withLock Metadata.EMPTY
-            try {
-                readAhead = nextFrame()
-                // Reading the first known frame resolves the headers: HEADERS carry them, anything
-                // else means they are absent. A HEADERS frame is consumed here; other frames are
-                // kept for receive().
-                if (readAhead is ResponseFrame.Headers) readAhead = null
-                checkNotNull(headersMetadata)
-            } catch (error: Throwable) {
-                fail(error)
-                throw error
+        while (true) {
+            call.headers?.let { return it }
+            (state.get() as? ResponseState.Ended)?.let { throw endedWithoutHeaders(it) }
+            if (readLock.tryLock()) {
+                try {
+                    readHeaders()
+                } finally {
+                    readLock.unlock()
+                }
+            } else {
+                // A receive() or another headers() is reading, and the first known frame it takes
+                // resolves the headers: wait for that rather than for its whole read.
+                call.headersReady.await()
+                // Woken by a close: the reader learns the outcome from the closed stream.
+                if (call.headers == null) readLock.withLock { readHeaders() }
             }
         }
     }
 
+    /**
+     * Reads the first known frame so [CallStream.headers] resolves: a HEADERS frame is consumed,
+     * any other is kept for [receive]. Holds [readLock].
+     */
+    private suspend fun readHeaders() {
+        if (call.headers != null) return
+        (state.get() as? ResponseState.Ended)?.let { throw endedWithoutHeaders(it) }
+        try {
+            val frame = nextFrame()
+            if (frame !is ResponseFrame.Headers) readAhead = frame
+        } catch (error: Throwable) {
+            throw fail(error)
+        }
+    }
+
+    /** What [headers] throws for a call that ended before the headers resolved; STATUS resolves them. */
+    private fun endedWithoutHeaders(ended: ResponseState.Ended): Throwable =
+        ended.error ?: IllegalStateException("the call completed without response headers")
+
     suspend fun receive(): T? = readLock.withLock { receiveLocked() }
 
     private suspend fun receiveLocked(): T? {
-        if (!failureDelivered) {
-            failure?.let {
-                failureDelivered = true
-                throw it
-            }
-        }
-        if (done) return null
+        (state.get() as? ResponseState.Ended)?.let { return replay(it) }
         try {
             while (true) {
                 when (val frame = readAhead?.also { readAhead = null } ?: nextFrame()) {
-                    // CallStream consumes ANSWER, so it never arrives here.
+                    // CallStream resolved the headers when it read this frame, and consumed ANSWER.
                     is ResponseFrame.Headers, is ResponseFrame.Answer -> {}
 
                     is ResponseFrame.Message -> {
@@ -743,15 +837,80 @@ internal class ResponseReader<T>(
                 }
             }
         } catch (error: Throwable) {
-            failureDelivered = true
-            fail(error)
-            throw error
+            throw fail(error)
         }
     }
 
+    /**
+     * Closes the call. One that has not received STATUS ends as `CANCELLED`, and a `receive()` or
+     * `headers()` pending in another coroutine fails with that. One that ended keeps its outcome.
+     */
     suspend fun close(cause: Throwable? = null) {
-        done = true
+        if (state.get() === ResponseState.Open) state.compareAndSet(ResponseState.Open, closedOutcome(cause))
         call.close(cause)
+    }
+
+    /** The outcome of a call closed or cancelled before its STATUS. */
+    private fun closedOutcome(cause: Throwable?): ResponseState.Failed =
+        ResponseState.Failed(TrevRpcException(Status.cancelled("the call was closed before its final status"), cause))
+
+    /** What a read gets from a call that ended: null for a clean end of stream, else the error. */
+    private fun replay(ended: ResponseState.Ended): T? {
+        ended.error?.let { throw it }
+        return null
+    }
+
+    /**
+     * Ends the call because a read failed with [error], unless something ended it first, and
+     * releases the stream. Returns what the read throws: [error] for a cancellation of the reading
+     * coroutine, which must propagate, otherwise the call's outcome. A failure that only follows from
+     * a close of the call is reported as that close.
+     */
+    private suspend fun fail(error: Throwable): Throwable {
+        val current = state.get()
+        if (current is ResponseState.Ended) {
+            // Decided already, by STATUS or a close. What the read reports now is how that happened.
+            return if (error is CancellationException) error else current.error ?: error
+        }
+        val callerCancelled = error is CancellationException && !currentCoroutineContext().isActive
+        val outcome =
+            when {
+                callerCancelled -> {
+                    closedOutcome(error)
+                }
+
+                call.end.closedLocally -> {
+                    closedOutcome(call.end.closeCause)
+                }
+
+                else -> {
+                    // A cancellation that is not the reading coroutine's own is a response failure,
+                    // not a reason for the caller to look cancelled.
+                    val failure =
+                        if (error is CancellationException) {
+                            TrevRpcException(Status.cancelled("response stream was cancelled"), error)
+                        } else {
+                            error
+                        }
+                    call.end.failure(failure)
+                    ResponseState.Failed(failure)
+                }
+            }
+        val ended = end(outcome)
+        val thrown = if (callerCancelled) error else ended.error ?: error
+        if (ended === outcome) {
+            val closeError = withContext(NonCancellable) { runCatching { call.close(error) }.exceptionOrNull() }
+            if (closeError != null && closeError !== thrown) thrown.addSuppressed(closeError)
+        }
+        return thrown
+    }
+
+    private fun end(outcome: ResponseState.Ended): ResponseState.Ended {
+        while (true) {
+            val current = state.get()
+            if (current is ResponseState.Ended) return current
+            if (state.compareAndSet(current, outcome)) return outcome
+        }
     }
 
     /**
@@ -773,37 +932,10 @@ internal class ResponseReader<T>(
         return frame
     }
 
-    /**
-     * Reads one frame from the transport and applies the response grammar: HEADERS is allowed
-     * once, and only as the first known frame after the ANSWER, which [CallStream] consumes.
-     */
-    private suspend fun nextFrame(): ResponseFrame {
-        val frame =
-            readResponse()
-                ?: throw TrevRpcException(Status.internal("response stream ended before final status"))
-        if (frame is ResponseFrame.Headers) {
-            if (headersMetadata != null) {
-                throw TrevRpcException(
-                    Status.internal("response HEADERS must be the first frame and appear at most once"),
-                )
-            }
-            headersMetadata = frame.metadata
-            call.reportHeaders(frame.metadata)
-        } else if (headersMetadata == null) {
-            headersMetadata = Metadata.EMPTY
-            call.reportHeaders(Metadata.EMPTY)
-        }
-        return frame
-    }
-
-    private suspend fun fail(error: Throwable) {
-        done = true
-        if (error !is CancellationException) {
-            failure = error
-            call.end.failure(error)
-        }
-        close(error)
-    }
+    /** Reads one frame, whose grammar [CallStream] has checked. The stream must not end without STATUS. */
+    private suspend fun nextFrame(): ResponseFrame =
+        readResponse()
+            ?: throw TrevRpcException(Status.internal("response stream ended before final status"))
 
     private fun receiveMessage(frame: ResponseFrame.Message): T {
         limits.admit(frame.body.size)?.let { throw it }
@@ -812,6 +944,10 @@ internal class ResponseReader<T>(
 
     private suspend fun receiveStatus(frame: ResponseFrame.Status): T? {
         val status = frame.status
+        // A close that got here first decided the outcome; from now on STATUS does.
+        if (!state.compareAndSet(ResponseState.Open, ResponseState.StatusReceived)) {
+            (state.get() as? ResponseState.Ended)?.let { return replay(it) }
+        }
         var trailingError: Throwable? = null
         val trailing =
             try {
@@ -820,9 +956,8 @@ internal class ResponseReader<T>(
                 // The caller was cancelled while waiting for the end of the stream. The server's
                 // status already decided the outcome: keep it, release the stream, and let the
                 // cancellation propagate.
-                terminalStatus = status
-                done = true
-                withContext(NonCancellable) { runCatching { close() } }
+                state.set(statusOutcome(status))
+                withContext(NonCancellable) { runCatching { call.close() } }
                 throw error
             } catch (error: Throwable) {
                 trailingError = error
@@ -831,38 +966,65 @@ internal class ResponseReader<T>(
         // The call's own deadline cut the wait short. That says nothing about the response, and the
         // server's status has already decided the outcome.
         if (trailingError?.isCallDeadline() == true) trailingError = null
-        done = true
         val closeError =
             try {
-                close()
+                call.close()
                 null
             } catch (error: CancellationException) {
+                state.set(statusOutcome(status))
                 throw error
             } catch (error: Throwable) {
                 error
             }
-        if (trailing != null) {
-            throw TrevRpcException(Status.internal("response stream contained data after final status"))
-        }
-        if (!status.isOk) {
-            terminalStatus = status
-            throw TrevRpcException(status).also { failure ->
-                trailingError?.let(failure::addSuppressed)
-                closeError?.let(failure::addSuppressed)
+        val outcome =
+            when {
+                trailing != null -> {
+                    ResponseState.Failed(TrevRpcException(Status.internal("response stream contained data after final status")))
+                }
+
+                !status.isOk -> {
+                    ResponseState.Failed(
+                        TrevRpcException(status).also { failure ->
+                            trailingError?.let(failure::addSuppressed)
+                            closeError?.let(failure::addSuppressed)
+                        },
+                        status,
+                    )
+                }
+
+                trailingError != null -> {
+                    ResponseState.Failed(
+                        if (trailingError.isMalformedTrailingData()) {
+                            TrevRpcException(Status.internal("response stream contained data after final status"), trailingError)
+                        } else {
+                            trailingError
+                        },
+                    )
+                }
+
+                closeError != null -> {
+                    ResponseState.Failed(closeError)
+                }
+
+                else -> {
+                    try {
+                        options.onResponseMetadata?.invoke(status.metadata)
+                        ResponseState.Completed(status)
+                    } catch (error: CancellationException) {
+                        state.set(statusOutcome(status))
+                        throw error
+                    } catch (error: Throwable) {
+                        ResponseState.Failed(error)
+                    }
+                }
             }
-        }
-        trailingError?.let { error ->
-            if (!error.isMalformedTrailingData()) throw error
-            throw TrevRpcException(
-                Status.internal("response stream contained data after final status"),
-                error,
-            )
-        }
-        if (closeError != null) throw closeError
-        options.onResponseMetadata?.invoke(status.metadata)
-        terminalStatus = status
-        return null
+        state.set(outcome)
+        return replay(outcome)
     }
+
+    /** The outcome the server's [status] alone decides. */
+    private fun statusOutcome(status: Status): ResponseState.Ended =
+        if (status.isOk) ResponseState.Completed(status) else ResponseState.Failed(TrevRpcException(status), status)
 }
 
 /**

@@ -140,6 +140,8 @@ Finding the status can mean reading responses the caller has not asked for yet. 
 
 If the call's own deadline passes while the client waits for the end of the stream after `STATUS`, the server's status still decides the outcome. Cancelling the caller's coroutine at that point propagates the cancellation, and `terminalStatus` holds the server's status.
 
+A call's outcome is recorded once and every later `receive()` and `headers()` replays it: `receive()` returns `null` only after a final status `OK`, and throws the same error again after a failure or a non-OK status. Cancelling a `receive()` or `headers()` that is waiting for the stream, for example with `withTimeout`, cancels the call, because a read abandoned in flight cannot be resumed without risking a lost message. The cancelled coroutine sees its own `CancellationException`, and every later `receive()` and `headers()` throws a `TrevRpcException` with `CANCELLED`. Use `CallOptions.streamIdleTimeout` or `timeout` to bound a wait and keep the call's outcome. `close()` from another coroutine fails a pending `receive()` with the same `CANCELLED` error, and a `headers()` that waits for a pending `receive()` returns as soon as the headers arrive.
+
 ### Compression
 
 Messages can travel compressed with zstd and a dictionary trained on them (see [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression)). Compression calls [zstd-jni](https://github.com/luben/zstd-jni), which `core` compiles against but does not ship, so the application adds it: `com.github.luben:zstd-jni` as an `aar` on Android (its AAR needs `compileSdk` 37), or the plain JAR on the JVM, at the version TrevRPC is tested with in [`gradle/libs.versions.toml`](gradle/libs.versions.toml). Configure it on the channel:
