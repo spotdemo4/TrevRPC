@@ -8,7 +8,7 @@
 }:
 mkGoModule (final: {
   pname = "trevrpc-go-interop";
-  version = "1.8.0";
+  version = "1.9.0";
 
   # The module plus the TrevRPC and protovalidate modules its go.mod replaces
   # with ../../ and ../../protovalidatetrevrpc, and the shared files its tests

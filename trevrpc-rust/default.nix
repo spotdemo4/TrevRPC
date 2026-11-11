@@ -14,7 +14,7 @@
 }:
 mkRustPackage (final: {
   pname = "trevrpc-rust";
-  version = "1.8.0";
+  version = "1.9.0";
 
   src = lib.fileset.toSource {
     root = ../.;
