@@ -13,6 +13,11 @@ go:
           - "**/go.mod"
           - "**/go.sum"
 
+javascript:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.{js,jsx,mjs,cjs}"
+
 kotlin:
   - changed-files:
       - any-glob-to-any-file:
@@ -29,7 +34,6 @@ nix:
 node:
   - changed-files:
       - any-glob-to-any-file:
-          - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}"
           - "**/package.json"
           - "**/package-lock.json"
 
@@ -50,3 +54,9 @@ rust:
           - "**/*.rs"
           - "**/Cargo.toml"
           - "**/Cargo.lock"
+
+typescript:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.{ts,tsx,mts,cts}"
+          - "**/tsconfig*.json"
