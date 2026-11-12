@@ -14,6 +14,13 @@ func (p *streamWorkers) count() int {
 	return p.workers
 }
 
+// busy is the number of workers running a task.
+func (p *streamWorkers) busy() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.workers - len(p.idle)
+}
+
 func waitForWorkers(t *testing.T, p *streamWorkers, want int) {
 	t.Helper()
 	deadline := time.Now().Add(testTimeout)

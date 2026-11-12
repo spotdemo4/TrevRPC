@@ -397,8 +397,11 @@ func TestShutdownRefusesStreamsStillAwaitingTheirRequest(t *testing.T) {
 			if _, err := waiting.Write(request[:len(request)-1]); err != nil {
 				t.Fatal(err)
 			}
-			// Streams are accepted in order, so once a later call completes,
-			// the server is reading this one.
+			// Wait until the server is reading it before shutting down: a
+			// later call that completes first proves nothing, since
+			// WebTransport may accept streams out of order. The listener's
+			// workers run nothing but its RPC streams.
+			waitFor(t, "the server to read the waiting stream", func() bool { return listener.workers.busy() == 1 })
 			call, err := opener.openStream(ctx)
 			if err != nil {
 				t.Fatal(err)
