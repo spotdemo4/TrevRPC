@@ -9,6 +9,7 @@ import { Echo } from "../build/interop/gen/interop_pb.js";
 import { createClient } from "../src/index.js";
 import { BenchLanes, Compressions } from "./bench-lanes.js";
 import { interopCompression } from "./compression.js";
+import { createJsonClient } from "./json-client.js";
 import { connectLane } from "./lane.js";
 import { newPayload } from "./records.js";
 
@@ -266,14 +267,21 @@ function resourceTiming(url, timeoutMs) {
   });
 }
 
-/** A connect-web or gRPC-Web client over the lane's HTTP version, checked with a first call. */
-async function fetchTarget(input, lane, signal) {
+/** The lane's fetch client of Echo: connect-web, gRPC-Web, or plain JSON. */
+function fetchClient(input, lane) {
+  if (lane.protocol === "json") {
+    return createJsonClient(input.url);
+  }
   const createTransport =
     lane.protocol === "connect" ? createConnectTransport : createGrpcWebTransport;
-  const client = createConnectClient(
-    Echo,
-    createTransport({ baseUrl: input.url, useBinaryFormat: true }),
-  );
+  return createConnectClient(Echo, createTransport({ baseUrl: input.url, useBinaryFormat: true }));
+}
+
+/**
+ * A connect-web, gRPC-Web or JSON client over the lane's HTTP version, checked with a first call.
+ */
+async function fetchTarget(input, lane, signal) {
+  const client = fetchClient(input, lane);
   const pad = padValue(input);
   const options = { signal, ...(pad && { headers: { [PadKey]: pad } }) };
 

@@ -190,6 +190,9 @@ class BrowserTest(unittest.TestCase):
         self.assertTrue(run.runs("none", "connect-web-h3", "server-stream"))
         self.assertFalse(run.runs("none", "connect-web", "client-stream"))
         self.assertFalse(run.runs("none", "grpc-web", "bidi"))
+        self.assertTrue(run.runs("none", "json-h3", "server-stream"))
+        self.assertFalse(run.runs("none", "json", "client-stream"))
+        self.assertFalse(run.runs("dictionary", "json", "unary"))
         self.assertTrue(run.runs("dictionary", "webtransport", "unary"))
         self.assertTrue(run.runs("stream", "websocket", "bidi"))
         self.assertFalse(run.runs("stream", "webtransport", "server-stream"))
@@ -411,7 +414,7 @@ class TableTest(unittest.TestCase):
             {("go", "quic"): 16, ("rust", "quic"): 16, ("connect", "connect"): 16,
              ("chromium", "webtransport"): 32, ("chromium", "websocket"): 32,
              ("chromium", "connect-web"): 8, ("chromium", "connect-web-h3"): 8,
-             ("chromium", "grpc-web"): 8},
+             ("chromium", "grpc-web"): 8, ("chromium", "json"): 8, ("chromium", "json-h3"): 8},
             self.cells("browser"),
         )  # fmt: skip
         # Compression on the TrevRPC lanes: bidi at every size over WebTransport, the rest at
@@ -423,6 +426,7 @@ class TableTest(unittest.TestCase):
         )  # fmt: skip
         self.assertEqual(8, self.cells("browser-lossy")[("chromium", "webtransport")])
         self.assertEqual(2, self.cells("browser-lossy")[("chromium", "grpc-web")])
+        self.assertEqual(2, self.cells("browser-lossy")[("chromium", "json")])
         # Validation runs each native client against its own server over QUIC.
         self.assertEqual({("go", "quic"): 24, ("rust", "quic"): 24}, self.cells("validation"))
         # Connection metadata runs with metadata, on TrevRPC only.

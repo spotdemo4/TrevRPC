@@ -2,8 +2,8 @@
 
 `bench/` measures end-to-end throughput and latency of every native client
 against every server over QUIC and QMux over TLS, plus grpc-go and connect-go
-baselines over HTTP/2, and the browser client in Chromium next to connect-web
-and gRPC-Web ([Browsers](#browsers)). Per-function microbenchmarks live in each runtime (`go test -bench` in
+baselines over HTTP/2, and the browser client in Chromium next to connect-web,
+gRPC-Web and plain JSON over `fetch` ([Browsers](#browsers)). Per-function microbenchmarks live in each runtime (`go test -bench` in
 `trevrpc-go`, `cargo bench` in `trevrpc-rust`), which `bench/micro.py`
 (`nix run .#trevrpc-bench-micro`) runs and compares across commits with
 benchstat; see the wiki's Benchmarks page.
@@ -182,19 +182,28 @@ result line. Its lanes, as the `transport` column names them:
 | `connect-web`    | connect-web, HTTP/2            | the baseline's Connect server (connect) | unary, server-stream |
 | `connect-web-h3` | connect-web, HTTP/3            | the baseline's Connect server (connect) | unary, server-stream |
 | `grpc-web`       | connect-web's gRPC-Web, HTTP/2 | the baseline's Connect server (connect) | unary, server-stream |
+| `json`           | `fetch` and JSON, HTTP/2       | the baseline's JSON API (connect)       | unary, server-stream |
+| `json-h3`        | `fetch` and JSON, HTTP/3       | the baseline's JSON API (connect)       | unary, server-stream |
 
 - The four Echo scenarios are `unary`, `server-stream`, `client-stream`, and
-  `bidi`. connect-web and gRPC-Web call through `fetch`, which cannot stream a
-  request, so they run `unary` and `server-stream` only. Browsers run no
+  `bidi`. connect-web, gRPC-Web and JSON call through `fetch`, which cannot
+  stream a request, so they run `unary` and `server-stream` only.
+- The JSON lanes are how most web apps get data from their server, with no RPC
+  framework: the page posts `JSON.stringify` of the request and reads
+  `response.json()`, and the server is a `net/http` handler with
+  `encoding/json`. `server-stream` answers with newline-delimited JSON, one
+  line per message, which the page parses as the body arrives. The message is a
+  JSON string, so the `records` payload's quotes are escaped on the wire. Browsers run no
   datagram or paced cells, and send metadata per call only.
 - Both payloads run on every lane. Only the TrevRPC lanes compress, in the
   `dictionary`, `stream` and `stream-dictionary` [modes](#compression) as the
   native clients do (with `--dictionary`), with the zstd codec trevrpc-js runs
   as WebAssembly on the page's thread.
-- Every worker shares one channel, or one connect-web transport, in one page.
+- Every worker shares one channel, or one connect-web transport, in one page;
+  the JSON lanes' `fetch` calls share the browser's connection to the server.
   Before warming up, each run checks that it really runs over its lane: the
   channel's transport, or the HTTP version of a first call.
-- Chromium reaches the Connect server over HTTP/3 because it is told to
+- Chromium reaches the Connect server and its JSON API over HTTP/3 because it is told to
   (`--origin-to-force-quic-on`) and trusts the certificate by its public key;
   it ignores Alt-Svc from a server whose certificate it does not trust.
 - The page is served from a loopback origin of its own, so the Connect server

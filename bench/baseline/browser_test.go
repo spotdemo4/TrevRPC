@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"maps"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"connectrpc.com/connect/v2"
@@ -60,6 +64,71 @@ func TestConnectOverHTTP3(t *testing.T) {
 			}
 			if !errors.Is(err, io.EOF) || received != 3 {
 				t.Fatalf("server stream: %d messages, err = %v", received, err)
+			}
+		})
+	}
+}
+
+// TestJSONAPI calls the JSON API that the browser benchmark's json lanes call,
+// over HTTP/2 and over HTTP/3 on the Connect port's UDP twin.
+func TestJSONAPI(t *testing.T) {
+	srv := startServer(t)
+	h2 := &http.Transport{TLSClientConfig: serverTLS(t, srv), ForceAttemptHTTP2: true}
+	t.Cleanup(h2.CloseIdleConnections)
+	h3 := &http3.Transport{TLSClientConfig: serverTLS(t, srv)}
+	t.Cleanup(func() { _ = h3.Close() })
+	for name, transport := range map[string]http.RoundTripper{"h2": h2, "h3": h3} {
+		t.Run(name, func(t *testing.T) {
+			client := &http.Client{Transport: transport}
+			// post returns the status, header and whole body of the response
+			// to body at path.
+			post := func(path, body string) (int, http.Header, []byte) {
+				t.Helper()
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://"+srv.addrs["connect"]+path, strings.NewReader(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				read, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := strings.TrimPrefix(name, "h") + ".0"; resp.Proto != "HTTP/"+want {
+					t.Fatalf("called over %s, want HTTP/%s", resp.Proto, want)
+				}
+				return resp.StatusCode, resp.Header, read
+			}
+
+			status, header, body := post(jsonUnaryPath, `{"message":"a \"quoted\" json"}`)
+			var echoed jsonResponse
+			if err := json.Unmarshal(body, &echoed); err != nil || status != http.StatusOK ||
+				header.Get("Content-Type") != "application/json" || echoed.Message != `a "quoted" json` {
+				t.Fatalf("unary: %d %v %q, err = %v", status, header, body, err)
+			}
+
+			status, header, body = post(jsonServerStreamPath, `{"message":"s","count":3}`)
+			if status != http.StatusOK || header.Get("Content-Type") != "application/x-ndjson" {
+				t.Fatalf("server stream: %d %v", status, header)
+			}
+			lines := bufio.NewScanner(bytes.NewReader(body))
+			var index uint32
+			for ; lines.Scan(); index++ {
+				var line jsonResponse
+				if err := json.Unmarshal(lines.Bytes(), &line); err != nil || line != (jsonResponse{Message: "s", Index: index}) {
+					t.Fatalf("server stream line %d: %q, err = %v", index, lines.Bytes(), err)
+				}
+			}
+			if index != 3 {
+				t.Fatalf("server stream: %d lines in %q", index, body)
+			}
+
+			if status, _, body := post(jsonUnaryPath, "{"); status != http.StatusBadRequest {
+				t.Fatalf("malformed request answered %d %q", status, body)
 			}
 		})
 	}

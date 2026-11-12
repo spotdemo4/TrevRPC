@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { measure, percentile, summarize } from "../interop-browser/bench.js";
+import { createJsonClient, jsonLines } from "../interop-browser/json-client.js";
 import { Records, newPayload } from "../interop-browser/records.js";
 
 const cli = fileURLToPath(new URL("../interop-browser/cli.js", import.meta.url));
@@ -180,6 +182,9 @@ test("the bench command validates its arguments before launching a browser", () 
     connect("connect-web-h3", "--cert", "cert.pem").map((value) =>
       value === "chromium" ? "firefox" : value,
     ),
+    connect("json", "--scenario", "client-stream"),
+    connect("json", "--compression", "dictionary", "--dictionary", "records.dict"),
+    connect("json-h3"),
   ]) {
     const result = spawnSync(process.execPath, [cli, ...bad], { encoding: "utf8" });
     assert.equal(result.status, 2, bad.join(" "));
@@ -197,4 +202,73 @@ test("the bench page is browser-only and the interop page leaves connect-web out
   assert.match(bench, /trevrpc\.interop\.v1\.Echo/);
   assert.doesNotMatch(bench, /from\s*["']node:|require\(["']node:|process\.binding/);
   assert.doesNotMatch(await readFile(pageBundle, "utf8"), /Connect-Protocol-Version/i);
+});
+
+/** A body that delivers chunks as they are, in turn. */
+function chunkedBody(...chunks) {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(new TextEncoder().encode(chunk));
+      }
+      controller.close();
+    },
+  });
+}
+
+test("JSON lines split across and within chunks parse in order", async () => {
+  const lines = await Array.fromAsync(
+    jsonLines(chunkedBody('{"index":0}\n{"ind', 'ex":1}\n{"index":2}\n{"index":3}')),
+  );
+  assert.deepEqual(lines, [{ index: 0 }, { index: 1 }, { index: 2 }, { index: 3 }]);
+  await assert.rejects(Array.fromAsync(jsonLines(chunkedBody('{"index":'))), SyntaxError);
+});
+
+test("the JSON client posts JSON and reads JSON and newline-delimited JSON back", async (t) => {
+  const requests = [];
+  const server = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) {
+      body += chunk;
+    }
+    requests.push({
+      url: req.url,
+      type: req.headers["content-type"],
+      pad: req.headers["bench-pad"],
+    });
+    const { message, count } = JSON.parse(body);
+    if (req.url === "/json/unary") {
+      res.end(JSON.stringify({ message, index: 0 }));
+    } else if (req.url === "/json/server-stream") {
+      for (let index = 0; index < count; index++) {
+        res.write(`${JSON.stringify({ message, index })}\n`);
+      }
+      res.end();
+    } else {
+      res.writeHead(404).end("no such route");
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const client = createJsonClient(baseUrl);
+
+  const message = '{"ts":"quoted"}';
+  assert.equal(
+    (await client.unary({ message }, { headers: { "bench-pad": "xx" } })).message,
+    message,
+  );
+  const streamed = await Array.fromAsync(client.serverStream({ message, count: 3 }));
+  assert.deepEqual(
+    streamed.map((response) => response.index),
+    [0, 1, 2],
+  );
+  assert.deepEqual(requests, [
+    { url: "/json/unary", type: "application/json", pad: "xx" },
+    { url: "/json/server-stream", type: "application/json", pad: undefined },
+  ]);
+  await assert.rejects(
+    createJsonClient(`${baseUrl}/missing`).unary({ message }),
+    /answered 404: no such route/,
+  );
 });

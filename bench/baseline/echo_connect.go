@@ -18,15 +18,17 @@ import (
 )
 
 // newConnectHandler returns the Echo handler with connect-go's defaults, plus
-// zstd and CORS. Its handlers also accept gRPC and gRPC-Web, which the browser
-// benchmark's gRPC-Web client speaks; the bench client only speaks the Connect
-// protocol. They accept gzip (built in) and zstd requests, and compress
-// responses with an encoding the client accepts.
+// zstd and CORS, next to the plain JSON API of echo_json.go. Its handlers also
+// accept gRPC and gRPC-Web, which the browser benchmark's gRPC-Web client
+// speaks; the bench client only speaks the Connect protocol. They accept gzip
+// (built in) and zstd requests, and compress responses with an encoding the
+// client accepts.
 func newConnectHandler() http.Handler {
 	mux := http.NewServeMux()
 	server := connect.NewServer()
 	echopbconnect.RegisterEchoHandler(server, connectEcho{})
 	connecthttp.Mount(mux, server, connecthttp.WithCompressors(connectgzip.New(), connectZstd))
+	mountJSON(mux)
 	return allowCrossOrigin(mux)
 }
 

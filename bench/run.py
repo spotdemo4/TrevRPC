@@ -78,11 +78,12 @@ BASELINE_TRANSPORTS = ("grpc", "connect")
 # The TrevRPC transports, as the clients' --transport names them.
 NATIVE_TRANSPORTS = ("quic", "tcp")
 # The browsers' lanes, as `trevrpc-interop-browser bench --transport` names them: TrevRPC over
-# WebTransport and over QMux on a WebSocket, against the TrevRPC servers, and connect-web and
-# gRPC-Web through fetch, over HTTP/2 or HTTP/3, against the baseline's Connect server. Fetch
-# cannot stream a request, so the fetch lanes run the unary and server-streaming scenarios only.
+# WebTransport and over QMux on a WebSocket, against the TrevRPC servers, and connect-web,
+# gRPC-Web and plain JSON through fetch, over HTTP/2 or HTTP/3, against the baseline's Connect
+# server, which also serves the JSON API. Fetch cannot stream a request, so the fetch lanes run the
+# unary and server-streaming scenarios only.
 TREVRPC_BROWSER_TRANSPORTS = ("webtransport", "websocket")
-FETCH_TRANSPORTS = ("connect-web", "connect-web-h3", "grpc-web")
+FETCH_TRANSPORTS = ("connect-web", "connect-web-h3", "grpc-web", "json", "json-h3")
 BROWSER_TRANSPORTS = (*TREVRPC_BROWSER_TRANSPORTS, *FETCH_TRANSPORTS)
 ECHO_SCENARIOS = ("unary", "server-stream", "client-stream", "bidi")
 BROWSER_SCENARIOS = {
@@ -90,7 +91,13 @@ BROWSER_SCENARIOS = {
     **dict.fromkeys(FETCH_TRANSPORTS, ECHO_SCENARIOS[:2]),
 }
 # The baseline port each fetch lane calls: Connect over HTTP/3 is on the UDP port of the number.
-FETCH_PORTS = {"connect-web": "connect", "connect-web-h3": "connect_h3", "grpc-web": "connect"}
+FETCH_PORTS = {
+    "connect-web": "connect",
+    "connect-web-h3": "connect_h3",
+    "grpc-web": "connect",
+    "json": "connect",
+    "json-h3": "connect_h3",
+}
 # The command that runs a browser's lanes, from the trevrpc-js package.
 BROWSER_COMMAND = ["trevrpc-interop-browser"]
 BROWSERS = ("chromium", "firefox")
@@ -702,8 +709,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=BROWSERS,
         action="append",
         default=[],
-        help="a browser whose lanes run: TrevRPC against every server, and connect-web and "
-        "gRPC-Web against the baseline's Connect server, through trevrpc-interop-browser",
+        help="a browser whose lanes run: TrevRPC against every server, and connect-web, "
+        "gRPC-Web and plain JSON against the baseline's Connect server, through "
+        "trevrpc-interop-browser",
     )
     _ = parser.add_argument("--scenarios", type=comma_list, default=list(SCENARIOS))
     _ = parser.add_argument("--sizes", type=int_list, default=[64])

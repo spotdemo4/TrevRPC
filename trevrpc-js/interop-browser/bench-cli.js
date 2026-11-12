@@ -10,7 +10,8 @@
 // The lanes are webtransport and websocket, the TrevRPC transports (--url is the WebTransport URL
 // and --cert-hash trusts its certificate; --ws-url is the WebSocket URL), and connect-web,
 // connect-web-h3 and grpc-web, which call a Connect server at --url through fetch over HTTP/2 or
-// HTTP/3. connect-web-h3 needs --cert to trust the certificate for HTTP/3.
+// HTTP/3, and json and json-h3, which call the baseline's JSON API at --url with plain fetch. The
+// HTTP/3 lanes need --cert to trust the certificate for HTTP/3.
 //
 // Only the TrevRPC lanes compress: --compression is none, dictionary, stream or
 // stream-dictionary, and the dictionary modes compress Echo messages with the zstd dictionary
