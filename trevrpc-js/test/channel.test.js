@@ -5,14 +5,15 @@ import { Echo } from "../build/interop/gen/interop_pb.js";
 import { Channel, connect, createChannel } from "../src/channel.js";
 import { createClient } from "../src/client.js";
 import { Code } from "../src/status.js";
+import { createCompression } from "../src/zstd.js";
 import { echoHandler } from "./echo-server.js";
 import { deferred, fakeTransport, isPending, turn } from "./support.js";
 
 // These tests cover the WebTransport lifecycle; the WebSocket fallback has its own tests.
 const WebTransportOnly = ["webtransport"];
 
-/** A WebTransport constructor whose sessions the test controls. */
-function fakeWebTransport() {
+/** A WebTransport constructor whose sessions the test controls, serving streams with `handler`. */
+function fakeWebTransport(handler = echoHandler) {
   const sessions = [];
   class FakeWebTransport {
     constructor(url, options) {
@@ -28,7 +29,7 @@ function fakeWebTransport() {
       });
       this.closed.catch(() => {});
       this.closeCalls = [];
-      this.streams = fakeTransport(echoHandler);
+      this.streams = fakeTransport(handler);
       sessions.push(this);
     }
 
@@ -672,4 +673,229 @@ test("createChannel throws on invalid options without starting a session", () =>
     (error) => error.code === Code.InvalidArgument,
   );
   assert.equal(sessions.length, 0);
+});
+
+/** The echo handler, recording the REQUEST of every call in `requests`. */
+function recordingEcho(requests) {
+  return (stream, session) => {
+    const readRequest = stream.readRequest.bind(stream);
+    stream.readRequest = async () => {
+      const request = await readRequest();
+      requests.push(request);
+      return request;
+    };
+    return echoHandler(stream, session);
+  };
+}
+
+/** Compression settings without dictionaries: every call queries the server about ID 0 alone. */
+const compression = await createCompression();
+
+test("calls started before a pending compression promise resolves are compressed", async () => {
+  const requests = [];
+  const { WebTransport, sessions } = fakeWebTransport(recordingEcho(requests));
+  const settings = deferred();
+  const changes = [];
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: settings.promise,
+    onStateChange: (change) => changes.push(change),
+  });
+  assert.equal(channel.compression, undefined);
+  assert.equal(sessions.length, 1, "the first attempt does not wait for the compression settings");
+
+  const client = createClient(Echo, channel);
+  const first = client.unary({ message: "early" });
+  const ready = channel.waitUntilReady();
+  sessions[0].becomeReady();
+  assert.equal(await isPending(first), true, "calls wait for the compression settings");
+  assert.equal(await isPending(ready), true);
+  assert.equal(channel.state, "connecting");
+
+  settings.resolve(compression);
+  assert.equal((await first).message, "early");
+  await ready;
+  assert.equal(channel.compression, compression);
+  assert.equal(requests[0].dictionaryQuery.length, 1, "the early call negotiated compression");
+  assert.deepEqual(changes, [
+    { state: "ready", previousState: "connecting", transport: "webtransport" },
+  ]);
+
+  assert.equal((await client.unary({ message: "later" })).message, "later");
+  assert.equal(requests[1].dictionaryQuery.length, 0, "the session's answer is cached");
+  channel.close();
+});
+
+test("compression settings that resolve before the session do not delay it", async () => {
+  const requests = [];
+  const { WebTransport, sessions } = fakeWebTransport(recordingEcho(requests));
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: Promise.resolve(compression),
+  });
+  const first = createClient(Echo, channel).unary({ message: "early" });
+  await turn();
+  assert.equal(channel.compression, compression);
+  sessions[0].becomeReady();
+  assert.equal((await first).message, "early");
+  assert.equal(requests[0].dictionaryQuery.length, 1);
+  channel.close();
+});
+
+test("a rejected compression promise leaves the channel uncompressed and reports the error", async () => {
+  const requests = [];
+  const { WebTransport, sessions } = fakeWebTransport(recordingEcho(requests));
+  const settings = deferred();
+  const changes = [];
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: settings.promise,
+    onStateChange: (change) => changes.push(change),
+  });
+  const first = createClient(Echo, channel).unary({ message: "early" });
+  sessions[0].becomeReady();
+  const failure = new Error("wasm blocked");
+  settings.reject(failure);
+
+  assert.equal((await first).message, "early");
+  assert.equal(channel.compression, undefined);
+  assert.equal(requests[0].dictionaryQuery.length, 0, "the call travels uncompressed");
+  assert.deepEqual(changes, [
+    {
+      state: "ready",
+      previousState: "connecting",
+      transport: "webtransport",
+      compressionError: failure,
+    },
+  ]);
+
+  // Only the first ready transition after the rejection reports it.
+  sessions[0].lose();
+  await waitFor(() => sessions.length === 2);
+  sessions[1].becomeReady();
+  await waitFor(() => channel.state === "ready");
+  assert.equal("compressionError" in changes.at(-1), false);
+  channel.close();
+});
+
+test("a rejected compression promise goes to reportError without onStateChange", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const failure = new Error("wasm blocked");
+  const reported = deferred();
+  globalThis.reportError = reported.resolve;
+  try {
+    const connecting = connect("https://example.test/trevrpc", {
+      transports: WebTransportOnly,
+      WebTransport,
+      compression: Promise.reject(failure),
+    });
+    sessions[0].becomeReady();
+    const channel = await connecting;
+    assert.equal(await reported.promise, failure);
+    assert.equal(channel.compression, undefined);
+    channel.close();
+  } finally {
+    delete globalThis.reportError;
+  }
+});
+
+test("connect resolves once both the session and a compression promise are ready", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const settings = deferred();
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: settings.promise,
+  });
+  sessions[0].becomeReady();
+  assert.equal(await isPending(connecting), true);
+  settings.resolve(compression);
+  const channel = await connecting;
+  assert.equal(channel.state, "ready");
+  assert.equal(channel.compression, compression);
+  channel.close();
+});
+
+test("closing a channel waiting for compression settings closes its new session", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const controller = new AbortController();
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: new Promise(() => {}),
+    signal: controller.signal,
+  });
+  sessions[0].becomeReady();
+  await turn();
+  assert.equal(sessions[0].closeCalls.length, 0);
+  controller.abort();
+  await assert.rejects(connecting, (error) => error.code === Code.Cancelled);
+  assert.equal(sessions[0].closeCalls.length, 1, "the ready session is closed");
+});
+
+test("a reconnect that starts before a compression promise settles waits for it", async () => {
+  const requests = [];
+  const { WebTransport, sessions } = fakeWebTransport(recordingEcho(requests));
+  const settings = deferred();
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: settings.promise,
+  });
+  sessions[0].failToConnect(new Error("handshake failed"));
+  await waitFor(() => sessions.length === 2);
+  sessions[1].becomeReady();
+  await turn(5);
+  assert.equal(channel.state, "reconnecting", "the new session waits for the settings");
+
+  settings.resolve(compression);
+  await waitFor(() => channel.state === "ready");
+  assert.equal((await createClient(Echo, channel).unary({ message: "a" })).message, "a");
+  assert.equal(requests[0].dictionaryQuery.length, 1, "the call negotiated compression");
+  channel.close();
+});
+
+test("a channel that closes before becoming ready reports a rejected compression promise", async () => {
+  const { WebTransport, sessions } = fakeWebTransport();
+  const failure = new Error("wasm blocked");
+  const changes = [];
+  const connecting = connect("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: Promise.reject(failure),
+    onStateChange: (change) => changes.push(change),
+  });
+  await turn();
+  sessions[0].failToConnect(new Error("handshake failed"));
+  await assert.rejects(connecting, (error) => /handshake failed/.test(error.statusMessage));
+  assert.deepEqual(
+    changes.map(({ state, compressionError }) => [state, compressionError]),
+    [["closed", failure]],
+  );
+});
+
+test("a compression promise that rejects after the channel closed goes to reportError", async () => {
+  const { WebTransport } = fakeWebTransport();
+  const settings = deferred();
+  const changes = [];
+  const channel = createChannel("https://example.test/trevrpc", {
+    transports: WebTransportOnly,
+    WebTransport,
+    compression: settings.promise,
+    onStateChange: (change) => changes.push(change),
+  });
+  channel.close();
+  const failure = new Error("wasm blocked");
+  const reported = deferred();
+  globalThis.reportError = reported.resolve;
+  try {
+    settings.reject(failure);
+    assert.equal(await reported.promise, failure);
+    assert.equal("compressionError" in changes[0], false);
+  } finally {
+    delete globalThis.reportError;
+  }
 });

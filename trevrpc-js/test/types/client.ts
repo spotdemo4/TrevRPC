@@ -14,6 +14,7 @@ import {
   type CallInterceptor,
   type ChannelStateChange,
   type ClientStreamingCall,
+  type Compression,
   type RequestValidator,
   type ResponseStream,
   type StreamStatus,
@@ -172,6 +173,17 @@ const compressed = await connect("https://example.test/trevrpc", {
 // Settings without dictionaries enable stream compression alone.
 await connect("https://example.test/trevrpc", { compression: await createCompression() });
 compressed.compression satisfies typeof compression | undefined;
+// A promise of the settings lets createChannel() return before the WebAssembly compiles.
+const pendingCompression = createChannel("https://example.test/trevrpc", {
+  compression: createCompression(),
+  onStateChange({ compressionError }) {
+    compressionError satisfies unknown;
+  },
+});
+pendingCompression.compression satisfies Compression | undefined;
+await connect("https://example.test/trevrpc", { compression: createCompression() });
+// @ts-expect-error A promise must resolve with compression settings.
+createChannel("https://example.test/trevrpc", { compression: Promise.resolve({ query: [] }) });
 // @ts-expect-error Compression settings come from createCompression().
 await connect("https://example.test/trevrpc", { compression: { query: [] } });
 

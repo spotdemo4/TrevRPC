@@ -18,6 +18,21 @@ export function transportCompression(transport) {
 }
 
 /**
+ * The property, true while it waits, of a transport whose compression settings are not known yet
+ * but will be by the time a stream it opens is: a Channel given a promise of them.
+ */
+export const CompressionPending = Symbol("trevrpc.compressionPending");
+
+/**
+ * Whether calls on a transport may compress: it has compression settings, or will have them once
+ * their streams open (see CompressionPending), so they must be set up on the session that carries
+ * them.
+ */
+export function mayCompress(transport) {
+  return transportCompression(transport) !== undefined || transport[CompressionPending] === true;
+}
+
+/**
  * The smallest message compressed without a dictionary: a smaller one rarely has anything to
  * compress against within itself.
  */

@@ -271,6 +271,14 @@ const compression = await createCompression({
 const channel = await connect(url, { compression });
 ```
 
+`compression` also takes the promise itself, so a channel created at module scope with `createChannel()` needs no top-level await, and the WebAssembly compiles while the first session is established:
+
+```js
+export const channel = createChannel(url, { compression: createCompression() });
+```
+
+The channel becomes ready once both are done, so calls started meanwhile wait and are compressed; `channel.compression` is undefined until then. If the promise rejects, the channel goes on without compression, as against a server that lacks the dictionaries, and reports the error as `compressionError` in its next state change to `"ready"`, or to `"closed"` if it closes first (or to `reportError()` without `onStateChange`, and once the channel is closed).
+
 Generated clients pick each message's dictionary by its protobuf type. The channel asks each new session's server which dictionaries it holds, so a message whose dictionary the server lacks travels uncompressed, and request messages are compressed once the answer arrives. A transport other than a `Channel` compresses when it has a `compression` property with these settings.
 
 Compression settings also enable stream compression, even without dictionaries (`createCompression()`): streaming methods marked `option (trevrpc.method) = {compression: COMPRESSION_STREAM}` compress each streamed direction with one zstd context per call, from its third message, so later messages compress against earlier ones. The contexts of a channel's calls may hold up to `streamCompressionMemory` bytes (64 MiB by default; 0 turns stream compression off).

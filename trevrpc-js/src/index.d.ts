@@ -575,8 +575,17 @@ export interface ConnectOptions {
    * `@trevrpc/trevrpc-js/zstd`. Dictionaries are negotiated with the server per session, so a
    * message whose dictionary the server lacks travels uncompressed. Compression settings also
    * enable stream compression on methods that allow it, even without dictionaries.
+   *
+   * A promise of the settings, such as `createCompression()` itself, lets `createChannel()` return
+   * right away while the WebAssembly compiles: it settles while the first session is established,
+   * and the channel becomes ready, and `connect()` resolves, only once both did, so calls started
+   * meanwhile wait and are compressed. If it rejects, the channel goes on without compression and
+   * reports the error as `ChannelStateChange.compressionError` on its next transition to "ready",
+   * or to "closed" if it closes first (to `reportError()` without `onStateChange`, and once it is
+   * closed). A transport that wraps the channel compresses the
+   * calls it starts once the settings are known.
    */
-  compression?: Compression;
+  compression?: Compression | PromiseLike<Compression>;
   /**
    * The memory, in bytes, the stream compression contexts of this channel's calls may hold.
    * Defaults to 64 MiB; 0 turns stream compression off. Calls beyond it compress per message.
@@ -613,6 +622,11 @@ export interface ChannelStateChange {
   error?: unknown;
   /** The transport of the new session, when it becomes ready. */
   transport?: TransportKind;
+  /**
+   * Why the promise of `ConnectOptions.compression` rejected, on the first transition to "ready" or
+   * "closed" after it did; the channel's calls travel uncompressed.
+   */
+  compressionError?: unknown;
 }
 
 /**
@@ -645,7 +659,10 @@ export class Channel implements Transport {
   readonly state: ChannelState;
   /** The transport of the current or last session; undefined before the first. */
   readonly transport: TransportKind | undefined;
-  /** The compression settings from the connect options. */
+  /**
+   * The compression settings from the connect options; undefined until a promise of them resolves,
+   * and if it rejects.
+   */
   readonly compression?: Compression;
   /** The connection metadata of the channel's calls, which a wrapping Transport forwards. */
   readonly connectionMetadata: ConnectionMetadataSource;

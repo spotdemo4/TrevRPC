@@ -1,5 +1,6 @@
 import {
   encodeMessage,
+  mayCompress,
   receivedMessage,
   sessionCompression,
   transportCompression,
@@ -233,7 +234,6 @@ export class Call {
    */
   static async open(transport, request, message, options, rpc = {}) {
     const fields = { ...request, metadata: options.metadata, ...timeoutField(options) };
-    const compression = transportCompression(transport);
     // The call carries the connection metadata that is current as it starts, like its own
     // metadata, until it ends: a change while its stream opens or before a replay is for later
     // calls.
@@ -241,7 +241,7 @@ export class Call {
     // The REQUEST depends on the session that carries the call if it negotiates compression, opens
     // a datagram flow or carries connection metadata.
     const perSession =
-      rpc.datagrams !== undefined || compression !== undefined || connectionMetadata !== undefined;
+      rpc.datagrams !== undefined || mayCompress(transport) || connectionMetadata !== undefined;
     const header = perSession
       ? null
       : encodeRequestFrame(fields, outgoing(message), options.maxFrameSize);
@@ -257,6 +257,9 @@ export class Call {
         rpc,
         connectionMetadata,
       };
+      // Compression settings are read once the stream is open: a Channel waiting for them opens
+      // none before they are known.
+      const compression = header === null ? transportCompression(transport) : undefined;
       await call.#write(
         header ?? call.#requestOnSession(fields, message, session, compression, transport, rpc),
       );

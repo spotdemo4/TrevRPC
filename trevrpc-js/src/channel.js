@@ -1,4 +1,5 @@
 import { certificateHashesUrl, fetchServerCertificateHashes } from "./certificate-hashes.js";
+import { CompressionPending } from "./compression.js";
 import { ConnectionMetadataSource } from "./connection-metadata.js";
 import { interceptorList } from "./interceptor.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
@@ -39,10 +40,19 @@ const DefaultReprobeIntervalMs = 5 * 60_000;
  * session and fail fast with Unavailable while it reconnects; a call that was in flight when the
  * session was lost is never replayed. Calls started while the channel first connects wait for
  * that attempt, and fail with its error if it fails.
+ *
+ * Compression settings may be given as a promise, which settles while the first session is
+ * established: the channel becomes ready only once both did, so every call is set up with the
+ * settings. If the promise rejects, the channel goes on without compression and reports the error
+ * as `compressionError` on its next transition to "ready" or "closed".
  */
 export class Channel {
   #dial;
   #compression;
+  /** Settles once the compression settings of a promise are known; undefined after that. */
+  #compressionPending;
+  /** `{ error }` once the compression promise rejected, until a state transition reports it. */
+  #compressionFailure;
   #streamCompressionBudget;
   #connectionMetadata;
   #interceptors;
@@ -91,8 +101,8 @@ export class Channel {
     this.#interceptors = interceptorList(options.interceptors, "interceptors");
     this.#streamCompressionBudget = new StreamBudget(options.streamCompressionMemory);
     this.#connectionMetadata = new ConnectionMetadataSource(options.connectionMetadata);
-    this.#compression = options.compression;
     this.#onStateChange = options.onStateChange;
+    this.#setCompression(options.compression);
     this.#connecting = this.#connect(retry);
   }
 
@@ -112,9 +122,17 @@ export class Channel {
     return this.#transport;
   }
 
-  /** The compression settings from the connect options, or undefined. */
+  /**
+   * The compression settings from the connect options, or undefined; undefined too until a promise
+   * of them resolves, and after it rejected.
+   */
   get compression() {
     return this.#compression;
+  }
+
+  /** Whether the compression settings are a promise that has yet to settle. */
+  get [CompressionPending]() {
+    return this.#compressionPending !== undefined;
   }
 
   /** The memory budget of the stream compression contexts of this channel's calls. */
@@ -198,11 +216,47 @@ export class Channel {
     const session = this.#session;
     this.#session = undefined;
     this.#stopped.abort();
-    this.#transition("closed");
+    this.#transition("closed", this.#compressionReport());
     for (const waiter of this.#waiters.splice(0)) {
       waiter.reject(unavailable("channel is closed"));
     }
     closeQuietly(session, closeInfo);
+  }
+
+  /** Adopts compression settings, or a promise of them, which then settles in the background. */
+  #setCompression(compression) {
+    if (typeof compression?.then !== "function") {
+      this.#compression = compression;
+      return;
+    }
+    this.#compressionPending = Promise.resolve(compression).then(
+      (settings) => {
+        this.#compression = settings ?? undefined;
+        this.#compressionPending = undefined;
+      },
+      (error) => {
+        this.#compressionPending = undefined;
+        if (this.#state === "closed") {
+          // No transition is left to report it.
+          globalThis.reportError?.(error);
+        } else {
+          this.#compressionFailure = { error };
+        }
+      },
+    );
+  }
+
+  /**
+   * Dials the next session, then waits for compression settings that are still pending, so that
+   * no call starts on the session before they are known. Returns early if the signal aborts; the
+   * caller then closes the session.
+   */
+  async #dialSession(signal) {
+    const dialed = await this.#dial(signal);
+    if (this.#compressionPending !== undefined) {
+      await settledOrAborted(this.#compressionPending, signal);
+    }
+    return dialed;
   }
 
   /**
@@ -213,7 +267,7 @@ export class Channel {
     const { signal } = this.#stopped;
     let dialed;
     try {
-      dialed = await this.#dial(signal);
+      dialed = await this.#dialSession(signal);
     } catch (error) {
       if (!signal.aborted) {
         if (retry) {
@@ -232,10 +286,31 @@ export class Channel {
     return undefined;
   }
 
+  /**
+   * The `compressionError` field of the next transition to "ready" or "closed", once the
+   * compression promise rejected and no transition reported it yet; reported to
+   * `globalThis.reportError` instead when nothing receives state transitions.
+   */
+  #compressionReport() {
+    const failure = this.#compressionFailure;
+    if (failure === undefined) {
+      return {};
+    }
+    this.#compressionFailure = undefined;
+    if (this.#onStateChange === undefined) {
+      globalThis.reportError?.(failure.error);
+    }
+    return { compressionError: failure.error };
+  }
+
   /** Adopts a new session and wakes up whoever waits for the channel to be ready. */
   #ready(dialed, extra) {
     this.#adopt(dialed);
-    this.#transition("ready", { ...extra, transport: dialed.transport });
+    this.#transition("ready", {
+      ...extra,
+      transport: dialed.transport,
+      ...this.#compressionReport(),
+    });
     for (const waiter of this.#waiters.splice(0)) {
       waiter.resolve();
     }
@@ -268,7 +343,7 @@ export class Channel {
       }
 
       try {
-        const dialed = await this.#dial(signal);
+        const dialed = await this.#dialSession(signal);
         if (signal.aborted) {
           closeQuietly(dialed.session);
           return;
@@ -514,6 +589,22 @@ function backoffDelay(attempt) {
   const { initialDelayMs, maxDelayMs, jitter } = Backoff;
   const base = Math.min(maxDelayMs, initialDelayMs * 2 ** (attempt - 1));
   return Math.min(maxDelayMs, base * (1 + (Math.random() * 2 - 1) * jitter));
+}
+
+/** Resolves once `promise`, which never rejects, settled or `signal` aborted. */
+function settledOrAborted(promise, signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    signal.addEventListener("abort", done, { once: true });
+    promise.then(done);
+  });
 }
 
 function sleep(delayMs, signal) {
