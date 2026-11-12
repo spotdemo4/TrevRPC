@@ -3,8 +3,8 @@
 [protovalidate](https://github.com/bufbuild/protovalidate) request validation for [TrevRPC](https://trev.zip/llc/TrevRPC) Go servers: requests that break their [`buf.validate`](https://buf.build/bufbuild/protovalidate) rules fail before the handler runs. It is a separate module so that TrevRPC itself does not depend on protovalidate or CEL.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.9.0 works with `trevrpc-go` 1.9.0, `trevrpc-js` 1.9.0, and `trevrpc-kotlin`
-> 1.9.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.10.0 works with `trevrpc-go` 1.10.0, `trevrpc-js` 1.10.0, and `trevrpc-kotlin`
+> 1.10.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 ```sh
 go get trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc

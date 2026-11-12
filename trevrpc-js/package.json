@@ -1,6 +1,6 @@
 {
   "name": "@trevrpc/trevrpc-js",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "Browser WebTransport client for TrevRPC, on protobuf-es",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {
