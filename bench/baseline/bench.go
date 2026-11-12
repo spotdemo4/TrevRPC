@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -132,6 +133,8 @@ type workerResult struct {
 	latencies []time.Duration
 	msgs      uint64
 	errors    uint64
+	// firstError is the first of errors, which reportErrors prints.
+	firstError error
 }
 
 // runBench connects, runs the warmup and the measured window, and summarizes.
@@ -170,6 +173,7 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 
 	wireStart, wireEnd, ok := snapshotWire(ctx, conn.wire, measureStart, measureEnd)
 	wg.Wait()
+	reportErrors(os.Stderr, results)
 	if !ok {
 		return zero, ctx.Err()
 	}
@@ -203,7 +207,7 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 // runWorker runs operations back to back until the measured window ends. An
 // operation counts only if it starts at or after measureStart and finishes by
 // measureEnd. A failed operation counts as an error if it started inside the
-// window; failures during warmup are ignored.
+// window; failures during warmup are ignored. The first such error is kept.
 func runWorker(ctx context.Context, w worker, measureStart, measureEnd time.Time) workerResult {
 	var result workerResult
 	for {
@@ -216,6 +220,9 @@ func runWorker(ctx context.Context, w worker, measureStart, measureEnd time.Time
 		inWindow := !opStart.Before(measureStart)
 		if err != nil {
 			if inWindow {
+				if result.errors == 0 {
+					result.firstError = err
+				}
 				result.errors++
 			}
 			if !sleepUntil(ctx, opEnd.Add(errorBackoff)) {
@@ -226,6 +233,16 @@ func runWorker(ctx context.Context, w worker, measureStart, measureEnd time.Time
 		if inWindow && !opEnd.After(measureEnd) {
 			result.latencies = append(result.latencies, opEnd.Sub(opStart))
 			result.msgs += uint64(msgs)
+		}
+	}
+}
+
+// reportErrors prints the first failed call of every worker that had one, so
+// the log of a run that reports errors says why.
+func reportErrors(w io.Writer, results []workerResult) {
+	for i, r := range results {
+		if r.firstError != nil {
+			_, _ = fmt.Fprintf(w, "worker %d: %d call(s) failed, first: %v\n", i, r.errors, r.firstError)
 		}
 	}
 }

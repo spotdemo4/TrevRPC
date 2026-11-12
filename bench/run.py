@@ -111,6 +111,14 @@ COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
 # Room on top of warmup and duration for connecting and draining, which for a browser includes
 # launching it again when it does not start in time.
 DEADLINE_SLACK = 80
+# How many more times a run that completed no operation in its measured window runs; see
+# `Runner.run_once`.
+STARVED_RETRIES = 2
+# What every bench client prints as its last line when no operation completed in its measured
+# window, whether its calls failed or ran past the window: the baselines report a window whose
+# every call failed as a result with no ops instead, and run_once retries both the same way, since
+# on a loaded machine one slow first call can fail as well as stall.
+STARVED = "no operation completed"
 COLUMNS = (
     "scenario", "size", "md", "conc", "conns", "rate", "rules", "transport", "compression",
     "client", "server", "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%",
@@ -422,6 +430,21 @@ def train_dictionary(directory: Path) -> Path:
     return dictionary
 
 
+@dataclass(frozen=True)
+class Attempt:
+    """One run of a cell."""
+
+    log: Path
+    # The server's log_size when the run started.
+    offset: int
+    # What the client measured, if it printed a valid result.
+    result: Result | None = None
+    # Why the run failed, if it did.
+    reason: str | None = None
+    # Whether no operation completed in the measured window.
+    starved: bool = False
+
+
 class Runner:
     """Runs the matrix for each client and server, collecting results and failures."""
 
@@ -512,9 +535,39 @@ class Runner:
     def run_once(
         self, cell: str, client: str, server: str, netem: str | None, command: list[str]
     ) -> Result | None:
-        """Runs the cell once, logging to CELL.log, and returns its result, or None after
-        recording why it failed."""
-        log = self.out / f"{cell}.log"
+        """Runs the cell, logging to CELL.log, and returns its result, or None after recording
+        why it failed.
+
+        A run that completed no operation in its measured window, failed or not, runs again up
+        to STARVED_RETRIES times, logging to CELL-retryN.log. The check keeps its windows to a
+        fifth of a second, so on a machine saturated by other builds a worker may not finish a
+        single call inside one, which says nothing about the code under test. Every other failure
+        is recorded at once, and a cell that completes nothing on every attempt still fails."""
+        retry = 0
+        while True:
+            name = cell if retry == 0 else f"{cell}-retry{retry}"
+            attempt = self.attempt(name, client, server, netem, command)
+            if not attempt.starved or retry == STARVED_RETRIES:
+                break
+            # The reason stays in the output even when a retry passes.
+            print(
+                f"retrying: {name} completed no operation: {attempt.reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+            retry += 1
+        if attempt.reason is not None:
+            reason = attempt.reason
+            if retry != 0:
+                reason += f", after {retry} earlier run(s) completed no operation"
+            self.fail(cell, reason, attempt.log, attempt.offset)
+        return attempt.result
+
+    def attempt(
+        self, name: str, client: str, server: str, netem: str | None, command: list[str]
+    ) -> Attempt:
+        """Runs the cell once, logging to NAME.log, and says how it went."""
+        log = self.out / f"{name}.log"
         offset = 0 if self.server is None else self.server.log_size()
         with log.open("w", encoding="utf-8") as stderr:
             completed = run_with_deadline(
@@ -522,19 +575,23 @@ class Runner:
             )
         line = completed.stdout.strip()
         if completed.returncode is None:
-            self.fail(cell, f"timed out after {self.matrix.deadline}s (see {log})", log, offset)
-            return None
+            reason = f"timed out after {self.matrix.deadline}s (see {log})"
+            return Attempt(log, offset, None, reason)
         if completed.returncode != 0:
-            self.fail(cell, f"exited {completed.returncode} (see {log})", log, offset)
-            return None
+            reason = f"exited {completed.returncode} (see {log})"
+            lines = log.read_text(encoding="utf-8", errors="replace").split("\n")
+            last = next((line.strip() for line in reversed(lines) if line.strip()), "")
+            if STARVED in last:
+                return Attempt(log, offset, None, f"{reason}: {last}", starved=True)
+            return Attempt(log, offset, None, reason)
         try:
             result = parse_result(client, server, line, netem)
         except ValueError as error:
-            self.fail(cell, f"printed an invalid result ({error}): {line}", log, offset)
-            return None
+            return Attempt(log, offset, None, f"printed an invalid result ({error}): {line}")
         if result.errors != 0:
-            self.fail(cell, f"reported errors: {line}", log, offset)
-        return result
+            starved = result.record.get("ops") == 0
+            return Attempt(log, offset, result, f"reported errors: {line}", starved)
+        return Attempt(log, offset, result)
 
     def fail(self, cell: str, reason: str, log: Path, offset: int) -> None:
         """Reports the failure now and keeps it, with the end of the cell's log and what the

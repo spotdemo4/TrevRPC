@@ -515,6 +515,104 @@ class FailureTest(unittest.TestCase):
             )  # fmt: skip
 
 
+# What a TrevRPC client prints when its window completed nothing, and the baselines' result line
+# when every call in it failed, or some.
+STARVED = "echo 'no operation completed in the 200ms measured window (0 failed)' >&2; exit 1"
+NO_OPS = "echo '" + json.dumps({**RESULT, "ops": 0, "msgs": 0, "errors": 2, "ops_per_sec": 0}) + "'"
+SOME_FAILED = "echo '" + json.dumps({**RESULT, "errors": 1}) + "'"
+PASSED = "echo '" + json.dumps(RESULT) + "'"
+
+
+class Cell:
+    """A cell run once in OUT, whose Nth run runs the Nth shell command of RUNS."""
+
+    def __init__(self, out: str, *runs: str) -> None:
+        self.out: Path = Path(out)
+        self.runner: run.Runner = run.Runner(
+            run.Matrix(["unary"], [64], [0], [1], 0.2, 0, 10), self.out
+        )
+        cases = " ".join(f"{index}) {command};;" for index, command in enumerate(runs, 1))
+        count = "n=$(($(cat runs 2>/dev/null || echo 0) + 1)); echo $n >runs"
+        script = f"cd {out}; {count}; case $n in {cases} esac"
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.result: run.Result | None = self.runner.run_once(
+                "cell", "go", "go", None, ["sh", "-c", script]
+            )
+        self.stderr: str = stderr.getvalue()
+
+    @property
+    def runs(self) -> int:
+        return int((self.out / "runs").read_text())
+
+
+class StarvedTest(unittest.TestCase):
+    def test_a_run_that_completes_no_operation_runs_again(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            cell = Cell(out, STARVED, STARVED, PASSED)
+
+            self.assertIsNotNone(cell.result)
+            self.assertEqual([], cell.runner.failures)
+            self.assertEqual(3, cell.runs)
+            # Each retried run's reason stays in the output.
+            self.assertIn(
+                f"retrying: cell completed no operation: exited 1 (see {out}/cell.log): "
+                "no operation completed in the 200ms measured window (0 failed)",
+                cell.stderr,
+            )
+            self.assertIn("retrying: cell-retry1 completed no operation: exited 1", cell.stderr)
+            # Every run keeps its log.
+            self.assertIn("no operation completed", (Path(out) / "cell.log").read_text())
+            self.assertIn("no operation completed", (Path(out) / "cell-retry1.log").read_text())
+            self.assertTrue((Path(out) / "cell-retry2.log").exists())
+
+    def test_a_run_whose_every_call_failed_runs_again(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            cell = Cell(out, NO_OPS, PASSED)
+
+            self.assertIsNotNone(cell.result)
+            self.assertEqual([], cell.runner.failures)
+            self.assertEqual(2, cell.runs)
+
+    def test_a_cell_that_never_completes_an_operation_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            cell = Cell(out, STARVED, STARVED, STARVED, PASSED)
+
+            self.assertIsNone(cell.result)
+            self.assertEqual(3, cell.runs)
+            self.assertEqual(
+                [run.Failure("cell", [
+                    f"exited 1 (see {out}/cell-retry2.log): "
+                    "no operation completed in the 200ms measured window (0 failed), "
+                    "after 2 earlier run(s) completed no operation",
+                    "no operation completed in the 200ms measured window (0 failed)",
+                ])],
+                cell.runner.failures,
+            )  # fmt: skip
+
+    def test_a_cell_whose_every_call_always_fails_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            cell = Cell(out, NO_OPS, NO_OPS, NO_OPS, PASSED)
+
+            self.assertEqual(3, cell.runs)
+            self.assertEqual(1, len(cell.runner.failures))
+            self.assertTrue(cell.runner.failures[0].details[0].startswith("reported errors: "))
+
+    def test_other_failures_fail_at_once(self) -> None:
+        for command in [
+            SOME_FAILED,
+            "echo 'call failed: reset' >&2; exit 1",
+            "echo nonsense",
+            # Only the client's last line says whether the window completed nothing.
+            "echo 'no operation completed earlier' >&2; echo 'panic: boom' >&2; exit 2",
+        ]:
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as out:
+                cell = Cell(out, command, PASSED)
+
+                self.assertEqual(1, cell.runs)
+                self.assertEqual(1, len(cell.runner.failures))
+                self.assertNotIn("retrying", cell.stderr)
+
+
 class FakeServer(run.Server):
     """A Server with only a log, which a cell's command appends to."""
 
