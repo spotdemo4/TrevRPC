@@ -247,6 +247,13 @@ type Admission func(AdmissionRequest) bool
 type ServerDiagnosticPhase string
 
 // Server diagnostic phases delivered to a [ServerDiagnosticHandler].
+//
+// ServerDiagnosticExecutionDetached reports a handler, authorizer or stream
+// Recv that was still running a second after its call stopped waiting for it,
+// because the call was cancelled or timed out. One that returns sooner, as a
+// handler that watches its context does, is not reported.
+// ServerDiagnosticExecutionFinallyExited reports that an execution reported
+// as detached returned.
 const (
 	ServerDiagnosticHandlerPanic           ServerDiagnosticPhase = "handler_panic"
 	ServerDiagnosticAuthorizerPanic        ServerDiagnosticPhase = "authorizer_panic"
@@ -972,31 +979,65 @@ func (l *requestExecutionLease) retainAs(reference *executionReference, phase Se
 	}
 	l.refs.Add(1)
 	l.runtime.executionStarted()
+	reference.mu.Lock()
 	reference.lease, reference.phase = l, phase
-	reference.detached, reference.finished = false, false
+	reference.detached, reference.reported, reference.finished = false, false, false
+	// A report scheduled for the execution the reference stood for before
+	// must not report this one.
+	reference.generation++
+	reference.mu.Unlock()
 	return reference
 }
 
+// detachedExecutionReportDelay is how long a detached execution may run on
+// before it is reported. A handler that watches its context returns
+// microseconds after the call is cancelled, but the call stops waiting for it
+// first, so without the delay every ordinary cancel would be reported.
+const detachedExecutionReportDelay = time.Second
+
 type executionReference struct {
-	lease    *requestExecutionLease
-	phase    ServerDiagnosticPhase
-	mu       sync.Mutex
-	detached bool
+	lease *requestExecutionLease
+	phase ServerDiagnosticPhase
+	mu    sync.Mutex
+	// generation tells the executions a reused reference stood for apart.
+	generation uint64
+	detached   bool
+	// reported says execution_detached was emitted, so finish must emit
+	// execution_finally_exited.
+	reported bool
 	finished bool
+	timer    *time.Timer
 }
 
+// detach records that the call no longer waits for the execution, which runs
+// on. It is counted at once, and reported as execution_detached if it is
+// still running detachedExecutionReportDelay later.
 func (r *executionReference) detach() {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.detached || r.finished {
-		r.mu.Unlock()
 		return
 	}
 	r.detached = true
 	r.lease.runtime.detached.Add(1)
-	r.mu.Unlock()
+	generation := r.generation
+	r.timer = time.AfterFunc(detachedExecutionReportDelay, func() { r.reportDetached(generation) })
+}
+
+// reportDetached emits execution_detached for the execution of generation, if
+// it has not finished.
+func (r *executionReference) reportDetached(generation uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.generation != generation || r.finished || r.reported {
+		return
+	}
+	r.reported = true
+	// Emitted under the lock, so it is queued before the
+	// execution_finally_exited of finish.
 	r.lease.runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticExecutionDetached, Service: r.lease.service, Method: r.lease.method, Kind: r.lease.kind})
 }
 
@@ -1010,13 +1051,19 @@ func (r *executionReference) finish() {
 		return
 	}
 	r.finished = true
-	detached := r.detached
+	lease, detached, reported := r.lease, r.detached, r.reported
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
 	r.mu.Unlock()
-	r.lease.release()
-	r.lease.runtime.executionFinished()
+	lease.release()
+	lease.runtime.executionFinished()
 	if detached {
-		r.lease.runtime.detached.Add(-1)
-		r.lease.runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticExecutionFinallyExited, Service: r.lease.service, Method: r.lease.method, Kind: r.lease.kind})
+		lease.runtime.detached.Add(-1)
+	}
+	if reported {
+		lease.runtime.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticExecutionFinallyExited, Service: lease.service, Method: lease.method, Kind: lease.kind})
 	}
 }
 

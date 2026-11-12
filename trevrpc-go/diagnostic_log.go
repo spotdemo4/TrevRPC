@@ -10,9 +10,9 @@ import (
 //   - slog.LevelError for a panic, an error a handler returned that became
 //     Internal, an invalid handler response, and a shutdown that did not
 //     finish in time;
-//   - slog.LevelWarn for a handler that kept running after its call ended,
-//     and a missing or invalid PROXY header from a trusted proxy, which
-//     suggests a misconfigured load balancer;
+//   - slog.LevelWarn for a handler that kept running for more than a second
+//     after its call ended, and a missing or invalid PROXY header from a
+//     trusted proxy, which suggests a misconfigured load balancer;
 //   - slog.LevelInfo for a handler that finally returned after its call ended;
 //   - slog.LevelDebug for the sessions and connections clients open and close,
 //     and failed TLS handshakes, which clients cause.
