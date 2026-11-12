@@ -964,20 +964,40 @@ func (l *requestExecutionLease) release() {
 	}
 }
 
+// retain starts an execution of the call. The caller must hold a reference to
+// the lease, so it cannot have been released.
 func (l *requestExecutionLease) retain(phase ServerDiagnosticPhase) *executionReference {
 	if l == nil {
 		return nil
 	}
-	return l.retainAs(&executionReference{}, phase)
+	l.refs.Add(1)
+	return l.started(&executionReference{}, phase)
 }
 
-// retainAs starts the execution that reference stands for. A reference that
-// has finished can start another, if nothing uses it any more.
-func (l *requestExecutionLease) retainAs(reference *executionReference, phase ServerDiagnosticPhase) *executionReference {
+// tryRetainAs starts the execution that reference stands for, for a goroutine
+// that does not hold a reference to the lease, such as one that reads a
+// stream of the call. A reference that has finished can start another, if
+// nothing uses it any more. Once the last reference is gone the call has let
+// go of its admission, which is never taken back: tryRetainAs then starts
+// nothing and reports false, because the call is over and an execution that
+// ended would release the admission a second time, freeing a request slot
+// that another call holds.
+func (l *requestExecutionLease) tryRetainAs(reference *executionReference, phase ServerDiagnosticPhase) (*executionReference, bool) {
 	if l == nil {
-		return nil
+		return nil, true
 	}
-	l.refs.Add(1)
+	for refs := l.refs.Load(); ; refs = l.refs.Load() {
+		if refs <= 0 {
+			return nil, false
+		}
+		if l.refs.CompareAndSwap(refs, refs+1) {
+			return l.started(reference, phase), true
+		}
+	}
+}
+
+// started counts an execution the lease was just retained for.
+func (l *requestExecutionLease) started(reference *executionReference, phase ServerDiagnosticPhase) *executionReference {
 	l.runtime.executionStarted()
 	reference.mu.Lock()
 	reference.lease, reference.phase = l, phase

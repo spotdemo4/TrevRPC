@@ -117,10 +117,15 @@ func TestReusedExecutionIsNotReportedForTheOneBefore(t *testing.T) {
 		defer lease.release()
 
 		var reference executionReference
-		execution := lease.retainAs(&reference, ServerDiagnosticResponseStreamPanic)
+		execution, ok := lease.tryRetainAs(&reference, ServerDiagnosticResponseStreamPanic)
+		if !ok {
+			t.Fatal("a held lease could not be retained")
+		}
 		execution.detach()
 		execution.finish()
-		execution = lease.retainAs(&reference, ServerDiagnosticResponseStreamPanic)
+		if execution, ok = lease.tryRetainAs(&reference, ServerDiagnosticResponseStreamPanic); !ok {
+			t.Fatal("a held lease could not be retained again")
+		}
 		time.Sleep(2 * detachedExecutionReportDelay)
 		synctest.Wait()
 		execution.finish()

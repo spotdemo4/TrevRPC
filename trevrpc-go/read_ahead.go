@@ -177,7 +177,12 @@ func (q *responseReadAhead) run() {
 			}
 		}
 
-		execution := q.lease.retainAs(&q.execution, ServerDiagnosticResponseStreamPanic)
+		execution, ok := q.lease.tryRetainAs(&q.execution, ServerDiagnosticResponseStreamPanic)
+		if !ok {
+			// The response has ended and let go of the call's admission, as it
+			// can before the goroutine runs after a request for a message.
+			return
+		}
 		if !q.state.CompareAndSwap(readAheadIdle, readAheadReceiving) {
 			execution.finish()
 			return

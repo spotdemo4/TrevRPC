@@ -161,3 +161,41 @@ func TestStreamReceiverNeverLeaksAnExecution(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamReceiverDoesNotRetakeAReleasedAdmission reads a stream after its
+// call has let go of its admission, as a goroutine of a handler that outlives
+// the call can. The receive must fail as the call ended, and must not take the
+// admission back: the execution that stood for it would release the
+// admission a second time, freeing a request slot that another call holds.
+func TestStreamReceiverDoesNotRetakeAReleasedAdmission(t *testing.T) {
+	server := NewServer()
+	runtime := server.freeze()
+	// held keeps a slot taken, so a slot released twice shows in the count
+	// instead of blocking.
+	held, ok := runtime.tryRequestLease(nil)
+	if !ok {
+		t.Fatal("failed to acquire request lease")
+	}
+	lease, ok := runtime.tryRequestLease(newWireRequest("/service/method"))
+	if !ok {
+		t.Fatal("failed to acquire request lease")
+	}
+	stream := &blockingTestStream{left: 1}
+	receiver := newStreamReceiver(context.Background(), MessageStream[int](stream), 0, "request", lease)
+	defer receiver.close()
+	lease.release()
+
+	for range 2 {
+		if _, err := receiver.recv(); StatusFromError(err).Code != CodeCancelled {
+			t.Fatalf("recv after the call ended = %v, want cancelled", err)
+		}
+	}
+	if got := len(stream.goroutines); got != 0 {
+		t.Fatalf("the stream was read on %d goroutines after the call ended, want none", got)
+	}
+	if got := len(runtime.requestLimit); got != 1 {
+		t.Fatalf("request slots held = %d, want 1: a slot was released twice", got)
+	}
+	waitForServerExecutionCount(t, server, 0)
+	held.release()
+}

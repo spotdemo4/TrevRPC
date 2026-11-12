@@ -643,3 +643,87 @@ func TestReadAheadReadsAFastHandlerAhead(t *testing.T) {
 		t.Fatalf("the handler was read %d times with the writer blocked, want %d", got, handlerReadAheadMessages)
 	}
 }
+
+// cancelOnWaitContext is a context that is cancelled the first time it is
+// waited on (its Done is called) after arm.
+type cancelOnWaitContext struct {
+	context.Context
+	cancel context.CancelFunc
+	armed  atomic.Bool
+}
+
+func newCancelOnWaitContext() *cancelOnWaitContext {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &cancelOnWaitContext{Context: ctx, cancel: cancel}
+}
+
+func (c *cancelOnWaitContext) arm() { c.armed.Store(true) }
+
+func (c *cancelOnWaitContext) Done() <-chan struct{} {
+	if c.armed.CompareAndSwap(true, false) {
+		c.cancel()
+	}
+	return c.Context.Done()
+}
+
+// TestReadAheadNeverReleasesTheAdmissionTwice races the end of a call against
+// the goroutine starting its next Recv. A handler that is read on request (as
+// one that waits for the peer is) is asked for a message by the writer, and
+// the call is cancelled before the goroutine gets to run: the writer gives up
+// the stream and lets go of the call's admission. The goroutine, woken by the
+// request, must not take the admission back for that Recv. Releasing it again
+// would free a request slot another call holds, or block forever when none
+// does.
+func TestReadAheadNeverReleasesTheAdmissionTwice(t *testing.T) {
+	server := NewServer()
+	srv := server.freeze()
+	// held keeps a slot taken, so a slot released twice shows in the count
+	// instead of blocking.
+	held, ok := srv.tryRequestLease(nil)
+	if !ok {
+		t.Fatal("failed to acquire request lease")
+	}
+	for i := range 200 {
+		before := runtime.NumGoroutine()
+		lease, ok := srv.tryRequestLease(newWireRequest("/example.Greeter/Download"))
+		if !ok {
+			t.Fatal("failed to acquire request lease")
+		}
+		ctx := newCancelOnWaitContext()
+		q := newResponseReadAhead(ctx, newAheadStream(-1, 16), 0, lease)
+		// Every handler counts as slow, so after the first message it is read
+		// only when the writer asks.
+		q.fastRecv = 0
+		q.start()
+		if _, _, err := q.next(true); err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		deadline := time.Now().Add(testTimeout)
+		for !q.parked.Load() {
+			if time.Now().After(deadline) {
+				t.Fatal("the read-ahead did not wait for a request")
+			}
+			runtime.Gosched()
+		}
+		// The writer asks for the next message, finds the call cancelled as it
+		// waits, and ends the response as serverResponseStream.release does.
+		ctx.arm()
+		if _, _, err := q.next(true); err == nil {
+			t.Fatal("next succeeded on a cancelled call")
+		}
+		q.close()
+		lease.release()
+
+		for runtime.NumGoroutine() > before {
+			if time.Now().After(deadline) {
+				t.Fatalf("call %d: goroutines = %d, want at most %d: the read-ahead did not end", i, runtime.NumGoroutine(), before)
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+		if got := len(srv.requestLimit); got != 1 {
+			t.Fatalf("call %d: request slots held = %d, want 1: a slot was released twice", i, got)
+		}
+	}
+	held.release()
+	waitForServerExecutionCount(t, server, 0)
+}

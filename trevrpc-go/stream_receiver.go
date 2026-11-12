@@ -101,9 +101,17 @@ func (r *streamReceiver[T]) recv() (T, error) {
 	if r.abandoned != nil {
 		return zero, r.abandoned
 	}
+	execution, ok := r.lease.tryRetainAs(&r.execution, r.phase())
+	if !ok {
+		// The call has let go of its admission, so it is over, whether or not
+		// its context says so yet.
+		r.abandoned = statusFromContextError(context.Canceled)
+		if r.ctx.Err() != nil {
+			r.abandoned = contextStatus(r.ctx)
+		}
+		return zero, r.abandoned
+	}
 	r.start()
-
-	execution := r.lease.retainAs(&r.execution, r.phase())
 	r.wake <- execution
 	var idle <-chan time.Time
 	if r.idleTimeout > 0 {
