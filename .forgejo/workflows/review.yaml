@@ -50,7 +50,7 @@ jobs:
           api: anthropic-messages
           api-key: ${{ secrets.PI_ACTION_API_KEY }}
           model: claude-sonnet-5-5
-          thinking: medium
+          thinking: high
           exclude-tools: bash,edit,write
           review: approve
           reapprove-unchanged: true
