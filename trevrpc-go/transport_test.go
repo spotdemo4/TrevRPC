@@ -1096,6 +1096,9 @@ func TestWebTransportIsRejectedWithoutAdmissionCallback(t *testing.T) {
 // The server must deliver the status and then drain, not stop, the request
 // side; only a client that keeps sending past the bound is stopped.
 func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
+	// Only the byte bound may stop the client here; a slow client must not hit
+	// the time bound, which TestDrainedRequestSideIsStoppedAfterTimeBound covers.
+	setDrainBounds(t, rpcTestTimeout, requestDrainLimit)
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
 
@@ -1141,18 +1144,37 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 				}
 				time.Sleep(25 * time.Millisecond)
 			}
-			// ...but a client that never finishes is stopped once the bound is hit.
-			for sent <= requestDrainLimit+1<<20 {
+			// ...but a client that never finishes is stopped once the bound is
+			// hit. When STOP_SENDING arrives depends on scheduling, so only flow
+			// control bounds what the client writes before it: the drain returns
+			// credit for at most requestDrainLimit+1 bytes beyond the request
+			// frame, and the server's stream window grants one frame more. Past
+			// that a Write blocks until the stop arrives. The write deadline
+			// turns a server that never stops the client into a failure instead
+			// of a hang.
+			if err := stream.(writeDeadlineStream).SetWriteDeadline(time.Now().Add(rpcTestTimeout)); err != nil {
+				t.Fatal(err)
+			}
+			flowControlBound := requestDrainLimit + 1 + int64(frameReceiveWindow(DefaultMaxFrameSize))
+			for {
 				n, err := stream.Write(chunk)
 				sent += int64(n)
-				if err != nil {
-					if sent < requestDrainLimit {
-						t.Fatalf("stopped after %d bytes, below the %d byte bound", sent, requestDrainLimit)
+				if err == nil {
+					if sent > flowControlBound {
+						t.Fatalf("wrote %d bytes, past the %d bytes flow control allows", sent, flowControlBound)
 					}
-					return
+					continue
 				}
+				// A stream error from the peer on the send side is its
+				// STOP_SENDING.
+				if !resetByPeer(err) {
+					t.Fatalf("write after %d bytes: %v, want the server's STOP_SENDING", sent, err)
+				}
+				if sent < requestDrainLimit {
+					t.Fatalf("stopped after %d bytes, below the %d byte bound", sent, requestDrainLimit)
+				}
+				return
 			}
-			t.Fatalf("a client that kept sending %d bytes was never stopped", sent)
 		})
 	}
 }
