@@ -6,6 +6,7 @@
 - Do not repeatedly run the full `nix flake check` during intermediate implementation or review stages; it is intentionally reserved for the final completion gate. Run it earlier only when diagnosing a specific Nix integration failure that cannot be isolated more narrowly.
 - Once the implementation and focused verification have stabilized, intent-to-add (`git add -N`) every new file so Nix can see it, run `nix fmt`, and run the full `nix flake check` exactly once before considering the task completed.
 - `nix fmt` must be used for formatting.
+- When a test fails in a way your change can't explain (for example, it passes on a rerun of the same code, or fails in code you didn't touch), treat it as flaky and file an issue straight away, without asking first. Search open issues first. If one already covers the test, comment on it with the new occurrence instead of filing another. Either way, include the test name, the command you ran, the commit, the failure output, how often it failed across reruns, and anything relevant about the environment, such as machine load or running under `nix flake check`. Don't disable, skip or loosen the test to get it passing, and don't fix it in the current change unless the change caused it. Mention the issue in your final summary.
 
 ## Version Control Requirements
 
