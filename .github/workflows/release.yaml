@@ -1,11 +1,13 @@
 name: release
 
+# Only the unscoped tag: flake-release releases each package to its own tag on the same commit, so
+# triggering on the package tags too would release everything twice.
 on:
   push:
     tags: ["v*"]
 
-# Bumper tags every package with the same version, so one base tag releases them all; each job
-# names its package tag in TAG. A shared group would cancel queued versions.
+# Bumper tags every package with the same version, so one base tag releases them all; flake-release
+# picks each package's tag by its source directory. A shared group would cancel queued versions.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -30,7 +32,6 @@ jobs:
       - name: Release to GitHub
         run: flake-release
         env:
-          TAG: trevrpc-go/${{ github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-go
@@ -51,7 +52,6 @@ jobs:
       - name: Release to GitHub
         run: flake-release
         env:
-          TAG: trevrpc-js/${{ github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-js
@@ -72,7 +72,6 @@ jobs:
       - name: Release to GitHub
         run: flake-release
         env:
-          TAG: trevrpc-kotlin/${{ github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-kotlin
@@ -93,7 +92,6 @@ jobs:
       - name: Release to GitHub
         run: flake-release
         env:
-          TAG: trevrpc-rust/${{ github.ref_name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
           PACKAGES: packages.x86_64-linux.trevrpc-rust

@@ -1,11 +1,13 @@
 name: release
 
+# Only the unscoped tag: flake-release releases each package to its own tag on the same commit, so
+# triggering on the package tags too would release everything twice.
 on:
   push:
     tags: ["v*"]
 
-# Bumper tags every package with the same version, so one base tag releases them all; each job
-# names its package tag in TAG. A shared group would cancel queued versions.
+# Bumper tags every package with the same version, so one base tag releases them all; flake-release
+# picks each package's tag by its source directory. A shared group would cancel queued versions.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -13,6 +15,8 @@ concurrency:
 # yaml-language-server-disable is not allowed
 enable-openid-connect: true
 
+# flake-release publishes each package after the packages it depends on (go.mod requires, npm peer
+# dependencies, Cargo dependencies) and skips it if one of them fails.
 jobs:
   go:
     # zizmor: ignore[excessive-permissions]
@@ -31,39 +35,15 @@ jobs:
       - name: Release to Forgejo and pkg.go.dev
         run: flake-release
         env:
-          TAG: trevrpc-go/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
           PKG_GO_DEV_PUBLISHING: true
           DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-go
-
-      # After trevrpc-go, which the module requires at the same version. Bumper tags it in its
-      # directory.
-      - name: Release oteltrevrpc to Forgejo and pkg.go.dev
-        run: flake-release
-        env:
-          TAG: trevrpc-go/oteltrevrpc/${{ github.ref_name }}
-          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-          PKG_GO_DEV_PUBLISHING: true
-          DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-go-otel
-
-      # After trevrpc-go, which the module requires at the same version. Bumper tags it in its
-      # directory.
-      - name: Release protovalidatetrevrpc to Forgejo and pkg.go.dev
-        run: flake-release
-        env:
-          TAG: trevrpc-go/protovalidatetrevrpc/${{ github.ref_name }}
-          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-          PKG_GO_DEV_PUBLISHING: true
-          DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-go-protovalidate
+          PACKAGES: |
+            packages.x86_64-linux.trevrpc-go
+            packages.x86_64-linux.trevrpc-go-otel
+            packages.x86_64-linux.trevrpc-go-protovalidate
 
   js:
     # zizmor: ignore[excessive-permissions]
@@ -82,39 +62,15 @@ jobs:
       - name: Release to Forgejo and npm
         run: flake-release
         env:
-          TAG: trevrpc-js/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
           NPMJS_TOKEN: ${{ secrets.NPM_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-js
-
-      # After trevrpc-js, which the adapter requires as a peer at the same version. Bumper tags it
-      # in its directory.
-      - name: Release @trevrpc/effect to Forgejo and npm
-        run: flake-release
-        env:
-          TAG: trevrpc-js/effect/${{ github.ref_name }}
-          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-          NPMJS_TOKEN: ${{ secrets.NPM_TOKEN }}
-          DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-js-effect
-
-      # After trevrpc-js, which the adapter requires as a peer at the same version. Bumper tags it
-      # in its directory.
-      - name: Release @trevrpc/protovalidate to Forgejo and npm
-        run: flake-release
-        env:
-          TAG: trevrpc-js/protovalidate/${{ github.ref_name }}
-          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-          NPMJS_TOKEN: ${{ secrets.NPM_TOKEN }}
-          DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-js-protovalidate
+          PACKAGES: |
+            packages.x86_64-linux.trevrpc-js
+            packages.x86_64-linux.trevrpc-js-effect
+            packages.x86_64-linux.trevrpc-js-protovalidate
 
   kotlin:
     # zizmor: ignore[excessive-permissions]
@@ -133,7 +89,6 @@ jobs:
       - name: Release to Forgejo and Maven Central
         run: flake-release
         env:
-          TAG: trevrpc-kotlin/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
@@ -161,39 +116,15 @@ jobs:
       - name: Release to Forgejo and crates.io
         run: flake-release
         env:
-          TAG: trevrpc-rust/${{ github.ref_name }}
           GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
           CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
           DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-rust
-
-      # After trevrpc, which cargo publish builds the crate against. Bumper gives the crate the
-      # same version, tagged in its directory.
-      - name: Release trevrpc-opentelemetry to Forgejo and crates.io
-        run: flake-release
-        env:
-          TAG: trevrpc-rust/crates/trevrpc-opentelemetry/${{ github.ref_name }}
-          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-          CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
-          DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-rust-otel
-
-      # After trevrpc, which cargo publish builds the crate against. Bumper gives the crate the
-      # same version, tagged in its directory.
-      - name: Release trevrpc-protovalidate to Forgejo and crates.io
-        run: flake-release
-        env:
-          TAG: trevrpc-rust/crates/trevrpc-protovalidate/${{ github.ref_name }}
-          GIT_TOKEN: ${{ secrets.DOCTOR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-          PACKAGE_REGISTRY_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-          CRATES_IO_TOKEN: ${{ secrets.CRATES_TOKEN }}
-          DELETE_OLD_RELEASE_ARTIFACTS: 2
-          PACKAGES: packages.x86_64-linux.trevrpc-rust-protovalidate
+          PACKAGES: |
+            packages.x86_64-linux.trevrpc-rust
+            packages.x86_64-linux.trevrpc-rust-otel
+            packages.x86_64-linux.trevrpc-rust-protovalidate
 
   buf:
     # zizmor: ignore[excessive-permissions]
