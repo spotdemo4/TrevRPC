@@ -7,6 +7,7 @@ import org.gradle.api.tasks.Exec
 import org.gradle.api.tasks.bundling.Zip
 import org.gradle.jvm.tasks.Jar
 import org.gradle.plugins.signing.SigningExtension
+import org.jetbrains.dokka.gradle.DokkaExtension
 import org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension
 import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 
@@ -42,6 +43,18 @@ val signingPassword =
         .orElse("")
         .get()
 val isSigningEnabled = !signingKey.isNullOrBlank()
+
+/**
+ * The javadoc JAR's page for a module that is used as a program rather than as a library. It links to
+ * the README of the release's own tag, so a published version keeps pointing at its own docs.
+ */
+fun placeholderJavadoc(version: String) =
+    """
+    <!doctype html>
+    <title>protoc-gen-trevrpc-kotlin</title>
+    <p>protoc-gen-trevrpc-kotlin is a protoc plugin, not a library. See
+    <a href="https://trev.zip/llc/TrevRPC/src/tag/trevrpc-kotlin/v$version/trevrpc-kotlin/README.md">its README</a>.</p>
+    """.trimIndent()
 val protobufVersion =
     libs.versions.protobuf.get()
 val kotlinVersion = libs.versions.kotlin.get()
@@ -153,7 +166,20 @@ publishableModules.forEach { (moduleName, metadata) ->
         pluginManager.apply("java-library")
         pluginManager.apply("maven-publish")
         pluginManager.apply("signing")
-        pluginManager.apply("org.jetbrains.dokka")
+        // The generator is a protoc plugin that nobody links against, so its javadoc JAR, which Maven
+        // Central requires, points to its README instead of documenting its internals with Dokka.
+        val documented = moduleName != "protoc-gen-trevrpc-kotlin"
+        if (documented) {
+            pluginManager.apply("org.jetbrains.dokka")
+            extensions.configure<DokkaExtension> {
+                dokkaSourceSets.configureEach {
+                    // The build has no network for the JDK's and the standard library's package lists,
+                    // so linking to their documentation only logs that it could not fetch them.
+                    enableJdkDocumentationLink.set(false)
+                    enableKotlinStdLibDocumentationLink.set(false)
+                }
+            }
+        }
 
         tasks.matching { it.name.startsWith("dokka") }.configureEach {
             notCompatibleWithConfigurationCache("Dokka resolves source-set classpaths during documentation generation")
@@ -168,11 +194,16 @@ publishableModules.forEach { (moduleName, metadata) ->
             }
         }
 
-        val dokkaJavadocJar =
-            tasks.register<Jar>("dokkaJavadocJar") {
-                dependsOn(tasks.named("dokkaGeneratePublicationHtml"))
+        val javadocJar =
+            tasks.register<Jar>("javadocJar") {
                 archiveClassifier.set("javadoc")
-                from(tasks.named("dokkaGeneratePublicationHtml"))
+                if (documented) {
+                    from(tasks.named("dokkaGeneratePublicationHtml"))
+                } else {
+                    from(resources.text.fromString(placeholderJavadoc(project.version.toString()))) {
+                        rename { "index.html" }
+                    }
+                }
             }
 
         extensions.configure<PublishingExtension> {
@@ -180,7 +211,7 @@ publishableModules.forEach { (moduleName, metadata) ->
                 create<MavenPublication>("maven") {
                     artifactId = moduleName
                     from(components["java"])
-                    artifact(dokkaJavadocJar)
+                    artifact(javadocJar)
                     pom {
                         name.set(metadata.first)
                         description.set(metadata.second)

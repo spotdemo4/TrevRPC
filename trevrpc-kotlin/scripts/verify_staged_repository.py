@@ -339,6 +339,14 @@ def main() -> None:
                 )
         verify_archive(sources_jar, required_suffixes=(".kt", ".java"))
         verify_archive(javadoc_jar, required_suffixes=(".html",))
+        if module == "protoc-gen-trevrpc-kotlin":
+            # The generator's javadoc is a page pointing to its README, not documentation.
+            with zipfile.ZipFile(javadoc_jar) as archive:
+                page = archive.read("index.html").decode()
+            require(
+                f"/src/tag/trevrpc-kotlin/v{version}/trevrpc-kotlin/README.md" in page,
+                f"{javadoc_jar} does not point to the README of {version}",
+            )
         verify_pom(pom, module, version, protobuf_version, minimum_kotlin_version)
         verify_module_metadata(module_metadata, module, gradle_version)
 

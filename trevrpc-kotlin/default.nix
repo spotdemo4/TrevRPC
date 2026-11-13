@@ -127,10 +127,19 @@ stdenvNoCC.mkDerivation (final: {
   };
   __darwinAllowLocalNetworking = true;
 
-  gradleFlags = [ "-Dorg.gradle.java.home=${jdk25.home}" ];
+  # Both caches start empty in every build, and Dokka's tasks discard the configuration cache.
+  gradleFlags = [
+    "-Dorg.gradle.java.home=${jdk25.home}"
+    "--no-build-cache"
+    "--no-configuration-cache"
+  ];
+  # One Gradle run builds, tests and verifies: each run starts a JVM and configures the build from
+  # nothing, and a second run would also stage the Maven repository again.
   gradleBuildTask = [
     "stageMavenRepository"
     ":protoc-gen-trevrpc-kotlin:installDist"
+    "check"
+    "verifyStagedMavenRepository"
   ];
   gradleUpdateScript = ''
     runHook preBuild
@@ -142,8 +151,9 @@ stdenvNoCC.mkDerivation (final: {
       :protoc-gen-trevrpc-kotlin:test
   '';
 
+  # The Gradle tests and checks ran with the build; the check phase only runs the Python tests.
   doCheck = true;
-  gradleCheckTask = "check verifyStagedMavenRepository";
+  dontUseGradleCheck = true;
   # The Android interop runner is plain Python; its host-side logic is tested here so it is
   # covered on every platform, not only where the emulator can run.
   postCheck = ''
