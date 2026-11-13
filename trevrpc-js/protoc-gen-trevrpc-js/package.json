@@ -1,6 +1,6 @@
 {
   "name": "@trevrpc/protoc-gen-trevrpc-js",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "description": "Generates message codecs for TrevRPC browser clients, next to protoc-gen-es's code",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {

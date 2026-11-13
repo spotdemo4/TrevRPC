@@ -11,8 +11,8 @@ The Rust crate is built on [Quinn](https://github.com/quinn-rs/quinn):
 The transports need no Cargo features: the HTTP/3, WebTransport, and TCP fallback servers are a handful of small crates next to Quinn (`h3`, `h2`, `tokio-rustls`, and the [`qmux`](https://crates.io/crates/qmux) crate), so a feature matrix would buy almost no compile time. Two features are optional: `webpki-roots` (on by default) gives `Channel::builder` the Mozilla roots to verify servers with, and `dev-certificate` adds the development certificate below and its `rcgen` dependency.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.10.0 works with `trevrpc-go` 1.10.0, `trevrpc-js` 1.10.0, and `trevrpc-kotlin`
-> 1.10.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.11.0 works with `trevrpc-go` 1.11.0, `trevrpc-js` 1.11.0, and `trevrpc-kotlin`
+> 1.11.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 

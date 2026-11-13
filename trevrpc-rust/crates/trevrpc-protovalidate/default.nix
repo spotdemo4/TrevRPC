@@ -7,7 +7,7 @@
 # trevrpc-rust package builds, tests and lints the crate with the rest of the workspace.
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-rust-protovalidate";
-  version = "1.10.0";
+  version = "1.11.0";
 
   # The workspace, whose manifest and lockfile the crate builds with, and the license it packages.
   src = lib.fileset.toSource {

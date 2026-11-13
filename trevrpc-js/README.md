@@ -5,8 +5,8 @@ TrevRPC is an RPC framework like gRPC, but uses QUIC (and HTTP/3 / WebTransport)
 `trevrpc-js` is the **browser client**: a WebTransport runtime with a QMux over WebSocket fallback, for the messages and service descriptors that [protobuf-es](https://github.com/bufbuild/protobuf-es) generates. It has no Node.js runtime; servers are written in Go or Rust, native QUIC clients in Go or Rust, and HTTP/3 clients in Kotlin.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.10.0 works with `trevrpc-go` 1.10.0, `trevrpc-js` 1.10.0, and `trevrpc-kotlin`
-> 1.10.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.11.0 works with `trevrpc-go` 1.11.0, `trevrpc-js` 1.11.0, and `trevrpc-kotlin`
+> 1.11.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 Full documentation: https://trev.zip/llc/TrevRPC/wiki
 
