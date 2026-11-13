@@ -301,6 +301,17 @@ func TestTheLeastRecentlyUsedBucketMakesRoom(t *testing.T) {
 	l.checkInvariants(t)
 }
 
+// bucketCount returns the number of buckets.
+func (l *Limiter) bucketCount() int {
+	total := 0
+	for _, s := range l.shards {
+		s.mu.Lock()
+		total += len(s.buckets)
+		s.mu.Unlock()
+	}
+	return total
+}
+
 // checkInvariants fails the test if a shard's list and table disagree or hold
 // more buckets than the shard may.
 func (l *Limiter) checkInvariants(t *testing.T) {

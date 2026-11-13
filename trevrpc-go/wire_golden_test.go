@@ -3,6 +3,7 @@ package trevrpc
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 	"testing"
 	"testing/iotest"
 
-	"github.com/quic-go/quic-go/quicvarint"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -223,9 +223,10 @@ func TestWireGoldenVectors(t *testing.T) {
 
 // TestWireGoldenDatagrams checks every datagram.* vector: the flow ID is a hex
 // integer and the messages are comma separated hex. An entry with a .datagram
-// is encoded from its messages, byte for byte, and decoded; one with a
-// .received is only decoded, to its messages (none for a datagram that is
-// dropped whole).
+// is sent from its messages by the real sender, byte for byte, and received;
+// one with a .received is only received, to its messages (none for a datagram
+// that is dropped whole). Receiving goes through the connection's dispatch
+// into the call's queue, as a datagram from the network does.
 func TestWireGoldenDatagrams(t *testing.T) {
 	entries := loadGoldenEntries(t)
 	vectors := map[string]bool{}
@@ -260,27 +261,43 @@ func TestWireGoldenDatagrams(t *testing.T) {
 			}
 			datagram := decodeGoldenHex(t, vector, wire)
 
+			// The vector's flow is a call of a server connection, which both
+			// sends and receives its datagrams.
+			conn := newFakeDatagramConn()
+			defer conn.close()
+			mux := newServerMux(conn)
+			defer mux.close()
+			call, err := mux.register(flow, true, DefaultMaxFrameSize, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
 			if encoded {
-				if got := appendDatagram(nil, flow, want); !bytes.Equal(got, datagram) {
-					t.Errorf("appendDatagram(%d, %x) = %x, want %x", flow, want, got, datagram)
+				batch := make([]encodedMessage, len(want))
+				for i, message := range want {
+					batch[i] = rawMessage(message)
 				}
-				// The sender packs encoded MESSAGE frames; they match.
-				packed := quicvarint.Append(nil, flow)
-				for _, message := range want {
-					packed = append(packed, rawMessage(message).frame...)
+				kept, err := call.sendBatch(context.Background(), batch)
+				if err != nil || len(kept) != 0 {
+					t.Fatalf("sendBatch(%x) kept %d messages for the stream, err = %v; want one datagram", want, len(kept), err)
 				}
-				if !bytes.Equal(packed, datagram) {
-					t.Errorf("packed frames = %x, want %x", packed, datagram)
+				if sent := conn.sentDatagrams(); len(sent) != 1 || !bytes.Equal(sent[0], datagram) {
+					t.Errorf("sent datagrams = %x, want %x", sent, datagram)
 				}
 			}
 
-			gotFlow, frames, ok := parseDatagram(datagram)
+			gotFlow, _, ok := parseDatagram(datagram)
 			if !ok || gotFlow != flow {
 				t.Fatalf("parseDatagram(%x) = %d, %v; want flow %d", datagram, gotFlow, ok, flow)
 			}
-			got, valid := datagramMessages(frames)
-			if !valid && len(want) != 0 {
-				t.Fatalf("datagramMessages(%x) dropped the datagram, want %x", frames, want)
+			mux.dispatch(datagram)
+			var got [][]byte
+			for {
+				message, ok := call.sink.pop()
+				if !ok {
+					break
+				}
+				got = append(got, message)
 			}
 			if len(got) != len(want) {
 				t.Fatalf("decoded %x, want %x", got, want)
@@ -309,8 +326,8 @@ func TestWireGoldenDatagrams(t *testing.T) {
 		{0x00, 0x01, 'a', 0x00, 0x05, 'b'},
 		{0x1f, 0x01}, // a skipped type with a length past the end
 	} {
-		if messages, valid := datagramMessages(frames); valid {
-			t.Errorf("datagramMessages(%x) = %x, true; want the datagram dropped", frames, messages)
+		if walkDatagramFrames(frames, nil) {
+			t.Errorf("walkDatagramFrames(%x) = true; want the datagram dropped", frames)
 		}
 	}
 }

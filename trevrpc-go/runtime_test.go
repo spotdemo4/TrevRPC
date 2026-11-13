@@ -274,7 +274,7 @@ func TestWireProtocolValidation(t *testing.T) {
 		t.Fatalf("expected invalid argument for unknown RPC kind, got %v", status)
 	}
 
-	status := statusFromWire(Unavailable("retry later").wire())
+	status := statusOverTheWire(t, Unavailable("retry later"))
 	if status.Code != CodeUnavailable || status.Message != "retry later" {
 		t.Fatalf("unexpected status value: %v", status)
 	}

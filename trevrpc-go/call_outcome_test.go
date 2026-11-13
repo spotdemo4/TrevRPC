@@ -358,7 +358,7 @@ func TestResponseThatLeavesNoRoomForAStatusIsReportedAsAFailure(t *testing.T) {
 func TestRequestStreamsReplayTheirFailureInsteadOfEOF(t *testing.T) {
 	t.Run("limitedByteStream", func(t *testing.T) {
 		limits := streamLimits{maxMessages: 1, maxBodySize: -1}
-		stream := limitByteStream(context.Background(), StreamOf([]byte("a"), []byte("b"), []byte("c")), limits, "request", nil, nil)
+		stream := limitByteStream(context.Background(), StreamOf([]byte("a"), []byte("b"), []byte("c")), limits, nil, nil)
 		if _, err := stream.Recv(); err != nil {
 			t.Fatal(err)
 		}
@@ -369,7 +369,7 @@ func TestRequestStreamsReplayTheirFailureInsteadOfEOF(t *testing.T) {
 		}
 	})
 	t.Run("limitedByteStream closed", func(t *testing.T) {
-		stream := limitByteStream(context.Background(), StreamOf([]byte("a")), streamLimits{maxMessages: -1, maxBodySize: -1}, "request", nil, nil)
+		stream := limitByteStream(context.Background(), StreamOf([]byte("a")), streamLimits{maxMessages: -1, maxBodySize: -1}, nil, nil)
 		if err := stream.Close(); err != nil {
 			t.Fatal(err)
 		}

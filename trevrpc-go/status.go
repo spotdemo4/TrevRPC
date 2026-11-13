@@ -225,16 +225,6 @@ func (s *Status) IsOK() bool {
 	return s != nil && s.Code == CodeOK
 }
 
-// wire returns the STATUS frame payload for s.
-func (s *Status) wire() *wireStatus {
-	return &wireStatus{Code: uint32(s.Code), Message: s.Message, Metadata: s.Metadata, Details: wireDetails(s.Details), RefusedStreamCompression: s.refusedStreamCompression}
-}
-
-// statusFromWire builds a status from a STATUS frame payload.
-func statusFromWire(status *wireStatus) *Status {
-	return &Status{Code: CodeFromUint32(status.Code), Message: status.Message, Metadata: cloneMetadata(status.Metadata), Details: detailsFromWire(status.Details)}
-}
-
 // wireDetails converts status details to their wire form, which aliases them.
 func wireDetails(details []Detail) []*wireDetail {
 	if len(details) == 0 {

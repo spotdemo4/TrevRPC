@@ -270,6 +270,12 @@ func marshalMessage(message ProtoMessage) ([]byte, error) {
 	return proto.Marshal(protoMessageV2(message))
 }
 
+// encodeMessage is the MESSAGE frame the server sends for message on a call
+// without compression, whose response compressor is nil.
+func encodeMessage(message ProtoMessage) (encodedMessage, error) {
+	return (*messageCompressor)(nil).encode(message)
+}
+
 // messageFrame is a received MESSAGE frame carrying body.
 func messageFrame(body []byte) responseFrame {
 	return responseFrame{kind: frameTypeMessage, body: body}
@@ -314,6 +320,16 @@ func rawResponse(bodies ...string) (encodedStream, error) {
 // respond is a streaming handler response over stream.
 func respond(stream encodedStream) (encodedStream, error) {
 	return stream, nil
+}
+
+// newWireRequest is a unary request for the method path
+// "/package.Service/Method", with empty metadata that tests may add to.
+func newWireRequest(method string) *wireRequest {
+	return &wireRequest{
+		Method:   method,
+		Metadata: Metadata{},
+		Kind:     RPCKindUnary,
+	}
 }
 
 // testRequestBytes is the request side of a stream: a REQUEST frame and then a
@@ -434,6 +450,25 @@ func readTestFrames(t testing.TB, data []byte, maxFrameSize int) []testFrame {
 		}
 		frames = append(frames, decoded)
 	}
+}
+
+// statusOverTheWire is status as a client decodes it from the STATUS frame the
+// server writes for it.
+func statusOverTheWire(t testing.TB, status *Status) *Status {
+	t.Helper()
+	frame, err := appendStatusFrame(nil, status, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatalf("encode status frame: %v", err)
+	}
+	next, err := newFrameReader(bytes.NewReader(frame), DefaultMaxFrameSize, -1).next()
+	if err != nil || next.typ != frameTypeStatus {
+		t.Fatalf("read frame = %v, %v; want STATUS", next.typ, err)
+	}
+	decoded, err := decodeStatus(next.payload)
+	if err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	return decoded
 }
 
 // requireStatusFrame fails the test unless frames is exactly one STATUS frame
@@ -615,6 +650,18 @@ func (t uploadWaitingTransport) streamingCall(ctx context.Context, _ *wireReques
 		close(t.uploadEnded)
 	}()
 	return uploadErrorFrameStream{errors: errors}, nil
+}
+
+// routeUnary registers handler for method as it stands, the way Register*
+// routes are registered but without the typed layer that decodes requests and
+// encodes responses, so tests can drive the runtime with any payload.
+func (s *Server) routeUnary(method string, handler unaryHandler) {
+	s.addUnaryRoute(method, handler, typedRoute{}, nil)
+}
+
+// routeStreaming is routeUnary for a streaming route of kind.
+func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHandler) {
+	s.addStreamingRoute(method, kind, handler, typedRoute{}, nil)
 }
 
 // routeBytes registers a unary handler that works on raw request and response

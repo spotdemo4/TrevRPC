@@ -437,11 +437,6 @@ func (s *Server) SetDiagnostics(handler ServerDiagnosticHandler) {
 	s.diagnostics = handler
 }
 
-// routeUnary registers a unary route handler for a method path.
-func (s *Server) routeUnary(method string, handler unaryHandler, options ...RouteOption) {
-	s.addUnaryRoute(method, handler, typedRoute{}, options)
-}
-
 // routeTypedUnary registers a unary route of Register*, whose handler
 // typed.bindUnary builds.
 func (s *Server) routeTypedUnary(method string, typed typedRoute, options []RouteOption) {
@@ -456,11 +451,6 @@ func (s *Server) addUnaryRoute(method string, handler unaryHandler, typed typedR
 	config := applyRouteOptions(options)
 	validateRouteMethod(method, RPCKindUnary, config.method)
 	s.routes[method] = route{kind: RPCKindUnary, unary: handler, plainCompression: config.plainCompression, method: config.method, request: typed.request, bindUnary: typed.bindUnary}
-}
-
-// routeStreaming registers a streaming route handler for a method path and RPC kind.
-func (s *Server) routeStreaming(method string, kind RPCKind, handler streamingHandler, options ...RouteOption) {
-	s.addStreamingRoute(method, kind, handler, typedRoute{}, options)
 }
 
 // routeTypedStreaming registers a streaming route of Register*, whose handler
@@ -1102,10 +1092,10 @@ func internalServerStatus() *Status { return Internal("internal server error") }
 // wireStatus returns the STATUS to send for err, the error a call ended with.
 // An error that is not a *Status with a code other than Internal, or whose
 // metadata is invalid, becomes Internal with a message that says nothing of
-// it, and is reported as a diagnostic of phase (or of the phase of the panic
-// that caused it), with the context of the call, ctx or what its
-// interceptors derived from it.
-func (r *serverRuntime) wireStatus(ctx context.Context, err error, phase ServerDiagnosticPhase, request *wireRequest) *Status {
+// it, and is reported as a ServerDiagnosticInternalError diagnostic (a panic
+// as one of the phase it happened in), with the context of the call, ctx or
+// what its interceptors derived from it.
+func (r *serverRuntime) wireStatus(ctx context.Context, err error, request *wireRequest) *Status {
 	if err == nil {
 		return OK()
 	}
@@ -1118,7 +1108,7 @@ func (r *serverRuntime) wireStatus(ctx context.Context, err error, phase ServerD
 			return status.clone()
 		}
 	}
-	r.emitDiagnostic(ServerDiagnostic{Phase: phase, Context: diagnosticContext(ctx, request), Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})
+	r.emitDiagnostic(ServerDiagnostic{Phase: ServerDiagnosticInternalError, Context: diagnosticContext(ctx, request), Service: requestService(request), Method: requestMethod(request), Kind: requestKind(request), Err: err})
 	return internalServerStatus()
 }
 
@@ -1308,7 +1298,7 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 
 	ctx, cancel, err := r.prepareRequest(ctx, request, lease)
 	if err != nil {
-		return call.failedUnary(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
+		return call.failedUnary(r.wireStatus(ctx, err, request), err)
 	}
 	defer cancel()
 
@@ -1318,7 +1308,7 @@ func (r *serverRuntime) handleRequest(ctx context.Context, request *wireRequest,
 	}
 	message, err := invokeUnaryHandler(ctx, r.interceptUnary(route.unary, request), body, handlerNeedsDeadlineRace(ctx), lease)
 	if err != nil {
-		return call.failedUnary(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
+		return call.failedUnary(r.wireStatus(ctx, err, request), err)
 	}
 	return call.successfulUnary(ctx, message)
 }
@@ -1424,12 +1414,12 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if err != nil {
 		cancel()
 		lease.release()
-		return call.failedStatus(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
+		return call.failedStatus(r.wireStatus(ctx, err, request), err)
 	}
 
 	limits := streamLimitsFromOptions(r.options)
 	requests := requestBody
-	requestBody = limitByteStream(ctx, requestBody, limits, "request", lease, request)
+	requestBody = limitByteStream(ctx, requestBody, limits, lease, request)
 	route, ok := r.routes[request.Method]
 	if !ok || route.streaming == nil {
 		cancel()
@@ -1463,7 +1453,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 		if err := r.sendAnswerAtDispatch(writer, request); err != nil {
 			cancel()
 			lease.release()
-			return call.failedStatus(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
+			return call.failedStatus(r.wireStatus(ctx, err, request), err)
 		}
 	}
 
@@ -1471,7 +1461,7 @@ func (r *serverRuntime) handleStreamingRequest(ctx context.Context, request *wir
 	if err != nil {
 		cancel()
 		lease.release()
-		return call.failedStatus(r.wireStatus(ctx, err, ServerDiagnosticInternalError, request), err)
+		return call.failedStatus(r.wireStatus(ctx, err, request), err)
 	}
 	if responses == nil {
 		cancel()
@@ -1774,7 +1764,7 @@ func (r *serverRuntime) recordRequestFailure(startedAt time.Time, request *wireR
 // failRequest is recordRequestFailure for a call that failed with err, whose
 // STATUS wireStatus decides and failRequest returns.
 func (r *serverRuntime) failRequest(ctx context.Context, startedAt time.Time, request *wireRequest, requestBodyLen int, err error) *Status {
-	status := r.wireStatus(ctx, err, ServerDiagnosticInternalError, request)
+	status := r.wireStatus(ctx, err, request)
 	r.recordRequestFailure(startedAt, request, requestBodyLen, status, err)
 	return status
 }
@@ -1838,16 +1828,17 @@ func cancelStreamRead(stream any) {
 	}
 }
 
+// limitedByteStream applies the stream limits to the request stream of a call.
+// The response stream is limited where it is written, by serverResponseStream.
 type limitedByteStream struct {
-	inner     byteStream
-	ctx       context.Context
-	limits    streamLimits
-	direction string
-	lease     *requestExecutionLease
-	request   *wireRequest
-	messages  int
-	bodySize  int
-	receiver  *streamReceiver[[]byte]
+	inner    byteStream
+	ctx      context.Context
+	limits   streamLimits
+	lease    *requestExecutionLease
+	request  *wireRequest
+	messages int
+	bodySize int
+	receiver *streamReceiver[[]byte]
 	// mu guards done, err and stopCancelRead: Close may run on another
 	// goroutine than Recv, such as the one that closes the stream when ctx ends.
 	mu             sync.Mutex
@@ -1858,9 +1849,9 @@ type limitedByteStream struct {
 	err error
 }
 
-func limitByteStream(ctx context.Context, inner byteStream, limits streamLimits, direction string, lease *requestExecutionLease, request *wireRequest) byteStream {
-	stream := &limitedByteStream{inner: inner, ctx: ctx, limits: limits, direction: direction, lease: lease, request: request}
-	stream.receiver = newStreamReceiver(ctx, inner, limits.idleTimeout, direction, lease)
+func limitByteStream(ctx context.Context, inner byteStream, limits streamLimits, lease *requestExecutionLease, request *wireRequest) byteStream {
+	stream := &limitedByteStream{inner: inner, ctx: ctx, limits: limits, lease: lease, request: request}
+	stream.receiver = newStreamReceiver(ctx, inner, limits.idleTimeout, "request", lease)
 	if cancellable, ok := inner.(contextCancelReadStream); ok {
 		stream.stopCancelRead = cancellable.trevrpcCancelReadOnContext(ctx)
 	}
@@ -1879,7 +1870,7 @@ func (s *limitedByteStream) Recv() ([]byte, error) {
 		return nil, err
 	}
 
-	if err := checkStreamLimits(s.direction, s.limits, &s.messages, &s.bodySize, len(body)); err != nil {
+	if err := checkStreamLimits("request", s.limits, &s.messages, &s.bodySize, len(body)); err != nil {
 		s.fail(err)
 		return nil, err
 	}
@@ -2148,7 +2139,7 @@ func (s *serverResponseStream) failureStatus(err error) (*Status, error) {
 	if tooLarge, ok := errors.AsType[*FrameTooLargeError](err); ok {
 		return s.oversizedResponseStatus(s.ctx, tooLarge), tooLarge
 	}
-	return s.runtime.wireStatus(s.ctx, err, ServerDiagnosticInternalError, s.request), err
+	return s.runtime.wireStatus(s.ctx, err, s.request), err
 }
 
 // writeFinalFrames writes headers and messages followed by the terminal STATUS
@@ -2264,7 +2255,7 @@ func (s *serverResponseStream) readNextResponseItem(wait bool) (responseStreamIt
 	if s.readAhead != nil {
 		item, ok, waitErr := s.readAhead.next(wait)
 		if waitErr != nil {
-			return responseStreamItem{status: s.runtime.wireStatus(s.ctx, waitErr, ServerDiagnosticInternalError, s.request), err: waitErr}, true
+			return responseStreamItem{status: s.runtime.wireStatus(s.ctx, waitErr, s.request), err: waitErr}, true
 		}
 		if !ok {
 			return responseStreamItem{}, false
@@ -2277,7 +2268,7 @@ func (s *serverResponseStream) readNextResponseItem(wait bool) (responseStreamIt
 		return responseStreamItem{status: s.terminalResponseStatus()}, true
 	}
 	if err != nil {
-		return responseStreamItem{status: s.runtime.wireStatus(s.ctx, err, ServerDiagnosticInternalError, s.request), err: err}, true
+		return responseStreamItem{status: s.runtime.wireStatus(s.ctx, err, s.request), err: err}, true
 	}
 
 	return responseStreamItem{message: message}, true

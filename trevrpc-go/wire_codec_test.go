@@ -72,9 +72,8 @@ func TestWireCodecMatchesProtobuf(t *testing.T) {
 			t.Fatalf("status %x: err = %v, protobuf err = %v", payload, err, wantStatusErr)
 		}
 		if err == nil {
-			wantDecoded := statusFromWire(&wantStatus)
-			if status.Code != wantDecoded.Code || status.Message != wantDecoded.Message || !metadataEqual(status.Metadata, wantDecoded.Metadata) || !reflect.DeepEqual(status.Details, wantDecoded.Details) {
-				t.Fatalf("status %x: got %+v, want %+v", payload, status, wantDecoded)
+			if status.Code != CodeFromUint32(wantStatus.Code) || status.Message != wantStatus.Message || !metadataEqual(status.Metadata, wantStatus.Metadata) || !reflect.DeepEqual(status.Details, detailsFromWire(wantStatus.Details)) {
+				t.Fatalf("status %x: got %+v, want %+v", payload, status, &wantStatus)
 			}
 		}
 
@@ -156,6 +155,12 @@ func checkEncoding(t *testing.T, typ frameType, appendFrame func([]byte) ([]byte
 	if !proto.Equal(decoded, protoMessage) {
 		t.Fatalf("%v: decoded %v, want %v", typ, decoded, protoMessage)
 	}
+}
+
+// wire is the STATUS payload of s as a message, for the protobuf runtime to
+// encode as the reference the direct codec is checked against.
+func (s *Status) wire() *wireStatus {
+	return &wireStatus{Code: uint32(s.Code), Message: s.Message, Metadata: s.Metadata, Details: wireDetails(s.Details), RefusedStreamCompression: s.refusedStreamCompression}
 }
 
 func wireRequestEqual(a, b *wireRequest) bool {

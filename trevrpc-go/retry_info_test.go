@@ -139,7 +139,7 @@ func TestRetryDelayFindsAStatusInTheErrorChain(t *testing.T) {
 
 func TestRetryDelaySurvivesTheWire(t *testing.T) {
 	status := ResourceExhausted("slow down").WithRetryDelay(1500 * time.Millisecond)
-	decoded := statusFromWire(status.wire())
+	decoded := statusOverTheWire(t, status)
 	if delay, ok := decoded.RetryDelay(); !ok || delay != 1500*time.Millisecond {
 		t.Fatalf("RetryDelay() = %v, %v", delay, ok)
 	}

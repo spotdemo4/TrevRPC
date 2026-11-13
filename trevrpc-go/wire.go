@@ -158,16 +158,6 @@ func (m *wireRequest) answer() (wireAnswer, bool) {
 	return answer, answered
 }
 
-// newWireRequest creates a unary RPC request for the method path
-// "/package.Service/Method".
-func newWireRequest(method string) *wireRequest {
-	return &wireRequest{
-		Method:   method,
-		Metadata: Metadata{},
-		Kind:     RPCKindUnary,
-	}
-}
-
 // splitMethodPath splits a method path "/service/method" into its parts, which
 // are substrings of path. A path is well-formed when it has exactly two
 // slashes, the first at index 0, and both parts are non-empty.

@@ -116,6 +116,43 @@ func takeMessage(t *testing.T, sink *datagramSink) string {
 	return string(message)
 }
 
+// appendDatagram appends a datagram payload that carries messages on flow, as
+// a peer would send it: the flow ID, then one MESSAGE frame per message.
+func appendDatagram(dst []byte, flow uint64, messages [][]byte) []byte {
+	dst = quicvarint.Append(dst, flow)
+	for _, message := range messages {
+		dst = append(dst, rawMessage(message).frame...)
+	}
+	return dst
+}
+
+// datagramMessages returns the payloads of a sent datagram's MESSAGE frames,
+// or false if a receiver would drop the datagram whole.
+func datagramMessages(frames []byte) ([][]byte, bool) {
+	if !walkDatagramFrames(frames, nil) {
+		return nil, false
+	}
+	var messages [][]byte
+	walkDatagramFrames(frames, func(typ frameType, message []byte) {
+		if typ == frameTypeMessage {
+			messages = append(messages, message)
+		}
+	})
+	return messages, true
+}
+
+// push queues one message as pushFrames would, and reports whether it did, so
+// tests can fill a sink and see each message the bounds drop.
+func (s *datagramSink) push(message []byte) bool {
+	s.mu.Lock()
+	queued := s.pushLocked(message)
+	s.mu.Unlock()
+	if queued {
+		notify(s.wake)
+	}
+	return queued
+}
+
 // ended reports whether the direction of the sink ended.
 func (s *datagramSink) ended() bool {
 	s.mu.Lock()
@@ -904,7 +941,7 @@ func TestServerCountsRequestDatagramsAgainstTheCallsLimitsAndIdleTimer(t *testin
 	limits := streamLimits{maxMessages: 3, maxBodySize: -1}
 	t.Run("message limit", func(t *testing.T) {
 		requests, flow, _ := newMergedRequests(t, &blockingReader{release: make(chan struct{}), err: io.EOF})
-		stream := limitByteStream(context.Background(), requests, limits, "request", nil, nil)
+		stream := limitByteStream(context.Background(), requests, limits, nil, nil)
 		defer discardMessageStream(stream)
 		for range 3 {
 			flow.sink.push([]byte("m"))
@@ -920,7 +957,7 @@ func TestServerCountsRequestDatagramsAgainstTheCallsLimitsAndIdleTimer(t *testin
 
 	t.Run("byte limit", func(t *testing.T) {
 		requests, flow, _ := newMergedRequests(t, &blockingReader{release: make(chan struct{}), err: io.EOF})
-		stream := limitByteStream(context.Background(), requests, streamLimits{maxMessages: -1, maxBodySize: 10}, "request", nil, nil)
+		stream := limitByteStream(context.Background(), requests, streamLimits{maxMessages: -1, maxBodySize: 10}, nil, nil)
 		defer discardMessageStream(stream)
 		flow.sink.push(bytes.Repeat([]byte("x"), 6))
 		if _, err := stream.Recv(); err != nil {
@@ -935,7 +972,7 @@ func TestServerCountsRequestDatagramsAgainstTheCallsLimitsAndIdleTimer(t *testin
 	t.Run("idle timer", func(t *testing.T) {
 		requests, flow, _ := newMergedRequests(t, &blockingReader{release: make(chan struct{}), err: io.EOF})
 		idle := 100 * time.Millisecond
-		stream := limitByteStream(context.Background(), requests, streamLimits{maxMessages: -1, maxBodySize: -1, idleTimeout: idle}, "request", nil, nil)
+		stream := limitByteStream(context.Background(), requests, streamLimits{maxMessages: -1, maxBodySize: -1, idleTimeout: idle}, nil, nil)
 		defer discardMessageStream(stream)
 
 		// Datagram messages alone keep the call alive for longer than the idle

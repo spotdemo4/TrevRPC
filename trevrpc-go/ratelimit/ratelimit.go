@@ -334,15 +334,4 @@ func (s *shard) moveToFront(b *bucket) {
 	s.pushFront(b)
 }
 
-// bucketCount returns the number of buckets, for tests.
-func (l *Limiter) bucketCount() int {
-	total := 0
-	for _, s := range l.shards {
-		s.mu.Lock()
-		total += len(s.buckets)
-		s.mu.Unlock()
-	}
-	return total
-}
-
 var _ trevrpc.Interceptor = (*Limiter)(nil)

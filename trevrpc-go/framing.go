@@ -193,18 +193,13 @@ type encodedMessage struct {
 	generation uint32
 }
 
-// frameTailSlack is the spare capacity encodeMessage leaves behind a frame, so
-// a unary response can append its two-byte OK STATUS without copying the frame.
+// frameTailSlack is the spare capacity encodeProtoMessage leaves behind a
+// frame, so a unary response can append its two-byte OK STATUS without copying
+// the frame.
 const frameTailSlack = 8
 
-// encodeMessage marshals message into a MESSAGE frame. The frame size limit is
-// enforced where the frame is written.
-func encodeMessage(message ProtoMessage) (encodedMessage, error) {
-	return encodeProtoMessage(protoMessageV2(message))
-}
-
-// encodeProtoMessage is encodeMessage for a message already converted with
-// protoMessageV2.
+// encodeProtoMessage marshals message into a MESSAGE frame. The frame size
+// limit is enforced where the frame is written.
 func encodeProtoMessage(protoMessage proto.Message) (encodedMessage, error) {
 	size := proto.Size(protoMessage)
 	frame, err := appendProtoFrame(make([]byte, 0, frameHeaderLen(frameTypeMessage, size)+size+frameTailSlack), frameTypeMessage, protoMessage, size)
@@ -357,7 +352,7 @@ func appendExactStatusFrame(dst []byte, status *Status, maxFrameSize int) ([]byt
 	return wire.appendPayload(dst), nil
 }
 
-// appendEncodedMessage appends a message frame produced by encodeMessage.
+// appendEncodedMessage appends a message frame produced by encodeProtoMessage.
 func appendEncodedMessage(dst []byte, message encodedMessage, maxFrameSize int) ([]byte, error) {
 	if message.size > maxFrameSize {
 		return dst, &FrameTooLargeError{Len: message.size, Max: maxFrameSize}

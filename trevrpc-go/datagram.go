@@ -111,17 +111,6 @@ func (c HandlerContext) RequestDatagrams() int64 {
 	return c.flow.received.Load()
 }
 
-// appendDatagram appends the datagram payload that carries messages on flow:
-// the flow ID as a minimal QUIC varint, then one MESSAGE frame per message.
-func appendDatagram(dst []byte, flow uint64, messages [][]byte) []byte {
-	dst = quicvarint.Append(dst, flow)
-	for _, message := range messages {
-		dst = appendFrameHeader(dst, frameTypeMessage, len(message))
-		dst = append(dst, message...)
-	}
-	return dst
-}
-
 // parseDatagram splits a datagram payload into its flow and its frames, which
 // alias datagram. It reports false for a payload that does not start with a
 // varint, and for flow 0, which no call has.
@@ -163,21 +152,6 @@ func walkDatagramFrames(frames []byte, fn func(typ frameType, payload []byte)) b
 		frames = frames[length:]
 	}
 	return true
-}
-
-// datagramMessages returns the payloads of a datagram's MESSAGE frames, or
-// false if the datagram is dropped whole.
-func datagramMessages(frames []byte) ([][]byte, bool) {
-	if !walkDatagramFrames(frames, nil) {
-		return nil, false
-	}
-	var messages [][]byte
-	walkDatagramFrames(frames, func(typ frameType, message []byte) {
-		if typ == frameTypeMessage {
-			messages = append(messages, message)
-		}
-	})
-	return messages, true
 }
 
 // datagramConn is the datagram surface of a QUIC connection or WebTransport
@@ -609,19 +583,9 @@ func newDatagramSink(maxMessage int) *datagramSink {
 	return &datagramSink{maxMessage: maxMessage, wake: make(chan struct{}, 1)}
 }
 
-// push queues message, and reports whether it did. A message is dropped when
-// the direction has ended, the queue is full, or the message is larger than a
-// frame may be.
-func (s *datagramSink) push(message []byte) bool {
-	s.mu.Lock()
-	queued := s.pushLocked(message)
-	s.mu.Unlock()
-	if queued {
-		notify(s.wake)
-	}
-	return queued
-}
-
+// pushLocked queues message, and reports whether it did. A message is dropped
+// when the direction has ended, the queue is full, or the message is larger
+// than a frame may be.
 func (s *datagramSink) pushLocked(message []byte) bool {
 	if s.closed || s.count == len(s.queue) || len(message) > s.maxMessage ||
 		(s.count > 0 && s.bytes+len(message) > datagramSinkBytes) {
