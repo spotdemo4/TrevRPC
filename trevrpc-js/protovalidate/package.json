@@ -1,6 +1,6 @@
 {
   "name": "@trevrpc/protovalidate",
-  "version": "1.11.0",
+  "version": "1.11.1",
   "description": "protovalidate request validation for TrevRPC browser clients",
   "homepage": "https://trev.zip/llc/TrevRPC",
   "bugs": {
@@ -48,7 +48,7 @@
   "peerDependencies": {
     "@bufbuild/protobuf": "^2.17.0",
     "@bufbuild/protovalidate": "^1.3.0",
-    "@trevrpc/trevrpc-js": "^1.11.0"
+    "@trevrpc/trevrpc-js": "^1.11.1"
   },
   "engines": {
     "node": ">=24"

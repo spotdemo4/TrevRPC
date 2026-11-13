@@ -92,7 +92,7 @@ let
 in
 stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
-  version = "1.11.0";
+  version = "1.11.1";
   passthru = {
     inherit androidSdk interopAndroid;
   };

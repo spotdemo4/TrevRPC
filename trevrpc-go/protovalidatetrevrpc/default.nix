@@ -4,7 +4,7 @@
 }:
 mkGoModule (final: {
   pname = "trevrpc-go-protovalidate";
-  version = "1.11.0";
+  version = "1.11.1";
 
   # The module itself plus the TrevRPC module its go.mod replaces with ../.
   src = lib.fileset.toSource {

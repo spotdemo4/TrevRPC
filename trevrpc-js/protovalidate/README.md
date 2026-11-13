@@ -3,8 +3,8 @@
 [protovalidate](https://github.com/bufbuild/protovalidate) request validation for the TrevRPC browser client, [`@trevrpc/trevrpc-js`](https://www.npmjs.com/package/@trevrpc/trevrpc-js): requests that break their [`buf.validate`](https://buf.build/bufbuild/protovalidate) rules fail before they are sent. It is a separate package so that `@trevrpc/trevrpc-js` itself does not depend on protovalidate or CEL.
 
 > **Compatibility:** every TrevRPC package shares one version, and packages of the same version are compatible
-> with each other: `trevrpc-rust` 1.11.0 works with `trevrpc-go` 1.11.0, `trevrpc-js` 1.11.0, and `trevrpc-kotlin`
-> 1.11.0. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
+> with each other: `trevrpc-rust` 1.11.1 works with `trevrpc-go` 1.11.1, `trevrpc-js` 1.11.1, and `trevrpc-kotlin`
+> 1.11.1. Compatibility across different versions isn't guaranteed yet; that's a milestone for 2.0.
 
 ```sh
 npm install @trevrpc/protovalidate @trevrpc/trevrpc-js @bufbuild/protobuf @bufbuild/protovalidate
