@@ -1,11 +1,11 @@
-# A Python runner from interop/ or bench/, packaged with the shared harness next to it.
+# A Python runner from interop/ or bench/, packaged with the shared harness next to it. The
+# runners' unit tests are not part of the package: the python-test check runs them.
 {
   lib,
   makeWrapper,
   openssl,
   python3,
   stdenvNoCC,
-  zstd,
   # The executable's name and the runner it starts, relative to the repository root.
   name,
   script,
@@ -16,6 +16,9 @@
   defaults ? { },
 }:
 let
+  # Without the unit tests, so that a change to one does not rebuild the runners and rerun the
+  # interop and bench checks that depend on them.
+  runnerSource = file: file.hasExt "py" && !lib.hasPrefix "test_" file.name;
   defaultFlags = lib.cli.toCommandLineShell (name: {
     option = "--${name}";
     sep = null;
@@ -28,28 +31,14 @@ stdenvNoCC.mkDerivation {
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      (lib.fileset.fileFilter (file: file.hasExt "py") ./.)
-      (lib.fileset.fileFilter (file: file.hasExt "py") ../bench)
+      (lib.fileset.fileFilter runnerSource ./.)
+      (lib.fileset.fileFilter runnerSource ../bench)
       # The interop runner takes its compression dictionary from these.
       ../testdata/zstd-golden-vectors.txt
     ];
   };
 
-  # The bench tests train the benchmark dictionary with zstd.
-  nativeBuildInputs = [
-    makeWrapper
-    openssl
-    python3
-    zstd
-  ];
-
-  doCheck = true;
-  checkPhase = ''
-    runHook preCheck
-    python3 -I -m unittest discover -s interop
-    python3 -I -m unittest discover -s bench
-    runHook postCheck
-  '';
+  nativeBuildInputs = [ makeWrapper ];
 
   # The runners find the harness at ../interop and the compression golden vectors at ../testdata
   # relative to themselves, as in the checkout.

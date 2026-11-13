@@ -4,10 +4,10 @@ import argparse
 import contextlib
 import io
 import os
+import select
 import stat
 import subprocess
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -77,19 +77,21 @@ class RunWithDeadlineTest(unittest.TestCase):
         self.assertEqual(harness.Completed(3, "out\n"), result)
 
     def test_stops_the_whole_process_group_at_the_deadline(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            marker = Path(temporary) / "survived"
-            started = time.monotonic()
-
-            # The grandchild would write the marker if it outlived the deadline.
+        # The grandchild inherits the pipe as its stdout, so the pipe ends only once every
+        # process of the group is gone.
+        read_end, write_end = os.pipe()
+        try:
             result = harness.run_with_deadline(
-                ["sh", "-c", f"(sleep 2; touch {marker}) & sleep 30"], 0.2
+                ["sh", "-c", "sleep 30 & sleep 30"], 0.2, stdout=write_end
             )
-            time.sleep(2.5)
+        finally:
+            os.close(write_end)
 
-            self.assertIsNone(result.returncode)
-            self.assertLess(time.monotonic() - started, 10)
-            self.assertFalse(marker.exists())
+        with os.fdopen(read_end) as pipe:
+            ended, _, _ = select.select([pipe], [], [], 10)
+            self.assertTrue(ended, "a process of the group outlived the deadline")
+            self.assertEqual("", pipe.read())
+        self.assertIsNone(result.returncode)
 
 
 class ParsePortsTest(unittest.TestCase):

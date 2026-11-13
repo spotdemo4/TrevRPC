@@ -588,6 +588,29 @@
             '';
           };
 
+          # The unit tests of the interop and bench runners, which interop/runner.nix packages.
+          python-test = {
+            root = ./.;
+            files = [
+              ./interop
+              ./bench
+            ];
+            filter = file: file.hasExt "py";
+            # The interop runner takes its compression dictionary from these.
+            include = [ ./testdata/zstd-golden-vectors.txt ];
+            # The harness makes certificates with openssl, and the bench tests train the benchmark
+            # dictionary with zstd.
+            packages = with pkgs; [
+              python3
+              openssl
+              zstd
+            ];
+            script = ''
+              python3 -I -m unittest discover -s interop
+              python3 -I -m unittest discover -s bench
+            '';
+          };
+
           actions-gh = {
             root = ./.github/workflows;
             filter = file: file.hasExt "yaml";
