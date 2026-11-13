@@ -18,7 +18,6 @@ import zip.trev.trevrpc.TrevRpcException
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -103,59 +102,52 @@ class Http3ExchangeStressTest {
             val cancelled = AtomicInteger()
             val completedFirst = AtomicInteger()
             val unexpected = ConcurrentLinkedQueue<Throwable>()
-            repeat(iterations) {
-                val factory = RacingFactory()
-                val transport =
-                    Http3RpcTransport(
-                        factory,
-                        CronetTransportOptions(closeTimeout = 3.seconds),
-                        Dispatchers.Default,
-                        shutdownContext = Dispatchers.Default,
-                    )
-                val opening = async(Dispatchers.Default) { transport.openStream(streamRequest()) }
-                assertTrue(factory.opened.await(5, TimeUnit.SECONDS))
-                assertTrue(factory.stream.startEntered.await(5, TimeUnit.SECONDS))
-                factory.stream.callback.onReady(factory.stream)
-                factory.stream.completeWrite(factory.stream.awaitWrite())
-                val stream: RpcClientStream = opening.await()
+            RaceThreads(2).use { threads ->
+                repeat(iterations) {
+                    val factory = RacingFactory()
+                    val transport =
+                        Http3RpcTransport(
+                            factory,
+                            CronetTransportOptions(closeTimeout = 3.seconds),
+                            Dispatchers.Default,
+                            shutdownContext = Dispatchers.Default,
+                        )
+                    val opening = async(Dispatchers.Default) { transport.openStream(streamRequest()) }
+                    assertTrue(factory.opened.await(5, TimeUnit.SECONDS))
+                    assertTrue(factory.stream.startEntered.await(5, TimeUnit.SECONDS))
+                    factory.stream.callback.onReady(factory.stream)
+                    factory.stream.completeWrite(factory.stream.awaitWrite())
+                    val stream: RpcClientStream = opening.await()
 
-                // A send cancelled after its write completed may still finish normally (as cancelled),
-                // leaving the exchange open; only a send that threw cancellation must fail the call.
-                val sendThrewCancellation = AtomicBoolean(false)
-                val send =
-                    launch(Dispatchers.Default) {
-                        try {
-                            stream.send(byteArrayOf(1))
-                        } catch (error: CancellationException) {
-                            sendThrewCancellation.set(true)
-                            throw error
+                    // A send cancelled after its write completed may still finish normally (as cancelled),
+                    // leaving the exchange open; only a send that threw cancellation must fail the call.
+                    val sendThrewCancellation = AtomicBoolean(false)
+                    val send =
+                        launch(Dispatchers.Default) {
+                            try {
+                                stream.send(byteArrayOf(1))
+                            } catch (error: CancellationException) {
+                                sendThrewCancellation.set(true)
+                                throw error
+                            }
                         }
-                    }
-                val write = factory.stream.awaitWrite()
-                val barrier = CyclicBarrier(2)
-                val completer =
-                    Thread {
-                        barrier.await()
-                        factory.stream.completeWrite(write)
-                    }
-                completer.start()
-                barrier.await()
-                send.cancel()
-                completer.join()
-                send.join()
+                    val write = factory.stream.awaitWrite()
+                    threads.round({ factory.stream.completeWrite(write) }, { send.cancel() })
+                    send.join()
 
-                if (sendThrewCancellation.get()) {
-                    val failure = runCatching { withTimeout(5_000) { stream.receive() } }.exceptionOrNull()
-                    when {
-                        failure is TrevRpcException && failure.status.code == Code.INTERNAL -> internal.incrementAndGet()
-                        failure is CancellationException && failure !is TimeoutCancellationException -> cancelled.incrementAndGet()
-                        else -> unexpected.add(failure ?: AssertionError("receive() returned after a canceled send"))
+                    if (sendThrewCancellation.get()) {
+                        val failure = runCatching { withTimeout(5_000) { stream.receive() } }.exceptionOrNull()
+                        when {
+                            failure is TrevRpcException && failure.status.code == Code.INTERNAL -> internal.incrementAndGet()
+                            failure is CancellationException && failure !is TimeoutCancellationException -> cancelled.incrementAndGet()
+                            else -> unexpected.add(failure ?: AssertionError("receive() returned after a canceled send"))
+                        }
+                    } else {
+                        completedFirst.incrementAndGet()
                     }
-                } else {
-                    completedFirst.incrementAndGet()
+                    runCatching { stream.close(null) }
+                    transport.close()
                 }
-                runCatching { stream.close(null) }
-                transport.close()
             }
             assertEquals(0, internal.get(), "canceled sends that surfaced INTERNAL")
             assertTrue(unexpected.isEmpty(), "unexpected outcomes: $unexpected")
@@ -171,47 +163,48 @@ class Http3ExchangeStressTest {
     fun `start racing close and a terminal callback settles every lease and cancels at most once`() =
         runBlocking {
             val random = Random(42)
-            repeat(300) { iteration ->
-                val factory = RacingFactory()
-                val gate = CountDownLatch(1)
-                factory.stream.startGate = gate
-                val transport =
-                    Http3RpcTransport(
-                        factory,
-                        CronetTransportOptions(closeTimeout = 2.seconds),
-                        Dispatchers.Default,
-                        shutdownContext = Dispatchers.Default,
+            RaceThreads(3).use { threads ->
+                repeat(300) { iteration ->
+                    val factory = RacingFactory()
+                    val gate = CountDownLatch(1)
+                    factory.stream.startGate = gate
+                    val transport =
+                        Http3RpcTransport(
+                            factory,
+                            CronetTransportOptions(closeTimeout = 2.seconds),
+                            Dispatchers.Default,
+                            shutdownContext = Dispatchers.Default,
+                        )
+                    val opening = async(Dispatchers.Default) { runCatching { transport.openStream(streamRequest()) } }
+                    assertTrue(factory.stream.startEntered.await(5, TimeUnit.SECONDS))
+
+                    val terminalDuringStart = random.nextBoolean()
+                    val delayGate = random.nextBoolean()
+                    val terminatorDone = CountDownLatch(1)
+                    threads.round(
+                        { runBlocking { runCatching { transport.close() } } },
+                        {
+                            try {
+                                if (terminalDuringStart) factory.stream.callback.onFailed(factory.stream, RuntimeException("net::ERR"))
+                            } finally {
+                                terminatorDone.countDown()
+                            }
+                        },
+                        {
+                            // start() returns only after the terminal callback, if any, was delivered.
+                            check(terminatorDone.await(5, TimeUnit.SECONDS)) { "the terminal callback did not return" }
+                            if (delayGate) Thread.sleep(2)
+                            gate.countDown()
+                        },
                     )
-                val opening = async(Dispatchers.Default) { runCatching { transport.openStream(streamRequest()) } }
-                assertTrue(factory.stream.startEntered.await(5, TimeUnit.SECONDS))
+                    val result = withTimeout(10_000) { opening.await() }
+                    assertTrue(result.isFailure, "iteration $iteration: the call opened on a closed channel")
 
-                val terminalDuringStart = random.nextBoolean()
-                val delayGate = random.nextBoolean()
-                val barrier = CyclicBarrier(3)
-                val closer =
-                    Thread {
-                        barrier.await()
-                        runBlocking { runCatching { transport.close() } }
-                    }
-                val terminator =
-                    Thread {
-                        barrier.await()
-                        if (terminalDuringStart) factory.stream.callback.onFailed(factory.stream, RuntimeException("net::ERR"))
-                    }
-                closer.start()
-                terminator.start()
-                barrier.await()
-                terminator.join()
-                if (delayGate) Thread.sleep(2)
-                gate.countDown()
-                closer.join(10_000)
-                val result = withTimeout(10_000) { opening.await() }
-                assertTrue(result.isFailure, "iteration $iteration: the call opened on a closed channel")
-
-                withTimeout(10_000) { transport.close() }
-                val context = "iteration $iteration terminalDuringStart=$terminalDuringStart"
-                assertEquals(0, transport.activeExchangeCount, "leases left behind: $context")
-                assertEquals(if (terminalDuringStart) 0 else 1, factory.stream.cancelCalls.get(), "native cancels: $context")
+                    withTimeout(10_000) { transport.close() }
+                    val context = "iteration $iteration terminalDuringStart=$terminalDuringStart"
+                    assertEquals(0, transport.activeExchangeCount, "leases left behind: $context")
+                    assertEquals(if (terminalDuringStart) 0 else 1, factory.stream.cancelCalls.get(), "native cancels: $context")
+                }
             }
         }
 }

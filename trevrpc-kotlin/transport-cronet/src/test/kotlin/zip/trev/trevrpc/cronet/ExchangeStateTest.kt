@@ -18,7 +18,6 @@ import zip.trev.trevrpc.Status
 import zip.trev.trevrpc.TrevRpcException
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
@@ -61,22 +60,20 @@ class ExchangeStateTest {
     fun `a write completion never finds its write gone while the call is still open`() =
         withContinuation { continuation ->
             val violations = AtomicInteger()
-            repeat(3_000) {
-                val call = CallStateMachine()
-                val pending = pendingWrite(continuation)
-                assertNull(call.installWrite(pending))
-                val barrier = CyclicBarrier(2)
-                val completer =
-                    Thread {
-                        barrier.await()
-                        if (call.takeCompletedWrite(pending.buffer, pending.endOfStream) == null && call.state is CallState.Open) {
-                            violations.incrementAndGet()
-                        }
-                    }
-                completer.start()
-                barrier.await()
-                call.settleWrite(pending, RuntimeException("canceled"))
-                completer.join()
+            RaceThreads(2).use { threads ->
+                repeat(3_000) {
+                    val call = CallStateMachine()
+                    val pending = pendingWrite(continuation)
+                    assertNull(call.installWrite(pending))
+                    threads.round(
+                        {
+                            if (call.takeCompletedWrite(pending.buffer, pending.endOfStream) == null && call.state is CallState.Open) {
+                                violations.incrementAndGet()
+                            }
+                        },
+                        { call.settleWrite(pending, RuntimeException("canceled")) },
+                    )
+                }
             }
             assertEquals(0, violations.get())
         }
@@ -235,64 +232,58 @@ class ExchangeStateTest {
     @Test
     fun `start cancel and terminal callbacks race without losing or repeating either`() {
         val random = Random(7)
-        repeat(3_000) { iteration ->
-            val native = NativeStreamLifecycle()
-            val cancels = AtomicInteger()
-            val releases = AtomicInteger()
-            val cancelRequested = random.nextBoolean()
-            val cancelBeforeOpen = cancelRequested && random.nextBoolean()
-            val terminalFires = random.nextBoolean()
-            val startDecided = CountDownLatch(1)
+        RaceThreads(3).use { threads ->
+            repeat(3_000) { iteration ->
+                val native = NativeStreamLifecycle()
+                val cancels = AtomicInteger()
+                val releases = AtomicInteger()
+                val cancelRequested = random.nextBoolean()
+                val cancelBeforeOpen = cancelRequested && random.nextBoolean()
+                val terminalFires = random.nextBoolean()
+                val startDecided = CountDownLatch(1)
 
-            val startedFlag = AtomicBoolean(false)
-            val finishedFlag = AtomicBoolean(false)
-            if (cancelBeforeOpen) assertFalse(native.requestCancel())
+                val startedFlag = AtomicBoolean(false)
+                val finishedFlag = AtomicBoolean(false)
+                if (cancelBeforeOpen) assertFalse(native.requestCancel())
 
-            val barrier = CyclicBarrier(3)
-            val starter =
-                Thread {
-                    barrier.await()
-                    startedFlag.set(native.beginStart())
-                    startDecided.countDown()
-                    if (!startedFlag.get()) {
-                        releases.incrementAndGet()
-                        return@Thread
-                    }
-                    Thread.onSpinWait()
-                    val afterStart = native.startReturned()
-                    if (afterStart == NativeStreamLifecycle.AfterStart.FINISHED) {
-                        finishedFlag.set(true)
-                        releases.incrementAndGet()
-                    } else if (afterStart == NativeStreamLifecycle.AfterStart.CANCEL) {
-                        cancels.incrementAndGet()
-                    }
-                }
-            val canceller =
-                Thread {
-                    barrier.await()
-                    if (cancelRequested && !cancelBeforeOpen) repeat(2) { if (native.requestCancel()) cancels.incrementAndGet() }
-                }
-            val terminator =
-                Thread {
-                    barrier.await()
-                    // Cronet reports a terminal callback only for a stream whose start() was called.
-                    startDecided.await()
-                    if (terminalFires && startedFlag.get() && native.terminated()) releases.incrementAndGet()
-                }
-            val threads = listOf(starter, canceller, terminator)
-            threads.forEach(Thread::start)
-            threads.forEach(Thread::join)
+                threads.round(
+                    starter@{
+                        startedFlag.set(native.beginStart())
+                        startDecided.countDown()
+                        if (!startedFlag.get()) {
+                            releases.incrementAndGet()
+                            return@starter
+                        }
+                        Thread.onSpinWait()
+                        val afterStart = native.startReturned()
+                        if (afterStart == NativeStreamLifecycle.AfterStart.FINISHED) {
+                            finishedFlag.set(true)
+                            releases.incrementAndGet()
+                        } else if (afterStart == NativeStreamLifecycle.AfterStart.CANCEL) {
+                            cancels.incrementAndGet()
+                        }
+                    },
+                    {
+                        if (cancelRequested && !cancelBeforeOpen) repeat(2) { if (native.requestCancel()) cancels.incrementAndGet() }
+                    },
+                    {
+                        // Cronet reports a terminal callback only for a stream whose start() was called.
+                        startDecided.await()
+                        if (terminalFires && startedFlag.get() && native.terminated()) releases.incrementAndGet()
+                    },
+                )
 
-            val context = "iteration $iteration cancelRequested=$cancelRequested beforeOpen=$cancelBeforeOpen terminal=$terminalFires"
-            assertTrue(cancels.get() <= 1, "canceled more than once: $context")
-            val started = startedFlag.get()
-            if (!started) {
-                assertEquals(0, cancels.get(), "abandoned stream was canceled: $context")
-                assertEquals(1, releases.get(), "abandoned stream not released once: $context")
-            } else {
-                assertEquals(if (terminalFires) 1 else 0, releases.get(), "release count: $context")
-                if (finishedFlag.get()) assertEquals(0, cancels.get(), "canceled after a terminal callback during start: $context")
-                if (!terminalFires && cancelRequested) assertEquals(1, cancels.get(), "cancel was lost: $context")
+                val context = "iteration $iteration cancelRequested=$cancelRequested beforeOpen=$cancelBeforeOpen terminal=$terminalFires"
+                assertTrue(cancels.get() <= 1, "canceled more than once: $context")
+                val started = startedFlag.get()
+                if (!started) {
+                    assertEquals(0, cancels.get(), "abandoned stream was canceled: $context")
+                    assertEquals(1, releases.get(), "abandoned stream not released once: $context")
+                } else {
+                    assertEquals(if (terminalFires) 1 else 0, releases.get(), "release count: $context")
+                    if (finishedFlag.get()) assertEquals(0, cancels.get(), "canceled after a terminal callback during start: $context")
+                    if (!terminalFires && cancelRequested) assertEquals(1, cancels.get(), "cancel was lost: $context")
+                }
             }
         }
     }

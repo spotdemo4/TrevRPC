@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.PrintStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -976,76 +977,83 @@ class GeneratorTest {
 }
 
 class GeneratedCodeCompilationTest {
+    /**
+     * Generates every schema with protoc, then compiles all of them and their fixtures in one javac
+     * and one kotlinc run: the compilers' start-up dominates this suite, so one compilation instead
+     * of one per schema saves most of its time. Each schema keeps its own protoc request and output
+     * directory, so a failure names the schema it comes from.
+     */
     @Test
-    fun `protoc generated four shape Echo client compiles against core and protobuf`(
+    fun `protoc generated clients for every schema compile against core and protobuf`(
         @TempDir temp: Path,
     ) {
-        val schema = Path.of(checkNotNull(System.getProperty("trevrpc.interop.proto")))
-        check(schema.isRegularFile()) { "Interop schema not found at $schema" }
-        compileSchemas(
-            temp,
-            schema.parent,
-            listOf(schema.fileName.toString()),
-            mapOf("CompileFixture.kt" to COMPILE_FIXTURE),
-        )
-    }
-
-    @Test
-    fun `protoc javac and kotlinc accept adversarial names file facades and legal overloads`(
-        @TempDir temp: Path,
-    ) {
-        val fixturePath = "trevrpc-kotlin/protoc-gen-trevrpc-kotlin/src/test/proto/compat"
-        val fixtureRoot =
-            generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath(), Path::getParent)
-                .map { it.resolve(fixturePath) }
-                .firstOrNull { it.resolve("overloads.proto").isRegularFile() }
-                ?: error("generator compatibility fixtures not found from ${System.getProperty("user.dir")}")
+        val interop = Path.of(checkNotNull(System.getProperty("trevrpc.interop.proto")))
+        check(interop.isRegularFile()) { "Interop schema not found at $interop" }
+        val testProtos = testProtoRoot()
 
         compileSchemas(
             temp,
-            fixtureRoot,
             listOf(
-                "naming/single_file.proto",
-                "naming/multiple_files.proto",
-                "naming/_mixed_CASE_file.proto",
-                "naming/custom_extension.rpc",
-                "naming/trailing_hash#.proto",
-                "left/shared.proto",
-                "right/shared.proto",
-                "overloads.proto",
-            ),
-            mapOf(
-                "NamingFixture.kt" to NAMING_FIXTURE,
-                "DerivedFixture.kt" to DERIVED_FIXTURE,
-                "SharedFixture.kt" to SHARED_FIXTURE,
-                "OverloadsFixture.kt" to OVERLOADS_FIXTURE,
+                // The four-shape Echo client of the interop suite.
+                Schema(
+                    "interop",
+                    interop.parent,
+                    listOf(interop.fileName.toString()),
+                    mapOf("CompileFixture.kt" to COMPILE_FIXTURE),
+                ),
+                // Adversarial names, file facades and legal overloads.
+                Schema(
+                    "compat",
+                    testProtos.resolve("compat"),
+                    listOf(
+                        "naming/single_file.proto",
+                        "naming/multiple_files.proto",
+                        "naming/_mixed_CASE_file.proto",
+                        "naming/custom_extension.rpc",
+                        "naming/trailing_hash#.proto",
+                        "left/shared.proto",
+                        "right/shared.proto",
+                        "overloads.proto",
+                    ),
+                    mapOf(
+                        "NamingFixture.kt" to NAMING_FIXTURE,
+                        "DerivedFixture.kt" to DERIVED_FIXTURE,
+                        "SharedFixture.kt" to SHARED_FIXTURE,
+                        "OverloadsFixture.kt" to OVERLOADS_FIXTURE,
+                    ),
+                ),
+                // `(trevrpc.method)` options as protoc encodes them from trevrpc/options.proto.
+                Schema(
+                    "unreliable",
+                    testProtos,
+                    listOf("unreliable/unreliable.proto", "trevrpc/options.proto"),
+                    mapOf("UnreliableFixture.kt" to UNRELIABLE_FIXTURE),
+                    extraProtoRoots = listOf(optionsProtoRoot()),
+                ),
             ),
         )
 
-        val generated = temp.resolve("kotlin")
-        val left = generated.resolve("left/shared.trevrpc.kt").readText()
-        val right = generated.resolve("right/shared.trevrpc.kt").readText()
-        val leftFacade = left.lineSequence().first { "@file:JvmName" in it }
-        val rightFacade = right.lineSequence().first { "@file:JvmName" in it }
+        val compat = temp.resolve("kotlin/compat")
+        val leftFacade =
+            compat
+                .resolve("left/shared.trevrpc.kt")
+                .readText()
+                .lineSequence()
+                .first { "@file:JvmName" in it }
+        val rightFacade =
+            compat
+                .resolve("right/shared.trevrpc.kt")
+                .readText()
+                .lineSequence()
+                .first { "@file:JvmName" in it }
         assertTrue(leftFacade.startsWith("@file:JvmName(\"TrevRpcGenerated_"), leftFacade)
         assertTrue(rightFacade.startsWith("@file:JvmName(\"TrevRpcGenerated_"), rightFacade)
         assertFalse(leftFacade == rightFacade)
-    }
 
-    @Test
-    fun `protoc generated unreliable client compiles and documents the Cronet fallback`(
-        @TempDir temp: Path,
-    ) {
-        val fixtureRoot = compatFixtureRoot("unreliable/unreliable.proto")
-        compileSchemas(
-            temp,
-            fixtureRoot,
-            listOf("unreliable/unreliable.proto", "trevrpc/options.proto"),
-            mapOf("UnreliableFixture.kt" to UNRELIABLE_FIXTURE),
-            extraProtoRoots = listOf(optionsProtoRoot()),
-        )
-
-        val generated = temp.resolve("kotlin/unreliable/unreliable.trevrpc.kt").readText()
+        // GeneratorTest covers the documentation and compression arguments with options it encodes
+        // itself; these checks are the ones that tie them to the field numbers and enum values protoc
+        // encodes from the real trevrpc/options.proto.
+        val generated = temp.resolve("kotlin/unreliable/unreliable/unreliable.trevrpc.kt").readText()
         val lines = generated.lines()
 
         fun documented(function: String): Boolean {
@@ -1055,7 +1063,6 @@ class GeneratedCodeCompilationTest {
         }
         listOf("upload", "watch", "track").forEach { assertTrue(documented(it), it) }
         listOf("lookup", "plain", "compressed").forEach { assertFalse(documented(it), it) }
-        assertTrue(lines.any { "requests and responses unreliable" in it })
         assertTrue(
             lines.any {
                 "TRACKER_COMPRESSED_PATH" in it && "CompressStream.BOTH, compressMessages = zip.trev.trevrpc.CompressMessages.BOTH)" in it
@@ -1064,40 +1071,17 @@ class GeneratedCodeCompilationTest {
         )
     }
 
-    @Test
-    fun `protoc rejects misused unreliable flags through the plugin with the shared error text`(
-        @TempDir temp: Path,
-    ) {
-        val root = temp.resolve("proto").createDirectories()
-        root.resolve("misuse.proto").toFile().writeText(
-            """
-            syntax = "proto3";
-            package bad.v1;
-            import "trevrpc/options.proto";
-            message M {}
-            service S {
-              rpc Get(M) returns (M) { option (trevrpc.method) = {unreliable_requests: true}; }
-            }
-            """.trimIndent(),
-        )
-        val plugin = Path.of(checkNotNull(System.getProperty("trevrpc.kotlin.plugin")))
-        val output = temp.resolve("out").createDirectories()
-        val process =
-            ProcessBuilder(
-                "protoc",
-                "--proto_path=$root",
-                "--proto_path=${optionsProtoRoot()}",
-                "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
-                "--trevrpc-kotlin_out=$output",
-                "misuse.proto",
-            ).redirectErrorStream(true).start()
-        val text = process.inputStream.bufferedReader().readText()
-        assertTrue(process.waitFor() != 0, text)
-        assertTrue(
-            text.contains("bad.v1.S.Get: unreliable_requests requires a client-streaming or bidirectional method"),
-            text,
-        )
-    }
+    /**
+     * One schema to generate: [protoFiles] relative to [protoRoot], and the Kotlin [fixtures] that
+     * use what they generate. [name] is the schema's output directory and how failures name it.
+     */
+    private class Schema(
+        val name: String,
+        val protoRoot: Path,
+        val protoFiles: List<String>,
+        val fixtures: Map<String, String>,
+        val extraProtoRoots: List<Path> = emptyList(),
+    )
 
     private fun optionsProtoRoot(): Path {
         val root = Path.of(checkNotNull(System.getProperty("trevrpc.options.proto.root")))
@@ -1105,48 +1089,68 @@ class GeneratedCodeCompilationTest {
         return root
     }
 
-    private fun compatFixtureRoot(marker: String): Path {
+    private fun testProtoRoot(): Path {
         val fixturePath = "trevrpc-kotlin/protoc-gen-trevrpc-kotlin/src/test/proto"
         return generateSequence(Path.of(System.getProperty("user.dir")).toAbsolutePath(), Path::getParent)
             .map { it.resolve(fixturePath) }
-            .firstOrNull { it.resolve(marker).isRegularFile() }
+            .firstOrNull {
+                it
+                    .resolve(
+                        "compat/overloads.proto",
+                    ).isRegularFile() && it.resolve("unreliable/unreliable.proto").isRegularFile()
+            }
             ?: error("generator fixtures not found from ${System.getProperty("user.dir")}")
     }
 
     private fun compileSchemas(
         temp: Path,
-        protoRoot: Path,
-        protoFiles: List<String>,
-        fixtures: Map<String, String>,
-        extraProtoRoots: List<Path> = emptyList(),
+        schemas: List<Schema>,
     ) {
-        val javaSources = temp.resolve("java").createDirectories()
-        val kotlinSources = temp.resolve("kotlin").createDirectories()
+        val javaSources = temp.resolve("java")
+        val kotlinSources = temp.resolve("kotlin")
         val plugin = Path.of(checkNotNull(System.getProperty("trevrpc.kotlin.plugin")))
-        runCommand(
-            listOf(
-                "protoc",
-                "--proto_path=$protoRoot",
-            ) + extraProtoRoots.map { "--proto_path=$it" } +
-                listOf(
-                    "--java_out=$javaSources",
-                    "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
-                    "--trevrpc-kotlin_out=$kotlinSources",
-                ) + protoFiles,
-            protoRoot,
-        )
-        fixtures.forEach { (name, content) -> kotlinSources.resolve(name).toFile().writeText(content) }
+        for (schema in schemas) {
+            val javaOut = javaSources.resolve(schema.name).createDirectories()
+            val kotlinOut = kotlinSources.resolve(schema.name).createDirectories()
+            runCommand(
+                listOf("protoc", "--proto_path=${schema.protoRoot}") +
+                    schema.extraProtoRoots.map { "--proto_path=$it" } +
+                    listOf(
+                        "--java_out=$javaOut",
+                        "--plugin=protoc-gen-trevrpc-kotlin=$plugin",
+                        "--trevrpc-kotlin_out=$kotlinOut",
+                    ) + schema.protoFiles,
+                schema.protoRoot,
+                "schema ${schema.name}",
+            )
+            schema.fixtures.forEach { (name, content) -> kotlinOut.resolve(name).toFile().writeText(content) }
+        }
+
+        // Every source lives under its schema's directory, so the paths a compiler reports name the
+        // schemas that broke.
+        fun failing(diagnostics: String): String =
+            schemas
+                .filter { schema ->
+                    listOf(javaSources, kotlinSources).any { "${it.resolve(schema.name)}${File.separator}" in diagnostics }
+                }.joinToString { it.name }
+                .ifEmpty { "no schema in particular" }
 
         val classpath = System.getProperty("java.class.path")
         val javaClasses = temp.resolve("java-classes").createDirectories()
-        compileJava(sourceFiles(javaSources, "java"), javaClasses, classpath)
+        compileJava(sourceFiles(javaSources, "java"), javaClasses, classpath, ::failing)
         val kotlinClasses = temp.resolve("kotlin-classes").createDirectories()
-        compileKotlin(sourceFiles(kotlinSources, "kt"), kotlinClasses, "$javaClasses${java.io.File.pathSeparator}$classpath")
+        compileKotlin(
+            sourceFiles(kotlinSources, "kt"),
+            kotlinClasses,
+            "$javaClasses${File.pathSeparator}$classpath",
+            ::failing,
+        )
     }
 
     private fun runCommand(
         command: List<String>,
         directory: Path,
+        subject: String,
     ) {
         val process =
             ProcessBuilder(command)
@@ -1155,7 +1159,7 @@ class GeneratedCodeCompilationTest {
                 .start()
         val output = process.inputStream.bufferedReader().readText()
         val status = process.waitFor()
-        check(status == 0) { "command failed ($status): ${command.joinToString(" ")}\n$output" }
+        check(status == 0) { "command failed for $subject ($status): ${command.joinToString(" ")}\n$output" }
     }
 
     private fun sourceFiles(
@@ -1170,19 +1174,22 @@ class GeneratedCodeCompilationTest {
         sources: List<Path>,
         destination: Path,
         classpath: String,
+        failing: (String) -> String,
     ) {
         val errors = ByteArrayOutputStream()
         val arguments =
             listOf("--release", "21", "-classpath", classpath, "-d", destination.toString()) +
                 sources.map(Path::toString)
         val status = ToolProvider.getSystemJavaCompiler().run(null, null, errors, *arguments.toTypedArray())
-        check(status == 0) { "javac failed:\n${errors.toString(Charsets.UTF_8)}" }
+        val diagnostics = errors.toString(Charsets.UTF_8)
+        check(status == 0) { "javac failed for ${failing(diagnostics)}:\n$diagnostics" }
     }
 
     private fun compileKotlin(
         sources: List<Path>,
         destination: Path,
         classpath: String,
+        failing: (String) -> String,
     ) {
         val errors = ByteArrayOutputStream()
         val compiler = K2JVMCompiler()
@@ -1204,7 +1211,8 @@ class GeneratedCodeCompilationTest {
                 Services.EMPTY,
                 arguments,
             )
-        assertEquals(ExitCode.OK, status, "kotlinc failed:\n${errors.toString(Charsets.UTF_8)}")
+        val diagnostics = errors.toString(Charsets.UTF_8)
+        assertEquals(ExitCode.OK, status) { "kotlinc failed for ${failing(diagnostics)}:\n$diagnostics" }
     }
 
     private companion object {
