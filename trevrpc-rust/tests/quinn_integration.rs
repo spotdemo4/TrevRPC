@@ -145,6 +145,47 @@ impl greeter::Greeter for TestGreeter {
     }
 }
 
+const fn require_send<F: Send>(future: F) -> F {
+    future
+}
+
+/// Makes every shape of call the generated client offers over any streaming transport, which
+/// only has to compile.
+#[allow(dead_code, reason = "only has to compile")]
+async fn call_every_generated_client_shape<T>(client: &greeter::GreeterClient<T>) -> TestResult
+where
+    T: StreamingRpcTransport,
+{
+    use std::future::IntoFuture as _;
+
+    let request = greeter::HelloRequest {
+        name: "a".to_owned(),
+    };
+    let requests = || trevrpc::stream::from_iter([request.clone()]);
+    let _reply: greeter::HelloReply = require_send(
+        client
+            .say_hello(&request)
+            .timeout(Duration::from_secs(1))
+            .into_future(),
+    )
+    .await?;
+    let _envelope = client.say_hello(&request).with_response().await?;
+    let _replies = client.lots_of_replies(&request).metadata("k", "v").await?;
+    let _upload = client.lots_of_greetings().await?;
+    let _reply: greeter::HelloReply = client.lots_of_greetings().send_all(requests()).await?;
+    let _envelope = client
+        .lots_of_greetings()
+        .send_all(requests())
+        .with_response()
+        .await?;
+    let _call = client
+        .bidi_hello()
+        .options(|options| options.with_max_response_messages(Some(1)))
+        .await?;
+    let _replies = client.bidi_hello().send_all(requests()).await?;
+    Ok(())
+}
+
 struct RunningServer {
     addr: SocketAddr,
     cert_der: CertificateDer<'static>,
