@@ -10,19 +10,27 @@ import { createClient } from "../src/client.js";
 import { Code } from "../src/status.js";
 import { StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
-import { deferred, fakeTransport } from "./support.js";
+import { deferred, fakeTransport, turn } from "./support.js";
 
 const plain = await createCompression();
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * How long a stream may stay unreleased before a test calls it leaked. A release takes a few turns
+ * of the event loop, so this only has to outlast a starved machine; a passing test never waits it
+ * out.
+ */
+const LeakMs = 5000;
 
 /**
  * A transport whose first stream refuses the optimistic call. The replacement stream's open is held
- * by the test: `release(after)` resolves it and then runs `after()`. `outcome` says how the server
- * saw the replacement stream: "cancelled" if the client reset it, "leaked" if nothing happened
- * for 300 ms.
+ * by the test: `release(after)` resolves it and then runs `after()`. `replayed` settles once the
+ * call has written its REQUEST on the replacement stream, so the stream is attached to the call.
+ * `outcome` says how the server saw the replacement stream: "cancelled" if the client reset it,
+ * "leaked" if nothing happened for LeakMs.
  */
 function replayHarness() {
   const prepared = deferred();
+  const replayed = deferred();
   const outcome = deferred();
   let served = 0;
   const transport = fakeTransport(async (stream) => {
@@ -39,15 +47,18 @@ function replayHarness() {
       await stream.refuse();
       return;
     }
-    const timer = sleep(300).then(() => "leaked");
+    replayed.resolve();
+    const leak = deferred();
+    const timer = setTimeout(() => leak.resolve("leaked"), LeakMs);
     const requestSideReset = stream.readFrame().then(
       () => "cancelled",
       () => "cancelled",
     );
     const responseSideCancelled = stream.responseCancelled.then((cancelled) =>
-      cancelled ? "cancelled" : timer,
+      cancelled ? "cancelled" : leak.promise,
     );
-    outcome.resolve(await Promise.race([timer, requestSideReset, responseSideCancelled]));
+    outcome.resolve(await Promise.race([leak.promise, requestSideReset, responseSideCancelled]));
+    clearTimeout(timer);
   });
   transport.compression = plain;
   const create = transport.createBidirectionalStream.bind(transport);
@@ -67,7 +78,12 @@ function replayHarness() {
     });
     return gate.promise;
   };
-  return { transport, prepared: prepared.promise, outcome: outcome.promise };
+  return {
+    transport,
+    prepared: prepared.promise,
+    replayed: replayed.promise,
+    outcome: outcome.promise,
+  };
 }
 
 /** Starts a refused optimistic call, which is about to open its replacement stream. */
@@ -92,10 +108,10 @@ test("replay: an abort while the replacement stream is opening resets it", async
 });
 
 test("replay: an abort after the replacement stream is attached resets it", async () => {
-  const { prepared, outcome, controller, echo } = await startReplay();
+  const { prepared, replayed, outcome, controller, echo } = await startReplay();
   const release = await prepared;
   release();
-  await sleep(50);
+  await replayed;
   controller.abort();
   await echo;
   assert.equal(await outcome, "cancelled");
@@ -120,22 +136,44 @@ function serveUnary(ending) {
     await stream.readMessage(EchoRequestSchema);
     await stream.writeMessage(EchoResponseSchema, { message: "ok" });
     await stream.writeStatus(Code.Ok);
-    served.resolve(stream);
     if (ending === "fin") {
       await stream.finish();
     }
+    served.resolve(stream);
   });
   return { echo: createClient(Echo, transport), served: served.promise };
 }
 
-/** Whether the client cancelled its read side of `stream` within `ms`. */
-async function clientReleased(stream, ms) {
-  let released = false;
-  stream.responseCancelled.then((cancelled) => {
-    released = cancelled;
+/** Whether the client has cancelled its read side of `stream`, once the event loop settled. */
+async function released(stream) {
+  let cancelled = false;
+  stream.responseCancelled.then((value) => {
+    cancelled = value;
   });
-  await sleep(ms);
-  return released;
+  await turn();
+  return cancelled;
+}
+
+/** Whether the client cancels its read side of `stream`, waiting for it no longer than LeakMs. */
+async function releases(stream) {
+  let timer;
+  const leaked = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), LeakMs);
+  });
+  try {
+    return await Promise.race([stream.responseCancelled, leaked]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Puts the call's deadline in the test's hands: timers only fire when the test ticks, so that a
+ * starved machine cannot let a deadline pass before the test looks.
+ */
+function holdTimers(t) {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  return (ms) => t.mock.timers.tick(ms);
 }
 
 test("after STATUS: a known frame past it resets the response side", async () => {
@@ -144,34 +182,42 @@ test("after STATUS: a known frame past it resets the response side", async () =>
   assert.equal(response.message, "ok");
   const stream = await served;
   await stream.writeHeaders({});
-  assert.equal(await clientReleased(stream, 100), true);
+  assert.equal(await releases(stream), true);
 });
 
-test("after STATUS: a server that never ends the stream is released at the deadline", async () => {
+test("after STATUS: a server that never ends the stream is released at the deadline", async (t) => {
+  const tick = holdTimers(t);
   const { echo, served } = serveUnary("open");
   const response = await echo.unary({ message: "hi" }, { timeoutMs: 100 });
   assert.equal(response.message, "ok");
   const stream = await served;
   // The outcome was reported at STATUS, and the deadline has not passed yet.
-  assert.equal(await clientReleased(stream, 20), false);
-  assert.equal(await clientReleased(stream, 300), true);
+  assert.equal(await released(stream), false);
+  tick(100);
+  assert.equal(await released(stream), true);
 });
 
-test("after STATUS: a server that never ends the stream is held while there is time left", async () => {
+test("after STATUS: a server that never ends the stream is held while there is time left", async (t) => {
+  const tick = holdTimers(t);
   const { echo, served } = serveUnary("open");
   await echo.unary({ message: "hi" }, { timeoutMs: 60_000 });
   const stream = await served;
-  assert.equal(await clientReleased(stream, 100), false);
+  tick(30_000);
+  assert.equal(await released(stream), false);
   // Ending the stream ends the wait, and with it the deadline watch.
   await stream.reset();
 });
 
-test("after STATUS: a stream the server ended is not cancelled at the deadline", async () => {
+test("after STATUS: a stream the server ended is not cancelled at the deadline", async (t) => {
+  const tick = holdTimers(t);
   const { echo, served } = serveUnary("fin");
   await echo.unary({ message: "hi" }, { timeoutMs: 50 });
   const stream = await served;
-  await sleep(150);
-  assert.equal(await clientReleased(stream, 0), false);
+  // The server has ended the stream; let the client read that end, which stops its deadline
+  // watch, before the deadline passes.
+  await turn();
+  tick(50);
+  assert.equal(await released(stream), false);
 });
 
 test("after STATUS: close() releases a server that never ends the stream", async () => {
@@ -189,16 +235,18 @@ test("after STATUS: close() releases a server that never ends the stream", async
   }
   assert.deepEqual(received, ["a"]);
   const stream = await served.promise;
-  assert.equal(await clientReleased(stream, 50), false, "no deadline: held until close()");
+  assert.equal(await released(stream), false, "no deadline: held until close()");
   await call.close();
-  assert.equal(await clientReleased(stream, 100), true);
+  assert.equal(await releases(stream), true);
   assert.equal((await call.status).code, Code.Ok, "the outcome does not change");
 });
 
-test("after STATUS: a stream that fails during the wait raises no unhandled rejection", async () => {
+test("after STATUS: a stream that fails during the wait raises no unhandled rejection", async (t) => {
+  const tick = holdTimers(t);
   const { echo, served } = serveUnary("open");
   await echo.unary({ message: "hi" }, { timeoutMs: 100 });
   const stream = await served;
   await stream.reset();
-  await sleep(150);
+  tick(100);
+  await turn();
 });
