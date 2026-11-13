@@ -113,7 +113,7 @@ mod tests {
 
     use super::{Closed, channel};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_waiting_receiver_wakes_for_a_new_value() {
         let (sender, mut receiver) = channel(None);
         let waiting = tokio::spawn(async move {
@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(waiting.await.unwrap(), Some(7));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_value_looked_at_is_not_a_change() {
         let (sender, mut receiver) = channel(0);
         sender.send(1);
@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(receiver.borrow_and_update(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn several_values_sent_before_the_wait_are_one_change() {
         let (sender, mut receiver) = channel(0);
         sender.send(1);
@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(receiver.changed().await, Err(Closed));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dropping_the_sender_wakes_a_waiting_receiver() {
         let (sender, mut receiver) = channel(0);
         let waiting = tokio::spawn(async move { receiver.changed().await });

@@ -1154,7 +1154,7 @@ mod tests {
         assert_eq!(io.stops.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn response_commit_lets_open_request_finish_without_stop() {
         let mut io = test_io(None);
         let (_body, pump) = start_request_pump(io.reader, streaming(), 1024);
@@ -1411,7 +1411,7 @@ mod tests {
         (end, io.writer, io.stops)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_inline_unary_end_reports_nothing_after_a_clean_fin() {
         let mut io = test_io(None);
         io.writer.write_all(&grease(3)).await.unwrap();
@@ -1472,7 +1472,7 @@ mod tests {
         let _ = pump.settle(RequestPumpSettle::ResponseStopped).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn committing_discards_an_arrived_request_end_at_once() {
         let mut io = test_io(None);
         io.writer.write_all(&grease(3)).await.unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
         assert_eq!(stops.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn committing_hands_a_request_still_open_to_the_bounded_drain() {
         let (end, _writer, stops) = unary_end(test_io(None));
 

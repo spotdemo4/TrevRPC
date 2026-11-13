@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(sender.try_send(2, 1), Err(TrySendError::Full(2)));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_waiting_send_completes_when_the_receiver_takes_a_value() {
         let (sender, mut receiver) = channel(LIMITS);
         for value in 0..3 {
@@ -378,7 +378,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dropping_the_receiver_fails_senders() {
         let (sender, receiver) = channel::<u8>(LIMITS);
         for value in 0..3 {
@@ -397,7 +397,7 @@ mod tests {
         assert!(sender.reserve().await.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_waiting_receiver_wakes_for_a_value_and_for_the_end() {
         let (sender, mut receiver) = channel(LIMITS);
         let reading = tokio::spawn(async move {
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(reading.await.unwrap(), (Some(7), None));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_permit_waits_for_room_and_queues_a_value() {
         let (sender, mut receiver) = channel(LIMITS);
         for value in 0..3 {
