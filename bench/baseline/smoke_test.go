@@ -134,6 +134,19 @@ func (s *testServer) stop(t *testing.T) {
 // tests.
 const benchStarvedRetries = 2
 
+// benchSlots bounds how many benches run at once, whatever -parallel allows.
+// The smoke tests run their subtests in parallel, and each bench keeps its
+// workers busy back to back, so a few at once already fill the machine. With
+// dozens at once on a many-core machine under load, and more so under the
+// race detector, the goroutines that time each window wake late: windows
+// complete no operation and the wire bytes are counted over a shorter span
+// than the operations. Four held up in race runs on a machine at a load
+// average of 60 to 100, where eight still ran a window again. The
+// trevrpc-interop bench tests (trevrpc-go/cmd/trevrpc-interop/bench_test.go)
+// have the same bound for the same reason, duplicated like benchPayload
+// because this module does not depend on trevrpc-go; change both together.
+var benchSlots = make(chan struct{}, 4)
+
 // benchLine runs the bench subcommand and returns its result line, failing the
 // test if it does not succeed. A run in which no operation completed inside
 // the measured window and none failed runs again up to benchStarvedRetries
@@ -146,7 +159,9 @@ func benchLine(t *testing.T, args ...string) []byte {
 	t.Helper()
 	for attempt := 0; ; attempt++ {
 		var out bytes.Buffer
+		benchSlots <- struct{}{}
 		err := run(t.Context(), args, nil, &out)
+		<-benchSlots
 		if err == nil {
 			return out.Bytes()
 		}
@@ -158,24 +173,29 @@ func benchLine(t *testing.T, args ...string) []byte {
 	}
 }
 
+// TestBenchScenarios runs every scenario over each transport and checks its
+// result line. TestBenchMetadataSizeAddsOnePadEntryToEveryCall covers
+// --metadata-size.
+//
+// The smoke tests run their subtests in parallel, each bench on a connection
+// of its own, since a bench spends most of its time waiting out a fixed
+// window. benchSlots bounds how many benches run at once, and a window that
+// still completes no operation runs again in benchLine.
 func TestBenchScenarios(t *testing.T) {
 	srv := startServer(t)
 	for _, transport := range transports {
 		for _, scenario := range scenarios {
 			for _, concurrency := range []int{1, 4} {
-				for _, metadataSize := range []int{0, 300} {
-					name := transport + "/" + scenario + "/c" + strconv.Itoa(concurrency) + "/md" + strconv.Itoa(metadataSize)
-					t.Run(name, func(t *testing.T) {
-						args := []string{
-							"bench", "--addr", srv.addrs[transport], "--tcp-addr", "ignored:1", "--ca", srv.ca,
-							"--server-name", "localhost", "--transport", transport, "--scenario", scenario,
-							"--size", "100", "--metadata-size", strconv.Itoa(metadataSize),
-							"--concurrency", strconv.Itoa(concurrency),
-							"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
-						}
-						checkResult(t, benchLine(t, args...), transport, scenario, concurrency, metadataSize)
-					})
-				}
+				t.Run(transport+"/"+scenario+"/c"+strconv.Itoa(concurrency), func(t *testing.T) {
+					t.Parallel()
+					args := []string{
+						"bench", "--addr", srv.addrs[transport], "--tcp-addr", "ignored:1", "--ca", srv.ca,
+						"--server-name", "localhost", "--transport", transport, "--scenario", scenario,
+						"--size", "100", "--concurrency", strconv.Itoa(concurrency),
+						"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
+					}
+					checkResult(t, benchLine(t, args...), transport, scenario, concurrency, 0)
+				})
 			}
 		}
 	}
@@ -340,14 +360,16 @@ func TestBenchLineRunsAStarvedBenchAgain(t *testing.T) {
 	})
 }
 
-// TestBenchMetadataSizeAddsOnePadEntryToEveryCall checks what the smoke test
-// cannot see: that every call carries exactly one bench-pad entry of the
-// asked size, and none without --metadata-size.
+// TestBenchMetadataSizeAddsOnePadEntryToEveryCall checks that every call
+// carries exactly one bench-pad entry of the asked size, and none without
+// --metadata-size, and that the result line echoes the size. Each subtest
+// has a server of its own and runs in parallel, as in TestBenchScenarios.
 func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 	for _, transport := range transports {
 		for _, scenario := range scenarios {
 			for _, size := range []int{0, 1, 4096} {
 				t.Run(transport+"/"+scenario+"/md"+strconv.Itoa(size), func(t *testing.T) {
+					t.Parallel()
 					testPadEntries(t, transport, scenario, size)
 				})
 			}
@@ -356,14 +378,16 @@ func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 }
 
 func testPadEntries(t *testing.T, transport, scenario string, size int) {
+	const concurrency = 2
 	counter := &padCounter{size: size}
 	addr, ca := startPadCountingServer(t, transport, counter)
+	// The size and messages are the ones checkResult expects.
 	args := []string{
 		"bench", "--addr", addr, "--ca", ca, "--transport", transport, "--scenario", scenario,
-		"--size", "10", "--metadata-size", strconv.Itoa(size), "--concurrency", "2",
-		"--duration", "0.2", "--warmup", "0.05", "--messages", "3",
+		"--size", "100", "--metadata-size", strconv.Itoa(size), "--concurrency", strconv.Itoa(concurrency),
+		"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
 	}
-	benchLine(t, args...)
+	checkResult(t, benchLine(t, args...), transport, scenario, concurrency, size)
 	calls, padded := counter.calls.Load(), counter.padded.Load()
 	if calls == 0 {
 		t.Fatal("the server saw no calls")

@@ -60,6 +60,19 @@ func startBenchServer(t *testing.T, extra ...string) (certFile string, ports lis
 // tests.
 const benchStarvedRetries = 2
 
+// benchSlots bounds how many benches run at once, whatever -parallel allows.
+// The bench tests run their subtests in parallel, and each bench keeps its
+// workers busy back to back, so a few at once already fill the machine. With
+// dozens at once on a many-core machine under load, and more so under the
+// race detector, the goroutines that time each window wake late: windows
+// complete no operation, paced echoes miss their deadline and the wire bytes
+// are counted over a shorter span than the operations. Four held up in race
+// runs on a machine at a load average of 60 to 100, where eight still ran a
+// window again. The baseline smoke tests (bench/baseline/smoke_test.go) have
+// the same bound for the same reason, duplicated because that module does not
+// depend on trevrpc-go; change both together.
+var benchSlots = make(chan struct{}, 4)
+
 // benchLine runs the bench subcommand through benchRetryingStarved and returns
 // its result line, failing the test if it does not succeed.
 func benchLine(t *testing.T, args ...string) string {
@@ -82,7 +95,9 @@ func benchRetryingStarved(t *testing.T, args []string) (string, error) {
 	t.Helper()
 	for attempt := 0; ; attempt++ {
 		var stdout, stderr bytes.Buffer
+		benchSlots <- struct{}{}
 		code := run(args, strings.NewReader(""), &stdout, &stderr)
+		<-benchSlots
 		if code == 0 {
 			return stdout.String(), nil
 		}
@@ -177,6 +192,16 @@ func TestBenchRetryingStarvedRunsOnlyAStarvedBenchAgain(t *testing.T) {
 	}
 }
 
+// TestBenchScenariosReportTheContractFields runs every scenario over each
+// transport and checks its result line against the contract.
+//
+// The bench tests run their subtests in parallel, each bench on channels of
+// its own to the test's server, since a bench spends most of its time waiting
+// out a fixed window. benchSlots bounds how many benches run at once, and a
+// window that still completes no operation runs again in benchLine. The
+// subtests only read benchScenarios, and the tests that swap its entries never
+// run alongside them: those are top-level tests without t.Parallel, which run
+// one after another and restore the map in a cleanup before the next starts.
 func TestBenchScenariosReportTheContractFields(t *testing.T) {
 	certFile, ports := startBenchServer(t)
 	const size, messages = 100, 5
@@ -197,6 +222,7 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 					continue
 				}
 				t.Run(fmt.Sprintf("%s/%s/md%d", tc.transport, scenario, metadataSize), func(t *testing.T) {
+					t.Parallel()
 					args := []string{
 						"bench",
 						"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -289,6 +315,7 @@ func TestBenchValidationScenariosCallEveryRequestType(t *testing.T) {
 	for _, scenario := range []string{"validation-unary", "validation-client-stream"} {
 		for _, validation := range []string{"none", "standard", "cel"} {
 			t.Run(scenario+"/"+validation, func(t *testing.T) {
+				t.Parallel()
 				args := []string{
 					"bench",
 					"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -321,6 +348,7 @@ func TestBenchSendsConnectionMetadata(t *testing.T) {
 	certFile, ports := startBenchServer(t)
 	for _, transport := range []string{"quic", "tcp"} {
 		t.Run(transport, func(t *testing.T) {
+			t.Parallel()
 			args := []string{
 				"bench",
 				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -352,6 +380,7 @@ func TestBenchSpreadsWorkersOverConnections(t *testing.T) {
 	certFile, ports := startBenchServer(t)
 	for _, transport := range []string{"quic", "tcp"} {
 		t.Run(transport, func(t *testing.T) {
+			t.Parallel()
 			args := []string{
 				"bench",
 				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),

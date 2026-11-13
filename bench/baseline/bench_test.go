@@ -46,19 +46,34 @@ func TestRunWorkerKeepsTheFirstErrorInTheWindow(t *testing.T) {
 }
 
 func TestRunWorkerIgnoresErrorsDuringWarmup(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
 	warmup, measured := errors.New("warmup"), errors.New("measured")
 	// The first call starts during the warmup and returns once the window has
-	// begun, so the second starts inside it. The warmup leaves the first call
-	// ample time to start.
-	start := time.Now().Add(time.Second)
-	w := &scriptedWorker{calls: []func() error{
-		fail(warmup, func() { time.Sleep(time.Until(start)) }),
-		fail(measured, cancel),
-	}}
-	result := runWorker(ctx, w, start, start.Add(time.Hour))
-	if result.errors != 1 || !errors.Is(result.firstError, measured) {
-		t.Fatalf("errors = %d, firstError = %v, want 1 and %v", result.errors, result.firstError, measured)
+	// begun, so the second starts inside it. A first call that only got to run
+	// once the window had begun did not start during the warmup, so that
+	// attempt proves nothing and runs again with a new window.
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithCancel(t.Context())
+		start := time.Now().Add(100 * time.Millisecond)
+		var startedInWarmup bool
+		w := &scriptedWorker{calls: []func() error{
+			fail(warmup, func() {
+				startedInWarmup = time.Now().Before(start)
+				time.Sleep(time.Until(start))
+			}),
+			fail(measured, cancel),
+		}}
+		result := runWorker(ctx, w, start, start.Add(time.Hour))
+		cancel()
+		if !startedInWarmup {
+			if attempt == 10 {
+				t.Fatal("the first call never started during the warmup")
+			}
+			continue
+		}
+		if result.errors != 1 || !errors.Is(result.firstError, measured) {
+			t.Fatalf("errors = %d, firstError = %v, want 1 and %v", result.errors, result.firstError, measured)
+		}
+		return
 	}
 }
 
