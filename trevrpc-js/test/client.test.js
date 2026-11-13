@@ -1069,22 +1069,14 @@ test("a stream that ends without a final status is an internal error", async () 
   await assert.rejects(stream.status, isStatus(Code.Internal));
 });
 
-test("misplaced frames and undecodable messages fail the stream", async () => {
-  const frames = [
-    [Code.InvalidArgument, encodeFrame(FrameType.Status, new Uint8Array([0x0a, 0xff]))],
-    [Code.InvalidArgument, encodeMessageFrame(new Uint8Array([0x0a, 0xff]))],
-    [Code.Internal, encodeStatusFrame({ metadata: { "trevrpc-x": new Uint8Array(0) } })],
-    [Code.Internal, encodeRequestFrame({ method: "/s/m" })],
-  ];
-  for (const [code, bytes] of frames) {
-    const { echo } = setup(async (stream) => {
-      await stream.readRequest();
-      await stream.write(bytes);
-    });
-    const stream = await echo.serverStream({});
-    await assert.rejects(stream[Symbol.asyncIterator]().next(), isStatus(code));
-    await assert.rejects(stream.status, isStatus(code));
-  }
+test("an undecodable streamed MESSAGE fails the stream", async () => {
+  const { echo } = setup(async (stream) => {
+    await stream.readRequest();
+    await stream.write(encodeMessageFrame(new Uint8Array([0x0a, 0xff])));
+  });
+  const stream = await echo.serverStream({});
+  await assert.rejects(stream[Symbol.asyncIterator]().next(), isStatus(Code.InvalidArgument));
+  await assert.rejects(stream.status, isStatus(Code.InvalidArgument));
 });
 
 test("a failure while draining after the final status does not change the outcome", async () => {

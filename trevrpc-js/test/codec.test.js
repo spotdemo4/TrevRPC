@@ -6,14 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  ScalarType,
-  create,
-  fromBinary,
-  mergeFromBinary,
-  protoInt64,
-  toBinary,
-} from "@bufbuild/protobuf";
+import { ScalarType, create, fromBinary, mergeFromBinary, toBinary } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 
 import * as editionsPb from "../build/test/gen/codec_editions_pb.js";
@@ -441,6 +434,9 @@ test("the recursion limit is protobuf-es's", () => {
 test("codecs reject the truncated inputs that fromBinary rejects", () => {
   for (const codec of Codecs) {
     const { schema } = codec;
+    if (codec === gen.ScalarsCodec) {
+      assertSame(decodeBare(codec, new Uint8Array(0)), create(schema), `${schema.typeName}: empty`);
+    }
     for (let i = 0; i < 20; i++) {
       const bytes = toBinary(schema, randomMessage(schema, 0));
       // Every prefix of short messages; of long ones, a sample and the last few.
@@ -705,14 +701,6 @@ test("encode handles messages larger than the writer keeps", () => {
   const small = create(pb.ScalarsSchema, { s: "small", i32: -1 });
   assert.deepEqual(gen.ScalarsCodec.encode(small), toBinary(pb.ScalarsSchema, small));
   assert.deepEqual(gen.ScalarsCodec.encode(large), toBinary(pb.ScalarsSchema, large));
-});
-
-test("decoded messages have the layout of create()", () => {
-  const empty = decodeBare(gen.ScalarsCodec, new Uint8Array(0));
-  assert.deepEqual(Object.keys(empty), Object.keys(create(pb.ScalarsSchema)));
-  assert.equal(Object.getPrototypeOf(empty), Object.prototype);
-  assert.equal(protoInt64.zero, empty.i64);
-  assert.equal(empty.i64String, "0");
 });
 
 test("services have the codecs of their generated request and response types", () => {

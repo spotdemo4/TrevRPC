@@ -152,6 +152,18 @@ test("wire encodings match the shared golden vectors and decode back", async () 
       assert.equal(hex(encodeWireMessage(codec, decoded)), hex(payload), `${name} round trip`);
     }
   }
+  assert.equal(
+    hex(encodeStatusFrame({ code: Code.Unavailable, message: "down" })),
+    vectors.get("status.unavailable.frame"),
+  );
+  assert.equal(
+    hex(encodeHeadersFrame({ metadata: { "x-a": bytes("1") } })),
+    vectors.get("headers.metadata.frame"),
+  );
+  assert.equal(
+    hex(encodeAnswerFrame({ connectionMetadata: 1 })),
+    vectors.get("answer.connection_metadata.frame"),
+  );
 });
 
 test("golden payloads decode to their logical fields", async () => {
@@ -294,22 +306,6 @@ test("unknown request fields are ignored when decoding", () => {
   const decoded = decodeWireMessage(RpcRequest, payload);
   assert.equal(decoded.method, "/svc/m");
   assert.equal(hex(encodeWireMessage(RpcRequest, decoded)), "0a062f7376632f6d");
-});
-
-test("status, headers and answer encoders match the golden frames", async () => {
-  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
-  assert.equal(
-    hex(encodeStatusFrame({ code: Code.Unavailable, message: "down" })),
-    vectors.get("status.unavailable.frame"),
-  );
-  assert.equal(
-    hex(encodeHeadersFrame({ metadata: { "x-a": bytes("1") } })),
-    vectors.get("headers.metadata.frame"),
-  );
-  assert.equal(
-    hex(encodeAnswerFrame({ connectionMetadata: 1 })),
-    vectors.get("answer.connection_metadata.frame"),
-  );
 });
 
 test("encoders enforce the frame size limit inclusively", () => {

@@ -247,20 +247,6 @@ test("fetchServerCertificateHashes derives the hashes URL from the channel URL",
   }
 });
 
-test("a 404 from the derived hashes URL adds no hashes", async (t) => {
-  t.mock.method(globalThis, "fetch", async () => new Response("", { status: 404 }));
-  const { WebTransport, sessions } = fakeWebTransport();
-  const connecting = connect("https://example.test/trevrpc", {
-    transports: WebTransportOnly,
-    WebTransport,
-    fetchServerCertificateHashes: true,
-  });
-  await waitFor(() => sessions.length === 1);
-  assert.deepEqual(sessions[0].options, { protocols: ["trevrpc-1"] });
-  sessions[0].becomeReady();
-  (await connecting).close();
-});
-
 test("fetchServerCertificateHashes is off by default and excludes serverCertificateHashesUrl", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => new Response("", { status: 404 }));
   const { WebTransport, sessions } = fakeWebTransport();

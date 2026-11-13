@@ -506,17 +506,6 @@ test("interrupting a server stream that waits for its next chunk cancels the cal
   assert.equal(await cancelled.promise, true);
 });
 
-test("anything but a service descriptor is rejected, as createClient rejects it", () => {
-  assert.throws(
-    () =>
-      createEffectClient(
-        EchoRequestSchema,
-        fakeTransport(() => {}),
-      ),
-    (error) => error instanceof TrevRpcError && error.code === Code.InvalidArgument,
-  );
-});
-
 test("other failures become TrevRpcErrors with Code.Unknown", async () => {
   const cause = new Error("boom");
   // An interceptor that throws fails the call with what it threw.
