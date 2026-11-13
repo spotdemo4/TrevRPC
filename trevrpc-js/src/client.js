@@ -382,11 +382,14 @@ export class BidirectionalStreamingCall {
    * goes on.
    */
   async send(message) {
+    // Each message goes out in a MESSAGE frame of its own, which can be written in front of it,
+    // unless the method sends request messages as datagrams, which copy them.
     const body = marshalMessage(
       this.#rpc.requestType,
       message,
       this.#rpc.validate,
       this.#rpc.requestCodec,
+      !this.#rpc.datagrams?.send,
     );
     try {
       await this.#call.sendMessage(body);

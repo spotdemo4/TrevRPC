@@ -1,6 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 
 import { byteView } from "./bytes.js";
+import { headroomOf } from "./headroom.js";
 import { internal, invalidArgument, resourceExhausted, unavailable } from "./status.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
 import { RpcAnswer, RpcHeaders, RpcRequest, RpcStatus } from "./wire.js";
@@ -24,16 +25,24 @@ const EmptyBytes = new Uint8Array(0);
 /**
  * Encodes a protobuf message body: `message` is a message of `schema` (a protobuf-es message
  * descriptor) or the init object `create()` takes. `codec`, the generated codec of `schema` if
- * there is one, encodes it; protobuf-es does otherwise, to the same bytes. A message that cannot
- * be encoded fails with InvalidArgument. Once it is encoded, `validate`, if given, checks it and
+ * there is one, encodes it; protobuf-es does otherwise, to the same bytes. With `headroom`, which
+ * only a body that goes out in a MESSAGE frame of its own should ask for, a codec leaves room in
+ * front of a large body for encodeFrame() to write the header in place. A message that cannot be
+ * encoded fails with InvalidArgument. Once it is encoded, `validate`, if given, checks it and
  * throws to reject it, so that it sees only well-formed messages.
  */
-export function marshalMessage(schema, message, validate, codec) {
+export function marshalMessage(schema, message, validate, codec, headroom = false) {
   let value;
   let body;
   try {
     value = create(schema, message);
-    body = codec === undefined ? toBinary(schema, value) : codec.encode(value);
+    if (codec === undefined) {
+      body = toBinary(schema, value);
+    } else if (headroom && typeof codec.encodeBody === "function") {
+      body = codec.encodeBody(value);
+    } else {
+      body = codec.encode(value);
+    }
   } catch (error) {
     throw invalidArgument(
       `failed to encode protobuf message: ${error?.message ?? String(error)}`,
@@ -84,10 +93,23 @@ export function decodeWireMessage(codec, payload) {
   }
 }
 
-/** Encodes one frame carrying an already-encoded payload. */
+/**
+ * Encodes one frame carrying an already-encoded payload. The MESSAGE frame of a body that a
+ * generated codec encoded with room in front (see headroom.js) gets its header written there, and
+ * is a view of the same buffer; every other frame copies its payload into a new buffer.
+ */
 export function encodeFrame(type, payload, maxFrameSize = DefaultMaxFrameSize) {
-  checkFrameLength(payload.byteLength, maxFrameSize);
-  const frame = new Uint8Array(frameSize(type, payload.byteLength));
+  const length = payload.byteLength;
+  checkFrameLength(length, maxFrameSize);
+  const header = varintLength(type) + varintLength(length);
+  // Only MESSAGE frames, so that framing a body again, as a resent message is, writes the very
+  // header a frame of it still in flight has.
+  if (type === FrameType.Message && header <= headroomOf(payload)) {
+    const frame = new Uint8Array(payload.buffer, payload.byteOffset - header, header + length);
+    writeVarint(frame, writeVarint(frame, 0, type), length);
+    return frame;
+  }
+  const frame = new Uint8Array(header + length);
   writeFrame(frame, 0, type, payload);
   return frame;
 }

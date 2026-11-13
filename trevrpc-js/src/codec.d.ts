@@ -24,6 +24,8 @@ export interface MessageCodec<Desc extends DescMessage = DescMessage> {
   encode(message: MessageShape<Desc>): Uint8Array<ArrayBuffer>;
   /** Decodes a message as `fromBinary(schema, bytes)` does. */
   decode(bytes: Uint8Array): MessageShape<Desc>;
+  /** Encodes a message for trevrpc-js's framing, which writes its frame header in front of it. */
+  encodeBody?(message: MessageShape<Desc>): Uint8Array;
   /** Reads a message; for generated code only. */
   readonly read: (
     reader: Reader,
@@ -113,7 +115,7 @@ export class Reader {
  */
 export class Writer {
   constructor(size?: number);
-  finish(): Uint8Array<ArrayBuffer>;
+  finish(headroom?: boolean): Uint8Array<ArrayBuffer>;
   byte(b: number): void;
   varint(v: number): void;
   uint32(v: unknown): void;

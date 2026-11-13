@@ -21,9 +21,12 @@ import * as pb from "../build/test/gen/codec_pb.js";
 import * as gen from "../build/test/gen/codec_trevrpc.js";
 import * as interopPb from "../build/test/gen/interop_pb.js";
 import * as interopGen from "../build/test/gen/interop_trevrpc.js";
+import * as methodsPb from "../build/test/gen/methods_pb.js";
+import * as methodsGen from "../build/test/gen/methods_trevrpc.js";
 import { createClient } from "../src/client.js";
 import { Reader, Writer, defineCodec } from "../src/codec.js";
-import { encodeMessageFrame } from "../src/framing.js";
+import { FrameType, encodeFrame, encodeMessageFrame, marshalMessage } from "../src/framing.js";
+import { FrameHeadroom, HeadroomMin } from "../src/headroom.js";
 import { Code } from "../src/status.js";
 import { fakeTransport } from "./support.js";
 
@@ -810,4 +813,124 @@ test("createClient rejects codecs that aren't message codecs", () => {
       what,
     );
   }
+});
+
+test("frames of large codec-encoded messages are written in place, with the bytes of a copy", () => {
+  // Around the size from which a body gets headroom (its encoding adds 5 bytes to the string).
+  for (const length of [HeadroomMin - 6, HeadroomMin - 5, 2000, 70_000]) {
+    const message = create(pb.ScalarsSchema, { s: "x".repeat(length), i32: 7 });
+    const body = marshalMessage(pb.ScalarsSchema, message, undefined, gen.ScalarsCodec, true);
+    // A body framed with others, as a unary call's request is, gets no headroom.
+    assert.equal(
+      marshalMessage(pb.ScalarsSchema, message, undefined, gen.ScalarsCodec).byteOffset,
+      0,
+    );
+    if (body.length < HeadroomMin) {
+      assert.equal(body.byteOffset, 0);
+      assert.deepEqual(body, toBinary(pb.ScalarsSchema, message));
+      continue;
+    }
+    assert.equal(body.byteOffset, FrameHeadroom);
+    const copied = encodeMessageFrame(body.slice());
+    const frame = encodeMessageFrame(body);
+    assert.equal(frame.buffer, body.buffer, "no copy");
+    assert.deepEqual(frame, copied);
+    // Framing the same body again, as a resent message is, gives the same frame.
+    assert.deepEqual(encodeMessageFrame(body), copied);
+    assert.deepEqual(body, toBinary(pb.ScalarsSchema, message));
+  }
+});
+
+test("other payloads are copied into a new frame, and nothing outside it is written", () => {
+  const message = create(pb.ScalarsSchema, { s: "x".repeat(HeadroomMin) });
+  const body = marshalMessage(pb.ScalarsSchema, message, undefined, gen.ScalarsCodec, true);
+  assert.equal(body.byteOffset, FrameHeadroom);
+  const expected = encodeMessageFrame(body.slice());
+  // Room in front that the codec runtime didn't make, a part of a body, and a protobuf-es body.
+  const foreign = new Uint8Array(FrameHeadroom + body.length).fill(0xee);
+  foreign.set(body, FrameHeadroom);
+  const view = foreign.subarray(FrameHeadroom);
+  const shifted = new Uint8Array(body.buffer, 0, body.length);
+  for (const payload of [view, body.subarray(1), body.subarray(0, body.length - 1), shifted]) {
+    const frame = encodeMessageFrame(payload);
+    assert.notEqual(frame.buffer, payload.buffer);
+    assert.deepEqual(frame, encodeMessageFrame(payload.slice()));
+  }
+  assert.ok(foreign.subarray(0, FrameHeadroom).every((b) => b === 0xee));
+  const plain = marshalMessage(pb.ScalarsSchema, message);
+  assert.notEqual(encodeMessageFrame(plain).buffer, plain.buffer);
+  // Frames of any other type copy the body, so its header in front is a MESSAGE frame's.
+  for (const type of [FrameType.ZstdMessage, FrameType.Request, 64]) {
+    assert.notEqual(encodeFrame(type, body).buffer, body.buffer);
+  }
+  assert.deepEqual(encodeMessageFrame(body), expected);
+});
+
+test("client-streaming calls send codec-encoded messages in place", async () => {
+  const received = [];
+  const transport = fakeTransport(async (stream) => {
+    await stream.readRequest();
+    for (let message; (message = await stream.readMessage(interopPb.EchoRequestSchema)) !== null;) {
+      received.push(message.message);
+    }
+    await stream.writeMessage(interopPb.EchoResponseSchema, {
+      message: received.join(""),
+      index: 3,
+    });
+    await stream.writeStatus();
+    await stream.finish();
+  });
+  const echo = createClient(interopPb.Echo, transport, { codecs: interopGen.EchoCodecs });
+  const call = await echo.clientStream();
+  for (const message of ["a", "é".repeat(100), "x".repeat(5000)]) {
+    await call.send({ message });
+  }
+  const response = await call.closeAndRecv();
+  assert.deepEqual(received, ["a", "é".repeat(100), "x".repeat(5000)]);
+  assert.equal(response.index, 3);
+  await transport.settled();
+});
+
+/** `codec` with counts of its encode() and encodeBody() calls. */
+function countingEncodes(codec) {
+  const counts = { encode: 0, encodeBody: 0 };
+  return {
+    counts,
+    codec: {
+      schema: codec.schema,
+      decode: (bytes) => codec.decode(bytes),
+      encode: (message) => (counts.encode++, codec.encode(message)),
+      encodeBody: (message) => (counts.encodeBody++, codec.encodeBody(message)),
+    },
+  };
+}
+
+test("only streamed request messages that go out in frames of their own get headroom", async () => {
+  const transport = fakeTransport(async (stream) => {
+    await stream.readRequest();
+    while ((await stream.readFrame()) !== null) {
+      // Every request message, whatever its frame.
+    }
+    await stream.writeMessage(interopPb.EchoResponseSchema, {});
+    await stream.writeStatus();
+    await stream.finish();
+  });
+  const large = "x".repeat(2 * HeadroomMin);
+  const echo = countingEncodes(interopGen.EchoRequestCodec);
+  const echoClient = createClient(interopPb.Echo, transport, { codecs: [echo.codec] });
+  // A unary request goes out in one buffer with the REQUEST frame, which copies it anyway.
+  await echoClient.unary({ message: large });
+  assert.deepEqual(echo.counts, { encode: 1, encodeBody: 0 });
+  const upload = await echoClient.clientStream();
+  await upload.send({ message: large });
+  await upload.closeAndRecv();
+  assert.deepEqual(echo.counts, { encode: 1, encodeBody: 1 });
+  // Requests that may travel as datagrams are copied into them.
+  const plain = countingEncodes(methodsGen.PlainCodec);
+  const unreliable = createClient(methodsPb.Unreliable, transport, { codecs: [plain.codec] });
+  const datagrams = await unreliable.client();
+  await datagrams.send({});
+  await datagrams.closeAndRecv().catch(() => {});
+  assert.deepEqual(plain.counts, { encode: 1, encodeBody: 0 });
+  await transport.settled();
 });

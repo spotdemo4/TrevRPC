@@ -14,6 +14,8 @@
 // which fromBinary() accepts: decode() then returns fromBinary()'s result, after decoding twice.
 import { create, fromBinary, mergeFromBinary, protoInt64, toBinary } from "@bufbuild/protobuf";
 
+import { HeadroomMin, allocateWithHeadroom } from "./headroom.js";
+
 /**
  * Strings up to this many bytes are decoded in JS when they are ASCII, instead of calling
  * TextDecoder, and strings up to this many UTF-16 units are encoded in JS instead of calling
@@ -60,10 +62,22 @@ class Codec {
    * message that create() made, or that a codec or fromBinary() decoded.
    */
   encode(message) {
+    return this.#encode(message, false);
+  }
+
+  /**
+   * Encodes `message` like encode(), into a buffer with room in front for the frame header, so
+   * that framing need not copy it into a frame; for trevrpc-js's framing only.
+   */
+  encodeBody(message) {
+    return this.#encode(message, true);
+  }
+
+  #encode(message, headroom) {
     const writer = acquireWriter();
     try {
       this.write(writer, message);
-      return writer.finish();
+      return writer.finish(headroom);
     } catch {
       // The codec rejected the message: protobuf-es throws its own error for it, field name and
       // all. Should protobuf-es accept it after all, its encoding is the right one.
@@ -728,9 +742,17 @@ export class Writer {
     this.view = new DataView(buf.buffer);
   }
 
-  /** Returns a copy of the bytes written. */
-  finish() {
-    return this.buf.slice(0, this.pos);
+  /**
+   * Returns a copy of the bytes written; with `headroom`, after room for a frame header if there
+   * are HeadroomMin bytes or more, which is when that is cheaper than framing a plain copy.
+   */
+  finish(headroom = false) {
+    if (!headroom || this.pos < HeadroomMin) {
+      return this.buf.slice(0, this.pos);
+    }
+    const bytes = allocateWithHeadroom(this.pos);
+    bytes.set(this.buf.subarray(0, this.pos));
+    return bytes;
   }
 
   /** Writes one byte, such as a tag that fits in one. */
