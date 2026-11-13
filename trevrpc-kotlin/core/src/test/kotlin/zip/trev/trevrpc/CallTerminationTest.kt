@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
@@ -291,7 +292,7 @@ class CallTerminationTest {
 
     @Test
     fun `the server's status wins when the call deadline cuts the wait for the end of the stream short`() =
-        bounded {
+        runTest {
             fun hangingAfter(vararg frames: ResponseFrame): RpcTransport {
                 val reads = AtomicInteger()
                 return OneStream(
@@ -313,48 +314,37 @@ class CallTerminationTest {
                     },
                 )
             }
-            // The deadline must leave room to read the frames before it cuts the wait short, even
-            // on a slow machine. Every call waits it out, so the calls run together.
-            val options = CallOptions(timeout = 2.seconds)
+            // On virtual time the deadline passes only once the call is idle, waiting for the end of
+            // the stream, so the frames are always read first however slow the machine is.
+            val deadline = 2.seconds
+            val options = CallOptions(timeout = deadline)
 
-            val streaming =
-                async {
-                    val call =
-                        Client(hangingAfter(message("a"), status(Status.ok())))
-                            .openServerStreaming("/svc/m", "request", strings, strings, options)
-                    assertEquals("a", call.receive())
-                    assertNull(call.receive())
-                    assertEquals(Code.OK, call.terminalStatus?.code)
-                }
+            fun client(vararg frames: ResponseFrame) = Client(hangingAfter(*frames), coroutineContext, testScheduler.timeSource)
 
-            val unary =
-                async {
-                    val reply =
-                        Client(hangingAfter(message("a"), status(Status.ok())))
-                            .unary("/svc/m", "request", strings, strings, options)
-                    assertEquals("a", reply)
-                }
+            // Only the deadline ends the wait for the end of the stream.
+            suspend fun <T> cutShortByDeadline(block: suspend () -> T): T {
+                val start = testScheduler.timeSource.markNow()
+                return block().also { assertEquals(deadline, start.elapsedNow()) }
+            }
 
-            val failed =
-                async {
-                    val call =
-                        Client(hangingAfter(status(Status(Code.ABORTED, "stop"))))
-                            .openServerStreaming("/svc/m", "request", strings, strings, options)
-                    val error = runCatching { call.receive() }.exceptionOrNull() as TrevRpcException
-                    assertEquals(Code.ABORTED, error.status.code)
-                    assertEquals(Code.ABORTED, call.terminalStatus?.code)
-                }
+            val streaming = client(message("a"), status(Status.ok())).openServerStreaming("/svc/m", "request", strings, strings, options)
+            assertEquals("a", streaming.receive())
+            cutShortByDeadline { assertNull(streaming.receive()) }
+            assertEquals(Code.OK, streaming.terminalStatus?.code)
 
-            val upload =
-                async {
-                    val call =
-                        Client(hangingAfter(message("a"), status(Status.ok())))
-                            .openClientStreaming<String, String>("/svc/m", strings, strings, options)
-                    call.closeSend()
-                    assertEquals("a", call.receive())
-                }
+            val reply =
+                cutShortByDeadline { client(message("a"), status(Status.ok())).unary("/svc/m", "request", strings, strings, options) }
+            assertEquals("a", reply)
 
-            listOf(streaming, unary, failed, upload).forEach { it.await() }
+            val failed = client(status(Status(Code.ABORTED, "stop"))).openServerStreaming("/svc/m", "request", strings, strings, options)
+            val error = cutShortByDeadline { runCatching { failed.receive() }.exceptionOrNull() as TrevRpcException }
+            assertEquals(Code.ABORTED, error.status.code)
+            assertEquals(Code.ABORTED, failed.terminalStatus?.code)
+
+            // The pump reads an upload's response; what it queued is delivered without waiting.
+            val upload = client(message("a"), status(Status.ok())).openClientStreaming<String, String>("/svc/m", strings, strings, options)
+            upload.closeSend()
+            assertEquals("a", upload.receive())
         }
 
     @Test
