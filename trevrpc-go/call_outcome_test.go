@@ -419,7 +419,7 @@ type stalledClient struct {
 func dialStalledClient(t *testing.T, listener *Listener, pki testPKI, request *wireRequest) *stalledClient {
 	t.Helper()
 	// A window of a few KiB, far below what the server writes.
-	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), clientQUICConfig(nil, 4<<10))
+	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), withTestHandshakeTimeout(clientQUICConfig(nil, 4<<10)))
 	if err != nil {
 		t.Fatal(err)
 	}

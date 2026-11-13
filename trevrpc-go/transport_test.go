@@ -262,11 +262,11 @@ func withTestHandshakeTimeout(config *quic.Config) *quic.Config {
 	return config
 }
 
-// dialNative dials listener with the default transport policy and fails the
-// test unless the channel uses QUIC. QMux over TLS only starts if QUIC has not
-// connected within FallbackDelay, which here is the whole dial timeout, so a
-// starved machine's slow handshake cannot hand the tests of the QUIC lane a
-// QMux channel.
+// dialNative dials listener with TransportAuto and fails the test unless the
+// channel uses QUIC. QMux over TLS only starts if QUIC has not connected within
+// FallbackDelay, which here is the whole dial timeout instead of the default
+// 300 ms, so a starved machine's slow handshake cannot hand the tests of the
+// QUIC lane a QMux channel.
 func dialNative(t testing.TB, pki testPKI, listener *Listener) *Channel {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
@@ -1053,7 +1053,7 @@ func TestWebTransportAdvertisesSessionFlowControl(t *testing.T) {
 	defer cancel()
 	tlsConfig := pki.client.Clone()
 	tlsConfig.NextProtos = []string{http3.NextProtoH3}
-	conn, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConfig, &quic.Config{EnableDatagrams: true})
+	conn, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConfig, withTestHandshakeTimeout(&quic.Config{EnableDatagrams: true}))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -1132,7 +1132,7 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
 
-	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), clientQUICConfig(nil, DefaultMaxFrameSize))
+	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), withTestHandshakeTimeout(clientQUICConfig(nil, DefaultMaxFrameSize)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1266,7 +1266,7 @@ func TestServerStopsTheUploadOfACallWhoseHandlerLeftARecvPending(t *testing.T) {
 			return StreamOf[*testMessage](), nil
 		})
 	})
-	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), clientQUICConfig(nil, DefaultMaxFrameSize))
+	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), withTestHandshakeTimeout(clientQUICConfig(nil, DefaultMaxFrameSize)))
 	if err != nil {
 		t.Fatal(err)
 	}

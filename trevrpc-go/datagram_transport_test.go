@@ -698,7 +698,7 @@ func rawNativeConn(t *testing.T, pki testPKI, listener *Listener) *quic.Conn {
 	defer cancel()
 	tlsConfig := pki.client.Clone()
 	tlsConfig.NextProtos = []string{ALPN}
-	conn, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConfig, &quic.Config{EnableDatagrams: true})
+	conn, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConfig, withTestHandshakeTimeout(&quic.Config{EnableDatagrams: true}))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

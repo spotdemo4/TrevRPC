@@ -196,12 +196,19 @@ func TestDialFallsBackToQMuxWhenUDPIsUnreachable(t *testing.T) {
 	exerciseRPCShapes(t, channel)
 }
 
-func TestDialPrefersQUIC(t *testing.T) {
-	pki := newTestPKI(t)
-	listener := startTestListener(t, pki, nil)
-	// dialNative dials with the default policy, which races QMux over TLS
-	// against QUIC, and fails unless QUIC won.
-	dialNative(t, pki, listener)
+// TestDialDefaultsPreferQUIC checks what Dial does without options: race
+// QMux over TLS against QUIC once QUIC has had defaultFallbackDelay. The race
+// itself is tested with scripted connectors above; a race over real sockets
+// would depend on how fast a loaded machine finishes a handshake.
+func TestDialDefaultsPreferQUIC(t *testing.T) {
+	var options DialOptions
+	if options.Transport != TransportAuto {
+		t.Fatalf("default Transport = %v, want TransportAuto", options.Transport)
+	}
+	connector := newRacingConnector(nil, nil, options.FallbackDelay, options.ReprobeInterval)
+	if connector.delay != defaultFallbackDelay || connector.reprobe != defaultReprobeInterval {
+		t.Fatalf("default delay %v and reprobe %v, want %v and %v", connector.delay, connector.reprobe, defaultFallbackDelay, defaultReprobeInterval)
+	}
 }
 
 func TestDialTCPOnly(t *testing.T) {

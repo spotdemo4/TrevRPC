@@ -376,7 +376,7 @@ func TestShutdownRefusesStreamsStillAwaitingTheirRequest(t *testing.T) {
 			listener, stop := serveForShutdownTest(t, pki, func(server *Server) { server.SetMetrics(metrics) })
 			var opener streamOpener
 			if transport == "native" {
-				conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), clientQUICConfig(nil, DefaultMaxFrameSize))
+				conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), withTestHandshakeTimeout(clientQUICConfig(nil, DefaultMaxFrameSize)))
 				if err != nil {
 					t.Fatal(err)
 				}

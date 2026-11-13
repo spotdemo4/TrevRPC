@@ -57,7 +57,7 @@ func TestPeerResetOfTheRequestStreamCancelsTheCall(t *testing.T) {
 		})
 	})
 
-	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), clientQUICConfig(nil, DefaultMaxFrameSize))
+	conn, err := quic.DialAddr(t.Context(), listener.Addr().String(), clientTLSConfig(pki.client, "localhost"), withTestHandshakeTimeout(clientQUICConfig(nil, DefaultMaxFrameSize)))
 	if err != nil {
 		t.Fatal(err)
 	}
