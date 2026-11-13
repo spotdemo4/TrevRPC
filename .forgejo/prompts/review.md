@@ -12,7 +12,7 @@ Review this pull request.
 
 ## What to look for
 
-- Correctness bugs, regressions, and unhandled edge cases in the Go (`trevrpc-go/`), Rust (`trevrpc-rust/`), JavaScript (`trevrpc-js/`), and Kotlin (`trevrpc-kotlin/`) runtimes, and the Go, Rust, and Kotlin `protoc-gen-trevrpc-*` code generators.
+- Correctness bugs, regressions, and unhandled edge cases in the Go (`trevrpc-go/`), Rust (`trevrpc-rust/`), JavaScript (`trevrpc-js/`), and Kotlin (`trevrpc-kotlin/`) runtimes, and the Go, Rust, JavaScript, and Kotlin `protoc-gen-trevrpc-*` code generators.
 - Changes to the wire protocol, QMux, framing, compression, status codes, or metadata that do not update every runtime that implements them, the golden vectors in `testdata/`, and the cross-runtime tests in `interop/`. Every client must keep working against every server, over native QUIC, HTTP/3, WebTransport, and each TCP fallback (QMux over TLS, HTTP/2, QMux over WebSocket).
 - Behavior that differs between runtimes for the same call: deadlines and cancellation, error and status mapping, half-close, stream resets, flow control, and limits.
 - Reliability problems during failures: connections that drop or restart mid-call, partial or reset streams, reconnects, draining, and shutdown. Look for calls that hang, tasks, goroutines, or coroutines that leak, and errors that are lost or reported with the wrong status.

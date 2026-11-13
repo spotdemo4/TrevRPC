@@ -1,6 +1,7 @@
 // Generates the Echo, UnreliableEcho, CompressedEcho and ValidatedEcho services, and the
 // buf.validate messages of ValidatedEcho's violations, from the shared interop protos with
-// protoc-gen-es, for the TrevRPC client and connect-web alike, and bundles the browser pages
+// protoc-gen-es, for the TrevRPC client and connect-web alike, with the message codecs of
+// protoc-gen-trevrpc-js, which the TrevRPC client uses, and bundles the browser pages
 // that run the interop scenarios and the load benchmark. Output goes to build/interop/.
 import { mkdir, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -30,6 +31,7 @@ export async function buildInterop() {
       "trevrpc/options.proto",
     ],
     outDir: `${outDir}/gen`,
+    codecs: true,
   });
 
   // The bench page also loads over the benchmark's emulated links, so it is minified.

@@ -10,14 +10,15 @@ import { RpcAnswer, RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
 /**
  * Creates a client for `service`, a service descriptor that protoc-gen-es generates, with one
  * function per method, named by the method's `localName`. Its calls run the interceptors of the
- * transport, then those of `options.interceptors`, and `options.validator` checks the request
- * messages they send.
+ * transport, then those of `options.interceptors`, `options.validator` checks the request
+ * messages they send, and `options.codecs` encode and decode the messages of their types.
  */
 export function createClient(service, transport, options = {}) {
   if (service?.kind !== "service" || !Array.isArray(service.methods)) {
     throw invalidArgument("createClient needs a protobuf-es service descriptor");
   }
-  const { interceptors: clientInterceptors, validator, ...callOptions } = options;
+  const { interceptors: clientInterceptors, validator, codecs, ...callOptions } = options;
+  const codecOf = codecsBySchema(codecs);
   const defaults = mergeCallOptions(defaultCallOptions(), callOptions);
   const interceptors = [
     ...interceptorList(transport.interceptors, "transport interceptors"),
@@ -32,6 +33,9 @@ export function createClient(service, transport, options = {}) {
       path: `/${service.typeName}/${method.name}`,
       requestType: method.input,
       responseType: method.output,
+      // The generated codecs of the request and response types, or undefined for protobuf-es.
+      requestCodec: codecOf.get(method.input),
+      responseCodec: codecOf.get(method.output),
       // Checks each request message once it is encoded, or undefined to send them unchecked.
       validate: requestValidation(validator, method.input),
       // Full protobuf names, which pick the compression dictionaries.
@@ -67,6 +71,36 @@ export function createClient(service, transport, options = {}) {
 }
 
 /**
+ * The codecs of the `codecs` client option, by message type. A codec is used only for the very
+ * schema it was generated with: the one its `_trevrpc.js` imports from the `_pb.js` the service
+ * comes from. Of several codecs of one type, the first is used.
+ */
+function codecsBySchema(codecs) {
+  const bySchema = new Map();
+  if (codecs == null) {
+    return bySchema;
+  }
+  if (typeof codecs[Symbol.iterator] !== "function" || typeof codecs === "string") {
+    throw invalidArgument("codecs must be an array of message codecs");
+  }
+  for (const codec of codecs) {
+    if (
+      codec?.schema?.kind !== "message" ||
+      typeof codec.encode !== "function" ||
+      typeof codec.decode !== "function"
+    ) {
+      throw invalidArgument(
+        "codecs must hold the message codecs that protoc-gen-trevrpc-js generates",
+      );
+    }
+    if (!bySchema.has(codec.schema)) {
+      bySchema.set(codec.schema, codec);
+    }
+  }
+  return bySchema;
+}
+
+/**
  * How each kind of RPC is called: whether its client method takes a request message, how it
  * starts, and, for streaming calls, what settles when the call ends after it started.
  */
@@ -96,7 +130,7 @@ const MethodShapes = Object.freeze({
 
 /** Calls a unary RPC and returns the decoded response. */
 export async function unaryCall(transport, rpc, request, options) {
-  const body = marshalMessage(rpc.requestType, request, rpc.validate);
+  const body = marshalMessage(rpc.requestType, request, rpc.validate, rpc.requestCodec);
   const call = await Call.open(transport, requestFields(rpc, RpcKind.Unary), body, options, rpc);
   const stream = new BidirectionalStreamingCall(call, rpc, { options });
   // The response decides the outcome, so the request side finishes in the background.
@@ -106,7 +140,7 @@ export async function unaryCall(transport, rpc, request, options) {
 
 /** Calls a server-streaming RPC and returns its response stream. */
 export async function serverStreamingCall(transport, rpc, request, options) {
-  const body = marshalMessage(rpc.requestType, request, rpc.validate);
+  const body = marshalMessage(rpc.requestType, request, rpc.validate, rpc.requestCodec);
   const call = await Call.open(
     transport,
     requestFields(rpc, RpcKind.ServerStreaming),
@@ -348,7 +382,12 @@ export class BidirectionalStreamingCall {
    * goes on.
    */
   async send(message) {
-    const body = marshalMessage(this.#rpc.requestType, message, this.#rpc.validate);
+    const body = marshalMessage(
+      this.#rpc.requestType,
+      message,
+      this.#rpc.validate,
+      this.#rpc.requestCodec,
+    );
     try {
       await this.#call.sendMessage(body);
     } catch (error) {
@@ -507,7 +546,7 @@ export class BidirectionalStreamingCall {
   /** Decodes a response message; one that does not decode fails the call. */
   #decode(payload) {
     try {
-      return unmarshalMessage(this.#rpc.responseType, payload);
+      return unmarshalMessage(this.#rpc.responseType, payload, this.#rpc.responseCodec);
     } catch (error) {
       throw this.#settleFailure(this.#call.fail(error));
     }

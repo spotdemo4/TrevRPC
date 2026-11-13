@@ -1,6 +1,7 @@
-// Generates build/test/gen/ with protoc-gen-es from test/proto/: types.proto, a message with every
-// kind of field, and methods.proto, whose services set the trevrpc.method option in every way the
-// runtime checks.
+// Generates build/test/gen/ with protoc-gen-es and protoc-gen-trevrpc-js from test/proto/:
+// types.proto, a message with every kind of field, methods.proto, whose services set the
+// trevrpc.method option in every way the runtime checks, and codec.proto with codec_editions.proto,
+// which the codec tests check against protobuf-es.
 import { rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
@@ -18,6 +19,23 @@ await rm(fileURLToPath(new URL("../build/test", import.meta.url)), {
 });
 await generateEs({
   protoDirs: [protoDir, interopProtoDir, optionsProtoDir],
-  files: ["types.proto", "methods.proto", "interop.proto", "trevrpc/options.proto"],
+  files: [
+    "types.proto",
+    "methods.proto",
+    "codec.proto",
+    "codec_editions.proto",
+    "interop.proto",
+    "trevrpc/options.proto",
+  ],
   outDir,
+  codecs: true,
+});
+
+// The codecs as TypeScript too, which the type check compiles.
+await generateEs({
+  protoDirs: [protoDir, interopProtoDir, optionsProtoDir],
+  files: ["codec.proto", "codec_editions.proto", "interop.proto"],
+  outDir: fileURLToPath(new URL("../build/test/gen-ts", import.meta.url)),
+  codecs: true,
+  target: "ts",
 });

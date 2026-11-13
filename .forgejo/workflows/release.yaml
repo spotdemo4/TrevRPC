@@ -71,6 +71,7 @@ jobs:
             packages.x86_64-linux.trevrpc-js
             packages.x86_64-linux.trevrpc-js-effect
             packages.x86_64-linux.trevrpc-js-protovalidate
+            packages.x86_64-linux.trevrpc-js-protoc-gen
 
   kotlin:
     # zizmor: ignore[excessive-permissions]

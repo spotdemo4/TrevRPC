@@ -1,0 +1,187 @@
+// Every kind of field that protoc-gen-trevrpc-js generates code for, and the fields it leaves to
+// protobuf-es, for test/codec.test.js, which checks the codecs against toBinary() and
+// fromBinary().
+syntax = "proto3";
+
+package codec.v1;
+
+import "codec_editions.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "interop.proto";
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  COLOR_RED = 1;
+  COLOR_NEGATIVE = -5;
+}
+
+message Scalars {
+  int32 i32 = 1;
+  uint32 u32 = 2;
+  sint32 s32 = 3;
+  bool b = 4;
+  double d = 5;
+  float f = 6;
+  fixed32 fx32 = 7;
+  sfixed32 sfx32 = 8;
+  string s = 9;
+  bytes by = 10;
+  Color color = 11;
+  optional int32 opt_i32 = 12;
+  optional string opt_s = 13;
+  int64 i64 = 14;
+  uint64 u64 = 15;
+  sint64 s64 = 16;
+  fixed64 fx64 = 17;
+  sfixed64 sfx64 = 18;
+  int64 i64_string = 19 [jstype = JS_STRING];
+  uint64 u64_string = 20 [jstype = JS_STRING];
+  optional uint64 opt_u64 = 21;
+  optional Color opt_color = 22;
+  optional bytes opt_by = 23;
+  int32 high_field_number = 2000;
+  int32 highest_field_number = 536870911;
+}
+
+message Lists {
+  repeated int32 i32 = 1;
+  repeated uint32 u32 = 2;
+  repeated sint32 s32 = 3;
+  repeated bool b = 4;
+  repeated double d = 5;
+  repeated float f = 6;
+  repeated fixed32 fx32 = 7;
+  repeated sfixed32 sfx32 = 8;
+  repeated string s = 9;
+  repeated bytes by = 10;
+  repeated Color color = 11;
+  repeated Scalars msgs = 12;
+  repeated int32 unpacked_i32 = 13 [packed = false];
+  repeated double unpacked_d = 14 [packed = false];
+  repeated int64 i64 = 15;
+  repeated uint64 u64 = 16;
+  repeated sint64 s64 = 17;
+  repeated fixed64 fx64 = 18;
+  repeated sfixed64 sfx64 = 19;
+  repeated int64 i64_string = 20 [jstype = JS_STRING];
+  repeated sint64 unpacked_s64 = 21 [packed = false];
+  repeated Color unpacked_color = 22 [packed = false];
+}
+
+message Maps {
+  map<string, string> ss = 1;
+  map<int32, string> is = 2;
+  map<bool, int32> bi = 3;
+  map<string, Scalars> sm = 4;
+  map<uint32, Color> ue = 5;
+  map<sint32, bytes> sb = 6;
+  map<int64, string> i64s = 7;
+  map<uint64, uint64> u64u = 8;
+  map<sint64, double> s64d = 9;
+  map<fixed64, float> fx64f = 10;
+  map<sfixed64, sint32> sfx64s = 11;
+  map<fixed32, bool> fx32b = 12;
+  map<sfixed32, Scalars> sfx32m = 13;
+}
+
+message Oneofs {
+  string before = 1;
+  oneof kind {
+    string text = 2;
+    int32 num = 3;
+    Scalars msg = 4;
+    int64 big = 6;
+    bytes data = 7;
+    Color color = 8;
+    // A wrapper in a oneof is a message, not unboxed.
+    google.protobuf.Int32Value wrapped = 9;
+  }
+  string after = 5;
+  oneof other {
+    double ratio = 10;
+    Oneofs self = 11;
+  }
+}
+
+message Nested {
+  message Inner {
+    string name = 1;
+    Inner child = 2;
+    message Deepest {
+      sint32 level = 1;
+    }
+    Deepest deepest = 3;
+  }
+  Inner inner = 1;
+  repeated Inner inners = 2;
+  map<string, Inner> by_name = 3;
+}
+
+message Recursive {
+  Recursive child = 1;
+  int32 depth = 2;
+}
+
+// Same field numbers, different packing: each must decode the other's encoding.
+message PackedOnly {
+  repeated int32 v = 1;
+  repeated double d = 2;
+  repeated sint64 s = 3;
+  repeated bool b = 4;
+}
+
+message UnpackedOnly {
+  repeated int32 v = 1 [packed = false];
+  repeated double d = 2 [packed = false];
+  repeated sint64 s = 3 [packed = false];
+  repeated bool b = 4 [packed = false];
+}
+
+// Decoding Scalars as Subset leaves most fields unknown.
+message Subset {
+  int32 i32 = 1;
+}
+
+// Message types without generated code: well-known types, a type from an editions file, which
+// protobuf-es reads, and a type generated in the same run from another file.
+message Foreign {
+  google.protobuf.Timestamp at = 1;
+  repeated google.protobuf.Duration windows = 2;
+  map<string, google.protobuf.Timestamp> stamps = 3;
+  codec.v1.editions.Legacy legacy = 4;
+  trevrpc.interop.v1.EchoRequest echo = 5;
+  repeated trevrpc.interop.v1.EchoResponse echoes = 6;
+  google.protobuf.Value value = 7;
+  google.protobuf.ListValue list = 8;
+}
+
+// protobuf-es unboxes a singular wrapper field, so the whole message is left to it.
+message Wrapped {
+  google.protobuf.StringValue name = 1;
+  google.protobuf.Int64Value count = 2;
+  google.protobuf.BytesValue data = 3;
+  string plain = 4;
+}
+
+// protobuf-es represents a Struct field as a JSON object, so the whole message is left to it.
+message Structured {
+  google.protobuf.Struct attributes = 1;
+  string plain = 2;
+}
+
+// Holds the messages left to protobuf-es, which must still nest inside generated code.
+message Holder {
+  Wrapped wrapped = 1;
+  repeated Structured structured = 2;
+  map<int32, Wrapped> wrapped_by_id = 3;
+  Scalars scalars = 4;
+}
+
+service Codecs {
+  rpc Echo(Scalars) returns (Scalars);
+  rpc Fallback(Wrapped) returns (Holder);
+  rpc Shared(Scalars) returns (trevrpc.interop.v1.EchoResponse);
+}

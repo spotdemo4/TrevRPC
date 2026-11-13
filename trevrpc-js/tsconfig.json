@@ -13,6 +13,7 @@
     "src/**/*.d.ts",
     "build/interop/gen/*.d.ts",
     "build/test/**/*.d.ts",
+    "build/test/gen-ts/*.ts",
     "test/types/*.ts"
   ]
 }

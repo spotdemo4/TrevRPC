@@ -92,6 +92,10 @@ jobs:
         working-directory: trevrpc-js/protovalidate
         run: npm audit --audit-level moderate --omit=dev
 
+      - name: Run npm audit on the protoc plugin
+        working-directory: trevrpc-js/protoc-gen-trevrpc-js
+        run: npm audit --audit-level moderate --omit=dev
+
   rust:
     runs-on: ubuntu-26.04
     permissions:

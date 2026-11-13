@@ -30,7 +30,8 @@ let
   # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
   # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
   # module is built on its own; only the script that embeds it is needed here. The Effect adapter
-  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own.
+  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own, as is
+  # protoc-gen-trevrpc-js/, whose source the build runs to generate the codecs it tests.
   sourceTree = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -45,6 +46,7 @@ let
           ./zstd-wasm
           ./effect
           ./protovalidate
+          ./protoc-gen-trevrpc-js/default.nix
           ./release-check.nix
         ]
       ))
@@ -155,6 +157,8 @@ buildNpmPackage (final: {
     tar -tzf "$TMPDIR/$tarball" | sort > tarball.list
     grep -qx 'package/src/index.js' tarball.list
     grep -qx 'package/src/index.d.ts' tarball.list
+    grep -qx 'package/src/codec.js' tarball.list
+    grep -qx 'package/src/codec.d.ts' tarball.list
     grep -qx 'package/src/zstd.js' tarball.list
     grep -qx 'package/src/zstd.d.ts' tarball.list
     grep -qx 'package/src/zstd-wasm.js' tarball.list
@@ -168,6 +172,12 @@ buildNpmPackage (final: {
         assert.deepEqual(Object.keys(runtime).sort(), [
           "Channel", "Code", "TrevRpcError", "bearerMetadata", "codeName", "connect", "createChannel",
           "createClient", "fetchServerCertificateHashes",
+        ]);
+        const codec = await import("@trevrpc/trevrpc-js/codec");
+        assert.deepEqual(Object.keys(codec).sort(), [
+          "EmptyBytes", "Int64Zero", "Reader", "RecursionLimit", "Writer", "boolKey", "defineCodec",
+          "depthError", "emptyMessage", "foreignError", "int64Key", "intKey", "readMessage",
+          "setMapEntry", "uint64Key", "writeMessage",
         ]);
         const zstd = await import("@trevrpc/trevrpc-js/zstd");
         assert.deepEqual(Object.keys(zstd), ["createCompression"]);

@@ -1,0 +1,53 @@
+{
+  "name": "@trevrpc/protoc-gen-trevrpc-js",
+  "version": "1.10.0",
+  "description": "Generates message codecs for TrevRPC browser clients, next to protoc-gen-es's code",
+  "homepage": "https://trev.zip/llc/TrevRPC",
+  "bugs": {
+    "url": "https://trev.zip/llc/TrevRPC/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://trev.zip/llc/TrevRPC.git",
+    "directory": "trevrpc-js/protoc-gen-trevrpc-js"
+  },
+  "bin": {
+    "protoc-gen-trevrpc-js": "bin/protoc-gen-trevrpc-js"
+  },
+  "files": [
+    "bin/**",
+    "src/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./src/plugin.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "format": "oxfmt --write",
+    "format:check": "oxfmt --check",
+    "lint": "oxlint --deny-warnings bin src",
+    "check": "npm run format:check && npm run lint"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.17.0",
+    "@bufbuild/protoplugin": "^2.17.0"
+  },
+  "peerDependencies": {
+    "@trevrpc/trevrpc-js": "^1.11.0"
+  },
+  "peerDependenciesMeta": {
+    "@trevrpc/trevrpc-js": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "npm@12.2.2"
+}

@@ -6,6 +6,10 @@ import type {
   MessageShape,
 } from "@bufbuild/protobuf";
 
+import type { MessageCodec } from "./codec.js";
+
+export type { MessageCodec } from "./codec.js";
+
 export const Code: Readonly<{
   Ok: 0;
   Cancelled: 1;
@@ -193,6 +197,15 @@ export interface ClientOptions extends CallOptions {
    * which rejects that send and leaves the call open. Without one, requests are not checked.
    */
   validator?: RequestValidator;
+  /**
+   * Generated codecs of the client's message types, such as `GreeterCodecs` from the
+   * `greeter_trevrpc.js` that protoc-gen-trevrpc-js generates next to `greeter_pb.js`. They
+   * encode requests and decode responses of their types to and from the same bytes, and fail as
+   * protobuf-es does, in less time; `MessageCodec` says which malformed input they decode
+   * differently. A codec applies only to the schema it was generated with; messages of other types
+   * use protobuf-es.
+   */
+  codecs?: Iterable<MessageCodec>;
 }
 
 export interface TransportStream {
@@ -480,7 +493,8 @@ export type Client<S extends DescService> = {
  * `GreeterService` from `greeter_pb.js`). The `trevrpc.method` option of each method decides
  * what its calls send as datagrams and compress; one the method's kind cannot use throws
  * InvalidArgument. Calls run the transport's interceptors, then those of `options.interceptors`,
- * and `options.validator` checks the request messages they send.
+ * `options.validator` checks the request messages they send, and `options.codecs` encode and
+ * decode the messages of their types.
  */
 export function createClient<S extends DescService>(
   service: S,

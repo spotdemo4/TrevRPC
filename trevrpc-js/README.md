@@ -28,7 +28,7 @@ message HelloRequest { string name = 1; }
 message HelloReply { string message = 1; }
 ```
 
-TrevRPC has no code generator of its own for JavaScript: generate the messages and the service descriptor with protobuf-es's `protoc-gen-es`, and pass the descriptor to `createClient()`.
+Generate the messages and the service descriptor with protobuf-es's `protoc-gen-es`, and pass the descriptor to `createClient()`. TrevRPC's own plugin, [`protoc-gen-trevrpc-js`](#message-codecs), is optional and only makes messages encode and decode faster.
 
 ```sh
 npm install @trevrpc/trevrpc-js @bufbuild/protobuf
@@ -60,6 +60,28 @@ const at = sample.at && timestampDate(sample.at);
 ```
 
 `JSON.stringify` throws on a `bigint`; use protobuf-es's `toJson()` or `toJsonString()` to serialize a message.
+
+### Message codecs
+
+[`@trevrpc/protoc-gen-trevrpc-js`](protoc-gen-trevrpc-js) runs after `protoc-gen-es` and writes `greeter_trevrpc.ts` next to `greeter_pb.ts`, with a codec for each message and the codecs of each service, which `createClient()` takes as its `codecs` option:
+
+```sh
+npm install --save-dev @trevrpc/protoc-gen-trevrpc-js
+protoc \
+  --plugin=protoc-gen-es=node_modules/.bin/protoc-gen-es \
+  --es_out=src/gen --es_opt=target=ts \
+  --plugin=protoc-gen-trevrpc-js=node_modules/.bin/protoc-gen-trevrpc-js \
+  --trevrpc-js_out=src/gen --trevrpc-js_opt=target=ts \
+  greeter.proto
+```
+
+```ts
+import { GreeterCodecs } from "./gen/greeter_trevrpc.js";
+
+const client = createClient(Greeter, channel, { codecs: GreeterCodecs });
+```
+
+A codec encodes and decodes the same messages, to the same bytes, as protobuf-es, and fails where protobuf-es fails, with its error; it does so with code written for its message type instead of protobuf-es's generic one. Decoding differs on two kinds of malformed input: a known field sent with another wire type is kept in `$unknown`, as the Go and Rust runtimes keep it, where `fromBinary` reads it as its declared type anyway; and a nested message whose last field runs past its length makes the codec fail and fall back to `fromBinary`, which accepts it, so such input is decoded twice. Types without a codec use protobuf-es, as do messages that protobuf-es represents specially (see the plugin's [README](protoc-gen-trevrpc-js#readme)). A codec's `encode(message)` and `decode(bytes)` run it directly, like `toBinary` and `fromBinary`.
 
 ### Method options
 
@@ -105,7 +127,7 @@ channel.close();
 
 ### Call options
 
-A client has one function per method, named by the method's `localName` (`SayHello` is `sayHello`). Every method takes `CallOptions` as its last argument; the same options can be given to `createClient()` as defaults, and per-call `metadata` is merged over the defaults per key. `createClient()` also takes `interceptors` ([below](#interceptors)).
+A client has one function per method, named by the method's `localName` (`SayHello` is `sayHello`). Every method takes `CallOptions` as its last argument; the same options can be given to `createClient()` as defaults, and per-call `metadata` is merged over the defaults per key. `createClient()` also takes `interceptors` ([below](#interceptors)), `validator` ([below](#request-validation)) and `codecs` ([above](#message-codecs)).
 
 | Option               | Meaning                                                                                       |
 | -------------------- | --------------------------------------------------------------------------------------------- |

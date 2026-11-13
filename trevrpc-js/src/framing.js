@@ -23,16 +23,17 @@ const EmptyBytes = new Uint8Array(0);
 
 /**
  * Encodes a protobuf message body: `message` is a message of `schema` (a protobuf-es message
- * descriptor) or the init object `create()` takes. A message that cannot be encoded fails with
- * InvalidArgument. Once it is encoded, `validate`, if given, checks it and throws to reject it,
- * so that it sees only well-formed messages.
+ * descriptor) or the init object `create()` takes. `codec`, the generated codec of `schema` if
+ * there is one, encodes it; protobuf-es does otherwise, to the same bytes. A message that cannot
+ * be encoded fails with InvalidArgument. Once it is encoded, `validate`, if given, checks it and
+ * throws to reject it, so that it sees only well-formed messages.
  */
-export function marshalMessage(schema, message, validate) {
+export function marshalMessage(schema, message, validate, codec) {
   let value;
   let body;
   try {
     value = create(schema, message);
-    body = toBinary(schema, value);
+    body = codec === undefined ? toBinary(schema, value) : codec.encode(value);
   } catch (error) {
     throw invalidArgument(
       `failed to encode protobuf message: ${error?.message ?? String(error)}`,
@@ -43,10 +44,14 @@ export function marshalMessage(schema, message, validate) {
   return body;
 }
 
-/** Decodes a protobuf message body of `schema`, rejecting malformed wire data. */
-export function unmarshalMessage(schema, body) {
+/**
+ * Decodes a protobuf message body of `schema`, with `codec`, its generated codec, if there is one,
+ * rejecting malformed wire data.
+ */
+export function unmarshalMessage(schema, body, codec) {
   try {
-    return fromBinary(schema, byteView(body));
+    const bytes = byteView(body);
+    return codec === undefined ? fromBinary(schema, bytes) : codec.decode(bytes);
   } catch (error) {
     throw invalidArgument(
       `failed to decode protobuf message: ${error?.message ?? String(error)}`,

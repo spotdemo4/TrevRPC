@@ -248,7 +248,8 @@ covers code generation, and the runtime guides cover streaming calls.
 ## using
 
 Each runtime has a library. Go, Rust, and Kotlin also have a `protoc` plugin that generates code from your
-services; JavaScript uses the service descriptors that protobuf-es generates.
+services; JavaScript uses the service descriptors that protobuf-es generates, and an optional plugin that
+generates faster message codecs.
 
 ### go
 
@@ -271,6 +272,13 @@ the client takes the messages and service descriptors that [protobuf-es](https:/
 ```sh
 npm install @trevrpc/trevrpc-js @bufbuild/protobuf
 npm install --save-dev @bufbuild/protoc-gen-es
+```
+
+[`@trevrpc/protoc-gen-trevrpc-js`](trevrpc-js/protoc-gen-trevrpc-js) runs after `protoc-gen-es` and generates a codec for each
+message, which encodes and decodes the same messages to the same bytes as protobuf-es, faster:
+
+```sh
+npm install --save-dev @trevrpc/protoc-gen-trevrpc-js
 ```
 
 for [Effect](https://effect.website), [`@trevrpc/effect`](trevrpc-js/effect) makes clients whose calls are effects and streams:
@@ -299,11 +307,12 @@ dependencies {
 
 ### nix
 
-the Go, Rust, and Kotlin packages provide their `protoc` plugins:
+the Go, Rust, and Kotlin packages provide their `protoc` plugins, and `trevrpc-js-protoc-gen` the JavaScript one:
 
 ```sh
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js-protoc-gen
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
 ```
 

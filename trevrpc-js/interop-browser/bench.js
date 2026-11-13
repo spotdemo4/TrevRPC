@@ -5,7 +5,9 @@ import { createClient as createConnectClient } from "@connectrpc/connect";
 import { createConnectTransport, createGrpcWebTransport } from "@connectrpc/connect-web";
 
 import { CompressedEcho } from "../build/interop/gen/compressed_pb.js";
+import { CompressedEchoCodecs } from "../build/interop/gen/compressed_trevrpc.js";
 import { Echo } from "../build/interop/gen/interop_pb.js";
+import { EchoCodecs } from "../build/interop/gen/interop_trevrpc.js";
 import { createClient } from "../src/index.js";
 import { BenchLanes, Compressions } from "./bench-lanes.js";
 import { interopCompression } from "./compression.js";
@@ -183,7 +185,10 @@ async function trevrpcTarget(input, signal) {
     channel.close();
     throw new Error(`connected over ${channel.transport}, want ${input.transport}`);
   }
-  const echo = createClient(mode.stream ? CompressedEcho : Echo, channel);
+  // With the generated codecs, as an app that cares about speed would call.
+  const echo = mode.stream
+    ? createClient(CompressedEcho, channel, { codecs: CompressedEchoCodecs })
+    : createClient(Echo, channel, { codecs: EchoCodecs });
   const pad = padValue(input);
   const options = { signal, ...(pad && { metadata: { [PadKey]: pad } }) };
   const operations = {

@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+import { runNodeJs } from "@bufbuild/protoplugin";
+
+import { protocGenTrevrpcJs } from "../src/plugin.js";
+
+runNodeJs(protocGenTrevrpcJs);

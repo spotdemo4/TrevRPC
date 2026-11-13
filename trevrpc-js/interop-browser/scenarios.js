@@ -2,9 +2,16 @@ import { ViolationsSchema } from "../build/interop/gen/buf/validate/validate_pb.
 // The interop scenarios of interop/README.md, run against a WebTransport Echo server. This module
 // only needs the web platform, so it runs unchanged in a browser bundle and under Node tests.
 import { CompressedEcho, RefusingEcho } from "../build/interop/gen/compressed_pb.js";
+import {
+  CompressedEchoCodecs,
+  RefusingEchoCodecs,
+} from "../build/interop/gen/compressed_trevrpc.js";
 import { Echo } from "../build/interop/gen/interop_pb.js";
+import { EchoCodecs } from "../build/interop/gen/interop_trevrpc.js";
 import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
+import { UnreliableEchoCodecs } from "../build/interop/gen/unreliable_trevrpc.js";
 import { ValidatedEcho } from "../build/interop/gen/validated_pb.js";
+import { ValidatedEchoCodecs } from "../build/interop/gen/validated_trevrpc.js";
 import { Code, TrevRpcError, codeName, createClient } from "../src/index.js";
 import { interopCompression } from "./compression.js";
 import { connectLane } from "./lane.js";
@@ -350,7 +357,7 @@ const scenarios = {
   async "connection-metadata"(_echo, { open }) {
     const channel = await open({ connectionMetadata: { "interop-suffix": "!" } });
     try {
-      const echo = createClient(Echo, channel, { timeoutMs: DeadlineMs });
+      const echo = createClient(Echo, channel, { timeoutMs: DeadlineMs, codecs: EchoCodecs });
       for (const message of ["a", "b", "c"]) {
         expectEcho(await echo.unary({ message }), `${message}!`, 0);
       }
@@ -544,12 +551,16 @@ export async function runScenarios({
   }
 
   try {
-    const echo = createClient(Echo, channel, { timeoutMs: DeadlineMs });
+    // Every client encodes and decodes with the generated codecs, which the interop checks against
+    // the Go and Rust servers.
+    const client = (service, codecs) =>
+      createClient(service, channel, { timeoutMs: DeadlineMs, codecs });
+    const echo = client(Echo, EchoCodecs);
     const context = {
-      unreliable: createClient(UnreliableEcho, channel, { timeoutMs: DeadlineMs }),
-      compressed: createClient(CompressedEcho, channel, { timeoutMs: DeadlineMs }),
-      refusing: createClient(RefusingEcho, channel, { timeoutMs: DeadlineMs }),
-      validated: createClient(ValidatedEcho, channel, { timeoutMs: DeadlineMs }),
+      unreliable: client(UnreliableEcho, UnreliableEchoCodecs),
+      compressed: client(CompressedEcho, CompressedEchoCodecs),
+      refusing: client(RefusingEcho, RefusingEchoCodecs),
+      validated: client(ValidatedEcho, ValidatedEchoCodecs),
       open,
       get transport() {
         return channel.transport;
