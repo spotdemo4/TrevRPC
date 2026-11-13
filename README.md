@@ -307,12 +307,12 @@ dependencies {
 
 ### nix
 
-the Go, Rust, and Kotlin packages provide their `protoc` plugins, and `trevrpc-js-protoc-gen` the JavaScript one:
+each language's package provides its `protoc` plugin:
 
 ```sh
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
-nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js-protoc-gen
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
 ```
 

@@ -345,6 +345,6 @@ npm run build      # generate the interop and test descriptors and bundle the in
 npm run interop -- --browser chromium --url ... --cert-hash ...
 ```
 
-`nix build .#trevrpc-js` runs the same checks and installs the library and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
+`nix build .#trevrpc-js` runs the same checks and installs the library, `protoc-gen-trevrpc-js`, and the wrapped `trevrpc-interop-browser` with matching Playwright browsers. The pinned `playwright` version must equal nixpkgs' `playwright-driver`; `nix run .#sync-playwright` updates it.
 
 Tests (`node --test`) cover the wire format against `testdata/wire-golden-vectors.txt` (frame bytes, and the frame reader against the shared byte streams), the QMux frames against `testdata/qmux-golden-vectors.txt`, framing, the `trevrpc.method` option, and the client — deadlines, cancellation, stream termination and reconnection — against in-memory fake servers, including a fake Echo server that runs all interop scenarios.

@@ -25,13 +25,17 @@ let
   expectedPlaywrightVersion = playwright-driver.version;
   # The libzstd WebAssembly module that the zstd entry point embeds.
   zstdWasm = callPackage ./zstd-wasm { };
+  # protoc-gen-trevrpc-js, which this package provides like the Go, Rust and Kotlin packages provide
+  # their plugins. It is an npm package of its own, and flake-release publishes one package.json per
+  # flake attribute, so the release publishes it from `.#trevrpc-js.protocGen`.
+  protocGen = callPackage ./protoc-gen-trevrpc-js { inherit interopProto trevrpcProto; };
 
   # The interop descriptors are generated from the shared interop protos, which import the TrevRPC
   # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
   # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
   # module is built on its own; only the script that embeds it is needed here. The Effect adapter
-  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own, as is
-  # protoc-gen-trevrpc-js/, whose source the build runs to generate the codecs it tests.
+  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own. The source
+  # of protoc-gen-trevrpc-js/ is kept: the build runs it to generate the codecs it tests.
   sourceTree = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -138,6 +142,8 @@ buildNpmPackage (final: {
     makeWrapper ${nodejs_26}/bin/node "$out/bin/trevrpc-interop-browser" \
       --add-flags "$interop/interop-browser/cli.js" \
       --set PLAYWRIGHT_BROWSERS_PATH "${playwright-driver.browsers}"
+
+    ln -s ${protocGen}/bin/protoc-gen-trevrpc-js "$out/bin/protoc-gen-trevrpc-js"
   '';
 
   doInstallCheck = true;
@@ -147,7 +153,12 @@ buildNpmPackage (final: {
     library="$out/lib/node_modules/@trevrpc/trevrpc-js"
 
     test -x "$out/bin/trevrpc-interop-browser"
-    test ! -e "$out/bin/protoc-gen-trevrpc-js"
+    test -x "$out/bin/protoc-gen-trevrpc-js"
+    mkdir -p "$TMPDIR/generated"
+    protoc --plugin=protoc-gen-trevrpc-js="$out/bin/protoc-gen-trevrpc-js" \
+      --trevrpc-js_out="$TMPDIR/generated" --proto_path=../interop/proto --proto_path=../proto \
+      interop.proto
+    test -s "$TMPDIR/generated/interop_trevrpc.js"
 
     # The published package is the browser client, nothing else.
     export HOME="$TMPDIR/home"
@@ -210,11 +221,11 @@ buildNpmPackage (final: {
     runHook postInstallCheck
   '';
 
-  passthru = { inherit zstdWasm; };
+  passthru = { inherit zstdWasm protocGen; };
 
   meta = {
-    mainProgram = "trevrpc-interop-browser";
-    description = "Browser WebTransport client for TrevRPC, on protobuf-es";
+    mainProgram = "protoc-gen-trevrpc-js";
+    description = "Browser WebTransport client and code generator for TrevRPC, on protobuf-es";
     license = lib.licenses.mit;
     # The interop CLI needs the Playwright browsers from nixpkgs.
     platforms = [

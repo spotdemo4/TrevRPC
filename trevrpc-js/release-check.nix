@@ -19,14 +19,13 @@
   trevrpc-js,
   trevrpc-js-effect,
   trevrpc-js-protovalidate,
-  trevrpc-js-protoc-gen,
 }:
 let
   packages = [
     trevrpc-js
     trevrpc-js-effect
     trevrpc-js-protovalidate
-    trevrpc-js-protoc-gen
+    trevrpc-js.protocGen
   ];
   # The directory flake-release enters: the package's sourceRoot within its source.
   directory = package: lib.removePrefix "${package.src.name}/" package.sourceRoot;

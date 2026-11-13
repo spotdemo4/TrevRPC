@@ -103,7 +103,6 @@ nix build .#trevrpc-rust
 nix build .#trevrpc-js
 nix build .#trevrpc-js-effect
 nix build .#trevrpc-js-protovalidate
-nix build .#trevrpc-js-protoc-gen
 nix build .#trevrpc-kotlin
 ```
 

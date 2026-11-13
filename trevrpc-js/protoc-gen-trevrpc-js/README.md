@@ -56,4 +56,4 @@ npm test --prefix ..
 npm run check      # format check, lint
 ```
 
-`nix build .#trevrpc-js-protoc-gen` checks the published files and runs the installed plugin.
+`nix build .#trevrpc-js.protocGen` checks the published files and runs the installed plugin; `nix build .#trevrpc-js` builds it too and puts it next to `trevrpc-interop-browser`.

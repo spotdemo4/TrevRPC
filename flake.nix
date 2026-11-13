@@ -301,9 +301,6 @@
               inherit (self.packages.${system}) trevrpc-js;
               inherit interopProto;
             };
-            trevrpc-js-protoc-gen = pkgs.callPackage ./trevrpc-js/protoc-gen-trevrpc-js {
-              inherit interopProto trevrpcProto;
-            };
             trevrpc-kotlin = pkgs.callPackage ./trevrpc-kotlin {
               inherit
                 wireGolden
@@ -372,7 +369,6 @@
             trevrpc-js
             trevrpc-js-effect
             trevrpc-js-protovalidate
-            trevrpc-js-protoc-gen
             trevrpc-kotlin
             trevrpc-rust
             trevrpc-bench-baseline
@@ -392,7 +388,6 @@
               trevrpc-js
               trevrpc-js-effect
               trevrpc-js-protovalidate
-              trevrpc-js-protoc-gen
               ;
           };
 
@@ -497,7 +492,7 @@
           };
 
           trevrpc-js-protoc-gen-lint = {
-            src = self.packages.${system}.trevrpc-js-protoc-gen;
+            src = self.packages.${system}.trevrpc-js.protocGen;
             packages = with pkgs; [
               oxfmt
               oxlint
