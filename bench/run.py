@@ -118,14 +118,17 @@ COMPRESSED_SCENARIOS = ("unary", "client-stream", "bidi")
 # Room on top of warmup and duration for connecting and draining, which for a browser includes
 # launching it again when it does not start in time.
 DEADLINE_SLACK = 80
-# How many more times a run that completed no operation in its measured window runs; see
-# `Runner.run_once`.
-STARVED_RETRIES = 2
+# How many more times a run that completed no operation in its measured window, or did not
+# connect, runs; see `Runner.run_once`.
+RETRIES = 2
 # What every bench client prints as its last line when no operation completed in its measured
 # window, whether its calls failed or ran past the window: the baselines report a window whose
 # every call failed as a result with no ops instead, and run_once retries both the same way, since
 # on a loaded machine one slow first call can fail as well as stall.
 STARVED = "no operation completed"
+# What every bench client prints in its last line when it did not connect before its connect
+# timeout: over a lossy link, TCP backs off for seconds when a burst hits its handshake.
+UNCONNECTED = "could not connect"
 COLUMNS = (
     "scenario", "size", "md", "conc", "conns", "rate", "rules", "transport", "compression",
     "client", "server", "ops/s", "msgs/s", "MB/s", "p50us", "p99us", "wire_B/msg", "lost%",
@@ -448,8 +451,9 @@ class Attempt:
     result: Result | None = None
     # Why the run failed, if it did.
     reason: str | None = None
-    # Whether no operation completed in the measured window.
-    starved: bool = False
+    # What went wrong, when it is worth running again: no operation completed in the measured
+    # window, or the client did not connect.
+    retry: str | None = None
 
 
 class Runner:
@@ -545,28 +549,32 @@ class Runner:
         """Runs the cell, logging to CELL.log, and returns its result, or None after recording
         why it failed.
 
-        A run that completed no operation in its measured window, failed or not, runs again up
-        to STARVED_RETRIES times, logging to CELL-retryN.log. The check keeps its windows to a
-        fifth of a second, so on a machine saturated by other builds a worker may not finish a
-        single call inside one, which says nothing about the code under test. Every other failure
-        is recorded at once, and a cell that completes nothing on every attempt still fails."""
-        retry = 0
+        A run that completed no operation in its measured window, failed or not, or whose client
+        did not connect, runs again up to RETRIES times, logging to CELL-retryN.log. The check
+        keeps its windows to a fifth of a second, so on a machine saturated by other builds a
+        worker may not finish a single call inside one, and over a lossy link one burst can hold
+        a TCP handshake past the client's connect timeout; neither says anything about the code
+        under test, and the measured window only starts once the client has connected. Every
+        other failure is recorded at once, and a cell that fails either way on every attempt
+        still fails."""
+        retries: list[str] = []
         while True:
-            name = cell if retry == 0 else f"{cell}-retry{retry}"
+            name = cell if not retries else f"{cell}-retry{len(retries)}"
             attempt = self.attempt(name, client, server, netem, command)
-            if not attempt.starved or retry == STARVED_RETRIES:
+            if attempt.retry is None or len(retries) == RETRIES:
                 break
             # The reason stays in the output even when a retry passes.
             print(
-                f"retrying: {name} completed no operation: {attempt.reason}",
+                f"retrying: {name} {attempt.retry}: {attempt.reason}",
                 file=sys.stderr,
                 flush=True,
             )
-            retry += 1
+            retries.append(attempt.retry)
         if attempt.reason is not None:
             reason = attempt.reason
-            if retry != 0:
-                reason += f", after {retry} earlier run(s) completed no operation"
+            if retries:
+                what = " or ".join(dict.fromkeys(retries))
+                reason += f", after {len(retries)} earlier run(s) {what}"
             self.fail(cell, reason, attempt.log, attempt.offset)
         return attempt.result
 
@@ -589,15 +597,17 @@ class Runner:
             lines = log.read_text(encoding="utf-8", errors="replace").split("\n")
             last = next((line.strip() for line in reversed(lines) if line.strip()), "")
             if STARVED in last:
-                return Attempt(log, offset, None, f"{reason}: {last}", starved=True)
+                return Attempt(log, offset, None, f"{reason}: {last}", "completed no operation")
+            if UNCONNECTED in last:
+                return Attempt(log, offset, None, f"{reason}: {last}", "did not connect")
             return Attempt(log, offset, None, reason)
         try:
             result = parse_result(client, server, line, netem)
         except ValueError as error:
             return Attempt(log, offset, None, f"printed an invalid result ({error}): {line}")
         if result.errors != 0:
-            starved = result.record.get("ops") == 0
-            return Attempt(log, offset, result, f"reported errors: {line}", starved)
+            retry = "completed no operation" if result.record.get("ops") == 0 else None
+            return Attempt(log, offset, result, f"reported errors: {line}", retry)
         return Attempt(log, offset, result)
 
     def fail(self, cell: str, reason: str, log: Path, offset: int) -> None:

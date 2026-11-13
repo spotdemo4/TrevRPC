@@ -421,6 +421,51 @@ func TestBenchCompressionModesShrinkTheRecordsPayload(t *testing.T) {
 	}
 }
 
+// closedAddr returns a loopback address that nothing listens on over TCP.
+func closedAddr(t *testing.T) string {
+	t.Helper()
+	listener, err := new(net.ListenConfig).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+// lastLine returns the last non-empty line of text.
+func lastLine(text string) string {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	return lines[len(lines)-1]
+}
+
+// TestBenchSaysWhenItCouldNotConnect checks the line bench/run.py runs a
+// cell again on, and that a configuration error does not print it.
+func TestBenchSaysWhenItCouldNotConnect(t *testing.T) {
+	certFile, _ := writeTestCertificate(t)
+	addr := closedAddr(t)
+	for _, test := range []struct {
+		addr, ca string
+		want     bool
+	}{
+		{addr: addr, ca: certFile, want: true},
+		{addr: addr, ca: certFile + ".missing", want: false},
+		// Dial rejects an address without a port before it connects.
+		{addr: "127.0.0.1", ca: certFile, want: false},
+	} {
+		args := []string{"bench", "--addr", test.addr, "--ca", test.ca, "--transport", "tcp", "--scenario", "unary", "--duration", "1", "--warmup", "0"}
+		var stdout, stderr bytes.Buffer
+		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 1 {
+			t.Fatalf("run(%v) = %d, want 1 (stderr: %s)", args, code, stderr.String())
+		}
+		if got := strings.Contains(lastLine(stderr.String()), "could not connect"); got != test.want {
+			t.Errorf("--addr %s --ca %s: last line %q says could not connect = %v, want %v", test.addr, test.ca, lastLine(stderr.String()), got, test.want)
+		}
+	}
+}
+
 func TestBenchCommandLineErrors(t *testing.T) {
 	for _, args := range [][]string{
 		{"bench"},

@@ -14,6 +14,11 @@ import { connectLane } from "./lane.js";
 import { newPayload } from "./records.js";
 
 const ConnectTimeoutMs = 10_000;
+/**
+ * What the error of a run that could not connect starts with, which bench/run.py runs again, as it
+ * does for the native clients: over a lossy link, one burst can hold a TCP handshake for seconds.
+ */
+const Unconnected = "could not connect";
 /** How long operations still running at the end of the window get to finish, as natively. */
 const GraceMs = 10_000;
 /** How long a worker waits after a failed operation before the next. */
@@ -161,16 +166,19 @@ function padValue(input) {
  */
 async function trevrpcTarget(input, signal) {
   const mode = Compressions[input.compression];
-  const channel = await connectLane({
-    url: input.url,
-    certHash: input.certHash,
-    transport: input.transport,
-    webSocketUrl: input.webSocketUrl,
-    ...((mode.dictionary || mode.stream) && {
-      compression: await interopCompression(mode.dictionary ? input.dictionary : undefined),
+  const compression =
+    (mode.dictionary || mode.stream) &&
+    (await interopCompression(mode.dictionary ? input.dictionary : undefined));
+  const channel = await connecting(() =>
+    connectLane({
+      url: input.url,
+      certHash: input.certHash,
+      transport: input.transport,
+      webSocketUrl: input.webSocketUrl,
+      ...(compression && { compression }),
+      signal: AbortSignal.timeout(ConnectTimeoutMs),
     }),
-    signal: AbortSignal.timeout(ConnectTimeoutMs),
-  });
+  );
   if (channel.transport !== input.transport) {
     channel.close();
     throw new Error(`connected over ${channel.transport}, want ${input.transport}`);
@@ -285,7 +293,9 @@ async function fetchTarget(input, lane, signal) {
   const pad = padValue(input);
   const options = { signal, ...(pad && { headers: { [PadKey]: pad } }) };
 
-  await client.unary({ message: "probe" }, { signal: AbortSignal.timeout(ConnectTimeoutMs) });
+  await connecting(() =>
+    client.unary({ message: "probe" }, { signal: AbortSignal.timeout(ConnectTimeoutMs) }),
+  );
   const probe = await resourceTiming(input.url, ConnectTimeoutMs);
   if (!probe) {
     throw new Error(`the probe call left no resource timing entry within ${ConnectTimeoutMs} ms`);
@@ -321,6 +331,15 @@ async function fetchTarget(input, lane, signal) {
     operation: (scenario, payload, count) => operations[scenario](payload, count),
     close: () => {},
   };
+}
+
+/** What connect resolves with, or an error that says it could not connect. */
+async function connecting(connect) {
+  try {
+    return await connect();
+  } catch (error) {
+    throw new Error(`${Unconnected}: ${error?.message ?? String(error)}`, { cause: error });
+  }
 }
 
 /** An operation that holds nothing across runs. */

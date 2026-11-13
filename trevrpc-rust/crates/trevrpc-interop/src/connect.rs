@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 
 use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::pki_types::pem::PemObject;
+use trevrpc::Code;
 use trevrpc::client::{Channel, ChannelConfig, TransportPolicy};
 
 use crate::{BoxError, Flags};
@@ -68,8 +69,31 @@ pub async fn channel_with(
     }
     let config = configure(config);
     let endpoint = client_endpoint(addr, &config, tls)?;
-    let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config).await?;
+    let channel = Channel::connect_with_config(endpoint.clone(), addr, server_name, config)
+        .await
+        .map_err(|error| -> BoxError {
+            if is_connect_failure(&error) {
+                format!("could not connect to {addr}: {error}").into()
+            } else {
+                error.into()
+            }
+        })?;
     Ok((channel, endpoint))
+}
+
+/// Whether a connect error is the network connect failing or running out of time, after which
+/// `bench/run.py` runs a bench client again: a transport error, such as a refused connection, or
+/// a status that says the server was unavailable or the connect ran out of time. Anything else,
+/// such as an invalid compression or connection metadata setting, fails the same way every time.
+fn is_connect_failure(error: &trevrpc::Error) -> bool {
+    match error {
+        trevrpc::Error::Transport(_) => true,
+        trevrpc::Error::Status(status) => matches!(
+            status.code(),
+            Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled
+        ),
+        _ => false,
+    }
 }
 
 /// A client QUIC endpoint bound to the unspecified address of `remote`'s family.

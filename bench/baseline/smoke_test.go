@@ -155,6 +155,41 @@ func TestBenchScenarios(t *testing.T) {
 	}
 }
 
+// TestBenchSaysWhenItCouldNotConnect checks the error run.py runs a cell again
+// on, over each transport, and that a configuration error does not say it.
+func TestBenchSaysWhenItCouldNotConnect(t *testing.T) {
+	cert, _ := writeCert(t)
+	listener, err := new(net.ListenConfig).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, transport := range transports {
+		for _, test := range []struct {
+			ca   string
+			want bool
+		}{
+			{ca: cert, want: true},
+			{ca: cert + ".missing", want: false},
+		} {
+			args := []string{
+				"bench", "--addr", addr, "--ca", test.ca, "--transport", transport,
+				"--scenario", "unary", "--duration", "0.2", "--warmup", "0",
+			}
+			err := run(t.Context(), args, nil, io.Discard)
+			if err == nil {
+				t.Fatalf("run(%v) connected to a closed port", args)
+			}
+			if got := strings.Contains(err.Error(), "could not connect"); got != test.want {
+				t.Errorf("%s --ca %s: error %q says could not connect = %v, want %v", transport, test.ca, err, got, test.want)
+			}
+		}
+	}
+}
+
 // padCounter counts the calls a server handles and those that carry the
 // bench-pad request metadata, and what the pad looked like.
 type padCounter struct {

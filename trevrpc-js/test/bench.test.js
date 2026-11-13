@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { measure, percentile, summarize } from "../interop-browser/bench.js";
+import { measure, percentile, runBench, summarize } from "../interop-browser/bench.js";
 import { createJsonClient, jsonLines } from "../interop-browser/json-client.js";
 import { Records, newPayload } from "../interop-browser/records.js";
 
@@ -65,6 +65,43 @@ test("operations close when their worker stops", async () => {
   const operation = { ...clock.operation(1, 1), close: () => closed++ };
   await measure({ operations: [operation, operation], start: 0, end: 5, now: clock.now });
   assert.equal(closed, 2);
+});
+
+/** A loopback port nothing listens on. */
+async function closedPort() {
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+test("a run that cannot connect says so, for run.py to run it again", async () => {
+  const port = await closedPort();
+  const input = {
+    scenario: "unary",
+    size: 64,
+    metadataSize: 0,
+    concurrency: 1,
+    duration: 1,
+    warmup: 0,
+    messages: 1,
+    payload: "repeat",
+    compression: "none",
+  };
+  await assert.rejects(
+    runBench({
+      ...input,
+      transport: "websocket",
+      url: `https://127.0.0.1:${port}`,
+      webSocketUrl: `ws://127.0.0.1:${port}/trevrpc`,
+    }),
+    /^Error: could not connect: /,
+  );
+  await assert.rejects(
+    runBench({ ...input, transport: "json", url: `http://127.0.0.1:${port}` }),
+    /^Error: could not connect: /,
+  );
 });
 
 test("the result line has the native clients' fields", () => {

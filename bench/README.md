@@ -38,9 +38,11 @@ runs `paced` and `unreliable-paced` once per rate in `--rates` (default 1000), a
 table and writes one JSON object per run to `DIR/results.jsonl`; without
 `--out`, `DIR` is a new `trevrpc-bench.*` directory under `$TMPDIR`. A run fails
 when its client exits non-zero or reports errors. A run in which no operation completed inside
-the measured window, whether its calls failed or ran past the window, runs again up to twice, since
-on a machine busy with other work a short window may not fit a single call; a cell that completes
-nothing on every attempt still fails. Each retry prints why the run before it failed. Each run's client stderr is kept in `DIR/CELL.log`, and each
+the measured window, whether its calls failed or ran past the window, or whose client could not
+connect, runs again up to twice, since on a machine busy with other work a short window may not fit
+a single call, and over a lossy link one burst can hold a TCP handshake past a client's connect
+timeout; every bench client says `could not connect` when connecting fails. A cell that
+fails either way on every attempt still fails. Each retry prints why the run before it failed. Each run's client stderr is kept in `DIR/CELL.log`, and each
 retry's in `DIR/CELL-retryN.log`; the baseline client logs the first failed call of each worker.
 Each server's stderr is kept in `DIR/server-NAME.log`. A benchmark with failed runs
 ends with every failed cell, why it failed, the last lines of its log, and what the server logged

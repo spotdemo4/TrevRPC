@@ -425,6 +425,46 @@ fn bench_spreads_workers_over_connections() {
     server.finish();
 }
 
+/// The line `bench/run.py` runs a cell again on, which a configuration error does not print.
+#[test]
+fn bench_says_when_it_could_not_connect() {
+    let dir = std::env::temp_dir().join(format!("trevrpc-interop-{}-closed", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_path = dir.join("cert.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    // Nothing listens on the port once the listener is dropped.
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string();
+    for (addr, ca, want) in [
+        (addr.as_str(), cert_path.clone(), true),
+        (addr.as_str(), dir.join("missing.pem"), false),
+        // An address without a port fails before the connect.
+        ("127.0.0.1", cert_path, false),
+    ] {
+        let output = Command::new(BIN)
+            .args(["bench", "--addr", addr, "--tcp-addr", addr, "--ca"])
+            .arg(&ca)
+            .args(["--transport", "tcp", "--scenario", "unary"])
+            .args(["--duration", "0.2", "--warmup", "0"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last = stderr.trim().lines().last().unwrap_or_default();
+        assert!(!output.status.success(), "bench connected to a closed port");
+        assert_eq!(
+            last.contains("could not connect"),
+            want,
+            "--addr {addr} --ca {}: last line {last:?}",
+            ca.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn bench_rejects_unusable_flags() {
     let server = Server::start("bench-flags");

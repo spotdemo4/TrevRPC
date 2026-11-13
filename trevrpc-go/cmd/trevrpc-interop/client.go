@@ -71,9 +71,25 @@ func (c *connectionConfig) dial(ctx context.Context, options trevrpc.DialOptions
 	defer cancel()
 	channel, err := trevrpc.Dial(dialCtx, c.addr, options)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", c.addr, err)
+		if !isConnectFailure(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("could not connect to %s: %w", c.addr, err)
 	}
 	return channel, nil
+}
+
+// isConnectFailure reports whether a Dial error is the network connect
+// failing or running out of time, after which bench/run.py runs a bench
+// client again. Anything else, such as an InvalidArgument for a malformed
+// address or option, fails the same way every time.
+func isConnectFailure(err error) bool {
+	switch trevrpc.StatusFromError(err).Code {
+	case trevrpc.CodeUnavailable, trevrpc.CodeDeadlineExceeded, trevrpc.CodeCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 type clientConfig struct {

@@ -522,6 +522,11 @@ class FailureTest(unittest.TestCase):
 # What a TrevRPC client prints when its window completed nothing, and the baselines' result line
 # when every call in it failed, or some.
 STARVED = "echo 'no operation completed in the 200ms measured window (0 failed)' >&2; exit 1"
+# What the browser client prints when its WebSocket did not open in time.
+UNCONNECTED = (
+    "echo 'trevrpc-interop-browser bench: could not connect: Cancelled: connection cancelled "
+    "after 10000 ms: the WebSocket was still opening' >&2; exit 1"
+)
 NO_OPS = "echo '" + json.dumps({**RESULT, "ops": 0, "msgs": 0, "errors": 2, "ops_per_sec": 0}) + "'"
 SOME_FAILED = "echo '" + json.dumps({**RESULT, "errors": 1}) + "'"
 PASSED = "echo '" + json.dumps(RESULT) + "'"
@@ -549,7 +554,7 @@ class Cell:
         return int((self.out / "runs").read_text())
 
 
-class StarvedTest(unittest.TestCase):
+class RetryTest(unittest.TestCase):
     def test_a_run_that_completes_no_operation_runs_again(self) -> None:
         with tempfile.TemporaryDirectory() as out:
             cell = Cell(out, STARVED, STARVED, PASSED)
@@ -601,6 +606,38 @@ class StarvedTest(unittest.TestCase):
             self.assertEqual(1, len(cell.runner.failures))
             self.assertTrue(cell.runner.failures[0].details[0].startswith("reported errors: "))
 
+    def test_a_run_that_did_not_connect_runs_again(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            cell = Cell(out, UNCONNECTED, PASSED)
+
+            self.assertIsNotNone(cell.result)
+            self.assertEqual([], cell.runner.failures)
+            self.assertEqual(2, cell.runs)
+            self.assertIn(
+                f"retrying: cell did not connect: exited 1 (see {out}/cell.log): "
+                "trevrpc-interop-browser bench: could not connect: Cancelled:",
+                cell.stderr,
+            )
+            self.assertIn("could not connect", (Path(out) / "cell.log").read_text())
+
+    def test_a_cell_that_never_connects_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            cell = Cell(out, UNCONNECTED, STARVED, UNCONNECTED, PASSED)
+
+            self.assertIsNone(cell.result)
+            self.assertEqual(3, cell.runs)
+            self.assertEqual(1, len(cell.runner.failures))
+            # Every kind of retry is counted, once each.
+            self.assertTrue(
+                cell.runner.failures[0]
+                .details[0]
+                .endswith(
+                    "the WebSocket was still opening, "
+                    "after 2 earlier run(s) did not connect or completed no operation"
+                ),
+                cell.runner.failures[0].details[0],
+            )
+
     def test_other_failures_fail_at_once(self) -> None:
         for command in [
             SOME_FAILED,
@@ -608,6 +645,7 @@ class StarvedTest(unittest.TestCase):
             "echo nonsense",
             # Only the client's last line says whether the window completed nothing.
             "echo 'no operation completed earlier' >&2; echo 'panic: boom' >&2; exit 2",
+            "echo 'could not connect earlier' >&2; echo 'panic: boom' >&2; exit 2",
         ]:
             with self.subTest(command=command), tempfile.TemporaryDirectory() as out:
                 cell = Cell(out, command, PASSED)

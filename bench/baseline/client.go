@@ -110,6 +110,9 @@ func dialGRPC(ctx context.Context, addr string, tlsConfig *tls.Config, pad strin
 }
 
 // waitReady connects and waits for the HTTP/2 connection to be established.
+// Like dialConnect, it says it could not connect when it fails, which run.py
+// runs a cell again on: only the network connect says it, since a
+// configuration error fails the same way every time.
 func waitReady(ctx context.Context, conn *grpc.ClientConn) error {
 	conn.Connect()
 	for {
@@ -117,10 +120,10 @@ func waitReady(ctx context.Context, conn *grpc.ClientConn) error {
 		case connectivity.Ready:
 			return nil
 		case connectivity.TransientFailure, connectivity.Shutdown:
-			return fmt.Errorf("connect to %s: %s", conn.Target(), state)
+			return fmt.Errorf("could not connect to %s: %s", conn.Target(), state)
 		}
 		if !conn.WaitForStateChange(ctx, conn.GetState()) {
-			return fmt.Errorf("connect to %s: %w", conn.Target(), ctx.Err())
+			return fmt.Errorf("could not connect to %s: %w", conn.Target(), ctx.Err())
 		}
 	}
 }
@@ -181,7 +184,7 @@ func dialConnect(ctx context.Context, addr string, tlsConfig *tls.Config, pad st
 	// One call establishes the connection the workers will share.
 	if _, err := client.Unary(ctx, &echopb.EchoRequest{}); err != nil {
 		transport.CloseIdleConnections()
-		return connection{}, fmt.Errorf("connect to %s: %w", addr, err)
+		return connection{}, fmt.Errorf("could not connect to %s: %w", addr, err)
 	}
 	return connection{client: client, wire: counter, close: transport.CloseIdleConnections}, nil
 }
