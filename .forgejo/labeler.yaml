@@ -6,6 +6,14 @@ actions:
           - .github/workflows/**
           - .forgejo/workflows/**
 
+erlang:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.{erl,hrl}"
+          - "**/*.app.src"
+          - "**/rebar.config"
+          - "**/rebar.lock"
+
 go:
   - changed-files:
       - any-glob-to-any-file:

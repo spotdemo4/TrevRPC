@@ -18,6 +18,7 @@ An issue that spans several gets all of them (e.g. go + rust).
   trevrpc-js/      type declarations, type tests (*.ts)        typescript
   package.json     npm packaging and dependencies              node
   trevrpc-kotlin/  Android Cronet client                       kotlin
+  trevrpc-erlang/  Erlang runtime                             erlang
   proto/, *.proto  protocol definitions, generated-code shape  proto
   interop/, bench/ Python harnesses                            python
   *.nix            flake, packaging, checks                    nix

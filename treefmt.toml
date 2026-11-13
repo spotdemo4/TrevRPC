@@ -27,6 +27,11 @@ includes = ["*.proto"]
 excludes = ["**/trailing_hash#.proto", "interop/proto/buf/validate/validate.proto"]
 no-positional-arg-support = true
 
+[formatter.erlfmt]
+command = "erlfmt"
+options = ["--write"]
+includes = ["*.erl", "*.hrl", "*.app.src", "rebar.config"]
+
 [formatter.ruff]
 command = "ruff"
 options = ["format"]

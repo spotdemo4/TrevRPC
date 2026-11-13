@@ -1,0 +1,10 @@
+{application, trevrpc, [
+    {description, "Protobuf over QUIC, HTTP/3 & WebTransport"},
+    {vsn, "1.11.1"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"Source", "https://trev.zip/llc/TrevRPC"}]}
+]}.

@@ -92,6 +92,12 @@
               ruff
               basedpyright
 
+              # erlang
+              beamMinimal28Packages.erlang
+              beamMinimal28Packages.rebar3
+              erlfmt
+              erlang-language-platform
+
               vscode-json-languageserver # json
               yaml-language-server # yaml
               tombi # toml
@@ -275,6 +281,12 @@
                 ;
             };
             trevrpc-go-otel = pkgs.callPackage ./trevrpc-go/oteltrevrpc { };
+            trevrpc-erlang = pkgs.callPackage ./trevrpc-erlang {
+              inherit
+                wireGolden
+                zstdGolden
+                ;
+            };
             trevrpc-go-protovalidate = pkgs.callPackage ./trevrpc-go/protovalidatetrevrpc { };
             # The Go interop and load benchmark executable, a module of its own so that the
             # TrevRPC module does not depend on protovalidate.
@@ -356,12 +368,14 @@
             ktlint
             ruff
             buf
+            erlfmt
           ];
         };
 
         # nix flake check
         checks = pkgs.mkChecks {
           inherit (self.packages.${system})
+            trevrpc-erlang
             trevrpc-go
             trevrpc-go-otel
             trevrpc-go-protovalidate
@@ -389,6 +403,14 @@
               trevrpc-js-effect
               trevrpc-js-protovalidate
               ;
+          };
+
+          trevrpc-erlang-lint = {
+            src = self.packages.${system}.trevrpc-erlang;
+            packages = with pkgs; [ erlfmt ];
+            script = ''
+              erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
+            '';
           };
 
           trevrpc-go-lint = {

@@ -26,6 +26,7 @@ direnv allow
 | `trevrpc-js/protovalidate/`         | protovalidate request validation for the browser client        |
 | `trevrpc-js/protoc-gen-trevrpc-js/` | `protoc-gen-trevrpc-js`, message codecs for the browser client |
 | `trevrpc-kotlin/`                   | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`  |
+| `trevrpc-erlang/`                   | Erlang runtime (in progress, wire protocol only so far)        |
 | `interop/`                          | cross-runtime test suite                                       |
 | `bench/`                            | load benchmarks and the grpc-go and connect-go baselines       |
 | `testdata/`                         | wire, QMux, and zstd golden vectors shared by the runtimes     |
@@ -89,6 +90,15 @@ with [gradle](https://gradle.org/) and [ktlint](https://pinterest.github.io/ktli
 ktlint "**/src/**/*.kt" "**/*.gradle.kts"
 ```
 
+with [rebar3](https://rebar3.org/) and [erlfmt](https://github.com/WhatsApp/erlfmt), in `trevrpc-erlang/`:
+
+```sh
+rebar3 eunit
+rebar3 xref
+rebar3 dialyzer
+erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
+```
+
 with the cross-runtime [interop](interop) suite:
 
 ```sh
@@ -104,6 +114,7 @@ nix build .#trevrpc-js
 nix build .#trevrpc-js-effect
 nix build .#trevrpc-js-protovalidate
 nix build .#trevrpc-kotlin
+nix build .#trevrpc-erlang
 ```
 
 ### release
