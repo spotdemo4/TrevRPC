@@ -2,6 +2,7 @@ package trevrpc
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"slices"
 	"sync"
@@ -186,6 +187,43 @@ func TestCancelledStreamFromSeqThatWatchesItsContextIsNotReported(t *testing.T) 
 		}
 		if got := server.freeze().detached.Load(); got != 0 {
 			t.Fatalf("detached executions = %d, want 0", got)
+		}
+	})
+}
+
+func TestRaceGuardedDetachesACallThatOutlivesItsDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server := NewServer()
+		runtime := server.freeze()
+		lease, ok := runtime.tryRequestLease(newWireRequest("/service/method"))
+		if !ok {
+			t.Fatal("failed to acquire request lease")
+		}
+		defer lease.release()
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		release := make(chan struct{})
+		abandoned := make(chan int, 1)
+		call := func() (int, error) {
+			<-release
+			return 7, nil
+		}
+		result, err := raceGuarded(ctx, lease, ServerDiagnosticHandlerPanic, lease.goRun, call, func(result int) { abandoned <- result })
+		if result != 0 || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("raceGuarded = %d, %v, want 0 and the deadline", result, err)
+		}
+		if got := runtime.detached.Load(); got != 1 {
+			t.Fatalf("detached executions while the call runs on = %d, want 1", got)
+		}
+
+		close(release)
+		synctest.Wait()
+		if got := <-abandoned; got != 7 {
+			t.Fatalf("abandoned result = %d, want 7", got)
+		}
+		if got := runtime.detached.Load(); got != 0 {
+			t.Fatalf("detached executions after the call returned = %d, want 0", got)
 		}
 	})
 }
