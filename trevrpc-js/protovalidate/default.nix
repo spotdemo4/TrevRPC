@@ -86,15 +86,11 @@ buildNpmPackage (final: {
     runHook preCheck
     npm test
 
-    # The published package is the adapter, nothing else, and it loads against the built
-    # trevrpc-js and protovalidate.
+    # The packed adapter loads against the built trevrpc-js and protovalidate, its peers; what the
+    # tarball holds is checked in release-check.nix.
     export HOME="$TMPDIR/home"
     mkdir -p "$HOME"
     tarball="$(npm pack . --silent --pack-destination "$TMPDIR")"
-    test "$tarball" = "trevrpc-protovalidate-${final.version}.tgz"
-    tar -tzf "$TMPDIR/$tarball" | sort > tarball.list
-    printf '%s\n' package/LICENSE package/README.md package/package.json \
-      package/src/index.d.ts package/src/index.js | diff -u - tarball.list
 
     consumer="$TMPDIR/consumer/node_modules"
     mkdir -p "$consumer/@trevrpc/protovalidate" "$consumer/@bufbuild"

@@ -161,20 +161,8 @@ buildNpmPackage (final: {
       interop.proto
     test -s "$TMPDIR/generated/interop_trevrpc.js"
 
-    # The published package is the browser client, nothing else.
-    export HOME="$TMPDIR/home"
-    mkdir -p "$HOME"
-    tarball="$(npm pack . --silent --pack-destination "$TMPDIR")"
-    test "$tarball" = "trevrpc-trevrpc-js-${final.version}.tgz"
-    tar -tzf "$TMPDIR/$tarball" | sort > tarball.list
-    grep -qx 'package/src/index.js' tarball.list
-    grep -qx 'package/src/index.d.ts' tarball.list
-    grep -qx 'package/src/codec.js' tarball.list
-    grep -qx 'package/src/codec.d.ts' tarball.list
-    grep -qx 'package/src/zstd.js' tarball.list
-    grep -qx 'package/src/zstd.d.ts' tarball.list
-    grep -qx 'package/src/zstd-wasm.js' tarball.list
-    ! grep -E 'interop|test/|build/|bin/|tools/|native|node_modules|\.rs$|Cargo' tarball.list
+    # What the published tarball holds is checked in release-check.nix, against the tarball the
+    # release packs from the source rather than one packed from this build.
 
     (
       cd "$out/lib"

@@ -45,15 +45,6 @@ buildNpmPackage (final: {
   checkPhase = ''
     runHook preCheck
 
-    # The published package is the plugin, nothing else.
-    export HOME="$TMPDIR/home"
-    mkdir -p "$HOME"
-    tarball="$(npm pack . --silent --pack-destination "$TMPDIR")"
-    test "$tarball" = "trevrpc-protoc-gen-trevrpc-js-${final.version}.tgz"
-    tar -tzf "$TMPDIR/$tarball" | sort > tarball.list
-    printf '%s\n' package/LICENSE package/README.md package/bin/protoc-gen-trevrpc-js \
-      package/package.json package/src/plugin.js | diff -u - tarball.list
-
     # It generates a codec file per proto file, in each target.
     for target in js+dts ts; do
       generated="$TMPDIR/generated-$target"
