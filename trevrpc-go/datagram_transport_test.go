@@ -134,7 +134,7 @@ func (c *datagramFrameCounter) RecordEvent(event qlogwriter.Event) {
 func (*datagramFrameCounter) Close() error { return nil }
 
 func (c *datagramFrameCounter) quicConfig() *quic.Config {
-	return &quic.Config{Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return c }}
+	return withTestHandshakeTimeout(&quic.Config{Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return c }})
 }
 
 // countingDatagramConn counts the datagrams that pass through a connection.

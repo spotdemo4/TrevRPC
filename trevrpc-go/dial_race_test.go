@@ -199,10 +199,9 @@ func TestDialFallsBackToQMuxWhenUDPIsUnreachable(t *testing.T) {
 func TestDialPrefersQUIC(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
-	channel := dialNative(t, pki, listener)
-	if transport := channel.Transport(); transport != TransportQUIC {
-		t.Fatalf("Transport = %q, want quic", transport)
-	}
+	// dialNative dials with the default policy, which races QMux over TLS
+	// against QUIC, and fails unless QUIC won.
+	dialNative(t, pki, listener)
 }
 
 func TestDialTCPOnly(t *testing.T) {

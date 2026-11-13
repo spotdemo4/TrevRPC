@@ -219,6 +219,7 @@ func serveTestListener(t testing.TB, server *Server, listenOptions ListenOptions
 // derived from parent.
 func serveTestListenerContext(parent context.Context, t testing.TB, server *Server, listenOptions ListenOptions) *Listener {
 	t.Helper()
+	listenOptions.QUICConfig = withTestHandshakeTimeout(listenOptions.QUICConfig)
 	listener, err := Listen("127.0.0.1:0", server, listenOptions)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -244,15 +245,44 @@ func serveTestListenerContext(parent context.Context, t testing.TB, server *Serv
 	return listener
 }
 
+// withTestHandshakeTimeout returns config, or a copy of it, that gives a QUIC
+// handshake the whole of rpcTestTimeout without network activity. quic-go
+// gives up after 5 s by default, and on a starved CI runner a loopback
+// handshake has stalled that long; a slow handshake should make a test slow,
+// not fail it.
+func withTestHandshakeTimeout(config *quic.Config) *quic.Config {
+	if config == nil {
+		config = new(quic.Config)
+	} else {
+		config = config.Clone()
+	}
+	if config.HandshakeIdleTimeout == 0 {
+		config.HandshakeIdleTimeout = rpcTestTimeout
+	}
+	return config
+}
+
+// dialNative dials listener with the default transport policy and fails the
+// test unless the channel uses QUIC. QMux over TLS only starts if QUIC has not
+// connected within FallbackDelay, which here is the whole dial timeout, so a
+// starved machine's slow handshake cannot hand the tests of the QUIC lane a
+// QMux channel.
 func dialNative(t testing.TB, pki testPKI, listener *Listener) *Channel {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client})
+	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+		TLSConfig:     pki.client,
+		QUICConfig:    withTestHandshakeTimeout(nil),
+		FallbackDelay: rpcTestTimeout,
+	})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	t.Cleanup(func() { _ = channel.Close() })
+	if transport := channel.Transport(); transport != TransportQUIC {
+		t.Fatalf("Transport = %q, want quic", transport)
+	}
 	return channel
 }
 
