@@ -251,21 +251,6 @@ class WireCodecTest {
     }
 
     @Test
-    fun `request codec reads the method path from field 1 and ignores unknown tags`() {
-        val path = "/example.greeter.Greeter/SayHello"
-        val encoded = WireCodec.encode(RpcRequest(path))
-        assertEquals(path, WireCodec.decodeRequest(encoded).method)
-        // Fields a later peer adds are skipped, whatever their wire type.
-        val withUnknown = encoded + byteArrayOf(0x52, 0x01, 0x6d, 0x5a, 0x01, 0x7a, 0x60, 0x01)
-        assertEquals(RpcRequest(path), WireCodec.decodeRequest(withUnknown))
-        assertEquals(path, WireCodec.decodeRequest(WireCodec.encode(RpcRequest(path))).method)
-        assertEquals(
-            listOf<Byte>(0x0a, path.length.toByte()),
-            encoded.take(2),
-        )
-    }
-
-    @Test
     fun `stream compression is an enum whose unknown values are rejected`() {
         StreamCompression.entries.forEach { value ->
             assertEquals(

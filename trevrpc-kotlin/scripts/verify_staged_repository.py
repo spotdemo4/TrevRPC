@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 import subprocess
@@ -76,9 +77,7 @@ def verify_archive(
             classes = [name for name in names if name.endswith(".class")]
             require(bool(classes), f"no class files in {path}")
             for name in classes:
-                data = archive.read(name)
-                require(data[:4] == b"\xca\xfe\xba\xbe", f"invalid class file {path}!{name}")
-                major = int.from_bytes(data[6:8], byteorder="big")
+                major = read_class_major(archive, path, name)
                 if expected_major is not None:
                     require(
                         major == expected_major,
@@ -91,20 +90,14 @@ def verify_archive(
                     )
 
 
-def verify_class_major(
-    archive: zipfile.ZipFile,
-    path: pathlib.Path,
-    name: str,
-    expected_major: int,
-) -> None:
-    require(name in archive.namelist(), f"missing class {path}!{name}")
-    data = archive.read(name)
+def read_class_major(archive: zipfile.ZipFile, path: pathlib.Path, name: str) -> int:
+    """The major version of class file `name` in the archive at `path`."""
+    try:
+        data = archive.read(name)
+    except KeyError:
+        raise AssertionError(f"missing class {path}!{name}") from None
     require(data[:4] == b"\xca\xfe\xba\xbe", f"invalid class file {path}!{name}")
-    major = int.from_bytes(data[6:8], byteorder="big")
-    require(
-        major == expected_major,
-        f"{path}!{name} has class major {major}, expected {expected_major}",
-    )
+    return int.from_bytes(data[6:8], byteorder="big")
 
 
 def dependency_rows(
@@ -293,65 +286,28 @@ def verify_generator_legal_metadata(
     )
 
 
-def parse_arguments(
-    argv: list[str],
-) -> tuple[pathlib.Path, str, str, str, str, str]:
-    require(
-        len(argv) == 11,
-        "usage: verify_staged_repository.py REPOSITORY --version VERSION "
-        + "--protobuf-version VERSION --kotlin-version VERSION "
-        + "--minimum-kotlin-version VERSION --gradle-version VERSION",
-    )
-    (
-        repository,
-        version_flag,
-        version,
-        protobuf_flag,
-        protobuf_version,
-        kotlin_flag,
-        kotlin_version,
-        minimum_kotlin_flag,
-        minimum_kotlin_version,
-        gradle_flag,
-        gradle_version,
-    ) = argv
-    require(version_flag == "--version", f"expected --version, got {version_flag}")
-    require(
-        protobuf_flag == "--protobuf-version",
-        f"expected --protobuf-version, got {protobuf_flag}",
-    )
-    require(
-        kotlin_flag == "--kotlin-version",
-        f"expected --kotlin-version, got {kotlin_flag}",
-    )
-    require(
-        minimum_kotlin_flag == "--minimum-kotlin-version",
-        f"expected --minimum-kotlin-version, got {minimum_kotlin_flag}",
-    )
-    require(
-        gradle_flag == "--gradle-version",
-        f"expected --gradle-version, got {gradle_flag}",
-    )
-    return (
-        pathlib.Path(repository),
-        version,
-        protobuf_version,
-        kotlin_version,
-        minimum_kotlin_version,
-        gradle_version,
-    )
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    _ = parser.add_argument("repository", type=pathlib.Path)
+    for option in (
+        "version",
+        "protobuf-version",
+        "kotlin-version",
+        "minimum-kotlin-version",
+        "gradle-version",
+    ):
+        _ = parser.add_argument(f"--{option}", required=True)
+    return parser.parse_args(argv)
 
 
 def main() -> None:
-    (
-        repository,
-        version,
-        protobuf_version,
-        kotlin_version,
-        minimum_kotlin_version,
-        gradle_version,
-    ) = parse_arguments(sys.argv[1:])
-    repository = repository.resolve()
+    arguments = parse_arguments(sys.argv[1:])
+    repository: pathlib.Path = arguments.repository.resolve()
+    version: str = arguments.version
+    protobuf_version: str = arguments.protobuf_version
+    kotlin_version: str = arguments.kotlin_version
+    minimum_kotlin_version: str = arguments.minimum_kotlin_version
+    gradle_version: str = arguments.gradle_version
     expected_generator_coordinates = [
         f"com.google.protobuf:protobuf-java:{protobuf_version}",
         "org.jetbrains:annotations:13.0",
@@ -409,8 +365,12 @@ def main() -> None:
                     "Main-Class: zip.trev.trevrpc.generator.MainKt" in manifest,
                     "executable generator has wrong Main-Class",
                 )
-                verify_class_major(
-                    archive, executable, "zip/trev/trevrpc/generator/MainKt.class", 65
+                main_major = read_class_major(
+                    archive, executable, "zip/trev/trevrpc/generator/MainKt.class"
+                )
+                require(
+                    main_major == 65,
+                    f"the generator's MainKt has class major {main_major}, expected 65",
                 )
                 verify_generator_legal_metadata(archive, executable, expected_generator_coordinates)
             process = subprocess.run(

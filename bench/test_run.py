@@ -453,10 +453,6 @@ class RepeatTest(unittest.TestCase):
             for rate in rates
         ]
 
-    def test_spread_is_the_range_as_a_share_of_the_median(self) -> None:
-        self.assertEqual(2.0, run.spread(self.results(1000, 1020)))
-        self.assertAlmostEqual(27.27, run.spread(self.results(1000, 1300, 1100)), places=2)
-
     def test_two_runs_agree_when_they_differ_by_at_most_the_tolerance(self) -> None:
         self.assertTrue(run.agree(self.results(1000, 1030), 3))
         self.assertFalse(run.agree(self.results(1000, 1031), 3))

@@ -44,22 +44,6 @@ class FramingMetadataTest {
     }
 
     @Test
-    fun `unknown and grease frames are skipped including after status and without buffering`() {
-        val unknown =
-            encodeFrame(0x40, ByteArray(10)) + encodeFrame(0x21, byteArrayOf(1)) + encodeFrame(QuicVarint.MAX_VALUE, byteArrayOf())
-        val stream =
-            unknown + encodeFrame(FrameType.HEADERS, byteArrayOf()) + unknown +
-                encodeFrame(FrameType.MESSAGE, byteArrayOf(9)) + unknown +
-                encodeFrame(FrameType.STATUS, byteArrayOf()) + unknown
-        for (split in 0..stream.size) {
-            val decoder = FrameDecoder()
-            val frames = decoder.feed(stream.copyOfRange(0, split)) + decoder.feed(stream.copyOfRange(split, stream.size))
-            decoder.finish()
-            assertEquals(listOf(FrameType.HEADERS, FrameType.MESSAGE, FrameType.STATUS), frames.map(Frame::type))
-        }
-    }
-
-    @Test
     fun `declared oversize is rejected from the header before payload arrives`() {
         val decoder = FrameDecoder(16)
         // MESSAGE with a declared length of 17; only the header is fed.

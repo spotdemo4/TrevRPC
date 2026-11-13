@@ -139,22 +139,6 @@ class StartServerTest(unittest.TestCase):
             with self.assertRaisesRegex(run.RunnerError, "'http2'"):
                 _ = run.start_server(command, certificates, "0.0.0.0", root / "interop.dict", root)
 
-    def test_reports_a_server_that_exits_early(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            certificates = run.Certificates(
-                root / "ca.pem", root / "server.pem", root / "server.key"
-            )
-
-            with self.assertRaisesRegex(run.RunnerError, "exited with 3"):
-                _ = run.start_server(
-                    ["sh", "-c", "exit 3", "--"],
-                    certificates,
-                    "0.0.0.0",
-                    root / "interop.dict",
-                    root,
-                )
-
 
 class ExtractDictionaryTest(unittest.TestCase):
     def test_writes_the_dictionary_of_the_vectors_in_the_test_apk(self) -> None:

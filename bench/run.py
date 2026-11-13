@@ -373,13 +373,6 @@ def validation_field(record: dict[str, object]) -> str:
     return validation
 
 
-def spread(results: list[Result]) -> float:
-    """The range of the runs' messages per second as a percentage of their median."""
-    rates = sorted(result.msgs_per_sec for result in results)
-    median = rates[(len(rates) - 1) // 2]
-    return (rates[-1] - rates[0]) / median * 100 if median > 0 else math.inf
-
-
 def agree(results: list[Result], tolerance: float) -> bool:
     """Whether two of the runs differ in messages per second by at most `tolerance` percent of
     the lower. The median of runs that include such a pair is one of them or between them, unless
