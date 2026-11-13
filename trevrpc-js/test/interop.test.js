@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { errors } from "playwright";
 
 import { LaunchAttempts, launchPlaywright, runPage } from "../interop-browser/driver.js";
+import { parseInteropArguments } from "../interop-browser/interop-cli.js";
 import { ScenarioNames } from "../interop-browser/names.js";
 import { runScenarios } from "../interop-browser/scenarios.js";
 import { encodeMessageFrame } from "../src/framing.js";
@@ -188,29 +189,51 @@ test("the CLI validates its arguments before launching a browser", () => {
     return copy;
   };
 
-  for (const bad of [
-    [],
-    arguments_({ "--browser": "netscape" }),
-    arguments_({ "--browser": "webkit" }),
-    arguments_({ "--browser": null }),
-    arguments_({ "--url": null }),
-    arguments_({ "--cert-hash": "abcd" }),
-    arguments_({ "--cert-hash": null }),
-    [...valid, "--unknown"],
-    [...valid, "--page-url", "https://127.0.0.1:4433/"],
-    [...valid, "--page-url", "/relative", "--cert", "cert.pem", "--key", "key.pem"],
-    [...valid, "--cert", "cert.pem", "--key", "key.pem"],
-    ["--write-page", "out", "--browser", "chromium"],
-    [...valid, "--page-protocol", "h3"],
-    [...valid, ...page, "--page-protocol", "h1"],
-    [...arguments_({ "--browser": "firefox" }), ...page, "--page-protocol", "h3"],
-    [...arguments_({ "--browser": "safari" }), ...page, "--page-protocol", "h2"],
+  const parsed = parseInteropArguments(valid);
+  assert.equal(parsed.browser.name, "chromium");
+  assert.equal(parsed.transport, "webtransport");
+  assert.deepEqual(
+    parsed.certHash,
+    Array.from({ length: 32 }, () => 0xab),
+  );
+  assert.deepEqual(parseInteropArguments(["--write-page", "out"]), { writePage: "out" });
+
+  // The message pins the check each case fails; cases with the same message fail different parts
+  // of its condition.
+  for (const [bad, message] of [
+    [arguments_({ "--browser": "netscape" }), /^--browser must be/],
+    [arguments_({ "--url": null }), /^--url is required/],
+    [arguments_({ "--cert-hash": "abcd" }), /^--cert-hash must be/],
+    [[...valid, "--transport", "quic"], /^--transport must be/],
+    [[...valid, "--unknown"], /Unknown option '--unknown'/],
+    [[...valid, "--page-url", "https://127.0.0.1:4433/"], /^--page-url must be/],
+    [
+      [...valid, "--page-url", "/relative", "--cert", "cert.pem", "--key", "key.pem"],
+      /^--page-url must be/,
+    ],
+    [[...valid, "--cert", "cert.pem", "--key", "key.pem"], /^--cert and --key are only used/],
+    [["--write-page", "out", "--browser", "chromium"], /^--write-page takes no other options/],
+    [[...valid, "--page-protocol", "h3"], /^--page-protocol is only used/],
+    [[...valid, ...page, "--page-protocol", "h1"], /^--page-protocol must be/],
+    [
+      [...arguments_({ "--browser": "firefox" }), ...page, "--page-protocol", "h3"],
+      /^firefox cannot be made to load the page over h3/,
+    ],
+    [
+      [...arguments_({ "--browser": "safari" }), ...page, "--page-protocol", "h2"],
+      /^safari cannot be made to load the page over h2/,
+    ],
   ]) {
-    const result = spawnSync(process.execPath, [cli, ...bad], { encoding: "utf8" });
-    assert.equal(result.status, 2, bad.join(" "));
-    assert.match(result.stderr, /usage: trevrpc-interop-browser/);
-    assert.equal(result.stdout, "");
+    assert.throws(() => parseInteropArguments(bad), { name: "UsageError", message }, bad.join(" "));
   }
+
+  // The contract with the scripts that run the CLI: status 2, the usage on stderr, nothing on
+  // stdout.
+  const result = spawnSync(process.execPath, [cli], { encoding: "utf8" });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /^trevrpc-interop-browser: --browser must be/);
+  assert.match(result.stderr, /\nusage: trevrpc-interop-browser --browser/);
+  assert.equal(result.stdout, "");
 });
 
 test("the CLI writes the page for a server to serve", async () => {

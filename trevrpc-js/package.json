@@ -42,7 +42,7 @@
     "format:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",
     "typecheck": "npm run build && tsc -p tsconfig.json",
-    "test": "npm run build && node --test --test-concurrency=1 test/*.test.js",
+    "test": "node --test test/*.test.js",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm test",
     "interop": "node interop-browser/cli.js"
   },

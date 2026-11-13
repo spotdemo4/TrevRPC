@@ -1,0 +1,183 @@
+// trevrpc-interop-browser without a subcommand: runs the interop scenarios of interop/README.md in
+// a real browser over WebTransport or QMux over WebSocket and prints `ok <name>` /
+// `fail <name>: <reason>` per scenario. Exits 0 only if every scenario passed.
+//
+//   trevrpc-interop-browser --browser chromium|firefox|safari --url <url> --cert-hash <hex>
+//                           [--transport webtransport|websocket|auto] [--ws-url <url>]
+//                           [--expect-transport webtransport|websocket] [--dictionary <file>]
+//                           [--page-url <url> --cert <pem> --key <pem> [--page-protocol h2|h3]]
+//   trevrpc-interop-browser --write-page <dir>
+//
+// --dictionary makes the channel compress Echo messages with that zstd dictionary, the one the
+// interop servers hold.
+//
+// --cert-hash is the SHA-256 of the server certificate's DER encoding in hex, trusted through
+// WebTransport serverCertificateHashes. WebSocket connections cannot pin a certificate hash, so the
+// Chromium and Firefox contexts ignore certificate errors instead; Safari needs the certificate
+// trusted by the system. Chromium and Firefox come from PLAYWRIGHT_BROWSERS_PATH unless
+// TREVRPC_BROWSER_CHROMIUM or TREVRPC_BROWSER_FIREFOX name an executable; Safari is driven through
+// safaridriver (see safari.js).
+//
+// The CLI serves the page from a loopback origin; the page fetches its input from there and posts
+// each result back, so every browser driver only has to open it.
+//
+// --write-page writes the page (index.html and page.js) to a directory, for a TrevRPC server to
+// serve through its HTTP fallback. --page-url then opens the page from that server instead, so the
+// scenarios run from the server's own origin: the CLI passes its origin to the page in the `report`
+// query parameter, and serves the input and results over HTTPS with the --cert and --key pair, so
+// that the HTTPS page may reach it, and with CORS. --page-protocol has the browser load the page
+// over HTTP/2 or HTTP/3, and fails every scenario unless the page and its script arrived over it.
+// Chromium loads it over HTTP/3 when it trusts the certificate by its public key and is forced to
+// use QUIC for the page's origin; it ignores Alt-Svc from a connection with certificate errors.
+// Firefox does not use HTTP/3 with an overridden certificate, so it loads the page over HTTP/2
+// only; Safari cannot be told either way.
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import { parseCertHash, parseOptions, UsageError } from "./arguments.js";
+import { Browsers, describe, pageHtml, readDictionary, runPage } from "./driver.js";
+import { ScenarioNames } from "./names.js";
+
+export const InteropUsage =
+  "usage: trevrpc-interop-browser --browser chromium|firefox|safari --url <url> --cert-hash <hex>" +
+  " [--transport webtransport|websocket|auto] [--ws-url <url>]" +
+  " [--expect-transport webtransport|websocket] [--dictionary <file>]" +
+  " [--page-url <url> --cert <pem> --key <pem> [--page-protocol h2|h3]]\n" +
+  "       trevrpc-interop-browser --write-page <dir>\n" +
+  "       trevrpc-interop-browser bench ...";
+const Transports = ["webtransport", "websocket", "auto"];
+/** Seventeen scenarios of at most ten seconds each, plus connecting, with slack. */
+const RunTimeoutMs = 180_000;
+const PageBundle = new URL("../build/interop/page.js", import.meta.url);
+const PageHtml = pageHtml("page.js");
+
+/**
+ * Runs the scenarios with args, printing a line per scenario, or writes the page; resolves with
+ * the exit code, or rejects with a UsageError when args do not describe a run.
+ */
+export async function runInteropCommand(args) {
+  const parsed = parseInteropArguments(args);
+  if (parsed.writePage !== undefined) {
+    await writePage(parsed.writePage);
+    return 0;
+  }
+  const { dictionaryFile, ...run } = parsed;
+  const results = await readDictionary(dictionaryFile)
+    .then((dictionary) => runInBrowser({ ...run, dictionary }))
+    .catch((error) =>
+      Object.fromEntries(ScenarioNames.map((name) => [name, failure(describe(error))])),
+    );
+
+  let passed = true;
+  for (const name of ScenarioNames) {
+    const result = results[name] ?? failure("did not complete");
+    passed &&= result.ok;
+    console.log(result.ok ? `ok ${name}` : `fail ${name}: ${result.reason}`);
+  }
+  return passed ? 0 : 1;
+}
+
+/** The run args describe, or { writePage } for --write-page; throws a UsageError otherwise. */
+export function parseInteropArguments(args) {
+  const values = parseOptions(args, {
+    browser: { type: "string" },
+    url: { type: "string" },
+    "cert-hash": { type: "string" },
+    transport: { type: "string", default: "webtransport" },
+    "ws-url": { type: "string" },
+    "expect-transport": { type: "string" },
+    dictionary: { type: "string" },
+    "page-url": { type: "string" },
+    "page-protocol": { type: "string" },
+    cert: { type: "string" },
+    key: { type: "string" },
+    "write-page": { type: "string" },
+  });
+  if (values["write-page"] !== undefined) {
+    if (Object.keys(values).some((name) => !["write-page", "transport"].includes(name))) {
+      throw new UsageError("--write-page takes no other options");
+    }
+    return { writePage: values["write-page"] };
+  }
+
+  const browser = Browsers[values.browser];
+  if (browser === undefined) {
+    throw new UsageError("--browser must be chromium, firefox or safari");
+  }
+  if (!values.url) {
+    throw new UsageError("--url is required");
+  }
+  const certHash = parseCertHash(values["cert-hash"]);
+  if (!Transports.includes(values.transport)) {
+    throw new UsageError("--transport must be webtransport, websocket or auto");
+  }
+  const pageUrl = values["page-url"];
+  if (pageUrl !== undefined && (!URL.canParse(pageUrl) || !values.cert || !values.key)) {
+    throw new UsageError("--page-url must be an absolute URL and needs --cert and --key");
+  }
+  if (pageUrl === undefined && (values.cert || values.key)) {
+    throw new UsageError("--cert and --key are only used with --page-url");
+  }
+  const pageProtocol = values["page-protocol"];
+  if (pageProtocol !== undefined) {
+    if (pageUrl === undefined) {
+      throw new UsageError("--page-protocol is only used with --page-url");
+    }
+    if (!["h2", "h3"].includes(pageProtocol)) {
+      throw new UsageError("--page-protocol must be h2 or h3");
+    }
+    if (browser.pageProtocols?.[pageProtocol] === undefined) {
+      throw new UsageError(`${browser.name} cannot be made to load the page over ${pageProtocol}`);
+    }
+  }
+  return {
+    browser,
+    page: pageUrl && { url: pageUrl, cert: values.cert, key: values.key, protocol: pageProtocol },
+    pageProtocol,
+    url: values.url,
+    certHash,
+    transport: values.transport,
+    webSocketUrl: values["ws-url"],
+    expectTransport: values["expect-transport"],
+    dictionaryFile: values.dictionary,
+  };
+}
+
+/** Writes the page to dir: index.html, and the page.js bundle it loads. */
+async function writePage(dir) {
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "index.html"), PageHtml);
+  await copyFile(PageBundle, join(dir, "page.js"));
+}
+
+/** Runs the page's scenarios, resolving with a result per scenario name that completed. */
+async function runInBrowser({ browser, page, ...input }) {
+  const results = {};
+  try {
+    await runPage({
+      browser,
+      extra: page?.protocol ? await browser.pageProtocols[page.protocol](page) : {},
+      page,
+      html: PageHtml,
+      bundles: { "/page.js": PageBundle },
+      input,
+      routes: {
+        "/result": ({ name, ok, reason }) => {
+          results[name] = ok ? { ok } : failure(reason);
+        },
+      },
+      runTimeoutMs: RunTimeoutMs,
+      timeoutMessage: "scenarios did not finish in time",
+    });
+  } catch (error) {
+    // Scenarios that completed before the failure keep their results.
+    for (const name of ScenarioNames) {
+      results[name] ??= failure(describe(error));
+    }
+  }
+  return results;
+}
+
+function failure(reason) {
+  return { ok: false, reason: String(reason).replace(/\s+/g, " ").trim() };
+}

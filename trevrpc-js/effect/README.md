@@ -57,6 +57,7 @@ The package is developed against the trevrpc-js of this checkout, which it links
 npm ci --prefix ..
 npm ci
 npm run check      # format check, lint, typecheck, tests
+npm test           # the tests alone, after npm run build
 ```
 
 `npm run bench` measures what a server stream costs per message and how many chunks it arrives in, over the same in-memory server (options: `--messages`, `--size`, `--chunk`, `--runs`).

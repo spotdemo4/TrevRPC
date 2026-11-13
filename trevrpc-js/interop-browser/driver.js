@@ -1,13 +1,11 @@
 // Drives a browser through a page this module serves: launches Chromium or Firefox through
 // Playwright, or Safari through safaridriver, serves the page with its input from a loopback
-// origin, and collects what the page posts back. The interop scenarios (cli.js) and the load
+// origin, and collects what the page posts back. The interop scenarios (interop-cli.js) and the load
 // benchmark (bench-cli.js) both run this way.
 import { X509Certificate, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-
-import { chromium, errors, firefox } from "playwright";
 
 import { openSafari } from "./safari.js";
 
@@ -36,7 +34,7 @@ export function pageHtml(bundle) {
  */
 export const Browsers = {
   chromium: {
-    ...playwrightBrowser(chromium, "TREVRPC_BROWSER_CHROMIUM", {
+    ...playwrightBrowser("chromium", "TREVRPC_BROWSER_CHROMIUM", {
       chromiumSandbox: false,
       args: [
         "--no-sandbox",
@@ -53,7 +51,7 @@ export const Browsers = {
     forceQuic: chromiumForceQuic,
   },
   firefox: {
-    ...playwrightBrowser(firefox, "TREVRPC_BROWSER_FIREFOX", {
+    ...playwrightBrowser("firefox", "TREVRPC_BROWSER_FIREFOX", {
       firefoxUserPrefs: { "network.http.http3.enable": true },
     }),
     pageProtocols: {
@@ -123,11 +121,23 @@ export async function runPage({
   }
 }
 
-/** A browser driven by Playwright: launched headless, with certificate errors ignored. */
-function playwrightBrowser(type, executableVariable, launchOptions) {
+/**
+ * Playwright, imported on first use: importing it takes most of a quarter second, which commands
+ * that fail on their arguments, or run Safari, should not wait for.
+ */
+function importPlaywright() {
+  return import("playwright");
+}
+
+/**
+ * The Playwright browser of type name (chromium or firefox): launched headless, with certificate
+ * errors ignored.
+ */
+function playwrightBrowser(name, executableVariable, launchOptions) {
   return {
-    name: type.name(),
+    name,
     async open(url, extra = {}, timeoutMs = SetupTimeoutMs) {
+      const type = (await importPlaywright())[name];
       const instance = await launchPlaywright(type, {
         ...launchOptions,
         ...(extra.args && { args: [...(launchOptions.args ?? []), ...extra.args] }),
@@ -163,6 +173,7 @@ function playwrightBrowser(type, executableVariable, launchOptions) {
  * time, up to LaunchAttempts times. Playwright kills a browser whose launch timed out.
  */
 export async function launchPlaywright(type, options) {
+  const { errors } = await importPlaywright();
   for (let attempt = 1; ; attempt++) {
     try {
       return await type.launch(options);

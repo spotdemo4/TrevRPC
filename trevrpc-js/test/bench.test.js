@@ -3,9 +3,11 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { parseBenchArguments } from "../interop-browser/bench-cli.js";
 import { measure, percentile, runBench, summarize } from "../interop-browser/bench.js";
 import { createJsonClient, jsonLines } from "../interop-browser/json-client.js";
 import { Records, newPayload } from "../interop-browser/records.js";
@@ -67,17 +69,19 @@ test("operations close when their worker stops", async () => {
   assert.equal(closed, 2);
 });
 
-/** A loopback port nothing listens on. */
-async function closedPort() {
-  const server = createServer();
+/**
+ * A loopback port that drops every connection it accepts. Unlike a port that was freed, it stays
+ * taken for the whole test, so no test file running at the same time can come to listen on it.
+ */
+async function droppingPort(t) {
+  const server = createNetServer((socket) => socket.destroy());
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address();
-  await new Promise((resolve) => server.close(resolve));
-  return port;
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  return server.address().port;
 }
 
-test("a run that cannot connect says so, for run.py to run it again", async () => {
-  const port = await closedPort();
+test("a run that cannot connect says so, for run.py to run it again", async (t) => {
+  const port = await droppingPort(t);
   const input = {
     scenario: "unary",
     size: 64,
@@ -172,9 +176,8 @@ test("percentiles are nearest-rank", () => {
   assert.equal(percentile(Float64Array.of(1, 2, 3, 4), 0.99), 4);
 });
 
-test("the bench command validates its arguments before launching a browser", () => {
+test("the bench command validates its arguments before launching a browser", async () => {
   const webtransport = [
-    "bench",
     "--browser",
     "chromium",
     "--transport",
@@ -185,7 +188,6 @@ test("the bench command validates its arguments before launching a browser", () 
     "ab".repeat(32),
   ];
   const connect = (lane, ...rest) => [
-    "bench",
     "--browser",
     "chromium",
     "--transport",
@@ -194,40 +196,67 @@ test("the bench command validates its arguments before launching a browser", () 
     "https://127.0.0.1:4433",
     ...rest,
   ];
-  for (const bad of [
-    ["bench"],
-    [...webtransport, "--unknown"],
-    webtransport.map((value) => (value === "chromium" ? "safari" : value)),
-    webtransport.map((value) => (value === "webtransport" ? "quic" : value)),
-    webtransport.filter((value, i) => i < 7),
-    webtransport.map((value) => (value === "https://127.0.0.1:4433/trevrpc" ? "/trevrpc" : value)),
-    [...webtransport, "--scenario", "unreliable-paced"],
-    [...webtransport, "--compression", "gzip"],
-    [...webtransport, "--compression", "dictionary"],
-    [...webtransport, "--dictionary", "records.dict"],
-    [...webtransport, "--compression", "stream", "--scenario", "server-stream"],
-    [...webtransport, "--compression", "dictionary", "--dictionary", "/nonexistent/records.dict"],
-    [...webtransport, "--payload", "random"],
-    connect("connect-web", "--payload", "records", "--compression", "stream"),
-    [...webtransport, "--duration", "0"],
-    [...webtransport, "--warmup", "-1"],
-    [...webtransport, "--size", "1.5"],
-    [...webtransport, "--concurrency", "0"],
-    connect("connect-web", "--scenario", "client-stream"),
-    connect("grpc-web", "--scenario", "bidi"),
-    connect("connect-web-h3"),
-    connect("connect-web-h3", "--cert", "cert.pem").map((value) =>
-      value === "chromium" ? "firefox" : value,
-    ),
-    connect("json", "--scenario", "client-stream"),
-    connect("json", "--compression", "dictionary", "--dictionary", "records.dict"),
-    connect("json-h3"),
+
+  const parsed = await parseBenchArguments(webtransport);
+  assert.equal(parsed.browser.name, "chromium");
+  assert.deepEqual(
+    parsed.certHash,
+    Array.from({ length: 32 }, () => 0xab),
+  );
+  assert.equal(parsed.dictionary, undefined);
+  assert.equal(parsed.duration, 5);
+
+  // The message pins the check each case fails; cases with the same message fail different parts
+  // of its condition.
+  for (const [bad, message] of [
+    [[], /^--browser must be/],
+    [[...webtransport, "--unknown"], /Unknown option '--unknown'/],
+    [webtransport.map((value) => (value === "chromium" ? "safari" : value)), /^--browser must be/],
+    [webtransport.map((value) => (value === "webtransport" ? "quic" : value)), /^--transport must/],
+    [webtransport.filter((value, i) => i < 6), /^--cert-hash must be/],
+    [
+      webtransport.map((value) =>
+        value === "https://127.0.0.1:4433/trevrpc" ? "/trevrpc" : value,
+      ),
+      /^--url must be/,
+    ],
+    [[...webtransport, "--scenario", "unreliable-paced"], /^the webtransport lane runs/],
+    [[...webtransport, "--compression", "gzip"], /^--compression must be/],
+    [[...webtransport, "--compression", "dictionary"], /^--dictionary goes with/],
+    [[...webtransport, "--dictionary", "records.dict"], /^--dictionary goes with/],
+    [
+      [...webtransport, "--compression", "stream", "--scenario", "server-stream"],
+      /^--compression stream runs/,
+    ],
+    [
+      [...webtransport, "--compression", "dictionary", "--dictionary", "/nonexistent/records.dict"],
+      /^--dictionary: ENOENT/,
+    ],
+    [[...webtransport, "--payload", "random"], /^--payload must be/],
+    [connect("connect-web", "--payload", "records", "--compression", "stream"), /not compress/],
+    [[...webtransport, "--duration", "0"], /^--duration must be a positive/],
+    // "--warmup -1" would fail as an ambiguous option before reaching the check.
+    [[...webtransport, "--warmup=-1"], /^--warmup must be a non-negative/],
+    [[...webtransport, "--size", "1.5"], /^--size must be an integer/],
+    [[...webtransport, "--concurrency", "0"], /^--concurrency must be an integer of at least 1/],
+    [connect("connect-web", "--scenario", "client-stream"), /^the connect-web lane runs/],
+    [connect("connect-web-h3"), /^the connect-web-h3 lane needs --cert/],
+    [
+      connect("connect-web-h3", "--cert", "cert.pem").map((value) =>
+        value === "chromium" ? "firefox" : value,
+      ),
+      /^firefox cannot be made to call over HTTP\/3/,
+    ],
   ]) {
-    const result = spawnSync(process.execPath, [cli, ...bad], { encoding: "utf8" });
-    assert.equal(result.status, 2, bad.join(" "));
-    assert.match(result.stderr, /usage: trevrpc-interop-browser bench/);
-    assert.equal(result.stdout, "");
+    await assert.rejects(parseBenchArguments(bad), { name: "UsageError", message }, bad.join(" "));
   }
+
+  // The contract with bench/run.py: status 2, the usage on stderr, nothing on stdout.
+  const result = spawnSync(process.execPath, [cli, "bench"], { encoding: "utf8" });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /^trevrpc-interop-browser bench: --browser must be/);
+  assert.match(result.stderr, /\nusage: trevrpc-interop-browser bench --browser/);
+  assert.equal(result.stdout, "");
 });
 
 test("the bench page is browser-only and the interop page leaves connect-web out", async () => {

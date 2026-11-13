@@ -17,25 +17,28 @@ await rm(fileURLToPath(new URL("../build/test", import.meta.url)), {
   recursive: true,
   force: true,
 });
-await generateEs({
-  protoDirs: [protoDir, interopProtoDir, optionsProtoDir],
-  files: [
-    "types.proto",
-    "methods.proto",
-    "codec.proto",
-    "codec_editions.proto",
-    "interop.proto",
-    "trevrpc/options.proto",
-  ],
-  outDir,
-  codecs: true,
-});
-
-// The codecs as TypeScript too, which the type check compiles.
-await generateEs({
-  protoDirs: [protoDir, interopProtoDir, optionsProtoDir],
-  files: ["codec.proto", "codec_editions.proto", "interop.proto"],
-  outDir: fileURLToPath(new URL("../build/test/gen-ts", import.meta.url)),
-  codecs: true,
-  target: "ts",
-});
+const protoDirs = [protoDir, interopProtoDir, optionsProtoDir];
+// Each run is mostly protoc and its plugins, in processes of their own, so they run side by side.
+await Promise.all([
+  generateEs({
+    protoDirs,
+    files: [
+      "types.proto",
+      "methods.proto",
+      "codec.proto",
+      "codec_editions.proto",
+      "interop.proto",
+      "trevrpc/options.proto",
+    ],
+    outDir,
+    codecs: true,
+  }),
+  // The codecs as TypeScript too, which the type check compiles.
+  generateEs({
+    protoDirs,
+    files: ["codec.proto", "codec_editions.proto", "interop.proto"],
+    outDir: fileURLToPath(new URL("../build/test/gen-ts", import.meta.url)),
+    codecs: true,
+    target: "ts",
+  }),
+]);

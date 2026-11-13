@@ -342,6 +342,7 @@ It prints `ok <name>` or `fail <name>: <reason>` per scenario and exits 0 only i
 npm ci
 npm run check      # format check, lint, typecheck, tests
 npm run build      # generate the interop and test descriptors and bundle the interop and benchmark pages into build/interop/
+npm test           # the tests alone, which read what npm run build generates
 npm run interop -- --browser chromium --url ... --cert-hash ...
 ```
 

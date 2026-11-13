@@ -19,8 +19,7 @@
 //
 // The page is cross-origin isolated, so its timers resolve to microseconds; servers reached
 // through fetch must answer CORS requests.
-import { parseArgs } from "node:util";
-
+import { parseCertHash, parseOptions, UsageError } from "./arguments.js";
 import { BenchLanes, Compressions, Payloads } from "./bench-lanes.js";
 import {
   Browsers,
@@ -32,7 +31,7 @@ import {
   runPage,
 } from "./driver.js";
 
-const Usage =
+export const BenchUsage =
   "usage: trevrpc-interop-browser bench --browser chromium|firefox --transport <lane> --url <url>" +
   " [--ws-url <url>] [--cert-hash <hex>] [--cert <pem>] [--scenario S] [--size N]" +
   " [--metadata-size N] [--concurrency N] [--duration S] [--warmup S] [--messages N]" +
@@ -48,7 +47,10 @@ const BenchBundle = new URL("../build/interop/bench.js", import.meta.url);
 const SetupTimeoutMs = LaunchAttempts * LaunchTimeoutMs + 20_000;
 const SlackMs = 15_000;
 
-/** Runs the bench subcommand with args, printing its result line; resolves with the exit code. */
+/**
+ * Runs the bench subcommand with args, printing its result line; resolves with the exit code, or
+ * rejects with a UsageError when args do not describe a run.
+ */
 export async function runBenchCommand(args) {
   const { browser, extra, ...input } = await parseBenchArguments(args);
   try {
@@ -71,77 +73,71 @@ export async function runBenchCommand(args) {
   }
 }
 
-/** The run args describe, or exits with the usage when they do not describe one. */
+/** The run args describe; rejects with a UsageError when they do not describe one. */
 export async function parseBenchArguments(args) {
-  let values;
-  try {
-    ({ values } = parseArgs({
-      args,
-      options: {
-        browser: { type: "string" },
-        transport: { type: "string" },
-        url: { type: "string" },
-        "ws-url": { type: "string" },
-        "cert-hash": { type: "string" },
-        cert: { type: "string" },
-        scenario: { type: "string", default: "unary" },
-        size: { type: "string", default: "64" },
-        "metadata-size": { type: "string", default: "0" },
-        concurrency: { type: "string", default: "1" },
-        duration: { type: "string", default: "5" },
-        warmup: { type: "string", default: "1" },
-        messages: { type: "string", default: "100" },
-        payload: { type: "string", default: "repeat" },
-        compression: { type: "string", default: "none" },
-        dictionary: { type: "string" },
-      },
-      strict: true,
-    }));
-  } catch (error) {
-    usageError(error.message);
-  }
+  const values = parseOptions(args, {
+    browser: { type: "string" },
+    transport: { type: "string" },
+    url: { type: "string" },
+    "ws-url": { type: "string" },
+    "cert-hash": { type: "string" },
+    cert: { type: "string" },
+    scenario: { type: "string", default: "unary" },
+    size: { type: "string", default: "64" },
+    "metadata-size": { type: "string", default: "0" },
+    concurrency: { type: "string", default: "1" },
+    duration: { type: "string", default: "5" },
+    warmup: { type: "string", default: "1" },
+    messages: { type: "string", default: "100" },
+    payload: { type: "string", default: "repeat" },
+    compression: { type: "string", default: "none" },
+    dictionary: { type: "string" },
+  });
 
   const browser = Browsers[values.browser];
   if (browser === undefined || browser.name === "safari") {
-    usageError("--browser must be chromium or firefox");
+    throw new UsageError("--browser must be chromium or firefox");
   }
   const lane = BenchLanes[values.transport];
   if (lane === undefined) {
-    usageError(`--transport must be one of ${Object.keys(BenchLanes).join(", ")}`);
+    throw new UsageError(`--transport must be one of ${Object.keys(BenchLanes).join(", ")}`);
   }
   if (!values.url || !URL.canParse(values.url)) {
-    usageError("--url must be an absolute URL");
+    throw new UsageError("--url must be an absolute URL");
   }
   if (!lane.scenarios.includes(values.scenario)) {
-    usageError(`the ${values.transport} lane runs ${lane.scenarios.join(", ")}`);
+    throw new UsageError(`the ${values.transport} lane runs ${lane.scenarios.join(", ")}`);
   }
   if (!Payloads.includes(values.payload)) {
-    usageError(`--payload must be one of ${Payloads.join(", ")}`);
+    throw new UsageError(`--payload must be one of ${Payloads.join(", ")}`);
   }
   const mode = Compressions[values.compression];
   if (mode === undefined) {
-    usageError(`--compression must be one of ${Object.keys(Compressions).join(", ")}`);
+    throw new UsageError(`--compression must be one of ${Object.keys(Compressions).join(", ")}`);
   }
   if (values.compression !== "none" && lane.transport === undefined) {
-    usageError(`the ${values.transport} lane does not compress`);
+    throw new UsageError(`the ${values.transport} lane does not compress`);
   }
   if (!mode.scenarios.includes(values.scenario)) {
-    usageError(`--compression ${values.compression} runs ${mode.scenarios.join(", ")}`);
+    throw new UsageError(`--compression ${values.compression} runs ${mode.scenarios.join(", ")}`);
   }
   if (Boolean(mode.dictionary) !== (values.dictionary !== undefined)) {
-    usageError("--dictionary goes with the dictionary and stream-dictionary compression modes");
+    throw new UsageError(
+      "--dictionary goes with the dictionary and stream-dictionary compression modes",
+    );
   }
-  const certHash = values["cert-hash"];
-  if (lane.transport === "webtransport" && !/^(?:[0-9a-fA-F]{2}){32}$/.test(certHash ?? "")) {
-    usageError("--cert-hash must be the hex SHA-256 of the certificate DER (64 hex digits)");
-  }
+  // Only WebTransport needs the hash, to trust the certificate.
+  const certHash =
+    lane.transport === "webtransport"
+      ? parseCertHash(values["cert-hash"])
+      : values["cert-hash"] && [...Buffer.from(values["cert-hash"], "hex")];
   let extra = {};
   if (lane.http === "h3") {
     if (browser.forceQuic === undefined) {
-      usageError(`${browser.name} cannot be made to call over HTTP/3`);
+      throw new UsageError(`${browser.name} cannot be made to call over HTTP/3`);
     }
     if (!values.cert) {
-      usageError(`the ${values.transport} lane needs --cert`);
+      throw new UsageError(`the ${values.transport} lane needs --cert`);
     }
     extra = await browser.forceQuic(new URL(values.url).host, values.cert);
   }
@@ -152,7 +148,7 @@ export async function parseBenchArguments(args) {
     transport: values.transport,
     url: values.url,
     webSocketUrl: values["ws-url"],
-    certHash: certHash && [...Buffer.from(certHash, "hex")],
+    certHash,
     scenario: values.scenario,
     size: integer(values, "size", 0),
     metadataSize: integer(values, "metadata-size", 0),
@@ -162,16 +158,16 @@ export async function parseBenchArguments(args) {
     warmup: seconds(values, "warmup", true),
     payload: values.payload,
     compression: values.compression,
-    dictionary: await readDictionary(values.dictionary).catch((error) =>
-      usageError(`--dictionary: ${error.message}`),
-    ),
+    dictionary: await readDictionary(values.dictionary).catch((error) => {
+      throw new UsageError(`--dictionary: ${error.message}`, { cause: error });
+    }),
   };
 }
 
 function integer(values, name, least) {
   const value = Number(values[name]);
   if (!Number.isSafeInteger(value) || value < least) {
-    usageError(`--${name} must be an integer of at least ${least}`);
+    throw new UsageError(`--${name} must be an integer of at least ${least}`);
   }
   return value;
 }
@@ -179,12 +175,9 @@ function integer(values, name, least) {
 function seconds(values, name, zero) {
   const value = Number(values[name]);
   if (!Number.isFinite(value) || value < 0 || (!zero && value === 0)) {
-    usageError(`--${name} must be a ${zero ? "non-negative" : "positive"} number of seconds`);
+    throw new UsageError(
+      `--${name} must be a ${zero ? "non-negative" : "positive"} number of seconds`,
+    );
   }
   return value;
-}
-
-function usageError(message) {
-  console.error(`trevrpc-interop-browser bench: ${message}\n${Usage}`);
-  process.exit(2);
 }

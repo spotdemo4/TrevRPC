@@ -52,6 +52,7 @@ The plugin runs from this directory with the dependencies of trevrpc-js, whose t
 
 ```sh
 npm ci --prefix ..
+npm run build --prefix ..
 npm test --prefix ..
 npm run check      # format check, lint
 ```

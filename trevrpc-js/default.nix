@@ -133,8 +133,9 @@ buildNpmPackage (final: {
 
     interop="$out/lib/trevrpc-interop-browser"
     mkdir -p "$interop/interop-browser" "$interop/build/interop"
-    cp interop-browser/cli.js interop-browser/driver.js interop-browser/names.js \
-      interop-browser/safari.js interop-browser/bench-cli.js interop-browser/bench-lanes.js \
+    cp interop-browser/cli.js interop-browser/arguments.js interop-browser/interop-cli.js \
+      interop-browser/driver.js interop-browser/names.js interop-browser/safari.js \
+      interop-browser/bench-cli.js interop-browser/bench-lanes.js \
       "$interop/interop-browser/"
     cp build/interop/page.js build/interop/bench.js "$interop/build/interop/"
     cp -R "$TMPDIR/interop-node_modules" "$interop/node_modules"

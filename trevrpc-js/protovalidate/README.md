@@ -51,6 +51,7 @@ The package is developed against the trevrpc-js of this checkout, which it links
 npm ci --prefix ..
 npm ci
 npm run check      # format check, lint, typecheck, tests
+npm test           # the tests alone, after npm run build
 ```
 
 The tests run the real client against the in-memory server of trevrpc-js's own tests. `nix build .#trevrpc-js-protovalidate` runs them against the built trevrpc-js, and checks the published files.
