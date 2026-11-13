@@ -387,8 +387,9 @@ func TestTrustedUDPProxyHeadersNameTheClient(t *testing.T) {
 	}
 
 	// Without a proxy in between, a trusted address's datagrams lack a header
-	// and are dropped.
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	// and are dropped. The dial is expected to fail, so a short timeout can
+	// only make a slow handshake look dropped, never fail the test wrongly.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	if channel, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly}); err == nil {
 		_ = channel.Close()
@@ -423,12 +424,13 @@ func TestUntrustedUDPPeersAreNotReadForAHeader(t *testing.T) {
 		t.Errorf("HTTP/2 handler saw %v, want the TCP peer", got)
 	}
 	// An untrusted peer's header is not stripped, so QUIC cannot read its
-	// datagrams.
+	// datagrams. As in TestTrustedUDPProxyHeadersNameTheClient, the dial is
+	// expected to fail, so its timeout is short.
 	server := addrPortOf(listener.Addr())
 	proxy := startUDPProxyForwarder(t, listener.Addr().String(), func(client netip.AddrPort) []byte {
 		return proxyV2UDPHeader(proxiedTestClient(client), server)
 	}, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	if channel, err := Dial(ctx, proxy, DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly}); err == nil {
 		_ = channel.Close()

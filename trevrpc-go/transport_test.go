@@ -1180,6 +1180,9 @@ func TestTerminalStatusReachesClientWhoseRequestSideIsStillOpen(t *testing.T) {
 }
 
 func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
+	// Short enough not to slow the suite, and long enough that stopping the
+	// client at once still falls well below the lower bound checked below.
+	setDrainBounds(t, 300*time.Millisecond, requestDrainLimit)
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
 	channel := dialNative(t, pki, listener)
@@ -1203,6 +1206,8 @@ func TestDrainedRequestSideIsStoppedAfterTimeBound(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// The drain started before the status reached the client, so the bound
+	// leaves 200 ms for that.
 	if elapsed := time.Since(started); elapsed < requestDrainTimeout-200*time.Millisecond {
 		t.Fatalf("stopped after %v, before the %v time bound", elapsed, requestDrainTimeout)
 	}

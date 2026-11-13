@@ -488,9 +488,12 @@ func waitForFinished(t *testing.T, metrics *recordingMetrics, within time.Durati
 func TestDeadlineEndsACallWhoseClientStoppedReading(t *testing.T) {
 	previous := responseWriteGrace
 	responseWriteGrace = 100 * time.Millisecond
+	// A cleanup, unlike a defer, runs after the parallel subtests finish.
 	t.Cleanup(func() { responseWriteGrace = previous })
 	for _, kind := range []RPCKind{RPCKindServerStreaming, RPCKindUnary} {
 		t.Run(kind.String(), func(t *testing.T) {
+			// Each kind has a server of its own.
+			t.Parallel()
 			listener, pki, metrics := stalledWriteServer(context.Background(), t, kind)
 			request := newWireRequest("/example.Greeter/Call")
 			request.Kind = kind

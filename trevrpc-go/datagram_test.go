@@ -976,17 +976,18 @@ func TestServerCountsRequestDatagramsAgainstTheCallsLimitsAndIdleTimer(t *testin
 		defer discardMessageStream(stream)
 
 		// Datagram messages alone keep the call alive for longer than the idle
-		// timeout...
+		// timeout: three ticks half of it apart outlast it...
+		const ticks = 3
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			for range 8 {
+			for range ticks {
 				time.Sleep(idle / 2)
 				flow.sink.push([]byte("tick"))
 			}
 		}()
 		began := time.Now()
-		for range 8 {
+		for range ticks {
 			if _, err := stream.Recv(); err != nil {
 				t.Fatalf("Recv after %v: %v", time.Since(began), err)
 			}

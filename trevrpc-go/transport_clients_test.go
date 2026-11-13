@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"testing"
@@ -56,16 +57,51 @@ func newHTTP2TestClientWith(t testing.TB, pki testPKI, listener *Listener, confi
 	t.Helper()
 	protocols := new(http.Protocols)
 	protocols.SetHTTP2(true)
-	roundTripper := &http.Transport{TLSClientConfig: pki.client.Clone(), Protocols: protocols}
+	conns := &dialedConns{}
+	roundTripper := &http.Transport{TLSClientConfig: pki.client.Clone(), Protocols: protocols, DialContext: conns.dial}
 	if configure != nil {
 		configure(roundTripper)
 	}
-	t.Cleanup(roundTripper.CloseIdleConnections)
+	// A connection whose last call left a stream open is not idle, and
+	// CloseIdleConnections would leave it to the server's shutdown, which
+	// waits a second for the client after its GOAWAY (#502). The test is
+	// over, so its connections close outright, as a client that exits does.
+	t.Cleanup(func() {
+		roundTripper.CloseIdleConnections()
+		conns.closeAll()
+	})
 	opener := httpTestOpener{
 		roundTripper: roundTripper,
 		url:          "https://" + listener.TCPAddr().String() + DefaultHTTPPath,
 	}
 	return newStreamClient(opener, DefaultMaxFrameSize)
+}
+
+// dialedConns dials TCP connections and keeps them, so that a test client's
+// cleanup can close them whatever state they are in.
+type dialedConns struct {
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (d *dialedConns) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, err := new(net.Dialer).DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.conns = append(d.conns, conn)
+	return conn, nil
+}
+
+func (d *dialedConns) closeAll() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, conn := range d.conns {
+		_ = conn.Close()
+	}
+	d.conns = nil
 }
 
 // newQMuxTestClient returns a Channel over QMux over TLS on the TCP listener.
