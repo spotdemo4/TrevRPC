@@ -5,65 +5,30 @@ use trevrpc::{Code, Metadata, ResponseEnvelope, ResponseFrame, Status};
 
 use crate::Error;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResponseStateFailureKind {
-    InvalidMetadata,
-    MalformedProtobuf,
-    MisplacedHeaders,
-    MissingTerminalStatus,
-    RemoteStatus,
-    TrailingFrame,
-}
-
-#[allow(dead_code)]
-impl ResponseStateFailureKind {
-    pub(crate) const fn category(self) -> &'static str {
-        match self {
-            Self::InvalidMetadata => "invalid_metadata",
-            Self::MalformedProtobuf => "malformed_protobuf",
-            Self::MisplacedHeaders => "misplaced_headers",
-            Self::MissingTerminalStatus => "missing_terminal_status",
-            Self::RemoteStatus => "remote_status",
-            Self::TrailingFrame => "trailing_frame",
-        }
-    }
-}
-
-#[allow(dead_code)]
+/// A response that broke its grammar or ended with a non-OK status, as the status the call fails
+/// with.
 #[derive(Debug)]
 pub struct ResponseStateFailure {
-    kind: ResponseStateFailureKind,
     status: Status,
 }
 
-#[allow(dead_code)]
 impl ResponseStateFailure {
-    const fn new(kind: ResponseStateFailureKind, status: Status) -> Self {
-        Self { kind, status }
+    const fn new(status: Status) -> Self {
+        Self { status }
     }
 
     /// The failure for a frame that follows STATUS.
     pub(crate) fn trailing_frame() -> Self {
-        Self::new(
-            ResponseStateFailureKind::TrailingFrame,
-            Status::internal("response stream continued after terminal status"),
-        )
+        Self::new(Status::internal(
+            "response stream continued after terminal status",
+        ))
     }
 
     /// The failure for a MESSAGE payload that does not decode as the expected protobuf message.
     pub(crate) fn malformed_protobuf() -> Self {
-        Self::new(
-            ResponseStateFailureKind::MalformedProtobuf,
-            Status::internal("response stream contained a malformed protobuf payload"),
-        )
-    }
-
-    pub(crate) const fn kind(&self) -> ResponseStateFailureKind {
-        self.kind
-    }
-
-    pub(crate) const fn status(&self) -> &Status {
-        &self.status
+        Self::new(Status::internal(
+            "response stream contained a malformed protobuf payload",
+        ))
     }
 
     pub(crate) fn into_status(self) -> Status {
@@ -128,12 +93,9 @@ impl ResponseState {
         match frame {
             ResponseFrame::Headers(metadata) => {
                 if !first_frame {
-                    return Err(ResponseStateFailure::new(
-                        ResponseStateFailureKind::MisplacedHeaders,
-                        Status::internal(
-                            "response stream sent HEADERS after another response frame",
-                        ),
-                    ));
+                    return Err(ResponseStateFailure::new(Status::internal(
+                        "response stream sent HEADERS after another response frame",
+                    )));
                 }
                 validate_metadata(&metadata)?;
                 *self = Self::Streaming;
@@ -161,7 +123,6 @@ impl ResponseState {
                 Ok(())
             }
             Self::AwaitingFirst | Self::Streaming => Err(ResponseStateFailure::new(
-                ResponseStateFailureKind::MissingTerminalStatus,
                 Status::internal("response stream ended before final status"),
             )),
             Self::StatusPending(status) => {
@@ -169,10 +130,7 @@ impl ResponseState {
                 if status.code() == Code::Ok {
                     Ok(())
                 } else {
-                    Err(ResponseStateFailure::new(
-                        ResponseStateFailureKind::RemoteStatus,
-                        status,
-                    ))
+                    Err(ResponseStateFailure::new(status))
                 }
             }
         }
@@ -246,10 +204,9 @@ fn trailing_read_error(error: Error) -> Error {
 
 fn validate_metadata(metadata: &Metadata) -> Result<(), ResponseStateFailure> {
     trevrpc::wire::validate_metadata(metadata).map_err(|_| {
-        ResponseStateFailure::new(
-            ResponseStateFailureKind::InvalidMetadata,
-            Status::internal("response stream contained invalid metadata"),
-        )
+        ResponseStateFailure::new(Status::internal(
+            "response stream contained invalid metadata",
+        ))
     })
 }
 
@@ -311,9 +268,20 @@ mod tests {
     use bytes::Bytes;
     use trevrpc::{Code, Metadata, ResponseFrame, Status};
 
-    use super::{
-        ResponseEvent, ResponseState, ResponseStateFailureKind, UnaryResponse, require_end,
-    };
+    use super::{ResponseEvent, ResponseState, ResponseStateFailure, UnaryResponse, require_end};
+
+    const MISSING_TERMINAL_STATUS: &str = "response stream ended before final status";
+    const MISPLACED_HEADERS: &str = "response stream sent HEADERS after another response frame";
+    const TRAILING_FRAME: &str = "response stream continued after terminal status";
+    const INVALID_METADATA: &str = "response stream contained invalid metadata";
+
+    /// Asserts that `failure` fails the call with INTERNAL and `message`, as callers see it.
+    #[track_caller]
+    fn assert_internal(failure: ResponseStateFailure, message: &str) {
+        let status = failure.into_status();
+        assert_eq!(status.code(), Code::Internal);
+        assert_eq!(status.message(), message);
+    }
 
     fn headers() -> ResponseFrame {
         let mut metadata = Metadata::new();
@@ -333,15 +301,7 @@ mod tests {
             .finish()
             .expect_err("clean EOF without status must fail");
 
-        assert_eq!(
-            failure.kind(),
-            ResponseStateFailureKind::MissingTerminalStatus
-        );
-        assert_eq!(failure.status().code(), Code::Internal);
-        assert_eq!(
-            failure.status().message(),
-            "response stream ended before final status"
-        );
+        assert_internal(failure, MISSING_TERMINAL_STATUS);
     }
 
     #[test]
@@ -375,8 +335,7 @@ mod tests {
             .accept(headers())
             .err()
             .expect("second HEADERS must be rejected");
-        assert_eq!(failure.kind(), ResponseStateFailureKind::MisplacedHeaders);
-        assert_eq!(failure.status().code(), Code::Internal);
+        assert_internal(failure, MISPLACED_HEADERS);
 
         let mut state = ResponseState::default();
         state.accept(message()).expect("message is fine");
@@ -384,7 +343,7 @@ mod tests {
             .accept(headers())
             .err()
             .expect("HEADERS after MESSAGE must be rejected");
-        assert_eq!(failure.kind(), ResponseStateFailureKind::MisplacedHeaders);
+        assert_internal(failure, MISPLACED_HEADERS);
 
         let mut state = ResponseState::default();
         state
@@ -394,7 +353,7 @@ mod tests {
             .accept(headers())
             .err()
             .expect("HEADERS after STATUS must be rejected");
-        assert_eq!(failure.kind(), ResponseStateFailureKind::TrailingFrame);
+        assert_internal(failure, TRAILING_FRAME);
     }
 
     #[test]
@@ -407,7 +366,7 @@ mod tests {
             .accept(message())
             .err()
             .expect("MESSAGE after STATUS must be rejected");
-        assert_eq!(failure.kind(), ResponseStateFailureKind::TrailingFrame);
+        assert_internal(failure, TRAILING_FRAME);
     }
 
     #[test]
@@ -417,7 +376,7 @@ mod tests {
         state.abort();
 
         let failure = state.accept(message()).err().expect("rejected");
-        assert_eq!(failure.kind(), ResponseStateFailureKind::TrailingFrame);
+        assert_internal(failure, TRAILING_FRAME);
         assert!(
             state.finish().is_ok(),
             "finishing an aborted response is a no-op"
@@ -454,7 +413,9 @@ mod tests {
             .unwrap();
         let failure = state.finish().expect_err("non-OK status fails");
 
-        assert_eq!(failure.kind(), ResponseStateFailureKind::RemoteStatus);
+        let status = failure.into_status();
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(status.message(), "gone");
         assert_eq!(
             state.terminal_status().map(Status::code),
             Some(Code::NotFound)
@@ -486,10 +447,7 @@ mod tests {
 
         let status = end(Some(Ok(()))).unwrap_err().into_status();
         assert_eq!(status.code(), Code::Internal);
-        assert_eq!(
-            status.message(),
-            "response stream continued after terminal status"
-        );
+        assert_eq!(status.message(), TRAILING_FRAME);
 
         let reset =
             crate::Error::transport(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
@@ -512,8 +470,7 @@ mod tests {
                 .accept(frame)
                 .err()
                 .expect("invalid metadata must be rejected");
-            assert_eq!(failure.kind(), ResponseStateFailureKind::InvalidMetadata);
-            assert_eq!(failure.status().code(), Code::Internal);
+            assert_internal(failure, INVALID_METADATA);
         }
     }
 
