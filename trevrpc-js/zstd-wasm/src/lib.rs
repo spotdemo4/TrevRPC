@@ -61,41 +61,67 @@ pub extern "C" fn zs_compress_bound(len: usize) -> usize {
 /// dictionary, or returns null. A referenced dictionary's own level takes precedence.
 #[unsafe(no_mangle)]
 pub extern "C" fn zs_cctx_new(level: c_int) -> *mut ZSTD_CCtx {
-    // SAFETY: the context is checked before use and only ever passed back to libzstd.
-    unsafe {
-        let cctx = ZSTD_createCCtx();
-        if cctx.is_null() {
-            return cctx;
-        }
-        let params = [
-            (ZSTD_cParameter::ZSTD_c_compressionLevel, level),
-            (ZSTD_cParameter::ZSTD_c_experimentalParam2, FORMAT_MAGICLESS),
-            (ZSTD_cParameter::ZSTD_c_checksumFlag, 0),
-            (ZSTD_cParameter::ZSTD_c_dictIDFlag, 1),
-            (ZSTD_cParameter::ZSTD_c_contentSizeFlag, 1),
-        ];
-        for (param, value) in params {
-            if ZSTD_isError(ZSTD_CCtx_setParameter(cctx, param, value)) != 0 {
-                return core::ptr::null_mut();
-            }
-        }
-        cctx
-    }
+    let params = [
+        (ZSTD_cParameter::ZSTD_c_compressionLevel, level),
+        (ZSTD_cParameter::ZSTD_c_experimentalParam2, FORMAT_MAGICLESS),
+        (ZSTD_cParameter::ZSTD_c_checksumFlag, 0),
+        (ZSTD_cParameter::ZSTD_c_dictIDFlag, 1),
+        (ZSTD_cParameter::ZSTD_c_contentSizeFlag, 1),
+    ];
+    // SAFETY: no dictionary.
+    unsafe { cctx_with(&params, core::ptr::null()) }
 }
 
 /// Creates the decompression context that reads magicless frames, or returns null.
 #[unsafe(no_mangle)]
 pub extern "C" fn zs_dctx_new() -> *mut ZSTD_DCtx {
-    // SAFETY: the context is checked before use and only ever passed back to libzstd.
+    dctx_with(&[(ZSTD_dParameter::ZSTD_d_experimentalParam1, FORMAT_MAGICLESS)])
+}
+
+/// Creates a compression context, sets `params` in order and then references `cdict` unless it
+/// is null. Returns null, after freeing the context, if any step fails.
+///
+/// # Safety
+///
+/// `cdict` must be null or come from this module.
+unsafe fn cctx_with(
+    params: &[(ZSTD_cParameter, c_int)],
+    cdict: *const ZSTD_CDict,
+) -> *mut ZSTD_CCtx {
+    // SAFETY: the context is checked before use, only ever passed back to libzstd and freed on
+    // failure; the caller passes a null or live dictionary.
+    unsafe {
+        let cctx = ZSTD_createCCtx();
+        if cctx.is_null() {
+            return cctx;
+        }
+        let ok = params
+            .iter()
+            .all(|&(param, value)| ZSTD_isError(ZSTD_CCtx_setParameter(cctx, param, value)) == 0)
+            && (cdict.is_null() || ZSTD_isError(ZSTD_CCtx_refCDict(cctx, cdict)) == 0);
+        if !ok {
+            ZSTD_freeCCtx(cctx);
+            return core::ptr::null_mut();
+        }
+        cctx
+    }
+}
+
+/// Creates a decompression context and sets `params` in order. Returns null, after freeing the
+/// context, if any step fails.
+fn dctx_with(params: &[(ZSTD_dParameter, c_int)]) -> *mut ZSTD_DCtx {
+    // SAFETY: the context is checked before use, only ever passed back to libzstd and freed on
+    // failure.
     unsafe {
         let dctx = ZSTD_createDCtx();
-        if dctx.is_null()
-            || ZSTD_isError(ZSTD_DCtx_setParameter(
-                dctx,
-                ZSTD_dParameter::ZSTD_d_experimentalParam1,
-                FORMAT_MAGICLESS,
-            )) != 0
-        {
+        if dctx.is_null() {
+            return dctx;
+        }
+        let ok = params
+            .iter()
+            .all(|&(param, value)| ZSTD_isError(ZSTD_DCtx_setParameter(dctx, param, value)) == 0);
+        if !ok {
+            ZSTD_freeDCtx(dctx);
             return core::ptr::null_mut();
         }
         dctx
@@ -230,32 +256,16 @@ pub unsafe extern "C" fn zs_stream_encoder_new(
     window_log: c_int,
     cdict: *const ZSTD_CDict,
 ) -> *mut ZSTD_CCtx {
-    // SAFETY: the context is checked before use and freed on failure.
-    unsafe {
-        let cctx = ZSTD_createCCtx();
-        if cctx.is_null() {
-            return cctx;
-        }
-        let params = [
-            (ZSTD_cParameter::ZSTD_c_compressionLevel, level),
-            (ZSTD_cParameter::ZSTD_c_windowLog, window_log),
-            (ZSTD_cParameter::ZSTD_c_experimentalParam2, FORMAT_MAGICLESS),
-            (ZSTD_cParameter::ZSTD_c_checksumFlag, 0),
-            (ZSTD_cParameter::ZSTD_c_contentSizeFlag, 0),
-            (ZSTD_cParameter::ZSTD_c_dictIDFlag, 1),
-        ];
-        let mut ok = params
-            .into_iter()
-            .all(|(param, value)| ZSTD_isError(ZSTD_CCtx_setParameter(cctx, param, value)) == 0);
-        if ok && !cdict.is_null() {
-            ok = ZSTD_isError(ZSTD_CCtx_refCDict(cctx, cdict)) == 0;
-        }
-        if !ok {
-            ZSTD_freeCCtx(cctx);
-            return core::ptr::null_mut();
-        }
-        cctx
-    }
+    let params = [
+        (ZSTD_cParameter::ZSTD_c_compressionLevel, level),
+        (ZSTD_cParameter::ZSTD_c_windowLog, window_log),
+        (ZSTD_cParameter::ZSTD_c_experimentalParam2, FORMAT_MAGICLESS),
+        (ZSTD_cParameter::ZSTD_c_checksumFlag, 0),
+        (ZSTD_cParameter::ZSTD_c_contentSizeFlag, 0),
+        (ZSTD_cParameter::ZSTD_c_dictIDFlag, 1),
+    ];
+    // SAFETY: the caller passes a null or live dictionary.
+    unsafe { cctx_with(&params, cdict) }
 }
 
 /// Compresses one message through a stream compressing context and flushes it, or ends the frame
@@ -324,25 +334,10 @@ pub unsafe extern "C" fn zs_stream_encoder_free(cctx: *mut ZSTD_CCtx) {
 /// of at most `2^window_log_max` bytes. Returns null on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn zs_stream_decoder_new(window_log_max: c_int) -> *mut ZSTD_DCtx {
-    // SAFETY: the context is checked before use and freed on failure.
-    unsafe {
-        let dctx = ZSTD_createDCtx();
-        if dctx.is_null() {
-            return dctx;
-        }
-        let params = [
-            (ZSTD_dParameter::ZSTD_d_experimentalParam1, FORMAT_MAGICLESS),
-            (ZSTD_dParameter::ZSTD_d_windowLogMax, window_log_max),
-        ];
-        if !params
-            .into_iter()
-            .all(|(param, value)| ZSTD_isError(ZSTD_DCtx_setParameter(dctx, param, value)) == 0)
-        {
-            ZSTD_freeDCtx(dctx);
-            return core::ptr::null_mut();
-        }
-        dctx
-    }
+    dctx_with(&[
+        (ZSTD_dParameter::ZSTD_d_experimentalParam1, FORMAT_MAGICLESS),
+        (ZSTD_dParameter::ZSTD_d_windowLogMax, window_log_max),
+    ])
 }
 
 /// Makes the frame that starts with the next chunk decompress with `ddict`, or with no
