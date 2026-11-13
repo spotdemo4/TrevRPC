@@ -209,7 +209,7 @@ func TestRaceGuardedDetachesACallThatOutlivesItsDeadline(t *testing.T) {
 			<-release
 			return 7, nil
 		}
-		result, err := raceGuarded(ctx, lease, ServerDiagnosticHandlerPanic, lease.goRun, call, func(result int) { abandoned <- result })
+		result, err := raceGuarded(ctx, lease, ServerDiagnosticHandlerPanic, true, call, func(result int) { abandoned <- result })
 		if result != 0 || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("raceGuarded = %d, %v, want 0 and the deadline", result, err)
 		}
@@ -224,6 +224,37 @@ func TestRaceGuardedDetachesACallThatOutlivesItsDeadline(t *testing.T) {
 		}
 		if got := runtime.detached.Load(); got != 0 {
 			t.Fatalf("detached executions after the call returned = %d, want 0", got)
+		}
+	})
+}
+
+func TestARacedAuthorizerThatApprovesAfterTheDeadlineFailsTheCall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server := NewServer()
+		runtime := server.freeze()
+		lease, ok := runtime.tryRequestLease(newWireRequest("/service/method"))
+		if !ok {
+			t.Fatal("failed to acquire request lease")
+		}
+		defer lease.release()
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		approved := AuthorizerFunc(func(ctx context.Context, _ HandlerContext) (context.Context, error) {
+			time.Sleep(2 * time.Second)
+			return ctx, nil
+		})
+		next, err := invokeAuthorizer(ctx, approved, HandlerContext{}, true, lease)
+		if next != ctx || StatusFromError(err).Code != CodeDeadlineExceeded {
+			t.Fatalf("invokeAuthorizer = %v, %v, want the call's context and DeadlineExceeded", next, err)
+		}
+		if got := runtime.detached.Load(); got != 1 {
+			t.Fatalf("detached executions while the authorizer runs on = %d, want 1", got)
+		}
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if got := runtime.detached.Load(); got != 0 {
+			t.Fatalf("detached executions after the authorizer returned = %d, want 0", got)
 		}
 	})
 }

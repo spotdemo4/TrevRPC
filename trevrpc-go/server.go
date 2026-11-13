@@ -1345,13 +1345,16 @@ func invokeUnaryHandler(
 	raceContext bool,
 	lease *requestExecutionLease,
 ) (encodedMessage, error) {
-	call := func() (encodedMessage, error) { return handler(ctx, body) }
+	// A closure for each branch: the one the race hands to another goroutine
+	// escapes to the heap, and the calls without a deadline should not pay
+	// for it.
 	var message encodedMessage
 	var err error
 	if raceContext {
-		message, err = raceGuarded(ctx, lease, ServerDiagnosticHandlerPanic, lease.goRun, call, nil)
+		call := func() (encodedMessage, error) { return handler(ctx, body) }
+		message, err = raceGuarded(ctx, lease, ServerDiagnosticHandlerPanic, true, call, nil)
 	} else {
-		message, err = guarded(ServerDiagnosticHandlerPanic, call)
+		message, err = guarded(ServerDiagnosticHandlerPanic, func() (encodedMessage, error) { return handler(ctx, body) })
 	}
 	if err = afterHandler(ctx, err); err != nil {
 		return encodedMessage{}, err
@@ -1371,8 +1374,9 @@ func guarded[T any](phase ServerDiagnosticPhase, call func() (T, error)) (result
 	return call()
 }
 
-// raceGuarded runs call through guarded on a goroutine that spawn starts, and
-// stops waiting for it when ctx ends, returning ctx's error. The execution is
+// raceGuarded runs call through guarded on a goroutine, a worker of the
+// listener (lease.goRun) when pooled is set and a goroutine of its own
+// otherwise, and stops waiting for it when ctx ends, returning ctx's error. The execution is
 // retained under phase until call returns and is detached once the call stops
 // waiting for it; a result that arrives after that goes to abandoned, unless
 // abandoned is nil.
@@ -1380,7 +1384,7 @@ func raceGuarded[T any](
 	ctx context.Context,
 	lease *requestExecutionLease,
 	phase ServerDiagnosticPhase,
-	spawn func(task func()),
+	pooled bool,
 	call func() (T, error),
 	abandoned func(T),
 ) (T, error) {
@@ -1393,27 +1397,41 @@ func raceGuarded[T any](
 		result T
 		err    error
 	}
-	outcomes := make(chan outcome)
-	stopped := make(chan struct{})
+	// Without an abandoned callback a late result needs no one: a buffered
+	// channel takes it and frees the goroutine at once. With one, the goroutine
+	// waits until the caller takes the result or stops waiting.
+	var outcomes chan outcome
+	var stopped chan struct{}
+	if abandoned == nil {
+		outcomes = make(chan outcome, 1)
+	} else {
+		outcomes = make(chan outcome)
+		stopped = make(chan struct{})
+	}
 	execution := lease.retain(phase)
-	spawn(func() {
+	task := func() {
 		defer execution.finish()
 		result, err := guarded(phase, call)
 		select {
 		case outcomes <- outcome{result: result, err: err}:
-		case <-stopped:
-			if abandoned != nil {
-				abandoned(result)
-			}
+		case <-stopped: // never ready when stopped is nil
+			abandoned(result)
 		}
-	})
+	}
+	if pooled {
+		lease.goRun(task)
+	} else {
+		go task()
+	}
 
 	select {
 	case outcome := <-outcomes:
 		return outcome.result, outcome.err
 	case <-ctx.Done():
 		execution.detach()
-		close(stopped)
+		if stopped != nil {
+			close(stopped)
+		}
 		return zero, ctx.Err()
 	}
 }
@@ -1544,18 +1562,18 @@ func invokeStreamingHandler(
 	raceContext bool,
 	lease *requestExecutionLease,
 ) (encodedStream, error) {
-	call := func() (encodedStream, error) { return handler(ctx, body, requestBody) }
+	// A closure for each branch, as in invokeUnaryHandler.
 	var responses encodedStream
 	var err error
 	if raceContext {
+		call := func() (encodedStream, error) { return handler(ctx, body, requestBody) }
 		// A goroutine of its own, not a pooled worker: on a worker, 64
 		// concurrent client-streaming calls ran 7% slower, while a streaming
 		// handler is long-lived enough that a fresh stack costs it little.
-		goroutine := func(task func()) { go task() }
 		discard := func(responses encodedStream) { discardMessageStream(responses) }
-		responses, err = raceGuarded(ctx, lease, ServerDiagnosticHandlerPanic, goroutine, call, discard)
+		responses, err = raceGuarded(ctx, lease, ServerDiagnosticHandlerPanic, false, call, discard)
 	} else {
-		responses, err = guarded(ServerDiagnosticHandlerPanic, call)
+		responses, err = guarded(ServerDiagnosticHandlerPanic, func() (encodedStream, error) { return handler(ctx, body, requestBody) })
 	}
 	if err := afterHandler(ctx, err); err != nil {
 		discardMessageStream(responses)
@@ -1643,7 +1661,7 @@ func invokeAuthorizer(ctx context.Context, authorizer Authorizer, info HandlerCo
 	if !raceContext {
 		return guarded(ServerDiagnosticAuthorizerPanic, call)
 	}
-	next, err := raceGuarded(ctx, lease, ServerDiagnosticAuthorizerPanic, lease.goRun, call, nil)
+	next, err := raceGuarded(ctx, lease, ServerDiagnosticAuthorizerPanic, true, call, nil)
 	// A call whose deadline passed fails with its deadline, even if the
 	// authorizer answered first.
 	if ctx.Err() != nil {
