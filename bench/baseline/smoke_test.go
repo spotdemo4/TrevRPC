@@ -128,6 +128,36 @@ func (s *testServer) stop(t *testing.T) {
 	s.done <- nil // keep later stops (Cleanup after an explicit stop) from blocking
 }
 
+// benchStarvedRetries is how many more times benchLine runs a bench that
+// completed no operation inside its measured window. Keep it in step with
+// RETRIES in run.py, the trevrpc-interop bench tests and the Rust self-interop
+// tests.
+const benchStarvedRetries = 2
+
+// benchLine runs the bench subcommand and returns its result line, failing the
+// test if it does not succeed. A run in which no operation completed inside
+// the measured window and none failed runs again up to benchStarvedRetries
+// times. The tests keep the windows to a few tenths of a second, so on a
+// machine saturated by other builds the workers may not fit a single call
+// inside one, which says nothing about the code under test. Every other
+// failure fails the test at once, and a bench that never completes an
+// operation still fails it.
+func benchLine(t *testing.T, args ...string) []byte {
+	t.Helper()
+	for attempt := 0; ; attempt++ {
+		var out bytes.Buffer
+		err := run(t.Context(), args, nil, &out)
+		if err == nil {
+			return out.Bytes()
+		}
+		if attempt < benchStarvedRetries && errors.Is(err, errStarved) {
+			t.Logf("%v; running the bench again", err)
+			continue
+		}
+		t.Fatalf("bench %v: %v", args[1:], err)
+	}
+}
+
 func TestBenchScenarios(t *testing.T) {
 	srv := startServer(t)
 	for _, transport := range transports {
@@ -136,7 +166,6 @@ func TestBenchScenarios(t *testing.T) {
 				for _, metadataSize := range []int{0, 300} {
 					name := transport + "/" + scenario + "/c" + strconv.Itoa(concurrency) + "/md" + strconv.Itoa(metadataSize)
 					t.Run(name, func(t *testing.T) {
-						var out bytes.Buffer
 						args := []string{
 							"bench", "--addr", srv.addrs[transport], "--tcp-addr", "ignored:1", "--ca", srv.ca,
 							"--server-name", "localhost", "--transport", transport, "--scenario", scenario,
@@ -144,10 +173,7 @@ func TestBenchScenarios(t *testing.T) {
 							"--concurrency", strconv.Itoa(concurrency),
 							"--duration", "0.2", "--warmup", "0.05", "--messages", "10",
 						}
-						if err := run(t.Context(), args, nil, &out); err != nil {
-							t.Fatal(err)
-						}
-						checkResult(t, out.Bytes(), transport, scenario, concurrency, metadataSize)
+						checkResult(t, benchLine(t, args...), transport, scenario, concurrency, metadataSize)
 					})
 				}
 			}
@@ -241,7 +267,7 @@ func startPadCountingServer(t *testing.T, transport string, counter *padCounter)
 		t.Cleanup(func() { _ = srv.Close() })
 		return lis.Addr().String(), certPath
 	}
-	srv := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&certificate)),
+	return serveGRPC(t, lis, certificate,
 		grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			counter.observeGRPC(ctx)
 			return handler(ctx, req)
@@ -249,11 +275,69 @@ func startPadCountingServer(t *testing.T, transport string, counter *padCounter)
 		grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 			counter.observeGRPC(stream.Context())
 			return handler(srv, stream)
-		}))
+		})), certPath
+}
+
+// serveGRPC serves Echo over TLS with grpc-go on lis until the test ends, and
+// returns its address.
+func serveGRPC(t *testing.T, lis net.Listener, certificate tls.Certificate, options ...grpc.ServerOption) string {
+	t.Helper()
+	srv := grpc.NewServer(append([]grpc.ServerOption{grpc.Creds(credentials.NewServerTLSFromCert(&certificate))}, options...)...)
 	echopb.RegisterEchoServer(srv, echoServer{})
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
-	return lis.Addr().String(), certPath
+	return lis.Addr().String()
+}
+
+// startSlowGRPCServer serves Echo over TLS with grpc-go, holding each of the
+// first slowCalls unary calls for delay before handling it.
+func startSlowGRPCServer(t *testing.T, slowCalls int64, delay time.Duration) (addr, ca string) {
+	t.Helper()
+	certPath, keyPath := writeCert(t)
+	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis, err := new(net.ListenConfig).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	return serveGRPC(t, lis, certificate,
+		grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if calls.Add(1) <= slowCalls {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return handler(ctx, req)
+		})), certPath
+}
+
+// TestBenchLineRunsAStarvedBenchAgain checks the error a run whose every call
+// outlasts its measured window ends with, and that benchLine runs such a run
+// again. One worker's first call, held for longer than the whole run, starves
+// the first run.
+func TestBenchLineRunsAStarvedBenchAgain(t *testing.T) {
+	const window = 250 * time.Millisecond
+	args := func(addr, ca string) []string {
+		return []string{
+			"bench", "--addr", addr, "--ca", ca, "--transport", "grpc", "--scenario", "unary", "--size", "100",
+			"--concurrency", "1", "--duration", "0.2", "--warmup", "0.05",
+		}
+	}
+	t.Run("starved", func(t *testing.T) {
+		addr, ca := startSlowGRPCServer(t, math.MaxInt64, 2*window)
+		if err := run(t.Context(), args(addr, ca), nil, io.Discard); !errors.Is(err, errStarved) {
+			t.Fatalf("run = %v, want %v", err, errStarved)
+		}
+	})
+	t.Run("starved once", func(t *testing.T) {
+		addr, ca := startSlowGRPCServer(t, 1, 2*window)
+		checkResult(t, benchLine(t, args(addr, ca)...), "grpc", "unary", 1, 0)
+	})
 }
 
 // TestBenchMetadataSizeAddsOnePadEntryToEveryCall checks what the smoke test
@@ -279,9 +363,7 @@ func testPadEntries(t *testing.T, transport, scenario string, size int) {
 		"--size", "10", "--metadata-size", strconv.Itoa(size), "--concurrency", "2",
 		"--duration", "0.2", "--warmup", "0.05", "--messages", "3",
 	}
-	if err := run(t.Context(), args, nil, io.Discard); err != nil {
-		t.Fatal(err)
-	}
+	benchLine(t, args...)
 	calls, padded := counter.calls.Load(), counter.padded.Load()
 	if calls == 0 {
 		t.Fatal("the server saw no calls")
@@ -509,25 +591,22 @@ func TestBenchCompressionShrinksBothDirections(t *testing.T) {
 	for _, transport := range transports {
 		wire := make(map[string]float64)
 		for _, compression := range compressions {
-			var out bytes.Buffer
 			args := []string{
 				"bench", "--addr", srv.addrs[transport], "--ca", srv.ca, "--transport", transport,
 				"--scenario", "bidi", "--size", "1024", "--duration", "0.2", "--warmup", "0.05",
 				"--payload", "records", "--compression", compression,
 			}
-			if err := run(t.Context(), args, nil, &out); err != nil {
-				t.Fatalf("%s %s: %v", transport, compression, err)
-			}
+			out := benchLine(t, args...)
 			var result struct {
 				Payload, Compression string
 				WireBytesPerMsg      float64 `json:"wire_bytes_per_msg"`
 				Errors               float64
 			}
-			if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+			if err := json.Unmarshal(out, &result); err != nil {
 				t.Fatal(err)
 			}
 			if result.Payload != "records" || result.Compression != compression || result.Errors != 0 {
-				t.Errorf("%s %s: result %s", transport, compression, out.String())
+				t.Errorf("%s %s: result %s", transport, compression, out)
 			}
 			wire[compression] = result.WireBytesPerMsg
 		}

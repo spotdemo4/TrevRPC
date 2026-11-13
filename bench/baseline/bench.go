@@ -247,6 +247,10 @@ func reportErrors(w io.Writer, results []workerResult) {
 	}
 }
 
+// errStarved is the error of a run in which no operation completed inside the
+// measured window and none failed: every call ran past it.
+var errStarved = errors.New("no operation completed inside the measured window")
+
 func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (benchResult, error) {
 	var latencies []time.Duration
 	var msgs, errs uint64
@@ -256,7 +260,7 @@ func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (bench
 		errs += r.errors
 	}
 	if len(latencies) == 0 && errs == 0 {
-		return benchResult{}, errors.New("no operation completed inside the measured window")
+		return benchResult{}, errStarved
 	}
 	slices.Sort(latencies)
 

@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -52,6 +54,129 @@ func startBenchServer(t *testing.T, extra ...string) (certFile string, ports lis
 	return certFile, ports
 }
 
+// benchStarvedRetries is how many more times benchRetryingStarved runs a bench
+// that completed no operation in its measured window. Keep it in step with
+// RETRIES in bench/run.py, the baseline smoke tests and the Rust self-interop
+// tests.
+const benchStarvedRetries = 2
+
+// benchLine runs the bench subcommand through benchRetryingStarved and returns
+// its result line, failing the test if it does not succeed.
+func benchLine(t *testing.T, args ...string) string {
+	t.Helper()
+	stdout, err := benchRetryingStarved(t, args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stdout
+}
+
+// benchRetryingStarved runs the bench subcommand and returns its stdout. A run
+// that completed no operation in its measured window while no call failed runs
+// again up to benchStarvedRetries times. The tests keep the windows to a few
+// tenths of a second, so on a machine saturated by other builds the workers
+// may not fit a single call inside one, which says nothing about the code
+// under test. Every other failure is returned at once, and a bench that never
+// completes an operation still fails.
+func benchRetryingStarved(t *testing.T, args []string) (string, error) {
+	t.Helper()
+	for attempt := 0; ; attempt++ {
+		var stdout, stderr bytes.Buffer
+		code := run(args, strings.NewReader(""), &stdout, &stderr)
+		if code == 0 {
+			return stdout.String(), nil
+		}
+		if attempt < benchStarvedRetries && benchStarved(stderr.String()) {
+			t.Logf("%s; running the bench again", lastLine(stderr.String()))
+			continue
+		}
+		return "", fmt.Errorf("bench %v: exit code = %d\nstdout:\n%s\nstderr:\n%s", args[1:], code, stdout.String(), stderr.String())
+	}
+}
+
+// benchStarved reports whether a bench's stderr ends by saying that no
+// operation completed in its measured window and none failed.
+func benchStarved(stderr string) bool {
+	line := lastLine(stderr)
+	return strings.Contains(line, "no operation completed in the") && strings.HasSuffix(line, "measured window (0 failed)")
+}
+
+// scriptedOperation stands in for the operation it wraps, which it only
+// closes: every run fails with err, or carries one message after delay.
+type scriptedOperation struct {
+	benchOperation
+	delay time.Duration
+	err   error
+}
+
+func (o scriptedOperation) run(ctx context.Context) (int, error) {
+	if o.err != nil {
+		return 0, o.err
+	}
+	if err := sleepUntil(ctx, time.Now().Add(o.delay)); err != nil {
+		return 0, err
+	}
+	return 1, nil
+}
+
+// TestBenchRetryingStarvedRunsOnlyAStarvedBenchAgain scripts every run of a
+// one-worker unary bench, so that none depends on how busy the machine is: a
+// starved run's every call outlasts the whole run, so none fits in its window,
+// a failing run's every call fails, and a fast run's calls take a millisecond
+// without a round trip.
+func TestBenchRetryingStarvedRunsOnlyAStarvedBenchAgain(t *testing.T) {
+	certFile, ports := startBenchServer(t)
+	const warmup, duration = 50 * time.Millisecond, 200 * time.Millisecond
+	starved := scriptedOperation{delay: 2 * (warmup + duration)}
+	failing := scriptedOperation{err: errors.New("scripted failure")}
+	fast := scriptedOperation{delay: time.Millisecond}
+	unary := benchScenarios["unary"]
+	t.Cleanup(func() { benchScenarios["unary"] = unary })
+	for _, test := range []struct {
+		name    string
+		script  []scriptedOperation
+		wantErr *regexp.Regexp
+	}{
+		{name: "fast", script: []scriptedOperation{fast}},
+		{name: "starved once", script: []scriptedOperation{starved, fast}},
+		{name: "starved twice", script: []scriptedOperation{starved, starved, fast}},
+		{name: "always starved", script: []scriptedOperation{starved, starved, starved}, wantErr: regexp.MustCompile(`no operation completed in the 200ms measured window \(0 failed\)`)},
+		{name: "failing", script: []scriptedOperation{failing}, wantErr: regexp.MustCompile(`no operation completed in the 200ms measured window \([1-9][0-9]* failed\)`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runs := 0
+			benchScenarios["unary"] = func(clients benchClients, config benchConfig, payload benchPayload) benchWorkload {
+				workload := unary(clients, config, payload).(operationLoop)
+				operation := fast
+				if runs++; runs <= len(test.script) {
+					operation = test.script[runs-1]
+				}
+				operation.benchOperation = workload.operation
+				workload.operation = operation
+				return workload
+			}
+			_, err := benchRetryingStarved(t, []string{
+				"bench",
+				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
+				"--ca", certFile,
+				"--scenario", "unary",
+				"--concurrency", "1",
+				"--duration", strconv.FormatFloat(duration.Seconds(), 'f', -1, 64),
+				"--warmup", strconv.FormatFloat(warmup.Seconds(), 'f', -1, 64),
+			})
+			if runs != len(test.script) {
+				t.Errorf("ran the bench %d times, want %d", runs, len(test.script))
+			}
+			switch {
+			case test.wantErr == nil && err != nil:
+				t.Errorf("err = %v, want success", err)
+			case test.wantErr != nil && (err == nil || !test.wantErr.MatchString(err.Error())):
+				t.Errorf("err = %v, want one matching %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestBenchScenariosReportTheContractFields(t *testing.T) {
 	certFile, ports := startBenchServer(t)
 	const size, messages = 100, 5
@@ -72,7 +197,6 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 					continue
 				}
 				t.Run(fmt.Sprintf("%s/%s/md%d", tc.transport, scenario, metadataSize), func(t *testing.T) {
-					var stdout, stderr bytes.Buffer
 					args := []string{
 						"bench",
 						"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -88,11 +212,9 @@ func TestBenchScenariosReportTheContractFields(t *testing.T) {
 						"--duration", "0.2",
 						"--warmup", "0.05",
 					}
-					if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
-						t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
-					}
-					checkBenchLine(t, stdout.String(), scenario, tc.wantTransport, size, metadataSize, messages, tc.wantWire, false)
-					checkBenchModes(t, stdout.String(), "repeat", "none")
+					stdout := benchLine(t, args...)
+					checkBenchLine(t, stdout, scenario, tc.wantTransport, size, metadataSize, messages, tc.wantWire, false)
+					checkBenchModes(t, stdout, "repeat", "none")
 				})
 			}
 		}
@@ -167,7 +289,6 @@ func TestBenchValidationScenariosCallEveryRequestType(t *testing.T) {
 	for _, scenario := range []string{"validation-unary", "validation-client-stream"} {
 		for _, validation := range []string{"none", "standard", "cel"} {
 			t.Run(scenario+"/"+validation, func(t *testing.T) {
-				var stdout, stderr bytes.Buffer
 				args := []string{
 					"bench",
 					"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -180,12 +301,10 @@ func TestBenchValidationScenariosCallEveryRequestType(t *testing.T) {
 					"--duration", "0.2",
 					"--warmup", "0.05",
 				}
-				if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
-					t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
-				}
-				checkBenchLine(t, stdout.String(), scenario, "quic", size, 0, messages, true, false)
+				stdout := benchLine(t, args...)
+				checkBenchLine(t, stdout, scenario, "quic", size, 0, messages, true, false)
 				var got struct{ Validation string }
-				if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				if err := json.Unmarshal([]byte(stdout), &got); err != nil {
 					t.Fatal(err)
 				}
 				if got.Validation != validation {
@@ -202,7 +321,6 @@ func TestBenchSendsConnectionMetadata(t *testing.T) {
 	certFile, ports := startBenchServer(t)
 	for _, transport := range []string{"quic", "tcp"} {
 		t.Run(transport, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
 			args := []string{
 				"bench",
 				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -216,15 +334,13 @@ func TestBenchSendsConnectionMetadata(t *testing.T) {
 				"--duration", "0.2",
 				"--warmup", "0.05",
 			}
-			if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
-				t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
-			}
+			stdout := benchLine(t, args...)
 			var got map[string]any
-			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-				t.Fatalf("result %q: %v", stdout.String(), err)
+			if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+				t.Fatalf("result %q: %v", stdout, err)
 			}
 			if got["metadata_scope"] != "connection" || got["metadata_size"] != float64(300) || got["errors"] != float64(0) {
-				t.Fatalf("result = %s", stdout.String())
+				t.Fatalf("result = %s", stdout)
 			}
 		})
 	}
@@ -236,7 +352,6 @@ func TestBenchSpreadsWorkersOverConnections(t *testing.T) {
 	certFile, ports := startBenchServer(t)
 	for _, transport := range []string{"quic", "tcp"} {
 		t.Run(transport, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
 			args := []string{
 				"bench",
 				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -249,15 +364,13 @@ func TestBenchSpreadsWorkersOverConnections(t *testing.T) {
 				"--duration", "0.2",
 				"--warmup", "0.05",
 			}
-			if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
-				t.Fatalf("exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
-			}
+			stdout := benchLine(t, args...)
 			var got map[string]any
-			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-				t.Fatalf("result %q: %v", stdout.String(), err)
+			if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+				t.Fatalf("result %q: %v", stdout, err)
 			}
 			if got["connections"] != float64(3) || got["errors"] != float64(0) || got["ops"] == float64(0) {
-				t.Fatalf("result = %s", stdout.String())
+				t.Fatalf("result = %s", stdout)
 			}
 		})
 	}
@@ -381,7 +494,6 @@ func TestBenchCompressionModesShrinkTheRecordsPayload(t *testing.T) {
 	wire := make(map[string]float64)
 	for _, compression := range []string{"none", "dictionary", "stream", "stream-dictionary"} {
 		for _, scenario := range []string{"client-stream", "bidi"} {
-			var stdout, stderr bytes.Buffer
 			args := []string{
 				"bench",
 				"--addr", net.JoinHostPort("127.0.0.1", strconv.Itoa(ports.Native)),
@@ -398,16 +510,14 @@ func TestBenchCompressionModesShrinkTheRecordsPayload(t *testing.T) {
 			if compression == "dictionary" || compression == "stream-dictionary" {
 				args = append(args, "--dictionary", dictionary)
 			}
-			if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
-				t.Fatalf("%s %s: exit code = %d\nstdout:\n%s\nstderr:\n%s", compression, scenario, code, stdout.String(), stderr.String())
-			}
-			checkBenchLine(t, stdout.String(), scenario, "quic", size, 0, 5, true, compression != "none")
-			checkBenchModes(t, stdout.String(), "records", compression)
+			stdout := benchLine(t, args...)
+			checkBenchLine(t, stdout, scenario, "quic", size, 0, 5, true, compression != "none")
+			checkBenchModes(t, stdout, "records", compression)
 			if scenario == "bidi" {
 				var result struct {
 					WireBytesPerMsg float64 `json:"wire_bytes_per_msg"`
 				}
-				if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+				if err := json.Unmarshal([]byte(stdout), &result); err != nil {
 					t.Fatal(err)
 				}
 				wire[compression] = result.WireBytesPerMsg
