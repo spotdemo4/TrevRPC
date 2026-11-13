@@ -1432,6 +1432,9 @@ test("sendAll stops quietly when the server ends the call first", async () => {
   const { echo } = setup(async (stream) => {
     await stream.readRequest();
     await stream.writeStatus(Code.NotFound, "gone");
+    // Ends the stream as servers do: a call keeps a response stream that stays open until its
+    // deadline, and that timer would keep this process alive for the whole of largeDeadline.
+    await stream.finish();
   });
   async function* endless() {
     for (;;) {
@@ -1547,6 +1550,8 @@ test("a send after an early OK status reports that the call is already over", as
     await stream.readRequest();
     await stream.writeMessage(EchoResponseSchema, { message: "enough", index: 7 });
     await stream.writeStatus(Code.Ok, "done", { t: new Uint8Array([3]) });
+    // As above: the stream ends, so the call does not hold it until largeDeadline.
+    await stream.finish();
   });
   const seen = {};
   const call = await echo.clientStream({ timeoutMs: largeDeadline, ...captureResponse(seen) });
