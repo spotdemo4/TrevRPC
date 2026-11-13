@@ -30,7 +30,14 @@ import {
 } from "../src/metadata.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
-import { RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus } from "../src/wire.js";
+import {
+  RpcAnswer,
+  RpcHeaders,
+  RpcKind,
+  RpcRequest,
+  RpcStatus,
+  sharedWriterKept,
+} from "../src/wire.js";
 import { chunked, concatBytes, hex, readGoldenVectors, readerOf } from "./support.js";
 
 const bytes = (text) => new TextEncoder().encode(text);
@@ -352,6 +359,7 @@ test("malformed wire payloads map to invalid argument", () => {
     [0x18, 0x00], // wrong wire type for a map
     [0x1a, 0x02, 0x08, 0x00], // wrong wire type for a map key
     [0x1a, 0x02, 0x0a, 0x05, 0x61, 0x61, 0x61, 0x61, 0x61], // a field past its entry's end
+    [0x1a, 0x03, 0x12, 0x02, 0x00, 0x00], // a value past its entry's end, into valid bytes
     [0x08, 0xff, 0xff, 0xff, 0xff, 0x1f], // varint above uint32
     [0x08, ...Array(10).fill(0xff), 0x01], // varint longer than 10 bytes
     [0x98, 0x01, ...Array(9).fill(0xff), 0x02], // unknown 10-byte varint above 64 bits
@@ -373,6 +381,13 @@ test("malformed wire payloads map to invalid argument", () => {
     [0x38, 0x00], // wrong wire type for a message
     [0x3a, 0x03, 0x0a, 0x01, 0x00], // wrong wire type inside a nested message
     [0x4a, 0x02, 0x10, 0x00], // wrong wire type for a map inside a nested message
+    // Reads in a DictionaryInfo (7) that run past its end into bytes its parent would accept.
+    [0x3a, 0x02, 0x08, 0x80, 0x01], // its id, a varint
+    [0x3a, 0x02, 0x18, 0x80, 0x01], // an unknown varint
+    [0x3a, 0x03, 0x1d, 0x01, 0x02, 0x03, 0x04], // an unknown fixed32
+    [0x3a, 0x03, 0x19, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08], // an unknown fixed64
+    [0x3a, 0x03, 0x1a, 0x02, 0x00, 0x00], // an unknown length-delimited field
+    [0x3a, 0x02, 0x1b, 0x9c, 0x00], // the end-group tag of an unknown group
   ];
   for (const [codec, payloads] of [
     [RpcStatus, status],
@@ -419,6 +434,35 @@ test("well-formed wire payloads decode, including unknown fields of every wire t
   assert.deepEqual(Object.keys(request.metadata), ["k"]);
   assert.equal(hex(request.metadata.k), "32");
   assert.equal(request.timeoutNanos, 2n ** 64n - 1n);
+});
+
+test("payloads encode the same whatever was encoded before", () => {
+  const request = {
+    method: "/svc/m",
+    metadata: { a: bytes("1") },
+    kind: RpcKind.ServerStreaming,
+    timeoutNanos: 300n,
+  };
+  const expected = hex(RpcRequest.encode(request));
+  // An encode that fails halfway through leaves nothing behind.
+  assert.throws(() => RpcRequest.encode({ ...request, kind: 1.5 }));
+  assert.equal(hex(RpcRequest.encode(request)), expected);
+  assert.ok(sharedWriterKept());
+  // One larger than the encodes the writer is kept for drops it, and its grown buffer.
+  const large = { metadata: { big: new Uint8Array(100_000) } };
+  assert.equal(RpcHeaders.decode(RpcHeaders.encode(large)).metadata.big.length, 100_000);
+  assert.equal(sharedWriterKept(), false);
+  assert.equal(hex(RpcRequest.encode(request)), expected);
+  assert.ok(sharedWriterKept());
+  // An encode can run while another one is in progress, from a value's String().
+  const inner = { code: Code.NotFound, message: "inner" };
+  const method = {
+    toString: () => `/svc/${RpcStatus.encode(inner).length}`,
+  };
+  const nested = RpcRequest.decode(RpcRequest.encode({ ...request, method }));
+  assert.equal(nested.method, `/svc/${RpcStatus.encode(inner).length}`);
+  assert.equal(nested.kind, RpcKind.ServerStreaming);
+  assert.equal(hex(RpcRequest.encode(request)), expected);
 });
 
 test("a metadata key named like an object property stays an entry", () => {
