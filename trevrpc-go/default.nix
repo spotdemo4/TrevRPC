@@ -53,7 +53,13 @@ mkGoModule (final: {
     # tests the pure-Go codec that builds without cgo use.
     test "$(go env CGO_ENABLED)" = 1
     go test ./...
-    go test -tags trevrpc_purego ./...
+    # The tag only changes internal/zstd, so only the packages whose tests
+    # reach it run again; the RPC tests that compress are in the main package.
+    zstd=$(go list ./internal/zstd)
+    purego=$(go list -test -f '{{.Dir}} {{join .Deps " "}} ' ./... \
+      | grep -F " $zstd " | cut -d' ' -f1 | sort -u)
+    grep -qx "$PWD" <<< "$purego"
+    go test -tags trevrpc_purego $purego
     # int is 32 bits wide on 386 and arm. A cgo build would need a 32-bit C
     # toolchain, and PIE needs cgo there. GOOS is pinned because the host's
     # may have no 32-bit port (darwin/386 does not exist).
