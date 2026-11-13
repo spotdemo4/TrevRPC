@@ -20,7 +20,8 @@
 //! half the round trips they made over four. A connection whose streaming calls in flight could
 //! each make a round trip faster than the call rate allows, at its round trip time, is therefore
 //! crowded too: the pool spreads and grows as it does at the rates, and a streaming call that finds
-//! every connection crowded waits up to [`CROWDED_DIAL_WAIT`] for the ones it dials. On a slow link
+//! every connection crowded waits for the ones it dials, up to [`DEFAULT_CROWDED_DIAL_WAIT`] unless
+//! the channel sets another bound. On a slow link
 //! many streams fit in a round trip without crowding it (64 over 20 ms make at most 3,200 round
 //! trips a second), so such a channel keeps one connection, and one congestion controller, as
 //! before. Unary calls end, so the call rate measures them as they are: eight that a server holds
@@ -58,9 +59,9 @@ pub const DEFAULT_BYTE_RATE: u64 = 100_000_000;
 const RATE_WINDOW: Duration = Duration::from_millis(100);
 
 /// How long a streaming call that finds every connection crowded waits for the connection the pool
-/// dials before it takes the least crowded one. Only a short round trip crowds a connection, so the
-/// handshake takes a few milliseconds.
-const CROWDED_DIAL_WAIT: Duration = Duration::from_millis(100);
+/// dials before it takes the least crowded one, by default. Only a short round trip crowds a
+/// connection, so the handshake takes a few milliseconds.
+pub const DEFAULT_CROWDED_DIAL_WAIT: Duration = Duration::from_millis(100);
 
 /// How long a connection the pool added may go unused before it closes, by default.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -99,6 +100,8 @@ struct Pool {
     call_rate: u64,
     /// Bytes per second, per connection, to spread and grow at.
     byte_rate: u64,
+    /// How long a streaming call that finds every connection crowded waits for the pool's dials.
+    crowded_dial_wait: Duration,
     load: Load,
     /// Whether a dial, or the pause after a failed one, is under way.
     dialing: AtomicBool,
@@ -228,6 +231,7 @@ impl QuicPool {
                 idle_timeout: dialer.quic_idle_timeout.max(Duration::from_millis(1)),
                 call_rate: dialer.quic_call_rate.max(1),
                 byte_rate: dialer.quic_byte_rate.max(1),
+                crowded_dial_wait: dialer.quic_crowded_dial_wait,
                 load: Load::new(),
                 dialer,
                 dialing: AtomicBool::new(false),
@@ -268,14 +272,14 @@ impl QuicPool {
     /// connection crowded, and the generation's own otherwise. Dials another one when the pool is
     /// below its minimum, or when every connection carries one of those rates and is busy, or is
     /// crowded. A `streaming` call that finds every connection crowded waits for such dials, up to
-    /// [`CROWDED_DIAL_WAIT`] in all, since it would stay where it starts.
+    /// the pool's crowded dial wait in all, since it would stay where it starts.
     async fn pick(&self, streaming: bool) -> (QuicTransport, CallGuard) {
         let pool = &self.inner;
         let rates = pool.load.record(|| pool.moved());
         // One allowance for every dial the call waits for: a burst of streams may need several.
         let started = Instant::now();
         loop {
-            let left = CROWDED_DIAL_WAIT.saturating_sub(started.elapsed());
+            let left = pool.crowded_dial_wait.saturating_sub(started.elapsed());
             if let Some(picked) = self.try_pick(rates, streaming, streaming && !left.is_zero()) {
                 return picked;
             }

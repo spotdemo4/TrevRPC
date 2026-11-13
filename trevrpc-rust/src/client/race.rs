@@ -173,6 +173,8 @@ pub struct Dialer {
     pub(crate) quic_call_rate: u64,
     /// How many bytes per second, per connection, a generation spreads and grows at.
     pub(crate) quic_byte_rate: u64,
+    /// How long a streaming call that finds every connection crowded waits for the dials.
+    pub(crate) quic_crowded_dial_wait: Duration,
     /// When QUIC last lost a race, or `None` while QUIC is preferred.
     pub(crate) quic_failed_at: Arc<Mutex<Option<Instant>>>,
 }

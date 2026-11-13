@@ -363,11 +363,14 @@ async fn slow_calls_keep_one_connection_however_many_are_in_flight() -> TestResu
 async fn streams_opened_together_spread_over_added_connections() -> TestResult {
     // Streams start no further calls, so the call rate never sees them. A few in flight crowd a
     // connection when they could outrun the call rate, here any two, and later streams wait for
-    // the next connection instead of piling onto a crowded one.
+    // the next connection instead of piling onto a crowded one. They wait as long as the dial
+    // takes: on a starved machine a handshake can outlast the default wait, and the streams would
+    // then rightly join the crowded connections.
     let server = RawServer::spawn_with_delay(false, Duration::from_millis(300))?;
     let client = connect_pooled(
         &server,
-        fast(ChannelConfig::new().with_max_quic_connections(3)),
+        fast(ChannelConfig::new().with_max_quic_connections(3))
+            .with_quic_crowded_dial_wait(TEST_TIMEOUT),
     )
     .await?;
 

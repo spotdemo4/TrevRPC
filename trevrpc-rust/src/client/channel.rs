@@ -6,7 +6,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
 use super::pool::{
-    DEFAULT_BYTE_RATE, DEFAULT_CALL_RATE, DEFAULT_IDLE_TIMEOUT, default_max_connections,
+    DEFAULT_BYTE_RATE, DEFAULT_CALL_RATE, DEFAULT_CROWDED_DIAL_WAIT, DEFAULT_IDLE_TIMEOUT,
+    default_max_connections,
 };
 use super::race::{
     DEFAULT_FALLBACK_DELAY, DEFAULT_REPROBE_INTERVAL, Dialer, GenerationTransport, TcpDialer,
@@ -136,6 +137,7 @@ pub struct ChannelConfig {
     quic_idle_timeout: Duration,
     quic_call_rate: u64,
     quic_byte_rate: u64,
+    quic_crowded_dial_wait: Duration,
 }
 
 impl ChannelConfig {
@@ -159,6 +161,7 @@ impl ChannelConfig {
             quic_idle_timeout: DEFAULT_IDLE_TIMEOUT,
             quic_call_rate: DEFAULT_CALL_RATE,
             quic_byte_rate: DEFAULT_BYTE_RATE,
+            quic_crowded_dial_wait: DEFAULT_CROWDED_DIAL_WAIT,
         }
     }
 
@@ -205,8 +208,8 @@ impl ChannelConfig {
     /// does the same while streaming calls crowd its connections: while they could each make a
     /// round trip faster than the call rate allows, at the connection's round trip time, as a few
     /// do over loopback but even 64 over a 20 ms round trip do not. A call stays on the connection
-    /// it started on, so a streaming call that finds every connection crowded waits up to 100 ms
-    /// for the one the channel dials. The default is half the available parallelism, from one to
+    /// it started on, so a streaming call that finds every connection crowded waits for the one the
+    /// channel dials, up to [`Self::with_quic_crowded_dial_wait`]. The default is half the available parallelism, from one to
     /// four; one disables it. `QMux` over TLS always uses one connection.
     #[must_use]
     pub const fn with_max_quic_connections(mut self, connections: usize) -> Self {
@@ -260,6 +263,16 @@ impl ChannelConfig {
     #[must_use]
     pub const fn with_quic_connection_byte_rate(mut self, bytes_per_second: u64) -> Self {
         self.quic_byte_rate = bytes_per_second;
+        self
+    }
+
+    /// Sets how long a streaming call that finds every QUIC connection crowded waits for the
+    /// connection the channel dials before it joins the least crowded one (see
+    /// [`Self::with_max_quic_connections`]). Only a short round trip crowds a connection, where a
+    /// handshake takes a few milliseconds, so the default is 100 ms; zero never waits.
+    #[must_use]
+    pub const fn with_quic_crowded_dial_wait(mut self, wait: Duration) -> Self {
+        self.quic_crowded_dial_wait = wait;
         self
     }
 
@@ -536,6 +549,7 @@ impl Channel {
             quic_idle_timeout: config.quic_idle_timeout,
             quic_call_rate: config.quic_call_rate,
             quic_byte_rate: config.quic_byte_rate,
+            quic_crowded_dial_wait: config.quic_crowded_dial_wait,
             quic_failed_at: Arc::default(),
         };
         let transport = dialer.dial().await?;
