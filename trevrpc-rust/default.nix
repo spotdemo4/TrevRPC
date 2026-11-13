@@ -46,7 +46,10 @@ mkRustPackage (final: {
     runHook preCheck
     cargo test --workspace --all-features --offline
     # Run every benchmark once so they keep compiling and working; the numbers are not checked.
-    cargo bench --offline --workspace --bench '*' -- --test
+    # Without --bench in its arguments Divan runs each benchmark once, as a test, so they are
+    # built in the test profile next to the tests instead of a third time, optimized, by
+    # `cargo bench`. A separate run, because --all-targets would leave out the doctests.
+    cargo test --workspace --all-features --offline --bench '*'
     runHook postCheck
   '';
 
@@ -60,7 +63,7 @@ mkRustPackage (final: {
     checkPhase = ''
       runHook preCheck
       cargo test --workspace --all-features --offline
-      cargo bench --offline --workspace --bench '*' -- --test
+      cargo test --workspace --all-features --offline --bench '*'
       cargo clippy --workspace --all-targets --offline
       cargo clippy --workspace --all-targets --all-features --offline
       runHook postCheck
