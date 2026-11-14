@@ -37,6 +37,11 @@ const DOMAIN: &str = "trevrpc.test";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds getting the certificate.
 const ISSUE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Pebble's answer when rustls-acme asks it to validate a challenge it has already validated.
+/// rustls-acme 0.15.4 does that when it finds the authorization pending a second after asking,
+/// and Pebble finishes validating before the second request: on a loaded machine both can take
+/// that long. The order fails, and rustls-acme orders again, which then succeeds.
+const CHALLENGE_ALREADY_VALID: &str = "Cannot update challenge with status valid";
 /// Bounds starting Pebble or its mock DNS server.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -117,7 +122,15 @@ async fn rustls_acme_answers_tls_alpn_01_on_the_tcp_listener() -> TestResult {
             let event = match event {
                 Ok(EventOk::DeployedNewCert) => Ok(()),
                 Ok(_) => continue,
-                Err(error) => Err(format!("{error:?}")),
+                Err(error) => {
+                    let error = format!("{error:?}");
+                    if error.contains(CHALLENGE_ALREADY_VALID) {
+                        // The state orders again after a second.
+                        eprintln!("ordering again after a challenge race: {error}");
+                        continue;
+                    }
+                    Err(error)
+                }
             };
             if let Some(deployed) = deployed.take() {
                 let _ = deployed.send(event);
