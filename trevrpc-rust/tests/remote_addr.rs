@@ -8,20 +8,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::greeter;
+use crate::support::{self, Serving};
 use bytes::Bytes;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use quinn::rustls::pki_types::ServerName;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use trevrpc::Status;
 use trevrpc::client::{Channel, ChannelConfig, QmuxTransport};
 use trevrpc::server::{
     AddressValidation, AuthorizationRequest, Authorizer, HttpAdmission, HttpAdmissionRequest,
     RequestContext, Server, ServerOptions,
 };
-use trevrpc::tcp::{IpPrefix, TcpFallback};
-use trevrpc::udp::QuicEndpoint;
+use trevrpc::tcp::IpPrefix;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -87,36 +85,19 @@ impl Authorizer for RecordingAuthorizer {
     }
 }
 
-/// Admits only HTTP RPCs from [`CLIENT`].
-fn admit_client(request: &HttpAdmissionRequest<'_>) -> bool {
-    request.remote_addr.ip() == IpAddr::from([203, 0, 113, 7])
-}
-
-struct RunningServer {
-    udp: SocketAddr,
-    tcp: SocketAddr,
-    cert: CertificateDer<'static>,
-    authorized: RecordingAuthorizer,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<trevrpc::Result<()>>,
-}
-
-impl RunningServer {
-    async fn stop(mut self) -> TestResult {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        within!(TEST_TIMEOUT, &mut self.task)???;
-        Ok(())
-    }
-
-    fn authorized(&self) -> Vec<Option<SocketAddr>> {
-        self.authorized
-            .0
+impl RecordingAuthorizer {
+    /// The client addresses of the calls authorized so far.
+    fn addresses(&self) -> Vec<Option<SocketAddr>> {
+        self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+}
+
+/// Admits only HTTP RPCs from [`CLIENT`].
+fn admit_client(request: &HttpAdmissionRequest<'_>) -> bool {
+    request.remote_addr.ip() == IpAddr::from([203, 0, 113, 7])
 }
 
 fn prefixes(networks: &[&str]) -> TestResult<Vec<IpPrefix>> {
@@ -127,11 +108,11 @@ fn prefixes(networks: &[&str]) -> TestResult<Vec<IpPrefix>> {
 }
 
 /// Spawns a greeter server on loopback whose TCP listener trusts `trusted_proxies` and whose
-/// QUIC endpoint trusts `trusted_udp_proxies`.
+/// QUIC endpoint trusts `trusted_udp_proxies`, and returns it with its authorizer.
 async fn spawn_server(
     trusted_proxies: &[&str],
     trusted_udp_proxies: &[&str],
-) -> TestResult<RunningServer> {
+) -> TestResult<(Serving, RecordingAuthorizer)> {
     spawn_server_validating(trusted_proxies, trusted_udp_proxies, AddressValidation::Off).await
 }
 
@@ -140,14 +121,7 @@ async fn spawn_server_validating(
     trusted_proxies: &[&str],
     trusted_udp_proxies: &[&str],
     address_validation: AddressValidation,
-) -> TestResult<RunningServer> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let tls = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key)?;
-
+) -> TestResult<(Serving, RecordingAuthorizer)> {
     let mut server = Server::new();
     server.set_options(
         ServerOptions::new()
@@ -159,41 +133,15 @@ async fn spawn_server_validating(
     greeter::register_greeter(&mut server, Greeter);
     let authorized = RecordingAuthorizer::default();
     server.set_authorizer(authorized.clone());
-    let endpoint = QuicEndpoint::server(
-        server.quic_config(tls.clone())?,
-        SocketAddr::from(([127, 0, 0, 1], 0)),
+    let trusted_proxies = prefixes(trusted_proxies)?;
+    let server = support::serve_with(
+        server,
+        support::self_signed()?,
         prefixes(trusted_udp_proxies)?,
-    )?;
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-    let udp = endpoint.endpoint().local_addr()?;
-    let tcp = listener.local_addr()?;
-    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls))
-        .with_trusted_proxies(prefixes(trusted_proxies)?);
-    let (shutdown, stopped) = oneshot::channel();
-    let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
-        let _ = stopped.await;
-    }));
-    Ok(RunningServer {
-        udp,
-        tcp,
-        cert: cert_der,
-        authorized,
-        shutdown: Some(shutdown),
-        task,
-    })
-}
-
-fn client_tls(
-    cert: &CertificateDer<'static>,
-    alpn: &[u8],
-) -> TestResult<quinn::rustls::ClientConfig> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert.clone())?;
-    let mut tls = quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![alpn.to_vec()];
-    Ok(tls)
+        |tcp| tcp.with_trusted_proxies(trusted_proxies),
+    )
+    .await?;
+    Ok((server, authorized))
 }
 
 /// Starts a TCP proxy in front of `upstream` that opens each connection with `header`.
@@ -226,13 +174,13 @@ fn proxy_v2_header() -> Vec<u8> {
 }
 
 /// Says hello over `QMux` over TLS to `addr` and returns the address the server reports.
-async fn qmux_remote_addr(server: &RunningServer, addr: SocketAddr) -> TestResult<String> {
+async fn qmux_remote_addr(server: &Serving, addr: SocketAddr) -> TestResult<String> {
     let transport = within!(
         TEST_TIMEOUT,
         QmuxTransport::connect(
             addr,
             "localhost",
-            client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+            support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
         ),
     )??;
     let reply = greeter::GreeterClient::new(transport.clone())
@@ -244,12 +192,13 @@ async fn qmux_remote_addr(server: &RunningServer, addr: SocketAddr) -> TestResul
 
 #[tokio::test]
 async fn native_quic_calls_see_the_client_address() -> TestResult {
-    let server = spawn_server(&[], &[]).await?;
+    let (server, authorized) = spawn_server(&[], &[]).await?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     let client_addr = endpoint.local_addr()?;
     let config = ChannelConfig::new();
-    endpoint
-        .set_default_client_config(config.quic_config(client_tls(&server.cert, trevrpc::ALPN)?)?);
+    endpoint.set_default_client_config(
+        config.quic_config(support::client_tls(&server.cert, &[trevrpc::ALPN])?)?,
+    );
     let channel = within!(
         TEST_TIMEOUT,
         Channel::connect_with_config(endpoint, server.udp, "localhost", config),
@@ -258,14 +207,14 @@ async fn native_quic_calls_see_the_client_address() -> TestResult {
         .say_hello(&greeter::HelloRequest::default())
         .await?;
     ensure_eq!(reply.message, client_addr.to_string());
-    ensure_eq!(server.authorized(), [Some(client_addr)]);
+    ensure_eq!(authorized.addresses(), [Some(client_addr)]);
     channel.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn trusted_proxies_name_the_client_with_either_header_version() -> TestResult {
-    let server = spawn_server(&["127.0.0.0/8"], &[]).await?;
+    let (server, authorized) = spawn_server(&["127.0.0.0/8"], &[]).await?;
     let v1 = spawn_proxy(
         server.tcp,
         b"PROXY TCP4 203.0.113.7 127.0.0.1 51000 443\r\n".to_vec(),
@@ -275,39 +224,40 @@ async fn trusted_proxies_name_the_client_with_either_header_version() -> TestRes
     let v2 = spawn_proxy(server.tcp, proxy_v2_header()).await?;
     ensure_eq!(qmux_remote_addr(&server, v2).await?, CLIENT);
     let client = Some(CLIENT.parse()?);
-    ensure_eq!(server.authorized(), [client, client]);
+    ensure_eq!(authorized.addresses(), [client, client]);
 
     // A health check of the proxy itself names no client: the proxy stands for it.
     let local = spawn_proxy(server.tcp, b"\r\n\r\n\0\r\nQUIT\n\x20\x00\x00\x00".to_vec()).await?;
     let reported: SocketAddr = qmux_remote_addr(&server, local).await?.parse()?;
     ensure_eq!(reported.ip(), IpAddr::from([127, 0, 0, 1]));
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn untrusted_peers_are_not_read_for_a_header() -> TestResult {
-    let server = spawn_server(&["192.0.2.0/24"], &[]).await?;
+    let (server, _) = spawn_server(&["192.0.2.0/24"], &[]).await?;
     // The PROXY header of an untrusted peer is the start of its TLS handshake, which fails.
     let proxy = spawn_proxy(server.tcp, proxy_v2_header()).await?;
     ensure!(qmux_remote_addr(&server, proxy).await.is_err());
     // Without one, the peer's own address is the client's.
     let reported: SocketAddr = qmux_remote_addr(&server, server.tcp).await?.parse()?;
     ensure_eq!(reported.ip(), IpAddr::from([127, 0, 0, 1]));
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn trusted_proxies_must_send_a_header() -> TestResult {
-    let server = spawn_server(&["127.0.0.1/32"], &[]).await?;
+    let (server, authorized) = spawn_server(&["127.0.0.1/32"], &[]).await?;
     ensure!(qmux_remote_addr(&server, server.tcp).await.is_err());
-    ensure_eq!(server.authorized(), []);
-    server.stop().await
+    ensure_eq!(authorized.addresses(), []);
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Posts a unary `SayHello` over HTTP/2 to `addr` and returns the response status.
-async fn http2_status(server: &RunningServer, addr: SocketAddr) -> TestResult<http::StatusCode> {
+async fn http2_status(server: &Serving, addr: SocketAddr) -> TestResult<http::StatusCode> {
     let stream = TcpStream::connect(addr).await?;
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls(&server.cert, b"h2")?));
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(support::client_tls(&server.cert, &[b"h2"])?));
     let tls = connector
         .connect(ServerName::try_from("localhost")?, stream)
         .await?;
@@ -333,7 +283,7 @@ async fn http2_status(server: &RunningServer, addr: SocketAddr) -> TestResult<ht
 
 #[tokio::test]
 async fn http_admission_sees_the_client_address() -> TestResult {
-    let server = spawn_server(&["127.0.0.0/8"], &[]).await?;
+    let (server, _) = spawn_server(&["127.0.0.0/8"], &[]).await?;
     let proxy = spawn_proxy(server.tcp, proxy_v2_header()).await?;
     ensure_eq!(http2_status(&server, proxy).await?, http::StatusCode::OK);
     let local = spawn_proxy(server.tcp, b"PROXY UNKNOWN\r\n".to_vec()).await?;
@@ -341,7 +291,7 @@ async fn http_admission_sees_the_client_address() -> TestResult {
         http2_status(&server, local).await?,
         http::StatusCode::FORBIDDEN
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Starts a UDP proxy in front of `upstream` that forwards the datagrams of each client from a
@@ -409,11 +359,12 @@ fn proxy_v2_udp_header(client: SocketAddr) -> Vec<u8> {
 }
 
 /// The client address a native QUIC call through `addr` reports.
-async fn native_remote_addr(server: &RunningServer, addr: SocketAddr) -> TestResult<String> {
+async fn native_remote_addr(server: &Serving, addr: SocketAddr) -> TestResult<String> {
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     let config = ChannelConfig::new();
-    endpoint
-        .set_default_client_config(config.quic_config(client_tls(&server.cert, trevrpc::ALPN)?)?);
+    endpoint.set_default_client_config(
+        config.quic_config(support::client_tls(&server.cert, &[trevrpc::ALPN])?)?,
+    );
     let channel = within!(
         Duration::from_secs(1),
         Channel::connect_with_config(endpoint, addr, "localhost", config),
@@ -426,8 +377,8 @@ async fn native_remote_addr(server: &RunningServer, addr: SocketAddr) -> TestRes
 }
 
 /// Posts a unary `SayHello` over HTTP/3 to `addr` and returns the response status.
-async fn http3_status(server: &RunningServer, addr: SocketAddr) -> TestResult<http::StatusCode> {
-    let tls = client_tls(&server.cert, trevrpc::HTTP3_ALPN)?;
+async fn http3_status(server: &Serving, addr: SocketAddr) -> TestResult<http::StatusCode> {
+    let tls = support::client_tls(&server.cert, &[trevrpc::HTTP3_ALPN])?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
@@ -460,11 +411,11 @@ async fn http3_status(server: &RunningServer, addr: SocketAddr) -> TestResult<ht
 
 #[tokio::test]
 async fn trusted_udp_proxies_name_the_client() -> TestResult {
-    let server = spawn_server(&[], &["127.0.0.0/8"]).await?;
+    let (server, authorized) = spawn_server(&[], &["127.0.0.0/8"]).await?;
     let proxy = spawn_udp_proxy(server.udp, proxy_v2_udp_header).await?;
     let reported: SocketAddr = native_remote_addr(&server, proxy).await?.parse()?;
     ensure_eq!(reported.ip(), IpAddr::from([203, 0, 113, 7]));
-    ensure_eq!(server.authorized(), [Some(reported)]);
+    ensure_eq!(authorized.addresses(), [Some(reported)]);
     // HTTP admission admits only that client.
     ensure_eq!(http3_status(&server, proxy).await?, http::StatusCode::OK);
 
@@ -473,12 +424,12 @@ async fn trusted_udp_proxies_name_the_client() -> TestResult {
     // The TCP listener does not trust UDP proxies.
     let reported: SocketAddr = qmux_remote_addr(&server, server.tcp).await?.parse()?;
     ensure_eq!(reported.ip(), IpAddr::from([127, 0, 0, 1]));
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn udp_proxy_local_headers_leave_the_proxy_address() -> TestResult {
-    let server = spawn_server(&[], &["127.0.0.1/32"]).await?;
+    let (server, _) = spawn_server(&[], &["127.0.0.1/32"]).await?;
     let proxy = spawn_udp_proxy(server.udp, |_| {
         b"\r\n\r\n\0\r\nQUIT\n\x20\x00\x00\x00".to_vec()
     })
@@ -489,23 +440,23 @@ async fn udp_proxy_local_headers_leave_the_proxy_address() -> TestResult {
         http3_status(&server, proxy).await?,
         http::StatusCode::FORBIDDEN
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn untrusted_udp_peers_are_not_read_for_a_header() -> TestResult {
-    let server = spawn_server(&[], &["192.0.2.0/24"]).await?;
+    let (server, _) = spawn_server(&[], &["192.0.2.0/24"]).await?;
     let reported: SocketAddr = native_remote_addr(&server, server.udp).await?.parse()?;
     ensure_eq!(reported.ip(), IpAddr::from([127, 0, 0, 1]));
     // The header of an untrusted peer reaches QUIC, which cannot read the datagram.
     let proxy = spawn_udp_proxy(server.udp, proxy_v2_udp_header).await?;
     ensure!(native_remote_addr(&server, proxy).await.is_err());
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn udp_proxy_clients_are_looked_up_at_the_handshake() -> TestResult {
-    let server = spawn_server(&[], &["127.0.0.0/8"]).await?;
+    let (server, _) = spawn_server(&[], &["127.0.0.0/8"]).await?;
     let forged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let proxy = spawn_udp_proxy(server.udp, {
         let forged = Arc::clone(&forged);
@@ -520,8 +471,9 @@ async fn udp_proxy_clients_are_looked_up_at_the_handshake() -> TestResult {
     .await?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     let config = ChannelConfig::new();
-    endpoint
-        .set_default_client_config(config.quic_config(client_tls(&server.cert, trevrpc::ALPN)?)?);
+    endpoint.set_default_client_config(
+        config.quic_config(support::client_tls(&server.cert, &[trevrpc::ALPN])?)?,
+    );
     let channel = within!(
         TEST_TIMEOUT,
         Channel::connect_with_config(endpoint, proxy, "localhost", config),
@@ -542,7 +494,7 @@ async fn udp_proxy_clients_are_looked_up_at_the_handshake() -> TestResult {
         .parse()?;
     ensure_eq!(after, before);
     channel.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Whether `datagram` is a QUIC version 1 Retry packet.
@@ -561,7 +513,7 @@ async fn address_validation_sends_retry() -> TestResult {
             true,
         ),
     ] {
-        let server = spawn_server_validating(&[], &[], validation).await?;
+        let (server, _) = spawn_server_validating(&[], &[], validation).await?;
         let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let relay = spawn_udp_relay(server.udp, |_| Vec::new(), {
             let retries = Arc::clone(&retries);
@@ -581,7 +533,7 @@ async fn address_validation_sends_retry() -> TestResult {
             retries_expected,
             "{validation:?}"
         );
-        server.stop().await?;
+        server.stop(TEST_TIMEOUT).await?;
     }
     Ok(())
 }

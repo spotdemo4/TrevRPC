@@ -1,15 +1,20 @@
-//! Helpers shared by the integration tests: raw frame IO over native QUIC and `WebTransport`
-//! streams, and a test-only `WebTransport` client.
+//! Helpers shared by the integration tests: a server on loopback ports, tests over each wire, raw
+//! frame IO over native QUIC and `WebTransport` streams, and a test-only `WebTransport` client.
 //!
 //! The library itself ships no `WebTransport` or HTTP/3 client; these exist only to exercise the
 //! server's `WebTransport` path.
 
 #[macro_use]
 mod ensure;
+mod serving;
+#[macro_use]
+mod wire;
 #[macro_use]
 mod within;
 
 pub use ensure::AssertionFailed;
+pub use serving::{Serving, client_tls, self_signed, self_signed_key, serve, serve_with};
+pub use wire::{Wire, WireRecv, WireSend};
 pub use within::TimedOut;
 
 use std::future::Future;

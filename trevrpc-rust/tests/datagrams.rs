@@ -5,18 +5,13 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::support;
+use crate::support::{self, Serving};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use trevrpc::client::{
     CallInfo, ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport,
 };
 use trevrpc::server::{RouteOptions, Server, ServerOptions};
-use trevrpc::tcp::TcpFallback;
 use trevrpc::{Metadata, ResponseFrame, RpcKind, RpcRequest, Status, Unreliable};
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -88,54 +83,11 @@ fn register_routes(server: &mut Server) {
     );
 }
 
-struct RunningServer {
-    udp: SocketAddr,
-    tcp: SocketAddr,
-    cert: CertificateDer<'static>,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<trevrpc::Result<()>>,
-}
-
-impl RunningServer {
-    async fn stop(mut self) -> TestResult {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        within!(TEST_TIMEOUT, &mut self.task)???;
-        Ok(())
-    }
-}
-
-async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let tls = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key)?;
-
+async fn spawn_server(options: ServerOptions) -> TestResult<Serving> {
     let mut server = Server::new();
     server.set_options(options);
     register_routes(&mut server);
-    let endpoint = quinn::Endpoint::server(
-        server.quic_config(tls.clone())?,
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-    )?;
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-    let udp = endpoint.local_addr()?;
-    let tcp = listener.local_addr()?;
-    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
-    let (shutdown, stopped) = oneshot::channel();
-    let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
-        let _ = stopped.await;
-    }));
-    Ok(RunningServer {
-        udp,
-        tcp,
-        cert: cert_der,
-        shutdown: Some(shutdown),
-        task,
-    })
+    support::serve(server, support::self_signed()?).await
 }
 
 fn server_options() -> ServerOptions {
@@ -144,24 +96,21 @@ fn server_options() -> ServerOptions {
         .with_graceful_shutdown_timeout(Some(Duration::from_millis(500)))
 }
 
-fn client_tls(cert: &CertificateDer<'static>) -> TestResult<quinn::rustls::ClientConfig> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert.clone())?;
-    Ok(quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth())
-}
-
-async fn connect_quic(server: &RunningServer) -> TestResult<(quinn::Endpoint, quinn::Connection)> {
-    let config = ChannelConfig::new().quic_config(client_tls(&server.cert)?)?;
+async fn connect_quic(server: &Serving) -> TestResult<(quinn::Endpoint, quinn::Connection)> {
+    let config = ChannelConfig::new().quic_config(support::client_tls(&server.cert, &[])?)?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(config);
     let connection = endpoint.connect(server.udp, "localhost")?.await?;
     Ok((endpoint, connection))
 }
 
-async fn connect_qmux(server: &RunningServer) -> TestResult<QmuxTransport> {
-    Ok(QmuxTransport::connect(server.tcp, "localhost", client_tls(&server.cert)?).await?)
+async fn connect_qmux(server: &Serving) -> TestResult<QmuxTransport> {
+    Ok(QmuxTransport::connect(
+        server.tcp,
+        "localhost",
+        support::client_tls(&server.cert, &[])?,
+    )
+    .await?)
 }
 
 /// What a bidirectional call received.
@@ -272,7 +221,7 @@ async fn native_quic_carries_unreliable_messages_in_datagrams_both_ways() -> Tes
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -295,7 +244,7 @@ async fn datagrams_and_qmux_work_with_connection_threads() -> TestResult {
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -317,7 +266,7 @@ async fn messages_too_large_for_a_datagram_travel_on_the_stream() -> TestResult 
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -336,7 +285,7 @@ async fn a_reliable_call_uses_no_datagrams_even_on_a_route_that_marks_responses(
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -352,7 +301,7 @@ async fn qmux_has_no_datagrams_and_keeps_every_message_on_the_stream() -> TestRe
     ensure_eq!(reply.trailer("datagrams")?, 0);
 
     transport.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// A raw native client call: a REQUEST that names a datagram flow, written to a bidirectional
@@ -437,7 +386,7 @@ async fn a_handler_that_sends_only_datagrams_still_gets_its_headers_flushed() ->
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -463,7 +412,7 @@ async fn datagrams_that_overtake_their_request_are_held_and_then_claimed() -> Te
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -490,7 +439,7 @@ async fn a_datagram_carries_every_message_frame_in_it_and_a_malformed_one_none()
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -509,7 +458,7 @@ async fn held_datagrams_that_wait_too_long_for_their_request_are_dropped() -> Te
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -555,7 +504,7 @@ async fn a_request_for_a_live_flow_fails_with_invalid_argument() -> TestResult {
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -582,7 +531,7 @@ async fn a_nonzero_flow_is_ignored_where_there_are_no_datagrams() -> TestResult 
     }
 
     transport.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -616,7 +565,7 @@ async fn request_datagrams_count_toward_the_message_limit() -> TestResult {
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -646,11 +595,11 @@ async fn datagram_only_traffic_keeps_the_idle_timer_alive() -> TestResult {
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 async fn connect_webtransport(
-    server: &RunningServer,
+    server: &Serving,
 ) -> TestResult<(web_transport_quinn::Client, web_transport_quinn::Session)> {
     let client = web_transport_quinn::ClientBuilder::new()
         .with_server_certificates(vec![server.cert.clone()])?;
@@ -710,5 +659,5 @@ async fn webtransport_carries_unreliable_messages_in_session_datagrams_both_ways
     ensure_delivered_at_most_once(&expected, &echoed)?;
 
     session.close(0, b"done");
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }

@@ -14,22 +14,21 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use prost::Message as _;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use trevrpc::client::{
     BidirectionalCall, CallOptions, ChannelConfig, QmuxTransport, QuicTransport,
     StreamingRpcTransport,
 };
 use trevrpc::server::{RequestContext, Server, ServerOptions};
-use trevrpc::tcp::TcpFallback;
 use trevrpc::{BoxStream, RpcKind, Status};
 
 #[allow(dead_code)]
 #[path = "../../examples/shared/greeter.rs"]
 pub mod greeter;
+// The integration tests' server on loopback ports; the benchmarks use only part of it.
+#[allow(dead_code)]
+#[path = "../../tests/support/serving.rs"]
+mod serving;
 
 /// Messages per streaming call, as in the load benchmarks' default.
 pub const MESSAGES: usize = 100;
@@ -168,34 +167,21 @@ pub enum Link {
 pub struct Fixture {
     pub runtime: Runtime,
     pub link: Link,
-    shutdown: Option<oneshot::Sender<()>>,
-    server: Option<JoinHandle<trevrpc::Result<()>>>,
+    server: Option<serving::Serving>,
 }
 
 impl Fixture {
     pub fn start(transport: Transport, variant: Variant) -> Self {
         let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
-        let (link, shutdown, server) = runtime.block_on(Self::connect(transport, variant));
+        let (link, server) = runtime.block_on(Self::connect(transport, variant));
         Self {
             runtime,
             link,
-            shutdown: Some(shutdown),
             server: Some(server),
         }
     }
 
-    async fn connect(
-        transport: Transport,
-        variant: Variant,
-    ) -> (Link, oneshot::Sender<()>, JoinHandle<trevrpc::Result<()>>) {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let cert_der = CertificateDer::from(cert.cert);
-        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let server_tls = quinn::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key)
-            .unwrap();
-
+    async fn connect(transport: Transport, variant: Variant) -> (Link, serving::Serving) {
         let mut server = Server::new();
         server.set_options(
             ServerOptions::new().with_graceful_shutdown_timeout(Some(Duration::from_millis(200))),
@@ -204,43 +190,35 @@ impl Fixture {
             Variant::Raw => register_raw(&mut server),
             Variant::Greeter => greeter::register_greeter(&mut server, BenchGreeter),
         }
-        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let endpoint =
-            quinn::Endpoint::server(server.quic_config(server_tls.clone()).unwrap(), loopback)
-                .unwrap();
-        let listener = TcpListener::bind(loopback).await.unwrap();
-        let udp = endpoint.local_addr().unwrap();
-        let tcp = listener.local_addr().unwrap();
-        let fallback = TcpFallback::new(listener, server.tcp_tls_config(server_tls));
-        let (shutdown, stopped) = oneshot::channel();
-        let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
-            let _ = stopped.await;
-        }));
+        let server = serving::serve(server, serving::self_signed().unwrap())
+            .await
+            .unwrap();
 
-        let mut roots = quinn::rustls::RootCertStore::empty();
-        roots.add(cert_der).unwrap();
-        let client_tls = quinn::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let client_tls = serving::client_tls(&server.cert, &[]).unwrap();
         let link = match transport {
             Transport::Quic => {
                 let mut endpoint = quinn::Endpoint::client(loopback).unwrap();
                 endpoint.set_default_client_config(
                     ChannelConfig::new().quic_config(client_tls).unwrap(),
                 );
-                let connection = endpoint.connect(udp, "localhost").unwrap().await.unwrap();
+                let connection = endpoint
+                    .connect(server.udp, "localhost")
+                    .unwrap()
+                    .await
+                    .unwrap();
                 Link::Quic {
                     endpoint,
                     transport: QuicTransport::new(connection),
                 }
             }
             Transport::Qmux => Link::Qmux(
-                QmuxTransport::connect(tcp, "localhost", client_tls)
+                QmuxTransport::connect(server.tcp, "localhost", client_tls)
                     .await
                     .unwrap(),
             ),
         };
-        (link, shutdown, task)
+        (link, server)
     }
 }
 
@@ -252,13 +230,8 @@ impl Drop for Fixture {
             Link::Quic { endpoint, .. } => endpoint.close(0_u8.into(), b"done"),
             Link::Qmux(transport) => transport.close(),
         }
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
         if let Some(server) = self.server.take() {
-            let _ = self
-                .runtime
-                .block_on(tokio::time::timeout(Duration::from_secs(5), server));
+            let _ = self.runtime.block_on(server.stop(Duration::from_secs(5)));
         }
     }
 }
