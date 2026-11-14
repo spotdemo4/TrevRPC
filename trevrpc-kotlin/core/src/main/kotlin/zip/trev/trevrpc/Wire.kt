@@ -172,6 +172,14 @@ sealed interface ResponseFrame {
     }
 
     /**
+     * How many datagrams the server sent on the call's datagram flow, right before STATUS. Calls of
+     * this client never have a flow, so [CallStream] only checks where it is and drops it.
+     */
+    class DatagramCount(
+        val count: Long,
+    ) : ResponseFrame
+
+    /**
      * The terminal status, carrying trailing metadata. [refusedStreamCompression] marks a server's
      * refusal of an optimistic call, which [Client] replays instead of reporting.
      */

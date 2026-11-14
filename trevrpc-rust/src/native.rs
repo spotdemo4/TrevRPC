@@ -41,8 +41,8 @@ impl<S: MuxSendStream> ResponseWriter for NativeResponseWriter<S> {
             .await
     }
 
-    fn set_codec(&mut self, codec: ResponseCodec) {
-        self.codec = codec;
+    fn codec(&mut self) -> &mut ResponseCodec {
+        &mut self.codec
     }
 
     async fn stopped(&mut self) -> Result<()> {

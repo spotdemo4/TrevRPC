@@ -102,6 +102,10 @@ type Listener struct {
 	udpClients       *proxiedClients
 	handshakeTimeout time.Duration
 	httpTCP          *httpTCPServer // nil unless HTTP or WebTransport is enabled
+	// datagramCountWait replaces, when positive, how long a call of a later
+	// connection waits for the datagrams a DATAGRAM_COUNT announced; tests
+	// lengthen it so a loaded machine cannot outlast it.
+	datagramCountWait atomic.Int64
 
 	// ctx is cancelled, with the cause errServerShutdown, when the listener
 	// begins shutting down. In-flight RPCs observe it through their contexts.

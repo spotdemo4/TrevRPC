@@ -7,7 +7,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures_util::FutureExt as _;
 
 use crate::datagram::{DatagramTransport, Unsent};
 use crate::framed::Chunked;
@@ -160,14 +159,6 @@ impl DatagramTransport for quinn::Connection {
     async fn recv(&self) -> Option<Bytes> {
         self.read_datagram().await.ok()
     }
-
-    fn try_recv(&self) -> Option<Bytes> {
-        self.read_datagram().now_or_never()?.ok()
-    }
-
-    fn transmitted(&self) -> Option<u64> {
-        Some(self.stats().frame_tx.datagram)
-    }
 }
 
 /// The datagrams of one `WebTransport` session, framed by this crate on the raw QUIC connection.
@@ -223,14 +214,6 @@ impl DatagramTransport for SessionDatagrams {
 
     async fn recv(&self) -> Option<Bytes> {
         self.connection.read_datagram().await.ok()
-    }
-
-    fn try_recv(&self) -> Option<Bytes> {
-        self.connection.read_datagram().now_or_never()?.ok()
-    }
-
-    fn transmitted(&self) -> Option<u64> {
-        Some(self.connection.stats().frame_tx.datagram)
     }
 }
 

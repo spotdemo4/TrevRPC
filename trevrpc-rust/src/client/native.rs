@@ -243,11 +243,12 @@ impl<C: MuxConnection> NativeTransport<C> {
             Some(ClientFlow {
                 requests,
                 responses,
+                expected,
                 guard,
                 ..
             }) => (
                 requests.map(|sender| sender.with_compression(call.requests.clone())),
-                Some((responses, guard)),
+                Some((responses, expected, guard)),
             ),
             None => (None, None),
         };
@@ -277,13 +278,19 @@ impl<C: MuxConnection> NativeTransport<C> {
                 refused: None,
                 optimism: directions.requests.then(|| Arc::clone(&self.optimism)),
                 connection_metadata: offered,
+                datagrams: responses
+                    .as_ref()
+                    .map(|(_, expected, _)| expected.announced())
+                    .unwrap_or_default(),
                 ..ResponseReading::default()
             },
             complete: false,
             retry,
         });
         Ok(match responses {
-            Some((responses, guard)) => MergedResponses::boxed(frames, responses, guard),
+            Some((responses, expected, guard)) => {
+                MergedResponses::boxed(frames, responses, expected, guard)
+            }
             None => frames,
         })
     }

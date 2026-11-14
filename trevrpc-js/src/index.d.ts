@@ -372,6 +372,12 @@ export interface ClientStreamingCall<TRequest, TResponse> {
  * in arrival order, and dropped when the call's queue is full (32 messages or 1 MiB) or the call
  * has ended. Without datagrams, such as over WebSocket, everything stays on the stream.
  *
+ * A direction that sent datagrams ends with a DATAGRAM_COUNT frame, which says how many, so the
+ * receiver can tell a late datagram from a lost one. A call writes it right before the end of its
+ * request stream, and when the server announces more response datagrams than have arrived, the
+ * call waits up to 10 ms for them (delivering them as they come) before it reports the end of the
+ * responses and the final status; cancellation and the deadline end that wait early.
+ *
  * Like a `ResponseStream`, iteration delivers buffered messages without returning to the event
  * loop.
  */

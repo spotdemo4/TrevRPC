@@ -17,7 +17,7 @@ use crate::compression::{
     self, Accept, CompressMessages, CompressStream, Compression, CompressionConfig,
     DEFAULT_SERVER_MEMORY, Inflater, ServerStream, StreamBudget,
 };
-use crate::datagram::MessageCount;
+use crate::datagram::{Announced, MessageCount};
 use crate::fallback::HttpFallback;
 use crate::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::http_admission::{normalize_origin, parse_origin};
@@ -2645,6 +2645,9 @@ pub struct RequestBudget {
     /// The decompressing state of stream-compressed request messages, when the server enabled
     /// them.
     pub(crate) stream: Option<Inflater>,
+    /// Where the request stream's `DATAGRAM_COUNT` is recorded, for a call that receives request
+    /// datagrams.
+    pub(crate) datagrams: Announced,
 }
 
 impl RequestBudget {
@@ -2656,6 +2659,7 @@ impl RequestBudget {
             body_size: 0,
             accept: Accept::None,
             stream: None,
+            datagrams: Announced::none(),
         }
     }
 

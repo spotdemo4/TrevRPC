@@ -456,29 +456,34 @@ func TestAServersBurstSharesADatagramAndIsNotOvertakenByTheStatus(t *testing.T) 
 	}
 }
 
-// pollOnlyConn hides the datagrams of a connection from the reader goroutine,
-// which waits as if it had not got round to them, and passes polls, calls
-// whose context is done already, through. A call's messages then arrive only
-// through the flush at the end of its stream.
-type pollOnlyConn struct{ datagramConn }
+// countedWait is what the WebTransport tests below let a call wait for the
+// datagrams a DATAGRAM_COUNT announced: far longer than the runtime's 10 ms,
+// so that a loaded machine cannot outlast it. They check that the call waits,
+// not how long.
+const countedWait = time.Second
 
-func (c pollOnlyConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
-	select {
-	case <-ctx.Done():
-		return c.datagramConn.ReceiveDatagram(ctx)
-	default:
-	}
-	<-ctx.Done()
-	return nil, context.Cause(ctx)
+// startCountingWebTransportListener serves the datagram service over
+// WebTransport, counting the DATAGRAM frames of its connections, and lets its
+// calls wait countedWait for counted datagrams.
+func startCountingWebTransportListener(t *testing.T, pki testPKI) (*Listener, *datagramFrameCounter) {
+	t.Helper()
+	frames := new(datagramFrameCounter)
+	server := NewServer()
+	options := server.Options()
+	options.EnableWebTransport = true
+	options.WebTransportAdmission = func(request AdmissionRequest) bool { return request.Origin == testOrigin }
+	server.SetOptions(options)
+	registerDatagramService(server)
+	listener := serveTestListener(t, server, ListenOptions{TLSConfig: pki.server, QUICConfig: frames.quicConfig()})
+	listener.datagramCountWait.Store(int64(countedWait))
+	return listener, frames
 }
 
-// TestTheEndOfAStreamPollsAWebTransportSessionsDatagrams polls a real
-// WebTransport session, whose datagrams webtransport-go receives through
-// quic-go's HTTP/3 streams, which return the error of a context that is done
-// before they look at their queue.
-func TestTheEndOfAStreamPollsAWebTransportSessionsDatagrams(t *testing.T) {
-	pki := newTestPKI(t)
-	listener := startTestListenerWith(t, pki, nil, registerDatagramService)
+// dialCountingWebTransport opens a WebTransport session to listener, counting
+// the DATAGRAM frames of its connection, and returns a client on it whose calls
+// wait countedWait for counted datagrams.
+func dialCountingWebTransport(t *testing.T, pki testPKI, listener *Listener) (*streamClient, *datagramFrameCounter) {
+	t.Helper()
 	frames := new(datagramFrameCounter)
 	response, session, err := dialWebTransportTest(pki, listener, webTransportTestDial{origin: testOrigin, quicTracer: frames.tracer})
 	if err != nil {
@@ -489,23 +494,31 @@ func TestTheEndOfAStreamPollsAWebTransportSessionsDatagrams(t *testing.T) {
 		_ = response.Body.Close()
 	})
 	client := newStreamClient(webTransportTestOpener{session}, DefaultMaxFrameSize)
-	// polled counts the datagrams that polls take from the session; the reader
-	// takes none, since pollOnlyConn hides them from it.
-	polled := &countingDatagramConn{datagramConn: session}
-	client.datagrams = newDatagramMux(pollOnlyConn{polled}, 1, false, 0)
-	defer client.datagrams.close()
+	client.datagrams = newDatagramMux(session, 1, false, 0)
+	client.datagrams.countWait = countedWait
+	t.Cleanup(client.datagrams.close)
+	return client, frames
+}
 
-	// A burst arrives whole or not at all. Not at all proves nothing by itself:
-	// loopback can lose the datagram, and quic-go's HTTP/3 layer hands each
-	// datagram to its session from a goroutine of its own, so one that the
-	// connection received with the STATUS can reach the session only after the
-	// end of the stream polled it. A round without the burst is run again, once
-	// it is clear that a poll would have taken the datagram. A poll that missed
-	// what the session queued fails here, and an end of the stream that never
-	// polled fails to deliver any burst.
-	const attempts = 20
-	for attempt := range attempts {
-		receivedBefore, polledBefore := frames.received.Load(), polled.received.Load()
+// TestAWebTransportClientGetsTheBurstThatCameWithTheStatus runs calls whose
+// server sends a burst in one datagram right before its STATUS. quic-go's
+// HTTP/3 layer hands each datagram to its WebTransport session on a goroutine
+// of its own, so the STATUS often reaches the call first (#553); the
+// DATAGRAM_COUNT in front of it makes the call wait for the datagram. A round
+// whose datagram the client's connection never received was lost on loopback
+// and proves nothing; every other round must deliver the whole burst.
+func TestAWebTransportClientGetsTheBurstThatCameWithTheStatus(t *testing.T) {
+	pki := newTestPKI(t)
+	listener := startTestListenerWith(t, pki, nil, registerDatagramService)
+	client, frames := dialCountingWebTransport(t, pki, listener)
+
+	const rounds, attempts = 10, 30
+	complete := 0
+	for attempt := 0; complete < rounds; attempt++ {
+		if attempt == attempts {
+			t.Fatalf("only %d of %d rounds kept their datagram in %d attempts", complete, rounds, attempts)
+		}
+		receivedBefore := frames.received.Load()
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 		stream, err := ServerStreaming[*testMessage, *testMessage](ctx, client, datagramBurstPath, &testMessage{}, newTestMessage, WithUnreliable(Unreliable{Responses: true}))
 		if err != nil {
@@ -523,28 +536,72 @@ func TestTheEndOfAStreamPollsAWebTransportSessionsDatagrams(t *testing.T) {
 		}
 		_ = stream.Close()
 		cancel()
-		switch got {
-		case datagramBurstSize:
-			return
-		case 0:
-		default:
+		switch {
+		case got == datagramBurstSize:
+			complete++
+		case got != 0:
 			t.Fatalf("attempt %d: %d of %d messages delivered", attempt, got, datagramBurstSize)
-		}
-		if !frames.receivedSince(receivedBefore) {
-			continue // lost on loopback
-		}
-		if polled.received.Load() != polledBefore {
-			// A poll at the end of the stream took the datagram, but only
-			// after the STATUS had ended the call's direction.
-			continue
-		}
-		// The datagram has not reached the session yet, or did after the end
-		// of the stream polled it: a poll must take it once it is there.
-		if !waitUntil(func() bool { _, ok := pollDatagram(polled); return ok }) {
-			t.Fatalf("attempt %d: the connection received the burst's datagram, but no poll took it from the session", attempt)
+		case frames.receivedSince(receivedBefore):
+			t.Fatalf("attempt %d: no message delivered, although the connection received the burst's datagram", attempt)
 		}
 	}
-	t.Fatalf("no burst was delivered in %d attempts: the end of the stream did not poll the session's datagrams", attempts)
+}
+
+// TestAWebTransportServerGetsTheRequestsThatCameWithTheEnd is the server's side
+// of the test above: the client sends its requests as datagrams and ends the
+// request right behind them, and the handler must see every request whose
+// datagram the server's connection received before it sees the end.
+func TestAWebTransportServerGetsTheRequestsThatCameWithTheEnd(t *testing.T) {
+	pki := newTestPKI(t)
+	listener, serverFrames := startCountingWebTransportListener(t, pki)
+	client, clientFrames := dialCountingWebTransport(t, pki, listener)
+
+	const requests, rounds, attempts = 4, 50, 100
+	complete := 0
+	for attempt := 0; complete < rounds; attempt++ {
+		if attempt == attempts {
+			t.Fatalf("only %d of %d rounds kept their datagrams in %d attempts", complete, rounds, attempts)
+		}
+		sentBefore, receivedBefore := clientFrames.sent.Load(), serverFrames.received.Load()
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+		call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, client, datagramChatPath, newTestMessage, WithUnreliable(Unreliable{Requests: true}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range requests {
+			if err := call.Send(&testMessage{Value: "request " + strconv.Itoa(i)}); err != nil {
+				t.Fatalf("attempt %d: Send: %v", attempt, err)
+			}
+		}
+		if err := call.CloseSend(); err != nil {
+			t.Fatalf("attempt %d: CloseSend: %v", attempt, err)
+		}
+		for {
+			if _, err := call.Recv(); err != nil {
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("attempt %d: Recv: %v", attempt, err)
+				}
+				break
+			}
+		}
+		status, ok := call.TerminalStatus()
+		_ = call.Close()
+		cancel()
+		if !ok || !status.IsOK() {
+			t.Fatalf("attempt %d: terminal status = %v, %v", attempt, status, ok)
+		}
+		received := trailerCount(t, status.Metadata, receivedTrailer)
+		if received == requests {
+			complete++
+			continue
+		}
+		// Requests were lost. That is a failure unless their datagrams never
+		// reached the server's connection.
+		sent := clientFrames.sent.Load() - sentBefore
+		if waitUntil(func() bool { return serverFrames.received.Load()-receivedBefore == sent }) {
+			t.Fatalf("attempt %d: the handler saw %d of %d requests, although the server's connection received all %d datagrams", attempt, received, requests, sent)
+		}
+	}
 }
 
 func TestAClientsReadyRequestsShareDatagrams(t *testing.T) {

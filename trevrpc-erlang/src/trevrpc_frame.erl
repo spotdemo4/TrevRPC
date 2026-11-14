@@ -19,8 +19,11 @@
 -export([
     encode/2,
     encode_raw/2,
+    encode_datagram_count/1,
+    decode_datagram_count/1,
     type_code/1,
     type_name/1,
+    name/1,
     is_grease/1,
     grease_type/1,
     reader/1,
@@ -41,7 +44,8 @@
     | status
     | zstd_message
     | zstd_stream_message
-    | answer.
+    | answer
+    | datagram_count.
 
 -type frame() :: {type(), binary()}.
 
@@ -84,15 +88,31 @@ encode_raw(Code, Payload) ->
     Length = iolist_size(Payload),
     [<<(trevrpc_varint:encode(Code))/binary, (trevrpc_varint:encode(Length))/binary>> | Payload].
 
+%% @doc Encodes a DATAGRAM_COUNT frame: the number of datagrams a direction
+%% sent, as a minimal varint.
+-spec encode_datagram_count(non_neg_integer()) -> iodata().
+encode_datagram_count(Count) ->
+    encode(datagram_count, trevrpc_varint:encode(Count)).
+
+%% @doc The count a DATAGRAM_COUNT payload holds: exactly one varint, in
+%% any valid encoding.
+-spec decode_datagram_count(binary()) -> {ok, non_neg_integer()} | error.
+decode_datagram_count(Payload) ->
+    case trevrpc_varint:decode(Payload) of
+        {Count, <<>>} -> {ok, Count};
+        _ -> error
+    end.
+
 %% @doc The type code of a known frame type.
--spec type_code(type()) -> 0..6.
+-spec type_code(type()) -> 0..7.
 type_code(message) -> 0;
 type_code(request) -> 1;
 type_code(headers) -> 2;
 type_code(status) -> 3;
 type_code(zstd_message) -> 4;
 type_code(zstd_stream_message) -> 5;
-type_code(answer) -> 6.
+type_code(answer) -> 6;
+type_code(datagram_count) -> 7.
 
 %% @doc The frame type of a type code, or `unknown' for a code the protocol
 %% does not assign (receivers skip those frames).
@@ -104,7 +124,14 @@ type_name(3) -> status;
 type_name(4) -> zstd_message;
 type_name(5) -> zstd_stream_message;
 type_name(6) -> answer;
+type_name(7) -> datagram_count;
 type_name(Code) when is_integer(Code), Code >= 0 -> unknown.
+
+%% @doc The name of a frame type as the protocol writes it, such as
+%% `"ZSTD_MESSAGE"', for error messages.
+-spec name(type()) -> unicode:chardata().
+name(Type) ->
+    string:uppercase(atom_to_list(Type)).
 
 %% @doc Whether `Code' is a grease type, `0x1f * N + 0x21', which is never
 %% assigned.

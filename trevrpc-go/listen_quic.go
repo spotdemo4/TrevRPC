@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -105,7 +106,11 @@ func (l *Listener) serveNative(conn *quic.Conn) {
 // datagram. It remembers twice as many ended flows as the connection has
 // streams.
 func (l *Listener) newDatagramMux(conn datagramConn, overhead int) *datagramMux {
-	return newDatagramMux(conn, overhead, true, 2*l.runtime.options.MaxConcurrentStreamsPerConnection)
+	mux := newDatagramMux(conn, overhead, true, 2*l.runtime.options.MaxConcurrentStreamsPerConnection)
+	if wait := l.datagramCountWait.Load(); wait > 0 {
+		mux.countWait = time.Duration(wait)
+	}
+	return mux
 }
 
 // quicPeer resolves the client address of one QUIC connection.

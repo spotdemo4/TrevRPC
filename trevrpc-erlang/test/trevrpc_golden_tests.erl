@@ -200,6 +200,7 @@ frame_type(<<"status">>) -> {known, status};
 frame_type(<<"message">>) -> {known, message};
 frame_type(<<"zstd_message">>) -> {known, zstd_message};
 frame_type(<<"zstd_stream_message">>) -> {known, zstd_stream_message};
+frame_type(<<"datagram_count">>) -> {known, datagram_count};
 frame_type(<<"grease">>) -> grease.
 
 %% Entries with both .payload and .frame: the frame a sender writes, and the

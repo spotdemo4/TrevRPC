@@ -12,6 +12,7 @@ use crate::compression::{
     Accept, ClientCompression, Dict, Inflater, MessageEncoder, StreamEnable, inflate,
 };
 use crate::connection_metadata::OfferedSet;
+use crate::datagram::Announced;
 use crate::framing::{
     self, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_payload, frame_type, is_known_frame_type,
 };
@@ -171,6 +172,11 @@ impl FrameChunks {
         framing::put_protobuf_frame(&mut self.scratch, frame_type, message, self.max_frame_size)
     }
 
+    /// Adds a `DATAGRAM_COUNT` frame that announces `count` datagrams.
+    pub fn datagram_count(&mut self, count: u64) -> Result<()> {
+        framing::put_datagram_count_frame(&mut self.scratch, count)
+    }
+
     /// Adds a message frame, which `encoder` compresses as its direction may.
     pub fn message(&mut self, body: Bytes, encoder: &mut MessageEncoder) -> Result<()> {
         // A message is checked against the frame size limit uncompressed, which limits the
@@ -226,13 +232,17 @@ pub struct ResponseCodec {
     pub(crate) encoder: MessageEncoder,
     /// The call's ANSWER, until it is written: set only when the server has something to answer.
     pub(crate) answer: Option<RpcAnswer>,
+    /// The datagrams the call has sent so far, which go out in a `DATAGRAM_COUNT` right before the
+    /// STATUS when there are any.
+    pub(crate) datagrams: u64,
 }
 
 /// Writes response frames, draining `frames`, with one write.
 ///
 /// The call's pending ANSWER goes out first, with the first frames that are not a lone STATUS: a
 /// call that fails before responding may go unanswered. With `frames` empty, only the pending
-/// ANSWER is written, if there is one.
+/// ANSWER is written, if there is one. If the call has sent datagrams, a `DATAGRAM_COUNT` goes out
+/// right before its STATUS, in the same write.
 pub async fn write_response_frames<W: FrameWrite>(
     send: &mut W,
     frames: &mut Vec<ResponseFrame>,
@@ -259,6 +269,9 @@ pub async fn write_response_frames<W: FrameWrite>(
         chunks.protobuf(frame_type::ANSWER, &answer)?;
     }
     for frame in frames.drain(..) {
+        if frame.is_status() && codec.datagrams > 0 {
+            chunks.datagram_count(codec.datagrams)?;
+        }
         chunks.response_frame(frame, &mut codec.encoder)?;
     }
     chunks.write(send).await
@@ -371,7 +384,8 @@ pub async fn write_request_stream<W: FrameWrite>(
 ///
 /// The REQUEST frame is written alone and flushed first, as the first datagram may not precede it.
 /// A message that cannot travel as a datagram is written to the stream, after the datagrams of
-/// its batch.
+/// its batch. If any datagram was sent, a `DATAGRAM_COUNT` ends the request stream's frames, and
+/// the caller finishes the stream after it; a call that fails sends none.
 pub async fn write_request_stream_datagrams<W: FrameWrite>(
     send: &mut W,
     request: &RpcRequest,
@@ -384,6 +398,7 @@ pub async fn write_request_stream_datagrams<W: FrameWrite>(
 
     let mut batch = Vec::with_capacity(MESSAGE_FRAME_BATCH);
     let mut on_stream = Vec::new();
+    let mut datagrams_sent = 0_u64;
     let mut done = false;
     while !done {
         let Some(body) = request_body.next().await.transpose()? else {
@@ -392,15 +407,21 @@ pub async fn write_request_stream_datagrams<W: FrameWrite>(
         batch.push(Bytes::from(body));
         done = take_ready_messages(request_body, &mut batch)?;
         // The upload is dropped to cancel the call, which also ends a send that waits.
-        datagrams
-            .send_batch(&mut batch, &mut on_stream, std::future::pending())
-            .await;
+        datagrams_sent = datagrams_sent.saturating_add(
+            datagrams
+                .send_batch(&mut batch, &mut on_stream, std::future::pending())
+                .await,
+        );
         if !on_stream.is_empty() {
             write_message_frames(send, &mut on_stream, max_frame_size, encoder).await?;
         }
     }
-    // The caller finishes the stream next, and its FIN must not overtake the datagrams.
-    datagrams.flushed(std::future::pending()).await;
+    if datagrams_sent > 0 {
+        // The server waits for the datagrams that the FIN may overtake.
+        let mut chunks = FrameChunks::with_capacity(max_frame_size, MAX_FRAME_HEADER_LEN);
+        chunks.datagram_count(datagrams_sent)?;
+        chunks.write(send).await?;
+    }
     Ok(())
 }
 
@@ -535,12 +556,21 @@ pub struct ResponseReading {
     pub(crate) connection_metadata: Option<OfferedSet>,
     /// An ANSWER, HEADERS, message or STATUS has arrived, after which no ANSWER may.
     pub(crate) answer_closed: bool,
+    /// Where the response's `DATAGRAM_COUNT` is recorded, for a call that receives datagrams.
+    pub(crate) datagrams: Announced,
+    /// The response's `DATAGRAM_COUNT` has arrived, after which only the STATUS may.
+    pub(crate) counted: bool,
 }
 
 impl ResponseReading {
     /// Notes the first frame of the response that is not an ANSWER. On an optimistic call it
     /// must be the STATUS that settles the call: an accepted call is answered first.
     fn start(&mut self, is_status: bool) -> Result<()> {
+        if self.counted && !is_status {
+            return Err(Error::from(Status::internal(
+                "response stream contained a frame after DATAGRAM_COUNT",
+            )));
+        }
         if !self.answer_closed {
             self.answer_closed = true;
             if self.replay.is_some() && !is_status {
@@ -549,6 +579,17 @@ impl ResponseReading {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Learns the call's `DATAGRAM_COUNT`, which may be followed only by the STATUS. Like every
+    /// frame but an ANSWER, it closes the ANSWER.
+    fn datagram_count(&mut self, payload: &[u8]) -> Result<()> {
+        self.start(false)?;
+        let count = framing::decode_datagram_count(payload)
+            .ok_or_else(|| Error::from(Status::internal(BAD_DATAGRAM_COUNT)))?;
+        self.counted = true;
+        self.datagrams.set(count);
         Ok(())
     }
 
@@ -588,7 +629,7 @@ impl ResponseReading {
 
 /// Decodes a frame received on a response stream, decompressing a `ZSTD_MESSAGE` with the
 /// dictionaries `reading` accepts and a `ZSTD_STREAM_MESSAGE` with its stream state. An ANSWER
-/// is learned into `reading` and yields `None`.
+/// and a `DATAGRAM_COUNT` are learned into `reading` and yield `None`.
 ///
 /// A REQUEST frame has no place on a response stream.
 pub fn decode_response_frame(
@@ -599,6 +640,10 @@ pub fn decode_response_frame(
 ) -> Result<Option<ResponseFrame>> {
     if frame_type == frame_type::ANSWER {
         reading.answer(&decode_payload::<RpcAnswer>(&payload)?)?;
+        return Ok(None);
+    }
+    if frame_type == frame_type::DATAGRAM_COUNT {
+        reading.datagram_count(&payload)?;
         return Ok(None);
     }
     reading.start(frame_type == frame_type::STATUS)?;
@@ -649,7 +694,9 @@ pub async fn read_response_frame<R: FrameRead>(
         let Some(header) = next_known_header(recv, max_frame_size, &mut |_| Ok(())).await? else {
             return Ok(None);
         };
-        let payload = if header.frame_type == frame_type::REQUEST {
+        // A frame that is rejected whatever its payload is not read: a REQUEST, and a
+        // DATAGRAM_COUNT too long to be an integer.
+        let payload = if header.frame_type == frame_type::REQUEST || bad_count_len(&header) {
             Bytes::new()
         } else {
             read_payload(recv, header.payload_len).await?
@@ -660,6 +707,15 @@ pub async fn read_response_frame<R: FrameRead>(
             return Ok(Some(frame));
         }
     }
+}
+
+/// The error for a `DATAGRAM_COUNT` payload that is not exactly one variable-length integer.
+const BAD_DATAGRAM_COUNT: &str = "DATAGRAM_COUNT payload is not one variable-length integer";
+
+/// Whether `header` is that of a `DATAGRAM_COUNT` whose payload is longer than any integer, which
+/// no reader needs to read to reject it.
+const fn bad_count_len(header: &FrameHeader) -> bool {
+    header.frame_type == frame_type::DATAGRAM_COUNT && header.payload_len > varint::MAX_LEN
 }
 
 /// A `ZSTD_STREAM_MESSAGE` in a direction whose receiver did not enable stream compression.
@@ -690,11 +746,21 @@ where
     decode_payload::<RpcRequest>(&payload)
 }
 
+/// What a request stream holds after REQUEST: a message, or its end.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RequestFrame {
+    /// A request message.
+    Message(Bytes),
+    /// A clean end of the stream, with the count of its `DATAGRAM_COUNT` if it had one.
+    End(Option<u64>),
+}
+
 /// Reads the next request message after REQUEST on a request stream, skipping unknown frames, or
-/// `None` at a clean end of stream.
+/// the clean end of the stream.
 ///
-/// Any known frame other than a message is a protocol error, rejected before its payload is read.
-/// A `ZSTD_MESSAGE` is decompressed with the dictionaries `accept` holds, and a
+/// A `DATAGRAM_COUNT` must be followed by the end of the stream and is reported with it. Any other
+/// known frame is a protocol error, rejected before its payload is read. A
+/// `ZSTD_MESSAGE` is decompressed with the dictionaries `accept` holds, and a
 /// `ZSTD_STREAM_MESSAGE` with `stream`, the direction's state when the server enabled it.
 pub async fn read_request_frame<R, F>(
     recv: &mut R,
@@ -702,21 +768,28 @@ pub async fn read_request_frame<R, F>(
     accept: &Accept,
     stream: Option<&mut Inflater>,
     mut on_skipped: F,
-) -> Result<Option<Bytes>>
+) -> Result<RequestFrame>
 where
     R: FrameRead,
     F: FnMut(usize) -> Result<()> + Send,
 {
     let Some(header) = next_known_header(recv, max_frame_size, &mut on_skipped).await? else {
-        return Ok(None);
+        return Ok(RequestFrame::End(None));
     };
     match header.frame_type {
-        frame_type::MESSAGE => read_payload(recv, header.payload_len).await.map(Some),
+        frame_type::MESSAGE => read_payload(recv, header.payload_len)
+            .await
+            .map(RequestFrame::Message),
+        frame_type::DATAGRAM_COUNT => {
+            read_request_count_and_end(recv, &header, max_frame_size, &mut on_skipped)
+                .await
+                .map(|count| RequestFrame::End(Some(count)))
+        }
         frame_type::ZSTD_MESSAGE => {
             let payload = read_payload(recv, header.payload_len).await?;
             let message = inflate(accept, &payload, max_frame_size)
                 .map_err(|rejected| rejected.into_error(Status::invalid_argument))?;
-            Ok(Some(message))
+            Ok(RequestFrame::Message(message))
         }
         frame_type::ZSTD_STREAM_MESSAGE => {
             let Some(stream) = stream else {
@@ -726,7 +799,7 @@ where
             let message = stream
                 .decode(&payload, max_frame_size)
                 .map_err(|rejected| rejected.into_error(Status::invalid_argument))?;
-            Ok(Some(message))
+            Ok(RequestFrame::Message(message))
         }
         frame_type::REQUEST => Err(invalid_argument(
             "request stream contained a second REQUEST",
@@ -740,7 +813,8 @@ where
 /// Reads to the end of a request stream, skipping unknown frames.
 ///
 /// A known frame is a protocol error described by `unexpected`; it is rejected before its payload
-/// is read.
+/// is read. A `DATAGRAM_COUNT` is no error, as long as the stream ends after it. It is ignored: a
+/// request stream that has one message has no datagrams to wait for.
 pub async fn read_request_end<R, F>(
     recv: &mut R,
     max_frame_size: usize,
@@ -752,8 +826,39 @@ where
     F: FnMut(usize) -> Result<()> + Send,
 {
     match next_known_header(recv, max_frame_size, &mut on_skipped).await? {
+        Some(header) if header.frame_type == frame_type::DATAGRAM_COUNT => {
+            read_request_count_and_end(recv, &header, max_frame_size, &mut on_skipped)
+                .await
+                .map(|_| ())
+        }
         Some(_) => Err(invalid_argument(unexpected)),
         None => Ok(()),
+    }
+}
+
+/// Reads the payload of the `DATAGRAM_COUNT` frame `header` on a request stream, and requires the
+/// stream to end after it, skipping unknown frames. Returns the count.
+async fn read_request_count_and_end<R, F>(
+    recv: &mut R,
+    header: &FrameHeader,
+    max_frame_size: usize,
+    on_skipped: &mut F,
+) -> Result<u64>
+where
+    R: FrameRead,
+    F: FnMut(usize) -> Result<()> + Send,
+{
+    if bad_count_len(header) {
+        return Err(invalid_argument(BAD_DATAGRAM_COUNT));
+    }
+    let payload = read_payload(recv, header.payload_len).await?;
+    let count = framing::decode_datagram_count(&payload)
+        .ok_or_else(|| invalid_argument(BAD_DATAGRAM_COUNT))?;
+    match next_known_header(recv, max_frame_size, on_skipped).await? {
+        Some(_) => Err(invalid_argument(
+            "request stream contained a frame after DATAGRAM_COUNT",
+        )),
+        None => Ok(count),
     }
 }
 
@@ -870,12 +975,13 @@ mod tests {
 
     use super::Chunked;
     use super::{
-        FrameChunks, ResponseCodec, ResponseReading, drain_fin_after_terminal_status,
-        read_frame_header, read_request, read_request_end, read_request_frame, read_response_frame,
+        FrameChunks, RequestFrame, ResponseCodec, ResponseReading, drain_fin_after_terminal_status,
+        next_known_header, read_frame_header, read_request, read_request_end, read_request_frame,
+        read_response_frame, write_request_stream_datagrams,
     };
     use crate::compression::{Accept, MessageEncoder};
     use crate::framing::{
-        DEFAULT_MAX_FRAME_SIZE, ResponseFrame, encode_frame, encode_message_frame,
+        self, DEFAULT_MAX_FRAME_SIZE, ResponseFrame, encode_frame, encode_message_frame,
         encode_protobuf_frame, frame_type,
     };
     use crate::test_io::{Chunks, Script, Sink};
@@ -1338,7 +1444,7 @@ mod tests {
 
         // 1 type + 1 length + 10 payload, then 2 type + 1 length + 3 payload.
         assert_eq!(skipped, [12, 6]);
-        assert_eq!(frame.as_deref(), Some(&b"m"[..]));
+        assert_eq!(frame, RequestFrame::Message(Bytes::from_static(b"m")));
     }
 
     #[tokio::test]
@@ -1458,5 +1564,381 @@ mod tests {
         .await
         .expect_err("REQUEST has no place on a response stream");
         assert_eq!(error.into_status().code(), Code::Internal);
+    }
+
+    fn count_frame(count: u64) -> Vec<u8> {
+        let mut frame = Vec::new();
+        framing::put_datagram_count_frame(&mut frame, count).expect("count should encode");
+        frame
+    }
+
+    /// The known frames of `wire`, as type and payload.
+    async fn known_frames(wire: Vec<u8>) -> Vec<(u64, Vec<u8>)> {
+        let mut recv = Script::new(wire);
+        let mut frames = Vec::new();
+        while let Some(header) = next_known_header(&mut recv, 1024, &mut |_| Ok(()))
+            .await
+            .expect("the wire should parse")
+        {
+            let payload = super::read_payload(&mut recv, header.payload_len)
+                .await
+                .expect("the payload should read");
+            frames.push((header.frame_type, payload.to_vec()));
+        }
+        frames
+    }
+
+    /// Reads a request stream's frames, through the end.
+    async fn read_request_frames(wire: Vec<u8>) -> crate::Result<Vec<RequestFrame>> {
+        let mut recv = Script::new(wire);
+        let mut frames = Vec::new();
+        loop {
+            let frame =
+                read_request_frame(&mut recv, 1024, &Accept::None, None, |_| Ok(())).await?;
+            let end = matches!(frame, RequestFrame::End(_));
+            frames.push(frame);
+            if end {
+                return Ok(frames);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_stream_may_end_with_a_datagram_count() {
+        let message = message_frame(b"m");
+        let one = RequestFrame::Message(Bytes::from_static(b"m"));
+        // The count may stand anywhere the end may, with unknown frames around it, and may be
+        // a non-minimal integer.
+        let non_minimal = encode_frame(frame_type::DATAGRAM_COUNT, &[0x40, 0x03], 1024).unwrap();
+        for (wire, expected) in [
+            (
+                [message.clone(), count_frame(2)].concat(),
+                vec![one, RequestFrame::End(Some(2))],
+            ),
+            (count_frame(0), vec![RequestFrame::End(Some(0))]),
+            (non_minimal, vec![RequestFrame::End(Some(3))]),
+            (
+                [grease(2), count_frame(300), grease(0)].concat(),
+                vec![RequestFrame::End(Some(300))],
+            ),
+            (
+                message,
+                vec![
+                    RequestFrame::Message(Bytes::from_static(b"m")),
+                    RequestFrame::End(None),
+                ],
+            ),
+        ] {
+            assert_eq!(read_request_frames(wire).await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_stream_rejects_a_malformed_or_misplaced_datagram_count() {
+        let bad = |payload: &[u8]| encode_frame(frame_type::DATAGRAM_COUNT, payload, 1024).unwrap();
+        let after = |frame: Vec<u8>| [count_frame(1), frame].concat();
+        for (name, wire) in [
+            ("empty", bad(&[])),
+            ("two integers", bad(&[0x01, 0x01])),
+            ("cut inside the integer", bad(&[0x40])),
+            ("bytes after the integer", bad(&[0x41, 0x2c, 0x00])),
+            ("a second count", after(count_frame(1))),
+            ("a message", after(message_frame(b"m"))),
+            (
+                "a compressed message",
+                after(encode_frame(frame_type::ZSTD_MESSAGE, &[], 1024).unwrap()),
+            ),
+            (
+                "HEADERS",
+                after(encode_frame(frame_type::HEADERS, &[], 1024).unwrap()),
+            ),
+            ("STATUS", after(status_frame(Status::ok()))),
+            (
+                "ANSWER",
+                after(encode_frame(frame_type::ANSWER, &[], 1024).unwrap()),
+            ),
+            (
+                "REQUEST",
+                after(
+                    encode_protobuf_frame(frame_type::REQUEST, &RpcRequest::new("/s/m"), 1024)
+                        .unwrap(),
+                ),
+            ),
+        ] {
+            let error = read_request_frames(wire)
+                .await
+                .expect_err("the stream must be rejected");
+            assert_eq!(error.into_status().code(), Code::InvalidArgument, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_datagram_count_too_long_for_an_integer_is_rejected_unread() {
+        let mut wire = vec![frame_type::DATAGRAM_COUNT.try_into().unwrap(), 9];
+        wire.extend([0_u8; 9]);
+        let mut recv = Script::with_read_size(wire, 1);
+        let error = read_request_frame(&mut recv, 1024, &Accept::None, None, |_| Ok(()))
+            .await
+            .expect_err("nine bytes are no integer");
+        assert_eq!(error.into_status().code(), Code::InvalidArgument);
+        assert_eq!(recv.served, 2, "the payload was never read");
+    }
+
+    #[tokio::test]
+    async fn the_request_end_accepts_a_datagram_count_before_the_end_only() {
+        let mut recv = Script::new([grease(1), count_frame(2), grease(1)].concat());
+        read_request_end(&mut recv, 1024, |_| Ok(()), "extra data")
+            .await
+            .expect("a count then the end is no error");
+
+        for wire in [
+            [count_frame(2), message_frame(b"m")].concat(),
+            [count_frame(2), count_frame(2)].concat(),
+        ] {
+            let error = read_request_end(&mut Script::new(wire), 1024, |_| Ok(()), "extra data")
+                .await
+                .expect_err("a known frame after the count is an error");
+            let status = error.into_status();
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_eq!(
+                status.message(),
+                "request stream contained a frame after DATAGRAM_COUNT"
+            );
+        }
+        let error = read_request_end(
+            &mut Script::new(encode_frame(frame_type::DATAGRAM_COUNT, &[], 1024).unwrap()),
+            1024,
+            |_| Ok(()),
+            "extra data",
+        )
+        .await
+        .expect_err("an empty count is malformed");
+        assert_eq!(error.into_status().code(), Code::InvalidArgument);
+    }
+
+    /// Reads a response stream's frames, through the end.
+    async fn read_response_frames(
+        wire: Vec<u8>,
+        reading: &mut ResponseReading,
+    ) -> crate::Result<Vec<ResponseFrame>> {
+        let mut recv = Script::new(wire);
+        let mut frames = Vec::new();
+        while let Some(frame) = read_response_frame(&mut recv, 1024, reading).await? {
+            frames.push(frame);
+        }
+        Ok(frames)
+    }
+
+    #[tokio::test]
+    async fn a_response_may_announce_its_datagrams_right_before_its_status() {
+        let headers = encode_frame(frame_type::HEADERS, &[], 1024).unwrap();
+        for wire in [
+            [
+                headers.clone(),
+                message_frame(b"m"),
+                count_frame(3),
+                status_frame(Status::ok()),
+            ]
+            .concat(),
+            // Without HEADERS, with unknown frames around the count.
+            [
+                grease(1),
+                count_frame(3),
+                grease(0),
+                status_frame(Status::ok()),
+            ]
+            .concat(),
+        ] {
+            let announced = crate::datagram::Expected::default().announced();
+            let mut reading = ResponseReading {
+                datagrams: announced.clone(),
+                ..ResponseReading::default()
+            };
+            let frames = read_response_frames(wire, &mut reading).await.unwrap();
+
+            assert_eq!(frames.last(), Some(&ResponseFrame::Status(Status::ok())));
+            assert!(
+                !frames
+                    .iter()
+                    .any(|frame| matches!(frame, ResponseFrame::Message(m) if m.is_empty()))
+            );
+            assert_eq!(announced.get(), Some(3));
+        }
+
+        // A call that receives no datagrams reads the same frames and records nothing.
+        let wire = [count_frame(3), status_frame(Status::ok())].concat();
+        let frames = read_response_frames(wire, &mut ResponseReading::default())
+            .await
+            .unwrap();
+        assert_eq!(frames, [ResponseFrame::Status(Status::ok())]);
+    }
+
+    #[tokio::test]
+    async fn a_response_rejects_a_malformed_or_misplaced_datagram_count() {
+        let bad = |payload: &[u8]| encode_frame(frame_type::DATAGRAM_COUNT, payload, 1024).unwrap();
+        let after = |frame: Vec<u8>| [count_frame(1), frame].concat();
+        for (name, wire) in [
+            ("empty", bad(&[])),
+            ("two integers", bad(&[0x01, 0x01])),
+            ("cut inside the integer", bad(&[0x80, 0x00])),
+            ("too long for an integer", bad(&[0; 9])),
+            ("a second count", after(count_frame(1))),
+            ("a message", after(message_frame(b"m"))),
+            (
+                "HEADERS",
+                after(encode_frame(frame_type::HEADERS, &[], 1024).unwrap()),
+            ),
+            (
+                "ANSWER",
+                after(encode_frame(frame_type::ANSWER, &[], 1024).unwrap()),
+            ),
+        ] {
+            let error = read_response_frames(wire, &mut ResponseReading::default())
+                .await
+                .expect_err("the stream must be rejected");
+            assert_eq!(error.into_status().code(), Code::Internal, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_status_is_written_with_the_count_of_the_datagrams_the_call_sent() {
+        let written = |codec_datagrams, mut frames: Vec<ResponseFrame>| async move {
+            let mut sink = Sink::default();
+            let mut codec = ResponseCodec {
+                datagrams: codec_datagrams,
+                ..ResponseCodec::default()
+            };
+            super::write_response_frames(&mut sink, &mut frames, 1024, &mut codec)
+                .await
+                .expect("frames should write");
+            assert_eq!(sink.0.len(), 1, "one write");
+            known_frames(sink.0.remove(0)).await
+        };
+        let types = |frames: &[(u64, Vec<u8>)]| {
+            frames
+                .iter()
+                .map(|(frame_type, _)| *frame_type)
+                .collect::<Vec<_>>()
+        };
+        let message = || ResponseFrame::message(&b"m"[..]);
+        let status = || ResponseFrame::Status(Status::ok());
+
+        // The count is right before the STATUS, in the same write.
+        let frames = written(3, vec![message(), status()]).await;
+        assert_eq!(
+            types(&frames),
+            [
+                frame_type::MESSAGE,
+                frame_type::DATAGRAM_COUNT,
+                frame_type::STATUS
+            ]
+        );
+        assert_eq!(
+            frames.get(1).map(|(_, payload)| payload.as_slice()),
+            Some(&[3_u8][..])
+        );
+        // A call that sent none announces none, and a batch without the STATUS announces nothing.
+        let frames = written(0, vec![message(), status()]).await;
+        assert_eq!(types(&frames), [frame_type::MESSAGE, frame_type::STATUS]);
+        let frames = written(3, vec![message()]).await;
+        assert_eq!(types(&frames), [frame_type::MESSAGE]);
+    }
+
+    /// The frames a request writer wrote, and how many datagrams its transport took.
+    async fn write_datagram_request(room: usize, messages: usize) -> (Vec<(u64, Vec<u8>)>, usize) {
+        use crate::datagram::{Demux, Unreliable};
+        use crate::test_io::Datagrams;
+
+        // A datagram of seven bytes holds the flow ID and one four-byte message.
+        let transport = Datagrams::new(7, room);
+        let demux = Demux::client(transport.clone(), DEFAULT_MAX_FRAME_SIZE);
+        let flow = demux
+            .open_client_flow(
+                crate::RpcKind::ClientStreaming,
+                Unreliable::REQUESTS,
+                Accept::None,
+            )
+            .expect("the call gets a flow");
+        let sender = flow.requests.expect("requests are unreliable");
+        let mut body = crate::stream::from_iter(vec![vec![7_u8; 4]; messages]);
+        let mut sink = Sink::default();
+        write_request_stream_datagrams(
+            &mut sink,
+            &RpcRequest::new("/s/m"),
+            &mut body,
+            DEFAULT_MAX_FRAME_SIZE,
+            &sender,
+            &mut MessageEncoder::default(),
+        )
+        .await
+        .expect("the request should write");
+        let wire = sink.0.concat();
+        let mut recv = Script::new(wire);
+        let mut frames = Vec::new();
+        while let Some(header) =
+            next_known_header(&mut recv, DEFAULT_MAX_FRAME_SIZE, &mut |_| Ok(()))
+                .await
+                .expect("the wire should parse")
+        {
+            let payload = super::read_payload(&mut recv, header.payload_len)
+                .await
+                .unwrap();
+            frames.push((header.frame_type, payload.to_vec()));
+        }
+        drop(flow.guard);
+        (frames, transport.sent().len())
+    }
+
+    #[tokio::test]
+    async fn a_request_stream_ends_with_the_count_of_the_datagrams_the_transport_took() {
+        // Three messages, a datagram each; the transport takes two, and the third goes on the
+        // stream, where it is not counted.
+        let (frames, sent) = write_datagram_request(2, 3).await;
+        assert_eq!(sent, 2);
+        let types: Vec<u64> = frames.iter().map(|(frame_type, _)| *frame_type).collect();
+        assert_eq!(
+            types,
+            [
+                frame_type::REQUEST,
+                frame_type::MESSAGE,
+                frame_type::DATAGRAM_COUNT
+            ]
+        );
+        assert_eq!(
+            frames.last().map(|(_, payload)| payload.as_slice()),
+            Some(&[2_u8][..])
+        );
+
+        // All of them taken: no message on the stream, and the count of all three.
+        let (frames, sent) = write_datagram_request(3, 3).await;
+        assert_eq!(sent, 3);
+        let types: Vec<u64> = frames.iter().map(|(frame_type, _)| *frame_type).collect();
+        assert_eq!(types, [frame_type::REQUEST, frame_type::DATAGRAM_COUNT]);
+        assert_eq!(
+            frames.last().map(|(_, payload)| payload.as_slice()),
+            Some(&[3_u8][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_stream_sends_no_count_when_no_datagram_was_sent() {
+        // The transport takes none, so every message is on the stream.
+        let (frames, sent) = write_datagram_request(0, 2).await;
+        assert_eq!(sent, 0);
+        let types: Vec<u64> = frames.iter().map(|(frame_type, _)| *frame_type).collect();
+        assert_eq!(
+            types,
+            [
+                frame_type::REQUEST,
+                frame_type::MESSAGE,
+                frame_type::MESSAGE
+            ]
+        );
+
+        // A call with no messages sends none either.
+        let (frames, sent) = write_datagram_request(2, 0).await;
+        assert_eq!(sent, 0);
+        let types: Vec<u64> = frames.iter().map(|(frame_type, _)| *frame_type).collect();
+        assert_eq!(types, [frame_type::REQUEST]);
     }
 }

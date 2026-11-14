@@ -217,12 +217,25 @@ put_state(#call{ref = Ref}, State) ->
     ok.
 
 %% @private Reads the next request frame, counting messages against the
-%% limit and decompressing ZSTD_MESSAGE frames. Frames other than MESSAGE
-%% and ZSTD_MESSAGE are errors on a request stream past its REQUEST.
+%% limit and decompressing ZSTD_MESSAGE frames. A DATAGRAM_COUNT is taken
+%% and checked here: it appears once, and only the end of the stream follows
+%% it. Other frames than MESSAGE and ZSTD_MESSAGE are errors on a request
+%% stream past its REQUEST.
 -spec read(#call_state{}, trevrpc_stream:deadline()) ->
     {{ok, {message, binary()}} | eof | {error, term()}, #call_state{}}.
 read(#call_state{stream = Stream, received = Received, max_messages = Max} = State, Deadline) ->
     case trevrpc_stream:next_frame(Stream, Deadline) of
+        {ok, {Type, _}, Next} when State#call_state.datagram_count =/= undefined ->
+            {{error, {after_datagram_count, Type}}, State#call_state{stream = Next}};
+        {ok, {datagram_count, Payload}, Next} ->
+            case trevrpc_frame:decode_datagram_count(Payload) of
+                {ok, Count} ->
+                    read(State#call_state{stream = Next, datagram_count = Count}, Deadline);
+                error ->
+                    {{error, {invalid, <<"malformed DATAGRAM_COUNT">>}}, State#call_state{
+                        stream = Next
+                    }}
+            end;
         {ok, {Type, _}, Next} when
             Type =:= message orelse Type =:= zstd_message orelse
                 (Type =:= zstd_stream_message andalso State#call_state.stream_decoder =/= undefined),
@@ -303,6 +316,15 @@ read_status({too_many_messages, Max}, _State) ->
     exhausted(io_lib:format("request stream exceeded maximum of ~b messages", [Max]));
 read_status({invalid, Message}, _State) ->
     trevrpc_status:new(invalid_argument, Message);
+read_status({after_datagram_count, Type}, _State) ->
+    trevrpc_status:new(
+        invalid_argument,
+        iolist_to_binary(
+            io_lib:format("request stream carried ~s after DATAGRAM_COUNT", [
+                trevrpc_frame:name(Type)
+            ])
+        )
+    );
 read_status({unexpected, zstd_stream_message}, _State) ->
     trevrpc_status:new(
         invalid_argument,
@@ -312,7 +334,7 @@ read_status({unexpected, Type}, _State) ->
     trevrpc_status:new(
         invalid_argument,
         iolist_to_binary(
-            io_lib:format("request stream carried ~s after REQUEST", [frame_name(Type)])
+            io_lib:format("request stream carried ~s after REQUEST", [trevrpc_frame:name(Type)])
         )
     );
 read_status(truncated, _State) ->
@@ -326,11 +348,3 @@ read_status(timeout, _State) ->
 
 exhausted(Message) ->
     trevrpc_status:new(resource_exhausted, iolist_to_binary(Message)).
-
-frame_name(request) -> "REQUEST";
-frame_name(headers) -> "HEADERS";
-frame_name(status) -> "STATUS";
-frame_name(answer) -> "ANSWER";
-frame_name(message) -> "MESSAGE";
-frame_name(zstd_message) -> "ZSTD_MESSAGE";
-frame_name(zstd_stream_message) -> "ZSTD_STREAM_MESSAGE".

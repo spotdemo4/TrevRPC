@@ -12,7 +12,7 @@ use crate::call_completion::CallCompletion;
 use crate::compression::{self, Accept, MessageEncoder, ServerCall, ServerStream};
 use crate::connection_metadata::ConnectionMetadataStore;
 use crate::datagram::{Demux, FlowSender, MergedRequests, MessageCount, ServerFlow};
-use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, ResponseCodec};
+use crate::framed::{self, FrameRead, MESSAGE_FRAME_BATCH, RequestFrame, ResponseCodec};
 use crate::request_pump::{
     RequestInputKind, RequestPumpFailure, RequestPumpReader, RequestPumpSettle, UnaryRequestEnd,
     start_request_pump,
@@ -43,9 +43,10 @@ pub trait ResponseWriter: Send + 'static {
 
     fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
 
-    /// Sets how the call's frames are written: how its messages are compressed and the ANSWER
-    /// that goes out first; see [`framed::write_response_frames`].
-    fn set_codec(&mut self, codec: ResponseCodec);
+    /// How the call's frames are written: how its messages are compressed, the ANSWER that goes
+    /// out first, and the datagrams that its STATUS announces; see
+    /// [`framed::write_response_frames`].
+    fn codec(&mut self) -> &mut ResponseCodec;
 }
 
 /// A request whose REQUEST frame, and the single message of a unary or server-streaming call,
@@ -176,8 +177,8 @@ where
         })
         .await?;
         match frame {
-            Some(body) => Vec::from(body),
-            None => {
+            RequestFrame::Message(body) => Vec::from(body),
+            RequestFrame::End(_) => {
                 return Err(Error::from(Status::invalid_argument(
                     "request stream ended before the request message",
                 )));
@@ -275,11 +276,12 @@ where
                 stream_compression: stream.answer,
                 connection_metadata,
             });
-        send.set_codec(ResponseCodec {
+        *send.codec() = ResponseCodec {
             encoder: MessageEncoder::new(compression.responses.clone())
                 .with_stream(stream.responses.take()),
             answer,
-        });
+            datagrams: 0,
+        };
         let request_body_len = body.len();
         let mut slots = StreamSlots::new(stream_permit);
         if !slots.acquire_request(request_limit.as_ref()) {
@@ -761,7 +763,7 @@ async fn handle_streaming_rpc<W, R>(
     let IncomingRequest {
         request,
         body,
-        budget,
+        mut budget,
         flow,
         compression,
         stream,
@@ -781,6 +783,10 @@ async fn handle_streaming_rpc<W, R>(
     }
     let max_frame_size = server.max_frame_size();
     let plain_compressed = budget.accept.plain_count();
+    if let Some(flow) = &flow {
+        // The request pump records the DATAGRAM_COUNT its stream ends with.
+        budget.datagrams = flow.expected.announced();
+    }
     let (request_body, mut request_pump) = start_request_pump(
         recv,
         RequestInputKind::for_rpc_kind(request.rpc_kind()),
@@ -792,12 +798,9 @@ async fn handle_streaming_rpc<W, R>(
         Some(flow) => {
             let count = MessageCount::new();
             let request_body = match flow.requests {
-                Some(datagrams) => MergedRequests::boxed(
-                    request_body,
-                    datagrams,
-                    flow.guard.drain_handle(),
-                    count.clone(),
-                ),
+                Some(datagrams) => {
+                    MergedRequests::boxed(request_body, datagrams, flow.expected, count.clone())
+                }
                 None => request_body,
             };
             let responses = server.route_unreliable(&request.method).responses.then(|| {
@@ -899,8 +902,6 @@ struct ResponseDatagrams {
     sender: FlowSender,
     /// The call's HEADERS frame has been handed to the transport.
     headers_flushed: bool,
-    /// The call has sent a datagram.
-    sent_any: bool,
 }
 
 impl ResponseDatagrams {
@@ -908,7 +909,6 @@ impl ResponseDatagrams {
         Self {
             sender,
             headers_flushed: false,
-            sent_any: false,
         }
     }
 
@@ -917,7 +917,9 @@ impl ResponseDatagrams {
     /// HEADERS, even empty ones, are written and flushed before the call's first datagram.
     /// The messages go out packed into datagrams, in order; those that cannot are written to the
     /// stream with the batch's other frames, after the datagrams. The terminal STATUS is
-    /// written after every datagram of its batch, and nothing follows it.
+    /// written after every datagram of its batch, and nothing follows it. The writer's codec
+    /// counts the datagrams the transport accepted, and announces them in a `DATAGRAM_COUNT` in
+    /// the write of the STATUS.
     async fn write<W: ResponseWriter>(
         &mut self,
         send: &mut W,
@@ -950,20 +952,14 @@ impl ResponseDatagrams {
             }
         }
         let mut on_stream = Vec::new();
-        self.sent_any |= !messages.is_empty();
-        self.sender
+        let accepted = self
+            .sender
             .send_batch(&mut messages, &mut on_stream, async {
                 cancellation.cancelled().await;
             })
             .await;
-        if self.sent_any && other.iter().any(ResponseFrame::is_status) {
-            // The STATUS must not overtake the datagrams sent before it.
-            self.sender
-                .flushed(async {
-                    cancellation.cancelled().await;
-                })
-                .await;
-        }
+        let codec = send.codec();
+        codec.datagrams = codec.datagrams.saturating_add(accepted);
         let mut frames_on_stream: Vec<ResponseFrame> =
             on_stream.into_iter().map(ResponseFrame::Message).collect();
         frames_on_stream.append(&mut other);
@@ -1083,13 +1079,14 @@ fn cancel_from_transport_error(cancellation: &CancellationToken, error: &Error) 
 
 #[cfg(test)]
 mod tests {
-    use super::{read_initial_request, try_acquire_permit, unary_response_frames};
+    use super::{ResponseWriter, read_initial_request, try_acquire_permit, unary_response_frames};
+    use crate::framed::{self, ResponseCodec};
     use crate::framing::{
         DEFAULT_MAX_FRAME_SIZE, encode_frame, encode_message_frame, encode_protobuf_frame,
         frame_type,
     };
     use crate::server::{Server, ServerOptions};
-    use crate::test_io::Script;
+    use crate::test_io::{Script, Sink};
     use crate::{Code, Metadata, ResponseEnvelope, ResponseFrame, RpcKind, RpcRequest, Status};
     use std::sync::Arc;
     use tokio::sync::{Semaphore, watch};
@@ -1302,5 +1299,171 @@ mod tests {
         // Failures are a lone STATUS.
         let frames = unary_response_frames(Err(Status::not_found("gone")));
         assert_eq!(frames, [ResponseFrame::Status(Status::not_found("gone"))]);
+    }
+
+    /// A response writer that records each write, with the codec the server sets.
+    struct Recorder {
+        sink: Sink,
+        codec: ResponseCodec,
+    }
+
+    impl ResponseWriter for Recorder {
+        async fn write_frames(&mut self, frames: &mut Vec<ResponseFrame>) -> crate::Result<()> {
+            framed::write_response_frames(
+                &mut self.sink,
+                frames,
+                DEFAULT_MAX_FRAME_SIZE,
+                &mut self.codec,
+            )
+            .await
+        }
+
+        async fn stopped(&mut self) -> crate::Result<()> {
+            std::future::pending().await
+        }
+
+        fn reset(&mut self) {}
+
+        fn finish(&mut self) -> impl Future<Output = crate::Result<()>> + Send {
+            std::future::ready(Ok(()))
+        }
+
+        fn codec(&mut self) -> &mut ResponseCodec {
+            &mut self.codec
+        }
+    }
+
+    /// The frame types of each write a response writer got, and each `DATAGRAM_COUNT`'s count.
+    async fn written_frames(sink: &Sink) -> Vec<Vec<(u64, Option<u64>)>> {
+        let mut writes = Vec::new();
+        for write in &sink.0 {
+            let mut recv = Script::new(write.clone());
+            let mut frames = Vec::new();
+            while let Some(header) =
+                framed::next_known_header(&mut recv, DEFAULT_MAX_FRAME_SIZE, &mut |_| Ok(()))
+                    .await
+                    .expect("the write should parse")
+            {
+                let payload = framed::read_payload(&mut recv, header.payload_len)
+                    .await
+                    .expect("the payload should read");
+                let count = (header.frame_type == frame_type::DATAGRAM_COUNT)
+                    .then(|| crate::framing::decode_datagram_count(&payload))
+                    .flatten();
+                frames.push((header.frame_type, count));
+            }
+            writes.push(frames);
+        }
+        writes
+    }
+
+    /// Writes `batches` of response frames through the response datagrams of a call whose
+    /// transport takes `room` datagrams of up to `max` bytes, and returns what the writer wrote
+    /// and how many datagrams the transport took.
+    async fn write_datagram_response(
+        max: usize,
+        room: usize,
+        batches: Vec<Vec<ResponseFrame>>,
+    ) -> (Vec<Vec<(u64, Option<u64>)>>, usize) {
+        use crate::compression::Accept;
+        use crate::datagram::Demux;
+        use crate::test_io::Datagrams;
+
+        let transport = Datagrams::new(max, room);
+        let demux = Demux::server(transport.clone(), None, DEFAULT_MAX_FRAME_SIZE);
+        let flow = demux
+            .open_server_flow(1, RpcKind::ServerStreaming, &Accept::None)
+            .expect("the flow opens");
+        let mut datagrams = super::ResponseDatagrams::new(flow.sender);
+        let mut writer = Recorder {
+            sink: Sink::default(),
+            codec: ResponseCodec::default(),
+        };
+        let cancellation = crate::server::CancellationToken::new();
+        for mut frames in batches {
+            datagrams
+                .write(&mut writer, &mut frames, &cancellation)
+                .await
+                .expect("the batch should write");
+        }
+        (written_frames(&writer.sink).await, transport.sent().len())
+    }
+
+    fn reply(body: &'static [u8]) -> ResponseFrame {
+        ResponseFrame::message(body)
+    }
+
+    fn ok() -> ResponseFrame {
+        ResponseFrame::Status(Status::ok())
+    }
+
+    #[tokio::test]
+    async fn a_response_that_sent_datagrams_announces_them_in_the_write_of_its_status() {
+        // The messages of the two batches go as two datagrams (a datagram holds one of them), and
+        // the second batch ends the call.
+        let (writes, sent) = write_datagram_response(
+            8,
+            usize::MAX,
+            vec![vec![reply(b"abc")], vec![reply(b"def"), ok()]],
+        )
+        .await;
+
+        assert_eq!(sent, 2);
+        // The empty HEADERS go first, alone; then the count and the STATUS share the last write.
+        assert_eq!(
+            writes,
+            [
+                vec![(frame_type::HEADERS, None)],
+                vec![
+                    (frame_type::DATAGRAM_COUNT, Some(2)),
+                    (frame_type::STATUS, None)
+                ]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_counts_only_the_datagrams_the_transport_took() {
+        // The transport takes one of the three datagrams; the other messages go on the stream,
+        // ahead of the count and the STATUS.
+        let (writes, sent) = write_datagram_response(
+            8,
+            1,
+            vec![vec![reply(b"abc"), reply(b"def"), reply(b"ghi"), ok()]],
+        )
+        .await;
+
+        assert_eq!(sent, 1);
+        assert_eq!(
+            writes,
+            [
+                vec![(frame_type::HEADERS, None)],
+                vec![
+                    (frame_type::MESSAGE, None),
+                    (frame_type::MESSAGE, None),
+                    (frame_type::DATAGRAM_COUNT, Some(1)),
+                    (frame_type::STATUS, None)
+                ]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_announces_nothing_when_it_sent_no_datagram() {
+        // The transport takes none, so every message goes on the stream.
+        let (writes, sent) = write_datagram_response(8, 0, vec![vec![reply(b"abc"), ok()]]).await;
+        assert_eq!(sent, 0);
+        assert_eq!(
+            writes,
+            [
+                vec![(frame_type::HEADERS, None)],
+                vec![(frame_type::MESSAGE, None), (frame_type::STATUS, None)]
+            ]
+        );
+
+        // Neither does a call that ends without a message.
+        let (writes, sent) = write_datagram_response(8, usize::MAX, vec![vec![ok()]]).await;
+        assert_eq!(sent, 0);
+        assert_eq!(writes, [vec![(frame_type::STATUS, None)]]);
     }
 }

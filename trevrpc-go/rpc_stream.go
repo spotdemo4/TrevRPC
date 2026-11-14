@@ -95,9 +95,23 @@ func writeRequestFrames(ctx context.Context, writer io.Writer, header []byte, re
 			clear(batch[:count])
 		}
 		if done {
-			return nil
+			return writeDatagramCount(writer, datagrams)
 		}
 	}
+}
+
+// writeDatagramCount writes the DATAGRAM_COUNT that ends a request whose
+// messages went out as datagrams, if any did, before the caller ends the
+// stream.
+func writeDatagramCount(writer io.Writer, datagrams *datagramSender) error {
+	if datagrams == nil {
+		return nil
+	}
+	if count := datagrams.flow.appendDatagramCount(nil); len(count) > 0 {
+		_, err := writer.Write(count)
+		return err
+	}
+	return nil
 }
 
 // messageFramesWriter is a writer that decides itself how header and messages
@@ -281,7 +295,7 @@ func handleRPCStream(ctx, serveCtx context.Context, server *Server, stream rpcSt
 		reader.readAhead = true
 		requests := &rpcRequestStream{ctx: requestCtx, reader: reader}
 		if request.flow != nil && request.flow.sink != nil {
-			requests.merge = newRequestMerge(request.flow)
+			requests.merge = newRequestMerge(requestCtx, request.flow)
 		}
 		if request.rpcKind() == RPCKindClientStreaming || request.rpcKind() == RPCKindBidirectionalStreaming {
 			upload = requests
@@ -606,6 +620,8 @@ func (s *rpcRequestStream) Close() error {
 // with its stream frames. The stream is read by a goroutine of its own, so
 // that a pending Recv wakes on a datagram without waiting for the next frame.
 type requestMerge struct {
+	// ctx is the call's context.
+	ctx  context.Context
 	flow *datagramFlow
 	// items carries what the goroutine read; it is unbuffered, so the goroutine
 	// is at most one frame ahead of Recv. It is created, with the goroutine,
@@ -624,18 +640,23 @@ type requestItem struct {
 	err   error
 }
 
-func newRequestMerge(flow *datagramFlow) *requestMerge {
-	return &requestMerge{flow: flow, stop: make(chan struct{})}
+func newRequestMerge(ctx context.Context, flow *datagramFlow) *requestMerge {
+	return &requestMerge{ctx: ctx, flow: flow, stop: make(chan struct{})}
 }
 
 // readLoop reads the request frames. Once the request ended, the datagram
-// direction ends with it: later datagrams are dropped.
+// direction ends with it, after the datagrams a clean end counted arrived:
+// later datagrams are dropped.
 func (m *requestMerge) readLoop(reader *frameReader) {
 	for {
 		next, err := reader.next()
 		terminal := err != nil || next.typ != frameTypeMessage
 		if terminal {
-			m.flow.endReceive()
+			var count uint64
+			if errors.Is(err, io.EOF) {
+				count = reader.datagramCount()
+			}
+			m.flow.endReceive(m.ctx, count, m.stop)
 		}
 		select {
 		case m.items <- requestItem{frame: next, err: err}:

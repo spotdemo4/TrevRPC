@@ -171,7 +171,7 @@ read_request(Call, InitialTimeout) ->
                 Next,
                 iolist_to_binary(
                     io_lib:format("request stream carried ~s where the request message belongs", [
-                        string:uppercase(atom_to_list(Type))
+                        trevrpc_frame:name(Type)
                     ])
                 )
             );

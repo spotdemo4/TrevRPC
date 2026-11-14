@@ -1,17 +1,20 @@
 # TrevRPC wire golden vectors.
 #
 # Every frame is: type (QUIC varint) | length (QUIC varint) | payload.
-# Frame types: 0 MESSAGE, 1 REQUEST, 2 HEADERS, 3 STATUS, 6 ANSWER; 0x1f*N+0x21 grease.
+# Frame types: 0 MESSAGE, 1 REQUEST, 2 HEADERS, 3 STATUS, 6 ANSWER, 7 DATAGRAM_COUNT;
+# 0x1f*N+0x21 grease.
 #
 # Entry kinds (values are lowercase hex; an empty value means zero bytes):
 #   <name>.payload  frame payload bytes (protobuf for REQUEST/HEADERS/STATUS,
-#                   raw message bytes for MESSAGE)
+#                   raw message bytes for MESSAGE, a QUIC varint for
+#                   DATAGRAM_COUNT)
 #   <name>.frame    the complete frame as written by a conforming sender
 #                   (minimal varints)
 #   <name>.stream   a byte stream a conforming receiver must accept
 #   <name>.frames   the known frames a receiver yields from <name>.stream,
 #                   comma separated as <type>:<payload hex>; unknown and grease
-#                   frames are skipped and therefore absent
+#                   frames are skipped and therefore absent. DATAGRAM_COUNT is
+#                   listed, whether or not a runtime surfaces it to its callers
 #
 # Datagram entries (datagram.*) are not frames:
 #   <name>.flow      the flow ID as an unsigned integer in hex
@@ -39,6 +42,8 @@
 #   answer.connection_metadata
 #                          RpcAnswer{connection_metadata:1}
 #   answer.empty           RpcAnswer{}
+#   datagram_count.one     DATAGRAM_COUNT 1
+#   datagram_count.large   DATAGRAM_COUNT 300, a two-byte varint
 #   status.ok              RpcStatus{code:0}
 #   status.unavailable     RpcStatus{code:14, message:"down"}
 #   status.metadata        RpcStatus{code:9, message:"stop", metadata:{"x-t":"2"}}
@@ -50,6 +55,12 @@
 #   stream.answered_response
 #                          ANSWER{connection_metadata:1}, HEADERS{metadata:{"x-a":"1"}},
 #                          MESSAGE "hi", STATUS OK
+#   stream.datagram_count_request
+#                          REQUEST{method:"/svc/m", kind:3, datagram_flow:1},
+#                          MESSAGE "hi", DATAGRAM_COUNT 2, end of stream
+#   stream.datagram_count_response
+#                          HEADERS{}, DATAGRAM_COUNT 3 as a non-minimal two-byte
+#                          varint, grease, STATUS OK
 
 request.unary.payload = 0a062f7376632f6d
 request.unary.frame = 01080a062f7376632f6d
@@ -87,6 +98,12 @@ answer.connection_metadata.frame = 06021801
 answer.empty.payload =
 answer.empty.frame = 0600
 
+datagram_count.one.payload = 01
+datagram_count.one.frame = 070101
+
+datagram_count.large.payload = 412c
+datagram_count.large.frame = 0702412c
+
 status.ok.payload =
 status.ok.frame = 0300
 
@@ -116,6 +133,12 @@ stream.unknown_frames.frames = 2:0a080a03782d61120131,0:6869,3:
 
 stream.answered_response.stream = 06021801020a0a080a03782d61120131000268690300
 stream.answered_response.frames = 6:1801,2:0a080a03782d61120131,0:6869,3:
+
+stream.datagram_count_request.stream = 010c0a062f7376632f6d1803280100026869070102
+stream.datagram_count_request.frames = 1:0a062f7376632f6d18032801,0:6869,7:02
+
+stream.datagram_count_response.stream = 02000702400321000300
+stream.datagram_count_response.frames = 2:,7:4003,3:
 
 datagram.flow_1.flow = 01
 datagram.flow_1.messages = 6869

@@ -69,10 +69,14 @@ const (
 	// frameTypeAnswer carries the server's answer to the negotiation fields
 	// of the REQUEST, before the response's HEADERS.
 	frameTypeAnswer frameType = 6
+	// frameTypeDatagramCount says how many datagrams the sender sent in the
+	// direction, right before its end. Readers take it in themselves (see
+	// frameReader.datagramCount), so nothing after them sees this type.
+	frameTypeDatagramCount frameType = 7
 )
 
 // known reports whether t is a frame type this runtime interprets.
-func (t frameType) known() bool { return t <= frameTypeAnswer }
+func (t frameType) known() bool { return t <= frameTypeDatagramCount }
 
 func (t frameType) String() string {
 	switch t {
@@ -90,6 +94,8 @@ func (t frameType) String() string {
 		return "ZSTD_STREAM_MESSAGE"
 	case frameTypeAnswer:
 		return "ANSWER"
+	case frameTypeDatagramCount:
+		return "DATAGRAM_COUNT"
 	default:
 		return fmt.Sprintf("unknown frame type %#x", uint64(t))
 	}
@@ -352,6 +358,12 @@ func appendExactStatusFrame(dst []byte, status *Status, maxFrameSize int) ([]byt
 	return wire.appendPayload(dst), nil
 }
 
+// appendDatagramCountFrame appends a DATAGRAM_COUNT frame of count.
+func appendDatagramCountFrame(dst []byte, count uint64) []byte {
+	dst = appendFrameHeader(dst, frameTypeDatagramCount, quicvarint.Len(count))
+	return quicvarint.Append(dst, count)
+}
+
 // appendEncodedMessage appends a message frame produced by encodeProtoMessage.
 func appendEncodedMessage(dst []byte, message encodedMessage, maxFrameSize int) ([]byte, error) {
 	if message.size > maxFrameSize {
@@ -391,6 +403,10 @@ type frameReader struct {
 	// which leaves the rest of a request in the stream when the server
 	// rejects it.
 	readAhead bool
+	// datagrams is the payload of the DATAGRAM_COUNT the stream carried, and
+	// counted says that it carried one; see datagramCount.
+	datagrams uint64
+	counted   bool
 
 	// ahead[start:end] holds bytes read from r but not consumed yet. err is
 	// the error r returned with them, reported once they are consumed.
@@ -409,6 +425,9 @@ func newFrameReader(r io.Reader, maxFrameSize, maxBytes int) *frameReader {
 // stream ends at a frame boundary; an end inside a frame is io.ErrUnexpectedEOF.
 // A declared payload length above the frame size limit is rejected before any
 // of the payload is read or allocated, whether or not the type is known.
+//
+// A DATAGRAM_COUNT is taken in, not returned; only the end of its direction,
+// a STATUS or the end of the stream, may follow it.
 func (fr *frameReader) next() (frame, error) {
 	for {
 		typ, length, headerLen, err := fr.readHeader()
@@ -419,6 +438,16 @@ func (fr *frameReader) next() (frame, error) {
 			return frame{}, &FrameTooLargeError{Len: int(min(length, math.MaxInt)), Max: fr.maxFrameSize}
 		}
 		size := int(length)
+
+		if fr.counted && typ.known() && typ != frameTypeStatus {
+			return frame{}, &frameDecodeError{Err: fmt.Errorf("%s after DATAGRAM_COUNT, which only the end of its direction may follow", typ)}
+		}
+		if typ == frameTypeDatagramCount {
+			if err := fr.readDatagramCount(size); err != nil {
+				return frame{}, err
+			}
+			continue
+		}
 
 		if typ == frameTypeZstdMessage {
 			return fr.readCompressed(size)
@@ -447,6 +476,33 @@ func (fr *frameReader) next() (frame, error) {
 		}
 	}
 }
+
+// maxDatagramCountPayload is the longest QUIC varint, and so the longest valid
+// DATAGRAM_COUNT payload.
+const maxDatagramCountPayload = 8
+
+// readDatagramCount reads the payload of a DATAGRAM_COUNT frame, which must be
+// exactly one QUIC varint, and remembers it.
+func (fr *frameReader) readDatagramCount(size int) error {
+	if size == 0 || size > maxDatagramCountPayload {
+		return &frameDecodeError{Err: fmt.Errorf("DATAGRAM_COUNT payload of %d bytes is not one varint", size)}
+	}
+	payload, err := fr.readPayload(size)
+	if err != nil {
+		return err
+	}
+	count, n, err := quicvarint.Parse(payload)
+	if err != nil || n != size {
+		return &frameDecodeError{Err: fmt.Errorf("DATAGRAM_COUNT payload %x is not one varint", payload)}
+	}
+	fr.datagrams, fr.counted = count, true
+	return nil
+}
+
+// datagramCount returns how many datagrams the sender said it sent in the
+// direction, zero if the stream carried no DATAGRAM_COUNT. It is meaningful
+// once the direction ended.
+func (fr *frameReader) datagramCount() uint64 { return fr.datagrams }
 
 // readCompressed reads the payload of a ZSTD_MESSAGE frame and returns the
 // message it decompresses to as a MESSAGE frame. The decompressed size is

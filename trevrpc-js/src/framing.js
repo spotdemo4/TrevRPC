@@ -18,6 +18,7 @@ export const FrameType = Object.freeze({
   ZstdMessage: 4,
   ZstdStreamMessage: 5,
   Answer: 6,
+  DatagramCount: 7,
 });
 
 const KnownFrameTypes = new Set(Object.values(FrameType));
@@ -127,6 +128,25 @@ export function encodeMessageFrame(body, maxFrameSize = DefaultMaxFrameSize) {
 export function encodeOutgoingFrame(message, maxFrameSize = DefaultMaxFrameSize) {
   checkFrameLength(message.size, maxFrameSize);
   return encodeFrame(message.type, message.payload, maxFrameSize);
+}
+
+/**
+ * Encodes a DATAGRAM_COUNT frame: how many datagrams the sender sent on the call's flow in the
+ * direction the frame ends, as one minimal QUIC varint.
+ */
+export function encodeDatagramCountFrame(count) {
+  const payload = new Uint8Array(varintLength(count));
+  writeVarint(payload, 0, count);
+  return encodeFrame(FrameType.DatagramCount, payload);
+}
+
+/**
+ * The datagram count a DATAGRAM_COUNT payload holds, a number or, above 2^53 - 1, a bigint; null
+ * unless the payload is exactly one QUIC varint. A varint that is not minimal is accepted.
+ */
+export function decodeDatagramCount(payload) {
+  const count = readVarint(payload, 0);
+  return count === null || count.next !== payload.byteLength ? null : count.value;
 }
 
 /**

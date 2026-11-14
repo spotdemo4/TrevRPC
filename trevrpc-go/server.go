@@ -2145,6 +2145,8 @@ func (s *serverResponseStream) writeJoined(writer io.Writer, headers []byte, mes
 		frames = append(frames, message.frame...)
 	}
 	if status != nil {
+		// The datagrams the response sent are counted right before its end.
+		frames = s.flow.appendDatagramCount(frames)
 		var err error
 		if frames, err = appendStatusFrame(frames, status, maxFrameSize); err != nil {
 			s.buffer = nil

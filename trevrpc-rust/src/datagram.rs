@@ -14,23 +14,27 @@
 //!   flow, through a bounded queue that drops instead of blocking. A server also holds datagrams
 //!   that overtake their REQUEST for a moment, and remembers recently ended flows.
 //! - [`FlowSender`] sends one call's messages as datagrams, and reports when a message has to
-//!   travel on the stream instead.
+//!   travel on the stream instead, and how many datagrams the transport took.
 //! - [`MergedRequests`] and [`MergedResponses`] merge a call's datagram messages with the MESSAGE
-//!   frames of its stream, so the rest of the runtime sees one ordinary message stream.
+//!   frames of its stream, so the rest of the runtime sees one ordinary message stream. When the
+//!   stream's direction ends with a `DATAGRAM_COUNT` that announces more datagrams than the
+//!   demultiplexer has received for the flow, they hold the end back for a moment, so datagrams
+//!   that a transport hands over after the stream data are not lost.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
+use futures_util::task::AtomicWaker;
 use futures_util::{FutureExt as _, StreamExt as _};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 
 use crate::compression::{Accept, CallDict, inflate};
 use crate::sync::MutexExt as _;
@@ -54,10 +58,10 @@ const QUEUE: queue::Limits = queue::Limits {
     values: queue::MESSAGES.values.saturating_mul(4),
     bytes: queue::MESSAGES.bytes,
 };
-/// The most datagrams a call dispatches when its stream ends, before it ends regardless.
-const MAX_DRAINED: usize = 1024;
-/// How long a call waits for its datagrams to reach the network before it ends regardless.
-const FLUSH_WAIT: Duration = Duration::from_millis(2);
+/// How long a streaming direction that has ended waits for the datagrams its `DATAGRAM_COUNT`
+/// announced and the demultiplexer has not received yet, before it ends regardless. A datagram
+/// still missing then is lost.
+const DATAGRAM_COUNT_WAIT: Duration = Duration::from_millis(10);
 /// How long a connection reuses the largest datagram size it read from the transport; see
 /// [`Link`].
 const MAX_SIZE_REUSE: Duration = Duration::from_millis(100);
@@ -159,15 +163,6 @@ pub trait DatagramTransport: Send + Sync + 'static {
     /// Receives the next datagram, whole and prefix included, or `None` once the connection has
     /// ended.
     fn recv(&self) -> impl Future<Output = Option<Bytes>> + Send;
-
-    /// Takes the next datagram the transport has already received, without waiting.
-    fn try_recv(&self) -> Option<Bytes>;
-
-    /// How many datagrams the transport has written to the network so far, or `None` if it cannot
-    /// tell. Datagrams queued by [`DatagramTransport::send`] count once they are on the wire.
-    fn transmitted(&self) -> Option<u64> {
-        None
-    }
 }
 
 /// The datagrams of a transport that has none. It cannot be constructed.
@@ -188,10 +183,6 @@ impl DatagramTransport for NoDatagrams {
     fn recv(&self) -> impl Future<Output = Option<Bytes>> + Send {
         std::future::pending()
     }
-
-    fn try_recv(&self) -> Option<Bytes> {
-        None
-    }
 }
 
 /// A [`DatagramTransport`] without its type parameter, with the future of a blocked send boxed:
@@ -200,10 +191,6 @@ trait SendLink: Send + Sync + 'static {
     fn prefix(&self) -> &[u8];
 
     fn max_size(&self) -> Option<usize>;
-
-    fn try_recv(&self) -> Option<Bytes>;
-
-    fn transmitted(&self) -> Option<u64>;
 
     /// Sends `datagram` if the transport has room right now; `None` when it would have to wait.
     fn send_now(&self, datagram: &Bytes) -> Option<std::result::Result<(), Unsent>>;
@@ -221,14 +208,6 @@ impl<T: DatagramTransport> SendLink for T {
 
     fn max_size(&self) -> Option<usize> {
         DatagramTransport::max_size(self)
-    }
-
-    fn try_recv(&self) -> Option<Bytes> {
-        DatagramTransport::try_recv(self)
-    }
-
-    fn transmitted(&self) -> Option<u64> {
-        DatagramTransport::transmitted(self)
     }
 
     fn send_now(&self, datagram: &Bytes) -> Option<std::result::Result<(), Unsent>> {
@@ -380,34 +359,51 @@ impl Messages {
     }
 }
 
+/// A datagram, with its transport prefix already removed, split into its flow ID and messages.
+struct Decoded {
+    flow: u64,
+    /// `None` when the datagram is dropped whole; see [`decode`]. It still counts as received for
+    /// its flow.
+    messages: Option<Messages>,
+}
+
 /// Splits a datagram, with its transport prefix already removed, into its flow ID and messages.
 ///
-/// Returns `None`, dropping the datagram whole, when it does not start with a flow ID, when the
-/// flow is zero (which means no flow), when its frames do not exactly fill it, when a message
+/// Returns `None` when the datagram does not start with a flow ID or the flow is zero (which
+/// means no flow): it belongs to no flow. Otherwise its flow is known, and its messages are
+/// `None`, dropping the datagram whole, when its frames do not exactly fill it, when a message
 /// is larger than `max_frame_size`, or when it holds a `ZSTD_STREAM_MESSAGE`, which needs the
 /// ordered delivery of a stream. Other frames that are not messages are skipped.
-fn decode(datagram: Bytes, max_frame_size: usize) -> Option<(u64, Messages)> {
+fn decode(datagram: Bytes, max_frame_size: usize) -> Option<Decoded> {
     let (flow, flow_len) = varint::decode(&datagram)?;
     if flow == 0 {
         return None;
     }
     let mut offset = flow_len;
     while offset < datagram.len() {
-        let (frame_type, start, end) = next_frame(&datagram, offset)?;
+        let Some((frame_type, start, end)) = next_frame(&datagram, offset) else {
+            return Some(Decoded {
+                flow,
+                messages: None,
+            });
+        };
         if (frame_type == MESSAGE_FRAME && end.saturating_sub(start) > max_frame_size)
             || frame_type == crate::framing::frame_type::ZSTD_STREAM_MESSAGE
         {
-            return None;
+            return Some(Decoded {
+                flow,
+                messages: None,
+            });
         }
         offset = end;
     }
-    Some((
+    Some(Decoded {
         flow,
-        Messages {
+        messages: Some(Messages {
             datagram,
             offset: flow_len,
-        },
-    ))
+        }),
+    })
 }
 
 /// What a server remembers about the flows it has finished.
@@ -449,18 +445,33 @@ impl EndedFlows {
     }
 }
 
-/// A datagram message held for a flow whose REQUEST has not arrived.
+/// A datagram held for a flow whose REQUEST has not arrived.
 struct Held {
     flow: u64,
-    messages: Messages,
+    /// The datagram's messages, or `None` for one that was dropped whole as malformed: it is held
+    /// only to be counted.
+    messages: Option<Messages>,
     at: Instant,
+    /// The datagrams of the flow that arrived after this one and found no room, which are
+    /// counted with it.
+    unheld: u64,
 }
 
 impl Held {
     /// The bytes the held datagram occupies.
-    const fn len(&self) -> usize {
-        self.messages.datagram.len()
+    fn len(&self) -> usize {
+        self.messages
+            .as_ref()
+            .map_or(0, |messages| messages.datagram.len())
     }
+}
+
+/// What a flow's REQUEST claims of the datagrams held for it.
+struct Claimed {
+    /// The messages of the datagrams that were well formed, oldest first.
+    messages: Vec<Messages>,
+    /// How many datagrams arrived for the flow, those that held no messages included.
+    received: u64,
 }
 
 /// The datagrams a server holds for flows it has not seen yet, bounded in count, bytes and time.
@@ -482,12 +493,19 @@ impl HeldDatagrams {
         }
     }
 
-    /// Holds a datagram unless that would exceed the bounds, in which case it is dropped.
-    fn hold(&mut self, flow: u64, messages: Messages, now: Instant) {
+    /// Holds a datagram, with `None` for its messages if it is malformed, unless that would
+    /// exceed the bounds, in which case it is dropped. A dropped datagram is still counted, with
+    /// the latest datagram held for its flow, if there is one.
+    fn hold(&mut self, flow: u64, messages: Option<Messages>, now: Instant) {
         self.expire(now);
-        let len = messages.datagram.len();
+        let len = messages
+            .as_ref()
+            .map_or(0, |messages| messages.datagram.len());
         if self.held.len() >= MAX_HELD_DATAGRAMS || self.bytes.saturating_add(len) > MAX_HELD_BYTES
         {
+            if let Some(held) = self.held.iter_mut().rev().find(|held| held.flow == flow) {
+                held.unheld = held.unheld.saturating_add(1);
+            }
             return;
         }
         self.bytes = self.bytes.saturating_add(len);
@@ -495,21 +513,29 @@ impl HeldDatagrams {
             flow,
             messages,
             at: now,
+            unheld: 0,
         });
     }
 
     /// Takes the unexpired datagrams held for `flow`, oldest first.
-    fn claim(&mut self, flow: u64, now: Instant) -> Vec<Messages> {
+    fn claim(&mut self, flow: u64, now: Instant) -> Claimed {
         self.expire(now);
+        let mut claimed = Claimed {
+            messages: Vec::new(),
+            received: 0,
+        };
         if !self.held.iter().any(|held| held.flow == flow) {
-            return Vec::new();
+            return claimed;
         }
-        let mut claimed = Vec::new();
         let mut kept = VecDeque::with_capacity(self.held.len());
         for held in self.held.drain(..) {
             if held.flow == flow {
                 self.bytes = self.bytes.saturating_sub(held.len());
-                claimed.push(held.messages);
+                claimed.received = claimed
+                    .received
+                    .saturating_add(1)
+                    .saturating_add(held.unheld);
+                claimed.messages.extend(held.messages);
             } else {
                 kept.push_back(held);
             }
@@ -527,11 +553,36 @@ enum Role {
     Client,
 }
 
+/// How many datagrams the demultiplexer has received for a flow, and the call that may wait for
+/// the rest of them.
+#[derive(Default)]
+struct Arrivals {
+    received: AtomicU64,
+    waiter: AtomicWaker,
+}
+
+impl Arrivals {
+    /// Counts `datagrams` more as received, and wakes the call waiting for them. Their messages
+    /// are queued first, so a call that sees the count also sees the messages.
+    fn record(&self, datagrams: u64) {
+        if datagrams > 0 {
+            self.received.fetch_add(datagrams, Ordering::Release);
+            self.waiter.wake();
+        }
+    }
+
+    fn received(&self) -> u64 {
+        self.received.load(Ordering::Acquire)
+    }
+}
+
 /// A registered flow: where its datagram messages go, if its call receives any.
 struct Slot {
     sink: Option<queue::Sender<Bytes>>,
     /// The dictionaries the call accepts on compressed messages.
     accept: Accept,
+    /// The datagrams received for the flow, in the direction its call receives.
+    arrivals: Arc<Arrivals>,
 }
 
 struct State {
@@ -548,8 +599,6 @@ struct Shared {
     max_frame_size: usize,
     /// The next flow ID a client allocates.
     next_flow: AtomicU64,
-    /// How many datagrams the senders of this connection have queued.
-    queued: Arc<AtomicU64>,
 }
 
 impl Shared {
@@ -564,14 +613,15 @@ impl Shared {
             }
             datagram.slice(prefix_len..)
         };
-        let Some((flow, messages)) = decode(datagram, self.max_frame_size) else {
+        let Some(Decoded { flow, messages }) = decode(datagram, self.max_frame_size) else {
             return;
         };
 
         let mut state = self.state.lock_unpoisoned();
         if let Some(slot) = state.flows.get(&flow) {
             if let Some(sink) = &slot.sink
-                && let Some(messages) = messages.inflate(&slot.accept, self.max_frame_size)
+                && let Some(messages) = messages
+                    .and_then(|messages| messages.inflate(&slot.accept, self.max_frame_size))
             {
                 for message in messages {
                     let size = message.len();
@@ -579,24 +629,12 @@ impl Shared {
                     let _ = sink.try_send(message, size);
                 }
             }
+            // Whatever became of its messages, the datagram arrived.
+            slot.arrivals.record(1);
             return;
         }
         if self.role == Role::Server && !state.ended.contains(flow) {
             state.held.hold(flow, messages, Instant::now());
-        }
-    }
-
-    /// Dispatches the datagrams the transport has received already, without waiting.
-    ///
-    /// A call whose stream has just ended uses this to deliver the datagrams that arrived before
-    /// the end: the reader task moves them on its own schedule, which may lag behind the stream.
-    fn drain(&self) {
-        // A peer that keeps sending cannot keep a call from ending.
-        for _ in 0..MAX_DRAINED {
-            let Some(datagram) = self.link.transport.try_recv() else {
-                return;
-            };
-            self.dispatch(datagram);
         }
     }
 
@@ -687,7 +725,6 @@ impl Demux {
             }),
             max_frame_size,
             next_flow: AtomicU64::new(1),
-            queued: Arc::new(AtomicU64::new(0)),
         });
         let starter: ReaderStarter =
             Box::new(move |shared| tokio::spawn(read_datagrams(transport, shared)));
@@ -718,7 +755,6 @@ impl Demux {
             link: Arc::clone(&self.shared.link),
             header: flow_header(self.shared.link.transport.prefix(), flow)?,
             max_frame_size: self.shared.max_frame_size,
-            queued: Arc::clone(&self.shared.queued),
             compress: CallDict::None,
         })
     }
@@ -757,16 +793,21 @@ impl Demux {
         }
         let sender = self.sender(flow)?;
         let (sink, responses) = Self::sink(kind.streams_responses());
-        self.shared
-            .state
-            .lock_unpoisoned()
-            .flows
-            .insert(flow, Slot { sink, accept });
+        let expected = Expected::default();
+        self.shared.state.lock_unpoisoned().flows.insert(
+            flow,
+            Slot {
+                sink,
+                accept,
+                arrivals: Arc::clone(&expected.arrivals),
+            },
+        );
         self.ensure_reader();
         Some(ClientFlow {
             flow,
             requests: unreliable.requests.then_some(sender),
             responses,
+            expected,
             guard: FlowGuard {
                 shared: Arc::clone(&self.shared),
                 flow,
@@ -790,6 +831,7 @@ impl Demux {
         }
         let sender = self.sender(flow).ok_or(FlowInUse)?;
         let (sink, requests) = Self::sink(kind.streams_requests());
+        let expected = Expected::default();
         let held = {
             let mut state = self.shared.state.lock_unpoisoned();
             if state.flows.contains_key(&flow) {
@@ -802,23 +844,27 @@ impl Demux {
                 Slot {
                     sink: sink.clone(),
                     accept: accept.clone(),
+                    arrivals: Arc::clone(&expected.arrivals),
                 },
             );
             held
         };
         if let Some(sink) = &sink {
             let max_frame_size = self.shared.max_frame_size;
-            for messages in held {
+            for messages in held.messages {
                 for message in messages.inflate(accept, max_frame_size).unwrap_or_default() {
                     let size = message.len();
                     let _ = sink.try_send(message, size);
                 }
             }
         }
+        // The datagrams that overtook the REQUEST count like the ones that follow it.
+        expected.arrivals.record(held.received);
         self.ensure_reader();
         Ok(ServerFlow {
             requests,
             sender,
+            expected,
             guard: FlowGuard {
                 shared: Arc::clone(&self.shared),
                 flow,
@@ -846,30 +892,6 @@ impl Drop for FlowGuard {
     }
 }
 
-impl FlowGuard {
-    /// A handle that dispatches the datagrams already received, without keeping the flow
-    /// registered.
-    #[must_use]
-    pub fn drain_handle(&self) -> DrainHandle {
-        DrainHandle(Arc::clone(&self.shared))
-    }
-
-    fn drain(&self) {
-        self.shared.drain();
-    }
-}
-
-/// Dispatches a connection's already received datagrams to their flows; see
-/// [`FlowGuard::drain_handle`].
-#[derive(Clone)]
-pub struct DrainHandle(Arc<Shared>);
-
-impl DrainHandle {
-    fn drain(&self) {
-        self.0.drain();
-    }
-}
-
 /// The client side of a call's datagram flow.
 pub struct ClientFlow {
     /// The ID to send in REQUEST.
@@ -878,6 +900,8 @@ pub struct ClientFlow {
     pub requests: Option<FlowSender>,
     /// The call's datagram response messages, if its responses stream.
     pub responses: Option<queue::Receiver<Bytes>>,
+    /// The datagrams the response direction is owed; see [`Expected`].
+    pub expected: Expected,
     /// Unregisters the flow when dropped.
     pub guard: FlowGuard,
 }
@@ -888,8 +912,104 @@ pub struct ServerFlow {
     pub requests: Option<queue::Receiver<Bytes>>,
     /// Sends the call's response messages.
     pub sender: FlowSender,
+    /// The datagrams the request direction is owed; see [`Expected`].
+    pub expected: Expected,
     /// Unregisters the flow when dropped.
     pub guard: FlowGuard,
+}
+
+/// The `DATAGRAM_COUNT` a direction ended with, recorded by whatever reads its stream: how many
+/// datagrams the peer sent in the direction. It stays unset on a direction that has none, and
+/// the default records nothing, for calls without a datagram flow.
+#[derive(Clone, Debug, Default)]
+pub struct Announced(Option<Arc<OnceLock<u64>>>);
+
+impl Announced {
+    /// A cell that records nothing.
+    pub(crate) const fn none() -> Self {
+        Self(None)
+    }
+
+    fn new() -> Self {
+        Self(Some(Arc::new(OnceLock::new())))
+    }
+
+    /// Records the count. The first one stands.
+    pub(crate) fn set(&self, count: u64) {
+        if let Some(cell) = &self.0 {
+            let _ = cell.set(count);
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<u64> {
+        self.0.as_ref().and_then(|cell| cell.get().copied())
+    }
+}
+
+/// What a call knows of the datagrams its receiving direction is owed: the count the stream
+/// announced, and how many the demultiplexer has received for the flow so far.
+#[derive(Clone)]
+pub struct Expected {
+    announced: Announced,
+    arrivals: Arc<Arrivals>,
+}
+
+impl Default for Expected {
+    fn default() -> Self {
+        Self {
+            announced: Announced::new(),
+            arrivals: Arc::default(),
+        }
+    }
+}
+
+impl Expected {
+    /// Where the reader of the direction's stream records its `DATAGRAM_COUNT`.
+    #[must_use]
+    pub fn announced(&self) -> Announced {
+        self.announced.clone()
+    }
+}
+
+/// The wait of a direction that has ended, for the datagrams its `DATAGRAM_COUNT` announced and the
+/// demultiplexer has not received yet.
+///
+/// The wait is bounded by [`DATAGRAM_COUNT_WAIT`] from the first poll, which the caller makes
+/// when the direction ends. The caller delivers what the flow's queue holds as it waits, and
+/// ends the direction once the wait is over.
+struct Stragglers {
+    expected: Expected,
+    timer: Option<Pin<Box<Sleep>>>,
+}
+
+impl Stragglers {
+    const fn new(expected: Expected) -> Self {
+        Self {
+            expected,
+            timer: None,
+        }
+    }
+
+    /// Whether no datagram is awaited any more: none was announced, every announced one has
+    /// arrived, or the wait has run out. A pending poll wakes when a datagram arrives.
+    ///
+    /// Take what the flow's queue holds only after this returns, so that every message of the
+    /// datagrams counted by now is in it.
+    fn poll_over(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let Some(announced) = self.expected.announced.get() else {
+            return Poll::Ready(());
+        };
+        let arrivals = &self.expected.arrivals;
+        // Registered before the count is read, so an arrival in between wakes the call.
+        arrivals.waiter.register(cx.waker());
+        if arrivals.received() >= announced {
+            return Poll::Ready(());
+        }
+        self.timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(DATAGRAM_COUNT_WAIT)))
+            .as_mut()
+            .poll(cx)
+    }
 }
 
 /// Sends one call's messages as datagrams.
@@ -900,8 +1020,6 @@ pub struct FlowSender {
     header: Bytes,
     /// The largest message sent in a datagram.
     max_frame_size: usize,
-    /// Counts the datagrams queued on the connection; see [`FlowSender::flushed`].
-    queued: Arc<AtomicU64>,
     /// Compresses the messages, once it has a dictionary.
     compress: CallDict,
 }
@@ -925,15 +1043,19 @@ impl FlowSender {
     /// The messages in `batch` are the ones that are ready now: nothing waits for more. A send
     /// that finds room returns without suspending, and one that has to wait never holds up other
     /// calls.
+    ///
+    /// Returns how many datagrams the transport accepted, which the call announces in its
+    /// `DATAGRAM_COUNT`: a datagram that was refused, whose messages go to `on_stream`, is not one.
     pub async fn send_batch(
         &self,
         batch: &mut Vec<Bytes>,
         on_stream: &mut Vec<Bytes>,
         cancelled: impl Future<Output = ()>,
-    ) {
+    ) -> u64 {
         let max = self.link.max_size();
         let mut cancelled = std::pin::pin!(cancelled);
         let mut fired = false;
+        let mut sent = 0_u64;
         let total = batch.iter().fold(self.header.len(), |total, message| {
             total.saturating_add(message_frame_len(message.len()))
         });
@@ -960,14 +1082,16 @@ impl FlowSender {
                 continue;
             };
             if !packed.is_empty() && datagram.len().saturating_add(frame) > max {
-                self.flush(
-                    &mut datagram,
-                    &mut packed,
-                    on_stream,
-                    cancelled.as_mut(),
-                    &mut fired,
-                )
-                .await;
+                sent = sent.saturating_add(
+                    self.flush(
+                        &mut datagram,
+                        &mut packed,
+                        on_stream,
+                        cancelled.as_mut(),
+                        &mut fired,
+                    )
+                    .await,
+                );
             }
             if packed.is_empty() {
                 datagram.reserve(total.min(max));
@@ -977,45 +1101,22 @@ impl FlowSender {
             packed.push(message);
         }
         if !packed.is_empty() {
-            self.flush(
-                &mut datagram,
-                &mut packed,
-                on_stream,
-                cancelled.as_mut(),
-                &mut fired,
-            )
-            .await;
+            sent = sent.saturating_add(
+                self.flush(
+                    &mut datagram,
+                    &mut packed,
+                    on_stream,
+                    cancelled.as_mut(),
+                    &mut fired,
+                )
+                .await,
+            );
         }
-    }
-
-    /// Waits until the transport has written every datagram queued on the connection to the
-    /// network, for a short while at most.
-    ///
-    /// A call ends with a stream frame, a STATUS or a FIN, and that frame can overtake the
-    /// datagrams queued just before it, which the receiver then drops as arriving after the end.
-    /// Calling this first keeps the order the sender intended. It does nothing for transports that
-    /// cannot say how many datagrams they have written, and gives up when `cancelled` finishes.
-    pub async fn flushed(&self, cancelled: impl Future<Output = ()>) {
-        let queued = self.queued.load(Ordering::Relaxed);
-        let now = Instant::now();
-        let deadline = now.checked_add(FLUSH_WAIT).unwrap_or(now);
-        let mut cancelled = std::pin::pin!(cancelled);
-        while self
-            .link
-            .transport
-            .transmitted()
-            .is_some_and(|written| written < queued)
-            && Instant::now() < deadline
-        {
-            tokio::select! {
-                biased;
-                () = cancelled.as_mut() => return,
-                () = tokio::task::yield_now() => {}
-            }
-        }
+        sent
     }
 
     /// Sends the datagram holding `packed`; its messages go to `on_stream` if that fails.
+    /// Returns how many datagrams the transport accepted, one or none.
     async fn flush(
         &self,
         datagram: &mut BytesMut,
@@ -1023,7 +1124,7 @@ impl FlowSender {
         on_stream: &mut Vec<Bytes>,
         cancelled: Pin<&mut impl Future<Output = ()>>,
         fired: &mut bool,
-    ) {
+    ) -> u64 {
         let datagram = datagram.split().freeze();
         // `None` when `cancelled` gave up on a send that had to wait.
         let sent = if let Some(sent) = self.link.transport.send_now(&datagram) {
@@ -1042,15 +1143,19 @@ impl FlowSender {
         };
         match sent {
             Some(Ok(())) => {
-                self.queued.fetch_add(1, Ordering::Relaxed);
                 packed.clear();
+                1
             }
             Some(Err(Unsent)) => {
                 // The datagram may have outgrown a path that shrank since the size was read.
                 self.link.reread_max_size();
                 on_stream.append(packed);
+                0
             }
-            None => on_stream.append(packed),
+            None => {
+                on_stream.append(packed);
+                0
+            }
         }
     }
 }
@@ -1084,13 +1189,15 @@ impl MessageCount {
 /// The request messages of a call: its stream's MESSAGE frames merged with its datagram
 /// messages in arrival order.
 ///
-/// The datagram queue is read until the stream's request side ends, then drained of what it holds
-/// and dropped, so datagrams that arrive later are dropped.
+/// The datagram queue is read until the stream's request side ends. If the request side ended
+/// with a `DATAGRAM_COUNT` that announces datagrams that have not arrived yet, the queue is read
+/// until they have, or [`DATAGRAM_COUNT_WAIT`] has passed. Then it is drained of what it holds
+/// and dropped, so datagrams that arrive later are dropped, and the requests end.
 pub struct MergedRequests {
     /// Polled only when it woke, so a datagram does not also cost a poll of the stream.
     requests: Gated<BoxStream<Vec<u8>>>,
     datagrams: Option<queue::Receiver<Bytes>>,
-    drain: DrainHandle,
+    stragglers: Stragglers,
     count: MessageCount,
     requests_done: bool,
     /// Alternates which source is polled first, so neither starves the other.
@@ -1099,17 +1206,18 @@ pub struct MergedRequests {
 
 impl MergedRequests {
     /// Merges `requests` with the datagram messages in `datagrams`, counting the latter in
-    /// `count` as they are delivered.
+    /// `count` as they are delivered. The datagrams `expected` says the request side is owed are
+    /// waited for when it ends.
     pub fn boxed(
         requests: BoxStream<Vec<u8>>,
         datagrams: queue::Receiver<Bytes>,
-        drain: DrainHandle,
+        expected: Expected,
         count: MessageCount,
     ) -> BoxStream<Vec<u8>> {
         Box::pin(Self {
             requests: Gated::new(requests),
             datagrams: Some(datagrams),
-            drain,
+            stragglers: Stragglers::new(expected),
             count,
             requests_done: false,
             datagrams_first: false,
@@ -1129,33 +1237,47 @@ impl MergedRequests {
             }
             Poll::Ready(None) => {
                 self.requests_done = true;
-                // The datagrams that arrived before the end of the stream are delivered first.
-                self.drain.drain();
                 Poll::Pending
             }
             other => other,
         }
     }
 
+    /// The next datagram message, while the request side is open.
     fn poll_datagrams(&mut self, cx: &Context<'_>) -> Poll<Option<Result<Vec<u8>>>> {
         let Some(datagrams) = &mut self.datagrams else {
             return Poll::Pending;
         };
-        let message = if self.requests_done {
-            datagrams.try_recv()
-        } else {
-            match datagrams.poll_recv(cx) {
-                Poll::Ready(message) => message,
-                Poll::Pending => return Poll::Pending,
+        match datagrams.poll_recv(cx) {
+            Poll::Ready(Some(message)) => {
+                self.count.add();
+                Poll::Ready(Some(Ok(message.to_vec())))
             }
-        };
-        if let Some(message) = message {
-            self.count.add();
-            Poll::Ready(Some(Ok(message.to_vec())))
-        } else {
-            if self.requests_done {
+            Poll::Ready(None) => {
                 self.datagrams = None;
+                Poll::Pending
             }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// The request side has ended: delivers the datagram messages that are queued, and ends once
+    /// no announced datagram is awaited any more.
+    fn poll_ending(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>>>> {
+        let Some(datagrams) = &mut self.datagrams else {
+            // The call failed: nothing more is delivered.
+            return Poll::Ready(None);
+        };
+        // The wait is polled first: the messages of every datagram it has counted are queued.
+        let over = self.stragglers.poll_over(cx).is_ready();
+        if let Some(message) = datagrams.try_recv() {
+            self.count.add();
+            return Poll::Ready(Some(Ok(message.to_vec())));
+        }
+        if over {
+            self.datagrams = None;
+            Poll::Ready(None)
+        } else {
             Poll::Pending
         }
     }
@@ -1166,29 +1288,26 @@ impl Stream for MergedRequests {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
-        this.datagrams_first = !this.datagrams_first;
-        if this.datagrams_first {
-            if let Poll::Ready(item) = this.poll_datagrams(cx) {
-                return Poll::Ready(item);
-            }
-            if let Poll::Ready(item) = this.poll_requests(cx) {
-                return Poll::Ready(item);
-            }
-        } else {
-            if let Poll::Ready(item) = this.poll_requests(cx) {
-                return Poll::Ready(item);
-            }
-            if let Poll::Ready(item) = this.poll_datagrams(cx) {
-                return Poll::Ready(item);
+        if !this.requests_done {
+            this.datagrams_first = !this.datagrams_first;
+            if this.datagrams_first {
+                if let Poll::Ready(item) = this.poll_datagrams(cx) {
+                    return Poll::Ready(item);
+                }
+                if let Poll::Ready(item) = this.poll_requests(cx) {
+                    return Poll::Ready(item);
+                }
+            } else {
+                if let Poll::Ready(item) = this.poll_requests(cx) {
+                    return Poll::Ready(item);
+                }
+                if let Poll::Ready(item) = this.poll_datagrams(cx) {
+                    return Poll::Ready(item);
+                }
             }
         }
         if this.requests_done {
-            // The request side has just ended: deliver what was queued before it, then end.
-            if let Poll::Ready(item) = this.poll_datagrams(cx) {
-                return Poll::Ready(item);
-            }
-            this.datagrams = None;
-            return Poll::Ready(None);
+            return this.poll_ending(cx);
         }
         Poll::Pending
     }
@@ -1199,20 +1318,24 @@ enum ResponsePhase {
     /// Frames and datagram messages are read as they arrive.
     Open,
     /// The response ended, with this terminal STATUS or none; the queued datagram messages are
-    /// delivered before it.
+    /// delivered before it, after waiting for the ones its `DATAGRAM_COUNT` announced if it has
+    /// a STATUS.
     Draining(Option<ResponseFrame>),
     /// The terminal frame has been delivered; only the stream's own end remains.
     Ended,
 }
 
 /// The response frames of a call: its stream's frames, with the datagram messages merged in
-/// after the HEADERS frame and ahead of the terminal STATUS.
+/// after the HEADERS frame and ahead of the terminal STATUS. When the response ends with a
+/// `DATAGRAM_COUNT` that announces datagrams that have not arrived yet, the STATUS waits for them,
+/// until [`DATAGRAM_COUNT_WAIT`] has passed.
 pub struct MergedResponses {
     /// Polled only when it woke, so a datagram does not also cost a poll of the stream.
     frames: Gated<BoxStream<ResponseFrame>>,
     datagrams: Option<queue::Receiver<Bytes>>,
+    stragglers: Stragglers,
     /// Keeps the call's flow registered until the response ends.
-    guard: FlowGuard,
+    _guard: FlowGuard,
     /// The call's HEADERS frame has been read.
     headers_read: bool,
     phase: ResponsePhase,
@@ -1221,16 +1344,19 @@ pub struct MergedResponses {
 
 impl MergedResponses {
     /// Merges `frames` with the datagram messages in `datagrams`, if the call receives any, and
-    /// keeps `guard` until the response ends or is dropped.
+    /// keeps `guard` until the response ends or is dropped. The datagrams `expected` says the
+    /// response is owed are waited for when it ends.
     pub fn boxed(
         frames: BoxStream<ResponseFrame>,
         datagrams: Option<queue::Receiver<Bytes>>,
+        expected: Expected,
         guard: FlowGuard,
     ) -> BoxStream<ResponseFrame> {
         Box::pin(Self {
             frames: Gated::new(frames),
             datagrams,
-            guard,
+            stragglers: Stragglers::new(expected),
+            _guard: guard,
             headers_read: false,
             phase: ResponsePhase::Open,
             datagrams_first: false,
@@ -1261,7 +1387,6 @@ impl MergedResponses {
         match self.frames.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(frame))) => match frame {
                 ResponseFrame::Status(_) => {
-                    self.guard.drain();
                     self.phase = ResponsePhase::Draining(Some(frame));
                     Poll::Pending
                 }
@@ -1272,12 +1397,19 @@ impl MergedResponses {
                 ResponseFrame::Message(_) => Poll::Ready(Some(Ok(frame))),
             },
             Poll::Ready(None) => {
-                self.guard.drain();
                 self.phase = ResponsePhase::Draining(None);
                 Poll::Pending
             }
             other => other,
         }
+    }
+
+    /// Whether the call is to wait for announced datagrams before it ends: its STATUS arrived,
+    /// and it delivers datagram messages.
+    const fn awaits_stragglers(&self) -> bool {
+        matches!(self.phase, ResponsePhase::Draining(Some(_)))
+            && self.headers_read
+            && self.datagrams.is_some()
     }
 
     /// The next queued datagram message, if the call delivers them.
@@ -1300,8 +1432,15 @@ impl Stream for MergedResponses {
             match this.phase {
                 ResponsePhase::Ended => return this.frames.poll_next_unpin(cx),
                 ResponsePhase::Draining(_) => {
+                    // The wait is polled first: the messages of every datagram it has counted
+                    // are queued.
+                    let over =
+                        !this.awaits_stragglers() || this.stragglers.poll_over(cx).is_ready();
                     if let Some(message) = this.next_queued() {
                         return Poll::Ready(Some(Ok(ResponseFrame::Message(message))));
+                    }
+                    if !over {
+                        return Poll::Pending;
                     }
                     this.datagrams = None;
                     return match std::mem::replace(&mut this.phase, ResponsePhase::Ended) {
@@ -1356,22 +1495,12 @@ mod tests {
         blocked: AtomicBool,
         unblocked: Notify,
         fail: AtomicBool,
-        /// How many datagrams the transport reports as written to the network, if it reports.
-        transmitted: Option<AtomicU64>,
         /// Datagrams that arrived and were not taken yet.
         incoming: Mutex<VecDeque<Bytes>>,
         arrived: Notify,
     }
 
     impl Fake {
-        /// A transport that reports how many datagrams it has written, starting at zero.
-        fn reporting(max: u64) -> Self {
-            let fake = Self::new(&[], max);
-            let mut inner = Arc::try_unwrap(fake.0).ok().unwrap();
-            inner.transmitted = Some(AtomicU64::new(0));
-            Self(Arc::new(inner))
-        }
-
         fn new(prefix: &[u8], max: u64) -> Self {
             Self(Arc::new(FakeInner {
                 prefix: Bytes::copy_from_slice(prefix),
@@ -1380,7 +1509,6 @@ mod tests {
                 blocked: AtomicBool::new(false),
                 unblocked: Notify::new(),
                 fail: AtomicBool::new(false),
-                transmitted: None,
                 incoming: Mutex::new(VecDeque::new()),
                 arrived: Notify::new(),
             }))
@@ -1408,6 +1536,11 @@ mod tests {
                 put_message_frame(&mut datagram, MESSAGE_FRAME, message);
             }
             self.arrive(&datagram);
+        }
+
+        /// Takes the next datagram that arrived, if one did.
+        fn take(&self) -> Option<Bytes> {
+            self.0.incoming.lock().unwrap().pop_front()
         }
 
         fn sent(&self) -> Vec<Bytes> {
@@ -1457,22 +1590,11 @@ mod tests {
                 let arrived = self.0.arrived.notified();
                 tokio::pin!(arrived);
                 arrived.as_mut().enable();
-                if let Some(datagram) = DatagramTransport::try_recv(self) {
+                if let Some(datagram) = self.take() {
                     return Some(datagram);
                 }
                 arrived.await;
             }
-        }
-
-        fn try_recv(&self) -> Option<Bytes> {
-            self.0.incoming.lock().unwrap().pop_front()
-        }
-
-        fn transmitted(&self) -> Option<u64> {
-            self.0
-                .transmitted
-                .as_ref()
-                .map(|written| written.load(Ordering::SeqCst))
         }
     }
 
@@ -1542,14 +1664,7 @@ mod tests {
             };
 
             // A receiver reads the same messages, or drops the datagram whole.
-            let decoded = decode(Bytes::from(datagram), MAX_FRAME).map(|(decoded, messages)| {
-                (
-                    decoded,
-                    messages
-                        .map(|(_, message)| message.to_vec())
-                        .collect::<Vec<_>>(),
-                )
-            });
+            let decoded = messages_of(&datagram, MAX_FRAME);
             if name == "truncated" {
                 assert_eq!(decoded, None, "{name}");
             } else {
@@ -1566,13 +1681,14 @@ mod tests {
             .collect()
     }
 
+    /// The flow and messages of a datagram, or `None` when it is dropped whole, whether it has a
+    /// flow or not.
     fn messages_of(datagram: &[u8], max_frame_size: usize) -> Option<(u64, Vec<Vec<u8>>)> {
-        decode(Bytes::copy_from_slice(datagram), max_frame_size).map(|(flow, messages)| {
-            (
-                flow,
-                messages.map(|(_, message)| message.to_vec()).collect(),
-            )
-        })
+        let Decoded { flow, messages } = decode(Bytes::copy_from_slice(datagram), max_frame_size)?;
+        Some((
+            flow,
+            messages?.map(|(_, message)| message.to_vec()).collect(),
+        ))
     }
 
     #[test]
@@ -1658,14 +1774,15 @@ mod tests {
         fake.arrive_for(5, b"ignored");
         settle().await;
         // They are not held for a later claim either: the flow exists.
-        assert!(
+        assert_eq!(
             demux
                 .shared
                 .state
                 .lock_unpoisoned()
                 .held
                 .claim(5, Instant::now())
-                .is_empty()
+                .received,
+            0
         );
     }
 
@@ -1781,8 +1898,8 @@ mod tests {
                 state.held.claim(flows, Instant::now()),
             )
         };
-        assert_eq!(forgotten.len(), 1);
-        assert!(remembered.is_empty());
+        assert_eq!(forgotten.messages.len(), 1);
+        assert_eq!(remembered.received, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1890,45 +2007,6 @@ mod tests {
         assert_eq!(unpack(&sent[1]), (1, vec![vec![4; 10], vec![5; 10]]));
     }
 
-    #[tokio::test]
-    async fn flushed_waits_for_the_transport_to_write_the_queued_datagrams_but_not_for_long() {
-        let fake = Fake::reporting(1200);
-        let demux = server(&fake);
-        let flow = demux.open_server_flow(1, BIDI, &Accept::None).unwrap();
-        // Nothing queued yet: nothing to wait for.
-        let started = std::time::Instant::now();
-        flow.sender.flushed(std::future::pending()).await;
-        assert!(started.elapsed() < FLUSH_WAIT);
-
-        assert_eq!(send_all(&flow.sender, &[b"x"]).await, Vec::<Vec<u8>>::new());
-
-        // The transport writes it while the call waits.
-        let writer = fake.clone();
-        tokio::spawn(async move {
-            writer
-                .0
-                .transmitted
-                .as_ref()
-                .unwrap()
-                .store(1, Ordering::SeqCst);
-        });
-        let started = std::time::Instant::now();
-        flow.sender.flushed(std::future::pending()).await;
-        assert!(started.elapsed() < FLUSH_WAIT);
-
-        // A transport that never writes it holds the call up for the limit and no longer.
-        assert_eq!(send_all(&flow.sender, &[b"y"]).await, Vec::<Vec<u8>>::new());
-        let started = std::time::Instant::now();
-        flow.sender.flushed(std::future::pending()).await;
-        assert!(started.elapsed() >= FLUSH_WAIT);
-        assert!(started.elapsed() < FLUSH_WAIT * 50);
-
-        // Cancellation ends the wait at once.
-        let started = std::time::Instant::now();
-        flow.sender.flushed(std::future::ready(())).await;
-        assert!(started.elapsed() < FLUSH_WAIT);
-    }
-
     #[tokio::test(start_paused = true)]
     async fn a_message_too_large_for_a_datagram_goes_on_the_stream_without_splitting_the_batch() {
         let fake = Fake::new(&[], 40);
@@ -1989,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_malformed_datagram_delivers_nothing_and_is_not_held() {
+    async fn a_malformed_datagram_delivers_nothing_and_holds_no_messages() {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
         let (mut requests, _flow) =
@@ -2001,15 +2079,15 @@ mod tests {
         settle().await;
 
         assert_eq!(drain(&mut requests), Vec::<Vec<u8>>::new());
-        assert!(
-            demux
-                .shared
-                .state
-                .lock_unpoisoned()
-                .held
-                .claim(9, Instant::now())
-                .is_empty()
-        );
+        // Nothing of it is held for the unknown flow, but it is counted for when that flow opens.
+        let claimed = demux
+            .shared
+            .state
+            .lock_unpoisoned()
+            .held
+            .claim(9, Instant::now());
+        assert!(claimed.messages.is_empty());
+        assert_eq!(claimed.received, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2136,14 +2214,15 @@ mod tests {
         fake.arrive_for(77, b"stray");
         settle().await;
 
-        assert!(
+        assert_eq!(
             demux
                 .shared
                 .state
                 .lock_unpoisoned()
                 .held
                 .claim(77, Instant::now())
-                .is_empty()
+                .received,
+            0
         );
     }
 
@@ -2197,7 +2276,7 @@ mod tests {
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
         let count = MessageCount::new();
         let mut merged =
-            MergedRequests::boxed(stream, requests, flow.guard.drain_handle(), count.clone());
+            MergedRequests::boxed(stream, requests, flow.expected.clone(), count.clone());
 
         stream_tx.send(Ok(b"s1".to_vec())).unwrap();
         fake.arrive_for(1, b"d1");
@@ -2226,12 +2305,8 @@ mod tests {
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
-        let mut merged = MergedRequests::boxed(
-            stream,
-            requests,
-            flow.guard.drain_handle(),
-            MessageCount::new(),
-        );
+        let mut merged =
+            MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());
 
         fake.arrive_for(1, b"queued");
         settle().await;
@@ -2258,12 +2333,8 @@ mod tests {
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
-        let mut merged = MergedRequests::boxed(
-            stream,
-            requests,
-            flow.guard.drain_handle(),
-            MessageCount::new(),
-        );
+        let mut merged =
+            MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());
 
         stream_tx
             .send(Err(Error::from(Status::cancelled("reset"))))
@@ -2276,51 +2347,275 @@ mod tests {
         assert!(merged.next().await.is_none());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn requests_deliver_datagrams_that_arrived_before_the_end_even_if_the_reader_lags() {
+    /// A server call with merged requests: the datagram transport, the stream the test ends by
+    /// hand, the `DATAGRAM_COUNT` cell the request pump would fill, and the merged requests.
+    struct MergedCall {
+        fake: Fake,
+        _demux: Demux,
+        /// Keeps the call's flow registered.
+        _flow: ServerFlow,
+        stream_tx: mpsc::UnboundedSender<Result<Vec<u8>>>,
+        announced: Announced,
+        merged: BoxStream<Vec<u8>>,
+    }
+
+    fn merged_call() -> MergedCall {
         let fake = Fake::new(&[], 1200);
         let demux = server(&fake);
         let (requests, flow) = requests_of(demux.open_server_flow(1, BIDI, &Accept::None).unwrap());
         let (stream_tx, stream) = channel_stream::<Vec<u8>>();
-        let mut merged = MergedRequests::boxed(
-            stream,
-            requests,
-            flow.guard.drain_handle(),
-            MessageCount::new(),
-        );
-
-        // The datagrams and the end of the stream arrive together, and nothing yields to the
-        // reader task before the end is seen.
-        for index in 0..3_u8 {
-            fake.arrive_for(1, &[index]);
+        let announced = flow.expected.announced();
+        let merged =
+            MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());
+        MergedCall {
+            fake,
+            _demux: demux,
+            _flow: flow,
+            stream_tx,
+            announced,
+            merged,
         }
-        drop(stream_tx);
+    }
 
+    /// Reads merged requests to their end, sorted, and how long that took.
+    async fn read_to_end(merged: &mut BoxStream<Vec<u8>>) -> (Vec<Vec<u8>>, Duration) {
+        let started = Instant::now();
         let mut delivered = Vec::new();
         while let Some(message) = merged.next().await {
             delivered.push(message.unwrap());
         }
         delivered.sort();
-        assert_eq!(delivered, [vec![0], vec![1], vec![2]]);
+        (delivered, started.elapsed())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn responses_deliver_datagrams_that_arrived_before_the_status_even_if_the_reader_lags() {
+    async fn requests_end_at_once_when_the_announced_datagrams_have_arrived() {
+        let mut call = merged_call();
+        // The datagrams and the end of the stream arrive together, and nothing yields to the
+        // reader task before the end is seen.
+        for index in 0..3_u8 {
+            call.fake.arrive_for(1, &[index]);
+        }
+        call.announced.set(3);
+        drop(call.stream_tx);
+
+        // The call waits for the reader to hand over what the count announced, but not for the
+        // bound.
+        let (delivered, elapsed) = read_to_end(&mut call.merged).await;
+
+        assert_eq!(delivered, [vec![0], vec![1], vec![2]]);
+        assert!(elapsed < DATAGRAM_COUNT_WAIT, "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_wait_for_the_datagrams_that_are_still_to_arrive() {
+        let mut call = merged_call();
+        call.fake.arrive_for(1, b"early");
+        settle().await;
+        call.announced.set(3);
+        drop(call.stream_tx);
+        let reading = tokio::spawn(async move { read_to_end(&mut call.merged).await });
+
+        // The end is held back while two of the three datagrams are missing, and what is queued
+        // is delivered meanwhile.
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        assert!(!reading.is_finished());
+        call.fake.arrive_for(1, b"second");
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        assert!(!reading.is_finished());
+        call.fake.arrive_for(1, b"third");
+
+        let (delivered, elapsed) = reading.await.unwrap();
+        assert_eq!(
+            delivered,
+            [b"early".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+        // It ended when the last datagram arrived, before the bound.
+        assert!(elapsed < DATAGRAM_COUNT_WAIT, "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_give_up_on_missing_datagrams_after_the_bound() {
+        let mut call = merged_call();
+        call.fake.arrive_for(1, b"only");
+        settle().await;
+        call.announced.set(2);
+        drop(call.stream_tx);
+
+        let (delivered, elapsed) = read_to_end(&mut call.merged).await;
+
+        assert_eq!(delivered, [b"only".to_vec()]);
+        assert!(elapsed >= DATAGRAM_COUNT_WAIT, "{elapsed:?}");
+        assert!(elapsed < DATAGRAM_COUNT_WAIT * 2, "{elapsed:?}");
+        // The datagram that is still missing is dropped if it comes later.
+        call.fake.arrive_for(1, b"late");
+        settle().await;
+        assert!(call.merged.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_without_a_count_end_at_once_with_what_is_queued() {
+        let mut call = merged_call();
+        call.fake.arrive_for(1, b"queued");
+        settle().await;
+        drop(call.stream_tx);
+
+        let (delivered, elapsed) = read_to_end(&mut call.merged).await;
+
+        assert_eq!(delivered, [b"queued".to_vec()]);
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_request_stream_does_not_wait_for_announced_datagrams() {
+        let mut call = merged_call();
+        call.announced.set(5);
+        call.stream_tx
+            .send(Err(Error::from(Status::cancelled("reset"))))
+            .unwrap();
+
+        let started = Instant::now();
+        assert!(call.merged.next().await.unwrap().is_err());
+        assert!(call.merged.next().await.is_none());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn datagrams_that_are_dropped_still_count_as_received() {
+        let mut call = merged_call();
+        // A malformed datagram, and as many good ones as the queue holds plus one that does not
+        // fit: every one of them arrived.
+        call.fake
+            .arrive(&[0x01, 0x00, 0x01, b'a', 0x00, 0x09, b'b']);
+        for index in 0..=QUEUE.values {
+            call.fake.arrive_for(1, index.to_string().as_bytes());
+        }
+        settle().await;
+        call.announced.set(u64::try_from(QUEUE.values).unwrap() + 2);
+        drop(call.stream_tx);
+
+        let (delivered, elapsed) = read_to_end(&mut call.merged).await;
+
+        assert_eq!(delivered.len(), QUEUE.values);
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn datagrams_held_before_the_request_count_as_received() {
+        let fake = Fake::new(&[], 1200);
+        let demux = server(&fake);
+        let _other = demux.open_server_flow(2, BIDI, &Accept::None).unwrap();
+        // A good datagram and a malformed one overtake the REQUEST of flow 9.
+        fake.arrive_for(9, b"held");
+        fake.arrive(&[0x09, 0x00, 0x09]);
+        settle().await;
+
+        let (requests, flow) = requests_of(demux.open_server_flow(9, BIDI, &Accept::None).unwrap());
+        let (stream_tx, stream) = channel_stream::<Vec<u8>>();
+        flow.expected.announced().set(2);
+        let mut merged =
+            MergedRequests::boxed(stream, requests, flow.expected.clone(), MessageCount::new());
+        drop(stream_tx);
+
+        let (delivered, elapsed) = read_to_end(&mut merged).await;
+
+        assert_eq!(delivered, [b"held".to_vec()]);
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn datagrams_the_holding_area_has_no_room_for_are_counted_with_the_flow() {
+        let now = Instant::now();
+        let mut held = HeldDatagrams::default();
+        let datagram = |flow: u8| {
+            decode(Bytes::from(vec![flow, 0x00, 0x01, b'x']), MAX_FRAME)
+                .unwrap()
+                .messages
+        };
+        for _ in 0..MAX_HELD_DATAGRAMS {
+            held.hold(9, datagram(9), now);
+        }
+        // Two more for the same flow find no room; one for a flow with nothing held is lost.
+        held.hold(9, datagram(9), now);
+        held.hold(9, datagram(9), now);
+        held.hold(8, datagram(8), now);
+
+        let claimed = held.claim(9, now);
+
+        assert_eq!(claimed.messages.len(), MAX_HELD_DATAGRAMS);
+        assert_eq!(
+            claimed.received,
+            u64::try_from(MAX_HELD_DATAGRAMS).unwrap() + 2
+        );
+        assert_eq!(held.claim(8, now).received, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responses_wait_for_the_announced_datagrams_ahead_of_the_status() {
+        let fake = Fake::new(&[], 1200);
+        let demux = Demux::client(fake.clone(), MAX_FRAME);
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
+        let id = flow.flow;
+        let announced = flow.expected.announced();
+        let (frames_tx, frames) = channel_stream::<ResponseFrame>();
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
+
+        frames_tx.send(Ok(headers())).unwrap();
+        assert_eq!(merged.next().await.unwrap().unwrap(), headers());
+        fake.arrive_for(id, b"a");
+        settle().await;
+        announced.set(3);
+        frames_tx.send(Ok(ok())).unwrap();
+        let reading = tokio::spawn(async move {
+            let started = Instant::now();
+            let mut frames = Vec::new();
+            loop {
+                let frame = merged.next().await.unwrap().unwrap();
+                let end = frame == ok();
+                frames.push(frame);
+                if end {
+                    return (frames, started.elapsed());
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        assert!(!reading.is_finished(), "the STATUS must wait");
+        fake.arrive_for(id, b"b");
+        fake.arrive_for(id, b"c");
+
+        let (frames, elapsed) = reading.await.unwrap();
+        // The STATUS comes last, after every announced datagram's message.
+        assert_eq!(frames.last(), Some(&ok()));
+        let mut messages: Vec<_> = frames.iter().take(3).cloned().collect();
+        messages.sort_by_key(|frame| format!("{frame:?}"));
+        assert_eq!(messages, [message(b"a"), message(b"b"), message(b"c")]);
+        assert!(elapsed < DATAGRAM_COUNT_WAIT, "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responses_end_at_once_when_the_announced_datagrams_have_arrived() {
         let fake = Fake::new(&[], 1200);
         let demux = Demux::client(fake.clone(), MAX_FRAME);
         let flow = demux
             .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
             .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
-        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
+        flow.expected.announced().set(3);
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
 
         frames_tx.send(Ok(headers())).unwrap();
         assert_eq!(merged.next().await.unwrap().unwrap(), headers());
+        // The datagrams and the STATUS arrive together, and nothing yields to the reader task
+        // before the STATUS is seen.
         for index in 0..3_u8 {
             fake.arrive_for(flow.flow, &[index]);
         }
         frames_tx.send(Ok(ok())).unwrap();
 
+        let started = Instant::now();
         let mut messages = Vec::new();
         loop {
             let frame = merged.next().await.unwrap().unwrap();
@@ -2331,6 +2626,65 @@ mod tests {
         }
         messages.sort();
         assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(started.elapsed() < DATAGRAM_COUNT_WAIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responses_give_up_on_missing_datagrams_after_the_bound() {
+        let fake = Fake::new(&[], 1200);
+        let demux = Demux::client(fake.clone(), MAX_FRAME);
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
+        let id = flow.flow;
+        let (frames_tx, frames) = channel_stream::<ResponseFrame>();
+        flow.expected.announced().set(2);
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
+
+        frames_tx.send(Ok(headers())).unwrap();
+        assert_eq!(merged.next().await.unwrap().unwrap(), headers());
+        fake.arrive_for(id, b"only");
+        settle().await;
+        frames_tx.send(Ok(ok())).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(merged.next().await.unwrap().unwrap(), message(b"only"));
+        assert_eq!(merged.next().await.unwrap().unwrap(), ok());
+        let elapsed = started.elapsed();
+        assert!(elapsed >= DATAGRAM_COUNT_WAIT, "{elapsed:?}");
+        assert!(elapsed < DATAGRAM_COUNT_WAIT * 2, "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn responses_that_do_not_deliver_datagrams_ignore_the_count() {
+        let fake = Fake::new(&[], 1200);
+        let demux = Demux::client(fake.clone(), MAX_FRAME);
+        // A client-streaming call has one response, which has no datagrams to wait for.
+        let flow = demux
+            .open_client_flow(RpcKind::ClientStreaming, Unreliable::REQUESTS, Accept::None)
+            .unwrap();
+        flow.expected.announced().set(5);
+        let (frames_tx, frames) = channel_stream::<ResponseFrame>();
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
+        frames_tx.send(Ok(headers())).unwrap();
+        frames_tx.send(Ok(ok())).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(merged.next().await.unwrap().unwrap(), headers());
+        assert_eq!(merged.next().await.unwrap().unwrap(), ok());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // Nor does a response whose HEADERS were never read: no datagram is delivered.
+        let flow = demux
+            .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
+            .unwrap();
+        flow.expected.announced().set(5);
+        let (frames_tx, frames) = channel_stream::<ResponseFrame>();
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
+        frames_tx.send(Ok(ok())).unwrap();
+        let started = Instant::now();
+        assert_eq!(merged.next().await.unwrap().unwrap(), ok());
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     fn headers() -> ResponseFrame {
@@ -2353,7 +2707,7 @@ mod tests {
             .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
             .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
-        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
 
         fake.arrive_for(flow.flow, b"early");
         settle().await;
@@ -2380,7 +2734,7 @@ mod tests {
             .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
             .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
-        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
 
         frames_tx.send(Ok(headers())).unwrap();
         assert_eq!(merged.next().await.unwrap().unwrap(), headers());
@@ -2416,7 +2770,7 @@ mod tests {
             .open_client_flow(BIDI, Unreliable::BOTH, Accept::None)
             .unwrap();
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
-        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
 
         fake.arrive_for(flow.flow, b"before headers");
         settle().await;
@@ -2437,7 +2791,7 @@ mod tests {
             .unwrap();
         let id = flow.flow;
         let (_frames_tx, frames) = channel_stream::<ResponseFrame>();
-        let merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
+        let merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
         assert!(demux.shared.state.lock_unpoisoned().flows.contains_key(&id));
 
         drop(merged);
@@ -2456,7 +2810,7 @@ mod tests {
         assert!(flow.responses.is_none() && flow.requests.is_some());
         let id = flow.flow;
         let (frames_tx, frames) = channel_stream::<ResponseFrame>();
-        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.guard);
+        let mut merged = MergedResponses::boxed(frames, flow.responses, flow.expected, flow.guard);
 
         fake.arrive_for(id, b"dropped");
         frames_tx.send(Ok(headers())).unwrap();

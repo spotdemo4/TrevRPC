@@ -3,10 +3,13 @@
 #![allow(clippy::unused_async_trait_impl)]
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
 use crate::Result;
+use crate::datagram::{DatagramTransport, Unsent};
 use crate::framed::{ChunkSource, FrameRead, FrameWrite};
 
 /// A readable stream that serves its bytes in small reads and counts what it served.
@@ -55,6 +58,51 @@ impl FrameWrite for Sink {
         self.0
             .push(chunks.iter().flat_map(|chunk| chunk.to_vec()).collect());
         Ok(())
+    }
+}
+
+/// A datagram transport that takes a limited number of datagrams, refuses the rest, and receives
+/// none. Clones share what it took.
+#[derive(Clone)]
+pub struct Datagrams {
+    max: usize,
+    room: Arc<AtomicUsize>,
+    sent: Arc<Mutex<Vec<Bytes>>>,
+}
+
+impl Datagrams {
+    /// A transport that sends datagrams of up to `max` bytes, `room` of them before it refuses.
+    pub fn new(max: usize, room: usize) -> Self {
+        Self {
+            max,
+            room: Arc::new(AtomicUsize::new(room)),
+            sent: Arc::default(),
+        }
+    }
+
+    /// The datagrams it took.
+    pub fn sent(&self) -> Vec<Bytes> {
+        self.sent.lock().expect("sent lock").clone()
+    }
+}
+
+impl DatagramTransport for Datagrams {
+    fn max_size(&self) -> Option<usize> {
+        Some(self.max)
+    }
+
+    async fn send(&self, datagram: Bytes) -> std::result::Result<(), Unsent> {
+        self.room
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |room| {
+                room.checked_sub(1)
+            })
+            .map_err(|_| Unsent)?;
+        self.sent.lock().expect("sent lock").push(datagram);
+        Ok(())
+    }
+
+    async fn recv(&self) -> Option<Bytes> {
+        std::future::pending().await
     }
 }
 

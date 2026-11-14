@@ -22,6 +22,12 @@ const FlowQueueMessages = 32;
 const FlowQueueBytes = 1 << 20;
 
 /**
+ * How long a call that ends with datagrams still on their way, by its DATAGRAM_COUNT, waits for
+ * them: a datagram still missing then is lost.
+ */
+export const DatagramCountWaitMs = 10;
+
+/**
  * Encoded size of one outgoing message (`{ type, payload }` from encodeMessage) as a MESSAGE or
  * ZSTD_MESSAGE frame inside a datagram.
  */
@@ -253,7 +259,8 @@ class DatagramEndpoint {
 
 /**
  * One call's datagram flow. Datagrams for the flow wait in a bounded buffer until the call
- * connects, then go straight to its handler. The call releases the flow when it ends.
+ * connects, then go straight to its handler. The flow counts the datagrams it sent and received,
+ * for DATAGRAM_COUNT. The call releases the flow when it ends.
  */
 class DatagramFlow {
   #endpoint;
@@ -262,6 +269,10 @@ class DatagramFlow {
   #buffered = [];
   #bufferedBytes = 0;
   #released = false;
+  #sent = 0;
+  #received = 0;
+  /** Waits of waitForReceived(), each `{ count, done }`. */
+  #waiters = new Set();
 
   constructor(endpoint, id, inflate) {
     this.#endpoint = endpoint;
@@ -269,11 +280,62 @@ class DatagramFlow {
     this.id = id;
   }
 
+  /** How many datagrams the flow sent: those the session accepted. */
+  get sent() {
+    return this.#sent;
+  }
+
+  /**
+   * How many datagrams the session received for the flow, those dropped whole as malformed or for
+   * lack of room included.
+   */
+  get received() {
+    return this.#received;
+  }
+
+  /**
+   * Receives one datagram of the flow: counts it, delivers its messages, and only then lets the
+   * waits for its count end, so that a call ending on the count has the messages.
+   */
+  deliverAll(messages) {
+    this.#received += 1;
+    this.#deliverMessages(messages);
+    for (const waiter of this.#waiters) {
+      if (this.#received >= waiter.count) {
+        waiter.done();
+      }
+    }
+  }
+
+  /**
+   * Resolves with whether the flow received `count` datagrams, at once if it has, once it has, or
+   * with false after `timeoutMs`, when `signal` aborts, or when the flow is released.
+   */
+  waitForReceived(count, timeoutMs, signal) {
+    if (this.#received >= count || this.#released || signal.aborted) {
+      return Promise.resolve(this.#received >= count);
+    }
+    return new Promise((resolve) => {
+      const waiter = {
+        count,
+        done: () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", waiter.done);
+          this.#waiters.delete(waiter);
+          resolve(this.#received >= count);
+        },
+      };
+      const timer = setTimeout(waiter.done, timeoutMs);
+      signal.addEventListener("abort", waiter.done, { once: true });
+      this.#waiters.add(waiter);
+    });
+  }
+
   /**
    * Delivers the messages of one received datagram, decompressed. A datagram with an invalid
    * message is dropped whole.
    */
-  deliverAll(messages) {
+  #deliverMessages(messages) {
     let payloads;
     try {
       payloads = messages.map(this.#inflate);
@@ -320,9 +382,14 @@ class DatagramFlow {
     return this.#released ? 0 : this.#endpoint.frameRoom(this.id);
   }
 
-  /** See DatagramEndpoint.send. */
-  send(messages, signal) {
-    return this.#released ? Promise.resolve(false) : this.#endpoint.send(this.id, messages, signal);
+  /** See DatagramEndpoint.send; a datagram that was sent counts. */
+  async send(messages, signal) {
+    if (this.#released) {
+      return false;
+    }
+    const sent = await this.#endpoint.send(this.id, messages, signal);
+    this.#sent += sent ? 1 : 0;
+    return sent;
   }
 
   /** Ends the flow: later datagrams for it are dropped. */
@@ -332,6 +399,9 @@ class DatagramFlow {
       this.#handler = undefined;
       this.#buffered = [];
       this.#endpoint.closeFlow(this.id);
+      for (const waiter of this.#waiters) {
+        waiter.done();
+      }
     }
   }
 }

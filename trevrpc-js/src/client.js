@@ -1,6 +1,13 @@
 import { deferred } from "./async.js";
 import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
-import { FrameType, decodeWireMessage, marshalMessage, unmarshalMessage } from "./framing.js";
+import { DatagramCountWaitMs } from "./datagram.js";
+import {
+  FrameType,
+  decodeDatagramCount,
+  decodeWireMessage,
+  marshalMessage,
+  unmarshalMessage,
+} from "./framing.js";
 import { interceptCall, interceptorList } from "./interceptor.js";
 import { validateMetadata } from "./metadata.js";
 import { methodSettings } from "./method-options.js";
@@ -239,6 +246,14 @@ class BidirectionalStreamingCall {
    * connects once HEADERS (or the first frame that implies them) was read; until then it buffers.
    */
   #flow;
+  /** The count a DATAGRAM_COUNT frame announced: the datagrams the server sent; else undefined. */
+  #datagramCount;
+  /**
+   * The final status, read but not yet reported because datagrams that DATAGRAM_COUNT announced
+   * are still missing; undefined otherwise. While it is set the pump waits for them instead of
+   * reading.
+   */
+  #ending;
   /** Receivers waiting for a frame. */
   #demand = 0;
   #headersWanted = false;
@@ -549,6 +564,9 @@ class BidirectionalStreamingCall {
     if (this.#terminal !== undefined || this.#failure !== undefined) {
       return false;
     }
+    if (this.#ending !== undefined) {
+      return true;
+    }
     if (this.#demand > 0 && this.#queue.length === 0) {
       return true;
     }
@@ -568,6 +586,10 @@ class BidirectionalStreamingCall {
   async #pump() {
     try {
       while (this.#wantsRead()) {
+        if (this.#ending !== undefined) {
+          await this.#endAfterDatagrams();
+          continue;
+        }
         let event;
         try {
           event = await this.#readEvent();
@@ -590,13 +612,41 @@ class BidirectionalStreamingCall {
     }
   }
 
-  /** Queues a message event, or ends the response with a status event. */
+  /**
+   * Queues a message event, or ends the response with a status event: at once, or, if the server
+   * announced datagrams that have not arrived, once the pump waited for them.
+   */
   #enqueue(event) {
     if (event.type === FrameType.Message) {
       this.#queue.push(event.payload);
       this.#queuedBytes += event.payload.byteLength;
+    } else if (this.#datagramsMissing()) {
+      this.#ending = event.status;
     } else {
       this.#endWithStatus(event.status);
+    }
+  }
+
+  /** Whether the server's DATAGRAM_COUNT announced more datagrams than the flow received. */
+  #datagramsMissing() {
+    return (
+      this.#flow !== undefined &&
+      this.#datagramCount !== undefined &&
+      this.#datagramCount > this.#flow.received
+    );
+  }
+
+  /**
+   * Waits for the announced datagrams, which are delivered as they arrive, for at most
+   * DatagramCountWaitMs; the call's cancellation or deadline ends the wait too. Then it reports
+   * the final status, unless the call failed meanwhile.
+   */
+  async #endAfterDatagrams() {
+    const status = this.#ending;
+    await this.#flow.waitForReceived(this.#datagramCount, DatagramCountWaitMs, this.#call.signal);
+    this.#ending = undefined;
+    if (this.#failure === undefined) {
+      this.#endWithStatus(status);
     }
   }
 
@@ -612,6 +662,7 @@ class BidirectionalStreamingCall {
       while (
         this.#terminal === undefined &&
         this.#failure === undefined &&
+        this.#ending === undefined &&
         this.#queuedBytes < ReadAheadBytes &&
         // The server's decision on an optimistic call may be a replay, which waits.
         !this.#call.replayable
@@ -702,10 +753,12 @@ class BidirectionalStreamingCall {
   }
 
   /**
-   * Applies a response frame. Enforces the response grammar `[ANSWER] [HEADERS] MESSAGE* STATUS`,
-   * and that an optimistic call's response starts with ANSWER or STATUS. A ZSTD_MESSAGE or
-   * ZSTD_STREAM_MESSAGE is a MESSAGE, decompressed. ANSWER is not the headers: they settle with
-   * the first frame after it. Returns the MESSAGE or STATUS event the frame is, `Replay` for the
+   * Applies a response frame. Enforces the response grammar
+   * `[ANSWER] [HEADERS] MESSAGE* [DATAGRAM_COUNT] STATUS`, and that an optimistic call's response
+   * starts with ANSWER or STATUS. A ZSTD_MESSAGE or ZSTD_STREAM_MESSAGE is a MESSAGE,
+   * decompressed. ANSWER is not the headers: they settle with the first frame after it.
+   * DATAGRAM_COUNT is kept for the final status, which waits for the datagrams it announces.
+   * Returns the MESSAGE or STATUS event the frame is, `Replay` for the
    * refusal of an optimistic call, which the caller replays before it reads on, and undefined for
    * frames that carry no event.
    */
@@ -716,6 +769,13 @@ class BidirectionalStreamingCall {
       this.#call.replayable
     ) {
       throw internal("optimistic call answered without an ANSWER frame");
+    }
+    if (
+      this.#datagramCount !== undefined &&
+      frame.type !== FrameType.Status &&
+      frame.type !== FrameType.DatagramCount
+    ) {
+      throw internal(`frame of type ${frame.type} after the DATAGRAM_COUNT frame`);
     }
     switch (frame.type) {
       case FrameType.Answer: {
@@ -751,6 +811,17 @@ class BidirectionalStreamingCall {
         this.#settleHeaders({});
         this.#flow?.connect(this.#onDatagram);
         return { type: FrameType.Message, payload };
+      }
+      case FrameType.DatagramCount: {
+        if (this.#datagramCount !== undefined) {
+          throw internal("duplicate DATAGRAM_COUNT frame");
+        }
+        const count = decodeDatagramCount(frame.payload);
+        if (count === null) {
+          throw internal("DATAGRAM_COUNT payload is not exactly one varint");
+        }
+        this.#datagramCount = count;
+        return undefined;
       }
       case FrameType.Status: {
         const status = decodeWireMessage(RpcStatus, frame.payload);

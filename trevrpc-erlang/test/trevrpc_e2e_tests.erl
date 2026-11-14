@@ -21,6 +21,8 @@
 -define(STREAM_CLIENT_STREAM, <<"/test.Streamed/ClientStream">>).
 -define(STREAM_SERVER_STREAM, <<"/test.Streamed/ServerStream">>).
 -define(STREAM_BIDI, <<"/test.Streamed/Bidi">>).
+%% The response of a request stream the server refused with `invalid_argument'.
+-define(INVALID(Text), [{status, #{code := invalid_argument, message := Text}}]).
 %% The message type the golden dictionary compresses.
 -define(TEXT, <<"test.Text">>).
 
@@ -267,6 +269,8 @@ e2e(Transport) ->
                 {"caller exit cancels", fun caller_exit_test/1},
                 {"invalid metadata", fun invalid_metadata_test/1},
                 {"malformed requests", fun malformed_test/1},
+                {"datagram counts on request streams", fun datagram_count_request_test/1},
+                {"datagram counts on response streams", fun datagram_count_response_test/1},
                 {"optimistic stream compression is refused", fun optimistic_test/1},
                 {"connection metadata", fun connection_metadata_test/1},
                 {"compression without a dictionary", fun plain_test/1},
@@ -578,6 +582,129 @@ malformed_test(#{channel := Channel}) ->
             true
         )
     ).
+
+%% DATAGRAM_COUNT is accepted right before the end of a request stream, in
+%% any encoding of its count, and rejected anywhere else. Nothing waits for
+%% the datagrams it announces: this runtime sends and receives none.
+datagram_count_request_test(#{channel := Channel}) ->
+    Upload = request(#{method => ?CLIENT_STREAM, kind => client_streaming}),
+    Message = trevrpc_frame:encode(message, <<"a">>),
+    Count = trevrpc_frame:encode_datagram_count(2),
+    ?assertMatch(
+        [{message, <<"a:1">>}, {status, #{code := ok}}],
+        raw_frames(Channel, [Upload, Message, Count])
+    ),
+    %% Non-minimal counts, an empty direction, and unknown frames before
+    %% and after the count.
+    ?assertMatch(
+        [{message, <<":0">>}, {status, #{code := ok}}],
+        raw_frames(Channel, [
+            Upload,
+            trevrpc_frame:encode_raw(16#21, <<"g">>),
+            trevrpc_frame:encode(datagram_count, <<16#C0, 0, 0, 0, 0, 0, 0, 5>>),
+            trevrpc_frame:encode_raw(16#40, <<>>)
+        ])
+    ),
+    %% A unary request carries one too, though it never streams datagrams.
+    ?assertMatch(
+        [{message, <<"a">>}, {status, #{code := ok}}],
+        raw_frames(Channel, [request(#{method => ?UNARY}), Message, Count])
+    ),
+    ?assertMatch(
+        ?INVALID(<<"request stream carried MESSAGE after DATAGRAM_COUNT">>),
+        raw_frames(Channel, [Upload, Count, Message])
+    ),
+    ?assertMatch(
+        ?INVALID(<<"request stream carried DATAGRAM_COUNT after DATAGRAM_COUNT">>),
+        raw_frames(Channel, [Upload, Message, Count, Count])
+    ),
+    ?assertMatch(
+        ?INVALID(<<"request stream carried MESSAGE after DATAGRAM_COUNT">>),
+        raw_frames(Channel, [
+            Upload, Count, trevrpc_frame:encode_raw(16#21, <<>>), Message
+        ])
+    ),
+    [
+        ?assertMatch(
+            ?INVALID(<<"malformed DATAGRAM_COUNT">>),
+            raw_frames(Channel, [Upload, trevrpc_frame:encode(datagram_count, Payload)])
+        )
+     || Payload <- [<<>>, <<16#40>>, <<1, 0>>, <<16#40, 1, 0>>]
+    ],
+    ?assertMatch(
+        ?INVALID(<<"request stream carried MESSAGE after DATAGRAM_COUNT">>),
+        raw_frames(Channel, [request(#{method => ?UNARY}), Count, Message])
+    ),
+    ?assertMatch(
+        ?INVALID(<<"request stream must start with REQUEST, not DATAGRAM_COUNT">>),
+        raw_frames(Channel, [Count, Upload])
+    ).
+
+%% On a response stream, DATAGRAM_COUNT sits right before STATUS, once.
+datagram_count_response_test(#{channel := Channel}) ->
+    Message = trevrpc_frame:encode(message, <<"a">>),
+    Headers = trevrpc_frame:encode(headers, trevrpc_wire:encode_headers(#{metadata => #{}})),
+    Status = trevrpc_frame:encode(status, trevrpc_wire:encode_status(#{code => ok})),
+    Count = trevrpc_frame:encode_datagram_count(2),
+    Internal = fun(Text) -> {error, #{code => internal, message => Text}} end,
+    %% Plays `Frames' as the response of a call whose server sends none, and
+    %% reads it to its end. `Fin' ends the response stream after them.
+    PlayFin = fun(Frames, Fin) ->
+        {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 5000}),
+        self() ! {trevrpc_stream, call_ref(Call), {data, iolist_to_binary(Frames), Fin}},
+        read_to_end(Call)
+    end,
+    Play = fun(Frames) -> PlayFin(Frames, false) end,
+    ?assertEqual([{ok, <<"a">>}, {eof, #{}}], Play([Headers, Message, Count, Status])),
+    %% No messages and no HEADERS, a non-minimal count, and grease around it.
+    ?assertEqual(
+        [{eof, #{}}],
+        Play([
+            trevrpc_frame:encode_raw(16#21, <<>>),
+            trevrpc_frame:encode(datagram_count, <<16#40, 3>>),
+            trevrpc_frame:encode_raw(16#40, <<"g">>),
+            Status
+        ])
+    ),
+    ?assertEqual(
+        [Internal(<<"unexpected MESSAGE after DATAGRAM_COUNT on the response stream">>)],
+        Play([Headers, Count, Message, Status])
+    ),
+    ?assertEqual(
+        [Internal(<<"unexpected DATAGRAM_COUNT after DATAGRAM_COUNT on the response stream">>)],
+        Play([Headers, Count, Count, Status])
+    ),
+    ?assertEqual(
+        [Internal(<<"unexpected HEADERS after DATAGRAM_COUNT on the response stream">>)],
+        Play([Count, Headers, Status])
+    ),
+    ?assertEqual(
+        [Internal(<<"unexpected ANSWER after DATAGRAM_COUNT on the response stream">>)],
+        Play([Count, trevrpc_frame:encode(answer, <<>>), Status])
+    ),
+    [
+        ?assertEqual(
+            [Internal(<<"malformed DATAGRAM_COUNT">>)],
+            Play([trevrpc_frame:encode(datagram_count, Payload), Status])
+        )
+     || Payload <- [<<>>, <<16#40>>, <<1, 0>>, <<16#40, 1, 0>>]
+    ],
+    %% The count has to come before STATUS: the response ended at it.
+    ?assertEqual(
+        [Internal(<<"response stream ended before final status">>)],
+        PlayFin([Headers, Count], true)
+    ).
+
+%% Everything a call's recv returns, up to its end.
+read_to_end(Call) ->
+    case trevrpc_client:recv(Call) of
+        {ok, _} = Message ->
+            [Message | read_to_end(Call)];
+        {eof, Trailers} ->
+            [{eof, Trailers}];
+        {error, #{code := Code, message := Message}} ->
+            [{error, #{code => Code, message => Message}}]
+    end.
 
 optimistic_test(#{channel := Channel}) ->
     ?assertEqual(

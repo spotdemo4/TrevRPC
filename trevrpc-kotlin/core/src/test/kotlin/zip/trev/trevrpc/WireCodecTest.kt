@@ -77,6 +77,8 @@ class WireCodecTest {
                             Status.invalidArgument("bad").withDetails(listOf(StatusDetail("x.Y", byteArrayOf(0x08, 0x01)))),
                         ),
                     ),
+                "datagram_count.one" to datagramCountEntry(1),
+                "datagram_count.large" to datagramCountEntry(300),
                 "message.hi" to messageEntry("hi".encodeToByteArray()),
                 "message.empty" to messageEntry(byteArrayOf()),
             )
@@ -92,6 +94,15 @@ class WireCodecTest {
         val greaseFrame = encodeFrame(0x40, grease)
         assertArrayEquals(vectors.getValue("grease.two_byte_type.frame"), greaseFrame)
         assertTrue(FrameDecoder().feed(greaseFrame).isEmpty())
+    }
+
+    @Test
+    fun `a DATAGRAM_COUNT payload is exactly one varint`() {
+        assertEquals(3L, WireCodec.decodeDatagramCount(byteArrayOf(0x40, 0x03)))
+        listOf(byteArrayOf(), byteArrayOf(0x40), byteArrayOf(0x01, 0x00)).forEach { payload ->
+            val error = assertThrows(TrevRpcException::class.java) { WireCodec.decodeDatagramCount(payload) }
+            assertEquals(Code.INTERNAL, error.status.code)
+        }
     }
 
     @Test
@@ -297,6 +308,8 @@ class WireCodecTest {
     private fun answerEntry(value: RpcAnswer) = Entry(FrameType.ANSWER, value, WireCodec::encode, WireCodec::decodeAnswer)
 
     private fun statusEntry(value: RpcStatus) = Entry(FrameType.STATUS, value, WireCodec::encode, WireCodec::decodeStatus)
+
+    private fun datagramCountEntry(value: Long) = Entry(FrameType.DATAGRAM_COUNT, value, QuicVarint::encode, WireCodec::decodeDatagramCount)
 
     // Message payloads are the application bytes themselves, so the codec is the identity.
     private fun messageEntry(value: ByteArray) = Entry(FrameType.MESSAGE, value.toList(), { it.toByteArray() }, { it.toList() })

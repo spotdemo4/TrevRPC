@@ -13,7 +13,9 @@ import {
   encodeOutgoingFrame,
   encodeRequestFrame,
   encodeWireMessage,
+  decodeDatagramCount,
   decodeWireMessage,
+  encodeDatagramCountFrame,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
@@ -78,6 +80,8 @@ const goldenCases = {
   "headers.empty": [FrameType.Headers, RpcHeaders, {}],
   "answer.connection_metadata": [FrameType.Answer, RpcAnswer, { connectionMetadata: 1 }],
   "answer.empty": [FrameType.Answer, RpcAnswer, {}],
+  "datagram_count.one": [FrameType.DatagramCount, undefined, Uint8Array.of(1)],
+  "datagram_count.large": [FrameType.DatagramCount, undefined, Uint8Array.of(0x41, 0x2c)],
   "status.ok": [FrameType.Status, RpcStatus, { code: Code.Ok }],
   "status.unavailable": [FrameType.Status, RpcStatus, { code: Code.Unavailable, message: "down" }],
   "status.metadata": [
@@ -206,6 +210,39 @@ test("golden payloads decode to their logical fields", async () => {
   assert.equal(details.length, 1);
   assert.equal(details[0].type, "x.Y");
   assert.deepEqual([...details[0].value], [0x08, 0x01]);
+});
+
+test("DATAGRAM_COUNT frames are minimal varints that decode back, whatever their form", async () => {
+  const vectors = await readGoldenVectors("wire-golden-vectors.txt");
+  assert.equal(hex(encodeDatagramCountFrame(1)), vectors.get("datagram_count.one.frame"));
+  assert.equal(hex(encodeDatagramCountFrame(300)), vectors.get("datagram_count.large.frame"));
+  assert.equal(decodeDatagramCount(fromHex(vectors.get("datagram_count.one.payload"))), 1);
+  assert.equal(decodeDatagramCount(fromHex(vectors.get("datagram_count.large.payload"))), 300);
+  for (const count of [
+    0,
+    63,
+    64,
+    16383,
+    16384,
+    2 ** 30 - 1,
+    2 ** 30,
+    2 ** 53 - 1,
+    2n ** 62n - 1n,
+  ]) {
+    const frame = encodeDatagramCountFrame(count);
+    assert.equal(frame[0], FrameType.DatagramCount);
+    assert.equal(frame[1], varintLength(count), `${count} is minimal`);
+    assert.equal(decodeDatagramCount(frame.subarray(2)), count);
+  }
+  // Not minimal, but exactly one varint.
+  assert.equal(decodeDatagramCount(Uint8Array.of(0x40, 0x03)), 3);
+  assert.equal(decodeDatagramCount(Uint8Array.of(0xc0, 0, 0, 0, 0, 0, 0, 3)), 3);
+  assert.equal(decodeDatagramCount(Uint8Array.of(0xc0, 0x20, 0, 0, 0, 0, 0, 0)), 2n ** 53n);
+  // Not exactly one varint.
+  assert.equal(decodeDatagramCount(new Uint8Array(0)), null);
+  assert.equal(decodeDatagramCount(Uint8Array.of(0x40)), null, "truncated");
+  assert.equal(decodeDatagramCount(Uint8Array.of(0x01, 0x01)), null, "trailing byte");
+  assert.equal(decodeDatagramCount(Uint8Array.of(0x41, 0x2c, 0)), null, "trailing byte");
 });
 
 test("datagram payloads match the golden vectors and decode back", async () => {
@@ -569,7 +606,7 @@ test("unknown frames are skipped wherever they appear", async () => {
     unknown(0x21), // grease before everything
     encodeMessageFrame(bytes("a")),
     unknown(0x40, 0),
-    unknown(7),
+    unknown(8),
     unknown(2 ** 40), // 8-byte type that still fits a number
     encodeFrame(2n ** 62n - 1n, new Uint8Array(2)), // largest type, a bigint
     encodeMessageFrame(bytes("b")),
@@ -709,7 +746,13 @@ test("frame reader expects only unknown frames and a clean end after the final f
     readerOf([concatBytes([encodeFrame(0x21, bytes("x")), encodeFrame(2n ** 61n, bytes("y"))])]),
   ).expectEnd();
 
-  for (const known of [FrameType.Message, FrameType.Request, FrameType.Headers, FrameType.Status]) {
+  for (const known of [
+    FrameType.Message,
+    FrameType.Request,
+    FrameType.Headers,
+    FrameType.Status,
+    FrameType.DatagramCount,
+  ]) {
     await assert.rejects(
       new FrameReader(readerOf([encodeFrame(known, new Uint8Array(0))])).expectEnd(),
       internal,

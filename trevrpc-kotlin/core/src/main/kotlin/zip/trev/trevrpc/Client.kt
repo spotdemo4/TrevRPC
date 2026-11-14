@@ -824,8 +824,9 @@ internal class ResponseReader<T>(
         try {
             while (true) {
                 when (val frame = readAhead?.also { readAhead = null } ?: nextFrame()) {
-                    // CallStream resolved the headers when it read this frame, and consumed ANSWER.
-                    is ResponseFrame.Headers, is ResponseFrame.Answer -> {}
+                    // CallStream resolved the headers when it read this frame, and consumed ANSWER and
+                    // DATAGRAM_COUNT.
+                    is ResponseFrame.Headers, is ResponseFrame.Answer, is ResponseFrame.DatagramCount -> {}
 
                     is ResponseFrame.Message -> {
                         return receiveMessage(frame)

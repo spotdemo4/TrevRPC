@@ -12,6 +12,7 @@ import {
   DefaultMaxFrameSize,
   FrameReader,
   FrameType,
+  encodeDatagramCountFrame,
   encodeOutgoingFrame,
   encodeRequestFrame,
 } from "./framing.js";
@@ -432,7 +433,7 @@ export class Call {
       await this.#write(encodeOutgoingFrame(this.#encode(body), this.#maxFrameSize));
     }
     if (this.#sendClosed && this.#uploadEnded === undefined) {
-      await this.#upload(this.#writer.close());
+      await this.#upload(this.#closeRequest());
       this.#closeCompleted = true;
     }
   }
@@ -655,13 +656,13 @@ export class Call {
           issued();
           await this.#replaying;
           if (!this.#closeCompleted) {
-            await this.#upload(this.#writer.close());
+            await this.#upload(this.#closeRequest());
             this.#closeCompleted = true;
           }
           return;
         }
         const copies = this.#copies;
-        const closing = this.#upload(this.#writer.close());
+        const closing = this.#upload(this.#closeRequest());
         issued();
         await this.#survivingRefusal(closing, copies);
         this.#closeCompleted = true;
@@ -669,11 +670,22 @@ export class Call {
     }
     // Datagram sends in flight go first, so the stream does not end before them.
     const closing = this.#sendDatagrams
-      ? this.#sendTail.then(() => this.#writer.close())
-      : this.#writer.close();
+      ? this.#sendTail.then(() => this.#closeRequest())
+      : this.#closeRequest();
     return this.#upload(closing).then(() => {
       this.#closeCompleted = true;
     });
+  }
+
+  /**
+   * Ends the request stream normally. A call that sent datagrams writes DATAGRAM_COUNT right
+   * before the end, so the server waits for those still on their way instead of dropping them.
+   */
+  #closeRequest() {
+    const sent = this.#flow?.sent ?? 0;
+    return sent === 0
+      ? this.#writer.close()
+      : Promise.all([this.#writer.write(encodeDatagramCountFrame(sent)), this.#writer.close()]);
   }
 
   /**

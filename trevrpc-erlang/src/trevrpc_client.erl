@@ -109,7 +109,10 @@
     deciding = false :: boolean(),
     kept = [] :: [iodata()],
     kept_bytes = 0 :: non_neg_integer(),
-    copy_reserved = 0 :: non_neg_integer()
+    copy_reserved = 0 :: non_neg_integer(),
+    %% The datagrams the server announced with DATAGRAM_COUNT, once read.
+    %% Nothing waits for them yet, as the runtime has no datagram messages.
+    datagram_count :: non_neg_integer() | undefined
 }).
 
 -type terminal() :: {eof, trevrpc_metadata:metadata()} | {error, trevrpc_status:status()}.
@@ -496,7 +499,7 @@ optimistic_error(Call, State, Type) ->
         State,
         iolist_to_binary(
             io_lib:format("optimistic call answered with ~s before ANSWER", [
-                string:uppercase(atom_to_list(Type))
+                trevrpc_frame:name(Type)
             ])
         )
     ).
@@ -713,7 +716,8 @@ single_response(Call) ->
     end.
 
 %% Reads response frames up to the next message, the headers, or the call's
-%% end, checking the grammar: [ANSWER] [HEADERS] MESSAGE* STATUS.
+%% end, checking the grammar: [ANSWER] [HEADERS] MESSAGE* [DATAGRAM_COUNT]
+%% STATUS.
 read_event(Call, #cstate{stream = Stream} = State) ->
     case trevrpc_stream:next_frame(Stream, Call#client_call.deadline) of
         {ok, Frame, Next} ->
@@ -726,6 +730,18 @@ read_event(Call, #cstate{stream = Stream} = State) ->
             read_failed(Call, Reason, State#cstate{stream = Next})
     end.
 
+frame(Call, {Type, _Payload}, #cstate{datagram_count = Count} = State) when
+    Count =/= undefined, Type =/= status
+->
+    protocol_error(
+        Call,
+        State,
+        iolist_to_binary(
+            io_lib:format("unexpected ~s after DATAGRAM_COUNT on the response stream", [
+                trevrpc_frame:name(Type)
+            ])
+        )
+    );
 frame(Call, {answer, Payload}, #cstate{answered = false} = State) ->
     case answer(Call, Payload, State) of
         {ok, Answered} -> read_event(Call, Answered);
@@ -752,6 +768,16 @@ frame(Call, {headers, Payload}, #cstate{headers = undefined} = State) ->
             end;
         error ->
             protocol_error(Call, State, <<"malformed HEADERS">>)
+    end;
+frame(Call, {datagram_count, Payload}, State) ->
+    case trevrpc_frame:decode_datagram_count(Payload) of
+        {ok, Count} ->
+            Counted = answered(State#cstate{
+                headers = headers_or_empty(State), datagram_count = Count
+            }),
+            read_event(Call, Counted);
+        error ->
+            protocol_error(Call, State, <<"malformed DATAGRAM_COUNT">>)
     end;
 frame(_Call, {message, Message}, State) ->
     {message, Message, answered(State#cstate{headers = headers_or_empty(State)})};
@@ -802,7 +828,7 @@ frame(Call, {Type, _Payload}, State) ->
         State,
         iolist_to_binary(
             io_lib:format("unexpected ~s on the response stream", [
-                string:uppercase(atom_to_list(Type))
+                trevrpc_frame:name(Type)
             ])
         )
     ).

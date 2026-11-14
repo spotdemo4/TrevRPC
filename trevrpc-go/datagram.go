@@ -181,6 +181,9 @@ const (
 	datagramSizeProbe = time.Second
 	// datagramSendQueue is the queue of the sender goroutine.
 	datagramSendQueue = 32
+	// datagramCountWait is how long the end of a direction waits for the
+	// datagrams its DATAGRAM_COUNT announced that have not arrived yet.
+	datagramCountWait = 10 * time.Millisecond
 )
 
 // datagramMux demultiplexes the datagrams of one connection.
@@ -194,9 +197,11 @@ type datagramMux struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// hold limits, variables of the mux so tests can shrink them.
+	// hold limits and the wait for counted datagrams, variables of the mux so
+	// tests can change them.
 	holdMessages, holdBytes int
 	holdTime                time.Duration
+	countWait               time.Duration
 
 	mu    sync.Mutex
 	flows map[uint64]*datagramFlow
@@ -210,16 +215,6 @@ type datagramMux struct {
 	// nextFlow is the last flow ID a client allocated.
 	nextFlow atomic.Uint64
 
-	// rx is held for reading by the reader while it waits for a datagram and
-	// dispatches it, and for writing by flush. waitCtx is the context of the
-	// reader's current wait, which flush cancels (under waitMu), and flushMu
-	// serializes the flushes.
-	rx         sync.RWMutex
-	flushMu    sync.Mutex
-	waitMu     sync.Mutex
-	waitCtx    context.Context
-	waitCancel context.CancelFunc
-
 	readOnce sync.Once
 	sendOnce sync.Once
 	out      chan datagramSend
@@ -231,10 +226,17 @@ type datagramMux struct {
 
 // heldDatagram is a datagram that arrived for a flow nobody registered yet.
 type heldDatagram struct {
-	flow     uint64
-	frames   []byte
-	size     int
-	deadline time.Time
+	flow uint64
+	// frames are the datagram's frames, if wellFormed; a malformed datagram
+	// is held only to be counted.
+	frames     []byte
+	wellFormed bool
+	size       int
+	deadline   time.Time
+	// unheld counts the datagrams of the flow that found no room while this
+	// one was held. They are dropped, but count toward the call's
+	// DATAGRAM_COUNT when it claims this one.
+	unheld uint64
 }
 
 // newDatagramMux returns the demultiplexer of conn. A client passes
@@ -242,10 +244,7 @@ type heldDatagram struct {
 // remembers.
 func newDatagramMux(conn datagramConn, overhead int, server bool, endedCapacity int) *datagramMux {
 	ctx, cancel := context.WithCancel(context.Background())
-	waitCtx, waitCancel := context.WithCancel(ctx)
 	return &datagramMux{
-		waitCtx:      waitCtx,
-		waitCancel:   waitCancel,
 		conn:         conn,
 		overhead:     overhead,
 		server:       server,
@@ -254,6 +253,7 @@ func newDatagramMux(conn datagramConn, overhead int, server bool, endedCapacity 
 		holdMessages: datagramHoldMessages,
 		holdBytes:    datagramHoldBytes,
 		holdTime:     datagramHoldTime,
+		countWait:    datagramCountWait,
 		flows:        make(map[uint64]*datagramFlow),
 		ended:        flowSet{capacity: endedCapacity},
 	}
@@ -285,7 +285,10 @@ type datagramFlow struct {
 	// reply carries the result of the call's datagram sends, one at a time.
 	reply chan error
 	// received counts the messages the call took from sink.
-	received    atomic.Int64
+	received atomic.Int64
+	// sent counts the datagrams of the call the transport accepted, which the
+	// end of the sending direction announces in DATAGRAM_COUNT.
+	sent        atomic.Uint64
 	releaseOnce sync.Once
 }
 
@@ -341,9 +344,15 @@ func (m *datagramMux) claimHeldLocked(flow *datagramFlow) {
 			continue
 		}
 		m.heldBytes -= held.size
-		if flow.sink != nil {
-			flow.sink.pushFrames(held.frames)
+		if flow.sink == nil {
+			continue
 		}
+		if held.wellFormed {
+			flow.sink.pushFrames(held.frames)
+		} else {
+			flow.sink.discard(1)
+		}
+		flow.sink.discard(held.unheld)
 	}
 	clear(m.held[len(kept):])
 	m.held = kept
@@ -374,113 +383,44 @@ func (f *datagramFlow) release() {
 	})
 }
 
-// pollContext makes one ReceiveDatagram call return a queued datagram without
-// waiting for one. quic-go's ReceiveDatagram, and webtransport-go's through
-// quic-go's HTTP/3 streams, first return the error of a context that is done,
-// then take a queued datagram, and only then wait on the context. A context
-// that is already done therefore never gets a datagram, which is how flush
-// once missed every datagram the reader had not taken yet. pollContext reports
-// no error the first time it is asked, which gets the call past that check,
-// and is done from the start, so the call does not wait.
-type pollContext struct {
-	context.Context
-	asked atomic.Bool
-}
-
-// closedDone is the Done channel of every pollContext.
-var closedDone = func() chan struct{} {
-	done := make(chan struct{})
-	close(done)
-	return done
-}()
-
-func (*pollContext) Done() <-chan struct{} { return closedDone }
-
-func (c *pollContext) Err() error {
-	if c.asked.Swap(true) {
-		return context.Canceled
-	}
-	return nil
-}
-
-// pollDatagram returns a datagram conn has queued, if it has one, without
-// waiting. A nil datagram counts as none, in case a ReceiveDatagram returns
-// without an error when the context is done.
-func pollDatagram(conn datagramConn) ([]byte, bool) {
-	datagram, err := conn.ReceiveDatagram(&pollContext{Context: context.Background()})
-	return datagram, err == nil && datagram != nil
-}
-
-// flush dispatches every datagram the connection received so far, including
-// the one the reader may hold at this moment.
-//
-// A stream's end and the datagrams sent before it travel the same packets, but
-// the reader and the goroutine that reads the stream run apart. Without the
-// flush, a call whose stream ended could drop messages that arrived before the
-// end, because the reader had popped them from the connection's queue and not
-// dispatched them yet. flush cancels the reader's wait and takes the lock the
-// reader holds while it waits and dispatches, so no dispatch is in flight when
-// it polls the queue.
-//
-// On a WebTransport session the queue is the session's, which quic-go's HTTP/3
-// layer fills from the connection's on a goroutine of its own. A datagram that
-// arrived with the end of a stream may not be in it yet when flush polls, and
-// is then dropped like any that arrives after its direction ended (#553).
-func (m *datagramMux) flush() {
-	m.flushMu.Lock()
-	defer m.flushMu.Unlock()
-	// Until the reader is re-armed below, every wait it starts is cancelled.
-	m.waitMu.Lock()
-	m.waitCancel()
-	m.waitMu.Unlock()
-
-	m.rx.Lock()
-	for {
-		datagram, ok := pollDatagram(m.conn)
-		if !ok {
-			break
-		}
-		m.dispatch(datagram)
-	}
-	m.rx.Unlock()
-
-	m.waitMu.Lock()
-	m.waitCtx, m.waitCancel = context.WithCancel(m.ctx)
-	m.waitMu.Unlock()
-}
-
-// endReceive ends the receiving direction of the call: the datagram messages
-// that arrived so far are queued for the call and later ones are dropped. It
-// is safe on a nil flow and on a flow that receives no stream.
-func (f *datagramFlow) endReceive() {
+// endReceive ends the receiving direction of the call, whose stream announced
+// count datagrams in its DATAGRAM_COUNT, zero if it had none. The end of a
+// stream and the datagrams sent before it leave the peer together, but the
+// datagrams can reach the call later: the network may reorder them, the peer's
+// QUIC stack may have sent them after the end, and the reader dispatches them
+// on a goroutine of its own, behind quic-go's HTTP/3 layer on WebTransport,
+// which moves each datagram to its session on another. So the direction stays
+// open until count datagrams arrived for the call, the mux's countWait passed,
+// the call's ctx ended, or stop is closed. Then the messages that arrived stay
+// queued for the call, and later ones are dropped. It is safe on a nil flow
+// and on a flow that receives no stream.
+func (f *datagramFlow) endReceive(ctx context.Context, count uint64, stop <-chan struct{}) {
 	if f == nil || f.sink == nil {
 		return
 	}
-	f.mux.flush()
+	if arrived := f.sink.awaitArrivals(count); arrived != nil {
+		timer := time.NewTimer(f.mux.countWait)
+		select {
+		case <-arrived:
+		case <-timer.C:
+		case <-ctx.Done():
+		case <-stop:
+		case <-f.mux.ctx.Done():
+		}
+		timer.Stop()
+	}
 	f.sink.close()
 }
 
-// readLoop dispatches the datagrams of the connection until it ends. It holds
-// rx for reading while it waits for a datagram and dispatches it, and flush
-// ends the wait to take rx for writing.
+// readLoop dispatches the datagrams of the connection until it ends.
 func (m *datagramMux) readLoop() {
 	defer m.close()
 	for {
-		m.rx.RLock()
-		m.waitMu.Lock()
-		ctx := m.waitCtx
-		m.waitMu.Unlock()
-		datagram, err := m.conn.ReceiveDatagram(ctx)
-		if err == nil {
-			m.dispatch(datagram)
-		}
-		m.rx.RUnlock()
-		if err != nil && ctx.Err() == nil {
-			return // the connection ended
-		}
-		if m.ctx.Err() != nil {
+		datagram, err := m.conn.ReceiveDatagram(m.ctx)
+		if err != nil {
 			return
 		}
+		m.dispatch(datagram)
 	}
 }
 
@@ -488,24 +428,47 @@ func (m *datagramMux) readLoop() {
 // not registered yet, or drops it. It never blocks.
 func (m *datagramMux) dispatch(datagram []byte) {
 	id, frames, ok := parseDatagram(datagram)
-	// A datagram whose frames do not exactly fill it delivers nothing.
-	if !ok || !walkDatagramFrames(frames, nil) {
+	if !ok {
 		return
 	}
+	// A datagram whose frames do not exactly fill it delivers nothing, but
+	// counts toward its call's DATAGRAM_COUNT all the same.
+	wellFormed := walkDatagramFrames(frames, nil)
 	m.mu.Lock()
 	if flow, live := m.flows[id]; live {
 		m.mu.Unlock()
-		if flow.sink != nil {
+		switch {
+		case flow.sink == nil:
+		case wellFormed:
 			flow.sink.pushFrames(frames)
+		default:
+			flow.sink.discard(1)
 		}
 		return
 	}
-	if !m.server || m.ended.has(id) || len(m.held) >= m.holdMessages || m.heldBytes+len(datagram) > m.holdBytes {
+	if !m.server || m.ended.has(id) {
 		m.mu.Unlock()
 		return
 	}
-	m.held = append(m.held, heldDatagram{flow: id, frames: frames, size: len(datagram), deadline: time.Now().Add(m.holdTime)})
-	m.heldBytes += len(datagram)
+	// A malformed datagram is held as a count of one, with no bytes.
+	held := heldDatagram{flow: id, wellFormed: wellFormed, deadline: time.Now().Add(m.holdTime)}
+	if wellFormed {
+		held.frames, held.size = frames, len(datagram)
+	}
+	if len(m.held) >= m.holdMessages || m.heldBytes+held.size > m.holdBytes {
+		// No room: the datagram is dropped, and counted on a datagram of
+		// its flow that is held, if there is one.
+		for i := range m.held {
+			if m.held[i].flow == id {
+				m.held[i].unheld++
+				break
+			}
+		}
+		m.mu.Unlock()
+		return
+	}
+	m.held = append(m.held, held)
+	m.heldBytes += held.size
 	if m.holdTimer == nil {
 		m.holdTimer = time.AfterFunc(m.holdTime, m.expireHeld)
 	}
@@ -582,6 +545,11 @@ type datagramSink struct {
 	count  int
 	bytes  int
 	closed bool
+	// arrived counts the datagrams of the call, whether or not they were
+	// queued. Once it reaches awaited, reached is closed; see awaitArrivals.
+	arrived uint64
+	awaited uint64
+	reached chan struct{}
 }
 
 func newDatagramSink(maxMessage int) *datagramSink {
@@ -608,15 +576,15 @@ func (s *datagramSink) pushLocked(message []byte) bool {
 // messages are queued before the end or none.
 //
 // Compressed messages are decompressed first, outside the lock, and one that
-// is rejected drops the whole datagram.
+// is rejected drops the whole datagram. Every datagram counts as arrived.
 func (s *datagramSink) pushFrames(frames []byte) {
 	compressed := false
 	walkDatagramFrames(frames, func(typ frameType, _ []byte) {
 		compressed = compressed || typ == frameTypeZstdMessage
 	})
 	var messages [][]byte
+	ok := true
 	if compressed {
-		ok := true
 		walkDatagramFrames(frames, func(typ frameType, payload []byte) {
 			if !ok {
 				return
@@ -630,25 +598,65 @@ func (s *datagramSink) pushFrames(frames []byte) {
 			}
 			messages = append(messages, payload)
 		})
-		if !ok {
-			return
-		}
 	}
 	queued := false
 	s.mu.Lock()
-	if compressed {
+	switch {
+	case !ok:
+	case compressed:
 		for _, message := range messages {
 			queued = s.pushLocked(message) || queued
 		}
-	} else {
+	default:
 		walkDatagramFrames(frames, func(_ frameType, message []byte) {
 			queued = s.pushLocked(message) || queued
 		})
 	}
+	reached := s.arriveLocked(1)
 	s.mu.Unlock()
 	if queued {
 		notify(s.wake)
 	}
+	if reached != nil {
+		close(reached)
+	}
+}
+
+// discard counts n datagrams of the call that deliver nothing.
+func (s *datagramSink) discard(n uint64) {
+	if n == 0 {
+		return
+	}
+	s.mu.Lock()
+	reached := s.arriveLocked(n)
+	s.mu.Unlock()
+	if reached != nil {
+		close(reached)
+	}
+}
+
+// arriveLocked counts n datagrams that arrived for the call, and returns the
+// channel to close if they are the last ones awaitArrivals waits for.
+func (s *datagramSink) arriveLocked(n uint64) chan struct{} {
+	s.arrived += n
+	reached := s.reached
+	if reached == nil || s.arrived < s.awaited {
+		return nil
+	}
+	s.reached = nil
+	return reached
+}
+
+// awaitArrivals returns a channel that is closed once count datagrams arrived
+// for the call, or nil if they have already.
+func (s *datagramSink) awaitArrivals(count uint64) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.arrived >= count {
+		return nil
+	}
+	s.awaited, s.reached = count, make(chan struct{})
+	return s.reached
 }
 
 // pop takes the oldest queued message.
@@ -740,6 +748,7 @@ func (f *datagramFlow) sendBatch(ctx context.Context, batch []encodedMessage) ([
 		}
 		err := m.send(ctx, f.reply, payload)
 		if err == nil {
+			f.sent.Add(1)
 			i, retried = j, false
 			continue
 		}
@@ -842,6 +851,19 @@ type datagramStream interface {
 type datagramSender struct {
 	flow *datagramFlow
 	ctx  context.Context
+}
+
+// appendDatagramCount appends the DATAGRAM_COUNT that ends the sending
+// direction of the call, if the call sent any datagrams. It is safe on a nil
+// flow.
+func (f *datagramFlow) appendDatagramCount(dst []byte) []byte {
+	if f == nil {
+		return dst
+	}
+	if sent := f.sent.Load(); sent > 0 {
+		return appendDatagramCountFrame(dst, sent)
+	}
+	return dst
 }
 
 // send sends the messages of batch as datagrams and returns those that must go

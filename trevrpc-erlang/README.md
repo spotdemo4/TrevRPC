@@ -17,6 +17,8 @@ QMux ([draft-ietf-quic-qmux-02](https://datatracker.ietf.org/doc/draft-ietf-quic
 
 Known issue: when a client on erlang_quic has finished an upload (`close_send`) while most of it is still queued, and the server answers early, erlang_quic can answer the server's STOP_SENDING with a RESET_STREAM whose final size contradicts the FIN it already sent. An erlang_quic server, such as this runtime's, then closes the connection with FINAL_SIZE_ERROR; quic-go does not check it. The Go and Rust clients are not affected. See [benoitc/erlang_quic#551](https://github.com/benoitc/erlang_quic/issues/551).
 
+Readers accept DATAGRAM_COUNT (frame type 7) only where the protocol allows it, right before the end of a request stream or right before STATUS on a response stream, with a payload of exactly one varint. Without datagram messages the runtime sends no count and waits for none.
+
 Not implemented yet: datagram messages, connection metadata sets (an offer is merged into its own call and never confirmed, so clients keep offering), and stream idle timeouts.
 
 ## Server

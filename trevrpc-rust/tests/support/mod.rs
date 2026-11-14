@@ -287,6 +287,13 @@ pub async fn write_message<S: RawSend>(send: &mut S, body: &[u8]) -> Result<()> 
     .await
 }
 
+/// Writes a `DATAGRAM_COUNT` frame announcing `count` datagrams.
+pub async fn write_datagram_count<S: RawSend>(send: &mut S, count: u64) -> Result<()> {
+    let mut frame = Vec::new();
+    framing::put_datagram_count_frame(&mut frame, count)?;
+    send.write_all(&frame).await
+}
+
 /// Writes a REQUEST frame and its first MESSAGE frame with one write.
 pub async fn write_request_and_message<S: RawSend>(
     send: &mut S,

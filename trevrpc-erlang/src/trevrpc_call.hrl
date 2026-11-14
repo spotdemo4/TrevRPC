@@ -42,5 +42,8 @@
     response_sender :: trevrpc_zstd_stream:sender() | undefined,
     reserve :: fun(() -> boolean()) | undefined,
     %% The request side ended: eof, or the status that ended it.
-    request_end :: undefined | eof | {error, trevrpc_status:status()}
+    request_end :: undefined | eof | {error, trevrpc_status:status()},
+    %% The datagrams the client announced with DATAGRAM_COUNT, once read.
+    %% Nothing waits for them yet, as the runtime has no datagram messages.
+    datagram_count :: non_neg_integer() | undefined
 }).

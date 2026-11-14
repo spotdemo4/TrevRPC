@@ -229,7 +229,7 @@ service Telemetry {
 }
 ```
 
-Their messages then travel in QUIC datagrams where the connection has them (native QUIC, and WebTransport on the server) and may be lost or reordered, never duplicated or corrupted. A message that does not fit a datagram, or whose datagram cannot be sent, goes on the stream, and QMux, HTTP/2 and HTTP/3 request streams keep every message on the stream. `protoc-gen-trevrpc-rust` reads the option and fails on a direction that does not stream; generated clients and `register_*` functions apply it.
+Their messages then travel in QUIC datagrams where the connection has them (native QUIC, and WebTransport on the server) and may be lost or reordered, never duplicated or corrupted. A message that does not fit a datagram, or whose datagram cannot be sent, goes on the stream, and QMux, HTTP/2 and HTTP/3 request streams keep every message on the stream. A direction that sent datagrams ends with a `DATAGRAM_COUNT` frame, so that the receiver waits, for at most 10 ms, for the datagrams that have not reached it yet instead of dropping them when the end of the direction overtakes them. `protoc-gen-trevrpc-rust` reads the option and fails on a direction that does not stream; generated clients and `register_*` functions apply it.
 
 The runtime options underneath are `trevrpc::Unreliable`, set on a client call with `CallOptions::with_unreliable` and on a server route with `RouteOptions::with_unreliable` and `Server::route_streaming_with_options`. A handler sees how many request messages arrived as datagrams with `RequestContext::datagram_requests_received`. The QUIC configurations from `Server::quic_config` and `ChannelConfig::quic_config` buffer at most 128 KiB of incoming datagrams per connection.
 

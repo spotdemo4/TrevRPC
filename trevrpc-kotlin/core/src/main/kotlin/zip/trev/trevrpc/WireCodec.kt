@@ -130,6 +130,17 @@ object WireCodec {
     }
 
     /**
+     * Decodes a DATAGRAM_COUNT payload, which must be exactly one QUIC varint in any encoding; any
+     * other payload is an `Internal` protocol error.
+     */
+    fun decodeDatagramCount(payload: ByteArray): Long {
+        if (payload.isEmpty() || QuicVarint.encodedLength(payload[0]) != payload.size) {
+            throw TrevRpcException(Status.internal("DATAGRAM_COUNT payload is not one varint"))
+        }
+        return QuicVarint.decode(payload)
+    }
+
+    /**
      * Decodes one known frame read from a response stream exactly once. A REQUEST frame is a known
      * frame the response grammar does not allow, which is an `Internal` protocol error. A
      * ZSTD_MESSAGE is validated but stays compressed; the message it carries is limited by
@@ -163,6 +174,10 @@ object WireCodec {
 
             FrameType.STATUS -> {
                 decodeStatus(frame.payload).let { ResponseFrame.Status(it.status, it.refusedStreamCompression) }
+            }
+
+            FrameType.DATAGRAM_COUNT -> {
+                ResponseFrame.DatagramCount(decodeDatagramCount(frame.payload))
             }
 
             else -> {

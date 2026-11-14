@@ -85,8 +85,8 @@ impl<S: BodySink> ResponseWriter for BodyWriter<S> {
         written
     }
 
-    fn set_codec(&mut self, codec: ResponseCodec) {
-        self.codec = codec;
+    fn codec(&mut self) -> &mut ResponseCodec {
+        &mut self.codec
     }
 
     async fn stopped(&mut self) -> Result<()> {

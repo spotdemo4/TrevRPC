@@ -36,12 +36,16 @@ pub mod frame_type {
     pub const ZSTD_STREAM_MESSAGE: u64 = 5;
     /// An `RpcAnswer`: the server's answer to the negotiation fields of the REQUEST.
     pub const ANSWER: u64 = 6;
+    /// How many datagrams the sender sent in the direction, as one QUIC variable-length integer:
+    /// right before the end of the direction, on calls whose sender sent any. See
+    /// [`crate::Unreliable`].
+    pub const DATAGRAM_COUNT: u64 = 7;
 }
 
 /// Returns whether `frame_type` is defined by wire version 1.
 #[must_use]
 pub const fn is_known_frame_type(frame_type: u64) -> bool {
-    frame_type <= frame_type::ANSWER
+    frame_type <= frame_type::DATAGRAM_COUNT
 }
 
 /// A frame of a response stream, the currency between the transports and the call layer.
@@ -99,6 +103,26 @@ where
     put_frame_header(out, frame_type, message.encoded_len(), max_frame_size)?;
     message.encode(out)?;
     Ok(())
+}
+
+/// Appends a `DATAGRAM_COUNT` frame announcing that the sender sent `count` datagrams in its
+/// direction, with a minimal variable-length integer.
+pub fn put_datagram_count_frame(out: &mut impl BufMut, count: u64) -> Result<()> {
+    put_frame_header(
+        out,
+        frame_type::DATAGRAM_COUNT,
+        varint::encoded_len(count),
+        varint::MAX_LEN,
+    )?;
+    varint::push(out, count)
+}
+
+/// Decodes the payload of a `DATAGRAM_COUNT` frame: exactly one variable-length integer, in any
+/// valid encoding. `None` when the payload is anything else.
+#[must_use]
+pub fn decode_datagram_count(payload: &[u8]) -> Option<u64> {
+    let (count, len) = varint::decode(payload)?;
+    (len == payload.len()).then_some(count)
 }
 
 /// Encodes a complete frame around `payload`.
@@ -301,9 +325,9 @@ mod tests {
     use bytes::BytesMut;
 
     use super::{
-        DEFAULT_MAX_FRAME_SIZE, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_payload, encode_frame,
-        encode_message_frame, encode_protobuf_frame, frame_type, is_known_frame_type,
-        put_frame_header, validate_payload_len,
+        DEFAULT_MAX_FRAME_SIZE, MAX_FRAME_HEADER_LEN, ResponseFrame, decode_datagram_count,
+        decode_payload, encode_frame, encode_message_frame, encode_protobuf_frame, frame_type,
+        is_known_frame_type, put_datagram_count_frame, put_frame_header, validate_payload_len,
     };
     use crate::{Code, Metadata, RpcAnswer, RpcHeaders, RpcKind, RpcRequest, RpcStatus, Status};
 
@@ -357,15 +381,54 @@ mod tests {
 
     #[test]
     fn known_frame_types_are_exactly_the_defined_ones() {
-        for known in 0..=6 {
+        for known in 0..=7 {
             assert!(is_known_frame_type(known));
         }
-        for unknown in [7, 0x21, 0x40, 0x5f, u64::MAX] {
+        for unknown in [8, 0x21, 0x40, 0x5f, u64::MAX] {
             assert!(!is_known_frame_type(unknown));
         }
         // The grease types 0x1f * N + 0x21 are all unknown.
         for n in 0..1000_u64 {
             assert!(!is_known_frame_type(0x1f * n + 0x21));
+        }
+    }
+
+    #[test]
+    fn datagram_count_frames_use_minimal_varints() {
+        for (count, frame) in [
+            (0, &[0x07, 0x01, 0x00][..]),
+            (1, &[0x07, 0x01, 0x01]),
+            (63, &[0x07, 0x01, 0x3f]),
+            (64, &[0x07, 0x02, 0x40, 0x40]),
+            (300, &[0x07, 0x02, 0x41, 0x2c]),
+            (16384, &[0x07, 0x04, 0x80, 0x00, 0x40, 0x00]),
+        ] {
+            let mut out = Vec::new();
+            put_datagram_count_frame(&mut out, count).expect("frame should encode");
+            assert_eq!(out, frame, "count {count}");
+            assert_eq!(decode_datagram_count(&out[2..]), Some(count));
+        }
+        assert!(put_datagram_count_frame(&mut Vec::new(), crate::varint::MAX + 1).is_err());
+    }
+
+    #[test]
+    fn datagram_count_payloads_are_exactly_one_varint_in_any_encoding() {
+        assert_eq!(decode_datagram_count(&[0x03]), Some(3));
+        assert_eq!(decode_datagram_count(&[0x40, 0x03]), Some(3));
+        assert_eq!(decode_datagram_count(&[0x80, 0x00, 0x00, 0x03]), Some(3));
+        assert_eq!(
+            decode_datagram_count(&[0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]),
+            Some(3)
+        );
+        // Empty, cut inside the integer, and bytes after it.
+        for payload in [
+            &[][..],
+            &[0x40],
+            &[0x80, 0x00],
+            &[0x01, 0x01],
+            &[0x41, 0x2c, 0x00],
+        ] {
+            assert_eq!(decode_datagram_count(payload), None, "{payload:?}");
         }
     }
 

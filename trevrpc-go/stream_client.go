@@ -544,17 +544,19 @@ func (s *transportResponseStream) pump() {
 			}
 		case err != nil:
 			// The response direction ended: late datagrams are dropped.
-			s.flow.endReceive()
+			s.flow.endReceive(s.ctx, 0, s.pumpStop)
 			if !errors.Is(err, io.EOF) {
 				s.endUpload(callStatus(s.ctx, err))
 			} else {
 				s.endUpload(nil)
 			}
 		case item.frame.typ == frameTypeStatus:
-			s.flow.endReceive()
 			if item.statusErr == nil {
 				s.endUpload(uploadEndError(item.status))
 			}
+			// The response direction ends once the datagrams the STATUS
+			// counted arrived: later ones are dropped.
+			s.flow.endReceive(s.ctx, s.reader.datagramCount(), s.pumpStop)
 		}
 		s.queued.Add(int64(len(item.frame.payload)))
 		select {

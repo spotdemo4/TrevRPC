@@ -8,12 +8,13 @@ import { encodeMessage, parseStreamChunk } from "../src/compression.js";
 import {
   FrameReader,
   FrameType,
+  decodeDatagramCount,
   encodeMessageFrame,
   decodeWireMessage,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
-import { Code } from "../src/status.js";
+import { Code, invalidArgument } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
 import { StreamCompression } from "../src/wire.js";
 import {
@@ -41,6 +42,8 @@ export class ServerStream {
     this.reader = readable.getReader();
     this.writer = writable.getWriter();
     this.frames = new FrameReader(this.reader);
+    /** The count of the request stream's DATAGRAM_COUNT frame, once readMessage() read it. */
+    this.datagramCount = undefined;
     // Settles when the client cancels its read side (STOP_SENDING from the server's view).
     this.responseCancelled = this.writer.closed.then(
       () => false,
@@ -62,10 +65,26 @@ export class ServerStream {
     return this.frames.readFrame();
   }
 
-  /** Reads the next request message, null at the end of the request stream. */
+  /**
+   * Reads the next request message, null at the end of the request stream. A DATAGRAM_COUNT frame
+   * is not a message: it is kept in `datagramCount`, and nothing but the end may follow it, or
+   * its payload is not one varint, which fail with InvalidArgument as on a real server.
+   */
   async readMessage(messageType) {
     const frame = await this.readFrame();
     if (frame === null) {
+      return null;
+    }
+    if (frame.type === FrameType.DatagramCount) {
+      const count = decodeDatagramCount(frame.payload);
+      if (count === null) {
+        throw invalidArgument("DATAGRAM_COUNT payload is not exactly one varint");
+      }
+      this.datagramCount = count;
+      const next = await this.readFrame();
+      if (next !== null) {
+        throw invalidArgument(`frame of type ${next.type} after the DATAGRAM_COUNT frame`);
+      }
       return null;
     }
     if (frame.type !== FrameType.Message) {

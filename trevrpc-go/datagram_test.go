@@ -670,6 +670,8 @@ func TestDatagramSenderStopsWhenTheConnectionCloses(t *testing.T) {
 type orderRecorder struct {
 	mu     sync.Mutex
 	events []string
+	// last is the last write, as it was.
+	last []byte
 }
 
 func (r *orderRecorder) record(event string) {
@@ -680,6 +682,9 @@ func (r *orderRecorder) record(event string) {
 
 func (r *orderRecorder) Write(data []byte) (int, error) {
 	r.record("write " + string(bytes.Trim(data, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c")))
+	r.mu.Lock()
+	r.last = bytes.Clone(data)
+	r.mu.Unlock()
 	return len(data), nil
 }
 
@@ -721,8 +726,30 @@ func TestRequestDatagramsFollowTheFlushedRequestAndOversizedMessagesStayOnTheStr
 			writes++
 		}
 	}
-	if datagrams != 2 || writes != 1 {
-		t.Fatalf("events = %q; want two small messages as datagrams and the large one in one write", events)
+	// The large message is one write, and the count of the datagrams ends
+	// the request.
+	if datagrams != 2 || writes != 2 {
+		t.Fatalf("events = %q; want two small messages as datagrams, the large one in one write and the count", events)
+	}
+	if want := appendDatagramCountFrame(nil, 2); !bytes.Equal(recorder.last, want) {
+		t.Fatalf("last write = %x, want DATAGRAM_COUNT %x", recorder.last, want)
+	}
+}
+
+func TestARequestWithoutDatagramsEndsWithoutACount(t *testing.T) {
+	recorder := &orderRecorder{}
+	mux := newClientMux(newFakeDatagramConn())
+	defer mux.close()
+	flow := mux.allocate(false, 1024, nil)
+	// Every message is too large for a datagram, so none is sent.
+	large := rawMessage(bytes.Repeat([]byte("L"), 2*datagramDefaultLimit))
+	mux.sizeLimit.Store(datagramDefaultLimit)
+	mux.sizeLimitAt.Store(time.Now().UnixNano())
+	if err := writeRequestFrames(context.Background(), recorder, []byte("REQUEST"), StreamOf(large), &datagramSender{flow: flow, ctx: context.Background()}, DefaultMaxFrameSize); err != nil {
+		t.Fatal(err)
+	}
+	if flow.sent.Load() != 0 || !bytes.Equal(recorder.last, large.frame) {
+		t.Fatalf("sent %d datagrams, last write %x; want none and the message last", flow.sent.Load(), recorder.last)
 	}
 }
 
@@ -855,7 +882,7 @@ func newMergedRequests(t *testing.T, reader io.Reader) (*rpcRequestStream, *data
 		t.Fatal(err)
 	}
 	t.Cleanup(flow.release)
-	requests := &rpcRequestStream{reader: newFrameReader(reader, DefaultMaxFrameSize, -1), merge: newRequestMerge(flow)}
+	requests := &rpcRequestStream{reader: newFrameReader(reader, DefaultMaxFrameSize, -1), merge: newRequestMerge(context.Background(), flow)}
 	t.Cleanup(func() { _ = requests.Close() })
 	return requests, flow, mux
 }
@@ -900,6 +927,59 @@ func TestServerMergesRequestDatagramsWithTheStreamAndEndsAfterQueuedOnes(t *test
 	}
 	if !requests.finished() {
 		t.Fatal("the request did not finish")
+	}
+}
+
+func TestServerRequestWaitsForTheDatagramsItsCountAnnounced(t *testing.T) {
+	stream := append(bytes.Clone(rawMessage([]byte("framed")).frame), appendDatagramCountFrame(nil, 2)...)
+	requests, flow, mux := newMergedRequests(t, bytes.NewReader(stream))
+	mux.countWait = testTimeout
+	// One of the two datagrams arrived with the end of the request, and the
+	// other follows it once the end waits for it.
+	mux.dispatch(appendDatagram(nil, flow.id, [][]byte{[]byte("first")}))
+	type result struct {
+		messages []string
+		err      error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		var got []string
+		for {
+			message, err := requests.Recv()
+			if errors.Is(err, io.EOF) {
+				done <- result{messages: got}
+				return
+			}
+			if err != nil {
+				done <- result{err: err}
+				return
+			}
+			got = append(got, string(message))
+		}
+	}()
+	eventually(t, "the end of the request to wait for its counted datagrams", flow.sink.awaiting)
+	select {
+	case got := <-done:
+		t.Fatalf("the request ended with %q, %v before its counted datagrams arrived", got.messages, got.err)
+	default:
+	}
+	mux.dispatch(appendDatagram(nil, flow.id, [][]byte{[]byte("second")}))
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(testTimeout):
+		t.Fatal("the request did not end once its counted datagrams arrived")
+	}
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	slices.Sort(got.messages)
+	if want := []string{"first", "framed", "second"}; !slices.Equal(got.messages, want) {
+		t.Fatalf("messages = %q, want %q", got.messages, want)
+	}
+	if waited := time.Since(start); waited >= testTimeout {
+		t.Fatalf("the request ended after %v, when the counted datagrams were in", waited)
 	}
 }
 
@@ -990,67 +1070,196 @@ func TestServerCountsRequestDatagramsAgainstTheCallsLimitsAndIdleTimer(t *testin
 	})
 }
 
-// polledConn hides its datagrams from the reader goroutine, which blocks as if
-// it had not got round to them, and hands them to a poll. Like quic-go, it
-// first returns the error of a context that is done, so a poll with a context
-// that is already done gets nothing.
-type polledConn struct {
-	fakeDatagramConn
-	pending chan []byte
+// arrivedCount returns how many datagrams of the call arrived.
+func (s *datagramSink) arrivedCount() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.arrived
 }
 
-func (c *polledConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
-	if err := context.Cause(ctx); err != nil {
-		return nil, err
-	}
-	select {
-	case <-ctx.Done():
-		// A poll: done, but it reported no error at first.
-		select {
-		case datagram := <-c.pending:
-			return datagram, nil
-		default:
-			return nil, context.Cause(ctx)
-		}
-	default:
-	}
-	select {
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
-	case <-c.closed:
-		return nil, errFakeConnClosed
-	}
+// awaiting reports whether the end of the direction waits for datagrams.
+func (s *datagramSink) awaiting() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reached != nil
 }
 
-func TestEndingTheDirectionTakesTheDatagramsTheReaderHasNotDispatchedYet(t *testing.T) {
-	conn := &polledConn{fakeDatagramConn: *newFakeDatagramConn(), pending: make(chan []byte, 8)}
+func TestEndingTheDirectionWaitsForTheDatagramsItsCountAnnounced(t *testing.T) {
+	conn := newFakeDatagramConn()
 	mux := newClientMux(conn)
 	defer mux.close()
+	mux.countWait = testTimeout
 	flow := mux.allocate(true, 1024, nil)
 	other := mux.allocate(true, 1024, nil)
 
-	// The datagrams reached the connection before the end of the stream, but
-	// the reader did not take them.
-	conn.pending <- appendDatagram(nil, flow.id, [][]byte{[]byte("a")})
-	conn.pending <- appendDatagram(nil, other.id, [][]byte{[]byte("for another call")})
-	conn.pending <- appendDatagram(nil, flow.id, [][]byte{[]byte("b")})
-	flow.endReceive()
+	// The end of the stream counted three datagrams. One arrived; the others,
+	// one of them malformed, are still on their way.
+	conn.deliver(flow.id, "a")
+	eventually(t, "the first datagram to arrive", func() bool { return flow.sink.arrivedCount() == 1 })
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		flow.endReceive(context.Background(), 3, nil)
+	}()
+	conn.deliver(other.id, "for another call")
+	conn.incoming <- append(quicvarint.Append(nil, flow.id), 0x00, 0x05, 'x')
+	eventually(t, "the malformed datagram to arrive", func() bool { return flow.sink.arrivedCount() == 2 })
+	eventually(t, "the end of the direction to wait", flow.sink.awaiting)
+	select {
+	case <-ended:
+		t.Fatal("the direction ended before its counted datagrams arrived")
+	default:
+	}
+	conn.deliver(flow.id, "b")
+	select {
+	case <-ended:
+	case <-time.After(testTimeout):
+		t.Fatal("the direction did not end once its counted datagrams arrived")
+	}
 
 	for _, want := range []string{"a", "b"} {
 		if message, ok := flow.sink.pop(); !ok || string(message) != want {
 			t.Fatalf("pop = %q, %v; want %q", message, ok, want)
 		}
 	}
-	if message, ok := other.sink.pop(); !ok || string(message) != "for another call" {
-		t.Fatalf("the other call's datagram = %q, %v", message, ok)
+	if message, ok := flow.sink.pop(); ok {
+		t.Fatalf("the malformed datagram delivered %q", message)
+	}
+	if got := takeMessage(t, other.sink); got != "for another call" {
+		t.Fatalf("the other call's datagram = %q", got)
 	}
 	if flow.sink.push([]byte("late")) {
 		t.Fatal("the direction accepts messages after it ended")
 	}
+}
+
+func TestEndingTheDirectionDoesNotWaitForDatagramsThatArrived(t *testing.T) {
+	conn := newFakeDatagramConn()
+	mux := newServerMux(conn)
+	defer mux.close()
+	mux.countWait = testTimeout
+	anchor, err := mux.register(99, false, 1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer anchor.release()
+
+	// A datagram held before the REQUEST counts once the call claims it.
+	conn.deliver(5, "held")
+	eventually(t, "the datagram to be held", func() bool { return mux.heldCount() == 1 })
+	flow, err := mux.register(5, true, 1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.deliver(5, "live")
+	eventually(t, "the second datagram to arrive", func() bool { return flow.sink.arrivedCount() == 2 })
+
+	start := time.Now()
+	flow.endReceive(context.Background(), 2, nil)
+	if waited := time.Since(start); waited >= testTimeout {
+		t.Fatalf("ending the direction waited %v for datagrams that had arrived", waited)
+	}
+	for _, want := range []string{"held", "live"} {
+		if message, ok := flow.sink.pop(); !ok || string(message) != want {
+			t.Fatalf("pop = %q, %v; want %q", message, ok, want)
+		}
+	}
 
 	var noReceive *datagramFlow
-	noReceive.endReceive()
-	mux.allocate(false, 1024, nil).endReceive()
+	noReceive.endReceive(context.Background(), 1, nil)
+	mux.allocate(false, 1024, nil).endReceive(context.Background(), 1, nil)
+}
+
+func TestDatagramsOfAFlowWithoutItsRequestCountWhenDroppedWhole(t *testing.T) {
+	conn := newFakeDatagramConn()
+	mux := newServerMux(conn)
+	defer mux.close()
+	mux.holdMessages = 2
+	// The anchor starts the reader, and its sentinel shows when the reader
+	// dispatched everything before it.
+	anchor, err := mux.register(99, true, 1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer anchor.release()
+
+	// A malformed datagram is held as a count, and one that finds the holding
+	// area full counts on a held datagram of its flow. One of a flow with
+	// nothing held is lost to the count.
+	conn.incoming <- append(quicvarint.Append(nil, 5), 0x00, 0x05, 'x')
+	conn.deliver(5, "held")
+	eventually(t, "both datagrams to be held", func() bool { return mux.heldCount() == 2 })
+	conn.deliver(5, "no room")
+	conn.deliver(6, "no room, nothing held")
+	conn.deliver(99, "sentinel")
+	if got := takeMessage(t, anchor.sink); got != "sentinel" {
+		t.Fatalf("the anchor got %q", got)
+	}
+
+	flow, err := mux.register(5, true, 1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := flow.sink.arrivedCount(); got != 3 {
+		t.Fatalf("arrived = %d, want 3: the malformed, the held and the unheld datagram", got)
+	}
+	if message, ok := flow.sink.pop(); !ok || string(message) != "held" {
+		t.Fatalf("pop = %q, %v; want only the held message", message, ok)
+	}
+	if message, ok := flow.sink.pop(); ok {
+		t.Fatalf("a dropped datagram delivered %q", message)
+	}
+	other, err := mux.register(6, true, 1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := other.sink.arrivedCount(); got != 0 {
+		t.Fatalf("arrived = %d for a flow whose only datagram found no room, want 0", got)
+	}
+}
+
+func TestEndingTheDirectionGivesUpOnMissingDatagrams(t *testing.T) {
+	t.Run("after the wait", func(t *testing.T) {
+		conn := newFakeDatagramConn()
+		mux := newClientMux(conn)
+		defer mux.close()
+		mux.countWait = 5 * time.Millisecond
+		flow := mux.allocate(true, 1024, nil)
+		flow.endReceive(context.Background(), 1, nil)
+		// The lost datagram turns up after all, and is dropped.
+		conn.deliver(flow.id, "late")
+		eventually(t, "the late datagram to arrive", func() bool { return flow.sink.arrivedCount() == 1 })
+		if message, ok := flow.sink.pop(); ok {
+			t.Fatalf("a datagram after the wait was delivered: %q", message)
+		}
+	})
+	for _, end := range []string{"context", "stop"} {
+		t.Run("when the call's "+end+" ends", func(t *testing.T) {
+			mux := newClientMux(newFakeDatagramConn())
+			defer mux.close()
+			mux.countWait = testTimeout
+			flow := mux.allocate(true, 1024, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stop := make(chan struct{})
+			go func() {
+				time.Sleep(5 * time.Millisecond)
+				if end == "context" {
+					cancel()
+				} else {
+					close(stop)
+				}
+			}()
+			start := time.Now()
+			flow.endReceive(ctx, 1, stop)
+			if waited := time.Since(start); waited >= testTimeout {
+				t.Fatalf("ending the direction waited %v", waited)
+			}
+			if !flow.sink.ended() {
+				t.Fatal("the direction did not end")
+			}
+		})
+	}
 }
 
 func TestMuxDeliversEveryMessageOfABatchedDatagramAndDropsMalformedOnesWhole(t *testing.T) {
@@ -1137,104 +1346,54 @@ func TestBufferedMessagePipeYieldsWhatIsReadyAndDrainsOnClose(t *testing.T) {
 	}
 }
 
-// TestPollDatagramTakesWhatIsQueuedWithoutWaiting polls a real quic-go
-// connection. quic-go returns the error of a context that is already done
-// before it looks at its queue, so polling with such a context, as flush once
-// did, never got a datagram, and a call whose stream ended dropped the
-// messages the reader had not taken yet.
-func TestPollDatagramTakesWhatIsQueuedWithoutWaiting(t *testing.T) {
-	pki := newTestPKI(t)
-	serverTLS := pki.server.Clone()
-	serverTLS.NextProtos = []string{"poll-test"}
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{EnableDatagrams: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
-	defer cancel()
-	clientTLS := pki.client.Clone()
-	clientTLS.NextProtos = []string{"poll-test"}
-	client, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, withTestHandshakeTimeout(&quic.Config{EnableDatagrams: true}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = client.CloseWithError(0, "") })
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = server.CloseWithError(0, "") })
+func TestFrameReaderTakesInADatagramCountOnlyRightBeforeTheEnd(t *testing.T) {
+	message := rawMessage([]byte("m")).frame
+	count := appendDatagramCountFrame(nil, 3)
+	status := appendFrameHeader(nil, frameTypeStatus, 0)
+	grease := []byte{0x21, 0x01, 0xff}
+	join := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 
-	// Nothing is queued: the poll returns at once.
-	start := time.Now()
-	if datagram, ok := pollDatagram(client); ok {
-		t.Fatalf("poll of an empty queue = %q, want none", datagram)
+	accepted := map[string][]byte{
+		"before the end":           join(message, count),
+		"before STATUS":            join(message, count, grease, status),
+		"with a non-minimal count": join(message, []byte{0x07, 0x02, 0x40, 0x03}, status),
 	}
-	if waited := time.Since(start); waited > time.Second {
-		t.Fatalf("poll of an empty queue waited %v", waited)
-	}
-
-	if err := server.SendDatagram([]byte("queued")); err != nil {
-		t.Fatal(err)
-	}
-	// Once the datagram arrives, nothing but the poll takes it from the queue.
-	for {
-		if datagram, ok := pollDatagram(client); ok {
-			if string(datagram) != "queued" {
-				t.Fatalf("poll = %q, want queued", datagram)
+	for name, stream := range accepted {
+		t.Run("accepts it "+name, func(t *testing.T) {
+			frames, err := readAllFrames(newFrameReader(bytes.NewReader(stream), DefaultMaxFrameSize, -1))
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("read = %v, want the end of the stream", err)
 			}
-			break
-		}
-		if ctx.Err() != nil {
-			t.Fatal("the queued datagram was never polled")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if datagram, ok := pollDatagram(client); ok {
-		t.Fatalf("second poll = %q, want none", datagram)
-	}
-}
-
-// pollSemanticsConn queues datagrams and receives them as quic-go does,
-// checking the context first when checkFirst is set, as quic-go v0.64 does,
-// and only after the queue otherwise, as earlier versions did.
-type pollSemanticsConn struct {
-	checkFirst bool
-	queue      [][]byte
-}
-
-func (c *pollSemanticsConn) SendDatagram([]byte) error { return nil }
-
-func (c *pollSemanticsConn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
-	if c.checkFirst {
-		if err := context.Cause(ctx); err != nil {
-			return nil, err
-		}
-	}
-	if len(c.queue) > 0 {
-		datagram := c.queue[0]
-		c.queue = c.queue[1:]
-		return datagram, nil
-	}
-	<-ctx.Done()
-	return nil, context.Cause(ctx)
-}
-
-func TestPollDatagramUnderEitherContextCheck(t *testing.T) {
-	for _, checkFirst := range []bool{true, false} {
-		conn := &pollSemanticsConn{checkFirst: checkFirst, queue: [][]byte{[]byte("a"), {}}}
-		var got []string
-		for {
-			datagram, ok := pollDatagram(conn)
-			if !ok {
-				break
+			for _, frame := range frames {
+				if frame.typ == frameTypeDatagramCount {
+					t.Fatal("the reader returned the DATAGRAM_COUNT")
+				}
 			}
-			got = append(got, string(datagram))
-		}
-		// The empty datagram is one too: only a nil result means none.
-		if len(got) != 2 || got[0] != "a" || got[1] != "" {
-			t.Fatalf("checkFirst=%v: polled %q, want \"a\" and an empty datagram", checkFirst, got)
-		}
+		})
+	}
+	reader := newFrameReader(bytes.NewReader(accepted["before STATUS"]), DefaultMaxFrameSize, -1)
+	if _, err := readAllFrames(reader); !errors.Is(err, io.EOF) || reader.datagramCount() != 3 {
+		t.Fatalf("datagram count = %d, %v; want 3", reader.datagramCount(), err)
+	}
+	if reader := newFrameReader(bytes.NewReader(message), DefaultMaxFrameSize, -1); reader.datagramCount() != 0 {
+		t.Fatal("a stream without DATAGRAM_COUNT counts datagrams")
+	}
+
+	rejected := map[string][]byte{
+		"a MESSAGE after it":   join(count, message),
+		"HEADERS after it":     join(count, appendFrameHeader(nil, frameTypeHeaders, 0), status),
+		"a second count":       join(count, count, status),
+		"an empty payload":     join([]byte{0x07, 0x00}, status),
+		"a truncated varint":   join([]byte{0x07, 0x01, 0x40}, status),
+		"a trailing byte":      join([]byte{0x07, 0x02, 0x01, 0x00}, status),
+		"an oversized payload": join([]byte{0x07, 0x09}, make([]byte, 9), status),
+	}
+	for name, stream := range rejected {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := readAllFrames(newFrameReader(bytes.NewReader(stream), DefaultMaxFrameSize, -1))
+			if _, ok := errors.AsType[*frameDecodeError](err); !ok {
+				t.Fatalf("read = %v, want a frame decode error", err)
+			}
+		})
 	}
 }

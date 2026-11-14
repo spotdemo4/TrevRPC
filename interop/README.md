@@ -218,12 +218,13 @@ not compress below about 1200 bytes either: the Go, Rust and browser clients
 send 4096 base64 digits from a fixed xorshift generator. The Android client,
 whose Cronet transport has no datagrams, may send `"x"` × 4096.
 
-`unreliable` waits for the first response before the rest because the stream
-can overtake the datagrams the client still has queued: QUIC stacks send a
-DATAGRAM frame only where it fits, and stream data goes ahead of it. The server
-drops the datagrams of a call whose requests have ended, so a client that sent
-everything at once could find none arrived. The Android client, which has no
-datagrams to lose, may send every request at once.
+`unreliable` waits for the first response before the rest, so that at least
+one request datagram is known to have arrived before the request ends. The
+stream can overtake the datagrams the client still has queued (QUIC stacks send
+a DATAGRAM frame only where it fits, and stream data goes ahead of it), and the
+server waits for those its DATAGRAM_COUNT announced for at most 10 ms, which a
+loaded machine can outlast. The Android client, which has no datagrams to lose,
+may send every request at once.
 
 Native clients running `unreliable` over `--transport quic` also check that
 their connection received QUIC DATAGRAM frames, which proves the

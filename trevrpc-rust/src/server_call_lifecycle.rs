@@ -121,8 +121,8 @@ impl ResponseWriter for FakeWriter {
         Ok(())
     }
 
-    fn set_codec(&mut self, codec: ResponseCodec) {
-        self.codec = codec;
+    fn codec(&mut self) -> &mut ResponseCodec {
+        &mut self.codec
     }
 }
 

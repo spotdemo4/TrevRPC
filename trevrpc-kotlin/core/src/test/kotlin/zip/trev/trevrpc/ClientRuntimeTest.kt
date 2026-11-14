@@ -692,6 +692,32 @@ class ClientRuntimeTest {
         }
 
     @Test
+    fun `a DATAGRAM_COUNT is dropped before STATUS and fails anywhere else`() =
+        runTest {
+            val counted =
+                testClient(StaticStreamTransport(headers(), message("a"), datagramCount(2), status(Status.ok())))
+                    .openServerStreaming("/svc/method", "request", strings, strings)
+            assertEquals("a", counted.receive())
+            assertNull(counted.receive())
+
+            val messageAfter =
+                testClient(StaticStreamTransport(datagramCount(1), message("a"), status(Status.ok())))
+                    .openServerStreaming("/svc/method", "request", strings, strings)
+            assertStatus(Code.INTERNAL, "response DATAGRAM_COUNT may only be followed by STATUS") { messageAfter.receive() }
+
+            val headersAfter =
+                testClient(StaticStreamTransport(datagramCount(1), headers(), status(Status.ok())))
+                    .openServerStreaming("/svc/method", "request", strings, strings)
+            assertCode(Code.INTERNAL) { headersAfter.receive() }
+
+            val twice =
+                testClient(StaticStreamTransport(message("a"), datagramCount(1), datagramCount(1), status(Status.ok())))
+                    .openServerStreaming("/svc/method", "request", strings, strings)
+            assertEquals("a", twice.receive())
+            assertCode(Code.INTERNAL) { twice.receive() }
+        }
+
+    @Test
     fun `response callbacks get headers separately from trailing metadata`() =
         runTest {
             val md = Metadata.of("x-h" to byteArrayOf(1))
@@ -793,6 +819,8 @@ private fun message(text: String): ResponseFrame = ResponseFrame.Message(text.en
 private fun status(status: Status): ResponseFrame = ResponseFrame.Status(status)
 
 private fun headers(metadata: Metadata = Metadata.EMPTY): ResponseFrame = ResponseFrame.Headers(metadata)
+
+private fun datagramCount(count: Long): ResponseFrame = ResponseFrame.DatagramCount(count)
 
 private class LoopbackTransport : RpcTransport {
     override suspend fun openStream(

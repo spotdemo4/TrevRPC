@@ -48,6 +48,33 @@ grease_types_test() ->
     ?assert(lists:all(fun trevrpc_frame:is_grease/1, [16#21, 16#40, 16#5f, 16#1f * 1000 + 16#21])),
     ?assertNot(lists:any(fun trevrpc_frame:is_grease/1, [0, 6, 16#20, 16#22, 16#41])).
 
+datagram_count_frame_test() ->
+    ?assertEqual(7, trevrpc_frame:type_code(datagram_count)),
+    ?assertEqual(datagram_count, trevrpc_frame:type_name(7)),
+    ?assertEqual("DATAGRAM_COUNT", trevrpc_frame:name(datagram_count)),
+    %% Counts are written as minimal varints.
+    ?assertEqual(<<7, 1, 0>>, iolist_to_binary(trevrpc_frame:encode_datagram_count(0))),
+    ?assertEqual(<<7, 1, 63>>, iolist_to_binary(trevrpc_frame:encode_datagram_count(63))),
+    ?assertEqual(<<7, 2, 16#40, 64>>, iolist_to_binary(trevrpc_frame:encode_datagram_count(64))),
+    Reader = trevrpc_frame:reader(trevrpc:default_max_frame_size()),
+    ?assertMatch(
+        {ok, [{datagram_count, <<16#40, 64>>}, {message, <<"m">>}], _},
+        trevrpc_frame:feed(<<7, 2, 16#40, 64, 0, 1, "m">>, Reader)
+    ).
+
+datagram_count_payload_test() ->
+    ?assertEqual({ok, 0}, trevrpc_frame:decode_datagram_count(<<0>>)),
+    ?assertEqual({ok, 300}, trevrpc_frame:decode_datagram_count(<<16#41, 16#2c>>)),
+    %% Any valid encoding is accepted, down to the widest.
+    ?assertEqual({ok, 3}, trevrpc_frame:decode_datagram_count(<<16#40, 3>>)),
+    ?assertEqual({ok, 3}, trevrpc_frame:decode_datagram_count(<<16#80, 0, 0, 3>>)),
+    ?assertEqual({ok, 3}, trevrpc_frame:decode_datagram_count(<<16#C0, 0, 0, 0, 0, 0, 0, 3>>)),
+    %% Exactly one varint: not none, not a truncated one, not extra bytes.
+    ?assertEqual(error, trevrpc_frame:decode_datagram_count(<<>>)),
+    ?assertEqual(error, trevrpc_frame:decode_datagram_count(<<16#40>>)),
+    ?assertEqual(error, trevrpc_frame:decode_datagram_count(<<1, 0>>)),
+    ?assertEqual(error, trevrpc_frame:decode_datagram_count(<<16#40, 3, 0>>)).
+
 frame_too_large_test() ->
     Reader = trevrpc_frame:reader(4),
     ?assertMatch({ok, [{message, <<"abcd">>}], _}, trevrpc_frame:feed(<<0, 4, "abcd">>, Reader)),
@@ -164,6 +191,14 @@ datagram_no_frame_size_limit_test() ->
     Message = binary:copy(<<"m">>, 65000),
     Datagram = iolist_to_binary(trevrpc_datagram:encode_messages(9, [Message])),
     ?assertEqual({ok, 9, [{message, Message}]}, trevrpc_datagram:decode(Datagram)).
+
+%% Frames other than messages are skipped in a datagram, a DATAGRAM_COUNT
+%% included.
+datagram_skips_count_test() ->
+    ?assertEqual(
+        {ok, 1, [{message, <<"hi">>}]},
+        trevrpc_datagram:decode(<<1, 7, 1, 2, 0, 2, "hi">>)
+    ).
 
 datagram_zstd_message_test() ->
     ?assertEqual(

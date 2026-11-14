@@ -331,7 +331,9 @@ read_request(Id, #entry{reader = Reader} = Entry, Bin, Fin, #state{transport = T
             );
         {ok, [{Type, _} | _], _} ->
             Message = iolist_to_binary(
-                io_lib:format("request stream must start with REQUEST, not ~s", [frame_name(Type)])
+                io_lib:format("request stream must start with REQUEST, not ~s", [
+                    trevrpc_frame:name(Type)
+                ])
             ),
             refuse(
                 Id, Entry#entry{fin = Fin}, trevrpc_status:new(invalid_argument, Message), State
@@ -660,11 +662,3 @@ cancel_timer(#entry{timer = undefined}) ->
 cancel_timer(#entry{timer = Timer}) ->
     _ = erlang:cancel_timer(Timer, [{async, true}, {info, false}]),
     ok.
-
-frame_name(message) -> "MESSAGE";
-frame_name(request) -> "REQUEST";
-frame_name(headers) -> "HEADERS";
-frame_name(status) -> "STATUS";
-frame_name(zstd_message) -> "ZSTD_MESSAGE";
-frame_name(zstd_stream_message) -> "ZSTD_STREAM_MESSAGE";
-frame_name(answer) -> "ANSWER".

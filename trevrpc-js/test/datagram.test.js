@@ -7,11 +7,18 @@ import { OneWayUnreliableEcho } from "../build/test/gen/methods_pb.js";
 import { Channel } from "../src/channel.js";
 import { createClient } from "../src/client.js";
 import { encodeMessage } from "../src/compression.js";
-import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
-import { FrameType, marshalMessage, unmarshalMessage } from "../src/framing.js";
+import { DatagramCountWaitMs, decodeDatagram, encodeDatagram } from "../src/datagram.js";
+import {
+  FrameType,
+  encodeDatagramCountFrame,
+  encodeFrame,
+  marshalMessage,
+  unmarshalMessage,
+} from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { RpcKind } from "../src/wire.js";
-import { deferred, fakeDatagrams, fakeTransport, isPending, turn } from "./support.js";
+import { concatBytes, deferred, fakeDatagrams, fakeTransport, isPending, turn } from "./support.js";
+import { encodeAnswerFrame, encodeHeadersFrame, encodeStatusFrame } from "./wire-server.js";
 
 const ownFlow = (request) => Number(request.datagramFlow);
 
@@ -54,6 +61,27 @@ function serving(requests, serve) {
 async function finishCall(stream) {
   await stream.writeStatus();
   await stream.finish();
+}
+
+/** Ends the response like a server that sent `count` datagrams: DATAGRAM_COUNT, STATUS, one write. */
+async function finishWithCount(stream, count) {
+  await stream.write(
+    concatBytes([encodeDatagramCountFrame(count), encodeStatusFrame({ code: Code.Ok })]),
+  );
+  await stream.finish();
+}
+
+/** The frames of the request stream after REQUEST, as `[type, payload]`; a reset ends the list. */
+async function readRequestFrames(stream) {
+  const frames = [];
+  try {
+    for (let frame; (frame = await stream.readFrame()) !== null;) {
+      frames.push([frame.type, frame.payload]);
+    }
+  } catch {
+    // The request stream was reset.
+  }
+  return frames;
 }
 
 test("a call to an unreliable method gets a flow per call, counted per session", async () => {
@@ -144,11 +172,13 @@ test("request messages that fit go out as datagrams after REQUEST, others on the
 
   await call.closeSend();
   await served.promise;
+  // The datagrams are announced by DATAGRAM_COUNT right before the end of the request stream.
   assert.deepEqual(
     frames.map((frame) => frame.type),
-    [FrameType.Message],
+    [FrameType.Message, FrameType.DatagramCount],
   );
   assert.equal(unmarshalMessage(EchoRequestSchema, frames[0].payload).message, fits + "x");
+  assert.deepEqual([...frames[1].payload], [2]);
   assert.equal(datagrams.writables, 1, "all calls share one writer");
   await call.close();
 });
@@ -171,7 +201,10 @@ test("without maxDatagramSize the limit is 1100 bytes", async () => {
   assert.equal(datagrams.sent[0].byteLength, 1100);
   await call.closeSend();
   await turn();
-  assert.equal(frames.length, 1);
+  assert.deepEqual(
+    frames.map((frame) => frame.type),
+    [FrameType.Message, FrameType.DatagramCount],
+  );
   await call.close();
 });
 
@@ -674,4 +707,457 @@ test("a channel without datagrams, like QMux over WebSocket, sends no flow", asy
   assert.deepEqual(sessions[0].requests.map(ownFlow), [0]);
   await call.close();
   channel.close();
+});
+
+// DATAGRAM_COUNT, request direction: what the client sends.
+
+test("closeSend writes DATAGRAM_COUNT with the datagrams sent, right before the end", async () => {
+  const datagrams = fakeDatagrams({ maxDatagramSize: 40 });
+  const frames = deferred();
+  const transport = sessionWith(
+    datagrams,
+    serving([], async (stream) => frames.resolve(await readRequestFrames(stream))),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+
+  // Two datagrams of one message each, then a message that only fits the stream, then a third.
+  await call.send({ message: "a" });
+  await call.send({ message: "b" });
+  await call.send({ message: "B".repeat(100) });
+  await call.send({ message: "c" });
+  assert.equal(datagrams.sent.length, 3);
+  await call.closeSend();
+
+  const read = await frames.promise;
+  assert.deepEqual(
+    read.map(([type]) => type),
+    [FrameType.Message, FrameType.DatagramCount],
+    "the count is the last frame, right before the end of the stream",
+  );
+  assert.deepEqual([...read[1][1]], [3], "a message on the stream is not a datagram");
+  await call.close();
+});
+
+test("the DATAGRAM_COUNT of a large count is a minimal varint", async () => {
+  const datagrams = fakeDatagrams();
+  const frames = deferred();
+  const transport = sessionWith(
+    datagrams,
+    serving([], async (stream) => frames.resolve(await readRequestFrames(stream))),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+  for (let index = 0; index < 64; index += 1) {
+    await call.send({ message: "x" });
+  }
+  await call.closeSend();
+  assert.deepEqual(
+    (await frames.promise).map(([type, payload]) => [type, [...payload]]),
+    [[FrameType.DatagramCount, [0x40, 64]]],
+  );
+  await call.close();
+});
+
+test("closeSend writes no DATAGRAM_COUNT when no datagram was sent", async () => {
+  const frames = deferred();
+  const handler = serving([], async (stream) => frames.resolve(await readRequestFrames(stream)));
+
+  // Nothing was sent at all.
+  const quiet = await createClient(UnreliableEcho, sessionWith(fakeDatagrams(), handler)).bidi();
+  await quiet.closeSend();
+  assert.deepEqual(await frames.promise, []);
+  await quiet.close();
+
+  // Every datagram write failed, so every message went on the stream.
+  const failing = fakeDatagrams();
+  failing.failWrites = true;
+  const stream = deferred();
+  const failed = await createClient(
+    UnreliableEcho,
+    sessionWith(
+      failing,
+      serving([], async (serverStream) => stream.resolve(await readRequestFrames(serverStream))),
+    ),
+  ).bidi();
+  await failed.send({ message: "a" });
+  await failed.send({ message: "b" });
+  await failed.closeSend();
+  assert.deepEqual(
+    (await stream.promise).map(([type]) => type),
+    [FrameType.Message, FrameType.Message],
+  );
+  await failed.close();
+});
+
+test("a datagram write that failed does not count, one that succeeded before it does", async () => {
+  const datagrams = fakeDatagrams();
+  const frames = deferred();
+  const transport = sessionWith(
+    datagrams,
+    serving([], async (stream) => frames.resolve(await readRequestFrames(stream))),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+  await call.send({ message: "datagram" });
+  datagrams.failWrites = true;
+  await call.send({ message: "stream" });
+  await call.closeSend();
+  const read = await frames.promise;
+  assert.deepEqual(
+    read.map(([type]) => type),
+    [FrameType.Message, FrameType.DatagramCount],
+  );
+  assert.equal(unmarshalMessage(EchoRequestSchema, read[0][1]).message, "stream");
+  assert.deepEqual([...read[1][1]], [1]);
+  await call.close();
+});
+
+test("a call that is cancelled sends no DATAGRAM_COUNT", async () => {
+  const datagrams = fakeDatagrams();
+  const frames = deferred();
+  const transport = sessionWith(
+    datagrams,
+    serving([], async (stream) => frames.resolve(await readRequestFrames(stream))),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+  await call.send({ message: "a" });
+  assert.equal(datagrams.sent.length, 1);
+  await call.close();
+  assert.deepEqual(await frames.promise, [], "the request stream was reset instead");
+});
+
+test("a call that does not send datagrams as requests sends no DATAGRAM_COUNT", async () => {
+  const frames = deferred();
+  const transport = sessionWith(
+    fakeDatagrams(),
+    serving([], async (stream) => frames.resolve(await readRequestFrames(stream))),
+  );
+  // Only the responses of Watch are unreliable, and Upload sends its requests on the stream.
+  const call = await createClient(OneWayUnreliableEcho, transport).upload();
+  call.closeAndRecv().catch(() => {});
+  assert.deepEqual(await frames.promise, []);
+  await call.close();
+});
+
+// The request stream as a server reads it: the test server applies the rules of the wire format.
+
+/** A server that reads request messages with ServerStream.readMessage until it fails or ends. */
+async function readRequests(frames) {
+  const outcome = deferred();
+  const transport = fakeTransport(async (stream) => {
+    await stream.readRequest();
+    const messages = [];
+    try {
+      for (let message; (message = await stream.readMessage(EchoRequestSchema)) !== null;) {
+        messages.push(message.message);
+      }
+      outcome.resolve({ messages, datagramCount: stream.datagramCount });
+    } catch (error) {
+      outcome.resolve({ messages, error });
+    }
+  });
+  const { writable } = await transport.createBidirectionalStream();
+  const writer = writable.getWriter();
+  for (const frame of frames) {
+    await writer.write(frame);
+  }
+  await writer.close();
+  return outcome.promise;
+}
+
+const requestFrame = encodeFrame(FrameType.Request, new TextEncoder().encode("\n\x06/svc/m"));
+const messageFrame = (message) =>
+  encodeFrame(FrameType.Message, marshalMessage(EchoRequestSchema, { message }));
+
+test("a request stream may end with one DATAGRAM_COUNT, which a server reads as no message", async () => {
+  const outcome = await readRequests([
+    requestFrame,
+    messageFrame("a"),
+    encodeFrame(FrameType.DatagramCount, Uint8Array.of(0x40, 2)),
+    encodeFrame(0x21, new Uint8Array(3)),
+  ]);
+  assert.equal(outcome.error, undefined);
+  assert.deepEqual(outcome.messages, ["a"]);
+  assert.equal(outcome.datagramCount, 2);
+});
+
+test("a request stream rejects a second count, a frame after the count and a malformed count", async () => {
+  const count = (...payload) => encodeFrame(FrameType.DatagramCount, Uint8Array.from(payload));
+  for (const { name, frames } of [
+    { name: "a second count", frames: [count(1), count(1)] },
+    { name: "a message after the count", frames: [count(1), messageFrame("late")] },
+    { name: "an empty count", frames: [count()] },
+    { name: "a count of two varints", frames: [count(1, 1)] },
+    { name: "a truncated count", frames: [count(0x40)] },
+  ]) {
+    const outcome = await readRequests([requestFrame, ...frames]);
+    assert.equal(outcome.error?.code, Code.InvalidArgument, name);
+  }
+});
+
+// DATAGRAM_COUNT, response direction: what the client receives.
+
+test("a call ends only once the datagrams that DATAGRAM_COUNT announces have arrived", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const datagrams = fakeDatagrams();
+  const flowOf = deferred();
+  const transport = sessionWith(
+    datagrams,
+    serving([], async (stream, request) => {
+      await stream.writeHeaders();
+      flowOf.resolve(ownFlow(request));
+      datagrams.push(responseDatagram(ownFlow(request), "one"));
+      await finishWithCount(stream, 2);
+    }),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+  const flow = await flowOf.promise;
+  assert.equal((await call.recv()).message, "one");
+
+  const ending = call.recv();
+  assert.equal(await isPending(ending), true, "STATUS waits for the second datagram");
+  assert.equal(await isPending(call.status), true);
+  datagrams.push(responseDatagram(flow, "two"));
+  assert.equal((await ending).message, "two", "delivered before the end of the responses");
+  assert.equal(await call.recv(), undefined);
+  assert.equal((await call.status).code, Code.Ok);
+});
+
+test(
+  "a call ends at once when the announced datagrams arrived already",
+  { timeout: 5000 },
+  async (t) => {
+    // The wait would never end: its timer is not ticked.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const datagrams = fakeDatagrams();
+    const written = deferred();
+    const release = deferred();
+    const transport = sessionWith(
+      datagrams,
+      serving([], async (stream, request) => {
+        const flow = ownFlow(request);
+        // Datagrams that overtook HEADERS count as well as those that follow it.
+        datagrams.push(responseDatagram(flow, "before-headers"));
+        await release.promise;
+        await stream.writeHeaders();
+        datagrams.push(responseDatagram(flow, "one", "two"));
+        await turn(5);
+        written.resolve();
+        await finishWithCount(stream, 2);
+      }),
+    );
+    const call = await createClient(UnreliableEcho, transport).bidi();
+    await turn(5);
+    release.resolve();
+    await written.promise;
+
+    const received = [];
+    for await (const response of call) {
+      received.push(response.message);
+    }
+    assert.deepEqual(received, ["before-headers", "one", "two"]);
+    assert.equal((await call.status).code, Code.Ok);
+  },
+);
+
+test("a call gives up on missing datagrams after the bound", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const datagrams = fakeDatagrams();
+  const flowOf = deferred();
+  const transport = sessionWith(
+    datagrams,
+    serving([], async (stream, request) => {
+      await stream.writeHeaders();
+      flowOf.resolve(ownFlow(request));
+      datagrams.push(responseDatagram(ownFlow(request), "one"));
+      await finishWithCount(stream, 3);
+    }),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+  const flow = await flowOf.promise;
+  assert.equal((await call.recv()).message, "one");
+
+  const ending = call.recv();
+  await turn(5);
+  t.mock.timers.tick(DatagramCountWaitMs - 1);
+  assert.equal(await isPending(ending), true, "still within the bound");
+  t.mock.timers.tick(1);
+  assert.equal(await ending, undefined);
+  assert.equal((await call.status).code, Code.Ok);
+
+  // A datagram that comes later is dropped.
+  datagrams.push(responseDatagram(flow, "late"));
+  await turn();
+  assert.equal(await call.recv(), undefined);
+});
+
+test("datagrams dropped whole count as received", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const datagrams = fakeDatagrams();
+  const transport = sessionWith(
+    datagrams,
+    serving([], async (stream, request) => {
+      const flow = ownFlow(request);
+      await stream.writeHeaders();
+      // 100 datagrams overflow the call's queue of 32 messages, and one is malformed.
+      for (let index = 0; index < 100; index += 1) {
+        datagrams.push(responseDatagram(flow, `m${index}`));
+      }
+      const truncated = responseDatagram(flow, "lost");
+      datagrams.push(truncated.subarray(0, truncated.byteLength - 1));
+      await turn(10);
+      await finishWithCount(stream, 101);
+    }),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+  // The status comes at once, though most datagrams found no room; nobody received meanwhile.
+  assert.equal((await call.status).code, Code.Ok);
+  const received = [];
+  for await (const response of call) {
+    received.push(response.message);
+  }
+  assert.equal(received.length, 32);
+});
+
+test("closing the call ends the wait for missing datagrams", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const transport = sessionWith(
+    fakeDatagrams(),
+    serving([], async (stream) => {
+      await stream.writeHeaders();
+      await finishWithCount(stream, 5);
+    }),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi();
+  const receiving = call.recv();
+  receiving.catch(() => {});
+  await turn(10);
+  assert.equal(await isPending(receiving), true);
+  await call.close();
+  await assert.rejects(receiving, (error) => error.code === Code.Cancelled);
+  await assert.rejects(call.status, (error) => error.code === Code.Cancelled);
+});
+
+test("the deadline ends the wait for missing datagrams", { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const transport = sessionWith(
+    fakeDatagrams(),
+    serving([], async (stream) => {
+      await stream.writeHeaders();
+      await finishWithCount(stream, 5);
+    }),
+  );
+  const call = await createClient(UnreliableEcho, transport).bidi({ timeoutMs: 3 });
+  const receiving = call.recv();
+  receiving.catch(() => {});
+  await turn(10);
+  // The deadline falls before the bound does.
+  t.mock.timers.tick(DatagramCountWaitMs - 1);
+  await assert.rejects(receiving, (error) => error.code === Code.DeadlineExceeded);
+  await assert.rejects(call.status, (error) => error.code === Code.DeadlineExceeded);
+});
+
+test(
+  "the count is ignored without a flow and in a direction that does not stream",
+  { timeout: 5000 },
+  async (t) => {
+    // The wait would never end: its timer is not ticked.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const answer = async (stream) => {
+      await stream.readRequest();
+      await stream.write(
+        concatBytes([
+          encodeFrame(
+            FrameType.Message,
+            marshalMessage(EchoResponseSchema, { message: "ok", index: 0 }),
+          ),
+          encodeDatagramCountFrame(5),
+          encodeStatusFrame({ code: Code.Ok }),
+        ]),
+      );
+      await stream.finish();
+    };
+
+    // A unary response never streams, so it never has a flow.
+    const unary = await createClient(Echo, fakeTransport(answer)).unary({ message: "x" });
+    assert.equal(unary.message, "ok");
+
+    // The responses of Upload do not stream, though its requests are unreliable and have a flow.
+    const upload = await createClient(
+      OneWayUnreliableEcho,
+      sessionWith(fakeDatagrams(), answer),
+    ).upload();
+    assert.equal((await upload.closeAndRecv()).message, "ok");
+
+    // A session without datagrams, like QMux over WebSocket, gives the call no flow.
+    const bidi = await createClient(UnreliableEcho, fakeTransport(answer)).bidi();
+    assert.equal((await bidi.recv()).message, "ok");
+    assert.equal(await bidi.recv(), undefined);
+  },
+);
+
+/** Plays a server that sends `frames` after REQUEST and ends the response. */
+function sendingFrames(...frames) {
+  return sessionWith(
+    fakeDatagrams(),
+    serving([], async (stream) => {
+      await stream.write(concatBytes(frames));
+      await stream.finish();
+    }),
+  );
+}
+
+const message = (text) =>
+  encodeFrame(FrameType.Message, marshalMessage(EchoResponseSchema, { message: text, index: 0 }));
+const count = (...payload) => encodeFrame(FrameType.DatagramCount, Uint8Array.from(payload));
+const ok = encodeStatusFrame({ code: Code.Ok });
+
+test("a response stream accepts one DATAGRAM_COUNT right before STATUS, in any varint form", async () => {
+  for (const service of [UnreliableEcho, Echo]) {
+    const grease = encodeFrame(0x21, new Uint8Array(2));
+    for (const frames of [
+      [count(0), ok],
+      [encodeHeadersFrame({}), message("a"), count(0x40, 0), grease, ok],
+      [encodeAnswerFrame({}), encodeHeadersFrame({}), count(0xc0, 0, 0, 0, 0, 0, 0, 0), ok],
+    ]) {
+      const call = await createClient(service, sendingFrames(...frames)).bidi();
+      for await (const response of call) {
+        assert.equal(response.message, "a");
+      }
+      assert.equal((await call.status).code, Code.Ok);
+    }
+  }
+});
+
+test("a response stream rejects a misplaced or malformed DATAGRAM_COUNT as Internal", async () => {
+  const headers = encodeHeadersFrame({});
+  for (const { name, frames } of [
+    { name: "a second count", frames: [count(0), count(0), ok] },
+    {
+      name: "a second count after unknown frames",
+      frames: [count(0), encodeFrame(0x21, new Uint8Array(1)), count(0), ok],
+    },
+    { name: "a message after the count", frames: [count(0), message("late"), ok] },
+    { name: "HEADERS after the count", frames: [count(0), headers, ok] },
+    { name: "ANSWER after the count", frames: [count(0), encodeAnswerFrame({}), ok] },
+    { name: "an empty count", frames: [count(), ok] },
+    { name: "a count of two varints", frames: [count(1, 1), ok] },
+    { name: "a truncated count", frames: [count(0x40), ok] },
+  ]) {
+    for (const service of [UnreliableEcho, Echo]) {
+      const call = await createClient(service, sendingFrames(...frames)).bidi();
+      await assert.rejects(
+        call.recv(),
+        (error) => error.code === Code.Internal,
+        `${name} on ${service.typeName}`,
+      );
+    }
+  }
+});
+
+test("a DATAGRAM_COUNT after STATUS does not change the outcome", async () => {
+  const call = await createClient(
+    UnreliableEcho,
+    sendingFrames(encodeHeadersFrame({}), ok, count(1)),
+  ).bidi();
+  assert.equal(await call.recv(), undefined);
+  assert.equal((await call.status).code, Code.Ok);
 });

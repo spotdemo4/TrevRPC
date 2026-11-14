@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use trevrpc::client::{
     CallInfo, ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport,
 };
+use trevrpc::framing::{self, DEFAULT_MAX_FRAME_SIZE, frame_type};
 use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::{Metadata, ResponseFrame, RpcKind, RpcRequest, Status, Unreliable};
 
@@ -380,6 +381,129 @@ async fn a_handler_that_sends_only_datagrams_still_gets_its_headers_flushed() ->
     }
     let sent = [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
     ensure_delivered_at_most_once(&sent, &echoed)?;
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    server.stop(TEST_TIMEOUT).await
+}
+
+#[tokio::test]
+async fn the_server_announces_the_datagrams_it_sent_right_before_its_status() -> TestResult {
+    let server = spawn_server(server_options()).await?;
+    let (endpoint, connection) = connect_quic(&server).await?;
+    let mut call = open_raw(&connection, ECHO_ALL, 1).await?;
+    for part in ["a", "b", "c"] {
+        support::write_message(&mut call.send, part.as_bytes()).await?;
+    }
+    call.send.finish()?;
+
+    // The frames of every type, through the STATUS.
+    let mut frames = Vec::new();
+    loop {
+        let frame = within!(
+            TEST_TIMEOUT,
+            support::read_any_frame(&mut call.recv, DEFAULT_MAX_FRAME_SIZE)
+        )??
+        .ok_or("the response ended early")?;
+        let end = frame.frame_type == frame_type::STATUS;
+        frames.push(frame);
+        if end {
+            break;
+        }
+    }
+    let mut received = 0_u64;
+    while let Ok(datagram) =
+        tokio::time::timeout(Duration::from_millis(500), connection.read_datagram()).await
+    {
+        datagram?;
+        received += 1;
+    }
+
+    // Only datagrams were sent, so HEADERS, the count and the STATUS are all there is.
+    let types: Vec<u64> = frames.iter().map(|frame| frame.frame_type).collect();
+    ensure_eq!(
+        types,
+        [
+            frame_type::HEADERS,
+            frame_type::DATAGRAM_COUNT,
+            frame_type::STATUS
+        ]
+    );
+    let count =
+        framing::decode_datagram_count(&frames[1].payload).ok_or("the count is not one integer")?;
+    ensure!(count > 0, "the server announced no datagram");
+    ensure_eq!(count, received, "the announced datagrams all arrived");
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    server.stop(TEST_TIMEOUT).await
+}
+
+#[tokio::test]
+async fn the_server_ends_the_requests_after_the_datagrams_their_count_announced() -> TestResult {
+    let server = spawn_server(server_options()).await?;
+    let (endpoint, connection) = connect_quic(&server).await?;
+    let mut call = open_raw(&connection, ECHO_ALL_RELIABLE_RESPONSES, 4).await?;
+
+    // The request ends, with its count, as the datagrams leave: it may reach the server before
+    // them, and the call must not end without them.
+    support::write_datagram_count(&mut call.send, 3).await?;
+    call.send.finish()?;
+    for part in [b"a", b"b", b"c"] {
+        connection.send_datagram(datagram(4, part))?;
+    }
+
+    let reply = support::read_unary_reply(&mut call.recv).await?;
+    ensure_eq!(reply.status.code(), trevrpc::Code::Ok);
+    let mut echoed = reply.messages;
+    echoed.sort();
+    ensure_eq!(echoed, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    ensure_eq!(
+        reply.status.metadata().get("datagrams"),
+        Some(&b"3".to_vec())
+    );
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    server.stop(TEST_TIMEOUT).await
+}
+
+#[tokio::test]
+async fn the_server_gives_up_on_announced_datagrams_that_never_come() -> TestResult {
+    let server = spawn_server(server_options()).await?;
+    let (endpoint, connection) = connect_quic(&server).await?;
+    let mut call = open_raw(&connection, ECHO_ALL_RELIABLE_RESPONSES, 4).await?;
+
+    // The client announces three datagrams and sends two.
+    for part in [b"a", b"b"] {
+        connection.send_datagram(datagram(4, part))?;
+    }
+    support::write_datagram_count(&mut call.send, 3).await?;
+    call.send.finish()?;
+
+    let reply = support::read_unary_reply(&mut call.recv).await?;
+    ensure_eq!(reply.status.code(), trevrpc::Code::Ok);
+    let mut echoed = reply.messages;
+    echoed.sort();
+    ensure_eq!(echoed, [b"a".to_vec(), b"b".to_vec()]);
+
+    connection.close(0_u32.into(), b"done");
+    endpoint.wait_idle().await;
+    server.stop(TEST_TIMEOUT).await
+}
+
+#[tokio::test]
+async fn the_server_rejects_a_datagram_count_that_is_not_followed_by_the_end() -> TestResult {
+    let server = spawn_server(server_options()).await?;
+    let (endpoint, connection) = connect_quic(&server).await?;
+    let mut call = open_raw(&connection, ECHO_ALL_RELIABLE_RESPONSES, 4).await?;
+
+    support::write_datagram_count(&mut call.send, 1).await?;
+    support::write_message(&mut call.send, b"late").await?;
+    call.send.finish()?;
+
+    let reply = support::read_unary_reply(&mut call.recv).await?;
+    ensure_eq!(reply.status.code(), trevrpc::Code::InvalidArgument);
 
     connection.close(0_u32.into(), b"done");
     endpoint.wait_idle().await;

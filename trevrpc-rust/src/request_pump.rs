@@ -7,7 +7,7 @@ use futures_util::FutureExt as _;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::framed::{self, FrameRead};
+use crate::framed::{self, FrameRead, RequestFrame};
 use crate::server::{CancellationSource, RequestBudget};
 use crate::transport_error::{self, TransportFailureKind};
 use crate::{BoxStream, Code, Error, Result, Status};
@@ -167,7 +167,16 @@ pub trait RequestPumpReader: FrameRead + Send + Sized + 'static {
                 })
                 .await;
             budget.stream = stream;
-            frame
+            match frame? {
+                RequestFrame::Message(body) => Ok(Some(body)),
+                RequestFrame::End(count) => {
+                    // The handler's requests end once the datagrams the count announces are in.
+                    if let Some(count) = count {
+                        budget.datagrams.set(count);
+                    }
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -1553,5 +1562,50 @@ mod tests {
         assert_eq!(failure.status().code(), Code::InvalidArgument);
         assert!(failure.cancellation_source().is_none());
         let _ = pump.settle(RequestPumpSettle::ResponseCommitted).await;
+    }
+
+    fn count_frame(count: u64) -> Vec<u8> {
+        let mut frame = Vec::new();
+        crate::framing::put_datagram_count_frame(&mut frame, count).expect("count should encode");
+        frame
+    }
+
+    #[tokio::test]
+    async fn request_pump_records_the_datagram_count_its_stream_ends_with() {
+        let mut io = test_io(None);
+        io.writer
+            .write_all(&[message(b"m"), count_frame(2)].concat())
+            .await
+            .expect("frames should be written");
+        drop(io.writer);
+        let announced = crate::datagram::Expected::default().announced();
+        let mut budget = RequestBudget::new(None, None);
+        budget.datagrams = announced.clone();
+        let (mut body, pump) = start_pump(io.reader, streaming(), 1024, budget);
+
+        assert_eq!(body.next().await.unwrap().unwrap(), b"m");
+        // The count is recorded before the bodies end.
+        assert!(body.next().await.is_none());
+        assert_eq!(announced.get(), Some(2));
+        assert_eq!(
+            pump.settle(RequestPumpSettle::ResponseCommitted).await,
+            super::RequestPumpOutcome::CleanFin
+        );
+    }
+
+    #[tokio::test]
+    async fn request_pump_fails_a_stream_with_a_message_after_its_datagram_count() {
+        let mut io = test_io(None);
+        io.writer
+            .write_all(&[count_frame(2), message(b"late")].concat())
+            .await
+            .expect("frames should be written");
+        let (_body, mut pump) = start_request_pump(io.reader, streaming(), 1024);
+
+        let failure = tokio::time::timeout(Duration::from_secs(1), pump.failure())
+            .await
+            .expect("the protocol error should wake control");
+        assert!(matches!(failure, RequestPumpFailure::Protocol(_)));
+        assert_eq!(failure.status().code(), Code::InvalidArgument);
     }
 }

@@ -186,7 +186,10 @@ internal class CallStream(
     /** Where the response is in its grammar. Only the one reader of [receive] touches it. */
     private var position = Position.START
 
-    /** The response grammar is `ANSWER? HEADERS? MESSAGE* STATUS`. */
+    /** Whether a DATAGRAM_COUNT arrived, which only STATUS may follow. */
+    private var counted = false
+
+    /** The response grammar is `ANSWER? HEADERS? MESSAGE* DATAGRAM_COUNT? STATUS`. */
     private enum class Position {
         /** Nothing arrived yet. */
         START,
@@ -363,6 +366,11 @@ internal class CallStream(
                     continue
                 }
 
+                // The call has no datagram flow, so there are no datagrams to wait for.
+                is ResponseFrame.DatagramCount -> {
+                    continue
+                }
+
                 is ResponseFrame.Message -> {
                     if (frame.streamSize == null) {
                         inflateResponse(frame, compression, maxMessageSize)
@@ -388,7 +396,14 @@ internal class CallStream(
      * reader to reject, as the data after the final status it is.
      */
     private fun admit(frame: ResponseFrame) {
+        if (counted && position != Position.ENDED && frame !is ResponseFrame.Status) {
+            throw TrevRpcException(Status.internal("response DATAGRAM_COUNT may only be followed by STATUS"))
+        }
         when (frame) {
+            is ResponseFrame.DatagramCount -> {
+                if (position != Position.ENDED) counted = true
+            }
+
             is ResponseFrame.Answer -> {
                 if (position != Position.START) {
                     throw TrevRpcException(Status.internal("response ANSWER must be the first frame and appear at most once"))

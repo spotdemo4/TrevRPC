@@ -80,7 +80,7 @@ func FuzzFrameReaderNeverPanics(f *testing.F) {
 				}
 				return
 			}
-			if !next.typ.known() || next.typ == frameTypeZstdMessage || next.typ == frameTypeZstdStreamMessage || len(next.payload) > 64 {
+			if !next.typ.known() || next.typ == frameTypeZstdMessage || next.typ == frameTypeZstdStreamMessage || next.typ == frameTypeDatagramCount || len(next.payload) > 64 {
 				t.Fatalf("frame reader returned %v with %d payload bytes", next.typ, len(next.payload))
 			}
 		}

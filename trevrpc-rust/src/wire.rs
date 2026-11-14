@@ -355,9 +355,17 @@ mod tests {
 
     use prost::Message;
 
-    use crate::framed::{next_known_header, read_payload};
+    use bytes::Bytes;
+
+    use crate::compression::Accept;
+    use crate::datagram::Expected;
+    use crate::framed::{
+        RequestFrame, ResponseReading, next_known_header, read_payload, read_request,
+        read_request_end, read_request_frame, read_response_frame,
+    };
     use crate::framing::{
-        DEFAULT_MAX_FRAME_SIZE, decode_payload, encode_frame, encode_protobuf_frame, frame_type,
+        DEFAULT_MAX_FRAME_SIZE, ResponseFrame, decode_datagram_count, decode_payload, encode_frame,
+        encode_protobuf_frame, frame_type, put_datagram_count_frame,
     };
     use crate::test_io::Script;
     use crate::{Code, Detail, Metadata, Status};
@@ -715,6 +723,30 @@ mod tests {
         checked.insert(name.to_owned());
     }
 
+    /// Checks one `DATAGRAM_COUNT` frame: the count encodes to the fixture's payload and frame
+    /// bytes, the payload decodes back, and the real frame reader reads the frame back.
+    async fn check_datagram_count(
+        vectors: &Vectors,
+        checked: &mut BTreeSet<String>,
+        name: &str,
+        count: u64,
+    ) {
+        let mut payload = Vec::new();
+        crate::varint::push(&mut payload, count).expect("count should encode");
+        let mut frame = Vec::new();
+        put_datagram_count_frame(&mut frame, count).expect("frame should encode");
+
+        assert_eq!(payload, vectors.get(&format!("{name}.payload")), "{name}");
+        assert_eq!(frame, vectors.get(&format!("{name}.frame")), "{name}");
+        assert_eq!(decode_datagram_count(&payload), Some(count), "{name}");
+        assert_eq!(
+            read_known_frames(&frame, 2).await,
+            [(frame_type::DATAGRAM_COUNT, payload)],
+            "{name}"
+        );
+        checked.insert(name.to_owned());
+    }
+
     fn metadata(key: &str, value: &[u8]) -> Metadata {
         Metadata::from([(key.to_owned(), value.to_vec())])
     }
@@ -883,6 +915,9 @@ mod tests {
         )
         .await;
 
+        check_datagram_count(&vectors, &mut checked, "datagram_count.one", 1).await;
+        check_datagram_count(&vectors, &mut checked, "datagram_count.large", 300).await;
+
         check_raw_frame(
             &vectors,
             &mut checked,
@@ -897,6 +932,87 @@ mod tests {
             vectors.frame_names(),
             "every .frame vector needs a logical value check"
         );
+    }
+
+    #[tokio::test]
+    async fn the_request_reader_accepts_the_golden_datagram_count_stream() {
+        let vectors = Vectors::load();
+        let wire = vectors.get("stream.datagram_count_request.stream");
+
+        for read_size in [1, 3, 4096] {
+            let mut recv = Script::with_read_size(wire.to_vec(), read_size);
+            let request = read_request(&mut recv, DEFAULT_MAX_FRAME_SIZE, |_| Ok(()))
+                .await
+                .expect("REQUEST should read");
+            assert_eq!(request.datagram_flow, 1);
+            let mut next = async || {
+                read_request_frame(
+                    &mut recv,
+                    DEFAULT_MAX_FRAME_SIZE,
+                    &Accept::None,
+                    None,
+                    |_| Ok(()),
+                )
+                .await
+                .expect("frame should read")
+            };
+            assert_eq!(
+                next().await,
+                RequestFrame::Message(Bytes::from_static(b"hi"))
+            );
+            // The count comes with the end of the stream.
+            assert_eq!(next().await, RequestFrame::End(Some(2)));
+        }
+
+        // A reader that expects no more messages takes the same stream to its end.
+        let mut recv = Script::new(wire.to_vec());
+        read_request(&mut recv, DEFAULT_MAX_FRAME_SIZE, |_| Ok(()))
+            .await
+            .expect("REQUEST should read");
+        read_request_frame(
+            &mut recv,
+            DEFAULT_MAX_FRAME_SIZE,
+            &Accept::None,
+            None,
+            |_| Ok(()),
+        )
+        .await
+        .expect("message should read");
+        read_request_end(&mut recv, DEFAULT_MAX_FRAME_SIZE, |_| Ok(()), "unexpected")
+            .await
+            .expect("the count and the end should read");
+    }
+
+    #[tokio::test]
+    async fn the_response_reader_accepts_the_golden_datagram_count_stream() {
+        let vectors = Vectors::load();
+        let wire = vectors.get("stream.datagram_count_response.stream");
+
+        for read_size in [1, 3, 4096] {
+            let announced = Expected::default().announced();
+            let mut reading = ResponseReading {
+                datagrams: announced.clone(),
+                ..ResponseReading::default()
+            };
+            let mut recv = Script::with_read_size(wire.to_vec(), read_size);
+            let mut frames = Vec::new();
+            while let Some(frame) =
+                read_response_frame(&mut recv, DEFAULT_MAX_FRAME_SIZE, &mut reading)
+                    .await
+                    .expect("frame should read")
+            {
+                frames.push(frame);
+            }
+            // The count, a non-minimal 3, is recorded and not a frame of the response.
+            assert_eq!(
+                frames,
+                [
+                    ResponseFrame::Headers(Metadata::new()),
+                    ResponseFrame::Status(Status::ok())
+                ]
+            );
+            assert_eq!(announced.get(), Some(3));
+        }
     }
 
     #[tokio::test]

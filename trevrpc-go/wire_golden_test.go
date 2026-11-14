@@ -16,6 +16,7 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"github.com/quic-go/quic-go/quicvarint"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -210,6 +211,22 @@ func TestWireGoldenVectors(t *testing.T) {
 		})
 	}
 
+	// The reader takes a DATAGRAM_COUNT in itself instead of returning it.
+	for name, count := range map[string]uint64{"datagram_count.one": 1, "datagram_count.large": 300} {
+		t.Run(name, func(t *testing.T) {
+			frame := appendDatagramCountFrame(nil, count)
+			assertGoldenBytes(t, name+".frame", frame, vectors)
+			assertGoldenBytes(t, name+".payload", quicvarint.Append(nil, count), vectors)
+			reader := newFrameReader(bytes.NewReader(frame), DefaultMaxFrameSize, -1)
+			if next, err := reader.next(); !errors.Is(err, io.EOF) {
+				t.Fatalf("read %s.frame = %v, %v; want it taken in", name, next, err)
+			}
+			if !reader.counted || reader.datagramCount() != count {
+				t.Fatalf("datagram count = %d (counted %v), want %d", reader.datagramCount(), reader.counted, count)
+			}
+		})
+	}
+
 	t.Run("grease.two_byte_type", func(t *testing.T) {
 		frame := appendFrameHeader(nil, 0x40, 3)
 		frame = append(frame, 0, 1, 2)
@@ -348,6 +365,7 @@ func TestWireGoldenStreams(t *testing.T) {
 		if !ok {
 			t.Fatalf("wire golden vector %q has no .frames", name)
 		}
+		wantFrames = datagramCountValues(t, wantFrames)
 		data := decodeGoldenHex(t, name, value)
 
 		for readerName, wrap := range map[string]func(io.Reader) io.Reader{
@@ -359,7 +377,12 @@ func TestWireGoldenStreams(t *testing.T) {
 				reader := newFrameReader(wrap(bytes.NewReader(data)), DefaultMaxFrameSize, -1)
 				var got []string
 				for {
+					counted := reader.counted
 					next, err := reader.next()
+					if !counted && reader.counted {
+						// Taken in on the way to the frame or the end returned.
+						got = append(got, fmt.Sprintf("7:#%d", reader.datagramCount()))
+					}
 					if errors.Is(err, io.EOF) {
 						break
 					}
@@ -377,6 +400,26 @@ func TestWireGoldenStreams(t *testing.T) {
 	if streams == 0 {
 		t.Fatal("no wire golden streams were found")
 	}
+}
+
+// datagramCountValues replaces the payload of every DATAGRAM_COUNT in a
+// .frames value with the count it encodes, as #count, since the reader keeps
+// the count rather than the payload.
+func datagramCountValues(t *testing.T, frames string) string {
+	t.Helper()
+	entries := strings.Split(frames, ",")
+	for i, entry := range entries {
+		payload, ok := strings.CutPrefix(entry, "7:")
+		if !ok {
+			continue
+		}
+		count, n, err := quicvarint.Parse(decodeGoldenHex(t, entry, payload))
+		if err != nil || n != len(payload)/2 {
+			t.Fatalf("DATAGRAM_COUNT payload %q is not one varint", payload)
+		}
+		entries[i] = fmt.Sprintf("7:#%d", count)
+	}
+	return strings.Join(entries, ",")
 }
 
 func metadataEqual(left, right Metadata) bool {
