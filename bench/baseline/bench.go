@@ -307,8 +307,14 @@ func summarize(cfg benchConfig, results []workerResult, wire wireSample) (benchR
 		},
 	}
 	res.BytesPerSec = res.MsgsPerSec * float64(cfg.size)
-	if wire.msgs > 0 {
-		perMsg := float64(wire.bytes) / float64(wire.msgs)
+	// A sampler starved until the window had passed sees no message; the
+	// window's are then the only count there is.
+	wireMsgs := wire.msgs
+	if wireMsgs == 0 {
+		wireMsgs = msgs
+	}
+	if wireMsgs > 0 {
+		perMsg := float64(wire.bytes) / float64(wireMsgs)
 		res.WireBytesPerMsg = &perMsg
 	}
 	return res, nil

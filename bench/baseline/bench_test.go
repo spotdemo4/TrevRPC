@@ -91,3 +91,67 @@ func TestReportErrorsPrintsEachWorkersFirstError(t *testing.T) {
 		t.Fatalf("reportErrors printed\n%s\nwant\n%s", out.String(), want)
 	}
 }
+
+// deliveringWorker delivers one message on each call.
+type deliveringWorker struct{}
+
+func (deliveringWorker) do(context.Context) (int, error) { return 1, nil }
+func (deliveringWorker) close()                          {}
+
+// TestRunWorkerCountsDeliveredMessagesOutsideTheWindow runs calls before the
+// window starts: none is measured, but each counts as delivered, which is
+// what snapshotWire reads at its instants.
+func TestRunWorkerCountsDeliveredMessagesOutsideTheWindow(t *testing.T) {
+	var delivered atomic.Uint64
+	now := time.Now()
+	result := runWorker(t.Context(), deliveringWorker{}, &delivered, now.Add(time.Hour), now.Add(10*time.Millisecond))
+	if result.msgs != 0 {
+		t.Fatalf("measured messages = %d, want 0 before the window", result.msgs)
+	}
+	if delivered.Load() == 0 {
+		t.Fatal("delivered messages = 0, want every call's")
+	}
+}
+
+// TestSnapshotWireTakesWhatChangedBetweenItsInstants samples a connection and
+// workers that already carried bytes and messages before the window: the
+// sample holds only what changed between its two instants, here nothing.
+func TestSnapshotWireTakesWhatChangedBetweenItsInstants(t *testing.T) {
+	var counter wireCounter
+	counter.written.Store(500)
+	delivered := make([]atomic.Uint64, 2)
+	delivered[0].Store(7)
+	delivered[1].Store(3)
+	now := time.Now()
+	sample, ok := snapshotWire(t.Context(), &counter, delivered, now, now)
+	if !ok {
+		t.Fatal("snapshotWire did not sample")
+	}
+	if sample != (wireSample{}) {
+		t.Fatalf("sample = %+v, want nothing carried between its instants", sample)
+	}
+}
+
+// TestSummarizeDividesWireBytesByTheSampledMessages divides the sample's bytes
+// by the messages delivered between its instants, not by the window's msgs:
+// the sampler wakes late on a busy machine, so the two cover different
+// intervals.
+func TestSummarizeDividesWireBytesByTheSampledMessages(t *testing.T) {
+	results := []workerResult{{latencies: []time.Duration{time.Millisecond}, msgs: 10}}
+	res, err := summarize(benchConfig{}, results, wireSample{bytes: 1000, msgs: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.WireBytesPerMsg == nil || *res.WireBytesPerMsg != 250 {
+		t.Fatalf("wire bytes per message = %v, want 250", res.WireBytesPerMsg)
+	}
+	// A sampler starved past the window saw no message: the window's count is
+	// the only one.
+	res, err = summarize(benchConfig{}, results, wireSample{bytes: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.WireBytesPerMsg == nil || *res.WireBytesPerMsg != 100 {
+		t.Fatalf("wire bytes per message with no message sampled = %v, want 100", res.WireBytesPerMsg)
+	}
+}

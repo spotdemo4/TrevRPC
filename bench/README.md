@@ -388,7 +388,8 @@ non-zero if it could not connect or measure:
   of the same interval. The bytes are sampled when the client wakes at the
   start and the end of the window, which a busy machine delays, so the
   messages are those the operations delivered between the same two instants,
-  not `msgs`. The paced scenarios count a message by when it was scheduled,
+  not `msgs`, unless the client woke too late to see any, when `msgs` is the
+  only count there is. The paced scenarios count a message by when it was scheduled,
   and a worker that falls behind sends the window's last messages after it,
   so they divide by the messages sent between those instants and echoed in
   time. It is omitted where the transport stack does not expose connection

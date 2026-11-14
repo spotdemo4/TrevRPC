@@ -702,7 +702,8 @@ func (o *bidiOperation) close() {
 	o.call = nil
 }
 
-// benchWorker holds what one worker measured. Only its goroutine writes it.
+// benchWorker holds what one worker measured. Only its goroutine writes it,
+// and only delivered, which is atomic, is read while the worker runs.
 type benchWorker struct {
 	latencies []time.Duration
 	messages  uint64
@@ -909,17 +910,19 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		}
 		return total
 	}
-	var wireBefore, wireAfter, deliveredBefore, deliveredAfter uint64
-	var wireFrom, wireTo time.Time
+	var sample wireSample
+	var wireBefore, deliveredBefore uint64
 	waitErr := sleepUntil(ctx, start)
 	if wire != nil {
-		wireFrom, wireBefore, deliveredBefore = time.Now(), wire.total(), deliveredSoFar()
+		sample.from, wireBefore, deliveredBefore = time.Now(), wire.total(), deliveredSoFar()
 	}
 	if waitErr == nil {
 		waitErr = sleepUntil(ctx, end)
 	}
 	if wire != nil {
-		wireAfter, deliveredAfter, wireTo = wire.total(), deliveredSoFar(), time.Now()
+		sample.bytes = wire.total() - wireBefore
+		sample.delivered = deliveredSoFar() - deliveredBefore
+		sample.to = time.Now()
 	}
 	if waitErr != nil {
 		cancel()
@@ -934,20 +937,36 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		return err
 	}
 	if wire != nil {
-		// The wire bytes are divided by the messages of the same interval: for
-		// paced messages, which count by when they were scheduled, possibly
-		// long before they were sent, those sent in it, and for operations
-		// those delivered in it.
-		wireMsgs := deliveredAfter - deliveredBefore
-		if config.paced() {
-			wireMsgs = deliveredBetween(workers, wireFrom, wireTo)
-		}
-		if wireMsgs > 0 {
-			perMsg := float64(wireAfter-wireBefore) / float64(wireMsgs)
-			result.WireBytesPerMsg = &perMsg
-		}
+		result.WireBytesPerMsg = sample.perMessage(&config, workers, result.Msgs)
 	}
 	return json.NewEncoder(out).Encode(result)
+}
+
+// wireSample is the bytes the client's connections carried between two
+// instants, and the messages its operations delivered between them.
+type wireSample struct {
+	bytes, delivered uint64
+	from, to         time.Time
+}
+
+// perMessage divides the sample's bytes by the messages of its interval: for
+// paced messages, which count by when they were scheduled, possibly long
+// before they were sent, those sent in it, and for operations those
+// delivered in it. A sampler starved until the window had passed sees none;
+// the window's messages, windowed, are then the only count there is. It is
+// nil when there were none at all.
+func (s wireSample) perMessage(config *benchConfig, workers []benchWorker, windowed uint64) *float64 {
+	messages := s.delivered
+	if config.paced() {
+		messages = deliveredBetween(workers, s.from, s.to)
+	} else if messages == 0 {
+		messages = windowed
+	}
+	if messages == 0 {
+		return nil
+	}
+	perMsg := float64(s.bytes) / float64(messages)
+	return &perMsg
 }
 
 // sleepUntil waits for t, or fails when ctx ends first.

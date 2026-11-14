@@ -735,3 +735,44 @@ func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 		}
 	}
 }
+
+// TestWireBytesAreDividedByTheMessagesOfTheSampledInterval divides a sample's
+// bytes by the messages delivered between its two instants, not by the
+// window's msgs: the sampler wakes late on a busy machine, so the two cover
+// different intervals.
+func TestWireBytesAreDividedByTheMessagesOfTheSampledInterval(t *testing.T) {
+	config := &benchConfig{scenario: "unary"}
+	got := wireSample{bytes: 1000, delivered: 4}.perMessage(config, nil, 10)
+	if got == nil || *got != 250 {
+		t.Fatalf("wire bytes per message = %v, want 250", got)
+	}
+	// A sampler starved past the window saw no message: the window's count is
+	// the only one.
+	if got := (wireSample{bytes: 1000}).perMessage(config, nil, 10); got == nil || *got != 100 {
+		t.Fatalf("wire bytes per message with no message sampled = %v, want 100", got)
+	}
+	if got := (wireSample{bytes: 1000}).perMessage(config, nil, 0); got != nil {
+		t.Fatalf("wire bytes per message with no message at all = %v, want none", *got)
+	}
+}
+
+// countingOperation is an operation that delivers one message per run.
+type countingOperation struct{}
+
+func (countingOperation) run(context.Context) (int, error) { return 1, nil }
+func (countingOperation) close()                           {}
+
+// TestOperationsCountDeliveredMessagesOutsideTheWindow runs operations before
+// the window starts: none is measured, but each counts as delivered, which is
+// what the wire sampling reads at its instants.
+func TestOperationsCountDeliveredMessagesOutsideTheWindow(t *testing.T) {
+	var w benchWorker
+	now := time.Now()
+	operationLoop{operation: countingOperation{}}.work(t.Context(), &w, now.Add(time.Hour), now.Add(10*time.Millisecond))
+	if w.messages != 0 {
+		t.Fatalf("measured messages = %d, want 0 before the window", w.messages)
+	}
+	if w.delivered.Load() == 0 {
+		t.Fatal("delivered messages = 0, want every operation's")
+	}
+}

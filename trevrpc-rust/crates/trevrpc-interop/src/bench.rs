@@ -1137,8 +1137,12 @@ impl Report {
                     .flat_map(|result| &result.delivered_sends)
                     .filter(|&&sent| sent >= sample.from && sent < sample.to)
                     .fold(0_u64, |total, _| total.saturating_add(1))
-            } else {
+            } else if sample.delivered > 0 {
                 sample.delivered
+            } else {
+                // A sampler starved until the window had passed sees no message; the window's
+                // are then the only count there is.
+                msgs
             };
             (sample.bytes, wire_msgs)
         });
@@ -1256,7 +1260,13 @@ const fn count(value: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerResult, error_breakdown};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::{Params, Report, WireSample, WorkerResult, error_breakdown};
+    use crate::Flags;
 
     fn worker(errors: &[(&str, u64)]) -> WorkerResult {
         WorkerResult {
@@ -1283,5 +1293,44 @@ mod tests {
                 ("operation timed out", 1),
             ]
         );
+    }
+
+    /// The wire bytes are divided by the messages delivered between the sample's two instants, not
+    /// by the window's: the sampler wakes late on a busy machine, so the two cover different
+    /// intervals.
+    #[test]
+    fn wire_bytes_are_divided_by_the_messages_of_the_sampled_interval() {
+        let params =
+            Params::parse(&Flags(HashMap::from([("scenario", "unary".to_owned())]))).unwrap();
+        let results = || {
+            vec![WorkerResult {
+                latencies: vec![Duration::from_millis(1)],
+                messages: 10,
+                ..WorkerResult::default()
+            }]
+        };
+        let from = Instant::now();
+        let wire = WireSample {
+            bytes: 1000,
+            delivered: 4,
+            from,
+            to: from,
+        };
+        let json = Report::new(&params, "quic", results(), Some(wire))
+            .unwrap()
+            .json();
+        assert!(json.contains(r#""wire_bytes_per_msg":250.0"#), "{json}");
+
+        // A sampler starved past the window saw no message: the window's count is the only one.
+        let starved = WireSample {
+            bytes: 1000,
+            delivered: 0,
+            from,
+            to: from,
+        };
+        let json = Report::new(&params, "quic", results(), Some(starved))
+            .unwrap()
+            .json();
+        assert!(json.contains(r#""wire_bytes_per_msg":100.0"#), "{json}");
     }
 }
