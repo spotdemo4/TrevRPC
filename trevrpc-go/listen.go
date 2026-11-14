@@ -258,6 +258,13 @@ func (l *Listener) stopAccepting() error {
 // then cancels in-flight RPCs and waits up to GracefulShutdownTimeout for
 // handlers to finish. It returns nil after a requested shutdown.
 //
+// HTTP/2 connections are the exception to a prompt return: net/http sends
+// them GOAWAY and, once their streams have ended, leaves each open for up to
+// a second for the client to close it, within GracefulShutdownTimeout. Cronet
+// closes the connection as soon as GOAWAY arrives with no streams open; other
+// HTTP/2 clients, such as Go's, may keep Serve waiting for that second. QUIC,
+// QMux and WebSocket connections close once their RPCs have ended.
+//
 // The contexts of handlers, interceptors and authorizers carry the values of
 // ctx, such as a logger, but not its cancellation: cancelling ctx shuts the
 // listener down gracefully as described above.
