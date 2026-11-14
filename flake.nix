@@ -381,311 +381,280 @@
         };
 
         # nix flake check
-        checks = pkgs.mkChecks {
-          inherit (self.packages.${system})
-            trevrpc-erlang
-            trevrpc-erlang-interop
-            trevrpc-go
-            trevrpc-go-otel
-            trevrpc-go-protovalidate
-            trevrpc-go-interop
-            trevrpc-js
-            trevrpc-js-effect
-            trevrpc-js-protovalidate
-            trevrpc-kotlin
-            trevrpc-rust
-            trevrpc-bench-baseline
-            trevrpc-bench-micro
-            ;
+        checks =
+          let
+            packages = self.packages.${system};
 
-          bench = pkgs.callPackage ./bench/check.nix {
-            inherit (self.packages.${system}) trevrpc-bench;
-          };
-          interop = pkgs.callPackage ./interop/check.nix {
-            inherit (self.packages.${system}) trevrpc-interop;
-          };
-          kotlin-interop-android = self.packages.${system}.trevrpc-kotlin.interopAndroid;
-          # The npm tarballs as the release job packs them, from the sources and not the builds.
-          trevrpc-js-release = pkgs.callPackage ./trevrpc-js/release-check.nix {
-            inherit (self.packages.${system})
+            # golangci-lint over a Go module's packages.
+            goLint = src: {
+              inherit src;
+              packages = with pkgs; [ golangci-lint ];
+              script = ''
+                golangci-lint run ./...
+              '';
+            };
+
+            # oxfmt, and oxlint and tsc over an npm package with the code its build generates;
+            # `lint` runs oxlint, and `comment` says what the build generates for it.
+            jsLint =
+              src:
+              { comment, lint }:
+              {
+                inherit src;
+                packages = with pkgs; [
+                  oxfmt
+                  oxlint
+                ];
+                script = ''
+                  oxfmt --check
+                  ${comment}
+                  npm run build
+                  ${lint}
+                  npm exec -- tsc -p tsconfig.json
+                '';
+              };
+
+            # An adapter's `npm run lint` gives oxlint the adapter's own directories.
+            jsAdapterLint =
+              src:
+              jsLint src {
+                comment = ''
+                  # oxlint's type-aware rules and tsc read the generated test client. oxlint is given
+                  # the package's own directories, so it doesn't follow the link to trevrpc-js.'';
+                lint = "npm run lint";
+              };
+          in
+          pkgs.mkChecks {
+            inherit (packages)
+              trevrpc-erlang
+              trevrpc-erlang-interop
+              trevrpc-go
+              trevrpc-go-otel
+              trevrpc-go-protovalidate
+              trevrpc-go-interop
               trevrpc-js
               trevrpc-js-effect
               trevrpc-js-protovalidate
+              trevrpc-kotlin
+              trevrpc-rust
+              trevrpc-bench-baseline
+              trevrpc-bench-micro
               ;
-          };
 
-          trevrpc-erlang-lint = {
-            src = self.packages.${system}.trevrpc-erlang;
-            packages = with pkgs; [ erlfmt ];
-            script = ''
-              erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
-            '';
-          };
+            bench = pkgs.callPackage ./bench/check.nix {
+              inherit (packages) trevrpc-bench;
+            };
+            interop = pkgs.callPackage ./interop/check.nix {
+              inherit (packages) trevrpc-interop;
+            };
+            kotlin-interop-android = packages.trevrpc-kotlin.interopAndroid;
+            # The npm tarballs as the release job packs them, from the sources and not the builds.
+            trevrpc-js-release = pkgs.callPackage ./trevrpc-js/release-check.nix {
+              inherit (packages)
+                trevrpc-js
+                trevrpc-js-effect
+                trevrpc-js-protovalidate
+                ;
+            };
 
-          trevrpc-erlang-interop-lint = {
-            root = ./trevrpc-erlang/interop;
-            files = [
-              ./trevrpc-erlang/interop/rebar.config
-              ./trevrpc-erlang/interop/src
-            ];
-            packages = with pkgs; [ erlfmt ];
-            script = ''
-              erlfmt --check rebar.config src/*.erl src/*.app.src
-            '';
-          };
+            trevrpc-erlang-lint = {
+              src = packages.trevrpc-erlang;
+              packages = with pkgs; [ erlfmt ];
+              script = ''
+                erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
+              '';
+            };
 
-          trevrpc-go-lint = {
-            src = self.packages.${system}.trevrpc-go;
-            packages = with pkgs; [ golangci-lint ];
-            script = ''
-              golangci-lint run ./...
-            '';
-          };
+            trevrpc-erlang-interop-lint = {
+              root = ./trevrpc-erlang/interop;
+              files = [
+                ./trevrpc-erlang/interop/rebar.config
+                ./trevrpc-erlang/interop/src
+              ];
+              packages = with pkgs; [ erlfmt ];
+              script = ''
+                erlfmt --check rebar.config src/*.erl src/*.app.src
+              '';
+            };
 
-          trevrpc-go-otel-lint = {
-            src = self.packages.${system}.trevrpc-go-otel;
-            packages = with pkgs; [ golangci-lint ];
-            script = ''
-              golangci-lint run ./...
-            '';
-          };
+            trevrpc-go-lint = goLint packages.trevrpc-go;
+            trevrpc-go-otel-lint = goLint packages.trevrpc-go-otel;
+            trevrpc-go-interop-lint = goLint packages.trevrpc-go-interop;
+            trevrpc-go-protovalidate-lint = goLint packages.trevrpc-go-protovalidate;
+            trevrpc-bench-baseline-lint = goLint packages.trevrpc-bench-baseline;
 
-          trevrpc-go-interop-lint = {
-            src = self.packages.${system}.trevrpc-go-interop;
-            packages = with pkgs; [ golangci-lint ];
-            script = ''
-              golangci-lint run ./...
-            '';
-          };
+            trevrpc-rust-lint = {
+              src = packages.trevrpc-rust;
+              packages = with pkgs; [
+                rustfmt
+                clippy
+              ];
+              script = ''
+                cargo fmt --all --check
+                cargo clippy --workspace --all-targets --offline -- -D warnings
+                cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
+              '';
+            };
 
-          trevrpc-go-protovalidate-lint = {
-            src = self.packages.${system}.trevrpc-go-protovalidate;
-            packages = with pkgs; [ golangci-lint ];
-            script = ''
-              golangci-lint run ./...
-            '';
-          };
+            trevrpc-js-lint = jsLint packages.trevrpc-js {
+              comment = "# oxlint's type-aware rules and tsc read the generated interop clients.";
+              lint = "oxlint --deny-warnings";
+            };
+            trevrpc-js-effect-lint = jsAdapterLint packages.trevrpc-js-effect;
+            trevrpc-js-protovalidate-lint = jsAdapterLint packages.trevrpc-js-protovalidate;
 
-          trevrpc-bench-baseline-lint = {
-            src = self.packages.${system}.trevrpc-bench-baseline;
-            packages = with pkgs; [ golangci-lint ];
-            script = ''
-              golangci-lint run ./...
-            '';
-          };
+            trevrpc-js-protoc-gen-lint = {
+              src = packages.trevrpc-js.protocGen;
+              packages = with pkgs; [
+                oxfmt
+                oxlint
+              ];
+              script = ''
+                oxfmt --check
+                npm run lint
+              '';
+            };
 
-          trevrpc-rust-lint = {
-            src = self.packages.${system}.trevrpc-rust;
-            packages = with pkgs; [
-              rustfmt
-              clippy
-            ];
-            script = ''
-              cargo fmt --all --check
-              cargo clippy --workspace --all-targets --offline -- -D warnings
-              cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
-            '';
-          };
+            # ktlint needs none of the dependencies, so it reads the sources instead of the package.
+            trevrpc-kotlin-lint = {
+              root = ./trevrpc-kotlin;
+              filter = file: file.hasExt "kt" || file.hasExt "kts";
+              packages = with pkgs; [
+                ktlint
+              ];
+              script = ''
+                ktlint --relative "**/src/**/*.kt" "**/*.gradle.kts"
+              '';
+            };
 
-          trevrpc-js-lint = {
-            src = self.packages.${system}.trevrpc-js;
-            packages = with pkgs; [
-              oxfmt
-              oxlint
-            ];
-            script = ''
-              oxfmt --check
-              # oxlint's type-aware rules and tsc read the generated interop clients.
-              npm run build
-              oxlint --deny-warnings
-              npm exec -- tsc -p tsconfig.json
-            '';
-          };
+            protobuf-lint = {
+              root = ./proto;
+              filter = file: file.hasExt "proto" || file.hasExt "yaml" || file.hasExt "md";
+              packages = with pkgs; [
+                buf
+              ];
+              script = ''
+                export BUF_CACHE_DIR=$(mktemp -d)
+                buf lint
+                buf format --diff --exit-code
+                buf build -o /dev/null
+              '';
+            };
 
-          trevrpc-js-effect-lint = {
-            src = self.packages.${system}.trevrpc-js-effect;
-            packages = with pkgs; [
-              oxfmt
-              oxlint
-            ];
-            script = ''
-              oxfmt --check
-              # oxlint's type-aware rules and tsc read the generated test client. oxlint is given
-              # the package's own directories, so it doesn't follow the link to trevrpc-js.
-              npm run build
-              npm run lint
-              npm exec -- tsc -p tsconfig.json
-            '';
-          };
+            nix = {
+              root = ./.;
+              filter = file: file.hasExt "nix";
+              packages = with pkgs; [
+                nixfmt
+              ];
+              script = ''
+                nixfmt --check "$file"
+              '';
+            };
 
-          trevrpc-js-protovalidate-lint = {
-            src = self.packages.${system}.trevrpc-js-protovalidate;
-            packages = with pkgs; [
-              oxfmt
-              oxlint
-            ];
-            script = ''
-              oxfmt --check
-              # oxlint's type-aware rules and tsc read the generated test client. oxlint is given
-              # the package's own directories, so it doesn't follow the link to trevrpc-js.
-              npm run build
-              npm run lint
-              npm exec -- tsc -p tsconfig.json
-            '';
-          };
+            shell-lint = {
+              root = ./.;
+              filter = file: file.hasExt "sh";
+              packages = with pkgs; [
+                shellcheck
+              ];
+              script = ''
+                shellcheck --external-sources "$file"
+              '';
+            };
 
-          trevrpc-js-protoc-gen-lint = {
-            src = self.packages.${system}.trevrpc-js.protocGen;
-            packages = with pkgs; [
-              oxfmt
-              oxlint
-            ];
-            script = ''
-              oxfmt --check
-              npm run lint
-            '';
-          };
+            python-lint = {
+              root = ./.;
+              filter = file: file.hasExt "py";
+              include = [ ./pyproject.toml ];
+              packages = with pkgs; [
+                ruff
+                pyright
+              ];
+              script = ''
+                ruff check
+                ruff format --check
+                pyright
+              '';
+            };
 
-          # ktlint needs none of the dependencies, so it reads the sources instead of the package.
-          trevrpc-kotlin-lint = {
-            root = ./trevrpc-kotlin;
-            filter = file: file.hasExt "kt" || file.hasExt "kts";
-            packages = with pkgs; [
-              ktlint
-            ];
-            script = ''
-              ktlint --relative "**/src/**/*.kt" "**/*.gradle.kts"
-            '';
-          };
+            # The unit tests of the interop and bench runners, which interop/runner.nix packages.
+            python-test = {
+              root = ./.;
+              files = [
+                ./interop
+                ./bench
+              ];
+              filter = file: file.hasExt "py";
+              # The interop runner takes its compression dictionary from these.
+              include = [ ./testdata/zstd-golden-vectors.txt ];
+              # The harness makes certificates with openssl, and the bench tests train the benchmark
+              # dictionary with zstd.
+              packages = with pkgs; [
+                python3
+                openssl
+                zstd
+              ];
+              script = ''
+                python3 -I -m unittest discover -s interop
+                python3 -I -m unittest discover -s bench
+              '';
+            };
 
-          protobuf-lint = {
-            root = ./proto;
-            filter = file: file.hasExt "proto" || file.hasExt "yaml" || file.hasExt "md";
-            packages = with pkgs; [
-              buf
-            ];
-            script = ''
-              export BUF_CACHE_DIR=$(mktemp -d)
-              buf lint
-              buf format --diff --exit-code
-              buf build -o /dev/null
-            '';
-          };
+            actions-gh = {
+              root = ./.github/workflows;
+              filter = file: file.hasExt "yaml";
+              packages = with pkgs; [
+                action-validator
+                zizmor
+              ];
+              script = ''
+                action-validator "$file"
+                zizmor --offline "$file"
+              '';
+            };
 
-          nix = {
-            root = ./.;
-            filter = file: file.hasExt "nix";
-            packages = with pkgs; [
-              nixfmt
-            ];
-            script = ''
-              nixfmt --check "$file"
-            '';
-          };
+            actions-fj = {
+              root = ./.forgejo/workflows;
+              filter = file: file.hasExt "yaml";
+              packages = with pkgs; [
+                forgejo-runner
+                zizmor
+              ];
+              script = ''
+                forgejo-runner validate --workflow --path "$file"
+                zizmor --offline "$file"
+              '';
+            };
 
-          shell-lint = {
-            root = ./.;
-            filter = file: file.hasExt "sh";
-            packages = with pkgs; [
-              shellcheck
-            ];
-            script = ''
-              shellcheck --external-sources "$file"
-            '';
-          };
+            renovate-fj = {
+              root = ./.forgejo;
+              files = ./.forgejo/renovate.jsonc;
+              packages = with pkgs; [
+                renovate
+              ];
+              script = ''
+                renovate-config-validator renovate.jsonc
+              '';
+            };
 
-          python-lint = {
-            root = ./.;
-            filter = file: file.hasExt "py";
-            include = [ ./pyproject.toml ];
-            packages = with pkgs; [
-              ruff
-              pyright
-            ];
-            script = ''
-              ruff check
-              ruff format --check
-              pyright
-            '';
+            config = {
+              root = ./.;
+              filter =
+                file:
+                file.hasExt "json"
+                || file.hasExt "jsonc"
+                || file.hasExt "yaml"
+                || file.hasExt "toml"
+                || file.hasExt "md";
+              packages = with pkgs; [
+                oxfmt
+              ];
+              script = ''
+                oxfmt --check
+              '';
+            };
           };
-
-          # The unit tests of the interop and bench runners, which interop/runner.nix packages.
-          python-test = {
-            root = ./.;
-            files = [
-              ./interop
-              ./bench
-            ];
-            filter = file: file.hasExt "py";
-            # The interop runner takes its compression dictionary from these.
-            include = [ ./testdata/zstd-golden-vectors.txt ];
-            # The harness makes certificates with openssl, and the bench tests train the benchmark
-            # dictionary with zstd.
-            packages = with pkgs; [
-              python3
-              openssl
-              zstd
-            ];
-            script = ''
-              python3 -I -m unittest discover -s interop
-              python3 -I -m unittest discover -s bench
-            '';
-          };
-
-          actions-gh = {
-            root = ./.github/workflows;
-            filter = file: file.hasExt "yaml";
-            packages = with pkgs; [
-              action-validator
-              zizmor
-            ];
-            script = ''
-              action-validator "$file"
-              zizmor --offline "$file"
-            '';
-          };
-
-          actions-fj = {
-            root = ./.forgejo/workflows;
-            filter = file: file.hasExt "yaml";
-            packages = with pkgs; [
-              forgejo-runner
-              zizmor
-            ];
-            script = ''
-              forgejo-runner validate --workflow --path "$file"
-              zizmor --offline "$file"
-            '';
-          };
-
-          renovate-fj = {
-            root = ./.forgejo;
-            files = ./.forgejo/renovate.jsonc;
-            packages = with pkgs; [
-              renovate
-            ];
-            script = ''
-              renovate-config-validator renovate.jsonc
-            '';
-          };
-
-          config = {
-            root = ./.;
-            filter =
-              file:
-              file.hasExt "json"
-              || file.hasExt "jsonc"
-              || file.hasExt "yaml"
-              || file.hasExt "toml"
-              || file.hasExt "md";
-            packages = with pkgs; [
-              oxfmt
-            ];
-            script = ''
-              oxfmt --check
-            '';
-          };
-        };
       }
     );
 }
