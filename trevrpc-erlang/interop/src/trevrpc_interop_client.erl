@@ -1,5 +1,5 @@
-%% @doc The `client' subcommand: runs the interop scenarios over native QUIC
-%% and prints `ok <name>', `fail <name>: <reason>' or
+%% @doc The `client' subcommand: runs the interop scenarios over native QUIC,
+%% QMux over TLS, or QUIC with a QMux fallback, and prints `ok <name>', `fail <name>: <reason>' or
 %% `skip <name>: <reason>' for each.
 -module(trevrpc_interop_client).
 
@@ -7,9 +7,6 @@
 
 -define(ECHO, "/trevrpc.interop.v1.Echo/").
 -define(DEADLINE, 10000).
-%% A client that cannot use the transport it is given exits with this, and
-%% the runner reports the cell as skipped.
--define(UNSUPPORTED, 77).
 
 %% Every scenario of interop/README.md, in order; those this client cannot
 %% run yet name why.
@@ -39,35 +36,52 @@ scenarios() ->
 %% @doc Runs the client and returns its exit status.
 -spec run(#{string() => string()}) -> non_neg_integer().
 run(Flags) ->
-    case maps:get("transport", Flags, "quic") of
-        "quic" ->
-            Selected = selection(Flags),
-            case connect(Flags) of
-                {ok, Channel} ->
-                    check_transport(Flags),
-                    Passed = run_scenarios(Channel, Selected),
-                    trevrpc_channel:close(Channel),
-                    case Passed of
-                        true -> 0;
-                        false -> 1
-                    end;
-                {error, Status} ->
-                    io:format(standard_error, "client: could not connect: ~p~n", [Status]),
-                    1
+    Selected = selection(Flags),
+    Transport = transport(Flags),
+    Expected = expected_transport(Flags, Transport),
+    case connect(Flags, Transport) of
+        {ok, Channel} ->
+            Connected = trevrpc_channel:transport(Channel),
+            Passed =
+                case Expected =:= any orelse Connected =:= Expected of
+                    true ->
+                        run_scenarios(Channel, Selected);
+                    false ->
+                        io:format(
+                            standard_error, "client: connected over ~s, expected ~s~n", [
+                                Connected, Expected
+                            ]
+                        ),
+                        false
+                end,
+            trevrpc_channel:close(Channel),
+            case Passed of
+                true -> 0;
+                false -> 1
             end;
-        Transport ->
-            io:format(
-                standard_error, "client: the Erlang client does not support --transport ~s yet~n", [
-                    Transport
-                ]
-            ),
-            ?UNSUPPORTED
+        {error, Status} ->
+            io:format(standard_error, "client: could not connect: ~p~n", [Status]),
+            1
     end.
 
-check_transport(Flags) ->
-    case maps:get("expect-transport", Flags, "quic") of
-        "quic" -> ok;
-        Other -> throw({usage, "client: the Erlang client connects over quic, not " ++ Other})
+transport(Flags) ->
+    case maps:get("transport", Flags, "quic") of
+        "quic" -> quic;
+        "tcp" -> tcp;
+        "auto" -> auto;
+        Other -> throw({usage, "client: unknown --transport " ++ Other})
+    end.
+
+%% The transport the channel must connect over: --expect-transport, or the
+%% only one --transport allows.
+expected_transport(Flags, Transport) ->
+    case {maps:get("expect-transport", Flags, undefined), Transport} of
+        {"quic", _} -> quic;
+        {"qmux", _} -> qmux;
+        {undefined, quic} -> quic;
+        {undefined, tcp} -> qmux;
+        {undefined, auto} -> any;
+        {Other, _} -> throw({usage, "client: unknown --expect-transport " ++ Other})
     end.
 
 selection(#{"scenarios" := List}) ->
@@ -85,18 +99,22 @@ selection(#{"scenarios" := List}) ->
 selection(#{}) ->
     all.
 
-connect(#{"addr" := Addr, "ca" := Ca} = Flags) ->
+connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
     {Host, Port} = host_port(Addr),
+    {TcpHost, TcpPort} = host_port(maps:get("tcp-addr", Flags, Addr)),
     trevrpc_channel:connect(
         #{
             host => Host,
             port => Port,
+            tcp_host => TcpHost,
+            tcp_port => TcpPort,
+            transport => Transport,
             server_name => maps:get("server-name", Flags, "localhost"),
             cacertfile => Ca
         },
         ?DEADLINE
     );
-connect(_Flags) ->
+connect(_Flags, _Transport) ->
     throw({usage, "client: --addr and --ca are required"}).
 
 host_port(Addr) ->

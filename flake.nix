@@ -284,6 +284,7 @@
             trevrpc-erlang = pkgs.callPackage ./trevrpc-erlang {
               inherit
                 wireGolden
+                qmuxGolden
                 zstdGolden
                 ;
             };

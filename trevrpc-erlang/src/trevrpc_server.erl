@@ -26,7 +26,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/1, start/1, port/1, stop/1]).
+-export([start_link/1, start/1, port/1, tcp_port/1, stop/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, routes/0, route/0, handler/0, result/0, config/0]).
@@ -56,6 +56,10 @@
     key => term(),
     certfile => file:filename_all(),
     keyfile => file:filename_all(),
+    tcp => boolean(),
+    tcp_port => inet:port_number(),
+    tls_handshake_timeout => pos_integer(),
+    max_tls_handshakes => pos_integer(),
     max_frame_size => pos_integer(),
     max_connections => pos_integer(),
     max_streams_per_connection => pos_integer(),
@@ -79,7 +83,9 @@
     initial_request_timeout := timeout(),
     graceful_shutdown_timeout := non_neg_integer(),
     %% Index 1: requests running on the whole server.
-    requests := counters:counters_ref()
+    requests := counters:counters_ref(),
+    %% The options of QMux sessions.
+    qmux := trevrpc_qmux:options()
 }.
 
 -record(state, {
@@ -87,11 +93,14 @@
     config :: config(),
     %% Index 1: connections; index 2: 1 once shutdown started.
     counters :: counters:counters_ref(),
-    connections = #{} :: #{reference() => pid()}
+    connections = #{} :: #{reference() => pid()},
+    %% The TCP listener, unless TCP is off.
+    tcp :: pid() | undefined
 }).
 
 -define(CONNECTIONS, 1).
 -define(STOPPING, 2).
+-define(TLS_HANDSHAKE_TIMEOUT, 10000).
 
 %% @doc Starts a server linked to the caller, listening once it returns.
 -spec start_link(options()) -> {ok, pid()} | ignore | {error, term()}.
@@ -108,6 +117,11 @@ start(Opts) ->
 port(Server) ->
     gen_server:call(Server, port).
 
+%% @doc The TCP port the server listens on for QMux over TLS.
+-spec tcp_port(pid()) -> {ok, inet:port_number()} | {error, term()}.
+tcp_port(Server) ->
+    gen_server:call(Server, tcp_port).
+
 %% @doc Shuts the server down gracefully: it stops taking connections and
 %% calls, cancels the calls in flight, gives their handlers up to the
 %% graceful shutdown timeout to exit, then closes every connection.
@@ -121,6 +135,7 @@ stop(Server) ->
 init(Opts) ->
     process_flag(trap_exit, true),
     _ = application:ensure_all_started(quic),
+    _ = application:ensure_all_started(ssl),
     case trevrpc_quic:credentials(Opts) of
         {ok, Credentials} -> listen(Opts, Credentials);
         {error, Reason} -> {stop, Reason}
@@ -132,7 +147,11 @@ listen(Opts, Credentials) ->
     Config = config(Opts),
     MaxConnections = maps:get(max_connections, Opts, 256),
     Streams = maps:get(max_streams_per_connection, Config),
-    Handler = fun(Conn) -> accept(Conn, Config, Counters, MaxConnections) end,
+    Handler = fun(Conn) ->
+        admit(
+            fun() -> trevrpc_server_conn:start(Conn, Config) end, Config, Counters, MaxConnections
+        )
+    end,
     QuicOpts0 = maps:merge(
         trevrpc_quic:transport_opts(
             maps:get(max_frame_size, Config),
@@ -149,8 +168,51 @@ listen(Opts, Credentials) ->
         extra_socket_opts => [{ip, maps:get(ip, Opts, {0, 0, 0, 0})}]
     },
     case quic:start_server(Name, maps:get(port, Opts, 0), QuicOpts) of
-        {ok, _} -> {ok, #state{name = Name, config = Config, counters = Counters}};
-        {error, Reason} -> {stop, Reason}
+        {ok, _} ->
+            State = #state{name = Name, config = Config, counters = Counters},
+            case listen_tcp(Opts, Credentials, State, MaxConnections) of
+                {ok, Tcp} ->
+                    {ok, State#state{tcp = Tcp}};
+                {error, Reason} ->
+                    _ = quic:stop_server(Name),
+                    {stop, Reason}
+            end;
+        {error, Reason} ->
+            {stop, Reason}
+    end.
+
+%% The TCP listener for QMux over TLS, by default on the UDP socket's port
+%% number, or any free port if that one is taken and none was asked for.
+listen_tcp(#{tcp := false}, _Credentials, _State, _MaxConnections) ->
+    {ok, undefined};
+listen_tcp(
+    Opts, Credentials, #state{name = Name, config = Config, counters = Counters}, MaxConnections
+) ->
+    Accept = fun(Socket) ->
+        case
+            admit(
+                fun() -> trevrpc_server_conn:start_qmux(Socket, Config) end,
+                Config,
+                Counters,
+                MaxConnections
+            )
+        of
+            {ok, _Pid} -> ok;
+            {error, _} = Error -> Error
+        end
+    end,
+    {ok, UdpPort} = quic:get_server_port(Name),
+    Listen = #{
+        ip => maps:get(ip, Opts, {0, 0, 0, 0}),
+        port => maps:get(tcp_port, Opts, UdpPort),
+        handshake_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
+        max_handshakes => maps:get(max_tls_handshakes, Opts, 256)
+    },
+    case trevrpc_tcp_listener:start_link(Listen, Credentials, Accept) of
+        {error, eaddrinuse} when not is_map_key(tcp_port, Opts) ->
+            trevrpc_tcp_listener:start_link(Listen#{port => 0}, Credentials, Accept);
+        Result ->
+            Result
     end.
 
 config(Opts) ->
@@ -164,12 +226,38 @@ config(Opts) ->
         max_stream_body_size => maps:get(max_stream_body_size, Opts, infinity),
         initial_request_timeout => maps:get(initial_request_timeout, Opts, 10000),
         graceful_shutdown_timeout => maps:get(graceful_shutdown_timeout, Opts, 30000),
-        requests => counters:new(1, [write_concurrency])
+        requests => counters:new(1, [write_concurrency]),
+        qmux => qmux_options(Opts)
     }.
 
-%% Runs in the listener for every new connection: refuses it when the server
-%% is full or stopping, otherwise starts the process that will own it.
-accept(Conn, #{server := Server} = Config, Counters, MaxConnections) ->
+%% QMux sessions get the windows and limits of QUIC connections, and
+%% keep-alives at half the idle timeout.
+qmux_options(Opts) ->
+    Streams = 4 * maps:get(max_streams_per_connection, Opts, 64),
+    Idle = maps:get(connection_idle_timeout, Opts, 30000),
+    #{
+        %% The QMux handshake follows the TLS one under the same bound, and a
+        %% client that stops reading is lost after the idle timeout.
+        handshake_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
+        send_timeout =>
+            case Idle of
+                infinity -> 30000;
+                _ -> Idle
+            end,
+        parameters => trevrpc_quic:qmux_parameters(
+            maps:get(max_frame_size, Opts, trevrpc:default_max_frame_size()), Streams, Streams, Idle
+        ),
+        keep_alive =>
+            case Idle of
+                infinity -> infinity;
+                _ -> max(1, Idle div 2)
+            end
+    }.
+
+%% Runs for every new connection, in the QUIC listener or in a TLS
+%% handshake's process: refuses it when the server is full or stopping,
+%% otherwise starts the process that will own it.
+admit(Start, #{server := Server}, Counters, MaxConnections) ->
     Stopping = counters:get(Counters, ?STOPPING) =:= 1,
     Full = counters:get(Counters, ?CONNECTIONS) >= MaxConnections,
     if
@@ -179,7 +267,7 @@ accept(Conn, #{server := Server} = Config, Counters, MaxConnections) ->
             {error, too_many_connections};
         true ->
             counters:add(Counters, ?CONNECTIONS, 1),
-            case trevrpc_server_conn:start(Conn, Config) of
+            case Start() of
                 {ok, Pid} ->
                     gen_server:cast(Server, {connection, Pid}),
                     {ok, Pid};
@@ -192,6 +280,10 @@ accept(Conn, #{server := Server} = Config, Counters, MaxConnections) ->
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
 handle_call(port, _From, #state{name = Name} = State) ->
     {reply, quic:get_server_port(Name), State};
+handle_call(tcp_port, _From, #state{tcp = undefined} = State) ->
+    {reply, {error, disabled}, State};
+handle_call(tcp_port, _From, #state{tcp = Tcp} = State) ->
+    {reply, trevrpc_tcp_listener:port(Tcp), State};
 handle_call(stop, _From, State) ->
     {reply, ok, shutdown(State)}.
 
@@ -199,7 +291,7 @@ handle_call(stop, _From, State) ->
 handle_cast({connection, Pid}, #state{connections = Connections} = State) ->
     {noreply, State#state{connections = Connections#{monitor(process, Pid) => Pid}}}.
 
--spec handle_info(term(), #state{}) -> {noreply, #state{}}.
+-spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, term(), #state{}}.
 handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{connections = Connections} = State) ->
     case maps:take(Monitor, Connections) of
         {_, Rest} ->
@@ -208,6 +300,11 @@ handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{connections = Conn
         error ->
             {noreply, State}
     end;
+handle_info({'EXIT', Tcp, Reason}, #state{tcp = Tcp} = State) ->
+    %% A server that silently stopped serving TCP would strand the clients
+    %% QUIC cannot reach: stop it all instead.
+    logger:error("trevrpc: the TCP listener exited: ~p", [Reason]),
+    {stop, {tcp_listener, Reason}, State#state{tcp = undefined}};
 handle_info(_Message, State) ->
     {noreply, State}.
 
@@ -224,6 +321,10 @@ shutdown(#state{counters = Counters, connections = Connections, name = Name} = S
             State;
         0 ->
             counters:put(Counters, ?STOPPING, 1),
+            case State#state.tcp of
+                undefined -> ok;
+                Tcp -> trevrpc_tcp_listener:stop(Tcp)
+            end,
             #{graceful_shutdown_timeout := Grace} = State#state.config,
             _ = [trevrpc_server_conn:shutdown(Pid) || Pid <- maps:values(Connections)],
             %% Each connection gives its handlers the grace period, then kills

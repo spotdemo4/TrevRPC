@@ -6,12 +6,14 @@ The Erlang runtime for TrevRPC. It is the core that a Gleam package (`trevrpc-gl
 
 ## Transports
 
-The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/erlang_quic), so nothing native is built. It needs Erlang/OTP 28 or later.
+The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/erlang_quic) and OTP's `ssl`, so nothing native is built. It needs Erlang/OTP 28 or later.
 
-| Role   | Today                          | Planned                                                                |
-| ------ | ------------------------------ | ---------------------------------------------------------------------- |
-| Server | Native QUIC (ALPN `trevrpc/1`) | QMux over TLS, HTTP/3 and HTTP/2, WebTransport and QMux over WebSocket |
-| Client | Native QUIC                    | QMux over TLS, with the QUIC/TCP race                                  |
+| Role   | Today                                                                                 | Planned                                                 |
+| ------ | ------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| Server | Native QUIC (ALPN `trevrpc/1`) and QMux over TLS (ALPN `qmux-02.trevrpc-1`)           | HTTP/3 and HTTP/2, WebTransport and QMux over WebSocket |
+| Client | Native QUIC and QMux over TLS, racing QUIC against TCP when the network may block UDP | -                                                       |
+
+QMux ([draft-ietf-quic-qmux-02](https://datatracker.ietf.org/doc/draft-ietf-quic-qmux/)) carries the same streams over TLS on TCP, with the same windows and limits as QUIC. Its implementation is in-tree (`trevrpc_qmux`) and checked against the shared golden vectors in `testdata/qmux-golden-vectors.txt`.
 
 Known issue: when a client on erlang_quic has finished an upload (`close_send`) while most of it is still queued, and the server answers early, erlang_quic can answer the server's STOP_SENDING with a RESET_STREAM whose final size contradicts the FIN it already sent. An erlang_quic server, such as this runtime's, then closes the connection with FINAL_SIZE_ERROR; quic-go does not check it. The Go and Rust clients are not affected. See [benoitc/erlang_quic#551](https://github.com/benoitc/erlang_quic/issues/551).
 
@@ -50,6 +52,8 @@ Messages are opaque binaries: handlers decode requests and encode responses, so 
 
 Unary and server-streaming handlers take `(Request, Call)`, client-streaming and bidirectional ones `(Call)`. They return `{ok, Response}` (single responses), `ok` (streamed responses) or `{error, Status}`, where a status is a map such as `trevrpc_status:new(not_found, <<"missing">>)`, optionally with `metadata` and `details`. `trevrpc_call` reads requests, sends responses, headers and trailers, and gives the call's metadata and deadline.
 
+The server also listens on TCP for QMux over TLS, by default on the same port number as QUIC, or on any free port if that one is taken: `tcp_port => P` picks it, `tcp => false` turns TCP off, and `trevrpc_server:tcp_port/1` returns it. Connections over either transport share the server's limits. A TLS client has `tls_handshake_timeout` (10 s) for its TLS handshake and again for its QMux parameters, at most `max_tls_handshakes` (256) handshakes run at once, and a QMux client that stops reading is dropped after the connection idle timeout.
+
 Each call runs in a process of its own, which the server stops when the call's deadline passes, when the client cancels it, and on shutdown, whether or not the handler cooperates. A handler that crashes, or returns an `internal` status, ends its call with `internal server error`; the cause goes to the logger. The server's limits and their defaults match the Go and Rust servers: 4 MiB frames, 256 connections, 64 concurrent streams per connection, 1024 concurrent requests, a 10 s initial request timeout, a 30 s connection idle timeout and a 30 s graceful shutdown.
 
 ## Client
@@ -65,6 +69,8 @@ ok = trevrpc_client:send(Call, Request),
 ok = trevrpc_client:close_send(Call),
 {eof, Trailers} = trevrpc_client:recv(Call).
 ```
+
+`transport` picks how a channel connects: `quic`, `tcp` (QMux over TLS) or `auto`, the default, which starts QUIC and, if it has not connected after `fallback_delay` (300 ms) or fails before, races QMux over TLS against it; the first to connect wins. Once QMux won, reconnects go straight to it for `reprobe_interval` (5 minutes) before trying QUIC again. `tcp_host` and `tcp_port` address the server's TCP listener, by default the QUIC host and port. `trevrpc_channel:transport/1` says which transport the current connection uses. A certificate in `cacerts` or `cacertfile` may be the server's own self-signed one.
 
 A channel reconnects on its own and follows the [connection lifecycle](https://trev.zip/llc/TrevRPC/wiki/Connection-Lifecycle) of the other runtimes: each connection is a generation, calls never move between generations, calls made while it reconnects fail at once with `unavailable`, and reconnects back off from 100 ms to 30 s with jitter. A call belongs to the process that started it; if that process exits, the channel cancels the call. `trevrpc_channel:subscribe/1` sends the calling process `{trevrpc_channel, Channel, State}` messages with the channel's state, `{ready, Generation}`, `connecting` or, last, `closed`, now and after every change, until `unsubscribe/1` or the process exits.
 
@@ -84,14 +90,14 @@ A channel reconnects on its own and follows the [connection lifecycle](https://t
 | `trevrpc_datagram`             | Datagram payloads                                                                             |
 | `trevrpc_varint`, `trevrpc_pb` | QUIC varints and the protobuf wire primitives                                                 |
 
-The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_quic`) is internal.
+The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_quic`, `trevrpc_transport`, `trevrpc_qmux`, `trevrpc_qmux_frame`, `trevrpc_tcp_listener`) is internal.
 
 ## Development
 
 rebar3 and Erlang/OTP 28 are in the repository's dev shell.
 
 ```sh
-rebar3 eunit      # unit tests, the shared golden vectors in ../testdata, and client/server over QUIC
+rebar3 eunit      # unit tests, the shared golden vectors in ../testdata, and client/server over QUIC and QMux
 rebar3 xref
 rebar3 dialyzer
 ```

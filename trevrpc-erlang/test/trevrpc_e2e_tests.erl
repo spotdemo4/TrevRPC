@@ -1,4 +1,5 @@
-%% Erlang client against Erlang server over native QUIC on loopback.
+%% Erlang client against Erlang server on loopback, over native QUIC and
+%% over QMux on TLS.
 -module(trevrpc_e2e_tests).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -15,29 +16,6 @@
 -define(CRASH, <<"/test.Echo/Crash">>).
 
 %%% Fixture
-
-credentials() ->
-    %% #'Extension'{extnID = ?'id-ce-subjectAltName', critical = false, extnValue = ...}
-    San = {'Extension', {2, 5, 29, 17}, false, [{dNSName, "localhost"}]},
-    #{server_config := Server, client_config := Client} = public_key:pkix_test_data(#{
-        %% TLS 1.3 takes no DSA keys, pkix_test_data's default.
-        server_chain => #{
-            root => [{key, {namedCurve, secp256r1}}],
-            intermediates => [],
-            peer => [{key, {namedCurve, secp256r1}}, {extensions, [San]}]
-        },
-        client_chain => #{
-            root => [{key, {namedCurve, secp256r1}}],
-            intermediates => [],
-            peer => [{key, {namedCurve, secp256r1}}]
-        }
-    }),
-    {KeyType, KeyDer} = proplists:get_value(key, Server),
-    #{
-        cert => proplists:get_value(cert, Server),
-        key => public_key:der_decode(KeyType, KeyDer),
-        cacerts => proplists:get_value(cacerts, Client)
-    }.
 
 %% A parked handler reports its pid to the test process registered as
 %% trevrpc_e2e_parked.
@@ -153,29 +131,41 @@ start_server(Credentials, Opts) ->
             Opts
         )
     ),
-    {ok, Port} = trevrpc_server:port(Server),
-    {Server, Port}.
+    Server.
 
-connect(Credentials, Port) ->
-    {ok, Channel} = trevrpc_channel:start(#{
-        host => {127, 0, 0, 1},
-        port => Port,
-        server_name => "localhost",
-        cacerts => maps:get(cacerts, Credentials)
-    }),
+%% The server's ports, for a next server to listen on.
+ports(Server) ->
+    {ok, Port} = trevrpc_server:port(Server),
+    {ok, TcpPort} = trevrpc_server:tcp_port(Server),
+    #{port => Port, tcp_port => TcpPort}.
+
+%% A channel to the server over the transport the fixture names: `quic'
+%% (the default) or `tcp' for QMux over TLS.
+connect(Credentials, Server) ->
+    Channel = start_channel(Server, Credentials),
     ok = trevrpc_channel:wait_until_ready(Channel, 30000),
     Channel.
 
-setup() ->
+start_channel(Server, Credentials) ->
+    {ok, Channel} = trevrpc_channel:start(
+        (ports(Server))#{
+            host => {127, 0, 0, 1},
+            transport => maps:get(transport, Credentials, quic),
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials)
+        }
+    ),
+    Channel.
+
+setup(Transport) ->
     {ok, _} = application:ensure_all_started(quic),
     logger:set_primary_config(level, none),
-    Credentials = credentials(),
-    {Server, Port} = start_server(Credentials, #{}),
+    Credentials = (trevrpc_test_tls:credentials())#{transport => Transport},
+    Server = start_server(Credentials, #{}),
     #{
         credentials => Credentials,
         server => Server,
-        port => Port,
-        channel => connect(Credentials, Port)
+        channel => connect(Credentials, Server)
     }.
 
 cleanup(#{server := Server, channel := Channel}) ->
@@ -184,7 +174,10 @@ cleanup(#{server := Server, channel := Channel}) ->
     logger:set_primary_config(level, notice).
 
 e2e_test_() ->
-    {setup, fun setup/0, fun cleanup/1, fun(Env) ->
+    [{atom_to_list(Transport), e2e(Transport)} || Transport <- [quic, tcp]].
+
+e2e(Transport) ->
+    {setup, fun() -> setup(Transport) end, fun cleanup/1, fun(Env) ->
         [
             {Name, {timeout, 30, fun() -> Test(Env) end}}
          || {Name, Test} <- [
@@ -435,8 +428,10 @@ concurrent_test(#{channel := Channel}) ->
 %% Sends REQUEST frames written by hand and returns the status the server
 %% ends the stream with.
 raw(Channel, Frames, Fin) ->
-    {ok, #{conn := Conn, id := Id, ref := Ref}} = trevrpc_channel:open_stream(Channel, infinity),
-    Stream = trevrpc_stream:new(Conn, Id, Ref, Channel, trevrpc_frame:reader(1 bsl 22)),
+    {ok, #{transport := Transport, id := Id, ref := Ref}} = trevrpc_channel:open_stream(
+        Channel, infinity
+    ),
+    Stream = trevrpc_stream:new(Transport, Id, Ref, Channel, trevrpc_frame:reader(1 bsl 22)),
     {ok, Sent} = trevrpc_stream:send(Stream, Frames, Fin, infinity),
     Result = raw_status(Sent),
     trevrpc_channel:stream_done(Channel, Id, Ref),
@@ -553,11 +548,14 @@ connection_metadata_test(#{channel := Channel}) ->
 %%% Servers of their own
 
 limits_test_() ->
+    [{atom_to_list(Transport), limits(Transport)} || Transport <- [quic, tcp]].
+
+limits(Transport) ->
     {setup,
         fun() ->
             {ok, _} = application:ensure_all_started(quic),
             logger:set_primary_config(level, none),
-            credentials()
+            (trevrpc_test_tls:credentials())#{transport => Transport}
         end,
         fun(_) -> logger:set_primary_config(level, notice) end, fun(Credentials) ->
             [
@@ -575,8 +573,8 @@ limits_test_() ->
         end}.
 
 stream_limit(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{max_streams_per_connection => 2}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{max_streams_per_connection => 2}),
+    Channel = connect(Credentials, Server),
     register(trevrpc_e2e_parked, self()),
     try
         {ok, _A} = trevrpc_client:bidi(Channel, ?PARK, #{}),
@@ -599,8 +597,8 @@ stream_limit(Credentials) ->
     end.
 
 frame_limit(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{max_frame_size => 1024}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{max_frame_size => 1024}),
+    Channel = connect(Credentials, Server),
     try
         ?assertMatch(
             {ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, binary:copy(<<"x">>, 1024), #{})
@@ -617,8 +615,8 @@ frame_limit(Credentials) ->
     end.
 
 initial_request_timeout(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{initial_request_timeout => 200}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{initial_request_timeout => 200}),
+    Channel = connect(Credentials, Server),
     try
         %% Half a REQUEST frame.
         <<Half:3/binary, _/binary>> = iolist_to_binary(request(#{method => ?UNARY})),
@@ -635,8 +633,8 @@ initial_request_timeout(Credentials) ->
 %% channel fails calls while reconnecting, then reconnects to the next
 %% server on the same port.
 shutdown_and_reconnect(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{graceful_shutdown_timeout => 500}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{graceful_shutdown_timeout => 500}),
+    Channel = connect(Credentials, Server),
     register(trevrpc_e2e_parked, self()),
     try
         ok = trevrpc_channel:subscribe(Channel),
@@ -646,6 +644,7 @@ shutdown_and_reconnect(Credentials) ->
             {parked, _} -> ok
         after 5000 -> error(not_parked)
         end,
+        Ports = ports(Server),
         ok = trevrpc_server:stop(Server),
         ?assertMatch({error, #{code := unavailable}}, trevrpc_client:recv(Call)),
         %% Once the channel noticed the server is gone, calls fail at once.
@@ -654,7 +653,7 @@ shutdown_and_reconnect(Credentials) ->
             {error, #{code => unavailable, message => <<"channel is reconnecting">>}},
             trevrpc_client:unary(Channel, ?UNARY, <<>>, #{timeout => 1000})
         ),
-        {Server2, Port} = start_server(Credentials, #{port => Port}),
+        Server2 = start_server(Credentials, Ports),
         try
             await_state(Channel, {ready, 2}),
             ?assertEqual(2, trevrpc_channel:generation(Channel)),
@@ -678,10 +677,10 @@ await_state(Channel, State) ->
 %% A connection that closes with a call in flight gives the call's slot in
 %% the server's request limit back.
 closed_connection_releases_slots(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{max_concurrent_requests => 1}),
+    Server = start_server(Credentials, #{max_concurrent_requests => 1}),
     register(trevrpc_e2e_parked, self()),
     try
-        First = connect(Credentials, Port),
+        First = connect(Credentials, Server),
         {ok, _Call} = trevrpc_client:bidi(First, ?PARK, #{}),
         Handler =
             receive
@@ -695,7 +694,7 @@ closed_connection_releases_slots(Credentials) ->
             {'DOWN', Monitor, process, Handler, _} -> ok
         after 10000 -> error(handler_alive)
         end,
-        Second = connect(Credentials, Port),
+        Second = connect(Credentials, Server),
         try
             ?assertMatch(
                 {ok, <<"x">>, _}, trevrpc_client:unary(Second, ?UNARY, <<"x">>, #{timeout => 5000})
@@ -711,8 +710,8 @@ closed_connection_releases_slots(Credentials) ->
 %% Shutdown closes a connection as soon as its last call ends, including one
 %% that was already writing its end when shutdown started.
 shutdown_waits_for_finishing_call(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{graceful_shutdown_timeout => 10000}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{graceful_shutdown_timeout => 10000}),
+    Channel = connect(Credentials, Server),
     register(trevrpc_e2e_parked, self()),
     try
         {ok, _Call} = trevrpc_client:bidi(Channel, ?HOLD, #{}),
@@ -762,8 +761,8 @@ shutdown_waits_for_finishing_call(Credentials) ->
 %% an erlang_quic server answers by closing the connection:
 %% benoitc/erlang_quic#551.)
 unread_uploads_keep_the_connection_window(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials, Server),
     Chunk = binary:copy(<<"u">>, 1048576),
     Rejected = {error, #{code => failed_precondition, message => <<"rejected">>}},
     try
@@ -790,8 +789,8 @@ unread_uploads_keep_the_connection_window(Credentials) ->
 %% never read. (erlang_quic would also release it once the stream is gone,
 %% but a peer may keep the stream open.)
 stopped_handler_returns_credit(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials, Server),
     register(trevrpc_e2e_parked, self()),
     Chunk = binary:copy(<<"u">>, 1048576),
     try
@@ -804,7 +803,7 @@ stopped_handler_returns_credit(Credentials) ->
             end,
         Monitor = monitor(process, Handler),
         1 = erlang:trace(Handler, true, ['receive', call]),
-        _ = erlang:trace_pattern({quic, consume, 3}, true, []),
+        _ = erlang:trace_pattern({trevrpc_transport, consume, 3}, true, []),
         ok = trevrpc_client:send(Call, Chunk),
         %% All of the request reached the handler's mailbox, unread.
         await_routed(Handler, byte_size(Chunk) + 5, 0),
@@ -820,7 +819,7 @@ stopped_handler_returns_credit(Credentials) ->
         end,
         ?assert(consumed(Handler, 0) >= byte_size(Chunk))
     after
-        _ = erlang:trace_pattern({quic, consume, 3}, false, []),
+        _ = erlang:trace_pattern({trevrpc_transport, consume, 3}, false, []),
         unregister(trevrpc_e2e_parked),
         trevrpc_channel:close(Channel),
         trevrpc_server:stop(Server)
@@ -836,11 +835,13 @@ await_routed(Pid, Bytes, Seen) ->
     after 10000 -> error({routed, Seen})
     end.
 
-%% The bytes the process returned with quic:consume/3.
+%% The bytes the process returned with trevrpc_transport:consume/3.
 consumed(Pid, Total) ->
     receive
-        {trace, Pid, call, {quic, consume, [_, _, Bytes]}} -> consumed(Pid, Total + Bytes);
-        {trace, Pid, 'receive', _} -> consumed(Pid, Total)
+        {trace, Pid, call, {trevrpc_transport, consume, [_, _, Bytes]}} ->
+            consumed(Pid, Total + Bytes);
+        {trace, Pid, 'receive', _} ->
+            consumed(Pid, Total)
     after 0 -> Total
     end.
 
@@ -850,8 +851,8 @@ consumed(Pid, Total) ->
 %% message the channel sent before it, so an empty mailbox then means none
 %% was sent.
 subscriptions(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{}),
-    Channel = connect(Credentials, Port),
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials, Server),
     ok = trevrpc_channel:subscribe(Channel),
     ok = trevrpc_channel:subscribe(Channel),
     await_state(Channel, {ready, 1}),
@@ -876,12 +877,13 @@ subscriptions(Credentials) ->
     flush_traces(Channel),
     %% The channel forgets it: its pid is nowhere in the channel's state.
     ?assertNot(contains(sys:get_state(Channel), Subscriber)),
+    Ports = ports(Server),
     ok = trevrpc_server:stop(Server),
     await_state(Channel, connecting),
     _ = trevrpc_channel:generation(Channel),
     ?assertEqual(none, next_state(Channel)),
     ok = trevrpc_channel:unsubscribe(Channel),
-    {Server2, Port} = start_server(Credentials, #{port => Port}),
+    Server2 = start_server(Credentials, Ports),
     try
         ok = trevrpc_channel:wait_until_ready(Channel, 30000),
         _ = trevrpc_channel:generation(Channel),
@@ -913,19 +915,430 @@ next_state(Channel) ->
     end.
 
 untrusted_server(Credentials) ->
-    {Server, Port} = start_server(Credentials, #{}),
-    Other = credentials(),
+    Server = start_server(Credentials, #{}),
+    Other = trevrpc_test_tls:credentials(),
     try
-        {ok, Channel} = trevrpc_channel:start(#{
-            host => {127, 0, 0, 1},
-            port => Port,
-            server_name => "localhost",
-            cacerts => maps:get(cacerts, Other)
-        }),
+        Channel = start_channel(Server, Credentials#{cacerts => maps:get(cacerts, Other)}),
         ?assertMatch(
             {error, #{code := unavailable}}, trevrpc_channel:wait_until_ready(Channel, 1000)
         ),
         trevrpc_channel:close(Channel)
     after
         trevrpc_server:stop(Server)
+    end.
+
+%%% Transport selection
+
+transport_selection_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = application:ensure_all_started(quic),
+            logger:set_primary_config(level, none),
+            trevrpc_test_tls:credentials()
+        end,
+        fun(_) -> logger:set_primary_config(level, notice) end, fun(Credentials) ->
+            [
+                {timeout, 30, fun() -> auto_prefers_quic(Credentials) end},
+                {timeout, 30, fun() -> auto_falls_back_to_qmux(Credentials) end},
+                {timeout, 30, fun() -> tcp_off(Credentials) end},
+                {timeout, 30, fun() -> self_signed(quic) end},
+                {timeout, 30, fun() -> self_signed(tcp) end},
+                {timeout, 30, fun() -> expired_self_signed(Credentials) end}
+            ]
+        end}.
+
+%% With both transports up, QUIC wins the race: QMux only starts after the
+%% fallback delay.
+auto_prefers_quic(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials#{transport => auto}, Server),
+    try
+        ?assertEqual(quic, trevrpc_channel:transport(Channel)),
+        ?assertMatch({ok, <<"q">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{}))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A UDP port that swallows every datagram stands in for a network that
+%% drops QUIC: the channel connects over QMux once the fallback delay
+%% passed, without waiting for QUIC to time out.
+auto_falls_back_to_qmux(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    {ok, Sink} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}, {active, false}]),
+    {ok, SinkPort} = inet:port(Sink),
+    #{tcp_port := TcpPort} = ports(Server),
+    {ok, Channel} = trevrpc_channel:start(#{
+        host => {127, 0, 0, 1},
+        port => SinkPort,
+        tcp_port => TcpPort,
+        fallback_delay => 50,
+        connect_timeout => 20000,
+        server_name => "localhost",
+        cacerts => maps:get(cacerts, Credentials)
+    }),
+    try
+        ok = trevrpc_channel:wait_until_ready(Channel, 5000),
+        ?assertEqual(qmux, trevrpc_channel:transport(Channel)),
+        ?assertMatch({ok, <<"t">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"t">>, #{}))
+    after
+        trevrpc_channel:close(Channel),
+        gen_udp:close(Sink),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A server without TCP serves QUIC alone: a QMux-only channel never
+%% connects.
+tcp_off(Credentials) ->
+    Server = start_server(Credentials, #{tcp => false}),
+    {ok, Port} = trevrpc_server:port(Server),
+    Opts = #{
+        host => {127, 0, 0, 1},
+        port => Port,
+        server_name => "localhost",
+        cacerts => maps:get(cacerts, Credentials)
+    },
+    {ok, Auto} = trevrpc_channel:start(Opts),
+    {ok, Tcp} = trevrpc_channel:start(Opts#{transport => tcp}),
+    try
+        ?assertEqual({error, disabled}, trevrpc_server:tcp_port(Server)),
+        ok = trevrpc_channel:wait_until_ready(Auto, 30000),
+        ?assertEqual(quic, trevrpc_channel:transport(Auto)),
+        ?assertMatch({error, #{code := unavailable}}, trevrpc_channel:wait_until_ready(Tcp, 500))
+    after
+        trevrpc_channel:close(Auto),
+        trevrpc_channel:close(Tcp),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A self-signed server certificate the client trusts by itself is accepted,
+%% but still only for its own host name.
+self_signed(Transport) ->
+    Credentials = (trevrpc_test_tls:self_signed())#{transport => Transport},
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials, Server),
+    Other = start_channel(Server, Credentials),
+    ok = trevrpc_channel:close(Other),
+    {ok, Wrong} = trevrpc_channel:start(
+        (ports(Server))#{
+            host => {127, 0, 0, 1},
+            transport => Transport,
+            server_name => "elsewhere",
+            cacerts => maps:get(cacerts, Credentials)
+        }
+    ),
+    try
+        ?assertMatch({ok, <<"s">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{})),
+        ?assertMatch({error, #{code := unavailable}}, trevrpc_channel:wait_until_ready(Wrong, 1000))
+    after
+        trevrpc_channel:close(Wrong),
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% Trusting a self-signed certificate by itself does not make it valid after
+%% it expired.
+expired_self_signed(_Credentials) ->
+    Credentials = (trevrpc_test_tls:self_signed([{validity, {{2020, 1, 1}, {2020, 1, 2}}}]))#{
+        transport => tcp
+    },
+    Server = start_server(Credentials, #{}),
+    Channel = start_channel(Server, Credentials),
+    try
+        ?assertMatch(
+            {error, #{code := unavailable}}, trevrpc_channel:wait_until_ready(Channel, 1000)
+        )
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%%% QMux failures
+
+qmux_failures_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = application:ensure_all_started(quic),
+            logger:set_primary_config(level, none),
+            (trevrpc_test_tls:credentials())#{transport => tcp}
+        end,
+        fun(_) -> logger:set_primary_config(level, notice) end, fun(Credentials) ->
+            [
+                {timeout, 30, fun() -> silent_client(Credentials) end},
+                {timeout, 30, fun() -> handshake_limit(Credentials) end},
+                {timeout, 30, fun() -> client_session_dies(Credentials) end},
+                {timeout, 30, fun() -> server_session_dies(Credentials) end},
+                {timeout, 30, fun() -> listener_exit_stops_server(Credentials) end},
+                {timeout, 60, fun() -> reprobe_window(Credentials) end},
+                {timeout, 30, fun() -> refused_connection_fails_at_once(Credentials) end},
+                {timeout, 30, fun() -> early_close_fails_the_attempt(Credentials) end},
+                {timeout, 30, fun() -> one_fallback_per_round(Credentials) end}
+            ]
+        end}.
+
+%% A client that completes TLS and sends nothing more is closed once the
+%% handshake timeout passes, and gives its connection slot back.
+silent_client(Credentials) ->
+    Server = start_server(Credentials, #{max_connections => 1, tls_handshake_timeout => 300}),
+    #{tcp_port := TcpPort} = ports(Server),
+    {ok, Silent} = ssl:connect({127, 0, 0, 1}, TcpPort, [
+        binary,
+        {active, false},
+        {verify, verify_none},
+        {alpn_advertised_protocols, [trevrpc:qmux_alpn()]}
+    ]),
+    try
+        ?assertEqual({error, closed}, drain(Silent)),
+        Channel = connect(Credentials, Server),
+        ?assertMatch({ok, <<"q">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{})),
+        trevrpc_channel:close(Channel)
+    after
+        _ = ssl:close(Silent),
+        trevrpc_server:stop(Server)
+    end.
+
+%% Reads until the socket closes, past the server's parameters.
+drain(Socket) ->
+    case ssl:recv(Socket, 0, 5000) of
+        {ok, _} -> drain(Socket);
+        Error -> Error
+    end.
+
+%% With one TLS handshake allowed at a time, a connection that never starts
+%% its handshake holds up the next until the handshake timeout drops it.
+handshake_limit(Credentials) ->
+    Server = start_server(Credentials, #{max_tls_handshakes => 1, tls_handshake_timeout => 500}),
+    #{tcp_port := TcpPort} = ports(Server),
+    {ok, Idle} = gen_tcp:connect({127, 0, 0, 1}, TcpPort, [binary, {active, false}]),
+    Channel = start_channel(Server, Credentials),
+    try
+        ?assertMatch(
+            {error, #{code := unavailable}}, trevrpc_channel:wait_until_ready(Channel, 200)
+        ),
+        ok = trevrpc_channel:wait_until_ready(Channel, 10000),
+        ?assertEqual({error, closed}, gen_tcp:recv(Idle, 0, 5000))
+    after
+        gen_tcp:close(Idle),
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The channel's session dying without a closed event is a lost connection.
+client_session_dies(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = connect(Credentials, Server),
+    try
+        ok = trevrpc_channel:subscribe(Channel),
+        await_state(Channel, {ready, 1}),
+        exit(session(Channel), kill),
+        await_state(Channel, connecting),
+        await_state(Channel, {ready, 2}),
+        ?assertMatch({ok, <<"k">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"k">>, #{}))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The channel's current QMux session.
+session(Channel) ->
+    {ok, #{transport := {qmux, Session}, id := Id, ref := Ref}} =
+        trevrpc_channel:open_stream(Channel, infinity),
+    trevrpc_channel:stream_done(Channel, Id, Ref),
+    Session.
+
+%% A server session dying without a closed event ends its connection, which
+%% gives its slot back: with one slot, the client reconnects.
+server_session_dies(Credentials) ->
+    Server = start_server(Credentials, #{max_connections => 1}),
+    Channel = connect(Credentials, Server),
+    try
+        ok = trevrpc_channel:subscribe(Channel),
+        await_state(Channel, {ready, 1}),
+        %% #state{connections = #{Monitor => Pid}} of the server, and
+        %% #state{role, owner} of a session.
+        Connections = maps:values(element(5, sys:get_state(Server))),
+        [Session] = [
+            Pid
+         || Pid <- processes(),
+            proc_lib:translate_initial_call(Pid) =:= {trevrpc_qmux, init, 1},
+            lists:member(element(4, sys:get_state(Pid)), Connections)
+        ],
+        exit(Session, kill),
+        await_state(Channel, connecting),
+        await_state(Channel, {ready, 2}),
+        ?assertMatch({ok, <<"k">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"k">>, #{}))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A server whose TCP listener died stops rather than serve QUIC alone.
+listener_exit_stops_server(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Monitor = monitor(process, Server),
+    Listener = element(tuple_size(sys:get_state(Server)), sys:get_state(Server)),
+    ?assert(is_pid(Listener)),
+    exit(Listener, kill),
+    receive
+        {'DOWN', Monitor, process, Server, Reason} ->
+            ?assertMatch({tcp_listener, killed}, Reason)
+    after 10000 -> error(server_alive)
+    end.
+
+%% QMux winning a race skips QUIC on reconnects for the reprobe interval,
+%% counted from that win: a reconnect within it does not extend it. The QUIC
+%% address is a UDP socket that swallows datagrams, so QUIC never connects;
+%% the channel's quic_attempt/1 calls show which rounds tried it. The
+%% checkpoints count from when the test saw the first win, which is no
+%% earlier than the win itself.
+reprobe_window(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    {ok, Sink} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}, {active, false}]),
+    {ok, SinkPort} = inet:port(Sink),
+    #{tcp_port := TcpPort} = ports(Server),
+    Interval = 6000,
+    {ok, Channel} = trevrpc_channel:start(#{
+        host => {127, 0, 0, 1},
+        port => SinkPort,
+        tcp_port => TcpPort,
+        fallback_delay => 50,
+        reprobe_interval => Interval,
+        server_name => "localhost",
+        cacerts => maps:get(cacerts, Credentials)
+    }),
+    try
+        ok = trevrpc_channel:subscribe(Channel),
+        1 = erlang:trace(Channel, true, [call]),
+        _ = [
+            erlang:trace_pattern({trevrpc_channel, Name, Arity}, true, [local])
+         || {Name, Arity} <- [{race, 1}, {quic_attempt, 1}, {won, 4}]
+        ],
+        await_state(Channel, {ready, 1}),
+        Won = erlang:monotonic_time(millisecond),
+        %% The first round started before the tracing.
+        _ = calls(Channel, won, []),
+        %% A sixth into the window: straight to QMux, which must not extend
+        %% the window past Won + Interval.
+        sleep_until(Won + Interval div 6),
+        exit(session(Channel), kill),
+        ?assertEqual([race, won], calls(Channel, won, [])),
+        await_state(Channel, connecting),
+        await_state(Channel, {ready, 2}),
+        %% Past the first window, and well before one opened by the second
+        %% win would close: QUIC again.
+        sleep_until(Won + Interval + 500),
+        exit(session(Channel), kill),
+        ?assertEqual([race, quic_attempt, won], calls(Channel, won, [])),
+        await_state(Channel, connecting),
+        await_state(Channel, {ready, 3}),
+        ?assertEqual(qmux, trevrpc_channel:transport(Channel))
+    after
+        _ = erlang:trace_pattern({trevrpc_channel, '_', '_'}, false, [local]),
+        trevrpc_channel:close(Channel),
+        gen_udp:close(Sink),
+        trevrpc_server:stop(Server)
+    end.
+
+sleep_until(Time) ->
+    timer:sleep(max(0, Time - erlang:monotonic_time(millisecond))).
+
+%% A server that refuses a QMux connection (here, for being full) closes it
+%% right after TLS: the attempt fails then, not at its timeout, whether the
+%% session's closed event comes before or after the attempt's result.
+refused_connection_fails_at_once(Credentials) ->
+    Server = start_server(Credentials, #{max_connections => 1}),
+    Occupant = connect(Credentials, Server),
+    {ok, Channel} = trevrpc_channel:start(
+        (ports(Server))#{
+            host => {127, 0, 0, 1},
+            transport => tcp,
+            connect_timeout => 10000,
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials)
+        }
+    ),
+    try
+        1 = erlang:trace(Channel, true, [call]),
+        _ = erlang:trace_pattern({trevrpc_channel, retry, 1}, true, [local]),
+        receive
+            {trace, Channel, call, {trevrpc_channel, retry, _}} -> ok
+        after 5000 -> error(attempt_not_failed)
+        end
+    after
+        _ = erlang:trace_pattern({trevrpc_channel, '_', '_'}, false, [local]),
+        trevrpc_channel:close(Channel),
+        trevrpc_channel:close(Occupant),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The same with the events in the order the race above cannot force: the
+%% session reports its close before the attempt reports the session. The
+%% attempt is held pending by a TCP listener that never answers TLS, and the
+%% test sends the closed event of a session the channel has not heard of.
+early_close_fails_the_attempt(Credentials) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {ip, {127, 0, 0, 1}}, {active, false}]),
+    {ok, TcpPort} = inet:port(Listen),
+    {ok, Channel} = trevrpc_channel:start(#{
+        host => {127, 0, 0, 1},
+        port => TcpPort,
+        tcp_port => TcpPort,
+        transport => tcp,
+        connect_timeout => 20000,
+        server_name => "localhost",
+        cacerts => maps:get(cacerts, Credentials)
+    }),
+    try
+        {ok, Held} = gen_tcp:accept(Listen, 5000),
+        1 = erlang:trace(Channel, true, [call]),
+        _ = erlang:trace_pattern({trevrpc_channel, retry, 1}, true, [local]),
+        Session = spawn(fun() -> ok end),
+        Channel ! {trevrpc_qmux, Session, {closed, connection_lost}},
+        receive
+            {trace, Channel, call, {trevrpc_channel, retry, _}} -> ok
+        after 5000 -> error(attempt_not_failed)
+        end,
+        gen_tcp:close(Held)
+    after
+        _ = erlang:trace_pattern({trevrpc_channel, '_', '_'}, false, [local]),
+        trevrpc_channel:close(Channel),
+        gen_tcp:close(Listen)
+    end.
+
+%% QMux joins a round once: when it already failed (TCP refused) and QUIC
+%% fails later, the round ends instead of trying QMux again.
+one_fallback_per_round(Credentials) ->
+    {ok, Sink} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}, {active, false}]),
+    {ok, SinkPort} = inet:port(Sink),
+    {ok, Closed} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
+    {ok, ClosedPort} = inet:port(Closed),
+    ok = gen_tcp:close(Closed),
+    {ok, Channel} = trevrpc_channel:start(#{
+        host => {127, 0, 0, 1},
+        port => SinkPort,
+        tcp_port => ClosedPort,
+        fallback_delay => 50,
+        connect_timeout => 500,
+        server_name => "localhost",
+        cacerts => maps:get(cacerts, Credentials)
+    }),
+    try
+        1 = erlang:trace(Channel, true, [call]),
+        _ = erlang:trace_pattern({trevrpc_channel, tcp_attempt, 1}, true, [local]),
+        _ = erlang:trace_pattern({trevrpc_channel, retry, 1}, true, [local]),
+        %% The first round: one QMux attempt before the retry.
+        ?assertEqual([tcp_attempt, retry], calls(Channel, retry, []))
+    after
+        _ = erlang:trace_pattern({trevrpc_channel, '_', '_'}, false, [local]),
+        trevrpc_channel:close(Channel),
+        gen_udp:close(Sink)
+    end.
+
+%% The traced calls of the channel until Last.
+calls(Channel, Last, Acc) ->
+    receive
+        {trace, Channel, call, {trevrpc_channel, Last, _}} ->
+            lists:reverse([Last | Acc]);
+        {trace, Channel, call, {trevrpc_channel, Name, _}} ->
+            calls(Channel, Last, [Name | Acc])
+    after 5000 -> error({calls, lists:reverse(Acc)})
     end.

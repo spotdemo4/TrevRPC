@@ -7,7 +7,14 @@
 %% frame, as the Go and Rust runtimes size theirs.
 -module(trevrpc_quic).
 
--export([credentials/1, stream_window/1, connection_window/2, transport_opts/3]).
+-export([
+    credentials/1,
+    read_certificates/1,
+    stream_window/1,
+    connection_window/2,
+    transport_opts/3,
+    qmux_parameters/4
+]).
 
 -define(MAX_CONNECTION_WINDOW, 16777216).
 -define(MAX_FRAME_HEADER, 16).
@@ -28,6 +35,9 @@ credentials(#{certfile := CertFile, keyfile := KeyFile}) ->
 credentials(_Opts) ->
     {error, no_certificate}.
 
+%% @doc The certificates of a PEM file, in order.
+-spec read_certificates(file:filename_all()) ->
+    {ok, [public_key:der_encoded(), ...]} | {error, term()}.
 read_certificates(Path) ->
     case read_pem(Path) of
         {ok, Entries} ->
@@ -94,4 +104,27 @@ transport_opts(MaxFrameSize, Streams, IdleTimeout) ->
         max_data => ConnectionWindow,
         max_receive_window => ConnectionWindow,
         notify_streams_available => true
+    }.
+
+%% @doc The QMux transport parameters of a session receiving on up to
+%% `ReceiveStreams' streams at once, allowing the peer to open `PeerStreams'
+%% streams, with the same windows as QUIC, an idle timeout (0 for none) and
+%% records of up to 64 KiB.
+-spec qmux_parameters(
+    pos_integer(), pos_integer(), non_neg_integer(), non_neg_integer() | infinity
+) ->
+    trevrpc_qmux_frame:parameters().
+qmux_parameters(MaxFrameSize, ReceiveStreams, PeerStreams, IdleTimeout) ->
+    StreamWindow = stream_window(MaxFrameSize),
+    #{
+        max_idle_timeout =>
+            case IdleTimeout of
+                infinity -> 0;
+                _ -> IdleTimeout
+            end,
+        initial_max_data => connection_window(MaxFrameSize, ReceiveStreams),
+        initial_max_stream_data_bidi_local => StreamWindow,
+        initial_max_stream_data_bidi_remote => StreamWindow,
+        initial_max_streams_bidi => PeerStreams,
+        max_record_size => 65536
     }.

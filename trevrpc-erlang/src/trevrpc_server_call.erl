@@ -24,7 +24,14 @@ start(Spec) ->
     {Pid, Monitor}.
 
 run(
-    #{conn := Conn, id := Id, ref := Ref, router := Router, route := Route, config := Config} = Spec
+    #{
+        transport := Transport,
+        id := Id,
+        ref := Ref,
+        router := Router,
+        route := Route,
+        config := Config
+    } = Spec
 ) ->
     #{kind := Kind, handler := Handler} = Route,
     #{request := #{method := Method}, metadata := Metadata, deadline := Deadline} = Spec,
@@ -32,7 +39,7 @@ run(
     Stream0 = trevrpc_stream:resume(
         maps:get(frames, Spec),
         maps:get(fin, Spec),
-        trevrpc_stream:new(Conn, Id, Ref, Router, maps:get(reader, Spec))
+        trevrpc_stream:new(Transport, Id, Ref, Router, maps:get(reader, Spec))
     ),
     %% A request that is a single message is bounded by the frame size
     %% alone; a stream of them by the cumulative body limit too.
@@ -159,10 +166,15 @@ finish(Call, Kind, Result, Router, Id) ->
             _ = trevrpc_stream:send(Stream, Frames, true, Deadline),
             %% Release a client still uploading, even before it reads the
             %% status.
-            case State#call_state.request_end of
-                eof -> ok;
-                _ -> _ = catch quic:stop_sending(trevrpc_stream:conn(Stream), Id, ?CANCELLED)
-            end,
+            _ =
+                case State#call_state.request_end of
+                    eof ->
+                        ok;
+                    _ ->
+                        trevrpc_transport:stop_sending(
+                            trevrpc_stream:transport(Stream), Id, ?CANCELLED
+                        )
+                end,
             %% Requests routed here that the handler never read give their
             %% credit back. The connection routed them before it took the
             %% finish request, so they are all in the mailbox now, and it

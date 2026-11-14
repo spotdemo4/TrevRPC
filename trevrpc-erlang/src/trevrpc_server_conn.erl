@@ -16,7 +16,7 @@
 
 -behaviour(gen_server).
 
--export([start/2, shutdown/1, finish/3]).
+-export([start/2, start_qmux/2, shutdown/1, finish/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(entry, {
@@ -38,7 +38,11 @@
 }).
 
 -record(state, {
-    conn :: pid(),
+    %% The connection: native QUIC, or a QMux session once its socket came.
+    transport :: trevrpc_transport:t() | undefined,
+    %% The QMux session's monitor: a session that dies without its closed
+    %% event still ends the connection.
+    session_monitor :: reference() | undefined,
     config :: trevrpc_server:config(),
     streams = #{} :: #{non_neg_integer() => #entry{}},
     monitors = #{} :: #{reference() => non_neg_integer()},
@@ -52,11 +56,31 @@
 
 -define(CANCELLED, 1).
 
-%% @doc Starts the owner of `Conn'. Called by the listener, which makes it
-%% the connection's owner before the connection sees its first packet.
+%% @doc Starts the owner of the QUIC connection `Conn'. Called by the
+%% listener, which makes it the connection's owner before the connection
+%% sees its first packet.
 -spec start(pid(), trevrpc_server:config()) -> {ok, pid()} | ignore | {error, term()}.
 start(Conn, Config) ->
-    gen_server:start(?MODULE, {Conn, Config}, []).
+    gen_server:start(?MODULE, {{quic, Conn}, Config}, []).
+
+%% @doc Starts the owner of a QMux session over the TLS connection `Socket',
+%% whose handshake completed. The caller must be the socket's controlling
+%% process; the session takes it over.
+-spec start_qmux(ssl:sslsocket(), trevrpc_server:config()) -> {ok, pid()} | {error, term()}.
+start_qmux(Socket, Config) ->
+    case gen_server:start(?MODULE, {undefined, Config}, []) of
+        {ok, Pid} ->
+            case ssl:controlling_process(Socket, Pid) of
+                ok ->
+                    gen_server:cast(Pid, {qmux, Socket}),
+                    {ok, Pid};
+                {error, _} = Error ->
+                    exit(Pid, kill),
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
 
 %% @doc Cancels every call, waits for their handlers up to the graceful
 %% shutdown timeout, then closes the connection.
@@ -77,14 +101,14 @@ finish(Pid, Id, Ref) ->
 
 %%% gen_server
 
--spec init({pid(), trevrpc_server:config()}) -> {ok, #state{}}.
-init({Conn, Config}) ->
+-spec init({trevrpc_transport:t() | undefined, trevrpc_server:config()}) -> {ok, #state{}}.
+init({Transport, Config}) ->
     %% Call processes are linked, so they die with this process however it
     %% exits; their own exits arrive as messages, and as the monitors' DOWN.
     process_flag(trap_exit, true),
     %% Exits with the server.
     monitor(process, maps:get(server, Config)),
-    {ok, #state{conn = Conn, config = Config}}.
+    {ok, #state{transport = Transport, config = Config}}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
 handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
@@ -97,6 +121,15 @@ handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
     end.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
+handle_cast({qmux, Socket}, #state{config = Config} = State) ->
+    case trevrpc_qmux:start(Socket, server, self(), maps:get(qmux, Config)) of
+        {ok, Session} ->
+            {noreply, State#state{
+                transport = {qmux, Session}, session_monitor = monitor(process, Session)
+            }};
+        {error, _Reason} ->
+            {stop, normal, State}
+    end;
 handle_cast(shutdown, #state{stopping = true} = State) ->
     {noreply, State};
 handle_cast(shutdown, #state{config = #{graceful_shutdown_timeout := Grace}} = State) ->
@@ -105,11 +138,15 @@ handle_cast(shutdown, #state{config = #{graceful_shutdown_timeout := Grace}} = S
     maybe_close(State1).
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
-handle_info({quic, Conn, Event}, #state{conn = Conn} = State) ->
+handle_info({Tag, Pid, Event}, #state{transport = {_, Pid}} = State) when
+    Tag =:= quic; Tag =:= trevrpc_qmux
+->
     quic_event(Event, State);
-handle_info({trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters, conn = Conn} = State) ->
+handle_info(
+    {trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters, transport = Transport} = State
+) ->
     case Waiters of
-        [] -> quic_connection:notify_send_ready(Conn);
+        [] -> trevrpc_transport:notify_send_ready(Transport);
         _ -> ok
     end,
     {noreply, State#state{send_waiters = [{Pid, Ref} | Waiters]}};
@@ -129,6 +166,8 @@ handle_info({timeout, Timer, {deadline, Id}}, #state{streams = Streams} = State)
         _ ->
             {noreply, State}
     end;
+handle_info({'DOWN', Monitor, process, _Pid, Reason}, #state{session_monitor = Monitor} = State) ->
+    quic_event({closed, {session_down, Reason}}, State#state{session_monitor = undefined});
 handle_info({'DOWN', Monitor, process, _Pid, Reason}, #state{monitors = Monitors} = State) ->
     case maps:take(Monitor, Monitors) of
         {Id, Rest} -> call_down(Id, Reason, State#state{monitors = Rest});
@@ -167,9 +206,9 @@ quic_event(_Event, State) ->
     %% connected, datagrams (not used yet), timers, transport errors.
     {noreply, State}.
 
-stream_opened(Id, #state{conn = Conn} = State) when Id band 2 =/= 0 ->
+stream_opened(Id, #state{transport = Transport} = State) when Id band 2 =/= 0 ->
     %% TrevRPC uses no unidirectional streams.
-    _ = catch quic:stop_sending(Conn, Id, ?CANCELLED),
+    _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
     State;
 stream_opened(Id, #state{stopping = true} = State) ->
     lone_status(Id, false, trevrpc_status:new(unavailable, <<"server is shutting down">>), State),
@@ -183,7 +222,7 @@ stream_opened(Id, #state{active = Active, config = Config} = State) ->
             ),
             State;
         false ->
-            _ = catch quic:set_stream_flow_control(State#state.conn, Id, manual),
+            ok = trevrpc_transport:manual_flow_control(State#state.transport, Id),
             #{
                 max_frame_size := MaxFrame,
                 max_stream_body_size := MaxBody,
@@ -211,26 +250,26 @@ stream_data(Id, Bin, Fin, #state{streams = Streams} = State) ->
             %% The call is ending; nothing reads its requests any more, so
             %% their credit goes back at once instead of waiting for the
             %% client to reset the stream.
-            _ = catch quic:consume(State#state.conn, Id, byte_size(Bin)),
+            _ = trevrpc_transport:consume(State#state.transport, Id, byte_size(Bin)),
             State#state{streams = Streams#{Id := Entry#entry{fin = Entry#entry.fin orelse Fin}}};
         _ ->
-            _ = catch quic:consume(State#state.conn, Id, byte_size(Bin)),
+            _ = trevrpc_transport:consume(State#state.transport, Id, byte_size(Bin)),
             State
     end.
 
 %% The peer reset its request side or stopped reading: it abandoned the call.
-abandoned(Id, #state{streams = Streams, conn = Conn} = State) ->
+abandoned(Id, #state{streams = Streams, transport = Transport} = State) ->
     case Streams of
         #{Id := #entry{state = reading} = Entry} ->
             cancel_timer(Entry),
-            _ = catch quic:reset_stream(Conn, Id, ?CANCELLED),
-            _ = catch quic:stop_sending(Conn, Id, ?CANCELLED),
+            _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
+            _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
             remove(Id, release(Id, Entry, State));
         #{Id := #entry{state = running, pid = Pid} = Entry} ->
             exit(Pid, kill),
             cancel_timer(Entry),
-            _ = catch quic:reset_stream(Conn, Id, ?CANCELLED),
-            _ = catch quic:stop_sending(Conn, Id, ?CANCELLED),
+            _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
+            _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
             release(Id, Entry#entry{state = cancelling, timer = undefined}, State);
         _ ->
             State
@@ -238,8 +277,8 @@ abandoned(Id, #state{streams = Streams, conn = Conn} = State) ->
 
 %%% Reading the REQUEST
 
-read_request(Id, #entry{reader = Reader} = Entry, Bin, Fin, #state{conn = Conn} = State) ->
-    _ = catch quic:consume(Conn, Id, byte_size(Bin)),
+read_request(Id, #entry{reader = Reader} = Entry, Bin, Fin, #state{transport = Transport} = State) ->
+    _ = trevrpc_transport:consume(Transport, Id, byte_size(Bin)),
     case trevrpc_frame:feed(Bin, Reader) of
         {ok, [], Next} when Fin ->
             Message =
@@ -413,7 +452,7 @@ admit(Id, Entry, Request, Route, Metadata, Timeout, Rest, #state{config = Config
                     _ -> erlang:monotonic_time(millisecond) + Timeout
                 end,
             Spec = #{
-                conn => State#state.conn,
+                transport => State#state.transport,
                 id => Id,
                 ref => Entry#entry.ref,
                 router => self(),
@@ -448,12 +487,15 @@ refuse(Id, Entry, Status, State) ->
 %% Writes a terminal STATUS from this process, which must not block, so it
 %% is queued without the send queue's ceiling. A request side the peer has
 %% not finished is stopped after it.
-lone_status(Id, Fin, Status, #state{conn = Conn, config = #{max_frame_size := Max}}) ->
-    _ = catch quic:send_data_async(Conn, Id, trevrpc_server_call:status_frame(Status, Max), true),
-    case Fin of
-        true -> ok;
-        false -> _ = catch quic:stop_sending(Conn, Id, ?CANCELLED)
-    end,
+lone_status(Id, Fin, Status, #state{transport = Transport, config = #{max_frame_size := Max}}) ->
+    ok = trevrpc_transport:send_data_async(
+        Transport, Id, trevrpc_server_call:status_frame(Status, Max), true
+    ),
+    _ =
+        case Fin of
+            true -> ok;
+            false -> trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED)
+        end,
     ok.
 
 %%% Call processes
@@ -500,22 +542,25 @@ shutdown_stream(_Id, _Entry, State) ->
     State.
 
 %% A call cut off by shutdown: the client sees its stream reset.
-cut_off(Id, #state{conn = Conn}) ->
-    _ = catch quic:reset_stream(Conn, Id, ?CANCELLED),
-    _ = catch quic:stop_sending(Conn, Id, ?CANCELLED),
+cut_off(Id, #state{transport = Transport}) ->
+    _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
+    _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
     ok.
 
-maybe_close(#state{stopping = true, streams = Streams, conn = Conn} = State) ->
+maybe_close(#state{stopping = true, streams = Streams, transport = Transport} = State) ->
     Calls = [Id || Id := #entry{pid = Pid} <- Streams, is_pid(Pid)],
     case Calls of
         [] ->
-            _ = catch quic:close(Conn, 0),
+            ok = close_transport(Transport),
             {stop, normal, State};
         _ ->
             {noreply, State}
     end;
 maybe_close(State) ->
     {noreply, State}.
+
+close_transport(undefined) -> ok;
+close_transport(Transport) -> trevrpc_transport:close(Transport, 0).
 
 %%% Bookkeeping
 

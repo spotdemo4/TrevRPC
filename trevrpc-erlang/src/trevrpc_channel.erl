@@ -1,4 +1,5 @@
-%% @doc A long-lived client channel to one TrevRPC server over native QUIC.
+%% @doc A long-lived client channel to one TrevRPC server, over native QUIC
+%% with QMux over TLS as the fallback for networks that block UDP.
 %%
 %% ```
 %% {ok, Channel} = trevrpc_channel:connect(#{
@@ -15,9 +16,16 @@
 %% each attempt up to 30 s, with 20 percent jitter, and start over once a
 %% generation is ready.
 %%
-%% The channel process owns the QUIC connection and routes each stream's
-%% events to the process that made the call, which reads and writes the
-%% stream itself; see {@link trevrpc_client}.
+%% With the `auto' transport (the default) each connection races the two
+%% transports, as the Go and Rust channels do: QUIC starts first, QMux over
+%% TLS after the fallback delay (300 ms) or as soon as QUIC fails, and the
+%% first to be ready wins while the other is closed. Once QMux won,
+%% reconnects use it directly until the reprobe interval (5 minutes) has
+%% passed, then race again. `quic' and `tcp' pin one transport.
+%%
+%% The channel process owns the connection and routes each stream's events
+%% to the process that made the call, which reads and writes the stream
+%% itself; see {@link trevrpc_client}.
 -module(trevrpc_channel).
 
 -behaviour(gen_server).
@@ -28,6 +36,7 @@
     connect/2,
     wait_until_ready/2,
     generation/1,
+    transport/1,
     subscribe/1,
     unsubscribe/1,
     close/1
@@ -42,9 +51,16 @@
 %% good.
 -type state() :: {ready, pos_integer()} | connecting | closed.
 
+%% `tcp_host' and `tcp_port' address the server's TCP listener, by default
+%% the same host and port as QUIC.
 -type options() :: #{
     host := inet:hostname() | inet:ip_address() | binary(),
     port := inet:port_number(),
+    tcp_host => inet:hostname() | inet:ip_address() | binary(),
+    tcp_port => inet:port_number(),
+    transport => auto | quic | tcp,
+    fallback_delay => non_neg_integer(),
+    reprobe_interval => non_neg_integer(),
     server_name => string(),
     verify => boolean(),
     cacertfile => file:filename_all(),
@@ -56,7 +72,7 @@
 
 %% What a calling process needs to use a stream it opened.
 -type stream_info() :: #{
-    conn := pid(),
+    transport := trevrpc_transport:t(),
     id := non_neg_integer(),
     ref := reference(),
     generation := pos_integer(),
@@ -67,19 +83,44 @@
 -define(MAX_DELAY, 30000).
 -define(CANCELLED, 1).
 
+%% A connection attempt: its transport kind, its connection once known, and
+%% for QUIC the process the connection is linked to (see quic_attempt/2).
+-type attempt() :: #{
+    kind := trevrpc_transport:kind(),
+    transport := trevrpc_transport:t() | undefined,
+    parent := pid() | undefined
+}.
+
 -record(state, {
     host :: inet:hostname() | inet:ip_address(),
     port :: inet:port_number(),
+    tcp_host :: inet:hostname() | inet:ip_address(),
+    tcp_port :: inet:port_number(),
+    policy :: auto | quic | tcp,
+    fallback_delay :: non_neg_integer(),
+    reprobe_interval :: non_neg_integer(),
+    %% Until when reconnects use QMux directly, after it won a race.
+    fallback_until :: integer() | undefined,
     quic_opts :: map(),
+    tls_opts :: [ssl:tls_client_option()],
+    qmux_opts :: trevrpc_qmux:options(),
     max_frame_size :: pos_integer(),
     connect_timeout :: pos_integer(),
     status = connecting :: connecting | ready,
-    conn :: pid() | undefined,
-    %% Tags the current connection attempt, so stale results are ignored.
-    attempt :: reference() | undefined,
-    %% The process that started the current connection, which lives as
-    %% long as the connection should (see attempt/1).
+    transport :: trevrpc_transport:t() | undefined,
+    %% The current race, its attempts, whether it started with QUIC, and
+    %% whether its QMux attempt started.
+    round :: reference() | undefined,
+    attempts = #{} :: #{reference() => attempt()},
+    raced = false :: boolean(),
+    fallback_started = false :: boolean(),
+    %% The ready connection's monitor, and for QUIC the process it is linked
+    %% to (see quic_attempt/1).
+    conn_monitor :: reference() | undefined,
     parent :: pid() | undefined,
+    %% Connections the channel closed, monitored until they exit: their late
+    %% events are ignored, so a closing one cannot pass for a new attempt's.
+    retired = #{} :: #{pid() => reference()},
     generation = 0 :: non_neg_integer(),
     delay = ?INITIAL_DELAY :: pos_integer(),
     ready_waiters = [] :: [{gen_server:from(), reference()}],
@@ -131,6 +172,11 @@ wait_until_ready(Channel, Timeout) ->
 generation(Channel) ->
     gen_server:call(Channel, generation).
 
+%% @doc The transport of the current generation, or `none' while connecting.
+-spec transport(pid()) -> trevrpc_transport:kind() | none.
+transport(Channel) ->
+    gen_server:call(Channel, transport).
+
 %% @doc Sends the calling process the channel's state now and after every
 %% change, as `{trevrpc_channel, Channel, State}' messages, until it
 %% unsubscribes or exits; `closed' is the last. Subscribing again only sends
@@ -175,23 +221,123 @@ stream_done(Channel, Id, Ref) ->
 -spec init(options()) -> {ok, #state{}}.
 init(Opts) ->
     _ = application:ensure_all_started(quic),
+    _ = application:ensure_all_started(ssl),
+    process_flag(trap_exit, true),
     MaxFrame = maps:get(max_frame_size, Opts, trevrpc:default_max_frame_size()),
-    Tls = maps:with([server_name, cacertfile, cacerts], Opts),
+    Idle = maps:get(idle_timeout, Opts, 30000),
+    Host = host(maps:get(host, Opts)),
+    Port = maps:get(port, Opts),
+    QuicTls = maps:with([server_name, cacertfile, cacerts], Opts),
     QuicOpts = maps:merge(
-        trevrpc_quic:transport_opts(MaxFrame, 64, maps:get(idle_timeout, Opts, 30000)),
-        Tls#{verify => maps:get(verify, Opts, true)}
+        trevrpc_quic:transport_opts(MaxFrame, 64, Idle), QuicTls#{
+            verify => maps:get(verify, Opts, true)
+        }
     ),
+    TcpHost = host(maps:get(tcp_host, Opts, Host)),
     State = #state{
-        host = host(maps:get(host, Opts)),
-        port = maps:get(port, Opts),
+        host = Host,
+        port = Port,
+        tcp_host = TcpHost,
+        tcp_port = maps:get(tcp_port, Opts, Port),
+        policy = maps:get(transport, Opts, auto),
+        fallback_delay = maps:get(fallback_delay, Opts, 300),
+        reprobe_interval = maps:get(reprobe_interval, Opts, 300000),
         quic_opts = QuicOpts,
+        tls_opts = tls_opts(Opts, TcpHost),
+        qmux_opts = #{
+            parameters => trevrpc_quic:qmux_parameters(MaxFrame, 64, 0, Idle),
+            keep_alive => max(1, Idle div 2),
+            handshake_timeout => maps:get(connect_timeout, Opts, 10000),
+            send_timeout => Idle
+        },
         max_frame_size = MaxFrame,
         connect_timeout = maps:get(connect_timeout, Opts, 10000)
     },
-    {ok, attempt(State)}.
+    {ok, race(State)}.
 
 host(Host) when is_binary(Host) -> binary_to_list(Host);
 host(Host) -> Host.
+
+%% TLS for QMux: the trust the options name, and for a host name, SNI and a
+%% check of the certificate against it. For an IP address only the chain is
+%% checked.
+tls_opts(Opts, Host) ->
+    Name =
+        case Opts of
+            #{server_name := ServerName} -> ServerName;
+            #{} when is_list(Host) -> Host;
+            #{} -> undefined
+        end,
+    DnsName =
+        case Name =:= undefined orelse inet:parse_address(Name) =/= {error, einval} of
+            true -> undefined;
+            false -> Name
+        end,
+    Trust =
+        case Opts of
+            #{verify := false} ->
+                [{verify, verify_none}];
+            #{cacerts := CaCerts} ->
+                pinned(CaCerts, DnsName);
+            #{cacertfile := File} ->
+                case trevrpc_quic:read_certificates(File) of
+                    {ok, CaCerts} -> pinned(CaCerts, DnsName);
+                    %% Each attempt fails with ssl's own error.
+                    {error, _} -> [{verify, verify_peer}, {cacertfile, File}]
+                end;
+            #{} ->
+                [{verify, verify_peer}, {cacerts, public_key:cacerts_get()}]
+        end,
+    Identity =
+        case DnsName of
+            undefined ->
+                [{server_name_indication, disable}];
+            _ ->
+                [
+                    {server_name_indication, DnsName},
+                    {customize_hostname_check, [
+                        {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+                    ]}
+                ]
+        end,
+    [
+        binary,
+        {active, false},
+        {nodelay, true},
+        {versions, ['tlsv1.3', 'tlsv1.2']},
+        {alpn_advertised_protocols, [trevrpc:qmux_alpn()]}
+        | Trust ++ Identity
+    ].
+
+%% Trust in the certificates `Trusted', which may include a self-signed
+%% server certificate itself, as Go and Rust clients allow. ssl refuses every
+%% self-signed peer certificate unless the verify fun accepts it, and then
+%% skips its host name check, so the fun checks, for a DNS name, that the
+%% certificate names the host, and its validity again.
+pinned(Trusted, DnsName) ->
+    Verify = fun
+        (Cert, {bad_cert, selfsigned_peer} = Reason, State) ->
+            Der = public_key:pkix_encode('OTPCertificate', Cert, otp),
+            case lists:member(Der, Trusted) andalso valid_pinned(Der, DnsName) of
+                true -> {valid, State};
+                false -> {fail, Reason}
+            end;
+        (_Cert, {bad_cert, _} = Reason, _State) ->
+            {fail, Reason};
+        (_Cert, {extension, _}, State) ->
+            {unknown, State};
+        (_Cert, _Valid, State) ->
+            {valid, State}
+    end,
+    [{verify, verify_peer}, {cacerts, Trusted}, {verify_fun, {Verify, []}}].
+
+valid_pinned(Der, DnsName) ->
+    Valid = element(1, public_key:pkix_path_validation(Der, [Der], [])) =:= ok,
+    Valid andalso
+        (DnsName =:= undefined orelse
+            public_key:pkix_verify_hostname(Der, [{dns_id, DnsName}], [
+                {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+            ])).
 
 -spec handle_call(term(), gen_server:from(), #state{}) ->
     {reply, term(), #state{}} | {noreply, #state{}} | {stop, normal, ok, #state{}}.
@@ -206,6 +352,10 @@ handle_call({wait_until_ready, Timeout}, From, #state{ready_waiters = Waiters} =
     {noreply, State#state{ready_waiters = [{From, Timer} | Waiters]}};
 handle_call(generation, _From, #state{generation = Generation} = State) ->
     {reply, Generation, State};
+handle_call(transport, _From, #state{status = ready, transport = Transport} = State) ->
+    {reply, trevrpc_transport:kind(Transport), State};
+handle_call(transport, _From, State) ->
+    {reply, none, State};
 handle_call({subscribe, Pid}, _From, #state{subscribers = Subscribers} = State) ->
     Pid ! {trevrpc_channel, self(), channel_state(State)},
     %% Subscribing again only repeats the current state.
@@ -235,47 +385,58 @@ handle_cast({stream_done, Id, Ref}, #state{streams = Streams} = State) ->
     end.
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
-handle_info({quic, Conn, Event}, #state{conn = Conn} = State) when Conn =/= undefined ->
-    quic_event(Event, State);
-handle_info(
-    {quic, Conn, {Outcome, _} = Event}, #state{conn = undefined, attempt = Attempt} = State
-) when
-    Attempt =/= undefined, (Outcome =:= connected orelse Outcome =:= error)
+handle_info({Tag, Pid, Event}, #state{status = ready, transport = {_, Pid}} = State) when
+    Tag =:= quic; Tag =:= trevrpc_qmux
 ->
-    %% quic:connect/4 returns at once for an address, so the handshake can
-    %% end before the attempt reports the connection.
-    quic_event(Event, State#state{conn = Conn});
-handle_info({quic, _OldConn, _Event}, State) ->
+    connection_event(Event, State);
+handle_info({Tag, Pid, _Event}, #state{retired = Retired} = State) when
+    (Tag =:= quic orelse Tag =:= trevrpc_qmux) andalso is_map_key(Pid, Retired)
+->
     {noreply, State};
-handle_info({connect_result, Attempt, Result}, #state{attempt = Attempt} = State) ->
-    case {Result, State#state.conn} of
-        {{ok, Conn}, undefined} ->
-            {noreply, State#state{conn = Conn}};
-        {{ok, Conn}, Conn} ->
-            {noreply, State};
-        {{ok, Other}, _Adopted} ->
-            _ = catch quic:close(Other, 0),
-            {noreply, State};
-        {{error, _Reason}, _} ->
-            {noreply, retry(State)}
+handle_info({Tag, Pid, Event}, State) when Tag =:= quic; Tag =:= trevrpc_qmux ->
+    case find_attempt(Pid, State) of
+        {ok, Ref} ->
+            attempt_event(Ref, Event, State);
+        error when Tag =:= quic ->
+            adopt(quic, Pid, Event, State);
+        error ->
+            adopt(qmux, Pid, Event, State)
     end;
-handle_info({connect_result, _Stale, {ok, Conn}}, #state{conn = Current} = State) when
-    Conn =/= Current
-->
-    %% An attempt that timed out connected after all.
-    _ = catch quic:close(Conn, 0),
-    {noreply, State};
+handle_info({connect_result, Ref, Result}, #state{attempts = Attempts} = State) ->
+    case {Attempts, Result} of
+        {#{Ref := #{transport := undefined} = Attempt}, {ok, Transport}} ->
+            {noreply, State#state{attempts = Attempts#{Ref := Attempt#{transport := Transport}}}};
+        {#{Ref := #{transport := Adopted}}, {ok, Transport}} when Adopted =/= Transport ->
+            %% The attempt adopted another connection from its events.
+            {noreply, retire(Transport, State)};
+        {#{Ref := _}, {ok, _}} ->
+            {noreply, State};
+        {#{Ref := _}, {error, _Reason}} ->
+            {noreply, attempt_failed(Ref, State)};
+        {#{}, {ok, Transport}} ->
+            %% A stale attempt connected after all, unless a later round
+            %% adopted its connection.
+            case
+                Transport =:= State#state.transport orelse
+                    find_attempt(trevrpc_transport:pid(Transport), State) =/= error
+            of
+                true -> {noreply, State};
+                false -> {noreply, retire(Transport, State)}
+            end;
+        {#{}, {error, _}} ->
+            {noreply, State}
+    end;
+handle_info({timeout, _Timer, {attempt_timeout, Ref}}, #state{attempts = Attempts} = State) ->
+    case Attempts of
+        #{Ref := _} -> {noreply, attempt_failed(Ref, State)};
+        #{} -> {noreply, State}
+    end;
 handle_info(
-    {timeout, _Timer, {connect_timeout, Attempt}},
-    #state{attempt = Attempt, status = connecting} = State
+    {timeout, _Timer, {fallback, Round}}, #state{round = Round, status = connecting} = State
 ) ->
-    case State#state.conn of
-        undefined -> ok;
-        Conn -> _ = catch quic:close(Conn, 0)
-    end,
-    {noreply, retry(State#state{conn = undefined})};
-handle_info({timeout, _Timer, reconnect}, #state{status = connecting, attempt = undefined} = State) ->
-    {noreply, attempt(State)};
+    {noreply, start_fallback(State)};
+handle_info({timeout, _Timer, reconnect}, #state{status = connecting, round = undefined} = State) ->
+    {noreply, race(State)};
 handle_info({timeout, Timer, {ready_timeout, From}}, #state{ready_waiters = Waiters} = State) ->
     case lists:keytake(From, 1, Waiters) of
         {value, {From, Timer}, Rest} ->
@@ -296,66 +457,108 @@ handle_info({timeout, _Timer, {open_timeout, From}}, #state{pending_opens = Pend
         false ->
             {noreply, State}
     end;
-handle_info({trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters, conn = Conn} = State) ->
+handle_info({trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters} = State) ->
     _ =
-        case {Waiters, Conn} of
-            {_, undefined} -> Pid ! {trevrpc_stream, Ref, closed};
-            {[], _} -> quic_connection:notify_send_ready(Conn);
+        case {Waiters, State#state.status} of
+            {_, connecting} -> Pid ! {trevrpc_stream, Ref, closed};
+            {[], ready} -> trevrpc_transport:notify_send_ready(State#state.transport);
             _ -> ok
         end,
     {noreply, State#state{send_waiters = [{Pid, Ref} | Waiters]}};
+handle_info({'DOWN', Monitor, process, Pid, _Reason}, #state{retired = Retired} = State) when
+    map_get(Pid, Retired) =:= Monitor
+->
+    {noreply, State#state{retired = maps:remove(Pid, Retired)}};
+handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{conn_monitor = Monitor} = State) ->
+    %% The connection's process died without telling: as if it closed.
+    {noreply, lost(State#state{conn_monitor = undefined})};
 handle_info(
     {'DOWN', Monitor, process, _Pid, _Reason}, #state{subscribers = Subscribers} = State
 ) when
     is_map_key(Monitor, Subscribers)
 ->
     {noreply, State#state{subscribers = maps:remove(Monitor, Subscribers)}};
-handle_info(
-    {'DOWN', Monitor, process, _Pid, _Reason},
-    #state{monitors = Monitors, streams = Streams} = State
-) ->
+handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{monitors = Monitors} = State) ->
     %% The calling process exited without finishing its call: cancel it.
     case maps:find(Monitor, Monitors) of
         {ok, Id} ->
-            #{Id := _} = Streams,
-            _ = catch quic:reset_stream(State#state.conn, Id, ?CANCELLED),
-            _ = catch quic:stop_sending(State#state.conn, Id, ?CANCELLED),
+            _ = trevrpc_transport:reset_stream(State#state.transport, Id, ?CANCELLED),
+            _ = trevrpc_transport:stop_sending(State#state.transport, Id, ?CANCELLED),
             {noreply, forget(Id, Monitor, State)};
         error ->
             {noreply, State}
     end;
+handle_info({'EXIT', _Pid, _Reason}, State) ->
+    %% Connect helpers and the processes QUIC connections are linked to.
+    {noreply, State};
 handle_info(_Message, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
-terminate(_Reason, #state{conn = Conn, subscribers = Subscribers} = State) ->
+terminate(_Reason, #state{subscribers = Subscribers} = State) ->
     _ = [Pid ! {trevrpc_channel, self(), closed} || Pid <- maps:values(Subscribers)],
     fail_streams(State),
-    case Conn of
-        undefined -> ok;
-        _ -> _ = catch quic:close(Conn, 0)
-    end,
+    _ = release_connection(stop_attempts(State)),
     ok.
 
-%%% Connecting
+%%% Racing
+
+%% Starts a round of connection attempts: QMux alone while it won recently,
+%% else QUIC, with QMux to follow.
+race(#state{policy = Policy, fallback_until = Until} = State) ->
+    Round = make_ref(),
+    UseFallback =
+        Policy =:= tcp orelse
+            (Policy =:= auto andalso Until =/= undefined andalso now_ms() < Until),
+    Started = State#state{
+        round = Round, attempts = #{}, raced = not UseFallback, fallback_started = UseFallback
+    },
+    case UseFallback of
+        true ->
+            tcp_attempt(Started);
+        false ->
+            _ =
+                case Policy of
+                    auto ->
+                        erlang:start_timer(State#state.fallback_delay, self(), {fallback, Round});
+                    quic ->
+                        ok
+                end,
+            quic_attempt(Started)
+    end.
+
+%% QMux joins a round once, when the fallback delay passes or QUIC fails,
+%% whichever comes first.
+start_fallback(#state{policy = auto, fallback_started = false} = State) ->
+    tcp_attempt(State#state{fallback_started = true});
+start_fallback(State) ->
+    State.
 
 %% quic:connect/4 blocks while it races the addresses of a host name, so it
 %% runs in a process of its own; the channel owns the connection either way.
 %% The connection is linked to the process that started it and stops when
 %% that process exits, so that process stays alive as its parent: it exits
 %% when told to, or with the channel, and takes the connection with it.
-attempt(#state{host = Host, port = Port, quic_opts = QuicOpts, connect_timeout = Timeout} = State) ->
-    stop_parent(State),
-    Attempt = make_ref(),
+quic_attempt(
+    #state{host = Host, port = Port, quic_opts = QuicOpts, connect_timeout = Timeout} = State
+) ->
+    Ref = make_ref(),
     Self = self(),
     Opts = QuicOpts#{connect_timeout => Timeout},
     Parent = spawn_link(fun() ->
         process_flag(trap_exit, true),
-        Self ! {connect_result, Attempt, catch_connect(Host, Port, Opts, Self)},
+        Result =
+            try quic:connect(Host, Port, Opts, Self) of
+                {ok, Conn} -> {ok, {quic, Conn}};
+                Error -> Error
+            catch
+                Class:Reason -> {error, {Class, Reason}}
+            end,
+        Self ! {connect_result, Ref, Result},
         parent_loop(Self)
     end),
-    erlang:start_timer(Timeout, self(), {connect_timeout, Attempt}),
-    State#state{attempt = Attempt, conn = undefined, parent = Parent}.
+    erlang:start_timer(Timeout, self(), {attempt_timeout, Ref}),
+    add_attempt(Ref, #{kind => quic, transport => undefined, parent => Parent}, State).
 
 parent_loop(Channel) ->
     receive
@@ -365,79 +568,212 @@ parent_loop(Channel) ->
         {'EXIT', _Other, _Reason} -> parent_loop(Channel)
     end.
 
-stop_parent(#state{parent = undefined}) ->
-    ok;
-stop_parent(#state{parent = Parent}) ->
-    Parent ! stop,
-    ok.
+%% A TLS connection whose handshake picked the QMux ALPN, then a QMux
+%% session over it, owned by the channel.
+tcp_attempt(
+    #state{
+        tcp_host = Host,
+        tcp_port = Port,
+        tls_opts = TlsOpts,
+        qmux_opts = QmuxOpts,
+        connect_timeout = Timeout
+    } = State
+) ->
+    Ref = make_ref(),
+    Self = self(),
+    _ = spawn_link(fun() ->
+        Result =
+            case ssl:connect(Host, Port, TlsOpts, Timeout) of
+                {ok, Socket} ->
+                    Qmux = trevrpc:qmux_alpn(),
+                    case ssl:negotiated_protocol(Socket) of
+                        {ok, Qmux} ->
+                            case trevrpc_qmux:start(Socket, client, Self, QmuxOpts) of
+                                {ok, Session} ->
+                                    {ok, {qmux, Session}};
+                                Error ->
+                                    _ = ssl:close(Socket),
+                                    Error
+                            end;
+                        _ ->
+                            _ = ssl:close(Socket),
+                            {error, no_application_protocol}
+                    end;
+                Error ->
+                    Error
+            end,
+        Self ! {connect_result, Ref, Result}
+    end),
+    erlang:start_timer(Timeout, self(), {attempt_timeout, Ref}),
+    add_attempt(Ref, #{kind => qmux, transport => undefined, parent => undefined}, State).
 
-catch_connect(Host, Port, Opts, Owner) ->
-    try
-        quic:connect(Host, Port, Opts, Owner)
-    catch
-        Class:Reason -> {error, {Class, Reason}}
+add_attempt(Ref, Attempt, #state{attempts = Attempts} = State) ->
+    State#state{attempts = Attempts#{Ref => Attempt}}.
+
+find_attempt(Pid, #state{attempts = Attempts}) ->
+    case [Ref || Ref := #{transport := {_, P}} <- Attempts, P =:= Pid] of
+        [Ref | _] -> {ok, Ref};
+        [] -> error
     end.
 
-%% Schedules the next attempt after the backoff delay, with jitter.
-retry(#state{delay = Delay} = State) ->
-    stop_parent(State),
+%% A connection can be ready, or already gone, before its attempt reports
+%% it: quic:connect/4 returns at once for an address, and a QMux session can
+%% get the server's parameters, or see it close, before its helper sends the
+%% result. Take it from its events; the channel's own closed connections are
+%% retired, so these come from the round's attempts.
+adopt(Kind, Pid, {Outcome, _} = Event, #state{attempts = Attempts} = State) when
+    Outcome =:= connected; Outcome =:= closed; Kind =:= quic andalso Outcome =:= error
+->
+    case [Ref || Ref := #{kind := K, transport := undefined} <- Attempts, K =:= Kind] of
+        [Ref | _] ->
+            Adopted = State#state{
+                attempts = Attempts#{Ref := (maps:get(Ref, Attempts))#{transport := {Kind, Pid}}}
+            },
+            attempt_event(Ref, Event, Adopted);
+        [] ->
+            {noreply, State}
+    end;
+adopt(_Kind, _Pid, _Event, State) ->
+    {noreply, State}.
+
+attempt_event(Ref, {connected, Info}, #state{attempts = Attempts} = State) ->
+    #{Ref := #{kind := Kind, transport := Transport}} = Attempts,
+    case Kind =:= qmux orelse maps:get(alpn, Info, undefined) =:= trevrpc:alpn() of
+        true -> {noreply, won(Ref, Transport, Kind, State)};
+        %% No or another application protocol: not a TrevRPC server.
+        false -> {noreply, attempt_failed(Ref, State)}
+    end;
+attempt_event(Ref, {Outcome, _Reason}, State) when Outcome =:= closed; Outcome =:= error ->
+    {noreply, attempt_failed(Ref, State)};
+attempt_event(_Ref, _Event, State) ->
+    {noreply, State}.
+
+%% The first ready connection becomes the generation; the race's other
+%% attempts close.
+won(Ref, Transport, Kind, #state{attempts = Attempts} = State) ->
+    #{Ref := #{parent := Parent}} = Attempts,
+    Stopped = stop_attempts(State#state{attempts = maps:remove(Ref, Attempts)}),
+    _ = [gen_server:reply(From, ok) || {From, _Timer} <- State#state.ready_waiters],
+    %% QMux winning a race against QUIC opens the window in which reconnects
+    %% skip QUIC; reconnects within it leave it as it is.
+    FallbackUntil =
+        case {State#state.policy, Kind, State#state.raced} of
+            {auto, qmux, true} -> now_ms() + State#state.reprobe_interval;
+            {auto, qmux, false} -> State#state.fallback_until;
+            _ -> undefined
+        end,
+    notify(Stopped#state{
+        status = ready,
+        transport = Transport,
+        generation = State#state.generation + 1,
+        delay = ?INITIAL_DELAY,
+        round = undefined,
+        attempts = #{},
+        ready_waiters = [],
+        fallback_until = FallbackUntil,
+        conn_monitor = monitor(process, trevrpc_transport:pid(Transport)),
+        parent = Parent
+    }).
+
+attempt_failed(Ref, #state{attempts = Attempts} = State) ->
+    #{Ref := #{kind := Kind} = Attempt} = Attempts,
+    Next = close_attempt(Attempt, State#state{attempts = maps:remove(Ref, Attempts)}),
+    %% QUIC failing starts the fallback at once.
+    Fallback =
+        case Kind of
+            quic -> start_fallback(Next);
+            qmux -> Next
+        end,
+    case map_size(Fallback#state.attempts) of
+        0 -> retry(Fallback);
+        _ -> Fallback
+    end.
+
+%% Closes the attempts; the caller forgets them.
+stop_attempts(#state{attempts = Attempts} = State) ->
+    lists:foldl(fun close_attempt/2, State, maps:values(Attempts)).
+
+close_attempt(#{transport := Transport, parent := Parent}, State) ->
+    _ =
+        case Parent of
+            undefined -> ok;
+            _ -> Parent ! stop
+        end,
+    retire(Transport, State).
+
+%% Closes a connection, and ignores what it sends until it exits.
+retire(undefined, State) ->
+    State;
+retire(Transport, #state{retired = Retired} = State) ->
+    ok = trevrpc_transport:close(Transport, 0),
+    Pid = trevrpc_transport:pid(Transport),
+    case Retired of
+        #{Pid := _} -> State;
+        #{} -> State#state{retired = Retired#{Pid => monitor(process, Pid)}}
+    end.
+
+%% Schedules the next race after the backoff delay, with jitter.
+retry(#state{delay = Delay} = State0) ->
+    State = stop_attempts(State0),
     Jittered = round(Delay * (0.8 + 0.4 * rand:uniform())),
     erlang:start_timer(Jittered, self(), reconnect),
     State#state{
         status = connecting,
-        conn = undefined,
-        attempt = undefined,
-        parent = undefined,
+        transport = undefined,
+        round = undefined,
+        attempts = #{},
         delay = min(?MAX_DELAY, Delay * 2)
     }.
 
-quic_event({connected, #{alpn := Alpn}}, #state{status = connecting} = State) ->
-    case Alpn =:= trevrpc:alpn() of
-        true ->
-            _ = [gen_server:reply(From, ok) || {From, _Timer} <- State#state.ready_waiters],
-            {noreply,
-                notify(State#state{
-                    status = ready,
-                    generation = State#state.generation + 1,
-                    delay = ?INITIAL_DELAY,
-                    attempt = undefined,
-                    ready_waiters = []
-                })};
-        false ->
-            _ = catch quic:close(State#state.conn, 0),
-            {noreply, retry(State)}
-    end;
-quic_event({connected, _Info}, #state{status = connecting, conn = Conn} = State) ->
-    %% No application protocol: not a TrevRPC server.
-    _ = catch quic:close(Conn, 0),
-    {noreply, retry(State)};
-quic_event({stream_data, Id, Bin, Fin}, State) ->
+%%% The ready connection
+
+connection_event({stream_data, Id, Bin, Fin}, State) ->
     route(Id, {data, Bin, Fin}, State);
-quic_event({stream_reset, Id, Code}, State) ->
+connection_event({stream_reset, Id, Code}, State) ->
     route(Id, {reset, Code}, State);
-quic_event({stop_sending, Id, Code}, State) ->
+connection_event({stop_sending, Id, Code}, State) ->
     route(Id, {stop_sending, Code}, State);
-quic_event({stream_opened, Id}, #state{conn = Conn} = State) ->
+connection_event({stream_opened, Id}, #state{transport = Transport} = State) ->
     %% Servers open no streams in TrevRPC.
-    _ = catch quic:stop_sending(Conn, Id, ?CANCELLED),
+    _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
     {noreply, State};
-quic_event({streams_available, bidi}, State) ->
+connection_event({streams_available, bidi}, State) ->
     retry_opens(State);
-quic_event(send_ready, #state{send_waiters = Waiters} = State) ->
+connection_event(send_ready, #state{send_waiters = Waiters} = State) ->
     _ = [Pid ! {trevrpc_stream, Ref, send_ready} || {Pid, Ref} <- Waiters],
     {noreply, State#state{send_waiters = []}};
-quic_event({closed, _Reason}, State) ->
+connection_event({closed, _Reason}, State) ->
     {noreply, lost(State)};
-quic_event({error, _Reason}, State) ->
+connection_event({error, _Reason}, State) ->
     {noreply, lost(State)};
-quic_event(_Event, State) ->
+connection_event(_Event, State) ->
     {noreply, State}.
 
 %% The connection is gone: fail its calls and reconnect.
-lost(#state{status = ready} = State) ->
-    reconnect(notify(State#state{status = connecting}));
 lost(State) ->
-    reconnect(State).
+    Connecting = notify((release_connection(State))#state{status = connecting}),
+    fail_streams(Connecting),
+    _ = [
+        gen_server:reply(From, {error, trevrpc_status:new(unavailable, <<"connection closed">>)})
+     || {From, _Owner, _Timer} <- Connecting#state.pending_opens
+    ],
+    _ = [demonitor(Monitor, [flush]) || Monitor <- maps:keys(Connecting#state.monitors)],
+    retry(Connecting#state{streams = #{}, monitors = #{}, pending_opens = [], send_waiters = []}).
+
+%% Lets the ready connection go: closes it, in case it reported an error
+%% rather than closing, and stops the process a QUIC connection is linked to.
+release_connection(#state{transport = Transport, conn_monitor = Monitor, parent = Parent} = State) ->
+    _ =
+        case Monitor of
+            undefined -> ok;
+            _ -> demonitor(Monitor, [flush])
+        end,
+    _ =
+        case Parent of
+            undefined -> ok;
+            _ -> Parent ! stop
+        end,
+    (retire(Transport, State))#state{conn_monitor = undefined, parent = undefined}.
 
 %% Tells the subscribers the channel's state.
 notify(#state{subscribers = Subscribers} = State) ->
@@ -447,15 +783,6 @@ notify(#state{subscribers = Subscribers} = State) ->
 
 channel_state(#state{status = ready, generation = Generation}) -> {ready, Generation};
 channel_state(#state{status = connecting}) -> connecting.
-
-reconnect(State) ->
-    fail_streams(State),
-    _ = [
-        gen_server:reply(From, {error, trevrpc_status:new(unavailable, <<"connection closed">>)})
-     || {From, _Owner, _Timer} <- State#state.pending_opens
-    ],
-    _ = [demonitor(Monitor, [flush]) || Monitor <- maps:keys(State#state.monitors)],
-    retry(State#state{streams = #{}, monitors = #{}, pending_opens = [], send_waiters = []}).
 
 fail_streams(#state{streams = Streams, send_waiters = Waiters}) ->
     _ = [Pid ! {trevrpc_stream, Ref, closed} || {Pid, Ref, _Monitor} <- maps:values(Streams)],
@@ -472,14 +799,14 @@ route(Id, Event, #state{streams = Streams} = State) ->
 
 %%% Streams
 
-open(From, Owner, Deadline, #state{conn = Conn} = State) ->
-    case catch quic:open_stream(Conn) of
+open(From, Owner, Deadline, #state{transport = Transport} = State) ->
+    case trevrpc_transport:open_stream(Transport) of
         {ok, Id} ->
-            _ = catch quic:set_stream_flow_control(Conn, Id, manual),
+            ok = trevrpc_transport:manual_flow_control(Transport, Id),
             Ref = make_ref(),
             Monitor = monitor(process, Owner),
             Info = #{
-                conn => Conn,
+                transport => Transport,
                 id => Id,
                 ref => Ref,
                 generation => State#state.generation,
@@ -524,3 +851,5 @@ forget(Id, Monitor, #state{streams = Streams, monitors = Monitors} = State) ->
 
 closed_status() ->
     trevrpc_status:new(unavailable, <<"channel is closed">>).
+
+now_ms() -> erlang:monotonic_time(millisecond).

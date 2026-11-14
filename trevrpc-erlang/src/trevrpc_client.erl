@@ -112,8 +112,8 @@ start(Channel, Method, Kind, Opts, First) ->
         ok ?= check_deadline(Deadline),
         ok ?= check_metadata(Metadata),
         {ok, Info} ?= trevrpc_channel:open_stream(Channel, Deadline),
-        #{conn := Conn, id := Id, ref := Ref, max_frame_size := Max} = Info,
-        Stream = trevrpc_stream:new(Conn, Id, Ref, Channel, trevrpc_frame:reader(Max)),
+        #{transport := Transport, id := Id, ref := Ref, max_frame_size := Max} = Info,
+        Stream = trevrpc_stream:new(Transport, Id, Ref, Channel, trevrpc_frame:reader(Max)),
         Call = #client_call{
             ref = Ref, channel = Channel, kind = Kind, deadline = Deadline, owner = self()
         },
@@ -386,7 +386,9 @@ headers_or_empty(#cstate{headers = Headers}) -> Headers.
 cancel_upload(#cstate{send_closed = true}) ->
     ok;
 cancel_upload(#cstate{stream = Stream}) ->
-    _ = catch quic:reset_stream(trevrpc_stream:conn(Stream), trevrpc_stream:id(Stream), ?CANCELLED),
+    _ = trevrpc_transport:reset_stream(
+        trevrpc_stream:transport(Stream), trevrpc_stream:id(Stream), ?CANCELLED
+    ),
     ok.
 
 read_failed(Call, timeout, State) ->

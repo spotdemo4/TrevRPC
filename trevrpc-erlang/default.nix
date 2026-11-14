@@ -2,6 +2,7 @@
   lib,
   beamMinimal28Packages,
   wireGolden,
+  qmuxGolden,
   zstdGolden,
 }:
 let
@@ -60,6 +61,7 @@ buildRebar3 (final: {
     root = ../.;
     fileset = lib.fileset.unions [
       wireGolden
+      qmuxGolden
       zstdGolden
       (lib.fileset.difference ./. (
         lib.fileset.unions [

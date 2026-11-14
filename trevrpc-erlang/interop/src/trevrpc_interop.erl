@@ -9,10 +9,10 @@
 %%                               [--scenarios <name,...>]
 %% '''
 %%
-%% The runtime serves and calls native QUIC only so far. The server reports
-%% only its native port and the scenarios it supports; the client exits 77
-%% for a transport it lacks, and reports the scenarios it does not implement
-%% as skipped.
+%% The runtime serves and calls native QUIC and QMux over TLS; it has no
+%% HTTP/3, WebTransport, HTTP/2 or WebSocket yet. The server reports only the
+%% ports of what it serves and the scenarios it supports; the client reports
+%% the scenarios it does not implement as skipped.
 -module(trevrpc_interop).
 
 -export([main/0, server_scenarios/0]).
@@ -104,7 +104,8 @@ server(#{"cert" := Cert, "key" := Key} = Flags) ->
         routes => routes()
     }),
     {ok, Port} = trevrpc_server:port(Server),
-    io:put_chars(json:encode(#{native => Port, scenarios => server_scenarios()})),
+    {ok, TcpPort} = trevrpc_server:tcp_port(Server),
+    io:put_chars(json:encode(#{native => Port, qmux => TcpPort, scenarios => server_scenarios()})),
     io:nl(),
     %% Runs until stdin reaches EOF; SIGTERM stops the whole VM.
     wait_stdin(),

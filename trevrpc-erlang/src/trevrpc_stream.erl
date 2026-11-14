@@ -17,7 +17,7 @@
 %% </ul>
 %%
 %% The stream is in manual flow control: the peer may send one window past
-%% the bytes returned with `quic:consume/3'. Bytes are returned as they are
+%% the bytes returned with `trevrpc_transport:consume/3'. Bytes are returned as they are
 %% read into the frame reader, which is only fed when the decoded frames
 %% have all been taken, so a slow reader holds the peer back.
 -module(trevrpc_stream).
@@ -25,7 +25,7 @@
 -export([
     new/5,
     resume/3,
-    conn/1,
+    transport/1,
     id/1,
     ref/1,
     finished/1,
@@ -51,7 +51,7 @@
     | timeout.
 
 -record(stream, {
-    conn :: pid(),
+    transport :: trevrpc_transport:t(),
     id :: non_neg_integer(),
     ref :: reference(),
     %% The process that routes this stream's events, asked for send_ready.
@@ -75,11 +75,12 @@
 %% already waiting, and returned at once before the reader blocks.
 -define(CONSUME_BATCH, 65536).
 
-%% @doc A stream of connection `Conn', whose events `Router' sends tagged
+%% @doc A stream of connection `Transport', whose events `Router' sends tagged
 %% with `Ref', read with `Reader'.
--spec new(pid(), non_neg_integer(), reference(), pid(), trevrpc_frame:reader()) -> stream().
-new(Conn, Id, Ref, Router, Reader) ->
-    #stream{conn = Conn, id = Id, ref = Ref, router = Router, reader = Reader}.
+-spec new(trevrpc_transport:t(), non_neg_integer(), reference(), pid(), trevrpc_frame:reader()) ->
+    stream().
+new(Transport, Id, Ref, Router, Reader) ->
+    #stream{transport = Transport, id = Id, ref = Ref, router = Router, reader = Reader}.
 
 %% @doc Hands frames already read, and whether the peer already finished,
 %% to a stream that continues another reader's work.
@@ -87,8 +88,8 @@ new(Conn, Id, Ref, Router, Reader) ->
 resume(Frames, Fin, Stream) ->
     Stream#stream{frames = Frames, fin = Fin}.
 
--spec conn(stream()) -> pid().
-conn(#stream{conn = Conn}) -> Conn.
+-spec transport(stream()) -> trevrpc_transport:t().
+transport(#stream{transport = Transport}) -> Transport.
 
 -spec id(stream()) -> non_neg_integer().
 id(#stream{id = Id}) -> Id.
@@ -165,10 +166,10 @@ batch_credit(Stream) ->
 
 flush_credit(#stream{unconsumed = 0} = Stream) ->
     Stream;
-flush_credit(#stream{conn = Conn, id = Id, unconsumed = Unconsumed} = Stream) ->
+flush_credit(#stream{transport = Transport, id = Id, unconsumed = Unconsumed} = Stream) ->
     %% The stream may already be gone (finished or reset); its credit no
     %% longer matters then.
-    _ = catch quic:consume(Conn, Id, Unconsumed),
+    _ = trevrpc_transport:consume(Transport, Id, Unconsumed),
     Stream#stream{unconsumed = 0}.
 
 %% @doc Writes `Data' to the stream, finishing it with `Fin'. When the
@@ -177,12 +178,11 @@ flush_credit(#stream{conn = Conn, id = Id, unconsumed = Unconsumed} = Stream) ->
     {ok, stream()} | {error, timeout | stopped | closed | term(), stream()}.
 send(#stream{stopped = true} = Stream, _Data, _Fin, _Deadline) ->
     {error, stopped, Stream};
-send(#stream{conn = Conn, id = Id} = Stream, Data, Fin, Deadline) ->
-    case catch quic:send_data(Conn, Id, Data, Fin) of
+send(#stream{transport = Transport, id = Id} = Stream, Data, Fin, Deadline) ->
+    case trevrpc_transport:send_data(Transport, Id, Data, Fin) of
         ok -> {ok, Stream};
         {error, send_queue_full} -> wait_send_ready(Stream, Data, Fin, Deadline);
-        {error, Reason} -> {error, Reason, Stream};
-        {'EXIT', _} -> {error, closed, Stream}
+        {error, Reason} -> {error, Reason, Stream}
     end.
 
 wait_send_ready(#stream{ref = Ref, router = Router} = Stream, Data, Fin, Deadline) ->
@@ -202,9 +202,9 @@ wait_send_ready(#stream{ref = Ref, router = Router} = Stream, Data, Fin, Deadlin
 %% side, both with `Code'. Errors are ignored, as the stream or the whole
 %% connection may already be gone.
 -spec abort(stream(), non_neg_integer()) -> ok.
-abort(#stream{conn = Conn, id = Id} = Stream, Code) ->
-    _ = catch quic:reset_stream(Conn, Id, Code),
-    _ = catch quic:stop_sending(Conn, Id, Code),
+abort(#stream{transport = Transport, id = Id} = Stream, Code) ->
+    _ = trevrpc_transport:reset_stream(Transport, Id, Code),
+    _ = trevrpc_transport:stop_sending(Transport, Id, Code),
     flush_events(Stream).
 
 %% @doc Gives up reading: returns the credit of every byte read or routed

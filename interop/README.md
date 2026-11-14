@@ -8,14 +8,14 @@ client also has a TCP fallback for networks that block UDP.
 | ------------------------ | ----------------- | ------------------- | ---------------- |
 | Go                       | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
 | Rust                     | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
-| Erlang                   | native QUIC       | not yet             | Go, Rust, Erlang |
+| Erlang                   | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
 | JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust         |
 | JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust         |
 | Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust         |
 | JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust         |
 
 The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves and calls native
-QUIC only so far, and takes part in what it implements; see
+QUIC and QMux over TLS only so far, and takes part in what it implements; see
 [Partial runtimes](#partial-runtimes).
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
