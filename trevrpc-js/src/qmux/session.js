@@ -2,7 +2,6 @@
 // the browser fallback when WebTransport is unavailable or blocked. A session exposes the part of
 // the WebTransport API that the channel uses, so calls run on it unchanged.
 import { deferred } from "../async.js";
-import { DefaultMaxFrameSize } from "../framing.js";
 import { CancelledStreamErrorCode } from "../status.js";
 import {
   FrameParser,
@@ -26,13 +25,16 @@ export const QMuxProtocol = "qmux-02.trevrpc-1";
 
 /** The largest record this endpoint accepts and sends. */
 const MaxRecordSize = 64 * 1024;
-/** Stream error code for streams abandoned locally. */
-const CancelledCode = CancelledStreamErrorCode;
 /** Writes wait while the WebSocket buffers more than this many bytes. */
 const SendBufferLimit = 1024 * 1024;
 const SendBufferPollMs = 5;
 /** Bounds opening the WebSocket and receiving the server's transport parameters. */
 const HandshakeTimeoutMs = 10_000;
+/**
+ * The receive window of the session and of each stream: one frame of the default `maxFrameSize`
+ * (DefaultMaxFrameSize in framing.js, 4 MiB) and its header, which is at most 16 bytes.
+ */
+const ReceiveWindow = 4 * 1024 * 1024 + 16;
 
 /**
  * The send side of a stream (RFC 9000 section 3.1): `Send` until the FIN or RESET_STREAM is queued
@@ -49,10 +51,6 @@ function transportError(message, { source = "session", streamErrorCode = null, c
   return error;
 }
 
-function protocolError(code, message, frameType) {
-  return new QMuxProtocolError(code, message, frameType);
-}
-
 /** A QMux session over one WebSocket. */
 export class QMuxWebSocketSession {
   /** Resolves once the server's transport parameters have arrived. */
@@ -61,14 +59,13 @@ export class QMuxWebSocketSession {
   closed;
 
   #ws;
-  #window;
   #peer = null;
   #streams = new Map();
   #openedLocal = 0;
   #maxLocal = 0;
   #connSendMax = 0;
   #connSent = 0;
-  #connRecvMax;
+  #connRecvMax = ReceiveWindow;
   #connReceived = 0;
   #connConsumed = 0;
   #pending = new FrameWriter();
@@ -87,16 +84,13 @@ export class QMuxWebSocketSession {
 
   /**
    * Opens a session to a `wss://` URL. `options.WebSocket` replaces the global WebSocket
-   * constructor; `options.maxFrameSize` sizes the receive windows like the native clients.
+   * constructor.
    */
   constructor(url, options = {}) {
     const WebSocketConstructor = options.WebSocket ?? globalThis.WebSocket;
     if (typeof WebSocketConstructor !== "function") {
       throw transportError("WebSocket is not available in this JavaScript runtime");
     }
-    // A frame header is at most 16 bytes, so the window fits one maximum-size frame.
-    this.#window = (options.maxFrameSize ?? DefaultMaxFrameSize) + 16;
-    this.#connRecvMax = this.#window;
     this.#settleReady = deferred();
     this.#settleClosed = deferred();
     this.ready = this.#settleReady.promise;
@@ -114,7 +108,7 @@ export class QMuxWebSocketSession {
     this.#ws = ws;
     this.#handshakeTimer = setTimeout(
       () => this.#finish(transportError("QMux handshake timed out"), false),
-      options.handshakeTimeoutMs ?? HandshakeTimeoutMs,
+      HandshakeTimeoutMs,
     );
   }
 
@@ -146,12 +140,7 @@ export class QMuxWebSocketSession {
     }
     const id = this.#openedLocal * 4;
     this.#openedLocal += 1;
-    const stream = new QMuxStream(
-      this,
-      id,
-      this.#peer.initialMaxStreamDataBidiRemote,
-      this.#window,
-    );
+    const stream = new QMuxStream(this, id, this.#peer.initialMaxStreamDataBidiRemote);
     this.#streams.set(id, stream);
     return { readable: stream.readable, writable: stream.writable };
   }
@@ -179,8 +168,8 @@ export class QMuxWebSocketSession {
     this.#open = true;
     // The transport parameters must be the first frame on the wire.
     writeTransportParameters(this.#pending, {
-      initialMaxData: this.#window,
-      initialMaxStreamDataBidiLocal: this.#window,
+      initialMaxData: ReceiveWindow,
+      initialMaxStreamDataBidiLocal: ReceiveWindow,
       maxRecordSize: MaxRecordSize,
     });
     this.#flush();
@@ -193,16 +182,20 @@ export class QMuxWebSocketSession {
     this.#lastActivity = Date.now();
     try {
       if (typeof data === "string") {
-        throw protocolError(TransportError.ProtocolViolation, "text message", 0);
+        throw new QMuxProtocolError(TransportError.ProtocolViolation, "text message", 0);
       }
       const record = new Uint8Array(data);
       if (record.length > MaxRecordSize) {
-        throw protocolError(TransportError.FrameEncodingError, "record exceeds max_record_size", 0);
+        throw new QMuxProtocolError(
+          TransportError.FrameEncodingError,
+          "record exceeds max_record_size",
+          0,
+        );
       }
       const parser = new FrameParser(record);
       for (let frame = parser.next(); frame !== null && !this.#closedError; frame = parser.next()) {
         if (this.#peer === null && frame.type !== FrameType.TransportParameters) {
-          throw protocolError(
+          throw new QMuxProtocolError(
             TransportError.ProtocolViolation,
             "first frame is not QX_TRANSPORT_PARAMETERS",
             frame.type,
@@ -256,7 +249,7 @@ export class QMuxWebSocketSession {
       case FrameType.StreamsBlockedBidi:
       case FrameType.StreamsBlockedUni:
         if (frame.maximum > 2 ** 60) {
-          throw protocolError(
+          throw new QMuxProtocolError(
             TransportError.FrameEncodingError,
             "stream count exceeds 2^60",
             frame.type,
@@ -282,7 +275,7 @@ export class QMuxWebSocketSession {
       }
       case FrameType.Ping:
         if (frame.sequence <= this.#pingReceived) {
-          throw protocolError(
+          throw new QMuxProtocolError(
             TransportError.ProtocolViolation,
             "QX_PING sequence is not increasing",
             frame.type,
@@ -293,7 +286,7 @@ export class QMuxWebSocketSession {
         this.#scheduleFlush();
         return;
       case FrameType.PingResponse:
-        throw protocolError(
+        throw new QMuxProtocolError(
           TransportError.ProtocolViolation,
           "QX_PING response was never requested",
           frame.type,
@@ -307,7 +300,7 @@ export class QMuxWebSocketSession {
             // A released stream received its final size and every byte up to it, so more data
             // lies beyond it. It would also skip the flow control checks, letting a peer send
             // without limit. An empty frame is ignored: it carries nothing to account for.
-            throw protocolError(
+            throw new QMuxProtocolError(
               TransportError.FinalSizeError,
               `stream ${frame.streamId} data beyond its final size`,
               frame.type,
@@ -319,7 +312,7 @@ export class QMuxWebSocketSession {
 
   #parameters(frame) {
     if (this.#peer !== null) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.ProtocolViolation,
         "repeated QX_TRANSPORT_PARAMETERS",
         frame.type,
@@ -348,14 +341,14 @@ export class QMuxWebSocketSession {
     const id = frame.streamId;
     if (id % 4 !== 0) {
       // The server may open no streams of either kind.
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.StreamLimitError,
         `stream ${id} exceeds the stream limit`,
         frame.type,
       );
     }
     if (id / 4 >= this.#openedLocal) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.StreamStateError,
         `stream ${id} was never opened`,
         frame.type,
@@ -370,7 +363,7 @@ export class QMuxWebSocketSession {
   received(length, frameType) {
     this.#connReceived += length;
     if (this.#connReceived > this.#connRecvMax) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.FlowControlError,
         "connection flow control limit exceeded",
         frameType,
@@ -381,8 +374,8 @@ export class QMuxWebSocketSession {
   /** Returns connection credit for received data that was read or discarded. */
   consumed(length) {
     this.#connConsumed += length;
-    if (this.#connRecvMax - this.#connConsumed <= this.#window / 2) {
-      this.#connRecvMax = this.#connConsumed + this.#window;
+    if (this.#connRecvMax - this.#connConsumed <= ReceiveWindow / 2) {
+      this.#connRecvMax = this.#connConsumed + ReceiveWindow;
       writeMaxData(this.#pending, this.#connRecvMax);
       this.#scheduleFlush();
     }
@@ -529,7 +522,6 @@ class QMuxStream {
   writeError = null;
 
   #session;
-  #window;
   #received = 0;
   #read = 0;
   #chunks = [];
@@ -541,12 +533,11 @@ class QMuxStream {
   #pullWaiter = null;
   #writeController;
 
-  constructor(session, id, sendMax, window) {
+  constructor(session, id, sendMax) {
     this.id = id;
     this.#session = session;
     this.sendMax = sendMax;
-    this.recvMax = window;
-    this.#window = window;
+    this.recvMax = ReceiveWindow;
     this.readable = new ReadableStream(
       { pull: (controller) => this.#pull(controller), cancel: () => this.#cancelRead() },
       { highWaterMark: 0 },
@@ -565,7 +556,7 @@ class QMuxStream {
               SendState.ResetSent,
               transportError(`stream aborted: ${reason?.message ?? reason}`, {
                 source: "stream",
-                streamErrorCode: CancelledCode,
+                streamErrorCode: CancelledStreamErrorCode,
               }),
             );
           },
@@ -580,21 +571,21 @@ class QMuxStream {
   onData(offset, data, fin) {
     const end = offset + data.length;
     if (this.#finalSize !== null && (end > this.#finalSize || (fin && end !== this.#finalSize))) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.FinalSizeError,
         `stream ${this.id} data beyond its final size`,
         FrameType.Stream,
       );
     }
     if (offset !== this.#received) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.ProtocolViolation,
         `stream ${this.id} data out of order`,
         FrameType.Stream,
       );
     }
     if (end > this.recvMax) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.FlowControlError,
         `stream ${this.id} exceeds its flow control limit`,
         FrameType.Stream,
@@ -621,14 +612,14 @@ class QMuxStream {
       return;
     }
     if ((this.#finalSize !== null && finalSize !== this.#finalSize) || finalSize < this.#received) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.FinalSizeError,
         `stream ${this.id} reset with an inconsistent final size`,
         FrameType.ResetStream,
       );
     }
     if (finalSize > this.recvMax) {
-      throw protocolError(
+      throw new QMuxProtocolError(
         TransportError.FlowControlError,
         `stream ${this.id} final size exceeds its flow control limit`,
         FrameType.ResetStream,
@@ -703,8 +694,8 @@ class QMuxStream {
 
   #consumed(length) {
     this.#read += length;
-    if (this.#finalSize === null && this.recvMax - this.#read <= this.#window / 2) {
-      this.recvMax = this.#read + this.#window;
+    if (this.#finalSize === null && this.recvMax - this.#read <= ReceiveWindow / 2) {
+      this.recvMax = this.#read + ReceiveWindow;
       this.#session.maxStreamData(this);
     }
     this.#session.consumed(length);
@@ -725,7 +716,7 @@ class QMuxStream {
     this.#read = this.#received;
     this.#session.consumed(unread);
     if (this.#finalSize === null && !this.#session.closedError) {
-      this.#session.stopSending(this, CancelledCode);
+      this.#session.stopSending(this, CancelledStreamErrorCode);
     }
     this.#maybeComplete();
   }
@@ -751,7 +742,7 @@ class QMuxStream {
    * error and wake writes parked in `sendCredit`, which see it and fail. Returns false when the
    * send side had already ended.
    */
-  #endSend(next, error = null, code = CancelledCode) {
+  #endSend(next, error = null, code = CancelledStreamErrorCode) {
     if (this.#sendState !== SendState.Send) {
       return false;
     }

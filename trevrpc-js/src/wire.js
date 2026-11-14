@@ -10,6 +10,8 @@
 // typical REQUEST), and decoding reads nested messages on the payload's one reader.
 import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 
+import { checkTag, overflowsUint32, setMapEntry } from "./protobuf-wire.js";
+
 export const RpcKind = Object.freeze({
   Unary: 0,
   ClientStreaming: 1,
@@ -203,24 +205,6 @@ function emptyMetadata() {
   return {};
 }
 
-/**
- * Sets a decoded metadata entry as an own property, so that a key such as `__proto__` is an entry
- * like any other and never replaces the object's prototype. Assignment does that for every other
- * key, faster than defining the property.
- */
-function setEntry(metadata, key, value) {
-  if (key === "__proto__") {
-    Object.defineProperty(metadata, key, {
-      value,
-      enumerable: true,
-      writable: true,
-      configurable: true,
-    });
-  } else {
-    metadata[key] = value;
-  }
-}
-
 export function writeString(writer, field, value) {
   if (value != null && value !== "") {
     writer.tag(field, WireType.LengthDelimited).string(value);
@@ -313,16 +297,10 @@ export class WireReader {
     const reader = this.#reader;
     const start = reader.pos;
     const tag = reader.uint32();
-    const length = reader.pos - start;
-    if (length > 5 || (length === 5 && this.#bytes[reader.pos - 1] > 0x0f)) {
+    if (overflowsUint32(this.#bytes, start, reader.pos)) {
       throw new Error("illegal tag: varint overflows uint32");
     }
-    const field = tag >>> 3;
-    const wireType = tag & 7;
-    if (field <= 0 || wireType > 5) {
-      throw new Error(`illegal tag: field no ${field} wire type ${wireType}`);
-    }
-    return tag;
+    return checkTag(tag);
   }
 
   string(wireType, name) {
@@ -407,7 +385,7 @@ export class WireReader {
         reader.skip(tag);
       }
     }
-    setEntry(metadata, key, value);
+    setMapEntry(metadata, key, value);
   }
 
   /** Skips the unknown field of `tag`, of any wire type. */
@@ -468,8 +446,7 @@ export class WireReader {
     const reader = this.#reader;
     const start = reader.pos;
     const value = reader.uint32();
-    const length = reader.pos - start;
-    if (length > 5 || (length === 5 && this.#bytes[reader.pos - 1] > 0x0f)) {
+    if (overflowsUint32(this.#bytes, start, reader.pos)) {
       throw new Error(`protobuf field ${name} exceeded uint32`);
     }
     return value;
