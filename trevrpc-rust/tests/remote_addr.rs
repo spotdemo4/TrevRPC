@@ -2,13 +2,12 @@
 //! or the one in the PROXY headers of a trusted proxy in front of the TCP listener or the UDP
 //! endpoint.
 
-use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support::{self, Serving};
+use crate::support::{self, Serving, TestResult};
 use bytes::Bytes;
 use quinn::rustls::pki_types::ServerName;
 use tokio::io::AsyncWriteExt as _;
@@ -20,8 +19,6 @@ use trevrpc::server::{
     RequestContext, Server, ServerOptions,
 };
 use trevrpc::tcp::IpPrefix;
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 

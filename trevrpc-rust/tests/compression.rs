@@ -1,13 +1,12 @@
 //! Compressed messages end to end: the frames a Rust server and a Rust client put on the wire,
 //! and compressed calls over QUIC and `QMux` over TLS, per message and with stream compression.
 
-use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::support::{self, Serving};
+use crate::support::{self, Serving, TestResult};
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::CertificateDer;
 use trevrpc::client::{
@@ -20,8 +19,6 @@ use trevrpc::{
     CompressMessages, CompressStream, Compression, Dictionary, Metadata, RpcAnswer, RpcKind,
     RpcRequest, RpcStatus,
 };
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UNARY: &str = "/test.Compressed/Echo";
@@ -384,8 +381,6 @@ async fn compressed_channel(
     server: &Serving,
     policy: TransportPolicy,
 ) -> TestResult<(quinn::Endpoint, trevrpc::client::Channel)> {
-    let mut tls = support::client_tls(&server.cert, &[])?;
-    tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
     let config = ChannelConfig::new()
         .with_compression(compression()?)
         .with_tcp_fallback(support::client_tls(&server.cert, &[])?)
@@ -1598,8 +1593,6 @@ async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_i
     // Channels offer it without any configuration: requests compress from the second call, once
     // the first call's answer arrived, over QUIC and QMux alike.
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
-        let mut tls = support::client_tls(&server.cert, &[])?;
-        tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
         let config = ChannelConfig::new()
             .with_tcp_fallback(support::client_tls(&server.cert, &[])?)
             .with_tcp_addr(server.tcp)

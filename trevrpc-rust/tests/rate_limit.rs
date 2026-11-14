@@ -1,21 +1,18 @@
 //! The rate-limit interceptor end to end: a real server over QUIC and `QMux` over TLS rejects a
 //! client that spends its tokens, and the client reads the retry delay from the error.
 
-use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support::{self, Serving};
+use crate::support::{self, Serving, TestResult};
 use trevrpc::client::{ChannelConfig, QmuxTransport, QuicTransport};
 use trevrpc::server::{
     RateLimit, RateLimitOptions, RatePolicy, RequestContext, Server, ServerOptions,
 };
 use trevrpc::{Code, Status};
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 

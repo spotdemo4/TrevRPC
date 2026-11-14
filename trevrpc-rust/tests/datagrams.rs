@@ -1,11 +1,10 @@
 //! Unreliable messages in datagrams: native QUIC, `WebTransport`, and the transports without
 //! datagrams.
 
-use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::support::{self, Serving};
+use crate::support::{self, Serving, TestResult};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use trevrpc::client::{
@@ -13,8 +12,6 @@ use trevrpc::client::{
 };
 use trevrpc::server::{RouteOptions, Server, ServerOptions};
 use trevrpc::{Metadata, ResponseFrame, RpcKind, RpcRequest, Status, Unreliable};
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 

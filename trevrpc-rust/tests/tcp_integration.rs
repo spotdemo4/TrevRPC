@@ -1,14 +1,13 @@
 //! The TCP listener: `QMux` over TLS, HTTP/2 and `QMux` over WebSocket, and the HTTP fallback it
 //! shares with the HTTP/3 endpoint.
 
-use std::error::Error;
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support::{self, Serving};
+use crate::support::{self, Serving, TestResult};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use prost::Message;
@@ -28,8 +27,6 @@ use trevrpc::server::{
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{Code, RpcKind, Status};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ORIGIN: &str = "https://app.example.test";

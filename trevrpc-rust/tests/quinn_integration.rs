@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support::{self, Wire, WireRecv, WireSend};
+use crate::support::{self, TestResult, WireRecv, WireSend};
 use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
 use prost::Message;
@@ -47,7 +47,12 @@ fn require_webtransport_admission_header(
     })
 }
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+/// The wires the twin tests run over: these servers have no TCP fallback.
+#[derive(Clone, Copy, Debug)]
+enum Wire {
+    Quic,
+    WebTransport,
+}
 
 struct TestGreeter;
 
@@ -3742,7 +3747,6 @@ impl WireClient {
                 let (client, session, _) = connect_webtransport_client(server).await?;
                 Self::WebTransport(client, session)
             }
-            Wire::Qmux => return Err("these servers have no TCP fallback".into()),
         };
         let client = greeter::GreeterClient::new(connection.transport());
         Ok((connection, client))

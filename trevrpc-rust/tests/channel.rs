@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::support;
+use crate::support::{self, TestResult};
 use futures_util::StreamExt as _;
 use quinn::rustls::pki_types::CertificateDer;
 use tokio::task::JoinHandle;
@@ -16,8 +16,6 @@ use trevrpc::client::{
 use trevrpc::{Code, RpcRequest, Status};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
-
-type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 struct FixedBackoff(Duration);
 

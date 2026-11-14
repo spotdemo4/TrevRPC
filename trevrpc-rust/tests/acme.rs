@@ -2,7 +2,6 @@
 //! validates TLS-ALPN-01 on the TCP listener, and the server presents it over QUIC and `QMux` over
 //! TLS.
 
-use std::error::Error;
 use std::fs::{self, File};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -12,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::greeter;
-use crate::support;
+use crate::support::{self, TestResult};
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::pem::PemObject as _;
 use quinn::rustls::pki_types::{CertificateDer, ServerName};
@@ -24,8 +23,6 @@ use trevrpc::Status;
 use trevrpc::client::{Channel, ChannelConfig, TransportKind, TransportPolicy};
 use trevrpc::server::{RequestContext, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 /// The name Pebble issues the certificate for. Its mock DNS server resolves every name to
 /// 127.0.0.1.

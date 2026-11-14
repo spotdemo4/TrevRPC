@@ -14,7 +14,10 @@ mod within;
 
 pub use ensure::AssertionFailed;
 pub use serving::{Serving, client_tls, self_signed, self_signed_key, serve, serve_with};
-pub use wire::{Wire, WireRecv, WireSend};
+pub use wire::{WireRecv, WireSend};
+
+/// The result of a test, or of a helper that fails one with any error.
+pub type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub use within::TimedOut;
 
 use std::future::Future;

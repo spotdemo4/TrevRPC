@@ -3,14 +3,13 @@
 //!
 //! Every test runs over native QUIC and over `QMux` over TLS, served by one `serve_with_tcp`.
 
-use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support::{self, Serving, Wire};
+use crate::support::{self, Serving, TestResult};
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::CertificateDer;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -21,7 +20,12 @@ use trevrpc::client::{
 use trevrpc::server::{Finish, Interceptor, RequestContext, Server, ServerOptions};
 use trevrpc::{Code, RpcKind, Status};
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+/// The wires these tests run over.
+#[derive(Clone, Copy, Debug)]
+enum Wire {
+    Quic,
+    Qmux,
+}
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a send may take to fail once the server has ended the call.
@@ -195,7 +199,6 @@ where
                 .map_err(|_| "scenario timed out")??;
             qmux.close();
         }
-        Wire::WebTransport => return Err("these tests have no WebTransport client".into()),
     }
     server.stop(TEST_TIMEOUT).await
 }
@@ -813,7 +816,6 @@ async fn connect(wire: Wire, server: &Serving) -> TestResult<Connected> {
             let closing = qmux.clone();
             (None, Arc::new(qmux), Box::new(move || closing.close()))
         }
-        Wire::WebTransport => return Err("these tests have no WebTransport client".into()),
     })
 }
 

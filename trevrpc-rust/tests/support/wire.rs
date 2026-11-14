@@ -5,21 +5,13 @@ use trevrpc::{Error, Result};
 
 use super::{RawRecv, RawSend};
 
-/// A wire a client reaches the server over.
-#[derive(Clone, Copy, Debug)]
-pub enum Wire {
-    /// Native QUIC.
-    Quic,
-    /// `QMux` over TLS, through the TCP fallback.
-    Qmux,
-    /// `WebTransport` over HTTP/3.
-    WebTransport,
-}
-
 /// Defines `mod $name`, with a test for each wire of the list (`quic`, `qmux` or `webtransport`)
 /// named after that wire, which awaits `$test` called with the wire. `$test` is a function, or a
-/// closure, of a [`Wire`] that returns a future of the test's result; without one, it is the
-/// function named `$name`.
+/// closure, of a `Wire` that returns a future of a [`TestResult`](super::TestResult); without one,
+/// it is the function named `$name`.
+///
+/// `Wire` is the calling file's own enum of the wires it can run, with a `Quic`, `Qmux` or
+/// `WebTransport` variant for each, so a wire the file cannot run fails to compile.
 ///
 /// The tests run on tokio's current-thread runtime, or with `multi_thread` first, on four worker
 /// threads.
@@ -48,23 +40,23 @@ macro_rules! over_each_wire {
     };
     (@test $runtime:tt quic, $test:expr) => {
         #$runtime
-        async fn quic() -> TestResult {
+        async fn quic() -> $crate::support::TestResult {
             let test = $test;
-            test($crate::support::Wire::Quic).await
+            test(Wire::Quic).await
         }
     };
     (@test $runtime:tt qmux, $test:expr) => {
         #$runtime
-        async fn qmux() -> TestResult {
+        async fn qmux() -> $crate::support::TestResult {
             let test = $test;
-            test($crate::support::Wire::Qmux).await
+            test(Wire::Qmux).await
         }
     };
     (@test $runtime:tt webtransport, $test:expr) => {
         #$runtime
-        async fn webtransport() -> TestResult {
+        async fn webtransport() -> $crate::support::TestResult {
             let test = $test;
-            test($crate::support::Wire::WebTransport).await
+            test(Wire::WebTransport).await
         }
     };
 }
