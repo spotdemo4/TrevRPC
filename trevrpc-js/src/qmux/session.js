@@ -2,6 +2,7 @@
 // the browser fallback when WebTransport is unavailable or blocked. A session exposes the part of
 // the WebTransport API that the channel uses, so calls run on it unchanged.
 import { deferred } from "../async.js";
+import { DefaultMaxFrameSize } from "../limits.js";
 import { CancelledStreamErrorCode } from "../status.js";
 import {
   FrameParser,
@@ -32,9 +33,9 @@ const SendBufferPollMs = 5;
 const HandshakeTimeoutMs = 10_000;
 /**
  * The receive window of the session and of each stream: one frame of the default `maxFrameSize`
- * (DefaultMaxFrameSize in framing.js, 4 MiB) and its header, which is at most 16 bytes.
+ * and its header, which is at most 16 bytes.
  */
-const ReceiveWindow = 4 * 1024 * 1024 + 16;
+const ReceiveWindow = DefaultMaxFrameSize + 16;
 
 /**
  * The send side of a stream (RFC 9000 section 3.1): `Send` until the FIN or RESET_STREAM is queued

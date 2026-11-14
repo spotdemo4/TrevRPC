@@ -2,11 +2,12 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 
 import { byteView } from "./bytes.js";
 import { headroomOf } from "./headroom.js";
+import { DefaultMaxFrameSize } from "./limits.js";
 import { internal, invalidArgument, resourceExhausted, unavailable } from "./status.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
 import { RpcRequest } from "./wire.js";
 
-export const DefaultMaxFrameSize = 4 * 1024 * 1024;
+export { DefaultMaxFrameSize };
 
 /** Frame types; every other type is unknown and skipped by receivers. */
 export const FrameType = Object.freeze({
