@@ -15,8 +15,8 @@ client also has a TCP fallback for networks that block UDP.
 | JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust         |
 
 The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves and calls native
-QUIC and QMux over TLS only so far, with compressed messages but not stream compression, and
-takes part in what it implements; see [Partial runtimes](#partial-runtimes).
+QUIC and QMux over TLS only so far, and takes part in what it implements; see
+[Partial runtimes](#partial-runtimes).
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
 packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,

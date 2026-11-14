@@ -12,6 +12,8 @@
 -module(trevrpc_wire).
 
 -export([
+    streams_requests/1,
+    streams_responses/1,
     encode_request/1,
     decode_request/1,
     encode_headers/1,
@@ -86,6 +88,18 @@
 }.
 
 -define(UINT64_MASK, 16#FFFFFFFFFFFFFFFF).
+
+%% @doc Whether a call of `Kind' streams its requests.
+-spec streams_requests(kind()) -> boolean().
+streams_requests(client_streaming) -> true;
+streams_requests(bidirectional_streaming) -> true;
+streams_requests(_) -> false.
+
+%% @doc Whether a call of `Kind' streams its responses.
+-spec streams_responses(kind()) -> boolean().
+streams_responses(server_streaming) -> true;
+streams_responses(bidirectional_streaming) -> true;
+streams_responses(_) -> false.
 
 %%% Request
 

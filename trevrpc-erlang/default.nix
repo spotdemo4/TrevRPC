@@ -1,12 +1,12 @@
 {
   lib,
-  beamMinimal28Packages,
+  beamMinimal29Packages,
   wireGolden,
   qmuxGolden,
   zstdGolden,
 }:
 let
-  inherit (beamMinimal28Packages) buildRebar3 fetchHex;
+  inherit (beamMinimal29Packages) buildRebar3 fetchHex;
 
   # The Hex dependencies, read from rebar.lock so that it is the one place their versions and
   # hashes live. pkg_hash_ext is the sha256 of the package tarball, which fetchHex checks.

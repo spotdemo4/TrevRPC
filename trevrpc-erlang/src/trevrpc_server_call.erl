@@ -40,10 +40,16 @@ run(
         max_stream_messages := MaxMessages,
         compression := Compression
     } = Config,
-    {_, PlainResponses} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
+    {_, Responses} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
     {Answer, ResponseDict} = trevrpc_zstd:negotiate(
-        Compression, Request, maps:get(response_type, Route, undefined), PlainResponses =/= none
+        Compression, Request, maps:get(response_type, Route, undefined), Responses =/= none
     ),
+    StreamRequests = maps:get(stream_requests, Spec),
+    %% A client that offered stream compression decodes stream-compressed
+    %% responses; the route decides whether they are.
+    StreamResponses =
+        maps:get(stream_compression, Request) =/= none andalso Responses =:= stream andalso
+            trevrpc_wire:streams_responses(Kind),
     Stream0 = trevrpc_stream:resume(
         maps:get(frames, Spec),
         maps:get(fin, Spec),
@@ -51,7 +57,7 @@ run(
     ),
     %% A request that is a single message is bounded by the frame size
     %% alone; a stream of them by the cumulative body limit too.
-    Stream = trevrpc_stream:charge_messages(streams_requests(Kind), Stream0),
+    Stream = trevrpc_stream:charge_messages(trevrpc_wire:streams_requests(Kind), Stream0),
     Call = #call{
         ref = Ref,
         method = Method,
@@ -66,27 +72,46 @@ run(
         max_messages = MaxMessages,
         compression = Compression,
         response_dict = ResponseDict,
-        answer = answer_frame(Answer)
+        answer = answer_frame(Answer, StreamRequests),
+        stream_decoder =
+            case StreamRequests of
+                true -> trevrpc_zstd_stream:decoder(Compression, all);
+                false -> undefined
+            end,
+        response_sender =
+            case StreamResponses of
+                true -> trevrpc_zstd_stream:sender(true);
+                false -> undefined
+            end,
+        reserve = fun() ->
+            trevrpc_server_conn:reserve(Router, Id, Ref, trevrpc_zstd_stream:encoder_cost())
+        end
     }),
     %% A client streaming requests learns at once which dictionaries it may
     %% compress them with; other calls carry the ANSWER with their first
     %% response frame.
     _ =
-        case streams_requests(Kind) of
+        case trevrpc_wire:streams_requests(Kind) of
             true -> trevrpc_call:send_answer(Call);
             false -> ok
         end,
     Result = handle(Kind, Handler, Call, Config),
     finish(Call, Kind, Result, Router, Id).
 
-answer_frame(undefined) ->
+%% The ANSWER the call owes: to a dictionary query, and that it decodes
+%% stream-compressed requests.
+answer_frame(undefined, false) ->
     [];
-answer_frame(Dictionaries) ->
-    trevrpc_frame:encode(answer, trevrpc_wire:encode_answer(#{dictionaries => Dictionaries})).
-
-streams_requests(client_streaming) -> true;
-streams_requests(bidirectional_streaming) -> true;
-streams_requests(_) -> false.
+answer_frame(Dictionaries, StreamRequests) ->
+    Answer = #{
+        dictionaries =>
+            case Dictionaries of
+                undefined -> [];
+                _ -> Dictionaries
+            end,
+        stream_compression => StreamRequests
+    },
+    trevrpc_frame:encode(answer, trevrpc_wire:encode_answer(Answer)).
 
 handle(Kind, Handler, Call, Config) when Kind =:= unary; Kind =:= server_streaming ->
     case read_request(Call, maps:get(initial_request_timeout, Config)) of
@@ -177,7 +202,7 @@ finish(Call, Kind, Result, Router, Id) ->
             {ok, Message} ->
                 [
                     Answer,
-                    trevrpc_call:encode_message(State, Message),
+                    element(1, trevrpc_call:encode_message(State, Message)),
                     status_frame(#{metadata => Trailers}, Max)
                 ];
             ok ->

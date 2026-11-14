@@ -39,6 +39,7 @@
     compress/3,
     inflate/4,
     parse_header/1,
+    dictionaries/2,
     dictionary_id/1,
     fingerprint/1,
     plain_min_size/0
@@ -514,6 +515,17 @@ decompress(#dict{info = #{id := Id}, ddict = DDict} = Dict, Payload, Size) ->
         error:_ ->
             erase(Key),
             {error, {invalid, <<"compressed message is corrupt">>}}
+    end.
+
+%% @doc The digested dictionary `Id' of `Config', for compressing and for
+%% decompressing; `undefined' for compression without a dictionary (ID 0),
+%% `error' for one it does not hold.
+-spec dictionaries(config(), non_neg_integer()) ->
+    {zstd:dict() | undefined, zstd:dict() | undefined} | error.
+dictionaries(#config{dicts = Dicts}, Id) ->
+    case Dicts of
+        #{Id := #dict{cdict = CDict, ddict = DDict}} -> {CDict, DDict};
+        #{} -> error
     end.
 
 %% @doc Validates that `Payload' is exactly one magicless zstd frame with a

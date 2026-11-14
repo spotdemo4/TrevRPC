@@ -41,7 +41,7 @@
     unsubscribe/1,
     close/1
 ]).
--export([open_stream/2, stream_done/3, learn/3]).
+-export([open_stream/2, stream_done/3, learn/3, reserve/4, release/4, optimism/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, stream_info/0, state/0]).
@@ -68,7 +68,8 @@
     max_frame_size => pos_integer(),
     connect_timeout => pos_integer(),
     idle_timeout => pos_integer(),
-    compression => trevrpc_zstd:settings()
+    compression => trevrpc_zstd:settings(),
+    stream_compression_memory => non_neg_integer()
 }.
 
 %% What a calling process needs to use a stream it opened.
@@ -81,12 +82,17 @@
     compression := trevrpc_zstd:config(),
     %% The dictionaries the connection shares with the server, once a call
     %% learned them from the server's answer.
-    shared := [non_neg_integer()] | undefined
+    shared := [non_neg_integer()] | undefined,
+    %% The channel's stream compression budget, and whether calls on the
+    %% connection compress their requests optimistically.
+    stream_budget := trevrpc_zstd_stream:budget() | undefined,
+    optimistic := boolean()
 }.
 
 -define(INITIAL_DELAY, 100).
 -define(MAX_DELAY, 30000).
 -define(CANCELLED, 1).
+-define(STREAM_COMPRESSION_MEMORY, 67108864).
 
 %% A connection attempt: its transport kind, its connection once known, and
 %% for QUIC the process the connection is linked to (see quic_attempt/2).
@@ -114,6 +120,12 @@
     compression :: trevrpc_zstd:config(),
     %% The current connection's shared dictionaries, once known.
     shared :: [non_neg_integer()] | undefined,
+    %% Stream compression: the channel's budget, whether the connection's
+    %% calls are optimistic (until its server refuses one, and again once a
+    %% call is answered), and what each stream holds from the budget.
+    stream_budget :: trevrpc_zstd_stream:budget() | undefined,
+    optimistic = true :: boolean(),
+    reserved = #{} :: #{non_neg_integer() => non_neg_integer()},
     status = connecting :: connecting | ready,
     transport :: trevrpc_transport:t() | undefined,
     %% The current race, its attempts, whether it started with QUIC, and
@@ -230,6 +242,29 @@ open_stream(Channel, Deadline) ->
 learn(Channel, Generation, Shared) ->
     gen_server:cast(Channel, {learn, Generation, Shared}).
 
+%% @private Reserves `Cost' bytes of the channel's stream compression
+%% memory for the calling process's stream `Id' (routed with `Ref'), held
+%% until the stream is done.
+-spec reserve(pid(), non_neg_integer(), reference(), non_neg_integer()) -> boolean().
+reserve(Channel, Id, Ref, Cost) ->
+    try
+        gen_server:call(Channel, {reserve, Id, Ref, Cost}, infinity)
+    catch
+        exit:_ -> false
+    end.
+
+%% @private Gives back `Cost' bytes stream `Id' reserved.
+-spec release(pid(), non_neg_integer(), reference(), non_neg_integer()) -> ok.
+release(Channel, Id, Ref, Cost) ->
+    gen_server:cast(Channel, {release, Id, Ref, Cost}).
+
+%% @private Whether the calls on generation `Generation' compress their
+%% requests optimistically: not after its server refused a call, and again
+%% once a call got a stream compression answer.
+-spec optimism(pid(), pos_integer(), boolean()) -> ok.
+optimism(Channel, Generation, Optimistic) ->
+    gen_server:cast(Channel, {optimism, Generation, Optimistic}).
+
 %% @private The calling process is done with stream `Id'.
 -spec stream_done(pid(), non_neg_integer(), reference()) -> ok.
 stream_done(Channel, Id, Ref) ->
@@ -278,7 +313,10 @@ init(Opts, Compression) ->
         },
         max_frame_size = MaxFrame,
         connect_timeout = maps:get(connect_timeout, Opts, 10000),
-        compression = Compression
+        compression = Compression,
+        stream_budget = trevrpc_zstd_stream:budget(
+            maps:get(stream_compression_memory, Opts, ?STREAM_COMPRESSION_MEMORY)
+        )
     },
     {ok, race(State)}.
 
@@ -399,7 +437,22 @@ handle_call(close, _From, State) ->
 handle_call({open_stream, _Owner, _Deadline}, _From, #state{status = connecting} = State) ->
     {reply, {error, trevrpc_status:new(unavailable, <<"channel is reconnecting">>)}, State};
 handle_call({open_stream, Owner, Deadline}, From, State) ->
-    open(From, Owner, Deadline, State).
+    open(From, Owner, Deadline, State);
+handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Id := {_Pid, Ref, _Monitor}} ->
+            case trevrpc_zstd_stream:reserve(State#state.stream_budget, Cost) of
+                true ->
+                    Reserved = State#state.reserved,
+                    {reply, true, State#state{
+                        reserved = Reserved#{Id => maps:get(Id, Reserved, 0) + Cost}
+                    }};
+                false ->
+                    {reply, false, State}
+            end;
+        #{} ->
+            {reply, false, State}
+    end.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast({stream_done, Id, Ref}, #state{streams = Streams} = State) ->
@@ -415,6 +468,19 @@ handle_cast(
 ) ->
     {noreply, State#state{shared = Shared}};
 handle_cast({learn, _Generation, _Shared}, State) ->
+    {noreply, State};
+handle_cast({release, Id, Ref, Cost}, #state{streams = Streams, reserved = Reserved} = State) ->
+    case {Streams, Reserved} of
+        {#{Id := {_Pid, Ref, _Monitor}}, #{Id := Held}} ->
+            Given = min(Cost, Held),
+            trevrpc_zstd_stream:release(State#state.stream_budget, Given),
+            {noreply, State#state{reserved = Reserved#{Id := Held - Given}}};
+        _ ->
+            {noreply, State}
+    end;
+handle_cast({optimism, Generation, Optimistic}, #state{generation = Generation} = State) ->
+    {noreply, State#state{optimistic = Optimistic}};
+handle_cast({optimism, _Generation, _Optimistic}, State) ->
     {noreply, State}.
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
@@ -700,6 +766,7 @@ won(Ref, Transport, Kind, #state{attempts = Attempts} = State) ->
         transport = Transport,
         generation = State#state.generation + 1,
         shared = undefined,
+        optimistic = true,
         delay = ?INITIAL_DELAY,
         round = undefined,
         attempts = #{},
@@ -792,7 +859,13 @@ lost(State) ->
      || {From, _Owner, _Timer} <- Connecting#state.pending_opens
     ],
     _ = [demonitor(Monitor, [flush]) || Monitor <- maps:keys(Connecting#state.monitors)],
-    retry(Connecting#state{streams = #{}, monitors = #{}, pending_opens = [], send_waiters = []}).
+    _ = [
+        trevrpc_zstd_stream:release(Connecting#state.stream_budget, Held)
+     || _Id := Held <- Connecting#state.reserved
+    ],
+    retry(Connecting#state{
+        streams = #{}, monitors = #{}, reserved = #{}, pending_opens = [], send_waiters = []
+    }).
 
 %% Lets the ready connection go: closes it, in case it reported an error
 %% rather than closing, and stops the process a QUIC connection is linked to.
@@ -846,7 +919,9 @@ open(From, Owner, Deadline, #state{transport = Transport} = State) ->
                 generation => State#state.generation,
                 max_frame_size => State#state.max_frame_size,
                 compression => State#state.compression,
-                shared => State#state.shared
+                shared => State#state.shared,
+                stream_budget => State#state.stream_budget,
+                optimistic => State#state.optimistic
             },
             {reply, {ok, Info}, State#state{
                 streams = (State#state.streams)#{Id => {Owner, Ref, Monitor}},
@@ -882,8 +957,15 @@ retry_opens(#state{pending_opens = [{From, Owner, Timer} | Rest]} = State) ->
             {noreply, State}
     end.
 
-forget(Id, Monitor, #state{streams = Streams, monitors = Monitors} = State) ->
-    State#state{streams = maps:remove(Id, Streams), monitors = maps:remove(Monitor, Monitors)}.
+%% Forgets stream `Id', giving back what it held of the stream compression
+%% budget.
+forget(Id, Monitor, #state{streams = Streams, monitors = Monitors, reserved = Reserved} = State) ->
+    trevrpc_zstd_stream:release(State#state.stream_budget, maps:get(Id, Reserved, 0)),
+    State#state{
+        streams = maps:remove(Id, Streams),
+        monitors = maps:remove(Monitor, Monitors),
+        reserved = maps:remove(Id, Reserved)
+    }.
 
 closed_status() ->
     trevrpc_status:new(unavailable, <<"channel is closed">>).

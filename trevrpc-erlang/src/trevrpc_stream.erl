@@ -34,6 +34,7 @@
     charge_message/2,
     next_frame/2,
     peek/1,
+    peek/2,
     send/4,
     abort/2,
     release/1,
@@ -135,6 +136,26 @@ peek(#stream{error = undefined, fin = false, ref = Ref} = Stream) ->
     after 0 -> {none, Stream}
     end;
 peek(Stream) ->
+    {none, Stream}.
+
+%% @doc The next frame the peer sent, without taking it, waiting for it
+%% until `Deadline'. `none' means none will come: the peer finished or the
+%% stream failed, which {@link next_frame/2} reports.
+-spec peek(stream(), deadline()) -> {trevrpc_frame:frame() | none | timeout, stream()}.
+peek(#stream{frames = [Frame | _]} = Stream, _Deadline) ->
+    {Frame, Stream};
+peek(#stream{error = undefined, fin = false, ref = Ref} = Stream, Deadline) ->
+    receive
+        {trevrpc_stream, Ref, Event} -> peek(event(Event, Stream), Deadline)
+    after 0 ->
+        Flushed = flush_credit(Stream),
+        receive
+            {trevrpc_stream, Ref, Event} -> peek(event(Event, Flushed), Deadline)
+        after timeout(Deadline) ->
+            {timeout, Flushed}
+        end
+    end;
+peek(Stream, _Deadline) ->
     {none, Stream}.
 
 %% @doc Takes the next frame the peer sent, waiting for it until `Deadline'.

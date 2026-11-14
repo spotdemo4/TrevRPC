@@ -1,12 +1,12 @@
 {
   lib,
-  beamMinimal28Packages,
+  beamMinimal29Packages,
   makeWrapper,
   stdenvNoCC,
   trevrpc-erlang,
 }:
 let
-  inherit (beamMinimal28Packages) buildRebar3 erlang;
+  inherit (beamMinimal29Packages) buildRebar3 erlang;
 
   app = buildRebar3 {
     name = "trevrpc_interop";

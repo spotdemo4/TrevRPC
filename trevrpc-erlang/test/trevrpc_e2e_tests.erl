@@ -18,6 +18,9 @@
 -define(TEXT_UNARY, <<"/test.Compressed/Unary">>).
 -define(TEXT_CLIENT_STREAM, <<"/test.Compressed/ClientStream">>).
 -define(TEXT_BIDI, <<"/test.Compressed/Bidi">>).
+-define(STREAM_CLIENT_STREAM, <<"/test.Streamed/ClientStream">>).
+-define(STREAM_SERVER_STREAM, <<"/test.Streamed/ServerStream">>).
+-define(STREAM_BIDI, <<"/test.Streamed/Bidi">>).
 %% The message type the golden dictionary compresses.
 -define(TEXT, <<"test.Text">>).
 
@@ -42,7 +45,16 @@ routes() ->
         ?TEXT_CLIENT_STREAM => typed(#{
             kind => client_streaming, handler => fun counted_client_stream/1
         }),
-        ?TEXT_BIDI => typed(#{kind => bidirectional_streaming, handler => fun counted_bidi/1})
+        ?TEXT_BIDI => typed(#{kind => bidirectional_streaming, handler => fun counted_bidi/1}),
+        ?STREAM_CLIENT_STREAM => typed(#{
+            kind => client_streaming, handler => fun counted_client_stream/1, compression => stream
+        }),
+        ?STREAM_SERVER_STREAM => typed(#{
+            kind => server_streaming, handler => fun server_stream/2, compression => stream
+        }),
+        ?STREAM_BIDI => typed(#{
+            kind => bidirectional_streaming, handler => fun counted_bidi/1, compression => stream
+        })
     }.
 
 typed(Route) ->
@@ -81,10 +93,12 @@ counted_bidi(Call) ->
     end.
 
 count_trailers(Call) ->
-    #{dictionary := Dictionary, plain := Plain} = trevrpc_call:compressed_received(Call),
+    #{dictionary := Dictionary, plain := Plain, stream := Stream} =
+        trevrpc_call:compressed_received(Call),
     trevrpc_call:set_trailers(Call, #{
         <<"x-dictionary">> => integer_to_binary(Dictionary),
-        <<"x-plain">> => integer_to_binary(Plain)
+        <<"x-plain">> => integer_to_binary(Plain),
+        <<"x-stream">> => integer_to_binary(Stream)
     }).
 
 unary(<<"fail">>, _Call) ->
@@ -696,6 +710,18 @@ compression(Transport) ->
                     {"compressed requests are checked", fun compressed_requests_test/1},
                     {"decompressed sizes count towards the body limit", fun body_limit_test/1},
                     {"a new connection negotiates again", fun reconnect_test/1},
+                    {"optimistic uploads stream-compress from the third message",
+                        fun optimistic_stream_test/1},
+                    {"a refused call is replayed, and answers restore optimism",
+                        fun refused_stream_test/1},
+                    {"streamed responses compress from the third message",
+                        fun stream_responses_test/1},
+                    {"servers decode the golden stream", fun golden_stream_test/1},
+                    {"a spent budget refuses optimistic calls", fun spent_budget_test/1},
+                    {"stopped calls give their memory back", fun stopped_call_memory_test/1},
+                    {"channels give stream memory back", fun channel_memory_test/1},
+                    {"a send past the copy cap waits for the answer", fun copy_cap_test/1},
+                    {"an optimistic call must be answered first", fun optimistic_order_test/1},
                     {"invalid compression settings", fun invalid_settings_test/1}
                 ]
             ]
@@ -936,6 +962,283 @@ reconnect_test(#{credentials := Credentials}) ->
         trevrpc_server:stop(Server2),
         trevrpc_channel:close(Channel)
     end.
+
+stream_opts() ->
+    (typed_opts())#{compression => stream}.
+
+stream_count({eof, #{<<"x-stream">> := Count}}) -> Count;
+stream_count({ok, _, #{trailers := #{<<"x-stream">> := Count}}}) -> Count.
+
+eight() ->
+    [<<(small())/binary, (integer_to_binary(I))/binary>> || I <- lists:seq(1, 8)].
+
+%% A client-streaming call sending `Messages' without waiting; returns the
+%% response and its trailers.
+upload(Channel, Method, Messages) ->
+    {ok, Call} = trevrpc_client:client_stream(Channel, Method, stream_opts()),
+    [ok = trevrpc_client:send(Call, Message) || Message <- Messages],
+    ok = trevrpc_client:close_send(Call),
+    {ok, Response} = trevrpc_client:recv(Call),
+    {eof, Trailers} = trevrpc_client:recv(Call),
+    {Response, Trailers}.
+
+optimistic_stream_test(Env) ->
+    Channel = compressed_channel(Env),
+    {Response, Trailers} = upload(Channel, ?STREAM_CLIENT_STREAM, eight()),
+    ?assertEqual(iolist_to_binary(eight()), Response),
+    %% Optimistic from the first call: the context starts at the third
+    %% request, without waiting for the answer.
+    ?assertEqual(<<"6">>, maps:get(<<"x-stream">>, Trailers)),
+    trevrpc_channel:close(Channel).
+
+refused_stream_test(Env) ->
+    Channel = compressed_channel(Env),
+    Self = self(),
+    %% The calls run in a process of their own, whose REQUEST offers are
+    %% traced.
+    Worker = spawn(fun() ->
+        receive
+            go ->
+                Result =
+                    try
+                        refused_calls(Channel)
+                    catch
+                        Class:Reason:Stack -> {Class, Reason, Stack}
+                    end,
+                Self ! {done, self(), Result}
+        end
+    end),
+    1 = erlang:trace(Worker, true, [call]),
+    _ = erlang:trace_pattern({trevrpc_wire, encode_request, 1}, true, []),
+    Worker ! go,
+    Result =
+        receive
+            {done, Worker, Done} -> Done
+        after 20000 -> timeout
+        end,
+    _ = erlang:trace_pattern({trevrpc_wire, encode_request, 1}, false, []),
+    ?assertEqual(ok, Result),
+    Delivered = erlang:trace_delivered(Worker),
+    receive
+        {trace_delivered, Worker, Delivered} -> ok
+    end,
+    %% The refused call, its replay, the bidi call, the last upload.
+    ?assertEqual([optimistic, enabled, enabled, optimistic], offers(Worker)),
+    trevrpc_channel:close(Channel).
+
+refused_calls(Channel) ->
+    %% ?CLIENT_STREAM does not allow stream compression, so the server
+    %% refuses the optimistic call and the client replays it: every request
+    %% arrives once.
+    {Response, _} = upload(Channel, ?CLIENT_STREAM, eight()),
+    ?assertEqual(<<(iolist_to_binary(eight()))/binary, ":8">>, Response),
+    %% Not optimistic any more: a bidi call compresses once its answer
+    %% arrives, which the first echo brings.
+    {ok, Call} = trevrpc_client:bidi(Channel, ?STREAM_BIDI, stream_opts()),
+    [
+        begin
+            ok = trevrpc_client:send(Call, Message),
+            {ok, Message} = trevrpc_client:recv(Call)
+        end
+     || Message <- eight()
+    ],
+    ok = trevrpc_client:close_send(Call),
+    ?assertEqual(<<"6">>, stream_count(trevrpc_client:recv(Call))),
+    %% That answer made the connection's calls optimistic again.
+    {_, Trailers} = upload(Channel, ?STREAM_CLIENT_STREAM, eight()),
+    ?assertEqual(<<"6">>, maps:get(<<"x-stream">>, Trailers)),
+    ok.
+
+offers(Pid) ->
+    receive
+        {trace, Pid, call, {trevrpc_wire, encode_request, [#{stream_compression := Offer}]}} ->
+            [Offer | offers(Pid)]
+    after 0 -> []
+    end.
+
+channel_memory_test(#{credentials := Credentials, server := Server}) ->
+    %% Room for one upload's compressing context and one chunk of copies.
+    {ok, Channel} = trevrpc_channel:start(
+        (ports(Server))#{
+            host => {127, 0, 0, 1},
+            transport => maps:get(transport, Credentials),
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials),
+            compression => maps:get(compression, Credentials),
+            stream_compression_memory => trevrpc_zstd_stream:encoder_cost() + 65536
+        }
+    ),
+    ok = trevrpc_channel:wait_until_ready(Channel, 30000),
+    %% Each upload gets the room, so each finished one gave it back.
+    [
+        ?assertEqual(
+            <<"6">>,
+            maps:get(<<"x-stream">>, element(2, upload(Channel, ?STREAM_CLIENT_STREAM, eight())))
+        )
+     || _ <- lists:seq(1, 3)
+    ],
+    trevrpc_channel:close(Channel).
+
+stream_responses_test(Env) ->
+    Channel = compressed_channel(Env),
+    %% The handler splits its request on colons.
+    Message = binary:copy(<<"service search region us-east-1 ">>, 4),
+    Request = <<"8:", Message/binary>>,
+    {ok, Call} = trevrpc_client:server_stream(
+        Channel, ?STREAM_SERVER_STREAM, Request, stream_opts()
+    ),
+    [?assertEqual({ok, Message}, trevrpc_client:recv(Call)) || _ <- lists:seq(1, 8)],
+    ?assertMatch({eof, _}, trevrpc_client:recv(Call)),
+    %% On the wire: two per-message frames, then the stream's context.
+    Frames = raw_frames(Channel, [
+        request(#{
+            method => ?STREAM_SERVER_STREAM,
+            kind => server_streaming,
+            stream_compression => enabled
+        }),
+        trevrpc_frame:encode(message, Request)
+    ]),
+    ?assertMatch(
+        [{message, _}, {message, _} | _], [F || {T, _} = F <- Frames, T =/= status]
+    ),
+    ?assertEqual(6, length([P || {zstd_stream_message, P} <- Frames])),
+    %% Without an offer, nothing is stream-compressed.
+    Plain = raw_frames(Channel, [
+        request(#{method => ?STREAM_SERVER_STREAM, kind => server_streaming}),
+        trevrpc_frame:encode(message, Request)
+    ]),
+    ?assertEqual([], [P || {zstd_stream_message, P} <- Plain]),
+    trevrpc_channel:close(Channel).
+
+golden_stream_test(Env) ->
+    Channel = compressed_channel(Env),
+    Vectors = trevrpc_zstd_tests:vectors(),
+    Chunks = [
+        trevrpc_frame:encode(zstd_stream_message, maps:get(K, Vectors))
+     || I <- lists:seq(0, 3), K <- [<<"stream.plain.", (integer_to_binary(I))/binary, ".payload">>]
+    ],
+    Upload = request(#{
+        method => ?STREAM_CLIENT_STREAM, kind => client_streaming, stream_compression => enabled
+    }),
+    ?assertMatch(
+        [
+            {answer, #{stream_compression := true}},
+            {message, _},
+            {status, #{code := ok, metadata := #{<<"x-stream">> := <<"4">>}}}
+        ],
+        raw_frames(Channel, [Upload | Chunks])
+    ),
+    ?assertMatch(
+        [{answer, _}, {status, #{code := invalid_argument}}],
+        raw_frames(Channel, [
+            Upload,
+            trevrpc_frame:encode(
+                zstd_stream_message, maps:get(<<"stream_bad.checksum_flag.payload">>, Vectors)
+            )
+        ])
+    ),
+    %% An optimistic call is accepted at dispatch.
+    ?assertMatch(
+        [{answer, #{stream_compression := true}}, {message, _}, {status, #{code := ok}}],
+        raw_frames(Channel, [
+            request(#{
+                method => ?STREAM_CLIENT_STREAM,
+                kind => client_streaming,
+                stream_compression => optimistic
+            })
+            | Chunks
+        ])
+    ),
+    trevrpc_channel:close(Channel).
+
+spent_budget_test(#{credentials := Credentials}) ->
+    Server = start_server(Credentials, #{stream_compression_memory => 1000}),
+    Channel = compressed_channel(#{credentials => Credentials, server => Server}),
+    %% No room to decode: the optimistic call is refused and replayed, and
+    %% the replay goes per message.
+    {Response, Trailers} = upload(Channel, ?STREAM_CLIENT_STREAM, eight()),
+    ?assertEqual(iolist_to_binary(eight()), Response),
+    ?assertEqual(<<"0">>, maps:get(<<"x-stream">>, Trailers)),
+    trevrpc_channel:close(Channel),
+    trevrpc_server:stop(Server).
+
+stopped_call_memory_test(#{credentials := Credentials}) ->
+    %% Room for one request stream's context at a time.
+    Server = start_server(Credentials, #{
+        stream_compression_memory => trevrpc_zstd_stream:decoder_cost()
+    }),
+    Channel = compressed_channel(#{credentials => Credentials, server => Server}),
+    %% A call that holds the context past its deadline is stopped.
+    {ok, Call} = trevrpc_client:bidi(Channel, ?STREAM_BIDI, (stream_opts())#{timeout => 300}),
+    ?assertMatch({error, #{code := deadline_exceeded}}, trevrpc_client:recv(Call)),
+    %% Each call after it gets the context, so each gave it back.
+    [
+        ?assertEqual(
+            <<"6">>,
+            maps:get(<<"x-stream">>, element(2, upload(Channel, ?STREAM_CLIENT_STREAM, eight())))
+        )
+     || _ <- lists:seq(1, 3)
+    ],
+    trevrpc_channel:close(Channel),
+    trevrpc_server:stop(Server).
+
+copy_cap_test(Env) ->
+    Channel = compressed_channel(Env),
+    {ok, Call} = trevrpc_client:client_stream(Channel, ?STREAM_CLIENT_STREAM, stream_opts()),
+    %% The answer is held back, so the call keeps every request it sends.
+    Answer = take_stream_data(Call),
+    Big = binary:copy(<<"x">>, 600000),
+    ok = trevrpc_client:send(Call, Big),
+    %% Keeping another would pass 1 MiB: the send waits for the answer. A
+    %% helper hands the answer over once the send blocks waiting for it.
+    Self = self(),
+    Ref = call_ref(Call),
+    Helper = spawn(fun() ->
+        await_blocked(Self, {trevrpc_stream, peek, 2}),
+        %% Announced first: messages from one process arrive in order, and
+        %% the waiting send takes only the answer.
+        Self ! {answered, self()},
+        Self ! {trevrpc_stream, Ref, Answer}
+    end),
+    ok = trevrpc_client:send(Call, Big),
+    %% The send returned only after the helper saw it wait.
+    receive
+        {answered, Helper} -> ok
+    after 0 ->
+        exit(Helper, kill),
+        error(send_did_not_wait)
+    end,
+    ok = trevrpc_client:close_send(Call),
+    ?assertEqual({ok, <<Big/binary, Big/binary>>}, trevrpc_client:recv(Call)),
+    ?assertMatch({eof, _}, trevrpc_client:recv(Call)),
+    trevrpc_channel:close(Channel).
+
+%% Waits until `Pid' is blocked in a receive inside `Function'.
+await_blocked(Pid, Function) ->
+    case erlang:process_info(Pid, [status, current_function]) of
+        [{status, waiting}, {current_function, Function}] ->
+            ok;
+        _ ->
+            erlang:yield(),
+            await_blocked(Pid, Function)
+    end.
+
+optimistic_order_test(Env) ->
+    Channel = compressed_channel(Env),
+    {ok, Call} = trevrpc_client:client_stream(Channel, ?STREAM_CLIENT_STREAM, stream_opts()),
+    %% The ANSWER the server sends at dispatch is replaced with HEADERS.
+    {data, _Answer, false} = take_stream_data(Call),
+    Headers = iolist_to_binary(
+        trevrpc_frame:encode(headers, trevrpc_wire:encode_headers(#{metadata => #{}}))
+    ),
+    self() ! {trevrpc_stream, call_ref(Call), {data, Headers, false}},
+    ?assertMatch(
+        {error, #{
+            code := internal, message := <<"optimistic call answered with HEADERS before ANSWER">>
+        }},
+        trevrpc_client:send(Call, small())
+    ),
+    trevrpc_channel:close(Channel).
 
 invalid_settings_test(#{credentials := Credentials, server := Server}) ->
     Invalid = #{dictionaries => [#{data => <<"not a dictionary">>}]},

@@ -79,7 +79,8 @@
     initial_request_timeout => timeout(),
     connection_idle_timeout => pos_integer() | infinity,
     graceful_shutdown_timeout => non_neg_integer(),
-    compression => trevrpc_zstd:settings()
+    compression => trevrpc_zstd:settings(),
+    stream_compression_memory => non_neg_integer()
 }.
 
 %% What each connection process needs, shared by all of them.
@@ -96,6 +97,8 @@
     %% Index 1: requests running on the whole server.
     requests := counters:counters_ref(),
     compression := trevrpc_zstd:config(),
+    %% What stream compression contexts may hold on the whole server.
+    stream_budget := trevrpc_zstd_stream:budget() | undefined,
     %% The options of QMux sessions.
     qmux := trevrpc_qmux:options()
 }.
@@ -113,6 +116,7 @@
 -define(CONNECTIONS, 1).
 -define(STOPPING, 2).
 -define(TLS_HANDSHAKE_TIMEOUT, 10000).
+-define(STREAM_COMPRESSION_MEMORY, 268435456).
 
 %% @doc Starts a server linked to the caller, listening once it returns.
 -spec start_link(options()) -> {ok, pid()} | ignore | {error, term()}.
@@ -268,6 +272,9 @@ listen_tcp(
 config(Opts, Compression) ->
     #{
         compression => Compression,
+        stream_budget => trevrpc_zstd_stream:budget(
+            maps:get(stream_compression_memory, Opts, ?STREAM_COMPRESSION_MEMORY)
+        ),
         server => self(),
         routes => maps:get(routes, Opts),
         max_frame_size => maps:get(max_frame_size, Opts, trevrpc:default_max_frame_size()),

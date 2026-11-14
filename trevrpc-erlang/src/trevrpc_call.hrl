@@ -29,10 +29,18 @@
     compression :: trevrpc_zstd:config(),
     response_dict = none :: non_neg_integer() | none,
     answer = [] :: iodata(),
-    %% Request messages that arrived compressed with a dictionary, and
-    %% without one.
+    %% Request messages that arrived compressed with a dictionary, without
+    %% one, and with the request stream's context.
     dictionary_received = 0 :: non_neg_integer(),
     plain_received = 0 :: non_neg_integer(),
+    stream_received = 0 :: non_neg_integer(),
+    %% Stream compression: the request stream's decompressing context when
+    %% the call decodes stream-compressed requests, and the response
+    %% stream's sender when the client decodes stream-compressed responses,
+    %% which reserves its context's memory with `reserve'.
+    stream_decoder :: trevrpc_zstd_stream:decoder() | undefined,
+    response_sender :: trevrpc_zstd_stream:sender() | undefined,
+    reserve :: fun(() -> boolean()) | undefined,
     %% The request side ended: eof, or the status that ended it.
     request_end :: undefined | eof | {error, trevrpc_status:status()}
 }).

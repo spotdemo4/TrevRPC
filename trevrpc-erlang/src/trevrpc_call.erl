@@ -32,6 +32,7 @@
     send/2,
     send_headers/2,
     set_trailers/2,
+    trailers/1,
     compressed_received/1
 ]).
 
@@ -100,7 +101,8 @@ send(#call{kind = Kind} = Call, Message) when
                     )
                 )};
         _ ->
-            write(Call, State#call_state{messages_sent = true}, encode_message(State, Message))
+            {Frame, Encoded} = encode_message(State, Message),
+            write(Call, Encoded#call_state{messages_sent = true}, Frame)
     end;
 send(_Call, _Message) ->
     erlang:error(badarg).
@@ -130,13 +132,21 @@ send_headers(Call, Metadata) ->
 set_trailers(Call, Metadata) ->
     put_state(Call, (state(Call))#call_state{trailers = Metadata}).
 
+%% @doc The trailing metadata set so far.
+-spec trailers(call()) -> trevrpc_metadata:metadata().
+trailers(Call) ->
+    (state(Call))#call_state.trailers.
+
 %% @doc How many of the request messages read so far arrived compressed
-%% with a dictionary (`dictionary') and without one (`plain').
+%% with a dictionary (`dictionary'), without one (`plain'), and with the
+%% request stream's context (`stream').
 -spec compressed_received(call()) ->
-    #{dictionary := non_neg_integer(), plain := non_neg_integer()}.
+    #{dictionary := non_neg_integer(), plain := non_neg_integer(), stream := non_neg_integer()}.
 compressed_received(Call) ->
-    #call_state{dictionary_received = Dictionary, plain_received = Plain} = state(Call),
-    #{dictionary => Dictionary, plain => Plain}.
+    #call_state{
+        dictionary_received = Dictionary, plain_received = Plain, stream_received = Stream
+    } = state(Call),
+    #{dictionary => Dictionary, plain => Plain, stream => Stream}.
 
 %% Any ANSWER still waiting goes first.
 write(Call, #call_state{stream = Stream, answer = Answer} = State, Frame) ->
@@ -154,13 +164,32 @@ write_status(_Reason) -> trevrpc_status:new(cancelled, <<"client stopped reading
 
 %%% Shared with trevrpc_server_call
 
-%% @private The frame of a response message: a ZSTD_MESSAGE when the call
+%% @private The frame of a response message: a ZSTD_STREAM_MESSAGE once the
+%% response stream's context runs, else a ZSTD_MESSAGE when the call
 %% negotiated a dictionary for its responses and it makes the message
-%% shorter, a MESSAGE otherwise.
--spec encode_message(#call_state{}, iodata()) -> iodata().
-encode_message(#call_state{response_dict = none}, Message) ->
+%% shorter, else a MESSAGE.
+-spec encode_message(#call_state{}, iodata()) -> {iodata(), #call_state{}}.
+encode_message(#call_state{response_sender = undefined} = State, Message) ->
+    {per_message(State, Message), State};
+encode_message(#call_state{response_sender = Sender, compression = Compression} = State, Message) ->
+    %% The context starts from the responses' dictionary, if they have one.
+    Seed =
+        case State#call_state.response_dict of
+            none -> 0;
+            Id -> Id
+        end,
+    case trevrpc_zstd_stream:next(Sender, Message, Compression, Seed, State#call_state.reserve) of
+        {stream, Payload, Next} ->
+            {trevrpc_frame:encode(zstd_stream_message, Payload), State#call_state{
+                response_sender = Next
+            }};
+        {message, Next} ->
+            {per_message(State, Message), State#call_state{response_sender = Next}}
+    end.
+
+per_message(#call_state{response_dict = none}, Message) ->
     trevrpc_frame:encode(message, Message);
-encode_message(#call_state{response_dict = Id, compression = Compression}, Message) ->
+per_message(#call_state{response_dict = Id, compression = Compression}, Message) ->
     case trevrpc_zstd:compress(Compression, Id, Message) of
         {ok, Payload} -> trevrpc_frame:encode(zstd_message, Payload);
         none -> trevrpc_frame:encode(message, Message)
@@ -194,12 +223,20 @@ put_state(#call{ref = Ref}, State) ->
     {{ok, {message, binary()}} | eof | {error, term()}, #call_state{}}.
 read(#call_state{stream = Stream, received = Received, max_messages = Max} = State, Deadline) ->
     case trevrpc_stream:next_frame(Stream, Deadline) of
-        {ok, {Type, _}, Next} when Type =:= message orelse Type =:= zstd_message, Received >= Max ->
+        {ok, {Type, _}, Next} when
+            Type =:= message orelse Type =:= zstd_message orelse
+                (Type =:= zstd_stream_message andalso State#call_state.stream_decoder =/= undefined),
+            Received >= Max
+        ->
             {{error, {too_many_messages, Max}}, State#call_state{stream = Next}};
         {ok, {message, _} = Frame, Next} ->
             {{ok, Frame}, State#call_state{stream = Next, received = Received + 1}};
         {ok, {zstd_message, Payload}, Next} ->
             inflate(Payload, State#call_state{stream = Next});
+        {ok, {zstd_stream_message, Payload}, Next} when
+            State#call_state.stream_decoder =/= undefined
+        ->
+            inflate_stream(Payload, State#call_state{stream = Next});
         {ok, {Type, _}, Next} ->
             {{error, {unexpected, Type}}, State#call_state{stream = Next}};
         {eof, Next} ->
@@ -220,6 +257,27 @@ inflate(Payload, #call_state{compression = Compression, max_frame_size = Max} = 
                         stream = Charged, received = State#call_state.received + 1
                     },
                     {{ok, {message, Message}}, count_compressed(Id, Read)};
+                {error, Reason, Failed} ->
+                    {{error, Reason}, State#call_state{stream = Failed}}
+            end;
+        {error, {too_large, Size}} ->
+            {{error, {frame_too_large, Size}}, State};
+        {error, {invalid, Message}} ->
+            {{error, {invalid, Message}}, State}
+    end.
+
+%% A ZSTD_STREAM_MESSAGE of a request stream whose call decodes them.
+inflate_stream(Payload, #call_state{stream_decoder = Decoder, max_frame_size = Max} = State) ->
+    case trevrpc_zstd_stream:decode(Decoder, Payload, Max) of
+        {ok, Message, Next} ->
+            case trevrpc_stream:charge_message(byte_size(Message), State#call_state.stream) of
+                {ok, Charged} ->
+                    {{ok, {message, Message}}, State#call_state{
+                        stream = Charged,
+                        stream_decoder = Next,
+                        received = State#call_state.received + 1,
+                        stream_received = State#call_state.stream_received + 1
+                    }};
                 {error, Reason, Failed} ->
                     {{error, Reason}, State#call_state{stream = Failed}}
             end;

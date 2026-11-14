@@ -16,7 +16,7 @@
 
 -behaviour(gen_server).
 
--export([start/2, start_qmux/2, shutdown/1, finish/3]).
+-export([start/2, start_qmux/2, shutdown/1, finish/3, reserve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(entry, {
@@ -34,7 +34,9 @@
     pid :: pid() | undefined,
     monitor :: reference() | undefined,
     %% Whether the stream still holds its concurrency slots.
-    counted = true :: boolean()
+    counted = true :: boolean(),
+    %% Stream compression memory the call holds, given back when it ends.
+    reserved = 0 :: non_neg_integer()
 }).
 
 -record(state, {
@@ -88,6 +90,16 @@ start_qmux(Socket, Config) ->
 shutdown(Pid) ->
     gen_server:cast(Pid, shutdown).
 
+%% @doc Reserves `Cost' bytes of stream compression memory for call `Ref'
+%% on stream `Id', until the call ends.
+-spec reserve(pid(), non_neg_integer(), reference(), non_neg_integer()) -> boolean().
+reserve(Pid, Id, Ref, Cost) ->
+    try
+        gen_server:call(Pid, {reserve, Id, Ref, Cost}, infinity)
+    catch
+        exit:_ -> false
+    end.
+
 %% @doc Asks to end the call on stream `Id' with its own terminal STATUS.
 %% `ok' releases its concurrency slots, after which only the call writes to
 %% the stream; `cancelled' means the call was already ended for it.
@@ -111,6 +123,19 @@ init({Transport, Config}) ->
     {ok, #state{transport = Transport, config = Config}}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
+handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams, config = Config} = State) ->
+    case Streams of
+        #{Id := #entry{ref = Ref, pid = Pid, reserved = Reserved} = Entry} when is_pid(Pid) ->
+            case trevrpc_zstd_stream:reserve(maps:get(stream_budget, Config), Cost) of
+                true ->
+                    Reserving = Entry#entry{reserved = Reserved + Cost},
+                    {reply, true, State#state{streams = Streams#{Id := Reserving}}};
+                false ->
+                    {reply, false, State}
+            end;
+        _ ->
+            {reply, false, State}
+    end;
 handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
     case Streams of
         #{Id := #entry{state = running, ref = Ref} = Entry} ->
@@ -185,6 +210,11 @@ terminate(_Reason, #state{streams = Streams} = State) ->
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),
     _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams), is_pid(Pid)],
+    Budget = maps:get(stream_budget, State#state.config),
+    _ = [
+        trevrpc_zstd_stream:release(Budget, Reserved)
+     || #entry{reserved = Reserved} <- maps:values(Streams)
+    ],
     ok.
 
 %%% Connection events
@@ -341,7 +371,6 @@ check_request(Payload, #{routes := Routes}) ->
         ok ?= validate_metadata(Metadata),
         {ok, Timeout} ?= timeout(Request),
         {ok, Route} ?= route(Method, Kind, Routes),
-        ok ?= check_optimistic(Compression),
         {ok, Request, Route, Metadata, Timeout}
     end.
 
@@ -424,15 +453,29 @@ route(Method, Kind, Routes) ->
                 )}
     end.
 
-%% This server does not decode stream-compressed requests yet, so it
-%% refuses every optimistic call before any application code runs, and the
-%% client replays it without stream compression.
-check_optimistic(optimistic) ->
-    {error, (trevrpc_status:new(resource_exhausted, <<"stream-compressed requests refused">>))#{
-        refused_stream_compression => true
-    }};
-check_optimistic(_) ->
-    ok.
+%% Whether the call decodes stream-compressed requests: the client offered
+%% stream compression, the route allows it for requests it streams, and the
+%% budget has room for the decompressing context, which the call holds until
+%% it ends. An optimistic call it cannot decode is refused before any
+%% application code runs, and the client replays it without stream
+%% compression.
+stream_requests(#{stream_compression := Offer, kind := Kind}, Route, Budget) ->
+    {Requests, _} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
+    Decode =
+        Offer =/= none andalso Requests =:= stream andalso trevrpc_wire:streams_requests(Kind) andalso
+            trevrpc_zstd_stream:reserve(Budget, trevrpc_zstd_stream:decoder_cost()),
+    case {Decode, Offer} of
+        {true, _} ->
+            {ok, true};
+        {false, optimistic} ->
+            {error, (trevrpc_status:new(
+                resource_exhausted, <<"stream-compressed requests refused">>
+            ))#{
+                refused_stream_compression => true
+            }};
+        {false, _} ->
+            {ok, false}
+    end.
 
 invalid(Message) ->
     {error, trevrpc_status:new(invalid_argument, Message)}.
@@ -445,38 +488,53 @@ admit(Id, Entry, Request, Route, Metadata, Timeout, Rest, #state{config = Config
                 Id, Entry, trevrpc_status:new(unavailable, <<"too many concurrent RPCs">>), State
             );
         false ->
-            counters:add(Requests, 1, 1),
-            Deadline =
-                case Timeout of
-                    infinity -> infinity;
-                    _ -> erlang:monotonic_time(millisecond) + Timeout
-                end,
-            Spec = #{
-                transport => State#state.transport,
-                id => Id,
-                ref => Entry#entry.ref,
-                router => self(),
-                reader => Entry#entry.reader,
-                frames => Rest,
-                fin => Entry#entry.fin,
-                request => Request,
-                metadata => Metadata,
-                route => Route,
-                deadline => Deadline,
-                config => Config
-            },
-            {Pid, Monitor} = trevrpc_server_call:start(Spec),
-            Running = Entry#entry{
-                state = running,
-                pid = Pid,
-                monitor = Monitor,
-                timer = start_timer(Timeout, {deadline, Id})
-            },
-            State#state{
-                streams = (State#state.streams)#{Id := Running},
-                monitors = (State#state.monitors)#{Monitor => Id}
-            }
+            case stream_requests(Request, Route, maps:get(stream_budget, Config)) of
+                {ok, Decode} ->
+                    start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State);
+                {error, Status} ->
+                    refuse(Id, Entry, Status, State)
+            end
     end.
+
+start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
+    #state{config = #{requests := Requests} = Config} = State,
+    counters:add(Requests, 1, 1),
+    Deadline =
+        case Timeout of
+            infinity -> infinity;
+            _ -> erlang:monotonic_time(millisecond) + Timeout
+        end,
+    Spec = #{
+        transport => State#state.transport,
+        id => Id,
+        ref => Entry#entry.ref,
+        router => self(),
+        reader => Entry#entry.reader,
+        frames => Rest,
+        fin => Entry#entry.fin,
+        request => Request,
+        metadata => Metadata,
+        route => Route,
+        deadline => Deadline,
+        config => Config,
+        stream_requests => Decode
+    },
+    {Pid, Monitor} = trevrpc_server_call:start(Spec),
+    Running = Entry#entry{
+        state = running,
+        pid = Pid,
+        monitor = Monitor,
+        timer = start_timer(Timeout, {deadline, Id}),
+        reserved =
+            case Decode of
+                true -> trevrpc_zstd_stream:decoder_cost();
+                false -> 0
+            end
+    },
+    State#state{
+        streams = (State#state.streams)#{Id := Running},
+        monitors = (State#state.monitors)#{Monitor => Id}
+    }.
 
 %% Ends a stream that has no call yet with a lone STATUS.
 refuse(Id, Entry, Status, State) ->
@@ -578,7 +636,15 @@ release(Id, #entry{pid = Pid} = Entry, #state{active = Active, config = Config} 
         streams = (State#state.streams)#{Id => Entry#entry{counted = false}}, active = Active - 1
     }.
 
-remove(Id, #state{streams = Streams} = State) ->
+%% Forgets the stream, giving back the stream compression memory its call
+%% held.
+remove(Id, #state{streams = Streams, config = Config} = State) ->
+    case Streams of
+        #{Id := #entry{reserved = Reserved}} ->
+            trevrpc_zstd_stream:release(maps:get(stream_budget, Config), Reserved);
+        #{} ->
+            ok
+    end,
     State#state{streams = maps:remove(Id, Streams)}.
 
 start_timer(infinity, _Message) ->

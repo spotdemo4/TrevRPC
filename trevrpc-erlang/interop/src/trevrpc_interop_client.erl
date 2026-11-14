@@ -7,6 +7,8 @@
 
 -define(ECHO, "/trevrpc.interop.v1.Echo/").
 -define(COMPRESSED_ECHO, "/trevrpc.interop.v1.CompressedEcho/").
+-define(REFUSING_ECHO, "/trevrpc.interop.v1.RefusingEcho/").
+-define(STREAM_RECEIVED, <<"interop-stream-compressed-received">>).
 -define(DEADLINE, 10000).
 %% The message of the plain.records compression golden vector: a JSON
 %% record that compresses without a dictionary.
@@ -36,8 +38,8 @@ scenarios() ->
         {<<"server-stream-headers">>, fun server_stream_headers/1},
         {<<"unreliable">>, {unsupported, <<"datagram messages are not implemented">>}},
         {<<"compressed">>, fun compressed/1},
-        {<<"compressed-stream">>, {unsupported, <<"stream compression is not implemented">>}},
-        {<<"refused-stream">>, {unsupported, <<"stream compression is not implemented">>}},
+        {<<"compressed-stream">>, fun compressed_stream/1},
+        {<<"refused-stream">>, fun refused_stream/1},
         {<<"compressed-plain">>, fun compressed_plain/1},
         {<<"connection-metadata">>, {unsupported, <<"connection metadata is not implemented">>}},
         {<<"validation">>, {unsupported, <<"buf.validate.Violations details are not decoded">>}}
@@ -361,6 +363,80 @@ compressed_plain(Channel) ->
                     Second/binary, ", want 1">>};
         Failed ->
             Failed
+    end.
+
+%% CompressedEcho.Bidi with eight messages, each echo awaited, then
+%% CompressedEcho.ClientStream with the same eight at once. Both are
+%% optimistic from the first call, so the server receives the third request
+%% and every later one stream-compressed.
+compressed_stream(Channel) ->
+    maybe
+        ok ?= stream_bidi(Channel, 6),
+        stream_upload(Channel, <<?COMPRESSED_ECHO "ClientStream">>, 6)
+    end.
+
+%% RefusingEcho.ClientStream, which the server refuses as optimistic and the
+%% client replays; then compressed-stream's bidi call, which is not
+%% optimistic and compresses once its answer arrives; then its client-stream
+%% call, optimistic again after that answer.
+refused_stream(Channel) ->
+    maybe
+        ok ?= stream_upload(Channel, <<?REFUSING_ECHO "ClientStream">>, none),
+        ok ?= stream_bidi(Channel, 1),
+        stream_upload(Channel, <<?COMPRESSED_ECHO "ClientStream">>, 6)
+    end.
+
+stream_messages() ->
+    [record(Latency) || Latency <- lists:seq(100, 107)].
+
+stream_opts(Metadata) ->
+    (opts(Metadata))#{compression => stream}.
+
+stream_bidi(Channel, AtLeast) ->
+    Header = #{<<"interop-header">> => <<"h">>},
+    Messages = stream_messages(),
+    maybe
+        {ok, Call} ?=
+            trevrpc_client:bidi(Channel, <<?COMPRESSED_ECHO "Bidi">>, stream_opts(Header)),
+        ok ?= ping_pong(Call, Messages, 0),
+        {ok, Headers} ?= trevrpc_client:headers(Call),
+        ok ?= expect(Header, Headers, "headers"),
+        ok ?= trevrpc_client:close_send(Call),
+        {eof, Trailers} ?= trevrpc_client:recv(Call),
+        ok ?=
+            expect(
+                <<"h">>, maps:get(<<"interop-trailer">>, Trailers, undefined), "interop-trailer"
+            ),
+        stream_received(Trailers, AtLeast)
+    else
+        Error -> describe(Error)
+    end.
+
+stream_upload(Channel, Method, AtLeast) ->
+    Messages = stream_messages(),
+    maybe
+        {ok, Call} ?= trevrpc_client:client_stream(Channel, Method, stream_opts(#{})),
+        ok ?= send_all(Call, Messages),
+        ok ?= trevrpc_client:close_send(Call),
+        {ok, Bin} ?= trevrpc_client:recv(Call),
+        ok ?= expect_response(Bin, iolist_to_binary(Messages), 8),
+        {eof, Trailers} ?= trevrpc_client:recv(Call),
+        stream_received(Trailers, AtLeast)
+    else
+        Error -> describe(Error)
+    end.
+
+stream_received(_Trailers, none) ->
+    ok;
+stream_received(Trailers, AtLeast) ->
+    case binary_to_integer(maps:get(?STREAM_RECEIVED, Trailers, <<"-1">>)) of
+        Count when Count >= AtLeast ->
+            ok;
+        Count ->
+            {error,
+                iolist_to_binary(
+                    io_lib:format("~s ~b, want at least ~b", [?STREAM_RECEIVED, Count, AtLeast])
+                )}
     end.
 
 record(Latency) ->

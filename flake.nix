@@ -93,8 +93,8 @@
               basedpyright
 
               # erlang
-              beamMinimal28Packages.erlang
-              beamMinimal28Packages.rebar3
+              beamMinimal29Packages.erlang
+              beamMinimal29Packages.rebar3
               erlfmt
               erlang-language-platform
 

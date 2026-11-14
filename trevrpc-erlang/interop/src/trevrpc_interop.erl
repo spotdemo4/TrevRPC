@@ -19,6 +19,8 @@
 
 -define(ECHO, "/trevrpc.interop.v1.Echo/").
 -define(COMPRESSED_ECHO, "/trevrpc.interop.v1.CompressedEcho/").
+-define(REFUSING_ECHO, "/trevrpc.interop.v1.RefusingEcho/").
+-define(STREAM_RECEIVED, <<"interop-stream-compressed-received">>).
 
 %% @doc The scenarios this server passes; clients skip the others.
 -spec server_scenarios() -> [binary()].
@@ -37,6 +39,8 @@ server_scenarios() ->
         <<"unary-headers">>,
         <<"server-stream-headers">>,
         <<"compressed">>,
+        <<"compressed-stream">>,
+        <<"refused-stream">>,
         <<"compressed-plain">>,
         <<"connection-metadata">>
     ].
@@ -155,6 +159,22 @@ routes() ->
         <<?COMPRESSED_ECHO "Unary">> => Echo#{
             kind => unary, handler => fun unary/2, compression => message
         },
+        <<?COMPRESSED_ECHO "Bidi">> => Echo#{
+            kind => bidirectional_streaming,
+            handler => fun(Call) -> counted(Call, fun bidi/1) end,
+            compression => stream
+        },
+        <<?COMPRESSED_ECHO "ClientStream">> => Echo#{
+            kind => client_streaming,
+            handler => fun(Call) -> counted(Call, fun client_stream/1) end,
+            compression => stream
+        },
+        %% Registered without stream compression, as a server built from a
+        %% schema without COMPRESSION_STREAM would be, so it refuses every
+        %% optimistic call.
+        <<?REFUSING_ECHO "ClientStream">> => Echo#{
+            kind => client_streaming, handler => fun client_stream/1
+        },
         <<?COMPRESSED_ECHO "Plain">> => #{
             kind => unary,
             handler => fun plain/2,
@@ -175,6 +195,20 @@ unary(Bin, Call) ->
                 {error, Status}
         end
     end).
+
+%% Runs an Echo handler, adding to an OK end's trailing metadata how many
+%% requests arrived stream-compressed.
+counted(Call, Handler) ->
+    case Handler(Call) of
+        {error, _} = Error ->
+            Error;
+        Result ->
+            #{stream := Stream} = trevrpc_call:compressed_received(Call),
+            trevrpc_call:set_trailers(
+                Call, (trevrpc_call:trailers(Call))#{?STREAM_RECEIVED => integer_to_binary(Stream)}
+            ),
+            Result
+    end.
 
 %% Echoes the text, with trailing metadata saying whether the request
 %% arrived compressed without a dictionary.
