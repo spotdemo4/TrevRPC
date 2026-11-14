@@ -13,12 +13,13 @@ import { methodSettings } from "../src/method-options.js";
 import { Code } from "../src/status.js";
 import { fakeTransport } from "./support.js";
 
-/** The settings of every method of `service`, by local name, without its kind. */
+/** What the settings of every method of `service` let its calls do, by local name. */
 function settingsOf(service) {
   return Object.fromEntries(
     service.methods.map((method) => {
-      const { kind: _, ...flags } = methodSettings(method);
-      return [method.localName, flags];
+      const { datagrams, compressStream, compress } = methodSettings(method);
+      const uses = Object.entries({ datagrams, compressStream, compress });
+      return [method.localName, Object.fromEntries(uses.filter(([, use]) => use !== undefined))];
     }),
   );
 }
@@ -46,26 +47,28 @@ test("clients have a function per method, named by its local name, that calls it
 test("the trevrpc.method option marks directions unreliable", () => {
   assert.deepEqual(settingsOf(methods.Unreliable), {
     unary: {},
-    server: { unreliableResponses: true },
-    client: { unreliableRequests: true },
-    bidi: { unreliableRequests: true, unreliableResponses: true },
+    server: { datagrams: { send: false, receive: true } },
+    client: { datagrams: { send: true, receive: false } },
+    bidi: { datagrams: { send: true, receive: true } },
   });
 });
 
 test("COMPRESSION_STREAM stream-compresses the streamed directions whose types have no redacted field", () => {
-  const all = { compressRequests: true, compressResponses: true };
+  const compress = { requests: true, responses: true };
   assert.deepEqual(settingsOf(methods.StreamCompressed), {
-    bidi: { ...all, compressStreamRequests: true, compressStreamResponses: true },
-    server: { ...all, compressStreamResponses: true },
-    client: { ...all, compressStreamRequests: true },
+    bidi: { compress, compressStream: { requests: true, responses: true } },
+    server: { compress, compressStream: { requests: false, responses: true } },
+    client: { compress, compressStream: { requests: true, responses: false } },
     // Wrapper holds a redacted field two levels down; Loop refers to itself.
-    redacted: { compressResponses: true, compressStreamResponses: true },
-    // The client leaves the unreliable direction out of stream compression when it calls.
+    redacted: {
+      compress: { requests: false, responses: true },
+      compressStream: { requests: false, responses: true },
+    },
+    // The unreliable direction is left out of stream compression.
     unreliableBidi: {
-      ...all,
-      unreliableResponses: true,
-      compressStreamRequests: true,
-      compressStreamResponses: true,
+      datagrams: { send: false, receive: true },
+      compress,
+      compressStream: { requests: true, responses: false },
     },
     unmarked: {},
   });
@@ -73,8 +76,8 @@ test("COMPRESSION_STREAM stream-compresses the streamed directions whose types h
 
 test("COMPRESSION_MESSAGE compresses without a dictionary, except types with redacted fields", () => {
   assert.deepEqual(settingsOf(methods.MessageCompressed), {
-    unary: { compressRequests: true, compressResponses: true },
-    redacted: { compressResponses: true },
+    unary: { compress: { requests: true, responses: true } },
+    redacted: { compress: { requests: false, responses: true } },
     // Redacted messages as the elements of a list and the values of a map.
     redactedElements: {},
     unmarked: {},

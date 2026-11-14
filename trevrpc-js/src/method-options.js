@@ -6,6 +6,7 @@
 import { BinaryReader, WireType } from "@bufbuild/protobuf/wire";
 
 import { invalidArgument } from "./status.js";
+import { RpcKind } from "./wire.js";
 
 /** The field number of the `trevrpc.method` extension of google.protobuf.MethodOptions. */
 const MethodOptionField = 58247;
@@ -13,33 +14,67 @@ const MethodOptionField = 58247;
 /** `trevrpc.Compression` values. */
 const Compression = Object.freeze({ Unspecified: 0, Message: 1, Stream: 2 });
 
-/** The kind of each protobuf-es `methodKind`, as calls and interceptors name it. */
+/**
+ * Each protobuf-es `methodKind`: its kind as calls and interceptors name it, its `RpcKind` on the
+ * wire, and which of its directions stream.
+ */
 const Kinds = Object.freeze({
   __proto__: null,
-  unary: "unary",
-  server_streaming: "serverStreaming",
-  client_streaming: "clientStreaming",
-  bidi_streaming: "bidirectionalStreaming",
+  unary: kind("unary", RpcKind.Unary, false, false),
+  server_streaming: kind("serverStreaming", RpcKind.ServerStreaming, false, true),
+  client_streaming: kind("clientStreaming", RpcKind.ClientStreaming, true, false),
+  bidi_streaming: kind("bidirectionalStreaming", RpcKind.BidirectionalStreaming, true, true),
 });
 
+function kind(name, rpcKind, streamsRequest, streamsResponse) {
+  return Object.freeze({ name, rpcKind, streamsRequest, streamsResponse });
+}
+
 /**
- * The call settings of `method`, a protobuf-es DescMethod: `{ kind, unreliableRequests,
- * unreliableResponses, compressRequests, compressResponses, compressStreamRequests,
- * compressStreamResponses }`, with each flag true only where the option sets it for a direction
- * that allows it. An option the method's kind cannot use throws InvalidArgument.
+ * The call settings of `method`, a protobuf-es DescMethod, as calls read them:
+ *
+ * - `kind`, as calls and interceptors name it, `rpcKind`, its value on the wire, and
+ *   `streamsRequest`, whether the request side streams.
+ * - `datagrams`, `{ send, receive }` for a method that marks a direction unreliable, else
+ *   undefined: `send` for request messages, which needs `unreliable_requests`, and `receive` for
+ *   response messages, which every such method with a streaming response accepts.
+ * - `compressStream`, `{ requests, responses }`, the directions it may stream-compress, else
+ *   undefined.
+ * - `compress`, `{ requests, responses }`, the directions whose messages it may compress without a
+ *   dictionary, else undefined.
+ *
+ * An option the method's kind cannot use throws InvalidArgument.
  */
 export function methodSettings(method) {
-  const kind = Kinds[method.methodKind];
+  const shape = Kinds[method.methodKind];
   const name = method.parent?.typeName ? `${method.parent.typeName}.${method.name}` : method.name;
-  if (kind === undefined) {
+  if (shape === undefined) {
     throw invalidArgument(`${name}: unsupported RPC kind ${JSON.stringify(method.methodKind)}`);
   }
   const options = trevrpcMethodOptions(method, name);
+  checkUnreliable(name, shape, options);
+  const { unreliableRequests, unreliableResponses } = options;
+  const compression = compressionDirections(name, shape, options, method);
   return {
-    kind,
-    ...unreliableDirections(name, kind, options),
-    ...compressionDirections(name, kind, options, method),
+    kind: shape.name,
+    rpcKind: shape.rpcKind,
+    streamsRequest: shape.streamsRequest,
+    datagrams:
+      unreliableRequests || unreliableResponses
+        ? { send: unreliableRequests, receive: shape.streamsResponse }
+        : undefined,
+    // Directions marked unreliable mostly travel as datagrams, so they are not stream-compressed.
+    compressStream: directions(
+      compression.streamRequests && !unreliableRequests,
+      compression.streamResponses && !unreliableResponses,
+    ),
+    compress: directions(compression.requests, compression.responses),
   };
+}
+
+/** `{ requests, responses }`, or undefined if neither is set. */
+function directions(requests, responses) {
+  return requests || responses ? { requests, responses } : undefined;
 }
 
 /** The method's `(trevrpc.method)` option, with unset fields false or zero. */
@@ -77,63 +112,47 @@ function trevrpcMethodOptions(method, name) {
   return options;
 }
 
-/** The `unreliable_*` flags that are set; one on a direction that does not stream throws. */
-function unreliableDirections(name, kind, options) {
-  const directions = {};
-  if (options.unreliableRequests) {
-    if (kind !== "clientStreaming" && kind !== "bidirectionalStreaming") {
-      throw invalidArgument(
-        `${name}: unreliable_requests requires a client-streaming or bidirectional method`,
-      );
-    }
-    directions.unreliableRequests = true;
+/** Throws if an `unreliable_*` flag marks a direction that does not stream. */
+function checkUnreliable(name, shape, options) {
+  if (options.unreliableRequests && !shape.streamsRequest) {
+    throw invalidArgument(
+      `${name}: unreliable_requests requires a client-streaming or bidirectional method`,
+    );
   }
-  if (options.unreliableResponses) {
-    if (kind !== "serverStreaming" && kind !== "bidirectionalStreaming") {
-      throw invalidArgument(
-        `${name}: unreliable_responses requires a server-streaming or bidirectional method`,
-      );
-    }
-    directions.unreliableResponses = true;
+  if (options.unreliableResponses && !shape.streamsResponse) {
+    throw invalidArgument(
+      `${name}: unreliable_responses requires a server-streaming or bidirectional method`,
+    );
   }
-  return directions;
 }
 
 /**
- * The directions `compression` lets compress, leaving out message types with a field marked
- * `debug_redact`. `COMPRESSION_MESSAGE` compresses messages without a dictionary in both
- * directions. `COMPRESSION_STREAM` does too, for the messages outside the stream, and
- * stream-compresses the directions that stream; on a unary method it throws, as does a value this
- * runtime does not know.
+ * The directions `compression` lets compress, `{ requests, responses, streamRequests,
+ * streamResponses }`, leaving out message types with a field marked `debug_redact`.
+ * `COMPRESSION_MESSAGE` compresses messages without a dictionary in both directions.
+ * `COMPRESSION_STREAM` does too, for the messages outside the stream, and stream-compresses the
+ * directions that stream; on a unary method it throws, as does a value this runtime does not know.
  */
-function compressionDirections(name, kind, { compression }, method) {
+function compressionDirections(name, shape, { compression }, method) {
+  const none = { requests: false, responses: false, streamRequests: false, streamResponses: false };
   if (compression === Compression.Unspecified) {
-    return {};
+    return none;
   }
   if (compression !== Compression.Message && compression !== Compression.Stream) {
     throw invalidArgument(`${name}: unknown compression ${compression}`);
   }
-  if (compression === Compression.Stream && kind === "unary") {
+  const stream = compression === Compression.Stream;
+  if (stream && !shape.streamsRequest && !shape.streamsResponse) {
     throw invalidArgument(`${name}: COMPRESSION_STREAM requires a streaming method`);
   }
   const requests = !hasRedactedField(method.input);
   const responses = !hasRedactedField(method.output);
-  const directions = {};
-  if (requests) {
-    directions.compressRequests = true;
-  }
-  if (responses) {
-    directions.compressResponses = true;
-  }
-  if (compression === Compression.Stream) {
-    if (requests && (kind === "clientStreaming" || kind === "bidirectionalStreaming")) {
-      directions.compressStreamRequests = true;
-    }
-    if (responses && (kind === "serverStreaming" || kind === "bidirectionalStreaming")) {
-      directions.compressStreamResponses = true;
-    }
-  }
-  return directions;
+  return {
+    requests,
+    responses,
+    streamRequests: stream && requests && shape.streamsRequest,
+    streamResponses: stream && responses && shape.streamsResponse,
+  };
 }
 
 /** Whether each message type checked so far has a redacted field. */
