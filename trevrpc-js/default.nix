@@ -34,8 +34,9 @@ let
   # schema options, and the wire, QMux and compression tests read the shared golden vectors; all
   # of them live outside this directory, as does the root oxlint config that ours extends. The wasm
   # module is built on its own; only the script that embeds it is needed here. The Effect adapter
-  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own. The source
-  # of protoc-gen-trevrpc-js/ is kept: the build runs it to generate the codecs it tests.
+  # in effect/ and the protovalidate adapter in protovalidate/ are packages of their own, which
+  # adapter.nix builds. The source of protoc-gen-trevrpc-js/ is kept: the build runs it to generate
+  # the codecs it tests.
   sourceTree = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -52,6 +53,7 @@ let
           ./protovalidate
           ./protoc-gen-trevrpc-js/default.nix
           ./release-check.nix
+          ./adapter.nix
         ]
       ))
       ./zstd-wasm/embed.js
