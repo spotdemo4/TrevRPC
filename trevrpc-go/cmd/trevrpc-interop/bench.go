@@ -715,9 +715,10 @@ type benchWorker struct {
 	// bytes are divided by the messages actually sent while they were counted.
 	deliveredSends []time.Time
 	// delivered counts the messages its operations delivered, in the window
-	// or not, for the wire-byte sampling to read at the same instants as the
-	// wire bytes.
+	// or not, for sampler to read at the same instants as the wire bytes.
 	delivered atomic.Uint64
+	// sampler is told when the worker starts an operation, or nil.
+	sampler *wireSampler
 }
 
 // deliveredBetween counts the paced messages sent in [from, to) and echoed in
@@ -743,6 +744,7 @@ func (l operationLoop) work(ctx context.Context, w *benchWorker, start, end time
 	defer operation.close()
 	for {
 		began := time.Now()
+		w.sampler.observe(began)
 		if !began.Before(end) {
 			return
 		}
@@ -894,35 +896,23 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	defer cancel()
 
 	workers := make([]benchWorker, config.concurrency)
+	var sampler *wireSampler
+	if wire != nil {
+		sampler = &wireSampler{wire: wire, workers: workers, start: start, end: end}
+	}
 	var group sync.WaitGroup
 	for i := range workers {
+		workers[i].sampler = sampler
 		workload := benchScenarios[config.scenario](clients[i%len(clients)], config, newBenchPayload(config.payload, config.size, i))
 		group.Go(func() { workload.work(opCtx, &workers[i], start, end) })
 	}
-	// The wire bytes are counted between when this goroutine wakes at start
-	// and at end, which a busy machine delays, so the messages they are
-	// divided by are counted between the same two instants rather than over
-	// the window.
-	deliveredSoFar := func() uint64 {
-		var total uint64
-		for i := range workers {
-			total += workers[i].delivered.Load()
-		}
-		return total
-	}
-	var sample wireSample
-	var wireBefore, deliveredBefore uint64
 	waitErr := sleepUntil(ctx, start)
-	if wire != nil {
-		sample.from, wireBefore, deliveredBefore = time.Now(), wire.total(), deliveredSoFar()
-	}
 	if waitErr == nil {
+		sampler.observe(time.Now())
 		waitErr = sleepUntil(ctx, end)
 	}
-	if wire != nil {
-		sample.bytes = wire.total() - wireBefore
-		sample.delivered = deliveredSoFar() - deliveredBefore
-		sample.to = time.Now()
+	if waitErr == nil {
+		sampler.observe(time.Now())
 	}
 	if waitErr != nil {
 		cancel()
@@ -936,10 +926,57 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if wire != nil {
-		result.WireBytesPerMsg = sample.perMessage(&config, workers, result.Msgs)
+	if sampler != nil {
+		result.WireBytesPerMsg = sampler.sample().perMessage(&config, workers, result.Msgs)
 	}
 	return json.NewEncoder(out).Encode(result)
+}
+
+// wireSampler samples the client's wire bytes and the messages its
+// operations delivered at the start and at the end of the measured window, so
+// the bytes are divided by the messages of the same interval. Whoever first
+// sees a boundary pass takes its sample: the main goroutine when its timer
+// fires, or a worker about to start an operation. A busy machine delays the
+// timer, but every operation the window measures starts after the start
+// sample and ends before the end sample. A nil sampler samples nothing.
+type wireSampler struct {
+	wire          *wireCounter
+	workers       []benchWorker
+	start, end    time.Time
+	begin, finish sync.Once
+	// at holds the instant, the wire bytes and the delivered messages of the
+	// start and the end sample.
+	at [2]wireSample
+}
+
+// observe takes the sample of each boundary that now has passed, unless it is
+// already taken. The start sample is always taken before the end sample.
+func (s *wireSampler) observe(now time.Time) {
+	if s == nil || now.Before(s.start) {
+		return
+	}
+	s.begin.Do(func() { s.at[0] = s.snapshot() })
+	if !now.Before(s.end) {
+		s.finish.Do(func() { s.at[1] = s.snapshot() })
+	}
+}
+
+func (s *wireSampler) snapshot() wireSample {
+	var delivered uint64
+	for i := range s.workers {
+		delivered += s.workers[i].delivered.Load()
+	}
+	return wireSample{bytes: s.wire.total(), delivered: delivered, from: time.Now()}
+}
+
+// sample returns what changed between the two samples, once both are taken.
+func (s *wireSampler) sample() wireSample {
+	return wireSample{
+		bytes:     s.at[1].bytes - s.at[0].bytes,
+		delivered: s.at[1].delivered - s.at[0].delivered,
+		from:      s.at[0].from,
+		to:        s.at[1].from,
+	}
 }
 
 // wireSample is the bytes the client's connections carried between two

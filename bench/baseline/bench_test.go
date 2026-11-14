@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -37,7 +36,7 @@ func TestRunWorkerKeepsTheFirstErrorInTheWindow(t *testing.T) {
 	first, later := errors.New("first"), errors.New("later")
 	w := &scriptedWorker{calls: []func() error{fail(first), fail(later), fail(later, cancel)}}
 	now := time.Now()
-	result := runWorker(ctx, w, new(atomic.Uint64), now, now.Add(time.Hour))
+	result := runWorker(ctx, w, newWireSampler(new(wireCounter), 1, now, now.Add(time.Hour)), 0, now, now.Add(time.Hour))
 	if result.errors != 3 {
 		t.Fatalf("errors = %d, want 3", result.errors)
 	}
@@ -63,7 +62,7 @@ func TestRunWorkerIgnoresErrorsDuringWarmup(t *testing.T) {
 			}),
 			fail(measured, cancel),
 		}}
-		result := runWorker(ctx, w, new(atomic.Uint64), start, start.Add(time.Hour))
+		result := runWorker(ctx, w, newWireSampler(new(wireCounter), 1, start, start.Add(time.Hour)), 0, start, start.Add(time.Hour))
 		cancel()
 		if !startedInWarmup {
 			if attempt == 10 {
@@ -107,33 +106,56 @@ func (deliveringWorker) close() {}
 // snapshotWire reads at its instants.
 func TestRunWorkerCountsDeliveredMessagesOutsideTheWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	var delivered atomic.Uint64
 	start := time.Now().Add(time.Hour)
-	result := runWorker(ctx, deliveringWorker{stop: cancel}, &delivered, start, start.Add(time.Hour))
+	sampler := newWireSampler(new(wireCounter), 1, start, start.Add(time.Hour))
+	result := runWorker(ctx, deliveringWorker{stop: cancel}, sampler, 0, start, start.Add(time.Hour))
 	if result.msgs != 0 {
 		t.Fatalf("measured messages = %d, want 0 before the window", result.msgs)
 	}
-	if got := delivered.Load(); got != 1 {
+	if got := sampler.delivered[0].Load(); got != 1 {
 		t.Fatalf("delivered messages = %d, want the call's 1", got)
 	}
 }
 
-// TestSnapshotWireTakesWhatChangedBetweenItsInstants samples a connection and
+// TestWireSamplerTakesWhatChangedBetweenTheBoundaries samples a connection and
 // workers that already carried bytes and messages before the window: the
-// sample holds only what changed between its two instants, here nothing.
-func TestSnapshotWireTakesWhatChangedBetweenItsInstants(t *testing.T) {
+// sample holds only what changed between the start and the end sample.
+func TestWireSamplerTakesWhatChangedBetweenTheBoundaries(t *testing.T) {
+	start := time.Now()
+	end := start.Add(time.Second)
 	var counter wireCounter
+	sampler := newWireSampler(&counter, 2, start, end)
 	counter.written.Store(500)
-	delivered := make([]atomic.Uint64, 2)
-	delivered[0].Store(7)
-	delivered[1].Store(3)
-	now := time.Now()
-	sample, ok := snapshotWire(t.Context(), &counter, delivered, now, now)
-	if !ok {
-		t.Fatal("snapshotWire did not sample")
+	sampler.deliver(0, 7)
+
+	sampler.observe(start.Add(-time.Millisecond))
+	counter.written.Store(600)
+	sampler.observe(start)
+	counter.written.Store(900)
+	sampler.deliver(1, 3)
+	sampler.observe(end)
+
+	if got, want := sampler.sample(), (wireSample{bytes: 300, msgs: 3}); got != want {
+		t.Fatalf("sample = %+v, want %+v", got, want)
 	}
-	if sample != (wireSample{}) {
-		t.Fatalf("sample = %+v, want nothing carried between its instants", sample)
+}
+
+// TestWireSamplerKeepsTheFirstObservationOfEachBoundary has the start and the
+// end observed again after their samples were taken, as the late main
+// goroutine does after a worker saw them pass: the later observations change
+// nothing, and an observation past the end takes a missing start sample first.
+func TestWireSamplerKeepsTheFirstObservationOfEachBoundary(t *testing.T) {
+	start := time.Now()
+	end := start.Add(time.Second)
+	var counter wireCounter
+	sampler := newWireSampler(&counter, 1, start, end)
+	sampler.observe(end.Add(time.Millisecond))
+	counter.written.Store(100)
+	sampler.deliver(0, 1)
+	sampler.observe(start)
+	sampler.observe(end)
+	if got := sampler.sample(); got != (wireSample{}) {
+		t.Fatalf("sample = %+v, want the first observation's, which saw nothing carried", got)
 	}
 }
 

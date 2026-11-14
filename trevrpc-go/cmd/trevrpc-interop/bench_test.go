@@ -788,3 +788,36 @@ func TestOperationsCountDeliveredMessagesOutsideTheWindow(t *testing.T) {
 		t.Fatalf("delivered messages = %d, want the first operation's 1", got)
 	}
 }
+
+// TestWireSamplerTakesWhatChangedBetweenTheBoundaries samples a connection and
+// workers that already carried bytes and messages before the window, and has
+// a worker see the start pass before the late main goroutine does: the sample
+// holds only what changed between the first observation of each boundary.
+func TestWireSamplerTakesWhatChangedBetweenTheBoundaries(t *testing.T) {
+	start := time.Now()
+	end := start.Add(time.Second)
+	wire := new(wireCounter)
+	workers := make([]benchWorker, 2)
+	sampler := &wireSampler{wire: wire, workers: workers, start: start, end: end}
+	wire.sent.Store(500)
+	workers[0].delivered.Add(7)
+
+	sampler.observe(start.Add(-time.Millisecond))
+	wire.sent.Store(600)
+	sampler.observe(start)
+	wire.sent.Store(900)
+	workers[1].delivered.Add(3)
+	sampler.observe(start.Add(time.Millisecond))
+	sampler.observe(end)
+	wire.sent.Store(1000)
+	workers[1].delivered.Add(1)
+	sampler.observe(end.Add(time.Millisecond))
+
+	got := sampler.sample()
+	if got.bytes != 300 || got.delivered != 3 {
+		t.Fatalf("sample = %d bytes and %d messages, want 300 and 3", got.bytes, got.delivered)
+	}
+	if got.to.Before(got.from) {
+		t.Fatalf("sample from %v to %v, want its end after its start", got.from, got.to)
+	}
+}
