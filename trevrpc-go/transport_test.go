@@ -262,6 +262,15 @@ func withTestHandshakeTimeout(config *quic.Config) *quic.Config {
 	return config
 }
 
+// testDial is Dial with withTestHandshakeTimeout applied to the QUIC
+// configuration, for every test dial that is meant to connect, including the
+// channel's reconnections. Dials that are meant to fail keep quic-go's
+// default, so that they fail as soon as a real client would.
+func testDial(ctx context.Context, addr string, options DialOptions) (*Channel, error) {
+	options.QUICConfig = withTestHandshakeTimeout(options.QUICConfig)
+	return Dial(ctx, addr, options)
+}
+
 // dialNative dials listener with TransportAuto and fails the test unless the
 // channel uses QUIC. QMux over TLS only starts if QUIC has not connected within
 // FallbackDelay, which here is the whole dial timeout instead of the default
@@ -271,9 +280,8 @@ func dialNative(t testing.TB, pki testPKI, listener *Listener) *Channel {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+	channel, err := testDial(ctx, listener.Addr().String(), DialOptions{
 		TLSConfig:     pki.client,
-		QUICConfig:    withTestHandshakeTimeout(nil),
 		FallbackDelay: rpcTestTimeout,
 	})
 	if err != nil {
@@ -707,7 +715,7 @@ func TestChannelReconnectsToRestartedServer(t *testing.T) {
 	events := make(chan ChannelEvent, 16)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, addr, DialOptions{TLSConfig: pki.client, OnEvent: func(event ChannelEvent) { events <- event }})
+	channel, err := testDial(ctx, addr, DialOptions{TLSConfig: pki.client, OnEvent: func(event ChannelEvent) { events <- event }})
 	if err != nil {
 		t.Fatal(err)
 	}

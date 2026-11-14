@@ -353,7 +353,7 @@ func TestTrustedUDPProxyHeadersNameTheClient(t *testing.T) {
 	native := func() Transport {
 		ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 		defer cancel()
-		channel, err := Dial(ctx, proxy, DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
+		channel, err := testDial(ctx, proxy, DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
 		if err != nil {
 			t.Fatalf("Dial through the proxy: %v", err)
 		}
@@ -553,7 +553,7 @@ func TestAddressValidationSendsRetry(t *testing.T) {
 			})
 			for range 2 {
 				ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
-				channel, err := Dial(ctx, relay, DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
+				channel, err := testDial(ctx, relay, DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
 				cancel()
 				if err != nil {
 					t.Fatalf("Dial: %v", err)

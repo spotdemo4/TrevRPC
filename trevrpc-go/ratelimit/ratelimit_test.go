@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	trevrpc "trev.zip/llc/trevrpc/trevrpc-go"
 )
@@ -467,7 +468,7 @@ func serve(t *testing.T, server *trevrpc.Server) *trevrpc.Channel {
 	if !roots.AppendCertsFromPEM(certificatePEM) {
 		t.Fatal("PEM holds no certificates")
 	}
-	listener, err := trevrpc.Listen("127.0.0.1:0", server, trevrpc.ListenOptions{TLSConfig: certificate.TLSConfig()})
+	listener, err := trevrpc.Listen("127.0.0.1:0", server, trevrpc.ListenOptions{TLSConfig: certificate.TLSConfig(), QUICConfig: testQUICConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,12 +483,21 @@ func serve(t *testing.T, server *trevrpc.Server) *trevrpc.Channel {
 	})
 
 	channel, err := trevrpc.Dial(ctx, listener.Addr().String(), trevrpc.DialOptions{
-		TLSConfig: &tls.Config{RootCAs: roots, ServerName: "localhost"},
-		Transport: trevrpc.TransportQUICOnly,
+		TLSConfig:  &tls.Config{RootCAs: roots, ServerName: "localhost"},
+		QUICConfig: testQUICConfig(),
+		Transport:  trevrpc.TransportQUICOnly,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = channel.Close() })
 	return channel
+}
+
+// testQUICConfig is the QUIC configuration of the test's listener and dial.
+// quic-go gives up a handshake after 5 s without network activity, which a
+// loopback handshake on a starved CI runner has exceeded, and either side
+// giving up fails the dial.
+func testQUICConfig() *quic.Config {
+	return &quic.Config{HandshakeIdleTimeout: 10 * time.Second}
 }

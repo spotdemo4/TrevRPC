@@ -24,7 +24,7 @@ func TestUnaryHandlerContextEndsWithItsCall(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
+	channel, err := testDial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestStreamingHandlerContextEndsBeforeItsStreamCloses(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
+	channel, err := testDial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -235,7 +235,7 @@ func dialValidating(t *testing.T, pki testPKI, listener *Listener, validator Val
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, Validator: validator})
+	channel, err := testDial(ctx, listener.Addr().String(), DialOptions{TLSConfig: pki.client, Validator: validator})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

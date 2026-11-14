@@ -117,7 +117,7 @@ func TestAutocertTLSALPN01(t *testing.T) {
 
 	for _, transport := range []TransportPolicy{TransportQUICOnly, TransportTCPOnly} {
 		ctx, cancel := context.WithTimeout(t.Context(), rpcTestTimeout)
-		channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+		channel, err := testDial(ctx, listener.Addr().String(), DialOptions{
 			TLSConfig: client,
 			Transport: transport,
 			TCPAddr:   listener.TCPAddr().String(),

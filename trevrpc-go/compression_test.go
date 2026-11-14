@@ -517,7 +517,7 @@ func TestCompressionOverEveryTransport(t *testing.T) {
 	}
 
 	// The native transports go through Dial and the QMux connector.
-	native, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Compression: testCompression(t), Transport: TransportQUICOnly})
+	native, err := testDial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Compression: testCompression(t), Transport: TransportQUICOnly})
 	if err != nil {
 		t.Fatal(err)
 	}
