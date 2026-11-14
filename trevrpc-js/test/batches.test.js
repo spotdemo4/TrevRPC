@@ -9,17 +9,12 @@ import { UnreliableEcho } from "../build/interop/gen/unreliable_pb.js";
 import { createClient } from "../src/client.js";
 import { encodeMessage } from "../src/compression.js";
 import { encodeDatagram } from "../src/datagram.js";
-import {
-  FrameType,
-  encodeFrame,
-  encodeMessageFrame,
-  encodeStatusFrame,
-  marshalMessage,
-} from "../src/framing.js";
+import { FrameType, encodeFrame, encodeMessageFrame, marshalMessage } from "../src/framing.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import { concatBytes, deferred, fakeDatagrams, fakeTransport, isPending, turn } from "./support.js";
+import { encodeStatusFrame } from "./wire-server.js";
 
 const isStatus = (code) => (error) => error instanceof TrevRpcError && error.code === code;
 

@@ -1,9 +1,10 @@
+import { settledOrAborted, sleep } from "./async.js";
 import { certificateHashesUrl, fetchServerCertificateHashes } from "./certificate-hashes.js";
 import { CompressionPending } from "./compression.js";
 import { ConnectionMetadataSource } from "./connection-metadata.js";
 import { interceptorList } from "./interceptor.js";
 import { QMuxWebSocketSession } from "./qmux/session.js";
-import { dialRace } from "./race.js";
+import { closeQuietly, dialRace } from "./race.js";
 import {
   Code,
   TrevRpcError,
@@ -589,40 +590,4 @@ function backoffDelay(attempt) {
   const { initialDelayMs, maxDelayMs, jitter } = Backoff;
   const base = Math.min(maxDelayMs, initialDelayMs * 2 ** (attempt - 1));
   return Math.min(maxDelayMs, base * (1 + (Math.random() * 2 - 1) * jitter));
-}
-
-/** Resolves once `promise`, which never rejects, settled or `signal` aborted. */
-function settledOrAborted(promise, signal) {
-  return new Promise((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    const done = () => {
-      signal.removeEventListener("abort", done);
-      resolve();
-    };
-    signal.addEventListener("abort", done, { once: true });
-    promise.then(done);
-  });
-}
-
-function sleep(delayMs, signal) {
-  return new Promise((resolve) => {
-    const done = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    };
-    const timer = setTimeout(done, delayMs);
-    signal.addEventListener("abort", done, { once: true });
-  });
-}
-
-function closeQuietly(session, closeInfo) {
-  try {
-    session?.close(closeInfo);
-  } catch {
-    // The session may already be gone.
-  }
 }

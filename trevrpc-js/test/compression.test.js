@@ -16,16 +16,15 @@ import {
   DefaultMaxFrameSize,
   FrameType,
   decodeWireMessage,
-  encodeAnswerFrame,
   encodeOutgoingFrame,
   encodeWireMessage,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
 import { Code, TrevRpcError } from "../src/status.js";
-import { RpcAnswer, RpcRequest } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import { fakeDatagrams, fakeTransport, hex, readGoldenVectors, turn } from "./support.js";
+import { RpcAnswer, RpcRequest, encodeAnswerFrame } from "./wire-server.js";
 
 const EchoTypes = ["trevrpc.interop.v1.EchoRequest", "trevrpc.interop.v1.EchoResponse"];
 

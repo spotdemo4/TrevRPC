@@ -15,6 +15,10 @@
 import { create, fromBinary, mergeFromBinary, protoInt64, toBinary } from "@bufbuild/protobuf";
 
 import { HeadroomMin, allocateWithHeadroom } from "./headroom.js";
+import { checkTag, overflowsUint32 } from "./protobuf-wire.js";
+
+/** Sets a map entry with a string key, which may be "__proto__", as an own property. */
+export { setMapEntry } from "./protobuf-wire.js";
 
 /**
  * Strings up to this many bytes are decoded in JS when they are ASCII, instead of calling
@@ -133,20 +137,6 @@ export function foreignError(typeName, message) {
   throw new Error(`cannot encode message ${message?.$typeName} as ${typeName}`);
 }
 
-/** Sets a map entry with a string key, which may be "__proto__", as an own property. */
-export function setMapEntry(record, key, value) {
-  if (key === "__proto__") {
-    Object.defineProperty(record, key, {
-      value,
-      enumerable: true,
-      writable: true,
-      configurable: true,
-    });
-  } else {
-    record[key] = value;
-  }
-}
-
 /** Converts a map key, always a string in the record, back to an integer of 32 bits or less. */
 export function intKey(key) {
   const n = Number.parseInt(key);
@@ -200,8 +190,7 @@ export class Reader {
     }
     const start = this.pos;
     const tag = this.uint32();
-    const length = this.pos - start;
-    if (length > 5 || (length === 5 && this.buf[this.pos - 1] > 0x0f)) {
+    if (overflowsUint32(this.buf, start, this.pos)) {
       throw new Error("illegal tag: varint overflows uint32");
     }
     return tag;
@@ -624,16 +613,6 @@ export class Reader {
       throw new RangeError("premature EOF");
     }
   }
-}
-
-/** Returns `tag`, or throws if its field number is 0 or its wire type invalid. */
-function checkTag(tag) {
-  const fieldNo = tag >>> 3;
-  const wireType = tag & 7;
-  if (fieldNo <= 0 || wireType > 5) {
-    throw new Error(`illegal tag: field no ${fieldNo} wire type ${wireType}`);
-  }
-  return tag;
 }
 
 /**

@@ -2,11 +2,12 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 
 import { byteView } from "./bytes.js";
 import { headroomOf } from "./headroom.js";
+import { DefaultMaxFrameSize } from "./limits.js";
 import { internal, invalidArgument, resourceExhausted, unavailable } from "./status.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
-import { RpcAnswer, RpcHeaders, RpcRequest, RpcStatus } from "./wire.js";
+import { RpcRequest } from "./wire.js";
 
-export const DefaultMaxFrameSize = 4 * 1024 * 1024;
+export { DefaultMaxFrameSize };
 
 /** Frame types; every other type is unknown and skipped by receivers. */
 export const FrameType = Object.freeze({
@@ -69,7 +70,7 @@ export function unmarshalMessage(schema, body, codec) {
   }
 }
 
-/** Encodes a wire payload with its codec from wire.js, such as RpcStatus. */
+/** Encodes a wire payload with its codec from wire.js, such as RpcRequest. */
 export function encodeWireMessage(codec, fields) {
   try {
     return codec.encode(fields);
@@ -144,21 +145,6 @@ export function encodeRequestFrame(request, message, maxFrameSize = DefaultMaxFr
   writeFrame(frame, requestSize, message.type, message.payload);
   writeFrame(frame, 0, FrameType.Request, payload);
   return frame;
-}
-
-/** Encodes a HEADERS frame from RpcHeaders fields. */
-export function encodeHeadersFrame(headers, maxFrameSize = DefaultMaxFrameSize) {
-  return encodeFrame(FrameType.Headers, encodeWireMessage(RpcHeaders, headers), maxFrameSize);
-}
-
-/** Encodes an ANSWER frame from RpcAnswer fields. */
-export function encodeAnswerFrame(answer, maxFrameSize = DefaultMaxFrameSize) {
-  return encodeFrame(FrameType.Answer, encodeWireMessage(RpcAnswer, answer), maxFrameSize);
-}
-
-/** Encodes a STATUS frame from RpcStatus fields. */
-export function encodeStatusFrame(status, maxFrameSize = DefaultMaxFrameSize) {
-  return encodeFrame(FrameType.Status, encodeWireMessage(RpcStatus, status), maxFrameSize);
 }
 
 /**

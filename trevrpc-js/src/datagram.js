@@ -3,6 +3,7 @@
 // demultiplexer from flow IDs to calls. Calls that stream an unreliable direction open a
 // DatagramFlow on the endpoint of the session that carries them. QMux over WebSocket has no
 // datagrams, so those calls never get a flow and everything stays on the stream.
+import { abortable } from "./async.js";
 import { byteView } from "./bytes.js";
 import { FrameType } from "./framing.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
@@ -11,14 +12,14 @@ import { readVarint, varintLength, writeVarint } from "./varint.js";
  * Largest datagram assumed when the browser does not report `maxDatagramSize`. Browsers silently
  * drop datagrams above the real limit, so this stays below a typical path MTU.
  */
-export const FallbackMaxDatagramSize = 1100;
+const FallbackMaxDatagramSize = 1100;
 
 /**
  * How much a flow buffers for a call that is not ready to take datagrams yet: at most this many
  * messages or bytes, then further datagrams are dropped.
  */
-export const FlowQueueMessages = 32;
-export const FlowQueueBytes = 1 << 20;
+const FlowQueueMessages = 32;
+const FlowQueueBytes = 1 << 20;
 
 /**
  * Encoded size of one outgoing message (`{ type, payload }` from encodeMessage) as a MESSAGE or
@@ -254,7 +255,7 @@ class DatagramEndpoint {
  * One call's datagram flow. Datagrams for the flow wait in a bounded buffer until the call
  * connects, then go straight to its handler. The call releases the flow when it ends.
  */
-export class DatagramFlow {
+class DatagramFlow {
   #endpoint;
   #inflate;
   #handler;
@@ -333,25 +334,4 @@ export class DatagramFlow {
       this.#endpoint.closeFlow(this.id);
     }
   }
-}
-
-/** Settles like `promise`, or rejects with the abort reason as soon as `signal` aborts. */
-function abortable(promise, signal) {
-  if (signal.aborted) {
-    return Promise.reject(signal.reason);
-  }
-  return new Promise((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
 }

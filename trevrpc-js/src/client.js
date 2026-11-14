@@ -1,3 +1,4 @@
+import { deferred } from "./async.js";
 import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
 import { FrameType, decodeWireMessage, marshalMessage, unmarshalMessage } from "./framing.js";
 import { interceptCall, interceptorList } from "./interceptor.js";
@@ -5,7 +6,7 @@ import { validateMetadata } from "./metadata.js";
 import { methodSettings } from "./method-options.js";
 import { Code, cancelled, internal, invalidArgument, statusError } from "./status.js";
 import { requestValidation } from "./validator.js";
-import { RpcAnswer, RpcHeaders, RpcKind, RpcStatus } from "./wire.js";
+import { RpcAnswer, RpcHeaders, RpcStatus } from "./wire.js";
 
 /**
  * Creates a client for `service`, a service descriptor that protoc-gen-es generates, with one
@@ -28,9 +29,9 @@ export function createClient(service, transport, options = {}) {
 
   for (const method of service.methods) {
     const settings = methodSettings(method);
+    // The wire method path, computed once per method rather than per call.
+    const path = `/${service.typeName}/${method.name}`;
     const rpc = {
-      // The wire method path, computed once per method rather than per call.
-      path: `/${service.typeName}/${method.name}`,
       requestType: method.input,
       responseType: method.output,
       // The generated codecs of the request and response types, or undefined for protobuf-es.
@@ -40,14 +41,17 @@ export function createClient(service, transport, options = {}) {
       validate: requestValidation(validator, method.input),
       // Full protobuf names, which pick the compression dictionaries.
       types: { request: method.input.typeName, response: method.output.typeName },
-      datagrams: datagramUse(settings),
-      compressStream: streamCompressionUse(settings),
-      compress: plainCompressionUse(settings),
+      // The REQUEST fields of every call: the method path and kind.
+      requestFields: { method: path, kind: settings.rpcKind },
+      streamsRequest: settings.streamsRequest,
+      datagrams: settings.datagrams,
+      compressStream: settings.compressStream,
+      compress: settings.compress,
     };
     const resolve = (override) => mergeCallOptions(defaults, override);
     const shape = MethodShapes[settings.kind];
     const info = {
-      method: rpc.path,
+      method: path,
       service: service.typeName,
       name: method.name,
       kind: settings.kind,
@@ -55,16 +59,18 @@ export function createClient(service, transport, options = {}) {
     };
     const call =
       interceptors.length === 0
-        ? async (request, override) => shape.start(transport, rpc, request, resolve(override))
+        ? async (request, override) => openCall(transport, rpc, shape, request, resolve(override))
         : async (request, override) =>
             interceptCall(
               interceptors,
               info,
               resolve(override),
-              (options) => shape.start(transport, rpc, request, options),
+              (options) => openCall(transport, rpc, shape, request, options),
               shape.ended,
             );
-    client[method.localName] = shape.takesRequest ? call : (override) => call(undefined, override);
+    client[method.localName] = settings.streamsRequest
+      ? (override) => call(undefined, override)
+      : call;
   }
 
   return client;
@@ -101,82 +107,44 @@ function codecsBySchema(codecs) {
 }
 
 /**
- * How each kind of RPC is called: whether its client method takes a request message, how it
- * starts, and, for streaming calls, what settles when the call ends after it started.
+ * What each kind of RPC returns once its call is open, given the call: the response, the response
+ * stream, or the call for sending requests; and, for streaming calls, what settles when the call
+ * ends after it started.
  */
 const MethodShapes = Object.freeze({
   __proto__: null,
   unary: {
-    takesRequest: true,
-    start: unaryCall,
+    open: (call) => receiveSingleResponse(call, "unary"),
   },
   serverStreaming: {
-    takesRequest: true,
-    start: serverStreamingCall,
+    open: (call) => new ResponseStream(call),
     ended: (stream) => stream.status,
   },
   clientStreaming: {
-    takesRequest: false,
-    start: (transport, rpc, _request, options) => clientStreamingCall(transport, rpc, options),
+    open: (call) => new ClientStreamingCall(call),
     ended: (call) => call.status,
   },
   bidirectionalStreaming: {
-    takesRequest: false,
-    start: (transport, rpc, _request, options) =>
-      bidirectionalStreamingCall(transport, rpc, options),
+    open: (call) => call,
     ended: (call) => call.status,
   },
 });
 
-/** Calls a unary RPC and returns the decoded response. */
-export async function unaryCall(transport, rpc, request, options) {
-  const body = marshalMessage(rpc.requestType, request, rpc.validate, rpc.requestCodec);
-  const call = await Call.open(transport, requestFields(rpc, RpcKind.Unary), body, options, rpc);
-  const stream = new BidirectionalStreamingCall(call, rpc, { options });
-  // The response decides the outcome, so the request side finishes in the background.
-  stream.closeSend().catch(() => {});
-  return await receiveSingleResponse(stream, "unary");
-}
-
-/** Calls a server-streaming RPC and returns its response stream. */
-export async function serverStreamingCall(transport, rpc, request, options) {
-  const body = marshalMessage(rpc.requestType, request, rpc.validate, rpc.requestCodec);
-  const call = await Call.open(
-    transport,
-    requestFields(rpc, RpcKind.ServerStreaming),
-    body,
-    options,
-    rpc,
-  );
-  const stream = new BidirectionalStreamingCall(call, rpc, { options });
-  stream.closeSend().catch(() => {});
-  return new ResponseStream(stream);
-}
-
-/** Calls a client-streaming RPC and returns a call for sending requests. */
-export async function clientStreamingCall(transport, rpc, options) {
-  const call = await Call.open(
-    transport,
-    requestFields(rpc, RpcKind.ClientStreaming),
-    undefined,
-    options,
-    rpc,
-  );
-  return new ClientStreamingCall(
-    new BidirectionalStreamingCall(call, rpc, { streamsRequest: true, options }),
-  );
-}
-
-/** Calls a bidirectional-streaming RPC. */
-export async function bidirectionalStreamingCall(transport, rpc, options) {
-  const call = await Call.open(
-    transport,
-    requestFields(rpc, RpcKind.BidirectionalStreaming),
-    undefined,
-    options,
-    rpc,
-  );
-  return new BidirectionalStreamingCall(call, rpc, { streamsRequest: true, options });
+/**
+ * Starts a call of the method `rpc` describes, of the kind `shape` describes. A method whose
+ * request does not stream takes `request`, which goes out with the REQUEST, and closes its request
+ * side in the background, as the response decides the outcome.
+ */
+async function openCall(transport, rpc, shape, request, options) {
+  const body = rpc.streamsRequest
+    ? undefined
+    : marshalMessage(rpc.requestType, request, rpc.validate, rpc.requestCodec);
+  const opened = await Call.open(transport, rpc.requestFields, body, options, rpc);
+  const call = new BidirectionalStreamingCall(opened, rpc, options);
+  if (!rpc.streamsRequest) {
+    call.closeSend().catch(() => {});
+  }
+  return await shape.open(call);
 }
 
 /**
@@ -220,44 +188,6 @@ const ReadAheadBytes = 1 << 20;
 const Replay = Symbol("replay");
 
 /**
- * How a method uses datagrams, or undefined if it does not: `send` for request messages, which
- * needs a streaming request and `unreliableRequests`, and `receive` for response messages, which
- * every call with a streaming response accepts. A method needs a flow if it marks either
- * direction unreliable; methodSettings rejects marks on a direction that does not stream.
- */
-function datagramUse({ kind, unreliableRequests, unreliableResponses }) {
-  const streamsRequest = kind === "clientStreaming" || kind === "bidirectionalStreaming";
-  const streamsResponse = kind === "serverStreaming" || kind === "bidirectionalStreaming";
-  if (!(unreliableRequests || unreliableResponses) || !(streamsRequest || streamsResponse)) {
-    return undefined;
-  }
-  return { send: Boolean(unreliableRequests) && streamsRequest, receive: streamsResponse };
-}
-
-/**
- * The directions a method may stream-compress, `{ requests, responses }`, or undefined for none:
- * those its settings mark (methodSettings leaves out directions that do not stream and message
- * types with redacted fields), except directions marked unreliable, whose messages mostly travel
- * as datagrams.
- */
-function streamCompressionUse({ compressStreamRequests, compressStreamResponses, ...method }) {
-  const requests = Boolean(compressStreamRequests) && !method.unreliableRequests;
-  const responses = Boolean(compressStreamResponses) && !method.unreliableResponses;
-  return requests || responses ? { requests, responses } : undefined;
-}
-
-/**
- * The directions whose messages a method may compress without a dictionary, `{ requests,
- * responses }`, or undefined for none: those its settings mark (methodSettings marks both for
- * `COMPRESSION_MESSAGE` and `COMPRESSION_STREAM`, except message types with redacted fields).
- */
-function plainCompressionUse({ compressRequests, compressResponses }) {
-  const requests = Boolean(compressRequests);
-  const responses = Boolean(compressResponses);
-  return requests || responses ? { requests, responses } : undefined;
-}
-
-/**
  * A bidirectional-streaming RPC. Messages are received with recv() or async iteration. The call
  * ends with the server's final status: a non-OK status makes recv() throw it, and `status`
  * settles with the final status or the error that ended the call. `headers` resolves once the
@@ -284,7 +214,7 @@ function plainCompressionUse({ compressRequests, compressResponses }) {
  * replayed without that, transparently: the caller's sends and the response continue on the
  * replay.
  */
-export class BidirectionalStreamingCall {
+class BidirectionalStreamingCall {
   #call;
   #rpc;
   /** Whether the request side streams, so that responses are read ahead of recv(). */
@@ -319,35 +249,25 @@ export class BidirectionalStreamingCall {
   #batching = 0;
   /** Settles on every change a waiter may care about. */
   #changed = deferred();
-  #resolveStatus;
-  #rejectStatus;
-  #resolveHeaders;
-  #rejectHeaders;
-  #headers;
+  #status = deferred();
+  #headers = deferred();
   #onResponseHeaders;
   #onResponseMetadata;
   /** Whether the headers were handed to onResponseHeaders. */
   #headersReported = false;
 
   /** The final status, or the error that ended the call. */
-  status = new Promise((resolve, reject) => {
-    this.#resolveStatus = resolve;
-    this.#rejectStatus = reject;
-  });
+  status = this.#status.promise;
 
-  constructor(call, rpc, { streamsRequest = false, options = {} } = {}) {
+  constructor(call, rpc, options) {
     this.#call = call;
     this.#rpc = rpc;
-    this.#streamsRequest = streamsRequest;
+    this.#streamsRequest = rpc.streamsRequest;
     this.#onResponseHeaders = options.onResponseHeaders;
     this.#onResponseMetadata = options.onResponseMetadata;
     this.#flow = rpc.datagrams?.receive ? call.flow : undefined;
     this.status.catch(() => {});
-    this.#headers = new Promise((resolve, reject) => {
-      this.#resolveHeaders = resolve;
-      this.#rejectHeaders = reject;
-    });
-    this.#headers.catch(() => {});
+    this.#headers.promise.catch(() => {});
     call.signal.addEventListener(
       "abort",
       () => {
@@ -371,7 +291,7 @@ export class BidirectionalStreamingCall {
   get headers() {
     this.#headersWanted = true;
     this.#kick();
-    return this.#headers;
+    return this.#headers.promise;
   }
 
   /**
@@ -726,7 +646,7 @@ export class BidirectionalStreamingCall {
     this.#call.finish(error);
     if (error === undefined) {
       this.#outcomeSettled = true;
-      this.#resolveStatus({ code, message, metadata });
+      this.#status.resolve({ code, message, metadata });
     } else {
       this.#rejectOutcome(error);
     }
@@ -751,7 +671,7 @@ export class BidirectionalStreamingCall {
 
   /** Settles the headers on their first frame, and hands them to onResponseHeaders once. */
   #settleHeaders(metadata) {
-    this.#resolveHeaders(metadata);
+    this.#headers.resolve(metadata);
     if (!this.#headersReported) {
       this.#headersReported = true;
       this.#onResponseHeaders?.(metadata);
@@ -879,8 +799,8 @@ export class BidirectionalStreamingCall {
   #rejectOutcome(error) {
     if (!this.#outcomeSettled) {
       this.#outcomeSettled = true;
-      this.#rejectStatus(error);
-      this.#rejectHeaders(error);
+      this.#status.reject(error);
+      this.#headers.reject(error);
     }
   }
 
@@ -922,7 +842,7 @@ export class BidirectionalStreamingCall {
 }
 
 /** A client-streaming RPC: send requests, then close and receive the single response. */
-export class ClientStreamingCall {
+class ClientStreamingCall {
   #call;
 
   constructor(call) {
@@ -957,7 +877,7 @@ export class ClientStreamingCall {
 }
 
 /** The response stream of a server-streaming RPC. */
-export class ResponseStream {
+class ResponseStream {
   #call;
 
   constructor(call) {
@@ -1001,18 +921,6 @@ export class ResponseStream {
   batches() {
     return this.#call.batches();
   }
-}
-
-function deferred() {
-  let resolve;
-  const promise = new Promise((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
-}
-
-function requestFields(rpc, kind) {
-  return { method: rpc.path, kind };
 }
 
 function validateResponseMetadata(metadata, what) {

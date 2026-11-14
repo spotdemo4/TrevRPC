@@ -1,3 +1,4 @@
+import { abortable, deferred, sleep } from "./async.js";
 import {
   encodeMessage,
   mayCompress,
@@ -592,10 +593,8 @@ export class Call {
    */
   #inOrder(operation) {
     const previous = this.#ordered;
-    let issued;
-    this.#ordered = new Promise((resolve) => {
-      issued = resolve;
-    });
+    const { promise, resolve: issued } = deferred();
+    this.#ordered = promise;
     return previous.then(() => operation(issued)).finally(issued);
   }
 
@@ -691,7 +690,7 @@ export class Call {
    * no readFrame() is pending.
    */
   tryReadFrame() {
-    throwIfAborted(this.signal);
+    this.signal.throwIfAborted();
     try {
       return this.#frames.tryReadFrame(this.#maxFrameSize);
     } catch (error) {
@@ -819,7 +818,7 @@ export class Call {
       throw this.signal.aborted ? this.signal.reason : statusFromTransportError(error);
     }
     // Cancelling the reader completes pending reads as end-of-stream instead of rejecting them.
-    throwIfAborted(this.signal);
+    this.signal.throwIfAborted();
     return result;
   }
 
@@ -870,56 +869,40 @@ function discardStream(stream) {
   stream.writable.abort(reason).catch(() => {});
 }
 
-function openStreamWhenAvailable(transport, signal, session) {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    let retryTimer;
-    const onAbort = () => {
-      clearTimeout(retryTimer);
-      reject(signal.reason);
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    const giveUpAt = Date.now() + StreamRefusalRetryMs;
-
-    const attempt = (delay) => {
-      let opening;
-      try {
-        opening = Promise.resolve(startStream(transport, session));
-      } catch (error) {
-        opening = Promise.reject(error);
+/**
+ * Opens a stream, and opens it again while the browser refuses it for want of stream credit, for
+ * up to StreamRefusalRetryMs. Rejects with the abort reason as soon as `signal` aborts, and
+ * discards a stream that opens after that.
+ */
+async function openStreamWhenAvailable(transport, signal, session) {
+  const giveUpAt = Date.now() + StreamRefusalRetryMs;
+  let delay = StreamRefusalFirstDelayMs;
+  for (;;) {
+    signal.throwIfAborted();
+    const opening = startStream(transport, session);
+    opening.then(
+      (stream) => {
+        if (signal.aborted) {
+          // The caller gave up while the stream was opening; do not leak it.
+          discardStream(stream);
+        }
+      },
+      () => {},
+    );
+    try {
+      return await abortable(opening, signal);
+    } catch (error) {
+      if (signal.aborted) {
+        throw signal.reason;
       }
-      opening.then(
-        (stream) => {
-          signal.removeEventListener("abort", onAbort);
-          if (signal.aborted) {
-            // The caller gave up while the stream was opening; do not leak it.
-            discardStream(stream);
-          } else {
-            resolve(stream);
-          }
-        },
-        (error) => {
-          if (signal.aborted) {
-            return;
-          }
-          if (isStreamRefusal(error) && Date.now() + delay <= giveUpAt) {
-            // Nothing reached the server, so opening the stream again is safe.
-            retryTimer = setTimeout(
-              () => attempt(Math.min(delay * 2, StreamRefusalMaxDelayMs)),
-              delay,
-            );
-            return;
-          }
-          signal.removeEventListener("abort", onAbort);
-          reject(statusFromTransportError(error));
-        },
-      );
-    };
-    attempt(StreamRefusalFirstDelayMs);
-  });
+      if (!isStreamRefusal(error) || Date.now() + delay > giveUpAt) {
+        throw statusFromTransportError(error);
+      }
+    }
+    // Nothing reached the server, so opening the stream again is safe.
+    await sleep(delay, signal);
+    delay = Math.min(delay * 2, StreamRefusalMaxDelayMs);
+  }
 }
 
 /**
@@ -950,7 +933,8 @@ function outgoing(body) {
   return body === undefined ? undefined : encodeMessage(body);
 }
 
-function startStream(transport, session) {
+/** Opens a stream as openStream() describes; a transport that throws rejects instead. */
+async function startStream(transport, session) {
   if (session === undefined) {
     return transport.createBidirectionalStream();
   }
@@ -965,12 +949,6 @@ function startStream(transport, session) {
   session.key = transport;
   session.datagrams = transport.datagrams;
   return transport.createBidirectionalStream();
-}
-
-function throwIfAborted(signal) {
-  if (signal.aborted) {
-    throw signal.reason;
-  }
 }
 
 /** Status errors describe themselves; anything else reaching the call is an internal bug. */

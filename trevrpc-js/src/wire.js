@@ -10,6 +10,8 @@
 // typical REQUEST), and decoding reads nested messages on the payload's one reader.
 import { BinaryReader, BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 
+import { checkTag, overflowsUint32, setMapEntry } from "./protobuf-wire.js";
+
 export const RpcKind = Object.freeze({
   Unary: 0,
   ClientStreaming: 1,
@@ -29,39 +31,39 @@ const MaxGroupDepth = 64;
 /** The shared writer is dropped after an encode larger than this, which grew its buffer. */
 const SharedWriterMax = 64 * 1024;
 
+// Each payload has the codec of the direction the client needs: it encodes REQUEST and decodes
+// HEADERS, ANSWER and STATUS. The server direction lives with the tests (test/wire-server.js), which
+// play the server, so that pages do not ship it.
+
 /**
- * The REQUEST payload: `{ method, metadata, kind, timeoutNanos, datagramFlow, acceptDictionaries,
- * dictionaryQuery, streamCompression, connectionMetadata }`. 64-bit fields encode from a bigint, a
- * number or a decimal string and decode as bigints; `connectionMetadata` is `{ id, metadata }`, or
- * undefined when absent.
+ * Encodes the REQUEST payload: `{ method, metadata, kind, timeoutNanos, datagramFlow,
+ * acceptDictionaries, dictionaryQuery, streamCompression, connectionMetadata }`. 64-bit fields
+ * encode from a bigint, a number or a decimal string; `connectionMetadata` is `{ id, metadata }`,
+ * or undefined when absent.
  */
 export const RpcRequest = Object.freeze({
   name: "RpcRequest",
   encode: (request) => encodeWith(writeRequest, request),
-  decode: (bytes) => decodeRequest(new WireReader(bytes)),
 });
 
-/** The HEADERS payload: `{ metadata }`. */
+/** Decodes the HEADERS payload: `{ metadata }`. */
 export const RpcHeaders = Object.freeze({
   name: "RpcHeaders",
-  encode: (headers) => encodeWith(writeHeaders, headers),
   decode: (bytes) => decodeHeaders(new WireReader(bytes)),
 });
 
-/** The ANSWER payload: `{ dictionaries, streamCompression, connectionMetadata }`. */
+/** Decodes the ANSWER payload: `{ dictionaries, streamCompression, connectionMetadata }`. */
 export const RpcAnswer = Object.freeze({
   name: "RpcAnswer",
-  encode: (answer) => encodeWith(writeAnswer, answer),
   decode: (bytes) => decodeAnswer(new WireReader(bytes)),
 });
 
 /**
- * The STATUS payload: `{ code, message, metadata, refusedStreamCompression, details }`, where each
- * detail is `{ type, value }`.
+ * Decodes the STATUS payload: `{ code, message, metadata, refusedStreamCompression, details }`,
+ * where each detail is `{ type, value }`.
  */
 export const RpcStatus = Object.freeze({
   name: "RpcStatus",
-  encode: (status) => encodeWith(writeStatus, status),
   decode: (bytes) => decodeStatus(new WireReader(bytes)),
 });
 
@@ -88,81 +90,6 @@ function writeRequest(writer, request) {
     writeMetadata(writer, 2, connection.metadata);
     writer.join();
   }
-}
-
-function writeHeaders(writer, headers) {
-  writeMetadata(writer, 1, headers.metadata);
-}
-
-function writeAnswer(writer, answer) {
-  writeDictionaries(writer, 1, answer.dictionaries);
-  writeBool(writer, 2, answer.streamCompression);
-  writeUint32(writer, 3, answer.connectionMetadata);
-}
-
-function writeStatus(writer, status) {
-  writeUint32(writer, 1, status.code);
-  writeString(writer, 2, status.message);
-  writeMetadata(writer, 3, status.metadata);
-  writeBool(writer, 4, status.refusedStreamCompression);
-  for (const detail of status.details ?? []) {
-    writer.tag(5, WireType.LengthDelimited).fork();
-    writeString(writer, 1, detail.type);
-    if (detail.value != null && detail.value.byteLength > 0) {
-      writer.tag(2, WireType.LengthDelimited).bytes(detail.value);
-    }
-    writer.join();
-  }
-}
-
-function decodeRequest(reader) {
-  const request = {
-    method: "",
-    metadata: emptyMetadata(),
-    kind: 0,
-    timeoutNanos: 0n,
-    datagramFlow: 0n,
-    acceptDictionaries: [],
-    dictionaryQuery: [],
-    streamCompression: 0,
-    connectionMetadata: undefined,
-  };
-  while (reader.more()) {
-    const tag = reader.tag();
-    const wireType = tag & 7;
-    switch (tag >>> 3) {
-      case 1:
-        request.method = reader.string(wireType, "method");
-        break;
-      case 2:
-        reader.metadataEntry(wireType, request.metadata, "metadata");
-        break;
-      case 3:
-        request.kind = reader.int32(wireType, "kind");
-        break;
-      case 4:
-        request.timeoutNanos = reader.uint64(wireType, "timeout_nanos");
-        break;
-      case 5:
-        request.datagramFlow = reader.uint64(wireType, "datagram_flow");
-        break;
-      case 6:
-        reader.repeatedUint32(wireType, request.acceptDictionaries, "accept_dictionaries");
-        break;
-      case 7:
-        request.dictionaryQuery.push(reader.dictionaryInfo(wireType, "dictionary_query"));
-        break;
-      case 8:
-        request.streamCompression = reader.int32(wireType, "stream_compression");
-        break;
-      case 9:
-        request.connectionMetadata = reader.connectionMetadata(wireType, "connection_metadata");
-        break;
-      default:
-        reader.skip(tag);
-    }
-  }
-  return request;
 }
 
 function decodeHeaders(reader) {
@@ -239,8 +166,11 @@ function decodeStatus(reader) {
 let sharedWriter;
 let sharedWriterBusy = false;
 
-/** Encodes `value` with `write(writer, value)` on the shared writer, and returns a copy. */
-function encodeWith(write, value) {
+/**
+ * Encodes `value` with `write(writer, value)` on the shared writer, and returns a copy. Exported,
+ * like the field writers and WireReader, for the server direction in test/wire-server.js.
+ */
+export function encodeWith(write, value) {
   if (sharedWriterBusy) {
     const writer = new BinaryWriter();
     write(writer, value);
@@ -275,25 +205,7 @@ function emptyMetadata() {
   return {};
 }
 
-/**
- * Sets a decoded metadata entry as an own property, so that a key such as `__proto__` is an entry
- * like any other and never replaces the object's prototype. Assignment does that for every other
- * key, faster than defining the property.
- */
-function setEntry(metadata, key, value) {
-  if (key === "__proto__") {
-    Object.defineProperty(metadata, key, {
-      value,
-      enumerable: true,
-      writable: true,
-      configurable: true,
-    });
-  } else {
-    metadata[key] = value;
-  }
-}
-
-function writeString(writer, field, value) {
+export function writeString(writer, field, value) {
   if (value != null && value !== "") {
     writer.tag(field, WireType.LengthDelimited).string(value);
   }
@@ -305,7 +217,7 @@ function writeInt32(writer, field, value) {
   }
 }
 
-function writeUint32(writer, field, value) {
+export function writeUint32(writer, field, value) {
   if (value != null && value !== 0) {
     writer.tag(field, WireType.Varint).uint32(value);
   }
@@ -317,14 +229,8 @@ function writeUint64(writer, field, value) {
   }
 }
 
-function writeBool(writer, field, value) {
-  if (value) {
-    writer.tag(field, WireType.Varint).bool(true);
-  }
-}
-
 /** Writes a `map<string, bytes>` field; both fields of every entry, even when empty. */
-function writeMetadata(writer, field, metadata) {
+export function writeMetadata(writer, field, metadata) {
   if (metadata == null) {
     return;
   }
@@ -341,7 +247,7 @@ function writeMetadata(writer, field, metadata) {
 }
 
 /** Writes a repeated DictionaryInfo field `{ id, fingerprint }`; an empty entry is still sent. */
-function writeDictionaries(writer, field, infos) {
+export function writeDictionaries(writer, field, infos) {
   if (infos == null) {
     return;
   }
@@ -362,7 +268,7 @@ function writeDictionaries(writer, field, infos) {
  * into the parent's bytes; at the top level, BinaryReader fails such a read itself. Every failure
  * is an Error, which the frame layer reports as InvalidArgument.
  */
-class WireReader {
+export class WireReader {
   #bytes;
   #reader;
   #end;
@@ -391,16 +297,10 @@ class WireReader {
     const reader = this.#reader;
     const start = reader.pos;
     const tag = reader.uint32();
-    const length = reader.pos - start;
-    if (length > 5 || (length === 5 && this.#bytes[reader.pos - 1] > 0x0f)) {
+    if (overflowsUint32(this.#bytes, start, reader.pos)) {
       throw new Error("illegal tag: varint overflows uint32");
     }
-    const field = tag >>> 3;
-    const wireType = tag & 7;
-    if (field <= 0 || wireType > 5) {
-      throw new Error(`illegal tag: field no ${field} wire type ${wireType}`);
-    }
-    return tag;
+    return checkTag(tag);
   }
 
   string(wireType, name) {
@@ -433,21 +333,9 @@ class WireReader {
     return BigInt(this.#reader.uint64());
   }
 
-  /** Appends one value, or a packed run of values, of a repeated uint32 field to `values`. */
-  repeatedUint32(wireType, values, name) {
-    if (wireType === WireType.Varint) {
-      values.push(this.#uint32Value(name));
-      return;
-    }
-    const packed = this.#nested(wireType, name);
-    while (packed.more()) {
-      values.push(packed.#uint32Value(name));
-    }
-  }
-
   /** A DictionaryInfo message, `{ id, fingerprint }`. */
   dictionaryInfo(wireType, name) {
-    const reader = this.#nested(wireType, name);
+    const reader = this.nested(wireType, name);
     const info = { id: 0, fingerprint: new Uint8Array(0) };
     while (reader.more()) {
       const tag = reader.tag();
@@ -465,7 +353,7 @@ class WireReader {
 
   /** A status Detail message, `{ type, value }`. */
   detail(wireType, name) {
-    const reader = this.#nested(wireType, name);
+    const reader = this.nested(wireType, name);
     const detail = { type: "", value: new Uint8Array(0) };
     while (reader.more()) {
       const tag = reader.tag();
@@ -481,27 +369,9 @@ class WireReader {
     return detail;
   }
 
-  /** A ConnectionMetadata message, `{ id, metadata }`. */
-  connectionMetadata(wireType, name) {
-    const reader = this.#nested(wireType, name);
-    const connection = { id: 0, metadata: emptyMetadata() };
-    while (reader.more()) {
-      const tag = reader.tag();
-      const field = tag >>> 3;
-      if (field === 1) {
-        connection.id = reader.uint32(tag & 7, `${name}.id`);
-      } else if (field === 2) {
-        reader.metadataEntry(tag & 7, connection.metadata, `${name}.metadata`);
-      } else {
-        reader.skip(tag);
-      }
-    }
-    return connection;
-  }
-
   /** Adds one `map<string, bytes>` entry to `metadata`; a later entry for a key replaces it. */
   metadataEntry(wireType, metadata, name) {
-    const reader = this.#nested(wireType, name);
+    const reader = this.nested(wireType, name);
     let key = "";
     let value = new Uint8Array(0);
     while (reader.more()) {
@@ -515,7 +385,7 @@ class WireReader {
         reader.skip(tag);
       }
     }
-    setEntry(metadata, key, value);
+    setMapEntry(metadata, key, value);
   }
 
   /** Skips the unknown field of `tag`, of any wire type. */
@@ -576,15 +446,14 @@ class WireReader {
     const reader = this.#reader;
     const start = reader.pos;
     const value = reader.uint32();
-    const length = reader.pos - start;
-    if (length > 5 || (length === 5 && this.#bytes[reader.pos - 1] > 0x0f)) {
+    if (overflowsUint32(this.#bytes, start, reader.pos)) {
       throw new Error(`protobuf field ${name} exceeded uint32`);
     }
     return value;
   }
 
   /** A reader over the length-delimited value of field `name`, which this reader skips past. */
-  #nested(wireType, name) {
+  nested(wireType, name) {
     expectWireType(wireType, WireType.LengthDelimited, name);
     const reader = this.#reader;
     const length = reader.uint32();

@@ -81,9 +81,10 @@ export function dialRace(primary, fallback, { delayMs, signal } = {}) {
   });
 }
 
-function closeQuietly(session) {
+/** Closes `session`, if any, ignoring a failure. */
+export function closeQuietly(session, closeInfo) {
   try {
-    session.close();
+    session?.close(closeInfo);
   } catch {
     // The session may already be gone.
   }
