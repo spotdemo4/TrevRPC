@@ -71,12 +71,8 @@ func (s *aheadStream) recvCount() int { return int(s.recvs.Load()) }
 // times the handler was read.
 func (s *aheadStream) waitForRecvs(t *testing.T, want int) int {
 	t.Helper()
-	deadline := time.Now().Add(testTimeout)
-	for s.recvCount() < want {
-		if time.Now().After(deadline) {
-			t.Fatalf("the handler was read %d times, want %d", s.recvCount(), want)
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(func() bool { return s.recvCount() >= want }) {
+		t.Fatalf("the handler was read %d times, want %d", s.recvCount(), want)
 	}
 	time.Sleep(30 * time.Millisecond)
 	return s.recvCount()
@@ -357,12 +353,8 @@ func TestReadAheadCancelledWithAFullQueueLeaksNothing(t *testing.T) {
 			if got := len(server.freeze().requestLimit); got != 0 {
 				t.Fatalf("%d request slots are still held", got)
 			}
-			deadline := time.Now().Add(testTimeout)
-			for runtime.NumGoroutine() > before {
-				if time.Now().After(deadline) {
-					t.Fatalf("goroutines = %d, want at most %d", runtime.NumGoroutine(), before)
-				}
-				time.Sleep(time.Millisecond)
+			if !waitUntil(func() bool { return runtime.NumGoroutine() <= before }) {
+				t.Fatalf("goroutines = %d, want at most %d", runtime.NumGoroutine(), before)
 			}
 			if stream.overlapped.Load() {
 				t.Fatal("the handler was read concurrently")

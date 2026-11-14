@@ -468,17 +468,14 @@ func stalledWriteServer(parent context.Context, t *testing.T, kind RPCKind) (*Li
 	return listener, pki, metrics
 }
 
-func waitForFinished(t *testing.T, metrics *recordingMetrics, within time.Duration) RPCFinished {
+func waitForFinished(t *testing.T, metrics *recordingMetrics) RPCFinished {
 	t.Helper()
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if _, finished := metrics.snapshot(); len(finished) > 0 {
-			return finished[0]
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("the call did not finish within %v", within)
-	return RPCFinished{}
+	var finished []RPCFinished
+	eventually(t, "the call to finish", func() bool {
+		_, finished = metrics.snapshot()
+		return len(finished) > 0
+	})
+	return finished[0]
 }
 
 // A client that keeps its connection but stops reading holds the writes of
@@ -501,7 +498,7 @@ func TestDeadlineEndsACallWhoseClientStoppedReading(t *testing.T) {
 			startedAt := time.Now()
 			dialStalledClient(t, listener, pki, request)
 
-			event := waitForFinished(t, metrics, 5*time.Second)
+			event := waitForFinished(t, metrics)
 			if elapsed := time.Since(startedAt); elapsed > 3*time.Second {
 				t.Fatalf("the call outlived its 300ms deadline by %v", elapsed)
 			}
@@ -511,7 +508,7 @@ func TestDeadlineEndsACallWhoseClientStoppedReading(t *testing.T) {
 			if kind == RPCKindUnary && event.Code == CodeOK {
 				t.Fatalf("a response the client never got finished OK")
 			}
-			waitFor(t, "the request slot to be released", func() bool { return len(listener.runtime.requestLimit) == 0 })
+			eventually(t, "the request slot to be released", func() bool { return len(listener.runtime.requestLimit) == 0 })
 		})
 	}
 }
@@ -527,7 +524,7 @@ func TestShutdownEndsACallWhoseClientStoppedReading(t *testing.T) {
 	dialStalledClient(t, listener, pki, request)
 	// Wait for the call to be stalled in a write: its request slot is held and
 	// nothing ends it.
-	waitFor(t, "the call to hold its request slot", func() bool { return len(listener.runtime.requestLimit) == 1 })
+	eventually(t, "the call to hold its request slot", func() bool { return len(listener.runtime.requestLimit) == 1 })
 	time.Sleep(200 * time.Millisecond)
 	if _, finished := metrics.snapshot(); len(finished) != 0 {
 		t.Fatalf("the call finished before the shutdown: %v", finished)
@@ -535,12 +532,12 @@ func TestShutdownEndsACallWhoseClientStoppedReading(t *testing.T) {
 
 	startedAt := time.Now()
 	shutdown()
-	event := waitForFinished(t, metrics, 5*time.Second)
+	event := waitForFinished(t, metrics)
 	if elapsed := time.Since(startedAt); elapsed > 3*time.Second {
 		t.Fatalf("shutdown took %v to end the stalled call, GracefulShutdownTimeout is %v", elapsed, DefaultServerOptions().GracefulShutdownTimeout)
 	}
 	if event.Code != CodeUnavailable {
 		t.Fatalf("finished %v (%v), want Unavailable", event.Code, event.Err)
 	}
-	waitFor(t, "the request slot to be released", func() bool { return len(listener.runtime.requestLimit) == 0 })
+	eventually(t, "the request slot to be released", func() bool { return len(listener.runtime.requestLimit) == 0 })
 }

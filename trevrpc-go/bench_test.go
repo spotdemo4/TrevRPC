@@ -225,25 +225,6 @@ type echoStream struct{ requests MessageStream[*testMessage] }
 func (s echoStream) Recv() (*testMessage, error) { return s.requests.Recv() }
 func (s echoStream) Close() error                { return s.requests.Close() }
 
-// benchTransport dials the test client of one transport.
-type benchTransport struct {
-	name string
-	dial func(testing.TB, testPKI, *Listener) Transport
-}
-
-var benchTransports = []benchTransport{
-	{"quic", func(tb testing.TB, pki testPKI, l *Listener) Transport { return dialNative(tb, pki, l) }},
-	{"qmux", func(tb testing.TB, pki testPKI, l *Listener) Transport { return newQMuxTestClient(tb, pki, l) }},
-	{"h3", newHTTP3TestClient},
-	{"h2", newHTTP2TestClient},
-	{"webtransport", func(tb testing.TB, pki testPKI, l *Listener) Transport {
-		return newWebTransportTestClient(tb, pki, l, testOrigin, nil)
-	}},
-	{"websocket", func(tb testing.TB, pki testPKI, l *Listener) Transport {
-		return newWebSocketTestClient(tb, pki, l, testOrigin)
-	}},
-}
-
 // benchEndToEnd serves the bench service on one listener for the whole
 // benchmark and runs fn once per transport and payload size, each on a fresh
 // client connection. Dialling and closing the client stay outside the timed
@@ -252,7 +233,7 @@ func benchEndToEnd(b *testing.B, fn func(ctx context.Context, b *testing.B, tran
 	b.Helper()
 	pki := newTestPKI(b)
 	listener := startTestListenerWith(b, pki, nil, registerBenchService)
-	for _, tr := range benchTransports {
+	for _, tr := range testTransports {
 		b.Run(tr.name, func(b *testing.B) {
 			runSizes(b, func(b *testing.B, size int) {
 				transport := tr.dial(b, pki, listener)

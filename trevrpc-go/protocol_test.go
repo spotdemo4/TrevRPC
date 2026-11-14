@@ -306,11 +306,10 @@ func TestServerStreamingHeadersAreWrittenBeforeTheFirstMessageIsPulled(t *testin
 	}
 	// The stream is blocked pulling its first message: the headers are out.
 	var written []testFrame
-	deadline := time.Now().Add(testTimeout)
-	for len(written) == 0 && time.Now().Before(deadline) {
+	waitUntil(func() bool {
 		written = readTestFrames(t, stream.snapshot(), DefaultMaxFrameSize)
-		time.Sleep(time.Millisecond)
-	}
+		return len(written) != 0
+	})
 	if len(written) != 1 || written[0].Kind != frameTypeHeaders {
 		t.Fatalf("written before the first message = %#v, want only HEADERS", written)
 	}

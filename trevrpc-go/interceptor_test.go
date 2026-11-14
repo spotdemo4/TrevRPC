@@ -43,16 +43,12 @@ func (r *finishRecorder) take() []string {
 // waitForFinishes waits until recorder holds count events and returns them.
 func (r *finishRecorder) waitForFinishes(t *testing.T, count int) []string {
 	t.Helper()
-	deadline := time.Now().Add(rpcTestTimeout)
-	for {
+	waitUntil(func() bool {
 		r.mu.Lock()
-		got := len(r.events)
-		r.mu.Unlock()
-		if got >= count || time.Now().After(deadline) {
-			return r.take()
-		}
-		time.Sleep(time.Millisecond)
-	}
+		defer r.mu.Unlock()
+		return len(r.events) >= count
+	})
+	return r.take()
 }
 
 // valuesInterceptor sets interceptorValueKey to name, after the values earlier
@@ -169,20 +165,12 @@ func TestInterceptorsAndServeValuesReachEveryHandlerOverEveryTransport(t *testin
 	serveCtx := context.WithValue(context.Background(), serveValueKey{}, "served")
 	listener := serveTestListenerContext(serveCtx, t, server, ListenOptions{TLSConfig: pki.server})
 
-	transports := map[string]Transport{
-		"native":         dialNative(t, pki, listener),
-		"http3":          newHTTP3TestClient(t, pki, listener),
-		"webtransport":   newWebTransportTestClient(t, pki, listener, testOrigin, nil),
-		"http2":          newHTTP2TestClient(t, pki, listener),
-		"qmux":           newQMuxTestClient(t, pki, listener),
-		"qmux websocket": newWebSocketTestClient(t, pki, listener, testOrigin),
-	}
 	methods := []string{"Unary", "ServerStreaming", "ClientStreaming", "Bidirectional"}
-	for name, transport := range transports {
-		t.Run(name, func(t *testing.T) {
+	for _, transport := range testTransports {
+		t.Run(transport.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), rpcTestTimeout)
 			defer cancel()
-			answers := inspectAll(ctx, t, transport)
+			answers := inspectAll(ctx, t, transport.dial(t, pki, listener))
 			for _, method := range methods {
 				if got, want := answers[method], "served|authorized "+method+"|outer>inner"; got != want {
 					t.Errorf("%s handler saw %q, want %q", method, got, want)

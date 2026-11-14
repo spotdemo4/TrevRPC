@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"net/http"
 	"net/netip"
 	"sync"
 	"testing"
@@ -94,27 +93,17 @@ func TestHandlersAuthorizersAndAdmissionSeeTheClientAddress(t *testing.T) {
 	recorder := &remoteAddrRecorder{}
 	listener := startRemoteAddrListener(t, pki, recorder, ListenOptions{})
 
-	for _, transport := range []struct {
-		name      string
-		transport func() Transport
-		admitted  bool
-	}{
-		{"native", func() Transport { return dialNative(t, pki, listener) }, false},
-		{"http3", func() Transport { return newHTTP3TestClient(t, pki, listener) }, true},
-		{"webtransport", func() Transport { return newWebTransportTestClient(t, pki, listener, testOrigin, nil) }, true},
-		{"http2", func() Transport { return newHTTP2TestClient(t, pki, listener) }, true},
-		{"qmux", func() Transport { return newQMuxTestClient(t, pki, listener) }, false},
-		{"qmux websocket", func() Transport { return newWebSocketTestClient(t, pki, listener, testOrigin) }, true},
-	} {
+	for _, transport := range testTransports {
 		t.Run(transport.name, func(t *testing.T) {
-			got := callRemoteAddr(t, transport.transport())
+			got := callRemoteAddr(t, transport.dial(t, pki, listener))
 			if got.Addr() != netip.MustParseAddr("127.0.0.1") || got.Port() == 0 {
 				t.Errorf("handler saw %v, want 127.0.0.1 and the client's port", got)
 			}
 			if authorized := recorder.lastAuthorized(); authorized != got {
 				t.Errorf("authorizer saw %v, handler %v", authorized, got)
 			}
-			if admitted := recorder.lastAdmitted(); transport.admitted && admitted != got {
+			// Only the transports over HTTP pass HTTP admission.
+			if admitted := recorder.lastAdmitted(); !transport.native && admitted != got {
 				t.Errorf("admission saw %v, handler %v", admitted, got)
 			}
 		})
@@ -162,34 +151,6 @@ func startProxyForwarder(t *testing.T, target string, header []byte) string {
 	return ln.Addr().String()
 }
 
-// newQMuxTestClientAt returns a Channel over QMux over TLS to addr.
-func newQMuxTestClientAt(t *testing.T, pki testPKI, addr string) (*Channel, error) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
-	defer cancel()
-	connector := &qmuxConnector{
-		addr:         addr,
-		tls:          clientQMuxTLSConfig(pki.client, "localhost"),
-		maxFrameSize: DefaultMaxFrameSize,
-	}
-	channel, err := dialChannel(ctx, connector, nil)
-	if err == nil {
-		t.Cleanup(func() { _ = channel.Close() })
-	}
-	return channel, err
-}
-
-// newHTTP2TestClientAt returns a Transport that sends every RPC as one
-// HTTP/2 request to addr.
-func newHTTP2TestClientAt(t *testing.T, pki testPKI, addr string) Transport {
-	t.Helper()
-	protocols := new(http.Protocols)
-	protocols.SetHTTP2(true)
-	roundTripper := &http.Transport{TLSClientConfig: pki.client.Clone(), Protocols: protocols}
-	t.Cleanup(roundTripper.CloseIdleConnections)
-	return newStreamClient(httpTestOpener{roundTripper: roundTripper, url: "https://" + addr + DefaultHTTPPath}, DefaultMaxFrameSize)
-}
-
 func TestTrustedProxyHeaderNamesTheClient(t *testing.T) {
 	pki := newTestPKI(t)
 	recorder := &remoteAddrRecorder{}
@@ -212,7 +173,7 @@ func TestTrustedProxyHeaderNamesTheClient(t *testing.T) {
 		want      netip.AddrPort
 	}{
 		{"qmux v1", qmuxV1, netip.MustParseAddrPort("203.0.113.7:4242")},
-		{"http2 v2", newHTTP2TestClientAt(t, pki, v2), netip.MustParseAddrPort("[2001:db8::7]:4343")},
+		{"http2 v2", newHTTP2TestClientAt(t, pki, v2, nil), netip.MustParseAddrPort("[2001:db8::7]:4343")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := callRemoteAddr(t, test.transport); got != test.want {
@@ -228,7 +189,7 @@ func TestTrustedProxyHeaderNamesTheClient(t *testing.T) {
 	}
 
 	// A LOCAL header, as health checks send, leaves the proxy's own address.
-	got := callRemoteAddr(t, newHTTP2TestClientAt(t, pki, local))
+	got := callRemoteAddr(t, newHTTP2TestClientAt(t, pki, local, nil))
 	if got.Addr() != netip.MustParseAddr("127.0.0.1") {
 		t.Errorf("handler saw %v after a LOCAL header, want the proxy's address", got)
 	}

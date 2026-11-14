@@ -1879,17 +1879,11 @@ func TestServerDiagnosticDispatcherExitsAfterDraining(t *testing.T) {
 		t.Fatal("diagnostic was not delivered")
 	}
 
-	deadline := time.Now().Add(testTimeout)
-	for time.Now().Before(deadline) {
+	eventually(t, "the diagnostic dispatcher to stop after draining", func() bool {
 		runtime.diagnostics.mu.Lock()
-		idle := !runtime.diagnostics.running && len(runtime.diagnostics.queue) == 0
-		runtime.diagnostics.mu.Unlock()
-		if idle {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("diagnostic dispatcher remained running after draining")
+		defer runtime.diagnostics.mu.Unlock()
+		return !runtime.diagnostics.running && len(runtime.diagnostics.queue) == 0
+	})
 }
 
 func TestServerNonCooperativeUnaryRetainsAdmissionUntilExit(t *testing.T) {
@@ -2049,26 +2043,16 @@ func TestServerAuthorizerAndDiagnosticPanicsAreContained(t *testing.T) {
 
 func waitForServerExecutionCount(t *testing.T, server *Server, want int64) {
 	t.Helper()
-	deadline := time.Now().Add(testTimeout)
-	for time.Now().Before(deadline) {
-		if server.freeze().active.Load() == want {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(func() bool { return server.freeze().active.Load() == want }) {
+		t.Fatalf("active server executions = %d, want %d", server.freeze().active.Load(), want)
 	}
-	t.Fatalf("active server executions = %d, want %d", server.freeze().active.Load(), want)
 }
 
 func waitForAtomicCount(t *testing.T, count *atomic.Int64, want int64, description string) {
 	t.Helper()
-	deadline := time.Now().Add(testTimeout)
-	for time.Now().Before(deadline) {
-		if count.Load() == want {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(func() bool { return count.Load() == want }) {
+		t.Fatalf("%s count = %d, want %d", description, count.Load(), want)
 	}
-	t.Fatalf("%s count = %d, want %d", description, count.Load(), want)
 }
 
 type closeCountingStream[T any] struct{ closed atomic.Int64 }

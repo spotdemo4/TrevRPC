@@ -25,6 +25,65 @@ func closeOnCleanup(t testing.TB, c io.Closer) {
 	})
 }
 
+// testTransport is one of the transports the test listener serves, with the
+// test client that speaks it.
+type testTransport struct {
+	name string
+	// native is set for the clients the library ships, which dial a
+	// *Channel. The others are the test-only clients over HTTP (HTTP/3,
+	// HTTP/2, WebTransport and QMux over WebSocket), which return a
+	// *streamClient and pass the server's HTTP admission.
+	native bool
+	// dial dials a new connection to listener, closed when the test ends.
+	dial func(t testing.TB, pki testPKI, listener *Listener) Transport
+}
+
+// testTransports are the transports the test listener serves. The tests and
+// benchmarks that run over every transport range over them, so a new
+// transport is covered everywhere at once. Benchmark results are compared
+// across runs by name, which keeps the names stable.
+var testTransports = []testTransport{
+	{name: "quic", native: true, dial: func(t testing.TB, pki testPKI, listener *Listener) Transport {
+		return dialNative(t, pki, listener)
+	}},
+	{name: "qmux", native: true, dial: func(t testing.TB, pki testPKI, listener *Listener) Transport {
+		return newQMuxTestClient(t, pki, listener)
+	}},
+	{name: "h3", dial: newHTTP3TestClient},
+	{name: "h2", dial: newHTTP2TestClient},
+	{name: "webtransport", dial: func(t testing.TB, pki testPKI, listener *Listener) Transport {
+		return newWebTransportTestClient(t, pki, listener, testOrigin, nil)
+	}},
+	{name: "websocket", dial: func(t testing.TB, pki testPKI, listener *Listener) Transport {
+		return newWebSocketTestClient(t, pki, listener, testOrigin)
+	}},
+}
+
+// eventually polls condition until it holds, and fails the test if it does
+// not within rpcTestTimeout, naming what it waited for.
+func eventually(t testing.TB, description string, condition func() bool) {
+	t.Helper()
+	if !waitUntil(condition) {
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+// waitUntil polls condition every millisecond until it holds, and reports
+// whether it did within rpcTestTimeout, which is generous because the tests
+// run on heavily loaded machines. Callers that report the state they found
+// on a timeout use it instead of eventually. It polls the wall clock, or the
+// fake one inside a synctest bubble.
+func waitUntil(condition func() bool) bool {
+	deadline := time.Now().Add(rpcTestTimeout)
+	for !condition() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
 // logGoroutines logs the stacks of the goroutines that run code of this
 // package or of quic-go, each distinct stack once with how many goroutines
 // share it, to show where a test hung. Frames are cut to function and

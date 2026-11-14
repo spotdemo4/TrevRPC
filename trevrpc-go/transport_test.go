@@ -290,18 +290,12 @@ func TestListenerServesEveryRPCShapeOverEveryTransport(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListener(t, pki, nil)
 
-	transports := map[string]Transport{
-		"native":                    dialNative(t, pki, listener),
-		"http3":                     newHTTP3TestClient(t, pki, listener),
-		"webtransport":              newWebTransportTestClient(t, pki, listener, testOrigin, nil),
-		"webtransport flow control": newWebTransportTestClient(t, pki, listener, testOrigin, flowControlledWebTransportConfig),
-		"http2":                     newHTTP2TestClient(t, pki, listener),
-		"qmux":                      newQMuxTestClient(t, pki, listener),
-		"qmux websocket":            newWebSocketTestClient(t, pki, listener, testOrigin),
+	for _, transport := range testTransports {
+		t.Run(transport.name, func(t *testing.T) { exerciseRPCShapes(t, transport.dial(t, pki, listener)) })
 	}
-	for name, transport := range transports {
-		t.Run(name, func(t *testing.T) { exerciseRPCShapes(t, transport) })
-	}
+	t.Run("webtransport flow control", func(t *testing.T) {
+		exerciseRPCShapes(t, newWebTransportTestClient(t, pki, listener, testOrigin, flowControlledWebTransportConfig))
+	})
 }
 
 func exerciseRPCShapes(t *testing.T, transport Transport) {
@@ -607,13 +601,7 @@ func TestListenerCloseStopsServeAndDrainsConnections(t *testing.T) {
 	case <-time.After(rpcTestTimeout):
 		t.Fatal("Serve did not return after Close")
 	}
-	deadline := time.Now().Add(rpcTestTimeout)
-	for channel.State() == ChannelStateReady {
-		if time.Now().After(deadline) {
-			t.Fatal("client connection was not closed by the server")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	eventually(t, "the server to close the client connection", func() bool { return channel.State() != ChannelStateReady })
 }
 
 func TestListenerShutdownClosesEveryTransportPromptly(t *testing.T) {
@@ -634,16 +622,9 @@ func TestListenerShutdownClosesEveryTransportPromptly(t *testing.T) {
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- listener.Serve(ctx) }()
 
-	for name, transport := range map[string]Transport{
-		"native":         dialNative(t, pki, listener),
-		"http3":          newHTTP3TestClient(t, pki, listener),
-		"webtransport":   newWebTransportTestClient(t, pki, listener, "", nil),
-		"http2":          newHTTP2TestClient(t, pki, listener),
-		"qmux":           newQMuxTestClient(t, pki, listener),
-		"qmux websocket": newWebSocketTestClient(t, pki, listener, ""),
-	} {
-		if _, err := Unary(context.Background(), transport, "/example.Greeter/Echo", &testMessage{Value: name}, newTestMessage); err != nil {
-			t.Fatalf("%s call: %v", name, err)
+	for _, transport := range testTransports {
+		if _, err := Unary(context.Background(), transport.dial(t, pki, listener), "/example.Greeter/Echo", &testMessage{Value: transport.name}, newTestMessage); err != nil {
+			t.Fatalf("%s call: %v", transport.name, err)
 		}
 	}
 
@@ -742,16 +723,11 @@ func TestChannelReconnectsToRestartedServer(t *testing.T) {
 	server := NewServer()
 	registerTestService(server)
 	var restarted *Listener
-	deadline := time.Now().Add(rpcTestTimeout)
-	for {
+	if !waitUntil(func() bool {
 		restarted, err = Listen(addr, server, ListenOptions{TLSConfig: pki.server})
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("rebind %s: %v", addr, err)
-		}
-		time.Sleep(20 * time.Millisecond)
+		return err == nil
+	}) {
+		t.Fatalf("rebind %s: %v", addr, err)
 	}
 	go func() { _ = restarted.Serve(t.Context()) }()
 
@@ -989,16 +965,10 @@ func TestWebTransportNegotiatesTheWireVersion(t *testing.T) {
 
 	const wantMessage = `unsupported WebTransport protocol; offered "chat", "trevrpc-10"`
 	// Diagnostics are delivered asynchronously.
-	deadline := time.Now().Add(rpcTestTimeout)
-	for {
-		if _, ok := diagnostics.Load(wantMessage); ok {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no session admission diagnostic %q", wantMessage)
-		}
-		time.Sleep(time.Millisecond)
-	}
+	eventually(t, "the session admission diagnostic", func() bool {
+		_, ok := diagnostics.Load(wantMessage)
+		return ok
+	})
 }
 
 func TestWebTransportProtocolMismatchSkipsAdmission(t *testing.T) {

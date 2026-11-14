@@ -303,18 +303,6 @@ func joinedSamples() string {
 	return joined.String()
 }
 
-// waitFor polls condition until it holds or a few seconds pass.
-func waitFor(t *testing.T, what string, condition func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !condition() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
 // TestOptimisticCallsReplayRefusals runs optimistic calls over the native
 // transports against routes that refuse them, checking that the client
 // replays each one transparently, and that it stops and resumes being
@@ -322,18 +310,13 @@ func waitFor(t *testing.T, what string, condition func() bool) {
 func TestOptimisticCallsReplayRefusals(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, registerRefusingService)
-	native, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = native.Close() })
-	qmuxChannel, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, TCPAddr: listener.TCPAddr().String(), Transport: TransportTCPOnly})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = qmuxChannel.Close() })
-
-	for name, channel := range map[string]*Channel{"native": native, "qmux": qmuxChannel} {
+	for _, transport := range testTransports {
+		// Optimistic calls are checked through the clients the library ships.
+		if !transport.native {
+			continue
+		}
+		name := transport.name
+		channel := transport.dial(t, pki, listener).(*Channel)
 		client := newOptimisticTestClient(t, channel)
 		t.Run(name+"/refused after the requests ended", func(t *testing.T) {
 			client.reset()
@@ -353,7 +336,7 @@ func TestOptimisticCallsReplayRefusals(t *testing.T) {
 		t.Run(name+"/refused while uploading", func(t *testing.T) {
 			client.reset()
 			got, err := uploadSamples(t.Context(), t, channel, "PlainUpload", func() {
-				waitFor(t, "the replay", func() bool { return len(client.streams()) == 2 })
+				eventually(t, "the replay", func() bool { return len(client.streams()) == 2 })
 			})
 			if err != nil || got.GetValue() != joinedSamples() {
 				t.Fatalf("upload = %q, %v", got.GetValue(), err)
@@ -434,7 +417,8 @@ func TestOptimisticCallsReplayRefusals(t *testing.T) {
 				t.Fatalf("%d requests arrived stream-compressed, want %d", compressed, streamTestMessages-streamCompressionStart+1)
 			}
 		})
-		if name == "native" {
+		// The datagram flow is checked over QUIC.
+		if name == "quic" {
 			t.Run(name+"/datagram flow", func(t *testing.T) {
 				client.reset()
 				chat, err := BidirectionalStreaming[*wrapperspb.StringValue](t.Context(), channel, testPath("StreamChat"), newStringValue,

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/quic-go/quic-go/quicvarint"
 	"google.golang.org/protobuf/proto"
@@ -350,12 +349,8 @@ func checkStreamFrames(t *testing.T, mu *sync.Mutex, log *[]*recordedStream) {
 // which happens as the calls finish on both sides.
 func waitForEmptyBudget(t *testing.T, name string, budget *streamBudget) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for budget.used.Load() != 0 {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s budget still holds %d bytes", name, budget.used.Load())
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(func() bool { return budget.used.Load() == 0 }) {
+		t.Fatalf("%s budget still holds %d bytes", name, budget.used.Load())
 	}
 }
 
@@ -365,45 +360,29 @@ func waitForEmptyBudget(t *testing.T, name string, budget *streamBudget) {
 func TestStreamCompressionOverEveryTransport(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, registerStreamCompressionService)
-	clients := map[string]*streamClient{
-		"http3":          newHTTP3TestClient(t, pki, listener).(*streamClient),
-		"webtransport":   newWebTransportTestClient(t, pki, listener, testOrigin, nil).(*streamClient),
-		"http2":          newHTTP2TestClient(t, pki, listener).(*streamClient),
-		"qmux websocket": newWebSocketTestClient(t, pki, listener, testOrigin).(*streamClient),
-	}
-	for name, client := range clients {
-		t.Run(name, func(t *testing.T) {
-			budget := newStreamBudget(0, defaultClientStreamCompressionMemory, nil)
+	for _, transport := range testTransports {
+		t.Run(transport.name, func(t *testing.T) {
+			dialed := transport.dial(t, pki, listener)
+			// A native transport's stream client comes from its channel,
+			// with the channel's budget; a test-only client gets a budget of
+			// its own.
+			var client *streamClient
+			var budget *streamBudget
+			if channel, ok := dialed.(*Channel); ok {
+				generation, err := channel.callGeneration(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				client = generation.(*streamGeneration).client
+				budget = client.streams
+			} else {
+				client = dialed.(*streamClient)
+				budget = newStreamBudget(0, defaultClientStreamCompressionMemory, nil)
+			}
 			mu, log := streamClientFor(client, budget)
-			exerciseStreamCalls(t, client)
+			exerciseStreamCalls(t, dialed)
 			checkStreamFrames(t, mu, log)
 			waitForEmptyBudget(t, "client", budget)
-			waitForEmptyBudget(t, "server", listener.server.freeze().streams)
-		})
-	}
-
-	// The native transports go through Dial and the QMux connector.
-	native, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = native.Close() })
-	qmuxChannel, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, TCPAddr: listener.TCPAddr().String(), Transport: TransportTCPOnly})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = qmuxChannel.Close() })
-	for name, channel := range map[string]*Channel{"native": native, "qmux": qmuxChannel} {
-		t.Run(name, func(t *testing.T) {
-			generation, err := channel.callGeneration(t.Context())
-			if err != nil {
-				t.Fatal(err)
-			}
-			client := generation.(*streamGeneration).client
-			mu, log := streamClientFor(client, client.streams)
-			exerciseStreamCalls(t, channel)
-			checkStreamFrames(t, mu, log)
-			waitForEmptyBudget(t, "client", client.streams)
 			waitForEmptyBudget(t, "server", listener.server.freeze().streams)
 		})
 	}
