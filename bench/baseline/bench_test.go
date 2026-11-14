@@ -103,7 +103,7 @@ func (deliveringWorker) close() {}
 
 // TestRunWorkerCountsDeliveredMessagesOutsideTheWindow runs a call before the
 // window starts: it is not measured, but counts as delivered, which is what
-// snapshotWire reads at its instants.
+// the wireSampler reads at the window's boundaries.
 func TestRunWorkerCountsDeliveredMessagesOutsideTheWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	start := time.Now().Add(time.Hour)

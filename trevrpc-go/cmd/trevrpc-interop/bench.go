@@ -749,10 +749,12 @@ func (l operationLoop) work(ctx context.Context, w *benchWorker, start, end time
 			return
 		}
 		messages, err := operation.run(ctx)
-		finished := time.Now()
 		if err == nil {
+			// Before finished is read, so that an operation that ends in the
+			// window is delivered before the end sample.
 			w.delivered.Add(uint64(messages))
 		}
+		finished := time.Now()
 		if err != nil {
 			if !began.Before(start) && !finished.After(end) {
 				w.errors++

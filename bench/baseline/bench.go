@@ -272,6 +272,11 @@ func runWorker(ctx context.Context, w worker, sampler *wireSampler, index int, m
 			return result
 		}
 		msgs, err := w.do(ctx)
+		if err == nil {
+			// Before opEnd is read, so that an operation that ends in the
+			// window is delivered before the end sample.
+			sampler.deliver(index, uint64(msgs))
+		}
 		opEnd := time.Now()
 		inWindow := !opStart.Before(measureStart)
 		if err != nil {
@@ -286,7 +291,6 @@ func runWorker(ctx context.Context, w worker, sampler *wireSampler, index int, m
 			}
 			continue
 		}
-		sampler.deliver(index, uint64(msgs))
 		if inWindow && !opEnd.After(measureEnd) {
 			result.latencies = append(result.latencies, opEnd.Sub(opStart))
 			result.msgs += uint64(msgs)
