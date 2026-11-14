@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
@@ -299,7 +300,10 @@ func serve(t *testing.T, server *trevrpc.Server) *trevrpc.Channel {
 
 	channel, err := trevrpc.Dial(ctx, listener.Addr().String(), trevrpc.DialOptions{
 		TLSConfig: &tls.Config{RootCAs: roots, ServerName: "localhost"},
-		Transport: trevrpc.TransportQUICOnly,
+		// quic-go gives up a handshake after 5 s without network activity,
+		// which a loopback handshake on a starved CI runner has exceeded.
+		QUICConfig: &quic.Config{HandshakeIdleTimeout: 10 * time.Second},
+		Transport:  trevrpc.TransportQUICOnly,
 	})
 	if err != nil {
 		t.Fatal(err)

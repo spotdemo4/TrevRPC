@@ -393,7 +393,7 @@ func TestStreamCompressionOverEveryTransport(t *testing.T) {
 func TestStreamCompressionStartsFromDictionaries(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, func(options *ServerOptions) { options.Compression = testCompression(t) }, registerStreamCompressionService)
-	channel, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Compression: testCompression(t), Transport: TransportQUICOnly})
+	channel, err := testDial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Compression: testCompression(t), Transport: TransportQUICOnly})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestStreamCompressionWithinBudget(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			listener := startTestListenerWith(t, pki, func(options *ServerOptions) { options.StreamCompressionMemory = test.server }, registerStreamCompressionService)
-			channel, err := Dial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly, StreamCompressionMemory: test.client})
+			channel, err := testDial(t.Context(), listener.Addr().String(), DialOptions{TLSConfig: pki.client, Transport: TransportQUICOnly, StreamCompressionMemory: test.client})
 			if err != nil {
 				t.Fatal(err)
 			}

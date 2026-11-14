@@ -48,7 +48,7 @@ func TestConnectionMetadataJoinsEveryCallAndIsReferencedOnceConfirmed(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 			defer cancel()
-			channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+			channel, err := testDial(ctx, listener.Addr().String(), DialOptions{
 				TLSConfig:          pki.client,
 				Transport:          tc.policy,
 				TCPAddr:            listener.TCPAddr().String(),
@@ -106,7 +106,7 @@ func TestConnectionMetadataConfirmationReachesStreamingCalls(t *testing.T) {
 	listener := startTestListener(t, pki, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+	channel, err := testDial(ctx, listener.Addr().String(), DialOptions{
 		TLSConfig:          pki.client,
 		Transport:          TransportQUICOnly,
 		ConnectionMetadata: Metadata{"suffix": []byte("!")},
@@ -142,7 +142,7 @@ func TestConnectionMetadataSatisfiesTheAuthorizer(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+	channel, err := testDial(ctx, listener.Addr().String(), DialOptions{
 		TLSConfig:          pki.client,
 		Transport:          TransportQUICOnly,
 		ConnectionMetadata: Metadata{"authorization": []byte("Bearer secret")},
@@ -264,7 +264,7 @@ func TestHandlersCannotChangeTheConnectionMetadataOfLaterCalls(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 	defer cancel()
-	channel, err := Dial(ctx, listener.Addr().String(), DialOptions{
+	channel, err := testDial(ctx, listener.Addr().String(), DialOptions{
 		TLSConfig:          pki.client,
 		Transport:          TransportQUICOnly,
 		ConnectionMetadata: Metadata{"suffix": []byte("!")},
