@@ -1168,7 +1168,7 @@ func TestPollDatagramTakesWhatIsQueuedWithoutWaiting(t *testing.T) {
 	defer cancel()
 	clientTLS := pki.client.Clone()
 	clientTLS.NextProtos = []string{"poll-test"}
-	client, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, &quic.Config{EnableDatagrams: true})
+	client, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, withTestHandshakeTimeout(&quic.Config{EnableDatagrams: true}))
 	if err != nil {
 		t.Fatal(err)
 	}

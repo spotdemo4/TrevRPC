@@ -134,7 +134,7 @@ func (c *datagramFrameCounter) RecordEvent(event qlogwriter.Event) {
 func (*datagramFrameCounter) Close() error { return nil }
 
 func (c *datagramFrameCounter) quicConfig() *quic.Config {
-	return &quic.Config{Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return c }}
+	return withTestHandshakeTimeout(&quic.Config{Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return c }})
 }
 
 // countingDatagramConn counts the datagrams that pass through a connection.
@@ -698,7 +698,7 @@ func rawNativeConn(t *testing.T, pki testPKI, listener *Listener) *quic.Conn {
 	defer cancel()
 	tlsConfig := pki.client.Clone()
 	tlsConfig.NextProtos = []string{ALPN}
-	conn, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConfig, &quic.Config{EnableDatagrams: true})
+	conn, err := quic.DialAddr(ctx, listener.Addr().String(), tlsConfig, withTestHandshakeTimeout(&quic.Config{EnableDatagrams: true}))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
