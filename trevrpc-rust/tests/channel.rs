@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::support;
+use crate::support::{self, TestResult};
 use futures_util::StreamExt as _;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use quinn::rustls::pki_types::CertificateDer;
 use tokio::task::JoinHandle;
 use trevrpc::client::{
     Channel, ChannelConfig, ChannelEvent, ChannelPhase, ReconnectBackoff, RpcTransport,
@@ -16,8 +16,6 @@ use trevrpc::client::{
 use trevrpc::{Code, RpcRequest, Status};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
-
-type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 struct FixedBackoff(Duration);
 
@@ -76,12 +74,7 @@ impl RawServer {
 
 /// A QUIC server endpoint with a new self-signed certificate.
 fn server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'static>)> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let crypto = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
+    let (cert_der, crypto) = support::self_signed()?;
     let server_config = trevrpc::server::Server::new().quic_config(crypto)?;
     let endpoint = quinn::Endpoint::server(server_config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
     Ok((endpoint, cert_der))
@@ -128,20 +121,15 @@ async fn run_raw_server(
     }
 }
 
-fn make_client_endpoint(cert: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert)?;
-    let crypto = quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let config = ChannelConfig::new().quic_config(crypto)?;
+fn make_client_endpoint(cert: &CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
+    let config = ChannelConfig::new().quic_config(support::client_tls(cert, &[])?)?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
 }
 
 async fn connect_channel(server: &RawServer, delay: Duration) -> TestResult<Channel> {
-    let endpoint = make_client_endpoint(server.cert.clone())?;
+    let endpoint = make_client_endpoint(&server.cert)?;
     Ok(Channel::connect_with_config(
         endpoint,
         server.addr,
@@ -261,7 +249,7 @@ async fn close_stops_reconnect_and_rebind_preserves_generation() -> TestResult {
 }
 
 async fn connect_pooled(server: &RawServer, config: ChannelConfig) -> TestResult<Channel> {
-    let endpoint = make_client_endpoint(server.cert.clone())?;
+    let endpoint = make_client_endpoint(&server.cert)?;
     Ok(Channel::connect_with_config(endpoint, server.addr, "localhost", config).await?)
 }
 
@@ -651,7 +639,7 @@ async fn connect_with_connection_metadata(
     server: &ConnectionMetadataServer,
     config: ChannelConfig,
 ) -> TestResult<Channel> {
-    let endpoint = make_client_endpoint(server.cert.clone())?;
+    let endpoint = make_client_endpoint(&server.cert)?;
     Ok(within!(
         TEST_TIMEOUT,
         Channel::connect_with_config(endpoint, server.addr, "localhost", config),

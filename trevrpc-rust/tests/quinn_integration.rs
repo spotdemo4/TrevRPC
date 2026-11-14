@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support;
+use crate::support::{self, TestResult, WireRecv, WireSend};
 use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
 use prost::Message;
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::server::WebPkiClientVerifier;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -47,7 +47,12 @@ fn require_webtransport_admission_header(
     })
 }
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+/// The wires the twin tests run over: these servers have no TCP fallback.
+#[derive(Clone, Copy, Debug)]
+enum Wire {
+    Quic,
+    WebTransport,
+}
 
 struct TestGreeter;
 
@@ -475,12 +480,16 @@ fn assert_pre_handler_metrics(metrics: &RecordingMetrics, code: Code) -> TestRes
     Ok(())
 }
 
-#[tokio::test]
-async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
+over_each_wire!(
+    round_trips_unary_and_all_streaming_modes,
+    [quic, webtransport]
+);
+
+async fn round_trips_unary_and_all_streaming_modes(wire: Wire) -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
-    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (connection, client) = WireClient::connect(wire, &server).await?;
 
     let reply = client
         .say_hello(&greeter::HelloRequest {
@@ -508,7 +517,7 @@ async fn quinn_round_trips_unary_and_all_streaming_modes() -> TestResult {
     let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
     ensure_eq!(messages, ["echo, left", "echo, right"]);
 
-    close_client(endpoint, connection).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
@@ -792,15 +801,21 @@ async fn backpressured_upload<T: StreamingRpcTransport>(transport: &T) -> TestRe
     Ok(())
 }
 
-#[tokio::test]
-async fn quinn_backpressured_upload_does_not_violate_quinn_recv_stream_contract() -> TestResult {
+over_each_wire!(
+    backpressured_upload_does_not_violate_quinn_recv_stream_contract,
+    [quic, webtransport]
+);
+
+async fn backpressured_upload_does_not_violate_quinn_recv_stream_contract(
+    wire: Wire,
+) -> TestResult {
     task_panics::install();
     let server = spawn_greeter_server(register_backpressured_upload_route)?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
-    backpressured_upload(&trevrpc::client::QuicTransport::new(connection.clone())).await?;
+    let (connection, _client) = WireClient::connect(wire, &server).await?;
+    backpressured_upload(&connection.transport()).await?;
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await?;
+    connection.close().await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -818,21 +833,6 @@ async fn http3_backpressured_upload_does_not_violate_quinn_recv_stream_contract(
 
     settle_detached_server_tasks().await;
     close_client(endpoint, connection).await?;
-    server.shutdown().await?;
-    assert_no_task_panics();
-    Ok(())
-}
-
-#[tokio::test]
-async fn webtransport_backpressured_upload_does_not_violate_quinn_recv_stream_contract()
--> TestResult {
-    task_panics::install();
-    let server = spawn_greeter_server(register_backpressured_upload_route)?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    backpressured_upload(&support::WebTransportRpc::new(session.clone())).await?;
-
-    settle_detached_server_tasks().await;
-    close_webtransport_client(client, session).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -863,30 +863,6 @@ async fn http3_request_reset_cancels_handler_that_is_not_reading_the_body() -> T
 
     settle_detached_server_tasks().await;
     close_client(endpoint, connection).await?;
-    server.shutdown().await?;
-    assert_no_task_panics();
-    Ok(())
-}
-
-/// The WebTransport request pump notices a reset of a request body the handler is not reading,
-/// whether or not unread data is buffered ahead of the reset.
-#[tokio::test]
-async fn webtransport_request_reset_cancels_handler_that_is_not_reading_the_body() -> TestResult {
-    task_panics::install();
-    let (source_tx, mut source_rx) = mpsc::unbounded_channel();
-    let server = spawn_greeter_server(|server| register_ignored_upload_route(server, &source_tx))?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-
-    for messages in IGNORED_UPLOAD_MESSAGES {
-        let (mut send, _recv) = session.open_bi().await?;
-        support::write_raw(&mut send, &ignored_upload_frames(messages)?).await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        send.reset(1)?;
-        expect_peer_reset(&mut source_rx).await?;
-    }
-
-    settle_detached_server_tasks().await;
-    close_webtransport_client(client, session).await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
@@ -977,65 +953,32 @@ async fn expect_peer_reset(
     Ok(())
 }
 
+over_each_wire!(
+    request_reset_cancels_handler_that_is_not_reading_the_body,
+    [quic, webtransport]
+);
+
 /// A peer reset of the request stream cancels a handler that is not reading the body, once the
 /// pump's queue is full, whether or not unread request data is buffered behind it.
-#[tokio::test]
-async fn quinn_request_reset_cancels_handler_that_is_not_reading_the_body() -> TestResult {
+async fn request_reset_cancels_handler_that_is_not_reading_the_body(wire: Wire) -> TestResult {
     task_panics::install();
     let (source_tx, mut source_rx) = mpsc::unbounded_channel();
     let server = spawn_greeter_server(|server| register_ignored_upload_route(server, &source_tx))?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (connection, _client) = WireClient::connect(wire, &server).await?;
 
     for messages in IGNORED_UPLOAD_MESSAGES {
         let (mut send, _recv) = connection.open_bi().await?;
-        send.write_all(&ignored_upload_frames(messages)?).await?;
+        support::write_raw(&mut send, &ignored_upload_frames(messages)?).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        send.reset(1_u32.into())?;
+        send.reset(1)?;
         expect_peer_reset(&mut source_rx).await?;
     }
 
     settle_detached_server_tasks().await;
-    close_client(endpoint, connection).await?;
+    connection.close().await?;
     server.shutdown().await?;
     assert_no_task_panics();
     Ok(())
-}
-
-#[tokio::test]
-async fn webtransport_round_trips_unary_and_all_streaming_modes() -> TestResult {
-    let server = spawn_greeter_server(|server| {
-        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-    })?;
-    let (endpoint, connection, client) = connect_webtransport_client(&server).await?;
-
-    let reply = client
-        .say_hello(&greeter::HelloRequest {
-            name: "unary".to_owned(),
-        })
-        .options(|_| authenticated_options())
-        .await?;
-    ensure_eq!(reply.message, "hello, unary");
-
-    let mut replies = client
-        .lots_of_replies(&greeter::HelloRequest {
-            name: "server stream".to_owned(),
-        })
-        .options(|_| authenticated_options())
-        .await?;
-    let mut messages = Vec::new();
-    while let Some(reply) = replies.next().await {
-        messages.push(reply?.message);
-    }
-    ensure_eq!(messages, ["hello, server stream", "goodbye, server stream"]);
-
-    let summary = run_client_greetings(&client, &["one", "two"], authenticated_options()).await?;
-    ensure_eq!(summary.message, "one,two");
-
-    let messages = run_bidi_greetings(&client, &["left", "right"], authenticated_options()).await?;
-    ensure_eq!(messages, ["echo, left", "echo, right"]);
-
-    close_webtransport_client(endpoint, connection).await?;
-    server.shutdown().await
 }
 
 /// Calls `SayHello` on a new stream of `session`, offering or referring to connection metadata
@@ -1250,7 +1193,7 @@ async fn h3_alpn_is_not_negotiated_unless_http3_or_webtransport_is_enabled() -> 
         server.set_options(fast_server_options().with_webtransport_enabled(false));
     })?;
     wait_for_server_ready(&server.ready).await?;
-    let endpoint = make_http3_client_endpoint(server.cert_der.clone())?;
+    let endpoint = make_http3_client_endpoint(&server.cert_der)?;
     let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
         .expect("ALPN mismatch handshake should complete");
     ensure!(result.is_err(), "h3 must not be negotiated");
@@ -1270,7 +1213,7 @@ async fn one_port_endpoint_accepts_quinn_http3_and_webtransport_clients() -> Tes
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
 
-    let endpoint = make_client_endpoint(server.cert_der.clone())?;
+    let endpoint = make_client_endpoint(&server.cert_der)?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
     let quinn_client =
         greeter::GreeterClient::new(trevrpc::client::QuicTransport::new(connection.clone()));
@@ -1898,7 +1841,7 @@ async fn quinn_stream_concurrency_limit_returns_unavailable() -> TestResult {
     )
     .await?;
     send.finish()?;
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::Unavailable);
     read_quinn_fin(&mut recv).await?;
@@ -1946,7 +1889,7 @@ async fn webtransport_stream_concurrency_limit_returns_unavailable() -> TestResu
     )
     .await?;
     send.finish()?;
-    let status = read_raw_webtransport_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
     ensure_eq!(status.code(), Code::Unavailable);
 
     let (mut send, mut recv) = session.open_bi().await?;
@@ -2002,7 +1945,7 @@ async fn quinn_request_concurrency_limit_returns_unavailable() -> TestResult {
     )
     .await?;
     send.finish()?;
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::Unavailable);
     read_quinn_fin(&mut recv).await?;
@@ -2119,7 +2062,7 @@ async fn quinn_connection_limit_refuses_new_connections() -> TestResult {
     })?;
     let (endpoint, connection, client) = connect_client(&server).await?;
     let hanging = hold_server_stream_open(&client).await?;
-    let second_endpoint = make_client_endpoint(server.cert_der.clone())?;
+    let second_endpoint = make_client_endpoint(&server.cert_der)?;
 
     let connect = within!(
         TEST_TIMEOUT,
@@ -2347,12 +2290,16 @@ async fn webtransport_connection_close_reports_connection_loss() -> TestResult {
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn quinn_server_streaming_deadline_while_response_pending() -> TestResult {
+over_each_wire!(
+    server_streaming_deadline_while_response_pending,
+    [quic, webtransport]
+);
+
+async fn server_streaming_deadline_while_response_pending(wire: Wire) -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
-    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (connection, client) = WireClient::connect(wire, &server).await?;
 
     let mut replies = client
         .lots_of_replies(&greeter::HelloRequest {
@@ -2363,56 +2310,31 @@ async fn quinn_server_streaming_deadline_while_response_pending() -> TestResult 
     let first = replies
         .next()
         .await
-        .expect("response stream should yield first item")?;
+        .ok_or("response stream should yield first item")??;
     ensure_eq!(first.message, "first");
 
     let error = replies
         .next()
         .await
-        .expect("deadline error should be emitted")
-        .expect_err("pending response should hit deadline");
+        .ok_or("deadline error should be emitted")?
+        .err()
+        .ok_or("pending response should hit deadline")?;
     ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
 
-    close_client(endpoint, connection).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn webtransport_server_streaming_deadline_while_response_pending() -> TestResult {
+over_each_wire!(
+    client_streaming_deadline_while_upload_pending,
+    [quic, webtransport]
+);
+
+async fn client_streaming_deadline_while_upload_pending(wire: Wire) -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
-
-    let mut replies = greeter_client
-        .lots_of_replies(&greeter::HelloRequest {
-            name: "cancel".to_owned(),
-        })
-        .options(|_| short_authenticated_options())
-        .await?;
-    let first = replies
-        .next()
-        .await
-        .expect("response stream should yield first item")?;
-    ensure_eq!(first.message, "first");
-
-    let error = replies
-        .next()
-        .await
-        .expect("deadline error should be emitted")
-        .expect_err("pending response should hit deadline");
-    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
-
-    close_webtransport_client(client, session).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn quinn_client_streaming_deadline_while_upload_pending() -> TestResult {
-    let server = spawn_greeter_server(|server| {
-        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-    })?;
-    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (connection, client) = WireClient::connect(wire, &server).await?;
 
     let requests: trevrpc::BoxStream<greeter::HelloRequest> =
         Box::pin(futures_util::stream::pending());
@@ -2421,40 +2343,21 @@ async fn quinn_client_streaming_deadline_while_upload_pending() -> TestResult {
         .options(|_| short_authenticated_options())
         .send_all(requests)
         .await
-        .expect_err("pending upload should hit deadline");
+        .err()
+        .ok_or("pending upload should hit deadline")?;
     ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
 
-    close_client(endpoint, connection).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn webtransport_client_streaming_deadline_while_upload_pending() -> TestResult {
+over_each_wire!(bidi_deadline_while_response_pending, [quic, webtransport]);
+
+async fn bidi_deadline_while_response_pending(wire: Wire) -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
-
-    let requests: trevrpc::BoxStream<greeter::HelloRequest> =
-        Box::pin(futures_util::stream::pending());
-    let error = greeter_client
-        .lots_of_greetings()
-        .options(|_| short_authenticated_options())
-        .send_all(requests)
-        .await
-        .expect_err("pending upload should hit deadline");
-    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
-
-    close_webtransport_client(client, session).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn quinn_bidi_deadline_while_response_pending() -> TestResult {
-    let server = spawn_greeter_server(|server| {
-        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-    })?;
-    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (connection, client) = WireClient::connect(wire, &server).await?;
 
     let mut replies = client
         .bidi_hello()
@@ -2463,41 +2366,24 @@ async fn quinn_bidi_deadline_while_response_pending() -> TestResult {
     let error = replies
         .recv()
         .await
-        .expect_err("pending bidi response should hit deadline");
+        .err()
+        .ok_or("pending bidi response should hit deadline")?;
     ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
     drop(replies);
 
-    close_client(endpoint, connection).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn webtransport_bidi_deadline_while_response_pending() -> TestResult {
-    let server = spawn_greeter_server(|server| {
-        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-    })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
+over_each_wire!(
+    terminal_status_drops_pending_request_stream,
+    [quic, webtransport]
+);
 
-    let mut replies = greeter_client
-        .bidi_hello()
-        .options(|_| short_authenticated_options())
-        .await?;
-    let error = replies
-        .recv()
-        .await
-        .expect_err("pending bidi response should hit deadline");
-    ensure_eq!(error.into_status().code(), Code::DeadlineExceeded);
-    drop(replies);
-
-    close_webtransport_client(client, session).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
+async fn terminal_status_drops_pending_request_stream(wire: Wire) -> TestResult {
     let server = spawn_greeter_server(register_reject_upload_route)?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::client::QuicTransport::new(connection.clone());
+    let (connection, _client) = WireClient::connect(wire, &server).await?;
+    let transport = connection.transport();
     let mut replies =
         trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
             &transport,
@@ -2509,33 +2395,11 @@ async fn quinn_terminal_status_drops_pending_request_stream() -> TestResult {
     let error = replies
         .recv()
         .await
-        .expect_err("terminal status should reject the stream");
+        .err()
+        .ok_or("terminal status should reject the stream")?;
 
     ensure_eq!(error.into_status().code(), Code::PermissionDenied);
-    close_client(endpoint, connection).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn webtransport_terminal_status_drops_pending_request_stream() -> TestResult {
-    let server = spawn_greeter_server(register_reject_upload_route)?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let transport = support::WebTransportRpc::new(session.clone());
-    let mut replies =
-        trevrpc::client::bidirectional_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
-            &transport,
-            &support::greeter_path("RejectUpload"),
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
-        .await?;
-
-    let error = replies
-        .recv()
-        .await
-        .expect_err("terminal status should reject the stream");
-
-    ensure_eq!(error.into_status().code(), Code::PermissionDenied);
-    close_webtransport_client(client, session).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
@@ -2756,7 +2620,7 @@ async fn quinn_terminal_response_status_drains_fin_without_stop_sending() -> Tes
 
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     });
-    let endpoint = make_client_endpoint(cert_der)?;
+    let endpoint = make_client_endpoint(&cert_der)?;
     let connection = endpoint.connect(server_addr, "localhost")?.await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let mut response = transport
@@ -2815,7 +2679,7 @@ async fn quinn_rejects_response_frame_after_terminal_status() -> TestResult {
 
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     });
-    let endpoint = make_client_endpoint(cert_der)?;
+    let endpoint = make_client_endpoint(&cert_der)?;
     let connection = endpoint.connect(server_addr, "localhost")?.await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let mut response = transport
@@ -2958,12 +2822,16 @@ fn ensure_unavailable_at_shutdown(status: TestResult<Status>) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn quinn_shutdown_refuses_streams_still_awaiting_their_request() -> TestResult {
+over_each_wire!(
+    shutdown_refuses_streams_still_awaiting_their_request,
+    [quic, webtransport]
+);
+
+async fn shutdown_refuses_streams_still_awaiting_their_request(wire: Wire) -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_options(unbounded_drain_options());
     })?;
-    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (connection, client) = WireClient::connect(wire, &server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     // A REQUEST frame header whose payload never follows.
     support::write_raw(&mut send, &large_request_header(64)?).await?;
@@ -2971,23 +2839,8 @@ async fn quinn_shutdown_refuses_streams_still_awaiting_their_request() -> TestRe
     assert_greeter_ready(&client).await?;
 
     within!(PROMPT_SHUTDOWN, server.shutdown())??;
-    ensure_unavailable_at_shutdown(read_raw_quinn_status(&mut recv).await)?;
-    close_client(endpoint, connection).await
-}
-
-#[tokio::test]
-async fn webtransport_shutdown_refuses_streams_still_awaiting_their_request() -> TestResult {
-    let server = spawn_greeter_server(|server| {
-        server.set_options(unbounded_drain_options());
-    })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
-    let (mut send, mut recv) = session.open_bi().await?;
-    support::write_raw(&mut send, &large_request_header(64)?).await?;
-    assert_greeter_ready(&greeter_client).await?;
-
-    within!(PROMPT_SHUTDOWN, server.shutdown())??;
-    ensure_unavailable_at_shutdown(read_raw_webtransport_status(&mut recv).await)?;
-    close_webtransport_client(client, session).await
+    ensure_unavailable_at_shutdown(read_raw_status(&mut recv).await)?;
+    connection.close().await
 }
 
 #[tokio::test]
@@ -3042,8 +2895,12 @@ async fn http3_shutdown_closes_active_connections() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
+over_each_wire!(
+    shutdown_is_bounded_with_pending_unary_handler,
+    [quic, webtransport]
+);
+
+async fn shutdown_is_bounded_with_pending_unary_handler(wire: Wire) -> TestResult {
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let server = spawn_greeter_server(move |server| {
         server.set_options(
@@ -3057,8 +2914,8 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
             }
         });
     })?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
-    let transport = trevrpc::client::QuicTransport::new(connection.clone());
+    let (connection, _client) = WireClient::connect(wire, &server).await?;
+    let transport = connection.transport();
     let call = tokio::spawn(async move {
         trevrpc::client::unary::<_, _, greeter::HelloReply>(
             &transport,
@@ -3071,63 +2928,17 @@ async fn quinn_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
         .await
     });
 
-    within!(TEST_TIMEOUT, started_rx.recv())
-        .expect("pending unary handler should start")
-        .expect("pending unary handler signal should remain open");
+    within!(TEST_TIMEOUT, started_rx.recv())?
+        .ok_or("pending unary handler signal should remain open")?;
     server.shutdown().await?;
-    let result =
-        within!(TEST_TIMEOUT, call).expect("pending client call should finish after shutdown")?;
-    let error = result.expect_err("shutdown should fail the pending RPC");
+    let error = within!(TEST_TIMEOUT, call)??
+        .err()
+        .ok_or("shutdown should fail the pending RPC")?;
     ensure!(matches!(
         error.into_status().code(),
         Code::Cancelled | Code::Unavailable | Code::DeadlineExceeded
     ));
-    close_client(endpoint, connection).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn webtransport_shutdown_is_bounded_with_pending_unary_handler() -> TestResult {
-    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-    let server = spawn_greeter_server(move |server| {
-        server.set_options(
-            fast_server_options().with_graceful_shutdown_timeout(Some(Duration::from_millis(50))),
-        );
-        server.route(support::greeter_path("Never"), move |_body| {
-            let started_tx = started_tx.clone();
-            async move {
-                let _ = started_tx.send(());
-                std::future::pending::<trevrpc::Result<Vec<u8>>>().await
-            }
-        });
-    })?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let transport = support::WebTransportRpc::new(session.clone());
-    let call = tokio::spawn(async move {
-        trevrpc::client::unary::<_, _, greeter::HelloReply>(
-            &transport,
-            &support::greeter_path("Never"),
-            &greeter::HelloRequest {
-                name: "shutdown".to_owned(),
-            },
-            CallOptions::new().with_timeout(TEST_TIMEOUT),
-        )
-        .await
-    });
-
-    within!(TEST_TIMEOUT, started_rx.recv())
-        .expect("pending WebTransport unary handler should start")
-        .expect("pending WebTransport unary handler signal should remain open");
-    server.shutdown().await?;
-    let result = within!(TEST_TIMEOUT, call)
-        .expect("pending WebTransport client call should finish after shutdown")?;
-    let error = result.expect_err("shutdown should fail the pending WebTransport RPC");
-    ensure!(matches!(
-        error.into_status().code(),
-        Code::Cancelled | Code::Unavailable | Code::DeadlineExceeded
-    ));
-
-    close_webtransport_client(client, session).await?;
+    connection.close().await?;
     Ok(())
 }
 
@@ -3154,7 +2965,7 @@ async fn quinn_local_close_maps_to_cancelled() -> TestResult {
 #[tokio::test]
 async fn quinn_rejects_alpn_mismatch() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
-    let endpoint = make_client_endpoint_with_alpn(server.cert_der.clone(), b"not-trevrpc")?;
+    let endpoint = make_client_endpoint_with_alpn(&server.cert_der, b"not-trevrpc")?;
 
     let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
         .expect("ALPN mismatch handshake should complete");
@@ -3168,7 +2979,7 @@ async fn quinn_rejects_alpn_mismatch() -> TestResult {
 #[tokio::test]
 async fn quinn_rejects_tls_identity_mismatch() -> TestResult {
     let server = spawn_greeter_server(|_| {})?;
-    let endpoint = make_client_endpoint(server.cert_der.clone())?;
+    let endpoint = make_client_endpoint(&server.cert_der)?;
 
     let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "wronghost")?)
         .expect("identity mismatch handshake should complete");
@@ -3182,7 +2993,7 @@ async fn quinn_rejects_tls_identity_mismatch() -> TestResult {
 #[tokio::test]
 async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
     let server = spawn_greeter_server_with_endpoint(make_mtls_server_endpoint()?, |_| {})?;
-    let endpoint = make_client_endpoint(server.cert_der.clone())?;
+    let endpoint = make_client_endpoint(&server.cert_der)?;
 
     let result = within!(TEST_TIMEOUT, endpoint.connect(server.addr, "localhost")?)
         .expect("mTLS rejection handshake should complete");
@@ -3208,18 +3019,22 @@ async fn quinn_mtls_rejects_clients_without_certificates() -> TestResult {
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn quinn_malformed_request_frames_return_invalid_argument_status() -> TestResult {
+over_each_wire!(
+    malformed_request_frames_return_invalid_argument_status,
+    [quic, webtransport]
+);
+
+async fn malformed_request_frames_return_invalid_argument_status(wire: Wire) -> TestResult {
     let metrics = RecordingMetrics::default();
     let observed_metrics = metrics.clone();
     let server = spawn_greeter_server(|server| {
         server.set_metrics(metrics);
     })?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (connection, _client) = WireClient::connect(wire, &server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
 
     // A REQUEST frame whose payload is a truncated protobuf varint.
-    send.write_all(&[0x01, 0x02, 0xff, 0xff]).await?;
+    support::write_raw(&mut send, &[0x01, 0x02, 0xff, 0xff]).await?;
     send.finish()?;
 
     let status = support::read_lone_status(&mut recv).await?;
@@ -3230,33 +3045,7 @@ async fn quinn_malformed_request_frames_return_invalid_argument_status() -> Test
         .await?;
     assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument)?;
 
-    close_client(endpoint, connection).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn webtransport_malformed_request_frames_return_invalid_argument_status() -> TestResult {
-    let metrics = RecordingMetrics::default();
-    let observed_metrics = metrics.clone();
-    let server = spawn_greeter_server(|server| {
-        server.set_metrics(metrics);
-    })?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let (mut send, mut recv) = session.open_bi().await?;
-
-    // A REQUEST frame whose payload is a truncated protobuf varint.
-    send.write_all(&[0x01, 0x02, 0xff, 0xff]).await?;
-    send.finish()?;
-
-    let status = support::read_lone_status(&mut recv).await?;
-
-    ensure_eq!(status.code(), Code::InvalidArgument);
-    observed_metrics
-        .wait_for_code(Code::InvalidArgument)
-        .await?;
-    assert_pre_handler_metrics(&observed_metrics, Code::InvalidArgument)?;
-
-    close_webtransport_client(client, session).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
@@ -3299,8 +3088,12 @@ async fn quinn_misplaced_request_stream_frames_return_invalid_argument_status() 
     Ok(())
 }
 
-#[tokio::test]
-async fn quinn_initial_request_timeout_rejects_partial_header() -> TestResult {
+over_each_wire!(
+    initial_request_timeout_rejects_partial_header,
+    [quic, webtransport]
+);
+
+async fn initial_request_timeout_rejects_partial_header(wire: Wire) -> TestResult {
     let metrics = RecordingMetrics::default();
     let observed_metrics = metrics.clone();
     let server = spawn_greeter_server(|server| {
@@ -3309,24 +3102,28 @@ async fn quinn_initial_request_timeout_rejects_partial_header() -> TestResult {
         );
         server.set_metrics(metrics);
     })?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (connection, _client) = WireClient::connect(wire, &server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     // One byte of a frame header that needs at least two.
-    send.write_all(&[0x01]).await?;
+    support::write_raw(&mut send, &[0x01]).await?;
 
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::DeadlineExceeded);
     observed_metrics
         .wait_for_code(Code::DeadlineExceeded)
         .await?;
     assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
-    close_client(endpoint, connection).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn quinn_initial_request_timeout_rejects_partial_body() -> TestResult {
+over_each_wire!(
+    initial_request_timeout_rejects_partial_body,
+    [quic, webtransport]
+);
+
+async fn initial_request_timeout_rejects_partial_body(wire: Wire) -> TestResult {
     let metrics = RecordingMetrics::default();
     let observed_metrics = metrics.clone();
     let server = spawn_greeter_server(|server| {
@@ -3335,76 +3132,28 @@ async fn quinn_initial_request_timeout_rejects_partial_body() -> TestResult {
         );
         server.set_metrics(metrics);
     })?;
-    let (endpoint, connection, _client) = connect_client(&server).await?;
+    let (connection, _client) = WireClient::connect(wire, &server).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     // A REQUEST frame that declares eight payload bytes and delivers one.
-    send.write_all(&[0x01, 0x08, 0x01]).await?;
+    support::write_raw(&mut send, &[0x01, 0x08, 0x01]).await?;
 
-    let status = read_raw_quinn_status(&mut recv).await?;
-
-    ensure_eq!(status.code(), Code::DeadlineExceeded);
-    observed_metrics
-        .wait_for_code(Code::DeadlineExceeded)
-        .await?;
-    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
-    close_client(endpoint, connection).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn webtransport_initial_request_timeout_rejects_partial_header() -> TestResult {
-    let metrics = RecordingMetrics::default();
-    let observed_metrics = metrics.clone();
-    let server = spawn_greeter_server(|server| {
-        server.set_options(
-            fast_server_options().with_initial_request_timeout(Some(Duration::from_millis(50))),
-        );
-        server.set_metrics(metrics);
-    })?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let (mut send, mut recv) = session.open_bi().await?;
-    // One byte of a frame header that needs at least two.
-    send.write_all(&[0x01]).await?;
-
-    let status = support::read_lone_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::DeadlineExceeded);
     observed_metrics
         .wait_for_code(Code::DeadlineExceeded)
         .await?;
     assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
-    close_webtransport_client(client, session).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
-#[tokio::test]
-async fn webtransport_initial_request_timeout_rejects_partial_body() -> TestResult {
-    let metrics = RecordingMetrics::default();
-    let observed_metrics = metrics.clone();
-    let server = spawn_greeter_server(|server| {
-        server.set_options(
-            fast_server_options().with_initial_request_timeout(Some(Duration::from_millis(50))),
-        );
-        server.set_metrics(metrics);
-    })?;
-    let (client, session, _greeter_client) = connect_webtransport_client(&server).await?;
-    let (mut send, mut recv) = session.open_bi().await?;
-    // A REQUEST frame that declares eight payload bytes and delivers one.
-    send.write_all(&[0x01, 0x08, 0x01]).await?;
+over_each_wire!(
+    large_partial_initial_body_does_not_hold_request_permit,
+    [quic, webtransport]
+);
 
-    let status = read_raw_webtransport_status(&mut recv).await?;
-
-    ensure_eq!(status.code(), Code::DeadlineExceeded);
-    observed_metrics
-        .wait_for_code(Code::DeadlineExceeded)
-        .await?;
-    assert_pre_handler_metrics(&observed_metrics, Code::DeadlineExceeded)?;
-    close_webtransport_client(client, session).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn quinn_large_partial_initial_body_does_not_hold_request_permit() -> TestResult {
+async fn large_partial_initial_body_does_not_hold_request_permit(wire: Wire) -> TestResult {
     const LARGE_FRAME_SIZE: usize = 1 << 30;
     let server = spawn_greeter_server(|server| {
         server.set_options(
@@ -3414,11 +3163,10 @@ async fn quinn_large_partial_initial_body_does_not_hold_request_permit() -> Test
                 .with_initial_request_timeout(Some(TEST_TIMEOUT)),
         );
     })?;
-    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (connection, client) = WireClient::connect(wire, &server).await?;
     let (mut send, _recv) = connection.open_bi().await?;
-    send.write_all(&large_request_header(LARGE_FRAME_SIZE)?)
-        .await?;
-    send.write_all(&[1]).await?;
+    support::write_raw(&mut send, &large_request_header(LARGE_FRAME_SIZE)?).await?;
+    support::write_raw(&mut send, &[1]).await?;
 
     let reply = client
         .say_hello(&greeter::HelloRequest {
@@ -3428,38 +3176,8 @@ async fn quinn_large_partial_initial_body_does_not_hold_request_permit() -> Test
         .await?;
     ensure_eq!(reply.message, "hello, after partial");
 
-    let _ = send.reset(1_u32.into());
-    close_client(endpoint, connection).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn webtransport_large_partial_initial_body_does_not_hold_request_permit() -> TestResult {
-    const LARGE_FRAME_SIZE: usize = 1 << 30;
-    let server = spawn_greeter_server(|server| {
-        server.set_options(
-            fast_server_options()
-                .with_max_frame_size(LARGE_FRAME_SIZE)
-                .with_max_concurrent_requests(Some(1))
-                .with_initial_request_timeout(Some(TEST_TIMEOUT)),
-        );
-    })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
-    let (mut send, _recv) = session.open_bi().await?;
-    send.write_all(&large_request_header(LARGE_FRAME_SIZE)?)
-        .await?;
-    send.write_all(&[1]).await?;
-
-    let reply = greeter_client
-        .say_hello(&greeter::HelloRequest {
-            name: "after partial".to_owned(),
-        })
-        .options(|_| CallOptions::new().with_timeout(TEST_TIMEOUT))
-        .await?;
-    ensure_eq!(reply.message, "hello, after partial");
-
     let _ = send.reset(1);
-    close_webtransport_client(client, session).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
@@ -3473,7 +3191,7 @@ async fn quinn_oversized_initial_frame_is_rejected_before_body() -> TestResult {
     )?)
     .await?;
 
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::ResourceExhausted);
     let stopped = within!(TEST_TIMEOUT, send.stopped())??;
@@ -3492,7 +3210,7 @@ async fn webtransport_oversized_initial_frame_is_rejected_before_body() -> TestR
     )?)
     .await?;
 
-    let status = read_raw_webtransport_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
 
     ensure_eq!(status.code(), Code::ResourceExhausted);
     let stopped = within!(TEST_TIMEOUT, send.stopped())??;
@@ -3815,13 +3533,7 @@ fn large_request_header(payload_len: usize) -> TestResult<Vec<u8>> {
 }
 
 /// Reads a response that must be a lone STATUS, as for failures before dispatch.
-async fn read_raw_quinn_status(recv: &mut quinn::RecvStream) -> TestResult<Status> {
-    Ok(within!(TEST_TIMEOUT, support::read_lone_status(recv))??)
-}
-
-async fn read_raw_webtransport_status(
-    recv: &mut web_transport_quinn::RecvStream,
-) -> TestResult<Status> {
+async fn read_raw_status<R: support::RawRecv>(recv: &mut R) -> TestResult<Status> {
     Ok(within!(TEST_TIMEOUT, support::read_lone_status(recv))??)
 }
 
@@ -3860,7 +3572,7 @@ async fn connect_client(
     greeter::GreeterClient<trevrpc::client::QuicTransport>,
 )> {
     wait_for_server_ready(&server.ready).await?;
-    let endpoint = make_client_endpoint(server.cert_der.clone())?;
+    let endpoint = make_client_endpoint(&server.cert_der)?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
     let transport = trevrpc::client::QuicTransport::new(connection.clone());
     let client = greeter::GreeterClient::new(transport);
@@ -3903,7 +3615,7 @@ async fn connect_http3_transport(
     server: &RunningServer,
 ) -> TestResult<(quinn::Endpoint, quinn::Connection, Http3Transport)> {
     wait_for_server_ready(&server.ready).await?;
-    let endpoint = make_http3_client_endpoint(server.cert_der.clone())?;
+    let endpoint = make_http3_client_endpoint(&server.cert_der)?;
     let connection = endpoint.connect(server.addr, "localhost")?.await?;
     let (mut driver, sender) =
         h3::client::new(h3_quinn::Connection::new(connection.clone())).await?;
@@ -4013,6 +3725,68 @@ async fn close_client(endpoint: quinn::Endpoint, connection: quinn::Connection) 
     Ok(())
 }
 
+/// A client over native QUIC or `WebTransport`, for the tests that run over both.
+#[allow(clippy::large_enum_variant, reason = "a test holds one or two")]
+enum WireClient {
+    Quic(quinn::Endpoint, quinn::Connection),
+    WebTransport(web_transport_quinn::Client, web_transport_quinn::Session),
+}
+
+/// A greeter client over any transport.
+type AnyGreeterClient = greeter::GreeterClient<Arc<dyn StreamingRpcTransport>>;
+
+impl WireClient {
+    /// Connects to `server` over `wire`, and returns the client and a greeter client over it.
+    async fn connect(wire: Wire, server: &RunningServer) -> TestResult<(Self, AnyGreeterClient)> {
+        let connection = match wire {
+            Wire::Quic => {
+                let (endpoint, connection, _) = connect_client(server).await?;
+                Self::Quic(endpoint, connection)
+            }
+            Wire::WebTransport => {
+                let (client, session, _) = connect_webtransport_client(server).await?;
+                Self::WebTransport(client, session)
+            }
+        };
+        let client = greeter::GreeterClient::new(connection.transport());
+        Ok((connection, client))
+    }
+
+    /// A new transport over the connection.
+    fn transport(&self) -> Arc<dyn StreamingRpcTransport> {
+        match self {
+            Self::Quic(_, connection) => {
+                Arc::new(trevrpc::client::QuicTransport::new(connection.clone()))
+            }
+            Self::WebTransport(_, session) => {
+                Arc::new(support::WebTransportRpc::new(session.clone()))
+            }
+        }
+    }
+
+    /// Opens a raw bidirectional stream.
+    async fn open_bi(&self) -> TestResult<(WireSend, WireRecv)> {
+        Ok(match self {
+            Self::Quic(_, connection) => {
+                let (send, recv) = connection.open_bi().await?;
+                (WireSend::Quic(send), WireRecv::Quic(recv))
+            }
+            Self::WebTransport(_, session) => {
+                let (send, recv) = session.open_bi().await?;
+                (WireSend::WebTransport(send), WireRecv::WebTransport(recv))
+            }
+        })
+    }
+
+    /// Closes the connection and waits for it to close.
+    async fn close(self) -> TestResult {
+        match self {
+            Self::Quic(endpoint, connection) => close_client(endpoint, connection).await,
+            Self::WebTransport(client, session) => close_webtransport_client(client, session).await,
+        }
+    }
+}
+
 fn authenticated_options() -> CallOptions {
     CallOptions::new()
         .with_timeout(TEST_TIMEOUT)
@@ -4086,15 +3860,13 @@ where
 fn server_tls(
     verifier: Option<Arc<dyn quinn::rustls::server::danger::ClientCertVerifier>>,
 ) -> TestResult<(quinn::rustls::ServerConfig, CertificateDer<'static>)> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let (cert_der, key) = support::self_signed_key()?;
     let builder = quinn::rustls::ServerConfig::builder();
     let builder = match verifier {
         Some(verifier) => builder.with_client_cert_verifier(verifier),
         None => builder.with_no_client_auth(),
     };
-    let tls = builder.with_single_cert(vec![cert_der.clone()], PrivateKeyDer::from(key_der))?;
+    let tls = builder.with_single_cert(vec![cert_der.clone()], key)?;
     Ok((tls, cert_der))
 }
 
@@ -4125,16 +3897,8 @@ fn make_mtls_server_endpoint() -> TestResult<(quinn::Endpoint, CertificateDer<'s
     ))
 }
 
-fn client_tls(cert_der: CertificateDer<'static>) -> TestResult<quinn::rustls::ClientConfig> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert_der)?;
-    Ok(quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth())
-}
-
-fn make_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
-    let config = ChannelConfig::new().quic_config(client_tls(cert_der)?)?;
+fn make_client_endpoint(cert_der: &CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
+    let config = ChannelConfig::new().quic_config(support::client_tls(cert_der, &[])?)?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
@@ -4142,11 +3906,10 @@ fn make_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<quinn::
 
 /// A client endpoint that negotiates an arbitrary ALPN protocol instead of `TrevRPC`'s.
 fn make_client_endpoint_with_alpn(
-    cert_der: CertificateDer<'static>,
+    cert_der: &CertificateDer<'static>,
     alpn: &[u8],
 ) -> TestResult<quinn::Endpoint> {
-    let mut tls = client_tls(cert_der)?;
-    tls.alpn_protocols = vec![alpn.to_vec()];
+    let tls = support::client_tls(cert_der, &[alpn])?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(tls)?,
@@ -4154,7 +3917,7 @@ fn make_client_endpoint_with_alpn(
     Ok(endpoint)
 }
 
-fn make_http3_client_endpoint(cert_der: CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
+fn make_http3_client_endpoint(cert_der: &CertificateDer<'static>) -> TestResult<quinn::Endpoint> {
     make_client_endpoint_with_alpn(cert_der, trevrpc::HTTP3_ALPN)
 }
 
@@ -4233,29 +3996,17 @@ where
     Ok(())
 }
 
-#[tokio::test]
-async fn quinn_response_headers_reach_every_rpc_shape() -> TestResult {
+over_each_wire!(response_headers_reach_every_rpc_shape, [quic, webtransport]);
+
+async fn response_headers_reach_every_rpc_shape(wire: Wire) -> TestResult {
     let server = spawn_greeter_server(|server| {
         server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
     })?;
-    let (endpoint, connection, client) = connect_client(&server).await?;
+    let (connection, client) = WireClient::connect(wire, &server).await?;
 
     exercise_headers(&client).await?;
 
-    close_client(endpoint, connection).await?;
-    server.shutdown().await
-}
-
-#[tokio::test]
-async fn webtransport_response_headers_reach_every_rpc_shape() -> TestResult {
-    let server = spawn_greeter_server(|server| {
-        server.set_authorizer(MetadataValueAuthorizer::bearer(AUTH_TOKEN));
-    })?;
-    let (client, session, greeter_client) = connect_webtransport_client(&server).await?;
-
-    exercise_headers(&greeter_client).await?;
-
-    close_webtransport_client(client, session).await?;
+    connection.close().await?;
     server.shutdown().await
 }
 
@@ -4407,7 +4158,7 @@ async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     support::write_request(&mut send, &request).await?;
     send.finish()?;
     ensure_eq!(
-        read_raw_quinn_status(&mut recv).await?.code(),
+        read_raw_status(&mut recv).await?.code(),
         Code::InvalidArgument
     );
 
@@ -4417,7 +4168,7 @@ async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     support::write_status(&mut send, Status::ok()).await?;
     send.finish()?;
     ensure_eq!(
-        read_raw_quinn_status(&mut recv).await?.code(),
+        read_raw_status(&mut recv).await?.code(),
         Code::InvalidArgument
     );
 
@@ -4427,7 +4178,7 @@ async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     support::write_request(&mut send, &request).await?;
     send.finish()?;
     ensure_eq!(
-        read_raw_quinn_status(&mut recv).await?.code(),
+        read_raw_status(&mut recv).await?.code(),
         Code::InvalidArgument
     );
 
@@ -4436,7 +4187,7 @@ async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     support::write_request_and_message(&mut send, &request, b"one").await?;
     support::write_message(&mut send, b"two").await?;
     send.finish()?;
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
     ensure_eq!(status.code(), Code::InvalidArgument);
 
     // Server-streaming requests are held to the same rule.
@@ -4446,7 +4197,7 @@ async fn quinn_unary_requests_need_exactly_one_message() -> TestResult {
     support::write_request(&mut send, &streaming).await?;
     send.finish()?;
     ensure_eq!(
-        read_raw_quinn_status(&mut recv).await?.code(),
+        read_raw_status(&mut recv).await?.code(),
         Code::InvalidArgument
     );
 
@@ -4469,7 +4220,7 @@ async fn quinn_grease_is_charged_to_the_request_body_limit() -> TestResult {
     for _ in 0..4 {
         support::write_grease(&mut send, &[0; 100]).await?;
     }
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
     ensure_eq!(status.code(), Code::ResourceExhausted);
 
     close_client(endpoint, connection).await?;
@@ -4492,7 +4243,7 @@ async fn quinn_oversized_unknown_frame_is_rejected_before_its_payload() -> TestR
     trevrpc::varint::push(&mut header, 0x1f * 3 + 0x21)?;
     trevrpc::varint::push(&mut header, 1025)?;
     support::write_raw(&mut send, &header).await?;
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
     ensure_eq!(status.code(), Code::ResourceExhausted);
 
     close_client(endpoint, connection).await?;
@@ -4508,7 +4259,7 @@ async fn quinn_initial_request_with_a_truncated_header_is_unavailable() -> TestR
     let (mut send, mut recv) = connection.open_bi().await?;
     support::write_raw(&mut send, &[0x01]).await?;
     send.finish()?;
-    let status = read_raw_quinn_status(&mut recv).await?;
+    let status = read_raw_status(&mut recv).await?;
     ensure_eq!(status.code(), Code::Unavailable);
 
     close_client(endpoint, connection).await?;
@@ -4541,7 +4292,7 @@ impl ScriptedServer {
             let _ = tokio::time::timeout(TEST_TIMEOUT, connection.closed()).await;
             Ok(())
         });
-        let endpoint = make_client_endpoint(cert_der)?;
+        let endpoint = make_client_endpoint(&cert_der)?;
         let connection = endpoint.connect(server_addr, "localhost")?.await?;
         Ok(Self {
             endpoint,

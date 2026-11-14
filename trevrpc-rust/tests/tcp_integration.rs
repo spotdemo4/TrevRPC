@@ -1,20 +1,19 @@
 //! The TCP listener: `QMux` over TLS, HTTP/2 and `QMux` over WebSocket, and the HTTP fallback it
 //! shares with the HTTP/3 endpoint.
 
-use std::error::Error;
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support;
+use crate::support::{self, Serving, TestResult};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use prost::Message;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use quinn::rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Barrier, mpsc, oneshot};
+use tokio::sync::{Barrier, mpsc};
 use tokio::task::JoinHandle;
 use trevrpc::client::{
     CallOptions, Channel, ChannelConfig, QmuxTransport, RpcTransport, StreamingRpcTransport,
@@ -28,8 +27,6 @@ use trevrpc::server::{
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{Code, RpcKind, Status};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ORIGIN: &str = "https://app.example.test";
@@ -107,25 +104,7 @@ fn admit_test_origin(request: &WebTransportAdmissionRequest<'_>) -> bool {
     request.origin == Some(ORIGIN)
 }
 
-struct RunningServer {
-    udp: SocketAddr,
-    tcp: SocketAddr,
-    cert: CertificateDer<'static>,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<trevrpc::Result<()>>,
-}
-
-impl RunningServer {
-    async fn stop(mut self) -> TestResult {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        within!(TEST_TIMEOUT, &mut self.task)???;
-        Ok(())
-    }
-}
-
-async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
+async fn spawn_server(options: ServerOptions) -> TestResult<Serving> {
     spawn_server_with(options, |_| {}).await
 }
 
@@ -133,54 +112,24 @@ async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
 async fn spawn_server_with(
     options: ServerOptions,
     configure: impl FnOnce(&mut Server),
-) -> TestResult<RunningServer> {
-    let (tls, cert_der) = localhost_tls()?;
-    spawn_server_with_tls(options, configure, tls, cert_der, |tcp| tcp).await
+) -> TestResult<Serving> {
+    spawn_server_with_tls(options, configure, support::self_signed()?, |tcp| tcp).await
 }
 
-/// A TLS configuration with a self-signed certificate for `localhost`, and that certificate.
-fn localhost_tls() -> TestResult<(quinn::rustls::ServerConfig, CertificateDer<'static>)> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let tls = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key)?;
-    Ok((tls, cert_der))
-}
-
-/// Spawns a server like [`spawn_server_with`] that presents `tls`, which clients trust through
-/// `cert`, with its TCP fallback adjusted by `configure_tcp`.
+/// Spawns a server like [`spawn_server_with`] that presents the TLS configuration of
+/// `(cert, tls)`, which clients trust through `cert`, with its TCP fallback adjusted by
+/// `configure_tcp`.
 async fn spawn_server_with_tls(
     options: ServerOptions,
     configure: impl FnOnce(&mut Server),
-    tls: quinn::rustls::ServerConfig,
-    cert_der: CertificateDer<'static>,
+    tls: (CertificateDer<'static>, quinn::rustls::ServerConfig),
     configure_tcp: impl FnOnce(TcpFallback) -> TcpFallback,
-) -> TestResult<RunningServer> {
+) -> TestResult<Serving> {
     let mut server = Server::new();
     server.set_options(options);
     greeter::register_greeter(&mut server, Greeter);
     configure(&mut server);
-    let endpoint = quinn::Endpoint::server(
-        server.quic_config(tls.clone())?,
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-    )?;
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-    let udp = endpoint.local_addr()?;
-    let tcp = listener.local_addr()?;
-    let fallback = configure_tcp(TcpFallback::new(listener, server.tcp_tls_config(tls)));
-    let (shutdown, stopped) = oneshot::channel();
-    let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
-        let _ = stopped.await;
-    }));
-    Ok(RunningServer {
-        udp,
-        tcp,
-        cert: cert_der,
-        shutdown: Some(shutdown),
-        task,
-    })
+    support::serve_with(server, tls, Vec::new(), configure_tcp).await
 }
 
 fn test_options() -> ServerOptions {
@@ -191,21 +140,8 @@ fn test_options() -> ServerOptions {
         .with_graceful_shutdown_timeout(Some(Duration::from_millis(500)))
 }
 
-fn client_tls(
-    cert: &CertificateDer<'static>,
-    alpn: &[u8],
-) -> TestResult<quinn::rustls::ClientConfig> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert.clone())?;
-    let mut tls = quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![alpn.to_vec()];
-    Ok(tls)
-}
-
 async fn connect_tls(
-    server: &RunningServer,
+    server: &Serving,
     alpn: &[u8],
 ) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
     connect_tls_at(server.tcp, &server.cert, alpn).await
@@ -217,7 +153,7 @@ async fn connect_tls_at(
     alpn: &[u8],
 ) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
     let stream = TcpStream::connect(addr).await?;
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls(cert, alpn)?));
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(support::client_tls(cert, &[alpn])?));
     Ok(connector
         .connect(ServerName::try_from("localhost")?, stream)
         .await?)
@@ -332,7 +268,7 @@ async fn qmux_over_tls_round_trips_every_rpc_shape() -> TestResult {
     let transport = QmuxTransport::connect(
         server.tcp,
         "localhost",
-        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+        support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
     )
     .await?;
     let client = greeter::GreeterClient::new(transport.clone());
@@ -347,7 +283,7 @@ async fn qmux_over_tls_round_trips_every_rpc_shape() -> TestResult {
         .await?;
     ensure_eq!(reply.message, format!("hello, {large}"));
     transport.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -356,7 +292,7 @@ async fn shutdown_closes_qmux_connections() -> TestResult {
     let transport = QmuxTransport::connect(
         server.tcp,
         "localhost",
-        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+        support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
     )
     .await?;
     let client = greeter::GreeterClient::new(transport.clone());
@@ -365,7 +301,7 @@ async fn shutdown_closes_qmux_connections() -> TestResult {
             name: "before".to_owned(),
         })
         .await?;
-    server.stop().await?;
+    server.stop(TEST_TIMEOUT).await?;
     within!(TEST_TIMEOUT, transport.closed())?;
     Ok(())
 }
@@ -384,7 +320,7 @@ async fn shutdown_ends_connections_that_have_not_started() -> TestResult {
     let mut no_qmux_handshake = connect_tls(&server, trevrpc::QMUX_ALPN).await?;
     let mut no_request = connect_tls(&server, b"http/1.1").await?;
 
-    within!(Duration::from_secs(2), server.stop())??;
+    within!(Duration::from_secs(2), server.stop(TEST_TIMEOUT))??;
     let mut buffer = [0_u8; 64];
     // Closed, by a FIN or a reset.
     let _ = within!(TEST_TIMEOUT, no_client_hello.read(&mut buffer))?;
@@ -432,7 +368,7 @@ async fn http2_serves_post_rpcs_and_advertises_http3() -> TestResult {
         bytes.extend_from_slice(&chunk);
     }
     ensure_eq!(decode_hello(&bytes)?, "hello, h2");
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -475,11 +411,11 @@ async fn http2_rejects_requests_that_are_not_trevrpc() -> TestResult {
             "{method} {path} {content_type}"
         );
     }
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 async fn websocket_session(
-    server: &RunningServer,
+    server: &Serving,
     origin: &str,
     subprotocol: &str,
 ) -> TestResult<std::result::Result<qmux::Session, http::StatusCode>> {
@@ -526,7 +462,7 @@ async fn qmux_over_websocket_serves_rpcs() -> TestResult {
     let response = within!(TEST_TIMEOUT, recv.read_all())??;
     ensure_eq!(decode_hello(&response)?, "hello, websocket");
     session.close(0, "done");
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -542,7 +478,7 @@ async fn websocket_upgrades_require_admission_and_the_subprotocol() -> TestResul
         websocket_session(&server, ORIGIN, "chat").await?.err(),
         Some(http::StatusCode::BAD_REQUEST)
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -565,7 +501,7 @@ async fn same_origin_admission_admits_the_servers_own_pages() -> TestResult {
             .err(),
         Some(http::StatusCode::FORBIDDEN)
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -581,7 +517,7 @@ async fn tcp_offers_only_enabled_protocols() -> TestResult {
     let transport = QmuxTransport::connect(
         server.tcp,
         "localhost",
-        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+        support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
     )
     .await?;
     let reply = greeter::GreeterClient::new(transport)
@@ -590,7 +526,7 @@ async fn tcp_offers_only_enabled_protocols() -> TestResult {
         })
         .await?;
     ensure_eq!(reply.message, "hello, native");
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
@@ -599,9 +535,10 @@ const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 async fn tcp_keeps_acme_tls_alpn_from_the_tls_config() -> TestResult {
     use tokio::io::AsyncReadExt as _;
 
-    let (mut tls, cert) = localhost_tls()?;
+    let (cert, mut tls) = support::self_signed()?;
     tls.alpn_protocols = vec![ACME_TLS_ALPN.to_vec()];
-    let server = spawn_server_with_tls(ServerOptions::new(), |_| {}, tls, cert, |tcp| tcp).await?;
+    let server =
+        spawn_server_with_tls(ServerOptions::new(), |_| {}, (cert, tls), |tcp| tcp).await?;
 
     let mut stream = connect_tls(&server, ACME_TLS_ALPN).await?;
     ensure_eq!(stream.get_ref().1.alpn_protocol(), Some(ACME_TLS_ALPN));
@@ -615,9 +552,9 @@ async fn tcp_keeps_acme_tls_alpn_from_the_tls_config() -> TestResult {
     // Certificate authorities validate TLS-ALPN-01 over TCP only.
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(
+        quinn::crypto::rustls::QuicClientConfig::try_from(support::client_tls(
             &server.cert,
-            ACME_TLS_ALPN,
+            &[ACME_TLS_ALPN],
         )?)?,
     )));
     let quic = within!(TEST_TIMEOUT, endpoint.connect(server.udp, "localhost")?)?;
@@ -626,7 +563,7 @@ async fn tcp_keeps_acme_tls_alpn_from_the_tls_config() -> TestResult {
     let transport = QmuxTransport::connect(
         server.tcp,
         "localhost",
-        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+        support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
     )
     .await?;
     let reply = greeter::GreeterClient::new(transport)
@@ -635,7 +572,7 @@ async fn tcp_keeps_acme_tls_alpn_from_the_tls_config() -> TestResult {
         })
         .await?;
     ensure_eq!(reply.message, "hello, native");
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -645,17 +582,17 @@ async fn tcp_offers_acme_tls_alpn_only_when_configured() -> TestResult {
         connect_tls(&server, ACME_TLS_ALPN).await.is_err(),
         "acme-tls/1 negotiated without it in the TLS configuration"
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 async fn channel(
-    server: &RunningServer,
+    server: &Serving,
     remote_addr: SocketAddr,
     config: ChannelConfig,
 ) -> TestResult<Channel> {
-    let quic_tls = client_tls(&server.cert, trevrpc::ALPN)?;
+    let quic_tls = support::client_tls(&server.cert, &[trevrpc::ALPN])?;
     let config = config
-        .with_tcp_fallback(client_tls(&server.cert, trevrpc::QMUX_ALPN)?)
+        .with_tcp_fallback(support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?)
         .with_tcp_addr(server.tcp);
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(config.quic_config(quic_tls)?);
@@ -682,7 +619,7 @@ async fn channel_falls_back_to_qmux_when_udp_is_unreachable() -> TestResult {
         exercise_greeter(&greeter::GreeterClient::new(channel.clone())),
     )??;
     channel.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[cfg(feature = "dev-certificate")]
@@ -700,8 +637,9 @@ async fn development_certificate_serves_every_transport_and_its_hashes() -> Test
         .with_development_certificate(Some(certificate.clone()));
     // Both listeners replace the resolver of the supplied TLS configuration with the one whose
     // hashes they serve.
-    let (unrelated_tls, _) = localhost_tls()?;
-    let server = spawn_server_with_tls(options, |_| {}, unrelated_tls, current, |tcp| tcp).await?;
+    let (_, unrelated_tls) = support::self_signed()?;
+    let server =
+        spawn_server_with_tls(options, |_| {}, (current, unrelated_tls), |tcp| tcp).await?;
 
     let quic = channel(&server, server.udp, ChannelConfig::new()).await?;
     ensure_eq!(quic.transport(), Some(TransportKind::Quic));
@@ -751,7 +689,7 @@ async fn development_certificate_serves_every_transport_and_its_hashes() -> Test
             .2,
         "fallback HTTP/3.0 GET /certificate-hashes\n"
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -772,7 +710,7 @@ async fn certificate_hashes_path_answers_404_without_a_development_certificate()
             "the fallback answered: {body}"
         );
     }
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -781,7 +719,7 @@ async fn channel_prefers_quic() -> TestResult {
     let channel = channel(&server, server.udp, ChannelConfig::new()).await?;
     ensure_eq!(channel.transport(), Some(TransportKind::Quic));
     channel.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -801,7 +739,7 @@ async fn channel_can_use_tcp_only() -> TestResult {
         .await?;
     ensure_eq!(reply.message, "hello, tcp");
     channel.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -858,7 +796,7 @@ async fn channel_builder_connects_to_a_url() -> TestResult {
             .tcp_fallback(false)
             .config(
                 ChannelConfig::new()
-                    .with_tcp_fallback(client_tls(&server.cert, trevrpc::QMUX_ALPN)?)
+                    .with_tcp_fallback(support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?)
                     .with_transport_policy(TransportPolicy::TcpOnly)
                     .with_tcp_addr(server.tcp),
             )
@@ -866,7 +804,7 @@ async fn channel_builder_connects_to_a_url() -> TestResult {
     )??;
     ensure_eq!(channel.transport(), Some(TransportKind::Qmux));
     channel.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// `localhost` resolves to `::1` as well as `127.0.0.1`, where the server listens; whichever comes
@@ -886,7 +824,7 @@ async fn channel_builder_tries_every_address_of_a_host() -> TestResult {
     ensure_eq!(channel.transport(), Some(TransportKind::Quic));
     ensure_eq!(channel.remote_addr(), server.udp);
     channel.close();
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -1064,12 +1002,12 @@ async fn ensure_unavailable(name: &str, call: JoinHandle<trevrpc::Result<()>>) -
 
 /// Checks that the server released the request slots of the lost calls: the barrier route only
 /// completes when `HANGING_ROUTES` calls are in it at once.
-async fn ensure_request_slots_released(server: &RunningServer) -> TestResult {
+async fn ensure_request_slots_released(server: &Serving) -> TestResult {
     let transport = Arc::new(
         QmuxTransport::connect(
             server.tcp,
             "localhost",
-            client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+            support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
         )
         .await?,
     );
@@ -1104,7 +1042,7 @@ async fn qmux_calls_fail_promptly_when_the_session_dies() -> TestResult {
     let transport = QmuxTransport::connect(
         relay.addr,
         "localhost",
-        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+        support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
     )
     .await?;
 
@@ -1176,7 +1114,7 @@ async fn qmux_calls_fail_promptly_when_the_session_dies() -> TestResult {
     // The handlers see the loss too, since the cut ended the server's session as well.
     events.all_connection_lost().await?;
     ensure_request_slots_released(&server).await?;
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -1215,7 +1153,7 @@ async fn qmux_over_websocket_handlers_are_cancelled_when_the_client_connection_d
     events.all_connection_lost().await?;
     ensure_request_slots_released(&server).await?;
     drop(streams);
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Answers with the request's HTTP version, method and path, then the request body. A request to
@@ -1290,7 +1228,7 @@ fn alt_svc(headers: &http::HeaderMap) -> Option<String> {
 
 /// Sends one HTTP/1.1 request on its own connection.
 async fn http1_request(
-    server: &RunningServer,
+    server: &Serving,
     method: &str,
     path: &str,
     body: &str,
@@ -1326,7 +1264,7 @@ async fn http1_request(
     ))
 }
 
-async fn http2_sender(server: &RunningServer) -> TestResult<h2::client::SendRequest<Bytes>> {
+async fn http2_sender(server: &Serving) -> TestResult<h2::client::SendRequest<Bytes>> {
     let tls = connect_tls(server, b"h2").await?;
     let (sender, connection) = h2::client::handshake(tls).await?;
     tokio::spawn(connection);
@@ -1357,7 +1295,7 @@ async fn http2_request(
 }
 
 async fn http2_fallback_request(
-    server: &RunningServer,
+    server: &Serving,
     sender: &h2::client::SendRequest<Bytes>,
     method: &str,
     path: &str,
@@ -1377,10 +1315,10 @@ type Http3Sender = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 /// Opens an HTTP/3 connection to the server, able to carry a WebTransport session when
 /// `webtransport` is set. The endpoint must outlive the connection.
 async fn http3_sender(
-    server: &RunningServer,
+    server: &Serving,
     webtransport: bool,
 ) -> TestResult<(quinn::Endpoint, Http3Sender)> {
-    let tls = client_tls(&server.cert, trevrpc::HTTP3_ALPN)?;
+    let tls = support::client_tls(&server.cert, &[trevrpc::HTTP3_ALPN])?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
@@ -1423,7 +1361,7 @@ async fn http3_exchange(
 
 /// Sends one HTTP/3 request on its own connection.
 async fn http3_request(
-    server: &RunningServer,
+    server: &Serving,
     method: &str,
     path: &str,
     body: &str,
@@ -1496,19 +1434,17 @@ async fn http_fallback_serves_every_http_version_alongside_rpcs() -> TestResult 
     let (status, _, reply) = http2_request(&sender, rpc, Bytes::from(unary_frame("h2")?)).await?;
     ensure_eq!(status, http::StatusCode::OK);
     ensure_eq!(decode_hello(&reply)?, "hello, h2");
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Behind a proxy that exposes the endpoint on another port, `Alt-Svc` advertises that port.
 #[tokio::test]
 async fn http2_responses_advertise_alt_svc_port() -> TestResult {
     let fallback = EchoFallback::default();
-    let (tls, cert_der) = localhost_tls()?;
     let server = spawn_server_with_tls(
         fallback_options(test_options(), &fallback),
         |_| {},
-        tls,
-        cert_der,
+        support::self_signed()?,
         |tcp| tcp.with_alt_svc_port(NonZeroU16::new(443)),
     )
     .await?;
@@ -1533,7 +1469,7 @@ async fn http2_responses_advertise_alt_svc_port() -> TestResult {
         http1_request(&server, "GET", "/app", "").await?.1,
         advertised
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -1557,7 +1493,7 @@ async fn http_fallback_alone_serves_every_http_version() -> TestResult {
         http3_request(&server, "GET", "/trevrpc", "").await?.2,
         expected("HTTP/3.0")
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -1593,7 +1529,7 @@ async fn http_fallback_requests_hold_a_stream_slot() -> TestResult {
             .0,
         http::StatusCode::OK
     );
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -1646,7 +1582,7 @@ async fn http3_serves_requests_alongside_a_webtransport_session() -> TestResult 
         ),
     }
     drop(session);
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 // Connection metadata: what a client sets once for its calls, which servers keep per connection.
@@ -1731,7 +1667,7 @@ async fn connection_metadata_joins_every_call_and_the_call_wins() -> TestResult 
         );
         channel.close();
     }
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// The frames of a call on `SUFFIX` that offers or refers to connection metadata set `id`.
@@ -1786,7 +1722,7 @@ async fn servers_confirm_connection_metadata_on_connections_only() -> TestResult
     let server = spawn_server_with(test_options(), register_suffix_route).await?;
 
     // A native QUIC connection stores and confirms an offer, then resolves references to it.
-    let tls = client_tls(&server.cert, trevrpc::ALPN)?;
+    let tls = support::client_tls(&server.cert, &[trevrpc::ALPN])?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
@@ -1845,5 +1781,5 @@ async fn servers_confirm_connection_metadata_on_connections_only() -> TestResult
         Code::InvalidArgument
     );
 
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }

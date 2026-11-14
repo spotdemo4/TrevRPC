@@ -2,7 +2,6 @@
 //! validates TLS-ALPN-01 on the TCP listener, and the server presents it over QUIC and `QMux` over
 //! TLS.
 
-use std::error::Error;
 use std::fs::{self, File};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -12,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::greeter;
+use crate::support::{self, TestResult};
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::pem::PemObject as _;
 use quinn::rustls::pki_types::{CertificateDer, ServerName};
@@ -23,8 +23,6 @@ use trevrpc::Status;
 use trevrpc::client::{Channel, ChannelConfig, TransportKind, TransportPolicy};
 use trevrpc::server::{RequestContext, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 /// The name Pebble issues the certificate for. Its mock DNS server resolves every name to
 /// 127.0.0.1.
@@ -84,7 +82,7 @@ async fn rustls_acme_answers_tls_alpn_01_on_the_tcp_listener() -> TestResult {
     // Pebble validates on the TCP listener's port, so it is bound first.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let pebble = Pebble::start(listener.local_addr()?.port()).await?;
-    let pebble_tls = Arc::new(client_tls(pebble.listener_cert.clone(), b"http/1.1")?);
+    let pebble_tls = Arc::new(support::client_tls(&pebble.listener_cert, &[b"http/1.1"])?);
     let mut state = AcmeConfig::new_with_client_config([DOMAIN], pebble_tls)
         .directory(&pebble.directory)
         .state();
@@ -167,16 +165,6 @@ async fn rustls_acme_answers_tls_alpn_01_on_the_tcp_listener() -> TestResult {
     let _ = shutdown.send(());
     within!(TEST_TIMEOUT, serving)???;
     Ok(())
-}
-
-/// A client configuration that trusts `cert` and offers `alpn`.
-fn client_tls(
-    cert: CertificateDer<'static>,
-    alpn: &[u8],
-) -> TestResult<quinn::rustls::ClientConfig> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert)?;
-    Ok(client_tls_with_roots(roots, alpn))
 }
 
 /// A client configuration that trusts `roots` and offers `alpn`.
@@ -315,7 +303,7 @@ async fn try_start(
             .env("PEBBLE_VA_NOSLEEP", "1")
             .env("PEBBLE_WFE_NONCEREJECT", "0"),
     )?;
-    let tls = Arc::new(client_tls(listener_cert.clone(), b"http/1.1")?);
+    let tls = Arc::new(support::client_tls(listener_cert, &[b"http/1.1"])?);
     pebble
         .wait_until(|| https_get(acme_addr, "/dir", tls.clone()))
         .await?;

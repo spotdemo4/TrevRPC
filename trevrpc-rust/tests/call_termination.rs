@@ -3,28 +3,29 @@
 //!
 //! Every test runs over native QUIC and over `QMux` over TLS, served by one `serve_with_tcp`.
 
-use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::greeter;
-use crate::support;
+use crate::support::{self, Serving, TestResult};
 use futures_util::StreamExt;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::sync::{Notify, mpsc};
+use quinn::rustls::pki_types::CertificateDer;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use trevrpc::client::{
     CallOptions, ChannelConfig, QmuxTransport, QuicTransport, StreamingRpcTransport,
 };
 use trevrpc::server::{Finish, Interceptor, RequestContext, Server, ServerOptions};
-use trevrpc::tcp::TcpFallback;
 use trevrpc::{Code, RpcKind, Status};
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+/// The wires these tests run over.
+#[derive(Clone, Copy, Debug)]
+enum Wire {
+    Quic,
+    Qmux,
+}
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a send may take to fail once the server has ended the call.
@@ -134,25 +135,7 @@ fn register_routes(server: &mut Server) {
     }
 }
 
-struct RunningServer {
-    udp: SocketAddr,
-    tcp: SocketAddr,
-    cert: CertificateDer<'static>,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<trevrpc::Result<()>>,
-}
-
-impl RunningServer {
-    async fn stop(mut self) -> TestResult {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        within!(TEST_TIMEOUT, &mut self.task)???;
-        Ok(())
-    }
-}
-
-async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
+async fn spawn_server(options: ServerOptions) -> TestResult<Serving> {
     spawn_server_with(options, |_| {}).await
 }
 
@@ -160,54 +143,16 @@ async fn spawn_server(options: ServerOptions) -> TestResult<RunningServer> {
 async fn spawn_server_with(
     options: ServerOptions,
     configure: impl FnOnce(&mut Server),
-) -> TestResult<RunningServer> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let tls = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key)?;
-
+) -> TestResult<Serving> {
     let mut server = Server::new();
     server.set_options(options);
     greeter::register_greeter(&mut server, Greeter);
     register_routes(&mut server);
     configure(&mut server);
-    let endpoint = quinn::Endpoint::server(
-        server.quic_config(tls.clone())?,
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-    )?;
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-    let udp = endpoint.local_addr()?;
-    let tcp = listener.local_addr()?;
-    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
-    let (shutdown, stopped) = oneshot::channel();
-    let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
-        let _ = stopped.await;
-    }));
-    Ok(RunningServer {
-        udp,
-        tcp,
-        cert: cert_der,
-        shutdown: Some(shutdown),
-        task,
-    })
+    support::serve(server, support::self_signed()?).await
 }
 
-fn client_tls(
-    cert: &CertificateDer<'static>,
-    alpn: &[u8],
-) -> TestResult<quinn::rustls::ClientConfig> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert.clone())?;
-    let mut tls = quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![alpn.to_vec()];
-    Ok(tls)
-}
-
-async fn connect_quic(server: &RunningServer) -> TestResult<(quinn::Endpoint, QuicTransport)> {
+async fn connect_quic(server: &Serving) -> TestResult<(quinn::Endpoint, QuicTransport)> {
     connect_quic_to(server.udp, &server.cert).await
 }
 
@@ -215,26 +160,20 @@ async fn connect_quic_to(
     addr: SocketAddr,
     cert: &CertificateDer<'static>,
 ) -> TestResult<(quinn::Endpoint, QuicTransport)> {
-    let config = ChannelConfig::new().quic_config(client_tls(cert, trevrpc::ALPN)?)?;
+    let config = ChannelConfig::new().quic_config(support::client_tls(cert, &[trevrpc::ALPN])?)?;
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     endpoint.set_default_client_config(config);
     let connection = endpoint.connect(addr, "localhost")?.await?;
     Ok((endpoint, QuicTransport::new(connection)))
 }
 
-async fn connect_qmux(server: &RunningServer) -> TestResult<QmuxTransport> {
+async fn connect_qmux(server: &Serving) -> TestResult<QmuxTransport> {
     Ok(QmuxTransport::connect(
         server.tcp,
         "localhost",
-        client_tls(&server.cert, trevrpc::QMUX_ALPN)?,
+        support::client_tls(&server.cert, &[trevrpc::QMUX_ALPN])?,
     )
     .await?)
-}
-
-#[derive(Clone, Copy)]
-enum Wire {
-    Quic,
-    Qmux,
 }
 
 /// Runs `scenario` against a fresh server over `wire`.
@@ -261,26 +200,7 @@ where
             qmux.close();
         }
     }
-    server.stop().await
-}
-
-/// Defines `$name::quic` and `$name::qmux`, which run the same scenario over each transport.
-macro_rules! over_each_transport {
-    ($name:ident, $options:expr, $scenario:expr) => {
-        mod $name {
-            use super::*;
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn quic() -> TestResult {
-                run(Wire::Quic, $options, $scenario).await
-            }
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn qmux() -> TestResult {
-                run(Wire::Qmux, $options, $scenario).await
-            }
-        }
-    };
+    server.stop(TEST_TIMEOUT).await
 }
 
 fn name(value: usize) -> greeter::HelloRequest {
@@ -318,10 +238,11 @@ fn slot_limited_options() -> ServerOptions {
         .with_graceful_shutdown_timeout(Some(Duration::from_millis(200)))
 }
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     stream_slot_is_free_before_a_unary_call_completes,
-    slot_limited_options(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, slot_limited_options(), |transport| async move {
         hammer(move |index| {
             let transport = Arc::clone(&transport);
             async move {
@@ -330,13 +251,14 @@ over_each_transport!(
             }
         })
         .await
-    }
+    })
 );
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     stream_slot_is_free_before_a_server_streaming_call_completes,
-    slot_limited_options(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, slot_limited_options(), |transport| async move {
         hammer(move |index| {
             let transport = Arc::clone(&transport);
             async move {
@@ -349,7 +271,7 @@ over_each_transport!(
             }
         })
         .await
-    }
+    })
 );
 
 /// The server-wide request limit is shared by every connection; one connection is enough.
@@ -359,10 +281,11 @@ fn request_limited_options() -> ServerOptions {
         .with_graceful_shutdown_timeout(Some(Duration::from_millis(200)))
 }
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     request_slot_is_free_before_a_call_completes,
-    request_limited_options(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, request_limited_options(), |transport| async move {
         hammer(move |index| {
             let transport = Arc::clone(&transport);
             async move {
@@ -376,34 +299,39 @@ over_each_transport!(
             }
         })
         .await
-    }
+    })
 );
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     over_limit_streams_still_receive_unavailable,
-    slot_limited_options().with_max_concurrent_streams_per_connection(Some(1)),
-    |transport| async move {
-        let client = greeter::GreeterClient::new(Arc::clone(&transport));
-        let mut held = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
-            transport.as_ref(),
-            &support::greeter_path(HOLD),
-            &name(0),
-            long_options(),
-        )
-        .await?;
-        ensure!(held.next().await.is_some());
-        // One call holds the only slot. The transport admits a spare stream, so the second
-        // call reaches the server and is answered with a lone UNAVAILABLE status.
-        let status = client
-            .say_hello(&name(1))
-            .await
-            .err()
-            .ok_or("the call above the limit should fail")?
-            .into_status();
-        ensure_eq!(status.code(), Code::Unavailable);
-        drop(held);
-        Ok(())
-    }
+    [quic, qmux],
+    |wire| run(
+        wire,
+        slot_limited_options().with_max_concurrent_streams_per_connection(Some(1)),
+        |transport| async move {
+            let client = greeter::GreeterClient::new(Arc::clone(&transport));
+            let mut held = trevrpc::client::server_streaming::<_, _, greeter::HelloReply>(
+                transport.as_ref(),
+                &support::greeter_path(HOLD),
+                &name(0),
+                long_options(),
+            )
+            .await?;
+            ensure!(held.next().await.is_some());
+            // One call holds the only slot. The transport admits a spare stream, so the second
+            // call reaches the server and is answered with a lone UNAVAILABLE status.
+            let status = client
+                .say_hello(&name(1))
+                .await
+                .err()
+                .ok_or("the call above the limit should fail")?
+                .into_status();
+            ensure_eq!(status.code(), Code::Unavailable);
+            drop(held);
+            Ok(())
+        }
+    )
 );
 
 fn upload_options() -> ServerOptions {
@@ -444,10 +372,11 @@ fn long_options() -> CallOptions {
     CallOptions::new().with_timeout(LONG_DEADLINE)
 }
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     client_streaming_upload_fails_when_the_server_limits_messages,
-    upload_options(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, upload_options(), |transport| async move {
         let client = greeter::GreeterClient::new(transport);
         let call = client
             .lots_of_greetings()
@@ -461,13 +390,14 @@ over_each_transport!(
             .ok_or("call should fail")?;
         ensure_eq!(status.into_status().code(), Code::ResourceExhausted);
         Ok(())
-    }
+    })
 );
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     bidi_upload_fails_when_the_server_limits_messages,
-    upload_options(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, upload_options(), |transport| async move {
         let client = greeter::GreeterClient::new(transport);
         let mut call = client.bidi_hello().options(|_| long_options()).await?;
         send_until_failure(|| call.send(large_message())).await?;
@@ -480,13 +410,14 @@ over_each_transport!(
         };
         ensure_eq!(status.code(), Code::ResourceExhausted);
         Ok(())
-    }
+    })
 );
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     client_streaming_upload_fails_when_the_handler_returns_early,
-    ServerOptions::new(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, ServerOptions::new(), |transport| async move {
         let call =
             trevrpc::client::client_streaming::<_, greeter::HelloRequest, greeter::HelloReply>(
                 transport.as_ref(),
@@ -502,13 +433,14 @@ over_each_transport!(
             .ok_or("call should fail")?;
         ensure_eq!(error.into_status().code(), Code::PermissionDenied);
         Ok(())
-    }
+    })
 );
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     bidi_upload_fails_when_the_handler_returns_early,
-    ServerOptions::new(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, ServerOptions::new(), |transport| async move {
         let mut call = trevrpc::client::bidirectional_streaming::<
             _,
             greeter::HelloRequest,
@@ -523,13 +455,14 @@ over_each_transport!(
         let error = call.recv().await.err().ok_or("call should fail")?;
         ensure_eq!(error.into_status().code(), Code::PermissionDenied);
         Ok(())
-    }
+    })
 );
 
-over_each_transport!(
+over_each_wire!(
+    multi_thread,
     bidi_send_fails_while_the_responses_are_being_read,
-    upload_options(),
-    |transport| async move {
+    [quic, qmux],
+    |wire| run(wire, upload_options(), |transport| async move {
         let client = greeter::GreeterClient::new(transport);
         let call = client.bidi_hello().options(|_| long_options()).await?;
         let (sender, mut replies) = call.split();
@@ -544,7 +477,7 @@ over_each_transport!(
         let status = reader.await?.err().ok_or("call should fail")?.into_status();
         ensure_eq!(status.code(), Code::ResourceExhausted);
         Ok(())
-    }
+    })
 );
 
 /// What a [`DeafServer`] does with the one call it accepts.
@@ -577,12 +510,7 @@ fn spawn_deaf_server(status: Status) -> TestResult<DeafServer> {
 }
 
 fn spawn_scripted_server(script: Script) -> TestResult<DeafServer> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let tls = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key)?;
+    let (cert_der, tls) = support::self_signed()?;
     let config = Server::new().quic_config(tls)?;
     let endpoint = quinn::Endpoint::server(config, SocketAddr::from(([127, 0, 0, 1], 0)))?;
     let addr = endpoint.local_addr()?;
@@ -875,7 +803,7 @@ type Connected = (
 );
 
 /// Connects to `server` over `wire`.
-async fn connect(wire: Wire, server: &RunningServer) -> TestResult<Connected> {
+async fn connect(wire: Wire, server: &Serving) -> TestResult<Connected> {
     Ok(match wire {
         Wire::Quic => {
             let (endpoint, quic) = connect_quic(server).await?;
@@ -974,10 +902,10 @@ async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
             if let Some(endpoint) = endpoint {
                 endpoint.close(0_u32.into(), b"done");
             }
-            server.stop().await
+            server.stop(TEST_TIMEOUT).await
         }
         Ending::ServerShutsDown => {
-            server.stop().await?;
+            server.stop(TEST_TIMEOUT).await?;
             ended().await?;
             expect_finish(&mut reports, &[Code::Unavailable]).await?;
             let status = within!(TEST_TIMEOUT, call)??
@@ -993,36 +921,23 @@ async fn interceptor_wait_ends(wire: Wire, ending: Ending) -> TestResult {
     }
 }
 
-/// Defines a test of [`interceptor_wait_ends`] over each transport.
-macro_rules! interceptor_wait_ends_over_each_transport {
-    ($name:ident, $ending:expr) => {
-        mod $name {
-            use super::*;
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn quic() -> TestResult {
-                interceptor_wait_ends(Wire::Quic, $ending).await
-            }
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn qmux() -> TestResult {
-                interceptor_wait_ends(Wire::Qmux, $ending).await
-            }
-        }
-    };
-}
-
-interceptor_wait_ends_over_each_transport!(
+over_each_wire!(
+    multi_thread,
     an_interceptor_wait_ends_when_the_client_cancels,
-    Ending::ClientCancels
+    [quic, qmux],
+    |wire| interceptor_wait_ends(wire, Ending::ClientCancels)
 );
-interceptor_wait_ends_over_each_transport!(
+over_each_wire!(
+    multi_thread,
     an_interceptor_wait_ends_when_the_connection_closes,
-    Ending::ConnectionCloses
+    [quic, qmux],
+    |wire| interceptor_wait_ends(wire, Ending::ConnectionCloses)
 );
-interceptor_wait_ends_over_each_transport!(
+over_each_wire!(
+    multi_thread,
     an_interceptor_wait_ends_when_the_server_shuts_down,
-    Ending::ServerShutsDown
+    [quic, qmux],
+    |wire| interceptor_wait_ends(wire, Ending::ServerShutsDown)
 );
 
 /// Starts a call of the flood route that nothing reads, so that the server's writes run out of
@@ -1078,7 +993,7 @@ async fn a_client_that_stops_reading_loses_its_slot_at_the_deadline(wire: Wire) 
     for endpoint in [endpoint, other_endpoint].into_iter().flatten() {
         endpoint.close(0_u32.into(), b"done");
     }
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Shutdown ends a call whose client stopped reading at once, rather than when the graceful
@@ -1095,7 +1010,7 @@ async fn shutdown_ends_a_call_whose_client_stopped_reading(wire: Wire) -> TestRe
     let held = stalled_flood(transport.as_ref(), Duration::ZERO).await?;
     // Let the server fill the windows and stall.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    server.stop().await?;
+    server.stop(TEST_TIMEOUT).await?;
     expect_finish(&mut reports, &[Code::Unavailable]).await?;
 
     drop(held);
@@ -1106,24 +1021,13 @@ async fn shutdown_ends_a_call_whose_client_stopped_reading(wire: Wire) -> TestRe
     Ok(())
 }
 
-/// Defines a test of `$scenario` over each transport.
-macro_rules! stalled_reader_over_each_transport {
-    ($scenario:ident) => {
-        mod $scenario {
-            use super::*;
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn quic() -> TestResult {
-                $scenario(Wire::Quic).await
-            }
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn qmux() -> TestResult {
-                $scenario(Wire::Qmux).await
-            }
-        }
-    };
-}
-
-stalled_reader_over_each_transport!(a_client_that_stops_reading_loses_its_slot_at_the_deadline);
-stalled_reader_over_each_transport!(shutdown_ends_a_call_whose_client_stopped_reading);
+over_each_wire!(
+    multi_thread,
+    a_client_that_stops_reading_loses_its_slot_at_the_deadline,
+    [quic, qmux]
+);
+over_each_wire!(
+    multi_thread,
+    shutdown_ends_a_call_whose_client_stopped_reading,
+    [quic, qmux]
+);

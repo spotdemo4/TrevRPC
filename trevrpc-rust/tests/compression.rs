@@ -1,30 +1,24 @@
 //! Compressed messages end to end: the frames a Rust server and a Rust client put on the wire,
 //! and compressed calls over QUIC and `QMux` over TLS, per message and with stream compression.
 
-use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::support::{self, Serving, TestResult};
 use futures_util::StreamExt;
-use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use quinn::rustls::pki_types::CertificateDer;
 use trevrpc::client::{
     ChannelConfig, MessageTypes, QuicTransport, StreamingRpcTransport, TransportPolicy,
 };
 use trevrpc::framing::{decode_payload, encode_message_frame, encode_protobuf_frame, frame_type};
 use trevrpc::server::{RouteOptions, Server, ServerOptions};
-use trevrpc::tcp::TcpFallback;
 use trevrpc::wire::DictionaryInfo;
 use trevrpc::{
     CompressMessages, CompressStream, Compression, Dictionary, Metadata, RpcAnswer, RpcKind,
     RpcRequest, RpcStatus,
 };
-
-type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UNARY: &str = "/test.Compressed/Echo";
@@ -95,14 +89,10 @@ fn compression() -> TestResult<Compression> {
     ))
 }
 
-struct RunningServer {
-    udp: SocketAddr,
-    tcp: SocketAddr,
-    cert: CertificateDer<'static>,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<trevrpc::Result<()>>,
-    /// How many calls the authorizer and the interceptor saw, and how many reached a refusing
-    /// route's handler.
+/// How many calls the authorizer and the interceptor of a server saw, and how many reached a
+/// refusing route's handler.
+#[derive(Default)]
+struct Counts {
     authorized: Arc<AtomicUsize>,
     intercepted: Arc<AtomicUsize>,
     handled: Arc<AtomicUsize>,
@@ -198,40 +188,17 @@ fn echo_and_count(
     Box::pin(requests.chain(report))
 }
 
-impl RunningServer {
-    async fn stop(mut self) -> TestResult {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        within!(TEST_TIMEOUT, &mut self.task)???;
-        Ok(())
-    }
-}
-
-fn self_signed() -> TestResult<(CertificateDer<'static>, quinn::rustls::ServerConfig)> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
-    let cert_der = CertificateDer::from(cert.cert);
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-    let tls = quinn::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key)?;
-    Ok((cert_der, tls))
-}
-
 /// Serves an echo service whose routes name their message types, over QUIC and TCP.
-async fn spawn_server(compression: Compression) -> TestResult<RunningServer> {
+async fn spawn_server(compression: Compression) -> TestResult<(Serving, Counts)> {
     spawn_server_with(ServerOptions::new().with_compression(compression)).await
 }
 
-async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> {
-    let (cert, tls) = self_signed()?;
+async fn spawn_server_with(options: ServerOptions) -> TestResult<(Serving, Counts)> {
     let mut server = Server::new();
     server.set_options(options);
-    let authorized = Arc::new(AtomicUsize::new(0));
-    let intercepted = Arc::new(AtomicUsize::new(0));
-    let handled = Arc::new(AtomicUsize::new(0));
-    server.set_authorizer(CountingAuthorizer(Arc::clone(&authorized)));
-    server.add_interceptor(CountingInterceptor(Arc::clone(&intercepted)));
+    let counts = Counts::default();
+    server.set_authorizer(CountingAuthorizer(Arc::clone(&counts.authorized)));
+    server.add_interceptor(CountingInterceptor(Arc::clone(&counts.intercepted)));
     server.route_with_options(
         PLAIN,
         RouteOptions::new()
@@ -265,7 +232,7 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
         options.with_compress_stream(CompressStream::REQUESTS),
         |context, _body, requests| concatenate(context, requests),
     );
-    let count = Arc::clone(&handled);
+    let count = Arc::clone(&counts.handled);
     server.route_streaming_with_options(
         REFUSING_UPLOAD,
         RpcKind::ClientStreaming,
@@ -275,7 +242,7 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
             concatenate(context, requests)
         },
     );
-    let count = Arc::clone(&handled);
+    let count = Arc::clone(&counts.handled);
     server.route_streaming_with_options(
         REFUSING_STREAM,
         RpcKind::BidirectionalStreaming,
@@ -285,44 +252,15 @@ async fn spawn_server_with(options: ServerOptions) -> TestResult<RunningServer> 
             async move { Ok(echo_and_count(context, requests)) }
         },
     );
-    let endpoint = quinn::Endpoint::server(
-        server.quic_config(tls.clone())?,
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-    )?;
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-    let udp = endpoint.local_addr()?;
-    let tcp = listener.local_addr()?;
-    let fallback = TcpFallback::new(listener, server.tcp_tls_config(tls));
-    let (shutdown, stopped) = oneshot::channel();
-    let task = tokio::spawn(server.serve_with_tcp(endpoint, fallback, async move {
-        let _ = stopped.await;
-    }));
-    Ok(RunningServer {
-        udp,
-        tcp,
-        cert,
-        shutdown: Some(shutdown),
-        task,
-        authorized,
-        intercepted,
-        handled,
-    })
-}
-
-fn client_tls(cert: &CertificateDer<'static>) -> TestResult<quinn::rustls::ClientConfig> {
-    let mut roots = quinn::rustls::RootCertStore::empty();
-    roots.add(cert.clone())?;
-    Ok(quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth())
+    let server = support::serve(server, support::self_signed()?).await?;
+    Ok((server, counts))
 }
 
 async fn quic_connection(
     addr: SocketAddr,
     cert: &CertificateDer<'static>,
 ) -> TestResult<(quinn::Endpoint, quinn::Connection)> {
-    let mut tls = client_tls(cert)?;
-    tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
+    let tls = support::client_tls(cert, &[trevrpc::ALPN])?;
     let config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
     ));
@@ -372,7 +310,7 @@ fn querying_request(method: &str) -> TestResult<RpcRequest> {
 
 #[tokio::test]
 async fn the_server_answers_and_compresses_its_responses() -> TestResult {
-    let server = spawn_server(compression()?).await?;
+    let (server, _) = spawn_server(compression()?).await?;
     let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
 
     let (mut send, mut recv) = connection.open_bi().await?;
@@ -435,23 +373,22 @@ async fn the_server_answers_and_compresses_its_responses() -> TestResult {
     );
 
     drop(connection);
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// The client of a channel with compression: over QUIC or over `QMux` over TLS.
 async fn compressed_channel(
-    server: &RunningServer,
+    server: &Serving,
     policy: TransportPolicy,
 ) -> TestResult<(quinn::Endpoint, trevrpc::client::Channel)> {
-    let mut tls = client_tls(&server.cert)?;
-    tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
     let config = ChannelConfig::new()
         .with_compression(compression()?)
-        .with_tcp_fallback(client_tls(&server.cert)?)
+        .with_tcp_fallback(support::client_tls(&server.cert, &[])?)
         .with_tcp_addr(server.tcp)
         .with_transport_policy(policy);
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
-    endpoint.set_default_client_config(config.quic_config(client_tls(&server.cert)?)?);
+    endpoint
+        .set_default_client_config(config.quic_config(support::client_tls(&server.cert, &[])?)?);
     let channel = trevrpc::client::Channel::connect_with_config(
         endpoint.clone(),
         server.udp,
@@ -464,7 +401,7 @@ async fn compressed_channel(
 
 #[tokio::test]
 async fn compressed_calls_work_over_quic_and_qmux() -> TestResult {
-    let server = spawn_server(compression()?).await?;
+    let (server, _) = spawn_server(compression()?).await?;
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let (_endpoint, channel) = compressed_channel(&server, policy).await?;
         for i in 0..2 {
@@ -496,7 +433,7 @@ async fn compressed_calls_work_over_quic_and_qmux() -> TestResult {
         }
         ensure!(replies.next().await.is_none());
     }
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -505,7 +442,7 @@ async fn invalid_compression_fails_at_startup() -> TestResult {
     server.set_options(ServerOptions::new().with_compression(
         Compression::new().with_dictionary(Dictionary::new(b"not a dictionary".to_vec())),
     ));
-    let (_, tls) = self_signed()?;
+    let (_, tls) = support::self_signed()?;
     ensure!(server.quic_config(tls).is_err());
     let config = ChannelConfig::new()
         .with_compression(Compression::new().with_dictionary(Dictionary::new(Vec::new())));
@@ -569,7 +506,7 @@ fn fake_server(
     CertificateDer<'static>,
     tokio::sync::mpsc::UnboundedReceiver<Received>,
 )> {
-    let (cert, mut tls) = self_signed()?;
+    let (cert, mut tls) = support::self_signed()?;
     tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
     let config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
@@ -753,7 +690,7 @@ fn stream_request(offer: bool) -> RpcRequest {
 #[tokio::test]
 async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_third_response()
 -> TestResult {
-    let server = spawn_server(Compression::new()).await?;
+    let (server, _) = spawn_server(Compression::new()).await?;
     let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
 
     // The golden stream, sent stream-compressed from its first message.
@@ -817,12 +754,13 @@ async fn the_server_decodes_stream_compressed_requests_and_compresses_from_the_t
     )?);
     ensure_eq!(status.code(), trevrpc::Code::InvalidArgument);
     drop(connection);
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn a_server_without_stream_compression_memory_neither_answers_nor_compresses() -> TestResult {
-    let server = spawn_server_with(ServerOptions::new().with_stream_compression_memory(0)).await?;
+    let (server, _) =
+        spawn_server_with(ServerOptions::new().with_stream_compression_memory(0)).await?;
     let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
     let mut requests = Vec::new();
     for i in 0..4 {
@@ -845,13 +783,13 @@ async fn a_server_without_stream_compression_memory_neither_answers_nor_compress
         ]
     );
     drop(connection);
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn stream_compressed_calls_work_over_quic_and_qmux() -> TestResult {
     for compression in [Compression::new(), compression()?] {
-        let server = spawn_server(compression.clone()).await?;
+        let (server, _) = spawn_server(compression.clone()).await?;
         for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
             let (_endpoint, channel) = compressed_channel(&server, policy).await?;
             let chat = trevrpc::client::bidirectional_streaming::<_, Echo, Echo>(
@@ -878,7 +816,7 @@ async fn stream_compressed_calls_work_over_quic_and_qmux() -> TestResult {
                 .ok_or("no stream-compressed count")?;
             ensure_eq!(compressed.as_slice(), b"4", "{policy:?}");
         }
-        server.stop().await?;
+        server.stop(TEST_TIMEOUT).await?;
     }
     Ok(())
 }
@@ -909,7 +847,7 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> TestResult<RawFrame> {
 
 #[tokio::test]
 async fn the_server_answers_before_reading_a_request_message() -> TestResult {
-    let server = spawn_server(Compression::new()).await?;
+    let (server, _) = spawn_server(Compression::new()).await?;
     let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
     for offer in [true, false] {
         let (mut send, mut recv) = connection.open_bi().await?;
@@ -954,12 +892,12 @@ async fn the_server_answers_before_reading_a_request_message() -> TestResult {
         );
     }
     drop(connection);
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 #[tokio::test]
 async fn client_streaming_uploads_are_stream_compressed_from_the_third_message() -> TestResult {
-    let server = spawn_server(Compression::new()).await?;
+    let (server, _) = spawn_server(Compression::new()).await?;
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let (_endpoint, channel) = compressed_channel(&server, policy).await?;
         // Calls are optimistic, so a burst compresses without waiting for the server's answer.
@@ -1014,7 +952,7 @@ async fn client_streaming_uploads_are_stream_compressed_from_the_third_message()
             "{policy:?}, sending a stream"
         );
     }
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Sends the REQUEST of an optimistic call and two request messages, ignoring a server that stops
@@ -1058,8 +996,8 @@ async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() 
             &prost::Message::encode_to_vec(&sample(i)),
         )?;
     }
-    let server = spawn_server(Compression::new()).await?;
-    let without_memory =
+    let (server, counts) = spawn_server(Compression::new()).await?;
+    let (without_memory, without_memory_counts) =
         spawn_server_with(ServerOptions::new().with_stream_compression_memory(0)).await?;
     // Routes that do not decode stream-compressed requests, and a server without the memory to.
     for (server, method, kind) in [
@@ -1079,9 +1017,9 @@ async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() 
         );
     }
     // The authorizer ran for each, but no handler did.
-    ensure_eq!(server.authorized.load(Ordering::SeqCst), 2);
-    ensure_eq!(server.handled.load(Ordering::SeqCst), 0);
-    ensure_eq!(without_memory.authorized.load(Ordering::SeqCst), 2);
+    ensure_eq!(counts.authorized.load(Ordering::SeqCst), 2);
+    ensure_eq!(counts.handled.load(Ordering::SeqCst), 0);
+    ensure_eq!(without_memory_counts.authorized.load(Ordering::SeqCst), 2);
 
     let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
     // A caller the authorizer rejects gets its error, not a refusal, so it cannot probe methods.
@@ -1096,7 +1034,7 @@ async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() 
         let status = trevrpc::Status::from(decode_payload::<RpcStatus>(&frames[0].payload)?);
         ensure_eq!(status.code(), trevrpc::Code::Unauthenticated, "{method}");
     }
-    ensure_eq!(server.handled.load(Ordering::SeqCst), 0);
+    ensure_eq!(counts.handled.load(Ordering::SeqCst), 0);
     // A call that fails for another reason gets that status instead.
     let frames = optimistic_raw_call(
         &connection,
@@ -1156,8 +1094,8 @@ async fn the_server_refuses_optimistic_calls_it_cannot_decode_once_authorized() 
         Some(&b"4"[..])
     );
     drop(connection);
-    without_memory.stop().await?;
-    server.stop().await
+    without_memory.stop(TEST_TIMEOUT).await?;
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// Echoes six messages one at a time on `STREAM`: the call is answered, so the connection's
@@ -1188,7 +1126,7 @@ async fn ping_pong(channel: &trevrpc::client::Channel, method: &str) -> TestResu
 
 #[tokio::test]
 async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
-    let server = spawn_server(Compression::new()).await?;
+    let (server, counts) = spawn_server(Compression::new()).await?;
     let expected: String = (0..8).map(|i| sample(i).value).collect();
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
         let (_endpoint, channel) = compressed_channel(&server, policy).await?;
@@ -1236,10 +1174,10 @@ async fn refused_calls_are_replayed_over_quic_and_qmux() -> TestResult {
     // The authorizer ran once per attempt, refused or replayed, and the interceptor and each
     // handler once per call: per policy, three refused calls and their replays and two answered
     // calls in between.
-    ensure_eq!(server.handled.load(Ordering::SeqCst), 6);
-    ensure_eq!(server.authorized.load(Ordering::SeqCst), 16);
-    ensure_eq!(server.intercepted.load(Ordering::SeqCst), 10);
-    server.stop().await
+    ensure_eq!(counts.handled.load(Ordering::SeqCst), 6);
+    ensure_eq!(counts.authorized.load(Ordering::SeqCst), 16);
+    ensure_eq!(counts.intercepted.load(Ordering::SeqCst), 10);
+    server.stop(TEST_TIMEOUT).await
 }
 
 /// What a scripted server does with one call.
@@ -1274,7 +1212,7 @@ fn scripted_server(
     CertificateDer<'static>,
     tokio::sync::mpsc::UnboundedReceiver<ScriptedCall>,
 )> {
-    let (cert, mut tls) = self_signed()?;
+    let (cert, mut tls) = support::self_signed()?;
     tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
     let config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
@@ -1471,7 +1409,7 @@ async fn a_replayed_call_keeps_the_connection_metadata_it_started_with() -> Test
     let set = |value: &str| Metadata::from([("x-set".to_owned(), value.as_bytes().to_vec())]);
     let config = ChannelConfig::new().with_connection_metadata(set("first"));
     let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
-    endpoint.set_default_client_config(config.quic_config(client_tls(&cert)?)?);
+    endpoint.set_default_client_config(config.quic_config(support::client_tls(&cert, &[])?)?);
     let channel = within!(
         TEST_TIMEOUT,
         trevrpc::client::Channel::connect_with_config(endpoint, addr, "localhost", config),
@@ -1603,7 +1541,7 @@ fn decompress_plain(payload: &[u8]) -> TestResult<Vec<u8>> {
 #[tokio::test]
 async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_it() -> TestResult {
     // The server holds no dictionaries: compression without one needs none.
-    let server = spawn_server_with(ServerOptions::new()).await?;
+    let (server, _) = spawn_server_with(ServerOptions::new()).await?;
     let (_endpoint, connection) = quic_connection(server.udp, &server.cert).await?;
     let message = prost::Message::encode_to_vec(&long_sample(0));
 
@@ -1655,14 +1593,14 @@ async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_i
     // Channels offer it without any configuration: requests compress from the second call, once
     // the first call's answer arrived, over QUIC and QMux alike.
     for policy in [TransportPolicy::QuicOnly, TransportPolicy::TcpOnly] {
-        let mut tls = client_tls(&server.cert)?;
-        tls.alpn_protocols = vec![trevrpc::ALPN.to_vec()];
         let config = ChannelConfig::new()
-            .with_tcp_fallback(client_tls(&server.cert)?)
+            .with_tcp_fallback(support::client_tls(&server.cert, &[])?)
             .with_tcp_addr(server.tcp)
             .with_transport_policy(policy);
         let mut endpoint = quinn::Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
-        endpoint.set_default_client_config(config.quic_config(client_tls(&server.cert)?)?);
+        endpoint.set_default_client_config(
+            config.quic_config(support::client_tls(&server.cert, &[])?)?,
+        );
         let channel = trevrpc::client::Channel::connect_with_config(
             endpoint.clone(),
             server.udp,
@@ -1694,5 +1632,5 @@ async fn messages_without_a_dictionary_travel_compressed_on_methods_that_allow_i
     }
 
     drop(connection);
-    server.stop().await
+    server.stop(TEST_TIMEOUT).await
 }
