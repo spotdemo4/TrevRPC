@@ -70,6 +70,15 @@ test("the interop scenarios pass against a spec-conforming Echo server", () =>
     ]);
   }));
 
+test("only the scenarios asked for run, in their usual order", () =>
+  withWebTransport(echoHandler, async () => {
+    const results = await runScenarios({ url, scenarios: ["bidi", "unary"] });
+    assert.deepEqual(results, [
+      { name: "unary", ok: true },
+      { name: "bidi", ok: true },
+    ]);
+  }));
+
 test("scenarios fail individually when the server misbehaves", () =>
   withWebTransport(
     // A unary server that ignores request metadata and never reports errors.
@@ -196,6 +205,11 @@ test("the CLI validates its arguments before launching a browser", () => {
     parsed.certHash,
     Array.from({ length: 32 }, () => 0xab),
   );
+  assert.deepEqual(parsed.scenarios, [...ScenarioNames]);
+  assert.deepEqual(parseInteropArguments([...valid, "--scenarios", "bidi,unary"]).scenarios, [
+    "unary",
+    "bidi",
+  ]);
   assert.deepEqual(parseInteropArguments(["--write-page", "out"]), { writePage: "out" });
 
   // The message pins the check each case fails; cases with the same message fail different parts
@@ -206,6 +220,7 @@ test("the CLI validates its arguments before launching a browser", () => {
     [arguments_({ "--cert-hash": "abcd" }), /^--cert-hash must be/],
     [[...valid, "--transport", "quic"], /^--transport must be/],
     [[...valid, "--unknown"], /Unknown option '--unknown'/],
+    [[...valid, "--scenarios", "unary,nope"], /^--scenarios: unknown scenario "nope"/],
     [[...valid, "--page-url", "https://127.0.0.1:4433/"], /^--page-url must be/],
     [
       [...valid, "--page-url", "/relative", "--cert", "cert.pem", "--key", "key.pem"],

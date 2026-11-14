@@ -17,19 +17,19 @@ ln -s .envrc.project .envrc
 direnv allow
 ```
 
-| directory                           | contents                                                       |
-| ----------------------------------- | -------------------------------------------------------------- |
-| `trevrpc-go/`                       | Go runtime, `protoc-gen-trevrpc-go`, examples                  |
-| `trevrpc-rust/`                     | Rust crate, `protoc-gen-trevrpc-rust`, examples                |
-| `trevrpc-js/`                       | browser client, browser interop runner                         |
-| `trevrpc-js/effect/`                | Effect adapter for the browser client                          |
-| `trevrpc-js/protovalidate/`         | protovalidate request validation for the browser client        |
-| `trevrpc-js/protoc-gen-trevrpc-js/` | `protoc-gen-trevrpc-js`, message codecs for the browser client |
-| `trevrpc-kotlin/`                   | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`  |
-| `trevrpc-erlang/`                   | Erlang runtime (in progress: native QUIC, QMux over TLS, zstd) |
-| `interop/`                          | cross-runtime test suite                                       |
-| `bench/`                            | load benchmarks and the grpc-go and connect-go baselines       |
-| `testdata/`                         | wire, QMux, and zstd golden vectors shared by the runtimes     |
+| directory                           | contents                                                                     |
+| ----------------------------------- | ---------------------------------------------------------------------------- |
+| `trevrpc-go/`                       | Go runtime, `protoc-gen-trevrpc-go`, examples                                |
+| `trevrpc-rust/`                     | Rust crate, `protoc-gen-trevrpc-rust`, examples                              |
+| `trevrpc-js/`                       | browser client, browser interop runner                                       |
+| `trevrpc-js/effect/`                | Effect adapter for the browser client                                        |
+| `trevrpc-js/protovalidate/`         | protovalidate request validation for the browser client                      |
+| `trevrpc-js/protoc-gen-trevrpc-js/` | `protoc-gen-trevrpc-js`, message codecs for the browser client               |
+| `trevrpc-kotlin/`                   | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`                |
+| `trevrpc-erlang/`                   | Erlang runtime (in progress: native QUIC, QMux over TLS and WebSocket, zstd) |
+| `interop/`                          | cross-runtime test suite                                                     |
+| `bench/`                            | load benchmarks and the grpc-go and connect-go baselines                     |
+| `testdata/`                         | wire, QMux, and zstd golden vectors shared by the runtimes                   |
 
 ### run
 

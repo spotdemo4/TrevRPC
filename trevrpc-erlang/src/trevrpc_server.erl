@@ -1,4 +1,5 @@
-%% @doc A TrevRPC server over native QUIC (ALPN `trevrpc/1').
+%% @doc A TrevRPC server over native QUIC (ALPN `trevrpc/1'), with QMux over
+%% TLS on a TCP listener for clients that cannot reach UDP.
 %%
 %% ```
 %% Routes = #{
@@ -12,6 +13,11 @@
 %% }),
 %% {ok, Port} = trevrpc_server:port(Server).
 %% '''
+%%
+%% With `webtransport => true', the TCP listener also serves browsers: QMux
+%% over WebSocket at the HTTP path (`http_path', `/trevrpc' by default), for
+%% the sessions that `webtransport_admission' accepts (see
+%% {@link trevrpc_admission}). WebTransport itself is not served yet.
 %%
 %% Messages are opaque binaries here: a handler decodes its request and
 %% encodes its response, usually through generated code. See
@@ -80,7 +86,10 @@
     connection_idle_timeout => pos_integer() | infinity,
     graceful_shutdown_timeout => non_neg_integer(),
     compression => trevrpc_zstd:settings(),
-    stream_compression_memory => non_neg_integer()
+    stream_compression_memory => non_neg_integer(),
+    webtransport => boolean(),
+    webtransport_admission => trevrpc_admission:admission(),
+    http_path => binary()
 }.
 
 %% What each connection process needs, shared by all of them.
@@ -117,6 +126,7 @@
 -define(STOPPING, 2).
 -define(TLS_HANDSHAKE_TIMEOUT, 10000).
 -define(STREAM_COMPRESSION_MEMORY, 268435456).
+-define(HTTP_PATH, <<"/trevrpc">>).
 
 %% @doc Starts a server linked to the caller, listening once it returns.
 -spec start_link(options()) -> {ok, pid()} | ignore | {error, term()}.
@@ -153,10 +163,12 @@ init(Opts) ->
     process_flag(trap_exit, true),
     _ = application:ensure_all_started(quic),
     _ = application:ensure_all_started(ssl),
+    _ = application:ensure_all_started(h1),
     maybe
         {ok, Credentials} ?= trevrpc_quic:credentials(Opts),
         {ok, Compression} ?= compression(Opts),
         ok ?= check_routes(maps:get(routes, Opts)),
+        ok ?= check_browsers(Opts),
         listen(Opts, Credentials, Compression)
     else
         {error, Reason} -> {error, Reason}
@@ -179,6 +191,20 @@ check_routes(Routes) ->
     case Invalid of
         [] -> ok;
         [Error | _] -> {error, Error}
+    end.
+
+check_browsers(Opts) ->
+    case Opts of
+        #{webtransport := Enabled} when not is_boolean(Enabled) ->
+            {error, {invalid_option, webtransport}};
+        #{webtransport_admission := Admission} when not is_function(Admission, 1) ->
+            {error, {invalid_option, webtransport_admission}};
+        #{http_path := <<"/", _/binary>>} ->
+            ok;
+        #{http_path := _} ->
+            {error, {invalid_option, http_path}};
+        #{} ->
+            ok
     end.
 
 route_errors(Route) ->
@@ -242,24 +268,46 @@ listen_tcp(#{tcp := false}, _Credentials, _State, _MaxConnections) ->
 listen_tcp(
     Opts, Credentials, #state{name = Name, config = Config, counters = Counters}, MaxConnections
 ) ->
-    Accept = fun(Socket) ->
-        case
-            admit(
-                fun() -> trevrpc_server_conn:start_qmux(Socket, Config) end,
-                Config,
-                Counters,
-                MaxConnections
-            )
-        of
-            {ok, _Pid} -> ok;
-            {error, _} = Error -> Error
+    Qmux = fun(Session) ->
+        fun(Socket) ->
+            case
+                admit(
+                    fun() -> trevrpc_server_conn:start_qmux(Socket, Session, Config) end,
+                    Config,
+                    Counters,
+                    MaxConnections
+                )
+            of
+                {ok, _Pid} -> ok;
+                {error, _} = Error -> Error
+            end
         end
     end,
+    Handshake = maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
+    Accept0 = #{qmux => Qmux(#{})},
+    Accept =
+        case maps:get(webtransport, Opts, false) of
+            true ->
+                Http = #{
+                    path => maps:get(http_path, Opts, ?HTTP_PATH),
+                    admission => maps:get(
+                        webtransport_admission, Opts, fun trevrpc_admission:no_origin/1
+                    ),
+                    timeout => Handshake,
+                    room => fun() -> room(Counters, MaxConnections) end
+                },
+                WebSocket = fun(Socket, Received) ->
+                    (Qmux(#{framing => websocket, received => Received}))(Socket)
+                end,
+                Accept0#{http1 => fun(Socket) -> trevrpc_http1:serve(Socket, Http, WebSocket) end};
+            false ->
+                Accept0
+        end,
     {ok, UdpPort} = quic:get_server_port(Name),
     Listen = #{
         ip => maps:get(ip, Opts, {0, 0, 0, 0}),
         port => maps:get(tcp_port, Opts, UdpPort),
-        handshake_timeout => maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
+        handshake_timeout => Handshake,
         max_handshakes => maps:get(max_tls_handshakes, Opts, 256)
     },
     case trevrpc_tcp_listener:start_link(Listen, Credentials, Accept) of
@@ -316,14 +364,8 @@ qmux_options(Opts) ->
 %% handshake's process: refuses it when the server is full or stopping,
 %% otherwise starts the process that will own it.
 admit(Start, #{server := Server}, Counters, MaxConnections) ->
-    Stopping = counters:get(Counters, ?STOPPING) =:= 1,
-    Full = counters:get(Counters, ?CONNECTIONS) >= MaxConnections,
-    if
-        Stopping ->
-            {error, shutting_down};
-        Full ->
-            {error, too_many_connections};
-        true ->
+    case room(Counters, MaxConnections) of
+        ok ->
             counters:add(Counters, ?CONNECTIONS, 1),
             case Start() of
                 {ok, Pid} ->
@@ -332,6 +374,20 @@ admit(Start, #{server := Server}, Counters, MaxConnections) ->
                 Error ->
                     counters:sub(Counters, ?CONNECTIONS, 1),
                     Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% Whether the server takes another connection now.
+room(Counters, MaxConnections) ->
+    case counters:get(Counters, ?STOPPING) of
+        1 ->
+            {error, shutting_down};
+        0 ->
+            case counters:get(Counters, ?CONNECTIONS) >= MaxConnections of
+                true -> {error, too_many_connections};
+                false -> ok
             end
     end.
 

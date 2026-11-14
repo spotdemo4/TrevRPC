@@ -117,30 +117,45 @@ class CellsTest(unittest.TestCase):
         self.assertEqual({"webtransport", "websocket", "app-webtransport"}, compressed)
         self.assertEqual(2, sum("--dictionary" not in cell.command for cell in cells))
 
-    def test_browser_lanes_need_their_ports_and_every_scenario(self) -> None:
+    def test_browser_lanes_need_their_ports_and_select_the_servers_scenarios(self) -> None:
         native_only = FakeServer("erlang", {"native": 1001})
-        partial = FakeServer("erlang", PORTS, ["unary"])
+        partial = FakeServer("erlang", PORTS, ["unary", "bidi"])
+        websocket_only = FakeServer("erlang", {"native": 1001, "qmux": 1002, "websocket": 1002})
 
         missing = run.browser_cells(
             "chromium", native_only, self.certificate, list(run.BROWSER_LANES), Path("d.dict")
         )
-        selective = run.browser_cells(
+        [selective] = run.browser_cells(
             "chromium", partial, self.certificate, ["webtransport"], Path("d.dict")
+        )
+        websocket = run.browser_cells(
+            "chromium", websocket_only, self.certificate, list(run.BROWSER_LANES), Path("d.dict")
         )
 
         self.assertEqual(
             [
                 "server erlang does not serve webtransport",
-                "server erlang does not serve webtransport, websocket",
+                "server erlang does not serve websocket",
                 "server erlang does not serve websocket",
                 "server erlang does not serve http3, webtransport",
-                "server erlang does not serve http2, webtransport, websocket",
+                "server erlang does not serve http2, websocket",
             ],
             [cell.skip for cell in missing],
         )
+        self.assertIsNone(selective.skip)
+        self.assertEqual(["--scenarios", "unary,bidi"], selective.command[-2:])
+        # Without WebTransport, the WebSocket lanes still run, with the WebSocket port as --url.
         self.assertEqual(
-            ["server erlang supports only some scenarios"], [c.skip for c in selective]
+            [
+                None,
+                None,
+                "server erlang does not serve http3, webtransport",
+                "server erlang does not serve http2",
+            ],
+            [cell.skip for cell in websocket if cell.name != "chromium-webtransport-to-erlang"],
         )
+        [lane] = [cell for cell in websocket if cell.name == "chromium-websocket-to-erlang"]
+        self.assertIn("https://127.0.0.1:1002/trevrpc", lane.command)
 
     def test_app_lanes_pin_the_page_protocol_where_the_browser_can_be_steered(self) -> None:
         pages: dict[str, list[str]] = {}

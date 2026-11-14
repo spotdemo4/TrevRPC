@@ -70,7 +70,7 @@ function incompressible(n) {
  * "websocket") the channel connected over, and `open(options)` connects another channel to the
  * same server, which the scenario closes.
  */
-const scenarios = {
+const Scenarios = {
   async unary(echo) {
     expectEcho(await echo.unary({ message: "hello" }), "hello", 0);
   },
@@ -497,9 +497,9 @@ async function compressedUpload(compressed) {
 }
 
 /**
- * Runs every scenario against the server at url, reporting each result as it completes through
- * onResult({ name, ok, reason }). Resolves with all results. A server that cannot be reached
- * fails every scenario.
+ * Runs the scenarios (every one by default, in ScenarioNames order) against the server at url,
+ * reporting each result as it completes through onResult({ name, ok, reason }). Resolves with all
+ * results. A server that cannot be reached fails every scenario.
  *
  * transport is "webtransport" (the default), "websocket" (QMux over WebSocket at webSocketUrl),
  * or "auto" (WebTransport with the WebSocket fallback). expectTransport fails every scenario
@@ -514,8 +514,10 @@ export async function runScenarios({
   webSocketUrl,
   expectTransport,
   dictionary,
+  scenarios = ScenarioNames,
   onResult = () => {},
 }) {
+  const names = ScenarioNames.filter((name) => scenarios.includes(name));
   const results = [];
   const report = (name, error) => {
     const result =
@@ -544,7 +546,7 @@ export async function runScenarios({
       throw new Error(`connected over ${channel.transport}, want ${expectTransport}`);
     }
   } catch (error) {
-    for (const name of ScenarioNames) {
+    for (const name of names) {
       report(name, new Error(`connect: ${describe(error)}`));
     }
     return results;
@@ -566,9 +568,9 @@ export async function runScenarios({
         return channel.transport;
       },
     };
-    for (const name of ScenarioNames) {
+    for (const name of names) {
       try {
-        await scenarios[name](echo, context);
+        await Scenarios[name](echo, context);
         report(name);
       } catch (error) {
         report(name, error);
@@ -581,7 +583,7 @@ export async function runScenarios({
 }
 
 for (const name of ScenarioNames) {
-  if (typeof scenarios[name] !== "function") {
+  if (typeof Scenarios[name] !== "function") {
     throw new Error(`missing interop scenario ${name}`);
   }
 }

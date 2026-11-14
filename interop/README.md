@@ -9,14 +9,15 @@ client also has a TCP fallback for networks that block UDP.
 | Go                       | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
 | Rust                     | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
 | Erlang                   | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
-| JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust         |
-| JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust         |
+| JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
+| JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust, Erlang |
 | Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust         |
 | JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust         |
 
-The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves and calls native
-QUIC and QMux over TLS only so far, and takes part in what it implements; see
-[Partial runtimes](#partial-runtimes).
+The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves native QUIC, QMux
+over TLS and QMux over WebSocket, and calls native QUIC and QMux over TLS, so far. It takes part
+in what it implements; see [Partial runtimes](#partial-runtimes). Browsers reach it over the
+websocket and fallback lanes.
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
 packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,
@@ -40,9 +41,8 @@ what it does, and what it skips is reported, never counted as passed:
 - A server leaves the ports of the transports it does not serve out of its
   readiness line, and `run.py` skips the cells that need them.
 - A server that supports only some scenarios lists them in its readiness line,
-  and `run.py` passes that list to native clients as `--scenarios`, so they
-  skip the rest. Browser cells against such a server are skipped, as the
-  browser runner cannot select scenarios yet.
+  and `run.py` passes that list to native and browser clients as `--scenarios`,
+  so they skip the rest.
 - A client given a transport it does not speak exits `77`, and its cell is
   skipped.
 - A client prints `skip <name>: <reason>` for each scenario it does not run.
@@ -309,14 +309,15 @@ trevrpc-interop-browser --browser chromium|firefox|safari --url <https://host:po
                         [--ws-url <wss://host:port/trevrpc>]
                         [--expect-transport webtransport|websocket] [--dictionary <file>]
                         [--page-url <https://host:port/> --cert <cert.pem> --key <key.pem>
-                         [--page-protocol h2|h3]]
+                         [--page-protocol h2|h3]] [--scenarios <name,...>]
 trevrpc-interop-browser --write-page <dir>
 ```
 
 It follows the same output contract. `--transport` defaults to `webtransport`;
 `--ws-url` defaults to `--url` with the `wss:` scheme. `--expect-transport`
 fails the run unless the channel connected over that transport. `--dictionary`
-makes the channel compress Echo messages with that zstd dictionary. Chromium and
+makes the channel compress Echo messages with that zstd dictionary. `--scenarios` runs only the
+scenarios it names, as the native clients' flag does. Chromium and
 Firefox ignore certificate errors, because WSS cannot pin a certificate hash.
 Safari is driven through `safaridriver`, which needs `sudo safaridriver --enable`
 once, and cannot ignore certificate errors (see [Certificates](#certificates)).

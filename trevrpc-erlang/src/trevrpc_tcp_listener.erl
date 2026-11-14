@@ -1,23 +1,33 @@
 %% @private The server's TCP listener: TLS connections, dispatched on the
-%% negotiated ALPN. `qmux-02.trevrpc-1' carries TrevRPC over QMux; the
-%% HTTP/2 and WebSocket fallbacks are not served yet, so it is the only
-%% protocol offered.
+%% negotiated ALPN. `qmux-02.trevrpc-1' carries TrevRPC over QMux. When the
+%% server serves browsers, `http/1.1' (or no ALPN at all) is HTTP/1.1, where
+%% a WebSocket upgrade carries QMux. HTTP/2 is not served yet.
 %%
 %% Each connection's handshake runs in a process of its own, bounded by the
 %% handshake timeout, so a slow client holds up no other. At most
 %% `max_handshakes' run at once: past that, connections wait in the kernel's
-%% backlog, so half-open handshakes cannot take every file descriptor.
+%% backlog, so half-open handshakes cannot take every file descriptor. An
+%% HTTP/1.1 connection counts as one until it upgrades to a WebSocket, its
+%% requests bounded by the same timeout.
 -module(trevrpc_tcp_listener).
 
 -export([start_link/3, port/1, stop/1]).
 
+-export_type([accept/0]).
+
+%% What serves each protocol: `qmux' takes over the socket of each QMux
+%% connection, as its controlling process, once its handshake completed,
+%% and `http1', when present, that of each HTTP/1.1 connection. They run in
+%% the handshake's process.
+-type accept() :: #{
+    qmux := fun((ssl:sslsocket()) -> ok | {error, term()}),
+    http1 => fun((ssl:sslsocket()) -> ok | {error, term()})
+}.
+
 %% @doc Starts listening on `port' at `ip' with the TLS `Credentials', linked
 %% to the caller, with at most `max_handshakes' handshakes of at most
-%% `handshake_timeout' milliseconds at once. `Accept' takes over each QMux connection's socket, as its
-%% controlling process, once its handshake completed; it runs in the
-%% handshake's process.
--spec start_link(map(), map(), fun((ssl:sslsocket()) -> ok | {error, term()})) ->
-    {ok, pid()} | {error, term()}.
+%% `handshake_timeout' milliseconds at once, serving what `Accept' has.
+-spec start_link(map(), map(), accept()) -> {ok, pid()} | {error, term()}.
 start_link(Opts, Credentials, Accept) ->
     Self = self(),
     Pid = proc_lib:spawn_link(fun() -> init(Self, Opts, Credentials, Accept) end),
@@ -52,7 +62,9 @@ init(Parent, Opts, #{cert := Cert, key := Key} = Credentials, Accept) ->
         {backlog, 1024},
         {ip, maps:get(ip, Opts, {0, 0, 0, 0})},
         {versions, ['tlsv1.3', 'tlsv1.2']},
-        {alpn_preferred_protocols, [trevrpc:qmux_alpn()]},
+        {alpn_preferred_protocols, [
+            trevrpc:qmux_alpn() | [<<"http/1.1">> || is_map_key(http1, Accept)]
+        ]},
         {certs_keys, [
             #{
                 cert => [Cert | maps:get(cert_chain, Credentials, [])],
@@ -137,18 +149,26 @@ handshake_owned(Socket, Accept, Timeout) ->
     case ssl:handshake(Socket, Timeout) of
         {ok, Tls} ->
             Qmux = trevrpc:qmux_alpn(),
-            case ssl:negotiated_protocol(Tls) of
-                {ok, Qmux} ->
-                    case Accept(Tls) of
+            Protocol =
+                case ssl:negotiated_protocol(Tls) of
+                    {ok, Qmux} -> qmux;
+                    {ok, <<"http/1.1">>} -> http1;
+                    {error, protocol_not_negotiated} -> http1;
+                    Other0 -> Other0
+                end,
+            case Accept of
+                #{Protocol := Serve} ->
+                    case Serve(Tls) of
                         ok ->
                             ok;
                         {error, Reason} ->
-                            logger:warning("trevrpc: refused QMux connection from ~s: ~p", [
-                                Peer, Reason
+                            logger:warning("trevrpc: refused ~s connection from ~s: ~p", [
+                                name(Protocol), Peer, Reason
                             ]),
                             ssl:close(Tls)
                     end;
-                Other ->
+                #{} ->
+                    Other = ssl:negotiated_protocol(Tls),
                     logger:warning(
                         "trevrpc: TLS connection from ~s negotiated ~p, which is not served", [
                             Peer, Other
@@ -161,6 +181,9 @@ handshake_owned(Socket, Accept, Timeout) ->
             _ = ssl:close(Socket),
             ok
     end.
+
+name(qmux) -> "QMux";
+name(http1) -> "HTTP/1.1".
 
 peer(Socket) ->
     case ssl:peername(Socket) of

@@ -6,7 +6,11 @@
 //                           [--transport webtransport|websocket|auto] [--ws-url <url>]
 //                           [--expect-transport webtransport|websocket] [--dictionary <file>]
 //                           [--page-url <url> --cert <pem> --key <pem> [--page-protocol h2|h3]]
+//                           [--scenarios <name,...>]
 //   trevrpc-interop-browser --write-page <dir>
+//
+// --scenarios runs only the scenarios it names, for a server that supports only some, and prints
+// `skip <name>: <reason>` for the others.
 //
 // --dictionary makes the channel compress Echo messages with that zstd dictionary, the one the
 // interop servers hold.
@@ -42,7 +46,8 @@ export const InteropUsage =
   "usage: trevrpc-interop-browser --browser chromium|firefox|safari --url <url> --cert-hash <hex>" +
   " [--transport webtransport|websocket|auto] [--ws-url <url>]" +
   " [--expect-transport webtransport|websocket] [--dictionary <file>]" +
-  " [--page-url <url> --cert <pem> --key <pem> [--page-protocol h2|h3]]\n" +
+  " [--page-url <url> --cert <pem> --key <pem> [--page-protocol h2|h3]]" +
+  " [--scenarios <name,...>]\n" +
   "       trevrpc-interop-browser --write-page <dir>\n" +
   "       trevrpc-interop-browser bench ...";
 const Transports = ["webtransport", "websocket", "auto"];
@@ -65,11 +70,15 @@ export async function runInteropCommand(args) {
   const results = await readDictionary(dictionaryFile)
     .then((dictionary) => runInBrowser({ ...run, dictionary }))
     .catch((error) =>
-      Object.fromEntries(ScenarioNames.map((name) => [name, failure(describe(error))])),
+      Object.fromEntries(run.scenarios.map((name) => [name, failure(describe(error))])),
     );
 
   let passed = true;
   for (const name of ScenarioNames) {
+    if (!run.scenarios.includes(name)) {
+      console.log(`skip ${name}: not in --scenarios`);
+      continue;
+    }
     const result = results[name] ?? failure("did not complete");
     passed &&= result.ok;
     console.log(result.ok ? `ok ${name}` : `fail ${name}: ${result.reason}`);
@@ -92,6 +101,7 @@ export function parseInteropArguments(args) {
     cert: { type: "string" },
     key: { type: "string" },
     "write-page": { type: "string" },
+    scenarios: { type: "string" },
   });
   if (values["write-page"] !== undefined) {
     if (Object.keys(values).some((name) => !["write-page", "transport"].includes(name))) {
@@ -132,6 +142,7 @@ export function parseInteropArguments(args) {
   }
   return {
     browser,
+    scenarios: parseScenarios(values.scenarios),
     page: pageUrl && { url: pageUrl, cert: values.cert, key: values.key, protocol: pageProtocol },
     pageProtocol,
     url: values.url,
@@ -143,6 +154,20 @@ export function parseInteropArguments(args) {
   };
 }
 
+/** The scenarios a --scenarios list names, every one without it; throws a UsageError otherwise. */
+function parseScenarios(list) {
+  if (list === undefined) {
+    return [...ScenarioNames];
+  }
+  const names = list.split(",");
+  for (const name of names) {
+    if (!ScenarioNames.includes(name)) {
+      throw new UsageError(`--scenarios: unknown scenario ${JSON.stringify(name)}`);
+    }
+  }
+  return ScenarioNames.filter((name) => names.includes(name));
+}
+
 /** Writes the page to dir: index.html, and the page.js bundle it loads. */
 async function writePage(dir) {
   await mkdir(dir, { recursive: true });
@@ -152,6 +177,7 @@ async function writePage(dir) {
 
 /** Runs the page's scenarios, resolving with a result per scenario name that completed. */
 async function runInBrowser({ browser, page, ...input }) {
+  const { scenarios } = input;
   const results = {};
   try {
     await runPage({
@@ -171,7 +197,7 @@ async function runInBrowser({ browser, page, ...input }) {
     });
   } catch (error) {
     // Scenarios that completed before the failure keep their results.
-    for (const name of ScenarioNames) {
+    for (const name of scenarios) {
       results[name] ??= failure(describe(error));
     }
   }

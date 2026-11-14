@@ -7,7 +7,7 @@
 Servers and native clients are interop executables taking the `server` and `client` subcommands.
 A runtime that does not implement everything yet takes part in what it does: a cell is skipped
 when its server reports no port for the transport it needs or its client exits 77 for a transport
-it lacks, and native clients skip the scenarios their server does not list. Only cells of the
+it lacks, and clients skip the scenarios their server does not list. Only cells of the
 runtimes named by `--may-skip` may skip; a skip anywhere else fails the run.
 Browsers run through `trevrpc-interop-browser`, by default over every lane: WebTransport, QMux over
 WebSocket, the fallback from a blocked UDP port to WebSocket, and the app lanes, where the server
@@ -200,24 +200,23 @@ def browser_cells(
     app_page = "http3" if browser == "chromium" else "http2"
     needs = {
         "webtransport": ["webtransport"],
-        "websocket": ["webtransport", "websocket"],
+        "websocket": ["websocket"],
         "fallback": ["websocket"],
         "app-webtransport": [app_page, "webtransport"],
-        "app-websocket": ["http2", "webtransport", "websocket"],
+        "app-websocket": ["http2", "websocket"],
     }
+    # A server that supports only some scenarios has the browser skip the others.
+    scenarios = [] if server.scenarios is None else ["--scenarios", ",".join(server.scenarios)]
     cells: list[Cell] = []
     runtimes = (browser, server.name)
     for lane in [lane for lane in BROWSER_LANES if lane in lanes]:
         name = f"{browser}-{lane}-to-{server.name}"
         if missing := server.missing(*needs[lane]):
             cells.append(skipped_cell(name, runtimes, server, missing))
-        elif server.scenarios is not None:
-            # The browser runner cannot leave scenarios out yet.
-            reason = f"server {server.name} supports only some scenarios"
-            cells.append(Cell(name, [], runtimes, skip=reason))
         else:
             arguments = browser_arguments(browser, lane, server, certificate, dictionary)
-            cells.append(Cell(name, [BROWSER, "--browser", browser, *arguments], runtimes))
+            command = [BROWSER, "--browser", browser, *arguments, *scenarios]
+            cells.append(Cell(name, command, runtimes))
     return cells
 
 
@@ -227,7 +226,10 @@ def browser_arguments(
     """The `trevrpc-interop-browser` arguments of one browser lane."""
     cert_hash = hashlib.sha256(certificate.der()).hexdigest()
     port = server.ports.get
-    webtransport = ["--url", f"https://127.0.0.1:{port('webtransport')}/trevrpc"]
+    # The WebSocket lanes leave the WebTransport URL unused, but the CLI takes one: a server without
+    # WebTransport gets its WebSocket URL there.
+    url_port = port("webtransport") or port("websocket")
+    webtransport = ["--url", f"https://127.0.0.1:{url_port}/trevrpc"]
     websocket = ["--ws-url", f"wss://127.0.0.1:{port('websocket')}/trevrpc"]
     pin = ["--cert-hash", cert_hash]
     compress = ["--dictionary", str(dictionary)]

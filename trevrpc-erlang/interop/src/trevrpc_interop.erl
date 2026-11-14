@@ -9,10 +9,11 @@
 %%                               [--scenarios <name,...>]
 %% '''
 %%
-%% The runtime serves and calls native QUIC and QMux over TLS; it has no
-%% HTTP/3, WebTransport, HTTP/2 or WebSocket yet. The server reports only the
-%% ports of what it serves and the scenarios it supports; the client reports
-%% the scenarios it does not implement as skipped.
+%% The runtime serves native QUIC, QMux over TLS and QMux over WebSocket, and
+%% calls native QUIC and QMux over TLS; it has no HTTP/3, WebTransport or
+%% HTTP/2 yet. The server reports only the ports of what it serves and the
+%% scenarios it supports; the client reports the scenarios it does not
+%% implement as skipped.
 -module(trevrpc_interop).
 
 -export([main/0, server_scenarios/0, compression/1]).
@@ -100,18 +101,25 @@ flags([Arg | _], _Allowed, _Flags) ->
 
 server(#{"cert" := Cert, "key" := Key} = Flags) ->
     {ok, Host} = inet:parse_address(maps:get("host", Flags, "127.0.0.1")),
-    %% With no HTTP fallback, --web-root is accepted and unused.
+    %% With no HTTP fallback, --web-root is accepted and unused. The browser
+    %% runner's page comes from an origin of its own, so every origin is
+    %% admitted.
     {ok, Server} = trevrpc_server:start(#{
         ip => Host,
         port => list_to_integer(maps:get("port", Flags, "0")),
         certfile => Cert,
         keyfile => Key,
         routes => routes(),
-        compression => compression(Flags)
+        compression => compression(Flags),
+        webtransport => true,
+        webtransport_admission => fun(_Request) -> true end
     }),
     {ok, Port} = trevrpc_server:port(Server),
     {ok, TcpPort} = trevrpc_server:tcp_port(Server),
-    io:put_chars(json:encode(#{native => Port, qmux => TcpPort, scenarios => server_scenarios()})),
+    Ready = #{
+        native => Port, qmux => TcpPort, websocket => TcpPort, scenarios => server_scenarios()
+    },
+    io:put_chars(json:encode(Ready)),
     io:nl(),
     %% Runs until stdin reaches EOF; SIGTERM stops the whole VM.
     wait_stdin(),

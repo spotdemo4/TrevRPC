@@ -16,7 +16,7 @@
 
 -behaviour(gen_server).
 
--export([start/2, start_qmux/2, shutdown/1, finish/3, reserve/4]).
+-export([start/2, start_qmux/3, shutdown/1, finish/3, reserve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(entry, {
@@ -66,15 +66,18 @@ start(Conn, Config) ->
     gen_server:start(?MODULE, {{quic, Conn}, Config}, []).
 
 %% @doc Starts the owner of a QMux session over the TLS connection `Socket',
-%% whose handshake completed. The caller must be the socket's controlling
-%% process; the session takes it over.
--spec start_qmux(ssl:sslsocket(), trevrpc_server:config()) -> {ok, pid()} | {error, term()}.
-start_qmux(Socket, Config) ->
+%% whose handshake completed, with the server's session options and `Opts'
+%% (how its records travel: see {@link trevrpc_qmux:options()}).
+%% The caller must be the socket's controlling process; the session takes
+%% it over.
+-spec start_qmux(ssl:sslsocket(), map(), trevrpc_server:config()) ->
+    {ok, pid()} | {error, term()}.
+start_qmux(Socket, Opts, Config) ->
     case gen_server:start(?MODULE, {undefined, Config}, []) of
         {ok, Pid} ->
             case ssl:controlling_process(Socket, Pid) of
                 ok ->
-                    gen_server:cast(Pid, {qmux, Socket}),
+                    gen_server:cast(Pid, {qmux, Socket, Opts}),
                     {ok, Pid};
                 {error, _} = Error ->
                     exit(Pid, kill),
@@ -146,8 +149,8 @@ handle_call({finish, Id, Ref}, _From, #state{streams = Streams} = State) ->
     end.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
-handle_cast({qmux, Socket}, #state{config = Config} = State) ->
-    case trevrpc_qmux:start(Socket, server, self(), maps:get(qmux, Config)) of
+handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
+    case trevrpc_qmux:start(Socket, server, self(), maps:merge(maps:get(qmux, Config), Opts)) of
         {ok, Session} ->
             {noreply, State#state{
                 transport = {qmux, Session}, session_monitor = monitor(process, Session)

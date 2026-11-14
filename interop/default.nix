@@ -25,7 +25,7 @@ callPackage ./runner.nix {
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
       "erlang=${lib.getExe trevrpc-erlang-interop}"
     ];
-    # The Erlang runtime serves and calls native QUIC only so far; its cells skip the rest.
+    # The Erlang runtime does not implement every transport and scenario yet; its cells skip the rest.
     may-skip = [ "erlang" ];
     browser = lib.optionals stdenv.hostPlatform.isLinux [
       "chromium"

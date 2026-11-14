@@ -1,6 +1,8 @@
 %% @doc A QMux session (draft-ietf-quic-qmux-02) over a TLS connection: QUIC's
 %% bidirectional streams, flow control and stream limits, carried in
-%% Size-prefixed records over a reliable byte stream.
+%% Size-prefixed records over a reliable byte stream, or in WebSocket
+%% messages (draft-lcurley-qmux-websocket-00) over a TLS connection that
+%% upgraded to a WebSocket (see `trevrpc_qmux_record').
 %%
 %% Its API and the events it sends its owner mirror erlang_quic's, so the
 %% rest of the runtime drives native QUIC and QMux the same way (see
@@ -53,13 +55,19 @@
 %%       QX_TRANSPORT_PARAMETERS to arrive (default 10 s).</li>
 %%   <li>`send_timeout': milliseconds a write to a peer that stopped reading
 %%       may block before the connection is lost (default 30 s).</li>
+%%   <li>`framing': how records travel, `tls' (the default) or
+%%       `websocket'.</li>
+%%   <li>`received': bytes already read from the socket, which come before
+%%       what it delivers (default none).</li>
 %% </ul>
 -type options() :: #{
     parameters := trevrpc_qmux_frame:parameters(),
     keep_alive => pos_integer() | infinity,
     send_queue_limit => pos_integer(),
     handshake_timeout => pos_integer(),
-    send_timeout => pos_integer()
+    send_timeout => pos_integer(),
+    framing => trevrpc_qmux_record:framing(),
+    received => binary()
 }.
 
 -record(stream, {
@@ -93,7 +101,9 @@
     local :: trevrpc_qmux_frame:parameters(),
     peer :: trevrpc_qmux_frame:parameters() | undefined,
     max_record_size :: pos_integer(),
-    buffer = <<>> :: binary(),
+    framing :: trevrpc_qmux_record:t(),
+    %% Bytes read before the session took the socket over.
+    received = <<>> :: binary(),
     streams = #{} :: #{non_neg_integer() => #stream{}},
     %% Streams we opened and may open; streams the peer opened and may open.
     opened_local = 0 :: non_neg_integer(),
@@ -220,13 +230,14 @@ init({Role, Owner, Opts}) ->
     Local = maps:get(parameters, Opts),
     Now = now_ms(),
     InitialData = maps:get(initial_max_data, Local, 0),
+    MaxRecordSize = maps:get(max_record_size, Local, trevrpc_qmux_frame:default_max_record_size()),
     {ok, #state{
         role = Role,
         owner = Owner,
         local = Local,
-        max_record_size = maps:get(
-            max_record_size, Local, trevrpc_qmux_frame:default_max_record_size()
-        ),
+        max_record_size = MaxRecordSize,
+        framing = trevrpc_qmux_record:new(maps:get(framing, Opts, tls), Role, MaxRecordSize),
+        received = maps:get(received, Opts, <<>>),
         max_remote = maps:get(initial_max_streams_bidi, Local, 0),
         conn_recv_max = InitialData,
         conn_recv_window = InitialData,
@@ -291,10 +302,10 @@ handle_cast({socket, Socket}, #state{handshake_timeout = Handshake, send_timeout
     %% A write that blocks longer than the send timeout closes the socket, so
     %% a peer that stops reading cannot hold this process, its timers and its
     %% callers.
-    case ssl:setopts(Socket, [{active, once}, {send_timeout, Send}, {send_timeout_close, true}]) of
+    case ssl:setopts(Socket, [{send_timeout, Send}, {send_timeout_close, true}]) of
         ok ->
             erlang:send_after(Handshake, self(), handshake_timeout),
-            noreply(State#state{socket = Socket});
+            received(State#state.received, State#state{socket = Socket, received = <<>>});
         {error, Reason} ->
             {stop, normal, lost({connection_lost, Reason}, State#state{socket = Socket})}
     end;
@@ -313,19 +324,7 @@ handle_info({ssl, Socket, _Data}, #state{socket = Socket, closing = true} = Stat
     %% Draining after CONNECTION_CLOSE.
     {noreply, State};
 handle_info({ssl, Socket, Data}, #state{socket = Socket} = State) ->
-    case
-        records(<<(State#state.buffer)/binary, Data/binary>>, State#state{last_received = now_ms()})
-    of
-        {ok, Next} ->
-            case ssl:setopts(Socket, [{active, once}]) of
-                ok -> noreply(Next);
-                {error, Reason} -> {stop, normal, lost({connection_lost, Reason}, Next)}
-            end;
-        {error, {Code, FrameType, Reason}, Next} ->
-            fail(Code, FrameType, Reason, Next);
-        {closed, Reason, Next} ->
-            quiet_close(Reason, Next)
-    end;
+    received(Data, State#state{last_received = now_ms()});
 handle_info({ssl_closed, Socket}, #state{socket = Socket, closing = true} = State) ->
     {stop, normal, State};
 handle_info({ssl_closed, Socket}, #state{socket = Socket} = State) ->
@@ -362,22 +361,61 @@ noreply(State) ->
 
 %%% Receiving
 
-records(Bin, State) ->
-    case trevrpc_qmux_frame:decode_record(Bin, State#state.max_record_size) of
-        more ->
-            {ok, State#state{buffer = Bin}};
-        {error, Error} ->
-            {error, Error, State};
-        {ok, Record, Rest} ->
-            case trevrpc_qmux_frame:decode_frames(Record) of
-                {ok, Frames} ->
-                    case frames(Frames, State) of
-                        {ok, Next} -> records(Rest, Next);
-                        Other -> Other
-                    end;
-                {error, Error} ->
-                    {error, Error, State}
+%% Handles bytes from the socket, then reads on.
+received(Data, State) ->
+    {Records, Replies, Then, Framing} =
+        case trevrpc_qmux_record:decode(Data, State#state.framing) of
+            {ok, R, P, F} -> {R, P, read_on, F};
+            {closed, Reason, R, P, F} -> {R, P, {closed, Reason}, F};
+            {error, Error, R, P, F} -> {R, P, {error, Error}, F}
+        end,
+    Result = records(Records, State#state{framing = Framing}),
+    After =
+        case Result of
+            {ok, S} -> S;
+            {_, _, S} -> S
+        end,
+    case send_now(Replies, After) of
+        {error, Reason1, Next} ->
+            {stop, normal, lost({connection_lost, Reason1}, Next)};
+        {ok, Next} ->
+            case {Result, Then} of
+                {{error, {Code, FrameType, Reason2}, _}, _} ->
+                    fail(Code, FrameType, Reason2, Next);
+                {{closed, Reason2, _}, _} ->
+                    quiet_close(Reason2, Next);
+                {{ok, _}, {error, {Code, FrameType, Reason2}}} ->
+                    fail(Code, FrameType, Reason2, Next);
+                {{ok, _}, {closed, Reason2}} ->
+                    quiet_close(Reason2, Next);
+                {{ok, _}, read_on} ->
+                    case ssl:setopts(Next#state.socket, [{active, once}]) of
+                        ok -> noreply(Next);
+                        {error, Reason2} -> {stop, normal, lost({connection_lost, Reason2}, Next)}
+                    end
             end
+    end.
+
+%% Sends what the framing answers the peer with, such as pongs, at once.
+send_now([], State) ->
+    {ok, State};
+send_now(Bytes, #state{socket = Socket} = State) ->
+    case ssl:send(Socket, Bytes) of
+        ok -> {ok, State#state{last_sent = now_ms()}};
+        {error, Reason} -> {error, Reason, State}
+    end.
+
+records([], State) ->
+    {ok, State};
+records([Record | Rest], State) ->
+    case trevrpc_qmux_frame:decode_frames(Record) of
+        {ok, Frames} ->
+            case frames(Frames, State) of
+                {ok, Next} -> records(Rest, Next);
+                Other -> Other
+            end;
+        {error, Error} ->
+            {error, Error, State}
     end.
 
 frames([], State) ->
@@ -757,7 +795,7 @@ flush(State, Records) ->
         [] ->
             send_records(lists:reverse(Records), Next);
         _ ->
-            Batch = [trevrpc_qmux_frame:record(Frames) | Records],
+            Batch = [trevrpc_qmux_record:encode(Frames, Next#state.framing) | Records],
             case iolist_size(Batch) >= 4 * ?MAX_SEND_RECORD of
                 true ->
                     case send_records(lists:reverse(Batch), Next) of
@@ -984,16 +1022,18 @@ close_with(Frame, Reason, #state{socket = Socket, owner = Owner} = State) ->
         undefined ->
             {stop, normal, State};
         _ ->
-            _ = ssl:send(Socket, trevrpc_qmux_frame:record(Frame)),
+            _ = ssl:send(Socket, trevrpc_qmux_record:close(Frame, State#state.framing)),
             _ = ssl:shutdown(Socket, write),
             erlang:send_after(?CLOSE_TIMEOUT, self(), close_timeout),
             _ = ssl:setopts(Socket, [{active, true}]),
             {noreply, State#state{closing = true}}
     end.
 
-%% The peer closed, or the idle timeout expired: end without frames.
+%% The peer closed, or the idle timeout expired: end without frames, but
+%% with the closing handshake of a WebSocket.
 quiet_close(Reason, #state{socket = Socket, owner = Owner} = State) ->
     Owner ! {trevrpc_qmux, self(), {closed, Reason}},
+    _ = send_now(trevrpc_qmux_record:close(none, State#state.framing), State),
     _ = ssl:shutdown(Socket, write),
     {stop, normal, State}.
 
