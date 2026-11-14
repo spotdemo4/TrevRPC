@@ -2042,35 +2042,34 @@ listener_exit_stops_server(Credentials) ->
 %% QMux winning a race skips QUIC on reconnects for the reprobe interval,
 %% counted from that win: a reconnect within it does not extend it. The QUIC
 %% address is a UDP socket that swallows datagrams, so QUIC never connects;
-%% the channel's quic_attempt/1 calls show which rounds tried it. The
-%% checkpoints count from when the test saw the first win, which is no
-%% earlier than the win itself.
+%% the channel's quic_attempt/1 calls show which rounds tried it, including
+%% a first round that is over before the test subscribes. The checkpoints
+%% count from when the test saw the first win, which is no earlier than the
+%% win itself.
 reprobe_window(Credentials) ->
     Server = start_server(Credentials, #{}),
     {ok, Sink} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}, {active, false}]),
     {ok, SinkPort} = inet:port(Sink),
     #{tcp_port := TcpPort} = ports(Server),
     Interval = 6000,
-    {ok, Channel} = trevrpc_channel:start(#{
-        host => {127, 0, 0, 1},
-        port => SinkPort,
-        tcp_port => TcpPort,
-        fallback_delay => 50,
-        reprobe_interval => Interval,
-        server_name => "localhost",
-        cacerts => maps:get(cacerts, Credentials)
-    }),
+    Channel = start_traced(
+        #{
+            host => {127, 0, 0, 1},
+            port => SinkPort,
+            tcp_port => TcpPort,
+            fallback_delay => 50,
+            reprobe_interval => Interval,
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials)
+        },
+        [{race, 1}, {quic_attempt, 1}, {won, 4}]
+    ),
     try
         ok = trevrpc_channel:subscribe(Channel),
-        1 = erlang:trace(Channel, true, [call]),
-        _ = [
-            erlang:trace_pattern({trevrpc_channel, Name, Arity}, true, [local])
-         || {Name, Arity} <- [{race, 1}, {quic_attempt, 1}, {won, 4}]
-        ],
         await_state(Channel, {ready, 1}),
         Won = erlang:monotonic_time(millisecond),
-        %% The first round started before the tracing.
-        _ = calls(Channel, won, []),
+        %% The first round raced QUIC, which never connects, and QMux won.
+        ?assertEqual([race, quic_attempt, won], calls(Channel, won, [])),
         %% A sixth into the window: straight to QMux, which must not extend
         %% the window past Won + Interval.
         sleep_until(Won + Interval div 6),
@@ -2102,18 +2101,17 @@ sleep_until(Time) ->
 refused_connection_fails_at_once(Credentials) ->
     Server = start_server(Credentials, #{max_connections => 1}),
     Occupant = connect(Credentials, Server),
-    {ok, Channel} = trevrpc_channel:start(
+    Channel = start_traced(
         (ports(Server))#{
             host => {127, 0, 0, 1},
             transport => tcp,
             connect_timeout => 10000,
             server_name => "localhost",
             cacerts => maps:get(cacerts, Credentials)
-        }
+        },
+        [{retry, 1}]
     ),
     try
-        1 = erlang:trace(Channel, true, [call]),
-        _ = erlang:trace_pattern({trevrpc_channel, retry, 1}, true, [local]),
         receive
             {trace, Channel, call, {trevrpc_channel, retry, _}} -> ok
         after 5000 -> error(attempt_not_failed)
@@ -2132,19 +2130,20 @@ refused_connection_fails_at_once(Credentials) ->
 early_close_fails_the_attempt(Credentials) ->
     {ok, Listen} = gen_tcp:listen(0, [binary, {ip, {127, 0, 0, 1}}, {active, false}]),
     {ok, TcpPort} = inet:port(Listen),
-    {ok, Channel} = trevrpc_channel:start(#{
-        host => {127, 0, 0, 1},
-        port => TcpPort,
-        tcp_port => TcpPort,
-        transport => tcp,
-        connect_timeout => 20000,
-        server_name => "localhost",
-        cacerts => maps:get(cacerts, Credentials)
-    }),
+    Channel = start_traced(
+        #{
+            host => {127, 0, 0, 1},
+            port => TcpPort,
+            tcp_port => TcpPort,
+            transport => tcp,
+            connect_timeout => 20000,
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials)
+        },
+        [{retry, 1}]
+    ),
     try
         {ok, Held} = gen_tcp:accept(Listen, 5000),
-        1 = erlang:trace(Channel, true, [call]),
-        _ = erlang:trace_pattern({trevrpc_channel, retry, 1}, true, [local]),
         Session = spawn(fun() -> ok end),
         Channel ! {trevrpc_qmux, Session, {closed, connection_lost}},
         receive
@@ -2166,19 +2165,19 @@ one_fallback_per_round(Credentials) ->
     {ok, Closed} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
     {ok, ClosedPort} = inet:port(Closed),
     ok = gen_tcp:close(Closed),
-    {ok, Channel} = trevrpc_channel:start(#{
-        host => {127, 0, 0, 1},
-        port => SinkPort,
-        tcp_port => ClosedPort,
-        fallback_delay => 50,
-        connect_timeout => 500,
-        server_name => "localhost",
-        cacerts => maps:get(cacerts, Credentials)
-    }),
+    Channel = start_traced(
+        #{
+            host => {127, 0, 0, 1},
+            port => SinkPort,
+            tcp_port => ClosedPort,
+            fallback_delay => 50,
+            connect_timeout => 500,
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials)
+        },
+        [{tcp_attempt, 1}, {retry, 1}]
+    ),
     try
-        1 = erlang:trace(Channel, true, [call]),
-        _ = erlang:trace_pattern({trevrpc_channel, tcp_attempt, 1}, true, [local]),
-        _ = erlang:trace_pattern({trevrpc_channel, retry, 1}, true, [local]),
         %% The first round: one QMux attempt before the retry.
         ?assertEqual([tcp_attempt, retry], calls(Channel, retry, []))
     after
@@ -2186,6 +2185,21 @@ one_fallback_per_round(Credentials) ->
         trevrpc_channel:close(Channel),
         gen_udp:close(Sink)
     end.
+
+%% Starts a channel with Opts, traced for the calls of the trevrpc_channel
+%% functions in Traced from its spawn, so that a call it makes before the
+%% test gets to it is not missed. The channel is the first process this one
+%% spawns, and inherits the tracing; this process calls none of them.
+start_traced(Opts, Traced) ->
+    _ = [
+        erlang:trace_pattern({trevrpc_channel, Name, Arity}, true, [local])
+     || {Name, Arity} <- Traced
+    ],
+    1 = erlang:trace(self(), true, [call, set_on_first_spawn]),
+    Started = trevrpc_channel:start(Opts),
+    1 = erlang:trace(self(), false, [call, set_on_first_spawn]),
+    {ok, Channel} = Started,
+    Channel.
 
 %% The traced calls of the channel until Last.
 calls(Channel, Last, Acc) ->

@@ -233,7 +233,10 @@ disabled_test(#{credentials := Credentials}) ->
         Port = tcp_port(Server),
         ?assertMatch({error, _}, connect(Port, [<<"http/1.1">>])),
         {ok, Socket} = connect(Port, []),
-        ok = ssl:send(Socket, <<"GET /trevrpc HTTP/1.1\r\nhost: x\r\n\r\n">>),
+        %% The server closes a connection it does not serve right after the
+        %% handshake, so the request may fail to go out. Either way no
+        %% response comes.
+        _ = ssl:send(Socket, <<"GET /trevrpc HTTP/1.1\r\nhost: x\r\n\r\n">>),
         ?assertEqual({error, closed}, ssl:recv(Socket, 0, 5000))
     after
         trevrpc_server:stop(Server)
