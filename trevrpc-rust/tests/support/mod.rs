@@ -4,8 +4,6 @@
 //! The library itself ships no `WebTransport` or HTTP/3 client; these exist only to exercise the
 //! server's `WebTransport` path.
 
-#![allow(dead_code)]
-
 #[macro_use]
 mod ensure;
 #[macro_use]
@@ -298,16 +296,6 @@ pub async fn write_status<S: RawSend>(send: &mut S, status: Status) -> Result<()
     send.write_all(&framing::encode_protobuf_frame(
         frame_type::STATUS,
         &RpcStatus::from(status),
-        DEFAULT_MAX_FRAME_SIZE,
-    )?)
-    .await
-}
-
-/// Writes a HEADERS frame.
-pub async fn write_headers<S: RawSend>(send: &mut S, metadata: Metadata) -> Result<()> {
-    send.write_all(&framing::encode_protobuf_frame(
-        frame_type::HEADERS,
-        &RpcHeaders { metadata },
         DEFAULT_MAX_FRAME_SIZE,
     )?)
     .await

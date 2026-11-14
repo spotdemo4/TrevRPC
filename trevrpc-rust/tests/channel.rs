@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::support;
 use futures_util::StreamExt as _;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::task::JoinHandle;
@@ -13,9 +14,6 @@ use trevrpc::client::{
     StreamingRpcTransport,
 };
 use trevrpc::{Code, RpcRequest, Status};
-
-#[macro_use]
-mod support;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 

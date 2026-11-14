@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use crate::greeter;
+use crate::support;
 use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
 use prost::Message;
@@ -19,12 +21,6 @@ use trevrpc::server::{
     RpcFinished, RpcStarted, Server, ServerOptions, WebTransportAdmission,
 };
 use trevrpc::{Code, RpcKind, RpcRequest, Status};
-
-#[allow(dead_code)]
-#[path = "../examples/shared/greeter.rs"]
-mod greeter;
-#[macro_use]
-mod support;
 
 const AUTH_TOKEN: &str = "integration-token";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3556,7 +3552,7 @@ async fn quinn_handles_bounded_mixed_load() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "longer soak test; run with `cargo test --test quinn_integration -- --ignored quinn_soaks_mixed_workload`"]
+#[ignore = "longer soak test; run with `cargo test --test integration -- --ignored quinn_soaks_mixed_workload`"]
 async fn quinn_soaks_mixed_workload() -> TestResult {
     let calls = std::env::var("TREVRPC_SOAK_CALLS")
         .ok()

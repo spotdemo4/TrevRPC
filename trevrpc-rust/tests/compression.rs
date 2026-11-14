@@ -24,9 +24,6 @@ use trevrpc::{
     RpcRequest, RpcStatus,
 };
 
-#[macro_use]
-mod support;
-
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);

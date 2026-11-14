@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::greeter;
 use bytes::Bytes;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::io::AsyncWriteExt as _;
@@ -21,12 +22,6 @@ use trevrpc::server::{
 };
 use trevrpc::tcp::{IpPrefix, TcpFallback};
 use trevrpc::udp::QuicEndpoint;
-
-#[allow(dead_code)]
-#[path = "../examples/shared/greeter.rs"]
-mod greeter;
-#[macro_use]
-mod support;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 

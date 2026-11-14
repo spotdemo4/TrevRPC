@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::greeter;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -17,12 +18,6 @@ use trevrpc::server::{
 };
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{Code, Status};
-
-#[allow(dead_code)]
-#[path = "../examples/shared/greeter.rs"]
-mod greeter;
-#[macro_use]
-mod support;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 

@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::greeter;
+use crate::support;
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
@@ -21,12 +23,6 @@ use trevrpc::client::{
 use trevrpc::server::{Finish, Interceptor, RequestContext, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
 use trevrpc::{Code, RpcKind, Status};
-
-#[allow(dead_code)]
-#[path = "../examples/shared/greeter.rs"]
-mod greeter;
-#[macro_use]
-mod support;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
