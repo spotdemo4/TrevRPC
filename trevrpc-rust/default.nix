@@ -24,7 +24,9 @@ mkRustPackage (final: {
       trevrpcProto
       wireGolden
       zstdGolden
-      ./.
+      # The workspace without the Nix files, which neither cargo nor the release needs, so that
+      # they don't rebuild the workspace or end up in the published crate.
+      (lib.fileset.difference ./. (lib.fileset.fileFilter (file: file.hasExt "nix") ./.))
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-rust";
