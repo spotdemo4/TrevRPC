@@ -6,6 +6,7 @@
 //! percentiles.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -462,9 +463,11 @@ struct WorkerResult {
     delivered_sends: Vec<Instant>,
 }
 
-/// The bytes the client's connections carried between two instants.
+/// The bytes the client's connections carried between two instants, and the messages that
+/// operations delivered between the same two instants.
 struct WireSample {
     bytes: u64,
+    delivered: u64,
     from: Instant,
     to: Instant,
 }
@@ -515,6 +518,9 @@ struct Worker<T> {
     messages: usize,
     interval: Duration,
     bidi: Option<BidirectionalCall<EchoRequest, EchoResponse>>,
+    /// The messages this worker's operations have delivered so far, in the window or not, which
+    /// the wire-byte sampling reads at the same instants as the wire bytes.
+    delivered: Arc<AtomicU64>,
 }
 
 impl<T> Worker<T>
@@ -946,6 +952,9 @@ where
         let measured = started >= window.start;
         match outcome {
             Ok(Ok(moved)) => {
+                worker
+                    .delivered
+                    .fetch_add(moved.messages, Ordering::Relaxed);
                 if measured && finished <= window.end {
                     result.latencies.push(finished.duration_since(started));
                     result.messages = result.messages.saturating_add(moved.messages);
@@ -987,9 +996,13 @@ where
             .checked_add(params.duration)
             .ok_or("--duration is too long")?,
     };
+    let delivered: Vec<Arc<AtomicU64>> = (0..params.concurrency)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
     let workers: Vec<_> = (0..params.concurrency)
         .zip(transports.iter().cycle())
-        .map(|(index, transport)| {
+        .zip(&delivered)
+        .map(|((index, transport), delivered)| {
             tokio::spawn(work(
                 Worker {
                     transport: transport.clone(),
@@ -1004,6 +1017,7 @@ where
                     messages: params.messages,
                     interval: params.interval,
                     bidi: None,
+                    delivered: Arc::clone(delivered),
                 },
                 window,
             ))
@@ -1011,18 +1025,27 @@ where
         .collect();
 
     // The wire bytes are counted between when this task wakes at the start and at the end of the
-    // window, which a busy machine delays.
+    // window, which a busy machine delays, so the messages they are divided by are counted between
+    // the same two instants rather than over the window.
+    let delivered_so_far = || {
+        delivered.iter().fold(0_u64, |total, count| {
+            total.saturating_add(count.load(Ordering::Relaxed))
+        })
+    };
     tokio::time::sleep_until(window.start).await;
     let from = Instant::now();
-    let before = link.wire_bytes();
+    let before = link.wire_bytes().map(|bytes| (bytes, delivered_so_far()));
     tokio::time::sleep_until(window.end).await;
-    let after = link.wire_bytes();
+    let after = link.wire_bytes().map(|bytes| (bytes, delivered_so_far()));
     let to = Instant::now();
-    let wire = before.zip(after).map(|(before, after)| WireSample {
-        bytes: after.saturating_sub(before),
-        from,
-        to,
-    });
+    let wire = before.zip(after).map(
+        |((bytes_before, delivered_before), (bytes_after, delivered_after))| WireSample {
+            bytes: bytes_after.saturating_sub(bytes_before),
+            delivered: delivered_after.saturating_sub(delivered_before),
+            from,
+            to,
+        },
+    );
 
     let mut results = Vec::with_capacity(workers.len());
     for worker in workers {
@@ -1104,19 +1127,20 @@ impl Report {
         let lost = results
             .iter()
             .fold(0_u64, |total, result| total.saturating_add(result.lost));
-        // A paced message counts by when it was scheduled, which may be long before it was sent,
-        // so the wire bytes are divided by the messages sent while they were counted instead.
-        let wire = wire.map(|WireSample { bytes, from, to }| {
+        // The wire bytes are divided by the messages of the same interval: for paced messages,
+        // which count by when they were scheduled, possibly long before they were sent, those sent
+        // in it, and for operations those delivered in it.
+        let wire = wire.map(|sample| {
             let wire_msgs = if paced {
                 results
                     .iter()
                     .flat_map(|result| &result.delivered_sends)
-                    .filter(|&&sent| sent >= from && sent < to)
+                    .filter(|&&sent| sent >= sample.from && sent < sample.to)
                     .fold(0_u64, |total, _| total.saturating_add(1))
             } else {
-                msgs
+                sample.delivered
             };
-            (bytes, wire_msgs)
+            (sample.bytes, wire_msgs)
         });
         let mut latencies: Vec<Duration> = results
             .into_iter()

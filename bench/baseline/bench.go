@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -166,31 +167,47 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 	defer time.AfterFunc(time.Until(measureEnd.Add(drainGrace)), cancel).Stop()
 
 	results := make([]workerResult, cfg.concurrency)
+	delivered := make([]atomic.Uint64, cfg.concurrency)
 	var wg sync.WaitGroup
 	for i, w := range workers {
-		wg.Go(func() { results[i] = runWorker(runCtx, w, measureStart, measureEnd) })
+		wg.Go(func() { results[i] = runWorker(runCtx, w, &delivered[i], measureStart, measureEnd) })
 	}
 
-	wireStart, wireEnd, ok := snapshotWire(ctx, conn.wire, measureStart, measureEnd)
+	wire, ok := snapshotWire(ctx, conn.wire, delivered, measureStart, measureEnd)
 	wg.Wait()
 	reportErrors(os.Stderr, results)
 	if !ok {
 		return zero, ctx.Err()
 	}
-	return summarize(cfg, results, wireEnd-wireStart)
+	return summarize(cfg, results, wire)
 }
 
-// snapshotWire returns the connection's byte total at the start and end of the
-// measured window. ok is false if ctx ended first.
-func snapshotWire(ctx context.Context, counter *wireCounter, measureStart, measureEnd time.Time) (start, end uint64, ok bool) {
+// wireSample is the bytes the connection carried between two instants, and
+// the messages the workers delivered between the same two instants.
+type wireSample struct {
+	bytes, msgs uint64
+}
+
+// snapshotWire samples the connection's byte total and the workers'
+// delivered messages when it wakes at the start and at the end of the
+// measured window, which a busy machine delays, so the bytes are divided by
+// the messages of the same interval. ok is false if ctx ended first.
+func snapshotWire(ctx context.Context, counter *wireCounter, delivered []atomic.Uint64, measureStart, measureEnd time.Time) (sample wireSample, ok bool) {
+	deliveredSoFar := func() uint64 {
+		var total uint64
+		for i := range delivered {
+			total += delivered[i].Load()
+		}
+		return total
+	}
 	if !sleepUntil(ctx, measureStart) {
-		return 0, 0, false
+		return wireSample{}, false
 	}
-	start = counter.total()
+	bytes, msgs := counter.total(), deliveredSoFar()
 	if !sleepUntil(ctx, measureEnd) {
-		return 0, 0, false
+		return wireSample{}, false
 	}
-	return start, counter.total(), true
+	return wireSample{bytes: counter.total() - bytes, msgs: deliveredSoFar() - msgs}, true
 }
 
 func sleepUntil(ctx context.Context, t time.Time) bool {
@@ -208,7 +225,9 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 // operation counts only if it starts at or after measureStart and finishes by
 // measureEnd. A failed operation counts as an error if it started inside the
 // window; failures during warmup are ignored. The first such error is kept.
-func runWorker(ctx context.Context, w worker, measureStart, measureEnd time.Time) workerResult {
+// delivered counts the messages of every operation that succeeds, in the
+// window or not, for snapshotWire.
+func runWorker(ctx context.Context, w worker, delivered *atomic.Uint64, measureStart, measureEnd time.Time) workerResult {
 	var result workerResult
 	for {
 		opStart := time.Now()
@@ -230,6 +249,7 @@ func runWorker(ctx context.Context, w worker, measureStart, measureEnd time.Time
 			}
 			continue
 		}
+		delivered.Add(uint64(msgs))
 		if inWindow && !opEnd.After(measureEnd) {
 			result.latencies = append(result.latencies, opEnd.Sub(opStart))
 			result.msgs += uint64(msgs)
@@ -251,7 +271,7 @@ func reportErrors(w io.Writer, results []workerResult) {
 // measured window and none failed: every call ran past it.
 var errStarved = errors.New("no operation completed inside the measured window")
 
-func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (benchResult, error) {
+func summarize(cfg benchConfig, results []workerResult, wire wireSample) (benchResult, error) {
 	var latencies []time.Duration
 	var msgs, errs uint64
 	for _, r := range results {
@@ -287,9 +307,9 @@ func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (bench
 		},
 	}
 	res.BytesPerSec = res.MsgsPerSec * float64(cfg.size)
-	if msgs > 0 {
-		wire := float64(wireBytes) / float64(msgs)
-		res.WireBytesPerMsg = &wire
+	if wire.msgs > 0 {
+		perMsg := float64(wire.bytes) / float64(wire.msgs)
+		res.WireBytesPerMsg = &perMsg
 	}
 	return res, nil
 }

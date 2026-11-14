@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func TestRunWorkerKeepsTheFirstErrorInTheWindow(t *testing.T) {
 	first, later := errors.New("first"), errors.New("later")
 	w := &scriptedWorker{calls: []func() error{fail(first), fail(later), fail(later, cancel)}}
 	now := time.Now()
-	result := runWorker(ctx, w, now, now.Add(time.Hour))
+	result := runWorker(ctx, w, new(atomic.Uint64), now, now.Add(time.Hour))
 	if result.errors != 3 {
 		t.Fatalf("errors = %d, want 3", result.errors)
 	}
@@ -62,7 +63,7 @@ func TestRunWorkerIgnoresErrorsDuringWarmup(t *testing.T) {
 			}),
 			fail(measured, cancel),
 		}}
-		result := runWorker(ctx, w, start, start.Add(time.Hour))
+		result := runWorker(ctx, w, new(atomic.Uint64), start, start.Add(time.Hour))
 		cancel()
 		if !startedInWarmup {
 			if attempt == 10 {

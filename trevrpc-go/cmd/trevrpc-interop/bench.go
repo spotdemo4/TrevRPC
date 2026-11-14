@@ -713,14 +713,18 @@ type benchWorker struct {
 	// behind its schedule sends a window's messages after it, so the wire
 	// bytes are divided by the messages actually sent while they were counted.
 	deliveredSends []time.Time
+	// delivered counts the messages its operations delivered, in the window
+	// or not, for the wire-byte sampling to read at the same instants as the
+	// wire bytes.
+	delivered atomic.Uint64
 }
 
 // deliveredBetween counts the paced messages sent in [from, to) and echoed in
 // time.
 func deliveredBetween(workers []benchWorker, from, to time.Time) uint64 {
 	var count uint64
-	for _, w := range workers {
-		for _, sent := range w.deliveredSends {
+	for i := range workers {
+		for _, sent := range workers[i].deliveredSends {
 			if !sent.Before(from) && sent.Before(to) {
 				count++
 			}
@@ -743,6 +747,9 @@ func (l operationLoop) work(ctx context.Context, w *benchWorker, start, end time
 		}
 		messages, err := operation.run(ctx)
 		finished := time.Now()
+		if err == nil {
+			w.delivered.Add(uint64(messages))
+		}
 		if err != nil {
 			if !began.Before(start) && !finished.After(end) {
 				w.errors++
@@ -892,18 +899,27 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		group.Go(func() { workload.work(opCtx, &workers[i], start, end) })
 	}
 	// The wire bytes are counted between when this goroutine wakes at start
-	// and at end, which a busy machine delays.
-	var wireBefore, wireAfter uint64
+	// and at end, which a busy machine delays, so the messages they are
+	// divided by are counted between the same two instants rather than over
+	// the window.
+	deliveredSoFar := func() uint64 {
+		var total uint64
+		for i := range workers {
+			total += workers[i].delivered.Load()
+		}
+		return total
+	}
+	var wireBefore, wireAfter, deliveredBefore, deliveredAfter uint64
 	var wireFrom, wireTo time.Time
 	waitErr := sleepUntil(ctx, start)
 	if wire != nil {
-		wireFrom, wireBefore = time.Now(), wire.total()
+		wireFrom, wireBefore, deliveredBefore = time.Now(), wire.total(), deliveredSoFar()
 	}
 	if waitErr == nil {
 		waitErr = sleepUntil(ctx, end)
 	}
 	if wire != nil {
-		wireAfter, wireTo = wire.total(), time.Now()
+		wireAfter, deliveredAfter, wireTo = wire.total(), deliveredSoFar(), time.Now()
 	}
 	if waitErr != nil {
 		cancel()
@@ -918,10 +934,11 @@ func runBench(ctx context.Context, config benchConfig, out io.Writer) error {
 		return err
 	}
 	if wire != nil {
-		// A paced message counts by when it was scheduled, which may be long
-		// before it was sent, so the wire bytes are divided by the messages
-		// sent while they were counted instead.
-		wireMsgs := result.Msgs
+		// The wire bytes are divided by the messages of the same interval: for
+		// paced messages, which count by when they were scheduled, possibly
+		// long before they were sent, those sent in it, and for operations
+		// those delivered in it.
+		wireMsgs := deliveredAfter - deliveredBefore
 		if config.paced() {
 			wireMsgs = deliveredBetween(workers, wireFrom, wireTo)
 		}
@@ -949,7 +966,8 @@ func sleepUntil(ctx context.Context, t time.Time) error {
 func summarize(config benchConfig, transport trevrpc.TransportKind, window time.Duration, workers []benchWorker) (benchResult, error) {
 	var latencies []time.Duration
 	var messages, lost, failures uint64
-	for _, w := range workers {
+	for i := range workers {
+		w := &workers[i]
 		latencies = append(latencies, w.latencies...)
 		messages += w.messages
 		lost += w.lost
