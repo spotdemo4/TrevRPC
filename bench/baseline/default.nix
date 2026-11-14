@@ -1,60 +1,30 @@
 {
   lib,
-  mkGoModule,
+  callPackage,
   protobuf,
   interopProto,
 }:
-mkGoModule (final: {
+callPackage ../../trevrpc-go/module.nix { } {
   pname = "trevrpc-bench-baseline";
   version = "0.0.0";
 
+  directory = ./.;
   # The module itself plus the shared interop proto its drift test regenerates
   # the Echo bindings from.
-  src = lib.fileset.toSource {
-    root = ../../.;
-    fileset = lib.fileset.unions [
-      interopProto
-      (lib.fileset.difference ./. (
-        lib.fileset.unions [
-          ./default.nix
-          ./gomod2nix.toml
-        ]
-      ))
-    ];
-  };
-  sourceRoot = "${final.src.name}/bench/baseline";
-  modules = ./gomod2nix.toml;
+  fileset = lib.fileset.unions [
+    interopProto
+    ./.
+  ];
 
   subPackages = [ "." ];
 
-  doCheck = true;
   # The echopb drift test regenerates code from interop.proto.
   nativeCheckInputs = [ protobuf ];
-  checkPhase = ''
-    runHook preCheck
-    export HOME=$(mktemp -d)
-    go test ./...
-    runHook postCheck
-  '';
-
-  doInstallCheck = true;
-  installCheckPhase = ''
-    runHook preInstallCheck
-    test "$(go list -m)" = 'trev.zip/llc/trevrpc/bench/baseline'
-    test -x "$out/bin/trevrpc-bench-baseline"
-    if "$out/bin/trevrpc-bench-baseline" 2> usage.out; then
-      echo "trevrpc-bench-baseline without a subcommand must fail" >&2
-      exit 1
-    fi
-    grep -q 'server|bench' usage.out
-    runHook postInstallCheck
-  '';
+  vet32Bit = false;
+  usage = "server|bench";
 
   meta = {
     mainProgram = "trevrpc-bench-baseline";
     description = "grpc-go and connect-go baselines for TrevRPC's load benchmarks";
-    license = lib.licenses.mit;
-    platforms = lib.platforms.all;
-    homepage = "https://trev.zip/llc/TrevRPC";
   };
-})
+}
