@@ -23,12 +23,8 @@ func (p *streamWorkers) busy() int {
 
 func waitForWorkers(t *testing.T, p *streamWorkers, want int) {
 	t.Helper()
-	deadline := time.Now().Add(testTimeout)
-	for p.count() != want {
-		if time.Now().After(deadline) {
-			t.Fatalf("workers = %d, want %d", p.count(), want)
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(func() bool { return p.count() == want }) {
+		t.Fatalf("workers = %d, want %d", p.count(), want)
 	}
 }
 
@@ -81,10 +77,7 @@ func TestStreamWorkersExitWhenTheListenerStops(t *testing.T) {
 	for range 4 {
 		p.run(func() {})
 	}
-	waitForWorkersAtLeast := time.Now().Add(testTimeout)
-	for p.count() == 0 && time.Now().Before(waitForWorkersAtLeast) {
-		time.Sleep(time.Millisecond)
-	}
+	eventually(t, "the workers to start", func() bool { return p.count() != 0 })
 	cancel()
 	waitForWorkers(t, p, 0)
 }

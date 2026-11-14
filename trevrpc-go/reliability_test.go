@@ -13,30 +13,6 @@ import (
 	"time"
 )
 
-// reliabilityDialers returns a function per transport the test server speaks.
-// Each call dials a new connection.
-func reliabilityDialers(t *testing.T, pki testPKI, listener *Listener) map[string]func() Transport {
-	t.Helper()
-	return map[string]func() Transport{
-		"quic":         func() Transport { return dialNative(t, pki, listener) },
-		"qmux":         func() Transport { return newQMuxTestClient(t, pki, listener) },
-		"webtransport": func() Transport { return newWebTransportTestClient(t, pki, listener, testOrigin, nil) },
-		"websocket":    func() Transport { return newWebSocketTestClient(t, pki, listener, testOrigin) },
-		"http3":        func() Transport { return newHTTP3TestClient(t, pki, listener) },
-		"http2":        func() Transport { return newHTTP2TestClient(t, pki, listener) },
-	}
-}
-
-// reliabilityTransports dials one connection per transport.
-func reliabilityTransports(t *testing.T, pki testPKI, listener *Listener) map[string]Transport {
-	t.Helper()
-	transports := map[string]Transport{}
-	for name, dial := range reliabilityDialers(t, pki, listener) {
-		transports[name] = dial()
-	}
-	return transports
-}
-
 // TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus covers a client that
 // never has more calls in flight on a connection than the server allows. The
 // server must release a call's stream slot before the client can see the
@@ -69,18 +45,21 @@ func TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus(t *testing.T) {
 			return nil
 		},
 	}
-	dialers := reliabilityDialers(t, pki, listener)
-	for _, name := range []string{"quic", "qmux"} {
-		dial := dialers[name]
+	for _, transport := range testTransports {
+		// The release ordering is checked through the clients the library
+		// ships.
+		if !transport.native {
+			continue
+		}
 		for shape, call := range calls {
-			t.Run(name+"/"+shape, func(t *testing.T) {
+			t.Run(transport.name+"/"+shape, func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 				defer cancel()
 				// Several connections keep the server busy, which widens the
 				// window between the last write of a call and its cleanup.
 				var transports []Transport
 				for range connections {
-					transports = append(transports, dial())
+					transports = append(transports, transport.dial(t, pki, listener))
 				}
 				var rejected atomic.Int64
 				var firstErr atomic.Value
@@ -119,11 +98,14 @@ func TestOverLimitStreamStillGetsUnavailable(t *testing.T) {
 	listener := startTestListener(t, pki, func(options *ServerOptions) {
 		options.MaxConcurrentStreamsPerConnection = limit
 	})
-	for name, transport := range map[string]Transport{
-		"quic": dialNative(t, pki, listener),
-		"qmux": newQMuxTestClient(t, pki, listener),
-	} {
-		t.Run(name, func(t *testing.T) {
+	for _, dialer := range testTransports {
+		// As in TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus, the
+		// clients the library ships.
+		if !dialer.native {
+			continue
+		}
+		t.Run(dialer.name, func(t *testing.T) {
+			transport := dialer.dial(t, pki, listener)
 			ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
 			defer cancel()
 			var held []ClientStreamingCall[*testMessage, *testMessage]
@@ -144,16 +126,13 @@ func TestOverLimitStreamStillGetsUnavailable(t *testing.T) {
 			})
 			// The server has accepted both streams once their first message
 			// is processed; give it a moment to start the handlers.
-			deadline := time.Now().Add(time.Second)
-			for {
-				_, err := Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage)
-				if status := StatusFromError(err); status.Code == CodeUnavailable && strings.Contains(status.Message, "too many concurrent streams") {
-					return
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("over-limit call error = %v, want Unavailable", err)
-				}
-				time.Sleep(10 * time.Millisecond)
+			var err error
+			if !waitUntil(func() bool {
+				_, err = Unary(ctx, transport, "/example.Greeter/Echo", &testMessage{Value: "x"}, newTestMessage)
+				status := StatusFromError(err)
+				return status.Code == CodeUnavailable && strings.Contains(status.Message, "too many concurrent streams")
+			}) {
+				t.Fatalf("over-limit call error = %v, want Unavailable", err)
 			}
 		})
 	}
@@ -205,8 +184,9 @@ func TestSendFailsPromptlyAfterServerRejectsUpload(t *testing.T) {
 		options.MaxStreamMessages = 2
 	}, registerEarlyFinishService)
 
-	for name, transport := range reliabilityTransports(t, pki, listener) {
-		t.Run(name, func(t *testing.T) {
+	for _, dialer := range testTransports {
+		t.Run(dialer.name, func(t *testing.T) {
+			transport := dialer.dial(t, pki, listener)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
@@ -249,8 +229,9 @@ func TestSendFailsPromptlyAfterHandlerReturnsEarly(t *testing.T) {
 	pki := newTestPKI(t)
 	listener := startTestListenerWith(t, pki, nil, registerEarlyFinishService)
 
-	for name, transport := range reliabilityTransports(t, pki, listener) {
-		t.Run(name, func(t *testing.T) {
+	for _, dialer := range testTransports {
+		t.Run(dialer.name, func(t *testing.T) {
+			transport := dialer.dial(t, pki, listener)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
@@ -288,8 +269,9 @@ func TestSendReportsEOFAfterServerFinishesCallSuccessfully(t *testing.T) {
 			return rawResponse()
 		})
 	})
-	for name, transport := range reliabilityTransports(t, pki, listener) {
-		t.Run(name, func(t *testing.T) {
+	for _, dialer := range testTransports {
+		t.Run(dialer.name, func(t *testing.T) {
+			transport := dialer.dial(t, pki, listener)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			call, err := BidirectionalStreaming[*testMessage, *testMessage](ctx, transport, "/example.Greeter/Done", newTestMessage)

@@ -88,19 +88,6 @@ func (c *fakeDatagramConn) calls() int {
 	return c.sendCalls
 }
 
-// eventually polls cond until it holds.
-func eventually(t *testing.T, description string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(testTimeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", description)
-}
-
 // takeMessage takes the next message of sink, waiting for it.
 func takeMessage(t *testing.T, sink *datagramSink) string {
 	t.Helper()

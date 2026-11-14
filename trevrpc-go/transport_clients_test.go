@@ -48,12 +48,13 @@ func newHTTP3TestClientAt(t testing.TB, pki testPKI, addr string) Transport {
 // POST /trevrpc request over HTTP/2 on the TCP listener.
 func newHTTP2TestClient(t testing.TB, pki testPKI, listener *Listener) Transport {
 	t.Helper()
-	return newHTTP2TestClientWith(t, pki, listener, nil)
+	return newHTTP2TestClientAt(t, pki, listener.TCPAddr().String(), nil)
 }
 
-// newHTTP2TestClientWith is newHTTP2TestClient with configure applied to the
-// HTTP transport, when not nil.
-func newHTTP2TestClientWith(t testing.TB, pki testPKI, listener *Listener, configure func(*http.Transport)) Transport {
+// newHTTP2TestClientAt returns a Transport that sends every RPC as one
+// HTTP/2 request to addr, with configure applied to the HTTP transport, when
+// not nil.
+func newHTTP2TestClientAt(t testing.TB, pki testPKI, addr string, configure func(*http.Transport)) Transport {
 	t.Helper()
 	protocols := new(http.Protocols)
 	protocols.SetHTTP2(true)
@@ -72,7 +73,7 @@ func newHTTP2TestClientWith(t testing.TB, pki testPKI, listener *Listener, confi
 	})
 	opener := httpTestOpener{
 		roundTripper: roundTripper,
-		url:          "https://" + listener.TCPAddr().String() + DefaultHTTPPath,
+		url:          "https://" + addr + DefaultHTTPPath,
 	}
 	return newStreamClient(opener, DefaultMaxFrameSize)
 }
@@ -107,19 +108,29 @@ func (d *dialedConns) closeAll() {
 // newQMuxTestClient returns a Channel over QMux over TLS on the TCP listener.
 func newQMuxTestClient(t testing.TB, pki testPKI, listener *Listener) *Channel {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
-	defer cancel()
-	connector := &qmuxConnector{
-		addr:         listener.TCPAddr().String(),
-		tls:          clientQMuxTLSConfig(pki.client, "localhost"),
-		maxFrameSize: DefaultMaxFrameSize,
-	}
-	channel, err := dialChannel(ctx, connector, nil)
+	channel, err := newQMuxTestClientAt(t, pki, listener.TCPAddr().String())
 	if err != nil {
 		t.Fatalf("QMux dial: %v", err)
 	}
-	t.Cleanup(func() { _ = channel.Close() })
 	return channel
+}
+
+// newQMuxTestClientAt dials addr with TransportTCPOnly, as a client that
+// falls back to QMux over TLS does, and returns the Channel or the error of
+// the dial.
+func newQMuxTestClientAt(t testing.TB, pki testPKI, addr string) (*Channel, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), rpcTestTimeout)
+	defer cancel()
+	channel, err := Dial(ctx, addr, DialOptions{TLSConfig: pki.client, Transport: TransportTCPOnly})
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(func() { _ = channel.Close() })
+	if transport := channel.Transport(); transport != TransportQMux {
+		t.Fatalf("Transport = %q, want qmux", transport)
+	}
+	return channel, nil
 }
 
 // newWebSocketTestClient returns a Transport that runs RPCs on the streams of

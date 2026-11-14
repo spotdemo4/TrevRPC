@@ -112,7 +112,7 @@ func TestRaceClosesTheLoser(t *testing.T) {
 	if kind := connectKind(t, newRacingConnector(quic, tcp, 10*time.Millisecond, 0)); kind != TransportQMux {
 		t.Fatalf("transport = %s, want qmux", kind)
 	}
-	waitFor(t, "the losing QUIC attempt to be cancelled", func() bool { return quic.cancelled.Load() > 0 })
+	eventually(t, "the losing QUIC attempt to be cancelled", func() bool { return quic.cancelled.Load() > 0 })
 }
 
 func TestRaceClosesALoserThatAlsoConnects(t *testing.T) {
@@ -124,7 +124,7 @@ func TestRaceClosesALoserThatAlsoConnects(t *testing.T) {
 		t.Fatalf("transport = %s, want qmux", kind)
 	}
 	close(quic.release)
-	waitFor(t, "the losing QUIC connection to be closed", func() bool { return quic.closed.Load() > 0 })
+	eventually(t, "the losing QUIC connection to be closed", func() bool { return quic.closed.Load() > 0 })
 }
 
 // uncancellableConnector ignores its context and connects once release is

@@ -56,15 +56,10 @@ func (c *finishedCapture) next(t *testing.T) RPCFinished {
 		// The interceptors' finish functions run before the metrics hook, so
 		// the metrics event of this call may not have arrived yet.
 		var finished []RPCFinished
-		deadline := time.Now().Add(rpcTestTimeout)
-		for {
+		if !waitUntil(func() bool {
 			_, finished = c.metrics.snapshot()
-			if len(finished) > c.consumed || time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(time.Millisecond)
-		}
-		if len(finished) <= c.consumed {
+			return len(finished) > c.consumed
+		}) {
 			t.Fatal("metrics did not see the call finish")
 		}
 		got := finished[c.consumed]
@@ -205,12 +200,11 @@ func TestRPCFinishedErrOfAnInterceptorErrorAndAResponseStreamError(t *testing.T)
 		t.Fatalf("stream ended with %v, want a redacted Internal", streamErr)
 	}
 
-	deadline := time.Now().Add(rpcTestTimeout)
 	var finished []RPCFinished
-	for len(finished) < 2 && time.Now().Before(deadline) {
+	waitUntil(func() bool {
 		_, finished = metrics.snapshot()
-		time.Sleep(time.Millisecond)
-	}
+		return len(finished) >= 2
+	})
 	if len(finished) != 2 {
 		t.Fatalf("finished %d calls, want 2", len(finished))
 	}

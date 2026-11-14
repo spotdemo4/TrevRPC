@@ -197,7 +197,7 @@ func TestHTTP2EnforcesTheStreamLimitPerConnection(t *testing.T) {
 	})
 	// By default net/http opens another connection when one is at the
 	// server's stream limit, which would bypass the per-connection limit.
-	transport := newHTTP2TestClientWith(t, pki, listener, func(roundTripper *http.Transport) {
+	transport := newHTTP2TestClientAt(t, pki, listener.TCPAddr().String(), func(roundTripper *http.Transport) {
 		roundTripper.HTTP2 = &http.HTTP2Config{StrictMaxConcurrentRequests: true}
 	})
 
@@ -348,7 +348,7 @@ func TestShutdownEndsConnectionsThatHaveNotStarted(t *testing.T) {
 		}
 	}()
 	// The HTTP/2 and HTTP/1.1 connections reach the HTTP server.
-	waitFor(t, "the HTTP server to take both HTTP connections", func() bool {
+	eventually(t, "the HTTP server to take both HTTP connections", func() bool {
 		listener.httpTCP.mu.Lock()
 		defer listener.httpTCP.mu.Unlock()
 		return len(listener.httpTCP.unstarted) == 2
@@ -401,7 +401,7 @@ func TestShutdownRefusesStreamsStillAwaitingTheirRequest(t *testing.T) {
 			// later call that completes first proves nothing, since
 			// WebTransport may accept streams out of order. The listener's
 			// workers run nothing but its RPC streams.
-			waitFor(t, "the server to read the waiting stream", func() bool { return listener.workers.busy() == 1 })
+			eventually(t, "the server to read the waiting stream", func() bool { return listener.workers.busy() == 1 })
 			call, err := opener.openStream(ctx)
 			if err != nil {
 				t.Fatal(err)

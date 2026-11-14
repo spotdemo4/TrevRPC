@@ -484,14 +484,13 @@ func TestCompressionOverEveryTransport(t *testing.T) {
 	listener := startTestListenerWith(t, pki, func(options *ServerOptions) { options.Compression = testCompression(t) }, registerCompressionService)
 	config := testCompressionConfig(t)
 
-	clients := map[string]*streamClient{
-		"http3":          newHTTP3TestClient(t, pki, listener).(*streamClient),
-		"webtransport":   newWebTransportTestClient(t, pki, listener, testOrigin, nil).(*streamClient),
-		"http2":          newHTTP2TestClient(t, pki, listener).(*streamClient),
-		"qmux websocket": newWebSocketTestClient(t, pki, listener, testOrigin).(*streamClient),
-	}
-	for name, client := range clients {
-		t.Run(name, func(t *testing.T) {
+	for _, transport := range testTransports {
+		if transport.native {
+			// The native transports are dialled with compression below.
+			continue
+		}
+		t.Run(transport.name, func(t *testing.T) {
+			client := transport.dial(t, pki, listener).(*streamClient)
 			var mu sync.Mutex
 			var log []*recordedStream
 			client.opener = recordingOpener{inner: client.opener, mu: &mu, log: &log}
@@ -533,7 +532,7 @@ func TestCompressionOverEveryTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = qmuxChannel.Close() })
-	for name, channel := range map[string]*Channel{"native": native, "qmux": qmuxChannel} {
+	for name, channel := range map[string]*Channel{"quic": native, "qmux": qmuxChannel} {
 		t.Run(name, func(t *testing.T) {
 			exerciseCompressedCalls(t, channel)
 			generation, err := channel.callGeneration(t.Context())
