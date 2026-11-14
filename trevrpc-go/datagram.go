@@ -421,6 +421,11 @@ func pollDatagram(conn datagramConn) ([]byte, bool) {
 // dispatched them yet. flush cancels the reader's wait and takes the lock the
 // reader holds while it waits and dispatches, so no dispatch is in flight when
 // it polls the queue.
+//
+// On a WebTransport session the queue is the session's, which quic-go's HTTP/3
+// layer fills from the connection's on a goroutine of its own. A datagram that
+// arrived with the end of a stream may not be in it yet when flush polls, and
+// is then dropped like any that arrives after its direction ended (#553).
 func (m *datagramMux) flush() {
 	m.flushMu.Lock()
 	defer m.flushMu.Unlock()

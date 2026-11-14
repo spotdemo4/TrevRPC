@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/quic-go/webtransport-go"
 
 	"trev.zip/llc/trevrpc/trevrpc-go/internal/qmux"
@@ -301,6 +302,8 @@ type webTransportTestDial struct {
 	available string
 	// addr, if set, is dialed instead of the listener's UDP address.
 	addr string
+	// quicTracer, if set, traces the client's QUIC connection.
+	quicTracer func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace
 }
 
 // dialWebTransportTest opens one WebTransport session to /trevrpc. Like
@@ -310,7 +313,7 @@ func dialWebTransportTest(pki testPKI, listener *Listener, dial webTransportTest
 	wt := &webtransport.Transport{
 		Config:               dial.config,
 		TLSClientConfig:      pki.client.Clone(),
-		QUICConfig:           &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
+		QUICConfig:           &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true, Tracer: dial.quicTracer},
 		ApplicationProtocols: dial.protocols,
 	}
 	header := http.Header{}
