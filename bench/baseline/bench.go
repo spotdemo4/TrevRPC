@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -166,31 +167,83 @@ func runBench(ctx context.Context, cfg benchConfig) (benchResult, error) {
 	defer time.AfterFunc(time.Until(measureEnd.Add(drainGrace)), cancel).Stop()
 
 	results := make([]workerResult, cfg.concurrency)
+	sampler := newWireSampler(conn.wire, cfg.concurrency, measureStart, measureEnd)
 	var wg sync.WaitGroup
 	for i, w := range workers {
-		wg.Go(func() { results[i] = runWorker(runCtx, w, measureStart, measureEnd) })
+		wg.Go(func() { results[i] = runWorker(runCtx, w, sampler, i, measureStart, measureEnd) })
 	}
 
-	wireStart, wireEnd, ok := snapshotWire(ctx, conn.wire, measureStart, measureEnd)
+	ok := sleepUntil(ctx, measureStart)
+	if ok {
+		sampler.observe(time.Now())
+		ok = sleepUntil(ctx, measureEnd)
+	}
+	if ok {
+		sampler.observe(time.Now())
+	}
 	wg.Wait()
 	reportErrors(os.Stderr, results)
 	if !ok {
 		return zero, ctx.Err()
 	}
-	return summarize(cfg, results, wireEnd-wireStart)
+	return summarize(cfg, results, sampler.sample())
 }
 
-// snapshotWire returns the connection's byte total at the start and end of the
-// measured window. ok is false if ctx ended first.
-func snapshotWire(ctx context.Context, counter *wireCounter, measureStart, measureEnd time.Time) (start, end uint64, ok bool) {
-	if !sleepUntil(ctx, measureStart) {
-		return 0, 0, false
+// wireSample is the bytes the connection carried between two instants, and
+// the messages the workers delivered between the same two instants.
+type wireSample struct {
+	bytes, msgs uint64
+}
+
+// wireSampler samples the connection's byte total and the workers' delivered
+// messages at the start and at the end of the measured window, so the bytes
+// are divided by the messages of the same interval. Whoever first sees a
+// boundary pass takes its sample: the main goroutine when its timer fires, or
+// a worker about to start an operation. A busy machine delays the timer, but
+// every operation the window measures starts after the start sample and ends
+// before the end sample.
+type wireSampler struct {
+	counter                  *wireCounter
+	delivered                []atomic.Uint64
+	measureStart, measureEnd time.Time
+	begin, end               sync.Once
+	// at holds the byte total and the delivered messages at the start and at
+	// the end.
+	at [2]wireSample
+}
+
+func newWireSampler(counter *wireCounter, workers int, measureStart, measureEnd time.Time) *wireSampler {
+	return &wireSampler{counter: counter, delivered: make([]atomic.Uint64, workers), measureStart: measureStart, measureEnd: measureEnd}
+}
+
+// deliver counts msgs delivered by worker.
+func (s *wireSampler) deliver(worker int, msgs uint64) {
+	s.delivered[worker].Add(msgs)
+}
+
+// observe takes the sample of each boundary that now has passed, unless it is
+// already taken. The start sample is always taken before the end sample.
+func (s *wireSampler) observe(now time.Time) {
+	if now.Before(s.measureStart) {
+		return
 	}
-	start = counter.total()
-	if !sleepUntil(ctx, measureEnd) {
-		return 0, 0, false
+	s.begin.Do(func() { s.at[0] = s.snapshot() })
+	if !now.Before(s.measureEnd) {
+		s.end.Do(func() { s.at[1] = s.snapshot() })
 	}
-	return start, counter.total(), true
+}
+
+func (s *wireSampler) snapshot() wireSample {
+	var msgs uint64
+	for i := range s.delivered {
+		msgs += s.delivered[i].Load()
+	}
+	return wireSample{bytes: s.counter.total(), msgs: msgs}
+}
+
+// sample returns what changed between the two samples, once both are taken.
+func (s *wireSampler) sample() wireSample {
+	return wireSample{bytes: s.at[1].bytes - s.at[0].bytes, msgs: s.at[1].msgs - s.at[0].msgs}
 }
 
 func sleepUntil(ctx context.Context, t time.Time) bool {
@@ -208,14 +261,22 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 // operation counts only if it starts at or after measureStart and finishes by
 // measureEnd. A failed operation counts as an error if it started inside the
 // window; failures during warmup are ignored. The first such error is kept.
-func runWorker(ctx context.Context, w worker, measureStart, measureEnd time.Time) workerResult {
+// The worker tells sampler, as worker index, when it starts an operation and
+// the messages of every operation that succeeds, in the window or not.
+func runWorker(ctx context.Context, w worker, sampler *wireSampler, index int, measureStart, measureEnd time.Time) workerResult {
 	var result workerResult
 	for {
 		opStart := time.Now()
+		sampler.observe(opStart)
 		if !opStart.Before(measureEnd) || ctx.Err() != nil {
 			return result
 		}
 		msgs, err := w.do(ctx)
+		if err == nil {
+			// Before opEnd is read, so that an operation that ends in the
+			// window is delivered before the end sample.
+			sampler.deliver(index, uint64(msgs))
+		}
 		opEnd := time.Now()
 		inWindow := !opStart.Before(measureStart)
 		if err != nil {
@@ -251,7 +312,7 @@ func reportErrors(w io.Writer, results []workerResult) {
 // measured window and none failed: every call ran past it.
 var errStarved = errors.New("no operation completed inside the measured window")
 
-func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (benchResult, error) {
+func summarize(cfg benchConfig, results []workerResult, wire wireSample) (benchResult, error) {
 	var latencies []time.Duration
 	var msgs, errs uint64
 	for _, r := range results {
@@ -287,9 +348,15 @@ func summarize(cfg benchConfig, results []workerResult, wireBytes uint64) (bench
 		},
 	}
 	res.BytesPerSec = res.MsgsPerSec * float64(cfg.size)
-	if msgs > 0 {
-		wire := float64(wireBytes) / float64(msgs)
-		res.WireBytesPerMsg = &wire
+	// A sampler starved until the window had passed sees no message; the
+	// window's are then the only count there is.
+	wireMsgs := wire.msgs
+	if wireMsgs == 0 {
+		wireMsgs = msgs
+	}
+	if wireMsgs > 0 {
+		perMsg := float64(wire.bytes) / float64(wireMsgs)
+		res.WireBytesPerMsg = &perMsg
 	}
 	return res, nil
 }

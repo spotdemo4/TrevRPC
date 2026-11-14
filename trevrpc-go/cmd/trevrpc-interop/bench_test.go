@@ -735,3 +735,89 @@ func TestBenchMetadataSizeAddsOnePadEntryToEveryCall(t *testing.T) {
 		}
 	}
 }
+
+// TestWireBytesAreDividedByTheMessagesOfTheSampledInterval divides a sample's
+// bytes by the messages delivered between its two instants, not by the
+// window's msgs: the sampler wakes late on a busy machine, so the two cover
+// different intervals.
+func TestWireBytesAreDividedByTheMessagesOfTheSampledInterval(t *testing.T) {
+	config := &benchConfig{scenario: "unary"}
+	got := wireSample{bytes: 1000, delivered: 4}.perMessage(config, nil, 10)
+	if got == nil || *got != 250 {
+		t.Fatalf("wire bytes per message = %v, want 250", got)
+	}
+	// A sampler starved past the window saw no message: the window's count is
+	// the only one.
+	if got := (wireSample{bytes: 1000}).perMessage(config, nil, 10); got == nil || *got != 100 {
+		t.Fatalf("wire bytes per message with no message sampled = %v, want 100", got)
+	}
+	if got := (wireSample{bytes: 1000}).perMessage(config, nil, 0); got != nil {
+		t.Fatalf("wire bytes per message with no message at all = %v, want none", *got)
+	}
+}
+
+// stoppingOperation delivers one message on its first run and cancels the
+// loop's context, so its next run fails and the loop returns.
+type stoppingOperation struct {
+	stop context.CancelFunc
+	runs *int
+}
+
+func (o stoppingOperation) run(ctx context.Context) (int, error) {
+	if *o.runs++; *o.runs == 1 {
+		o.stop()
+		return 1, nil
+	}
+	return 0, ctx.Err()
+}
+func (stoppingOperation) close() {}
+
+// TestOperationsCountDeliveredMessagesOutsideTheWindow runs an operation
+// before the window starts: it is not measured, but counts as delivered,
+// which is what the wire sampling reads at its instants.
+func TestOperationsCountDeliveredMessagesOutsideTheWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	var w benchWorker
+	var runs int
+	start := time.Now().Add(time.Hour)
+	operationLoop{operation: stoppingOperation{stop: cancel, runs: &runs}}.work(ctx, &w, start, start.Add(time.Hour))
+	if w.messages != 0 {
+		t.Fatalf("measured messages = %d, want 0 before the window", w.messages)
+	}
+	if got := w.delivered.Load(); got != 1 {
+		t.Fatalf("delivered messages = %d, want the first operation's 1", got)
+	}
+}
+
+// TestWireSamplerTakesWhatChangedBetweenTheBoundaries samples a connection and
+// workers that already carried bytes and messages before the window, and has
+// a worker see the start pass before the late main goroutine does: the sample
+// holds only what changed between the first observation of each boundary.
+func TestWireSamplerTakesWhatChangedBetweenTheBoundaries(t *testing.T) {
+	start := time.Now()
+	end := start.Add(time.Second)
+	wire := new(wireCounter)
+	workers := make([]benchWorker, 2)
+	sampler := &wireSampler{wire: wire, workers: workers, start: start, end: end}
+	wire.sent.Store(500)
+	workers[0].delivered.Add(7)
+
+	sampler.observe(start.Add(-time.Millisecond))
+	wire.sent.Store(600)
+	sampler.observe(start)
+	wire.sent.Store(900)
+	workers[1].delivered.Add(3)
+	sampler.observe(start.Add(time.Millisecond))
+	sampler.observe(end)
+	wire.sent.Store(1000)
+	workers[1].delivered.Add(1)
+	sampler.observe(end.Add(time.Millisecond))
+
+	got := sampler.sample()
+	if got.bytes != 300 || got.delivered != 3 {
+		t.Fatalf("sample = %d bytes and %d messages, want 300 and 3", got.bytes, got.delivered)
+	}
+	if got.to.Before(got.from) {
+		t.Fatalf("sample from %v to %v, want its end after its start", got.from, got.to)
+	}
+}
