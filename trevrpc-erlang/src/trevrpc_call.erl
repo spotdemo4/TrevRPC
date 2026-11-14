@@ -37,7 +37,9 @@
 ]).
 
 %% Used by trevrpc_server_call.
--export([state/1, put_state/2, read/2, read_status/2, encode_message/2, send_answer/1]).
+-export([
+    state/1, put_state/2, read/2, read_status/2, decode/3, encode_message/2, send_answer/1
+]).
 
 -export_type([call/0]).
 
@@ -58,8 +60,11 @@ metadata(#call{metadata = Metadata}) -> Metadata.
 deadline(#call{deadline = Deadline}) -> Deadline.
 
 %% @doc Reads the next request message of a client-streaming or
-%% bidirectional call. `eof' means the client sent every request.
--spec recv(call()) -> {ok, binary()} | eof | {error, trevrpc_status:status()}.
+%% bidirectional call, decoded with the route's codec if it has one.
+%% `eof' means the client sent every request. A message the codec cannot
+%% decode returns an `invalid_argument' status, and the call can go on
+%% reading.
+-spec recv(call()) -> {ok, term()} | eof | {error, trevrpc_status:status()}.
 recv(#call{kind = Kind} = Call) when Kind =:= client_streaming; Kind =:= bidirectional_streaming ->
     State = state(Call),
     case State#call_state.request_end of
@@ -67,7 +72,7 @@ recv(#call{kind = Kind} = Call) when Kind =:= client_streaming; Kind =:= bidirec
             {Result, Next} = read(State, Call#call.deadline),
             put_state(Call, ended(Result, Next)),
             case Result of
-                {ok, {message, Message}} -> {ok, Message};
+                {ok, {message, Message}} -> decode(Call, Message, <<"failed to decode message">>);
                 eof -> eof;
                 {error, Reason} -> {error, read_status(Reason, State)}
             end;
@@ -77,6 +82,15 @@ recv(#call{kind = Kind} = Call) when Kind =:= client_streaming; Kind =:= bidirec
 recv(_Call) ->
     erlang:error(badarg).
 
+%% @private Decodes a request message with the route's codec; `Failure' is
+%% the status message of one it cannot decode.
+-spec decode(call(), binary(), binary()) -> {ok, term()} | {error, trevrpc_status:status()}.
+decode(#call{codec = Codec}, Message, Failure) ->
+    case trevrpc_codec:decode(Codec, Message) of
+        {ok, Decoded} -> {ok, Decoded};
+        error -> {error, trevrpc_status:new(invalid_argument, Failure)}
+    end.
+
 ended({ok, _}, State) ->
     State;
 ended(eof, State) ->
@@ -85,11 +99,21 @@ ended({error, Reason}, State) ->
     State#call_state{request_end = {error, read_status(Reason, State)}}.
 
 %% @doc Sends a response message of a server-streaming or bidirectional
-%% call, after the headers if they are waiting.
--spec send(call(), iodata()) -> ok | {error, trevrpc_status:status()}.
-send(#call{kind = Kind} = Call, Message) when
+%% call, after the headers if they are waiting. With a codec, `Response' is
+%% encoded with it first, and one it cannot encode returns an `internal'
+%% status without sending anything; without one, it is the message's bytes.
+-spec send(call(), term()) -> ok | {error, trevrpc_status:status()}.
+send(#call{kind = Kind, codec = Codec} = Call, Response) when
     Kind =:= server_streaming; Kind =:= bidirectional_streaming
 ->
+    case trevrpc_codec:encode(Codec, Response) of
+        {ok, Message} -> send_message(Call, Message);
+        error -> {error, trevrpc_status:new(internal, <<"failed to encode response">>)}
+    end;
+send(_Call, _Message) ->
+    erlang:error(badarg).
+
+send_message(Call, Message) ->
     #call_state{max_frame_size = Max} = State = state(Call),
     case iolist_size(Message) of
         Size when Size > Max ->
@@ -103,9 +127,7 @@ send(#call{kind = Kind} = Call, Message) when
         _ ->
             {Frame, Encoded} = encode_message(State, Message),
             write(Call, Encoded#call_state{messages_sent = true}, Frame)
-    end;
-send(_Call, _Message) ->
-    erlang:error(badarg).
+    end.
 
 %% @doc Sends the response headers at once, before any response message.
 %% They can be sent once, and only before the first response message.

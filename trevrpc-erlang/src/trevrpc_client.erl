@@ -11,8 +11,11 @@
 %% {eof, Trailers} = trevrpc_client:recv(Call).
 %% '''
 %%
-%% Messages are opaque binaries here: the caller encodes requests and
-%% decodes responses, usually through generated code.
+%% Messages are binaries, unless the call has a `codec' (see
+%% {@link trevrpc_codec}): then requests are terms it encodes and responses
+%% terms it decoded. Code that protoc-gen-trevrpc-erlang generates passes
+%% one. A response the codec cannot decode ends the call with an `internal'
+%% status.
 %%
 %% A call is read and written by the process that started it, which owns
 %% its stream; if that process exits first, the channel cancels the call. A
@@ -57,7 +60,8 @@
     metadata => trevrpc_metadata:metadata(),
     request_type => binary(),
     response_type => binary(),
-    compression => trevrpc_zstd:directions()
+    compression => trevrpc_zstd:directions(),
+    codec => trevrpc_codec:codec()
 }.
 
 -record(client_call, {
@@ -66,7 +70,8 @@
     channel :: pid(),
     kind :: trevrpc_wire:kind(),
     deadline :: trevrpc_stream:deadline(),
-    owner :: pid()
+    owner :: pid(),
+    codec :: trevrpc_codec:codec() | undefined
 }).
 
 -opaque call() :: #client_call{}.
@@ -124,8 +129,8 @@
 -define(COPY_CHUNK, 65536).
 
 %% @doc A unary call. `trailers' is the trailing metadata of the OK status.
--spec unary(pid(), binary(), iodata(), options()) ->
-    {ok, binary(), #{
+-spec unary(pid(), binary(), term(), options()) ->
+    {ok, term(), #{
         headers := trevrpc_metadata:metadata(), trailers := trevrpc_metadata:metadata()
     }}
     | {error, trevrpc_status:status()}.
@@ -137,7 +142,7 @@ unary(Channel, Method, Request, Opts) ->
 
 %% @doc Starts a server-streaming call; read its responses with
 %% {@link recv/1}.
--spec server_stream(pid(), binary(), iodata(), options()) ->
+-spec server_stream(pid(), binary(), term(), options()) ->
     {ok, call()} | {error, trevrpc_status:status()}.
 server_stream(Channel, Method, Request, Opts) ->
     start(Channel, Method, server_streaming, Opts, {message, Request}).
@@ -153,17 +158,27 @@ client_stream(Channel, Method, Opts) ->
 bidi(Channel, Method, Opts) ->
     start(Channel, Method, bidirectional_streaming, Opts, none).
 
-start(Channel, Method, Kind, Opts, First) ->
+start(Channel, Method, Kind, Opts, Request) ->
     Deadline = deadline(Opts),
     Metadata = maps:get(metadata, Opts, #{}),
+    Codec = maps:get(codec, Opts, undefined),
     maybe
         ok ?= check_deadline(Deadline),
         ok ?= check_metadata(Metadata),
+        ok ?= check_codec(Codec),
+        %% Encoded before the stream opens, which a request the codec
+        %% cannot encode never does.
+        {ok, First} ?= first(Codec, Request),
         {ok, Info} ?= trevrpc_channel:open_stream(Channel, Deadline),
         #{ref := Ref, max_frame_size := Max} = Info,
         #{compression := Compression, shared := Shared, generation := Generation} = Info,
         Call = #client_call{
-            ref = Ref, channel = Channel, kind = Kind, deadline = Deadline, owner = self()
+            ref = Ref,
+            channel = Channel,
+            kind = Kind,
+            deadline = Deadline,
+            owner = self(),
+            codec = Codec
         },
         {Requests, Responses} = Modes = trevrpc_zstd:directions(maps:get(compression, Opts, none)),
         #{query := Query, accept := Accept, requests := RequestDict} = trevrpc_zstd:prepare(
@@ -299,36 +314,60 @@ check_metadata(Metadata) ->
         {error, Message} -> {error, trevrpc_status:new(invalid_argument, Message)}
     end.
 
+first(_Codec, none) ->
+    {ok, none};
+first(Codec, {message, Request}) ->
+    case trevrpc_codec:encode(Codec, Request) of
+        {ok, Message} -> {ok, {message, Message}};
+        error -> {error, encode_status()}
+    end.
+
+encode_status() ->
+    trevrpc_status:new(internal, <<"failed to encode request">>).
+
+check_codec(Codec) ->
+    case trevrpc_codec:check(Codec) of
+        ok -> ok;
+        error -> {error, trevrpc_status:new(invalid_argument, <<"invalid codec">>)}
+    end.
+
 timeout_nanos(infinity) ->
     0;
 timeout_nanos(Deadline) ->
     max(1, Deadline - erlang:monotonic_time(millisecond)) * 1000000.
 
 %% @doc Sends a request message of a client-streaming or bidirectional
-%% call. `{error, Status}' means the call ended, with `Status' (which is OK
-%% when the server finished it successfully); its responses can still be
-%% read.
--spec send(call(), iodata()) -> ok | {error, trevrpc_status:status()}.
-send(#client_call{kind = Kind} = Call, Message) when
+%% call, encoded with the call's codec if it has one. `{error, Status}'
+%% means the call ended, with `Status' (which is OK when the server
+%% finished it successfully); its responses can still be read. A request
+%% the codec cannot encode abandons the call with an `internal' status.
+-spec send(call(), term()) -> ok | {error, trevrpc_status:status()}.
+send(#client_call{kind = Kind, codec = Codec} = Call, Request) when
     Kind =:= client_streaming; Kind =:= bidirectional_streaming
 ->
     case state(Call) of
         #cstate{send_closed = true} ->
             erlang:error(send_closed);
         #cstate{terminal = undefined} = State ->
-            case before_send(Call, State, iolist_size(Message)) of
-                {ok, Ready} ->
-                    {Frame, Encoded} = encode_request(Call, Ready, Message),
-                    put_state(Call, keep(Encoded, Message)),
-                    write(Call, Frame, false);
-                {error, Status} ->
-                    {error, Status}
+            case trevrpc_codec:encode(Codec, Request) of
+                {ok, Message} -> send_message(Call, State, Message);
+                error -> {error, abort(Call, State, encode_status())}
             end;
         #cstate{terminal = Terminal} ->
             {error, terminal_status(Terminal)}
     end;
 send(_Call, _Message) ->
     erlang:error(badarg).
+
+send_message(Call, State, Message) ->
+    case before_send(Call, State, iolist_size(Message)) of
+        {ok, Ready} ->
+            {Frame, Encoded} = encode_request(Call, Ready, Message),
+            put_state(Call, keep(Encoded, Message)),
+            write(Call, Frame, false);
+        {error, Status} ->
+            {error, Status}
+    end.
 
 %% Takes what the server decided, if it has arrived, and makes room to keep
 %% a copy of a request of `Size' bytes while an optimistic call waits; with
@@ -591,7 +630,7 @@ close_send(Call) ->
 
 %% @doc Ends the requests of a client-streaming call and returns its
 %% response.
--spec close_and_recv(call()) -> {ok, binary()} | {error, trevrpc_status:status()}.
+-spec close_and_recv(call()) -> {ok, term()} | {error, trevrpc_status:status()}.
 close_and_recv(Call) ->
     _ = close_send(Call),
     case single_response(Call) of
@@ -626,20 +665,20 @@ write(Call, Data, Fin) ->
 ended_upload(Call, State) ->
     {error, terminal_status(read_terminal(Call, State#cstate{send_closed = true}))}.
 
-%% @doc Reads the next response message. `{eof, Trailers}' ends a call with
-%% an OK status and its trailing metadata; `{error, Status}' ends it with
-%% any other.
--spec recv(call()) -> {ok, binary()} | terminal().
+%% @doc Reads the next response message, decoded with the call's codec if
+%% it has one. `{eof, Trailers}' ends a call with an OK status and its
+%% trailing metadata; `{error, Status}' ends it with any other.
+-spec recv(call()) -> {ok, term()} | terminal().
 recv(Call) ->
     case state(Call) of
         #cstate{pending = [Message | Rest]} = State ->
             put_state(Call, State#cstate{pending = Rest}),
-            {ok, Message};
+            received(Call, Message);
         #cstate{terminal = undefined} = State ->
             case read_event(Call, State) of
                 {message, Message, Next} ->
                     put_state(Call, Next),
-                    {ok, Message};
+                    received(Call, Message);
                 {headers, Next} ->
                     put_state(Call, Next),
                     recv(Call);
@@ -650,6 +689,20 @@ recv(Call) ->
         #cstate{terminal = Terminal} = State ->
             done(Call, State),
             Terminal
+    end.
+
+%% A response message, decoded with the call's codec. One it cannot decode
+%% abandons the call, as a response that breaks the protocol does.
+received(#client_call{codec = Codec} = Call, Message) ->
+    case trevrpc_codec:decode(Codec, Message) of
+        {ok, Decoded} ->
+            {ok, Decoded};
+        error ->
+            Status = abort(
+                Call, state(Call), trevrpc_status:new(internal, <<"failed to decode response">>)
+            ),
+            done(Call, state(Call)),
+            {error, Status}
     end.
 
 %% @doc The response headers, reading as far as needed: up to the HEADERS

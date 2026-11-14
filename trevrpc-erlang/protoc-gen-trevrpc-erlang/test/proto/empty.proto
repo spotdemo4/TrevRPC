@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+// Empty has no package and a service without methods.
+service Empty {}
+
+message Lonely {
+  int32 value = 1;
+}

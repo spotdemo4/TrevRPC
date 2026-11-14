@@ -17,19 +17,20 @@ ln -s .envrc.project .envrc
 direnv allow
 ```
 
-| directory                           | contents                                                                                        |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `trevrpc-go/`                       | Go runtime, `protoc-gen-trevrpc-go`, examples                                                   |
-| `trevrpc-rust/`                     | Rust crate, `protoc-gen-trevrpc-rust`, examples                                                 |
-| `trevrpc-js/`                       | browser client, browser interop runner                                                          |
-| `trevrpc-js/effect/`                | Effect adapter for the browser client                                                           |
-| `trevrpc-js/protovalidate/`         | protovalidate request validation for the browser client                                         |
-| `trevrpc-js/protoc-gen-trevrpc-js/` | `protoc-gen-trevrpc-js`, message codecs for the browser client                                  |
-| `trevrpc-kotlin/`                   | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`                                   |
-| `trevrpc-erlang/`                   | Erlang runtime (in progress: native QUIC, QMux over TLS and WebSocket, HTTP/3 and HTTP/2, zstd) |
-| `interop/`                          | cross-runtime test suite                                                                        |
-| `bench/`                            | load benchmarks and the grpc-go and connect-go baselines                                        |
-| `testdata/`                         | wire, QMux, and zstd golden vectors shared by the runtimes                                      |
+| directory                                   | contents                                                                                        |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `trevrpc-go/`                               | Go runtime, `protoc-gen-trevrpc-go`, examples                                                   |
+| `trevrpc-rust/`                             | Rust crate, `protoc-gen-trevrpc-rust`, examples                                                 |
+| `trevrpc-js/`                               | browser client, browser interop runner                                                          |
+| `trevrpc-js/effect/`                        | Effect adapter for the browser client                                                           |
+| `trevrpc-js/protovalidate/`                 | protovalidate request validation for the browser client                                         |
+| `trevrpc-js/protoc-gen-trevrpc-js/`         | `protoc-gen-trevrpc-js`, message codecs for the browser client                                  |
+| `trevrpc-kotlin/`                           | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`                                   |
+| `trevrpc-erlang/`                           | Erlang runtime (in progress: native QUIC, QMux over TLS and WebSocket, HTTP/3 and HTTP/2, zstd) |
+| `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang`, gpb message modules and service stubs                              |
+| `interop/`                                  | cross-runtime test suite                                                                        |
+| `bench/`                                    | load benchmarks and the grpc-go and connect-go baselines                                        |
+| `testdata/`                                 | wire, QMux, and zstd golden vectors shared by the runtimes                                      |
 
 ### run
 
@@ -97,6 +98,14 @@ rebar3 eunit
 rebar3 xref
 rebar3 dialyzer
 erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
+```
+
+the same in `trevrpc-erlang/protoc-gen-trevrpc-erlang/`, whose tests also need `protoc`. The Erlang interop
+executable runs on bindings generated from `interop/proto`, kept in `trevrpc-erlang/interop/src/generated`;
+after changing the plugin or those protos, regenerate them with `protoc` on the PATH:
+
+```sh
+trevrpc-erlang/interop/generate.sh
 ```
 
 with the cross-runtime [interop](interop) suite:

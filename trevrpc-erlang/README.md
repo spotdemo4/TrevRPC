@@ -50,7 +50,7 @@ chat(Call) ->
     end.
 ```
 
-Messages are opaque binaries: handlers decode requests and encode responses, so the runtime depends on no protobuf library (Erlang users can pick gpb, Elixir users protox, and the Gleam package its own generator).
+The runtime depends on no protobuf library: messages are binaries, unless the route has a `codec` (`#{encode := fun((Message) -> iodata()), decode := fun((binary()) -> Message)}`, see `trevrpc_codec`), with which handlers get and give messages as terms. The code [protoc-gen-trevrpc-erlang](#code-generation) generates sets one on every route and call; Elixir users can pass protox's encoders and decoders. A request the codec cannot decode ends the call with `invalid_argument` (`trevrpc_call:recv/1` returns that status to a streaming handler), and a response it cannot encode ends it with `internal`, which the client sees as an internal server error (`trevrpc_call:send/2` returns that status to the handler). A codec that cannot encode is logged as an error, as it is a bug of this side, and one that cannot decode at debug level, as it is more likely a bad peer; the log has the exception's class, its reason's tag and where it was raised, never the message.
 
 Unary and server-streaming handlers take `(Request, Call)`, client-streaming and bidirectional ones `(Call)`. They return `{ok, Response}` (single responses), `ok` (streamed responses) or `{error, Status}`, where a status is a map such as `trevrpc_status:new(not_found, <<"missing">>)`, optionally with `metadata` and `details`. `trevrpc_call` reads requests, sends responses, headers and trailers, and gives the call's metadata and deadline.
 
@@ -100,9 +100,61 @@ ok = trevrpc_client:close_send(Call),
 {eof, Trailers} = trevrpc_client:recv(Call).
 ```
 
+Messages are binaries here too, unless the call's options have a `codec`, which encodes requests and decodes responses. A request it cannot encode and a response it cannot decode end the call with an `internal` status, the first before anything is sent when it is the call's only request.
+
 `transport` picks how a channel connects: `quic`, `tcp` (QMux over TLS) or `auto`, the default, which starts QUIC and, if it has not connected after `fallback_delay` (300 ms) or fails before, races QMux over TLS against it; the first to connect wins. Once QMux won, reconnects go straight to it for `reprobe_interval` (5 minutes) before trying QUIC again. `tcp_host` and `tcp_port` address the server's TCP listener, by default the QUIC host and port. `trevrpc_channel:transport/1` says which transport the current connection uses. A certificate in `cacerts` or `cacertfile` may be the server's own self-signed one.
 
 A channel reconnects on its own and follows the [connection lifecycle](https://trev.zip/llc/TrevRPC/wiki/Connection-Lifecycle) of the other runtimes: each connection is a generation, calls never move between generations, calls made while it reconnects fail at once with `unavailable`, and reconnects back off from 100 ms to 30 s with jitter. A call belongs to the process that started it; if that process exits, the channel cancels the call. `trevrpc_channel:subscribe/1` sends the calling process `{trevrpc_channel, Channel, State}` messages with the channel's state, `{ready, Generation}`, `connecting` or, last, `closed`, now and after every change, until `unsubscribe/1` or the process exits.
+
+## Code generation
+
+`protoc-gen-trevrpc-erlang` ([`protoc-gen-trevrpc-erlang/`](protoc-gen-trevrpc-erlang)) is a protoc plugin. For every proto file it generates a module that encodes and decodes the file's messages, made by [gpb](https://github.com/tomas-abrahamsson/gpb), and for every service a module with its behaviour, its routes and a client function per method. The `trevrpc-erlang` Nix package provides it, as the other runtimes' packages provide their plugins, or build it with `rebar3 escriptize` in its directory (the escript is `_build/default/bin/protoc-gen-trevrpc-erlang`). Run it with protoc or buf, with the repository's `proto/` on the include path for `trevrpc/options.proto`:
+
+```sh
+protoc --plugin=protoc-gen-trevrpc-erlang=path/to/protoc-gen-trevrpc-erlang \
+    -I proto -I path/to/TrevRPC/proto --trevrpc-erlang_out=src/generated example/greeter/v1/greeter.proto
+```
+
+For service `example.greeter.v1.Greeter` in `greeter.proto`, it writes `greeter_pb.erl` and `example_greeter_v1_greeter.erl`:
+
+```erlang
+-module(greeter).
+-behaviour(example_greeter_v1_greeter).
+-export([say_hello/2, chat/1]).
+
+say_hello(#{name := Name}, _Call) ->
+    {ok, #{message => <<"hello ", Name/binary>>}}.
+
+chat(Call) ->
+    case trevrpc_call:recv(Call) of
+        {ok, #{name := Name}} ->
+            ok = trevrpc_call:send(Call, #{message => <<"hello ", Name/binary>>}),
+            chat(Call);
+        eof ->
+            ok;
+        {error, Status} ->
+            {error, Status}
+    end.
+```
+
+```erlang
+{ok, Server} = trevrpc_server:start_link(#{..., routes => example_greeter_v1_greeter:routes(greeter)}),
+
+{ok, #{message := Message}, _} = example_greeter_v1_greeter:say_hello(Channel, #{name => <<"you">>}),
+{ok, Call} = example_greeter_v1_greeter:chat(Channel, #{timeout => 5000}),
+ok = trevrpc_client:send(Call, #{name => <<"you">>}),
+{ok, #{message := Reply}} = trevrpc_client:recv(Call).
+```
+
+- A method is a callback and a client function named in snake case (`SayHello` is `say_hello`). Client functions take the channel, then the request unless the client streams, then, optionally, `trevrpc_client` call options, which win over those of the schema.
+- `routes/1` takes a module that implements the behaviour, or a map of handler funs by method name; a method left out of the map is not routed, and a name that is no method fails with `{unknown_method, Name, Methods}`. Several services' routes merge with `maps:merge/2`.
+- Routes and calls carry each method's message types, which pick its compression dictionaries, how its `trevrpc.method` option lets its messages be compressed (never a side whose message type has a field marked `debug_redact`), and a codec: handlers and callers get and give messages as gpb terms.
+- Messages are gpb's maps, or records with `msg_format=records` (defined in the message module's `.hrl`), with strings as binaries and message names that carry their package (`'example.greeter.v1.HelloRequest'`); a oneof is `{Field, Value}` and an unset optional field is left out. A message module holds its file's messages and those they use from other files, but not the definitions behind custom options (descriptor.proto).
+- Parameters (`--trevrpc-erlang_opt=name=value,...`): `msg_format` (`maps` or `records`), `module_prefix`, `pb_suffix` (`_pb`), and `service_suffix`.
+- Editions files are refused, and `unreliable_requests` and `unreliable_responses` are checked but do nothing until the runtime has datagram messages.
+- gpb's modules export functions without specs, and carry `-compile([nowarn_missing_spec])` for that; xref's `locals_not_used` check needs them in `xref_ignores`, as gpb leaves functions they do not use.
+
+The generated modules need nothing but the runtime. The escript carries gpb, which is LGPL-2.1-or-later; the code gpb generates is not covered by that license.
 
 ## Compression
 
@@ -152,6 +204,7 @@ The codecs, `trevrpc_zstd` and `trevrpc_zstd_stream`, are checked against the sh
 | `trevrpc_call`                 | The handler API                                                                               |
 | `trevrpc_channel`              | The client channel: reconnects, generations, stream credit                                    |
 | `trevrpc_client`               | Client calls                                                                                  |
+| `trevrpc_codec`                | The codecs of routes and calls                                                                |
 | `trevrpc_status`               | Status codes and statuses                                                                     |
 | `trevrpc_metadata`             | Metadata key rules and size limits                                                            |
 | `trevrpc`                      | Protocol identifiers and the default frame size limit                                         |
@@ -174,6 +227,6 @@ rebar3 xref
 rebar3 dialyzer
 ```
 
-`nix build .#trevrpc-erlang` runs all three. `nix fmt` formats the sources with erlfmt.
+`nix build .#trevrpc-erlang` runs all three. `nix fmt` formats the sources with erlfmt. The same commands work in `protoc-gen-trevrpc-erlang/`, whose tests also need `protoc`, and `nix build .#trevrpc-erlang` runs them too, as it builds the plugin it provides. The interop executable's bindings, in `interop/src/generated`, are regenerated with `interop/generate.sh`, and a check fails when they differ from what the plugin generates.
 
 The Hex dependencies are declared in `rebar.config` and pinned in `rebar.lock`, which is the one place their versions and hashes live: after changing a dependency, update the lock with `rebar3 upgrade`, and the Nix package reads versions and tarball hashes from it.

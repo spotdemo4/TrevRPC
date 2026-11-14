@@ -20,9 +20,6 @@
 
 -export([main/0, server_scenarios/0, compression/1]).
 
--define(ECHO, "/trevrpc.interop.v1.Echo/").
--define(COMPRESSED_ECHO, "/trevrpc.interop.v1.CompressedEcho/").
--define(REFUSING_ECHO, "/trevrpc.interop.v1.RefusingEcho/").
 -define(STREAM_RECEIVED, <<"interop-stream-compressed-received">>).
 
 %% @doc The scenarios this server passes; clients skip the others.
@@ -149,7 +146,7 @@ compression(#{"dictionary" := Path}) ->
             #{
                 data => Data,
                 messages => [
-                    trevrpc_interop_proto:request_type(), trevrpc_interop_proto:response_type()
+                    <<"trevrpc.interop.v1.EchoRequest">>, <<"trevrpc.interop.v1.EchoResponse">>
                 ]
             }
         ]
@@ -157,56 +154,45 @@ compression(#{"dictionary" := Path}) ->
 compression(#{}) ->
     #{}.
 
+%% The services of interop/proto, from the generated modules: their routes
+%% carry each method's message types, compression and codec.
 routes() ->
     Echo = #{
-        request_type => trevrpc_interop_proto:request_type(),
-        response_type => trevrpc_interop_proto:response_type()
+        unary => fun unary/2,
+        client_stream => fun client_stream/1,
+        server_stream => fun server_stream/2,
+        bidi => fun bidi/1
     },
-    Plain = trevrpc_interop_proto:plain_type(),
-    #{
-        <<?ECHO "Unary">> => Echo#{kind => unary, handler => fun unary/2},
-        <<?ECHO "ClientStream">> => Echo#{kind => client_streaming, handler => fun client_stream/1},
-        <<?ECHO "ServerStream">> => Echo#{kind => server_streaming, handler => fun server_stream/2},
-        <<?ECHO "Bidi">> => Echo#{kind => bidirectional_streaming, handler => fun bidi/1},
-        <<?COMPRESSED_ECHO "Unary">> => Echo#{
-            kind => unary, handler => fun unary/2, compression => message
-        },
-        <<?COMPRESSED_ECHO "Bidi">> => Echo#{
-            kind => bidirectional_streaming,
-            handler => fun(Call) -> counted(Call, fun bidi/1) end,
-            compression => stream
-        },
-        <<?COMPRESSED_ECHO "ClientStream">> => Echo#{
-            kind => client_streaming,
-            handler => fun(Call) -> counted(Call, fun client_stream/1) end,
-            compression => stream
-        },
-        %% Registered without stream compression, as a server built from a
-        %% schema without COMPRESSION_STREAM would be, so it refuses every
-        %% optimistic call.
-        <<?REFUSING_ECHO "ClientStream">> => Echo#{
-            kind => client_streaming, handler => fun client_stream/1
-        },
-        <<?COMPRESSED_ECHO "Plain">> => #{
-            kind => unary,
-            handler => fun plain/2,
-            request_type => Plain,
-            response_type => Plain,
-            compression => message
-        }
-    }.
+    Compressed = #{
+        unary => fun unary/2,
+        bidi => fun(Call) -> counted(Call, fun bidi/1) end,
+        client_stream => fun(Call) -> counted(Call, fun client_stream/1) end,
+        plain => fun plain/2
+    },
+    %% RefusingEcho drops its stream compression, as a server built from a
+    %% schema without COMPRESSION_STREAM would, so it refuses every
+    %% optimistic call.
+    Refusing = maps:map(
+        fun(_Path, Route) -> maps:remove(compression, Route) end,
+        trevrpc_interop_v1_refusing_echo:routes(#{client_stream => fun client_stream/1})
+    ),
+    maps:merge(
+        maps:merge(
+            trevrpc_interop_v1_echo:routes(Echo),
+            trevrpc_interop_v1_compressed_echo:routes(Compressed)
+        ),
+        Refusing
+    ).
 
-unary(Bin, Call) ->
-    with_request(Bin, fun(#{message := Message} = Request) ->
-        start(Call),
-        case failure(Request) of
-            none ->
-                Suffix = maps:get(<<"interop-suffix">>, trevrpc_call:metadata(Call), <<>>),
-                ok(Call, response(<<Message/binary, Suffix/binary>>, 0));
-            Status ->
-                {error, Status}
-        end
-    end).
+unary(#{message := Message} = Request, Call) ->
+    start(Call),
+    case failure(Request) of
+        none ->
+            Suffix = maps:get(<<"interop-suffix">>, trevrpc_call:metadata(Call), <<>>),
+            ok(Call, response(<<Message/binary, Suffix/binary>>, 0));
+        Status ->
+            {error, Status}
+    end.
 
 %% Runs an Echo handler, adding to an OK end's trailing metadata how many
 %% requests arrived stream-compressed.
@@ -224,17 +210,12 @@ counted(Call, Handler) ->
 
 %% Echoes the text, with trailing metadata saying whether the request
 %% arrived compressed without a dictionary.
-plain(Bin, Call) ->
-    case trevrpc_interop_proto:decode_plain(Bin) of
-        {ok, Text} ->
-            #{plain := Plain} = trevrpc_call:compressed_received(Call),
-            trevrpc_call:set_trailers(Call, #{
-                <<"interop-plain-compressed-received">> => integer_to_binary(Plain)
-            }),
-            {ok, trevrpc_interop_proto:encode_plain(Text)};
-        error ->
-            {error, trevrpc_status:new(invalid_argument, <<"failed to decode request">>)}
-    end.
+plain(#{text := Text}, Call) ->
+    #{plain := Plain} = trevrpc_call:compressed_received(Call),
+    trevrpc_call:set_trailers(Call, #{
+        <<"interop-plain-compressed-received">> => integer_to_binary(Plain)
+    }),
+    {ok, #{text => Text}}.
 
 client_stream(Call) ->
     start(Call),
@@ -242,29 +223,25 @@ client_stream(Call) ->
 
 client_stream(Call, Messages, Count) ->
     case trevrpc_call:recv(Call) of
-        {ok, Bin} ->
-            with_request(Bin, fun(#{message := Message} = Request) ->
-                case failure(Request) of
-                    none -> client_stream(Call, [Message | Messages], Count + 1);
-                    Status -> {error, Status}
-                end
-            end);
+        {ok, #{message := Message} = Request} ->
+            case failure(Request) of
+                none -> client_stream(Call, [Message | Messages], Count + 1);
+                Status -> {error, Status}
+            end;
         eof ->
             ok(Call, response(iolist_to_binary(lists:reverse(Messages)), Count));
         {error, Status} ->
             {error, Status}
     end.
 
-server_stream(Bin, Call) ->
-    with_request(Bin, fun(#{message := Message, count := Count} = Request) ->
-        start(Call),
-        Sent = send_all(Call, [response(Message, Index) || Index <- lists:seq(0, Count - 1)]),
-        case {Sent, failure(Request)} of
-            {ok, none} -> ok(Call);
-            {ok, Status} -> {error, Status};
-            {Error, _} -> Error
-        end
-    end).
+server_stream(#{message := Message, count := Count} = Request, Call) ->
+    start(Call),
+    Sent = send_all(Call, [response(Message, Index) || Index <- lists:seq(0, Count - 1)]),
+    case {Sent, failure(Request)} of
+        {ok, none} -> ok(Call);
+        {ok, Status} -> {error, Status};
+        {Error, _} -> Error
+    end.
 
 bidi(Call) ->
     start(Call),
@@ -272,18 +249,16 @@ bidi(Call) ->
 
 bidi(Call, Index) ->
     case trevrpc_call:recv(Call) of
-        {ok, Bin} ->
-            with_request(Bin, fun(#{message := Message} = Request) ->
-                case failure(Request) of
-                    none ->
-                        case trevrpc_call:send(Call, response(Message, Index)) of
-                            ok -> bidi(Call, Index + 1);
-                            Error -> Error
-                        end;
-                    Status ->
-                        {error, Status}
-                end
-            end);
+        {ok, #{message := Message} = Request} ->
+            case failure(Request) of
+                none ->
+                    case trevrpc_call:send(Call, response(Message, Index)) of
+                        ok -> bidi(Call, Index + 1);
+                        Error -> Error
+                    end;
+                Status ->
+                    {error, Status}
+            end;
         eof ->
             ok(Call);
         {error, Status} ->
@@ -296,12 +271,6 @@ send_all(Call, [Response | Rest]) ->
     case trevrpc_call:send(Call, Response) of
         ok -> send_all(Call, Rest);
         Error -> Error
-    end.
-
-with_request(Bin, Fun) ->
-    case trevrpc_interop_proto:decode_request(Bin) of
-        {ok, Request} -> Fun(Request);
-        error -> {error, trevrpc_status:new(invalid_argument, <<"failed to decode request">>)}
     end.
 
 %% Every method sends headers {interop-header: v} before its first response
@@ -340,10 +309,10 @@ failure(#{fail_code := 8, fail_message := Message}) ->
     #{
         code => resource_exhausted,
         message => Message,
-        details => [trevrpc_interop_proto:retry_info(1, 500000000)]
+        details => [trevrpc_interop_retry:retry_info(1, 500000000)]
     };
 failure(#{fail_code := Code, fail_message := Message}) ->
     trevrpc_status:new(trevrpc_status:from_int(Code), Message).
 
 response(Message, Index) ->
-    trevrpc_interop_proto:encode_response(#{message => Message, index => Index}).
+    #{message => Message, index => Index}.

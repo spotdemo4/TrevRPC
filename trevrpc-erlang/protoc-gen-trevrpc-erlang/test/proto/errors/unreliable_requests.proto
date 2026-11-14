@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package example.errors;
+
+import "trevrpc/options.proto";
+
+service UnreliableRequests {
+  rpc ServerStream(Empty) returns (stream Empty) {
+    option (trevrpc.method) = {unreliable_requests: true};
+  }
+}
+
+message Empty {}

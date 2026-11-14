@@ -247,7 +247,7 @@ covers code generation, and the runtime guides cover streaming calls.
 
 ## using
 
-Each runtime has a library. Go, Rust, and Kotlin also have a `protoc` plugin that generates code from your
+Each runtime has a library. Go, Rust, Kotlin, and Erlang also have a `protoc` plugin that generates code from your
 services; JavaScript uses the service descriptors that protobuf-es generates, and an optional plugin that
 generates faster message codecs.
 
@@ -305,6 +305,13 @@ dependencies {
 `protoc-gen-trevrpc-kotlin` is available from [nix](#nix), or from a checkout with
 `./gradlew :protoc-gen-trevrpc-kotlin:installDist` in `trevrpc-kotlin/`
 
+### erlang
+
+the Erlang runtime is in progress and not published yet ([#477](https://trev.zip/llc/TrevRPC/issues/477)).
+`protoc-gen-trevrpc-erlang` generates [gpb](https://github.com/tomas-abrahamsson/gpb) message modules and
+service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
+`trevrpc-erlang/protoc-gen-trevrpc-erlang/`. See [`trevrpc-erlang`](trevrpc-erlang#code-generation).
+
 ### nix
 
 each language's package provides its `protoc` plugin:
@@ -314,6 +321,7 @@ nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang
 ```
 
 ### download

@@ -5,9 +5,9 @@
 
 -export([run/1]).
 
--define(ECHO, "/trevrpc.interop.v1.Echo/").
--define(COMPRESSED_ECHO, "/trevrpc.interop.v1.CompressedEcho/").
--define(REFUSING_ECHO, "/trevrpc.interop.v1.RefusingEcho/").
+-define(ECHO, trevrpc_interop_v1_echo).
+-define(COMPRESSED_ECHO, trevrpc_interop_v1_compressed_echo).
+-define(REFUSING_ECHO, trevrpc_interop_v1_refusing_echo).
 -define(STREAM_RECEIVED, <<"interop-stream-compressed-received">>).
 -define(DEADLINE, 10000).
 %% The message of the plain.records compression golden vector: a JSON
@@ -181,17 +181,12 @@ report(Name, {fail, Why}) -> io:format("fail ~ts: ~ts~n", [Name, Why]).
 
 %%% Scenarios
 
-%% Echo calls name their message types, which pick the dictionary.
+%% The generated functions add each method's message types, which pick the
+%% dictionary, its compression and its codec.
 opts() ->
-    #{
-        timeout => ?DEADLINE,
-        request_type => trevrpc_interop_proto:request_type(),
-        response_type => trevrpc_interop_proto:response_type()
-    }.
+    #{timeout => ?DEADLINE}.
 
 opts(Metadata) -> (opts())#{metadata => Metadata}.
-
-request(Fields) -> trevrpc_interop_proto:encode_request(Fields).
 
 unary(Channel) ->
     expect_unary(call_unary(Channel, #{message => <<"hello">>}, opts()), <<"hello">>, 0).
@@ -215,11 +210,11 @@ unary_retry_delay(Channel) ->
         {error, Exhausted} ?=
             call_unary(Channel, #{fail_code => 8, fail_message => <<"slow down">>}, opts()),
         ok ?= expect_status({error, Exhausted}, resource_exhausted, <<"slow down">>),
-        ok ?= expect(1500, trevrpc_interop_proto:retry_delay(Exhausted), "retry delay"),
+        ok ?= expect(1500, trevrpc_interop_retry:retry_delay(Exhausted), "retry delay"),
         {error, Missing} ?=
             call_unary(Channel, #{fail_code => 5, fail_message => <<"missing">>}, opts()),
         ok ?= expect_status({error, Missing}, not_found, <<"missing">>),
-        expect(none, trevrpc_interop_proto:retry_delay(Missing), "retry delay")
+        expect(none, trevrpc_interop_retry:retry_delay(Missing), "retry delay")
     else
         {ok, _, _} -> {error, <<"call succeeded">>};
         {error, _} = Error -> Error
@@ -231,34 +226,32 @@ unary_large(Channel) ->
 
 client_stream(Channel) ->
     maybe
-        {ok, Call} ?= trevrpc_client:client_stream(Channel, <<?ECHO "ClientStream">>, opts()),
+        {ok, Call} ?= ?ECHO:client_stream(Channel, opts()),
         ok ?= send_all(Call, [<<"a">>, <<"b">>, <<"c">>]),
-        {ok, Bin} ?= trevrpc_client:close_and_recv(Call),
-        expect_response(Bin, <<"abc">>, 3)
+        {ok, Response} ?= trevrpc_client:close_and_recv(Call),
+        expect_response(Response, <<"abc">>, 3)
     else
         Error -> describe(Error)
     end.
 
 server_stream(Channel) ->
     expect_stream(
-        trevrpc_client:server_stream(
-            Channel, <<?ECHO "ServerStream">>, request(#{message => <<"s">>, count => 3}), opts()
-        ),
+        ?ECHO:server_stream(Channel, #{message => <<"s">>, count => 3}, opts()),
         [{<<"s">>, 0}, {<<"s">>, 1}, {<<"s">>, 2}],
         ok
     ).
 
 server_stream_error(Channel) ->
-    Request = request(#{message => <<"s">>, count => 2, fail_code => 9, fail_message => <<"stop">>}),
+    Request = #{message => <<"s">>, count => 2, fail_code => 9, fail_message => <<"stop">>},
     expect_stream(
-        trevrpc_client:server_stream(Channel, <<?ECHO "ServerStream">>, Request, opts()),
+        ?ECHO:server_stream(Channel, Request, opts()),
         [{<<"s">>, 0}, {<<"s">>, 1}],
         {failed_precondition, <<"stop">>}
     ).
 
 bidi(Channel) ->
     maybe
-        {ok, Call} ?= trevrpc_client:bidi(Channel, <<?ECHO "Bidi">>, opts()),
+        {ok, Call} ?= ?ECHO:bidi(Channel, opts()),
         ok ?= ping_pong(Call, [<<"1">>, <<"2">>, <<"3">>], 0),
         ok ?= trevrpc_client:close_send(Call),
         {eof, _} ?= trevrpc_client:recv(Call),
@@ -269,10 +262,10 @@ bidi(Channel) ->
 
 bidi_error(Channel) ->
     maybe
-        {ok, Call} ?= trevrpc_client:bidi(Channel, <<?ECHO "Bidi">>, opts()),
+        {ok, Call} ?= ?ECHO:bidi(Channel, opts()),
         ok ?= ping_pong(Call, [<<"1">>], 0),
         %% The server can end the call before this send.
-        _ = trevrpc_client:send(Call, request(#{fail_code => 10, fail_message => <<"abort">>})),
+        _ = trevrpc_client:send(Call, #{fail_code => 10, fail_message => <<"abort">>}),
         expect_status(trevrpc_client:recv(Call), aborted, <<"abort">>)
     else
         Error -> describe(Error)
@@ -281,9 +274,9 @@ bidi_error(Channel) ->
 unary_headers(Channel) ->
     Header = #{<<"interop-header">> => <<"h">>},
     case call_unary(Channel, #{message => <<"hello">>}, opts(Header)) of
-        {ok, Bin, #{headers := Headers, trailers := Trailers}} ->
+        {ok, Response, #{headers := Headers, trailers := Trailers}} ->
             maybe
-                ok ?= expect_response(Bin, <<"hello">>, 0),
+                ok ?= expect_response(Response, <<"hello">>, 0),
                 ok ?= expect(Header, Headers, "headers"),
                 expect(#{<<"interop-trailer">> => <<"h">>}, Trailers, "trailers")
             end;
@@ -293,10 +286,9 @@ unary_headers(Channel) ->
 
 server_stream_headers(Channel) ->
     Header = #{<<"interop-header">> => <<"h">>},
-    Request = request(#{message => <<"s">>, count => 2}),
+    Request = #{message => <<"s">>, count => 2},
     maybe
-        {ok, Call} ?=
-            trevrpc_client:server_stream(Channel, <<?ECHO "ServerStream">>, Request, opts(Header)),
+        {ok, Call} ?= ?ECHO:server_stream(Channel, Request, opts(Header)),
         {ok, Headers} ?= trevrpc_client:headers(Call),
         ok ?= expect(Header, Headers, "headers"),
         ok ?= expect_messages(Call, [{<<"s">>, 0}, {<<"s">>, 1}]),
@@ -313,7 +305,7 @@ compressed(Channel) ->
     maybe
         ok ?= expect_unary(call_unary(Channel, #{message => record(100)}, opts()), record(100), 0),
         ok ?= expect_unary(call_unary(Channel, #{message => record(101)}, opts()), record(101), 0),
-        {ok, Call} ?= trevrpc_client:bidi(Channel, <<?ECHO "Bidi">>, opts()),
+        {ok, Call} ?= ?ECHO:bidi(Channel, opts()),
         ok ?= send_all(Call, Messages),
         ok ?= trevrpc_client:close_send(Call),
         ok ?= expect_messages(Call, lists:zip(Messages, [0, 1, 2])),
@@ -328,26 +320,15 @@ compressed(Channel) ->
 %% dictionary.
 compressed_plain(Channel) ->
     Text = binary:copy(?PLAIN_RECORD, 2),
-    Opts = #{
-        timeout => ?DEADLINE,
-        request_type => trevrpc_interop_proto:plain_type(),
-        response_type => trevrpc_interop_proto:plain_type(),
-        compression => message
-    },
     Plain = fun() ->
         maybe
-            {ok, Bin, #{trailers := Trailers}} ?=
-                trevrpc_client:unary(
-                    Channel,
-                    <<?COMPRESSED_ECHO "Plain">>,
-                    trevrpc_interop_proto:encode_plain(Text),
-                    Opts
-                ),
-            {ok, Text} ?= trevrpc_interop_proto:decode_plain(Bin),
+            {ok, #{text := Echoed}, #{trailers := Trailers}} ?=
+                ?COMPRESSED_ECHO:plain(Channel, #{text => Text}, opts()),
+            true ?= Echoed =:= Text,
             #{<<"interop-plain-compressed-received">> := Received} ?= Trailers,
             {ok, Received}
         else
-            {ok, _Other} -> {error, <<"the echoed text differs">>};
+            false -> {error, <<"the echoed text differs">>};
             #{} -> {error, <<"no interop-plain-compressed-received trailer">>};
             Error -> describe(Error)
         end
@@ -372,7 +353,7 @@ compressed_plain(Channel) ->
 compressed_stream(Channel) ->
     maybe
         ok ?= stream_bidi(Channel, 6),
-        stream_upload(Channel, <<?COMPRESSED_ECHO "ClientStream">>, 6)
+        stream_upload(Channel, ?COMPRESSED_ECHO, 6)
     end.
 
 %% RefusingEcho.ClientStream, which the server refuses as optimistic and the
@@ -381,23 +362,19 @@ compressed_stream(Channel) ->
 %% call, optimistic again after that answer.
 refused_stream(Channel) ->
     maybe
-        ok ?= stream_upload(Channel, <<?REFUSING_ECHO "ClientStream">>, none),
+        ok ?= stream_upload(Channel, ?REFUSING_ECHO, none),
         ok ?= stream_bidi(Channel, 1),
-        stream_upload(Channel, <<?COMPRESSED_ECHO "ClientStream">>, 6)
+        stream_upload(Channel, ?COMPRESSED_ECHO, 6)
     end.
 
 stream_messages() ->
     [record(Latency) || Latency <- lists:seq(100, 107)].
 
-stream_opts(Metadata) ->
-    (opts(Metadata))#{compression => stream}.
-
 stream_bidi(Channel, AtLeast) ->
     Header = #{<<"interop-header">> => <<"h">>},
     Messages = stream_messages(),
     maybe
-        {ok, Call} ?=
-            trevrpc_client:bidi(Channel, <<?COMPRESSED_ECHO "Bidi">>, stream_opts(Header)),
+        {ok, Call} ?= ?COMPRESSED_ECHO:bidi(Channel, opts(Header)),
         ok ?= ping_pong(Call, Messages, 0),
         {ok, Headers} ?= trevrpc_client:headers(Call),
         ok ?= expect(Header, Headers, "headers"),
@@ -412,14 +389,16 @@ stream_bidi(Channel, AtLeast) ->
         Error -> describe(Error)
     end.
 
-stream_upload(Channel, Method, AtLeast) ->
+%% A ClientStream call of `Service', which is CompressedEcho or
+%% RefusingEcho; both allow stream compression in the schema.
+stream_upload(Channel, Service, AtLeast) ->
     Messages = stream_messages(),
     maybe
-        {ok, Call} ?= trevrpc_client:client_stream(Channel, Method, stream_opts(#{})),
+        {ok, Call} ?= Service:client_stream(Channel, opts()),
         ok ?= send_all(Call, Messages),
         ok ?= trevrpc_client:close_send(Call),
-        {ok, Bin} ?= trevrpc_client:recv(Call),
-        ok ?= expect_response(Bin, iolist_to_binary(Messages), 8),
+        {ok, Response} ?= trevrpc_client:recv(Call),
+        ok ?= expect_response(Response, iolist_to_binary(Messages), 8),
         {eof, Trailers} ?= trevrpc_client:recv(Call),
         stream_received(Trailers, AtLeast)
     else
@@ -448,13 +427,13 @@ record(Latency) ->
 
 %%% Helpers
 
-call_unary(Channel, Fields, Opts) ->
-    trevrpc_client:unary(Channel, <<?ECHO "Unary">>, request(Fields), Opts).
+call_unary(Channel, Request, Opts) ->
+    ?ECHO:unary(Channel, Request, Opts).
 
 send_all(_Call, []) ->
     ok;
 send_all(Call, [Message | Rest]) ->
-    case trevrpc_client:send(Call, request(#{message => Message})) of
+    case trevrpc_client:send(Call, #{message => Message}) of
         ok -> send_all(Call, Rest);
         Error -> Error
     end.
@@ -463,14 +442,16 @@ ping_pong(_Call, [], _Index) ->
     ok;
 ping_pong(Call, [Message | Rest], Index) ->
     maybe
-        ok ?= trevrpc_client:send(Call, request(#{message => Message})),
-        {ok, Bin} ?= trevrpc_client:recv(Call),
-        ok ?= expect_response(Bin, Message, Index),
+        ok ?= trevrpc_client:send(Call, #{message => Message}),
+        {ok, Response} ?= trevrpc_client:recv(Call),
+        ok ?= expect_response(Response, Message, Index),
         ping_pong(Call, Rest, Index + 1)
     end.
 
-expect_unary({ok, Bin, _Metadata}, Message, Index) -> expect_response(Bin, Message, Index);
-expect_unary(Error, _Message, _Index) -> describe(Error).
+expect_unary({ok, Response, _Metadata}, Message, Index) ->
+    expect_response(Response, Message, Index);
+expect_unary(Error, _Message, _Index) ->
+    describe(Error).
 
 expect_stream({ok, Call}, Expected, End) ->
     maybe
@@ -488,8 +469,8 @@ expect_messages(_Call, []) ->
     ok;
 expect_messages(Call, [{Message, Index} | Rest]) ->
     case trevrpc_client:recv(Call) of
-        {ok, Bin} ->
-            case expect_response(Bin, Message, Index) of
+        {ok, Response} ->
+            case expect_response(Response, Message, Index) of
                 ok -> expect_messages(Call, Rest);
                 Error -> Error
             end;
@@ -497,20 +478,15 @@ expect_messages(Call, [{Message, Index} | Rest]) ->
             describe(Other)
     end.
 
-expect_response(Bin, Message, Index) ->
-    case trevrpc_interop_proto:decode_response(Bin) of
-        {ok, #{message := Message, index := Index}} ->
-            ok;
-        {ok, #{message := Got, index := GotIndex}} ->
-            {error,
-                iolist_to_binary(
-                    io_lib:format("response (~ts, ~b), want (~ts, ~b)", [
-                        abbreviate(Got), GotIndex, abbreviate(Message), Index
-                    ])
-                )};
-        error ->
-            {error, <<"malformed EchoResponse">>}
-    end.
+expect_response(#{message := Message, index := Index}, Message, Index) ->
+    ok;
+expect_response(#{message := Got, index := GotIndex}, Message, Index) ->
+    {error,
+        iolist_to_binary(
+            io_lib:format("response (~ts, ~b), want (~ts, ~b)", [
+                abbreviate(Got), GotIndex, abbreviate(Message), Index
+            ])
+        )}.
 
 expect_status({error, Status}, Code, Message) ->
     case {trevrpc_status:code(Status), trevrpc_status:message(Status)} of

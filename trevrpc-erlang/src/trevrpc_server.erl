@@ -45,25 +45,28 @@
 
 %% A handler's outcome. `ok' (streaming responses) and `{ok, Response}'
 %% (single responses) end the call with OK; `{error, Status}' with that
-%% status.
--type result() :: ok | {ok, iodata()} | {error, trevrpc_status:status()}.
+%% status. A response is the message's bytes, or a term the route's codec
+%% encodes.
+-type result() :: ok | {ok, term()} | {error, trevrpc_status:status()}.
 
 %% Unary and server-streaming handlers get the request message;
 %% client-streaming and bidirectional ones read requests from the call.
 -type handler() ::
-    fun((binary(), trevrpc_call:call()) -> result())
+    fun((term(), trevrpc_call:call()) -> result())
     | fun((trevrpc_call:call()) -> result()).
 
 %% `request_type' and `response_type' are the protobuf full names of the
 %% method's messages, which pick their compression dictionaries, and
 %% `compression' how its messages may be compressed without one (see
-%% {@link trevrpc_zstd:directions()}).
+%% {@link trevrpc_zstd:directions()}). With a `codec', handlers get and give
+%% decoded messages; without one, their bytes.
 -type route() :: #{
     kind := trevrpc_wire:kind(),
     handler := handler(),
     request_type => binary(),
     response_type => binary(),
-    compression => trevrpc_zstd:directions()
+    compression => trevrpc_zstd:directions(),
+    codec => trevrpc_codec:codec()
 }.
 
 %% Method paths (`/package.Service/Method') to their routes.
@@ -195,7 +198,7 @@ compression(Opts) ->
         {error, Message} -> {error, {compression, Message}}
     end.
 
-%% A route's compression options are checked once, so that a mistake fails
+%% A route's options are checked once, so that a mistake fails
 %% the start rather than every call.
 check_routes(Routes) ->
     Invalid = [
@@ -238,7 +241,12 @@ route_errors(Route) ->
      || Key <- [request_type, response_type],
         not is_binary(maps:get(Key, Route, <<>>))
     ],
-    Directions ++ Types.
+    Codec =
+        case trevrpc_codec:check(maps:get(codec, Route, undefined)) of
+            ok -> [];
+            error -> [{invalid_codec, maps:get(codec, Route)}]
+        end,
+    Directions ++ Types ++ Codec.
 
 listen(Opts, Credentials, Compression) ->
     Name = list_to_atom("trevrpc_server_" ++ integer_to_list(erlang:unique_integer([positive]))),

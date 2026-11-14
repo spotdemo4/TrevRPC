@@ -1,0 +1,7 @@
+edition = "2023";
+
+package example.errors;
+
+message Edition {
+  string text = 1;
+}

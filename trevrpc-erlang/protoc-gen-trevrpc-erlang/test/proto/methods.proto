@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package example.methods.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trevrpc/options.proto";
+
+// Methods covers every kind of method, the schema options, and the names the
+// generator has to mangle.
+service Methods {
+  rpc Unary(Request) returns (Reply);
+  rpc ClientStream(stream Request) returns (Reply);
+  rpc ServerStream(Request) returns (stream Reply);
+  rpc Bidi(stream Request) returns (stream Reply);
+
+  rpc Compressed(Request) returns (Reply) {
+    option (trevrpc.method) = {compression: COMPRESSION_MESSAGE};
+  }
+  rpc StreamCompressed(stream Request) returns (Reply) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+  // The secret side is never compressed.
+  rpc Redacted(stream Secret) returns (stream Reply) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+  rpc Unreliable(stream Request) returns (stream Reply) {
+    option (trevrpc.method) = {
+      unreliable_requests: true
+      unreliable_responses: true
+    };
+  }
+
+  // A reserved word, and an acronym.
+  rpc Receive(Request) returns (Reply);
+  rpc GetHTTPStatus(Request) returns (Reply);
+}
+
+message Request {
+  string text = 1;
+  optional int32 count = 2;
+  google.protobuf.Timestamp at = 3;
+  Kind kind = 4;
+  Nested nested = 5;
+  map<string, Nested> by_name = 6;
+  oneof choice {
+    string name = 7;
+    int64 id = 8;
+  }
+
+  message Nested {
+    bytes data = 1;
+  }
+}
+
+message Reply {
+  string text = 1;
+}
+
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_ONE = 1;
+}
+
+// Secret holds a redacted field one message down.
+message Secret {
+  Inner inner = 1;
+
+  message Inner {
+    string token = 1 [debug_redact = true];
+  }
+}
+
+// Unused is defined here but used by no service.
+message Unused {
+  string text = 1;
+}

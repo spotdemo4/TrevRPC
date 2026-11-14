@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package example.errors;
+
+service Collision {
+  rpc GetFoo(Empty) returns (Empty);
+  rpc Get_Foo(Empty) returns (Empty);
+}
+
+message Empty {}

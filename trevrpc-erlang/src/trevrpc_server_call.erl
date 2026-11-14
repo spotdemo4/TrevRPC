@@ -64,7 +64,8 @@ run(
         kind = Kind,
         metadata = Metadata,
         deadline = Deadline,
-        owner = self()
+        owner = self(),
+        codec = maps:get(codec, Route, undefined)
     },
     trevrpc_call:put_state(Call, #call_state{
         stream = Stream,
@@ -114,12 +115,26 @@ answer_frame(Dictionaries, StreamRequests) ->
     trevrpc_frame:encode(answer, trevrpc_wire:encode_answer(Answer)).
 
 handle(Kind, Handler, Call, Config) when Kind =:= unary; Kind =:= server_streaming ->
-    case read_request(Call, maps:get(initial_request_timeout, Config)) of
-        {ok, Request} -> invoke(Call, fun() -> Handler(Request, Call) end);
-        {error, Status} -> {error, Status}
+    maybe
+        {ok, Message} ?= read_request(Call, maps:get(initial_request_timeout, Config)),
+        {ok, Request} ?= trevrpc_call:decode(Call, Message, <<"failed to decode request">>),
+        invoke(Call, fun() -> encoded(Call, Handler(Request, Call)) end)
     end;
 handle(_Kind, Handler, Call, _Config) ->
-    invoke(Call, fun() -> Handler(Call) end).
+    invoke(Call, fun() -> encoded(Call, Handler(Call)) end).
+
+%% A single response, encoded with the route's codec. One it cannot encode
+%% ends the call with an `internal' status, which the client sees as an
+%% internal server error, as for a crashing handler.
+encoded(#call{kind = Kind, codec = Codec}, {ok, Response}) when
+    Kind =:= unary; Kind =:= client_streaming
+->
+    case trevrpc_codec:encode(Codec, Response) of
+        {ok, Message} -> {ok, Message};
+        error -> {error, trevrpc_status:new(internal, <<"failed to encode response">>)}
+    end;
+encoded(_Call, Result) ->
+    Result.
 
 invoke(Call, Fun) ->
     try

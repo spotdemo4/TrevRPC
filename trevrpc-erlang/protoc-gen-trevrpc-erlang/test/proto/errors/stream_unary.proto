@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package example.errors;
+
+import "trevrpc/options.proto";
+
+service StreamUnary {
+  rpc Unary(Empty) returns (Empty) {
+    option (trevrpc.method) = {compression: COMPRESSION_STREAM};
+  }
+}
+
+message Empty {}

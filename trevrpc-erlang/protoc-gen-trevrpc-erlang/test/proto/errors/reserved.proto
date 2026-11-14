@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package example.errors;
+
+service Reserved {
+  rpc Routes(Empty) returns (Empty);
+}
+
+message Empty {}

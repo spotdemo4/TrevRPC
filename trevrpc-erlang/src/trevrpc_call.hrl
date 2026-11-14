@@ -10,7 +10,10 @@
     metadata :: trevrpc_metadata:metadata(),
     deadline :: trevrpc_stream:deadline(),
     %% The call process: the only one that can read and write the call.
-    owner :: pid()
+    owner :: pid(),
+    %% The route's codec: requests are decoded and responses encoded with
+    %% it, or are binaries without one.
+    codec :: trevrpc_codec:codec() | undefined
 }).
 
 %% What changes as the call runs, kept in the call process's dictionary

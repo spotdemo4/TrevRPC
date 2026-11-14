@@ -52,3 +52,6 @@ go.mod text linguist-language=Go
 
 # Gradle wrapper jar is binary and vendored
 gradle-wrapper.jar binary linguist-vendored=true
+
+# Linguist: generated bindings
+trevrpc-erlang/interop/src/generated/** linguist-generated=true

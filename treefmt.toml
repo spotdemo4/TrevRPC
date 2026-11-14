@@ -31,6 +31,8 @@ no-positional-arg-support = true
 command = "erlfmt"
 options = ["--write"]
 includes = ["*.erl", "*.hrl", "*.app.src", "rebar.config"]
+# Kept as protoc-gen-trevrpc-erlang generates them, which a check compares against.
+excludes = ["trevrpc-erlang/interop/src/generated/*"]
 
 [formatter.ruff]
 command = "ruff"

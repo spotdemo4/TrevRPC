@@ -286,6 +286,7 @@
                 wireGolden
                 qmuxGolden
                 zstdGolden
+                trevrpcProto
                 ;
             };
             trevrpc-erlang-interop = pkgs.callPackage ./trevrpc-erlang/interop {
@@ -466,6 +467,7 @@
               '';
             };
 
+            # The generated bindings in src/generated are left as generated.
             trevrpc-erlang-interop-lint = {
               root = ./trevrpc-erlang/interop;
               files = [
@@ -475,6 +477,34 @@
               packages = with pkgs; [ erlfmt ];
               script = ''
                 erlfmt --check rebar.config src/*.erl src/*.app.src
+              '';
+            };
+
+            # The interop bindings are what protoc-gen-trevrpc-erlang generates from interop/proto.
+            trevrpc-erlang-interop-generated = {
+              root = ./.;
+              files = [
+                ./interop/proto
+                ./proto
+                ./trevrpc-erlang/interop/generate.sh
+                ./trevrpc-erlang/interop/src/generated
+              ];
+              packages = [
+                pkgs.protobuf
+                packages.trevrpc-erlang
+              ];
+              script = ''
+                PROTOC_GEN_TREVRPC_ERLANG=$(command -v protoc-gen-trevrpc-erlang) \
+                  bash trevrpc-erlang/interop/generate.sh "$TMPDIR/generated"
+                diff -ru trevrpc-erlang/interop/src/generated "$TMPDIR/generated"
+              '';
+            };
+
+            trevrpc-erlang-protoc-gen-lint = {
+              src = packages.trevrpc-erlang.protocGen;
+              packages = with pkgs; [ erlfmt ];
+              script = ''
+                erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
               '';
             };
 

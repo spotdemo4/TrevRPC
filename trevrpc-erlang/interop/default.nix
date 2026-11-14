@@ -20,6 +20,20 @@ let
       ];
     };
     beamDeps = [ trevrpc-erlang ];
+
+    # xref, and dialyzer, which checks the generated bindings' specs against the runtime's types.
+    # rebar3 takes the runtime and its dependencies from _checkouts instead of fetching them.
+    doCheck = true;
+    checkPhase = ''
+      runHook preCheck
+      export HOME=$(mktemp -d)
+      ${trevrpc-erlang.lock.checkouts}
+      cp -R ${trevrpc-erlang.src}/trevrpc-erlang _checkouts/trevrpc
+      chmod -R u+w _checkouts
+      rebar3 xref
+      rebar3 dialyzer
+      runHook postCheck
+    '';
   };
 
   # Every application the executable loads.
