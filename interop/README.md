@@ -15,9 +15,11 @@ client also has a TCP fallback for networks that block UDP.
 | JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust         |
 
 The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves native QUIC, QMux
-over TLS and QMux over WebSocket, and calls native QUIC and QMux over TLS, so far. It takes part
-in what it implements; see [Partial runtimes](#partial-runtimes). Browsers reach it over the
-websocket and fallback lanes.
+over TLS, QMux over WebSocket and the HTTP mapping over HTTP/3 and HTTP/2, and calls native QUIC
+and QMux over TLS, so far. It takes part in what it implements; see
+[Partial runtimes](#partial-runtimes). Browsers reach it over the websocket and fallback lanes.
+Its server has no HTTP fallback to serve the app lanes' page, so it leaves its `http3` and
+`http2` ports out, and the Android client, which runs every scenario, is not run against it.
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
 packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,

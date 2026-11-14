@@ -1,5 +1,7 @@
-%% @doc Admission of browser sessions: which QMux over WebSocket upgrades
-%% (and WebTransport sessions) a server accepts.
+%% @doc Admission of browser sessions and HTTP requests: which QMux over
+%% WebSocket upgrades (and WebTransport sessions) a server accepts, with
+%% `webtransport_admission', and which HTTP/3 and HTTP/2 calls, with
+%% `http_admission'.
 %%
 %% An admission is a fun that gets the request and returns whether to
 %% accept it. The `Origin' check is the defence against cross-site
@@ -13,8 +15,9 @@
 %% }).
 %% '''
 %%
-%% Without one, {@link no_origin/1} admits only requests without an
-%% `Origin', which browsers always send.
+%% Without one, {@link no_origin/1} admits only sessions without an
+%% `Origin', which browsers always send. HTTP calls are all admitted
+%% without one.
 -module(trevrpc_admission).
 
 -export([no_origin/1, same_origin/1, admit/2, normalize_origin/1]).
@@ -23,14 +26,17 @@
 
 -define(DEFAULT_PORTS, #{<<"https">> => 443, <<"wss">> => 443, <<"http">> => 80, <<"ws">> => 80}).
 
-%% A request for a session:
+%% A request for a session or a call:
 %% <ul>
-%%   <li>`method': `<<"GET">>' for a WebSocket upgrade.</li>
-%%   <li>`protocol': the HTTP version, such as `<<"HTTP/1.1">>'.</li>
-%%   <li>`path', `authority' (the `Host'), and `origin' when the request
-%%       has one.</li>
+%%   <li>`method': `<<"GET">>' for a WebSocket upgrade, `<<"POST">>' for an
+%%       HTTP call.</li>
+%%   <li>`protocol': the HTTP version, such as `<<"HTTP/1.1">>',
+%%       `<<"HTTP/2.0">>' or `<<"HTTP/3.0">>'.</li>
+%%   <li>`path', `authority' (the `Host', or `:authority'), and `origin'
+%%       when the request has one.</li>
 %%   <li>`secure': whether the request came over TLS.</li>
-%%   <li>`headers': every request header, names in lower case.</li>
+%%   <li>`headers': every request header, names in lower case, without
+%%       pseudo-headers.</li>
 %%   <li>`peer': the client's address and port, when known.</li>
 %% </ul>
 -type request() :: #{

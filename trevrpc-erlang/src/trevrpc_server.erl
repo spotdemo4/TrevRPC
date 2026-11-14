@@ -14,10 +14,16 @@
 %% {ok, Port} = trevrpc_server:port(Server).
 %% '''
 %%
+%% With `http => true', the server also serves the HTTP mapping, for
+%% clients such as Cronet: a `POST' to the HTTP path (`http_path',
+%% `/trevrpc' by default) over HTTP/3 on the UDP socket and over HTTP/2 on
+%% the TCP listener, for the requests that `http_admission' accepts (all of
+%% them by default).
+%%
 %% With `webtransport => true', the TCP listener also serves browsers: QMux
-%% over WebSocket at the HTTP path (`http_path', `/trevrpc' by default), for
-%% the sessions that `webtransport_admission' accepts (see
-%% {@link trevrpc_admission}). WebTransport itself is not served yet.
+%% over WebSocket at the HTTP path, for the sessions that
+%% `webtransport_admission' accepts (see {@link trevrpc_admission}).
+%% WebTransport itself is not served yet.
 %%
 %% Messages are opaque binaries here: a handler decodes its request and
 %% encodes its response, usually through generated code. See
@@ -87,6 +93,8 @@
     graceful_shutdown_timeout => non_neg_integer(),
     compression => trevrpc_zstd:settings(),
     stream_compression_memory => non_neg_integer(),
+    http => boolean(),
+    http_admission => trevrpc_admission:admission(),
     webtransport => boolean(),
     webtransport_admission => trevrpc_admission:admission(),
     http_path => binary()
@@ -109,7 +117,12 @@
     %% What stream compression contexts may hold on the whole server.
     stream_budget := trevrpc_zstd_stream:budget() | undefined,
     %% The options of QMux sessions.
-    qmux := trevrpc_qmux:options()
+    qmux := trevrpc_qmux:options(),
+    %% The HTTP mapping's options, with the idle timeout of HTTP/2
+    %% connections, unless HTTP is off.
+    http := (trevrpc_http:options() | #{idle_timeout := timeout()}) | undefined,
+    %% Over HTTP, the owner of each QUIC connection until its ALPN hook ran.
+    owners := ets:tid() | undefined
 }.
 
 -record(state, {
@@ -127,6 +140,7 @@
 -define(TLS_HANDSHAKE_TIMEOUT, 10000).
 -define(STREAM_COMPRESSION_MEMORY, 268435456).
 -define(HTTP_PATH, <<"/trevrpc">>).
+-define(H3, <<"h3">>).
 
 %% @doc Starts a server linked to the caller, listening once it returns.
 -spec start_link(options()) -> {ok, pid()} | ignore | {error, term()}.
@@ -164,6 +178,7 @@ init(Opts) ->
     _ = application:ensure_all_started(quic),
     _ = application:ensure_all_started(ssl),
     _ = application:ensure_all_started(h1),
+    _ = application:ensure_all_started(h2),
     maybe
         {ok, Credentials} ?= trevrpc_quic:credentials(Opts),
         {ok, Compression} ?= compression(Opts),
@@ -195,6 +210,10 @@ check_routes(Routes) ->
 
 check_browsers(Opts) ->
     case Opts of
+        #{http := Enabled} when not is_boolean(Enabled) ->
+            {error, {invalid_option, http}};
+        #{http_admission := Admission} when not is_function(Admission, 1) ->
+            {error, {invalid_option, http_admission}};
         #{webtransport := Enabled} when not is_boolean(Enabled) ->
             {error, {invalid_option, webtransport}};
         #{webtransport_admission := Admission} when not is_function(Admission, 1) ->
@@ -227,7 +246,7 @@ listen(Opts, Credentials, Compression) ->
     Config = config(Opts, Compression),
     MaxConnections = maps:get(max_connections, Opts, 256),
     Streams = maps:get(max_streams_per_connection, Config),
-    Handler = fun(Conn) ->
+    Start = fun(Conn) ->
         admit(
             fun() -> trevrpc_server_conn:start(Conn, Config) end, Config, Counters, MaxConnections
         )
@@ -243,13 +262,14 @@ listen(Opts, Credentials, Compression) ->
         ),
         Credentials
     ),
-    QuicOpts = QuicOpts0#{
-        connection_handler => Handler,
-        extra_socket_opts => [{ip, maps:get(ip, Opts, {0, 0, 0, 0})}]
-    },
+    QuicOpts = maps:merge(
+        QuicOpts0#{extra_socket_opts => [{ip, maps:get(ip, Opts, {0, 0, 0, 0})}]},
+        quic_handlers(Start, Config)
+    ),
     case quic:start_server(Name, maps:get(port, Opts, 0), QuicOpts) of
         {ok, _} ->
-            State = #state{name = Name, config = Config, counters = Counters},
+            {ok, UdpPort} = quic:get_server_port(Name),
+            State = #state{name = Name, config = alt_svc(Config, UdpPort), counters = Counters},
             case listen_tcp(Opts, Credentials, State, MaxConnections) of
                 {ok, Tcp} ->
                     {ok, State#state{tcp = Tcp}};
@@ -260,6 +280,50 @@ listen(Opts, Credentials, Compression) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% Who owns each QUIC connection: the process `Start' starts for it. With
+%% HTTP, a connection that negotiated `h3' is HTTP/3, whose `quic_h3'
+%% process the owner hands the connection to in the ALPN hook, which runs
+%% in the connection's process; a table, where each owner registers itself,
+%% tells the hook the owner.
+quic_handlers(Start, #{owners := undefined}) ->
+    #{connection_handler => Start};
+quic_handlers(Start, #{owners := Owners}) ->
+    #{
+        alpn => [trevrpc:alpn(), ?H3],
+        %% The control and QPACK streams of HTTP/3, and room for the
+        %% unidirectional streams clients send to grease the protocol. They
+        %% apply to native connections too, which stop each unidirectional
+        %% stream and drop what it carried.
+        max_streams_uni => 8,
+        max_stream_data_uni => 16384,
+        %% The owner registers itself in the table as it starts.
+        connection_handler => Start,
+        alpn_handler => fun(Conn, Alpn) ->
+            case ets:take(Owners, Conn) of
+                [{_, Owner}] when Alpn =:= ?H3 -> serve_h3(Conn, Owner);
+                [{_, Owner}] -> {ok, Owner};
+                [] -> {error, no_owner}
+            end
+        end
+    }.
+
+%% Starts HTTP/3 on the QUIC connection `Conn', whose events go to `Owner'
+%% from now on.
+serve_h3(Conn, Owner) ->
+    maybe
+        %% No handler: the owner answers each request.
+        {ok, H3} ?= quic_h3:accept(Conn, #{owner => Owner, handler => undefined}),
+        ok ?= trevrpc_server_conn:serve_h3(Owner, H3, Conn),
+        {ok, H3}
+    end.
+
+%% HTTP/2 responses advertise HTTP/3 on the UDP socket.
+alt_svc(#{http := undefined} = Config, _UdpPort) ->
+    Config;
+alt_svc(#{http := Http} = Config, UdpPort) ->
+    AltSvc = iolist_to_binary(io_lib:format("h3=\":~b\"; ma=86400", [UdpPort])),
+    Config#{http := Http#{alt_svc => AltSvc}}.
 
 %% The TCP listener for QMux over TLS, by default on the UDP socket's port
 %% number, or any free port if that one is taken and none was asked for.
@@ -284,7 +348,26 @@ listen_tcp(
         end
     end,
     Handshake = maps:get(tls_handshake_timeout, Opts, ?TLS_HANDSHAKE_TIMEOUT),
-    Accept0 = #{qmux => Qmux(#{})},
+    Accept0 =
+        case maps:get(http, Config) of
+            undefined ->
+                #{qmux => Qmux(#{})};
+            _ ->
+                H2 = fun(Socket) ->
+                    case
+                        admit(
+                            fun() -> trevrpc_server_conn:start_h2(Socket, Config) end,
+                            Config,
+                            Counters,
+                            MaxConnections
+                        )
+                    of
+                        {ok, _Pid} -> ok;
+                        {error, _} = Error -> Error
+                    end
+                end,
+                #{qmux => Qmux(#{}), h2 => H2}
+        end,
     Accept =
         case maps:get(webtransport, Opts, false) of
             true ->
@@ -333,8 +416,25 @@ config(Opts, Compression) ->
         initial_request_timeout => maps:get(initial_request_timeout, Opts, 10000),
         graceful_shutdown_timeout => maps:get(graceful_shutdown_timeout, Opts, 30000),
         requests => counters:new(1, [write_concurrency]),
-        qmux => qmux_options(Opts)
+        qmux => qmux_options(Opts),
+        http => http_options(Opts),
+        owners =>
+            case Opts of
+                #{http := true} ->
+                    ets:new(trevrpc_owners, [public, set, {write_concurrency, true}]);
+                #{} ->
+                    undefined
+            end
     }.
+
+http_options(#{http := true} = Opts) ->
+    #{
+        path => maps:get(http_path, Opts, ?HTTP_PATH),
+        admission => maps:get(http_admission, Opts, undefined),
+        idle_timeout => maps:get(connection_idle_timeout, Opts, 30000)
+    };
+http_options(#{}) ->
+    undefined.
 
 %% QMux sessions get the windows and limits of QUIC connections, and
 %% keep-alives at half the idle timeout.

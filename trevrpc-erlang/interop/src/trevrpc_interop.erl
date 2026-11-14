@@ -9,11 +9,13 @@
 %%                               [--scenarios <name,...>]
 %% '''
 %%
-%% The runtime serves native QUIC, QMux over TLS and QMux over WebSocket, and
-%% calls native QUIC and QMux over TLS; it has no HTTP/3, WebTransport or
-%% HTTP/2 yet. The server reports only the ports of what it serves and the
-%% scenarios it supports; the client reports the scenarios it does not
-%% implement as skipped.
+%% The runtime serves native QUIC, QMux over TLS, QMux over WebSocket and the
+%% HTTP mapping over HTTP/3 and HTTP/2, and calls native QUIC and QMux over
+%% TLS; it has no WebTransport and no HTTP fallback yet. The server reports
+%% only the ports of what it serves and the scenarios it supports; the client
+%% reports the scenarios it does not implement as skipped. It leaves out the
+%% `http3' and `http2' ports even so: the only clients of them in `run.py',
+%% the browser app lanes, load their page through the HTTP fallback.
 -module(trevrpc_interop).
 
 -export([main/0, server_scenarios/0, compression/1]).
@@ -103,7 +105,8 @@ server(#{"cert" := Cert, "key" := Key} = Flags) ->
     {ok, Host} = inet:parse_address(maps:get("host", Flags, "127.0.0.1")),
     %% With no HTTP fallback, --web-root is accepted and unused. The browser
     %% runner's page comes from an origin of its own, so every origin is
-    %% admitted.
+    %% admitted. HTTP is served, so that the WebSocket lanes run while the
+    %% TCP listener offers h2 as well.
     {ok, Server} = trevrpc_server:start(#{
         ip => Host,
         port => list_to_integer(maps:get("port", Flags, "0")),
@@ -111,6 +114,7 @@ server(#{"cert" := Cert, "key" := Key} = Flags) ->
         keyfile => Key,
         routes => routes(),
         compression => compression(Flags),
+        http => true,
         webtransport => true,
         webtransport_admission => fun(_Request) -> true end
     }),

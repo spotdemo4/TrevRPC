@@ -1,9 +1,9 @@
-%% @doc One end of an RPC's bidirectional QUIC stream, as the process
-%% that reads and writes it sees it: a server's call process or a client's
-%% calling process.
+%% @doc One end of an RPC's bidirectional stream (a QUIC or QMux stream, or
+%% an HTTP request stream), as the process that reads and writes it sees
+%% it: a server's call process or a client's calling process.
 %%
 %% erlang_quic delivers every event of a connection to the one process that
-%% owns it. That process (`trevrpc_server_conn' or `trevrpc_channel') routes
+%% owns it, and so do quic_h3 and erlang_h2. That process (`trevrpc_server_conn' or `trevrpc_channel') routes
 %% a stream's events to the process using the stream as
 %% `{trevrpc_stream, Ref, Event}' messages:
 %%
@@ -220,18 +220,31 @@ flush_credit(#stream{transport = Transport, id = Id, unconsumed = Unconsumed} = 
     Stream#stream{unconsumed = 0}.
 
 %% @doc Writes `Data' to the stream, finishing it with `Fin'. When the
-%% connection's send queue is full, waits until `Deadline' for it to drain.
+%% connection's send queue is full, or over HTTP/2 the peer's window, waits
+%% until `Deadline' for it to drain.
 -spec send(stream(), iodata(), boolean(), deadline()) ->
     {ok, stream()} | {error, timeout | stopped | closed | term(), stream()}.
 send(#stream{stopped = true} = Stream, _Data, _Fin, _Deadline) ->
     {error, stopped, Stream};
 send(#stream{transport = Transport, id = Id} = Stream, Data, Fin, Deadline) ->
-    case trevrpc_transport:send_data(Transport, Id, Data, Fin) of
+    case trevrpc_transport:send_data(Transport, Id, Data, Fin, timeout(Deadline)) of
         ok -> {ok, Stream};
         {error, send_queue_full} -> wait_send_ready(Stream, Data, Fin, Deadline);
         {error, Reason} -> {error, Reason, Stream}
     end.
 
+%% quic_h3 tells the writer it refused itself.
+wait_send_ready(#stream{transport = {h3, H3, _}, id = Id, ref = Ref} = Stream, Data, Fin, Deadline) ->
+    receive
+        {quic_h3, H3, {send_ready, Id}} ->
+            send(Stream, Data, Fin, Deadline);
+        {trevrpc_stream, Ref, closed} ->
+            {error, closed, Stream#stream{error = closed}};
+        {trevrpc_stream, Ref, {stop_sending, _}} ->
+            {error, stopped, Stream#stream{stopped = true}}
+    after timeout(Deadline) ->
+        {error, timeout, Stream}
+    end;
 wait_send_ready(#stream{ref = Ref, router = Router} = Stream, Data, Fin, Deadline) ->
     Router ! {trevrpc_send_ready, self(), Ref},
     receive

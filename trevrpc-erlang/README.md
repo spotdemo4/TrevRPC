@@ -6,12 +6,12 @@ The Erlang runtime for TrevRPC. It is the core that a Gleam package (`trevrpc-gl
 
 ## Transports
 
-The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/erlang_quic), [erlang_h1](https://github.com/benoitc/erlang_h1), [erlang_ws](https://github.com/benoitc/erlang_ws) and OTP's `ssl` and `zstd`, so nothing native is built. It needs Erlang/OTP 29 or later, whose `zstd:flush/1` stream compression needs.
+The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/erlang_quic) (and its HTTP/3, `quic_h3`), [erlang_h2](https://github.com/benoitc/erlang_h2), [erlang_h1](https://github.com/benoitc/erlang_h1), [erlang_ws](https://github.com/benoitc/erlang_ws) and OTP's `ssl` and `zstd`, so nothing native is built. It needs Erlang/OTP 29 or later, whose `zstd:flush/1` stream compression needs.
 
-| Role   | Today                                                                                                                    | Planned                         |
-| ------ | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------- |
-| Server | Native QUIC (ALPN `trevrpc/1`), QMux over TLS (ALPN `qmux-02.trevrpc-1`) and, for browsers, QMux over WebSocket (opt-in) | HTTP/3 and HTTP/2, WebTransport |
-| Client | Native QUIC and QMux over TLS, racing QUIC against TCP when the network may block UDP                                    | -                               |
+| Role   | Today                                                                                                                                                                                 | Planned      |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| Server | Native QUIC (ALPN `trevrpc/1`), QMux over TLS (ALPN `qmux-02.trevrpc-1`), the HTTP mapping over HTTP/3 and HTTP/2 for Cronet (opt-in) and, for browsers, QMux over WebSocket (opt-in) | WebTransport |
+| Client | Native QUIC and QMux over TLS, racing QUIC against TCP when the network may block UDP                                                                                                 | -            |
 
 QMux ([draft-ietf-quic-qmux-02](https://datatracker.ietf.org/doc/draft-ietf-quic-qmux/)) carries the same streams over TLS on TCP, with the same windows and limits as QUIC, and over a WebSocket ([draft-lcurley-qmux-websocket-00](https://datatracker.ietf.org/doc/draft-lcurley-qmux-websocket/)) one record per binary message. Its implementation is in-tree (`trevrpc_qmux`) and checked against the shared golden vectors in `testdata/qmux-golden-vectors.txt`.
 
@@ -55,6 +55,20 @@ Messages are opaque binaries: handlers decode requests and encode responses, so 
 Unary and server-streaming handlers take `(Request, Call)`, client-streaming and bidirectional ones `(Call)`. They return `{ok, Response}` (single responses), `ok` (streamed responses) or `{error, Status}`, where a status is a map such as `trevrpc_status:new(not_found, <<"missing">>)`, optionally with `metadata` and `details`. `trevrpc_call` reads requests, sends responses, headers and trailers, and gives the call's metadata and deadline.
 
 The server also listens on TCP for QMux over TLS, by default on the same port number as QUIC, or on any free port if that one is taken: `tcp_port => P` picks it, `tcp => false` turns TCP off, and `trevrpc_server:tcp_port/1` returns it. Connections over either transport share the server's limits. A TLS client has `tls_handshake_timeout` (10 s) for its TLS handshake and again for its QMux parameters, at most `max_tls_handshakes` (256) handshakes run at once, and a QMux client that stops reading is dropped after the connection idle timeout.
+
+### Android (HTTP/3 and HTTP/2)
+
+With `http => true`, the server also serves the [HTTP mapping](https://trev.zip/llc/TrevRPC/wiki/HTTP3) that the Kotlin Cronet client uses: each call is a `POST` to the HTTP path (`http_path`, `/trevrpc` by default) with media type `application/trevrpc`, whose request and response bodies carry the usual frames. The UDP socket then also offers ALPN `h3` and the TCP listener `h2`, as the Go and Rust servers do, and HTTP/2 responses advertise HTTP/3 with `Alt-Svc`.
+
+```erlang
+{ok, Server} = trevrpc_server:start_link(#{
+    ...,
+    http => true,
+    http_admission => fun(#{authority := Authority}) -> Authority =:= <<"rpc.example.com">> end
+}).
+```
+
+Before a call is accepted, a request off the HTTP path gets `404`, another method `405`, another media type `415`, one that `http_admission` refuses `403` (and `500` if it fails), and one past `max_streams_per_connection`, or on a server shutting down, `503`. The admission is optional (every valid request is admitted without one), gets the same request map as the browser admission below, with `protocol` `<<"HTTP/3.0">>` or `<<"HTTP/2.0">>`, and runs in the connection's process, so keep it quick. After the `200`, a call has the deadlines and the server-wide limits it has over native QUIC, and its request stream is credited as its handler reads. Over HTTP/2 a stream receives one frame ahead of its handler. Over HTTP/3, quic_h3 delivers a request's headers before the stream can be put in manual flow control, and erlang_quic credits that first delivery with a whole connection window, so one stream can receive up to the connection window (16 MiB by default) ahead, a weaker bound than native QUIC's one frame per stream; what a connection holds unread stays within that window. Upstream: [benoitc/erlang_quic#554](https://github.com/benoitc/erlang_quic/issues/554). A client cancels a call by resetting its stream, and the server cancels with `H3_REQUEST_CANCELLED` or `CANCEL`. On shutdown, HTTP/3 clients get a `GOAWAY` at once; HTTP/2 clients get `503` for new requests and the `GOAWAY` as the connection closes, because erlang_h2 closes a connection 100 ms after its `GOAWAY` whatever still runs ([benoitc/erlang_h2#41](https://github.com/benoitc/erlang_h2/issues/41)). An HTTP/2 connection without a call for the connection idle timeout is closed. There is no HTTP fallback for other paths yet.
 
 ### Browsers
 
@@ -134,7 +148,7 @@ The codecs, `trevrpc_zstd` and `trevrpc_zstd_stream`, are checked against the sh
 | Module                         | Purpose                                                                                       |
 | ------------------------------ | --------------------------------------------------------------------------------------------- |
 | `trevrpc_server`               | The server: listener, connection limit, graceful shutdown                                     |
-| `trevrpc_admission`            | Admission of browser sessions                                                                 |
+| `trevrpc_admission`            | Admission of browser sessions and HTTP requests                                               |
 | `trevrpc_call`                 | The handler API                                                                               |
 | `trevrpc_channel`              | The client channel: reconnects, generations, stream credit                                    |
 | `trevrpc_client`               | Client calls                                                                                  |
@@ -148,14 +162,14 @@ The codecs, `trevrpc_zstd` and `trevrpc_zstd_stream`, are checked against the sh
 | `trevrpc_zstd_stream`          | Stream compression: ZSTD_STREAM_MESSAGE payloads and the memory budget                        |
 | `trevrpc_varint`, `trevrpc_pb` | QUIC varints and the protobuf wire primitives                                                 |
 
-The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_quic`, `trevrpc_transport`, `trevrpc_qmux`, `trevrpc_qmux_frame`, `trevrpc_qmux_record`, `trevrpc_tcp_listener`, `trevrpc_http1`) is internal.
+The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_quic`, `trevrpc_transport`, `trevrpc_qmux`, `trevrpc_qmux_frame`, `trevrpc_qmux_record`, `trevrpc_tcp_listener`, `trevrpc_http`, `trevrpc_http1`) is internal.
 
 ## Development
 
 rebar3 and Erlang/OTP 29 are in the repository's dev shell.
 
 ```sh
-rebar3 eunit      # unit tests, the shared golden vectors in ../testdata, client/server over QUIC and QMux, and QMux over WebSocket
+rebar3 eunit      # unit tests, the shared golden vectors in ../testdata, client/server over QUIC and QMux, QMux over WebSocket, and the HTTP mapping
 rebar3 xref
 rebar3 dialyzer
 ```

@@ -72,10 +72,10 @@ serve(Socket, #{timeout := Timeout} = Opts, Start) ->
     end.
 
 handle(Conn, Id, Method, Target, Headers, Peer, #{path := HttpPath} = Opts, Start) ->
-    Path = hd(binary:split(Target, <<"?">>)),
+    Path = trevrpc_http:path(Target),
     Upgrade =
         Method =:= <<"GET">> andalso
-            lists:member(<<"websocket">>, tokens(header(<<"upgrade">>, Headers))),
+            lists:member(<<"websocket">>, tokens(trevrpc_http:header(<<"upgrade">>, Headers))),
     if
         Path =/= HttpPath ->
             respond(Conn, Id, 404, <<"not found">>);
@@ -86,7 +86,7 @@ handle(Conn, Id, Method, Target, Headers, Peer, #{path := HttpPath} = Opts, Star
                 method => Method,
                 protocol => <<"HTTP/1.1">>,
                 path => Path,
-                authority => header(<<"host">>, Headers),
+                authority => trevrpc_http:header(<<"host">>, Headers),
                 secure => true,
                 headers => Headers
             },
@@ -95,7 +95,7 @@ handle(Conn, Id, Method, Target, Headers, Peer, #{path := HttpPath} = Opts, Star
 
 upgrade(Conn, Id, #{headers := Headers} = Request0, #{admission := Admission} = Opts, Start) ->
     Request =
-        case header(<<"origin">>, Headers) of
+        case trevrpc_http:header(<<"origin">>, Headers) of
             <<>> -> Request0;
             Origin -> Request0#{origin => Origin}
         end,
@@ -165,13 +165,6 @@ describe(Request) ->
             #{} -> "an unknown peer"
         end,
     io_lib:format("~s (origin ~s)", [Peer, maps:get(origin, Request, <<"none">>)]).
-
-%% The value of a header, or empty; h1 gives names in lower case.
-header(Name, Headers) ->
-    case lists:keyfind(Name, 1, Headers) of
-        {_, Value} -> iolist_to_binary(Value);
-        false -> <<>>
-    end.
 
 tokens(Value) ->
     [string:lowercase(string:trim(Token)) || Token <- binary:split(Value, <<",">>, [global])].

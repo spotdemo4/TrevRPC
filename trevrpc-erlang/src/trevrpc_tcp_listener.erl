@@ -1,7 +1,8 @@
 %% @private The server's TCP listener: TLS connections, dispatched on the
 %% negotiated ALPN. `qmux-02.trevrpc-1' carries TrevRPC over QMux. When the
-%% server serves browsers, `http/1.1' (or no ALPN at all) is HTTP/1.1, where
-%% a WebSocket upgrade carries QMux. HTTP/2 is not served yet.
+%% server serves the HTTP mapping, `h2' is HTTP/2. When it serves browsers,
+%% `http/1.1' (or no ALPN at all) is HTTP/1.1, where a WebSocket upgrade
+%% carries QMux.
 %%
 %% Each connection's handshake runs in a process of its own, bounded by the
 %% handshake timeout, so a slow client holds up no other. At most
@@ -17,10 +18,12 @@
 
 %% What serves each protocol: `qmux' takes over the socket of each QMux
 %% connection, as its controlling process, once its handshake completed,
-%% and `http1', when present, that of each HTTP/1.1 connection. They run in
-%% the handshake's process.
+%% `h2', when present, that of each HTTP/2 connection, and `http1', when
+%% present, that of each HTTP/1.1 connection. They run in the handshake's
+%% process.
 -type accept() :: #{
     qmux := fun((ssl:sslsocket()) -> ok | {error, term()}),
+    h2 => fun((ssl:sslsocket()) -> ok | {error, term()}),
     http1 => fun((ssl:sslsocket()) -> ok | {error, term()})
 }.
 
@@ -63,7 +66,8 @@ init(Parent, Opts, #{cert := Cert, key := Key} = Credentials, Accept) ->
         {ip, maps:get(ip, Opts, {0, 0, 0, 0})},
         {versions, ['tlsv1.3', 'tlsv1.2']},
         {alpn_preferred_protocols, [
-            trevrpc:qmux_alpn() | [<<"http/1.1">> || is_map_key(http1, Accept)]
+            trevrpc:qmux_alpn()
+            | [<<"h2">> || is_map_key(h2, Accept)] ++ [<<"http/1.1">> || is_map_key(http1, Accept)]
         ]},
         {certs_keys, [
             #{
@@ -152,6 +156,7 @@ handshake_owned(Socket, Accept, Timeout) ->
             Protocol =
                 case ssl:negotiated_protocol(Tls) of
                     {ok, Qmux} -> qmux;
+                    {ok, <<"h2">>} -> h2;
                     {ok, <<"http/1.1">>} -> http1;
                     {error, protocol_not_negotiated} -> http1;
                     Other0 -> Other0
@@ -183,6 +188,7 @@ handshake_owned(Socket, Accept, Timeout) ->
     end.
 
 name(qmux) -> "QMux";
+name(h2) -> "HTTP/2";
 name(http1) -> "HTTP/1.1".
 
 peer(Socket) ->

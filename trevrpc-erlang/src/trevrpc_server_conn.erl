@@ -1,9 +1,13 @@
-%% @private The owner of one server-side QUIC connection.
+%% @private The owner of one server-side connection: native QUIC, QMux, or
+%% the HTTP mapping over HTTP/3 or HTTP/2.
 %%
 %% It receives every event of the connection. For each stream it reads the
 %% REQUEST frame, checks it, and either answers with a lone STATUS or starts
 %% a call process (`trevrpc_server_call') to run the handler, then routes
-%% the stream's events to that process.
+%% the stream's events to that process. An HTTP request first passes the
+%% HTTP mapping's checks ({@link trevrpc_http}): a request they refuse gets
+%% an HTTP error, and an accepted one a `200', after which its bodies are
+%% the stream as on the other transports.
 %%
 %% It also owns each call's lifecycle: the initial request timeout, the
 %% call's deadline, the peer's cancellation, and shutdown all end a call by
@@ -16,7 +20,7 @@
 
 -behaviour(gen_server).
 
--export([start/2, start_qmux/3, shutdown/1, finish/3, reserve/4]).
+-export([start/2, start_qmux/3, start_h2/2, serve_h3/3, shutdown/1, finish/3, reserve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(entry, {
@@ -53,10 +57,21 @@
     active = 0 :: non_neg_integer(),
     %% Processes waiting for the send queue to drain.
     send_waiters = [] :: [{pid(), reference()}],
-    stopping = false :: boolean()
+    stopping = false :: boolean(),
+    %% The client's address, for the HTTP admission: looked up at the first
+    %% request over HTTP/3.
+    peer :: {inet:ip_address(), inet:port_number()} | undefined | unknown,
+    %% When an HTTP/2 connection last had a stream, to close it once idle.
+    active_at = 0 :: integer(),
+    %% Lone STATUS frames quic_h3 refused with a full send queue, written
+    %% again when it says the stream's writer may (`send_ready').
+    pending = #{} :: #{non_neg_integer() => binary()}
 }).
 
 -define(CANCELLED, 1).
+-define(H3_NO_ERROR, 16#100).
+%% HTTP/2 windows are at most 2^31 - 1 bytes.
+-define(MAX_H2_WINDOW, 2147483647).
 
 %% @doc Starts the owner of the QUIC connection `Conn'. Called by the
 %% listener, which makes it the connection's owner before the connection
@@ -86,6 +101,38 @@ start_qmux(Socket, Opts, Config) ->
         {error, _} = Error ->
             Error
     end.
+
+%% @doc Starts the owner of an HTTP/2 connection over the TLS connection
+%% `Socket', whose handshake completed. The caller must be the socket's
+%% controlling process; the HTTP/2 connection takes it over.
+-spec start_h2(ssl:sslsocket(), trevrpc_server:config()) -> {ok, pid()} | {error, term()}.
+start_h2(Socket, Config) ->
+    case gen_server:start(?MODULE, {undefined, Config}, []) of
+        {ok, Pid} ->
+            Peer =
+                case ssl:peername(Socket) of
+                    {ok, Address} -> Address;
+                    {error, _} -> unknown
+                end,
+            case ssl:controlling_process(Socket, Pid) of
+                ok ->
+                    gen_server:cast(Pid, {h2, Socket, Peer}),
+                    {ok, Pid};
+                {error, _} = Error ->
+                    exit(Pid, kill),
+                    Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc Makes the owner `Pid' of the QUIC connection `Quic', which
+%% negotiated `h3', serve HTTP/3 through `H3', the connection's `quic_h3'
+%% process, whose events it receives from now on. Called in the QUIC
+%% connection's ALPN hook, before any stream event.
+-spec serve_h3(pid(), pid(), pid()) -> ok.
+serve_h3(Pid, H3, Quic) ->
+    gen_server:call(Pid, {h3, H3, Quic}).
 
 %% @doc Cancels every call, waits for their handlers up to the graceful
 %% shutdown timeout, then closes the connection.
@@ -123,9 +170,21 @@ init({Transport, Config}) ->
     process_flag(trap_exit, true),
     %% Exits with the server.
     monitor(process, maps:get(server, Config)),
+    %% With HTTP, the QUIC connection's ALPN hook looks its owner up here.
+    %% Registered before this process can stop, and removed when it does
+    %% if the hook never ran.
+    _ =
+        case {Transport, Config} of
+            {{quic, Conn}, #{owners := Owners}} when Owners =/= undefined ->
+                ets:insert(Owners, {Conn, self()});
+            _ ->
+                true
+        end,
     {ok, #state{transport = Transport, config = Config}}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
+handle_call({h3, H3, Quic}, _From, #state{transport = {quic, Quic}} = State) ->
+    {reply, ok, State#state{transport = {h3, H3, Quic}}};
 handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams, config = Config} = State) ->
     case Streams of
         #{Id := #entry{ref = Ref, pid = Pid, reserved = Reserved} = Entry} when is_pid(Pid) ->
@@ -158,18 +217,45 @@ handle_cast({qmux, Socket, Opts}, #state{config = Config} = State) ->
         {error, _Reason} ->
             {stop, normal, State}
     end;
+handle_cast({h2, Socket, Peer}, #state{config = Config} = State) ->
+    case start_h2_connection(Socket, Config) of
+        {ok, Conn} ->
+            arm_idle(maps:get(idle_timeout, maps:get(http, Config))),
+            {noreply, State#state{
+                transport = {h2, Conn},
+                peer = Peer,
+                active_at = erlang:monotonic_time(millisecond)
+            }};
+        {error, _Reason} ->
+            _ = ssl:close(Socket),
+            {stop, normal, State}
+    end;
 handle_cast(shutdown, #state{stopping = true} = State) ->
     {noreply, State};
 handle_cast(shutdown, #state{config = #{graceful_shutdown_timeout := Grace}} = State) ->
+    %% HTTP clients send no more requests; QUIC and QMux streams that still
+    %% open are refused one by one.
+    _ =
+        case State#state.transport of
+            undefined -> ok;
+            Transport -> trevrpc_transport:goaway(Transport)
+        end,
     State1 = maps:fold(fun shutdown_stream/3, State#state{stopping = true}, State#state.streams),
     erlang:send_after(Grace, self(), kill_calls),
     maybe_close(State1).
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
-handle_info({Tag, Pid, Event}, #state{transport = {_, Pid}} = State) when
-    Tag =:= quic; Tag =:= trevrpc_qmux
+handle_info({Tag, Pid, Event}, #state{transport = Transport} = State) when
+    is_tuple(Transport),
+    element(2, Transport) =:= Pid,
+    (Tag =:= quic orelse Tag =:= trevrpc_qmux orelse Tag =:= quic_h3 orelse Tag =:= h2)
 ->
     quic_event(Event, State);
+handle_info({'EXIT', Pid, _Reason}, #state{transport = {h2, Pid}} = State) ->
+    %% The HTTP/2 connection, linked, ended.
+    {stop, normal, State};
+handle_info({timeout, _Timer, idle}, State) ->
+    idle(State);
 handle_info(
     {trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters, transport = Transport} = State
 ) ->
@@ -203,12 +289,22 @@ handle_info({'DOWN', Monitor, process, _Pid, Reason}, #state{monitors = Monitors
     end;
 handle_info(kill_calls, #state{streams = Streams} = State) ->
     _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams), is_pid(Pid)],
-    {noreply, State};
+    %% A STATUS that a client which stopped reading still has not taken
+    %% holds the connection no longer.
+    maybe_close(State#state{pending = #{}});
 handle_info(_Message, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{streams = Streams} = State) ->
+    %% A QUIC connection that never got to its ALPN hook.
+    _ =
+        case {State#state.transport, State#state.config} of
+            {{quic, Conn}, #{owners := Owners}} when Owners =/= undefined ->
+                ets:delete(Owners, Conn);
+            _ ->
+                true
+        end,
     %% Calls still in flight, as when the connection closes under them,
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),
@@ -226,10 +322,29 @@ quic_event({stream_opened, Id}, State) ->
     {noreply, stream_opened(Id, State)};
 quic_event({stream_data, Id, Bin, Fin}, State) ->
     {noreply, stream_data(Id, Bin, Fin, State)};
+quic_event({request, Id, Method, Target, Headers}, State) ->
+    {noreply, http_request(Id, Method, Target, Headers, State)};
+quic_event({data, Id, Bin, Fin}, State) ->
+    {noreply, stream_data(Id, Bin, Fin, State)};
+quic_event({trailers, Id, _Trailers}, State) ->
+    %% The HTTP mapping has no request trailers: the client broke it.
+    maybe_close(abandoned(Id, State));
 quic_event({stream_reset, Id, _Code}, State) ->
-    {noreply, abandoned(Id, State)};
+    %% The STATUS a stopping connection waited on may have gone with it.
+    maybe_close(abandoned(Id, State));
 quic_event({stop_sending, Id, _Code}, State) ->
-    {noreply, abandoned(Id, State)};
+    maybe_close(abandoned(Id, State));
+quic_event({send_ready, Id}, #state{transport = {h3, _, _}, pending = Pending} = State) ->
+    case Pending of
+        #{Id := Frame} ->
+            case trevrpc_transport:send_data_async(State#state.transport, Id, Frame, true) of
+                %% Refused again: quic_h3 tells this process once more.
+                {error, send_queue_full} -> {noreply, State};
+                ok -> maybe_close(State#state{pending = maps:remove(Id, Pending)})
+            end;
+        #{} ->
+            {noreply, State}
+    end;
 quic_event(send_ready, #state{send_waiters = Waiters} = State) ->
     _ = [Pid ! {trevrpc_stream, Ref, send_ready} || {Pid, Ref} <- Waiters],
     {noreply, State#state{send_waiters = []}};
@@ -244,29 +359,180 @@ stream_opened(Id, #state{transport = Transport} = State) when Id band 2 =/= 0 ->
     _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
     State;
 stream_opened(Id, #state{stopping = true} = State) ->
-    lone_status(Id, false, trevrpc_status:new(unavailable, <<"server is shutting down">>), State),
-    State;
-stream_opened(Id, #state{active = Active, config = Config} = State) ->
-    #{max_streams_per_connection := Max} = Config,
-    case Active >= Max of
+    lone_status(Id, false, trevrpc_status:new(unavailable, <<"server is shutting down">>), State);
+stream_opened(Id, State) ->
+    case full(State) of
         true ->
             lone_status(
                 Id, false, trevrpc_status:new(unavailable, <<"too many concurrent RPCs">>), State
-            ),
-            State;
+            );
         false ->
             ok = trevrpc_transport:manual_flow_control(State#state.transport, Id),
-            #{
-                max_frame_size := MaxFrame,
-                max_stream_body_size := MaxBody,
-                initial_request_timeout := Initial
-            } =
-                Config,
-            Entry = #entry{
-                reader = trevrpc_frame:reader(MaxFrame, #{max_bytes => MaxBody}),
-                timer = start_timer(Initial, {initial, Id})
-            },
-            State#state{streams = (State#state.streams)#{Id => Entry}, active = Active + 1}
+            open_stream(Id, State)
+    end.
+
+full(#state{active = Active, config = #{max_streams_per_connection := Max}}) ->
+    Active >= Max.
+
+%% Reads the REQUEST of the stream that opened.
+open_stream(Id, #state{active = Active, config = Config} = State) ->
+    #{
+        max_frame_size := MaxFrame,
+        max_stream_body_size := MaxBody,
+        initial_request_timeout := Initial
+    } = Config,
+    Entry = #entry{
+        reader = trevrpc_frame:reader(MaxFrame, #{max_bytes => MaxBody}),
+        timer = start_timer(Initial, {initial, Id})
+    },
+    State#state{streams = (State#state.streams)#{Id => Entry}, active = Active + 1}.
+
+%%% HTTP requests
+
+http_request(Id, Method, Target, Headers, #state{transport = Transport} = State0) ->
+    {Peer, State} = peer(State0),
+    Version =
+        case trevrpc_transport:kind(Transport) of
+            h3 -> <<"HTTP/3.0">>;
+            h2 -> <<"HTTP/2.0">>
+        end,
+    Http = http_options(State),
+    Checked =
+        case trevrpc_http:check(Version, Method, Target, Headers, Peer, Http) of
+            ok when State#state.stopping ->
+                {refuse, 503, [], <<"server is shutting down">>};
+            ok ->
+                case full(State) of
+                    true -> {refuse, 503, [], <<"too many concurrent RPCs on HTTP connection">>};
+                    false -> ok
+                end;
+            Refusal ->
+                Refusal
+        end,
+    case Checked of
+        ok ->
+            accept_http(Id, Http, State);
+        {refuse, Status, Extra, Message} ->
+            refuse_http(Id, Status, trevrpc_http:refusal_headers(Extra, Http), Message, State),
+            State
+    end.
+
+%% The client's address: from the socket over HTTP/2, from the QUIC
+%% connection over HTTP/3, the first time it is asked.
+peer(#state{peer = undefined, transport = {h3, _H3, Quic}} = State) ->
+    Peer =
+        case quic:peername(Quic) of
+            {ok, Address} -> Address;
+            {error, _} -> unknown
+        end,
+    peer(State#state{peer = Peer});
+peer(#state{peer = Peer} = State) when is_tuple(Peer) ->
+    {Peer, State};
+peer(State) ->
+    {undefined, State}.
+
+%% HTTP/2 responses advertise HTTP/3; HTTP/3 ones need not.
+http_options(#state{transport = {h2, _}, config = #{http := Http}}) -> Http;
+http_options(#state{config = #{http := Http}}) -> maps:remove(alt_svc, Http).
+
+%% Accepts the call: the stream's data comes here from now on, credited as
+%% it is read, and the call starts once its REQUEST arrived.
+accept_http(Id, Http, #state{transport = Transport} = State) ->
+    case accept_stream(Transport, Id, trevrpc_http:accepted_headers(Http)) of
+        ok ->
+            open_stream(Id, State#state{active_at = erlang:monotonic_time(millisecond)});
+        {error, _} ->
+            %% The stream is gone already.
+            _ = trevrpc_transport:reset_stream(Transport, Id, ?CANCELLED),
+            State
+    end.
+
+accept_stream({h3, H3, _Quic}, Id, Headers) ->
+    maybe
+        ok ?= h3_handler(H3, Id),
+        ok ?= quic_h3:send_response(H3, Id, 200, Headers),
+        %% quic_h3 holds a response's HEADERS back until its first DATA;
+        %% the client hears of its acceptance at once, as from Go and Rust.
+        _ = quic_h3:send_data(H3, Id, <<>>, false),
+        ok
+    end;
+accept_stream({h2, Conn}, Id, Headers) ->
+    maybe
+        ok ?= h2:set_stream_handler(Conn, Id, self(), #{flow_control => manual}),
+        h2:send_response(Conn, Id, 200, Headers)
+    end.
+
+%% What arrived before is sent here as messages, after this.
+h3_handler(H3, Id) ->
+    case
+        quic_h3:set_stream_handler(H3, Id, self(), #{flow_control => manual, drain_buffer => false})
+    of
+        ok -> ok;
+        {ok, _} -> ok;
+        {error, _} = Error -> Error
+    end.
+
+%% Answers a request the mapping refused, and stops reading its body.
+refuse_http(Id, Status, Headers, Message, #state{transport = {h3, H3, Quic}}) ->
+    _ = quic_h3:respond(H3, Id, Status, Headers, <<Message/binary, $\n>>),
+    _ = quic:stop_sending(Quic, Id, ?H3_NO_ERROR),
+    ok;
+refuse_http(Id, Status, Headers, Message, #state{transport = {h2, Conn}}) ->
+    %% The response is written whole, so the stream can end (RFC 9113
+    %% Section 8.1): erlang_h2 would otherwise hold the rest of the body.
+    _ = h2:respond(Conn, Id, Status, Headers, <<Message/binary, $\n>>),
+    _ = h2:cancel(Conn, Id, no_error),
+    ok.
+
+%% HTTP/2 connections without a stream for the idle timeout are closed, as
+%% the Go server's are. QUIC's idle timeout covers HTTP/3.
+arm_idle(infinity) ->
+    ok;
+arm_idle(Timeout) ->
+    _ = erlang:start_timer(Timeout, self(), idle),
+    ok.
+
+idle(#state{config = #{http := #{idle_timeout := Timeout}}, streams = Streams} = State) when
+    map_size(Streams) > 0
+->
+    arm_idle(Timeout),
+    {noreply, State};
+idle(#state{config = #{http := #{idle_timeout := Timeout}}, active_at = At} = State) ->
+    case erlang:monotonic_time(millisecond) - At of
+        Idle when Idle >= Timeout ->
+            ok = close_transport(State#state.transport),
+            {stop, normal, State};
+        Idle ->
+            arm_idle(Timeout - Idle),
+            {noreply, State}
+    end.
+
+start_h2_connection(Socket, Config) ->
+    #{max_frame_size := MaxFrame, max_streams_per_connection := Max} = Config,
+    Opts = #{
+        settings => #{
+            initial_window_size => min(trevrpc_quic:stream_window(MaxFrame), ?MAX_H2_WINDOW),
+            %% One spare stream lets an RPC past the limit still get its 503.
+            max_concurrent_streams => Max + 1
+        },
+        connection_window_size => max(
+            65535, min(trevrpc_quic:connection_window(MaxFrame, Max), ?MAX_H2_WINDOW)
+        )
+    },
+    maybe
+        {ok, Conn} ?= h2_connection:start_link(server, Socket, self(), Opts),
+        ok ?= transfer(Socket, Conn),
+        ok ?= h2_connection:activate(Conn),
+        {ok, Conn}
+    end.
+
+transfer(Socket, Conn) ->
+    case ssl:controlling_process(Socket, Conn) of
+        ok ->
+            ok;
+        {error, _} = Error ->
+            exit(Conn, kill),
+            Error
     end.
 
 stream_data(Id, Bin, Fin, #state{streams = Streams} = State) ->
@@ -305,7 +571,8 @@ abandoned(Id, #state{streams = Streams, transport = Transport} = State) ->
             _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
             release(Id, Entry#entry{state = cancelling, timer = undefined}, State);
         _ ->
-            State
+            %% A STATUS still waiting to be written goes with its stream.
+            State#state{pending = maps:remove(Id, State#state.pending)}
     end.
 
 %%% Reading the REQUEST
@@ -544,22 +811,27 @@ start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
 %% Ends a stream that has no call yet with a lone STATUS.
 refuse(Id, Entry, Status, State) ->
     cancel_timer(Entry),
-    lone_status(Id, Entry#entry.fin, Status, State),
-    remove(Id, release(Id, Entry, State)).
+    remove(Id, release(Id, Entry, lone_status(Id, Entry#entry.fin, Status, State))).
 
 %% Writes a terminal STATUS from this process, which must not block, so it
-%% is queued without the send queue's ceiling. A request side the peer has
-%% not finished is stopped after it.
-lone_status(Id, Fin, Status, #state{transport = Transport, config = #{max_frame_size := Max}}) ->
-    ok = trevrpc_transport:send_data_async(
-        Transport, Id, trevrpc_server_call:status_frame(Status, Max), true
-    ),
+%% is queued without the send queue's ceiling, or over HTTP/3, which has
+%% none, written again once quic_h3's queue drained. A request side the
+%% peer has not finished is stopped after it.
+lone_status(
+    Id, Fin, Status, #state{transport = Transport, config = #{max_frame_size := Max}} = State
+) ->
+    Frame = iolist_to_binary(trevrpc_server_call:status_frame(Status, Max)),
+    State1 =
+        case trevrpc_transport:send_data_async(Transport, Id, Frame, true) of
+            ok -> State;
+            {error, send_queue_full} -> State#state{pending = (State#state.pending)#{Id => Frame}}
+        end,
     _ =
         case Fin of
             true -> ok;
             false -> trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED)
         end,
-    ok.
+    State1.
 
 %%% Call processes
 
@@ -568,10 +840,10 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
         #{Id := #entry{state = finishing}} ->
             maybe_close(remove(Id, State));
         #{Id := #entry{state = expiring, fin = Fin}} ->
-            lone_status(
+            State1 = lone_status(
                 Id, Fin, trevrpc_status:new(deadline_exceeded, <<"deadline exceeded">>), State
             ),
-            maybe_close(remove(Id, State));
+            maybe_close(remove(Id, State1));
         #{Id := #entry{state = cancelling}} ->
             maybe_close(remove(Id, State));
         #{Id := #entry{state = shutdown}} ->
@@ -582,8 +854,12 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
             %% handler failures itself.
             logger:error("trevrpc call process on stream ~b exited: ~p", [Id, Reason]),
             cancel_timer(Entry),
-            State1 = release(Id, Entry, State),
-            lone_status(Id, Fin, trevrpc_status:new(internal, <<"internal server error">>), State1),
+            State1 = lone_status(
+                Id,
+                Fin,
+                trevrpc_status:new(internal, <<"internal server error">>),
+                release(Id, Entry, State)
+            ),
             maybe_close(remove(Id, State1));
         _ ->
             maybe_close(State)
@@ -612,11 +888,11 @@ cut_off(Id, #state{transport = Transport}) ->
 
 maybe_close(#state{stopping = true, streams = Streams, transport = Transport} = State) ->
     Calls = [Id || Id := #entry{pid = Pid} <- Streams, is_pid(Pid)],
-    case Calls of
-        [] ->
+    case Calls =:= [] andalso map_size(State#state.pending) =:= 0 of
+        true ->
             ok = close_transport(Transport),
             {stop, normal, State};
-        _ ->
+        false ->
             {noreply, State}
     end;
 maybe_close(State) ->
@@ -650,7 +926,7 @@ remove(Id, #state{streams = Streams, config = Config} = State) ->
         #{} ->
             ok
     end,
-    State#state{streams = maps:remove(Id, Streams)}.
+    State#state{streams = maps:remove(Id, Streams), active_at = erlang:monotonic_time(millisecond)}.
 
 start_timer(infinity, _Message) ->
     undefined;
