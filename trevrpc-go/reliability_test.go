@@ -61,29 +61,43 @@ func TestConnectionStreamSlotIsFreeWhenClientSeesTheStatus(t *testing.T) {
 				for range connections {
 					transports = append(transports, transport.dial(t, pki, listener))
 				}
-				var rejected atomic.Int64
-				var firstErr atomic.Value
+				// Failures are tallied by code, with the first error of each:
+				// a rejection over the limit (Unavailable) is the regression
+				// this test is for, and any other code is a different fault.
+				// The errors differ in concrete type, so they are kept under a
+				// mutex; an atomic.Value panics when the type changes.
+				type failures struct {
+					count int
+					first error
+				}
+				var mu sync.Mutex
+				failed := map[Code]*failures{}
 				var workers sync.WaitGroup
 				for _, transport := range transports {
 					for range limit {
 						workers.Go(func() {
 							for range callsPerWorker {
-								if err := call(ctx, transport); err != nil {
-									if StatusFromError(err).Code == CodeUnavailable {
-										rejected.Add(1)
-									}
-									firstErr.CompareAndSwap(nil, err)
+								err := call(ctx, transport)
+								if err == nil {
+									continue
 								}
+								code := StatusFromError(err).Code
+								mu.Lock()
+								tally := failed[code]
+								if tally == nil {
+									tally = &failures{first: err}
+									failed[code] = tally
+								}
+								tally.count++
+								mu.Unlock()
 							}
 						})
 					}
 				}
 				workers.Wait()
-				if rejected.Load() != 0 {
-					t.Fatalf("%d calls were rejected as over the limit, first error: %v", rejected.Load(), firstErr.Load())
-				}
-				if err, _ := firstErr.Load().(error); err != nil {
-					t.Fatalf("call failed: %v", err)
+				for code, tally := range failed {
+					t.Errorf("%d of %d calls failed with %v, first error: %v",
+						tally.count, connections*limit*callsPerWorker, code, tally.first)
 				}
 			})
 		}
