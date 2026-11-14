@@ -14,7 +14,6 @@ import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import {
   FrameType,
   encodeOutgoingFrame,
-  encodeStatusFrame,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
@@ -23,6 +22,7 @@ import { Code, TrevRpcError, invalidArgument } from "../src/status.js";
 import { StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import { ServerStreams, parseMethodPath } from "./support.js";
+import { encodeStatusFrame } from "./wire-server.js";
 
 const EchoService = Echo.typeName;
 const UnreliableEchoService = UnreliableEcho.typeName;

@@ -8,17 +8,20 @@ import { encodeMessage, parseStreamChunk } from "../src/compression.js";
 import {
   FrameReader,
   FrameType,
-  encodeAnswerFrame,
-  encodeHeadersFrame,
   encodeMessageFrame,
   decodeWireMessage,
-  encodeStatusFrame,
   marshalMessage,
   unmarshalMessage,
 } from "../src/framing.js";
 import { Code } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
-import { RpcRequest, StreamCompression } from "../src/wire.js";
+import { StreamCompression } from "../src/wire.js";
+import {
+  RpcRequest,
+  encodeAnswerFrame,
+  encodeHeadersFrame,
+  encodeStatusFrame,
+} from "./wire-server.js";
 
 /**
  * Splits a wire method path into `{ service, method }`, or returns null unless it is exactly

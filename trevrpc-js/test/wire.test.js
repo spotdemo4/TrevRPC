@@ -8,13 +8,10 @@ import { decodeDatagram, encodeDatagram } from "../src/datagram.js";
 import {
   FrameReader,
   FrameType,
-  encodeAnswerFrame,
   encodeFrame,
-  encodeHeadersFrame,
   encodeMessageFrame,
   encodeOutgoingFrame,
   encodeRequestFrame,
-  encodeStatusFrame,
   encodeWireMessage,
   decodeWireMessage,
   marshalMessage,
@@ -30,15 +27,17 @@ import {
 } from "../src/metadata.js";
 import { Code, TrevRpcError } from "../src/status.js";
 import { readVarint, varintLength, writeVarint } from "../src/varint.js";
+import { RpcKind, sharedWriterKept } from "../src/wire.js";
+import { chunked, concatBytes, hex, readGoldenVectors, readerOf } from "./support.js";
 import {
   RpcAnswer,
   RpcHeaders,
-  RpcKind,
   RpcRequest,
   RpcStatus,
-  sharedWriterKept,
-} from "../src/wire.js";
-import { chunked, concatBytes, hex, readGoldenVectors, readerOf } from "./support.js";
+  encodeAnswerFrame,
+  encodeHeadersFrame,
+  encodeStatusFrame,
+} from "./wire-server.js";
 
 const bytes = (text) => new TextEncoder().encode(text);
 const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));

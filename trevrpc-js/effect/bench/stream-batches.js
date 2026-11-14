@@ -13,8 +13,9 @@ import { parseArgs } from "node:util";
 import { createClient } from "@trevrpc/trevrpc-js";
 import { Effect, Stream } from "effect";
 
-import { encodeMessageFrame, encodeStatusFrame, marshalMessage } from "../../src/framing.js";
+import { encodeMessageFrame, marshalMessage } from "../../src/framing.js";
 import { fakeTransport } from "../../test/support.js";
+import { encodeStatusFrame } from "../../test/wire-server.js";
 import { Echo, EchoResponseSchema } from "../build/test/gen/echo_pb.js";
 import { createEffectClient } from "../src/index.js";
 

@@ -27,7 +27,7 @@ import {
   StreamBudget,
 } from "../src/stream-compression.js";
 import { varintLength, writeVarint } from "../src/varint.js";
-import { RpcAnswer, RpcRequest, RpcStatus, StreamCompression } from "../src/wire.js";
+import { StreamCompression } from "../src/wire.js";
 import { createCompression } from "../src/zstd.js";
 import {
   ServerStreams,
@@ -39,6 +39,7 @@ import {
   readGoldenVectors,
   turn,
 } from "./support.js";
+import { RpcAnswer, RpcRequest, RpcStatus } from "./wire-server.js";
 
 const vectors = await readGoldenVectors("zstd-golden-vectors.txt");
 const fromHex = (value) => Uint8Array.from(Buffer.from(value, "hex"));

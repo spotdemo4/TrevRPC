@@ -6,18 +6,16 @@ import { createClient } from "../src/client.js";
 import { encodeMessage } from "../src/compression.js";
 import {
   FrameType,
-  encodeAnswerFrame,
   encodeFrame,
-  encodeHeadersFrame,
   encodeMessageFrame,
   encodeRequestFrame,
-  encodeStatusFrame,
   marshalMessage,
 } from "../src/framing.js";
 import { CancelledStreamErrorCode, Code, TrevRpcError } from "../src/status.js";
 import { RpcKind } from "../src/wire.js";
 import { echoHandler } from "./echo-server.js";
 import { concatBytes, deferred, fakeTransport, turn } from "./support.js";
+import { encodeAnswerFrame, encodeHeadersFrame, encodeStatusFrame } from "./wire-server.js";
 
 const text = new TextDecoder();
 

@@ -5,8 +5,9 @@ import { Code, TrevRpcError } from "@trevrpc/trevrpc-js";
 import { Cause, Effect, Exit, Stream } from "effect";
 
 // The in-memory server of trevrpc-js's own tests, which runs the real client end to end.
-import { encodeMessageFrame, encodeStatusFrame, marshalMessage } from "../../src/framing.js";
+import { encodeMessageFrame, marshalMessage } from "../../src/framing.js";
 import { concatBytes, deferred, fakeTransport } from "../../test/support.js";
+import { encodeStatusFrame } from "../../test/wire-server.js";
 import { Echo, EchoRequestSchema, EchoResponseSchema } from "../build/test/gen/echo_pb.js";
 import { createEffectClient, toTrevRpcError } from "../src/index.js";
 

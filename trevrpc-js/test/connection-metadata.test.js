@@ -8,14 +8,13 @@ import {
   FrameReader,
   FrameType,
   decodeWireMessage,
-  encodeAnswerFrame,
   encodeMessageFrame,
   encodeRequestFrame,
 } from "../src/framing.js";
 import { Code } from "../src/status.js";
-import { RpcStatus } from "../src/wire.js";
 import { echoHandler } from "./echo-server.js";
 import { fakeTransport } from "./support.js";
+import { RpcStatus, encodeAnswerFrame } from "./wire-server.js";
 
 const url = "https://example.test/trevrpc";
 const decoder = new TextDecoder();
