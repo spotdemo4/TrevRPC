@@ -1,6 +1,7 @@
 // TrevRPC over QMux over WebSocket (draft-ietf-quic-qmux-02, draft-lcurley-qmux-websocket-00):
 // the browser fallback when WebTransport is unavailable or blocked. A session exposes the part of
 // the WebTransport API that the channel uses, so calls run on it unchanged.
+import { deferred } from "../async.js";
 import { DefaultMaxFrameSize } from "../framing.js";
 import { CancelledStreamErrorCode } from "../status.js";
 import {
@@ -96,12 +97,10 @@ export class QMuxWebSocketSession {
     // A frame header is at most 16 bytes, so the window fits one maximum-size frame.
     this.#window = (options.maxFrameSize ?? DefaultMaxFrameSize) + 16;
     this.#connRecvMax = this.#window;
-    this.ready = new Promise((resolve, reject) => {
-      this.#settleReady = { resolve, reject };
-    });
-    this.closed = new Promise((resolve, reject) => {
-      this.#settleClosed = { resolve, reject };
-    });
+    this.#settleReady = deferred();
+    this.#settleClosed = deferred();
+    this.ready = this.#settleReady.promise;
+    this.closed = this.#settleClosed.promise;
     this.ready.catch(() => {});
     this.closed.catch(() => {});
 

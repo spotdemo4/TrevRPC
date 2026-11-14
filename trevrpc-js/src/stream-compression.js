@@ -3,6 +3,7 @@
 // section of the wire format). A client offers it in its REQUEST on methods that allow it, and
 // may compress its requests once the server's ANSWER accepts them, or from the start when it offers
 // optimistically. Contexts hold memory for the whole call, so every channel has a budget for them.
+import { deferred } from "./async.js";
 import { encodeMessage, parseStreamChunk } from "./compression.js";
 import { FrameType } from "./framing.js";
 import { internal, resourceExhausted } from "./status.js";
@@ -262,10 +263,8 @@ export class ReplayCopies {
   #bodies = [];
   #bytes = 0;
   #releases = [];
-  #resolve;
-  decided = new Promise((resolve) => {
-    this.#resolve = resolve;
-  });
+  #decision = deferred();
+  decided = this.#decision.promise;
 
   constructor(budget) {
     this.#budget = budget;
@@ -292,7 +291,7 @@ export class ReplayCopies {
       release();
     }
     this.#bytes = 0;
-    this.#resolve(outcome);
+    this.#decision.resolve(outcome);
     return this.#bodies.splice(0);
   }
 }

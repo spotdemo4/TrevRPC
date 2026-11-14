@@ -1,3 +1,4 @@
+import { deferred } from "./async.js";
 import { Call, EarlyOk, defaultCallOptions, mergeCallOptions } from "./call.js";
 import { FrameType, decodeWireMessage, marshalMessage, unmarshalMessage } from "./framing.js";
 import { interceptCall, interceptorList } from "./interceptor.js";
@@ -248,21 +249,15 @@ export class BidirectionalStreamingCall {
   #batching = 0;
   /** Settles on every change a waiter may care about. */
   #changed = deferred();
-  #resolveStatus;
-  #rejectStatus;
-  #resolveHeaders;
-  #rejectHeaders;
-  #headers;
+  #status = deferred();
+  #headers = deferred();
   #onResponseHeaders;
   #onResponseMetadata;
   /** Whether the headers were handed to onResponseHeaders. */
   #headersReported = false;
 
   /** The final status, or the error that ended the call. */
-  status = new Promise((resolve, reject) => {
-    this.#resolveStatus = resolve;
-    this.#rejectStatus = reject;
-  });
+  status = this.#status.promise;
 
   constructor(call, rpc, options) {
     this.#call = call;
@@ -272,11 +267,7 @@ export class BidirectionalStreamingCall {
     this.#onResponseMetadata = options.onResponseMetadata;
     this.#flow = rpc.datagrams?.receive ? call.flow : undefined;
     this.status.catch(() => {});
-    this.#headers = new Promise((resolve, reject) => {
-      this.#resolveHeaders = resolve;
-      this.#rejectHeaders = reject;
-    });
-    this.#headers.catch(() => {});
+    this.#headers.promise.catch(() => {});
     call.signal.addEventListener(
       "abort",
       () => {
@@ -300,7 +291,7 @@ export class BidirectionalStreamingCall {
   get headers() {
     this.#headersWanted = true;
     this.#kick();
-    return this.#headers;
+    return this.#headers.promise;
   }
 
   /**
@@ -655,7 +646,7 @@ export class BidirectionalStreamingCall {
     this.#call.finish(error);
     if (error === undefined) {
       this.#outcomeSettled = true;
-      this.#resolveStatus({ code, message, metadata });
+      this.#status.resolve({ code, message, metadata });
     } else {
       this.#rejectOutcome(error);
     }
@@ -680,7 +671,7 @@ export class BidirectionalStreamingCall {
 
   /** Settles the headers on their first frame, and hands them to onResponseHeaders once. */
   #settleHeaders(metadata) {
-    this.#resolveHeaders(metadata);
+    this.#headers.resolve(metadata);
     if (!this.#headersReported) {
       this.#headersReported = true;
       this.#onResponseHeaders?.(metadata);
@@ -808,8 +799,8 @@ export class BidirectionalStreamingCall {
   #rejectOutcome(error) {
     if (!this.#outcomeSettled) {
       this.#outcomeSettled = true;
-      this.#rejectStatus(error);
-      this.#rejectHeaders(error);
+      this.#status.reject(error);
+      this.#headers.reject(error);
     }
   }
 
@@ -930,14 +921,6 @@ export class ResponseStream {
   batches() {
     return this.#call.batches();
   }
-}
-
-function deferred() {
-  let resolve;
-  const promise = new Promise((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
 }
 
 function validateResponseMetadata(metadata, what) {

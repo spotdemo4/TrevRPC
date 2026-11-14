@@ -3,6 +3,7 @@
 // demultiplexer from flow IDs to calls. Calls that stream an unreliable direction open a
 // DatagramFlow on the endpoint of the session that carries them. QMux over WebSocket has no
 // datagrams, so those calls never get a flow and everything stays on the stream.
+import { abortable } from "./async.js";
 import { byteView } from "./bytes.js";
 import { FrameType } from "./framing.js";
 import { readVarint, varintLength, writeVarint } from "./varint.js";
@@ -333,25 +334,4 @@ export class DatagramFlow {
       this.#endpoint.closeFlow(this.id);
     }
   }
-}
-
-/** Settles like `promise`, or rejects with the abort reason as soon as `signal` aborts. */
-function abortable(promise, signal) {
-  if (signal.aborted) {
-    return Promise.reject(signal.reason);
-  }
-  return new Promise((resolve, reject) => {
-    const onAbort = () => reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
-  });
 }
