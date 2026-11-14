@@ -3,7 +3,7 @@ module trev.zip/llc/trevrpc/trevrpc-go/oteltrevrpc
 go 1.26.0
 
 require (
-	github.com/quic-go/quic-go v0.64.1
+	github.com/quic-go/quic-go v0.65.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0

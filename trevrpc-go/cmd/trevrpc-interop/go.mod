@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.12-20260825204119-511051f7f437.2
-	github.com/quic-go/quic-go v0.64.1
+	github.com/quic-go/quic-go v0.65.0
 	google.golang.org/protobuf v1.36.12
 	trev.zip/llc/trevrpc/trevrpc-go v1.11.1
 	trev.zip/llc/trevrpc/trevrpc-go/protovalidatetrevrpc v1.11.1
