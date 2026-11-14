@@ -14,6 +14,12 @@
 -define(REJECT, <<"/test.Echo/Reject">>).
 -define(STOP, <<"/test.Echo/Stop">>).
 -define(CRASH, <<"/test.Echo/Crash">>).
+-define(PLAIN, <<"/test.Compressed/Plain">>).
+-define(TEXT_UNARY, <<"/test.Compressed/Unary">>).
+-define(TEXT_CLIENT_STREAM, <<"/test.Compressed/ClientStream">>).
+-define(TEXT_BIDI, <<"/test.Compressed/Bidi">>).
+%% The message type the golden dictionary compresses.
+-define(TEXT, <<"test.Text">>).
 
 %%% Fixture
 
@@ -30,8 +36,56 @@ routes() ->
         ?HOLD => #{kind => bidirectional_streaming, handler => fun hold/1},
         ?REJECT => #{kind => client_streaming, handler => fun reject/1},
         ?STOP => #{kind => client_streaming, handler => fun stop/1},
-        ?CRASH => #{kind => unary, handler => fun(_Request, _Call) -> erlang:error(boom) end}
+        ?CRASH => #{kind => unary, handler => fun(_Request, _Call) -> erlang:error(boom) end},
+        ?PLAIN => #{kind => unary, handler => fun counted_unary/2, compression => message},
+        ?TEXT_UNARY => typed(#{kind => unary, handler => fun counted_unary/2}),
+        ?TEXT_CLIENT_STREAM => typed(#{
+            kind => client_streaming, handler => fun counted_client_stream/1
+        }),
+        ?TEXT_BIDI => typed(#{kind => bidirectional_streaming, handler => fun counted_bidi/1})
     }.
+
+typed(Route) ->
+    Route#{request_type => ?TEXT, response_type => ?TEXT}.
+
+%% Echoes, ending with how many requests arrived compressed in its
+%% trailers.
+counted_unary(Request, Call) ->
+    count_trailers(Call),
+    {ok, Request}.
+
+counted_client_stream(Call) ->
+    counted_client_stream(Call, []).
+
+counted_client_stream(Call, Acc) ->
+    case trevrpc_call:recv(Call) of
+        {ok, Message} ->
+            counted_client_stream(Call, [Message | Acc]);
+        eof ->
+            count_trailers(Call),
+            {ok, iolist_to_binary(lists:reverse(Acc))};
+        {error, Status} ->
+            {error, Status}
+    end.
+
+counted_bidi(Call) ->
+    case trevrpc_call:recv(Call) of
+        {ok, Message} ->
+            ok = trevrpc_call:send(Call, Message),
+            counted_bidi(Call);
+        eof ->
+            count_trailers(Call),
+            ok;
+        {error, Status} ->
+            {error, Status}
+    end.
+
+count_trailers(Call) ->
+    #{dictionary := Dictionary, plain := Plain} = trevrpc_call:compressed_received(Call),
+    trevrpc_call:set_trailers(Call, #{
+        <<"x-dictionary">> => integer_to_binary(Dictionary),
+        <<"x-plain">> => integer_to_binary(Plain)
+    }).
 
 unary(<<"fail">>, _Call) ->
     {error, #{
@@ -201,6 +255,7 @@ e2e(Transport) ->
                 {"malformed requests", fun malformed_test/1},
                 {"optimistic stream compression is refused", fun optimistic_test/1},
                 {"connection metadata", fun connection_metadata_test/1},
+                {"compression without a dictionary", fun plain_test/1},
                 {"many concurrent calls", fun concurrent_test/1}
             ]
         ]
@@ -543,6 +598,375 @@ connection_metadata_test(#{channel := Channel}) ->
     ?assertMatch(
         #{code := invalid_argument, message := <<"unknown connection metadata set 1">>},
         raw(Channel, [Reference, trevrpc_frame:encode(message, <<"e">>)], true)
+    ).
+
+plain_test(#{credentials := Credentials, server := Server}) ->
+    %% A channel of its own, whose first call queries.
+    Channel = connect(Credentials, Server),
+    Text = binary:copy(<<"{\"service\":\"search\",\"status\":404}">>, 12),
+    Opts = #{compression => message, timeout => 5000},
+    Plain = fun(Method, Message, CallOpts) ->
+        {ok, Message, #{trailers := #{<<"x-plain">> := Count}}} =
+            trevrpc_client:unary(Channel, Method, Message, CallOpts),
+        Count
+    end,
+    %% The first request goes before the answer, the second compressed.
+    ?assertEqual(<<"0">>, Plain(?PLAIN, Text, Opts)),
+    ?assertEqual(<<"1">>, Plain(?PLAIN, Text, Opts)),
+    %% Not below 256 bytes, nor where the call's options do not allow it.
+    ?assertEqual(<<"0">>, Plain(?PLAIN, binary:part(Text, 0, 255), Opts)),
+    ?assertEqual(<<"0">>, Plain(?PLAIN, Text, #{})),
+    %% A type without a dictionary here still compresses without one.
+    ?assertEqual(<<"1">>, Plain(?TEXT_UNARY, Text, Opts#{request_type => ?TEXT})),
+    %% Responses are compressed where the client accepts ID 0 and the route
+    %% allows it.
+    Request = trevrpc_frame:encode(message, Text),
+    ?assertMatch(
+        [{zstd_message, _}, {status, #{code := ok}}],
+        raw_frames(Channel, [request(#{method => ?PLAIN, accept_dictionaries => [0]}), Request])
+    ),
+    ?assertMatch(
+        [{message, Text}, {status, #{code := ok}}],
+        raw_frames(Channel, [request(#{method => ?PLAIN}), Request])
+    ),
+    ?assertMatch(
+        [{message, Text}, {status, #{code := ok}}],
+        raw_frames(Channel, [request(#{method => ?TEXT_UNARY, accept_dictionaries => [0]}), Request])
+    ),
+    trevrpc_channel:close(Channel).
+
+%% Sends frames written by hand and returns every frame of the response,
+%% ANSWER and STATUS decoded.
+raw_frames(Channel, Frames) ->
+    {ok, #{transport := Transport, id := Id, ref := Ref}} = trevrpc_channel:open_stream(
+        Channel, infinity
+    ),
+    Stream = trevrpc_stream:new(Transport, Id, Ref, Channel, trevrpc_frame:reader(1 bsl 22)),
+    {ok, Sent} = trevrpc_stream:send(Stream, Frames, true, infinity),
+    Result = collect_frames(Sent, erlang:monotonic_time(millisecond) + 5000, []),
+    trevrpc_channel:stream_done(Channel, Id, Ref),
+    Result.
+
+collect_frames(Stream, Deadline, Acc) ->
+    case trevrpc_stream:next_frame(Stream, Deadline) of
+        {ok, {status, Payload}, _} ->
+            {ok, Status} = trevrpc_wire:decode_status(Payload),
+            lists:reverse(Acc, [{status, maps:with([code, message, metadata], Status)}]);
+        {ok, {answer, Payload}, Next} ->
+            {ok, Answer} = trevrpc_wire:decode_answer(Payload),
+            collect_frames(Next, Deadline, [{answer, Answer} | Acc]);
+        {ok, Frame, Next} ->
+            collect_frames(Next, Deadline, [Frame | Acc]);
+        Other ->
+            lists:reverse(Acc, [Other])
+    end.
+
+%%% Dictionaries
+
+compression_test_() ->
+    [{atom_to_list(Transport), compression(Transport)} || Transport <- [quic, tcp]].
+
+compression(Transport) ->
+    {setup,
+        fun() ->
+            {ok, _} = application:ensure_all_started(quic),
+            logger:set_primary_config(level, none),
+            Credentials = (trevrpc_test_tls:credentials())#{
+                transport => Transport, compression => dictionary_settings()
+            },
+            #{
+                credentials => Credentials,
+                server => start_server(Credentials, #{compression => dictionary_settings()})
+            }
+        end,
+        fun(#{server := Server}) ->
+            trevrpc_server:stop(Server),
+            logger:set_primary_config(level, notice)
+        end,
+        fun(Env) ->
+            [
+                {Name, {timeout, 30, fun() -> Test(Env) end}}
+             || {Name, Test} <- [
+                    {"compressed both ways once answered", fun dictionary_test/1},
+                    {"a request stream compresses once its answer arrives", fun mid_call_test/1},
+                    {"a waiting upload takes its answer", fun upload_answer_test/1},
+                    {"a malformed answer ends an upload", fun malformed_answer_test/1},
+                    {"the server compresses only what the client accepts",
+                        fun server_compression_test/1},
+                    {"compressed requests are checked", fun compressed_requests_test/1},
+                    {"decompressed sizes count towards the body limit", fun body_limit_test/1},
+                    {"a new connection negotiates again", fun reconnect_test/1},
+                    {"invalid compression settings", fun invalid_settings_test/1}
+                ]
+            ]
+        end}.
+
+dictionary_settings() ->
+    #{dictionaries => [#{data => golden(<<"dict.d1.dictionary">>), messages => [?TEXT]}]}.
+
+golden(Name) ->
+    maps:get(Name, trevrpc_zstd_tests:vectors()).
+
+%% A 71-byte message the golden dictionary compresses.
+small() ->
+    golden(<<"ok.small.message">>).
+
+compressed_channel(#{credentials := Credentials, server := Server}) ->
+    {ok, Channel} = trevrpc_channel:start(
+        (ports(Server))#{
+            host => {127, 0, 0, 1},
+            transport => maps:get(transport, Credentials),
+            server_name => "localhost",
+            cacerts => maps:get(cacerts, Credentials),
+            compression => maps:get(compression, Credentials)
+        }
+    ),
+    ok = trevrpc_channel:wait_until_ready(Channel, 30000),
+    Channel.
+
+typed_opts() ->
+    #{request_type => ?TEXT, response_type => ?TEXT, timeout => 5000}.
+
+dictionary_count({eof, #{<<"x-dictionary">> := Count}}) -> Count;
+dictionary_count({ok, _, #{trailers := #{<<"x-dictionary">> := Count}}}) -> Count.
+
+dictionary_test(Env) ->
+    Channel = compressed_channel(Env),
+    Message = small(),
+    Unary = fun() ->
+        {ok, Message, _} =
+            Result = trevrpc_client:unary(Channel, ?TEXT_UNARY, Message, typed_opts()),
+        dictionary_count(Result)
+    end,
+    %% The first call's request goes before the server's answer; the
+    %% response is compressed with the dictionary the answer confirms.
+    ?assertEqual(<<"0">>, Unary()),
+    ?assertEqual(<<"1">>, Unary()),
+    %% With the shared set known, a stream compresses from its first
+    %% request.
+    {ok, Call} = trevrpc_client:bidi(Channel, ?TEXT_BIDI, typed_opts()),
+    [ok = trevrpc_client:send(Call, Message) || _ <- lists:seq(1, 3)],
+    ok = trevrpc_client:close_send(Call),
+    [?assertEqual({ok, Message}, trevrpc_client:recv(Call)) || _ <- lists:seq(1, 3)],
+    ?assertEqual(<<"3">>, dictionary_count(trevrpc_client:recv(Call))),
+    %% Types without a dictionary go uncompressed.
+    ?assertMatch(
+        {ok, Message, #{trailers := #{<<"x-dictionary">> := <<"0">>}}},
+        trevrpc_client:unary(Channel, ?TEXT_UNARY, Message, #{timeout => 5000})
+    ),
+    trevrpc_channel:close(Channel).
+
+mid_call_test(Env) ->
+    Channel = compressed_channel(Env),
+    Message = small(),
+    {ok, Call} = trevrpc_client:bidi(Channel, ?TEXT_BIDI, typed_opts()),
+    ok = trevrpc_client:send(Call, Message),
+    %% Reading the echo takes the ANSWER that came before it.
+    ?assertEqual({ok, Message}, trevrpc_client:recv(Call)),
+    ok = trevrpc_client:send(Call, Message),
+    ok = trevrpc_client:close_send(Call),
+    ?assertEqual({ok, Message}, trevrpc_client:recv(Call)),
+    ?assertEqual(<<"1">>, dictionary_count(trevrpc_client:recv(Call))),
+    trevrpc_channel:close(Channel).
+
+upload_answer_test(Env) ->
+    Channel = compressed_channel(Env),
+    Message = small(),
+    {ok, Call} = trevrpc_client:client_stream(Channel, ?TEXT_CLIENT_STREAM, typed_opts()),
+    %% The server answers at dispatch. The ANSWER is held back while the
+    %% first request goes, then a send that finds it waiting takes it
+    %% without reading the response.
+    Answer = take_stream_data(Call),
+    ok = trevrpc_client:send(Call, Message),
+    self() ! {trevrpc_stream, call_ref(Call), Answer},
+    ok = trevrpc_client:send(Call, Message),
+    ok = trevrpc_client:send(Call, Message),
+    ok = trevrpc_client:close_send(Call),
+    Expected = binary:copy(Message, 3),
+    ?assertEqual({ok, Expected}, trevrpc_client:recv(Call)),
+    ?assertEqual(<<"2">>, dictionary_count(trevrpc_client:recv(Call))),
+    trevrpc_channel:close(Channel).
+
+malformed_answer_test(Env) ->
+    Channel = compressed_channel(Env),
+    Message = small(),
+    {ok, Call} = trevrpc_client:client_stream(Channel, ?TEXT_CLIENT_STREAM, typed_opts()),
+    %% The ANSWER the server sends at dispatch is the stream's first data;
+    %% it is replaced with a malformed one before a send takes it.
+    {data, _Answer, false} = take_stream_data(Call),
+    self() !
+        {trevrpc_stream, call_ref(Call),
+            {data, iolist_to_binary(trevrpc_frame:encode(answer, <<16#FF>>)), false}},
+    Malformed = #{code => internal, message => <<"malformed ANSWER">>},
+    ?assertMatch({error, Malformed}, trevrpc_client:send(Call, Message)),
+    ?assertMatch({error, Malformed}, trevrpc_client:recv(Call)),
+    trevrpc_channel:close(Channel).
+
+%% The routing tag of a client call's stream events: the first field of
+%% its record.
+call_ref(Call) -> element(2, Call).
+
+%% Takes the next data event of the call's stream out of the mailbox,
+%% before the call reads it.
+take_stream_data(Call) ->
+    Ref = call_ref(Call),
+    receive
+        {trevrpc_stream, Ref, {data, _, _} = Data} -> Data
+    after 5000 -> error(no_stream_data)
+    end.
+
+server_compression_test(Env) ->
+    Channel = compressed_channel(Env),
+    Message = small(),
+    Request = fun(Fields) -> request(Fields#{method => ?TEXT_UNARY}) end,
+    Body = trevrpc_frame:encode(message, Message),
+    [D1, Plain] = trevrpc_zstd:query(trevrpc_zstd_tests:config()),
+    %% Compressed with the dictionary the client accepts.
+    [{zstd_message, Payload}, {status, #{code := ok}}] =
+        raw_frames(Channel, [Request(#{accept_dictionaries => [1]}), Body]),
+    ?assertEqual(golden(<<"ok.small.payload">>), Payload),
+    ?assertMatch(
+        [{message, Message}, {status, _}], raw_frames(Channel, [Request(#{}), Body])
+    ),
+    %% A query is answered; a dictionary the answer does not confirm is not
+    %% used, even where the client accepts it.
+    ?assertMatch(
+        [{answer, #{dictionaries := [D1, Plain]}}, {zstd_message, _}, {status, _}],
+        raw_frames(Channel, [
+            Request(#{accept_dictionaries => [1], dictionary_query => [D1, Plain]}), Body
+        ])
+    ),
+    Wrong = D1#{fingerprint => <<"12345678">>},
+    ?assertMatch(
+        [{answer, #{dictionaries := [Plain]}}, {message, Message}, {status, _}],
+        raw_frames(Channel, [
+            Request(#{accept_dictionaries => [1], dictionary_query => [Wrong, Plain]}), Body
+        ])
+    ),
+    %% A streaming call gets its ANSWER at dispatch, before any response.
+    ?assertMatch(
+        [{answer, _}, {message, <<>>}, {status, #{code := ok}}],
+        raw_frames(Channel, [
+            request(#{
+                method => ?TEXT_CLIENT_STREAM,
+                kind => client_streaming,
+                dictionary_query => [D1]
+            })
+        ])
+    ),
+    trevrpc_channel:close(Channel).
+
+compressed_requests_test(Env) ->
+    Channel = compressed_channel(Env),
+    Unary = request(#{method => ?TEXT_UNARY}),
+    Compressed = fun(Name) -> trevrpc_frame:encode(zstd_message, golden(Name)) end,
+    ?assertMatch(
+        [{message, _}, {status, #{code := ok, metadata := #{<<"x-dictionary">> := <<"1">>}}}],
+        raw_frames(Channel, [Unary, Compressed(<<"ok.small.payload">>)])
+    ),
+    ?assertMatch(
+        [{message, _}, {status, #{code := ok, metadata := #{<<"x-plain">> := <<"1">>}}}],
+        raw_frames(Channel, [Unary, Compressed(<<"plain.records.payload">>)])
+    ),
+    ?assertMatch(
+        [{status, #{code := invalid_argument, message := <<"invalid ZSTD_MESSAGE payload">>}}],
+        raw_frames(Channel, [Unary, Compressed(<<"bad.trailing_bytes.payload">>)])
+    ),
+    ?assertMatch(
+        [
+            {status, #{
+                code := invalid_argument,
+                message := <<"compressed message uses dictionary 300, which is not accepted">>
+            }}
+        ],
+        raw_frames(Channel, [Unary, Compressed(<<"bad.unknown_dictionary.payload">>)])
+    ),
+    ?assertMatch(
+        [{status, #{code := resource_exhausted}}],
+        raw_frames(Channel, [Unary, Compressed(<<"too_large.zeros.payload">>)])
+    ),
+    ?assertMatch(
+        [{status, #{code := invalid_argument}}],
+        raw_frames(Channel, [Unary, trevrpc_frame:encode(zstd_stream_message, <<0>>)])
+    ),
+    trevrpc_channel:close(Channel).
+
+body_limit_test(#{credentials := Credentials}) ->
+    Server = start_server(Credentials, #{max_stream_body_size => 4096}),
+    Channel = connect(Credentials, Server),
+    {ok, Zeros} = trevrpc_zstd:compress(trevrpc_zstd:plain(), 0, <<0:(10000 * 8)>>),
+    ?assertMatch(
+        [
+            {status, #{
+                code := resource_exhausted,
+                message := <<"request stream exceeded maximum body size of 4096 bytes">>
+            }}
+        ],
+        raw_frames(Channel, [
+            request(#{method => ?TEXT_CLIENT_STREAM, kind => client_streaming}),
+            trevrpc_frame:encode(zstd_message, Zeros)
+        ])
+    ),
+    trevrpc_channel:close(Channel),
+    trevrpc_server:stop(Server).
+
+reconnect_test(#{credentials := Credentials}) ->
+    Server = start_server(Credentials, #{
+        compression => dictionary_settings(), graceful_shutdown_timeout => 0
+    }),
+    Channel = compressed_channel(#{credentials => Credentials, server => Server}),
+    Message = small(),
+    Unary = fun() ->
+        dictionary_count(trevrpc_client:unary(Channel, ?TEXT_UNARY, Message, typed_opts()))
+    end,
+    ?assertEqual(<<"0">>, Unary()),
+    ?assertEqual(<<"1">>, Unary()),
+    ok = trevrpc_channel:subscribe(Channel),
+    Ports = ports(Server),
+    ok = trevrpc_server:stop(Server),
+    await_state(Channel, connecting),
+    %% The next server lacks the dictionary, so the next connection must
+    %% not take the last one's shared set for its own.
+    Server2 = start_server(Credentials, Ports),
+    try
+        await_state(Channel, {ready, 2}),
+        ?assertEqual(<<"0">>, Unary()),
+        ?assertEqual(<<"0">>, Unary())
+    after
+        trevrpc_server:stop(Server2),
+        trevrpc_channel:close(Channel)
+    end.
+
+invalid_settings_test(#{credentials := Credentials, server := Server}) ->
+    Invalid = #{dictionaries => [#{data => <<"not a dictionary">>}]},
+    ?assertMatch(
+        {error, #{code := invalid_argument}},
+        trevrpc_channel:connect(
+            (ports(Server))#{host => {127, 0, 0, 1}, compression => Invalid}, 1000
+        )
+    ),
+    ?assertMatch(
+        {error, {compression, _}},
+        trevrpc_server:start(#{
+            ip => {127, 0, 0, 1},
+            cert => maps:get(cert, Credentials),
+            key => maps:get(key, Credentials),
+            routes => routes(),
+            compression => Invalid
+        })
+    ),
+    ?assertMatch(
+        {error, {route, ?PLAIN, {invalid_compression, everything}}},
+        trevrpc_server:start(#{
+            ip => {127, 0, 0, 1},
+            cert => maps:get(cert, Credentials),
+            key => maps:get(key, Credentials),
+            routes => #{
+                ?PLAIN => #{
+                    kind => unary, handler => fun counted_unary/2, compression => everything
+                }
+            }
+        })
     ).
 
 %%% Servers of their own

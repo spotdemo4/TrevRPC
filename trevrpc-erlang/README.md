@@ -6,7 +6,7 @@ The Erlang runtime for TrevRPC. It is the core that a Gleam package (`trevrpc-gl
 
 ## Transports
 
-The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/erlang_quic) and OTP's `ssl`, so nothing native is built. It needs Erlang/OTP 28 or later.
+The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/erlang_quic) and OTP's `ssl` and `zstd`, so nothing native is built. It needs Erlang/OTP 28 or later.
 
 | Role   | Today                                                                                 | Planned                                                 |
 | ------ | ------------------------------------------------------------------------------------- | ------------------------------------------------------- |
@@ -17,7 +17,7 @@ QMux ([draft-ietf-quic-qmux-02](https://datatracker.ietf.org/doc/draft-ietf-quic
 
 Known issue: when a client on erlang_quic has finished an upload (`close_send`) while most of it is still queued, and the server answers early, erlang_quic can answer the server's STOP_SENDING with a RESET_STREAM whose final size contradicts the FIN it already sent. An erlang_quic server, such as this runtime's, then closes the connection with FINAL_SIZE_ERROR; quic-go does not check it. The Go and Rust clients are not affected. See [benoitc/erlang_quic#551](https://github.com/benoitc/erlang_quic/issues/551).
 
-Not implemented yet: datagram messages, compressed messages (an optimistic stream-compression call is refused, and the client replays it), connection metadata sets (an offer is merged into its own call and never confirmed, so clients keep offering), and stream idle timeouts.
+Not implemented yet: datagram messages, stream compression (an optimistic stream-compression call is refused, and the client replays it), connection metadata sets (an offer is merged into its own call and never confirmed, so clients keep offering), and stream idle timeouts.
 
 ## Server
 
@@ -74,6 +74,41 @@ ok = trevrpc_client:close_send(Call),
 
 A channel reconnects on its own and follows the [connection lifecycle](https://trev.zip/llc/TrevRPC/wiki/Connection-Lifecycle) of the other runtimes: each connection is a generation, calls never move between generations, calls made while it reconnects fail at once with `unavailable`, and reconnects back off from 100 ms to 30 s with jitter. A call belongs to the process that started it; if that process exits, the channel cancels the call. `trevrpc_channel:subscribe/1` sends the calling process `{trevrpc_channel, Channel, State}` messages with the channel's state, `{ready, Generation}`, `connecting` or, last, `closed`, now and after every change, until `unsubscribe/1` or the process exits.
 
+## Compression
+
+Messages can travel compressed with zstd and a dictionary trained on your own messages, negotiated per connection as in the other runtimes (see the wiki's [Compression](https://trev.zip/llc/TrevRPC/wiki/Compression) guide). Servers and channels take the same settings:
+
+```erlang
+{ok, Dictionary} = file:read_file("metrics.dict"),
+Compression = #{
+    dictionaries => [#{data => Dictionary, messages => [<<"example.v1.MetricSample">>]}],
+    level => 1
+},
+{ok, Server} = trevrpc_server:start_link(#{..., compression => Compression}),
+{ok, Channel} = trevrpc_channel:connect(#{..., compression => Compression}, 5000).
+```
+
+Messages are opaque binaries, so the runtime learns their protobuf types from the route (`request_type`, `response_type`) and from the call options of the same names, and picks each direction's dictionary from them. `compression => message` (the schema's `COMPRESSION_MESSAGE`) on a route or in a call's options also lets messages of 256 bytes or more travel compressed without a dictionary where none applies; `#{requests => message, responses => none}` sets the directions apart, for a type with a field marked `debug_redact`. Without settings, servers and channels still compress without a dictionary where methods allow it.
+
+```erlang
+Routes = #{
+    <<"/example.v1.Metrics/Get">> => #{
+        kind => unary,
+        handler => fun get/2,
+        request_type => <<"example.v1.GetRequest">>,
+        response_type => <<"example.v1.MetricSample">>,
+        compression => message
+    }
+},
+trevrpc_client:unary(Channel, <<"/example.v1.Metrics/Get">>, Request, #{
+    request_type => <<"example.v1.GetRequest">>,
+    response_type => <<"example.v1.MetricSample">>,
+    compression => message
+}).
+```
+
+A message travels compressed only when that makes it smaller. A channel's first call on a connection asks which dictionaries the server shares, so its request messages go uncompressed until the answer arrives; a request stream starts compressing as soon as it has. Decompressed sizes count towards the frame size and body limits. `trevrpc_call:compressed_received/1` tells a handler how many of its requests arrived compressed. The codec, `trevrpc_zstd`, is checked against the shared golden vectors in `testdata/zstd-golden-vectors.txt`.
+
 ## Modules
 
 | Module                         | Purpose                                                                                       |
@@ -88,6 +123,7 @@ A channel reconnects on its own and follows the [connection lifecycle](https://t
 | `trevrpc_frame`                | Frame encoding, and an incremental reader with the frame size and cumulative byte limits      |
 | `trevrpc_wire`                 | The control messages `RpcRequest`, `RpcHeaders`, `RpcAnswer` and `RpcStatus`, encoded by hand |
 | `trevrpc_datagram`             | Datagram payloads                                                                             |
+| `trevrpc_zstd`                 | Compression settings, their negotiation, and ZSTD_MESSAGE payloads                            |
 | `trevrpc_varint`, `trevrpc_pb` | QUIC varints and the protobuf wire primitives                                                 |
 
 The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_quic`, `trevrpc_transport`, `trevrpc_qmux`, `trevrpc_qmux_frame`, `trevrpc_tcp_listener`) is internal.

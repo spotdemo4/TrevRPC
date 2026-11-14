@@ -27,6 +27,7 @@
     reader/2,
     charge_messages/2,
     charge/2,
+    charge_message/2,
     feed/2,
     at_boundary/1
 ]).
@@ -159,6 +160,15 @@ charge(Bytes, #reader{max_bytes = Max, charged = Charged} = Reader) ->
         Total when Total > Max -> {error, {body_too_large, Max}};
         Total -> {ok, Reader#reader{charged = Total}}
     end.
+
+%% @doc Charges `Bytes', the decompressed size of a compressed message,
+%% against the cumulative limit if messages count towards it.
+-spec charge_message(non_neg_integer(), reader()) ->
+    {ok, reader()} | {error, {body_too_large, non_neg_integer()}}.
+charge_message(Bytes, #reader{charge_messages = true} = Reader) ->
+    charge(Bytes, Reader);
+charge_message(_Bytes, Reader) ->
+    {ok, Reader}.
 
 %% @doc Reads the frames `Data' completes, in order. Frames of unknown type
 %% are skipped. A frame longer than the frame size limit, or one that takes

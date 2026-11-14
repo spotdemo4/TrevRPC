@@ -31,7 +31,9 @@
     finished/1,
     stopped/1,
     charge_messages/2,
+    charge_message/2,
     next_frame/2,
+    peek/1,
     send/4,
     abort/2,
     release/1,
@@ -110,6 +112,30 @@ stopped(#stream{stopped = Stopped}) -> Stopped.
 -spec charge_messages(boolean(), stream()) -> stream().
 charge_messages(Enabled, #stream{reader = Reader} = Stream) ->
     Stream#stream{reader = trevrpc_frame:charge_messages(Enabled, Reader)}.
+
+%% @doc Charges `Bytes', the decompressed size of a compressed message,
+%% against the reader's cumulative limit, if messages count towards it. A
+%% stream past its limit fails, as if the reader had found it.
+-spec charge_message(non_neg_integer(), stream()) ->
+    {ok, stream()} | {error, read_error(), stream()}.
+charge_message(Bytes, #stream{reader = Reader} = Stream) ->
+    case trevrpc_frame:charge_message(Bytes, Reader) of
+        {ok, Next} -> {ok, Stream#stream{reader = Next}};
+        {error, Reason} -> fail(Reason, Stream)
+    end.
+
+%% @doc The next frame the peer sent, if it has arrived, without taking it
+%% and without waiting.
+-spec peek(stream()) -> {trevrpc_frame:frame() | none, stream()}.
+peek(#stream{frames = [Frame | _]} = Stream) ->
+    {Frame, Stream};
+peek(#stream{error = undefined, fin = false, ref = Ref} = Stream) ->
+    receive
+        {trevrpc_stream, Ref, Event} -> peek(event(Event, Stream))
+    after 0 -> {none, Stream}
+    end;
+peek(Stream) ->
+    {none, Stream}.
 
 %% @doc Takes the next frame the peer sent, waiting for it until `Deadline'.
 %% `eof' means the peer finished at a frame boundary.

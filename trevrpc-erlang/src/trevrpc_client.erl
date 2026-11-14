@@ -21,7 +21,11 @@
 %%
 %% Options: `timeout' (milliseconds) or `deadline' (in
 %% `erlang:monotonic_time(millisecond)' units), sent to the server and
-%% enforced locally, and `metadata', the request metadata.
+%% enforced locally, and `metadata', the request metadata. `request_type'
+%% and `response_type' are the protobuf full names of the method's
+%% messages, which pick their compression dictionaries, and `compression'
+%% says how its messages may be compressed without one (see
+%% {@link trevrpc_zstd:directions()}), as the method's schema options do.
 -module(trevrpc_client).
 
 -export([
@@ -42,7 +46,10 @@
 -type options() :: #{
     timeout => non_neg_integer(),
     deadline => integer(),
-    metadata => trevrpc_metadata:metadata()
+    metadata => trevrpc_metadata:metadata(),
+    request_type => binary(),
+    response_type => binary(),
+    compression => trevrpc_zstd:directions()
 }.
 
 -record(client_call, {
@@ -68,7 +75,15 @@
     headers :: trevrpc_metadata:metadata() | undefined,
     %% Messages read ahead, while looking for headers or a status.
     pending = [] :: [binary()],
-    terminal :: terminal() | undefined
+    terminal :: terminal() | undefined,
+    %% Compression: the channel's configuration, the dictionaries response
+    %% messages may use, the dictionary of request messages (see
+    %% trevrpc_zstd:prepare/5), and the generation whose shared set the
+    %% call's ANSWER teaches the channel, when the call queried.
+    compression :: trevrpc_zstd:config(),
+    accept = [] :: [non_neg_integer()],
+    requests = none :: non_neg_integer() | {pending, non_neg_integer()} | none,
+    learn :: pos_integer() | undefined
 }).
 
 -type terminal() :: {eof, trevrpc_metadata:metadata()} | {error, trevrpc_status:status()}.
@@ -113,9 +128,32 @@ start(Channel, Method, Kind, Opts, First) ->
         ok ?= check_metadata(Metadata),
         {ok, Info} ?= trevrpc_channel:open_stream(Channel, Deadline),
         #{transport := Transport, id := Id, ref := Ref, max_frame_size := Max} = Info,
+        #{compression := Compression, shared := Shared, generation := Generation} = Info,
         Stream = trevrpc_stream:new(Transport, Id, Ref, Channel, trevrpc_frame:reader(Max)),
         Call = #client_call{
             ref = Ref, channel = Channel, kind = Kind, deadline = Deadline, owner = self()
+        },
+        {PlainRequests, PlainResponses} = trevrpc_zstd:directions(
+            maps:get(compression, Opts, none)
+        ),
+        #{query := Query, accept := Accept, requests := Requests} = trevrpc_zstd:prepare(
+            Compression,
+            Shared,
+            maps:get(request_type, Opts, undefined),
+            maps:get(response_type, Opts, undefined),
+            {PlainRequests =/= none, PlainResponses =/= none}
+        ),
+        State = #cstate{
+            stream = Stream,
+            max_frame_size = Max,
+            compression = Compression,
+            accept = Accept,
+            requests = Requests,
+            learn =
+                case Query of
+                    [] -> undefined;
+                    _ -> Generation
+                end
         },
         Request = trevrpc_frame:encode(
             request,
@@ -123,16 +161,18 @@ start(Channel, Method, Kind, Opts, First) ->
                 method => Method,
                 metadata => Metadata,
                 kind => Kind,
-                timeout_nanos => timeout_nanos(Deadline)
+                timeout_nanos => timeout_nanos(Deadline),
+                accept_dictionaries => Accept,
+                dictionary_query => Query
             })
         ),
         %% A single request goes with its REQUEST, in one write.
         {Frames, Fin} =
             case First of
                 none -> {Request, false};
-                {message, Message} -> {[Request, trevrpc_frame:encode(message, Message)], true}
+                {message, Message} -> {[Request, request_frame(State, Message)], true}
             end,
-        put_state(Call, #cstate{stream = Stream, max_frame_size = Max, send_closed = Fin}),
+        put_state(Call, State#cstate{send_closed = Fin}),
         case write(Call, Frames, Fin) of
             ok ->
                 {ok, Call};
@@ -174,12 +214,58 @@ send(#client_call{kind = Kind} = Call, Message) when
     Kind =:= client_streaming; Kind =:= bidirectional_streaming
 ->
     case state(Call) of
-        #cstate{send_closed = true} -> erlang:error(send_closed);
-        #cstate{terminal = undefined} -> write(Call, trevrpc_frame:encode(message, Message), false);
-        #cstate{terminal = Terminal} -> {error, terminal_status(Terminal)}
+        #cstate{send_closed = true} ->
+            erlang:error(send_closed);
+        #cstate{terminal = undefined} = State ->
+            case check_answer(Call, State) of
+                {ok, Answered} -> write(Call, request_frame(Answered, Message), false);
+                {error, Status} -> {error, Status}
+            end;
+        #cstate{terminal = Terminal} ->
+            {error, terminal_status(Terminal)}
     end;
 send(_Call, _Message) ->
     erlang:error(badarg).
+
+%% The frame of a request message: a ZSTD_MESSAGE when the call's request
+%% dictionary is shared and makes the message shorter, a MESSAGE otherwise.
+request_frame(#cstate{requests = Id, compression = Compression}, Message) when is_integer(Id) ->
+    case trevrpc_zstd:compress(Compression, Id, Message) of
+        {ok, Payload} -> trevrpc_frame:encode(zstd_message, Payload);
+        none -> trevrpc_frame:encode(message, Message)
+    end;
+request_frame(_State, Message) ->
+    trevrpc_frame:encode(message, Message).
+
+%% A request stream waiting for its ANSWER to confirm its dictionary takes
+%% the ANSWER as soon as it has arrived, so it starts compressing mid-call.
+%% Returns the state the next request is encoded with, or the status of a
+%% call a malformed ANSWER ended, as reading it would.
+check_answer(Call, #cstate{requests = {pending, _}, answered = false, stream = Stream} = State) ->
+    case trevrpc_stream:peek(Stream) of
+        {{answer, _}, Peeked} ->
+            {ok, {answer, Payload}, Next} = trevrpc_stream:next_frame(Peeked, infinity),
+            case answer(Call, Payload, State#cstate{stream = Next}) of
+                {ok, Answered} ->
+                    put_state(Call, Answered),
+                    {ok, Answered};
+                error ->
+                    {terminal, {error, Status}, _Ended} =
+                        protocol_error(Call, State#cstate{stream = Next}, <<"malformed ANSWER">>),
+                    {error, Status}
+            end;
+        {none, Peeked} ->
+            Polled = State#cstate{stream = Peeked},
+            put_state(Call, Polled),
+            {ok, Polled};
+        {_Other, Peeked} ->
+            %% Another frame came first, so no ANSWER will.
+            Unconfirmed = answered(State#cstate{stream = Peeked}),
+            put_state(Call, Unconfirmed),
+            {ok, Unconfirmed}
+    end;
+check_answer(_Call, State) ->
+    {ok, State}.
 
 %% @doc Ends the requests of a client-streaming or bidirectional call.
 -spec close_send(call()) -> ok | {error, trevrpc_status:status()}.
@@ -322,30 +408,38 @@ read_event(Call, #cstate{stream = Stream} = State) ->
     end.
 
 frame(Call, {answer, Payload}, #cstate{answered = false} = State) ->
-    %% Nothing this client negotiates is answered yet; the ANSWER is checked
-    %% and skipped.
-    case trevrpc_wire:decode_answer(Payload) of
-        {ok, _Answer} -> read_event(Call, State#cstate{answered = true});
+    case answer(Call, Payload, State) of
+        {ok, Answered} -> read_event(Call, Answered);
         error -> protocol_error(Call, State, <<"malformed ANSWER">>)
     end;
 frame(Call, {headers, Payload}, #cstate{headers = undefined} = State) ->
     case trevrpc_wire:decode_headers(Payload) of
         {ok, #{metadata := Metadata}} ->
             case trevrpc_metadata:validate(Metadata) of
-                ok -> {headers, State#cstate{answered = true, headers = Metadata}};
+                ok -> {headers, answered(State#cstate{headers = Metadata})};
                 {error, Message} -> protocol_error(Call, State, Message)
             end;
         error ->
             protocol_error(Call, State, <<"malformed HEADERS">>)
     end;
 frame(_Call, {message, Message}, State) ->
-    {message, Message, State#cstate{answered = true, headers = headers_or_empty(State)}};
+    {message, Message, answered(State#cstate{headers = headers_or_empty(State)})};
+frame(Call, {zstd_message, Payload}, State) ->
+    #cstate{compression = Compression, accept = Accept, max_frame_size = Max} = State,
+    case trevrpc_zstd:inflate(Compression, Accept, Payload, Max) of
+        {ok, Message, _Id} ->
+            {message, Message, answered(State#cstate{headers = headers_or_empty(State)})};
+        {error, {too_large, Size}} ->
+            read_failed(Call, {frame_too_large, Size}, State);
+        {error, {invalid, Message}} ->
+            protocol_error(Call, State, Message)
+    end;
 frame(Call, {status, Payload}, State) ->
     case trevrpc_wire:decode_status(Payload) of
         {ok, #{code := Code, metadata := Trailers} = Status} ->
             case trevrpc_metadata:validate(Trailers) of
                 ok ->
-                    Ended = State#cstate{answered = true, headers = headers_or_empty(State)},
+                    Ended = answered(State#cstate{headers = headers_or_empty(State)}),
                     cancel_upload(Ended),
                     Terminal =
                         case Code of
@@ -369,6 +463,38 @@ frame(Call, {Type, _Payload}, State) ->
             ])
         )
     ).
+
+%% Takes the call's ANSWER: the dictionaries its query confirmed are the
+%% connection's shared set, and the request stream compresses with its
+%% dictionary only if they include it.
+answer(#client_call{channel = Channel}, Payload, #cstate{learn = Learn} = State) ->
+    case trevrpc_wire:decode_answer(Payload) of
+        {ok, #{dictionaries := Dictionaries}} when Learn =/= undefined ->
+            Shared = trevrpc_zstd:shared(State#cstate.compression, Dictionaries),
+            trevrpc_channel:learn(Channel, Learn, Shared),
+            Requests =
+                case State#cstate.requests of
+                    {pending, Id} ->
+                        case lists:member(Id, Shared) of
+                            true -> Id;
+                            false -> none
+                        end;
+                    Requests0 ->
+                        Requests0
+                end,
+            {ok, State#cstate{answered = true, requests = Requests}};
+        {ok, _Answer} ->
+            {ok, answered(State)};
+        error ->
+            error
+    end.
+
+%% No ANSWER can come once another known frame arrived, so a request
+%% dictionary still waiting for one is not confirmed.
+answered(#cstate{requests = {pending, _}} = State) ->
+    State#cstate{answered = true, requests = none};
+answered(State) ->
+    State#cstate{answered = true}.
 
 %% Fields of a decoded status worth keeping: the code, and what is set.
 present(code, _) -> true;

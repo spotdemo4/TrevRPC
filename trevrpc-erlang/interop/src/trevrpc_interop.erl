@@ -15,9 +15,10 @@
 %% the scenarios it does not implement as skipped.
 -module(trevrpc_interop).
 
--export([main/0, server_scenarios/0]).
+-export([main/0, server_scenarios/0, compression/1]).
 
 -define(ECHO, "/trevrpc.interop.v1.Echo/").
+-define(COMPRESSED_ECHO, "/trevrpc.interop.v1.CompressedEcho/").
 
 %% @doc The scenarios this server passes; clients skip the others.
 -spec server_scenarios() -> [binary()].
@@ -36,6 +37,7 @@ server_scenarios() ->
         <<"unary-headers">>,
         <<"server-stream-headers">>,
         <<"compressed">>,
+        <<"compressed-plain">>,
         <<"connection-metadata">>
     ].
 
@@ -94,14 +96,14 @@ flags([Arg | _], _Allowed, _Flags) ->
 
 server(#{"cert" := Cert, "key" := Key} = Flags) ->
     {ok, Host} = inet:parse_address(maps:get("host", Flags, "127.0.0.1")),
-    %% The runtime does not compress yet, so --dictionary is accepted and
-    %% unused; with no HTTP fallback, so is --web-root.
+    %% With no HTTP fallback, --web-root is accepted and unused.
     {ok, Server} = trevrpc_server:start(#{
         ip => Host,
         port => list_to_integer(maps:get("port", Flags, "0")),
         certfile => Cert,
         keyfile => Key,
-        routes => routes()
+        routes => routes(),
+        compression => compression(Flags)
     }),
     {ok, Port} = trevrpc_server:port(Server),
     {ok, TcpPort} = trevrpc_server:tcp_port(Server),
@@ -121,12 +123,45 @@ wait_stdin() ->
         _ -> wait_stdin()
     end.
 
-routes() ->
+%% @doc The compression settings of --dictionary: that dictionary, for the
+%% Echo message types.
+-spec compression(#{string() => string()}) -> trevrpc_zstd:settings().
+compression(#{"dictionary" := Path}) ->
+    {ok, Data} = file:read_file(Path),
     #{
-        <<?ECHO "Unary">> => #{kind => unary, handler => fun unary/2},
-        <<?ECHO "ClientStream">> => #{kind => client_streaming, handler => fun client_stream/1},
-        <<?ECHO "ServerStream">> => #{kind => server_streaming, handler => fun server_stream/2},
-        <<?ECHO "Bidi">> => #{kind => bidirectional_streaming, handler => fun bidi/1}
+        dictionaries => [
+            #{
+                data => Data,
+                messages => [
+                    trevrpc_interop_proto:request_type(), trevrpc_interop_proto:response_type()
+                ]
+            }
+        ]
+    };
+compression(#{}) ->
+    #{}.
+
+routes() ->
+    Echo = #{
+        request_type => trevrpc_interop_proto:request_type(),
+        response_type => trevrpc_interop_proto:response_type()
+    },
+    Plain = trevrpc_interop_proto:plain_type(),
+    #{
+        <<?ECHO "Unary">> => Echo#{kind => unary, handler => fun unary/2},
+        <<?ECHO "ClientStream">> => Echo#{kind => client_streaming, handler => fun client_stream/1},
+        <<?ECHO "ServerStream">> => Echo#{kind => server_streaming, handler => fun server_stream/2},
+        <<?ECHO "Bidi">> => Echo#{kind => bidirectional_streaming, handler => fun bidi/1},
+        <<?COMPRESSED_ECHO "Unary">> => Echo#{
+            kind => unary, handler => fun unary/2, compression => message
+        },
+        <<?COMPRESSED_ECHO "Plain">> => #{
+            kind => unary,
+            handler => fun plain/2,
+            request_type => Plain,
+            response_type => Plain,
+            compression => message
+        }
     }.
 
 unary(Bin, Call) ->
@@ -140,6 +175,20 @@ unary(Bin, Call) ->
                 {error, Status}
         end
     end).
+
+%% Echoes the text, with trailing metadata saying whether the request
+%% arrived compressed without a dictionary.
+plain(Bin, Call) ->
+    case trevrpc_interop_proto:decode_plain(Bin) of
+        {ok, Text} ->
+            #{plain := Plain} = trevrpc_call:compressed_received(Call),
+            trevrpc_call:set_trailers(Call, #{
+                <<"interop-plain-compressed-received">> => integer_to_binary(Plain)
+            }),
+            {ok, trevrpc_interop_proto:encode_plain(Text)};
+        error ->
+            {error, trevrpc_status:new(invalid_argument, <<"failed to decode request">>)}
+    end.
 
 client_stream(Call) ->
     start(Call),

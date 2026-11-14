@@ -41,7 +41,7 @@
     unsubscribe/1,
     close/1
 ]).
--export([open_stream/2, stream_done/3]).
+-export([open_stream/2, stream_done/3, learn/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([options/0, stream_info/0, state/0]).
@@ -67,7 +67,8 @@
     cacerts => [public_key:der_encoded()],
     max_frame_size => pos_integer(),
     connect_timeout => pos_integer(),
-    idle_timeout => pos_integer()
+    idle_timeout => pos_integer(),
+    compression => trevrpc_zstd:settings()
 }.
 
 %% What a calling process needs to use a stream it opened.
@@ -76,7 +77,11 @@
     id := non_neg_integer(),
     ref := reference(),
     generation := pos_integer(),
-    max_frame_size := pos_integer()
+    max_frame_size := pos_integer(),
+    compression := trevrpc_zstd:config(),
+    %% The dictionaries the connection shares with the server, once a call
+    %% learned them from the server's answer.
+    shared := [non_neg_integer()] | undefined
 }.
 
 -define(INITIAL_DELAY, 100).
@@ -106,6 +111,9 @@
     qmux_opts :: trevrpc_qmux:options(),
     max_frame_size :: pos_integer(),
     connect_timeout :: pos_integer(),
+    compression :: trevrpc_zstd:config(),
+    %% The current connection's shared dictionaries, once known.
+    shared :: [non_neg_integer()] | undefined,
     status = connecting :: connecting | ready,
     transport :: trevrpc_transport:t() | undefined,
     %% The current race, its attempts, whether it started with QUIC, and
@@ -149,13 +157,17 @@ start(Opts) ->
 %% milliseconds for its first connection.
 -spec connect(options(), timeout()) -> {ok, pid()} | {error, trevrpc_status:status()}.
 connect(Opts, Timeout) ->
-    {ok, Channel} = start_link(Opts),
-    case wait_until_ready(Channel, Timeout) of
-        ok ->
-            {ok, Channel};
-        {error, Status} ->
-            close(Channel),
-            {error, Status}
+    case start_link(Opts) of
+        {ok, Channel} ->
+            case wait_until_ready(Channel, Timeout) of
+                ok ->
+                    {ok, Channel};
+                {error, Status} ->
+                    close(Channel),
+                    {error, Status}
+            end;
+        {error, {compression, Message}} ->
+            {error, trevrpc_status:new(invalid_argument, Message)}
     end.
 
 %% @doc Waits up to `Timeout' milliseconds for the channel to be ready.
@@ -211,6 +223,13 @@ open_stream(Channel, Deadline) ->
         exit:_ -> {error, closed_status()}
     end.
 
+%% @private A call on generation `Generation' learned the dictionaries the
+%% connection shares with the server from its answer. The first answer
+%% wins; they all come from one configuration.
+-spec learn(pid(), pos_integer(), [non_neg_integer()]) -> ok.
+learn(Channel, Generation, Shared) ->
+    gen_server:cast(Channel, {learn, Generation, Shared}).
+
 %% @private The calling process is done with stream `Id'.
 -spec stream_done(pid(), non_neg_integer(), reference()) -> ok.
 stream_done(Channel, Id, Ref) ->
@@ -218,8 +237,15 @@ stream_done(Channel, Id, Ref) ->
 
 %%% gen_server
 
--spec init(options()) -> {ok, #state{}}.
+%% Invalid settings fail the start without taking a linked caller down.
+-spec init(options()) -> {ok, #state{}} | {error, {compression, binary()}}.
 init(Opts) ->
+    case trevrpc_zstd:config(maps:get(compression, Opts, #{})) of
+        {ok, Compression} -> init(Opts, Compression);
+        {error, Message} -> {error, {compression, Message}}
+    end.
+
+init(Opts, Compression) ->
     _ = application:ensure_all_started(quic),
     _ = application:ensure_all_started(ssl),
     process_flag(trap_exit, true),
@@ -251,7 +277,8 @@ init(Opts) ->
             send_timeout => Idle
         },
         max_frame_size = MaxFrame,
-        connect_timeout = maps:get(connect_timeout, Opts, 10000)
+        connect_timeout = maps:get(connect_timeout, Opts, 10000),
+        compression = Compression
     },
     {ok, race(State)}.
 
@@ -382,7 +409,13 @@ handle_cast({stream_done, Id, Ref}, #state{streams = Streams} = State) ->
             {noreply, forget(Id, Monitor, State)};
         _ ->
             {noreply, State}
-    end.
+    end;
+handle_cast(
+    {learn, Generation, Shared}, #state{generation = Generation, shared = undefined} = State
+) ->
+    {noreply, State#state{shared = Shared}};
+handle_cast({learn, _Generation, _Shared}, State) ->
+    {noreply, State}.
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}}.
 handle_info({Tag, Pid, Event}, #state{status = ready, transport = {_, Pid}} = State) when
@@ -666,6 +699,7 @@ won(Ref, Transport, Kind, #state{attempts = Attempts} = State) ->
         status = ready,
         transport = Transport,
         generation = State#state.generation + 1,
+        shared = undefined,
         delay = ?INITIAL_DELAY,
         round = undefined,
         attempts = #{},
@@ -810,7 +844,9 @@ open(From, Owner, Deadline, #state{transport = Transport} = State) ->
                 id => Id,
                 ref => Ref,
                 generation => State#state.generation,
-                max_frame_size => State#state.max_frame_size
+                max_frame_size => State#state.max_frame_size,
+                compression => State#state.compression,
+                shared => State#state.shared
             },
             {reply, {ok, Info}, State#state{
                 streams = (State#state.streams)#{Id => {Owner, Ref, Monitor}},

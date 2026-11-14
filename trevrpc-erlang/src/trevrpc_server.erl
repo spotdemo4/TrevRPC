@@ -42,7 +42,17 @@
     fun((binary(), trevrpc_call:call()) -> result())
     | fun((trevrpc_call:call()) -> result()).
 
--type route() :: #{kind := trevrpc_wire:kind(), handler := handler()}.
+%% `request_type' and `response_type' are the protobuf full names of the
+%% method's messages, which pick their compression dictionaries, and
+%% `compression' how its messages may be compressed without one (see
+%% {@link trevrpc_zstd:directions()}).
+-type route() :: #{
+    kind := trevrpc_wire:kind(),
+    handler := handler(),
+    request_type => binary(),
+    response_type => binary(),
+    compression => trevrpc_zstd:directions()
+}.
 
 %% Method paths (`/package.Service/Method') to their routes.
 -type routes() :: #{binary() => route()}.
@@ -68,7 +78,8 @@
     max_stream_body_size => pos_integer() | infinity,
     initial_request_timeout => timeout(),
     connection_idle_timeout => pos_integer() | infinity,
-    graceful_shutdown_timeout => non_neg_integer()
+    graceful_shutdown_timeout => non_neg_integer(),
+    compression => trevrpc_zstd:settings()
 }.
 
 %% What each connection process needs, shared by all of them.
@@ -84,6 +95,7 @@
     graceful_shutdown_timeout := non_neg_integer(),
     %% Index 1: requests running on the whole server.
     requests := counters:counters_ref(),
+    compression := trevrpc_zstd:config(),
     %% The options of QMux sessions.
     qmux := trevrpc_qmux:options()
 }.
@@ -131,20 +143,58 @@ stop(Server) ->
 
 %%% gen_server
 
--spec init(options()) -> {ok, #state{}} | {stop, term()}.
+%% A failed start returns its error without taking a linked caller down.
+-spec init(options()) -> {ok, #state{}} | {error, term()}.
 init(Opts) ->
     process_flag(trap_exit, true),
     _ = application:ensure_all_started(quic),
     _ = application:ensure_all_started(ssl),
-    case trevrpc_quic:credentials(Opts) of
-        {ok, Credentials} -> listen(Opts, Credentials);
-        {error, Reason} -> {stop, Reason}
+    maybe
+        {ok, Credentials} ?= trevrpc_quic:credentials(Opts),
+        {ok, Compression} ?= compression(Opts),
+        ok ?= check_routes(maps:get(routes, Opts)),
+        listen(Opts, Credentials, Compression)
+    else
+        {error, Reason} -> {error, Reason}
     end.
 
-listen(Opts, Credentials) ->
+compression(Opts) ->
+    case trevrpc_zstd:config(maps:get(compression, Opts, #{})) of
+        {ok, Compression} -> {ok, Compression};
+        {error, Message} -> {error, {compression, Message}}
+    end.
+
+%% A route's compression options are checked once, so that a mistake fails
+%% the start rather than every call.
+check_routes(Routes) ->
+    Invalid = [
+        {route, Method, Reason}
+     || Method := Route <- Routes,
+        Reason <- route_errors(Route)
+    ],
+    case Invalid of
+        [] -> ok;
+        [Error | _] -> {error, Error}
+    end.
+
+route_errors(Route) ->
+    Directions =
+        try trevrpc_zstd:directions(maps:get(compression, Route, none)) of
+            _ -> []
+        catch
+            error:_ -> [{invalid_compression, maps:get(compression, Route)}]
+        end,
+    Types = [
+        {invalid_type, Key}
+     || Key <- [request_type, response_type],
+        not is_binary(maps:get(Key, Route, <<>>))
+    ],
+    Directions ++ Types.
+
+listen(Opts, Credentials, Compression) ->
     Name = list_to_atom("trevrpc_server_" ++ integer_to_list(erlang:unique_integer([positive]))),
     Counters = counters:new(2, [write_concurrency]),
-    Config = config(Opts),
+    Config = config(Opts, Compression),
     MaxConnections = maps:get(max_connections, Opts, 256),
     Streams = maps:get(max_streams_per_connection, Config),
     Handler = fun(Conn) ->
@@ -175,10 +225,10 @@ listen(Opts, Credentials) ->
                     {ok, State#state{tcp = Tcp}};
                 {error, Reason} ->
                     _ = quic:stop_server(Name),
-                    {stop, Reason}
+                    {error, Reason}
             end;
         {error, Reason} ->
-            {stop, Reason}
+            {error, Reason}
     end.
 
 %% The TCP listener for QMux over TLS, by default on the UDP socket's port
@@ -215,8 +265,9 @@ listen_tcp(
             Result
     end.
 
-config(Opts) ->
+config(Opts, Compression) ->
     #{
+        compression => Compression,
         server => self(),
         routes => maps:get(routes, Opts),
         max_frame_size => maps:get(max_frame_size, Opts, trevrpc:default_max_frame_size()),

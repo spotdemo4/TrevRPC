@@ -31,11 +31,12 @@
     recv/1,
     send/2,
     send_headers/2,
-    set_trailers/2
+    set_trailers/2,
+    compressed_received/1
 ]).
 
 %% Used by trevrpc_server_call.
--export([state/1, put_state/2, read/2, read_status/2]).
+-export([state/1, put_state/2, read/2, read_status/2, encode_message/2, send_answer/1]).
 
 -export_type([call/0]).
 
@@ -99,9 +100,7 @@ send(#call{kind = Kind} = Call, Message) when
                     )
                 )};
         _ ->
-            write(
-                Call, State#call_state{messages_sent = true}, trevrpc_frame:encode(message, Message)
-            )
+            write(Call, State#call_state{messages_sent = true}, encode_message(State, Message))
     end;
 send(_Call, _Message) ->
     erlang:error(badarg).
@@ -131,12 +130,21 @@ send_headers(Call, Metadata) ->
 set_trailers(Call, Metadata) ->
     put_state(Call, (state(Call))#call_state{trailers = Metadata}).
 
-write(Call, #call_state{stream = Stream} = State, Frame) ->
-    case trevrpc_stream:send(Stream, Frame, false, Call#call.deadline) of
+%% @doc How many of the request messages read so far arrived compressed
+%% with a dictionary (`dictionary') and without one (`plain').
+-spec compressed_received(call()) ->
+    #{dictionary := non_neg_integer(), plain := non_neg_integer()}.
+compressed_received(Call) ->
+    #call_state{dictionary_received = Dictionary, plain_received = Plain} = state(Call),
+    #{dictionary => Dictionary, plain => Plain}.
+
+%% Any ANSWER still waiting goes first.
+write(Call, #call_state{stream = Stream, answer = Answer} = State, Frame) ->
+    case trevrpc_stream:send(Stream, [Answer | Frame], false, Call#call.deadline) of
         {ok, Next} ->
-            put_state(Call, State#call_state{stream = Next});
+            put_state(Call, State#call_state{stream = Next, answer = []});
         {error, Reason, Next} ->
-            put_state(Call, State#call_state{stream = Next}),
+            put_state(Call, State#call_state{stream = Next, answer = []}),
             {error, write_status(Reason)}
     end.
 
@@ -145,6 +153,26 @@ write_status(closed) -> trevrpc_status:new(unavailable, <<"connection closed">>)
 write_status(_Reason) -> trevrpc_status:new(cancelled, <<"client stopped reading">>).
 
 %%% Shared with trevrpc_server_call
+
+%% @private The frame of a response message: a ZSTD_MESSAGE when the call
+%% negotiated a dictionary for its responses and it makes the message
+%% shorter, a MESSAGE otherwise.
+-spec encode_message(#call_state{}, iodata()) -> iodata().
+encode_message(#call_state{response_dict = none}, Message) ->
+    trevrpc_frame:encode(message, Message);
+encode_message(#call_state{response_dict = Id, compression = Compression}, Message) ->
+    case trevrpc_zstd:compress(Compression, Id, Message) of
+        {ok, Payload} -> trevrpc_frame:encode(zstd_message, Payload);
+        none -> trevrpc_frame:encode(message, Message)
+    end.
+
+%% @private Sends the call's ANSWER now, if one is waiting.
+-spec send_answer(call()) -> ok | {error, trevrpc_status:status()}.
+send_answer(Call) ->
+    case state(Call) of
+        #call_state{answer = []} -> ok;
+        State -> write(Call, State, [])
+    end.
 
 %% @private
 -spec state(call()) -> #call_state{}.
@@ -160,16 +188,18 @@ put_state(#call{ref = Ref}, State) ->
     ok.
 
 %% @private Reads the next request frame, counting messages against the
-%% limit. Frames other than MESSAGE are errors on a request stream past its
-%% REQUEST.
+%% limit and decompressing ZSTD_MESSAGE frames. Frames other than MESSAGE
+%% and ZSTD_MESSAGE are errors on a request stream past its REQUEST.
 -spec read(#call_state{}, trevrpc_stream:deadline()) ->
     {{ok, {message, binary()}} | eof | {error, term()}, #call_state{}}.
 read(#call_state{stream = Stream, received = Received, max_messages = Max} = State, Deadline) ->
     case trevrpc_stream:next_frame(Stream, Deadline) of
-        {ok, {message, _} = Frame, Next} when Received < Max ->
-            {{ok, Frame}, State#call_state{stream = Next, received = Received + 1}};
-        {ok, {message, _}, Next} ->
+        {ok, {Type, _}, Next} when Type =:= message orelse Type =:= zstd_message, Received >= Max ->
             {{error, {too_many_messages, Max}}, State#call_state{stream = Next}};
+        {ok, {message, _} = Frame, Next} ->
+            {{ok, Frame}, State#call_state{stream = Next, received = Received + 1}};
+        {ok, {zstd_message, Payload}, Next} ->
+            inflate(Payload, State#call_state{stream = Next});
         {ok, {Type, _}, Next} ->
             {{error, {unexpected, Type}}, State#call_state{stream = Next}};
         {eof, Next} ->
@@ -177,6 +207,32 @@ read(#call_state{stream = Stream, received = Received, max_messages = Max} = Sta
         {error, Reason, Next} ->
             {{error, Reason}, State#call_state{stream = Next}}
     end.
+
+%% A server accepts every dictionary it holds, and compression without one.
+%% The decompressed size counts towards the cumulative limit, as a
+%% MESSAGE's payload would.
+inflate(Payload, #call_state{compression = Compression, max_frame_size = Max} = State) ->
+    case trevrpc_zstd:inflate(Compression, all, Payload, Max) of
+        {ok, Message, Id} ->
+            case trevrpc_stream:charge_message(byte_size(Message), State#call_state.stream) of
+                {ok, Charged} ->
+                    Read = State#call_state{
+                        stream = Charged, received = State#call_state.received + 1
+                    },
+                    {{ok, {message, Message}}, count_compressed(Id, Read)};
+                {error, Reason, Failed} ->
+                    {{error, Reason}, State#call_state{stream = Failed}}
+            end;
+        {error, {too_large, Size}} ->
+            {{error, {frame_too_large, Size}}, State};
+        {error, {invalid, Message}} ->
+            {{error, {invalid, Message}}, State}
+    end.
+
+count_compressed(0, #call_state{plain_received = Plain} = State) ->
+    State#call_state{plain_received = Plain + 1};
+count_compressed(_Id, #call_state{dictionary_received = Dictionary} = State) ->
+    State#call_state{dictionary_received = Dictionary + 1}.
 
 %% @private The status a failed read of the request stream ends the call
 %% with.
@@ -187,9 +243,12 @@ read_status({body_too_large, Max}, _State) ->
     exhausted(io_lib:format("request stream exceeded maximum body size of ~b bytes", [Max]));
 read_status({too_many_messages, Max}, _State) ->
     exhausted(io_lib:format("request stream exceeded maximum of ~b messages", [Max]));
-read_status({unexpected, Type}, _State) when Type =:= zstd_message; Type =:= zstd_stream_message ->
+read_status({invalid, Message}, _State) ->
+    trevrpc_status:new(invalid_argument, Message);
+read_status({unexpected, zstd_stream_message}, _State) ->
     trevrpc_status:new(
-        invalid_argument, <<"request stream carried a compressed message without negotiation">>
+        invalid_argument,
+        <<"request stream carried ZSTD_STREAM_MESSAGE without stream compression">>
     );
 read_status({unexpected, Type}, _State) ->
     trevrpc_status:new(

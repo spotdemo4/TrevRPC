@@ -6,7 +6,17 @@
 -export([run/1]).
 
 -define(ECHO, "/trevrpc.interop.v1.Echo/").
+-define(COMPRESSED_ECHO, "/trevrpc.interop.v1.CompressedEcho/").
 -define(DEADLINE, 10000).
+%% The message of the plain.records compression golden vector: a JSON
+%% record that compresses without a dictionary.
+-define(PLAIN_RECORD, <<
+    "{\"service\":\"search\",\"region\":\"us-east-1\",\"status\":200,\"latency_ms\":118,"
+    "\"path\":\"/v1/search\",\"query\":\"wireless headphones\",\"results\":[{\"id\":\"p-1001\","
+    "\"title\":\"Wireless headphones\",\"price\":59.99},{\"id\":\"p-1002\",\"title\":"
+    "\"Wireless earbuds\",\"price\":39.99},{\"id\":\"p-1003\",\"title\":"
+    "\"Wireless headphones pro\",\"price\":129.99}]}"
+>>).
 
 %% Every scenario of interop/README.md, in order; those this client cannot
 %% run yet name why.
@@ -28,7 +38,7 @@ scenarios() ->
         {<<"compressed">>, fun compressed/1},
         {<<"compressed-stream">>, {unsupported, <<"stream compression is not implemented">>}},
         {<<"refused-stream">>, {unsupported, <<"stream compression is not implemented">>}},
-        {<<"compressed-plain">>, {unsupported, <<"compression is not implemented">>}},
+        {<<"compressed-plain">>, fun compressed_plain/1},
         {<<"connection-metadata">>, {unsupported, <<"connection metadata is not implemented">>}},
         {<<"validation">>, {unsupported, <<"buf.validate.Violations details are not decoded">>}}
     ].
@@ -110,7 +120,8 @@ connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
             tcp_port => TcpPort,
             transport => Transport,
             server_name => maps:get("server-name", Flags, "localhost"),
-            cacertfile => Ca
+            cacertfile => Ca,
+            compression => trevrpc_interop:compression(Flags)
         },
         ?DEADLINE
     );
@@ -168,9 +179,15 @@ report(Name, {fail, Why}) -> io:format("fail ~ts: ~ts~n", [Name, Why]).
 
 %%% Scenarios
 
-opts() -> #{timeout => ?DEADLINE}.
+%% Echo calls name their message types, which pick the dictionary.
+opts() ->
+    #{
+        timeout => ?DEADLINE,
+        request_type => trevrpc_interop_proto:request_type(),
+        response_type => trevrpc_interop_proto:response_type()
+    }.
 
-opts(Metadata) -> #{timeout => ?DEADLINE, metadata => Metadata}.
+opts(Metadata) -> (opts())#{metadata => Metadata}.
 
 request(Fields) -> trevrpc_interop_proto:encode_request(Fields).
 
@@ -302,6 +319,48 @@ compressed(Channel) ->
         ok
     else
         Error -> describe(Error)
+    end.
+
+%% CompressedEcho.Plain twice with a record that compresses on its own: the
+%% first call's answer lets the second compress its request without a
+%% dictionary.
+compressed_plain(Channel) ->
+    Text = binary:copy(?PLAIN_RECORD, 2),
+    Opts = #{
+        timeout => ?DEADLINE,
+        request_type => trevrpc_interop_proto:plain_type(),
+        response_type => trevrpc_interop_proto:plain_type(),
+        compression => message
+    },
+    Plain = fun() ->
+        maybe
+            {ok, Bin, #{trailers := Trailers}} ?=
+                trevrpc_client:unary(
+                    Channel,
+                    <<?COMPRESSED_ECHO "Plain">>,
+                    trevrpc_interop_proto:encode_plain(Text),
+                    Opts
+                ),
+            {ok, Text} ?= trevrpc_interop_proto:decode_plain(Bin),
+            #{<<"interop-plain-compressed-received">> := Received} ?= Trailers,
+            {ok, Received}
+        else
+            {ok, _Other} -> {error, <<"the echoed text differs">>};
+            #{} -> {error, <<"no interop-plain-compressed-received trailer">>};
+            Error -> describe(Error)
+        end
+    end,
+    maybe
+        {ok, _First} ?= Plain(),
+        {ok, <<"1">>} ?= Plain(),
+        ok
+    else
+        {ok, Second} ->
+            {error,
+                <<"the second request arrived with interop-plain-compressed-received ",
+                    Second/binary, ", want 1">>};
+        Failed ->
+            Failed
     end.
 
 record(Latency) ->

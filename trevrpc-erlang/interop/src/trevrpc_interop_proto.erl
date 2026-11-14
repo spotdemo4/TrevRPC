@@ -1,6 +1,7 @@
 %% @doc The interop messages, encoded by hand: `trevrpc.interop.v1.EchoRequest'
-%% and `EchoResponse' (interop/proto/interop.proto), and the
-%% `google.rpc.RetryInfo' status detail.
+%% and `EchoResponse' (interop/proto/interop.proto), `PlainMessage'
+%% (interop/proto/compressed.proto), and the `google.rpc.RetryInfo' status
+%% detail.
 -module(trevrpc_interop_proto).
 
 -export([
@@ -8,6 +9,11 @@
     decode_request/1,
     encode_response/1,
     decode_response/1,
+    encode_plain/1,
+    decode_plain/1,
+    request_type/0,
+    response_type/0,
+    plain_type/0,
     retry_info/2,
     retry_delay/1
 ]).
@@ -65,6 +71,35 @@ decode_response(Bin) ->
         (2, {varint, V}, M) -> M#{index := trevrpc_pb:to_uint32(V)};
         (_, _, M) -> M
     end).
+
+%% @doc Encodes a `PlainMessage' carrying `Text'.
+-spec encode_plain(binary()) -> iodata().
+encode_plain(Text) ->
+    string(1, Text).
+
+%% @doc Decodes a `PlainMessage' into its text.
+-spec decode_plain(binary()) -> {ok, binary()} | error.
+decode_plain(Bin) ->
+    case
+        decode(Bin, #{text => <<>>}, fun
+            (1, {bytes, V}, M) -> M#{text := V};
+            (_, _, M) -> M
+        end)
+    of
+        {ok, #{text := Text}} -> {ok, Text};
+        error -> error
+    end.
+
+%% @doc The full names of the message types, which pick their compression
+%% dictionaries.
+-spec request_type() -> binary().
+request_type() -> <<"trevrpc.interop.v1.EchoRequest">>.
+
+-spec response_type() -> binary().
+response_type() -> <<"trevrpc.interop.v1.EchoResponse">>.
+
+-spec plain_type() -> binary().
+plain_type() -> <<"trevrpc.interop.v1.PlainMessage">>.
 
 %% @doc A `google.rpc.RetryInfo' status detail whose `retry_delay' (a
 %% `google.protobuf.Duration') is `Seconds' and `Nanos'.

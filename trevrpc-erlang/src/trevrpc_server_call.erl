@@ -34,8 +34,16 @@ run(
     } = Spec
 ) ->
     #{kind := Kind, handler := Handler} = Route,
-    #{request := #{method := Method}, metadata := Metadata, deadline := Deadline} = Spec,
-    #{max_frame_size := MaxFrame, max_stream_messages := MaxMessages} = Config,
+    #{request := #{method := Method} = Request, metadata := Metadata, deadline := Deadline} = Spec,
+    #{
+        max_frame_size := MaxFrame,
+        max_stream_messages := MaxMessages,
+        compression := Compression
+    } = Config,
+    {_, PlainResponses} = trevrpc_zstd:directions(maps:get(compression, Route, none)),
+    {Answer, ResponseDict} = trevrpc_zstd:negotiate(
+        Compression, Request, maps:get(response_type, Route, undefined), PlainResponses =/= none
+    ),
     Stream0 = trevrpc_stream:resume(
         maps:get(frames, Spec),
         maps:get(fin, Spec),
@@ -53,10 +61,28 @@ run(
         owner = self()
     },
     trevrpc_call:put_state(Call, #call_state{
-        stream = Stream, max_frame_size = MaxFrame, max_messages = MaxMessages
+        stream = Stream,
+        max_frame_size = MaxFrame,
+        max_messages = MaxMessages,
+        compression = Compression,
+        response_dict = ResponseDict,
+        answer = answer_frame(Answer)
     }),
+    %% A client streaming requests learns at once which dictionaries it may
+    %% compress them with; other calls carry the ANSWER with their first
+    %% response frame.
+    _ =
+        case streams_requests(Kind) of
+            true -> trevrpc_call:send_answer(Call);
+            false -> ok
+        end,
     Result = handle(Kind, Handler, Call, Config),
     finish(Call, Kind, Result, Router, Id).
+
+answer_frame(undefined) ->
+    [];
+answer_frame(Dictionaries) ->
+    trevrpc_frame:encode(answer, trevrpc_wire:encode_answer(#{dictionaries => Dictionaries})).
 
 streams_requests(client_streaming) -> true;
 streams_requests(bidirectional_streaming) -> true;
@@ -145,19 +171,20 @@ earliest(Deadline, Timeout) -> min(Deadline, erlang:monotonic_time(millisecond) 
 %% its terminal STATUS, once the connection released its slots.
 finish(Call, Kind, Result, Router, Id) ->
     State = trevrpc_call:state(Call),
-    #call_state{trailers = Trailers, max_frame_size = Max} = State,
+    #call_state{trailers = Trailers, max_frame_size = Max, answer = Answer} = State,
     Frames =
         case response(Kind, Result, Max) of
             {ok, Message} ->
                 [
-                    trevrpc_frame:encode(message, Message),
+                    Answer,
+                    trevrpc_call:encode_message(State, Message),
                     status_frame(#{metadata => Trailers}, Max)
                 ];
             ok ->
-                status_frame(#{metadata => Trailers}, Max);
+                [Answer | status_frame(#{metadata => Trailers}, Max)];
             {error, Status} ->
                 log_internal(Call, Status),
-                status_frame(maps:merge(#{metadata => Trailers}, Status), Max)
+                [Answer | status_frame(maps:merge(#{metadata => Trailers}, Status), Max)]
         end,
     case trevrpc_server_conn:finish(Router, Id, Call#call.ref) of
         ok ->

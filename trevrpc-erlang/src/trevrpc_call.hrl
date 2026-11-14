@@ -23,6 +23,16 @@
     headers_sent = false :: boolean(),
     messages_sent = false :: boolean(),
     trailers = #{} :: trevrpc_metadata:metadata(),
+    %% The server's compression, the dictionary response messages are
+    %% compressed with, and the ANSWER that goes out before the first
+    %% response frame, while it waits.
+    compression :: trevrpc_zstd:config(),
+    response_dict = none :: non_neg_integer() | none,
+    answer = [] :: iodata(),
+    %% Request messages that arrived compressed with a dictionary, and
+    %% without one.
+    dictionary_received = 0 :: non_neg_integer(),
+    plain_received = 0 :: non_neg_integer(),
     %% The request side ended: eof, or the status that ended it.
     request_end :: undefined | eof | {error, trevrpc_status:status()}
 }).
