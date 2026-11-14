@@ -4,7 +4,7 @@ import { readVarint, varintLength } from "../varint.js";
 import { FrameType, FrameWriter, QMuxProtocolError, TransportError } from "./frames.js";
 
 /** The max_record_size a peer may assume until told otherwise, and the smallest it may set. */
-export const DefaultMaxRecordSize = 16382;
+const DefaultMaxRecordSize = 16382;
 
 const Param = Object.freeze({
   MaxIdleTimeout: 0x01,

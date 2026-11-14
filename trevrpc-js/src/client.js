@@ -214,7 +214,7 @@ const Replay = Symbol("replay");
  * replayed without that, transparently: the caller's sends and the response continue on the
  * replay.
  */
-export class BidirectionalStreamingCall {
+class BidirectionalStreamingCall {
   #call;
   #rpc;
   /** Whether the request side streams, so that responses are read ahead of recv(). */
@@ -842,7 +842,7 @@ export class BidirectionalStreamingCall {
 }
 
 /** A client-streaming RPC: send requests, then close and receive the single response. */
-export class ClientStreamingCall {
+class ClientStreamingCall {
   #call;
 
   constructor(call) {
@@ -877,7 +877,7 @@ export class ClientStreamingCall {
 }
 
 /** The response stream of a server-streaming RPC. */
-export class ResponseStream {
+class ResponseStream {
   #call;
 
   constructor(call) {

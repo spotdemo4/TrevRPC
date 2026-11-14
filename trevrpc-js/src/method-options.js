@@ -162,7 +162,7 @@ const redacted = new WeakMap();
  * Whether `message`, a DescMessage, has a field marked `debug_redact`, directly or in a
  * message-typed field (singular, repeated or a map value), however deeply nested.
  */
-export function hasRedactedField(message) {
+function hasRedactedField(message) {
   let found = redacted.get(message);
   if (found !== undefined) {
     return found;

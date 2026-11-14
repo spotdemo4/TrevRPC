@@ -81,7 +81,7 @@ Object.defineProperty(TrevRpcError.prototype, "retryDelayMs", {
  * a second. Fields it does not know are skipped, and a repeated field takes its last value, as
  * protobuf decoders do.
  */
-export function decodeRetryInfo(value) {
+function decodeRetryInfo(value) {
   let duration;
   let seconds = 0n;
   let nanos = 0;
@@ -131,7 +131,7 @@ function lengthDelimited(reader, wireType) {
 Object.defineProperty(TrevRpcError.prototype, "_tag", { value: "TrevRpcError" });
 
 /** Converts a number into a known status code, defaulting unknown values to Unknown. */
-export function codeFromNumber(code) {
+function codeFromNumber(code) {
   return Number.isInteger(code) && code >= 0 && code < CodeNames.length ? code : Code.Unknown;
 }
 

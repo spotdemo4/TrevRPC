@@ -212,7 +212,7 @@ const DidSizes = [0, 1, 2, 4];
  * contents are not checked; decompression does that. A content size beyond 2^53 is approximate,
  * which only matters for limits it exceeds anyway.
  */
-export function parseZstdHeader(payload) {
+function parseZstdHeader(payload) {
   const bytes = byteView(payload);
   const invalid = () => internal("invalid ZSTD_MESSAGE payload");
   if (bytes.byteLength === 0) {

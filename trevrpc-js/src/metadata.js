@@ -4,12 +4,12 @@ export const MaxMetadataEntries = 64;
 export const MaxMetadataKeyLen = 128;
 export const MaxMetadataValueLen = 8 * 1024;
 export const MaxMetadataTotalSize = 64 * 1024;
-export const ReservedMetadataPrefix = "trevrpc-";
+const ReservedMetadataPrefix = "trevrpc-";
 
 const textEncoder = new TextEncoder();
 
 /** Normalizes a metadata key to lowercase ASCII. */
-export function normalizeMetadataKey(key) {
+function normalizeMetadataKey(key) {
   return String(key).toLowerCase();
 }
 
@@ -27,7 +27,7 @@ export function normalizeMetadata(metadata = {}) {
 }
 
 /** Converts a metadata value into bytes. */
-export function metadataValueToBytes(value) {
+function metadataValueToBytes(value) {
   if (value instanceof Uint8Array) {
     return value;
   }
