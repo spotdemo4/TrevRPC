@@ -92,24 +92,29 @@ func TestReportErrorsPrintsEachWorkersFirstError(t *testing.T) {
 	}
 }
 
-// deliveringWorker delivers one message on each call.
-type deliveringWorker struct{}
+// deliveringWorker delivers one message on its call and then stops the run
+// by cancelling it.
+type deliveringWorker struct{ stop context.CancelFunc }
 
-func (deliveringWorker) do(context.Context) (int, error) { return 1, nil }
-func (deliveringWorker) close()                          {}
+func (w deliveringWorker) do(context.Context) (int, error) {
+	w.stop()
+	return 1, nil
+}
+func (deliveringWorker) close() {}
 
-// TestRunWorkerCountsDeliveredMessagesOutsideTheWindow runs calls before the
-// window starts: none is measured, but each counts as delivered, which is
-// what snapshotWire reads at its instants.
+// TestRunWorkerCountsDeliveredMessagesOutsideTheWindow runs a call before the
+// window starts: it is not measured, but counts as delivered, which is what
+// snapshotWire reads at its instants.
 func TestRunWorkerCountsDeliveredMessagesOutsideTheWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
 	var delivered atomic.Uint64
-	now := time.Now()
-	result := runWorker(t.Context(), deliveringWorker{}, &delivered, now.Add(time.Hour), now.Add(10*time.Millisecond))
+	start := time.Now().Add(time.Hour)
+	result := runWorker(ctx, deliveringWorker{stop: cancel}, &delivered, start, start.Add(time.Hour))
 	if result.msgs != 0 {
 		t.Fatalf("measured messages = %d, want 0 before the window", result.msgs)
 	}
-	if delivered.Load() == 0 {
-		t.Fatal("delivered messages = 0, want every call's")
+	if got := delivered.Load(); got != 1 {
+		t.Fatalf("delivered messages = %d, want the call's 1", got)
 	}
 }
 

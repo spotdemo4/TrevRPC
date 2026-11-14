@@ -756,23 +756,35 @@ func TestWireBytesAreDividedByTheMessagesOfTheSampledInterval(t *testing.T) {
 	}
 }
 
-// countingOperation is an operation that delivers one message per run.
-type countingOperation struct{}
+// stoppingOperation delivers one message on its first run and cancels the
+// loop's context, so its next run fails and the loop returns.
+type stoppingOperation struct {
+	stop context.CancelFunc
+	runs *int
+}
 
-func (countingOperation) run(context.Context) (int, error) { return 1, nil }
-func (countingOperation) close()                           {}
+func (o stoppingOperation) run(ctx context.Context) (int, error) {
+	if *o.runs++; *o.runs == 1 {
+		o.stop()
+		return 1, nil
+	}
+	return 0, ctx.Err()
+}
+func (stoppingOperation) close() {}
 
-// TestOperationsCountDeliveredMessagesOutsideTheWindow runs operations before
-// the window starts: none is measured, but each counts as delivered, which is
-// what the wire sampling reads at its instants.
+// TestOperationsCountDeliveredMessagesOutsideTheWindow runs an operation
+// before the window starts: it is not measured, but counts as delivered,
+// which is what the wire sampling reads at its instants.
 func TestOperationsCountDeliveredMessagesOutsideTheWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
 	var w benchWorker
-	now := time.Now()
-	operationLoop{operation: countingOperation{}}.work(t.Context(), &w, now.Add(time.Hour), now.Add(10*time.Millisecond))
+	var runs int
+	start := time.Now().Add(time.Hour)
+	operationLoop{operation: stoppingOperation{stop: cancel, runs: &runs}}.work(ctx, &w, start, start.Add(time.Hour))
 	if w.messages != 0 {
 		t.Fatalf("measured messages = %d, want 0 before the window", w.messages)
 	}
-	if w.delivered.Load() == 0 {
-		t.Fatal("delivered messages = 0, want every operation's")
+	if got := w.delivered.Load(); got != 1 {
+		t.Fatalf("delivered messages = %d, want the first operation's 1", got)
 	}
 }
