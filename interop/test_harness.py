@@ -94,16 +94,35 @@ class RunWithDeadlineTest(unittest.TestCase):
         self.assertIsNone(result.returncode)
 
 
-class ParsePortsTest(unittest.TestCase):
+class ParseReadinessTest(unittest.TestCase):
     def test_accepts_the_readiness_line(self) -> None:
         self.assertEqual(
-            {"native": 4433, "qmux": 4436}, harness.parse_ports('{"native":4433,"qmux":4436}')
+            harness.Readiness({"native": 4433, "qmux": 4436}, None),
+            harness.parse_readiness('{"native":4433,"qmux":4436}'),
+        )
+
+    def test_a_partial_server_lists_its_scenarios(self) -> None:
+        self.assertEqual(
+            harness.Readiness({"native": 4433}, ["unary", "bidi"]),
+            harness.parse_readiness('{"native":4433,"scenarios":["unary","bidi"]}'),
         )
 
     def test_rejects_malformed_lines(self) -> None:
-        for line in ["", "ready", "[]", "{}", '{"native":0}', '{"native":true}', '{"native":"1"}']:
+        for line in [
+            "",
+            "ready",
+            "[]",
+            "{}",
+            '{"native":0}',
+            '{"native":true}',
+            '{"native":"1"}',
+            '{"scenarios":["unary"]}',
+            '{"native":1,"scenarios":"unary"}',
+            '{"native":1,"scenarios":[""]}',
+            '{"native":1,"scenarios":[1]}',
+        ]:
             with self.subTest(line=line), self.assertRaises(harness.RunnerError):
-                _ = harness.parse_ports(line)
+                _ = harness.parse_readiness(line)
 
 
 class ServerTest(unittest.TestCase):

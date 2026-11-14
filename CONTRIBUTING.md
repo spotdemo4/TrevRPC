@@ -26,7 +26,7 @@ direnv allow
 | `trevrpc-js/protovalidate/`         | protovalidate request validation for the browser client        |
 | `trevrpc-js/protoc-gen-trevrpc-js/` | `protoc-gen-trevrpc-js`, message codecs for the browser client |
 | `trevrpc-kotlin/`                   | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`  |
-| `trevrpc-erlang/`                   | Erlang runtime (in progress, wire protocol only so far)        |
+| `trevrpc-erlang/`                   | Erlang runtime (in progress: native QUIC server and client)    |
 | `interop/`                          | cross-runtime test suite                                       |
 | `bench/`                            | load benchmarks and the grpc-go and connect-go baselines       |
 | `testdata/`                         | wire, QMux, and zstd golden vectors shared by the runtimes     |
@@ -115,6 +115,7 @@ nix build .#trevrpc-js-effect
 nix build .#trevrpc-js-protovalidate
 nix build .#trevrpc-kotlin
 nix build .#trevrpc-erlang
+nix build .#trevrpc-erlang-interop
 ```
 
 ### release

@@ -287,6 +287,9 @@
                 zstdGolden
                 ;
             };
+            trevrpc-erlang-interop = pkgs.callPackage ./trevrpc-erlang/interop {
+              inherit (self.packages.${system}) trevrpc-erlang;
+            };
             trevrpc-go-protovalidate = pkgs.callPackage ./trevrpc-go/protovalidatetrevrpc { };
             # The Go interop and load benchmark executable, a module of its own so that the
             # TrevRPC module does not depend on protovalidate.
@@ -340,7 +343,12 @@
             };
             # nix run .#trevrpc-interop: the interop matrix; see interop/README.md.
             trevrpc-interop = pkgs.callPackage ./interop {
-              inherit (self.packages.${system}) trevrpc-go-interop trevrpc-js trevrpc-rust;
+              inherit (self.packages.${system})
+                trevrpc-erlang-interop
+                trevrpc-go-interop
+                trevrpc-js
+                trevrpc-rust
+                ;
             };
             # nix run .#trevrpc-bench: the load benchmarks; see bench/README.md.
             trevrpc-bench = pkgs.callPackage ./bench {
@@ -376,6 +384,7 @@
         checks = pkgs.mkChecks {
           inherit (self.packages.${system})
             trevrpc-erlang
+            trevrpc-erlang-interop
             trevrpc-go
             trevrpc-go-otel
             trevrpc-go-protovalidate
@@ -410,6 +419,18 @@
             packages = with pkgs; [ erlfmt ];
             script = ''
               erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
+            '';
+          };
+
+          trevrpc-erlang-interop-lint = {
+            root = ./trevrpc-erlang/interop;
+            files = [
+              ./trevrpc-erlang/interop/rebar.config
+              ./trevrpc-erlang/interop/src
+            ];
+            packages = with pkgs; [ erlfmt ];
+            script = ''
+              erlfmt --check rebar.config src/*.erl src/*.app.src
             '';
           };
 

@@ -2,6 +2,7 @@
   lib,
   stdenv,
   callPackage,
+  trevrpc-erlang-interop,
   trevrpc-go-interop,
   trevrpc-js,
   trevrpc-rust,
@@ -17,11 +18,15 @@ callPackage ./runner.nix {
     server = [
       "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
+      "erlang=${lib.getExe trevrpc-erlang-interop}"
     ];
     client = [
       "go=${lib.getExe' trevrpc-go-interop "trevrpc-interop-go"}"
       "rust=${lib.getExe' trevrpc-rust "trevrpc-interop-rust"}"
+      "erlang=${lib.getExe trevrpc-erlang-interop}"
     ];
+    # The Erlang runtime serves and calls native QUIC only so far; its cells skip the rest.
+    may-skip = [ "erlang" ];
     browser = lib.optionals stdenv.hostPlatform.isLinux [
       "chromium"
       "firefox"

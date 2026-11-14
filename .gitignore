@@ -23,6 +23,10 @@ node_modules/
 .gradle/
 .kotlin/
 
+# erlang
+erl_crash.dump
+rebar3.crashdump
+
 # python
 .ruff_cache/
 .venv/

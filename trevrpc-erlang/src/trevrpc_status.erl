@@ -1,9 +1,13 @@
 %% @doc TrevRPC status codes, whose numeric values match gRPC's.
 -module(trevrpc_status).
 
--export([to_int/1, from_int/1, codes/0]).
+-export([to_int/1, from_int/1, codes/0, new/2, ok/0, code/1, message/1]).
 
--export_type([code/0]).
+-export_type([code/0, status/0]).
+
+%% A status: a code, and optionally a message, trailing metadata and
+%% details, as an `RpcStatus' carries them.
+-type status() :: trevrpc_wire:status().
 
 -type code() ::
     ok
@@ -23,6 +27,23 @@
     | unavailable
     | data_loss
     | unauthenticated.
+
+%% @doc A status with a code and a message.
+-spec new(code(), unicode:unicode_binary()) -> status().
+new(Code, Message) when is_atom(Code), is_binary(Message) ->
+    #{code => Code, message => Message}.
+
+%% @doc The OK status.
+-spec ok() -> status().
+ok() -> #{code => ok}.
+
+%% @doc The code of a status.
+-spec code(status()) -> code().
+code(Status) -> maps:get(code, Status, ok).
+
+%% @doc The message of a status, empty when it has none.
+-spec message(status()) -> binary().
+message(Status) -> maps:get(message, Status, <<>>).
 
 %% @doc Every code, in numeric order.
 -spec codes() -> [code(), ...].

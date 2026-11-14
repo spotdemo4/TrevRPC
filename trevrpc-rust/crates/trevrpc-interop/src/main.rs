@@ -6,6 +6,7 @@
 //! trevrpc-interop-rust client --addr <host:port> --ca <pem> [--server-name localhost]
 //!                             [--transport quic|tcp|auto] [--tcp-addr <host:port>]
 //!                             [--expect-transport quic|qmux] [--dictionary <file>]
+//!                             [--scenarios <name,...>]
 //! trevrpc-interop-rust bench --addr <host:port> [--tcp-addr <host:port>] --ca <pem>
 //!                            [--server-name localhost] --transport quic|tcp
 //!                            --scenario unary|server-stream|client-stream|bidi|
@@ -69,9 +70,12 @@ async fn main() -> ExitCode {
                 "tcp-addr",
                 "expect-transport",
                 "dictionary",
+                "scenarios",
             ],
         )
-        .map(Command::Client),
+        .and_then(|flags| {
+            client::selection(&flags).map(|selected| Command::Client(flags, selected))
+        }),
         Some("bench") => parse_flags(
             args,
             &[
@@ -115,7 +119,7 @@ async fn main() -> ExitCode {
             Ok(()) => std::process::exit(0),
             Err(error) => failure(&error),
         },
-        Command::Client(flags) => match client::run(&flags).await {
+        Command::Client(flags, selected) => match client::run(&flags, selected.as_ref()).await {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::FAILURE,
             Err(error) => failure(&error),
@@ -134,7 +138,7 @@ fn failure(error: &BoxError) -> ExitCode {
 
 enum Command {
     Server(Flags),
-    Client(Flags),
+    Client(Flags, Option<client::Selection>),
     Bench(Flags),
 }
 

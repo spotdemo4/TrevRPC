@@ -4,40 +4,98 @@ The Erlang runtime for TrevRPC. It is the core that a Gleam package (`trevrpc-gl
 
 > **Status:** early work in progress, not published. Progress is tracked in [#477](https://trev.zip/llc/TrevRPC/issues/477).
 
-## What's here
+## Transports
 
-The wire protocol, with no transport yet:
+The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/erlang_quic), so nothing native is built. It needs Erlang/OTP 28 or later.
 
-| Module             | Purpose                                                                                                                                      |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `trevrpc`          | Protocol identifiers (ALPN, QMux and WebTransport protocol, media type) and the default frame size limit                                     |
-| `trevrpc_varint`   | QUIC variable-length integers                                                                                                                |
-| `trevrpc_frame`    | Frame encoding, and an incremental reader that enforces the frame size limit and an optional cumulative byte limit, and skips unknown frames |
-| `trevrpc_wire`     | The control messages `RpcRequest`, `RpcHeaders`, `RpcAnswer` and `RpcStatus`, encoded by hand                                                |
-| `trevrpc_pb`       | The protobuf wire primitives `trevrpc_wire` uses                                                                                             |
-| `trevrpc_datagram` | Datagram payloads: a flow ID and frames                                                                                                      |
-| `trevrpc_metadata` | Metadata key rules and size limits                                                                                                           |
-| `trevrpc_status`   | Status codes                                                                                                                                 |
+| Role   | Today                          | Planned                                                                |
+| ------ | ------------------------------ | ---------------------------------------------------------------------- |
+| Server | Native QUIC (ALPN `trevrpc/1`) | QMux over TLS, HTTP/3 and HTTP/2, WebTransport and QMux over WebSocket |
+| Client | Native QUIC                    | QMux over TLS, with the QUIC/TCP race                                  |
 
-The runtime treats application messages as opaque bytes, so it depends on no protobuf library: Erlang users can pick gpb, Elixir users protox, and the Gleam package its own generator.
+Known issue: when a client on erlang_quic has finished an upload (`close_send`) while most of it is still queued, and the server answers early, erlang_quic can answer the server's STOP_SENDING with a RESET_STREAM whose final size contradicts the FIN it already sent. An erlang_quic server, such as this runtime's, then closes the connection with FINAL_SIZE_ERROR; quic-go does not check it. The Go and Rust clients are not affected. See [benoitc/erlang_quic#551](https://github.com/benoitc/erlang_quic/issues/551).
 
-## Planned transports
+Not implemented yet: datagram messages, compressed messages (an optimistic stream-compression call is refused, and the client replays it), connection metadata sets (an offer is merged into its own call and never confirmed, so clients keep offering), and stream idle timeouts.
 
-All of them use pure-Erlang libraries, so nothing native is built:
+## Server
 
-- Native QUIC (`trevrpc/1`) on [erlang_quic](https://github.com/benoitc/erlang_quic)
-- HTTP/3 and WebTransport on erlang_quic's `quic_h3` and [erlang-webtransport](https://github.com/benoitc/erlang-webtransport)
-- HTTP/2 on [erlang_h2](https://github.com/benoitc/erlang_h2)
-- QMux over TLS and over WebSocket, implemented in-tree
+```erlang
+Routes = #{
+    <<"/example.greeter.Greeter/SayHello">> => #{
+        kind => unary,
+        handler => fun(Request, _Call) -> {ok, Request} end
+    },
+    <<"/example.greeter.Greeter/Chat">> => #{
+        kind => bidirectional_streaming,
+        handler => fun chat/1
+    }
+},
+{ok, Server} = trevrpc_server:start_link(#{
+    port => 4433, certfile => "cert.pem", keyfile => "key.pem", routes => Routes
+}).
+
+chat(Call) ->
+    case trevrpc_call:recv(Call) of
+        {ok, Message} ->
+            ok = trevrpc_call:send(Call, Message),
+            chat(Call);
+        eof ->
+            ok;
+        {error, Status} ->
+            {error, Status}
+    end.
+```
+
+Messages are opaque binaries: handlers decode requests and encode responses, so the runtime depends on no protobuf library (Erlang users can pick gpb, Elixir users protox, and the Gleam package its own generator).
+
+Unary and server-streaming handlers take `(Request, Call)`, client-streaming and bidirectional ones `(Call)`. They return `{ok, Response}` (single responses), `ok` (streamed responses) or `{error, Status}`, where a status is a map such as `trevrpc_status:new(not_found, <<"missing">>)`, optionally with `metadata` and `details`. `trevrpc_call` reads requests, sends responses, headers and trailers, and gives the call's metadata and deadline.
+
+Each call runs in a process of its own, which the server stops when the call's deadline passes, when the client cancels it, and on shutdown, whether or not the handler cooperates. A handler that crashes, or returns an `internal` status, ends its call with `internal server error`; the cause goes to the logger. The server's limits and their defaults match the Go and Rust servers: 4 MiB frames, 256 connections, 64 concurrent streams per connection, 1024 concurrent requests, a 10 s initial request timeout, a 30 s connection idle timeout and a 30 s graceful shutdown.
+
+## Client
+
+```erlang
+{ok, Channel} = trevrpc_channel:connect(#{host => "localhost", port => 4433, cacertfile => "ca.pem"}, 5000),
+{ok, Reply, #{headers := Headers, trailers := Trailers}} =
+    trevrpc_client:unary(Channel, <<"/example.greeter.Greeter/SayHello">>, Request, #{timeout => 1000}),
+
+{ok, Call} = trevrpc_client:bidi(Channel, <<"/example.greeter.Greeter/Chat">>, #{}),
+ok = trevrpc_client:send(Call, Request),
+{ok, Response} = trevrpc_client:recv(Call),
+ok = trevrpc_client:close_send(Call),
+{eof, Trailers} = trevrpc_client:recv(Call).
+```
+
+A channel reconnects on its own and follows the [connection lifecycle](https://trev.zip/llc/TrevRPC/wiki/Connection-Lifecycle) of the other runtimes: each connection is a generation, calls never move between generations, calls made while it reconnects fail at once with `unavailable`, and reconnects back off from 100 ms to 30 s with jitter. A call belongs to the process that started it; if that process exits, the channel cancels the call. `trevrpc_channel:subscribe/1` sends the calling process `{trevrpc_channel, Channel, State}` messages with the channel's state, `{ready, Generation}`, `connecting` or, last, `closed`, now and after every change, until `unsubscribe/1` or the process exits.
+
+## Modules
+
+| Module                         | Purpose                                                                                       |
+| ------------------------------ | --------------------------------------------------------------------------------------------- |
+| `trevrpc_server`               | The server: listener, connection limit, graceful shutdown                                     |
+| `trevrpc_call`                 | The handler API                                                                               |
+| `trevrpc_channel`              | The client channel: reconnects, generations, stream credit                                    |
+| `trevrpc_client`               | Client calls                                                                                  |
+| `trevrpc_status`               | Status codes and statuses                                                                     |
+| `trevrpc_metadata`             | Metadata key rules and size limits                                                            |
+| `trevrpc`                      | Protocol identifiers and the default frame size limit                                         |
+| `trevrpc_frame`                | Frame encoding, and an incremental reader with the frame size and cumulative byte limits      |
+| `trevrpc_wire`                 | The control messages `RpcRequest`, `RpcHeaders`, `RpcAnswer` and `RpcStatus`, encoded by hand |
+| `trevrpc_datagram`             | Datagram payloads                                                                             |
+| `trevrpc_varint`, `trevrpc_pb` | QUIC varints and the protobuf wire primitives                                                 |
+
+The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_quic`) is internal.
 
 ## Development
 
-It needs Erlang/OTP 28 or later (for the `zstd` module that compression will use) and rebar3, both in the repository's dev shell.
+rebar3 and Erlang/OTP 28 are in the repository's dev shell.
 
 ```sh
-rebar3 eunit      # unit tests and the shared golden vectors in ../testdata
+rebar3 eunit      # unit tests, the shared golden vectors in ../testdata, and client/server over QUIC
 rebar3 xref
 rebar3 dialyzer
 ```
 
 `nix build .#trevrpc-erlang` runs all three. `nix fmt` formats the sources with erlfmt.
+
+The Hex dependencies are declared in `rebar.config` and pinned in `rebar.lock`, which is the one place their versions and hashes live: after changing a dependency, update the lock with `rebar3 upgrade`, and the Nix package reads versions and tarball hashes from it.

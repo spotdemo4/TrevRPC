@@ -214,3 +214,40 @@ func TestCommandLineErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckScenarios(t *testing.T) {
+	all := clientConfig{}
+	if err := all.checkScenarios(); err != nil || all.selected != nil {
+		t.Fatalf("empty --scenarios: selected = %v, err = %v; want every scenario", all.selected, err)
+	}
+	some := clientConfig{scenarios: "unary, bidi,,"}
+	if err := some.checkScenarios(); err != nil {
+		t.Fatal(err)
+	}
+	if len(some.selected) != 2 || !some.selected["unary"] || !some.selected["bidi"] {
+		t.Fatalf("selected = %v, want unary and bidi", some.selected)
+	}
+	unknown := clientConfig{scenarios: "unary,nope"}
+	if err := unknown.checkScenarios(); err == nil || !strings.Contains(err.Error(), `"nope"`) {
+		t.Fatalf("err = %v, want an unknown scenario error", err)
+	}
+}
+
+// Scenarios outside the selection are skipped, not run, and do not fail the
+// client.
+func TestRunScenariosSkipsUnselected(t *testing.T) {
+	var out bytes.Buffer
+	passed, err := runScenarios(t.Context(), nil, map[string]bool{}, &out)
+	if err != nil || !passed {
+		t.Fatalf("passed = %v, err = %v", passed, err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != len(scenarios) {
+		t.Fatalf("%d lines for %d scenarios:\n%s", len(lines), len(scenarios), out.String())
+	}
+	for i, line := range lines {
+		if want := "skip " + scenarios[i].name + ": not in --scenarios"; line != want {
+			t.Errorf("line %d = %q, want %q", i, line, want)
+		}
+	}
+}

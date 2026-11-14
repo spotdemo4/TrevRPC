@@ -77,10 +77,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		config.register(flags, "transport policy: quic, tcp (QMux over TLS) or auto (QUIC with TCP fallback)")
 		flags.StringVar(&config.expectTransport, "expect-transport", "", "fail unless the channel connects over this transport (quic or qmux)")
 		flags.StringVar(&config.dictionary, "dictionary", "", "zstd dictionary file for compressed messages")
+		flags.StringVar(&config.scenarios, "scenarios", "", "comma-separated scenarios to run, such as those the server supports; the others are reported as skipped (default: all)")
 		if err := flags.Parse(args[1:]); err != nil {
 			return 2
 		}
 		if err := config.check("client", "quic", "tcp", "auto"); err != nil {
+			printf(stderr, "%v\n", err)
+			return 2
+		}
+		if err := config.checkScenarios(); err != nil {
 			printf(stderr, "%v\n", err)
 			return 2
 		}

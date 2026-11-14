@@ -190,9 +190,12 @@ class Failure:
 
 
 def failure_details(log: str, limit: int = FAILURE_LINES) -> list[str]:
-    """The last `limit` lines of a failed cell's log that are not passing interop scenarios: its
-    `fail` lines, browser errors, timeouts, and anything a crashing client printed."""
-    lines = [line for line in log.splitlines() if line.strip() and not line.startswith("ok ")]
+    """The last `limit` lines of a failed cell's log that are not passing or skipped interop
+    scenarios: its `fail` lines, browser errors, timeouts, and anything a crashing client
+    printed."""
+    lines = [
+        line for line in log.splitlines() if line.strip() and not line.startswith(("ok ", "skip "))
+    ]
     return lines[-limit:]
 
 
@@ -256,20 +259,42 @@ def generate_certificate(directory: Path) -> Certificate:
 # --- servers ---------------------------------------------------------------------------------
 
 
-def parse_ports(line: str) -> dict[str, int]:
-    """Parses a server's readiness line, such as `{"native":N,"qmux":N,...}`."""
+@dataclass(frozen=True)
+class Readiness:
+    """What a server's readiness line reports: the ports of the transports it serves, and the
+    scenarios it supports, or None when it supports every scenario."""
+
+    ports: dict[str, int]
+    scenarios: list[str] | None
+
+
+def parse_readiness(line: str) -> Readiness:
+    """Parses a server's readiness line, such as `{"native":N,"qmux":N,...}`. A server that
+    serves only some transports leaves the others' ports out, and one that supports only some
+    scenarios lists them under `scenarios`."""
     try:
         value = cast(object, json.loads(line))
     except json.JSONDecodeError as error:
         raise RunnerError(f"server readiness line is not JSON: {line!r}") from error
-    if not isinstance(value, dict) or not value:
+    if not isinstance(value, dict):
         raise RunnerError(f"server readiness line is not a JSON object of ports: {line!r}")
+    fields = dict(cast(dict[str, object], value))
+    scenarios: list[str] | None = None
+    if "scenarios" in fields:
+        listed = fields.pop("scenarios")
+        if not isinstance(listed, list) or not all(
+            isinstance(name, str) and name for name in cast(list[object], listed)
+        ):
+            raise RunnerError(f"server readiness line has invalid scenarios: {line!r}")
+        scenarios = cast(list[str], listed)
+    if not fields:
+        raise RunnerError(f"server readiness line reports no port: {line!r}")
     ports: dict[str, int] = {}
-    for name, port in cast(dict[str, object], value).items():
+    for name, port in fields.items():
         if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
             raise RunnerError(f"server readiness line has an invalid {name!r} port: {line!r}")
         ports[name] = port
-    return ports
+    return Readiness(ports, scenarios)
 
 
 class Server:
@@ -282,6 +307,8 @@ class Server:
     name: str
     log: Path
     ports: dict[str, int]
+    # The scenarios the server supports, or None for every scenario.
+    scenarios: list[str] | None
     process: subprocess.Popen[str]
 
     def __init__(
@@ -333,7 +360,9 @@ class Server:
                     f"server {name} exited with {status} before reporting its ports"
                     + self._log_tail()
                 )
-            self.ports = parse_ports(line)
+            readiness = parse_readiness(line)
+            self.ports = readiness.ports
+            self.scenarios = readiness.scenarios
         except BaseException:
             _ = self.stop()
             raise
@@ -344,6 +373,10 @@ class Server:
             return self.ports[name]
         except KeyError:
             raise RunnerError(f"server {self.name} did not report a {name!r} port") from None
+
+    def missing(self, *names: str) -> list[str]:
+        """The transports among `names` the server does not serve."""
+        return [name for name in names if name not in self.ports]
 
     def stop(self) -> str | None:
         """Closes stdin and waits for the server to exit. After SHUTDOWN_TIMEOUT, it sends

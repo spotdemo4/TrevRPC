@@ -97,6 +97,34 @@ type clientConfig struct {
 	expectTransport string
 	// dictionary is a compression dictionary file, if set.
 	dictionary string
+	// scenarios is the --scenarios list, and selected the scenarios it names,
+	// or nil to run every scenario.
+	scenarios string
+	selected  map[string]bool
+}
+
+// checkScenarios parses --scenarios, rejecting names that are not
+// scenarios. An empty list selects every scenario.
+func (c *clientConfig) checkScenarios() error {
+	if c.scenarios == "" {
+		return nil
+	}
+	known := make(map[string]bool, len(scenarios))
+	for _, s := range scenarios {
+		known[s.name] = true
+	}
+	c.selected = make(map[string]bool)
+	for name := range strings.SplitSeq(c.scenarios, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !known[name] {
+			return fmt.Errorf("client: unknown scenario %q in --scenarios", name)
+		}
+		c.selected[name] = true
+	}
+	return nil
 }
 
 // interopMessageTypes are the message types the interop compression
@@ -144,9 +172,10 @@ type scenario struct {
 	run  func(context.Context, *scenarioEnv) error
 }
 
-// runClient runs every scenario against a server over the configured transport
-// and prints "ok <name>" or "fail <name>: <reason>" for each. It reports
-// whether all scenarios passed.
+// runClient runs the selected scenarios against a server over the configured
+// transport and prints "ok <name>" or "fail <name>: <reason>" for each, and
+// "skip <name>: <reason>" for the others. It reports whether all the
+// scenarios it ran passed.
 func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, error) {
 	// Over QUIC alone, the connection is watched for DATAGRAM frames, which
 	// proves that the server's datagram messages arrived.
@@ -184,12 +213,21 @@ func runClient(ctx context.Context, config clientConfig, out io.Writer) (bool, e
 	if frames != nil {
 		env.datagramFrames = frames.datagramFrames.Load
 	}
-	return runScenarios(ctx, env, out)
+	return runScenarios(ctx, env, config.selected, out)
 }
 
-func runScenarios(ctx context.Context, env *scenarioEnv, out io.Writer) (bool, error) {
+// runScenarios runs the selected scenarios, or every one for a nil
+// selection, and prints "skip <name>: ..." for the others, such as those
+// the server does not support.
+func runScenarios(ctx context.Context, env *scenarioEnv, selected map[string]bool, out io.Writer) (bool, error) {
 	passed := true
 	for _, s := range scenarios {
+		if selected != nil && !selected[s.name] {
+			if _, err := fmt.Fprintf(out, "skip %s: not in --scenarios\n", s.name); err != nil {
+				return false, fmt.Errorf("write result: %w", err)
+			}
+			continue
+		}
 		scenarioCtx, cancel := context.WithTimeout(ctx, scenarioTimeout)
 		err := s.run(scenarioCtx, env)
 		cancel()

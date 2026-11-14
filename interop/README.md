@@ -4,17 +4,22 @@ Cross-runtime interoperability tests. Every server is exercised by every client
 over every transport that client speaks. QUIC is the primary transport; each
 client also has a TCP fallback for networks that block UDP.
 
-| Client                   | Primary transport | TCP fallback        | Servers  |
-| ------------------------ | ----------------- | ------------------- | -------- |
-| Go                       | native QUIC       | QMux over TLS       | Go, Rust |
-| Rust                     | native QUIC       | QMux over TLS       | Go, Rust |
-| JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust |
-| JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust |
-| Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust |
-| JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust |
+| Client                   | Primary transport | TCP fallback        | Servers          |
+| ------------------------ | ----------------- | ------------------- | ---------------- |
+| Go                       | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
+| Rust                     | native QUIC       | QMux over TLS       | Go, Rust, Erlang |
+| Erlang                   | native QUIC       | not yet             | Go, Rust, Erlang |
+| JavaScript (Chromium)    | WebTransport      | QMux over WebSocket | Go, Rust         |
+| JavaScript (Firefox)     | WebTransport      | QMux over WebSocket | Go, Rust         |
+| Kotlin (Cronet, Android) | HTTP/3            | HTTP/2              | Go, Rust         |
+| JavaScript (Safari)      | WebTransport      | QMux over WebSocket | Go, Rust         |
+
+The Erlang runtime ([#477](https://trev.zip/llc/TrevRPC/issues/477)) serves and calls native
+QUIC only so far, and takes part in what it implements; see
+[Partial runtimes](#partial-runtimes).
 
 `run.py` drives the desktop matrix. `nix run .#trevrpc-interop` runs it with the
-packaged Go and Rust servers and clients and, on Linux, Chromium and Firefox,
+packaged Go, Rust and Erlang servers and clients and, on Linux, Chromium and Firefox,
 unless the command line names any `--server`, `--client`, or `--browser`, which
 then replace all three. `nix flake check` runs that default matrix. CI runs the Android client on an emulator because it needs
 KVM (once over HTTP/3 and once over HTTP/2 with QUIC disabled), and runs Safari
@@ -26,6 +31,28 @@ Each cell's output is printed as it finishes and kept in `CELL.log` under
 that explain it (its `fail` lines, browser errors, timeouts, or whatever a
 crashing client printed), so the reason survives logs cut to their last lines,
 as CI and Nix print them.
+
+### Partial runtimes
+
+A runtime that does not implement every transport or scenario yet takes part in
+what it does, and what it skips is reported, never counted as passed:
+
+- A server leaves the ports of the transports it does not serve out of its
+  readiness line, and `run.py` skips the cells that need them.
+- A server that supports only some scenarios lists them in its readiness line,
+  and `run.py` passes that list to native clients as `--scenarios`, so they
+  skip the rest. Browser cells against such a server are skipped, as the
+  browser runner cannot select scenarios yet.
+- A client given a transport it does not speak exits `77`, and its cell is
+  skipped.
+- A client prints `skip <name>: <reason>` for each scenario it does not run.
+
+Only the cells of runtimes named with `--may-skip` (a client, browser or server
+name) may skip; a skipped cell or scenario anywhere else fails the run, so a
+regression in a complete runtime cannot pass as a skip. The packaged matrix
+passes `--may-skip erlang`. Every run that skipped anything ends with a summary
+of the skipped cells and of the passing cells that skipped scenarios, and says
+which runtimes those skips were allowed for instead of that every cell passed.
 
 ## Cells
 
@@ -225,6 +252,11 @@ have their own entry points but follow the same output contract.
   `P` is the UDP port and `T` the TCP port. The ports within each group are
   equal when one socket serves several protocols. The Go server uses the same
   number for `P` and `T`; the Rust server may use different ones.
+- A server that does not serve a transport yet leaves its port out, and one
+  that supports only some scenarios lists them under `scenarios`, such as
+  `{"native":<P>,"scenarios":["unary","bidi"]}` (see
+  [Partial runtimes](#partial-runtimes)). It accepts every flag above even when
+  it cannot use one yet.
 - With `--dictionary`, holds that zstd dictionary for compressed messages of
   the types `trevrpc.interop.v1.EchoRequest` and
   `trevrpc.interop.v1.EchoResponse`.
@@ -251,6 +283,7 @@ have their own entry points but follow the same output contract.
 <binary> client --addr <host:port> --ca <cert.pem> [--server-name localhost]
                 [--transport quic|tcp|auto] [--tcp-addr <host:port>]
                 [--expect-transport quic|qmux] [--dictionary <file>]
+                [--scenarios <name,...>]
 ```
 
 - `--transport` selects QUIC only (`quic`, the default), QMux over TLS only
@@ -260,9 +293,13 @@ have their own entry points but follow the same output contract.
   transport.
 - `--dictionary` holds that zstd dictionary for compressed messages, as the
   server's flag does.
-- Runs every scenario above in order.
-- Prints `ok <name>` or `fail <name>: <reason>` per scenario to stdout.
-- Exits `0` only if every scenario passed.
+- Runs every scenario above in order, or with `--scenarios`, only the ones it
+  names; an unknown name is a usage error.
+- Prints `ok <name>` or `fail <name>: <reason>` per scenario it runs to stdout,
+  and `skip <name>: <reason>` for the others, those left out of `--scenarios`
+  and those the client does not implement yet.
+- Exits `0` only if every scenario it ran passed, and `77` when it does not
+  support the `--transport` it was given.
 
 ### Browser client
 

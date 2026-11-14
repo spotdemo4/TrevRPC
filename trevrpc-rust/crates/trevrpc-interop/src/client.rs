@@ -29,8 +29,60 @@ type CompressedEcho = CompressedEchoClient<Channel>;
 type RefusingEcho = RefusingEchoClient<Channel>;
 type ValidatedEcho = ValidatedEchoClient<Channel>;
 
-/// Runs every scenario and returns whether all of them passed.
-pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
+/// Every scenario, in the order they run.
+const SCENARIOS: [&str; 19] = [
+    "unary",
+    "unary-metadata",
+    "unary-error",
+    "unary-retry-delay",
+    "unary-large",
+    "client-stream",
+    "server-stream",
+    "server-stream-error",
+    "bidi",
+    "bidi-error",
+    "unary-headers",
+    "server-stream-headers",
+    "unreliable",
+    "compressed",
+    "compressed-stream",
+    "refused-stream",
+    "compressed-plain",
+    "connection-metadata",
+    "validation",
+];
+
+/// The scenarios `--scenarios` selects.
+pub type Selection = HashSet<&'static str>;
+
+/// Parses `--scenarios`, a comma-separated list of scenarios to run; the others are reported
+/// as skipped. Without it every scenario runs (`None`).
+///
+/// # Errors
+///
+/// Returns an error for a name that is not a scenario.
+pub fn selection(flags: &Flags) -> Result<Option<Selection>, BoxError> {
+    let Some(list) = flags.get("scenarios") else {
+        return Ok(None);
+    };
+    let mut selected = Selection::new();
+    for name in list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let known = SCENARIOS
+            .iter()
+            .find(|scenario| **scenario == name)
+            .ok_or_else(|| format!("unknown scenario {name:?} in --scenarios"))?;
+        selected.insert(known);
+    }
+    Ok(Some(selected))
+}
+
+/// Runs the selected scenarios, or every scenario without a selection, and returns whether all
+/// of those passed.
+pub async fn run(flags: &Flags, selected: Option<&Selection>) -> Result<bool, BoxError> {
     let (channel, endpoint) = connect::channel(flags).await?;
     if let Some(expected) = flags.get("expect-transport") {
         let actual = match channel.transport() {
@@ -50,18 +102,30 @@ pub async fn run(flags: &Flags) -> Result<bool, BoxError> {
 
     let mut passed = true;
     for (name, scenario) in scenarios(&client, &unreliable, &compressed, &refusing, &channel) {
-        passed &= report(name, scenario).await;
+        passed &= report(name, scenario, selected).await;
     }
-    passed &= report("connection-metadata", connection_metadata(flags)).await;
+    passed &= report("connection-metadata", connection_metadata(flags), selected).await;
     let validated = ValidatedEchoClient::new(channel.clone());
-    passed &= report("validation", validation(&validated)).await;
+    passed &= report("validation", validation(&validated), selected).await;
 
     channel.close();
     endpoint.wait_idle().await;
     Ok(passed)
 }
 
-async fn report(name: &str, scenario: impl Future<Output = Scenario>) -> bool {
+/// Runs a scenario and prints how it went, or prints that it was skipped when the selection
+/// leaves it out.
+async fn report(
+    name: &str,
+    scenario: impl Future<Output = Scenario>,
+    selected: Option<&Selection>,
+) -> bool {
+    if selected.is_some_and(|selected| !selected.contains(name)) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "skip {name}: not in --scenarios");
+        let _ = stdout.flush();
+        return true;
+    }
     let outcome = tokio::time::timeout(SCENARIO_BACKSTOP, scenario)
         .await
         .unwrap_or_else(|_| Err("timed out".to_owned()));
@@ -868,4 +932,46 @@ fn counter(metadata: &Metadata, key: &str) -> Result<usize, String> {
         .ok()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| format!("trailing metadata {key} is not a decimal number"))
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use std::collections::HashMap;
+
+    use super::{SCENARIOS, Selection, selection};
+    use crate::Flags;
+
+    fn flags(scenarios: Option<&str>) -> Flags {
+        let mut map = HashMap::new();
+        if let Some(list) = scenarios {
+            map.insert("scenarios", list.to_owned());
+        }
+        Flags(map)
+    }
+
+    #[test]
+    fn without_the_flag_every_scenario_runs() {
+        assert!(selection(&flags(None)).unwrap().is_none());
+    }
+
+    #[test]
+    fn selects_the_named_scenarios() {
+        let selected = selection(&flags(Some("unary, bidi,,"))).unwrap().unwrap();
+        assert_eq!(selected, Selection::from(["unary", "bidi"]));
+    }
+
+    #[test]
+    fn rejects_unknown_names() {
+        let error = selection(&flags(Some("unary,nope"))).unwrap_err();
+        assert!(error.to_string().contains("\"nope\""), "{error}");
+    }
+
+    #[test]
+    fn every_scenario_can_be_selected() {
+        let all = SCENARIOS.join(",");
+        assert_eq!(
+            selection(&flags(Some(&all))).unwrap().unwrap().len(),
+            SCENARIOS.len()
+        );
+    }
 }
