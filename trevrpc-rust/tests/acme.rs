@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::greeter;
 use futures_util::StreamExt;
 use quinn::rustls::pki_types::pem::PemObject as _;
 use quinn::rustls::pki_types::{CertificateDer, ServerName};
@@ -22,12 +23,6 @@ use trevrpc::Status;
 use trevrpc::client::{Channel, ChannelConfig, TransportKind, TransportPolicy};
 use trevrpc::server::{RequestContext, Server, ServerOptions};
 use trevrpc::tcp::TcpFallback;
-
-#[allow(dead_code)]
-#[path = "../examples/shared/greeter.rs"]
-mod greeter;
-#[macro_use]
-mod support;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 

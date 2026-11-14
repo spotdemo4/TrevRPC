@@ -10,6 +10,8 @@ license = "MIT"
 license-file = "../LICENSE"
 keywords = ["quic", "rpc", "protobuf", "webtransport", "http3"]
 categories = ["network-programming"]
+# The files in tests/ are modules of one test binary, tests/integration.rs.
+autotests = false
 
 [workspace]
 members = [
@@ -200,6 +202,10 @@ path = "src/lib.rs"
 [[example]]
 name = "greeter_server"
 required-features = ["dev-certificate"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [[bench]]
 name = "frames"
