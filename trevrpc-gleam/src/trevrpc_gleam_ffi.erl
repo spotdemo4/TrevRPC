@@ -166,20 +166,31 @@ start(
     end.
 
 port(Server) ->
-    case trevrpc_server:port(Server) of
-        {ok, Port} -> {ok, Port};
-        {error, _} -> {error, nil}
-    end.
+    listening(fun() -> trevrpc_server:port(Server) end).
 
 tcp_port(Server) ->
-    case trevrpc_server:tcp_port(Server) of
-        {ok, Port} -> {ok, Port};
+    listening(fun() -> trevrpc_server:tcp_port(Server) end).
+
+listening(Port) ->
+    case unless_down(Port, {error, down}) of
+        {ok, Number} -> {ok, Number};
         {error, _} -> {error, nil}
     end.
 
+%% Stopping a server that is already down does nothing.
 stop(Server) ->
-    ok = trevrpc_server:stop(Server),
+    _ = unless_down(fun() -> trevrpc_server:stop(Server) end, ok),
     nil.
+
+%% A call to a server that is down, or goes down while the call waits (as
+%% during a stop), exits with the server's exit reason; that is `Down'. A
+%% timeout leaves the server up, so it still exits.
+unless_down(Call, Down) ->
+    try
+        Call()
+    catch
+        exit:{Reason, {gen_server, call, _}} when Reason =/= timeout -> Down
+    end.
 
 %%% Server calls
 

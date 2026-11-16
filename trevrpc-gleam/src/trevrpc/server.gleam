@@ -113,6 +113,7 @@ pub fn port(server: Server) -> Result(Int, Nil)
 @external(erlang, "trevrpc_gleam_ffi", "tcp_port")
 pub fn tcp_port(server: Server) -> Result(Int, Nil)
 
-/// Shuts the server down gracefully.
+/// Shuts the server down gracefully, and returns once it is down. Stopping a
+/// server that is already down does nothing.
 @external(erlang, "trevrpc_gleam_ffi", "stop")
 pub fn stop(server: Server) -> Nil

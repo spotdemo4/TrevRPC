@@ -498,5 +498,6 @@ pub fn server_lifecycle_test() {
   server.stop(srv)
   server.port(srv) |> should.equal(Error(Nil))
   server.tcp_port(srv) |> should.equal(Error(Nil))
+  server.stop(srv)
   remove(dir)
 }
