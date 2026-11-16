@@ -407,9 +407,8 @@ flow_control_test(#{credentials := Credentials} = Env) ->
 %% Over HTTP/3, a full send queue alone could be the client outpacing a
 %% server that reads everything. The client stays held back across a round
 %% trip, in which such a server would have granted more credit: what it has
-%% sent, all within the server's connection credit, does not grow, and the
-%% stream still refuses more. That credit is about the connection window,
-%% and nothing more can reach the call than the client sent.
+%% sent does not grow, and the stream still refuses more. It sent no more
+%% than the stream's credit.
 stuck({quic_h3, Conn}, Id, Chunk) ->
     Quic = quic_h3:get_quic_conn(Conn),
     {ok, #{data_sent := Sent}} = quic:get_stats(Quic),
@@ -417,9 +416,9 @@ stuck({quic_h3, Conn}, Id, Chunk) ->
     ok = acked(Quic, 250),
     ?assertMatch({ok, #{data_sent := Sent}}, quic:get_stats(Quic)),
     ?assertEqual({error, send_queue_full}, quic_h3:send_data(Conn, Id, Chunk, false)),
-    %% The connection window, slid on by what the server did read: the
-    %% request's HEADERS and its REQUEST frame, at most one frame.
-    ?assert(Sent =< trevrpc_quic:connection_window(1024, 4 * 64) + 1024, Sent),
+    %% One stream window, slid on by what the server did read: the
+    %% request's HEADERS and its REQUEST frame, less than another window.
+    ?assert(Sent =< 2 * trevrpc_quic:stream_window(1024), Sent),
     ok;
 stuck({h2, _Conn}, _Id, _Chunk) ->
     ok.
@@ -436,14 +435,11 @@ acked(Quic, N) ->
             acked(Quic, N - 1)
     end.
 
-%% How far ahead of a call that does not read its stream may get. Over
-%% HTTP/2, one frame. quic_h3 delivers a request's HEADERS before its
-%% stream can be put in manual flow control, and erlang_quic's automatic
-%% credit grants the stream a whole connection window on that first
-%% delivery (benoitc/erlang_quic#554); the connection window, here 256
-%% frames of the stream limit's four times 64 streams, bounds it still.
+%% How far ahead of a call that does not read its stream may get: one
+%% frame. A request stream keeps its initial window, one frame, until the
+%% call registers for it in manual flow control.
 max_delivered(#{version := h2}) -> 2048;
-max_delivered(#{version := h3}) -> trevrpc_quic:connection_window(1024, 4 * 64).
+max_delivered(#{version := h3}) -> trevrpc_quic:stream_window(1024).
 
 %% Sends `Chunk' up to `N' times, and says whether the client was held
 %% back before it sent them all: its send queue full (HTTP/3), or a send
@@ -575,7 +571,7 @@ blocked_reset_test(#{credentials := Credentials, version := Version} = Env) ->
     close(Client),
     trevrpc_server:stop(Server).
 
-shutdown_test(#{credentials := Credentials, version := Version} = Env) ->
+shutdown_test(#{credentials := Credentials} = Env) ->
     Server = start_server(Credentials, #{graceful_shutdown_timeout => 300}),
     {Tag, Conn} = Client = connect(Env#{port => port(Server), tcp_port => tcp_port(Server)}),
     {ok, Running} = open(Client, post(?MEDIA_TYPE)),
@@ -596,30 +592,17 @@ shutdown_test(#{credentials := Credentials, version := Version} = Env) ->
     ok = await_queued(Owner, 2, 100),
     ok = sys:resume(Owner),
     {503, _, _, _} = response_head(Client, Late),
-    %% HTTP/3 clients hear at once that no more requests are taken. HTTP/2
-    %% ones only as the connection closes, after the call that ran is cut
-    %% off at the graceful shutdown timeout, as erlang_h2 would close it
-    %% 100 ms after a GOAWAY.
-    First =
-        receive
-            {Tag, Conn, {goaway, _}} -> goaway;
-            {Tag, Conn, {goaway, _, _}} -> goaway;
-            {Tag, Conn, {stream_reset, Running, _}} -> reset
-        after 5000 -> error(no_goaway_or_reset)
-        end,
-    case {Version, First} of
-        {h3, goaway} ->
-            receive
-                {Tag, Conn, {stream_reset, Running, _}} -> ok
-            after 5000 -> error(not_reset)
-            end;
-        {h2, reset} ->
-            receive
-                {Tag, Conn, {goaway, _, _}} -> ok
-            after 5000 -> error(no_goaway)
-            end;
-        Order ->
-            error({unexpected_order, Order})
+    %% The client hears at once that no more requests are taken, and the
+    %% call that ran is cut off at the graceful shutdown timeout.
+    receive
+        {Tag, Conn, {goaway, _}} -> ok;
+        {Tag, Conn, {goaway, _, _}} -> ok;
+        {Tag, Conn, {stream_reset, Running, _}} -> error(reset_before_goaway)
+    after 5000 -> error(no_goaway)
+    end,
+    receive
+        {Tag, Conn, {stream_reset, Running, _}} -> ok
+    after 5000 -> error(not_reset)
     end,
     receive
         {'DOWN', Monitor, process, Handler, _} -> ok

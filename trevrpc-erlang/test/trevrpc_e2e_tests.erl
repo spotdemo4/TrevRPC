@@ -1608,12 +1608,10 @@ shutdown_waits_for_finishing_call(Credentials) ->
 %% Request data the server never reads gives its connection credit back:
 %% after more of it than the 16 MiB connection window, the connection still
 %% carries a 1 MiB call. Each upload's server answers after the first
-%% message, while the rest is still arriving, and the client reads the
-%% status without finishing its upload. (Finishing it first, with
-%% close_send, can make erlang_quic answer the server's STOP_SENDING with a
-%% RESET_STREAM whose final size contradicts the FIN it already sent, which
-%% an erlang_quic server answers by closing the connection:
-%% benoitc/erlang_quic#551.)
+%% message, while the rest is still arriving. The client finishes its
+%% upload first, so its end can go out ahead of most of the data, and the
+%% reset that answers the server's STOP_SENDING has to keep the final size
+%% that end gave, or the server closes the connection.
 unread_uploads_keep_the_connection_window(Credentials) ->
     Server = start_server(Credentials, #{}),
     Channel = connect(Credentials, Server),
@@ -1625,6 +1623,7 @@ unread_uploads_keep_the_connection_window(Credentials) ->
                 {ok, Call} = trevrpc_client:client_stream(Channel, ?REJECT, #{timeout => 10000}),
                 _ = trevrpc_client:send(Call, <<"first">>),
                 _ = trevrpc_client:send(Call, Chunk),
+                _ = trevrpc_client:close_send(Call),
                 ?assertEqual(Rejected, trevrpc_client:recv(Call))
             end
          || _ <- lists:seq(1, 20)

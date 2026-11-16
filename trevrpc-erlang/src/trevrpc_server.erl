@@ -123,9 +123,7 @@
     qmux := trevrpc_qmux:options(),
     %% The HTTP mapping's options, with the idle timeout of HTTP/2
     %% connections, unless HTTP is off.
-    http := (trevrpc_http:options() | #{idle_timeout := timeout()}) | undefined,
-    %% Over HTTP, the owner of each QUIC connection until its ALPN hook ran.
-    owners := ets:tid() | undefined
+    http := (trevrpc_http:options() | #{idle_timeout := timeout()}) | undefined
 }.
 
 -record(state, {
@@ -292,11 +290,10 @@ listen(Opts, Credentials, Compression) ->
 %% Who owns each QUIC connection: the process `Start' starts for it. With
 %% HTTP, a connection that negotiated `h3' is HTTP/3, whose `quic_h3'
 %% process the owner hands the connection to in the ALPN hook, which runs
-%% in the connection's process; a table, where each owner registers itself,
-%% tells the hook the owner.
-quic_handlers(Start, #{owners := undefined}) ->
+%% in the connection's process.
+quic_handlers(Start, #{http := undefined}) ->
     #{connection_handler => Start};
-quic_handlers(Start, #{owners := Owners}) ->
+quic_handlers(Start, #{http := _}) ->
     #{
         alpn => [trevrpc:alpn(), ?H3],
         %% The control and QPACK streams of HTTP/3, and room for the
@@ -305,14 +302,10 @@ quic_handlers(Start, #{owners := Owners}) ->
         %% stream and drop what it carried.
         max_streams_uni => 8,
         max_stream_data_uni => 16384,
-        %% The owner registers itself in the table as it starts.
         connection_handler => Start,
-        alpn_handler => fun(Conn, Alpn) ->
-            case ets:take(Owners, Conn) of
-                [{_, Owner}] when Alpn =:= ?H3 -> serve_h3(Conn, Owner);
-                [{_, Owner}] -> {ok, Owner};
-                [] -> {error, no_owner}
-            end
+        alpn_handler => fun
+            (Conn, ?H3, Owner) -> serve_h3(Conn, Owner);
+            (_Conn, _Alpn, Owner) -> {ok, Owner}
         end
     }.
 
@@ -425,14 +418,7 @@ config(Opts, Compression) ->
         graceful_shutdown_timeout => maps:get(graceful_shutdown_timeout, Opts, 30000),
         requests => counters:new(1, [write_concurrency]),
         qmux => qmux_options(Opts),
-        http => http_options(Opts),
-        owners =>
-            case Opts of
-                #{http := true} ->
-                    ets:new(trevrpc_owners, [public, set, {write_concurrency, true}]);
-                #{} ->
-                    undefined
-            end
+        http => http_options(Opts)
     }.
 
 http_options(#{http := true} = Opts) ->

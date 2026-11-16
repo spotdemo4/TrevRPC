@@ -170,16 +170,6 @@ init({Transport, Config}) ->
     process_flag(trap_exit, true),
     %% Exits with the server.
     monitor(process, maps:get(server, Config)),
-    %% With HTTP, the QUIC connection's ALPN hook looks its owner up here.
-    %% Registered before this process can stop, and removed when it does
-    %% if the hook never ran.
-    _ =
-        case {Transport, Config} of
-            {{quic, Conn}, #{owners := Owners}} when Owners =/= undefined ->
-                ets:insert(Owners, {Conn, self()});
-            _ ->
-                true
-        end,
     {ok, #state{transport = Transport, config = Config}}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
@@ -297,14 +287,6 @@ handle_info(_Message, State) ->
 
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{streams = Streams} = State) ->
-    %% A QUIC connection that never got to its ALPN hook.
-    _ =
-        case {State#state.transport, State#state.config} of
-            {{quic, Conn}, #{owners := Owners}} when Owners =/= undefined ->
-                ets:delete(Owners, Conn);
-            _ ->
-                true
-        end,
     %% Calls still in flight, as when the connection closes under them,
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),

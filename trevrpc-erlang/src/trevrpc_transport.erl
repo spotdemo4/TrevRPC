@@ -163,14 +163,16 @@ open_stream({quic, Conn}) -> ?SAFE(quic:open_stream(Conn));
 open_stream({qmux, Session}) -> trevrpc_qmux:open_stream(Session);
 open_stream(_Transport) -> {error, unsupported}.
 
-%% @doc Tells an HTTP/3 client that the connection takes no more requests;
-%% those it sent already are served. erlang_h2 closes a connection 100 ms
-%% after its GOAWAY, calls in flight or not (benoitc/erlang_h2#41), so
-%% HTTP/2 connections, like QUIC and QMux ones, refuse new requests one by
-%% one instead, and send their GOAWAY as they close.
+%% @doc Tells an HTTP client that the connection takes no more requests;
+%% those it sent already are served. The connection's owner decides when
+%% the calls are cut off and the connection closes, so erlang_h2 waits for
+%% it. QUIC and QMux connections refuse new streams one by one instead.
 -spec goaway(t()) -> ok.
 goaway({h3, H3, _Quic}) ->
     _ = ?SAFE(quic_h3:goaway(H3)),
+    ok;
+goaway({h2, Conn}) ->
+    _ = ?SAFE(h2:goaway(Conn, #{timeout => infinity})),
     ok;
 goaway(_Transport) ->
     ok.
@@ -185,7 +187,8 @@ close({h3, H3, _Quic}, _Code) ->
     _ = ?SAFE(quic_h3:close(H3, ?H3_NO_ERROR)),
     ok;
 close({h2, Conn}, _Code) ->
-    %% h2:goaway/1 writes the GOAWAY before it returns.
+    %% h2:goaway/1 writes the GOAWAY before it returns, unless goaway/1
+    %% sent it already at shutdown, when it does nothing.
     _ = ?SAFE(h2:goaway(Conn)),
     _ = ?SAFE(h2:close(Conn)),
     ok.
