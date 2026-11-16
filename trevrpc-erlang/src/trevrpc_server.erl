@@ -164,21 +164,25 @@ start_link(Opts) ->
 start(Opts) ->
     gen_server:start(?MODULE, Opts, []).
 
-%% @doc The UDP port the server listens on, or `{error, stopped}' once
-%% stopped.
+%% @doc The UDP port the server listens on. Like every call to the server,
+%% it exits (`noproc') once the server is down, and with the server's exit
+%% reason when the server goes down while it waits, as during a stop.
 -spec port(pid()) -> {ok, inet:port_number()} | {error, term()}.
 port(Server) ->
     gen_server:call(Server, port).
 
-%% @doc The TCP port the server listens on for QMux over TLS: `{error,
-%% disabled}' with TCP off, `{error, stopped}' once stopped.
+%% @doc The TCP port the server listens on for QMux over TLS, or `{error,
+%% disabled}' with TCP off. It exits once the server is down, as port/1
+%% does.
 -spec tcp_port(pid()) -> {ok, inet:port_number()} | {error, term()}.
 tcp_port(Server) ->
     gen_server:call(Server, tcp_port).
 
 %% @doc Shuts the server down gracefully: it stops taking connections and
 %% calls, cancels the calls in flight, gives their handlers up to the
-%% graceful shutdown timeout to exit, then closes every connection.
+%% graceful shutdown timeout to exit, then closes every connection, and
+%% exits `normal'. Returns once the server is down; exits (`noproc') if it
+%% already is, as gen_server:stop/1 does, so a server is stopped once.
 -spec stop(pid()) -> ok.
 stop(Server) ->
     gen_server:call(Server, stop, infinity).
@@ -186,6 +190,8 @@ stop(Server) ->
 %%% gen_server
 
 %% A failed start returns its error without taking a linked caller down.
+%% The server traps exits so that the TCP listener's exit is a message; see
+%% handle_info/2 for the others.
 -spec init(options()) -> {ok, #state{}} | {error, term()}.
 init(Opts) ->
     process_flag(trap_exit, true),
@@ -277,7 +283,6 @@ datagram_route(Route) ->
     Route.
 
 listen(Opts, Credentials, Compression) ->
-    Name = list_to_atom("trevrpc_server_" ++ integer_to_list(erlang:unique_integer([positive]))),
     Counters = counters:new(2, [write_concurrency]),
     Config = config(Opts, Compression),
     MaxConnections = maps:get(max_connections, Opts, 256),
@@ -302,8 +307,8 @@ listen(Opts, Credentials, Compression) ->
         QuicOpts0#{extra_socket_opts => [{ip, maps:get(ip, Opts, {0, 0, 0, 0})}]},
         quic_handlers(Start, Config)
     ),
-    case quic:start_server(Name, maps:get(port, Opts, 0), QuicOpts) of
-        {ok, _} ->
+    case start_quic(maps:get(port, Opts, 0), QuicOpts) of
+        {ok, Name} ->
             {ok, UdpPort} = quic:get_server_port(Name),
             State = #state{name = Name, config = alt_svc(Config, UdpPort), counters = Counters},
             case listen_tcp(Opts, Credentials, State, MaxConnections) of
@@ -315,6 +320,35 @@ listen(Opts, Credentials, Compression) ->
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Starts the QUIC listener under the first name no running listener holds.
+%% `quic:start_server/3' registers each listener under an atom, and atoms are
+%% never freed, so names are reused: a node makes no more of them than it ever
+%% ran servers at once.
+start_quic(Port, Opts) ->
+    start_quic(1, Port, Opts).
+
+start_quic(N, Port, Opts) ->
+    Name = list_to_atom("trevrpc_server_" ++ integer_to_list(N)),
+    %% The registry forgets a listener once it has seen it exit, so a name
+    %% it no longer holds is free to take. Taken names are skipped here,
+    %% cheaply, rather than through the option checks of a start.
+    case quic:get_server_info(Name) of
+        {ok, _} ->
+            start_quic(N + 1, Port, Opts);
+        {error, _} ->
+            case quic:start_server(Name, Port, Opts) of
+                {ok, _} ->
+                    {ok, Name};
+                %% Taken by a listener starting or stopping meanwhile.
+                {error, {already_started, _}} ->
+                    start_quic(N + 1, Port, Opts);
+                {error, already_present} ->
+                    start_quic(N + 1, Port, Opts);
+                {error, Reason} ->
+                    {error, Reason}
+            end
     end.
 
 %% Who owns each QUIC connection: the process `Start' starts for it. With
@@ -517,14 +551,13 @@ room(Counters, MaxConnections) ->
             end
     end.
 
--spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
+-spec handle_call(term(), gen_server:from(), #state{}) ->
+    {reply, term(), #state{}} | {stop, normal, ok, #state{}}.
 handle_call(stop, _From, State) ->
-    {reply, ok, shutdown(State)};
-handle_call(Request, _From, #state{counters = Counters} = State) ->
-    case counters:get(Counters, ?STOPPING) of
-        1 -> {reply, {error, stopped}, State};
-        0 -> {reply, listening_port(Request, State), State}
-    end.
+    %% terminate/2 finds the shutdown done; the reply follows it.
+    {stop, normal, ok, shutdown(State)};
+handle_call(Request, _From, State) ->
+    {reply, listening_port(Request, State), State}.
 
 listening_port(port, #state{name = Name}) ->
     quic:get_server_port(Name);
@@ -551,6 +584,13 @@ handle_info({'EXIT', Tcp, Reason}, #state{tcp = Tcp} = State) ->
     %% QUIC cannot reach: stop it all instead.
     logger:error("trevrpc: the TCP listener exited: ~p", [Reason]),
     {stop, {tcp_listener, Reason}, State#state{tcp = undefined}};
+handle_info({'EXIT', _From, normal}, State) ->
+    {noreply, State};
+handle_info({'EXIT', _From, Reason}, State) ->
+    %% A server started with start/1 is its own parent, so gen_server leaves
+    %% every exit signal to it: one that would end a process not trapping
+    %% exits ends the server, gracefully, as its parent's would.
+    {stop, Reason, State};
 handle_info(_Message, State) ->
     {noreply, State}.
 
@@ -579,8 +619,6 @@ shutdown(#state{counters = Counters, connections = Connections, name = Name} = S
             Left = await_connections(Connections, Deadline),
             _ = [exit(Pid, kill) || Pid <- maps:values(Left)],
             _ = quic:stop_server(Name),
-            %% An 'EXIT' the listener sent before it was stopped is no
-            %% longer the server's concern.
             State#state{connections = #{}, tcp = undefined}
     end.
 

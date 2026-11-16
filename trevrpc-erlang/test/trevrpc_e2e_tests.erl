@@ -1789,14 +1789,49 @@ stop_test_() ->
             trevrpc_test_tls:credentials()
         end,
         fun(Credentials) ->
-            [{timeout, 30, fun() -> stale_listener_exit(Credentials) end}]
+            [
+                {timeout, 30, fun() -> stop_exits(Credentials) end},
+                {timeout, 30, fun() -> exit_signal_stops(Credentials) end},
+                {timeout, 30, fun() -> normal_exit_signal_ignored(Credentials) end},
+                {timeout, 30, fun() -> stale_listener_exit(Credentials) end},
+                {timeout, 60, fun() -> quic_names_reused(Credentials) end}
+            ]
         end}.
 
+%% stop/1 returns once the server is down, and it exits `normal'.
+stop_exits(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Monitor = monitor(process, Server),
+    ?assertEqual(ok, trevrpc_server:stop(Server)),
+    ?assertEqual(normal, down_reason(Monitor)),
+    ?assertExit({noproc, _}, trevrpc_server:port(Server)).
+
+%% A server started with start/1 is its own parent: an exit signal that
+%% would end a process not trapping exits ends it, gracefully.
+exit_signal_stops(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    {_Name, Listener} = quic_listener(Server),
+    Monitor = monitor(process, Server),
+    exit(Server, shutdown),
+    ?assertEqual(shutdown, down_reason(Monitor)),
+    %% Its QUIC listener went down with it: stopping one returns once its
+    %% supervisor has exited.
+    ?assertNot(is_process_alive(Listener)).
+
+%% An exit signal with reason `normal' leaves the server alone.
+normal_exit_signal_ignored(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    exit(Server, normal),
+    try
+        ?assertMatch({ok, _}, trevrpc_server:port(Server))
+    after
+        trevrpc_server:stop(Server)
+    end.
+
 %% An 'EXIT' the TCP listener sent just before the server stopped it, still
-%% queued when the server has stopped, leaves the stopped server alone. The
-%% server is suspended while the `stop' request and the 'EXIT' after it
-%% reach it, so it handles them in that order; the call after both is
-%% answered.
+%% queued behind the `stop' request, is never handled: the server stops
+%% normally. The server is suspended while the `stop' request and the 'EXIT'
+%% after it reach it, so it handles them in that order.
 stale_listener_exit(Credentials) ->
     Server = start_server(Credentials, #{}),
     {links, Links} = process_info(Server, links),
@@ -1804,17 +1839,60 @@ stale_listener_exit(Credentials) ->
         P
      || P <- Links, is_pid(P), {trevrpc_tcp_listener, _, _} <- [proc_lib:initial_call(P)]
     ],
+    Monitor = monitor(process, Server),
     ok = sys:suspend(Server),
     Stop = gen_server:send_request(Server, stop),
     Server ! {'EXIT', Tcp, shutdown},
     ok = sys:resume(Server),
-    try
-        ?assertEqual({reply, ok}, gen_server:receive_response(Stop, 30000)),
-        ?assertEqual({error, stopped}, trevrpc_server:tcp_port(Server)),
-        ?assertEqual({error, stopped}, trevrpc_server:port(Server))
-    after
-        %% A stopped server's process stays up.
-        exit(Server, kill)
+    ?assertEqual({reply, ok}, gen_server:receive_response(Stop, 30000)),
+    ?assertEqual(normal, down_reason(Monitor)).
+
+%% Each QUIC listener is registered under an atom, which is never freed:
+%% servers started one after another reuse one name rather than make one
+%% each. A name is free once erlang_quic's registry has seen its listener
+%% exit, which it learns from a monitor of its own, after the stop: each
+%% round waits for that, as a next start would find the name taken before.
+quic_names_reused(Credentials) ->
+    Names = lists:usort([
+        begin
+            Server = start_server(Credentials, #{tcp => false}),
+            {Name, _Listener} = quic_listener(Server),
+            ok = trevrpc_server:stop(Server),
+            ok = await_unregistered(Name),
+            Name
+        end
+     || _ <- lists:seq(1, 20)
+    ]),
+    ?assertMatch([_], Names).
+
+%% The name and supervisor of the server's QUIC listener in erlang_quic's
+%% registry.
+quic_listener(Server) ->
+    {ok, Port} = trevrpc_server:port(Server),
+    [Listener] = [
+        {Name, Pid}
+     || Name <- quic:which_servers(),
+        {ok, #{pid := Pid}} <- [quic:get_server_info(Name)],
+        is_process_alive(Pid),
+        quic:get_server_port(Name) =:= {ok, Port}
+    ],
+    Listener.
+
+%% Waits until erlang_quic's registry no longer lists the stopped listener
+%% `Name', which it does once it has handled the listener's 'DOWN'.
+await_unregistered(Name) ->
+    case quic:get_server_info(Name) of
+        {error, not_found} ->
+            ok;
+        {ok, _} ->
+            timer:sleep(1),
+            await_unregistered(Name)
+    end.
+
+down_reason(Monitor) ->
+    receive
+        {'DOWN', Monitor, process, _, Reason} -> Reason
+    after 30000 -> error(timeout)
     end.
 
 %%% Transport selection
