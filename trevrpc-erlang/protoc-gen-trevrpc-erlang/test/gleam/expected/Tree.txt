@@ -1,0 +1,9 @@
+name: "root"
+children {
+  name: "leaf"
+}
+children {
+  name: "other"
+  parent {
+  }
+}

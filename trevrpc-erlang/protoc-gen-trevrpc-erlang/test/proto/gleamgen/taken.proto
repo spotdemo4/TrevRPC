@@ -1,0 +1,6 @@
+// A message named as a type of Gleam's prelude.
+syntax = "proto3";
+
+package gleamgen;
+
+message Result {}

@@ -1,0 +1,11 @@
+at {
+  x: 1
+  y: 1
+}
+level: LEVEL_HIGH
+reason: REASON_LOST
+detail: "lost"
+tags {
+  key: "k"
+  value: "v"
+}

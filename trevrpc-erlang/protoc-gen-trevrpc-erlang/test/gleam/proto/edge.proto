@@ -1,0 +1,67 @@
+// Names and shapes that need care in Gleam, in a file without a package.
+syntax = "proto3";
+
+enum Mode {
+  NONE = 0;
+  FAST = 1;
+}
+
+// A capital per letter: Gleam's atom is h_t_t_p_status.
+message HTTPStatus {
+  int32 code = 1;
+}
+
+message Point3D {
+  double x = 1;
+}
+
+// No fields: Gleam makes the constructor an atom, gpb a 1-tuple. Its atom,
+// end, is a reserved word in Erlang.
+message End {}
+
+message Tree {
+  string name = 1;
+  repeated Tree children = 2;
+  Tree parent = 3;
+}
+
+message Keywords {
+  string type = 1;
+  int32 fn = 2;
+  string camelCase = 3;
+  Mode mode = 4;
+  optional Mode maybe = 5;
+  map<string, Mode> modes = 6;
+}
+
+// Two oneofs whose fields share a name: their constructors take longer
+// names.
+message First {
+  oneof choice {
+    int32 value = 1;
+    End stop = 2;
+  }
+}
+
+message Second {
+  oneof pick {
+    int32 value = 1;
+    HTTPStatus status = 2;
+  }
+}
+
+message Foo {
+  int32 x = 1;
+}
+
+// Without a package, a message's name is an atom a field or an enum value
+// can share: only the message is renamed for gpb.
+message Holder {
+  enum Kind {
+    Foo = 0;
+    Bar = 1;
+  }
+
+  Kind kind = 1;
+  Point3D Point3D = 2;
+}

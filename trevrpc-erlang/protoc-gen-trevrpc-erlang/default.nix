@@ -61,6 +61,8 @@ stdenv.mkDerivation (final: {
   installPhase = ''
     runHook preInstall
     install -Dm755 _build/default/bin/protoc-gen-trevrpc-erlang $out/bin/protoc-gen-trevrpc-erlang
+    # The same escript generates Gleam when run under this name.
+    ln -s protoc-gen-trevrpc-erlang $out/bin/protoc-gen-trevrpc-gleam
     runHook postInstall
   '';
 
@@ -80,12 +82,16 @@ stdenv.mkDerivation (final: {
       exit 1
     fi
     grep -q "edition" $out_dir/editions.log
+    protoc --plugin=protoc-gen-trevrpc-gleam=$out/bin/protoc-gen-trevrpc-gleam \
+      -I test/gleam/proto --trevrpc-gleam_out=$out_dir fixture/v1/shapes.proto
+    test -f $out_dir/fixture/v1/shapes.gleam
+    test -f $out_dir/fixture/v1/fixture@v1@shapes_shim.erl
     runHook postInstallCheck
   '';
 
   meta = {
     mainProgram = "protoc-gen-trevrpc-erlang";
-    description = "protoc plugin generating Erlang code for TrevRPC services";
+    description = "protoc plugins generating Erlang and Gleam code for TrevRPC services";
     # The escript carries gpb, which is LGPL-2.1-or-later.
     license = with lib.licenses; [
       mit

@@ -500,6 +500,61 @@
               '';
             };
 
+            # The Gleam code protoc-gen-trevrpc-gleam generates compiles, every value survives
+            # gpb, and protoc reads the bytes. Gleam takes its packages from build/packages, filled
+            # from manifest.toml's, instead of fetching them.
+            trevrpc-erlang-protoc-gen-gleam =
+              let
+                root = ./trevrpc-erlang/protoc-gen-trevrpc-erlang/test/gleam;
+                manifest = builtins.fromTOML (builtins.readFile (root + "/manifest.toml"));
+                hex = pkgs.lib.listToAttrs (
+                  map (
+                    package:
+                    pkgs.lib.nameValuePair package.name (
+                      pkgs.beamMinimal29Packages.fetchHex {
+                        pkg = package.name;
+                        inherit (package) version;
+                        sha256 = pkgs.lib.toLower package.outer_checksum;
+                      }
+                    )
+                  ) manifest.packages
+                );
+                # What Gleam records of the packages it downloaded.
+                downloaded = pkgs.writeText "packages.toml" (
+                  "[packages]\n"
+                  + pkgs.lib.concatMapStrings (
+                    package: "${package.name} = \"${package.version}\"\n"
+                  ) manifest.packages
+                );
+              in
+              {
+                inherit root;
+                files = [
+                  (root + "/gleam.toml")
+                  (root + "/manifest.toml")
+                  (root + "/proto")
+                  (root + "/test")
+                  (root + "/expected")
+                  (root + "/test.sh")
+                ];
+                packages = [
+                  pkgs.gleam
+                  pkgs.beamMinimal29Packages.erlang
+                  pkgs.protobuf
+                  packages.trevrpc-erlang
+                ];
+                script = ''
+                  export HOME=$(mktemp -d)
+                  mkdir -p build/packages
+                  ${pkgs.lib.concatStrings (
+                    pkgs.lib.mapAttrsToList (name: src: "cp -R ${src} build/packages/${name}\n") hex
+                  )}
+                  cp ${downloaded} build/packages/packages.toml
+                  chmod -R u+w build
+                  PROTOC_GEN_TREVRPC_GLEAM=$(command -v protoc-gen-trevrpc-gleam) bash test.sh
+                '';
+              };
+
             trevrpc-erlang-protoc-gen-lint = {
               src = packages.trevrpc-erlang.protocGen;
               packages = with pkgs; [ erlfmt ];

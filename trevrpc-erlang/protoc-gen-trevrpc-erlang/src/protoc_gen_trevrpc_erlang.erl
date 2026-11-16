@@ -13,9 +13,13 @@
 %% - `module_prefix': put before every module name (none by default);
 %% - `pb_suffix': put after the names of message modules (`_pb');
 %% - `service_suffix': put after the names of service modules (none).
+%%
+%% Run as `protoc-gen-trevrpc-gleam' (the same escript under that name), it
+%% generates Gleam types for the messages instead, encoded and decoded by
+%% gpb (see {@link trevrpc_gen_gleam}); it takes no parameters.
 -module(protoc_gen_trevrpc_erlang).
 
--export([main/1, generate/1]).
+-export([main/1, generate/1, generate/2]).
 
 %% CodeGeneratorResponse.Feature: FEATURE_PROTO3_OPTIONAL. Editions are
 %% not supported, so protoc refuses editions files.
@@ -27,8 +31,15 @@
 main(_Args) ->
     ok = io:setopts(standard_io, [binary, {encoding, latin1}]),
     Request = read(<<>>),
-    ok = file:write(standard_io, generate(Request)),
+    ok = file:write(standard_io, generate(target(escript:script_name()), Request)),
     halt(0).
+
+%% What to generate: Gleam when the escript runs as protoc-gen-trevrpc-gleam.
+target(Script) ->
+    case filename:basename(Script) of
+        "protoc-gen-trevrpc-gleam" ++ _ -> gleam;
+        _ -> erlang
+    end.
 
 read(Acc) ->
     case file:read(standard_io, 65536) of
@@ -36,20 +47,35 @@ read(Acc) ->
         eof -> Acc
     end.
 
-%% @doc The `CodeGeneratorResponse' to a `CodeGeneratorRequest'. Failures
-%% go in its `error' field, as protoc expects.
+%% @doc The `CodeGeneratorResponse' to a `CodeGeneratorRequest', with
+%% Erlang code. Failures go in its `error' field, as protoc expects.
 -spec generate(binary()) -> iodata().
 generate(Bin) ->
+    generate(erlang, Bin).
+
+%% @doc The `CodeGeneratorResponse' to a `CodeGeneratorRequest', with Erlang
+%% or Gleam code.
+-spec generate(erlang | gleam, binary()) -> iodata().
+generate(Target, Bin) ->
     Response =
         maybe
             {ok, Request} ?= trevrpc_gen_descriptor:decode_request(Bin),
-            {ok, Options} ?= options(maps:get(parameter, Request)),
-            {ok, Files} ?= files(Request, Options),
+            {ok, Files} ?= target_files(Target, Request),
             #{supported_features => ?FEATURES, files => Files}
         else
             {error, Message} -> #{error => Message}
         end,
     trevrpc_gen_descriptor:encode_response(Response).
+
+target_files(erlang, Request) ->
+    maybe
+        {ok, Options} ?= options(maps:get(parameter, Request)),
+        files(Request, Options)
+    end;
+target_files(gleam, #{parameter := <<>>} = Request) ->
+    trevrpc_gen_gleam:files(Request);
+target_files(gleam, #{parameter := Parameter}) ->
+    {error, <<"protoc-gen-trevrpc-gleam takes no parameters, got \"", Parameter/binary, "\"">>}.
 
 options(Parameter) ->
     Defaults = #{

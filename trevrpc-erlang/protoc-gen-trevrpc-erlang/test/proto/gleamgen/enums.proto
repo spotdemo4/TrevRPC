@@ -1,0 +1,9 @@
+// A file with enums and no messages.
+syntax = "proto3";
+
+package gleamgen;
+
+enum Level {
+  LEVEL_UNSPECIFIED = 0;
+  LEVEL_HIGH = 1;
+}

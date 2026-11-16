@@ -1,0 +1,22 @@
+// A file whose module, error, every generated module's doc comments name
+// ("is an error."): only what imports it imports it, and it imports
+// common.proto, which must not import it back.
+syntax = "proto3";
+
+package fixture.v1;
+
+import "fixture/v1/common.proto";
+import "fixture/v1/enums.proto";
+
+enum Reason {
+  REASON_UNSPECIFIED = 0;
+  REASON_LOST = 1;
+}
+
+message Failure {
+  fixture.common.v1.Point at = 1;
+  Level level = 2;
+  Reason reason = 3;
+  string detail = 4;
+  map<string, string> tags = 5;
+}

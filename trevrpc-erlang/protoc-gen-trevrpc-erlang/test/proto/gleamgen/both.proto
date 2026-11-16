@@ -1,0 +1,13 @@
+// Uses two messages Gleam would name alike, which one gpb module cannot
+// hold.
+syntax = "proto3";
+
+package gleamgen;
+
+import "gleamgen/a.proto";
+import "gleamgen/b.proto";
+
+message Both {
+  gleamgen.a.Point a = 1;
+  gleamgen.b.Point b = 2;
+}

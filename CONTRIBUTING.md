@@ -27,7 +27,7 @@ direnv allow
 | `trevrpc-js/protoc-gen-trevrpc-js/`         | `protoc-gen-trevrpc-js`, message codecs for the browser client                                  |
 | `trevrpc-kotlin/`                           | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`                                   |
 | `trevrpc-erlang/`                           | Erlang runtime (in progress: native QUIC, QMux over TLS and WebSocket, HTTP/3 and HTTP/2, zstd) |
-| `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang`, gpb message modules and service stubs                              |
+| `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang` and `protoc-gen-trevrpc-gleam`: gpb messages, Gleam types, stubs    |
 | `interop/`                                  | cross-runtime test suite                                                                        |
 | `bench/`                                    | load benchmarks and the grpc-go and connect-go baselines                                        |
 | `testdata/`                                 | wire, QMux, and zstd golden vectors shared by the runtimes                                      |
@@ -100,7 +100,9 @@ rebar3 dialyzer
 erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
 ```
 
-the same in `trevrpc-erlang/protoc-gen-trevrpc-erlang/`, whose tests also need `protoc`. The Erlang interop
+the same in `trevrpc-erlang/protoc-gen-trevrpc-erlang/`, whose tests also need `protoc`. Its Gleam fixture,
+`test/gleam/test.sh`, generates Gleam code from its protos and runs it, and needs `gleam` too
+(`nix shell nixpkgs#gleam`); the `trevrpc-erlang-protoc-gen-gleam` check runs it. The Erlang interop
 executable runs on bindings generated from `interop/proto`, kept in `trevrpc-erlang/interop/src/generated`;
 after changing the plugin or those protos, regenerate them with `protoc` on the PATH:
 

@@ -1,0 +1,9 @@
+// Two fields with one Gleam label.
+syntax = "proto3";
+
+package gleamgen;
+
+message Labels {
+  int32 ab = 1;
+  int32 AB = 2;
+}

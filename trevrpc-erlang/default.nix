@@ -57,6 +57,7 @@ in
   postInstall = ''
     mkdir -p $out/bin
     ln -s ${protocGen}/bin/protoc-gen-trevrpc-erlang $out/bin/protoc-gen-trevrpc-erlang
+    ln -s ${protocGen}/bin/protoc-gen-trevrpc-gleam $out/bin/protoc-gen-trevrpc-gleam
   '';
 
   meta = {

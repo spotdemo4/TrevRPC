@@ -1,0 +1,10 @@
+// Enums and no messages, so gpb's module has no records.
+syntax = "proto3";
+
+package fixture.v1;
+
+enum Level {
+  LEVEL_UNSPECIFIED = 0;
+  LEVEL_LOW = 1;
+  LEVEL_HIGH = 2;
+}

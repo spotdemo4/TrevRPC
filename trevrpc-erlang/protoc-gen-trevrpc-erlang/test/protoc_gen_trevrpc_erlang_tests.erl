@@ -238,6 +238,100 @@ module_names_test() ->
     {_, Service} = lists:keyfind(<<"my_example_methods_v1_methods_svc.erl">>, 1, Files),
     ?assertMatch({match, _}, re:run(Service, <<"my_methods_proto:decode_msg">>)).
 
+%% A file in a subdirectory, which gpb names by its base name.
+subdirectory_test() ->
+    {ok, Files} = generate(["nested/v1/point.proto"], <<>>),
+    ?assertEqual([<<"point_pb.erl">>], [Name || {Name, _} <- Files]).
+
+%%% Gleam
+
+%% The files of a proto file: its Gleam module where its path says, and
+%% gpb's module and the shim beside it.
+gleam_files_test() ->
+    {ok, Files} = generate(gleam, ["nested/v1/point.proto"], <<>>),
+    ?assertEqual(
+        [
+            <<"nested/v1/nested@v1@point_pb.erl">>,
+            <<"nested/v1/nested@v1@point_pb.hrl">>,
+            <<"nested/v1/nested@v1@point_shim.erl">>,
+            <<"nested/v1/point.gleam">>
+        ],
+        lists:sort([Name || {Name, _} <- Files])
+    ),
+    {_, Gleam} = lists:keyfind(<<"nested/v1/point.gleam">>, 1, Files),
+    ?assertNotEqual(nomatch, binary:match(Gleam, <<"pub type Point {\n  Point(\n    x: Int,">>)),
+    {_, Pb} = lists:keyfind(<<"nested/v1/nested@v1@point_pb.hrl">>, 1, Files),
+    %% gpb's record takes the Gleam constructor's name.
+    ?assertNotEqual(nomatch, binary:match(Pb, <<"-record(point,">>)).
+
+%% A file with enums and no messages: gpb's module has no records.
+gleam_enums_test() ->
+    {ok, Files} = generate(gleam, ["gleamgen/enums.proto"], <<>>),
+    {_, Gleam} = lists:keyfind(<<"gleamgen/enums.gleam">>, 1, Files),
+    ?assertNotEqual(nomatch, binary:match(Gleam, <<"pub type Level {\n  LevelUnspecified\n">>)),
+    {_, Shim} = lists:keyfind(<<"gleamgen/gleamgen@enums_shim.erl">>, 1, Files),
+    ?assertEqual(nomatch, binary:match(Shim, <<"-export">>)).
+
+gleam_errors_test_() ->
+    [
+        ?_assertEqual(
+            {error, <<"protoc-gen-trevrpc-gleam takes no parameters, got \"x=y\"">>},
+            generate(gleam, ["empty.proto"], <<"x=y">>)
+        ),
+        ?_assertEqual(
+            {error, <<
+                "gleamgen/both.proto: two messages this file uses would both be Gleam's point, "
+                "which a gpb module cannot tell apart"
+            >>},
+            generate(gleam, ["gleamgen/both.proto"], <<>>)
+        ),
+        ?_assertEqual(
+            {error, <<"two Gleam types are named ShapeKind">>},
+            generate(gleam, ["gleamgen/types.proto"], <<>>)
+        ),
+        ?_assertEqual(
+            {error, <<"gleamgen.Labels: two fields are labelled ab in Gleam">>},
+            generate(gleam, ["gleamgen/labels.proto"], <<>>)
+        ),
+        ?_assertEqual(
+            {error, <<"Gleam type Result is taken by Gleam itself">>},
+            generate(gleam, ["gleamgen/taken.proto"], <<>>)
+        ),
+        ?_assertEqual(
+            {error, <<
+                "gleamgen/Upper.proto: a Gleam module needs a path of lower-case letters, digits "
+                "and underscores, each part starting with a letter"
+            >>},
+            generate(gleam, ["gleamgen/Upper.proto"], <<>>)
+        )
+    ].
+
+%% As the Gleam compiler's to_snake_case and to_upper_camel_case, with
+%% which it names constructors' atoms and modules' types.
+gleam_names_test_() ->
+    [
+        ?_assertEqual(Want, trevrpc_gen_gleam:gleam_snake(Name))
+     || {Name, Want} <- [
+            {<<"ShapeStyle">>, <<"shape_style">>},
+            {<<"HTTPStatus">>, <<"h_t_t_p_status">>},
+            {<<"Point3D">>, <<"point3_d">>},
+            {<<"End">>, <<"end">>},
+            {<<"Ok">>, <<"ok">>}
+        ]
+    ] ++
+        [
+            ?_assertEqual(Want, trevrpc_gen_gleam:upper_camel(Name))
+         || {Name, Want} <- [
+                {<<"login_user">>, <<"LoginUser">>},
+                {<<"Int_Value">>, <<"IntValue">>},
+                {<<"wibble">>, <<"Wibble">>},
+                {<<"Wibble">>, <<"Wibble">>},
+                {<<"wibble__wobble_">>, <<"WibbleWobble">>},
+                {<<"Shape_Style">>, <<"ShapeStyle">>},
+                {<<>>, <<>>}
+            ]
+        ].
+
 %%% Failures
 
 errors_test_() ->
@@ -368,10 +462,16 @@ generated(Protos, Parameter) ->
     {ok, _} = generate(Protos, Parameter).
 
 generate(Protos, Parameter) ->
-    response(request(Protos, Parameter)).
+    generate(erlang, Protos, Parameter).
+
+generate(Target, Protos, Parameter) ->
+    response(Target, request(Protos, Parameter)).
 
 response(Request) ->
-    Fields = fields(iolist_to_binary(protoc_gen_trevrpc_erlang:generate(Request))),
+    response(erlang, Request).
+
+response(Target, Request) ->
+    Fields = fields(iolist_to_binary(protoc_gen_trevrpc_erlang:generate(Target, Request))),
     case [Error || {1, {bytes, Error}} <- Fields] of
         [Error] ->
             {error, Error};

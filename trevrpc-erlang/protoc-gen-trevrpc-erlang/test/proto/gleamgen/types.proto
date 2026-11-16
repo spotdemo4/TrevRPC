@@ -1,0 +1,12 @@
+// A message named as another message's oneof type.
+syntax = "proto3";
+
+package gleamgen;
+
+message ShapeKind {}
+
+message Shape {
+  oneof kind {
+    int32 x = 1;
+  }
+}

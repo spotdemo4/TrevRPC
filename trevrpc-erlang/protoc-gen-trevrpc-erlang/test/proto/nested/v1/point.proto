@@ -1,0 +1,8 @@
+// A file in a subdirectory, which gpb names by its base name.
+syntax = "proto3";
+
+package example.nested.v1;
+
+message Point {
+  int32 x = 1;
+}

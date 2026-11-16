@@ -1,0 +1,13 @@
+type: "t"
+fn: 7
+camelCase: "c"
+mode: FAST
+maybe: NONE
+modes {
+  key: "x"
+  value: FAST
+}
+modes {
+  key: "y"
+  value: 5
+}

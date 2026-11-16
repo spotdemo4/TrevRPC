@@ -1,0 +1,11 @@
+# Compiles and runs the Gleam code protoc-gen-trevrpc-gleam generates from
+# proto/, into src/, with test.sh.
+name = "fixture"
+version = "1.0.0"
+target = "erlang"
+
+[dependencies]
+gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"

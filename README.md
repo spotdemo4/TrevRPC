@@ -311,6 +311,9 @@ the Erlang runtime is in progress and not published yet ([#477](https://trev.zip
 `protoc-gen-trevrpc-erlang` generates [gpb](https://github.com/tomas-abrahamsson/gpb) message modules and
 service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
 `trevrpc-erlang/protoc-gen-trevrpc-erlang/`. See [`trevrpc-erlang`](trevrpc-erlang#code-generation).
+The same escript, run as `protoc-gen-trevrpc-gleam` (the nix package installs both), generates Gleam types
+for messages that gpb encodes and decodes; Gleam service stubs are not generated yet. See
+[Gleam messages](trevrpc-erlang#gleam-messages).
 
 ### nix
 

@@ -11,24 +11,45 @@
 %% (`msg_format=records', with the record definitions in a `.hrl' file of
 %% the module's name). Strings are binaries, and message names carry their
 %% package, as gpb's `strings_as_binaries' and `use_packages' have them.
+%% Records can also take names chosen by the caller (`{records, Names}'),
+%% as protoc-gen-trevrpc-gleam's do: the atoms Gleam gives the constructors
+%% of its types, so that a Gleam value is gpb's record.
 -module(trevrpc_gen_messages).
 
--export([defs/1, generate/4]).
+-export([defs/1, generate/4, gpb_name/1]).
 
 -export_type([defs/0, format/0]).
 
 -type defs() :: list().
--type format() :: maps | records.
+-type format() :: maps | records | {records, #{atom() => atom()}}.
 
 %% @doc The definitions of every message, enum and service in a
-%% `FileDescriptorSet'.
+%% `FileDescriptorSet'. gpb names each file by its base name, so two files
+%% with the same base name cannot be generated together.
 -spec defs(binary()) -> {ok, defs()} | {error, binary()}.
 defs(FileSet) ->
     %% Version 2 represents proto3 optional fields.
     case gpb_parse_descr:defs_from_descriptors(FileSet, [use_packages, {proto_defs_version, 2}]) of
-        {ok, Defs} -> {ok, Defs};
-        {error, Reason} -> {error, iolist_to_binary(gpb_parse_descr:format_error(Reason))}
+        {ok, Defs} ->
+            Names = [unicode:characters_to_binary(Name) || {file, {_, Name}} <- Defs],
+            case Names -- lists:usort(Names) of
+                [] ->
+                    {ok, Defs};
+                [Name | _] ->
+                    {error, <<
+                        "two proto files are named ",
+                        Name/binary,
+                        ", which gpb cannot tell apart, as it names files by their base name"
+                    >>}
+            end;
+        {error, Reason} ->
+            {error, iolist_to_binary(gpb_parse_descr:format_error(Reason))}
     end.
+
+%% @doc The name gpb gives proto file `File': its base name.
+-spec gpb_name(binary()) -> binary().
+gpb_name(File) ->
+    lists:last(binary:split(File, <<"/">>, [global])).
 
 %% @doc The files of module `Module', which encodes and decodes the messages
 %% of proto file `File' and the services' messages: `Module.erl', and
@@ -56,10 +77,18 @@ generate(File, Module, Defs, Format) ->
         | case Format of
             maps -> [maps];
             %% Definitions as records would need gpb's header to compile.
-            records -> [defs_as_proplists]
+            records -> [defs_as_proplists];
+            %% Gleam's Dict is an Erlang map.
+            {records, _} -> [defs_as_proplists, mapfields_as_maps]
         end
     ],
-    Result = gpb_compile:proto_defs(binary_to_atom(Module, utf8), keep(File, Needed, Defs), Opts),
+    Kept = keep(File, Needed, Defs),
+    Named =
+        case Format of
+            {records, Names} -> rename(Kept, Names);
+            _ -> Kept
+        end,
+    Result = gpb_compile:proto_defs(binary_to_atom(Module, utf8), Named, Opts),
     Files = written(Ref, []),
     case Result of
         {ok, _Warnings} ->
@@ -70,6 +99,52 @@ generate(File, Module, Defs, Format) ->
         {error, Reason, _Warnings} ->
             {error, iolist_to_binary(gpb_compile:format_error(Reason))}
     end.
+
+%% Gives the messages in `Names' their new names where definitions name a
+%% message: their own definitions and entries keyed by them, field types
+%% (maps' values too), the files that contain them, and services' inputs
+%% and outputs. Nowhere else: in a file without a package a message's name
+%% has no dots, and a field or an enum value can be the same atom.
+rename(Defs, Names) ->
+    [rename_def(Def, Names) || Def <- Defs].
+
+rename_def({{msg, Name}, Fields}, Names) ->
+    {{msg, renamed(Name, Names)}, [rename_field(Field, Names) || Field <- Fields]};
+rename_def({{Kind, Key}, Messages}, Names) when Kind =:= msg_containment ->
+    {{Kind, Key}, [renamed(Name, Names) || Name <- Messages]};
+rename_def({proto3_msgs, Messages}, Names) ->
+    {proto3_msgs, [renamed(Name, Names) || Name <- Messages]};
+rename_def({{service, Service}, Rpcs}, Names) ->
+    {{service, Service}, [rename_rpc(Rpc, Names) || Rpc <- Rpcs]};
+rename_def({{Kind, Name}, Value}, Names) when
+    is_atom(Name), is_map_key(Name, Names), Kind =/= enum
+->
+    %% Options, extension ranges and reserved numbers or names of a message.
+    {{Kind, renamed(Name, Names)}, Value};
+rename_def(Def, _Names) ->
+    Def.
+
+rename_field({field, Name, Number, Position, Type, Occurrence, Opts}, Names) ->
+    {field, Name, Number, Position, rename_type(Type, Names), Occurrence, Opts};
+rename_field({gpb_oneof, Name, Position, Fields, Opts}, Names) ->
+    {gpb_oneof, Name, Position, [rename_field(Field, Names) || Field <- Fields], Opts};
+rename_field(Other, _Names) ->
+    Other.
+
+rename_type({msg, Name}, Names) -> {msg, renamed(Name, Names)};
+rename_type({map, Key, Value}, Names) -> {map, Key, rename_type(Value, Names)};
+rename_type(Type, _Names) -> Type.
+
+%% gpb's rpc record: name, input, output, then whether they stream.
+rename_rpc(Rpc, Names) when is_tuple(Rpc), element(1, Rpc) =:= rpc ->
+    setelement(
+        4, setelement(3, Rpc, renamed(element(3, Rpc), Names)), renamed(element(4, Rpc), Names)
+    );
+rename_rpc(Other, _Names) ->
+    Other.
+
+renamed(Name, Names) ->
+    maps:get(Name, Names, Name).
 
 written(Ref, Files) ->
     receive
@@ -95,7 +170,8 @@ own(File, Defs) ->
     Contained ++ lists:append([[element(3, Rpc), element(4, Rpc)] || Rpc <- Rpcs]).
 
 gpb_key(File, Defs) ->
-    hd([Key || {file, {Key, Name}} <- Defs, unicode:characters_to_binary(Name) =:= File]).
+    Base = gpb_name(File),
+    hd([Key || {file, {Key, Name}} <- Defs, unicode:characters_to_binary(Name) =:= Base]).
 
 %% `Names' and the messages and enums they use, all the way down.
 needed(Names, Defs) ->

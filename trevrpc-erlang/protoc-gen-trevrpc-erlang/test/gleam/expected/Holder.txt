@@ -1,0 +1,4 @@
+kind: Bar
+Point3D {
+  x: 2
+}

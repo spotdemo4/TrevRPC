@@ -1,0 +1,21 @@
+// Types shapes.proto uses from another file and package.
+syntax = "proto3";
+
+package fixture.common.v1;
+
+enum Unit {
+  UNIT_UNSPECIFIED = 0;
+  UNIT_PIXEL = 1;
+  UNIT_POINT = 2;
+}
+
+message Point {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+message Size {
+  double width = 1;
+  double height = 2;
+  Unit unit = 3;
+}

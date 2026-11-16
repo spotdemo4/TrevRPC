@@ -1,0 +1,43 @@
+// Every kind of field, and types from another file.
+syntax = "proto3";
+
+package fixture.v1;
+
+import "fixture/v1/common.proto";
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  COLOR_RED = 1;
+  COLOR_DARK_BLUE = 2;
+}
+
+message Shape {
+  message Style {
+    bool filled = 1;
+    repeated Color palette = 2;
+  }
+
+  string name = 1;
+  optional int64 id = 2;
+  fixture.common.v1.Point origin = 3;
+  repeated fixture.common.v1.Point points = 4;
+  Color color = 5;
+  bytes blob = 6;
+  map<string, int32> counts = 7;
+  oneof kind {
+    double radius = 8;
+    fixture.common.v1.Point corner = 9;
+    string label = 10;
+    fixture.common.v1.Size size = 16;
+  }
+  Style style = 11;
+  repeated string tags = 12;
+  float ratio = 13;
+  uint64 big = 14;
+  map<string, fixture.common.v1.Point> named = 15;
+  map<int32, Color> colors = 17;
+  optional Color accent = 18;
+  repeated double weights = 19;
+  sint32 delta = 20;
+  fixed64 stamp = 21;
+}

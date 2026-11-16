@@ -1,0 +1,6 @@
+// A file whose path is no Gleam module name.
+syntax = "proto3";
+
+package gleamgen;
+
+message Upper {}

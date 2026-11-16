@@ -1,0 +1,55 @@
+name: "square"
+id: -42
+origin {
+  x: 1
+  y: -2
+}
+points {
+}
+points {
+  x: 3
+  y: 4
+}
+color: COLOR_DARK_BLUE
+blob: "\000\377\001"
+counts {
+  key: "a"
+  value: 1
+}
+counts {
+  key: "b"
+  value: -7
+}
+corner {
+  x: 9
+  y: 9
+}
+style {
+  filled: true
+  palette: COLOR_RED
+  palette: 77
+}
+tags: "x"
+tags: "\303\274\303\261"
+ratio: 0.5
+big: 18446744073709551615
+named {
+  key: "p"
+  value {
+    x: 5
+    y: 6
+  }
+}
+colors {
+  key: 1
+  value: COLOR_RED
+}
+colors {
+  key: 2
+  value: 9
+}
+accent: COLOR_RED
+weights: 1.5
+weights: -0.25
+delta: -3
+stamp: 1700000000
