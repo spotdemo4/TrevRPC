@@ -1780,6 +1780,43 @@ untrusted_server(Credentials) ->
         trevrpc_server:stop(Server)
     end.
 
+%%% Stopping
+
+stop_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = application:ensure_all_started(quic),
+            trevrpc_test_tls:credentials()
+        end,
+        fun(Credentials) ->
+            [{timeout, 30, fun() -> stale_listener_exit(Credentials) end}]
+        end}.
+
+%% An 'EXIT' the TCP listener sent just before the server stopped it, still
+%% queued when the server has stopped, leaves the stopped server alone. The
+%% server is suspended while the `stop' request and the 'EXIT' after it
+%% reach it, so it handles them in that order; the call after both is
+%% answered.
+stale_listener_exit(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    {links, Links} = process_info(Server, links),
+    [Tcp] = [
+        P
+     || P <- Links, is_pid(P), {trevrpc_tcp_listener, _, _} <- [proc_lib:initial_call(P)]
+    ],
+    ok = sys:suspend(Server),
+    Stop = gen_server:send_request(Server, stop),
+    Server ! {'EXIT', Tcp, shutdown},
+    ok = sys:resume(Server),
+    try
+        ?assertEqual({reply, ok}, gen_server:receive_response(Stop, 30000)),
+        ?assertEqual({error, stopped}, trevrpc_server:tcp_port(Server)),
+        ?assertEqual({error, stopped}, trevrpc_server:port(Server))
+    after
+        %% A stopped server's process stays up.
+        exit(Server, kill)
+    end.
+
 %%% Transport selection
 
 transport_selection_test_() ->

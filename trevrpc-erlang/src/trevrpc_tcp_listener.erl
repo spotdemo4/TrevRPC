@@ -48,12 +48,18 @@ port(Listener) ->
     after 5000 -> {error, timeout}
     end.
 
-%% @doc Stops accepting connections. Those already accepted stay open.
+%% @doc Stops accepting connections, returning once the listening socket is
+%% closed, so that a next listener can bind its port at once. Those already
+%% accepted stay open.
 -spec stop(pid()) -> ok.
 stop(Listener) ->
+    Monitor = monitor(process, Listener),
     unlink(Listener),
     exit(Listener, shutdown),
-    ok.
+    %% The listener closes its socket before it exits.
+    receive
+        {'DOWN', Monitor, process, Listener, _Reason} -> ok
+    end.
 
 init(Parent, Opts, #{cert := Cert, key := Key} = Credentials, Accept) ->
     KeyType = element(1, Key),

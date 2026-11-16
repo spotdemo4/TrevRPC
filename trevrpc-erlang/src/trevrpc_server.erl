@@ -164,12 +164,14 @@ start_link(Opts) ->
 start(Opts) ->
     gen_server:start(?MODULE, Opts, []).
 
-%% @doc The UDP port the server listens on.
+%% @doc The UDP port the server listens on, or `{error, stopped}' once
+%% stopped.
 -spec port(pid()) -> {ok, inet:port_number()} | {error, term()}.
 port(Server) ->
     gen_server:call(Server, port).
 
-%% @doc The TCP port the server listens on for QMux over TLS.
+%% @doc The TCP port the server listens on for QMux over TLS: `{error,
+%% disabled}' with TCP off, `{error, stopped}' once stopped.
 -spec tcp_port(pid()) -> {ok, inet:port_number()} | {error, term()}.
 tcp_port(Server) ->
     gen_server:call(Server, tcp_port).
@@ -516,14 +518,20 @@ room(Counters, MaxConnections) ->
     end.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
-handle_call(port, _From, #state{name = Name} = State) ->
-    {reply, quic:get_server_port(Name), State};
-handle_call(tcp_port, _From, #state{tcp = undefined} = State) ->
-    {reply, {error, disabled}, State};
-handle_call(tcp_port, _From, #state{tcp = Tcp} = State) ->
-    {reply, trevrpc_tcp_listener:port(Tcp), State};
 handle_call(stop, _From, State) ->
-    {reply, ok, shutdown(State)}.
+    {reply, ok, shutdown(State)};
+handle_call(Request, _From, #state{counters = Counters} = State) ->
+    case counters:get(Counters, ?STOPPING) of
+        1 -> {reply, {error, stopped}, State};
+        0 -> {reply, listening_port(Request, State), State}
+    end.
+
+listening_port(port, #state{name = Name}) ->
+    quic:get_server_port(Name);
+listening_port(tcp_port, #state{tcp = undefined}) ->
+    {error, disabled};
+listening_port(tcp_port, #state{tcp = Tcp}) ->
+    trevrpc_tcp_listener:port(Tcp).
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 handle_cast({connection, Pid}, #state{connections = Connections} = State) ->
@@ -571,7 +579,9 @@ shutdown(#state{counters = Counters, connections = Connections, name = Name} = S
             Left = await_connections(Connections, Deadline),
             _ = [exit(Pid, kill) || Pid <- maps:values(Left)],
             _ = quic:stop_server(Name),
-            State#state{connections = #{}}
+            %% An 'EXIT' the listener sent before it was stopped is no
+            %% longer the server's concern.
+            State#state{connections = #{}, tcp = undefined}
     end.
 
 await_connections(Connections, _Deadline) when map_size(Connections) =:= 0 ->
