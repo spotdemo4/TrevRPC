@@ -60,7 +60,8 @@ let
       defaultJava = jdk25;
     }).wrapped;
 
-  # Minimal SDK for the Android interop build; also used by `nix run .#update-kotlin-deps`.
+  # SDK for the Android interop build, with the emulator and its x86_64 system image; also used by
+  # `nix run .#update-kotlin-deps`.
   androidSdk =
     (androidenv.composeAndroidPackages {
       platformVersions = [
@@ -74,6 +75,16 @@ let
       includeSystemImages = true;
       systemImageTypes = [ "google_apis" ];
       abiVersions = [ "x86_64" ];
+    }).androidsdk;
+
+  # SDK for the dev shell: only what compiling the interop app needs. It leaves out the emulator and
+  # its system images, which are large and only run on x86_64-linux.
+  androidSdkMinimal =
+    (androidenv.composeAndroidPackages {
+      platformVersions = [ "37.0" ];
+      buildToolsVersions = [ "37.0.0" ];
+      includeEmulator = false;
+      includeSystemImages = false;
     }).androidsdk;
 
   # The emulator needs KVM and an x86_64 host; meta.platforms restricts it to x86_64-linux.
@@ -94,7 +105,7 @@ stdenvNoCC.mkDerivation (final: {
   pname = "trevrpc-kotlin";
   version = "1.11.1";
   passthru = {
-    inherit androidSdk interopAndroid;
+    inherit androidSdk androidSdkMinimal interopAndroid;
   };
 
   src = lib.fileset.toSource {

@@ -83,7 +83,7 @@
               # kotlin / android
               jdk25
               gradle_9
-              androidenv.androidPkgs.androidsdk
+              self.packages.${system}.trevrpc-kotlin.androidSdkMinimal
               kotlin-lsp
               ktlint
 
