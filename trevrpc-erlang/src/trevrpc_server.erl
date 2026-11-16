@@ -60,13 +60,24 @@
 %% `compression' how its messages may be compressed without one (see
 %% {@link trevrpc_zstd:directions()}). With a `codec', handlers get and give
 %% decoded messages; without one, their bytes.
+%%
+%% `unreliable' (see {@link trevrpc_datagram:unreliable()}) lets the
+%% responses of a server-streaming or bidirectional method travel as
+%% datagrams, on calls whose client gave them a datagram flow over native
+%% QUIC: they can be lost or reordered, but are never duplicated. Each goes
+%% on the stream instead when it does not fit a datagram. Request datagrams
+%% are accepted on every call with a flow, so `requests' only turns the
+%% route's stream compression of requests into per-message compression, as
+%% the client compresses them. Generated routes carry the method's schema
+%% option.
 -type route() :: #{
     kind := trevrpc_wire:kind(),
     handler := handler(),
     request_type => binary(),
     response_type => binary(),
     compression => trevrpc_zstd:directions(),
-    codec => trevrpc_codec:codec()
+    codec => trevrpc_codec:codec(),
+    unreliable => trevrpc_datagram:unreliable()
 }.
 
 %% Method paths (`/package.Service/Method') to their routes.
@@ -244,7 +255,24 @@ route_errors(Route) ->
             ok -> [];
             error -> [{invalid_codec, maps:get(codec, Route)}]
         end,
-    Directions ++ Types ++ Codec.
+    Unreliable =
+        case trevrpc_datagram:check_unreliable(maps:get(unreliable, Route, #{})) of
+            ok -> [];
+            error -> [{invalid_unreliable, maps:get(unreliable, Route)}]
+        end,
+    Directions ++ Types ++ Codec ++ Unreliable.
+
+%% Directions whose messages travel as datagrams are never stream-compressed,
+%% which needs a stream's ordered delivery: their messages are compressed
+%% one by one instead.
+datagram_route(#{unreliable := Unreliable, kind := Kind} = Route) ->
+    Directions = trevrpc_zstd:directions(maps:get(compression, Route, none)),
+    {Requests, Responses} = trevrpc_datagram:compression(
+        Directions, trevrpc_datagram:effective(Unreliable, Kind)
+    ),
+    Route#{compression => #{requests => Requests, responses => Responses}};
+datagram_route(Route) ->
+    Route.
 
 listen(Opts, Credentials, Compression) ->
     Name = list_to_atom("trevrpc_server_" ++ integer_to_list(erlang:unique_integer([positive]))),
@@ -408,7 +436,9 @@ config(Opts, Compression) ->
             maps:get(stream_compression_memory, Opts, ?STREAM_COMPRESSION_MEMORY)
         ),
         server => self(),
-        routes => maps:get(routes, Opts),
+        routes => maps:map(
+            fun(_Method, Route) -> datagram_route(Route) end, maps:get(routes, Opts)
+        ),
         max_frame_size => maps:get(max_frame_size, Opts, trevrpc:default_max_frame_size()),
         max_streams_per_connection => maps:get(max_streams_per_connection, Opts, 64),
         max_concurrent_requests => maps:get(max_concurrent_requests, Opts, 1024),

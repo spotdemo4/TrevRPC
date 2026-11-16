@@ -57,7 +57,10 @@ run(
     ),
     %% A request that is a single message is bounded by the frame size
     %% alone; a stream of them by the cumulative body limit too.
-    Stream = trevrpc_stream:charge_messages(trevrpc_wire:streams_requests(Kind), Stream0),
+    Stream1 = trevrpc_stream:charge_messages(trevrpc_wire:streams_requests(Kind), Stream0),
+    %% A call with a datagram flow reads the request datagrams of a request
+    %% stream, and sends its responses as datagrams if the route lets them.
+    {Stream, RequestFlow, Sender} = flow(maps:get(flow, Spec, undefined), Kind, Route, Stream1),
     Call = #call{
         ref = Ref,
         method = Method,
@@ -84,6 +87,8 @@ run(
                 true -> trevrpc_zstd_stream:sender(true);
                 false -> undefined
             end,
+        datagram_flow = RequestFlow,
+        datagram_sender = Sender,
         reserve = fun() ->
             trevrpc_server_conn:reserve(Router, Id, Ref, trevrpc_zstd_stream:encoder_cost())
         end
@@ -98,6 +103,20 @@ run(
         end,
     Result = handle(Kind, Handler, Call, Config),
     finish(Call, Kind, Result, Router, Id).
+
+flow(undefined, _Kind, _Route, Stream) ->
+    {Stream, undefined, undefined};
+flow({Flow, Credit}, Kind, Route, Stream) ->
+    {_, Responses} = trevrpc_datagram:effective(maps:get(unreliable, Route, #{}), Kind),
+    Sender =
+        case Responses of
+            true -> trevrpc_datagram:sender(trevrpc_stream:transport(Stream), Flow);
+            false -> undefined
+        end,
+    case trevrpc_wire:streams_requests(Kind) of
+        true -> {trevrpc_stream:datagrams(Credit, Stream), Flow, Sender};
+        false -> {Stream, undefined, Sender}
+    end.
 
 %% The ANSWER the call owes: to a dictionary query, and that it decodes
 %% stream-compressed requests.
@@ -212,6 +231,8 @@ earliest(Deadline, Timeout) -> min(Deadline, erlang:monotonic_time(millisecond) 
 finish(Call, Kind, Result, Router, Id) ->
     State = trevrpc_call:state(Call),
     #call_state{trailers = Trailers, max_frame_size = Max, answer = Answer} = State,
+    %% A call that sent response datagrams announces them before its STATUS.
+    Count = trevrpc_datagram:count_frame(State#call_state.datagram_sender),
     Frames =
         case response(Kind, Result, Max) of
             {ok, Message} ->
@@ -221,10 +242,10 @@ finish(Call, Kind, Result, Router, Id) ->
                     status_frame(#{metadata => Trailers}, Max)
                 ];
             ok ->
-                [Answer | status_frame(#{metadata => Trailers}, Max)];
+                [Answer, Count | status_frame(#{metadata => Trailers}, Max)];
             {error, Status} ->
                 log_internal(Call, Status),
-                [Answer | status_frame(maps:merge(#{metadata => Trailers}, Status), Max)]
+                [Answer, Count | status_frame(maps:merge(#{metadata => Trailers}, Status), Max)]
         end,
     case trevrpc_server_conn:finish(Router, Id, Call#call.ref) of
         ok ->

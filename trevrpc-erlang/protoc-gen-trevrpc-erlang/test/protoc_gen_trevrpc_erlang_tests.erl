@@ -110,9 +110,9 @@ routes_from_module() ->
     ?assertMatch(#{kind := unary}, maps:get(?PATH("Receive"), Routes)),
     ?assertMatch(#{kind := unary}, maps:get(?PATH("GetHTTPStatus"), Routes)).
 
-%% As the Go generator has it: no direction with a redacted field, a
-%% context per call only where a direction streams, and nothing for the
-%% unreliable flags, which the runtime has no datagram messages for.
+%% As the Go generator has it: no direction with a redacted field, and a
+%% context per call only where a direction streams. The unreliable flags
+%% are a route's and a call's `unreliable'.
 compression() ->
     Routes = ?METHODS:routes(handler_module),
     Compression = fun(Method) ->
@@ -123,7 +123,16 @@ compression() ->
     ?assertEqual(#{requests => stream, responses => message}, Compression("StreamCompressed")),
     ?assertEqual(#{requests => none, responses => stream}, Compression("Redacted")),
     ?assertEqual(none, Compression("Unreliable")),
-    ?assertEqual(none, Compression("Unary")).
+    ?assertEqual(none, Compression("Unary")),
+    ?assertMatch(
+        #{unreliable := #{requests := true, responses := true}},
+        maps:get(?PATH("Unreliable"), Routes)
+    ),
+    ?assertNot(is_map_key(unreliable, maps:get(?PATH("Bidi"), Routes))),
+    ?assertMatch(
+        {bidi, channel, _, #{unreliable := #{requests := true, responses := true}}},
+        ?METHODS:unreliable(channel)
+    ).
 
 %% A route decodes requests and encodes replies.
 route_codecs() ->

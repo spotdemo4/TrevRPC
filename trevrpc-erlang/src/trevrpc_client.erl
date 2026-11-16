@@ -37,6 +37,16 @@
 %% if the server refuses the call before its handler runs, replays it
 %% without stream compression on a new stream, transparently. A send that
 %% would keep more waits for the answer.
+%%
+%% `unreliable' (see {@link trevrpc_datagram:unreliable()}), which generated
+%% code passes from the method's schema option, gives a streaming call a
+%% datagram flow when the connection is native QUIC and its server takes
+%% datagrams. Its requests then travel as datagrams if `requests' is set,
+%% each on the stream instead when it does not fit one, and the server's
+%% response datagrams are accepted whichever directions are set. Datagram
+%% messages can be lost or reordered, but are never duplicated. Such a call
+%% is never optimistic, and does not stream-compress the directions that
+%% travel as datagrams.
 -module(trevrpc_client).
 
 -export([
@@ -61,7 +71,8 @@
     request_type => binary(),
     response_type => binary(),
     compression => trevrpc_zstd:directions(),
-    codec => trevrpc_codec:codec()
+    codec => trevrpc_codec:codec(),
+    unreliable => trevrpc_datagram:unreliable()
 }.
 
 -record(client_call, {
@@ -116,8 +127,15 @@
     kept_bytes = 0 :: non_neg_integer(),
     copy_reserved = 0 :: non_neg_integer(),
     %% The datagrams the server announced with DATAGRAM_COUNT, once read.
-    %% Nothing waits for them yet, as the runtime has no datagram messages.
-    datagram_count :: non_neg_integer() | undefined
+    datagram_count :: non_neg_integer() | undefined,
+    %% Datagram messages: the call's flow while it reads response
+    %% datagrams, the sender of its request datagrams, and the response
+    %% datagram messages that arrived before the headers, which wait for
+    %% them.
+    flow :: pos_integer() | undefined,
+    datagram_sender :: trevrpc_datagram:sender() | undefined,
+    early = [] :: [binary()],
+    early_bytes = 0 :: non_neg_integer()
 }).
 
 -type terminal() :: {eof, trevrpc_metadata:metadata()} | {error, trevrpc_status:status()}.
@@ -127,6 +145,10 @@
 %% decides, and how much budget it reserves for them at a time.
 -define(MAX_KEPT, 1048576).
 -define(COPY_CHUNK, 65536).
+%% The most response datagram messages, and bytes, that wait for the
+%% headers.
+-define(EARLY_MESSAGES, 128).
+-define(EARLY_BYTES, 65536).
 
 %% @doc A unary call. `trailers' is the trailing metadata of the OK status.
 -spec unary(pid(), binary(), term(), options()) ->
@@ -169,7 +191,9 @@ start(Channel, Method, Kind, Opts, Request) ->
         %% Encoded before the stream opens, which a request the codec
         %% cannot encode never does.
         {ok, First} ?= first(Codec, Request),
-        {ok, Info} ?= trevrpc_channel:open_stream(Channel, Deadline),
+        ok ?= check_unreliable(maps:get(unreliable, Opts, #{})),
+        Unreliable = trevrpc_datagram:effective(maps:get(unreliable, Opts, #{}), Kind),
+        {ok, Info} ?= trevrpc_channel:open_stream(Channel, Deadline, datagrams(Unreliable, Kind)),
         #{ref := Ref, max_frame_size := Max} = Info,
         #{compression := Compression, shared := Shared, generation := Generation} = Info,
         Call = #client_call{
@@ -180,7 +204,11 @@ start(Channel, Method, Kind, Opts, Request) ->
             owner = self(),
             codec = Codec
         },
-        {Requests, Responses} = Modes = trevrpc_zstd:directions(maps:get(compression, Opts, none)),
+        {Requests, Responses} =
+            Modes = trevrpc_datagram:compression(
+                trevrpc_zstd:directions(maps:get(compression, Opts, none)), Unreliable
+            ),
+        {Flow, Stream, Sender} = flow(Info, Kind, Unreliable, new_stream(Info, Channel)),
         #{query := Query, accept := Accept, requests := RequestDict} = trevrpc_zstd:prepare(
             Compression,
             Shared,
@@ -193,10 +221,28 @@ start(Channel, Method, Kind, Opts, Request) ->
             metadata => Metadata,
             kind => Kind,
             accept_dictionaries => Accept,
-            dictionary_query => Query
+            dictionary_query => Query,
+            datagram_flow =>
+                case Flow of
+                    undefined -> 0;
+                    _ -> Flow
+                end
         },
-        State = offer(Call, Info, #cstate{
-            stream = new_stream(Info, Channel),
+        %% A call with a flow is never optimistic: a replay would need
+        %% another.
+        Offering =
+            case Flow of
+                undefined -> Info;
+                _ -> Info#{optimistic := false}
+            end,
+        State = offer(Call, Offering, #cstate{
+            stream = Stream,
+            flow =
+                case trevrpc_wire:streams_responses(Kind) of
+                    true -> Flow;
+                    false -> undefined
+                end,
+            datagram_sender = Sender,
             generation = Generation,
             max_frame_size = Max,
             request = Fields,
@@ -231,6 +277,34 @@ start(Channel, Method, Kind, Opts, Request) ->
 
 new_stream(#{transport := Transport, id := Id, ref := Ref, max_frame_size := Max}, Channel) ->
     trevrpc_stream:new(Transport, Id, Ref, Channel, trevrpc_frame:reader(Max)).
+
+%% Whether a call asks for a datagram flow: when it marks a direction it
+%% streams, saying whether it reads a stream of responses on it.
+datagrams({false, false}, _Kind) -> undefined;
+datagrams(_Unreliable, Kind) -> trevrpc_wire:streams_responses(Kind).
+
+%% The call's flow, the stream reading its response datagrams if it streams
+%% responses, and the sender of its request datagrams if they travel so.
+flow(#{flow := undefined}, _Kind, _Unreliable, Stream) ->
+    {undefined, Stream, undefined};
+flow(#{flow := {Flow, Credit}}, Kind, {Requests, _}, Stream) ->
+    Reading =
+        case trevrpc_wire:streams_responses(Kind) of
+            true -> trevrpc_stream:datagrams(Credit, Stream);
+            false -> Stream
+        end,
+    Sender =
+        case Requests of
+            true -> trevrpc_datagram:sender(trevrpc_stream:transport(Stream), Flow);
+            false -> undefined
+        end,
+    {Flow, Reading, Sender}.
+
+check_unreliable(Unreliable) ->
+    case trevrpc_datagram:check_unreliable(Unreliable) of
+        ok -> ok;
+        error -> {error, trevrpc_status:new(invalid_argument, <<"invalid unreliable option">>)}
+    end.
 
 request_frame(#cstate{request = Fields, offer = Offer}, Deadline) ->
     trevrpc_frame:encode(
@@ -361,10 +435,21 @@ send(_Call, _Message) ->
 
 send_message(Call, State, Message) ->
     case before_send(Call, State, iolist_size(Message)) of
-        {ok, Ready} ->
+        {ok, #cstate{datagram_sender = undefined} = Ready} ->
             {Frame, Encoded} = encode_request(Call, Ready, Message),
             put_state(Call, keep(Encoded, Message)),
             write(Call, Frame, false);
+        {ok, #cstate{datagram_sender = Sender} = Ready} ->
+            %% In a datagram, or on the stream when it does not fit one or
+            %% cannot be sent.
+            {Frame, Encoded} = encode_request(Call, Ready, Message),
+            case trevrpc_datagram:send(Frame, Sender) of
+                {sent, Next} ->
+                    put_state(Call, Encoded#cstate{datagram_sender = Next});
+                {stream, Next} ->
+                    put_state(Call, Encoded#cstate{datagram_sender = Next}),
+                    write(Call, Frame, false)
+            end;
         {error, Status} ->
             {error, Status}
     end.
@@ -619,13 +704,17 @@ replay(#client_call{channel = Channel, deadline = Deadline} = Call, State, Fin) 
 offer_again(Call, Info, State) ->
     offer(Call, Info#{optimistic := false}, State).
 
-%% @doc Ends the requests of a client-streaming or bidirectional call.
+%% @doc Ends the requests of a client-streaming or bidirectional call. A
+%% call that sent request datagrams announces how many first.
 -spec close_send(call()) -> ok | {error, trevrpc_status:status()}.
 close_send(Call) ->
     case state(Call) of
-        #cstate{send_closed = true} -> ok;
-        #cstate{terminal = undefined} -> write(Call, <<>>, true);
-        #cstate{terminal = Terminal} -> {error, terminal_status(Terminal)}
+        #cstate{send_closed = true} ->
+            ok;
+        #cstate{terminal = undefined, datagram_sender = Sender} ->
+            write(Call, trevrpc_datagram:count_frame(Sender), true);
+        #cstate{terminal = Terminal} ->
+            {error, terminal_status(Terminal)}
     end.
 
 %% @doc Ends the requests of a client-streaming call and returns its
@@ -682,9 +771,17 @@ recv(Call) ->
                 {headers, Next} ->
                     put_state(Call, Next),
                     recv(Call);
-                {terminal, Terminal, Next} ->
+                {queued, Next} ->
+                    put_state(Call, Next),
+                    recv(Call);
+                {terminal, Terminal, #cstate{pending = []} = Next} ->
                     done(Call, Next),
-                    Terminal
+                    Terminal;
+                {terminal, _Terminal, Next} ->
+                    %% Datagram messages that arrived before the end go
+                    %% first.
+                    put_state(Call, Next),
+                    recv(Call)
             end;
         #cstate{terminal = Terminal} = State ->
             done(Call, State),
@@ -718,6 +815,9 @@ headers(Call) ->
                 {headers, Next} ->
                     put_state(Call, Next),
                     {ok, Next#cstate.headers};
+                {queued, Next} ->
+                    put_state(Call, Next),
+                    headers(Call);
                 {terminal, Terminal, Next} ->
                     put_state(Call, Next#cstate{terminal = Terminal}),
                     headers(Call)
@@ -770,11 +870,14 @@ single_response(Call) ->
 
 %% Reads response frames up to the next message, the headers, or the call's
 %% end, checking the grammar: [ANSWER] [HEADERS] MESSAGE* [DATAGRAM_COUNT]
-%% STATUS.
+%% STATUS. Datagram messages read on the way are queued (`queued'), once
+%% the headers are known.
 read_event(Call, #cstate{stream = Stream} = State) ->
     case trevrpc_stream:next_frame(Stream, Call#client_call.deadline) of
         {ok, Frame, Next} ->
-            frame(Call, Frame, State#cstate{stream = Next});
+            with_early(frame(Call, Frame, State#cstate{stream = Next}));
+        {datagram, Messages, Next} ->
+            datagram(Call, Messages, State#cstate{stream = Next});
         {eof, Next} ->
             protocol_error(
                 Call, State#cstate{stream = Next}, <<"response stream ended before final status">>
@@ -782,6 +885,46 @@ read_event(Call, #cstate{stream = Stream} = State) ->
         {error, Reason, Next} ->
             read_failed(Call, Reason, State#cstate{stream = Next})
     end.
+
+%% The messages of a response datagram: queued for recv once the headers
+%% are known, and until then kept, as long as there is room.
+datagram(Call, Messages, State) ->
+    case datagram_messages(Messages, State) of
+        [] ->
+            read_event(Call, State);
+        Decoded when State#cstate.headers =:= undefined ->
+            read_event(Call, keep_early(Decoded, State));
+        Decoded ->
+            {queued, State#cstate{pending = State#cstate.pending ++ Decoded}}
+    end.
+
+datagram_messages(Messages, State) ->
+    #cstate{compression = Compression, accept = Accept, max_frame_size = Max} = State,
+    case trevrpc_datagram:messages(Messages, Compression, Accept, Max) of
+        {ok, Decoded} -> [Message || {Message, _} <- Decoded];
+        drop -> []
+    end.
+
+keep_early(Messages, #cstate{early = Early, early_bytes = Bytes} = State) ->
+    Size = lists:sum([byte_size(Message) || Message <- Messages]),
+    case length(Early) + length(Messages) =< ?EARLY_MESSAGES andalso Bytes + Size =< ?EARLY_BYTES of
+        true -> State#cstate{early = Early ++ Messages, early_bytes = Bytes + Size};
+        false -> State
+    end.
+
+%% Once the headers are known, the datagram messages that waited for them
+%% are queued.
+with_early({message, Message, State}) -> {message, Message, flush_early(State)};
+with_early({headers, State}) -> {headers, flush_early(State)};
+with_early({queued, State}) -> {queued, flush_early(State)};
+with_early({terminal, Terminal, State}) -> {terminal, Terminal, flush_early(State)}.
+
+flush_early(#cstate{early = []} = State) ->
+    State;
+flush_early(#cstate{headers = undefined} = State) ->
+    State;
+flush_early(#cstate{early = Early, pending = Pending} = State) ->
+    State#cstate{pending = Pending ++ Early, early = [], early_bytes = 0}.
 
 frame(Call, {Type, _Payload}, #cstate{datagram_count = Count} = State) when
     Count =/= undefined, Type =/= status
@@ -861,7 +1004,9 @@ frame(Call, {status, Payload}, State) ->
         {ok, #{code := Code, metadata := Trailers} = Status} ->
             case trevrpc_metadata:validate(Trailers) of
                 ok ->
-                    Ended = answered(State#cstate{headers = headers_or_empty(State)}),
+                    Ended = end_datagrams(
+                        Call, answered(State#cstate{headers = headers_or_empty(State)})
+                    ),
                     cancel_upload(Ended),
                     Terminal =
                         case Code of
@@ -951,6 +1096,25 @@ present(_, _) -> true.
 headers_or_empty(#cstate{headers = undefined}) -> #{};
 headers_or_empty(#cstate{headers = Headers}) -> Headers.
 
+%% The response datagrams end with the STATUS, once those its
+%% DATAGRAM_COUNT announced arrived or 10 ms passed; the messages that
+%% arrived are queued before the end.
+end_datagrams(_Call, #cstate{flow = undefined} = State) ->
+    State;
+end_datagrams(Call, #cstate{flow = Flow, stream = Stream} = State) ->
+    Count =
+        case State#cstate.datagram_count of
+            undefined -> 0;
+            Announced -> Announced
+        end,
+    Until = trevrpc_datagram:count_wait(Call#client_call.deadline),
+    {Datagrams, Taken} = trevrpc_stream:take_datagrams(
+        trevrpc_stream:end_datagrams(Flow, Count, Until, Stream)
+    ),
+    Messages = lists:append([datagram_messages(Messages, State) || Messages <- Datagrams]),
+    #cstate{pending = Pending} = Flushed = flush_early(State),
+    Flushed#cstate{stream = Taken, flow = undefined, pending = Pending ++ Messages}.
+
 %% A status that arrives while the client is still uploading ends the
 %% upload.
 cancel_upload(#cstate{send_closed = true}) ->
@@ -991,6 +1155,8 @@ read_terminal(Call, State) ->
         {message, Message, Next} ->
             read_terminal(Call, Next#cstate{pending = Next#cstate.pending ++ [Message]});
         {headers, Next} ->
+            read_terminal(Call, Next);
+        {queued, Next} ->
             read_terminal(Call, Next);
         {terminal, Terminal, Next} ->
             put_state(Call, Next#cstate{terminal = Terminal}),

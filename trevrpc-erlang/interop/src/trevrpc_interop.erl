@@ -38,6 +38,7 @@ server_scenarios() ->
         <<"bidi-error">>,
         <<"unary-headers">>,
         <<"server-stream-headers">>,
+        <<"unreliable">>,
         <<"compressed">>,
         <<"compressed-stream">>,
         <<"refused-stream">>,
@@ -176,13 +177,12 @@ routes() ->
         fun(_Path, Route) -> maps:remove(compression, Route) end,
         trevrpc_interop_v1_refusing_echo:routes(#{client_stream => fun client_stream/1})
     ),
-    maps:merge(
-        maps:merge(
-            trevrpc_interop_v1_echo:routes(Echo),
-            trevrpc_interop_v1_compressed_echo:routes(Compressed)
-        ),
-        Refusing
-    ).
+    lists:foldl(fun maps:merge/2, #{}, [
+        trevrpc_interop_v1_echo:routes(Echo),
+        trevrpc_interop_v1_compressed_echo:routes(Compressed),
+        Refusing,
+        trevrpc_interop_v1_unreliable_echo:routes(#{bidi => fun unreliable/1})
+    ]).
 
 unary(#{message := Message} = Request, Call) ->
     start(Call),
@@ -313,6 +313,29 @@ failure(#{fail_code := 8, fail_message := Message}) ->
     };
 failure(#{fail_code := Code, fail_message := Message}) ->
     trevrpc_status:new(trevrpc_status:from_int(Code), Message).
+
+%% UnreliableEcho.Bidi: `count' responses per request as it arrives, then
+%% how many requests arrived, and how many of them as datagrams.
+unreliable(Call) ->
+    unreliable(Call, 0).
+
+unreliable(Call, Received) ->
+    case trevrpc_call:recv(Call) of
+        {ok, #{message := Message, count := Count}} ->
+            case send_all(Call, [response(Message, Index) || Index <- lists:seq(0, Count - 1)]) of
+                ok -> unreliable(Call, Received + 1);
+                Error -> Error
+            end;
+        eof ->
+            trevrpc_call:set_trailers(Call, #{
+                <<"interop-received">> => integer_to_binary(Received),
+                <<"interop-datagrams-received">> =>
+                    integer_to_binary(trevrpc_call:datagrams_received(Call))
+            }),
+            ok;
+        {error, Status} ->
+            {error, Status}
+    end.
 
 response(Message, Index) ->
     #{message => Message, index => Index}.

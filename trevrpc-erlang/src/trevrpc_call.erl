@@ -33,7 +33,8 @@
     send_headers/2,
     set_trailers/2,
     trailers/1,
-    compressed_received/1
+    compressed_received/1,
+    datagrams_received/1
 ]).
 
 %% Used by trevrpc_server_call.
@@ -126,7 +127,28 @@ send_message(Call, Message) ->
                 )};
         _ ->
             {Frame, Encoded} = encode_message(State, Message),
-            write(Call, Encoded#call_state{messages_sent = true}, Frame)
+            case Encoded#call_state.datagram_sender of
+                undefined -> write(Call, Encoded#call_state{messages_sent = true}, Frame);
+                _ -> send_datagram(Call, Encoded, Frame)
+            end
+    end.
+
+%% A response of a route whose responses travel as datagrams, on a call
+%% with a flow: in a datagram, after the HEADERS (empty if the handler sent
+%% none), so that the client knows the call was accepted; on the stream when
+%% it does not fit one or the datagram cannot be sent.
+send_datagram(Call, #call_state{headers_sent = false} = State, Frame) ->
+    Headers = trevrpc_frame:encode(headers, trevrpc_wire:encode_headers(#{metadata => #{}})),
+    case write(Call, State#call_state{headers_sent = true}, Headers) of
+        ok -> send_datagram(Call, state(Call), Frame);
+        Error -> Error
+    end;
+send_datagram(Call, #call_state{datagram_sender = Sender} = State, Frame) ->
+    case trevrpc_datagram:send(Frame, Sender) of
+        {sent, Next} ->
+            put_state(Call, State#call_state{datagram_sender = Next, messages_sent = true});
+        {stream, Next} ->
+            write(Call, State#call_state{datagram_sender = Next, messages_sent = true}, Frame)
     end.
 
 %% @doc Sends the response headers at once, before any response message.
@@ -169,6 +191,12 @@ compressed_received(Call) ->
         dictionary_received = Dictionary, plain_received = Plain, stream_received = Stream
     } = state(Call),
     #{dictionary => Dictionary, plain => Plain, stream => Stream}.
+
+%% @doc How many of the request messages read so far arrived as datagrams:
+%% none on transports without datagrams and on calls without a flow.
+-spec datagrams_received(call()) -> non_neg_integer().
+datagrams_received(Call) ->
+    (state(Call))#call_state.datagrams_received.
 
 %% Any ANSWER still waiting goes first.
 write(Call, #call_state{stream = Stream, answer = Answer} = State, Frame) ->
@@ -238,15 +266,41 @@ put_state(#call{ref = Ref}, State) ->
     put({trevrpc_call, Ref}, State),
     ok.
 
-%% @private Reads the next request frame, counting messages against the
+%% @private Reads the next request message, counting messages against the
 %% limit and decompressing ZSTD_MESSAGE frames. A DATAGRAM_COUNT is taken
 %% and checked here: it appears once, and only the end of the stream follows
 %% it. Other frames than MESSAGE and ZSTD_MESSAGE are errors on a request
 %% stream past its REQUEST.
+%%
+%% Messages that arrived as datagrams are read in between, counting
+%% towards the same limits. At the end of the stream, the datagrams its
+%% DATAGRAM_COUNT announced that have not arrived yet get 10 ms more.
 -spec read(#call_state{}, trevrpc_stream:deadline()) ->
     {{ok, {message, binary()}} | eof | {error, term()}, #call_state{}}.
+read(#call_state{datagram_messages = [{Message, Id} | Rest]} = State, _Deadline) ->
+    datagram_message(Message, Id, State#call_state{datagram_messages = Rest});
 read(#call_state{stream = Stream, received = Received, max_messages = Max} = State, Deadline) ->
     case trevrpc_stream:next_frame(Stream, Deadline) of
+        {datagram, Messages, Next} ->
+            #call_state{compression = Compression, max_frame_size = MaxFrame} = State,
+            Read =
+                case trevrpc_datagram:messages(Messages, Compression, all, MaxFrame) of
+                    {ok, Decoded} -> State#call_state{stream = Next, datagram_messages = Decoded};
+                    drop -> State#call_state{stream = Next}
+                end,
+            read(Read, Deadline);
+        {eof, Next} when
+            State#call_state.datagram_flow =/= undefined, not State#call_state.datagrams_ended
+        ->
+            Count =
+                case State#call_state.datagram_count of
+                    undefined -> 0;
+                    Announced -> Announced
+                end,
+            Ended = trevrpc_stream:end_datagrams(
+                State#call_state.datagram_flow, Count, trevrpc_datagram:count_wait(Deadline), Next
+            ),
+            read(State#call_state{stream = Ended, datagrams_ended = true}, Deadline);
         {ok, {Type, _}, Next} when State#call_state.datagram_count =/= undefined ->
             {{error, {after_datagram_count, Type}}, State#call_state{stream = Next}};
         {ok, {datagram_count, Payload}, Next} ->
@@ -278,6 +332,27 @@ read(#call_state{stream = Stream, received = Received, max_messages = Max} = Sta
             {eof, State#call_state{stream = Next}};
         {error, Reason, Next} ->
             {{error, Reason}, State#call_state{stream = Next}}
+    end.
+
+%% A request message that arrived in a datagram.
+datagram_message(_Message, _Id, #call_state{received = Received, max_messages = Max} = State) when
+    Received >= Max
+->
+    {{error, {too_many_messages, Max}}, State};
+datagram_message(Message, Id, #call_state{stream = Stream} = State) ->
+    case trevrpc_stream:charge_message(byte_size(Message), Stream) of
+        {ok, Charged} ->
+            Read = State#call_state{
+                stream = Charged,
+                received = State#call_state.received + 1,
+                datagrams_received = State#call_state.datagrams_received + 1
+            },
+            case Id of
+                raw -> {{ok, {message, Message}}, Read};
+                _ -> {{ok, {message, Message}}, count_compressed(Id, Read)}
+            end;
+        {error, Reason, Failed} ->
+            {{error, Reason}, State#call_state{stream = Failed}}
     end.
 
 %% A server accepts every dictionary it holds, and compression without one.

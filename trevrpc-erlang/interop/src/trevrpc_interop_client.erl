@@ -8,6 +8,11 @@
 -define(ECHO, trevrpc_interop_v1_echo).
 -define(COMPRESSED_ECHO, trevrpc_interop_v1_compressed_echo).
 -define(REFUSING_ECHO, trevrpc_interop_v1_refusing_echo).
+-define(UNRELIABLE_ECHO, trevrpc_interop_v1_unreliable_echo).
+%% The unreliable scenario's small requests, and the size of the one that
+%% cannot be a datagram.
+-define(UNRELIABLE_REQUESTS, 50).
+-define(UNRELIABLE_LARGE, 4096).
 -define(STREAM_RECEIVED, <<"interop-stream-compressed-received">>).
 -define(DEADLINE, 10000).
 %% The message of the plain.records compression golden vector: a JSON
@@ -36,7 +41,7 @@ scenarios() ->
         {<<"bidi-error">>, fun bidi_error/1},
         {<<"unary-headers">>, fun unary_headers/1},
         {<<"server-stream-headers">>, fun server_stream_headers/1},
-        {<<"unreliable">>, {unsupported, <<"datagram messages are not implemented">>}},
+        {<<"unreliable">>, fun unreliable/1},
         {<<"compressed">>, fun compressed/1},
         {<<"compressed-stream">>, fun compressed_stream/1},
         {<<"refused-stream">>, fun refused_stream/1},
@@ -270,6 +275,138 @@ bidi_error(Channel) ->
     else
         Error -> describe(Error)
     end.
+
+%% Requests "0" to "49" without waiting, then, once a response came back, a
+%% 4096-character one that no datagram fits. Every response must be one that
+%% was sent, at most once, and the large one must come back. Over QMux all
+%% of them come back on the stream; over QUIC some may be lost, but some
+%% requests and responses travel as datagrams.
+unreliable(Channel) ->
+    Large = incompressible(?UNRELIABLE_LARGE),
+    Small = [integer_to_binary(N) || N <- lists:seq(0, ?UNRELIABLE_REQUESTS - 1)],
+    Total = ?UNRELIABLE_REQUESTS + 1,
+    Before = datagrams_delivered(Channel),
+    maybe
+        {ok, Call} ?= ?UNRELIABLE_ECHO:bidi(Channel, opts()),
+        ok ?= send_each(Call, Small),
+        %% The stream may overtake the datagrams still queued, and the
+        %% server drops those that arrive after the requests end: the rest
+        %% go once one came back.
+        {ok, Pending} ?= echoed(trevrpc_client:recv(Call), maps:from_keys([Large | Small], true)),
+        ok ?= trevrpc_client:send(Call, #{message => Large, count => 1}),
+        ok ?= trevrpc_client:close_send(Call),
+        {ok, Left, Trailers} ?= echoes(Call, Pending),
+        false ?= maps:is_key(Large, Left),
+        {ok, Received} ?= count(Trailers, <<"interop-received">>),
+        {ok, Datagrams} ?= count(Trailers, <<"interop-datagrams-received">>),
+        Responses = Total - map_size(Left),
+        case trevrpc_channel:transport(Channel) of
+            quic when Received < 1; Received > Total; Datagrams < 1 ->
+                {error,
+                    iolist_to_binary(
+                        io_lib:format(
+                            "on QUIC: interop-received = ~b, interop-datagrams-received = ~b; "
+                            "want 1..~b and at least 1",
+                            [Received, Datagrams, Total]
+                        )
+                    )};
+            quic ->
+                case datagrams_delivered(Channel) > Before of
+                    true ->
+                        ok;
+                    false ->
+                        {error, <<
+                            "the connection received no DATAGRAM frames, so the server sent no "
+                            "response as a datagram"
+                        >>}
+                end;
+            _ when Responses =/= Total; Received =/= Total; Datagrams =/= 0 ->
+                {error,
+                    iolist_to_binary(
+                        io_lib:format(
+                            "on QMux: ~b responses, interop-received = ~b, "
+                            "interop-datagrams-received = ~b; want ~b, ~b, 0",
+                            [Responses, Received, Datagrams, Total, Total]
+                        )
+                    )};
+            _ ->
+                ok
+        end
+    else
+        true -> {error, <<"the 4096-byte echo, which cannot be a datagram, is missing">>};
+        Error -> describe(Error)
+    end.
+
+send_each(_Call, []) ->
+    ok;
+send_each(Call, [Message | Rest]) ->
+    case trevrpc_client:send(Call, #{message => Message, count => 1}) of
+        ok -> send_each(Call, Rest);
+        Error -> Error
+    end.
+
+%% Takes a response off the messages not echoed yet.
+echoed({ok, #{message := Message, index := 0}}, Pending) when is_map_key(Message, Pending) ->
+    {ok, maps:remove(Message, Pending)};
+echoed({ok, #{message := Message, index := Index}}, _Pending) ->
+    {error,
+        iolist_to_binary(
+            io_lib:format("unexpected or repeated response (~ts, ~b)", [abbreviate(Message), Index])
+        )};
+echoed({eof, _}, _Pending) ->
+    {error, <<"the stream ended before the first response">>};
+echoed(Other, _Pending) ->
+    Other.
+
+%% Reads the responses up to the end of the call.
+echoes(Call, Pending) ->
+    case trevrpc_client:recv(Call) of
+        {eof, Trailers} ->
+            {ok, Pending, Trailers};
+        Result ->
+            case echoed(Result, Pending) of
+                {ok, Left} -> echoes(Call, Left);
+                Error -> Error
+            end
+    end.
+
+count(Metadata, Key) ->
+    case Metadata of
+        #{Key := Value} ->
+            try binary_to_integer(Value) of
+                Count when Count >= 0 -> {ok, Count};
+                _ -> bad_count(Key, Value)
+            catch
+                error:badarg -> bad_count(Key, Value)
+            end;
+        #{} ->
+            {error, <<"trailing metadata has no ", Key/binary>>}
+    end.
+
+bad_count(Key, Value) ->
+    {error,
+        iolist_to_binary(io_lib:format("trailing metadata ~ts = ~p, want a count", [Key, Value]))}.
+
+%% How many datagrams the channel's connection delivered: 0 over QMux.
+datagrams_delivered(Channel) ->
+    case trevrpc_channel:datagram_stats(Channel) of
+        #{delivered := Delivered} -> Delivered;
+        none -> 0
+    end.
+
+%% `N' base64 digits from a fixed xorshift generator, as every client sends
+%% them: they do not compress below what a datagram holds.
+incompressible(N) ->
+    Digits = <<"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/">>,
+    incompressible(N, 16#9e3779b97f4a7c15, Digits, []).
+
+incompressible(0, _State, _Digits, Acc) ->
+    list_to_binary(lists:reverse(Acc));
+incompressible(N, State0, Digits, Acc) ->
+    State1 = State0 bxor ((State0 bsl 13) band 16#FFFFFFFFFFFFFFFF),
+    State2 = State1 bxor (State1 bsr 7),
+    State = State2 bxor ((State2 bsl 17) band 16#FFFFFFFFFFFFFFFF),
+    incompressible(N - 1, State, Digits, [binary:at(Digits, State rem 64) | Acc]).
 
 unary_headers(Channel) ->
     Header = #{<<"interop-header">> => <<"h">>},

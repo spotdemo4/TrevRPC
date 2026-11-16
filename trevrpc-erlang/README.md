@@ -15,9 +15,9 @@ The runtime is pure Erlang, built on [erlang_quic](https://github.com/benoitc/er
 
 QMux ([draft-ietf-quic-qmux-02](https://datatracker.ietf.org/doc/draft-ietf-quic-qmux/)) carries the same streams over TLS on TCP, with the same windows and limits as QUIC, and over a WebSocket ([draft-lcurley-qmux-websocket-00](https://datatracker.ietf.org/doc/draft-lcurley-qmux-websocket/)) one record per binary message. Its implementation is in-tree (`trevrpc_qmux`) and checked against the shared golden vectors in `testdata/qmux-golden-vectors.txt`.
 
-Readers accept DATAGRAM_COUNT (frame type 7) only where the protocol allows it, right before the end of a request stream or right before STATUS on a response stream, with a payload of exactly one varint. Without datagram messages the runtime sends no count and waits for none.
+A method whose schema marks a streaming direction unreliable (`unreliable_requests` or `unreliable_responses` in `trevrpc.method`) can send that direction's messages as [datagram messages](https://trev.zip/llc/TrevRPC/wiki/Protocol-and-Wire-Format#datagram-messages). Generated routes and client calls carry `unreliable => #{requests => true, responses => true}`, which hand-written ones can set too. A client gives such a call a datagram flow when its connection is native QUIC and the server takes datagrams. Each message then travels in a datagram of its own, or on the stream when it does not fit the largest datagram the connection takes now or the send fails, and a direction that sent datagrams ends with DATAGRAM_COUNT, for whose missing datagrams the receiver waits 10 ms. Datagram messages can be lost or reordered, but are never duplicated, and they count towards the same limits as the stream's. Over QMux and HTTP, every message stays on the stream. A server holds the datagrams that overtake their REQUEST (64 datagrams, 64 KiB, 500 ms per connection), and a call queues at most 128 received datagram messages, or 64 KiB, dropping the rest. `trevrpc_call:datagrams_received/1` says how many request messages arrived as datagrams, and `trevrpc_channel:datagram_stats/1` gives the connection's datagram counters.
 
-Not implemented yet: datagram messages, connection metadata sets (an offer is merged into its own call and never confirmed, so clients keep offering), and stream idle timeouts.
+Not implemented yet: connection metadata sets (an offer is merged into its own call and never confirmed, so clients keep offering), and stream idle timeouts.
 
 ## Server
 
@@ -146,10 +146,10 @@ ok = trevrpc_client:send(Call, #{name => <<"you">>}),
 
 - A method is a callback and a client function named in snake case (`SayHello` is `say_hello`). Client functions take the channel, then the request unless the client streams, then, optionally, `trevrpc_client` call options, which win over those of the schema.
 - `routes/1` takes a module that implements the behaviour, or a map of handler funs by method name; a method left out of the map is not routed, and a name that is no method fails with `{unknown_method, Name, Methods}`. Several services' routes merge with `maps:merge/2`.
-- Routes and calls carry each method's message types, which pick its compression dictionaries, how its `trevrpc.method` option lets its messages be compressed (never a side whose message type has a field marked `debug_redact`), and a codec: handlers and callers get and give messages as gpb terms.
+- Routes and calls carry each method's message types, which pick its compression dictionaries, how its `trevrpc.method` option lets its messages be compressed (never a side whose message type has a field marked `debug_redact`) and travel as datagrams, and a codec: handlers and callers get and give messages as gpb terms.
 - Messages are gpb's maps, or records with `msg_format=records` (defined in the message module's `.hrl`), with strings as binaries and message names that carry their package (`'example.greeter.v1.HelloRequest'`); a oneof is `{Field, Value}` and an unset optional field is left out. A message module holds its file's messages and those they use from other files, but not the definitions behind custom options (descriptor.proto).
 - Parameters (`--trevrpc-erlang_opt=name=value,...`): `msg_format` (`maps` or `records`), `module_prefix`, `pb_suffix` (`_pb`), and `service_suffix`.
-- Editions files are refused, and `unreliable_requests` and `unreliable_responses` are checked but do nothing until the runtime has datagram messages.
+- Editions files are refused.
 - gpb's modules export functions without specs, and carry `-compile([nowarn_missing_spec])` for that; xref's `locals_not_used` check needs them in `xref_ignores`, as gpb leaves functions they do not use.
 
 The generated modules need nothing but the runtime. The escript carries gpb, which is LGPL-2.1-or-later; the code gpb generates is not covered by that license.
@@ -208,19 +208,19 @@ The codecs, `trevrpc_zstd` and `trevrpc_zstd_stream`, are checked against the sh
 | `trevrpc`                      | Protocol identifiers and the default frame size limit                                         |
 | `trevrpc_frame`                | Frame encoding, and an incremental reader with the frame size and cumulative byte limits      |
 | `trevrpc_wire`                 | The control messages `RpcRequest`, `RpcHeaders`, `RpcAnswer` and `RpcStatus`, encoded by hand |
-| `trevrpc_datagram`             | Datagram payloads                                                                             |
+| `trevrpc_datagram`             | Datagram payloads, the `unreliable` option, and sending and receiving datagram messages       |
 | `trevrpc_zstd`                 | Compression settings, their negotiation, and ZSTD_MESSAGE payloads                            |
 | `trevrpc_zstd_stream`          | Stream compression: ZSTD_STREAM_MESSAGE payloads and the memory budget                        |
 | `trevrpc_varint`, `trevrpc_pb` | QUIC varints and the protobuf wire primitives                                                 |
 
-The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_quic`, `trevrpc_transport`, `trevrpc_qmux`, `trevrpc_qmux_frame`, `trevrpc_qmux_record`, `trevrpc_tcp_listener`, `trevrpc_http`, `trevrpc_http1`) is internal.
+The rest (`trevrpc_server_conn`, `trevrpc_server_call`, `trevrpc_stream`, `trevrpc_datagram_flows`, `trevrpc_quic`, `trevrpc_transport`, `trevrpc_qmux`, `trevrpc_qmux_frame`, `trevrpc_qmux_record`, `trevrpc_tcp_listener`, `trevrpc_http`, `trevrpc_http1`) is internal.
 
 ## Development
 
 rebar3 and Erlang/OTP 29 are in the repository's dev shell.
 
 ```sh
-rebar3 eunit      # unit tests, the shared golden vectors in ../testdata, client/server over QUIC and QMux, QMux over WebSocket, and the HTTP mapping
+rebar3 eunit      # unit tests, the shared golden vectors in ../testdata, client/server over QUIC and QMux, datagram messages, QMux over WebSocket, and the HTTP mapping
 rebar3 xref
 rebar3 dialyzer
 ```

@@ -14,7 +14,17 @@
 %%   <li>`closed': the connection closed.</li>
 %%   <li>`send_ready': the connection's send queue drained, after a
 %%       {@link send/4} found it full.</li>
+%%   <li>`{datagram, Messages, Bytes}': the messages of a datagram of the
+%%       call's flow (see {@link trevrpc_datagram_flows}), read only once
+%%       {@link datagrams/2} enabled them.</li>
+%%   <li>`datagrams_arrived': the datagrams {@link end_datagrams/4} waits
+%%       for arrived.</li>
 %% </ul>
+%%
+%% {@link next_frame/2} returns the datagrams read, in the order they
+%% arrived, after the frames read before them, and before the end of the
+%% stream. They never block the stream: the connection drops datagrams for
+%% a reader that falls behind.
 %%
 %% The stream is in manual flow control: the peer may send one window past
 %% the bytes returned with `trevrpc_transport:consume/3'. Bytes are returned as they are
@@ -35,6 +45,9 @@
     next_frame/2,
     peek/1,
     peek/2,
+    datagrams/2,
+    end_datagrams/4,
+    take_datagrams/1,
     send/4,
     abort/2,
     release/1,
@@ -69,7 +82,11 @@
     %% The peer stopped reading (STOP_SENDING); sends are pointless.
     stopped = false :: boolean(),
     %% Why reading ended, once it failed.
-    error :: read_error() | undefined
+    error :: read_error() | undefined,
+    %% The credit of the call's flow while its datagrams are read, and the
+    %% datagrams read and not taken yet, as `{Messages, Bytes}'.
+    credit :: trevrpc_datagram_flows:credit() | undefined,
+    datagrams = queue:new() :: queue:queue({[trevrpc_datagram:message()], non_neg_integer()})
 }).
 
 -opaque stream() :: #stream{}.
@@ -158,22 +175,37 @@ peek(#stream{error = undefined, fin = false, ref = Ref} = Stream, Deadline) ->
 peek(Stream, _Deadline) ->
     {none, Stream}.
 
-%% @doc Takes the next frame the peer sent, waiting for it until `Deadline'.
-%% `eof' means the peer finished at a frame boundary.
+%% @doc Takes the next frame the peer sent, or the messages of the next
+%% datagram, waiting for them until `Deadline'. `eof' means the peer
+%% finished at a frame boundary.
 -spec next_frame(stream(), deadline()) ->
     {ok, trevrpc_frame:frame(), stream()}
+    | {datagram, [trevrpc_datagram:message()], stream()}
     | {eof, stream()}
     | {error, read_error(), stream()}.
 next_frame(#stream{frames = [Frame | Rest]} = Stream, _Deadline) ->
     {ok, Frame, Stream#stream{frames = Rest}};
 next_frame(#stream{error = Error} = Stream, _Deadline) when Error =/= undefined ->
     {error, Error, Stream};
-next_frame(#stream{fin = true, reader = Reader} = Stream, _Deadline) ->
+next_frame(#stream{datagrams = Datagrams, credit = Credit} = Stream, Deadline) ->
+    case queue:out(Datagrams) of
+        {{value, {Messages, Bytes}}, Rest} ->
+            _ =
+                case Credit of
+                    undefined -> ok;
+                    _ -> trevrpc_datagram_flows:take(Credit, length(Messages), Bytes)
+                end,
+            {datagram, Messages, Stream#stream{datagrams = Rest}};
+        {empty, _} ->
+            next_stream_frame(Stream, Deadline)
+    end.
+
+next_stream_frame(#stream{fin = true, reader = Reader} = Stream, _Deadline) ->
     case trevrpc_frame:at_boundary(Reader) of
         true -> {eof, Stream};
         false -> fail(truncated, Stream)
     end;
-next_frame(#stream{ref = Ref} = Stream, Deadline) ->
+next_stream_frame(#stream{ref = Ref} = Stream, Deadline) ->
     receive
         {trevrpc_stream, Ref, Event} -> next_frame(event(Event, Stream), Deadline)
     after 0 ->
@@ -183,6 +215,60 @@ next_frame(#stream{ref = Ref} = Stream, Deadline) ->
         after timeout(Deadline) ->
             {error, timeout, Flushed}
         end
+    end.
+
+%% @doc Reads the datagrams of the call's flow, whose credit is `Credit',
+%% from now on.
+-spec datagrams(trevrpc_datagram_flows:credit(), stream()) -> stream().
+datagrams(Credit, Stream) ->
+    Stream#stream{credit = Credit}.
+
+%% @doc Ends the datagrams of the call's flow `Flow' as the end of the
+%% stream's direction arrived, announcing `Count' datagrams in its
+%% DATAGRAM_COUNT (0 for none): waits until that many arrived, `Until'
+%% passes, or the stream fails, then reads no more datagrams. Those read by
+%% then are still returned by {@link next_frame/2}, before the end.
+-spec end_datagrams(pos_integer(), non_neg_integer(), deadline(), stream()) -> stream().
+end_datagrams(_Flow, _Count, _Until, #stream{credit = undefined} = Stream) ->
+    Stream;
+end_datagrams(Flow, Count, Until, #stream{credit = Credit, ref = Ref, router = Router} = Stream) ->
+    Waited =
+        case Count of
+            0 ->
+                Stream;
+            _ ->
+                Router ! {trevrpc_await_datagrams, self(), Ref, Flow, Count},
+                await_datagrams(Stream, Until)
+        end,
+    ok = trevrpc_datagram_flows:close(Credit),
+    %% What the connection sent before the credit closed is the call's.
+    (drain_datagrams(Waited))#stream{credit = undefined}.
+
+%% @doc Takes the messages of every datagram read and not taken yet, in
+%% order: those of a direction whose datagrams ended.
+-spec take_datagrams(stream()) -> {[[trevrpc_datagram:message()]], stream()}.
+take_datagrams(#stream{datagrams = Datagrams, credit = undefined} = Stream) ->
+    {[Messages || {Messages, _Bytes} <- queue:to_list(Datagrams)], Stream#stream{
+        datagrams = queue:new()
+    }}.
+
+await_datagrams(#stream{ref = Ref} = Stream, Until) ->
+    receive
+        {trevrpc_stream, Ref, datagrams_arrived} ->
+            Stream;
+        {trevrpc_stream, Ref, Event} ->
+            case event(Event, Stream) of
+                #stream{error = undefined} = Next -> await_datagrams(Next, Until);
+                Failed -> Failed
+            end
+    after timeout(Until) ->
+        Stream
+    end.
+
+drain_datagrams(#stream{ref = Ref} = Stream) ->
+    receive
+        {trevrpc_stream, Ref, {datagram, _, _} = Event} -> drain_datagrams(event(Event, Stream))
+    after 0 -> Stream
     end.
 
 event({data, Bin, Fin}, #stream{reader = Reader, unconsumed = Unconsumed} = Stream) ->
@@ -201,6 +287,14 @@ event(closed, Stream) ->
     Stream#stream{error = closed};
 event(send_ready, Stream) ->
     %% A stale wake-up from an earlier full send queue.
+    Stream;
+event({datagram, _Messages, _Bytes}, #stream{credit = undefined} = Stream) ->
+    %% The call reads no datagrams, or no more.
+    Stream;
+event({datagram, Messages, Bytes}, #stream{datagrams = Datagrams} = Stream) ->
+    Stream#stream{datagrams = queue:in({Messages, Bytes}, Datagrams)};
+event(datagrams_arrived, Stream) ->
+    %% A late answer to a wait that timed out.
     Stream.
 
 fail(Reason, Stream) ->

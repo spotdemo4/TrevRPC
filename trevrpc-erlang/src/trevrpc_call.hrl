@@ -47,6 +47,15 @@
     %% The request side ended: eof, or the status that ended it.
     request_end :: undefined | eof | {error, trevrpc_status:status()},
     %% The datagrams the client announced with DATAGRAM_COUNT, once read.
-    %% Nothing waits for them yet, as the runtime has no datagram messages.
-    datagram_count :: non_neg_integer() | undefined
+    datagram_count :: non_neg_integer() | undefined,
+    %% Datagram messages: the call's flow while it reads request datagrams,
+    %% whether the request side's datagrams ended, the messages of the
+    %% datagram being read (each with the dictionary it used, or `raw'), how
+    %% many request messages arrived as datagrams, and the sender of
+    %% response datagrams when the route lets responses travel in them.
+    datagram_flow :: pos_integer() | undefined,
+    datagrams_ended = false :: boolean(),
+    datagram_messages = [] :: [{binary(), non_neg_integer() | raw}],
+    datagrams_received = 0 :: non_neg_integer(),
+    datagram_sender :: trevrpc_datagram:sender() | undefined
 }).

@@ -25,6 +25,8 @@
     manual_flow_control/2,
     notify_send_ready/1,
     open_stream/1,
+    send_datagram/2,
+    datagram_max_size/1,
     goaway/1,
     close/2
 ]).
@@ -162,6 +164,25 @@ notify_send_ready(_Transport) ->
 open_stream({quic, Conn}) -> ?SAFE(quic:open_stream(Conn));
 open_stream({qmux, Session}) -> trevrpc_qmux:open_stream(Session);
 open_stream(_Transport) -> {error, unsupported}.
+
+%% @doc Sends a datagram. Only native QUIC carries them here; erlang_quic
+%% refuses one that does not fit, or that finds the congestion window full,
+%% at once.
+-spec send_datagram(t(), iodata()) -> ok | {error, term()}.
+send_datagram({quic, Conn}, Payload) -> ?SAFE(quic:send_datagram(Conn, Payload));
+send_datagram(_Transport, _Payload) -> {error, unsupported}.
+
+%% @doc The largest datagram payload the connection takes now: 0 when it
+%% carries none, as on every transport but native QUIC, or when the peer
+%% does not take them.
+-spec datagram_max_size(t()) -> non_neg_integer().
+datagram_max_size({quic, Conn}) ->
+    case ?SAFE(quic:datagram_max_size(Conn)) of
+        Size when is_integer(Size) -> Size;
+        _ -> 0
+    end;
+datagram_max_size(_Transport) ->
+    0.
 
 %% @doc Tells an HTTP client that the connection takes no more requests;
 %% those it sent already are served. The connection's owner decides when

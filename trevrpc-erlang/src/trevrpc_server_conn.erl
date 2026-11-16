@@ -40,7 +40,9 @@
     %% Whether the stream still holds its concurrency slots.
     counted = true :: boolean(),
     %% Stream compression memory the call holds, given back when it ends.
-    reserved = 0 :: non_neg_integer()
+    reserved = 0 :: non_neg_integer(),
+    %% The call's datagram flow, registered until the stream is forgotten.
+    flow :: pos_integer() | undefined
 }).
 
 -record(state, {
@@ -65,7 +67,9 @@
     active_at = 0 :: integer(),
     %% Lone STATUS frames quic_h3 refused with a full send queue, written
     %% again when it says the stream's writer may (`send_ready').
-    pending = #{} :: #{non_neg_integer() => binary()}
+    pending = #{} :: #{non_neg_integer() => binary()},
+    %% The datagram flows of the calls, on native QUIC.
+    flows :: trevrpc_datagram_flows:flows()
 }).
 
 -define(CANCELLED, 1).
@@ -170,7 +174,8 @@ init({Transport, Config}) ->
     process_flag(trap_exit, true),
     %% Exits with the server.
     monitor(process, maps:get(server, Config)),
-    {ok, #state{transport = Transport, config = Config}}.
+    Flows = trevrpc_datagram_flows:new(server, 2 * maps:get(max_streams_per_connection, Config)),
+    {ok, #state{transport = Transport, config = Config, flows = Flows}}.
 
 -spec handle_call(term(), gen_server:from(), #state{}) -> {reply, term(), #state{}}.
 handle_call({h3, H3, Quic}, _From, #state{transport = {quic, Quic}} = State) ->
@@ -246,6 +251,11 @@ handle_info({'EXIT', Pid, _Reason}, #state{transport = {h2, Pid}} = State) ->
     {stop, normal, State};
 handle_info({timeout, _Timer, idle}, State) ->
     idle(State);
+handle_info({timeout, _Timer, trevrpc_datagram_hold}, #state{flows = Flows} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    {noreply, State#state{flows = trevrpc_datagram_flows:expire(Now, Flows)}};
+handle_info({trevrpc_await_datagrams, Pid, Ref, Flow, Count}, #state{flows = Flows} = State) ->
+    {noreply, State#state{flows = trevrpc_datagram_flows:await(Flow, Pid, Ref, Count, Flows)}};
 handle_info(
     {trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters, transport = Transport} = State
 ) ->
@@ -330,10 +340,13 @@ quic_event({send_ready, Id}, #state{transport = {h3, _, _}, pending = Pending} =
 quic_event(send_ready, #state{send_waiters = Waiters} = State) ->
     _ = [Pid ! {trevrpc_stream, Ref, send_ready} || {Pid, Ref} <- Waiters],
     {noreply, State#state{send_waiters = []}};
+quic_event({datagram, Datagram}, #state{transport = {quic, _}, flows = Flows} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    {noreply, State#state{flows = trevrpc_datagram_flows:dispatch(Datagram, Now, Flows)}};
 quic_event({closed, _Reason}, State) ->
     {stop, normal, State};
 quic_event(_Event, State) ->
-    %% connected, datagrams (not used yet), timers, transport errors.
+    %% connected, timers, transport errors.
     {noreply, State}.
 
 stream_opened(Id, #state{transport = Transport} = State) when Id band 2 =/= 0 ->
@@ -742,13 +755,27 @@ admit(Id, Entry, Request, Route, Metadata, Timeout, Rest, #state{config = Config
                 Id, Entry, trevrpc_status:new(unavailable, <<"too many concurrent RPCs">>), State
             );
         false ->
-            case stream_requests(Request, Route, maps:get(stream_budget, Config)) of
-                {ok, Decode} ->
-                    start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State);
-                {error, Status} ->
-                    refuse(Id, Entry, Status, State)
+            maybe
+                {ok, Flow} ?= flow(Request, State),
+                {ok, Decode} ?= stream_requests(Request, Route, maps:get(stream_budget, Config)),
+                Flowing = Entry#entry{flow = Flow},
+                start_call(Id, Flowing, Request, Route, Metadata, Timeout, Rest, Decode, State)
+            else
+                {error, Status} -> refuse(Id, Entry, Status, State)
             end
     end.
+
+%% The call's datagram flow, on native QUIC, which alone carries datagrams
+%% here: another transport ignores it. A flow that is in use fails the call.
+flow(#{datagram_flow := Flow}, #state{transport = {quic, _}, flows = Flows}) when Flow > 0 ->
+    case trevrpc_datagram_flows:in_use(Flow, Flows) of
+        false ->
+            {ok, Flow};
+        true ->
+            invalid(iolist_to_binary(io_lib:format("datagram flow ~b is already in use", [Flow])))
+    end;
+flow(_Request, _State) ->
+    {ok, undefined}.
 
 start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
     #state{config = #{requests := Requests} = Config} = State,
@@ -758,7 +785,9 @@ start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
             infinity -> infinity;
             _ -> erlang:monotonic_time(millisecond) + Timeout
         end,
+    Credit = trevrpc_datagram_flows:credit(),
     Spec = #{
+        flow => flow_spec(Entry#entry.flow, Credit),
         transport => State#state.transport,
         id => Id,
         ref => Entry#entry.ref,
@@ -774,6 +803,7 @@ start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
         stream_requests => Decode
     },
     {Pid, Monitor} = trevrpc_server_call:start(Spec),
+    Flows = register_flow(Entry, Pid, Credit, Request, State#state.flows),
     Running = Entry#entry{
         state = running,
         pid = Pid,
@@ -787,8 +817,21 @@ start_call(Id, Entry, Request, Route, Metadata, Timeout, Rest, Decode, State) ->
     },
     State#state{
         streams = (State#state.streams)#{Id := Running},
-        monitors = (State#state.monitors)#{Monitor => Id}
+        monitors = (State#state.monitors)#{Monitor => Id},
+        flows = Flows
     }.
+
+flow_spec(undefined, _Credit) -> undefined;
+flow_spec(Flow, Credit) -> {Flow, Credit}.
+
+%% The call's flow is its own from now on: the datagrams that arrived for it
+%% before its REQUEST go to it now.
+register_flow(#entry{flow = undefined}, _Pid, _Credit, _Request, Flows) ->
+    Flows;
+register_flow(#entry{flow = Flow, ref = Ref}, Pid, Credit, #{kind := Kind}, Flows) ->
+    Receives = trevrpc_wire:streams_requests(Kind),
+    {ok, Registered} = trevrpc_datagram_flows:register(Flow, Pid, Ref, Credit, Receives, Flows),
+    Registered.
 
 %% Ends a stream that has no call yet with a lone STATUS.
 refuse(Id, Entry, Status, State) ->
@@ -900,15 +943,24 @@ release(Id, #entry{pid = Pid} = Entry, #state{active = Active, config = Config} 
     }.
 
 %% Forgets the stream, giving back the stream compression memory its call
-%% held.
-remove(Id, #state{streams = Streams, config = Config} = State) ->
-    case Streams of
-        #{Id := #entry{reserved = Reserved}} ->
-            trevrpc_zstd_stream:release(maps:get(stream_budget, Config), Reserved);
-        #{} ->
-            ok
-    end,
-    State#state{streams = maps:remove(Id, Streams), active_at = erlang:monotonic_time(millisecond)}.
+%% held, and its datagram flow.
+remove(Id, #state{streams = Streams, config = Config, flows = Flows} = State) ->
+    Released =
+        case Streams of
+            #{Id := #entry{reserved = Reserved, flow = Flow}} ->
+                trevrpc_zstd_stream:release(maps:get(stream_budget, Config), Reserved),
+                case Flow of
+                    undefined -> Flows;
+                    _ -> trevrpc_datagram_flows:release(Flow, Flows)
+                end;
+            #{} ->
+                Flows
+        end,
+    State#state{
+        streams = maps:remove(Id, Streams),
+        active_at = erlang:monotonic_time(millisecond),
+        flows = Released
+    }.
 
 start_timer(infinity, _Message) ->
     undefined;

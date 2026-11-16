@@ -18,6 +18,8 @@
 
 -define(MAX_CONNECTION_WINDOW, 16777216).
 -define(MAX_FRAME_HEADER, 16).
+%% The largest DATAGRAM frame a connection takes, as quinn advertises.
+-define(MAX_DATAGRAM_FRAME_SIZE, 65535).
 
 %% @doc The certificate, chain and key for TLS, from `cert', `cert_chain'
 %% and `key' (DER certificates and a decoded key), or from `certfile' and
@@ -103,7 +105,9 @@ transport_opts(MaxFrameSize, Streams, IdleTimeout) ->
         max_stream_data_uni => 0,
         max_data => ConnectionWindow,
         max_receive_window => ConnectionWindow,
-        notify_streams_available => true
+        notify_streams_available => true,
+        %% Datagram messages: a DATAGRAM frame of any size the path carries.
+        max_datagram_frame_size => ?MAX_DATAGRAM_FRAME_SIZE
     }.
 
 %% @doc The QMux transport parameters of a session receiving on up to

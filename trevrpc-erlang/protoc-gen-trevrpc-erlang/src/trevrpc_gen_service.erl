@@ -414,6 +414,7 @@ schema_options(Context, Method, {Input, InputOp}, {Output, OutputOp}) ->
         ["response_type => <<\"", Output, "\">>"]
     ] ++
         compression(Context, Method) ++
+        unreliable(Method) ++
         [
             [
                 "codec => #{\n",
@@ -460,6 +461,15 @@ compression(#{messages := Messages}, Method) ->
                     "}"
                 ]
             ]
+    end.
+
+%% The directions whose messages may travel as datagrams, as
+%% `trevrpc_datagram:unreliable()': the method's flags, which only streaming
+%% directions may carry.
+unreliable(#{unreliable_requests := Requests, unreliable_responses := Responses}) ->
+    case [Key || {Key, true} <- [{"requests", Requests}, {"responses", Responses}]] of
+        [] -> [];
+        Keys -> [["unreliable => #{", lists:join(", ", [[Key, " => true"] || Key <- Keys]), "}"]]
     end.
 
 %% Whether message type `Name' has a field marked `debug_redact', itself or
