@@ -142,7 +142,7 @@ one table per profile, and each JSON record carries the profile as `netem`.
 - `loss 1%` drops packets independently, which real links rarely do: Wi-Fi
   and cellular retransmit below IP, so their losses show up as delay, and what
   is lost goes in bursts. netem's Gilbert-Elliott model, `loss gemodel P R
-1-H 1-K`, drops in bursts: it enters a bad state with probability `P` per
+  1-H 1-K`, drops in bursts: it enters a bad state with probability `P` per
   packet, leaves it with probability `R`, and loses `1-H` of the packets in it
   (`1-K` in the good state). The `lossy` table runs two such profiles, of
   about 1% and 3% loss, beside `loss 1%` for comparison.

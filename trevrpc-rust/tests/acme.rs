@@ -252,7 +252,7 @@ async fn try_start(
         dir,
         &format!("pebble-challtestsrv-{attempt}"),
         Command::new("pebble-challtestsrv").args([
-            "-dns01",
+            "-dnsserver",
             &dns_addr.to_string(),
             "-defaultIPv4",
             "127.0.0.1",
@@ -378,7 +378,11 @@ async fn https_get(
         .connect(ServerName::try_from("127.0.0.1")?, stream)
         .await?;
     stream
-        .write_all(format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+        // Pebble rejects requests without a User-Agent, as RFC 8555 section 6.1 requires one.
+        .write_all(
+            format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nUser-Agent: trevrpc-test\r\n\r\n")
+                .as_bytes(),
+        )
         .await?;
     let mut response = Vec::new();
     // Pebble may close without close_notify; the response is complete by then.

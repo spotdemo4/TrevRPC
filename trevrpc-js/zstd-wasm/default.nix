@@ -35,6 +35,9 @@ stdenv.mkDerivation {
     lld
     binaryen
   ];
+  # cargoSetupHook would point zstd-sys at a system libzstd, which a wasm32-unknown-unknown build
+  # doesn't have; the module needs the bundled libzstd with its wasm shims.
+  dontCargoUseSystemLibs = true;
 
   # zstd-sys compiles libzstd with cc; the wrapped compilers target the build machine, so the C
   # side uses the bare LLVM tools.

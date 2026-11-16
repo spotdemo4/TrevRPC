@@ -182,7 +182,7 @@ func tryStartPebble(t *testing.T, dir, certFile, keyFile string, validationPort 
 	managementAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freeTestPort(t, "tcp")))
 
 	dns := startTestProcess(t, nil, "pebble-challtestsrv",
-		"-dns01", dnsAddr,
+		"-dnsserver", dnsAddr,
 		"-defaultIPv4", "127.0.0.1",
 		// Pebble validates the first address, which would be an IPv6 one.
 		"-defaultIPv6", "",

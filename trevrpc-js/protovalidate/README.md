@@ -13,9 +13,9 @@ npm install @trevrpc/protovalidate @trevrpc/trevrpc-js @bufbuild/protobuf @bufbu
 Generate the messages with `protoc-gen-es` as usual, with `buf/validate/validate.proto` on the include path (or a `buf.build/bufbuild/protovalidate` dependency in `buf.yaml`), and pass a request validator to `createClient`:
 
 ```ts
-import { createClient } from "@trevrpc/trevrpc-js";
-import { createRequestValidator } from "@trevrpc/protovalidate";
 import { ViolationsSchema } from "@bufbuild/protovalidate/gen/buf/validate/validate_pb.js";
+import { createRequestValidator } from "@trevrpc/protovalidate";
+import { createClient } from "@trevrpc/trevrpc-js";
 
 import { Users } from "./gen/users/v1/users_pb.js";
 

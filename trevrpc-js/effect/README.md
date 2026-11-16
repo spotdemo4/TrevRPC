@@ -11,8 +11,8 @@ npm install @trevrpc/effect @trevrpc/trevrpc-js @bufbuild/protobuf effect
 ```
 
 ```ts
-import { createChannel } from "@trevrpc/trevrpc-js";
 import { createEffectClient } from "@trevrpc/effect";
+import { createChannel } from "@trevrpc/trevrpc-js";
 import { Stream } from "effect";
 
 import { Greeter } from "./gen/greeter/v1/greeter_pb.js";

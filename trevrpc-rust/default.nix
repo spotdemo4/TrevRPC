@@ -34,6 +34,9 @@ mkRustPackage (final: {
   cargoBuildFlags = [ "--workspace" ];
   # The build script of prost-protovalidate-types, which trevrpc-protovalidate needs, runs protoc.
   nativeBuildInputs = [ protobuf ];
+  # Build the bundled C libraries (libzstd) that crates.io users get by default, instead of the
+  # system ones that cargoSetupHook would otherwise make the -sys crates link.
+  dontCargoUseSystemLibs = true;
 
   doCheck = true;
   # The tests and benchmarks bind loopback UDP sockets and run the interop executable against itself.
