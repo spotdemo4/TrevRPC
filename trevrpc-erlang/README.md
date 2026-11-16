@@ -1,6 +1,6 @@
 # trevrpc-erlang
 
-The Erlang runtime for TrevRPC. It is the core that a Gleam package (`trevrpc-gleam`) will wrap with a typed API and generated stubs, and Elixir can use it directly.
+The Erlang runtime for TrevRPC. It is the core that [trevrpc-gleam](../trevrpc-gleam) wraps with a typed API and generated stubs, and Elixir can use it directly.
 
 > **Status:** early work in progress, not published. Progress is tracked in [#477](https://trev.zip/llc/TrevRPC/issues/477).
 
@@ -154,36 +154,9 @@ ok = trevrpc_client:send(Call, #{name => <<"you">>}),
 
 The generated modules need nothing but the runtime. The escript carries gpb, which is LGPL-2.1-or-later; the code gpb generates is not covered by that license.
 
-### Gleam messages
+### Gleam
 
-The same escript, run as `protoc-gen-trevrpc-gleam` (the Nix package installs both names), generates Gleam types for a proto file's messages, which gpb encodes and decodes, so Gleam needs no protobuf runtime of its own. Gleam's custom types compile to tagged tuples (`Point(x: 1, y: 2)` is `{point, 1, 2}`), which are gpb's records once they take the Gleam constructors' names. Generate into a Gleam project's `src/`, with every proto file the ones you generate import, `google/protobuf/*.proto` included:
-
-```sh
-protoc --plugin=protoc-gen-trevrpc-gleam=path/to/protoc-gen-trevrpc-gleam \
-    -I proto --trevrpc-gleam_out=src example/shapes/v1/shapes.proto
-```
-
-For `example/shapes/v1/shapes.proto` it writes the module `example/shapes/v1/shapes.gleam`, and beside it gpb's module `example@shapes@v1@shapes_pb.erl` (with its `.hrl`) and `example@shapes@v1@shapes_shim.erl`, which converts the fields whose representations differ:
-
-```gleam
-import example/shapes/v1/shapes.{Corner, Shape}
-import gleam/option.{Some}
-
-let shape = Shape(..shapes.new_shape(), name: "square", kind: Some(Corner(shapes.Point(1, 2))))
-let bytes = shapes.encode_shape(shape)
-let assert Ok(decoded) = shapes.decode_shape(bytes)
-```
-
-- A message is a type with one constructor, its fields labelled with their names in snake case (a Gleam keyword gets an underscore after it, `type_`). Nested types take their parents' names, `Shape.Style` is `ShapeStyle`.
-- proto3 `optional` fields, message fields and oneofs are `Option`s, so a field set to its default stays apart from an unset one. A repeated field is a `List`, a map a `Dict`, bytes a `BitArray`, and every integer an `Int`.
-- An enum is a type with a constructor per value (`COLOR_RED` is `ColorRed`, prefixed with the enum's name where the value is not), and `ColorUnrecognized(Int)` for a value the schema does not know.
-- A oneof is a type with a constructor per field, named after the field (`Corner(Point)`), or after the oneof and the field (`ShapeKindCorner`) where the short name is taken.
-- `new_*` gives a message with every field at its default, as Gleam constructors list every field. `encode_*` and `decode_*` use the wire format; `decode_*` returns `Error(Nil)` for malformed data, for a string that is not UTF-8, and for a float that is infinite or NaN, which a Gleam `Float` cannot hold. `encode_*` panics on a `BitArray` field that does not hold whole bytes.
-- Unknown fields are dropped. Groups and editions files are refused, as are names Gleam cannot take or tell apart: module paths that are not lower-case, types or constructors that would collide or hide Gleam's own (`Result`, `Ok`), and two messages one file uses that would share a constructor name in gpb's module (`a.v1.Point` and `b.v1.Point`).
-- A message whose fields all match gpb's representation goes to gpb untouched; the shim converts the others, and checks their strings, in a pass over the message on each encode or decode.
-- Services are not generated yet: their stubs come with trevrpc-gleam, the typed binding to this runtime.
-
-`test/gleam` in the plugin's directory is a Gleam project that runs the generated code: `test/gleam/test.sh` generates it, runs its tests, and checks with protoc that its bytes decode as expected.
+`protoc-gen-trevrpc-gleam`, in [trevrpc-gleam](../trevrpc-gleam#code-generation), builds on this plugin: it carries its modules, which make gpb's modules, check methods and read their options, and the plugin protocol (`trevrpc_gen_plugin`). Changes here reach it too, and its tests share `test/support` and `test/proto`.
 
 ## Compression
 
@@ -256,6 +229,8 @@ rebar3 xref
 rebar3 dialyzer
 ```
 
-`nix build .#trevrpc-erlang` runs all three. `nix fmt` formats the sources with erlfmt. The same commands work in `protoc-gen-trevrpc-erlang/`, whose tests also need `protoc`, and `nix build .#trevrpc-erlang` runs them too, as it builds the plugin it provides. Its Gleam fixture needs `gleam` as well (`nix shell nixpkgs#gleam`), and the `trevrpc-erlang-protoc-gen-gleam` check runs it. The interop executable's bindings, in `interop/src/generated`, are regenerated with `interop/generate.sh`, and a check fails when they differ from what the plugin generates.
+`nix build .#trevrpc-erlang` runs all three. `nix fmt` formats the sources with erlfmt. The same commands work in `protoc-gen-trevrpc-erlang/`, whose tests also need `protoc`, and `nix build .#trevrpc-erlang` runs them too, as it builds the plugin it provides. The interop executable's bindings, in `interop/src/generated`, are regenerated with `interop/generate.sh`, and a check fails when they differ from what the plugin generates.
 
-The Hex dependencies are declared in `rebar.config` and pinned in `rebar.lock`, which is the one place their versions and hashes live: after changing a dependency, update the lock with `rebar3 upgrade`, and the Nix package reads versions and tarball hashes from it.
+`gleam.toml` lets Gleam build this application from its sources, so that trevrpc-gleam can depend on it by path; the `trevrpc-gleam-versions` check (`trevrpc-gleam/check-versions.py`) keeps its version, ranges and the versions trevrpc-gleam locks in step with rebar3's files.
+
+The Hex dependencies are declared in `rebar.config` and pinned in `rebar.lock`, which is the one place their versions and hashes live: after changing a dependency, update the lock with `rebar3 upgrade`, and the Nix package reads versions and tarball hashes from it. Change `gleam.toml`'s range to match, and lock the same version in trevrpc-gleam with `gleam update`.

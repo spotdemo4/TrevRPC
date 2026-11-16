@@ -14,6 +14,13 @@ erlang:
           - "**/rebar.config"
           - "**/rebar.lock"
 
+gleam:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.gleam"
+          - "**/gleam.toml"
+          - trevrpc-gleam/**
+
 go:
   - changed-files:
       - any-glob-to-any-file:

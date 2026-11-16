@@ -1,0 +1,10 @@
+{application, protoc_gen_trevrpc_gleam, [
+    {description, "protoc plugin generating Gleam code for TrevRPC services"},
+    {vsn, "1.11.1"},
+    {registered, []},
+    {applications, [kernel, stdlib, gpb, protoc_gen_trevrpc_erlang]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"Source", "https://trev.zip/llc/TrevRPC"}]}
+]}.

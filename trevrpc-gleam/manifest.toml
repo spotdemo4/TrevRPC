@@ -1,0 +1,23 @@
+# Do not manually edit this file, it is managed by Gleam.
+#
+# This file locks the dependency versions used, to make your build
+# deterministic and to prevent unexpected versions from being included
+# in your application.
+#
+# You should check this file into your source control repository.
+
+packages = [
+  { name = "erlang_h1", version = "0.11.0", build_tools = ["rebar3"], requirements = [], otp_app = "h1", source = "hex", outer_checksum = "EE34B740EBBE5B0AC31BA653B345D3D82C814757F6711EEECABA9519D9A3781D" },
+  { name = "erlang_ws", version = "0.5.0", build_tools = ["rebar3"], requirements = [], otp_app = "ws", source = "hex", outer_checksum = "CAD7961A5AF19C463948A77DDE525E43D55D71F709A21AE3EA929EC6E50B065F" },
+  { name = "gleam_stdlib", version = "1.0.5", build_tools = ["gleam"], requirements = [], otp_app = "gleam_stdlib", source = "hex", outer_checksum = "CEE5B6C076A85B45F60C585F4316C63EC8B7127C119D5738C3958A9C4D50404E" },
+  { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleeunit", source = "hex", outer_checksum = "EC31ABA74256AEA531EDF8169931D775BBB384FED0A8A1BDC4DD9354E3E21826" },
+  { name = "h2", version = "0.18.0", build_tools = ["rebar3"], requirements = [], otp_app = "h2", source = "hex", outer_checksum = "11824E2963716B1DF80A1F2C6C1EB31E67BF2176931E6FBC74C362E0F872539A" },
+  { name = "idna", version = "8.0.0", build_tools = ["rebar3"], requirements = [], otp_app = "idna", source = "hex", outer_checksum = "E0C5CE7846F14515AF66142A55B8097D5F46D10DF9235E781F168BEF5622BCF9" },
+  { name = "quic", version = "3.1.0", build_tools = ["rebar3"], requirements = ["idna"], otp_app = "quic", source = "hex", outer_checksum = "3F70147CDC6C5BB3DF2C08D4C04C7263620D59069FA5A38FF7D946451F13B265" },
+  { name = "trevrpc", version = "1.11.1", build_tools = ["gleam"], requirements = ["erlang_h1", "erlang_ws", "h2", "quic"], source = "local", path = "../trevrpc-erlang" },
+]
+
+[requirements]
+gleam_stdlib = { version = ">= 0.44.0 and < 2.0.0" }
+gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
+trevrpc = { path = "../trevrpc-erlang" }

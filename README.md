@@ -311,9 +311,13 @@ the Erlang runtime is in progress and not published yet ([#477](https://trev.zip
 `protoc-gen-trevrpc-erlang` generates [gpb](https://github.com/tomas-abrahamsson/gpb) message modules and
 service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
 `trevrpc-erlang/protoc-gen-trevrpc-erlang/`. See [`trevrpc-erlang`](trevrpc-erlang#code-generation).
-The same escript, run as `protoc-gen-trevrpc-gleam` (the nix package installs both), generates Gleam types
-for messages that gpb encodes and decodes; Gleam service stubs are not generated yet. See
-[Gleam messages](trevrpc-erlang#gleam-messages).
+
+### gleam
+
+[`trevrpc-gleam`](trevrpc-gleam), the typed Gleam binding to the Erlang runtime, is in progress too.
+`protoc-gen-trevrpc-gleam` generates Gleam types for messages, which gpb encodes and decodes, and service
+modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
+`trevrpc-gleam/protoc-gen-trevrpc-gleam/`. See [`trevrpc-gleam`](trevrpc-gleam#code-generation).
 
 ### nix
 
@@ -325,6 +329,7 @@ nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-gleam
 ```
 
 ### download

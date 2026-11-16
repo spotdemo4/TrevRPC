@@ -15,7 +15,7 @@
 %% the codecs encode and decode with.
 -module(trevrpc_gen_service).
 
--export([check/2, generate/2]).
+-export([check/2, check_files/1, generate/2, modes/2]).
 
 -export_type([context/0]).
 
@@ -39,6 +39,14 @@
 %% after.
 -define(RESERVED, [<<"routes">>, <<"module_info">>, <<"behaviour_info">>]).
 
+%% @doc Checks the services of `Files' (see check/2): the first error.
+-spec check_files([trevrpc_gen_descriptor:file()]) -> ok | {error, binary()}.
+check_files(Files) ->
+    trevrpc_gen_errors:first([
+        check(Package, Service)
+     || #{package := Package, services := Services} <- Files, Service <- Services
+    ]).
+
 %% @doc Checks that a service's methods have distinct function names, none
 %% of them taken, and options that apply to them.
 -spec check(binary(), trevrpc_gen_descriptor:service()) -> ok | {error, binary()}.
@@ -47,16 +55,18 @@ check(Package, #{name := Service, methods := Methods}) ->
     Named = [{trevrpc_gen_names:snake(Name), Name} || #{name := Name} <- Methods],
     Errors =
         [
-            format("service ~ts RPC methods ~ts and ~ts both require generated function ~ts", [
-                Full, First, Second, Snake
-            ])
+            trevrpc_gen_errors:format(
+                "service ~ts RPC methods ~ts and ~ts both require generated function ~ts", [
+                    Full, First, Second, Snake
+                ]
+            )
          || {Snake, First} <- Named,
             {S, Second} <- Named,
             S =:= Snake,
             First < Second
         ] ++
             [
-                format(
+                trevrpc_gen_errors:format(
                     "service ~ts RPC method ~ts requires generated function ~ts, which is taken", [
                         Full, Name, Snake
                     ]
@@ -79,22 +89,22 @@ method_errors(Service, #{name := Name} = Method) ->
     } = Method,
     Full = <<Service/binary, ".", Name/binary>>,
     [
-        format("~ts: COMPRESSION_STREAM requires a streaming method", [Full])
+        trevrpc_gen_errors:format("~ts: COMPRESSION_STREAM requires a streaming method", [Full])
      || Compression =:= ?STREAM, not Requests, not Responses
     ] ++
         [
-            format("~ts: unknown compression ~b", [Full, Compression])
+            trevrpc_gen_errors:format("~ts: unknown compression ~b", [Full, Compression])
          || Compression > ?STREAM
         ] ++
         [
-            format(
+            trevrpc_gen_errors:format(
                 "~ts: unreliable_requests requires a client-streaming or bidirectional method",
                 [Full]
             )
          || UnreliableRequests, not Requests
         ] ++
         [
-            format(
+            trevrpc_gen_errors:format(
                 "~ts: unreliable_responses requires a server-streaming or bidirectional method",
                 [Full]
             )
@@ -425,28 +435,10 @@ schema_options(Context, Method, {Input, InputOp}, {Output, OutputOp}) ->
             ]
         ].
 
-%% How a method's messages may be compressed without a dictionary, as
-%% `trevrpc_zstd:directions()': not at all without COMPRESSION_MESSAGE or
-%% COMPRESSION_STREAM, never for a side whose message type has a field
-%% marked `debug_redact', and with a context per call only for a side that
-%% streams.
+%% The `compression' of a method's route and calls, as
+%% `trevrpc_zstd:directions()' (see modes/2).
 compression(#{messages := Messages}, Method) ->
-    #{
-        compression := Compression,
-        input := Input,
-        output := Output,
-        client_streaming := StreamsRequests,
-        server_streaming := StreamsResponses
-    } = Method,
-    Mode = fun(Type, Streams) ->
-        case redacted(Type, Messages, #{}) of
-            true -> none;
-            false when Compression =:= ?STREAM, Streams -> stream;
-            false when Compression =/= ?UNSPECIFIED -> message;
-            false -> none
-        end
-    end,
-    case {Mode(Input, StreamsRequests), Mode(Output, StreamsResponses)} of
+    case modes(Messages, Method) of
         {none, none} ->
             [];
         {Same, Same} ->
@@ -471,6 +463,31 @@ unreliable(#{unreliable_requests := Requests, unreliable_responses := Responses}
         [] -> [];
         Keys -> [["unreliable => #{", lists:join(", ", [[Key, " => true"] || Key <- Keys]), "}"]]
     end.
+
+%% @doc How a method's messages may be compressed without a dictionary, as
+%% `{Requests, Responses}': not at all without COMPRESSION_MESSAGE or
+%% COMPRESSION_STREAM, never for a side whose message type has a field
+%% marked `debug_redact', and with a context per call only for a side that
+%% streams. `Messages' are the request's, by full name.
+-spec modes(#{binary() => trevrpc_gen_descriptor:message()}, trevrpc_gen_descriptor:method()) ->
+    {none | message | stream, none | message | stream}.
+modes(Messages, Method) ->
+    #{
+        compression := Compression,
+        input := Input,
+        output := Output,
+        client_streaming := StreamsRequests,
+        server_streaming := StreamsResponses
+    } = Method,
+    Mode = fun(Type, Streams) ->
+        case redacted(Type, Messages, #{}) of
+            true -> none;
+            false when Compression =:= ?STREAM, Streams -> stream;
+            false when Compression =/= ?UNSPECIFIED -> message;
+            false -> none
+        end
+    end,
+    {Mode(Input, StreamsRequests), Mode(Output, StreamsResponses)}.
 
 %% Whether message type `Name' has a field marked `debug_redact', itself or
 %% in a message type it contains; `Seen' ends recursive types.
@@ -502,6 +519,3 @@ path(Service, #{name := Name}) ->
 
 qualified(<<>>, Name) -> Name;
 qualified(Package, Name) -> <<Package/binary, ".", Name/binary>>.
-
-format(Format, Args) ->
-    unicode:characters_to_binary(io_lib:format(Format, Args)).

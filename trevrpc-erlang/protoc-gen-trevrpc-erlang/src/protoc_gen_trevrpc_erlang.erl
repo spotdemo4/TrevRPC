@@ -14,68 +14,29 @@
 %% - `pb_suffix': put after the names of message modules (`_pb');
 %% - `service_suffix': put after the names of service modules (none).
 %%
-%% Run as `protoc-gen-trevrpc-gleam' (the same escript under that name), it
-%% generates Gleam types for the messages instead, encoded and decoded by
-%% gpb (see {@link trevrpc_gen_gleam}); it takes no parameters.
+%% The plugin protocol and the modules protoc-gen-trevrpc-gleam builds on
+%% are shared with it: see {@link trevrpc_gen_plugin}.
 -module(protoc_gen_trevrpc_erlang).
 
--export([main/1, generate/1, generate/2]).
-
-%% CodeGeneratorResponse.Feature: FEATURE_PROTO3_OPTIONAL. Editions are
-%% not supported, so protoc refuses editions files.
--define(FEATURES, 1).
+-export([main/1, generate/1]).
 
 %% @doc Runs the plugin: reads a `CodeGeneratorRequest' from standard input
 %% and writes the `CodeGeneratorResponse'.
 -spec main([string()]) -> no_return().
 main(_Args) ->
-    ok = io:setopts(standard_io, [binary, {encoding, latin1}]),
-    Request = read(<<>>),
-    ok = file:write(standard_io, generate(target(escript:script_name()), Request)),
-    halt(0).
+    trevrpc_gen_plugin:main(fun files/1).
 
-%% What to generate: Gleam when the escript runs as protoc-gen-trevrpc-gleam.
-target(Script) ->
-    case filename:basename(Script) of
-        "protoc-gen-trevrpc-gleam" ++ _ -> gleam;
-        _ -> erlang
-    end.
-
-read(Acc) ->
-    case file:read(standard_io, 65536) of
-        {ok, Data} -> read(<<Acc/binary, Data/binary>>);
-        eof -> Acc
-    end.
-
-%% @doc The `CodeGeneratorResponse' to a `CodeGeneratorRequest', with
-%% Erlang code. Failures go in its `error' field, as protoc expects.
+%% @doc The `CodeGeneratorResponse' to a `CodeGeneratorRequest'. Failures
+%% go in its `error' field, as protoc expects.
 -spec generate(binary()) -> iodata().
 generate(Bin) ->
-    generate(erlang, Bin).
+    trevrpc_gen_plugin:generate(fun files/1, Bin).
 
-%% @doc The `CodeGeneratorResponse' to a `CodeGeneratorRequest', with Erlang
-%% or Gleam code.
--spec generate(erlang | gleam, binary()) -> iodata().
-generate(Target, Bin) ->
-    Response =
-        maybe
-            {ok, Request} ?= trevrpc_gen_descriptor:decode_request(Bin),
-            {ok, Files} ?= target_files(Target, Request),
-            #{supported_features => ?FEATURES, files => Files}
-        else
-            {error, Message} -> #{error => Message}
-        end,
-    trevrpc_gen_descriptor:encode_response(Response).
-
-target_files(erlang, Request) ->
+files(Request) ->
     maybe
         {ok, Options} ?= options(maps:get(parameter, Request)),
         files(Request, Options)
-    end;
-target_files(gleam, #{parameter := <<>>} = Request) ->
-    trevrpc_gen_gleam:files(Request);
-target_files(gleam, #{parameter := Parameter}) ->
-    {error, <<"protoc-gen-trevrpc-gleam takes no parameters, got \"", Parameter/binary, "\"">>}.
+    end.
 
 options(Parameter) ->
     Defaults = #{
@@ -139,17 +100,11 @@ files(#{files_to_generate := Names, files := Files, file_set := FileSet}, Option
     ]),
     Generate = [maps:get(Name, ByName) || Name <- Names],
     maybe
-        ok ?= check_services(Generate),
+        ok ?= trevrpc_gen_service:check_files(Generate),
         ok ?= check_modules(Generate, Options),
         {ok, Defs} ?= trevrpc_gen_messages:defs(FileSet),
         generated(Generate, Defs, Messages, Format, Options, [])
     end.
-
-check_services(Files) ->
-    first_error([
-        trevrpc_gen_service:check(Package, Service)
-     || #{package := Package, services := Services} <- Files, Service <- Services
-    ]).
 
 %% Every generated module needs a name no other one has.
 check_modules(Files, Options) ->
@@ -166,7 +121,7 @@ check_modules(Files, Options) ->
         ]
      || #{name := Name, package := Package, services := Services} <- Files
     ]),
-    first_error([
+    trevrpc_gen_errors:first([
         {error, <<First/binary, " and ", Second/binary, " both require module ", Module/binary>>}
      || {Module, First} <- Modules,
         {M, Second} <- Modules,
@@ -176,12 +131,6 @@ check_modules(Files, Options) ->
 
 qualified(<<>>, Name) -> Name;
 qualified(Package, Name) -> <<Package/binary, ".", Name/binary>>.
-
-first_error(Results) ->
-    case [Error || {error, _} = Error <- Results] of
-        [] -> ok;
-        [Error | _] -> Error
-    end.
 
 generated([], _Defs, _Messages, _Format, _Options, Acc) ->
     {ok, lists:append(lists:reverse(Acc))};

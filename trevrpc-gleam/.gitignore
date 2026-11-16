@@ -1,0 +1,4 @@
+/build
+# What test.sh generates.
+/test/greet
+/test/trevrpc

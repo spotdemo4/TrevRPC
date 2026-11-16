@@ -1,0 +1,48 @@
+// The service the tests serve and call through the generated stubs.
+syntax = "proto3";
+
+package greet.v1;
+
+import "trevrpc/options.proto";
+
+message HelloRequest {
+  string name = 1;
+  int32 count = 2;
+  // Fails the call with this message, as INVALID_ARGUMENT: SayHello at once,
+  // Countdown after its first reply.
+  optional string fail = 3;
+  // Milliseconds SayHello waits before it replies.
+  int32 delay = 4;
+}
+
+message HelloReply {
+  string message = 1;
+  int32 index = 2;
+}
+
+service Greeter {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+  // `count` replies.
+  rpc Countdown(HelloRequest) returns (stream HelloReply);
+  // The names, joined.
+  rpc Collect(stream HelloRequest) returns (HelloReply);
+  // A reply per request.
+  rpc Chat(stream HelloRequest) returns (stream HelloReply);
+  // A reply per request, and in the trailers how many requests arrived, and
+  // how many of them as datagrams.
+  rpc Telemetry(stream HelloRequest) returns (stream HelloReply) {
+    option (trevrpc.method) = {
+      unreliable_requests: true
+      unreliable_responses: true
+      compression: COMPRESSION_MESSAGE
+    };
+  }
+  // Named as every module the generated code imports from trevrpc, whose
+  // functions must not break the code that uses those modules.
+  rpc Channel(HelloRequest) returns (HelloReply);
+  rpc Client(HelloRequest) returns (HelloReply);
+  rpc Handler(HelloRequest) returns (HelloReply);
+  rpc Schema(HelloRequest) returns (HelloReply);
+  rpc Server(HelloRequest) returns (HelloReply);
+  rpc Status(HelloRequest) returns (HelloReply);
+}

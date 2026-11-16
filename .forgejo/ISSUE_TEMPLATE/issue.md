@@ -19,6 +19,7 @@ An issue that spans several gets all of them (e.g. go + rust).
   package.json     npm packaging and dependencies              node
   trevrpc-kotlin/  Android Cronet client                       kotlin
   trevrpc-erlang/  Erlang runtime                             erlang
+  trevrpc-gleam/   Gleam binding, Gleam codegen (*.gleam)      gleam
   proto/, *.proto  protocol definitions, generated-code shape  proto
   interop/, bench/ Python harnesses                            python
   *.nix            flake, packaging, checks                    nix

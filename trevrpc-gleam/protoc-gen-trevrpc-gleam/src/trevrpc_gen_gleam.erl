@@ -33,11 +33,13 @@
 %% - messages without fields: Gleam makes their constructor an atom, gpb a
 %%   one-element tuple.
 %%
-%% Unknown fields are dropped, as gpb drops them. Services are left for the
-%% service stubs that use trevrpc-gleam.
+%% Unknown fields are dropped, as gpb drops them. Each service gets a module
+%% of its own, over trevrpc-gleam (see {@link trevrpc_gen_gleam_service}).
 -module(trevrpc_gen_gleam).
 
 -export([files/1, gleam_snake/1, upper_camel/1]).
+%% Used by trevrpc_gen_gleam_service.
+-export([label/1, alias/2, type_name_of/2]).
 
 -define(KEYWORDS, [
     <<"as">>,
@@ -79,6 +81,19 @@
     <<"Dict">>
 ]).
 -define(TAKEN_CONSTRUCTORS, [<<"True">>, <<"False">>, <<"Nil">>, <<"Ok">>, <<"Error">>]).
+
+%% Modules the generated code imports, whose names a proto file's module
+%% cannot take as its alias.
+-define(TAKEN_ALIASES, [
+    <<"dict">>,
+    <<"option">>,
+    <<"channel">>,
+    <<"client">>,
+    <<"handler">>,
+    <<"schema">>,
+    <<"server">>,
+    <<"status">>
+]).
 
 -define(INTS, [
     int32, int64, uint32, uint64, sint32, sint64, fixed32, fixed64, sfixed32, sfixed64
@@ -128,9 +143,23 @@ upper(C) -> C.
 -spec files(map()) -> {ok, [{binary(), iodata()}]} | {error, binary()}.
 files(#{files_to_generate := Names, files := Files, file_set := FileSet}) ->
     maybe
+        ok ?=
+            trevrpc_gen_service:check_files([
+                File
+             || #{name := Name} = File <- Files, lists:member(Name, Names)
+            ]),
         {ok, Defs} ?= trevrpc_gen_messages:defs(FileSet),
         {ok, World} ?= world(Defs, [Name || #{name := Name} <- Files]),
-        generate(Names, Defs, World, [])
+        Descriptors = #{
+            descriptors => maps:from_list([{Name, File} || #{name := Name} = File <- Files]),
+            %% Every message of the request, for the fields marked
+            %% debug_redact, as trevrpc_gen_service:modes/2 takes them.
+            descriptor_messages => maps:from_list([
+                {Name, Message}
+             || #{messages := Ms} <- Files, #{name := Name} = Message <- Ms
+            ])
+        },
+        generate(Names, Defs, maps:merge(World, Descriptors), [])
     end.
 
 generate([], _Defs, _World, Acc) ->
@@ -181,7 +210,7 @@ contains(_) -> false.
 no_groups(Defs) ->
     case [Name || {{group, Name}, _} <- Defs] of
         [] -> ok;
-        [Name | _] -> fail("~ts: groups are not supported", [Name])
+        [Name | _] -> trevrpc_gen_errors:new("~ts: groups are not supported", [Name])
     end.
 
 %% The Gleam module of each proto file: its path without `.proto', whose
@@ -205,7 +234,7 @@ module(Key, Name) ->
                 last => lists:last(Parts)
             }};
         false ->
-            fail(
+            trevrpc_gen_errors:new(
                 "~ts: a Gleam module needs a path of lower-case letters, digits and underscores, "
                 "each part starting with a letter",
                 [Name]
@@ -255,7 +284,7 @@ file_names(Key, #{owners := Owners, messages := Messages, enums := Enums} = Worl
                 [F || {_, Type} <- MessageNames, F <- message_functions(Type)],
                 []
             ),
-        ok ?= first_error([labels(Message, World) || {Message, _} <- MessageNames]),
+        ok ?= trevrpc_gen_errors:first([labels(Message, World) || {Message, _} <- MessageNames]),
         {ok,
             {Key, #{
                 messages => maps:from_list(MessageNames),
@@ -338,11 +367,11 @@ message_functions(Type) ->
 unique(What, Names, Taken) ->
     case [N || N <- Names, lists:member(N, Taken)] of
         [Name | _] ->
-            fail("Gleam ~ts ~ts is taken by Gleam itself", [What, Name]);
+            trevrpc_gen_errors:new("Gleam ~ts ~ts is taken by Gleam itself", [What, Name]);
         [] ->
             case Names -- lists:usort(Names) of
                 [] -> ok;
-                [Name | _] -> fail("two Gleam ~tss are named ~ts", [What, Name])
+                [Name | _] -> trevrpc_gen_errors:new("two Gleam ~tss are named ~ts", [What, Name])
             end
     end.
 
@@ -449,14 +478,43 @@ file(Name, Defs, #{files := Files, modules := Modules, owners := Owners} = World
             trevrpc_gen_messages:generate(Name, Pb, Defs, {records, Records}),
         ok ?= distinct_records(PbFiles, Pb),
         Context = World#{key => Key, pb => Pb, shim => Shim, own => Own},
+        {ok, ServiceFiles} ?= services(Name, Dir, Context),
         {ok,
             [{<<Dir/binary, File/binary>>, Data} || {File, Data} <- PbFiles] ++
                 [
                     {<<Path/binary, ".gleam">>, gleam_module(Name, Context)},
                     {<<Dir/binary, Shim/binary, ".erl">>, shim_module(Name, Context)}
-                ]}
+                ] ++ ServiceFiles}
     else
         {error, Message} -> {error, Message}
+    end.
+
+%% A module per service of the file, whose path no file's module has.
+services(Name, Dir, #{descriptors := Descriptors, modules := Modules} = Context) ->
+    #{package := Package, services := Services} = maps:get(Name, Descriptors),
+    Paths = [Path || _ := #{path := Path} <- Modules],
+    Results = [
+        begin
+            Path = trevrpc_gen_gleam_service:module_path(Dir, Service),
+            case lists:member(Path, Paths) of
+                true ->
+                    trevrpc_gen_errors:new(
+                        "service ~ts's module ~ts is a proto file's module too", [Service, Path]
+                    );
+                false ->
+                    case
+                        trevrpc_gen_gleam_service:generate(Name, S, Context#{package => Package})
+                    of
+                        {ok, Source} -> {ok, {<<Path/binary, ".gleam">>, Source}};
+                        {error, _} = Error -> Error
+                    end
+            end
+        end
+     || #{name := Service} = S <- Services
+    ],
+    case trevrpc_gen_errors:first(Results) of
+        ok -> {ok, [File || {ok, File} <- Results]};
+        Error -> Error
     end.
 
 %% The atom of a message's record: its Gleam constructor's.
@@ -481,7 +539,7 @@ distinct_records(Files, Pb) ->
         [] ->
             ok;
         [Record | _] ->
-            fail(
+            trevrpc_gen_errors:new(
                 "two messages this file uses would both be Gleam's ~ts, "
                 "which a gpb module cannot tell apart",
                 [Record]
@@ -551,10 +609,12 @@ types(Type) -> [Type].
 %% How a module refers to another file's module: by the last part of its
 %% path, or its whole path with underscores where that part is ambiguous or
 %% taken.
+-spec alias(term(), #{term() => #{path := binary(), last := binary(), atom() => term()}}) ->
+    binary().
 alias(Key, Modules) ->
     #{last := Last, path := Path} = maps:get(Key, Modules),
     Ambiguous =
-        lists:member(Last, [<<"dict">>, <<"option">>]) orelse
+        lists:member(Last, ?TAKEN_ALIASES) orelse
             length([K || K := #{last := L} <- Modules, L =:= Last]) > 1,
     case Ambiguous of
         true -> binary:replace(Path, <<"/">>, <<"_">>, [global]);
@@ -606,8 +666,9 @@ message_types(Message, Context) ->
     ],
     [{Message, MessageType} | Oneofs].
 
-%% A field's label: its name in snake case, with an underscore after a
-%% Gleam keyword.
+%% @doc A field's label, or a function's name: its name in snake case, with
+%% an underscore after a Gleam keyword.
+-spec label(binary()) -> binary().
 label(Name) ->
     Snake = trevrpc_gen_names:snake(Name),
     case lists:member(Snake, ?KEYWORDS) of
@@ -620,9 +681,12 @@ labels(Message, Context) ->
     Labels = [label(Label) || {Label, _, _} <- slots(Message, Context)],
     Valid = [L || L <- Labels, re:run(L, <<"^[a-z][a-z0-9_]*$">>, [{capture, none}]) =:= match],
     case {Labels -- Valid, Labels -- lists:usort(Labels)} of
-        {[], []} -> ok;
-        {[Label | _], _} -> fail("~ts: field ~ts cannot be a Gleam label", [Message, Label]);
-        {[], [Label | _]} -> fail("~ts: two fields are labelled ~ts in Gleam", [Message, Label])
+        {[], []} ->
+            ok;
+        {[Label | _], _} ->
+            trevrpc_gen_errors:new("~ts: field ~ts cannot be a Gleam label", [Message, Label]);
+        {[], [Label | _]} ->
+            trevrpc_gen_errors:new("~ts: two fields are labelled ~ts in Gleam", [Message, Label])
     end.
 
 gleam_type({scalar, int}, _Context) ->
@@ -740,6 +804,8 @@ default({msg, Message}, Context) ->
 names_of(Name, #{owners := Owners, names := Names}) ->
     maps:get(maps:get(Name, Owners), Names).
 
+%% @doc A message's or enum's type name in Gleam.
+-spec type_name_of(atom(), map()) -> binary().
 type_name_of(Name, Context) ->
     #{messages := Messages, enums := Enums} = names_of(Name, Context),
     case Messages of
@@ -1093,14 +1159,3 @@ enum_conversions(Way, Enum, Values, Context) ->
             from -> [Name, "(N) when is_integer(N) -> {", Unrecognized, ", N}"]
         end,
     [lists:join(";\n", Clauses ++ [Last]), ".\n\n"].
-
-%%% Errors
-
-first_error(Results) ->
-    case [Error || {error, _} = Error <- Results] of
-        [] -> ok;
-        [Error | _] -> Error
-    end.
-
-fail(Format, Args) ->
-    {error, unicode:characters_to_binary(io_lib:format(Format, Args))}.

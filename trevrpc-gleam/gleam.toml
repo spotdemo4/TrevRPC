@@ -1,0 +1,18 @@
+name = "trevrpc_gleam"
+version = "1.11.1"
+description = "Gleam binding for the TrevRPC Erlang runtime"
+licences = ["MIT"]
+target = "erlang"
+
+[repository]
+type = "forgejo"
+host = "https://trev.zip"
+user = "llc"
+repo = "TrevRPC"
+
+[dependencies]
+gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+trevrpc = { path = "../trevrpc-erlang" }
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"

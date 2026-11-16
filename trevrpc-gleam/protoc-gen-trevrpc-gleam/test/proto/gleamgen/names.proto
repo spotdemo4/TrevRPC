@@ -1,0 +1,12 @@
+// Two methods whose Gleam functions would share a name: Foo's foo_method
+// and FooMethod.
+syntax = "proto3";
+
+package gleamgen;
+
+message Empty {}
+
+service Names {
+  rpc Foo(Empty) returns (Empty);
+  rpc FooMethod(Empty) returns (Empty);
+}

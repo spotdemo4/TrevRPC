@@ -34,6 +34,16 @@ includes = ["*.erl", "*.hrl", "*.app.src", "rebar.config"]
 # Kept as protoc-gen-trevrpc-erlang generates them, which a check compares against.
 excludes = ["trevrpc-erlang/interop/src/generated/*"]
 
+[formatter.gleam]
+command = "gleam"
+options = ["format"]
+includes = ["*.gleam"]
+# Kept as protoc-gen-trevrpc-gleam generates them.
+excludes = [
+  "trevrpc-gleam/test/greet/**",
+  "trevrpc-gleam/protoc-gen-trevrpc-gleam/test/gleam/src/**",
+]
+
 [formatter.ruff]
 command = "ruff"
 options = ["format"]

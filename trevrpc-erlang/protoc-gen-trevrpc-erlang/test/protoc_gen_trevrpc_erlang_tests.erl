@@ -243,95 +243,6 @@ subdirectory_test() ->
     {ok, Files} = generate(["nested/v1/point.proto"], <<>>),
     ?assertEqual([<<"point_pb.erl">>], [Name || {Name, _} <- Files]).
 
-%%% Gleam
-
-%% The files of a proto file: its Gleam module where its path says, and
-%% gpb's module and the shim beside it.
-gleam_files_test() ->
-    {ok, Files} = generate(gleam, ["nested/v1/point.proto"], <<>>),
-    ?assertEqual(
-        [
-            <<"nested/v1/nested@v1@point_pb.erl">>,
-            <<"nested/v1/nested@v1@point_pb.hrl">>,
-            <<"nested/v1/nested@v1@point_shim.erl">>,
-            <<"nested/v1/point.gleam">>
-        ],
-        lists:sort([Name || {Name, _} <- Files])
-    ),
-    {_, Gleam} = lists:keyfind(<<"nested/v1/point.gleam">>, 1, Files),
-    ?assertNotEqual(nomatch, binary:match(Gleam, <<"pub type Point {\n  Point(\n    x: Int,">>)),
-    {_, Pb} = lists:keyfind(<<"nested/v1/nested@v1@point_pb.hrl">>, 1, Files),
-    %% gpb's record takes the Gleam constructor's name.
-    ?assertNotEqual(nomatch, binary:match(Pb, <<"-record(point,">>)).
-
-%% A file with enums and no messages: gpb's module has no records.
-gleam_enums_test() ->
-    {ok, Files} = generate(gleam, ["gleamgen/enums.proto"], <<>>),
-    {_, Gleam} = lists:keyfind(<<"gleamgen/enums.gleam">>, 1, Files),
-    ?assertNotEqual(nomatch, binary:match(Gleam, <<"pub type Level {\n  LevelUnspecified\n">>)),
-    {_, Shim} = lists:keyfind(<<"gleamgen/gleamgen@enums_shim.erl">>, 1, Files),
-    ?assertEqual(nomatch, binary:match(Shim, <<"-export">>)).
-
-gleam_errors_test_() ->
-    [
-        ?_assertEqual(
-            {error, <<"protoc-gen-trevrpc-gleam takes no parameters, got \"x=y\"">>},
-            generate(gleam, ["empty.proto"], <<"x=y">>)
-        ),
-        ?_assertEqual(
-            {error, <<
-                "gleamgen/both.proto: two messages this file uses would both be Gleam's point, "
-                "which a gpb module cannot tell apart"
-            >>},
-            generate(gleam, ["gleamgen/both.proto"], <<>>)
-        ),
-        ?_assertEqual(
-            {error, <<"two Gleam types are named ShapeKind">>},
-            generate(gleam, ["gleamgen/types.proto"], <<>>)
-        ),
-        ?_assertEqual(
-            {error, <<"gleamgen.Labels: two fields are labelled ab in Gleam">>},
-            generate(gleam, ["gleamgen/labels.proto"], <<>>)
-        ),
-        ?_assertEqual(
-            {error, <<"Gleam type Result is taken by Gleam itself">>},
-            generate(gleam, ["gleamgen/taken.proto"], <<>>)
-        ),
-        ?_assertEqual(
-            {error, <<
-                "gleamgen/Upper.proto: a Gleam module needs a path of lower-case letters, digits "
-                "and underscores, each part starting with a letter"
-            >>},
-            generate(gleam, ["gleamgen/Upper.proto"], <<>>)
-        )
-    ].
-
-%% As the Gleam compiler's to_snake_case and to_upper_camel_case, with
-%% which it names constructors' atoms and modules' types.
-gleam_names_test_() ->
-    [
-        ?_assertEqual(Want, trevrpc_gen_gleam:gleam_snake(Name))
-     || {Name, Want} <- [
-            {<<"ShapeStyle">>, <<"shape_style">>},
-            {<<"HTTPStatus">>, <<"h_t_t_p_status">>},
-            {<<"Point3D">>, <<"point3_d">>},
-            {<<"End">>, <<"end">>},
-            {<<"Ok">>, <<"ok">>}
-        ]
-    ] ++
-        [
-            ?_assertEqual(Want, trevrpc_gen_gleam:upper_camel(Name))
-         || {Name, Want} <- [
-                {<<"login_user">>, <<"LoginUser">>},
-                {<<"Int_Value">>, <<"IntValue">>},
-                {<<"wibble">>, <<"Wibble">>},
-                {<<"Wibble">>, <<"Wibble">>},
-                {<<"wibble__wobble_">>, <<"WibbleWobble">>},
-                {<<"Shape_Style">>, <<"ShapeStyle">>},
-                {<<>>, <<>>}
-            ]
-        ].
-
 %%% Failures
 
 errors_test_() ->
@@ -394,7 +305,7 @@ errors_test_() ->
 %% Proto3 optional fields, and no editions, which protoc then refuses to
 %% hand the plugin.
 features_test() ->
-    Fields = fields(
+    Fields = trevrpc_gen_test:fields(
         iolist_to_binary(protoc_gen_trevrpc_erlang:generate(request(["empty.proto"], <<>>)))
     ),
     ?assertEqual([1], [Features || {2, {varint, Features}} <- Fields]).
@@ -436,16 +347,10 @@ module_name_test() ->
 proto_dir() ->
     filename:join(filename:dirname(?FILE), "proto").
 
-options_dir() ->
-    case os:getenv("TREVRPC_PROTO") of
-        false -> filename:join([filename:dirname(?FILE), "..", "..", "..", "proto"]);
-        Dir -> Dir
-    end.
-
 %% The files generated for `Protos', compiled and loaded; returns their
 %% names.
 load({ok, Files}) ->
-    Dir = scratch(),
+    Dir = trevrpc_gen_test:scratch(),
     [ok = file:write_file(filename:join(Dir, Name), Content) || {Name, Content} <- Files],
     [
         begin
@@ -462,91 +367,13 @@ generated(Protos, Parameter) ->
     {ok, _} = generate(Protos, Parameter).
 
 generate(Protos, Parameter) ->
-    generate(erlang, Protos, Parameter).
+    response(request(Protos, Parameter)).
 
-generate(Target, Protos, Parameter) ->
-    response(Target, request(Protos, Parameter)).
+request(Protos, Parameter) ->
+    Options = trevrpc_gen_test:options_dir(
+        filename:join([filename:dirname(?FILE), "..", "..", "..", "proto"])
+    ),
+    trevrpc_gen_test:request(Protos, Parameter, [proto_dir(), Options]).
 
 response(Request) ->
-    response(erlang, Request).
-
-response(Target, Request) ->
-    Fields = fields(iolist_to_binary(protoc_gen_trevrpc_erlang:generate(Target, Request))),
-    case [Error || {1, {bytes, Error}} <- Fields] of
-        [Error] ->
-            {error, Error};
-        [] ->
-            {ok, [
-                {Name, Content}
-             || {15, {bytes, File}} <- Fields,
-                {1, {bytes, Name}} <- fields(File),
-                {15, {bytes, Content}} <- fields(File)
-            ]}
-    end.
-
-%% A CodeGeneratorRequest for `Protos', from the descriptors protoc writes.
-request(Protos, Parameter) ->
-    Set = filename:join(scratch(), "set.bin"),
-    Protoc = os:find_executable("protoc"),
-    ?assertNotEqual(false, Protoc),
-    Args =
-        [
-            "--include_imports",
-            "--descriptor_set_out=" ++ Set,
-            "-I",
-            proto_dir(),
-            "-I",
-            options_dir()
-        ] ++
-            Protos,
-    Port = open_port({spawn_executable, Protoc}, [
-        {args, Args}, exit_status, stderr_to_stdout, binary
-    ]),
-    ?assertEqual({0, <<>>}, wait(Port, <<>>)),
-    {ok, Bin} = file:read_file(Set),
-    iolist_to_binary([
-        [bytes(1, Proto) || Proto <- Protos],
-        bytes(2, Parameter),
-        [bytes(15, File) || {1, {bytes, File}} <- fields(Bin)]
-    ]).
-
-wait(Port, Output) ->
-    receive
-        {Port, {data, Data}} -> wait(Port, <<Output/binary, Data/binary>>);
-        {Port, {exit_status, Status}} -> {Status, Output}
-    end.
-
-scratch() ->
-    Dir = filename:join([
-        os:getenv("TMPDIR", "/tmp"),
-        "protoc_gen_trevrpc_erlang_tests",
-        integer_to_list(erlang:unique_integer([positive]))
-    ]),
-    ok = filelib:ensure_path(Dir),
-    Dir.
-
-bytes(Number, Payload) ->
-    Data = iolist_to_binary(Payload),
-    [varint((Number bsl 3) bor 2), varint(byte_size(Data)), Data].
-
-varint(Value) when Value < 128 -> <<Value>>;
-varint(Value) -> <<1:1, (Value band 127):7, (varint(Value bsr 7))/binary>>.
-
-fields(<<>>) ->
-    [];
-fields(Bin) ->
-    {Tag, Rest} = read_varint(Bin, 0, 0),
-    case Tag band 7 of
-        0 ->
-            {Value, Next} = read_varint(Rest, 0, 0),
-            [{Tag bsr 3, {varint, Value}} | fields(Next)];
-        2 ->
-            {Length, R} = read_varint(Rest, 0, 0),
-            <<Value:Length/binary, Next/binary>> = R,
-            [{Tag bsr 3, {bytes, Value}} | fields(Next)]
-    end.
-
-read_varint(<<0:1, B:7, Rest/binary>>, Shift, Acc) ->
-    {Acc bor (B bsl Shift), Rest};
-read_varint(<<1:1, B:7, Rest/binary>>, Shift, Acc) ->
-    read_varint(Rest, Shift + 7, Acc bor (B bsl Shift)).
+    trevrpc_gen_test:response(protoc_gen_trevrpc_erlang:generate(Request)).
