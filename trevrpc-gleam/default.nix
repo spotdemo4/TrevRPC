@@ -34,7 +34,9 @@ mkGleamPackage (finalAttrs: {
       ))
     ];
   };
-  gleamRoot = "trevrpc-gleam";
+  # sourceRoot, not gleamRoot, so that flake-release finds gleam.toml there; the rest of the
+  # source, with the runtime's path dependency, is still unpacked beside it.
+  sourceRoot = "${finalAttrs.src.name}/trevrpc-gleam";
 
   gleamLibrary = true;
   # The runtime needs Erlang/OTP 29.
@@ -43,7 +45,7 @@ mkGleamPackage (finalAttrs: {
 
   # gleam build compiles the tests too, with the test service's code.
   preBuild = ''
-    PROTOC_GEN_TREVRPC_GLEAM=${lib.getExe protocGen} bash trevrpc-gleam/generate.sh
+    PROTOC_GEN_TREVRPC_GLEAM=${lib.getExe protocGen} bash generate.sh
   '';
 
   postInstall = ''

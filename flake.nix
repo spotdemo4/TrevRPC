@@ -167,6 +167,11 @@
               jdk25
               gradle_9
               python3
+              # erlang and gleam: rebar3 hex needs the runtime's Erlang/OTP 29, and gleam builds
+              # trevrpc-gleam's rebar3 dependencies with rebar3 and runs escript
+              beamMinimal29Packages.erlang
+              beamMinimal29Packages.rebar3
+              gleam
             ];
           };
 
