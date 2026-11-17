@@ -1,4 +1,12 @@
-/build
+_build/
+build/
+erl_crash.dump
+rebar3.crashdump
+
 # What test.sh generates.
-/test/greet
-/test/trevrpc
+/test/greet/
+/test/trevrpc/
+
+# What protoc-gen-trevrpc-gleam's Gleam test generates.
+/protoc-gen-trevrpc-gleam/test/gleam/src/
+/protoc-gen-trevrpc-gleam/test/gleam/out/

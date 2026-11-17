@@ -1,2 +1,4 @@
 _build/
+/build/
+erl_crash.dump
 rebar3.crashdump

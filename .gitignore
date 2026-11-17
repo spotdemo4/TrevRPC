@@ -7,27 +7,7 @@
 .claude/
 .codex/
 
-# build
-build/
-dist/
-target/
-
-# go
-/trevrpc-go/bin/
-
-# javascript
-node_modules/
-/trevrpc-js/src/zstd-wasm.js
-
-# kotlin
-.gradle/
-.kotlin/
-
-# erlang
-erl_crash.dump
-rebar3.crashdump
-
-# python
+# python (pyproject.toml is at the root and covers every script)
 .ruff_cache/
 .venv/
 __pycache__/

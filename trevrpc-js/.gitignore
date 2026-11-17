@@ -1,0 +1,4 @@
+node_modules/
+build/
+/src/zstd-wasm.js
+/zstd-wasm/target/
