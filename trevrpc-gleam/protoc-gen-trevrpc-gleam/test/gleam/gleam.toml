@@ -1,7 +1,8 @@
 # Compiles and runs the Gleam code protoc-gen-trevrpc-gleam generates from
 # proto/, into src/, with test.sh.
 name = "fixture"
-version = "1.0.0"
+# 0.0.0 marks the fixture unversioned, so bumper neither bumps nor tags it.
+version = "0.0.0"
 target = "erlang"
 
 [dependencies]
