@@ -49,5 +49,5 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "npm@12.2.2"
+  "packageManager": "npm@12.2.3"
 }
