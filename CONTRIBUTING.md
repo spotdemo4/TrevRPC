@@ -59,6 +59,8 @@ nix fmt
 
 ### check
 
+`nix flake check` builds every package as the check `package_<name>`, and runs the repository-wide checks in `flake.nix` and each runtime's checks in its `checks.nix`, which are named after its directory: `lint` in `trevrpc-go/checks.nix` is `trevrpc-go-lint`.
+
 ```sh
 nix flake check
 ```

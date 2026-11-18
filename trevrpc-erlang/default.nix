@@ -30,6 +30,7 @@ in
       zstdGolden
       (lib.fileset.difference ./. (
         lib.fileset.unions [
+          ./checks.nix
           ./default.nix
           ./deps.nix
           ./gleam.nix

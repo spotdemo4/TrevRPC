@@ -117,7 +117,8 @@ stdenvNoCC.mkDerivation (final: {
       interopHarness
       interopProto
       trevrpcProto
-      ./.
+      # The flake's checks of the package, which the build doesn't read.
+      (lib.fileset.difference ./. ./checks.nix)
     ];
   };
   sourceRoot = "${final.src.name}/trevrpc-kotlin";

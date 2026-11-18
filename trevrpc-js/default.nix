@@ -52,6 +52,7 @@ let
           ./effect
           ./protovalidate
           ./protoc-gen-trevrpc-js/default.nix
+          ./checks.nix
           ./release-check.nix
           ./adapter.nix
         ]

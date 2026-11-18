@@ -400,235 +400,28 @@
           ];
         };
 
-        # nix flake check
+        # nix flake check, which also builds every package as the check package_<name>
         checks =
           let
             packages = self.packages.${system};
 
-            # golangci-lint over a Go module's packages.
-            goLint = src: {
-              inherit src;
-              packages = with pkgs; [ golangci-lint ];
-              script = ''
-                golangci-lint run ./...
-              '';
-            };
-
-            # oxfmt, and oxlint and tsc over an npm package with the code its build generates;
-            # `lint` runs oxlint, and `comment` says what the build generates for it.
-            jsLint =
-              src:
-              { comment, lint }:
-              {
-                inherit src;
-                packages = with pkgs; [
-                  oxfmt
-                  oxlint
-                ];
-                script = ''
-                  oxfmt --check
-                  ${comment}
-                  npm run build
-                  ${lint}
-                  npm exec -- tsc -p tsconfig.json
-                '';
-              };
-
-            # An adapter's `npm run lint` gives oxlint the adapter's own directories.
-            jsAdapterLint =
-              src:
-              jsLint src {
-                comment = ''
-                  # oxlint's type-aware rules and tsc read the generated test client. oxlint is given
-                  # the package's own directories, so it doesn't follow the link to trevrpc-js.'';
-                lint = "npm run lint";
-              };
+            # A directory's checks.nix, whose checks are named after the group: lint in the
+            # trevrpc-go group is trevrpc-go-lint.
+            callChecks = path: pkgs.callChecks path { inherit self; };
           in
           pkgs.mkChecks {
-            inherit (packages)
-              trevrpc-erlang
-              trevrpc-erlang-interop
-              trevrpc-go
-              trevrpc-go-otel
-              trevrpc-go-protovalidate
-              trevrpc-go-interop
-              trevrpc-js
-              trevrpc-js-effect
-              trevrpc-js-protovalidate
-              trevrpc-kotlin
-              trevrpc-rust
-              trevrpc-bench-baseline
-              trevrpc-bench-micro
-              ;
+            trevrpc-erlang = callChecks ./trevrpc-erlang;
+            trevrpc-go = callChecks ./trevrpc-go;
+            trevrpc-js = callChecks ./trevrpc-js;
+            trevrpc-kotlin = callChecks ./trevrpc-kotlin;
+            trevrpc-rust = callChecks ./trevrpc-rust;
+            trevrpc-bench-baseline = callChecks ./bench/baseline;
 
             bench = pkgs.callPackage ./bench/check.nix {
               inherit (packages) trevrpc-bench;
             };
             interop = pkgs.callPackage ./interop/check.nix {
               inherit (packages) trevrpc-interop;
-            };
-            kotlin-interop-android = packages.trevrpc-kotlin.interopAndroid;
-            # The npm tarballs as the release job packs them, from the sources and not the builds.
-            trevrpc-js-release = pkgs.callPackage ./trevrpc-js/release-check.nix {
-              inherit (packages)
-                trevrpc-js
-                trevrpc-js-effect
-                trevrpc-js-protovalidate
-                ;
-            };
-
-            trevrpc-erlang-lint = {
-              src = packages.trevrpc-erlang;
-              packages = with pkgs; [ erlfmt ];
-              script = ''
-                erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
-              '';
-            };
-
-            # The generated bindings in src/generated are left as generated.
-            trevrpc-erlang-interop-lint = {
-              root = ./trevrpc-erlang/interop;
-              files = [
-                ./trevrpc-erlang/interop/rebar.config
-                ./trevrpc-erlang/interop/src
-              ];
-              packages = with pkgs; [ erlfmt ];
-              script = ''
-                erlfmt --check rebar.config src/*.erl src/*.app.src
-              '';
-            };
-
-            # The interop bindings are what protoc-gen-trevrpc-erlang generates from interop/proto.
-            trevrpc-erlang-interop-generated = {
-              root = ./.;
-              files = [
-                ./interop/proto
-                ./proto
-                ./trevrpc-erlang/interop/generate.sh
-                ./trevrpc-erlang/interop/src/generated
-              ];
-              packages = [
-                pkgs.protobuf
-                packages.trevrpc-erlang
-              ];
-              script = ''
-                PROTOC_GEN_TREVRPC_ERLANG=$(command -v protoc-gen-trevrpc-erlang) \
-                  bash trevrpc-erlang/interop/generate.sh "$TMPDIR/generated"
-                diff -ru trevrpc-erlang/interop/src/generated "$TMPDIR/generated"
-              '';
-            };
-
-            # trevrpc as Gleam builds and publishes it: the binding's tests, a Gleam server and
-            # client on loopback.
-            trevrpc-erlang-gleam = packages.trevrpc-erlang.gleam;
-
-            # The Gleam code protoc-gen-trevrpc-gleam generates compiles, every value survives
-            # gpb, and protoc reads the bytes.
-            trevrpc-erlang-protoc-gen-gleam =
-              pkgs.callPackage ./trevrpc-erlang/protoc-gen-trevrpc-gleam/test/gleam
-                {
-                  protocGen = packages.trevrpc-erlang.protocGenGleam;
-                };
-
-            trevrpc-erlang-gleam-lint = {
-              root = ./.;
-              files = [
-                ./trevrpc-erlang/src
-                ./trevrpc-erlang/test
-                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/test/gleam/test
-              ];
-              packages = with pkgs; [ gleam ];
-              script = ''
-                gleam format --check trevrpc-erlang/src trevrpc-erlang/test \
-                  trevrpc-erlang/protoc-gen-trevrpc-gleam/test/gleam/test
-              '';
-            };
-
-            trevrpc-erlang-protoc-gen-gleam-lint = {
-              src = packages.trevrpc-erlang.protocGenGleam;
-              packages = with pkgs; [ erlfmt ];
-              script = ''
-                erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
-              '';
-            };
-
-            # trevrpc's rebar3 files are what sync-erlang-deps makes of gleam.toml and manifest.toml.
-            trevrpc-erlang-deps = {
-              root = ./.;
-              files = [
-                ./trevrpc-erlang/erlang_deps.py
-                ./trevrpc-erlang/gleam.toml
-                ./trevrpc-erlang/manifest.toml
-                ./trevrpc-erlang/rebar.config
-                ./trevrpc-erlang/rebar.lock
-                ./trevrpc-erlang/interop/rebar.lock
-                ./trevrpc-erlang/protoc-gen-trevrpc-erlang/rebar.config
-                ./trevrpc-erlang/protoc-gen-trevrpc-erlang/rebar.lock
-                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.config
-                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock
-              ];
-              packages = with pkgs; [ python3 ];
-              script = ''
-                python3 -I trevrpc-erlang/erlang_deps.py check
-              '';
-            };
-
-            trevrpc-erlang-protoc-gen-lint = {
-              src = packages.trevrpc-erlang.protocGen;
-              packages = with pkgs; [ erlfmt ];
-              script = ''
-                erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl test/support/*.erl
-              '';
-            };
-
-            trevrpc-go-lint = goLint packages.trevrpc-go;
-            trevrpc-go-otel-lint = goLint packages.trevrpc-go-otel;
-            trevrpc-go-interop-lint = goLint packages.trevrpc-go-interop;
-            trevrpc-go-protovalidate-lint = goLint packages.trevrpc-go-protovalidate;
-            trevrpc-bench-baseline-lint = goLint packages.trevrpc-bench-baseline;
-
-            trevrpc-rust-lint = {
-              src = packages.trevrpc-rust;
-              packages = with pkgs; [
-                rustfmt
-                clippy
-              ];
-              script = ''
-                cargo fmt --all --check
-                cargo clippy --workspace --all-targets --offline -- -D warnings
-                cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
-              '';
-            };
-
-            trevrpc-js-lint = jsLint packages.trevrpc-js {
-              comment = "# oxlint's type-aware rules and tsc read the generated interop clients.";
-              lint = "oxlint --deny-warnings";
-            };
-            trevrpc-js-effect-lint = jsAdapterLint packages.trevrpc-js-effect;
-            trevrpc-js-protovalidate-lint = jsAdapterLint packages.trevrpc-js-protovalidate;
-
-            trevrpc-js-protoc-gen-lint = {
-              src = packages.trevrpc-js.protocGen;
-              packages = with pkgs; [
-                oxfmt
-                oxlint
-              ];
-              script = ''
-                oxfmt --check
-                npm run lint
-              '';
-            };
-
-            # ktlint needs none of the dependencies, so it reads the sources instead of the package.
-            trevrpc-kotlin-lint = {
-              root = ./trevrpc-kotlin;
-              filter = file: file.hasExt "kt" || file.hasExt "kts";
-              packages = with pkgs; [
-                ktlint
-              ];
-              script = ''
-                ktlint --relative "**/src/**/*.kt" "**/*.gradle.kts"
-              '';
             };
 
             protobuf-lint = {

@@ -23,6 +23,7 @@ mkGleamPackage (finalAttrs: {
       trevrpcProto
       (lib.fileset.difference ./. (
         lib.fileset.unions [
+          ./checks.nix
           ./default.nix
           ./deps.nix
           ./gleam.nix
