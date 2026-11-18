@@ -10,15 +10,18 @@
 let
   inherit (beamMinimal29Packages) buildRebar3;
   lock = callPackage ./deps.nix { } ./rebar.lock;
-  # protoc-gen-trevrpc-erlang, which this package provides like the other runtimes' packages
-  # provide their plugins. It is an escript of its own, built and tested in its own derivation.
+  # protoc-gen-trevrpc-erlang and protoc-gen-trevrpc-gleam, which this package provides like the
+  # other runtimes' packages provide their plugins. Each is an escript of its own, built and tested
+  # in its own derivation.
   protocGen = callPackage ./protoc-gen-trevrpc-erlang { inherit trevrpcProto; };
+  protocGenGleam = callPackage ./protoc-gen-trevrpc-gleam { inherit trevrpcProto; };
 in
 (buildRebar3 (final: {
   name = "trevrpc";
   version = "1.11.1";
 
-  # The application plus the golden vectors its tests read.
+  # The application plus the golden vectors its tests read. rebar3 leaves the Gleam binding's
+  # sources alone; gleam.nix builds and tests them.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -29,10 +32,15 @@ in
         lib.fileset.unions [
           ./default.nix
           ./deps.nix
+          ./gleam.nix
+          ./check-versions.py
           (lib.fileset.maybeMissing ./_build)
-          # the interop executable and the protoc plugin, packages of their own
+          (lib.fileset.maybeMissing ./build)
+          (lib.fileset.maybeMissing ./test/greet)
+          # the interop executable and the protoc plugins, packages of their own
           ./interop
           ./protoc-gen-trevrpc-erlang
+          ./protoc-gen-trevrpc-gleam
         ]
       ))
     ];
@@ -57,22 +65,29 @@ in
   postInstall = ''
     mkdir -p $out/bin
     ln -s ${protocGen}/bin/protoc-gen-trevrpc-erlang $out/bin/protoc-gen-trevrpc-erlang
+    ln -s ${protocGenGleam}/bin/protoc-gen-trevrpc-gleam $out/bin/protoc-gen-trevrpc-gleam
   '';
 
   meta = {
     mainProgram = "protoc-gen-trevrpc-erlang";
-    description = "Erlang runtime for TrevRPC";
+    description = "Erlang runtime and Gleam binding for TrevRPC";
     license = lib.licenses.mit;
     homepage = "https://trev.zip/llc/TrevRPC";
     downloadPage = "https://trev.zip/llc/TrevRPC/releases";
   };
 })).overrideAttrs
   # buildRebar3 sets passthru itself. The interop executable's checks take the dependencies from
-  # lock, as this package's do.
+  # lock, as this package's do. gleam is the same package built and tested by Gleam, as gleam
+  # publish builds it for Hex.
   (
     previous: {
       passthru = previous.passthru // {
-        inherit protocGen lock;
+        inherit protocGen protocGenGleam lock;
+        gleam = callPackage ./gleam.nix {
+          inherit (previous) version;
+          inherit trevrpcProto;
+          protocGen = protocGenGleam;
+        };
       };
     }
   )

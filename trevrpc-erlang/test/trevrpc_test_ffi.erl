@@ -1,8 +1,18 @@
-%% What the tests need from Erlang: a self-signed certificate for localhost
-%% in PEM files, waiting, and watching a process by a name it registers.
+%% What the Gleam tests need from Erlang: running them, a self-signed
+%% certificate for localhost in PEM files, waiting, and watching a process by
+%% a name it registers.
 -module(trevrpc_test_ffi).
 
+-export([run_tests/0]).
 -export([credentials/0, remove/1, sleep/1, register_self/1, is_alive/1, monitor/1, wait_down/2]).
+
+%% Runs the tests in trevrpc_test, with eunit's timeouts scaled as gleeunit
+%% scales them, and halts with their result.
+run_tests() ->
+    case eunit:test(trevrpc_test, [verbose, {scale_timeouts, 10}]) of
+        ok -> erlang:halt(0);
+        error -> erlang:halt(1)
+    end.
 
 %% The certificate's and key's files, and the directory that holds them.
 credentials() ->
@@ -12,7 +22,7 @@ credentials() ->
     ]),
     Dir = filename:join(
         os:getenv("TMPDIR", "/tmp"),
-        "trevrpc_gleam_" ++ integer_to_list(erlang:unique_integer([positive]))
+        "trevrpc_test_" ++ integer_to_list(erlang:unique_integer([positive]))
     ),
     ok = filelib:ensure_path(Dir),
     CertFile = filename:join(Dir, "cert.pem"),

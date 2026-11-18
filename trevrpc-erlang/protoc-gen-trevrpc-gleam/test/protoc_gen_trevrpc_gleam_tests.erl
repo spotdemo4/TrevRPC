@@ -28,7 +28,7 @@ gleam_files_test() ->
     %% gpb's record takes the Gleam constructor's name.
     ?assertNotEqual(nomatch, binary:match(Pb, <<"-record(point,">>)).
 
-%% A service gets a module beside its file's, over trevrpc-gleam: a method
+%% A service gets a module beside its file's, over the Gleam binding: a method
 %% description, a handler and a client function per method, and routes.
 gleam_service_test() ->
     {ok, Files} = generate(["methods.proto"], <<>>),

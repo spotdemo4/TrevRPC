@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generates the test service's code into test/ with protoc-gen-trevrpc-gleam.
+# Generates the Gleam tests' service code into test/ with protoc-gen-trevrpc-gleam.
 # PROTOC_GEN_TREVRPC_GLEAM names the plugin; without it, it is built from
 # protoc-gen-trevrpc-gleam with rebar3. TREVRPC_PROTO names
 # the directory of trevrpc/options.proto, the repository's proto/ by default.

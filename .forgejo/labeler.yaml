@@ -19,7 +19,7 @@ gleam:
       - any-glob-to-any-file:
           - "**/*.gleam"
           - "**/gleam.toml"
-          - trevrpc-gleam/**
+          - trevrpc-erlang/protoc-gen-trevrpc-gleam/**
 
 go:
   - changed-files:

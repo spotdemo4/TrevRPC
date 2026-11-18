@@ -167,8 +167,8 @@
               jdk25
               gradle_9
               python3
-              # erlang and gleam: rebar3 hex needs the runtime's Erlang/OTP 29, and gleam builds
-              # trevrpc-gleam's rebar3 dependencies with rebar3 and runs escript
+              # erlang and gleam: gleam publishes trevrpc on the runtime's Erlang/OTP 29, builds its
+              # rebar3 dependencies with rebar3, and runs escript
               beamMinimal29Packages.erlang
               beamMinimal29Packages.rebar3
               gleam
@@ -294,7 +294,6 @@
                 trevrpcProto
                 ;
             };
-            trevrpc-gleam = pkgs.callPackage ./trevrpc-gleam { inherit trevrpcProto; };
             trevrpc-erlang-interop = pkgs.callPackage ./trevrpc-erlang/interop {
               inherit (self.packages.${system}) trevrpc-erlang;
             };
@@ -437,7 +436,6 @@
             inherit (packages)
               trevrpc-erlang
               trevrpc-erlang-interop
-              trevrpc-gleam
               trevrpc-go
               trevrpc-go-otel
               trevrpc-go-protovalidate
@@ -508,57 +506,62 @@
               '';
             };
 
+            # trevrpc as Gleam builds and publishes it: the binding's tests, a Gleam server and
+            # client on loopback.
+            trevrpc-erlang-gleam = packages.trevrpc-erlang.gleam;
+
             # The Gleam code protoc-gen-trevrpc-gleam generates compiles, every value survives
             # gpb, and protoc reads the bytes.
-            trevrpc-gleam-protoc-gen = pkgs.callPackage ./trevrpc-gleam/protoc-gen-trevrpc-gleam/test/gleam {
-              inherit (packages.trevrpc-gleam) protocGen;
-            };
+            trevrpc-erlang-protoc-gen-gleam =
+              pkgs.callPackage ./trevrpc-erlang/protoc-gen-trevrpc-gleam/test/gleam
+                {
+                  protocGen = packages.trevrpc-erlang.protocGenGleam;
+                };
 
-            trevrpc-gleam-lint = {
+            trevrpc-erlang-gleam-lint = {
               root = ./.;
               files = [
-                ./trevrpc-gleam/src
-                ./trevrpc-gleam/test
-                ./trevrpc-gleam/protoc-gen-trevrpc-gleam/test/gleam/test
+                ./trevrpc-erlang/src
+                ./trevrpc-erlang/test
+                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/test/gleam/test
               ];
               packages = with pkgs; [ gleam ];
               script = ''
-                gleam format --check trevrpc-gleam/src trevrpc-gleam/test \
-                  trevrpc-gleam/protoc-gen-trevrpc-gleam/test/gleam/test
+                gleam format --check trevrpc-erlang/src trevrpc-erlang/test \
+                  trevrpc-erlang/protoc-gen-trevrpc-gleam/test/gleam/test
               '';
             };
 
-            trevrpc-gleam-protoc-gen-lint = {
-              src = packages.trevrpc-gleam.protocGen;
+            trevrpc-erlang-protoc-gen-gleam-lint = {
+              src = packages.trevrpc-erlang.protocGenGleam;
               packages = with pkgs; [ erlfmt ];
               script = ''
                 erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
               '';
             };
 
-            # trevrpc-gleam's packaging is in step with trevrpc-erlang's: versions, dependency
-            # ranges and locked versions (see the script).
-            trevrpc-gleam-versions = {
+            # gleam.toml, manifest.toml and protoc-gen-trevrpc-gleam are in step with rebar3's files:
+            # versions, description, dependency ranges and locked versions (see the script).
+            trevrpc-erlang-versions = {
               root = ./.;
               files = [
+                ./trevrpc-erlang/check-versions.py
+                ./trevrpc-erlang/default.nix
                 ./trevrpc-erlang/gleam.toml
+                ./trevrpc-erlang/manifest.toml
                 ./trevrpc-erlang/rebar.config
                 ./trevrpc-erlang/rebar.lock
                 ./trevrpc-erlang/src/trevrpc.app.src
-                ./trevrpc-gleam/check-versions.py
-                ./trevrpc-gleam/default.nix
-                ./trevrpc-gleam/gleam.toml
-                ./trevrpc-gleam/manifest.toml
-                ./trevrpc-gleam/protoc-gen-trevrpc-gleam/default.nix
-                ./trevrpc-gleam/protoc-gen-trevrpc-gleam/rebar.config
-                ./trevrpc-gleam/protoc-gen-trevrpc-gleam/rebar.lock
-                ./trevrpc-gleam/protoc-gen-trevrpc-gleam/src/protoc_gen_trevrpc_gleam.app.src
                 ./trevrpc-erlang/protoc-gen-trevrpc-erlang/rebar.config
                 ./trevrpc-erlang/protoc-gen-trevrpc-erlang/rebar.lock
+                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/default.nix
+                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.config
+                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock
+                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/src/protoc_gen_trevrpc_gleam.app.src
               ];
               packages = with pkgs; [ python3 ];
               script = ''
-                python3 -I trevrpc-gleam/check-versions.py
+                python3 -I trevrpc-erlang/check-versions.py
               '';
             };
 

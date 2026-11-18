@@ -1,5 +1,5 @@
 %% @doc protoc-gen-trevrpc-gleam: the protoc plugin that generates Gleam
-%% code for TrevRPC services, over trevrpc-gleam.
+%% code for TrevRPC services, over the Gleam binding in trevrpc.
 %%
 %% For every proto file it generates Gleam types for its messages, which a
 %% gpb module encodes and decodes, and a module per service (see

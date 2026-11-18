@@ -1,4 +1,4 @@
-%% @doc protoc-gen-trevrpc-gleam's service modules, over trevrpc-gleam.
+%% @doc protoc-gen-trevrpc-gleam's service modules, over the Gleam binding.
 %%
 %% Each service of `example/v1/greeter.proto' gets a module of its own
 %% beside the file's, `example/v1/greeter_trevrpc.gleam' for a service
@@ -69,7 +69,7 @@ snake(#{name := Name}) -> trevrpc_gen_names:snake(Name).
 
 label(#{name := Name}) -> trevrpc_gen_gleam:label(Name).
 
-%% The modules of the methods' messages, and trevrpc-gleam's.
+%% The modules of the methods' messages, and the Gleam binding's.
 imports(Methods, #{modules := Modules, owners := Owners}) ->
     Keys = lists:usort([
         maps:get(binary_to_atom(Type), Owners)

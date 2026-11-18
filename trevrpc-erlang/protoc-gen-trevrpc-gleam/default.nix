@@ -8,10 +8,10 @@
 }:
 let
   inherit (beamMinimal29Packages) erlang rebar3;
-  lock = callPackage ../../trevrpc-erlang/deps.nix { } ./rebar.lock;
+  lock = callPackage ../deps.nix { } ./rebar.lock;
   # protoc-gen-trevrpc-erlang, which this builds on: its modules, the test helpers and protos
   # the tests share, and its rebar.config, with which rebar3 compiles it.
-  erlangPlugin = ../../trevrpc-erlang/protoc-gen-trevrpc-erlang;
+  erlangPlugin = ../protoc-gen-trevrpc-erlang;
 in
 stdenv.mkDerivation (final: {
   pname = "protoc-gen-trevrpc-gleam";
@@ -39,7 +39,7 @@ stdenv.mkDerivation (final: {
       ))
     ];
   };
-  sourceRoot = "${final.src.name}/trevrpc-gleam/protoc-gen-trevrpc-gleam";
+  sourceRoot = "${final.src.name}/trevrpc-erlang/protoc-gen-trevrpc-gleam";
 
   nativeBuildInputs = [ rebar3 ];
   # The escript runs on this Erlang, which patchShebangs points it at.
@@ -53,7 +53,7 @@ stdenv.mkDerivation (final: {
     runHook preConfigure
     export HOME=$(mktemp -d)
     ${lock.checkouts}
-    cp -R ../../trevrpc-erlang/protoc-gen-trevrpc-erlang _checkouts/protoc_gen_trevrpc_erlang
+    cp -R ../protoc-gen-trevrpc-erlang _checkouts/protoc_gen_trevrpc_erlang
     chmod -R u+w _checkouts
     runHook postConfigure
   '';

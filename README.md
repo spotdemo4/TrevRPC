@@ -314,10 +314,10 @@ service modules; it is available from [nix](#nix), or from a checkout with `reba
 
 ### gleam
 
-[`trevrpc-gleam`](trevrpc-gleam), the typed Gleam binding to the Erlang runtime, is in progress too.
-`protoc-gen-trevrpc-gleam` generates Gleam types for messages, which gpb encodes and decodes, and service
-modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
-`trevrpc-gleam/protoc-gen-trevrpc-gleam/`. See [`trevrpc-gleam`](trevrpc-gleam#code-generation).
+the typed [Gleam binding](trevrpc-erlang#gleam) to the Erlang runtime is in progress too, in the same `trevrpc`
+package as the runtime. `protoc-gen-trevrpc-gleam` generates Gleam types for messages, which gpb encodes and
+decodes, and service modules; it is available from [nix](#nix), or from a checkout with `rebar3 escriptize` in
+`trevrpc-erlang/protoc-gen-trevrpc-gleam/`. See [`trevrpc-erlang`](trevrpc-erlang#gleam-code-generation).
 
 ### nix
 
@@ -328,8 +328,7 @@ nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-go
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-rust
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-js
 nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-kotlin
-nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang
-nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-gleam
+nix shell git+https://trev.zip/llc/TrevRPC.git#trevrpc-erlang   # protoc-gen-trevrpc-erlang and protoc-gen-trevrpc-gleam
 ```
 
 ### download

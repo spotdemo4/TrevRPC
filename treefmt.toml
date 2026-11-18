@@ -40,8 +40,8 @@ options = ["format"]
 includes = ["*.gleam"]
 # Kept as protoc-gen-trevrpc-gleam generates them.
 excludes = [
-  "trevrpc-gleam/test/greet/**",
-  "trevrpc-gleam/protoc-gen-trevrpc-gleam/test/gleam/src/**",
+  "trevrpc-erlang/test/greet/**",
+  "trevrpc-erlang/protoc-gen-trevrpc-gleam/test/gleam/src/**",
 ]
 
 [formatter.ruff]

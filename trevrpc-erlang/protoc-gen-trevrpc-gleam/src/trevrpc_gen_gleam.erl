@@ -34,7 +34,7 @@
 %%   one-element tuple.
 %%
 %% Unknown fields are dropped, as gpb drops them. Each service gets a module
-%% of its own, over trevrpc-gleam (see {@link trevrpc_gen_gleam_service}).
+%% of its own, over the Gleam binding (see {@link trevrpc_gen_gleam_service}).
 -module(trevrpc_gen_gleam).
 
 -export([files/1, gleam_snake/1, upper_camel/1]).

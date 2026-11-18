@@ -7,7 +7,6 @@ import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
-import gleeunit
 import gleeunit/should
 import greet/v1/greeter.{HelloReply, HelloRequest}
 import greet/v1/greeter_trevrpc
@@ -19,9 +18,14 @@ import trevrpc/schema
 import trevrpc/server
 import trevrpc/status
 
-pub fn main() {
-  gleeunit.main()
+/// Runs this module's tests. gleeunit.main() would run every module in test/,
+/// the runtime's eunit tests too, which rebar3 runs.
+pub fn main() -> Nil {
+  run_tests()
 }
+
+@external(erlang, "trevrpc_test_ffi", "run_tests")
+fn run_tests() -> Nil
 
 // The service
 
@@ -147,7 +151,7 @@ fn telemetry(call: Call, received: Int) -> Result(Nil, status.Status) {
   }
 }
 
-const watched = "trevrpc_gleam_watched_handler"
+const watched = "trevrpc_test_watched_handler"
 
 // Erlang
 

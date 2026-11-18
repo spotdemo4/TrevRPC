@@ -17,22 +17,21 @@ ln -s .envrc.project .envrc
 direnv allow
 ```
 
-| directory                                   | contents                                                                                        |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `trevrpc-go/`                               | Go runtime, `protoc-gen-trevrpc-go`, examples                                                   |
-| `trevrpc-rust/`                             | Rust crate, `protoc-gen-trevrpc-rust`, examples                                                 |
-| `trevrpc-js/`                               | browser client, browser interop runner                                                          |
-| `trevrpc-js/effect/`                        | Effect adapter for the browser client                                                           |
-| `trevrpc-js/protovalidate/`                 | protovalidate request validation for the browser client                                         |
-| `trevrpc-js/protoc-gen-trevrpc-js/`         | `protoc-gen-trevrpc-js`, message codecs for the browser client                                  |
-| `trevrpc-kotlin/`                           | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`                                   |
-| `trevrpc-erlang/`                           | Erlang runtime (in progress: native QUIC, QMux over TLS and WebSocket, HTTP/3 and HTTP/2, zstd) |
-| `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang`, gpb message modules and service stubs                              |
-| `trevrpc-gleam/`                            | Gleam binding to the Erlang runtime                                                             |
-| `trevrpc-gleam/protoc-gen-trevrpc-gleam/`   | `protoc-gen-trevrpc-gleam`, Gleam messages and service modules, on `protoc-gen-trevrpc-erlang`  |
-| `interop/`                                  | cross-runtime test suite                                                                        |
-| `bench/`                                    | load benchmarks and the grpc-go and connect-go baselines                                        |
-| `testdata/`                                 | wire, QMux, and zstd golden vectors shared by the runtimes                                      |
+| directory                                   | contents                                                                                                                                                |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `trevrpc-go/`                               | Go runtime, `protoc-gen-trevrpc-go`, examples                                                                                                           |
+| `trevrpc-rust/`                             | Rust crate, `protoc-gen-trevrpc-rust`, examples                                                                                                         |
+| `trevrpc-js/`                               | browser client, browser interop runner                                                                                                                  |
+| `trevrpc-js/effect/`                        | Effect adapter for the browser client                                                                                                                   |
+| `trevrpc-js/protovalidate/`                 | protovalidate request validation for the browser client                                                                                                 |
+| `trevrpc-js/protoc-gen-trevrpc-js/`         | `protoc-gen-trevrpc-js`, message codecs for the browser client                                                                                          |
+| `trevrpc-kotlin/`                           | Android client, Cronet transport, `protoc-gen-trevrpc-kotlin`                                                                                           |
+| `trevrpc-erlang/`                           | Erlang runtime (in progress: native QUIC, QMux over TLS and WebSocket, HTTP/3 and HTTP/2, zstd) and its Gleam binding (`src/trevrpc/`), one Hex package |
+| `trevrpc-erlang/protoc-gen-trevrpc-erlang/` | `protoc-gen-trevrpc-erlang`, gpb message modules and service stubs                                                                                      |
+| `trevrpc-erlang/protoc-gen-trevrpc-gleam/`  | `protoc-gen-trevrpc-gleam`, Gleam messages and service modules, on `protoc-gen-trevrpc-erlang`                                                          |
+| `interop/`                                  | cross-runtime test suite                                                                                                                                |
+| `bench/`                                    | load benchmarks and the grpc-go and connect-go baselines                                                                                                |
+| `testdata/`                                 | wire, QMux, and zstd golden vectors shared by the runtimes                                                                                              |
 
 ### run
 
@@ -102,12 +101,11 @@ rebar3 dialyzer
 erlfmt --check rebar.config src/*.erl src/*.app.src test/*.erl
 ```
 
-the same in `trevrpc-erlang/protoc-gen-trevrpc-erlang/` and `trevrpc-gleam/protoc-gen-trevrpc-gleam/`, whose
+the same in `trevrpc-erlang/protoc-gen-trevrpc-erlang/` and `trevrpc-erlang/protoc-gen-trevrpc-gleam/`, whose
 tests also need `protoc`. The Gleam plugin's fixture, `test/gleam/test.sh`, generates Gleam code from its protos
-and runs it, and needs `gleam` too (`nix shell nixpkgs#gleam`); the `trevrpc-gleam-protoc-gen` check runs it.
-`trevrpc-gleam/test.sh`
-generates the binding's test service and runs its tests, a Gleam server and client on loopback; the
-`nix build .#trevrpc-gleam` runs it, and `nix fmt` formats Gleam with `gleam format`. The Erlang interop
+and runs it, and needs `gleam` too (`nix shell nixpkgs#gleam`); the `trevrpc-erlang-protoc-gen-gleam` check runs it.
+`trevrpc-erlang/gleam-test.sh` generates the Gleam binding's test service and runs its tests, a Gleam server and
+client on loopback; `nix build .#trevrpc-erlang.gleam` runs it, and `nix fmt` formats Gleam with `gleam format`. The Erlang interop
 executable runs on bindings generated from `interop/proto`, kept in `trevrpc-erlang/interop/src/generated`;
 after changing the plugin or those protos, regenerate them with `protoc` on the PATH:
 
@@ -132,7 +130,7 @@ nix build .#trevrpc-js-protovalidate
 nix build .#trevrpc-kotlin
 nix build .#trevrpc-erlang
 nix build .#trevrpc-erlang-interop
-nix build .#trevrpc-gleam
+nix build .#trevrpc-erlang.gleam
 ```
 
 ### release
@@ -143,10 +141,9 @@ with [bumper](https://trev.zip/llc/bumper):
 bumper
 ```
 
-the Gleam packages repeat the runtime's version in `trevrpc-erlang/gleam.toml`, `trevrpc-gleam/gleam.toml`,
-`trevrpc-gleam/manifest.toml` and `protoc-gen-trevrpc-gleam`'s `app.src` and `default.nix`; the
-`trevrpc-gleam-versions` check fails when a bump or a dependency update misses one of them, or leaves the
-dependency ranges and locked versions apart from `rebar.config` and `rebar.lock`, or the two protoc plugins' `gpb`
-apart
+the Erlang runtime's version is repeated in `trevrpc-erlang/gleam.toml`, with which `gleam publish` builds the Hex
+package, and in `protoc-gen-trevrpc-gleam`'s `app.src` and `default.nix`; the `trevrpc-erlang-versions` check fails
+when a bump or a dependency update misses one of them, or leaves `gleam.toml`'s dependency ranges or
+`manifest.toml`'s locked versions apart from `rebar.config` and `rebar.lock`, or the two protoc plugins' `gpb` apart
 
 releases are automatically created per runtime for [significant](https://www.conventionalcommits.org/en/v1.0.0/#summary) changes
