@@ -10,6 +10,7 @@
   "allowedCommands": [
     "^nix run \\.#update-go-deps$",
     "^nix run \\.#update-kotlin-deps$",
+    "^nix run \\.#sync-erlang-deps$",
     "^nix run \\.#sync-playwright$"
   ],
   "allowedUnsafeExecutions": ["gradleWrapper"],
@@ -51,7 +52,11 @@
     "schedule": ["* * * * 0"], // sunday
     "skipInstalls": false,
     "postUpgradeTasks": {
-      "commands": ["nix run .#update-go-deps", "nix run .#sync-playwright"],
+      "commands": [
+        "nix run .#update-go-deps",
+        "nix run .#sync-playwright",
+        "nix run .#sync-erlang-deps"
+      ],
       "fileFilters": [
         "trevrpc-go/go.mod",
         "trevrpc-go/go.sum",
@@ -60,7 +65,12 @@
         "bench/baseline/go.sum",
         "bench/baseline/gomod2nix.toml",
         "trevrpc-js/package.json",
-        "trevrpc-js/package-lock.json"
+        "trevrpc-js/package-lock.json",
+        "trevrpc-erlang/rebar.config",
+        "trevrpc-erlang/rebar.lock",
+        "trevrpc-erlang/interop/rebar.lock",
+        "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.config",
+        "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock"
       ],
       "executionMode": "branch"
     }
@@ -117,6 +127,10 @@
       "matchManagers": ["nix"],
       "addLabels": ["nix"]
     },
+    {
+      "matchManagers": ["gleam"],
+      "addLabels": ["gleam"]
+    },
 
     // sync playwright from nix to npm
     {
@@ -140,6 +154,23 @@
       "postUpgradeTasks": {
         "commands": ["nix run .#update-go-deps"],
         "fileFilters": ["**/go.mod", "**/go.sum", "**/gomod2nix.toml"],
+        "executionMode": "branch"
+      }
+    },
+
+    // sync trevrpc's rebar3 files, which no manager updates, from gleam.toml and manifest.toml
+    {
+      "matchManagers": ["gleam"],
+      "matchFileNames": ["trevrpc-erlang/gleam.toml"],
+      "postUpgradeTasks": {
+        "commands": ["nix run .#sync-erlang-deps"],
+        "fileFilters": [
+          "trevrpc-erlang/rebar.config",
+          "trevrpc-erlang/rebar.lock",
+          "trevrpc-erlang/interop/rebar.lock",
+          "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.config",
+          "trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock"
+        ],
         "executionMode": "branch"
       }
     },

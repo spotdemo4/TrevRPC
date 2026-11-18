@@ -26,7 +26,8 @@ mkGleamPackage (finalAttrs: {
           ./default.nix
           ./deps.nix
           ./gleam.nix
-          ./check-versions.py
+          ./erlang_deps.py
+          ./test_erlang_deps.py
           (lib.fileset.maybeMissing ./_build)
           (lib.fileset.maybeMissing ./build)
           (lib.fileset.maybeMissing ./test/greet)

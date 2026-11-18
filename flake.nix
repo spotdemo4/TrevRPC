@@ -247,6 +247,18 @@
             '';
           };
 
+          # trevrpc's rebar3 files, from gleam.toml and manifest.toml (see the script). Renovate runs
+          # it after updating them.
+          sync-erlang-deps = {
+            packages = [ pkgs.python3 ];
+            # The tarballs it downloads from repo.hex.pm need CA certificates, which a runner may not
+            # point Python at.
+            script = ''
+              export SSL_CERT_FILE="''${SSL_CERT_FILE:-${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt}"
+              python3 -I trevrpc-erlang/erlang_deps.py sync
+            '';
+          };
+
           sync-playwright = {
             packages = [ pkgs.nodejs_26 ];
             script = ''
@@ -540,28 +552,24 @@
               '';
             };
 
-            # gleam.toml, manifest.toml and protoc-gen-trevrpc-gleam are in step with rebar3's files:
-            # versions, description, dependency ranges and locked versions (see the script).
-            trevrpc-erlang-versions = {
+            # trevrpc's rebar3 files are what sync-erlang-deps makes of gleam.toml and manifest.toml.
+            trevrpc-erlang-deps = {
               root = ./.;
               files = [
-                ./trevrpc-erlang/check-versions.py
-                ./trevrpc-erlang/default.nix
+                ./trevrpc-erlang/erlang_deps.py
                 ./trevrpc-erlang/gleam.toml
                 ./trevrpc-erlang/manifest.toml
                 ./trevrpc-erlang/rebar.config
                 ./trevrpc-erlang/rebar.lock
-                ./trevrpc-erlang/src/trevrpc.app.src
+                ./trevrpc-erlang/interop/rebar.lock
                 ./trevrpc-erlang/protoc-gen-trevrpc-erlang/rebar.config
                 ./trevrpc-erlang/protoc-gen-trevrpc-erlang/rebar.lock
-                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/default.nix
                 ./trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.config
                 ./trevrpc-erlang/protoc-gen-trevrpc-gleam/rebar.lock
-                ./trevrpc-erlang/protoc-gen-trevrpc-gleam/src/protoc_gen_trevrpc_gleam.app.src
               ];
               packages = with pkgs; [ python3 ];
               script = ''
-                python3 -I trevrpc-erlang/check-versions.py
+                python3 -I trevrpc-erlang/erlang_deps.py check
               '';
             };
 
@@ -674,16 +682,23 @@
               '';
             };
 
-            # The unit tests of the interop and bench runners, which interop/runner.nix packages.
+            # The unit tests of the interop and bench runners, which interop/runner.nix packages, and
+            # of sync-erlang-deps.
             python-test = {
               root = ./.;
               files = [
                 ./interop
                 ./bench
+                ./trevrpc-erlang
               ];
               filter = file: file.hasExt "py";
-              # The interop runner takes its compression dictionary from these.
-              include = [ ./testdata/zstd-golden-vectors.txt ];
+              # The interop runner takes its compression dictionary from these, and erlang_deps's tests
+              # render the runtime's locks.
+              include = [
+                ./testdata/zstd-golden-vectors.txt
+                ./trevrpc-erlang/rebar.lock
+                ./trevrpc-erlang/interop/rebar.lock
+              ];
               # The harness makes certificates with openssl, and the bench tests train the benchmark
               # dictionary with zstd.
               packages = with pkgs; [
@@ -694,6 +709,7 @@
               script = ''
                 python3 -I -m unittest discover -s interop
                 python3 -I -m unittest discover -s bench
+                python3 -I -m unittest discover -s trevrpc-erlang
               '';
             };
 

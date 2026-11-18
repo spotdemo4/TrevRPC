@@ -113,6 +113,12 @@ after changing the plugin or those protos, regenerate them with `protoc` on the 
 trevrpc-erlang/interop/generate.sh
 ```
 
+the Erlang runtime's Hex dependencies are declared in `trevrpc-erlang/gleam.toml` and locked in its `manifest.toml`,
+which Renovate updates. Renovate then runs `nix run .#sync-erlang-deps`, which copies them into rebar3's files:
+`rebar.config`, `rebar.lock`, the interop executable's `rebar.lock`, and `protoc-gen-trevrpc-gleam`'s `gpb`, which
+follows `protoc-gen-trevrpc-erlang`'s. Run it after changing those by hand; the `trevrpc-erlang-deps` check fails
+when they drift
+
 with the cross-runtime [interop](interop) suite:
 
 ```sh
@@ -140,10 +146,5 @@ with [bumper](https://trev.zip/llc/bumper):
 ```sh
 bumper
 ```
-
-the Erlang runtime's version is repeated in `trevrpc-erlang/gleam.toml`, with which `gleam publish` builds the Hex
-package, and in `protoc-gen-trevrpc-gleam`'s `app.src` and `default.nix`; the `trevrpc-erlang-versions` check fails
-when a bump or a dependency update misses one of them, or leaves `gleam.toml`'s dependency ranges or
-`manifest.toml`'s locked versions apart from `rebar.config` and `rebar.lock`, or the two protoc plugins' `gpb` apart
 
 releases are automatically created per runtime for [significant](https://www.conventionalcommits.org/en/v1.0.0/#summary) changes

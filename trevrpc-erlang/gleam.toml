@@ -1,10 +1,9 @@
 # The one Hex package for Erlang and Gleam: gleam publish ships the runtime's
 # Erlang modules, the Gleam binding in src/trevrpc/, and the Erlang that Gleam
 # compiles it to, so rebar3 and mix build the package without Gleam.
-# rebar.config, rebar.lock and src/trevrpc.app.src stay the source of truth
-# for the runtime: the trevrpc-erlang-versions check (check-versions.py) keeps
-# the version, description and dependencies here and in manifest.toml in step
-# with them.
+# The Hex dependencies are declared here and locked in manifest.toml, which
+# Renovate updates; sync-erlang-deps (erlang_deps.py) copies them into
+# rebar.config and rebar.lock, with which rebar3 builds the runtime.
 name = "trevrpc"
 version = "1.11.1"
 description = "Protobuf over QUIC, HTTP/3 & WebTransport"
