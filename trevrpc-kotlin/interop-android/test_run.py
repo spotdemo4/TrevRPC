@@ -1,6 +1,7 @@
 """Unit tests for the interop runner's host-side logic. Run with `python3 -I -m unittest`."""
 
 import contextlib
+import io
 import json
 import os
 import stat
@@ -144,6 +145,18 @@ class StartServerTest(unittest.TestCase):
 
             with self.assertRaisesRegex(run.RunnerError, "'http2'"):
                 _ = run.start_server(command, certificates, "0.0.0.0", root / "interop.dict", root)
+
+
+class HostLoadTest(unittest.TestCase):
+    def test_reports_cpu_count_and_load_average(self) -> None:
+        with mock.patch.object(run.os, "getloadavg", return_value=(1.5, 0.25, 2.0)):
+            self.assertEqual(
+                f"host has {os.cpu_count()} CPUs, load average 1.50 0.25 2.00", run.host_load()
+            )
+
+    def test_reports_an_unknown_load_average(self) -> None:
+        with mock.patch.object(run.os, "getloadavg", side_effect=OSError):
+            self.assertTrue(run.host_load().endswith("load average unknown"))
 
 
 class EmulatorSerialsTest(unittest.TestCase):
@@ -317,11 +330,15 @@ def adb_calls(root: Path) -> list[list[str]]:
 
 
 @contextlib.contextmanager
-def booted_emulator(root: Path) -> Generator[run.Emulator]:
-    """An Emulator on the fake tools in ROOT that has booted; it is shut down afterwards."""
+def booted_emulator(root: Path, stderr: io.StringIO | None = None) -> Generator[run.Emulator]:
+    """An Emulator on the fake tools in ROOT that has booted; it is shut down afterwards. The
+    runner's progress lines go to `stderr`, or nowhere."""
     tools = fake_android_tools(root)
     path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
-    with mock.patch.dict(os.environ, {"PATH": path}):
+    with (
+        mock.patch.dict(os.environ, {"PATH": path}),
+        contextlib.redirect_stderr(stderr or io.StringIO()),
+    ):
         emulator = run.Emulator(root, root, run.DEFAULT_SYSTEM_IMAGE)
         try:
             emulator.wait_for_boot()
@@ -334,10 +351,14 @@ class EmulatorTest(unittest.TestCase):
     def test_runs_its_own_adb_server_and_finds_its_emulator_by_avd_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with booted_emulator(root) as emulator:
+            stderr = io.StringIO()
+            with booted_emulator(root, stderr) as emulator:
                 pass
 
             self.assertEqual("emulator-5556", emulator.serial)
+            self.assertRegex(
+                stderr.getvalue(), r"emulator booted in \d+s; host has \d+ CPUs, load average "
+            )
             server_env = cast(
                 dict[str, str],
                 json.loads((root / "adb-server-env.json").read_text(encoding="utf-8")),

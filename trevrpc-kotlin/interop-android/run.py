@@ -50,7 +50,9 @@ TEST_PACKAGE = "zip.trev.trevrpc.interop.android.test"
 TEST_RUNNER = "androidx.test.runner.AndroidJUnitRunner"
 DEFAULT_SYSTEM_IMAGE = "system-images;android-33;google_apis;x86_64"
 CA_DIRECTORY = "/system/etc/security/cacerts"
-BOOT_TIMEOUT = 180
+# A cold boot takes about 20 s on an idle host, but CI runners that share their CPUs took up to
+# 155 s for a reboot.
+BOOT_TIMEOUT = 300
 NETWORK_TIMEOUT = 60
 # `dumpsys connectivity` prints every network and request; on a loaded emulator it can take longer
 # than a quick probe allows.
@@ -62,6 +64,20 @@ DICTIONARY_VECTORS = "zstd-golden-vectors.txt"
 
 
 # --- processes -------------------------------------------------------------------------------
+
+
+def note(message: str) -> None:
+    """Prints a progress line to stderr, which CI logs keep next to the scenario lines."""
+    print(f"trevrpc-interop-android: {message}", file=sys.stderr, flush=True)
+
+
+def host_load() -> str:
+    """The host's CPU count and load average, to tell a slow host from a real failure."""
+    try:
+        load = " ".join(f"{value:.2f}" for value in os.getloadavg())
+    except OSError:
+        load = "unknown"
+    return f"host has {os.cpu_count()} CPUs, load average {load}"
 
 
 def probe(command: list[str], env: dict[str, str] | None = None, timeout: float = 5) -> str | None:
@@ -391,7 +407,9 @@ class Emulator:
                 and boot_id != previous_boot_id
             )
 
+        started = time.monotonic()
         self.wait_until(booted, "boot", BOOT_TIMEOUT)
+        note(f"emulator booted in {time.monotonic() - started:.0f}s; {host_load()}")
 
     def prepare(self, ca: Path, work_dir: Path) -> None:
         """Boots the emulator and readies it for the scenarios.
@@ -713,6 +731,7 @@ def execute(args: Options) -> Outcomes:
         raise RunnerError(
             f"{args.work_dir} has {free} bytes free, at least {MIN_FREE_BYTES} are required"
         )
+    note(host_load())
 
     certificates = generate_certificates(args.work_dir / "certificates")
     dictionary = extract_dictionary(args.test_apk, args.work_dir)

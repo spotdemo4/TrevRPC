@@ -14,57 +14,26 @@ concurrency:
 # yaml-language-server-disable is not allowed
 enable-openid-connect: true
 
+# Each server's run is a call to android-interop.yaml. The rust run starts after the go run, pass or
+# fail, so the runner holds one emulator at a time: two on a shared runner slowed boots and calls
+# past their timeouts.
 jobs:
-  interop:
+  go:
     # zizmor: ignore[excessive-permissions]
-    name: android-to-${{ matrix.server }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        server: [go, rust]
-    env:
-      SERVER: ${{ matrix.server }}
-      CELL: android-to-${{ matrix.server }}
-    steps:
-      - name: Initialize
-        uses: spotdemo4/nix-init@058efbda6393adccb321793a01b3fe4ea0533885 # v1.80.0
-        with:
-          github_token: ${{ secrets.GH_TOKEN }}
-          niks3_url: https://niks3.trev.zip
-          shell: android
+    # Forgejo takes a local path here, not GitHub's `$/` syntax.
+    uses: ./.forgejo/workflows/android-interop.yaml # zizmor: ignore[self-repository]
+    with:
+      server: go
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
-      - name: Run Android interop over HTTP/3
-        env:
-          TRANSPORT: http3
-          OUTPUT: ${{ runner.temp }}/${{ env.CELL }}/http3
-          WORK_DIR: ${{ runner.temp }}/android-work/http3
-        run: |
-          trevrpc-interop-android \
-            --server-command "trevrpc-interop-$SERVER" \
-            --transport "$TRANSPORT" \
-            --output "$OUTPUT" \
-            --work-dir "$WORK_DIR"
-
-      # Runs with QUIC disabled, as on a network that blocks UDP, even if the HTTP/3 run failed.
-      - name: Run Android interop over HTTP/2
-        if: ${{ !cancelled() }}
-        env:
-          TRANSPORT: http2
-          OUTPUT: ${{ runner.temp }}/${{ env.CELL }}/http2
-          WORK_DIR: ${{ runner.temp }}/android-work/http2
-        run: |
-          trevrpc-interop-android \
-            --server-command "trevrpc-interop-$SERVER" \
-            --transport "$TRANSPORT" \
-            --output "$OUTPUT" \
-            --work-dir "$WORK_DIR"
-
-      - name: Upload failure diagnostics
-        if: ${{ failure() }}
-        uses: https://data.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
-        with:
-          name: ${{ env.CELL }}
-          path: ${{ runner.temp }}/${{ env.CELL }}
-          if-no-files-found: ignore
+  rust:
+    # zizmor: ignore[excessive-permissions]
+    needs: go
+    if: ${{ !cancelled() }}
+    # Forgejo takes a local path here, not GitHub's `$/` syntax.
+    uses: ./.forgejo/workflows/android-interop.yaml # zizmor: ignore[self-repository]
+    with:
+      server: rust
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
