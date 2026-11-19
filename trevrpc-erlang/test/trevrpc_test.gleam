@@ -511,7 +511,22 @@ pub fn server_lifecycle_test() {
   let route = server.unary(schema.raw("/raw.Echo/Echo"), fn(r, _) { Ok(r) })
   server.start(server.config(0, cert, key, [route, route]))
   |> should.equal(Error("two routes for /raw.Echo/Echo"))
-  let assert Ok(srv) = server.start(server.config(0, cert, key, [route]))
+  server.start(
+    server.Config(
+      ..server.config(0, cert, key, [route]),
+      webtransport: True,
+      webtransport_origins: ["app.example.com"],
+    ),
+  )
+  |> should.equal(Error("not an origin: app.example.com"))
+  let assert Ok(srv) =
+    server.start(
+      server.Config(
+        ..server.config(0, cert, key, [route]),
+        webtransport: True,
+        webtransport_origins: ["https://app.example.com"],
+      ),
+    )
   let assert Ok(_) = server.port(srv)
   server.stop(srv)
   server.port(srv) |> should.equal(Error(Nil))

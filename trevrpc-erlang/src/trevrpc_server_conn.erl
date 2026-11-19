@@ -1,5 +1,5 @@
-%% @private The owner of one server-side connection: native QUIC, QMux, or
-%% the HTTP mapping over HTTP/3 or HTTP/2.
+%% @private The owner of one server-side connection: native QUIC, QMux,
+%% the HTTP mapping over HTTP/3 or HTTP/2, or a WebTransport session.
 %%
 %% It receives every event of the connection. For each stream it starts a
 %% call process (`trevrpc_server_call') at once and routes the stream's
@@ -10,6 +10,12 @@
 %% ({@link trevrpc_http}): a request they refuse gets an HTTP error, and an
 %% accepted one a `200', after which its bodies are the stream as on the
 %% other transports.
+%%
+%% A WebTransport CONNECT on an HTTP/3 connection that passes its checks
+%% becomes a session of erlang-webtransport, with a connection process of
+%% its own, which this one starts, and waits for when it shuts down. The
+%% session's handler, {@link trevrpc_webtransport}, sends that process the
+%% session's events.
 %%
 %% It also owns each call's lifecycle and the resources it holds: its slots
 %% in the per-connection and server-wide limits, its datagram flow, its
@@ -30,9 +36,11 @@
     %% starting: the call process reads and checks the REQUEST; running: it
     %% was admitted and runs its handler; finishing: it is writing its
     %% terminal STATUS; expiring: it was stopped at its deadline;
+    %% overflowing: it was stopped for reading too slowly (WebTransport);
     %% cancelling: the peer abandoned the call; shutdown: the server is
     %% shutting down.
-    state = starting :: starting | running | finishing | expiring | cancelling | shutdown,
+    state = starting ::
+        starting | running | finishing | expiring | overflowing | cancelling | shutdown,
     ref :: reference(),
     %% The peer finished the request side.
     fin = false :: boolean(),
@@ -73,8 +81,11 @@
     %% Lone STATUS frames quic_h3 refused with a full send queue, written
     %% again when it says the stream's writer may (`send_ready').
     pending = #{} :: #{non_neg_integer() => binary()},
-    %% The datagram flows of the calls, on native QUIC.
-    flows :: trevrpc_datagram_flows:flows()
+    %% The datagram flows of the calls, on native QUIC and WebTransport.
+    flows :: trevrpc_datagram_flows:flows(),
+    %% The connection processes of the WebTransport sessions of an HTTP/3
+    %% connection, by their monitors.
+    sessions = #{} :: #{reference() => pid()}
 }).
 
 -define(CANCELLED, 1).
@@ -276,6 +287,8 @@ handle_cast({h2, Socket, Peer}, #state{config = Config} = State) ->
 handle_cast(shutdown, #state{stopping = true} = State) ->
     {noreply, State};
 handle_cast(shutdown, #state{config = #{graceful_shutdown_timeout := Grace}} = State) ->
+    %% A WebTransport session shuts down as a connection of its own.
+    _ = [shutdown(Pid) || Pid <- maps:values(State#state.sessions)],
     %% HTTP clients send no more requests; QUIC and QMux streams that still
     %% open are refused one by one.
     _ =
@@ -288,10 +301,17 @@ handle_cast(shutdown, #state{config = #{graceful_shutdown_timeout := Grace}} = S
     maybe_close(State1).
 
 -spec handle_info(term(), #state{}) -> {noreply, #state{}} | {stop, normal, #state{}}.
+handle_info(
+    {trevrpc_wt, Session, {established, {wt, Session, _, _} = Transport}},
+    #state{transport = undefined} = State
+) ->
+    %% The first event of the session whose connection this is.
+    {noreply, State#state{transport = Transport, session_monitor = monitor(process, Session)}};
 handle_info({Tag, Pid, Event}, #state{transport = Transport} = State) when
     is_tuple(Transport),
     element(2, Transport) =:= Pid,
-    (Tag =:= quic orelse Tag =:= trevrpc_qmux orelse Tag =:= quic_h3 orelse Tag =:= h2)
+    (Tag =:= quic orelse Tag =:= trevrpc_qmux orelse Tag =:= quic_h3 orelse Tag =:= h2 orelse
+        Tag =:= trevrpc_wt)
 ->
     quic_event(Event, State);
 handle_info({'EXIT', Pid, _Reason}, #state{transport = {h2, Pid}} = State) ->
@@ -322,6 +342,10 @@ handle_info({timeout, Timer, {deadline, Id}}, #state{streams = Streams} = State)
     end;
 handle_info({'DOWN', Monitor, process, _Pid, Reason}, #state{session_monitor = Monitor} = State) ->
     quic_event({closed, {session_down, Reason}}, State#state{session_monitor = undefined});
+handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{sessions = Sessions} = State) when
+    is_map_key(Monitor, Sessions)
+->
+    maybe_close(State#state{sessions = maps:remove(Monitor, Sessions)});
 handle_info({'DOWN', Monitor, process, _Pid, Reason}, #state{monitors = Monitors} = State) ->
     case maps:take(Monitor, Monitors) of
         {Id, Rest} -> call_down(Id, Reason, State#state{monitors = Rest});
@@ -336,10 +360,11 @@ handle_info(_Message, State) ->
     {noreply, State}.
 
 -spec terminate(term(), #state{}) -> ok.
-terminate(_Reason, #state{streams = Streams} = State) ->
+terminate(_Reason, #state{streams = Streams, sessions = Sessions} = State) ->
     %% Calls still in flight, as when the connection closes under them,
     %% give their slots in the server's request limit back.
     _ = maps:fold(fun release/3, State, Streams),
+    _ = [shutdown(Pid) || Pid <- maps:values(Sessions)],
     _ = [exit(Pid, kill) || #entry{pid = Pid} <- maps:values(Streams)],
     Budget = maps:get(stream_budget, State#state.config),
     _ = [
@@ -366,6 +391,8 @@ quic_event({stream_reset, Id, _Code}, State) ->
     maybe_close(abandoned(Id, State));
 quic_event({stop_sending, Id, _Code}, State) ->
     maybe_close(abandoned(Id, State));
+quic_event({stream_overflow, Id}, State) ->
+    {noreply, overflowed(Id, State)};
 quic_event({send_ready, Id}, #state{transport = {h3, _, _}, pending = Pending} = State) ->
     case Pending of
         #{Id := Frame} ->
@@ -380,7 +407,9 @@ quic_event({send_ready, Id}, #state{transport = {h3, _, _}, pending = Pending} =
 quic_event(send_ready, #state{send_waiters = Waiters} = State) ->
     _ = [Pid ! {trevrpc_stream, Ref, send_ready} || {Pid, Ref} <- Waiters],
     {noreply, State#state{send_waiters = []}};
-quic_event({datagram, Datagram}, #state{transport = {quic, _}, flows = Flows} = State) ->
+quic_event({datagram, Datagram}, #state{transport = Transport, flows = Flows} = State) when
+    element(1, Transport) =:= quic; element(1, Transport) =:= wt
+->
     Now = erlang:monotonic_time(millisecond),
     {noreply, State#state{flows = trevrpc_datagram_flows:dispatch(Datagram, Now, Flows)}};
 quic_event({closed, _Reason}, State) ->
@@ -426,6 +455,12 @@ open_stream(Id, #state{active = Active, config = Config} = State) ->
 
 %%% HTTP requests
 
+http_request(Id, <<"CONNECT">>, Target, Headers, State) ->
+    connect(Id, Target, Headers, State);
+http_request(Id, _Method, _Target, _Headers, #state{config = #{http := undefined}} = State) ->
+    %% A server that serves WebTransport but not the HTTP mapping.
+    refuse_http(Id, 404, trevrpc_http:refusal_headers([], #{}), <<"not found">>, State),
+    State;
 http_request(Id, Method, Target, Headers, #state{transport = Transport} = State0) ->
     {Peer, State} = peer(State0),
     Version =
@@ -451,6 +486,62 @@ http_request(Id, Method, Target, Headers, #state{transport = Transport} = State0
             accept_http(Id, Http, State);
         {refuse, Status, Extra, Message} ->
             refuse_http(Id, Status, trevrpc_http:refusal_headers(Extra, Http), Message, State),
+            State
+    end.
+
+%% A WebTransport CONNECT: a session if it passes the checks, the ones of
+%% erlang-webtransport included, of which there is one per connection, as
+%% from the Rust server.
+connect(Id, _Target, _Headers, #state{config = #{webtransport := undefined}} = State) ->
+    refuse_http(Id, 404, trevrpc_http:refusal_headers([], #{}), <<"not found">>, State),
+    State;
+connect(Id, Target, Headers, #state{config = #{webtransport := WebTransport}} = State0) ->
+    {Peer, State} = peer(State0),
+    Checked =
+        case trevrpc_http:check_connect(Target, Headers, Peer, WebTransport) of
+            ok when State#state.stopping ->
+                {refuse, 503, [], <<"server is shutting down">>};
+            ok when map_size(State#state.sessions) > 0 ->
+                {refuse, 503, [], <<"one WebTransport session per connection">>};
+            Result ->
+                Result
+        end,
+    case Checked of
+        ok ->
+            accept_session(Id, Headers, WebTransport, State);
+        {refuse, Status, Extra, Message} ->
+            refuse_http(Id, Status, trevrpc_http:refusal_headers(Extra, #{}), Message, State),
+            State
+    end.
+
+%% Starts the session's connection process, then the session, which tells
+%% that process it started. erlang-webtransport 0.5.11 answers the CONNECT,
+%% refusals included: `webtransport:accept/4' returns an error only after it
+%% refused or reset the request, and `{ok, Session}' once the session's
+%% `init/3' ran and the `200' went out. A session that ends later takes
+%% its connection process with it, which ends its entry here.
+accept_session(Id, Headers, #{session := SessionOpts}, State) ->
+    #state{transport = {h3, H3, Quic}, config = Config, sessions = Sessions} = State,
+    #{max_frame_size := MaxFrame, max_streams_per_connection := MaxStreams} = Config,
+    {ok, Conn} = gen_server:start(?MODULE, {undefined, Config}, []),
+    Monitor = monitor(process, Conn),
+    Opts = SessionOpts#{
+        transport => h3,
+        handler => trevrpc_webtransport,
+        handler_opts => #{
+            conn => Conn,
+            window => trevrpc_quic:stream_window(MaxFrame),
+            connection_window => trevrpc_quic:connection_window(MaxFrame, 4 * MaxStreams),
+            quic => Quic,
+            session_id => Id
+        }
+    },
+    case webtransport:accept(H3, Id, Headers, Opts) of
+        {ok, _Session} ->
+            State#state{sessions = Sessions#{Monitor => Conn}};
+        {error, _Reason} ->
+            demonitor(Monitor, [flush]),
+            exit(Conn, kill),
             State
     end.
 
@@ -609,6 +700,21 @@ abandoned(Id, #state{streams = Streams, transport = Transport} = State) ->
             State#state{pending = maps:remove(Id, State#state.pending)}
     end.
 
+%% A WebTransport stream ran too far ahead of its call, which its session
+%% could not hold back (see trevrpc_webtransport): the call ends with
+%% `resource_exhausted' once its process is gone.
+overflowed(Id, #state{streams = Streams} = State) ->
+    case Streams of
+        #{Id := #entry{state = Running, pid = Pid} = Entry} when
+            Running =:= starting; Running =:= running
+        ->
+            exit(Pid, kill),
+            cancel_timer(Entry),
+            release(Id, Entry#entry{state = overflowing, timer = undefined}, State);
+        _ ->
+            State
+    end.
+
 %%% Admission
 
 %% Whether the server takes the call: a slot in its request limit, the
@@ -651,9 +757,12 @@ stream_requests(Offer, Requests, Kind, Budget) ->
             {ok, false}
     end.
 
-%% The call's datagram flow, on native QUIC, which alone carries datagrams
-%% here: another transport ignores it. A flow that is in use fails the call.
-flow(Flow, #state{transport = {quic, _}, flows = Flows}) when Flow > 0 ->
+%% The call's datagram flow, on native QUIC and WebTransport, which alone
+%% carry datagrams here: another transport ignores it. A flow that is in use
+%% fails the call.
+flow(Flow, #state{transport = Transport, flows = Flows}) when
+    Flow > 0, element(1, Transport) =:= quic orelse element(1, Transport) =:= wt
+->
     case trevrpc_datagram_flows:in_use(Flow, Flows) of
         false ->
             {ok, Flow};
@@ -730,6 +839,9 @@ call_down(Id, Reason, #state{streams = Streams} = State) ->
                 Id, Fin, trevrpc_status:new(deadline_exceeded, <<"deadline exceeded">>), State
             ),
             maybe_close(remove(Id, State1));
+        #{Id := #entry{state = overflowing, fin = Fin}} ->
+            Status = trevrpc_status:new(resource_exhausted, <<"requests read too slowly">>),
+            maybe_close(remove(Id, lone_status(Id, Fin, Status, State)));
         #{Id := #entry{state = cancelling}} ->
             maybe_close(remove(Id, State));
         #{Id := #entry{state = shutdown}} ->
@@ -778,7 +890,10 @@ cut_off(Id, #state{transport = Transport}) ->
     ok.
 
 maybe_close(#state{stopping = true, streams = Streams, transport = Transport} = State) ->
-    case map_size(Streams) =:= 0 andalso map_size(State#state.pending) =:= 0 of
+    case
+        map_size(Streams) =:= 0 andalso map_size(State#state.pending) =:= 0 andalso
+            map_size(State#state.sessions) =:= 0
+    of
         true ->
             ok = close_transport(Transport),
             {stop, normal, State};
@@ -810,6 +925,7 @@ release(Id, #entry{admitted = Admitted} = Entry, #state{active = Active, config 
 %% Forgets the stream, giving back the stream compression memory its call
 %% held, and its datagram flow.
 remove(Id, #state{streams = Streams, config = Config, flows = Flows} = State) ->
+    ok = forget(Id, State),
     Released =
         case Streams of
             #{Id := #entry{reserved = Reserved, flow = Flow}} ->
@@ -826,6 +942,14 @@ remove(Id, #state{streams = Streams, config = Config, flows = Flows} = State) ->
         active_at = erlang:monotonic_time(millisecond),
         flows = Released
     }.
+
+%% Over WebTransport, what the call left unread no longer holds the session
+%% back. The other transports need no call: this process makes none into
+%% them for a call that ends normally.
+forget(Id, #state{transport = {wt, _, _, _} = Transport}) ->
+    trevrpc_transport:forget(Transport, Id);
+forget(_Id, _State) ->
+    ok.
 
 start_timer(infinity, _Message) ->
     undefined;

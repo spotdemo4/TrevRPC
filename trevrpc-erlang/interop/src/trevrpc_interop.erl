@@ -20,9 +20,9 @@
 %% The `bench' subcommand is the load client of bench/README.md (see
 %% {@link trevrpc_interop_bench}).
 %%
-%% The runtime serves native QUIC, QMux over TLS, QMux over WebSocket and the
-%% HTTP mapping over HTTP/3 and HTTP/2, and calls native QUIC and QMux over
-%% TLS; it has no WebTransport and no HTTP fallback yet. The server reports
+%% The runtime serves native QUIC, QMux over TLS, WebTransport, QMux over
+%% WebSocket and the HTTP mapping over HTTP/3 and HTTP/2, and calls native
+%% QUIC and QMux over TLS; it has no HTTP fallback yet. The server reports
 %% only the ports of what it serves and the scenarios it supports; the client
 %% reports the scenarios it does not implement as skipped. It leaves out the
 %% `http3' and `http2' ports even so: the only clients of them in `run.py',
@@ -141,7 +141,11 @@ server(#{"cert" := _, "key" := _} = Flags) ->
     {ok, Port} = trevrpc_server:port(Server),
     {ok, TcpPort} = trevrpc_server:tcp_port(Server),
     Ready = #{
-        native => Port, qmux => TcpPort, websocket => TcpPort, scenarios => server_scenarios()
+        native => Port,
+        qmux => TcpPort,
+        webtransport => Port,
+        websocket => TcpPort,
+        scenarios => server_scenarios()
     },
     io:put_chars(json:encode(Ready)),
     io:nl(),

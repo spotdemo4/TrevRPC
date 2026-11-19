@@ -11,7 +11,7 @@
 %% other.
 -module(trevrpc_http).
 
--export([check/6, accepted_headers/1, refusal_headers/2, path/1, header/2]).
+-export([check/6, check_connect/4, accepted_headers/1, refusal_headers/2, path/1, header/2]).
 
 -export_type([options/0, refusal/0]).
 
@@ -50,9 +50,27 @@ check(Version, Method, Target, Headers, Peer, #{path := HttpPath} = Opts) ->
             {refuse, 405, [{<<"allow">>, <<"POST">>}], <<"method must be POST">>};
         true ->
             case media_type(Headers) of
-                true -> admit(Version, Method, Path, Headers, Peer, Opts);
+                true -> admit(Version, Method, Path, Headers, Peer, Opts, <<"HTTP">>);
                 false -> {refuse, 415, [], <<"unsupported media type">>}
             end
+    end.
+
+%% @doc Checks an HTTP/3 CONNECT request for a WebTransport session, with
+%% the WebTransport options (`path' and `admission'): `404' off the path,
+%% `403' for a request the admission refused and `500' when it failed.
+%% erlang-webtransport checks the rest of the request.
+-spec check_connect(
+    binary(),
+    [{binary(), binary()}],
+    {inet:ip_address(), inet:port_number()} | undefined,
+    #{path := binary(), admission := trevrpc_admission:admission() | undefined, _ => _}
+) -> ok | refusal().
+check_connect(Target, Headers, Peer, #{path := HttpPath} = Opts) ->
+    case path(Target) of
+        HttpPath ->
+            admit(<<"HTTP/3.0">>, <<"CONNECT">>, HttpPath, Headers, Peer, Opts, <<"WebTransport">>);
+        _ ->
+            {refuse, 404, [], <<"not found">>}
     end.
 
 %% Exactly one Content-Type, the TrevRPC media type in any case, without
@@ -63,9 +81,9 @@ media_type(Headers) ->
         _ -> false
     end.
 
-admit(_Version, _Method, _Path, _Headers, _Peer, #{admission := undefined}) ->
+admit(_Version, _Method, _Path, _Headers, _Peer, #{admission := undefined}, _What) ->
     ok;
-admit(Version, Method, Path, Headers, Peer, #{admission := Admission}) ->
+admit(Version, Method, Path, Headers, Peer, #{admission := Admission}, What) ->
     Plain = [Header || {<<C, _/binary>>, _} = Header <- Headers, C =/= $:],
     Authority =
         case header(<<":authority">>, Headers) of
@@ -94,9 +112,9 @@ admit(Version, Method, Path, Headers, Peer, #{admission := Admission}) ->
         true ->
             ok;
         false ->
-            {refuse, 403, [], <<"HTTP admission denied">>};
+            {refuse, 403, [], <<What/binary, " admission denied">>};
         {error, Reason} ->
-            logger:error("trevrpc: the HTTP admission failed: ~p", [Reason]),
+            logger:error("trevrpc: the ~s admission failed: ~p", [What, Reason]),
             {refuse, 500, [], <<"internal server error">>}
     end.
 
@@ -106,7 +124,8 @@ accepted_headers(Opts) ->
     [{<<"content-type">>, ?MEDIA_TYPE} | alt_svc(Opts)].
 
 %% @doc The headers of a refusal with `Extra' headers of its own.
--spec refusal_headers([{binary(), binary()}], options()) -> [{binary(), binary()}].
+-spec refusal_headers([{binary(), binary()}], #{alt_svc => binary(), _ => _}) ->
+    [{binary(), binary()}].
 refusal_headers(Extra, Opts) ->
     [{<<"content-type">>, <<"text/plain; charset=utf-8">>} | Extra ++ alt_svc(Opts)].
 

@@ -20,10 +20,15 @@
 %% the TCP listener, for the requests that `http_admission' accepts (all of
 %% them by default).
 %%
-%% With `webtransport => true', the TCP listener also serves browsers: QMux
-%% over WebSocket at the HTTP path, for the sessions that
-%% `webtransport_admission' accepts (see {@link trevrpc_admission}).
-%% WebTransport itself is not served yet.
+%% With `webtransport => true', the server also serves browsers, at the
+%% HTTP path, for the sessions that `webtransport_admission' accepts (see
+%% {@link trevrpc_admission}): WebTransport over HTTP/3 on the UDP socket,
+%% and QMux over WebSocket on the TCP listener. Each HTTP/3 connection
+%% carries at most one WebTransport session, whose calls count against
+%% `max_streams_per_connection' as a connection's would. A session handles
+%% its streams' data one chunk at a time, and holds back the chunks of its
+%% other calls while one call is a window behind on reading its own (see
+%% {@link trevrpc_webtransport}).
 %%
 %% Messages are opaque binaries here: a handler decodes its request and
 %% encodes its response, usually through generated code. See
@@ -134,7 +139,18 @@
     qmux := trevrpc_qmux:options(),
     %% The HTTP mapping's options, with the idle timeout of HTTP/2
     %% connections, unless HTTP is off.
-    http := (trevrpc_http:options() | #{idle_timeout := timeout()}) | undefined
+    http := (trevrpc_http:options() | #{idle_timeout := timeout()}) | undefined,
+    %% How WebTransport sessions are admitted, the limits each session
+    %% grants its client, and erlang-webtransport's HTTP/3 options for them,
+    %% unless WebTransport is off.
+    webtransport :=
+        #{
+            path := binary(),
+            admission := trevrpc_admission:admission(),
+            session := map(),
+            h3 := map()
+        }
+        | undefined
 }.
 
 -record(state, {
@@ -204,6 +220,7 @@ init(Opts) ->
         {ok, Compression} ?= compression(Opts),
         ok ?= check_routes(maps:get(routes, Opts)),
         ok ?= check_browsers(Opts),
+        ok = webtransport_routers(Opts),
         listen(Opts, Credentials, Compression)
     else
         {error, Reason} -> {error, Reason}
@@ -270,6 +287,38 @@ route_errors(Route) ->
         end,
     Directions ++ Types ++ Codec ++ Unreliable.
 
+%% erlang-webtransport finds the stream router of each HTTP/3 connection in
+%% a named table, which the first process that needs it creates, and which
+%% goes with that process: here it is a process of its own, which outlives
+%% every server of the node.
+webtransport_routers(#{webtransport := true}) ->
+    case ets:whereis(webtransport_routers) of
+        undefined ->
+            Parent = self(),
+            {Pid, Monitor} = spawn_monitor(fun() -> own_webtransport_routers(Parent) end),
+            receive
+                {Pid, ready} -> demonitor(Monitor, [flush]);
+                {'DOWN', Monitor, process, Pid, _} -> ok
+            end,
+            ok;
+        _ ->
+            ok
+    end;
+webtransport_routers(#{}) ->
+    ok.
+
+own_webtransport_routers(Parent) ->
+    try ets:new(webtransport_routers, [named_table, public, set]) of
+        _ ->
+            Parent ! {self(), ready},
+            receive
+            after infinity -> ok
+            end
+    catch
+        %% Created by another process meanwhile.
+        error:badarg -> ok
+    end.
+
 %% Directions whose messages travel as datagrams are never stream-compressed,
 %% which needs a stream's ordered delivery: their messages are compressed
 %% one by one instead.
@@ -304,7 +353,10 @@ listen(Opts, Credentials, Compression) ->
         Credentials
     ),
     QuicOpts = maps:merge(
-        QuicOpts0#{extra_socket_opts => [{ip, maps:get(ip, Opts, {0, 0, 0, 0})}]},
+        maps:merge(
+            QuicOpts0#{extra_socket_opts => [{ip, maps:get(ip, Opts, {0, 0, 0, 0})}]},
+            webtransport_quic(Config)
+        ),
         quic_handlers(Start, Config)
     ),
     case start_quic(maps:get(port, Opts, 0), QuicOpts) of
@@ -351,13 +403,21 @@ start_quic(N, Port, Opts) ->
             end
     end.
 
+%% The QUIC options WebTransport needs (draft-ietf-webtrans-http3 Section
+%% 3.1): RESET_STREAM_AT, and resets that carry their stream's final size,
+%% which sessions with flow control count. QUIC datagrams are on already.
+webtransport_quic(#{webtransport := undefined}) ->
+    #{};
+webtransport_quic(#{webtransport := _}) ->
+    #{reset_stream_at => true, stream_reset_final_size => true}.
+
 %% Who owns each QUIC connection: the process `Start' starts for it. With
-%% HTTP, a connection that negotiated `h3' is HTTP/3, whose `quic_h3'
-%% process the owner hands the connection to in the ALPN hook, which runs
-%% in the connection's process.
-quic_handlers(Start, #{http := undefined}) ->
+%% HTTP or WebTransport, a connection that negotiated `h3' is HTTP/3, whose
+%% `quic_h3' process the owner hands the connection to in the ALPN hook,
+%% which runs in the connection's process.
+quic_handlers(Start, #{http := undefined, webtransport := undefined}) ->
     #{connection_handler => Start};
-quic_handlers(Start, #{http := _}) ->
+quic_handlers(Start, Config) ->
     #{
         alpn => [trevrpc:alpn(), ?H3],
         %% The control and QPACK streams of HTTP/3, and room for the
@@ -369,7 +429,7 @@ quic_handlers(Start, #{http := _}) ->
         connection_handler => Start,
         alpn_handler => fun
             (Conn, ?H3, Owner) ->
-                serve_h3(Conn, Owner);
+                serve_h3(Conn, Owner, Config);
             (Conn, _Alpn, Owner) ->
                 %% Every stream the client opens starts in manual flow
                 %% control (see trevrpc_transport:hold_streams/1).
@@ -379,11 +439,27 @@ quic_handlers(Start, #{http := _}) ->
     }.
 
 %% Starts HTTP/3 on the QUIC connection `Conn', whose events go to `Owner'
-%% from now on.
-serve_h3(Conn, Owner) ->
+%% from now on. With WebTransport, they go through the connection's stream
+%% router, which keeps those of the sessions' streams and datagrams, and the
+%% connection advertises WebTransport in its SETTINGS.
+serve_h3(Conn, Owner, #{webtransport := undefined}) ->
+    %% No handler: the owner answers each request.
+    accept_h3(Conn, Owner, #{owner => Owner, handler => undefined});
+serve_h3(Conn, Owner, #{webtransport := #{h3 := H3Settings}}) ->
+    #{connection_handler := Routed, settings := Settings} = H3Settings,
+    #{owner := Router} = PerConnection = Routed(Conn),
+    ok = webtransport_h3_router:set_passthrough(Router, Owner),
+    accept_h3(Conn, Owner, PerConnection#{
+        handler => undefined,
+        settings => Settings,
+        %% The client's SETTINGS tell its WebTransport draft.
+        defer_requests_until_settings => true,
+        notify_streams_available => true
+    }).
+
+accept_h3(Conn, Owner, Opts) ->
     maybe
-        %% No handler: the owner answers each request.
-        {ok, H3} ?= quic_h3:accept(Conn, #{owner => Owner, handler => undefined}),
+        {ok, H3} ?= quic_h3:accept(Conn, Opts),
         ok ?= trevrpc_server_conn:serve_h3(Owner, H3, Conn),
         {ok, H3}
     end.
@@ -489,7 +565,8 @@ config(Opts, Compression) ->
         graceful_shutdown_timeout => maps:get(graceful_shutdown_timeout, Opts, 30000),
         requests => counters:new(1, [write_concurrency]),
         qmux => qmux_options(Opts),
-        http => http_options(Opts)
+        http => http_options(Opts),
+        webtransport => webtransport_options(Opts)
     }.
 
 http_options(#{http := true} = Opts) ->
@@ -499,6 +576,27 @@ http_options(#{http := true} = Opts) ->
         idle_timeout => maps:get(connection_idle_timeout, Opts, 30000)
     };
 http_options(#{}) ->
+    undefined.
+
+%% WebTransport sessions grant their clients what QUIC connections do,
+%% where their draft has flow control of its own (Safari's, and the latest
+%% drafts'), and take no unidirectional streams, which TrevRPC does not use.
+webtransport_options(#{webtransport := true} = Opts) ->
+    MaxFrame = maps:get(max_frame_size, Opts, trevrpc:default_max_frame_size()),
+    Streams = 4 * maps:get(max_streams_per_connection, Opts, 64),
+    Session = #{
+        max_data => trevrpc_quic:connection_window(MaxFrame, Streams),
+        max_stream_data => trevrpc_quic:stream_window(MaxFrame),
+        max_streams_bidi => Streams,
+        max_streams_uni => 0
+    },
+    #{
+        path => maps:get(http_path, Opts, ?HTTP_PATH),
+        admission => maps:get(webtransport_admission, Opts, fun trevrpc_admission:no_origin/1),
+        session => Session,
+        h3 => webtransport:h3_settings(Session)
+    };
+webtransport_options(#{}) ->
     undefined.
 
 %% QMux sessions get the windows and limits of QUIC connections, and

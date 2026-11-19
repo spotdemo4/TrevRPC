@@ -1,10 +1,11 @@
 %% @private A connection of any transport: native QUIC (an erlang_quic
-%% connection), QMux (a `trevrpc_qmux' session), or the HTTP mapping over
-%% HTTP/3 (a `quic_h3' connection) or HTTP/2 (an erlang_h2 connection).
+%% connection), QMux (a `trevrpc_qmux' session), the HTTP mapping over
+%% HTTP/3 (a `quic_h3' connection) or HTTP/2 (an erlang_h2 connection), or
+%% a WebTransport session (see {@link trevrpc_webtransport}).
 %%
 %% Each carries bidirectional streams with flow control, and sends its owner
-%% events tagged `quic', `trevrpc_qmux', `quic_h3' or `h2'. QUIC and QMux
-%% streams are the RPCs' own streams; HTTP request streams carry one RPC in
+%% events tagged `quic', `trevrpc_qmux', `quic_h3', `h2' or `trevrpc_wt'.
+%% QUIC, QMux and WebTransport streams are the RPCs' own streams; HTTP request streams carry one RPC in
 %% their request and response bodies, on streams the client opened, and are
 %% cancelled with the HTTP codes (`H3_REQUEST_CANCELLED', `CANCEL') instead
 %% of TrevRPC's. HTTP/2 has no STOP_SENDING: a stream whose reading stops is
@@ -25,6 +26,7 @@
     manual_flow_control/2,
     hold_streams/1,
     track_flow_control/3,
+    forget/2,
     notify_send_ready/1,
     open_stream/1,
     send_datagram/2,
@@ -35,7 +37,7 @@
 
 -export_type([t/0, kind/0]).
 
--type kind() :: quic | qmux | h3 | h2.
+-type kind() :: quic | qmux | h3 | h2 | wt.
 
 %% A call on a connection that may be gone.
 -define(SAFE(Call),
@@ -47,9 +49,15 @@
 ).
 
 %% A QMux connection is the session and its send queue; an HTTP/3
-%% connection is the `quic_h3' process and its QUIC connection.
+%% connection is the `quic_h3' process and its QUIC connection; a
+%% WebTransport session is the session's process, its QUIC connection, and
+%% the size of the quarter stream ID that prefixes its datagrams.
 -type t() ::
-    {quic, pid()} | {qmux, pid(), trevrpc_qmux:send_queue()} | {h3, pid(), pid()} | {h2, pid()}.
+    {quic, pid()}
+    | {qmux, pid(), trevrpc_qmux:send_queue()}
+    | {h3, pid(), pid()}
+    | {h2, pid()}
+    | {wt, pid(), pid(), pos_integer()}.
 
 -define(H3_NO_ERROR, 16#100).
 -define(H3_REQUEST_CANCELLED, 16#10c).
@@ -61,11 +69,12 @@ pid(Transport) -> element(2, Transport).
 kind(Transport) -> element(1, Transport).
 
 %% @doc The tag of the events the connection sends its owner.
--spec tag(t()) -> quic | trevrpc_qmux | quic_h3 | h2.
+-spec tag(t()) -> quic | trevrpc_qmux | quic_h3 | h2 | trevrpc_wt.
 tag({quic, _}) -> quic;
 tag({qmux, _, _}) -> trevrpc_qmux;
 tag({h3, _, _}) -> quic_h3;
-tag({h2, _}) -> h2.
+tag({h2, _}) -> h2;
+tag({wt, _, _, _}) -> trevrpc_wt.
 
 %% @doc Writes `Data', finishing the stream with `Fin', waiting as long as
 %% it takes over HTTP/2.
@@ -76,7 +85,8 @@ send_data(Transport, Id, Data, Fin) ->
 %% @doc Writes `Data', finishing the stream with `Fin'. A full send queue
 %% returns `{error, send_queue_full}' at once, except over HTTP/2, which
 %% waits up to `Timeout' milliseconds for the peer's window and returns
-%% `{error, timeout}' after. quic_h3 and erlang_h2 take a binary only (they
+%% `{error, timeout}' after, and over WebTransport, which waits as long for
+%% the session to take the write. quic_h3 and erlang_h2 take a binary only (they
 %% size and frame the payload whole), so the HTTP writes copy `Data' into
 %% one.
 -spec send_data(t(), non_neg_integer(), iodata(), boolean(), timeout()) ->
@@ -88,7 +98,9 @@ send_data({qmux, Session, Queue}, Id, Data, Fin, _Timeout) ->
 send_data({h3, H3, _Quic}, Id, Data, Fin, _Timeout) ->
     ?SAFE(quic_h3:send_data(H3, Id, iolist_to_binary(Data), Fin));
 send_data({h2, Conn}, Id, Data, Fin, Timeout) ->
-    ?SAFE(h2:send_data(Conn, Id, iolist_to_binary(Data), Fin, #{block => Timeout})).
+    ?SAFE(h2:send_data(Conn, Id, iolist_to_binary(Data), Fin, #{block => Timeout}));
+send_data({wt, Session, _Quic, _Prefix}, Id, Data, Fin, Timeout) ->
+    trevrpc_webtransport:send(Session, Id, Data, Fin, Timeout).
 
 %% @doc Queues data without waiting and without the send queue's limit.
 %% quic_h3 has no such write: when it refuses one, the caller is sent
@@ -109,13 +121,22 @@ send_data_async({h3, H3, _Quic}, Id, Data, Fin) ->
 send_data_async({h2, Conn}, Id, Data, Fin) ->
     %% HTTP/2 buffers what the peer's window does not take yet.
     _ = ?SAFE(h2:send_data(Conn, Id, iolist_to_binary(Data), Fin)),
-    ok.
+    ok;
+send_data_async({wt, Session, _Quic, _Prefix}, Id, Data, Fin) ->
+    %% The session queues what its send queue does not take yet.
+    trevrpc_webtransport:send_async(Session, Id, Data, Fin).
 
 -spec consume(t(), non_neg_integer(), non_neg_integer()) -> ok | {error, term()}.
-consume({quic, Conn}, Id, Bytes) -> ?SAFE(quic:consume(Conn, Id, Bytes));
-consume({qmux, Session, _}, Id, Bytes) -> trevrpc_qmux:consume(Session, Id, Bytes);
-consume({h3, H3, _Quic}, Id, Bytes) -> ?SAFE(quic_h3:consume(H3, Id, Bytes));
-consume({h2, Conn}, Id, Bytes) -> ?SAFE(h2:consume(Conn, Id, Bytes)).
+consume({quic, Conn}, Id, Bytes) ->
+    ?SAFE(quic:consume(Conn, Id, Bytes));
+consume({qmux, Session, _}, Id, Bytes) ->
+    trevrpc_qmux:consume(Session, Id, Bytes);
+consume({h3, H3, _Quic}, Id, Bytes) ->
+    ?SAFE(quic_h3:consume(H3, Id, Bytes));
+consume({h2, Conn}, Id, Bytes) ->
+    ?SAFE(h2:consume(Conn, Id, Bytes));
+consume({wt, Session, _Quic, _Prefix}, Id, Bytes) ->
+    trevrpc_webtransport:consume(Session, Id, Bytes).
 
 %% @doc Resets the sending side. An HTTP request stream is cancelled
 %% whole, its receiving side as well.
@@ -127,7 +148,9 @@ reset_stream({qmux, Session, _}, Id, Code) ->
 reset_stream({h3, H3, _Quic}, Id, _Code) ->
     ?SAFE(quic_h3:cancel(H3, Id, ?H3_REQUEST_CANCELLED));
 reset_stream({h2, Conn}, Id, _Code) ->
-    ?SAFE(h2:cancel(Conn, Id, cancel)).
+    ?SAFE(h2:cancel(Conn, Id, cancel));
+reset_stream({wt, Session, _Quic, _Prefix}, Id, Code) ->
+    trevrpc_webtransport:reset_stream(Session, Id, Code).
 
 %% @doc Stops the receiving side. HTTP/2 cannot: the connection consumes
 %% what still arrives.
@@ -141,7 +164,9 @@ stop_sending({h3, _H3, Quic}, Id, _Code) ->
     %% with a reset, which quic_h3 reports as for any other.
     ?SAFE(quic:stop_sending(Quic, Id, ?H3_REQUEST_CANCELLED));
 stop_sending({h2, _Conn}, _Id, _Code) ->
-    ok.
+    ok;
+stop_sending({wt, Session, _Quic, _Prefix}, Id, Code) ->
+    trevrpc_webtransport:stop_sending(Session, Id, Code).
 
 %% @doc Puts a stream in manual flow control, which QMux streams always
 %% are, and HTTP request streams from their acceptance, without waiting.
@@ -187,6 +212,16 @@ track_flow_control({quic, Conn}, Id, Consumed) ->
 track_flow_control(_Transport, _Id, _Consumed) ->
     ok.
 
+%% @doc Tells the connection that nothing reads stream `Id' any more, as
+%% when its call ended: over WebTransport, the bytes its call left unread
+%% no longer hold the session back. The other transports return credit for
+%% each byte as it is read or dropped.
+-spec forget(t(), non_neg_integer()) -> ok.
+forget({wt, Session, _Quic, _Prefix}, Id) ->
+    trevrpc_webtransport:forget(Session, Id);
+forget(_Transport, _Id) ->
+    ok.
+
 %% @doc Asks for a `send_ready' event once the send queue drained. Over
 %% HTTP/3 the writer that was refused is told itself, and HTTP/2 writers
 %% wait in {@link send_data/5}.
@@ -204,24 +239,34 @@ open_stream({quic, Conn}) -> ?SAFE(quic:open_stream(Conn));
 open_stream({qmux, Session, _}) -> trevrpc_qmux:open_stream(Session);
 open_stream(_Transport) -> {error, unsupported}.
 
-%% @doc Sends a datagram. Only native QUIC carries them here; erlang_quic
-%% refuses one that does not fit, or that finds the congestion window full,
-%% at once.
+%% @doc Sends a datagram. Only native QUIC and WebTransport carry them here;
+%% erlang_quic refuses one that does not fit, or that finds the congestion
+%% window full, at once, and a WebTransport session drops it.
 -spec send_datagram(t(), iodata()) -> ok | {error, term()}.
-send_datagram({quic, Conn}, Payload) -> ?SAFE(quic:send_datagram(Conn, Payload));
-send_datagram(_Transport, _Payload) -> {error, unsupported}.
+send_datagram({quic, Conn}, Payload) ->
+    ?SAFE(quic:send_datagram(Conn, Payload));
+send_datagram({wt, Session, _Quic, _Prefix}, Payload) ->
+    trevrpc_webtransport:send_datagram(Session, Payload);
+send_datagram(_Transport, _Payload) ->
+    {error, unsupported}.
 
 %% @doc The largest datagram payload the connection takes now: 0 when it
-%% carries none, as on every transport but native QUIC, or when the peer
-%% does not take them.
+%% carries none, as on every transport but native QUIC and WebTransport, or
+%% when the peer does not take them. A WebTransport session's datagrams
+%% start with its quarter stream ID.
 -spec datagram_max_size(t()) -> non_neg_integer().
 datagram_max_size({quic, Conn}) ->
-    case ?SAFE(quic:datagram_max_size(Conn)) of
-        Size when is_integer(Size) -> Size;
-        _ -> 0
-    end;
+    quic_datagram_max_size(Conn);
+datagram_max_size({wt, _Session, Quic, Prefix}) when is_integer(Prefix) ->
+    max(0, quic_datagram_max_size(Quic) - Prefix);
 datagram_max_size(_Transport) ->
     0.
+
+quic_datagram_max_size(Conn) ->
+    case ?SAFE(quic:datagram_max_size(Conn)) of
+        Size when is_integer(Size), Size >= 0 -> Size;
+        _ -> 0
+    end.
 
 %% @doc Tells an HTTP client that the connection takes no more requests;
 %% those it sent already are served. The connection's owner decides when
@@ -234,6 +279,8 @@ goaway({h3, H3, _Quic}) ->
 goaway({h2, Conn}) ->
     _ = ?SAFE(h2:goaway(Conn, #{timeout => infinity})),
     ok;
+goaway({wt, Session, _Quic, _Prefix}) ->
+    trevrpc_webtransport:drain(Session);
 goaway(_Transport) ->
     ok.
 
@@ -251,4 +298,6 @@ close({h2, Conn}, _Code) ->
     %% sent it already at shutdown, when it does nothing.
     _ = ?SAFE(h2:goaway(Conn)),
     _ = ?SAFE(h2:close(Conn)),
-    ok.
+    ok;
+close({wt, Session, _Quic, _Prefix}, _Code) ->
+    trevrpc_webtransport:close(Session).

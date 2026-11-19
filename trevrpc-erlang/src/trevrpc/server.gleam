@@ -68,6 +68,13 @@ pub type Config {
     /// Whether to serve the HTTP mapping, over HTTP/3 and HTTP/2, which
     /// the Android client uses.
     http: Bool,
+    /// Whether to serve browsers: WebTransport over HTTP/3, and QMux over
+    /// WebSocket on the TCP listener.
+    webtransport: Bool,
+    /// The origins of the pages, besides the server's own, that may open a
+    /// browser session. Browsers always send an `Origin`; clients that send
+    /// none are admitted too.
+    webtransport_origins: List(String),
     max_frame_size: Option(Int),
     max_streams_per_connection: Option(Int),
     max_concurrent_requests: Option(Int),
@@ -92,6 +99,8 @@ pub fn config(
     tcp: True,
     tcp_port: None,
     http: False,
+    webtransport: False,
+    webtransport_origins: [],
     max_frame_size: None,
     max_streams_per_connection: None,
     max_concurrent_requests: None,
