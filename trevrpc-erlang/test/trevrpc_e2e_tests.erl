@@ -581,15 +581,16 @@ stale_stream_test(#{channel := Channel}) ->
     Self = self(),
     Caller = spawn_link(fun() ->
         ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{})),
-        {Generation, Transport, Queued} = get({trevrpc_channel, Channel}),
-        put({trevrpc_channel, Channel}, {Generation - 1, Transport, Queued}),
+        {Generation, Version, Pool, Counters} = get({trevrpc_channel, Channel}),
+        put({trevrpc_channel, Channel}, {Generation - 1, Version, Pool, Counters}),
         Self ! {remembered, self()},
         receive
             go -> ok
         end,
         Result = trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{}),
         Self !
-            {done, self(), Result, {Generation, Transport, Queued}, get({trevrpc_channel, Channel})}
+            {done, self(), Result, {Generation, Version, Pool, Counters},
+                get({trevrpc_channel, Channel})}
     end),
     receive
         {remembered, Caller} -> ok
@@ -621,7 +622,7 @@ queued_opens_test(#{channel := Channel}) ->
     Self = self(),
     Caller = spawn_link(fun() ->
         ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{})),
-        {_, _, Queued} = get({trevrpc_channel, Channel}),
+        {_, _, _, Queued} = get({trevrpc_channel, Channel}),
         Self ! {queued, self(), Queued},
         receive
             go -> ok
@@ -651,8 +652,14 @@ queued_opens_test(#{channel := Channel}) ->
     end,
     ?assertEqual([], traced_calls(Caller, [])).
 
+%% The calls Pid made, traced, but those that only read a transport's
+%% tuple and call no process.
 traced_calls(Pid, Acc) ->
     receive
+        {trace, Pid, call, {trevrpc_transport, Accessor, [_]}} when
+            Accessor =:= pid; Accessor =:= kind; Accessor =:= tag
+        ->
+            traced_calls(Pid, Acc);
         {trace, Pid, call, {Module, Function, Args}} ->
             traced_calls(Pid, [{Module, Function, length(Args)} | Acc])
     after 0 -> lists:usort(Acc)
@@ -1633,12 +1640,12 @@ dead_connection_is_forgotten(Credentials) ->
         ok = trevrpc_channel:subscribe(Channel),
         await_state(Channel, {ready, 1}),
         ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"d">>, #{})),
-        {1, Transport, _} = get({trevrpc_channel, Channel}),
+        {1, _, [{1, Transport}], _} = get({trevrpc_channel, Channel}),
         exit(trevrpc_transport:pid(Transport), kill),
         await_state(Channel, connecting),
         await_state(Channel, {ready, 2}),
         ?assertMatch({ok, <<"d">>, _}, trevrpc_client:unary(Channel, ?UNARY, <<"d">>, #{})),
-        ?assertMatch({2, _, _}, get({trevrpc_channel, Channel}))
+        ?assertMatch({2, _, _, _}, get({trevrpc_channel, Channel}))
     after
         trevrpc_channel:close(Channel),
         trevrpc_server:stop(Server)
@@ -1657,7 +1664,7 @@ orphan_stream_is_cancelled(Credentials) ->
     try
         _ = spawn_link(fun() ->
             ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"o">>, #{})),
-            {_, Transport, _} = get({trevrpc_channel, Channel}),
+            {_, _, [{1, Transport}], _} = get({trevrpc_channel, Channel}),
             Self ! {orphan, trevrpc_transport:open_stream(Transport)}
         end),
         Orphan =
@@ -2411,6 +2418,352 @@ expired_self_signed(_Credentials) ->
         ?assertMatch(
             {error, #{code := unavailable}}, trevrpc_channel:wait_until_ready(Channel, 1000)
         )
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%%% A pool of QUIC connections
+
+pool_test_() ->
+    {setup,
+        fun() ->
+            {ok, _} = application:ensure_all_started(quic),
+            logger:set_primary_config(level, none),
+            trevrpc_test_tls:credentials()
+        end,
+        fun(_) -> logger:set_primary_config(level, notice) end, fun(Credentials) ->
+            [
+                {timeout, 30, fun() -> pool_spreads_calls(Credentials) end},
+                {timeout, 30, fun() -> lost_extra_fails_its_calls(Credentials) end},
+                {timeout, 30, fun() -> extras_drain_after_their_generation(Credentials) end},
+                {timeout, 30, fun() -> qmux_keeps_one_connection(Credentials) end},
+                {timeout, 30, fun() -> extras_events_wait_for_their_attempts(Credentials) end},
+                {timeout, 30, fun() -> draining_extra_fails_its_writers(Credentials) end},
+                {timeout, 30, fun() -> failed_extra_does_not_hold_up_ready(Credentials) end},
+                {timeout, 30, fun() -> lost_generation_stops_its_extras_attempts(Credentials) end}
+            ]
+        end}.
+
+pool_channel(Credentials, Server, Transport) ->
+    pool_channel(Credentials, Server, Transport, #{}).
+
+pool_channel(Credentials, Server, Transport, Opts) ->
+    {ok, Channel} = trevrpc_channel:start(
+        maps:merge(
+            (ports(Server))#{
+                host => {127, 0, 0, 1},
+                transport => Transport,
+                server_name => "localhost",
+                cacerts => maps:get(cacerts, Credentials),
+                min_quic_connections => 3
+            },
+            Opts
+        )
+    ),
+    ok = trevrpc_channel:wait_until_ready(Channel, 10000),
+    Channel.
+
+%% The calling process's view of the channel's pool, which wait_until_ready
+%% returned with full: its connections' numbers and transports, and the
+%% counters of their calls in flight.
+pool_view(Channel) ->
+    ok = trevrpc_channel:wait_until_ready(Channel, 10000),
+    ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"p">>, #{})),
+    {_, _, Pool, Counters} = get({trevrpc_channel, Channel}),
+    {Pool, Counters}.
+
+loads(Pool, Counters) ->
+    [atomics:get(Counters, 2 + Slot) || {Slot, _} <- Pool].
+
+%% Returns once the traced channel has joined an extra to its pool.
+await_join(Channel) ->
+    receive
+        {trace, Channel, call, {trevrpc_channel, join, _}} -> ok
+    after 10000 -> error(no_extra_joined)
+    end.
+
+%% A call held open by a process of its own until released: the process
+%% reports once its call is up, then its call's end.
+hold_call(Channel) ->
+    Self = self(),
+    Pid = spawn_link(fun() ->
+        {ok, Call} = trevrpc_client:bidi(Channel, ?BIDI, #{timeout => 20000}),
+        ok = trevrpc_client:send(Call, <<"h">>),
+        {ok, <<"h">>} = trevrpc_client:recv(Call),
+        Self ! {held, self()},
+        receive
+            release -> ok
+        end,
+        Result =
+            case trevrpc_client:close_send(Call) of
+                ok -> trevrpc_client:recv(Call);
+                Error -> Error
+            end,
+        %% The channel takes this call, after the end of the call above.
+        _ = trevrpc_channel:generation(Channel),
+        Self ! {done, self(), Result}
+    end),
+    receive
+        {held, Pid} -> Pid
+    after 5000 -> error(not_held)
+    end.
+
+release_call(Pid) ->
+    Pid ! release,
+    receive
+        {done, Pid, Result} -> Result
+    after 10000 -> error(not_done)
+    end.
+
+%% With three connections, each call goes to the one with the fewest in
+%% flight: 30 calls opened one after another spread 10, 10 and 10. A call
+%% with a datagram flow stays on the generation's own connection.
+pool_spreads_calls(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = pool_channel(Credentials, Server, quic),
+    try
+        {Pool, Counters} = pool_view(Channel),
+        ?assertEqual(3, length(Pool)),
+        Held = [hold_call(Channel) || _ <- lists:seq(1, 30)],
+        ?assertEqual([10, 10, 10], loads(Pool, Counters)),
+        [{1, Own} | _] = Pool,
+        {ok, #{transport := OnOwn, id := Id, ref := Ref}} = trevrpc_channel:open_stream(
+            Channel, infinity, false
+        ),
+        ?assertEqual(Own, OnOwn),
+        trevrpc_channel:stream_done(Channel, Id, Ref),
+        ?assertEqual(lists:duplicate(30, {eof, #{}}), [release_call(Pid) || Pid <- Held]),
+        ?assertEqual([0, 0, 0], loads(Pool, Counters))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% An extra that is lost fails only its own calls; the generation goes on,
+%% and the channel dials the extra again.
+lost_extra_fails_its_calls(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = pool_channel(Credentials, Server, quic),
+    try
+        ok = trevrpc_channel:subscribe(Channel),
+        await_state(Channel, {ready, 1}),
+        {[_, {2, Extra}, _] = Pool, _} = pool_view(Channel),
+        Held = [hold_call(Channel) || _ <- lists:seq(1, 6)],
+        _ = erlang:trace_pattern({trevrpc_channel, join, 2}, true, [local]),
+        1 = erlang:trace(Channel, true, [call]),
+        exit(trevrpc_transport:pid(Extra), kill),
+        Results = [release_call(Pid) || Pid <- Held],
+        ?assertEqual(4, length([ok || {eof, #{}} <- Results])),
+        ?assertEqual(2, length([failed || {error, #{code := unavailable}} <- Results])),
+        ?assertEqual(1, trevrpc_channel:generation(Channel)),
+        ok = await_join(Channel),
+        _ = erlang:trace(Channel, false, [call]),
+        {Redialled, _} = pool_view(Channel),
+        ?assertMatch([_, {2, _}, _], Redialled),
+        ?assertNotEqual(Pool, Redialled)
+    after
+        _ = erlang:trace_pattern({trevrpc_channel, join, 2}, false, [local]),
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% When the generation's own connection is lost, its calls fail, but its
+%% extras' calls go on to their end; the extras then close, and the next
+%% generation dials a pool of its own.
+extras_drain_after_their_generation(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = pool_channel(Credentials, Server, quic),
+    try
+        ok = trevrpc_channel:subscribe(Channel),
+        await_state(Channel, {ready, 1}),
+        {[{1, Own}, {2, Extra2}, {3, Extra3}], _} = pool_view(Channel),
+        Held = [hold_call(Channel) || _ <- lists:seq(1, 6)],
+        Monitors = [monitor(process, trevrpc_transport:pid(E)) || E <- [Extra2, Extra3]],
+        exit(trevrpc_transport:pid(Own), kill),
+        await_state(Channel, connecting),
+        await_state(Channel, {ready, 2}),
+        Results = [release_call(Pid) || Pid <- Held],
+        ?assertEqual(4, length([ok || {eof, #{}} <- Results])),
+        ?assertEqual(2, length([failed || {error, #{code := unavailable}} <- Results])),
+        [
+            receive
+                {'DOWN', Monitor, process, _, _} -> ok
+            after 5000 -> error(extra_not_closed)
+            end
+         || Monitor <- Monitors
+        ],
+        {Next, _} = pool_view(Channel),
+        ?assertEqual(3, length(Next)),
+        ?assertEqual([], [T || {_, T} <- Next, lists:member(T, [Own, Extra2, Extra3])])
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The extras are dialled in parallel, so the events of their connections
+%% may come before the results of the attempts that dialled them: each is
+%% held until its own attempt's result names its connection. Over QMux,
+%% whose generation dials no extras of its own, two attempts are set up by
+%% hand, and the connected events of B and A come before the results of A
+%% and B.
+extras_events_wait_for_their_attempts(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = pool_channel(Credentials, Server, tcp),
+    Idle = fun() ->
+        spawn_link(fun() ->
+            receive
+                stop -> ok
+            end
+        end)
+    end,
+    [A, B, ParentA, ParentB] = [Idle() || _ <- lists:seq(1, 4)],
+    try
+        #{extra_attempts := AttemptsField, extras := ExtrasField} = channel_fields(),
+        Generation = trevrpc_channel:generation(Channel),
+        RefA = make_ref(),
+        RefB = make_ref(),
+        Attempt = fun(Slot, Parent) ->
+            #{slot => Slot, generation => Generation, transport => undefined, parent => Parent}
+        end,
+        _ = sys:replace_state(Channel, fun(State) ->
+            setelement(AttemptsField, State, #{
+                RefA => Attempt(2, ParentA), RefB => Attempt(3, ParentB)
+            })
+        end),
+        Connected = {connected, #{alpn => trevrpc:alpn()}},
+        Channel ! {quic, B, Connected},
+        Channel ! {quic, A, Connected},
+        Channel ! {extra_result, RefA, {ok, {quic, A}}},
+        Channel ! {extra_result, RefB, {ok, {quic, B}}},
+        Extras = element(ExtrasField, sys:get_state(Channel)),
+        ?assertMatch(
+            #{A := #{slot := 2, parent := ParentA}, B := #{slot := 3, parent := ParentB}}, Extras
+        )
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A draining extra closes once its last call ends; a writer still waiting
+%% for that extra's send queue then learns that its stream closed. The
+%% writer is set up by hand, as a full send queue is not something a test
+%% can count on.
+draining_extra_fails_its_writers(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = pool_channel(Credentials, Server, quic),
+    try
+        ok = trevrpc_channel:subscribe(Channel),
+        await_state(Channel, {ready, 1}),
+        {[{1, Own}, {2, Extra}, _], _} = pool_view(Channel),
+        [OnOwn, OnExtra, OnThird] = [hold_call(Channel) || _ <- lists:seq(1, 3)],
+        exit(trevrpc_transport:pid(Own), kill),
+        await_state(Channel, connecting),
+        #{send_waiters := WaitersField} = channel_fields(),
+        ExtraPid = trevrpc_transport:pid(Extra),
+        Writer = make_ref(),
+        Self = self(),
+        _ = sys:replace_state(Channel, fun(State) ->
+            Waiters = element(WaitersField, State),
+            setelement(WaitersField, State, Waiters#{ExtraPid => [{Self, Writer}]})
+        end),
+        Monitor = monitor(process, ExtraPid),
+        ?assertEqual({eof, #{}}, release_call(OnExtra)),
+        receive
+            {trevrpc_stream, Writer, closed} -> ok
+        after 5000 -> error(writer_not_told)
+        end,
+        ?assertNot(maps:is_key(ExtraPid, element(WaitersField, sys:get_state(Channel)))),
+        receive
+            {'DOWN', Monitor, process, _, _} -> ok
+        after 5000 -> error(extra_not_closed)
+        end,
+        ?assertMatch({error, #{code := unavailable}}, release_call(OnOwn)),
+        ?assertEqual({eof, #{}}, release_call(OnThird))
+    after
+        trevrpc_channel:close(Channel),
+        trevrpc_server:stop(Server)
+    end.
+
+%% A failed extra does not hold up wait_until_ready/2, and neither does
+%% one still being dialled when its generation ends. Over QMux, whose
+%% generation dials no extras of its own, the attempt is set up by hand.
+failed_extra_does_not_hold_up_ready(Credentials) ->
+    with_settling_attempt(Credentials, fun(Channel, Ref, _Parent) ->
+        Channel ! {extra_result, Ref, {error, refused}}
+    end).
+
+lost_generation_stops_its_extras_attempts(Credentials) ->
+    with_settling_attempt(Credentials, fun(Channel, _Ref, Parent) ->
+        ok = trevrpc_channel:subscribe(Channel),
+        Monitor = monitor(process, Parent),
+        {_, _, [{1, Own}], _} = get({trevrpc_channel, Channel}),
+        exit(trevrpc_transport:pid(Own), kill),
+        receive
+            {'DOWN', Monitor, process, _, _} -> ok
+        after 5000 -> error(attempt_not_stopped)
+        end,
+        await_state(Channel, connecting)
+    end).
+
+%% Runs End against a channel whose generation dials one extra, set up by
+%% hand, with a wait_until_ready/2 call held up by it, and checks that the
+%% call returns. The channel's QUIC port is a socket that never answers, so
+%% the extra the channel dials again does not join the pool and make the
+%% channel ready in its place.
+with_settling_attempt(Credentials, End) ->
+    Server = start_server(Credentials, #{}),
+    {ok, Silent} = gen_udp:open(0, [{ip, {127, 0, 0, 1}}]),
+    {ok, SilentPort} = inet:port(Silent),
+    Channel = pool_channel(Credentials, Server, tcp, #{port => SilentPort}),
+    Parent = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    try
+        ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"s">>, #{})),
+        #{extra_attempts := AttemptsField, pool_settling := SettlingField} = channel_fields(),
+        Ref = make_ref(),
+        Attempt = #{
+            slot => 2,
+            generation => trevrpc_channel:generation(Channel),
+            transport => undefined,
+            parent => Parent
+        },
+        _ = sys:replace_state(Channel, fun(State) ->
+            setelement(SettlingField, setelement(AttemptsField, State, #{Ref => Attempt}), true)
+        end),
+        Request = gen_server:send_request(Channel, {wait_until_ready, 10000}),
+        %% Taken in order after the request, so the request is waiting.
+        _ = sys:get_state(Channel),
+        %% wait_response/2, unlike receive_response/2, keeps the request
+        %% when it times out.
+        ?assertEqual(timeout, gen_server:wait_response(Request, 0)),
+        End(Channel, Ref, Parent),
+        ?assertEqual({reply, ok}, gen_server:receive_response(Request, 10000))
+    after
+        exit(Parent, kill),
+        trevrpc_channel:close(Channel),
+        gen_udp:close(Silent),
+        trevrpc_server:stop(Server)
+    end.
+
+%% The positions of the fields of trevrpc_channel's state record, read from
+%% its source.
+channel_fields() ->
+    Source = filename:join([code:lib_dir(trevrpc), "src", "trevrpc_channel.erl"]),
+    {ok, Forms} = epp:parse_file(Source, []),
+    [Fields] = [Fs || {attribute, _, record, {state, Fs}} <- Forms],
+    maps:from_list(lists:zip([field_name(F) || F <- Fields], lists:seq(2, length(Fields) + 1))).
+
+%% QMux over TLS always uses one connection.
+qmux_keeps_one_connection(Credentials) ->
+    Server = start_server(Credentials, #{}),
+    Channel = pool_channel(Credentials, Server, tcp),
+    try
+        ?assertMatch({ok, _, _}, trevrpc_client:unary(Channel, ?UNARY, <<"q">>, #{})),
+        ?assertMatch({_, _, [{1, {qmux, _, _}}], _}, get({trevrpc_channel, Channel}))
     after
         trevrpc_channel:close(Channel),
         trevrpc_server:stop(Server)

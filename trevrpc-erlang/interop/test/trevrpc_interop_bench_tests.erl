@@ -30,7 +30,7 @@ bench_test_() ->
          || Transport <- ["quic", "tcp"], Scenario <- ?SCENARIOS
         ] ++
             [
-                {"records, stream compression, metadata and two connections",
+                {"records, stream compression, metadata, two channels and two QUIC connections each",
                     {timeout, 60, fun() -> options(Env) end}},
                 {"what the runtime cannot do is a usage error", fun() -> refusals(Env) end}
             ]
@@ -112,7 +112,8 @@ options(#{flags := Flags}) ->
                 "size" => "256",
                 "compression" => "stream",
                 "metadata-size" => "64",
-                "connections" => "2"
+                "connections" => "2",
+                "min-quic-connections" => "2"
             }),
             ?assertMatch(
                 #{

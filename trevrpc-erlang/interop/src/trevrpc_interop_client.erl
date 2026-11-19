@@ -117,7 +117,8 @@ selection(#{}) ->
     all.
 
 %% @doc Connects a channel to --addr (and --tcp-addr) over `Transport',
-%% trusting --ca, with the compression settings of --dictionary.
+%% trusting --ca, with the compression settings of --dictionary, and over
+%% native QUIC --min-quic-connections connections (default 1).
 -spec connect(#{string() => string()}, quic | tcp | auto) ->
     {ok, pid()} | {error, trevrpc_status:status()}.
 connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
@@ -132,7 +133,8 @@ connect(#{"addr" := Addr, "ca" := Ca} = Flags, Transport) ->
             transport => Transport,
             server_name => maps:get("server-name", Flags, "localhost"),
             cacertfile => Ca,
-            compression => trevrpc_interop:compression(Flags)
+            compression => trevrpc_interop:compression(Flags),
+            min_quic_connections => list_to_integer(maps:get("min-quic-connections", Flags, "1"))
         },
         ?DEADLINE
     );

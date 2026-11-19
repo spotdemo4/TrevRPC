@@ -23,6 +23,14 @@
 %% reconnects use it directly until the reprobe interval (5 minutes) has
 %% passed, then race again. `quic' and `tcp' pin one transport.
 %%
+%% Over native QUIC, `min_quic_connections' keeps a pool of that many
+%% connections and spreads the calls over it, each to the connection with
+%% the fewest in flight. The generation's own connection is the pool's
+%% first and decides its life; the others, its extras, are dialled when it
+%% is ready and again when lost, which fails only their own calls. When the
+%% generation ends its extras drain: they take no new calls and close after
+%% their last.
+%%
 %% The channel process owns the connection and routes each stream's events
 %% to the process that made the call, which reads and writes the stream
 %% itself; see {@link trevrpc_client}. A calling process opens its streams
@@ -73,7 +81,8 @@
     connect_timeout => pos_integer(),
     idle_timeout => pos_integer(),
     compression => trevrpc_zstd:settings(),
-    stream_compression_memory => non_neg_integer()
+    stream_compression_memory => non_neg_integer(),
+    min_quic_connections => pos_integer()
 }.
 
 %% What a calling process needs to use a stream it opened.
@@ -94,9 +103,10 @@
     %% The stream's datagram flow and its credit, when the calling process
     %% asked for one and the connection carries datagrams.
     flow := {pos_integer(), trevrpc_datagram_flows:credit()} | undefined,
-    %% How many opens the channel holds for stream credit, which callers
-    %% opening their own streams do not pass.
-    queued_opens := atomics:atomics_ref()
+    %% The generation's connections, numbered, as of a version, and the
+    %% counters callers read to open their own streams (see open_stream/3).
+    pool := {non_neg_integer(), [{pos_integer(), trevrpc_transport:t()}]},
+    counters := atomics:atomics_ref()
 }.
 
 %% Whether a call asks for a datagram flow, and whether it reads a stream of
@@ -107,6 +117,16 @@
 -define(MAX_DELAY, 30000).
 -define(CANCELLED, 1).
 -define(STREAM_COMPRESSION_MEMORY, 67108864).
+%% The counters a channel publishes for callers that open their own
+%% streams: the opens it holds for stream credit, the version of its pool
+%% of connections, and from ?LOADS + 1 on, the calls in flight on each of
+%% the pool's connections, by number.
+-define(QUEUED, 1).
+-define(VERSION, 2).
+-define(LOADS, 2).
+
+%% A stream, by its connection's process and its ID on that connection.
+-type key() :: {pid(), non_neg_integer()}.
 
 %% A connection attempt: its transport kind, its connection once known, and
 %% for QUIC the process the connection is linked to (see quic_attempt/2).
@@ -114,6 +134,20 @@
     kind := trevrpc_transport:kind(),
     transport := trevrpc_transport:t() | undefined,
     parent := pid() | undefined
+}.
+
+-type extra() :: #{
+    transport := trevrpc_transport:t(),
+    slot := pos_integer(),
+    monitor := reference(),
+    parent := pid()
+}.
+
+-type extra_attempt() :: #{
+    slot := pos_integer(),
+    generation := non_neg_integer(),
+    transport := trevrpc_transport:t() | undefined,
+    parent := pid()
 }.
 
 -record(state, {
@@ -139,7 +173,7 @@
     %% call is answered), and what each stream holds from the budget.
     stream_budget :: trevrpc_zstd_stream:budget() | undefined,
     optimistic = true :: boolean(),
-    reserved = #{} :: #{non_neg_integer() => non_neg_integer()},
+    reserved = #{} :: #{key() => non_neg_integer()},
     status = connecting :: connecting | ready,
     transport :: trevrpc_transport:t() | undefined,
     %% The current race, its attempts, whether it started with QUIC, and
@@ -160,21 +194,43 @@
     generation = 0 :: non_neg_integer(),
     delay = ?INITIAL_DELAY :: pos_integer(),
     ready_waiters = [] :: [{gen_server:from(), reference()}],
-    %% Stream ID => {calling process, routing tag, monitor}.
-    streams = #{} :: #{non_neg_integer() => {pid(), reference(), reference()}},
-    monitors = #{} :: #{reference() => non_neg_integer()},
+    %% Stream => {calling process, routing tag, monitor}, and the streams by
+    %% routing tag and by monitor.
+    streams = #{} :: #{key() => {pid(), reference(), reference()}},
+    refs = #{} :: #{reference() => key()},
+    monitors = #{} :: #{reference() => key()},
     %% Opens refused for lack of stream credit, waiting for more, with the
     %% calling process and whether it asked for a datagram flow.
     pending_opens = [] :: [{gen_server:from(), {pid(), datagrams()}, reference()}],
-    %% Their number, for callers that open their own streams.
-    queued_opens = atomics:new(1, []) :: atomics:atomics_ref(),
+    %% The counters callers that open their own streams read (?QUEUED and
+    %% the others).
+    counters :: atomics:atomics_ref(),
     %% The datagram flows of the connection's calls, the flow of each
     %% stream that has one, and whether the connection carries datagrams,
     %% once a call asked.
     flows = trevrpc_datagram_flows:new(client, 0) :: trevrpc_datagram_flows:flows(),
-    stream_flows = #{} :: #{non_neg_integer() => pos_integer()},
+    stream_flows = #{} :: #{key() => pos_integer()},
     datagrams :: boolean() | undefined,
-    send_waiters = [] :: [{pid(), reference()}],
+    %% Processes waiting for each connection's send queue to drain.
+    send_waiters = #{} :: #{pid() => [{pid(), reference()}]},
+    %% Over native QUIC, the generation's own connection is number 1 of its
+    %% pool, and min_quic_connections - 1 more, the extras, join it: each
+    %% with its number, monitor and parent, while they are dialled, and with
+    %% the delay before one lost is dialled again. Extras of a generation
+    %% that ended drain: they take no new calls and close after their last.
+    min_quic = 1 :: pos_integer(),
+    version = 0 :: non_neg_integer(),
+    extras = #{} :: #{pid() => extra()},
+    draining = #{} :: #{pid() => extra()},
+    extra_attempts = #{} :: #{reference() => extra_attempt()},
+    extra_delays = #{} :: #{pos_integer() => pos_integer()},
+    %% Events of connections no extra's attempt knows yet, until the
+    %% attempt's result names the connection, and whether a new generation
+    %% still dials extras, which holds back wait_until_ready/2.
+    held_events = #{} :: #{pid() => [term()]},
+    pool_settling = false :: boolean(),
+    %% The calls in flight on each connection.
+    loads = #{} :: #{pid() => non_neg_integer()},
     %% Processes told of every change of state.
     subscribers = #{} :: #{reference() => pid()}
 }).
@@ -268,26 +324,47 @@ open_stream(Channel, Deadline) ->
 %% stream of responses, `false' when it reads one response) and the
 %% connection carries datagrams.
 %%
-%% The calling process remembers the channel's connection and its
-%% generation from its last stream, opens the stream on it itself, and
-%% registers it with the channel before it writes to it, so no event of the
-%% stream can reach the channel first. The channel opens it instead when
-%% the process knows no connection yet, the server's stream limit is
-%% reached (the channel waits for credit), or the connection is gone or
-%% was replaced.
+%% The calling process remembers the channel's connections and their
+%% generation from its last stream, opens the stream itself on the one with
+%% the fewest calls in flight (the generation's own for a call that asks
+%% for a datagram flow), and registers it with the channel before it writes
+%% to it, so no event of the stream can reach the channel first. The
+%% channel opens it instead when the process knows no connection yet, its
+%% connections changed, the server's stream limit is reached (the channel
+%% waits for credit, and the process waits behind the opens already
+%% waiting), or the connection is gone or was replaced.
 -spec open_stream(pid(), trevrpc_stream:deadline(), datagrams()) ->
     {ok, stream_info()} | {error, trevrpc_status:status()}.
 open_stream(Channel, Deadline, Datagrams) ->
     case get({?MODULE, Channel}) of
-        {Generation, Transport, Queued} ->
-            case atomics:get(Queued, 1) of
-                0 -> own_open(Channel, Generation, Transport, Deadline, Datagrams);
-                %% Opens wait for stream credit: this one waits behind them.
-                _ -> channel_open(Channel, Deadline, Datagrams)
+        {Generation, Version, Pool, Counters} ->
+            case
+                atomics:get(Counters, ?QUEUED) =:= 0 andalso
+                    atomics:get(Counters, ?VERSION) =:= Version
+            of
+                true ->
+                    Transport = place(Pool, Counters, Datagrams),
+                    own_open(Channel, Generation, Transport, Deadline, Datagrams);
+                false ->
+                    channel_open(Channel, Deadline, Datagrams)
             end;
         undefined ->
             channel_open(Channel, Deadline, Datagrams)
     end.
+
+%% The connection a call goes to: the generation's own, number 1, for a
+%% call with a datagram flow, else the one with the fewest calls in flight,
+%% the lowest numbered of those, as the channel's own opens order them.
+place([{1, Own}], _Counters, _Datagrams) ->
+    Own;
+place([{1, Own} | _], _Counters, Datagrams) when Datagrams =/= undefined ->
+    Own;
+place(Pool, Counters, _Datagrams) ->
+    {_Load, _Slot, Transport} = lists:min([
+        {atomics:get(Counters, ?LOADS + Slot), Slot, Transport}
+     || {Slot, Transport} <- Pool
+    ]),
+    Transport.
 
 %% Opens the stream on the remembered connection and registers it. A
 %% caller killed in between leaves a stream nobody registered. A QMux
@@ -299,7 +376,8 @@ own_open(Channel, Generation, Transport, Deadline, Datagrams) ->
     case trevrpc_transport:open_stream(Transport) of
         {ok, Id} ->
             ok = trevrpc_transport:manual_flow_control(Transport, Id),
-            case register_stream(Channel, Generation, Id, Datagrams) of
+            Conn = trevrpc_transport:pid(Transport),
+            case register_stream(Channel, Generation, Conn, Id, Datagrams) of
                 {ok, Info} ->
                     {ok, Info};
                 stale ->
@@ -310,13 +388,13 @@ own_open(Channel, Generation, Transport, Deadline, Datagrams) ->
             channel_open(Channel, Deadline, Datagrams)
     end.
 
-%% Has the channel open the stream, and remembers its connection. A
+%% Has the channel open the stream, and remembers its connections. A
 %% channel that is gone is forgotten.
 channel_open(Channel, Deadline, Datagrams) ->
     _ = erase({?MODULE, Channel}),
     try gen_server:call(Channel, {open_stream, {self(), Datagrams}, Deadline}, infinity) of
-        {ok, #{generation := Generation, transport := Transport, queued_opens := Queued}} = Opened ->
-            put({?MODULE, Channel}, {Generation, Transport, Queued}),
+        {ok, #{generation := Generation, pool := {Version, Pool}, counters := Counters}} = Opened ->
+            put({?MODULE, Channel}, {Generation, Version, Pool, Counters}),
             Opened;
         Error ->
             Error
@@ -324,9 +402,11 @@ channel_open(Channel, Deadline, Datagrams) ->
         exit:_ -> {error, closed_status()}
     end.
 
-register_stream(Channel, Generation, Id, Datagrams) ->
+register_stream(Channel, Generation, Conn, Id, Datagrams) ->
     try
-        gen_server:call(Channel, {register_stream, Generation, Id, {self(), Datagrams}}, infinity)
+        gen_server:call(
+            Channel, {register_stream, Generation, Conn, Id, {self(), Datagrams}}, infinity
+        )
     catch
         exit:_ -> stale
     end.
@@ -391,7 +471,10 @@ init(Opts, Compression) ->
         }
     ),
     TcpHost = host(maps:get(tcp_host, Opts, Host)),
+    MinQuic = max(1, maps:get(min_quic_connections, Opts, 1)),
     State = #state{
+        min_quic = MinQuic,
+        counters = atomics:new(?LOADS + MinQuic, [{signed, true}]),
         host = Host,
         port = Port,
         tcp_host = TcpHost,
@@ -502,7 +585,9 @@ valid_pinned(Der, DnsName) ->
 
 -spec handle_call(term(), gen_server:from(), #state{}) ->
     {reply, term(), #state{}} | {noreply, #state{}} | {stop, normal, ok, #state{}}.
-handle_call({wait_until_ready, _Timeout}, _From, #state{status = ready} = State) ->
+handle_call(
+    {wait_until_ready, _Timeout}, _From, #state{status = ready, pool_settling = false} = State
+) ->
     {reply, ok, State};
 handle_call({wait_until_ready, Timeout}, From, #state{ready_waiters = Waiters} = State) ->
     Timer =
@@ -545,38 +630,45 @@ handle_call({open_stream, _Owner, _Deadline}, _From, #state{status = connecting}
 handle_call({open_stream, Owner, Deadline}, From, State) ->
     open(From, Owner, Deadline, State);
 handle_call(
-    {register_stream, Generation, Id, Opener},
+    {register_stream, Generation, Conn, Id, Opener},
     _From,
     #state{status = ready, generation = Generation} = State
 ) ->
-    {Info, Registered} = opened(Id, Opener, State),
-    {reply, {ok, Info}, Registered};
-handle_call({register_stream, _Generation, _Id, _Opener}, _From, State) ->
+    case slot(Conn, State) of
+        undefined ->
+            %% A connection of the generation that is gone.
+            {reply, stale, State};
+        _ ->
+            {Info, Registered} = opened(Conn, Id, Opener, State),
+            {reply, {ok, Info}, Registered}
+    end;
+handle_call({register_stream, _Generation, _Conn, _Id, _Opener}, _From, State) ->
     %% The connection the stream is on is no longer the channel's.
     {reply, stale, State};
-handle_call({reserve, Id, Ref, Cost}, _From, #state{streams = Streams} = State) ->
-    case Streams of
-        #{Id := {_Pid, Ref, _Monitor}} ->
+handle_call({reserve, Id, Ref, Cost}, _From, State) ->
+    case stream_key(Id, Ref, State) of
+        {ok, Key} ->
             case trevrpc_zstd_stream:reserve(State#state.stream_budget, Cost) of
                 true ->
                     Reserved = State#state.reserved,
                     {reply, true, State#state{
-                        reserved = Reserved#{Id => maps:get(Id, Reserved, 0) + Cost}
+                        reserved = Reserved#{Key => maps:get(Key, Reserved, 0) + Cost}
                     }};
                 false ->
                     {reply, false, State}
             end;
-        #{} ->
+        error ->
             {reply, false, State}
     end.
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
-handle_cast({stream_done, Id, Ref}, #state{streams = Streams} = State) ->
-    case Streams of
-        #{Id := {_Pid, Ref, Monitor}} ->
+handle_cast({stream_done, Id, Ref}, State) ->
+    case stream_key(Id, Ref, State) of
+        {ok, Key} ->
+            {_Pid, Ref, Monitor} = maps:get(Key, State#state.streams),
             demonitor(Monitor, [flush]),
-            {noreply, forget(Id, Monitor, State)};
-        _ ->
+            {noreply, forget(Key, State)};
+        error ->
             {noreply, State}
     end;
 handle_cast(
@@ -585,12 +677,13 @@ handle_cast(
     {noreply, State#state{shared = Shared}};
 handle_cast({learn, _Generation, _Shared}, State) ->
     {noreply, State};
-handle_cast({release, Id, Ref, Cost}, #state{streams = Streams, reserved = Reserved} = State) ->
-    case {Streams, Reserved} of
-        {#{Id := {_Pid, Ref, _Monitor}}, #{Id := Held}} ->
+handle_cast({release, Id, Ref, Cost}, #state{reserved = Reserved} = State) ->
+    case stream_key(Id, Ref, State) of
+        {ok, Key} when is_map_key(Key, Reserved) ->
+            Held = map_get(Key, Reserved),
             Given = min(Cost, Held),
             trevrpc_zstd_stream:release(State#state.stream_budget, Given),
-            {noreply, State#state{reserved = Reserved#{Id := Held - Given}}};
+            {noreply, State#state{reserved = Reserved#{Key := Held - Given}}};
         _ ->
             {noreply, State}
     end;
@@ -603,11 +696,18 @@ handle_cast({optimism, _Generation, _Optimistic}, State) ->
 handle_info({Tag, Pid, Event}, #state{status = ready, transport = Transport} = State) when
     (Tag =:= quic orelse Tag =:= trevrpc_qmux), element(2, Transport) =:= Pid
 ->
-    connection_event(Event, State);
+    connection_event(Pid, Event, State);
+handle_info({quic, Pid, Event}, #state{extras = Extras, draining = Draining} = State) when
+    is_map_key(Pid, Extras); is_map_key(Pid, Draining)
+->
+    connection_event(Pid, Event, State);
 handle_info({Tag, Pid, _Event}, #state{retired = Retired} = State) when
     (Tag =:= quic orelse Tag =:= trevrpc_qmux) andalso is_map_key(Pid, Retired)
 ->
     {noreply, State};
+handle_info({quic, Pid, Event}, #state{status = ready} = State) ->
+    %% Only an extra's attempt dials while the generation is ready.
+    {noreply, extra_attempt_event(Pid, Event, State)};
 handle_info({Tag, Pid, Event}, State) when Tag =:= quic; Tag =:= trevrpc_qmux ->
     case find_attempt(Pid, State) of
         {ok, Ref} ->
@@ -641,6 +741,20 @@ handle_info({connect_result, Ref, Result}, #state{attempts = Attempts} = State) 
         {#{}, {error, _}} ->
             {noreply, State}
     end;
+handle_info({extra_result, Ref, Result}, State) ->
+    {noreply, extra_result(Ref, Result, State)};
+handle_info({timeout, _Timer, {extra_timeout, Ref}}, #state{extra_attempts = Attempts} = State) ->
+    case Attempts of
+        #{Ref := _} -> {noreply, extra_failed(Ref, State)};
+        #{} -> {noreply, State}
+    end;
+handle_info(
+    {timeout, _Timer, {redial, Slot, Generation}},
+    #state{status = ready, generation = Generation} = State
+) ->
+    {noreply, dial_extra(Slot, State)};
+handle_info({timeout, _Timer, {redial, _Slot, _Generation}}, State) ->
+    {noreply, State};
 handle_info({timeout, _Timer, {attempt_timeout, Ref}}, #state{attempts = Attempts} = State) ->
     case Attempts of
         #{Ref := _} -> {noreply, attempt_failed(Ref, State)};
@@ -674,14 +788,21 @@ handle_info({timeout, _Timer, {open_timeout, From}}, #state{pending_opens = Pend
     end;
 handle_info({trevrpc_await_datagrams, Pid, Ref, Flow, Count}, #state{flows = Flows} = State) ->
     {noreply, State#state{flows = trevrpc_datagram_flows:await(Flow, Pid, Ref, Count, Flows)}};
-handle_info({trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters} = State) ->
-    _ =
-        case {Waiters, State#state.status} of
-            {_, connecting} -> Pid ! {trevrpc_stream, Ref, closed};
-            {[], ready} -> trevrpc_transport:notify_send_ready(State#state.transport);
-            _ -> ok
-        end,
-    {noreply, State#state{send_waiters = [{Pid, Ref} | Waiters]}};
+handle_info({trevrpc_send_ready, Pid, Ref}, #state{send_waiters = Waiters, refs = Refs} = State) ->
+    case Refs of
+        #{Ref := {Conn, _Id}} ->
+            ConnWaiters = maps:get(Conn, Waiters, []),
+            _ =
+                case ConnWaiters of
+                    [] -> trevrpc_transport:notify_send_ready(conn_transport(Conn, State));
+                    _ -> ok
+                end,
+            {noreply, State#state{send_waiters = Waiters#{Conn => [{Pid, Ref} | ConnWaiters]}}};
+        #{} ->
+            %% Its stream is gone, with its connection.
+            Pid ! {trevrpc_stream, Ref, closed},
+            {noreply, State}
+    end;
 handle_info({'DOWN', Monitor, process, Pid, _Reason}, #state{retired = Retired} = State) when
     map_get(Pid, Retired) =:= Monitor
 ->
@@ -689,6 +810,12 @@ handle_info({'DOWN', Monitor, process, Pid, _Reason}, #state{retired = Retired} 
 handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{conn_monitor = Monitor} = State) ->
     %% The connection's process died without telling: as if it closed.
     {noreply, lost(State#state{conn_monitor = undefined})};
+handle_info(
+    {'DOWN', _Monitor, process, Pid, _Reason}, #state{extras = Extras, draining = Draining} = State
+) when
+    is_map_key(Pid, Extras); is_map_key(Pid, Draining)
+->
+    {noreply, extra_lost(Pid, State)};
 handle_info(
     {'DOWN', Monitor, process, _Pid, _Reason}, #state{subscribers = Subscribers} = State
 ) when
@@ -698,9 +825,9 @@ handle_info(
 handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{monitors = Monitors} = State) ->
     %% The calling process exited without finishing its call: cancel it.
     case maps:find(Monitor, Monitors) of
-        {ok, Id} ->
-            cancel_stream(State#state.transport, Id),
-            {noreply, forget(Id, Monitor, State)};
+        {ok, {Conn, Id} = Key} ->
+            cancel_stream(conn_transport(Conn, State), Id),
+            {noreply, forget(Key, State)};
         error ->
             {noreply, State}
     end;
@@ -713,8 +840,14 @@ handle_info(_Message, State) ->
 -spec terminate(term(), #state{}) -> ok.
 terminate(_Reason, #state{subscribers = Subscribers} = State) ->
     _ = [Pid ! {trevrpc_channel, self(), closed} || Pid <- maps:values(Subscribers)],
-    fail_streams(State),
-    _ = release_connection(stop_attempts(State)),
+    fail_streams(fun(_Conn) -> true end, State),
+    Stopped = stop_extra_attempts(stop_attempts(State)),
+    Closed = lists:foldl(
+        fun close_extra/2,
+        Stopped,
+        maps:values(Stopped#state.extras) ++ maps:values(Stopped#state.draining)
+    ),
+    _ = release_connection(Closed),
     ok.
 
 %%% Racing
@@ -755,13 +888,20 @@ start_fallback(State) ->
 %% The connection is linked to the process that started it and stops when
 %% that process exits, so that process stays alive as its parent: it exits
 %% when told to, or with the channel, and takes the connection with it.
-quic_attempt(
-    #state{host = Host, port = Port, quic_opts = QuicOpts, connect_timeout = Timeout} = State
-) ->
+quic_attempt(#state{connect_timeout = Timeout} = State) ->
     Ref = make_ref(),
+    Parent = quic_connect(connect_result, Ref, State),
+    erlang:start_timer(Timeout, self(), {attempt_timeout, Ref}),
+    add_attempt(Ref, #{kind => quic, transport => undefined, parent => Parent}, State).
+
+%% Dials a QUIC connection the channel owns, from a parent process that
+%% sends the channel `{Tag, Ref, Result}'.
+quic_connect(
+    Tag, Ref, #state{host = Host, port = Port, quic_opts = QuicOpts, connect_timeout = Timeout}
+) ->
     Self = self(),
     Opts = QuicOpts#{connect_timeout => Timeout},
-    Parent = spawn_link(fun() ->
+    spawn_link(fun() ->
         process_flag(trap_exit, true),
         Result =
             try quic:connect(Host, Port, Opts, Self) of
@@ -770,11 +910,9 @@ quic_attempt(
             catch
                 Class:Reason -> {error, {Class, Reason}}
             end,
-        Self ! {connect_result, Ref, Result},
+        Self ! {Tag, Ref, Result},
         parent_loop(Self)
-    end),
-    erlang:start_timer(Timeout, self(), {attempt_timeout, Ref}),
-    add_attempt(Ref, #{kind => quic, transport => undefined, parent => Parent}, State).
+    end).
 
 parent_loop(Channel) ->
     receive
@@ -885,7 +1023,6 @@ attempt_event(_Ref, _Event, State) ->
 won(Ref, Transport, Kind, #state{attempts = Attempts} = State) ->
     #{Ref := #{parent := Parent}} = Attempts,
     Stopped = stop_attempts(State#state{attempts = maps:remove(Ref, Attempts)}),
-    _ = [gen_server:reply(From, ok) || {From, _Timer} <- State#state.ready_waiters],
     %% QMux winning a race against QUIC opens the window in which reconnects
     %% skip QUIC; reconnects within it leave it as it is.
     FallbackUntil =
@@ -894,23 +1031,27 @@ won(Ref, Transport, Kind, #state{attempts = Attempts} = State) ->
             {auto, qmux, false} -> State#state.fallback_until;
             _ -> undefined
         end,
-    notify(Stopped#state{
-        status = ready,
-        transport = Transport,
-        generation = State#state.generation + 1,
-        shared = undefined,
-        optimistic = true,
-        delay = ?INITIAL_DELAY,
-        round = undefined,
-        attempts = #{},
-        ready_waiters = [],
-        fallback_until = FallbackUntil,
-        conn_monitor = monitor(process, trevrpc_transport:pid(Transport)),
-        parent = Parent,
-        flows = trevrpc_datagram_flows:new(client, 0),
-        stream_flows = #{},
-        datagrams = undefined
-    }).
+    Conn = trevrpc_transport:pid(Transport),
+    notify(
+        start_pool(Kind, Stopped#state{
+            pool_settling = true,
+            status = ready,
+            transport = Transport,
+            generation = State#state.generation + 1,
+            shared = undefined,
+            optimistic = true,
+            delay = ?INITIAL_DELAY,
+            round = undefined,
+            attempts = #{},
+            fallback_until = FallbackUntil,
+            conn_monitor = monitor(process, trevrpc_transport:pid(Transport)),
+            parent = Parent,
+            flows = trevrpc_datagram_flows:new(client, 0),
+            datagrams = undefined,
+            loads = (Stopped#state.loads)#{Conn => 0},
+            extra_delays = #{}
+        })
+    ).
 
 attempt_failed(Ref, #state{attempts = Attempts} = State) ->
     #{Ref := #{kind := Kind} = Attempt} = Attempts,
@@ -962,53 +1103,62 @@ retry(#state{delay = Delay} = State0) ->
         delay = min(?MAX_DELAY, Delay * 2)
     }.
 
-%%% The ready connection
+%%% The ready connections
 
-connection_event({stream_data, Id, Bin, Fin}, State) ->
-    route(Id, {data, Bin, Fin}, State);
-connection_event({stream_reset, Id, Code}, State) ->
-    route(Id, {reset, Code}, State);
-connection_event({stop_sending, Id, Code}, State) ->
-    route(Id, {stop_sending, Code}, State);
-connection_event({stream_opened, Id}, #state{transport = Transport} = State) ->
+%% An event of connection Conn: the generation's own, an extra, or one that
+%% drains.
+connection_event(Conn, {stream_data, Id, Bin, Fin}, State) ->
+    route(Conn, Id, {data, Bin, Fin}, State);
+connection_event(Conn, {stream_reset, Id, Code}, State) ->
+    route(Conn, Id, {reset, Code}, State);
+connection_event(Conn, {stop_sending, Id, Code}, State) ->
+    route(Conn, Id, {stop_sending, Code}, State);
+connection_event(Conn, {stream_opened, Id}, State) ->
     %% Servers open no streams in TrevRPC.
-    _ = trevrpc_transport:stop_sending(Transport, Id, ?CANCELLED),
+    _ = trevrpc_transport:stop_sending(conn_transport(Conn, State), Id, ?CANCELLED),
     {noreply, State};
-connection_event({streams_available, bidi}, State) ->
+connection_event(_Conn, {streams_available, bidi}, State) ->
     retry_opens(State);
-connection_event({datagram, Datagram}, #state{flows = Flows} = State) ->
-    Now = erlang:monotonic_time(millisecond),
-    {noreply, State#state{flows = trevrpc_datagram_flows:dispatch(Datagram, Now, Flows)}};
-connection_event(send_ready, #state{send_waiters = Waiters} = State) ->
-    _ = [Pid ! {trevrpc_stream, Ref, send_ready} || {Pid, Ref} <- Waiters],
-    {noreply, State#state{send_waiters = []}};
-connection_event({closed, _Reason}, State) ->
-    {noreply, lost(State)};
-connection_event({error, _Reason}, State) ->
-    {noreply, lost(State)};
-connection_event(_Event, State) ->
+connection_event(Conn, {datagram, Datagram}, #state{flows = Flows} = State) ->
+    %% Calls with datagram flows are on the generation's own connection.
+    case own(Conn, State) of
+        true ->
+            Now = erlang:monotonic_time(millisecond),
+            {noreply, State#state{flows = trevrpc_datagram_flows:dispatch(Datagram, Now, Flows)}};
+        false ->
+            {noreply, State}
+    end;
+connection_event(Conn, send_ready, #state{send_waiters = Waiters} = State) ->
+    _ = [Pid ! {trevrpc_stream, Ref, send_ready} || {Pid, Ref} <- maps:get(Conn, Waiters, [])],
+    {noreply, State#state{send_waiters = maps:remove(Conn, Waiters)}};
+connection_event(Conn, {Outcome, _Reason}, State) when Outcome =:= closed; Outcome =:= error ->
+    case own(Conn, State) of
+        true -> {noreply, lost(State)};
+        false -> {noreply, extra_lost(Conn, State)}
+    end;
+connection_event(_Conn, _Event, State) ->
     {noreply, State}.
 
-%% The connection is gone: fail its calls and reconnect.
-lost(State) ->
-    Connecting = notify((release_connection(State))#state{status = connecting}),
-    fail_streams(Connecting),
+own(Conn, #state{transport = Transport}) ->
+    Transport =/= undefined andalso trevrpc_transport:pid(Transport) =:= Conn.
+
+%% The generation's own connection is gone: fail its calls and reconnect.
+%% Its extras take no new calls and close after their last.
+lost(#state{transport = Transport} = State0) ->
+    Own = trevrpc_transport:pid(Transport),
+    State1 = drain_extras(stop_extra_attempts(State0)),
+    Connecting = notify((release_connection(State1))#state{status = connecting}),
+    fail_streams(fun(Conn) -> Conn =:= Own end, Connecting),
     _ = [
         gen_server:reply(From, {error, trevrpc_status:new(unavailable, <<"connection closed">>)})
      || {From, _Owner, _Timer} <- Connecting#state.pending_opens
     ],
-    _ = [demonitor(Monitor, [flush]) || Monitor <- maps:keys(Connecting#state.monitors)],
-    _ = [
-        trevrpc_zstd_stream:release(Connecting#state.stream_budget, Held)
-     || _Id := Held <- Connecting#state.reserved
-    ],
-    retry((pending([], Connecting))#state{
-        streams = #{},
-        monitors = #{},
-        reserved = #{},
-        send_waiters = [],
+    Forgotten = forget_streams(Own, Connecting),
+    retry((pending([], Forgotten))#state{
+        send_waiters = maps:remove(Own, Forgotten#state.send_waiters),
         flows = trevrpc_datagram_flows:new(client, 0),
-        stream_flows = #{}
+        stream_flows = #{},
+        loads = maps:remove(Own, Forgotten#state.loads)
     }).
 
 %% Lets the ready connection go: closes it, in case it reported an error
@@ -1035,20 +1185,43 @@ notify(#state{subscribers = Subscribers} = State) ->
 channel_state(#state{status = ready, generation = Generation}) -> {ready, Generation};
 channel_state(#state{status = connecting}) -> connecting.
 
-fail_streams(#state{streams = Streams, send_waiters = Waiters}) ->
-    _ = [Pid ! {trevrpc_stream, Ref, closed} || {Pid, Ref, _Monitor} <- maps:values(Streams)],
-    _ = [Pid ! {trevrpc_stream, Ref, closed} || {Pid, Ref} <- Waiters],
+%% Tells the calls on the connections Which accepts that they closed.
+fail_streams(Which, #state{streams = Streams} = State) ->
+    _ = [
+        Pid ! {trevrpc_stream, Ref, closed}
+     || {Conn, _Id} := {Pid, Ref, _Monitor} <- Streams, Which(Conn)
+    ],
+    fail_send_waiters(Which, State).
+
+%% Tells the writers waiting for the send queues of the connections Which
+%% accepts that their streams closed.
+fail_send_waiters(Which, #state{send_waiters = Waiters}) ->
+    _ = [
+        Pid ! {trevrpc_stream, Ref, closed}
+     || Conn := ConnWaiters <- Waiters, Which(Conn), {Pid, Ref} <- ConnWaiters
+    ],
     ok.
 
-route(Id, Event, #state{streams = Streams} = State) ->
+%% Forgets the streams of connection Conn, which is gone.
+forget_streams(Conn, #state{streams = Streams} = State) ->
+    lists:foldl(
+        fun({Key, {_Pid, _Ref, Monitor}}, Acc) ->
+            demonitor(Monitor, [flush]),
+            forget(Key, Acc)
+        end,
+        State,
+        [{Key, Value} || {C, _} = Key := Value <- Streams, C =:= Conn]
+    ).
+
+route(Conn, Id, Event, #state{streams = Streams} = State) ->
     _ =
         case {Streams, Event} of
-            {#{Id := {Pid, Ref, _Monitor}}, _} ->
+            {#{{Conn, Id} := {Pid, Ref, _Monitor}}, _} ->
                 Pid ! {trevrpc_stream, Ref, Event};
             {#{}, {data, _, _}} ->
                 %% A stream no call reads: one whose caller is done, or
                 %% exited before it registered the stream it opened.
-                cancel_stream(State#state.transport, Id);
+                cancel_stream(conn_transport(Conn, State), Id);
             _ ->
                 ok
         end,
@@ -1066,27 +1239,48 @@ open(From, Opener, Deadline, #state{pending_opens = [_ | _]} = State) ->
     %% Opens wait for stream credit: this one waits behind them, even if
     %% credit came back and the channel has not heard of it yet.
     queue_open(From, Opener, Deadline, State);
-open(From, Opener, Deadline, #state{transport = Transport} = State0) ->
+open(From, {_Owner, Datagrams} = Opener, Deadline, State) ->
+    %% The connections in the order a call goes to them, as place/3 picks.
+    Candidates =
+        case pool(State) of
+            [{1, Own} | _] when Datagrams =/= undefined ->
+                [Own];
+            Pool ->
+                [T || {_, _, T} <- lists:sort([{load(Slot, State), Slot, T} || {Slot, T} <- Pool])]
+        end,
+    open_on(Candidates, From, Opener, Deadline, false, State).
+
+open_on([Transport | Rest], From, Opener, Deadline, Limited, State0) ->
     case trevrpc_transport:open_stream(Transport) of
         {ok, Id} ->
             ok = trevrpc_transport:manual_flow_control(Transport, Id),
-            {Info, State} = opened(Id, Opener, State0),
+            {Info, State} = opened(trevrpc_transport:pid(Transport), Id, Opener, State0),
             {reply, {ok, Info}, State};
         {error, stream_limit} ->
-            queue_open(From, Opener, Deadline, State0);
+            open_on(Rest, From, Opener, Deadline, true, State0);
         _ ->
-            {reply, {error, trevrpc_status:new(unavailable, <<"could not open a stream">>)}, State0}
-    end.
+            open_on(Rest, From, Opener, Deadline, Limited, State0)
+    end;
+open_on([], From, Opener, Deadline, true, State) ->
+    queue_open(From, Opener, Deadline, State);
+open_on([], _From, _Opener, _Deadline, false, State) ->
+    {reply, {error, trevrpc_status:new(unavailable, <<"could not open a stream">>)}, State}.
 
-%% Routes the events of stream `Id', open on the current connection, to the
-%% process that opened it, and what that process needs to use it.
-opened(Id, {Owner, Datagrams}, #state{transport = Transport} = State0) ->
+%% Routes the events of stream `Id', open on connection Conn of the current
+%% generation, to the process that opened it, and what that process needs
+%% to use it.
+opened(Conn, Id, {Owner, Datagrams}, State0) ->
+    Key = {Conn, Id},
     Ref = make_ref(),
     Monitor = monitor(process, Owner),
-    {Flow, State} = flow(Id, Owner, Ref, Datagrams, State0),
+    {Flow, State} =
+        case own(Conn, State0) of
+            true -> flow(Key, Owner, Ref, Datagrams, State0);
+            false -> {undefined, State0}
+        end,
     Info = #{
         flow => Flow,
-        transport => Transport,
+        transport => conn_transport(Conn, State),
         id => Id,
         ref => Ref,
         generation => State#state.generation,
@@ -1095,12 +1289,22 @@ opened(Id, {Owner, Datagrams}, #state{transport = Transport} = State0) ->
         shared => State#state.shared,
         stream_budget => State#state.stream_budget,
         optimistic => State#state.optimistic,
-        queued_opens => State#state.queued_opens
+        pool => {State#state.version, pool(State)},
+        counters => State#state.counters
     },
-    {Info, State#state{
-        streams = (State#state.streams)#{Id => {Owner, Ref, Monitor}},
-        monitors = (State#state.monitors)#{Monitor => Id}
-    }}.
+    {Info,
+        add_load(Conn, 1, State#state{
+            streams = (State#state.streams)#{Key => {Owner, Ref, Monitor}},
+            refs = (State#state.refs)#{Ref => Key},
+            monitors = (State#state.monitors)#{Monitor => Key}
+        })}.
+
+%% The stream of a call, by its ID and routing tag.
+stream_key(Id, Ref, #state{refs = Refs}) ->
+    case Refs of
+        #{Ref := {_Conn, Id} = Key} -> {ok, Key};
+        #{} -> error
+    end.
 
 %% Holds an open until stream credit comes back, or its deadline passes.
 queue_open(From, Opener, Deadline, State) ->
@@ -1114,20 +1318,20 @@ queue_open(From, Opener, Deadline, State) ->
         end,
     {noreply, pending(State#state.pending_opens ++ [{From, Opener, Timer}], State)}.
 
-%% A datagram flow for stream `Id', if its call asked for one and the
+%% A datagram flow for stream Key, if its call asked for one and the
 %% connection carries datagrams: native QUIC whose server takes them, which
 %% is asked once per connection.
-flow(_Id, _Owner, _Ref, undefined, State) ->
+flow(_Key, _Owner, _Ref, undefined, State) ->
     {undefined, State};
-flow(Id, Owner, Ref, Receives, #state{datagrams = undefined, transport = Transport} = State) ->
-    flow(Id, Owner, Ref, Receives, State#state{
+flow(Key, Owner, Ref, Receives, #state{datagrams = undefined, transport = Transport} = State) ->
+    flow(Key, Owner, Ref, Receives, State#state{
         datagrams = trevrpc_transport:datagram_max_size(Transport) > 0
     });
-flow(_Id, _Owner, _Ref, _Receives, #state{datagrams = false} = State) ->
+flow(_Key, _Owner, _Ref, _Receives, #state{datagrams = false} = State) ->
     {undefined, State};
-flow(Id, Owner, Ref, Receives, #state{flows = Flows, stream_flows = StreamFlows} = State) ->
+flow(Key, Owner, Ref, Receives, #state{flows = Flows, stream_flows = StreamFlows} = State) ->
     {Flow, Credit, Allocated} = trevrpc_datagram_flows:allocate(Owner, Ref, Receives, Flows),
-    {{Flow, Credit}, State#state{flows = Allocated, stream_flows = StreamFlows#{Id => Flow}}}.
+    {{Flow, Credit}, State#state{flows = Allocated, stream_flows = StreamFlows#{Key => Flow}}}.
 
 %% Stream credit came back: open the waiting streams, in order, while it
 %% lasts.
@@ -1145,26 +1349,278 @@ retry_opens(#state{pending_opens = [{From, Owner, Timer} | Rest]} = State) ->
     end.
 
 %% Sets the opens waiting for stream credit, and publishes their number.
-pending(Pending, #state{queued_opens = Queued} = State) ->
-    atomics:put(Queued, 1, length(Pending)),
+pending(Pending, #state{counters = Counters} = State) ->
+    atomics:put(Counters, ?QUEUED, length(Pending)),
     State#state{pending_opens = Pending}.
 
-%% Forgets stream `Id', giving back what it held of the stream compression
-%% budget, and its datagram flow.
-forget(Id, Monitor, #state{streams = Streams, monitors = Monitors, reserved = Reserved} = State) ->
-    trevrpc_zstd_stream:release(State#state.stream_budget, maps:get(Id, Reserved, 0)),
+%% Forgets stream Key, giving back what it held of the stream compression
+%% budget, its datagram flow, and its place on its connection.
+forget({Conn, _Id} = Key, #state{streams = Streams, reserved = Reserved} = State) ->
+    {_Pid, Ref, Monitor} = maps:get(Key, Streams),
+    trevrpc_zstd_stream:release(State#state.stream_budget, maps:get(Key, Reserved, 0)),
     {Flows, StreamFlows} =
-        case maps:take(Id, State#state.stream_flows) of
+        case maps:take(Key, State#state.stream_flows) of
             {Flow, Rest} -> {trevrpc_datagram_flows:release(Flow, State#state.flows), Rest};
             error -> {State#state.flows, State#state.stream_flows}
         end,
-    State#state{
-        streams = maps:remove(Id, Streams),
-        monitors = maps:remove(Monitor, Monitors),
-        reserved = maps:remove(Id, Reserved),
+    add_load(Conn, -1, State#state{
+        streams = maps:remove(Key, Streams),
+        refs = maps:remove(Ref, State#state.refs),
+        monitors = maps:remove(Monitor, State#state.monitors),
+        reserved = maps:remove(Key, Reserved),
         flows = Flows,
         stream_flows = StreamFlows
-    }.
+    }).
+
+%%% The pool of QUIC connections
+
+%% The generation's connections, by number: its own, then its extras.
+pool(#state{status = connecting}) ->
+    [];
+pool(#state{transport = Transport, extras = Extras}) ->
+    [{1, Transport} | lists:sort([{Slot, T} || _ := #{slot := Slot, transport := T} <- Extras])].
+
+%% The number of connection Conn in the pool: undefined for one that is not
+%% in it, such as one that drains.
+slot(Conn, #state{extras = Extras} = State) ->
+    case {own(Conn, State), Extras} of
+        {true, _} -> 1;
+        {false, #{Conn := #{slot := Slot}}} -> Slot;
+        {false, #{}} -> undefined
+    end.
+
+%% The connection Conn: the generation's own, an extra, or one that drains.
+conn_transport(Conn, #state{extras = Extras, draining = Draining} = State) ->
+    case {own(Conn, State), Extras, Draining} of
+        {true, _, _} -> State#state.transport;
+        {false, #{Conn := #{transport := Transport}}, _} -> Transport;
+        {false, _, #{Conn := #{transport := Transport}}} -> Transport
+    end.
+
+load(Slot, #state{counters = Counters}) ->
+    atomics:get(Counters, ?LOADS + Slot).
+
+%% Counts N more calls in flight on connection Conn; one that drains closes
+%% after its last.
+add_load(Conn, N, #state{loads = Loads, counters = Counters} = State) ->
+    Load = maps:get(Conn, Loads, 0) + N,
+    _ =
+        case slot(Conn, State) of
+            undefined -> ok;
+            Slot -> atomics:add(Counters, ?LOADS + Slot, N)
+        end,
+    case State#state.draining of
+        #{Conn := Extra} when Load =< 0 ->
+            %% Its last call ended; a writer still waiting for its send
+            %% queue has no call left on it.
+            fail_send_waiters(fun(C) -> C =:= Conn end, State),
+            close_extra(Extra, State#state{
+                draining = maps:remove(Conn, State#state.draining),
+                loads = maps:remove(Conn, Loads),
+                send_waiters = maps:remove(Conn, State#state.send_waiters)
+            });
+        _ ->
+            State#state{loads = Loads#{Conn => Load}}
+    end.
+
+%% Publishes that the pool changed: callers that remember it ask again.
+bump(#state{version = Version, counters = Counters} = State) ->
+    atomics:put(Counters, ?VERSION, Version + 1),
+    State#state{version = Version + 1}.
+
+%% A generation starts with its own connection alone, and over native QUIC
+%% dials its extras.
+start_pool(Kind, #state{min_quic = Min, counters = Counters} = State) ->
+    _ = [atomics:put(Counters, ?LOADS + Slot, 0) || Slot <- lists:seq(1, Min)],
+    Bumped = bump(State),
+    Dialled =
+        case Kind of
+            quic -> lists:foldl(fun dial_extra/2, Bumped, lists:seq(2, Min));
+            qmux -> Bumped
+        end,
+    settle(Dialled).
+
+%% The channel is ready for wait_until_ready/2 once a new generation dials
+%% no extra: each joined or failed. A failed one does not hold it up, and is
+%% dialled again, though a redial that starts while another extra is still
+%% being dialled is waited for too, a connect timeout at most.
+settle(#state{pool_settling = true, extra_attempts = Attempts} = State) when
+    map_size(Attempts) =:= 0
+->
+    _ = [gen_server:reply(From, ok) || {From, _Timer} <- State#state.ready_waiters],
+    State#state{pool_settling = false, ready_waiters = [], held_events = #{}};
+settle(#state{extra_attempts = Attempts} = State) when map_size(Attempts) =:= 0 ->
+    State#state{held_events = #{}};
+settle(State) ->
+    State.
+
+%% Dials the extra numbered Slot, unless it is up or being dialled.
+dial_extra(Slot, #state{extras = Extras, extra_attempts = Attempts} = State) ->
+    Taken = [S || _ := #{slot := S} <- Extras] ++ [S || _ := #{slot := S} <- Attempts],
+    case lists:member(Slot, Taken) of
+        true ->
+            State;
+        false ->
+            Ref = make_ref(),
+            Parent = quic_connect(extra_result, Ref, State),
+            erlang:start_timer(State#state.connect_timeout, self(), {extra_timeout, Ref}),
+            Attempt = #{
+                slot => Slot,
+                generation => State#state.generation,
+                transport => undefined,
+                parent => Parent
+            },
+            State#state{extra_attempts = Attempts#{Ref => Attempt}}
+    end.
+
+extra_result(Ref, Result, #state{extra_attempts = Attempts} = State) ->
+    case {Attempts, Result} of
+        {#{Ref := #{transport := undefined} = Attempt}, {ok, Transport}} ->
+            %% Its connection's events that came first go now.
+            Conn = trevrpc_transport:pid(Transport),
+            {Held, Rest} =
+                case maps:take(Conn, State#state.held_events) of
+                    {Events, Others} -> {Events, Others};
+                    error -> {[], State#state.held_events}
+                end,
+            Known = State#state{
+                extra_attempts = Attempts#{Ref := Attempt#{transport := Transport}},
+                held_events = Rest
+            },
+            lists:foldl(fun(Event, Acc) -> extra_attempt_event(Conn, Event, Acc) end, Known, Held);
+        {#{Ref := #{transport := Adopted}}, {ok, Transport}} when Adopted =/= Transport ->
+            retire(Transport, State);
+        {#{Ref := _}, {ok, _}} ->
+            State;
+        {#{Ref := _}, {error, _}} ->
+            extra_failed(Ref, State);
+        {#{}, {ok, Transport}} ->
+            %% It joined the pool from its events already, or its attempt
+            %% was given up.
+            case slot(trevrpc_transport:pid(Transport), State) of
+                undefined -> retire(Transport, State);
+                _ -> State
+            end;
+        {#{}, {error, _}} ->
+            State
+    end.
+
+%% An event of a connection an extra's attempt dialled. One that comes
+%% before the attempt's result names the connection is held until then:
+%% the extras are dialled in parallel, so which attempt it belongs to is
+%% not known before.
+extra_attempt_event(Conn, {Outcome, _} = Event, #state{extra_attempts = Attempts} = State) when
+    Outcome =:= connected; Outcome =:= closed; Outcome =:= error
+->
+    Known = [Ref || Ref := #{transport := {quic, C}} <- Attempts, C =:= Conn],
+    case Known of
+        [Ref | _] ->
+            extra_attempt_outcome(Ref, Event, State);
+        [] when map_size(Attempts) > 0 ->
+            Held = State#state.held_events,
+            State#state{held_events = Held#{Conn => maps:get(Conn, Held, []) ++ [Event]}};
+        [] ->
+            State
+    end;
+extra_attempt_event(_Conn, _Event, State) ->
+    State.
+
+extra_attempt_outcome(Ref, {connected, Info}, State) ->
+    case maps:get(alpn, Info, undefined) =:= trevrpc:alpn() of
+        true -> join(Ref, State);
+        false -> extra_failed(Ref, State)
+    end;
+extra_attempt_outcome(Ref, _Failed, State) ->
+    extra_failed(Ref, State).
+
+%% The extra an attempt dialled joins the pool, and takes calls from now on.
+join(Ref, #state{extra_attempts = Attempts} = State) ->
+    {#{slot := Slot, transport := Transport, parent := Parent}, Rest} = maps:take(Ref, Attempts),
+    Conn = trevrpc_transport:pid(Transport),
+    Extra = #{
+        transport => Transport, slot => Slot, monitor => monitor(process, Conn), parent => Parent
+    },
+    atomics:put(State#state.counters, ?LOADS + Slot, 0),
+    settle(
+        bump(State#state{
+            extra_attempts = Rest,
+            extras = (State#state.extras)#{Conn => Extra},
+            loads = (State#state.loads)#{Conn => 0},
+            extra_delays = maps:remove(Slot, State#state.extra_delays)
+        })
+    ).
+
+%% An extra's attempt failed: it is dialled again after a backoff.
+extra_failed(Ref, #state{extra_attempts = Attempts} = State) ->
+    {#{slot := Slot, transport := Transport, parent := Parent}, Rest} = maps:take(Ref, Attempts),
+    Parent ! stop,
+    settle(redial(Slot, retire(Transport, State#state{extra_attempts = Rest}))).
+
+%% Dials the extra numbered Slot again after its backoff, which doubles each
+%% time, as the channel's reconnects do.
+redial(Slot, #state{extra_delays = Delays, generation = Generation} = State) ->
+    Delay = maps:get(Slot, Delays, ?INITIAL_DELAY),
+    Jittered = round(Delay * (0.8 + 0.4 * rand:uniform())),
+    erlang:start_timer(Jittered, self(), {redial, Slot, Generation}),
+    State#state{extra_delays = Delays#{Slot => min(?MAX_DELAY, Delay * 2)}}.
+
+%% An extra, or one that drains, is gone: its own calls fail, and an extra
+%% of the current generation is dialled again.
+extra_lost(Conn, #state{extras = Extras, draining = Draining} = State0) ->
+    {Extra, Current} =
+        case Extras of
+            #{Conn := E} -> {E, true};
+            #{} -> {maps:get(Conn, Draining), false}
+        end,
+    State1 = State0#state{
+        extras = maps:remove(Conn, Extras), draining = maps:remove(Conn, Draining)
+    },
+    fail_streams(fun(C) -> C =:= Conn end, State1),
+    State2 = forget_streams(Conn, State1),
+    State3 = close_extra(Extra, State2#state{
+        send_waiters = maps:remove(Conn, State2#state.send_waiters),
+        loads = maps:remove(Conn, State2#state.loads)
+    }),
+    case Current of
+        true ->
+            #{slot := Slot} = Extra,
+            atomics:put(State3#state.counters, ?LOADS + Slot, 0),
+            redial(Slot, bump(State3));
+        false ->
+            State3
+    end.
+
+%% The generation ended: its extras take no new calls, and close after
+%% their last.
+drain_extras(#state{extras = Extras, loads = Loads} = State) ->
+    Drained = maps:fold(
+        fun(Conn, Extra, Acc) ->
+            case maps:get(Conn, Loads, 0) of
+                0 ->
+                    close_extra(Extra, Acc#state{loads = maps:remove(Conn, Acc#state.loads)});
+                _ ->
+                    Acc#state{draining = (Acc#state.draining)#{Conn => Extra}}
+            end
+        end,
+        State#state{extras = #{}},
+        Extras
+    ),
+    bump(Drained).
+
+stop_extra_attempts(#state{extra_attempts = Attempts} = State) ->
+    maps:fold(
+        fun(_Ref, #{transport := Transport, parent := Parent}, Acc) ->
+            Parent ! stop,
+            retire(Transport, Acc)
+        end,
+        State#state{extra_attempts = #{}, held_events = #{}, pool_settling = false},
+        Attempts
+    ).
+
+close_extra(#{transport := Transport, monitor := Monitor, parent := Parent}, State) ->
+    demonitor(Monitor, [flush]),
+    Parent ! stop,
+    retire(Transport, State).
 
 closed_status() ->
     trevrpc_status:new(unavailable, <<"channel is closed">>).

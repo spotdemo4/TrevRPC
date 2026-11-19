@@ -31,6 +31,9 @@ pub type Config {
     max_frame_size: Option(Int),
     connect_timeout: Option(Int),
     idle_timeout: Option(Int),
+    /// How many QUIC connections the channel keeps open and spreads its
+    /// calls over, by default one; QMux over TLS always uses one.
+    min_quic_connections: Option(Int),
   )
 }
 
@@ -47,6 +50,7 @@ pub fn config(host: String, port: Int) -> Config {
     max_frame_size: None,
     connect_timeout: None,
     idle_timeout: None,
+    min_quic_connections: None,
   )
 }
 
