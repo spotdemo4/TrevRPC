@@ -1774,7 +1774,7 @@ unread_streams_share_the_connection_window(Credentials) ->
     end.
 
 %% The connection credit the server granted once it received Target
-%% bytes, more than one stream's window. Every read asserts the grant stays
+%% bytes. Every read asserts the grant stays
 %% within the connection window, and what the flow reader checks besides.
 window_held(Flow, Target, Deadline) ->
     #{granted := Granted, received := Received} = Flow(),
@@ -1798,10 +1798,10 @@ window_held(Flow, Target, Deadline) ->
 %% bytes, its grant would be past the window once 8.5 MiB arrived.
 %%
 %% A QMux session tells it, and grants credit only for what its readers
-%% consume. Its client holds back the other streams once one used its
-%% window and filled its send queue, so the bytes consumed, which must stay
-%% those of the calls' first messages, show it once more than one stream's
-%% window arrived.
+%% consume. Its client may hold back the other streams once one used its
+%% window and filled its send queue, so what arrives may be that one
+%% window; the bytes consumed, which must stay those of the calls' first
+%% messages, show it once a stream's window of unread data arrived.
 flow_reader({qmux, Session, _Queue}) ->
     {
         fun() ->
@@ -1810,7 +1810,7 @@ flow_reader({qmux, Session, _Queue}) ->
             ?assert(Consumed < 1 bsl 20),
             #{granted => Max, received => Received}
         end,
-        (4 bsl 20) + 1024
+        4 bsl 20
     };
 flow_reader({quic, Conn}) ->
     #{max_data_local := Granted, data_received := Received} = quic_state_fields(
