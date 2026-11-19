@@ -1,5 +1,6 @@
 """Unit tests for the interop runner's host-side logic. Run with `python3 -I -m unittest`."""
 
+import contextlib
 import json
 import os
 import stat
@@ -9,6 +10,7 @@ import tempfile
 import textwrap
 import unittest
 import zipfile
+from collections.abc import Generator
 from pathlib import Path
 from typing import cast
 from unittest import mock
@@ -157,18 +159,131 @@ class EmulatorSerialsTest(unittest.TestCase):
         self.assertEqual(["emulator-5556", "emulator-5558"], run.emulator_serials(devices))
 
 
+def connectivity(default: str, *networks: str) -> str:
+    """`dumpsys connectivity` output with the given default network and network agents, each
+    given as `ID TYPE STATE`, in the format Android 13 prints."""
+    agents = [
+        f"  NetworkAgentInfo{{network{{{network_id}}}  handle{{432902426637}}  ni{{{kind} {state}"
+        + " extra: } created=2026-11-19T01:03:26.855Z Score(Policies : TRANSPORT_PRIMARY)"
+        for network_id, kind, state in (network.split() for network in networks)
+    ]
+    return "\n".join(["NetworkProviders for:", f"Active default network: {default}", *agents])
+
+
+MOBILE_ONLY = connectivity("100", "100 MOBILE[HSPA] CONNECTED")
+
+
+class MobileDataProblemTest(unittest.TestCase):
+    def test_accepts_a_connected_mobile_default_network(self) -> None:
+        self.assertIsNone(run.mobile_data_problem(MOBILE_ONLY))
+
+    def test_accepts_a_wifi_network_that_has_disconnected(self) -> None:
+        dumpsys = connectivity("100", "100 MOBILE[LTE] CONNECTED", "101 WIFI DISCONNECTED")
+
+        self.assertIsNone(run.mobile_data_problem(dumpsys))
+
+    def test_rejects_wifi_as_the_default_network(self) -> None:
+        dumpsys = connectivity("101", "100 MOBILE[LTE] CONNECTED", "101 WIFI CONNECTED")
+
+        self.assertEqual("Wi-Fi network 101 is CONNECTED", run.mobile_data_problem(dumpsys))
+
+    def test_rejects_wifi_that_could_still_become_the_default(self) -> None:
+        dumpsys = connectivity("100", "100 MOBILE[LTE] CONNECTED", "101 WIFI CONNECTING")
+
+        self.assertEqual("Wi-Fi network 101 is CONNECTING", run.mobile_data_problem(dumpsys))
+
+    def test_rejects_no_default_network(self) -> None:
+        self.assertEqual(
+            "there is no default network", run.mobile_data_problem(connectivity("none"))
+        )
+        self.assertEqual(
+            "default network 100 is not a connected mobile network",
+            run.mobile_data_problem(connectivity("100", "100 MOBILE[LTE] CONNECTING")),
+        )
+
+
 def write_executable(path: Path, lines: list[str]) -> None:
     _ = path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def fake_android_tools(root: Path, *, adb_server_fails: bool = False) -> Path:
-    """Writes avdmanager, emulator and adb stand-ins to ROOT/bin and returns that directory.
+# The adb stand-in. Its state lives in files in ROOT, its first argument; tests create or read them:
+#   adb-calls.log      every call's arguments, one JSON list per line
+#   adb-server-fails   if present, the server exits at once as if its port were taken
+#   wifi_on            the wifi_on setting ("1" until `svc wifi disable` writes "0")
+#   wifi-stuck         how many `svc wifi disable` calls to ignore ("forever" ignores them all)
+#   dumpsys-0, -1, ... `dumpsys connectivity` prints these in turn, then repeats the last
+#   ping-fails         if present, `ping` gets no answer
+# The server knows two emulators: emulator-5554 belongs to another run, and emulator-5556 answers to
+# the AVD name the fake emulator was started with. `reboot` changes the boot ID.
+FAKE_ADB = """\
+import hashlib, json, os, shutil, socket, sys, time
+from pathlib import Path
 
-    The adb server listens on ANDROID_ADB_SERVER_PORT, or exits at once with `adb_server_fails`.
-    It knows two emulators: emulator-5554 belongs to another run, and emulator-5556 answers to
-    the AVD name the fake emulator was started with.
-    """
+root = Path(sys.argv[1])
+arguments = sys.argv[2:]
+with (root / "adb-calls.log").open("a") as log:
+    print(json.dumps(arguments), file=log)
+
+
+def read(name, default):
+    path = root / name
+    return path.read_text() if path.exists() else default
+
+
+if arguments == ["nodaemon", "server"]:
+    if (root / "adb-server-fails").exists():
+        sys.exit("could not install *smartsocket* listener: Address already in use")
+    environment = {
+        name: os.environ.get(name)
+        for name in ("ANDROID_ADB_SERVER_PORT", "ADB_LOCAL_TRANSPORT_MAX_PORT")
+    }
+    _ = (root / "adb-server-env.json").write_text(json.dumps(environment))
+    listener = socket.create_server(("localhost", int(os.environ["ANDROID_ADB_SERVER_PORT"])))
+    time.sleep(600)
+elif arguments == ["devices"]:
+    print("List of devices attached")
+    print("emulator-5554\\tdevice")
+    print("emulator-5556\\tdevice")
+elif arguments[:1] == ["-s"]:
+    serial, command = arguments[1], arguments[2:]
+    if command == ["emu", "avd", "name"]:
+        print(read("avd-name", "") if serial == "emulator-5556" else "other")
+        print("OK")
+    elif command == ["get-state"]:
+        print("device")
+    elif command == ["shell", "getprop", "sys.boot_completed"]:
+        print("1")
+    elif command == ["shell", "cat", "/proc/sys/kernel/random/boot_id"]:
+        print("boot-" + read("boots", "0"))
+    elif command == ["reboot"]:
+        _ = (root / "boots").write_text(str(int(read("boots", "0")) + 1))
+    elif command == ["shell", "id", "-u"]:
+        print("0")
+    elif command[:1] == ["push"]:
+        _ = shutil.copyfile(command[1], root / "pushed")
+    elif command[:2] == ["shell", "sha256sum"]:
+        print(hashlib.sha256((root / "pushed").read_bytes()).hexdigest(), command[2])
+    elif command == ["shell", "settings", "get", "global", "wifi_on"]:
+        print(read("wifi_on", "1"))
+    elif command == ["shell", "svc", "wifi", "disable"]:
+        disables = int(read("wifi-disables", "0")) + 1
+        _ = (root / "wifi-disables").write_text(str(disables))
+        stuck = read("wifi-stuck", "0")
+        if stuck != "forever" and disables > int(stuck):
+            _ = (root / "wifi_on").write_text("0")
+    elif command == ["shell", "dumpsys", "connectivity"]:
+        outputs = sorted(root.glob("dumpsys-[0-9]*"), key=lambda path: int(path.name[8:]))
+        calls = int(read("dumpsys-calls", "0"))
+        _ = (root / "dumpsys-calls").write_text(str(calls + 1))
+        print(outputs[min(calls, len(outputs) - 1)].read_text())
+    elif command[:2] == ["shell", "ping"]:
+        sys.exit(1 if (root / "ping-fails").exists() else 0)
+"""
+
+
+def fake_android_tools(root: Path) -> Path:
+    """Writes avdmanager, emulator and adb stand-ins to ROOT/bin and returns that directory."""
     tools = root / "bin"
     tools.mkdir()
     write_executable(tools / "avdmanager", ["#!/bin/sh", "cat >/dev/null"])
@@ -176,66 +291,51 @@ def fake_android_tools(root: Path, *, adb_server_fails: bool = False) -> Path:
         tools / "emulator",
         [
             f"#!{sys.executable}",
-            "import json, sys, time",
+            "import json, os, sys, time",
             "from pathlib import Path",
             f"root = Path({str(root)!r})",
-            "import os",
             "_ = (root / 'emulator-args.json').write_text(json.dumps(sys.argv[1:]))",
             "_ = (root / 'emulator-tmpdir').write_text(os.environ['TMPDIR'])",
             "_ = (root / 'avd-name').write_text(sys.argv[sys.argv.index('-avd') + 1])",
             "time.sleep(600)",
         ],
     )
+    _ = (root / "fake_adb.py").write_text(FAKE_ADB, encoding="utf-8")
     write_executable(
-        tools / "adb",
-        [
-            f"#!{sys.executable}",
-            "import json, os, socket, sys, time",
-            "from pathlib import Path",
-            f"root = Path({str(root)!r})",
-            "arguments = sys.argv[1:]",
-            "if arguments == ['nodaemon', 'server']:",
-            "    if " + repr(adb_server_fails) + ":",
-            "        sys.exit('could not install *smartsocket* listener: Address already in use')",
-            "    environment = {name: os.environ.get(name) for name in",
-            "                   ('ANDROID_ADB_SERVER_PORT', 'ADB_LOCAL_TRANSPORT_MAX_PORT')}",
-            "    _ = (root / 'adb-server-env.json').write_text(json.dumps(environment))",
-            "    listener = socket.create_server(",
-            "        ('localhost', int(os.environ['ANDROID_ADB_SERVER_PORT'])))",
-            "    time.sleep(600)",
-            "elif arguments == ['devices']:",
-            "    print('List of devices attached')",
-            "    print('emulator-5554\\tdevice')",
-            "    print('emulator-5556\\tdevice')",
-            "elif arguments[:1] == ['-s']:",
-            "    serial, command = arguments[1], arguments[2:]",
-            "    if command == ['emu', 'avd', 'name']:",
-            "        mine = serial == 'emulator-5556'",
-            "        print((root / 'avd-name').read_text() if mine else 'other')",
-            "        print('OK')",
-            "    elif command == ['get-state']:",
-            "        print('device')",
-            "    elif command[:3] == ['shell', 'getprop', 'sys.boot_completed']:",
-            "        print('1')",
-            "    elif command[:2] == ['shell', 'cat']:",
-            "        print('boot-1')",
-        ],
+        tools / "adb", ["#!/bin/sh", f'exec {sys.executable} {root / "fake_adb.py"} {root} "$@"']
     )
     return tools
+
+
+def adb_calls(root: Path) -> list[list[str]]:
+    """The arguments of every call to the fake adb, without `-s SERIAL`."""
+    calls = [
+        cast(list[str], json.loads(line))
+        for line in (root / "adb-calls.log").read_text(encoding="utf-8").splitlines()
+    ]
+    return [call[2:] if call[:1] == ["-s"] else call for call in calls]
+
+
+@contextlib.contextmanager
+def booted_emulator(root: Path) -> Generator[run.Emulator]:
+    """An Emulator on the fake tools in ROOT that has booted; it is shut down afterwards."""
+    tools = fake_android_tools(root)
+    path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
+    with mock.patch.dict(os.environ, {"PATH": path}):
+        emulator = run.Emulator(root, root, run.DEFAULT_SYSTEM_IMAGE)
+        try:
+            emulator.wait_for_boot()
+            yield emulator
+        finally:
+            emulator.shutdown()
 
 
 class EmulatorTest(unittest.TestCase):
     def test_runs_its_own_adb_server_and_finds_its_emulator_by_avd_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            tools = fake_android_tools(root)
-            path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
-            with mock.patch.dict(os.environ, {"PATH": path}):
-                emulator = run.Emulator(root, root, run.DEFAULT_SYSTEM_IMAGE)
-                try:
-                    emulator.wait_for_boot()
-                finally:
-                    emulator.shutdown()
+            with booted_emulator(root) as emulator:
+                pass
 
             self.assertEqual("emulator-5556", emulator.serial)
             server_env = cast(
@@ -263,7 +363,8 @@ class EmulatorTest(unittest.TestCase):
     def test_fails_without_starting_the_emulator_when_the_adb_server_exits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            tools = fake_android_tools(root, adb_server_fails=True)
+            tools = fake_android_tools(root)
+            (root / "adb-server-fails").touch()
             path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
             with (
                 mock.patch.dict(os.environ, {"PATH": path}),
@@ -272,6 +373,117 @@ class EmulatorTest(unittest.TestCase):
                 _ = run.Emulator(root, root, run.DEFAULT_SYSTEM_IMAGE)
 
             self.assertFalse((root / "avd-name").exists())
+
+
+class MobileDataTest(unittest.TestCase):
+    def test_turns_wifi_off_until_the_setting_reads_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with booted_emulator(root) as emulator:
+                emulator.use_mobile_data(timeout=5)
+
+            self.assertIn(["shell", "svc", "wifi", "disable"], adb_calls(root))
+            self.assertEqual("0", (root / "wifi_on").read_text(encoding="utf-8"))
+
+    def test_asks_again_until_wifi_goes_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "wifi-stuck").write_text("2", encoding="utf-8")
+            with booted_emulator(root) as emulator:
+                emulator.use_mobile_data(timeout=60)
+
+            self.assertEqual(3, adb_calls(root).count(["shell", "svc", "wifi", "disable"]))
+            self.assertEqual("0", (root / "wifi_on").read_text(encoding="utf-8"))
+
+    def test_fails_when_wifi_never_goes_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "wifi-stuck").write_text("forever", encoding="utf-8")
+            with (
+                booted_emulator(root) as emulator,
+                self.assertRaisesRegex(run.WaitTimeout, "did not turn Wi-Fi off within 1s"),
+            ):
+                emulator.use_mobile_data(timeout=1)
+
+    def test_polls_until_mobile_data_is_the_only_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "wifi_on").write_text("0", encoding="utf-8")
+            outputs = [
+                connectivity("101", "100 MOBILE[LTE] CONNECTED", "101 WIFI CONNECTED"),
+                connectivity("none"),
+                MOBILE_ONLY,
+            ]
+            for index, output in enumerate(outputs):
+                _ = (root / f"dumpsys-{index}").write_text(output, encoding="utf-8")
+            with booted_emulator(root) as emulator:
+                emulator.wait_for_mobile_data(timeout=10)
+
+            self.assertEqual("3", (root / "dumpsys-calls").read_text(encoding="utf-8"))
+
+    def test_turns_wifi_off_again_if_it_comes_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "wifi_on").write_text("1", encoding="utf-8")
+            _ = (root / "dumpsys-0").write_text(MOBILE_ONLY, encoding="utf-8")
+            with booted_emulator(root) as emulator:
+                emulator.wait_for_mobile_data(timeout=10)
+
+            self.assertIn(["shell", "svc", "wifi", "disable"], adb_calls(root))
+
+    def test_names_the_unmet_condition_and_keeps_the_last_dumpsys(self) -> None:
+        wifi = connectivity("100", "100 MOBILE[LTE] CONNECTED", "101 WIFI CONNECTED")
+        for dumpsys, ping_fails, problem in [
+            (wifi, False, "Wi-Fi network 101 is CONNECTED"),
+            (MOBILE_ONLY, True, f"{run.EMULATOR_HOST} did not answer a ping"),
+        ]:
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "wifi_on").write_text("0", encoding="utf-8")
+                _ = (root / "dumpsys-0").write_text(dumpsys, encoding="utf-8")
+                if ping_fails:
+                    (root / "ping-fails").touch()
+                with (
+                    booted_emulator(root) as emulator,
+                    self.assertRaisesRegex(run.WaitTimeout, f"within 1s: {problem}$"),
+                ):
+                    emulator.wait_for_mobile_data(timeout=1)
+
+                self.assertEqual(dumpsys, (root / "connectivity.log").read_text(encoding="utf-8"))
+
+    def test_passes_an_emulator_exit_through_without_a_network_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _ = (root / "dumpsys-0").write_text(MOBILE_ONLY, encoding="utf-8")
+            with booted_emulator(root) as emulator:
+                emulator.process.kill()
+                _ = emulator.process.wait()
+                with self.assertRaises(run.RunnerError) as raised:
+                    emulator.wait_for_mobile_data(timeout=10)
+
+            self.assertNotIsInstance(raised.exception, run.WaitTimeout)
+            self.assertRegex(str(raised.exception), "^emulator exited with ")
+
+    def test_prepare_turns_wifi_off_before_the_ca_reboots_and_waits_after_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _ = (root / "dumpsys-0").write_text(MOBILE_ONLY, encoding="utf-8")
+            certificates = run.generate_certificates(root / "certificates")
+            with booted_emulator(root) as emulator:
+                emulator.prepare(certificates.ca, root)
+
+            calls = adb_calls(root)
+            last = {str(call): index for index, call in enumerate(calls)}
+            first_disable = calls.index(["shell", "svc", "wifi", "disable"])
+            self.assertLess(first_disable, calls.index(["disable-verity"]))
+            self.assertGreater(
+                last[str(["shell", "dumpsys", "connectivity"])], last[str(["reboot"])]
+            )
+            self.assertGreater(
+                last[str(["shell", "ping", "-c", "1", "-W", "1", run.EMULATOR_HOST])],
+                last[str(["reboot"])],
+            )
+            self.assertEqual("2", (root / "boots").read_text(encoding="utf-8"))
 
 
 class ExtractDictionaryTest(unittest.TestCase):

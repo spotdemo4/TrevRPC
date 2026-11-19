@@ -51,6 +51,10 @@ TEST_RUNNER = "androidx.test.runner.AndroidJUnitRunner"
 DEFAULT_SYSTEM_IMAGE = "system-images;android-33;google_apis;x86_64"
 CA_DIRECTORY = "/system/etc/security/cacerts"
 BOOT_TIMEOUT = 180
+NETWORK_TIMEOUT = 60
+# `dumpsys connectivity` prints every network and request; on a loaded emulator it can take longer
+# than a quick probe allows.
+DUMPSYS_TIMEOUT = 15
 INSTRUMENTATION_TIMEOUT = 180
 MIN_FREE_BYTES = 6 * 1024**3
 # The test APK carries the compression golden vectors, whose dictionary it compresses with.
@@ -60,11 +64,11 @@ DICTIONARY_VECTORS = "zstd-golden-vectors.txt"
 # --- processes -------------------------------------------------------------------------------
 
 
-def probe(command: list[str], env: dict[str, str] | None = None) -> str | None:
+def probe(command: list[str], env: dict[str, str] | None = None, timeout: float = 5) -> str | None:
     """Returns stdout of a quick command, or None if it failed or timed out."""
     try:
         result = subprocess.run(
-            command, text=True, capture_output=True, timeout=5, env=env, check=False
+            command, text=True, capture_output=True, timeout=timeout, env=env, check=False
         )
     except OSError, subprocess.TimeoutExpired:
         return None
@@ -205,6 +209,27 @@ def free_port() -> int:
         return cast(int, listener.getsockname()[1])
 
 
+_NETWORK_AGENT = re.compile(
+    r"NetworkAgentInfo\{network\{(\d+)\}.*?\bni\{([A-Z_]+)(?:\[[^\]]*\])? ([A-Z_]+)"
+)
+_DEFAULT_NETWORK = re.compile(r"^\s*Active default network: (\d+)\s*$", re.MULTILINE)
+
+
+def mobile_data_problem(dumpsys: str) -> str | None:
+    """Returns why `dumpsys connectivity` does not show a connected mobile network as the default
+    network with no Wi-Fi network other than a disconnected one, or None if it does."""
+    networks = [match.groups() for match in _NETWORK_AGENT.finditer(dumpsys)]
+    for network_id, kind, state in networks:
+        if kind == "WIFI" and state != "DISCONNECTED":
+            return f"Wi-Fi network {network_id} is {state}"
+    default = _DEFAULT_NETWORK.search(dumpsys)
+    if default is None:
+        return "there is no default network"
+    if (default.group(1), "MOBILE", "CONNECTED") not in networks:
+        return f"default network {default.group(1)} is not a connected mobile network"
+    return None
+
+
 def emulator_serials(devices: str) -> list[str]:
     """Returns the emulator serials in `adb devices` output, in any state."""
     return [
@@ -214,12 +239,17 @@ def emulator_serials(devices: str) -> list[str]:
     ]
 
 
+class WaitTimeout(RunnerError):
+    """An emulator condition that did not hold before its deadline."""
+
+
 class Emulator:
     """A headless emulator with a writable system partition, reached through its own adb server."""
 
     name: str
     env: dict[str, str]
     serial: str | None
+    output: Path
     log_path: Path
     adb_server: subprocess.Popen[bytes]
     process: subprocess.Popen[bytes]
@@ -234,6 +264,7 @@ class Emulator:
         temporary.mkdir(exist_ok=True)
         self.name = f"trevrpc-interop-{os.getpid()}"
         self.serial = None
+        self.output = output
         self.env = {
             **os.environ,
             "TMPDIR": str(temporary),
@@ -311,10 +342,10 @@ class Emulator:
         """Runs an adb command against the emulator and returns its stdout."""
         return run_checked(self.adb_command(*arguments), timeout=timeout, env=self.env)
 
-    def adb_probe(self, *arguments: str) -> str | None:
+    def adb_probe(self, *arguments: str, timeout: float = 5) -> str | None:
         if self.serial is None:
             return None
-        return probe(self.adb_command(*arguments), self.env)
+        return probe(self.adb_command(*arguments), self.env, timeout)
 
     def _find_serial(self) -> str | None:
         """Returns the serial of this run's emulator once it has registered with the adb server.
@@ -333,7 +364,7 @@ class Emulator:
                 return
             time.sleep(1)
         self._require_running()
-        raise RunnerError(f"emulator did not {description} within {timeout}s")
+        raise WaitTimeout(f"emulator did not {description} within {timeout}s")
 
     def _require_running(self) -> None:
         if self.adb_server.poll() is not None:
@@ -361,6 +392,77 @@ class Emulator:
             )
 
         self.wait_until(booted, "boot", BOOT_TIMEOUT)
+
+    def prepare(self, ca: Path, work_dir: Path) -> None:
+        """Boots the emulator and readies it for the scenarios.
+
+        Wi-Fi goes off before the reboots that install the CA, so every later boot comes up
+        without it, and the scenarios start only once mobile data reaches the host.
+        """
+        self.wait_for_boot()
+        self.use_mobile_data()
+        self.install_ca(ca, work_dir)
+        self.wait_for_mobile_data()
+        for setting in (
+            "window_animation_scale",
+            "transition_animation_scale",
+            "animator_duration_scale",
+        ):
+            _ = self.adb("shell", "settings", "put", "global", setting, "0")
+
+    def _wifi_off(self) -> bool:
+        """Whether Wi-Fi is off; if not, asks again to turn it off."""
+        if self.adb_probe("shell", "settings", "get", "global", "wifi_on") == "0":
+            return True
+        _ = self.adb_probe("shell", "svc", "wifi", "disable")
+        return False
+
+    def use_mobile_data(self, timeout: int = NETWORK_TIMEOUT) -> None:
+        """Turns Wi-Fi off, which lasts across reboots.
+
+        The emulator has a mobile and a Wi-Fi network, which come up in either order after each
+        boot. When the default network changes, Cronet fails the call in flight with
+        ERR_NETWORK_CHANGED, and its channel can stay unable to reach the host afterwards, so the
+        scenarios run on mobile data alone. Right after a boot the Wi-Fi service may not take the
+        request yet, so it is repeated until the setting reads off.
+        """
+        self.wait_until(self._wifi_off, "turn Wi-Fi off", timeout)
+
+    def wait_for_mobile_data(self, timeout: int = NETWORK_TIMEOUT) -> None:
+        """Waits until mobile data is the default network, Wi-Fi is off, and the host answers.
+
+        On a timeout the error names the condition last unmet, and the last `dumpsys
+        connectivity` output is written to `connectivity.log` in the output directory.
+        """
+        problem = "nothing was checked"
+        last_dumpsys = ""
+
+        def ready() -> bool:
+            nonlocal problem, last_dumpsys
+            if not self._wifi_off():
+                problem = "Wi-Fi is on"
+                return False
+            dumpsys = self.adb_probe("shell", "dumpsys", "connectivity", timeout=DUMPSYS_TIMEOUT)
+            if dumpsys is None:
+                problem = f"dumpsys connectivity failed or took over {DUMPSYS_TIMEOUT}s"
+                return False
+            last_dumpsys = dumpsys
+            if (problem_now := mobile_data_problem(dumpsys)) is not None:
+                problem = problem_now
+                return False
+            if self.adb_probe("shell", "ping", "-c", "1", "-W", "1", EMULATOR_HOST) is None:
+                problem = f"{EMULATOR_HOST} did not answer a ping"
+                return False
+            return True
+
+        try:
+            self.wait_until(ready, f"reach {EMULATOR_HOST} over mobile data alone", timeout)
+        except WaitTimeout as error:
+            _ = (self.output / "connectivity.log").write_text(last_dumpsys, encoding="utf-8")
+            raise WaitTimeout(f"{error}: {problem}") from error
+        except RunnerError:
+            _ = (self.output / "connectivity.log").write_text(last_dumpsys, encoding="utf-8")
+            raise
 
     def reboot(self) -> None:
         previous = self.adb_probe("shell", "cat", "/proc/sys/kernel/random/boot_id")
@@ -621,14 +723,7 @@ def execute(args: Options) -> Outcomes:
             args.server_command, certificates, args.server_host, dictionary, args.output
         )
         emulator = Emulator(args.work_dir, args.output, args.system_image)
-        emulator.wait_for_boot()
-        emulator.install_ca(certificates.ca, args.work_dir)
-        for setting in (
-            "window_animation_scale",
-            "transition_animation_scale",
-            "animator_duration_scale",
-        ):
-            _ = emulator.adb("shell", "settings", "put", "global", setting, "0")
+        emulator.prepare(certificates.ca, args.work_dir)
         _ = emulator.adb("install", "-r", str(args.app_apk), timeout=90)
         _ = emulator.adb("install", "-r", str(args.test_apk), timeout=90)
         _ = emulator.adb("logcat", "-c")
